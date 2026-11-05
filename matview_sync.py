@@ -439,10 +439,8 @@ class MaterializedViewPlan:
                 stmts.extend(sp.drop_statements())
             return stmts
         stmts = []
-        for t_name in self.trigger_names:
-            if self.dialect == Dialect.POSTGRES:
-                stmts.append(f"DROP TRIGGER IF EXISTS {t_name} ON {self.view_spec.base_table} CASCADE;")
-            else:
+        if self.dialect != Dialect.POSTGRES:
+            for t_name in self.trigger_names:
                 stmts.append(f"DROP TRIGGER IF EXISTS {t_name};")
         for fn_name in self.function_names:
             stmts.append(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
@@ -715,16 +713,18 @@ def parse_table_schema(schema_sql: str) -> Dict[str, TableSchema]:
 
 
 def introspect_sqlite_schemas(
-    conn: sqlite3.Connection, object_prefix: str = DEFAULT_OBJECT_PREFIX
+    conn: Any, object_prefix: str = DEFAULT_OBJECT_PREFIX
 ) -> Dict[str, TableSchema]:
     """Extracts user base table schemas directly from a live SQLite connection."""
-    rows = conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         "SELECT name, sql FROM sqlite_master "
         "WHERE type = 'table' AND sql IS NOT NULL "
         "AND name NOT LIKE 'sqlite_%' "
         "AND name NOT LIKE '__matview_%' "
         "AND name NOT LIKE '__mv_%'"
-    ).fetchall()
+    )
+    rows = cur.fetchall() or []
     if object_prefix:
         rows = [
             (n, s)
@@ -737,7 +737,8 @@ def introspect_sqlite_schemas(
             parsed = parse_table_schema(sql)
             schemas.update(parsed)
         except ValueError:
-            p_rows = conn.execute(f"PRAGMA table_info({tbl_name})").fetchall()
+            cur.execute(f"PRAGMA table_info({tbl_name})")
+            p_rows = cur.fetchall() or []
             cols: Dict[str, ColumnDef] = {}
             for _, c_name, c_type, notnull, _, pk in p_rows:
                 cols[c_name] = ColumnDef(
@@ -961,13 +962,11 @@ def _parse_from_and_joins(from_clause: str) -> List[JoinClause]:
 
 
 def _parse_select_item(raw_item: str, idx: int) -> Tuple[SelectItem, bool]:
-    alias_match = _find_top_level_keyword(raw_item, r"\bAS\s+[A-Za-z0-9_\"`\[\]]+\s*$")
-    if alias_match:
-        expr = raw_item[: alias_match.start()].strip()
-        alias_part = re.sub(
-            r"^AS\s+", "", raw_item[alias_match.start() :].strip(), flags=re.IGNORECASE
-        )
-        alias = _unquote_ident(alias_part)
+    as_matches = _find_all_top_level_keywords(raw_item, r"\bAS\b")
+    last_as = as_matches[-1] if as_matches else None
+    if last_as and re.match(r"^[A-Za-z0-9_\"`\[\]]+$", raw_item[last_as.end() :].strip()):
+        expr = raw_item[: last_as.start()].strip()
+        alias = _unquote_ident(raw_item[last_as.end() :].strip())
     else:
         m_imp = re.match(
             r"^(.*\))\s+([A-Za-z_][A-Za-z0-9_]*)$", raw_item.strip(), flags=re.DOTALL
@@ -1074,7 +1073,8 @@ def _parse_select_item(raw_item: str, idx: int) -> Tuple[SelectItem, bool]:
             )
 
     agg_pattern = r"\b(" + "|".join(re.escape(k) for k in _AGG_NAME_MAP.keys()) + r")\s*\("
-    contains_agg = bool(re.search(agg_pattern, expr, flags=re.IGNORECASE))
+    is_scalar_subquery = bool(re.match(r"^\(\s*SELECT\b", expr.strip(), flags=re.IGNORECASE))
+    contains_agg = (not is_scalar_subquery) and bool(re.search(agg_pattern, expr, flags=re.IGNORECASE))
     if contains_agg:
         if alias == expr:
             alias = f"agg_expr_{idx}"
@@ -1416,11 +1416,24 @@ def _try_unwrap_simple_cte(raw_select_sql: str, known_tables: Optional[Set[str]]
             s = re.sub(rf"\b(?:{re.escape(cte_name)}|{re.escape(outer_cte_alias)})\s*\.\s*", "", tok, flags=re.IGNORECASE)
             for c_al, c_ex in sorted(col_map.items(), key=lambda x: len(x[0]), reverse=True):
                 if c_al != c_ex.lower():
-                    s = re.sub(rf"(?<![.\w])\b{re.escape(c_al)}\b(?!\s*\()", f"({c_ex})", s, flags=re.IGNORECASE)
+                    repl = c_ex if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", c_ex) else f"({c_ex})"
+                    s = re.sub(rf"(?<![.\w])\b{re.escape(c_al)}\b(?!\s*\()", repl, s, flags=re.IGNORECASE)
             out.append(s)
         return "".join(out)
 
-    new_select_part = _subst_cte_cols(outer_before_from)
+    m_sel_kw = re.match(r"^SELECT\s+(DISTINCT\s+|ALL\s+)?(.*)$", outer_before_from, flags=re.IGNORECASE | re.DOTALL)
+    if not m_sel_kw:
+        return None
+    sel_mod = m_sel_kw.group(1) or ""
+    outer_raw_items = _split_top_level(m_sel_kw.group(2).strip(), ",")
+    if len(outer_raw_items) == 1 and outer_raw_items[0].strip() == "*":
+        return None
+    rebuilt_items: List[str] = []
+    for idx_o, raw_o in enumerate(outer_raw_items):
+        o_it, _ = _parse_select_item(raw_o, idx_o)
+        subst_raw = _subst_cte_cols(o_it.raw_expr)
+        rebuilt_items.append(f"{subst_raw} AS {o_it.alias}")
+    new_select_part = f"SELECT {sel_mod}{', '.join(rebuilt_items)}"
     outer_w = _subst_cte_cols(clauses["WHERE"]) if "WHERE" in clauses else None
     if inner_where and outer_w:
         comb_w = f"({inner_where}) AND ({outer_w})"
@@ -2419,6 +2432,8 @@ class IncrementalViewCompiler:
             AggFunc.SUM,
             AggFunc.TOTAL,
             AggFunc.AVG,
+            AggFunc.MIN,
+            AggFunc.MAX,
             AggFunc.VAR_POP,
             AggFunc.VAR_SAMP,
             AggFunc.STDDEV_POP,
@@ -2484,6 +2499,8 @@ class IncrementalViewCompiler:
             AggFunc.SUM,
             AggFunc.TOTAL,
             AggFunc.AVG,
+            AggFunc.MIN,
+            AggFunc.MAX,
             AggFunc.VAR_POP,
             AggFunc.VAR_SAMP,
             AggFunc.STDDEV_POP,
@@ -2869,19 +2886,24 @@ class IncrementalViewCompiler:
         if not ident:
             return None
         pat = re.compile(
-            rf'((?:COUNT|SUM|AVG|TOTAL|MIN|MAX|VAR_POP|VARIANCE|VAR_SAMP|STDDEV_POP|STDDEV|STD|STDDEV_SAMP|ROW_NUMBER|RANK|DENSE_RANK)\s*\(([^)]*)\))\s+AS\s+["`\[]?{re.escape(ident)}["`\]]?\b',
+            rf'((?:COUNT|SUM|AVG|TOTAL|MIN|MAX|VAR_POP|VARIANCE|VAR_SAMP|STDDEV_POP|STDDEV|STD|STDDEV_SAMP|ROW_NUMBER|RANK|DENSE_RANK|NTILE)\s*\(([^)]*)\)(?:\s+FILTER\s*\([^)]*\))?(?:\s+OVER\s*\([^)]*\))?)\s+AS\s+["`\[]?{re.escape(ident)}["`\]]?\b',
             re.IGNORECASE,
         )
         m = pat.search(self.view.raw_select_sql)
         if m:
             fn_expr = m.group(1).strip().upper()
             inner_arg = m.group(2).strip()
-            if fn_expr.startswith(("COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK")):
+            if fn_expr.startswith(("COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE")):
                 return self._int_type()
             if fn_expr.startswith("SUM"):
                 c_arg = self._lookup_col_def(inner_arg)
                 if c_arg and "INT" in c_arg.data_type.upper():
                     return self._int_type()
+                return self._float_type()
+            if fn_expr.startswith(("MIN", "MAX")):
+                c_arg = self._lookup_col_def(inner_arg)
+                if c_arg:
+                    return self._normalize_dialect_type(c_arg.data_type)
                 return self._float_type()
             if fn_expr.startswith(("AVG", "TOTAL", "VAR_", "VARIANCE", "STDDEV", "STD")):
                 return self._float_type()
@@ -3144,7 +3166,7 @@ class IncrementalViewCompiler:
                 )
             for c_name in col_names:
                 modified = re.sub(
-                    rf"(?<![.\w])\b{re.escape(c_name)}\b(?!\s*\()",
+                    rf"(?<![.\w\"`\[])(?:[\"`\[])?\b{re.escape(c_name)}\b(?:[\"`\]])?(?!\s*\()",
                     f"{record_prefix}.{c_name}",
                     modified,
                     flags=re.IGNORECASE,
@@ -3240,7 +3262,7 @@ class IncrementalViewCompiler:
                     out_stmts = [chunk_cte_sql]
                     if not grp_exprs and full_sqls:
                         base_full = full_sqls[0].strip().rstrip(";")
-                        w_tok = "" if " WHERE " in base_full.upper() else "\nWHERE TRUE"
+                        w_tok = "" if _find_top_level_keyword(base_full, r"\bWHERE\b") else "\nWHERE TRUE"
                         seed_sql = f"{base_full}{w_tok}\nON CONFLICT (__mv_global_id) DO NOTHING;"
                         out_stmts.append(seed_sql)
                     return out_stmts
@@ -3281,7 +3303,7 @@ class IncrementalViewCompiler:
                     out_stmts = [do_block]
                     if not grp_exprs and full_sqls:
                         base_full = full_sqls[0].strip().rstrip(";")
-                        w_tok = "" if " WHERE " in base_full.upper() else "\nWHERE TRUE"
+                        w_tok = "" if _find_top_level_keyword(base_full, r"\bWHERE\b") else "\nWHERE TRUE"
                         seed_sql = f"{base_full}{w_tok}\nON CONFLICT (__mv_global_id) DO NOTHING;"
                         out_stmts.append(seed_sql)
                     return out_stmts
@@ -3343,7 +3365,7 @@ class IncrementalViewCompiler:
         for idx_s, raw_s in enumerate(full_sqls):
             s_clean = raw_s.strip().rstrip(";")
             m_head = re.match(
-                r"^INSERT\s+INTO\s+([A-Za-z0-9_]+)\s*\(([^)]+)\)\s*(SELECT\b.*)$",
+                r"^INSERT\s+INTO\s+([A-Za-z0-9_]+)\s*\(([^)]+)\)\s*((?:WITH|SELECT)\b.*)$",
                 s_clean,
                 flags=re.DOTALL | re.IGNORECASE,
             )
@@ -3352,21 +3374,30 @@ class IncrementalViewCompiler:
                 continue
             target_tbl, cols_str, select_body = m_head.groups()
             cols = [c.strip() for c in _split_top_level(cols_str, ",")]
-            aliased_inner = re.sub(
-                r"^SELECT\s+(DISTINCT\s+)?(.*?)(\s+FROM\b.*)$",
-                lambda m_sel: (
-                    "SELECT "
-                    + (m_sel.group(1) or "")
-                    + ", ".join(
-                        f"{_parse_select_item(ex.strip(), 0)[0].raw_expr} AS {col}"
-                        for col, ex in zip(cols, _split_top_level(m_sel.group(2), ","))
-                    )
-                    + m_sel.group(3)
-                ),
-                select_body,
-                count=1,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
+            m_top_from = _find_top_level_keyword(select_body, r"\bFROM\b")
+            if (
+                m_top_from
+                and re.match(r"^SELECT\b", select_body.strip(), flags=re.IGNORECASE)
+                and not _find_top_level_keyword(select_body, r"\b(?:UNION|INTERSECT|EXCEPT)\b")
+            ):
+                before_from = select_body[: m_top_from.start()].strip()
+                from_onward = select_body[m_top_from.start() :]
+                m_sel_prefix = re.match(r"^SELECT\s+(DISTINCT\s+)?(.*)$", before_from, flags=re.DOTALL | re.IGNORECASE)
+                if m_sel_prefix:
+                    dist_kw = m_sel_prefix.group(1) or ""
+                    raw_sel_exprs = _split_top_level(m_sel_prefix.group(2), ",")
+                    if len(raw_sel_exprs) == len(cols) and not (len(raw_sel_exprs) == 1 and raw_sel_exprs[0].strip() == "*"):
+                        aliased_cols = ", ".join(
+                            f"{_parse_select_item(ex.strip(), 0)[0].raw_expr} AS {col}"
+                            for col, ex in zip(cols, raw_sel_exprs)
+                        )
+                        aliased_inner = f"SELECT {dist_kw}{aliased_cols} {from_onward}"
+                    else:
+                        aliased_inner = select_body
+                else:
+                    aliased_inner = select_body
+            else:
+                aliased_inner = select_body
             is_aux_dist = "__val" in cols and "__ref_cnt" in cols
             tbl_pks = ([*main_pk_cols, "__val"] if is_aux_dist else main_pk_cols) if (is_aux_dist or target_tbl == raw_plan.backing_table_name) else []
             tbl_pks = [c for c in tbl_pks if c in cols]
@@ -3648,6 +3679,8 @@ class IncrementalViewCompiler:
                     fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
                     dt = self._infer_expr_storage_type(fake_it)
                     null_str = ""
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
                 col_defs_sql.append(f"{mv_col} {dt}{null_str}")
 
         def _expr_key(item: SelectItem) -> str:
@@ -3795,7 +3828,10 @@ class IncrementalViewCompiler:
                 for g_expr in grp_exprs:
                     c_def = self._col_def(g_expr)
                     mv_col = self._group_col_alias(g_expr)
-                    dist_cols.append(f"{mv_col} {self._normalize_dialect_type(c_def.data_type)} NOT NULL")
+                    g_dt = self._normalize_dialect_type(c_def.data_type)
+                    if self.dialect == Dialect.MYSQL and g_dt.upper() == "TEXT":
+                        g_dt = "VARCHAR(255)"
+                    dist_cols.append(f"{mv_col} {g_dt} NOT NULL")
             dist_cols.append(f"__val {val_type} NOT NULL")
             dist_cols.append(f"__ref_cnt {self._int_type()} NOT NULL DEFAULT 0")
             dist_cols.append(f"PRIMARY KEY ({', '.join(pk_cols)}, __val)")
@@ -4065,7 +4101,7 @@ class IncrementalViewCompiler:
             self.primary_schema
             and any(c.primary_key and "INT" in c.data_type.upper() for c in self.primary_schema.columns.values())
         )
-        if not has_holistic_or_distinct and (self.dialect in (Dialect.SQLITE, Dialect.POSTGRES) or has_int_pk):
+        if not has_holistic_or_distinct and (self.dialect == Dialect.SQLITE or has_int_pk):
             pk_col = "rowid"
             if self.primary_schema:
                 for c_def in self.primary_schema.columns.values():
@@ -4340,6 +4376,20 @@ class IncrementalViewCompiler:
         ]
 
     def _build_recompute_subquery_raw(self, item: SelectItem, record_prefix: str) -> str:
+        if getattr(self, "_alg_mode", None) == "union_all_agg":
+            inner_u = getattr(self, "_union_all_inner_sql", "")
+            u_alias = getattr(self, "_union_all_sub_alias", "__mv_u")
+            orig_item = getattr(self, "_uall_orig_item_map", {}).get(id(item), item)
+            orig_grps = getattr(self, "_uall_orig_grp_exprs", self._effective_group_by_exprs)
+            u_conds: List[str] = []
+            if self.view.where_clause:
+                u_conds.append(f"({self.view.where_clause})")
+            for orig_g, branch_g in zip(orig_grps, self._effective_group_by_exprs):
+                rhs_g = self._rewrite_expr_for_record(branch_g, record_prefix)
+                u_conds.append(self._null_safe_eq(f"({orig_g})", f"({rhs_g})", is_nullable=True))
+            w_u = f" WHERE {' AND '.join(u_conds)}" if u_conds else ""
+            u_agg_sql = self._sql_backfill_agg_expr(orig_item)
+            return f"(SELECT {u_agg_sql} FROM ({inner_u}) AS {u_alias}{w_u})"
         base_t = self.view.base_table
         conds: List[str] = []
         if self.view.where_clause:
@@ -5498,7 +5548,10 @@ class IncrementalViewCompiler:
                 if t_low != al.lower():
                     mod = re.sub(rf"\b{re.escape(t_low)}\s*\.\s*", f"{al}.", mod, flags=re.IGNORECASE)
             for c_low, als in sorted(col_to_aliases.items(), key=lambda x: len(x[0]), reverse=True):
-                if len(als) == 1:
+                if len(als) == 1 or any(
+                    j.on_condition and re.search(rf"\b{re.escape(c_low)}\b", j.on_condition, re.IGNORECASE)
+                    for j in self.view.joins
+                ):
                     al = als[0]
                     mod = re.sub(
                         rf"(?<![.\w])\b({re.escape(c_low)})\b(?!\s*[.(])",
@@ -5551,6 +5604,8 @@ class IncrementalViewCompiler:
                 else:
                     fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
                     dt = self._infer_expr_storage_type(fake_it)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
                 col_defs_sql.append(f"{mv_col} {dt}")
 
         def _expr_key(item: SelectItem) -> str:
@@ -6103,7 +6158,8 @@ class IncrementalViewCompiler:
             col_defs_sql.append(f"__mv_cnt_1 {self._int_type()} NOT NULL DEFAULT 0")
             view_where = "__mv_cnt_0 > 0 AND __mv_cnt_1 <= 0"
         else:
-            # UNION ALL (PK-lineage per branch)
+            # UNION ALL (PK-lineage per branch with reference count for PK-swapping/chaining UPDATEs)
+            col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
             view_where = None
 
         index_ddls, index_names = self._build_all_index_ddls(
@@ -6133,22 +6189,40 @@ class IncrementalViewCompiler:
                 b_sel_raw = [it.raw_expr for it in b_items]
                 w_sql = f" WHERE {w_clause}" if w_clause else ""
                 initial_populate_sqls.append(
-                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)})\n"
-                    f"SELECT {b_pk_raw}, {', '.join(b_sel_raw)} FROM {t_name}{w_sql};"
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"SELECT {b_pk_raw}, {', '.join(b_sel_raw)}, 1 FROM {t_name}{w_sql};"
                 )
                 pk_new = self._canonical_group_pk_expr([f"'{b_tag}'", *[f"NEW.{c}" for c in pk_cols]])
                 pk_old = self._canonical_group_pk_expr([f"'{b_tag}'", *[f"OLD.{c}" for c in pk_cols]])
                 sel_new = [self._rewrite_expr_for_record(it.raw_expr, "NEW", table_schema=ts) for it in b_items]
                 w_new = self._rewrite_expr_for_record(w_clause, "NEW", table_schema=ts) if w_clause else None
                 w_old = self._rewrite_expr_for_record(w_clause, "OLD", table_schema=ts) if w_clause else None
-                ins_st = (
-                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)})\n"
-                    f"    SELECT {pk_new}, {', '.join(sel_new)}{from_dual}\n"
-                    f"    WHERE TRUE;"
+                if self.dialect == Dialect.MYSQL:
+                    u_assigns = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                    ins_st = (
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"    SELECT {pk_new}, {', '.join(sel_new)}, 1{from_dual}\n"
+                        f"    WHERE TRUE\n"
+                        f"    ON DUPLICATE KEY UPDATE {u_assigns}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                    )
+                else:
+                    u_assigns = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                    ins_st = (
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"    SELECT {pk_new}, {', '.join(sel_new)}, 1\n"
+                        f"    WHERE TRUE\n"
+                        f"    ON CONFLICT (__mv_pk) DO UPDATE SET {u_assigns}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                    )
+                dec_st = (
+                    f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1 "
+                    f"WHERE {mv_table}.__mv_pk = ({pk_old});"
                 )
-                del_st = f"DELETE FROM {mv_table} WHERE {mv_table}.__mv_pk = ({pk_old});"
+                cln_st = (
+                    f"DELETE FROM {mv_table} WHERE ({mv_table}.__mv_pk = ({pk_old})) "
+                    f"AND {mv_table}.__mv_row_count <= 0;"
+                )
                 by_table_ops.setdefault(t_name, []).append(
-                    ([ins_st], [del_st], [del_st], [ins_st], [], w_new, w_old)
+                    ([ins_st], [dec_st, cln_st], [dec_st], [ins_st], [cln_st], w_new, w_old)
                 )
         elif op_kind == "UNION":
             union_branches_sql: List[str] = []
@@ -6322,6 +6396,7 @@ class IncrementalViewCompiler:
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
             col_defs_sql.append(f"{it.alias} {dt}")
+        col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
 
         index_ddls, index_names = self._build_all_index_ddls(
             mv_table=mv_table,
@@ -6339,8 +6414,8 @@ class IncrementalViewCompiler:
         sel_raw = [it.raw_expr for it in self.view.select_items]
         w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
         initial_populate_sql = (
-            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)})\n"
-            f"SELECT {pk_raw}, {', '.join(sel_raw)}\n"
+            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+            f"SELECT {pk_raw}, {', '.join(sel_raw)}, 1\n"
             f"FROM {base_t}{w_sql};"
         )
 
@@ -6353,28 +6428,36 @@ class IncrementalViewCompiler:
         if self.dialect == Dialect.MYSQL:
             upd_assigns = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
             ins_st = (
-                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)})\n"
-                f"    SELECT {pk_new}, {', '.join(sel_new)}{from_dual}\n"
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                f"    SELECT {pk_new}, {', '.join(sel_new)}, 1{from_dual}\n"
                 f"    WHERE TRUE\n"
-                f"    ON DUPLICATE KEY UPDATE {upd_assigns};"
+                f"    ON DUPLICATE KEY UPDATE {upd_assigns}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
             )
         else:
             upd_assigns = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
             ins_st = (
-                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)})\n"
-                f"    SELECT {pk_new}, {', '.join(sel_new)}\n"
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                f"    SELECT {pk_new}, {', '.join(sel_new)}, 1\n"
                 f"    WHERE TRUE\n"
-                f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_assigns};"
+                f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_assigns}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
             )
-        del_st = f"DELETE FROM {mv_table} WHERE {mv_table}.__mv_pk = ({pk_old});"
+        dec_st = (
+            f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1 "
+            f"WHERE {mv_table}.__mv_pk = ({pk_old});"
+        )
+        cln_st = (
+            f"DELETE FROM {mv_table} WHERE ({mv_table}.__mv_pk = ({pk_old})) "
+            f"AND {mv_table}.__mv_row_count <= 0;"
+        )
 
         t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
             view_name=view_name,
             base_t=base_t,
             ins_stmts=[ins_st],
-            del_stmts=[del_st],
-            upd_old_stmts=[del_st],
+            del_stmts=[dec_st, cln_st],
+            upd_old_stmts=[dec_st],
             upd_new_stmts=[ins_st],
+            upd_cleanup_old_stmts=[cln_st],
             trunc_stmts=[f"DELETE FROM {mv_table};"],
             where_new=w_new,
             where_old=w_old,
@@ -6382,9 +6465,9 @@ class IncrementalViewCompiler:
         inc_spec = IncrementalBackfillSpec(
             mode="offset_batch",
             offset_insert_template=(
-                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)})\n"
-                f"SELECT __mv_pk, {', '.join(user_columns)} FROM (\n"
-                f"SELECT {pk_raw} AS __mv_pk, {', '.join(f'{it.raw_expr} AS {it.alias}' for it in self.view.select_items)} FROM {base_t}{w_sql}\n"
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                f"SELECT __mv_pk, {', '.join(user_columns)}, __mv_row_count FROM (\n"
+                f"SELECT {pk_raw} AS __mv_pk, {', '.join(f'{it.raw_expr} AS {it.alias}' for it in self.view.select_items)}, 1 AS __mv_row_count FROM {base_t}{w_sql}\n"
                 f") AS __mv_init LIMIT ? OFFSET ?;"
             ),
         )
@@ -6462,6 +6545,8 @@ class IncrementalViewCompiler:
                 b0_g = _subst_branch_expr(g_expr, b0_cmap)
                 fake_it = SelectItem(raw_expr=b0_g, alias=mv_col, is_aggregate=False)
                 dt = self._infer_expr_storage_type(fake_it)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
                 col_defs_sql.append(f"{mv_col} {dt}")
 
         def _expr_key(item: SelectItem) -> str:
@@ -6694,6 +6779,8 @@ class IncrementalViewCompiler:
                     mg: self._group_col_alias_for_items(og, saved_work_items)
                     for mg, og in zip(mapped_grps, saved_grp_exprs)
                 }
+                self._uall_orig_grp_exprs = saved_grp_exprs
+                self._uall_orig_item_map = {id(m_it): orig_it for m_it, orig_it in zip(mapped_items, saved_work_items)}
                 self._working_select_items = mapped_items
                 self._effective_group_by_exprs = mapped_grps
 
@@ -7356,12 +7443,14 @@ class MaterializedViewManager:
         dialect: Dialect | str = Dialect.SQLITE,
         ignore_limitations: bool = False,
         object_prefix: str = DEFAULT_OBJECT_PREFIX,
+        pg_use_transition_tables: bool = False,
     ) -> None:
         if isinstance(dialect, str):
             dialect = Dialect(dialect.lower())
         self.dialect = dialect
         self.ignore_limitations = ignore_limitations
         self.object_prefix = object_prefix
+        self.pg_use_transition_tables = pg_use_transition_tables
         self.catalog_table = (
             f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
         )
@@ -7376,6 +7465,11 @@ class MaterializedViewManager:
 
     def _ensure_catalog(self) -> None:
         cur = self.conn.cursor()
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("PRAGMA recursive_triggers = ON;")
+            except Exception:
+                pass
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {self.catalog_table} (
@@ -7391,7 +7485,11 @@ class MaterializedViewManager:
             );
             """
         )
-        self.conn.commit()
+        self._commit()
+
+    def _commit(self) -> None:
+        if hasattr(self.conn, "commit"):
+            self.conn.commit()
 
     def _param_placeholder(self) -> str:
         return "?" if self.dialect == Dialect.SQLITE else "%s"
@@ -7416,32 +7514,80 @@ class MaterializedViewManager:
     def fetch_schema(self, extra_schema_sql: Optional[str] = None) -> Dict[str, TableSchema]:
         """Fetches the live schema of all user base tables from the connected database."""
         schemas: Dict[str, TableSchema] = {}
-        if self.dialect == Dialect.SQLITE and isinstance(self.conn, sqlite3.Connection):
+        if self.dialect == Dialect.SQLITE:
             schemas = introspect_sqlite_schemas(self.conn, object_prefix=self.object_prefix)
             schemas.pop(self.catalog_table, None)
-        else:
+        elif self.dialect == Dialect.POSTGRES:
             cur = self.conn.cursor()
             cur.execute(
                 """
-                SELECT table_name, column_name, data_type, is_nullable
-                FROM information_schema.columns
-                WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'mysql', 'performance_schema', 'sys')
-                  AND table_name NOT LIKE '__matview_%'
-                  AND table_name NOT LIKE '__mv_%'
-                ORDER BY table_name, ordinal_position
+                SELECT kcu.table_name, kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
+                 AND tc.table_name = kcu.table_name
+                WHERE tc.constraint_type = 'PRIMARY KEY'
+                  AND tc.table_schema = current_schema()
+                """
+            )
+            pk_pairs = {(str(r[0]).lower(), str(r[1]).lower()) for r in (cur.fetchall() or [])}
+            cur.execute(
+                """
+                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable
+                FROM information_schema.columns c
+                JOIN information_schema.tables t
+                  ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+                WHERE c.table_schema = current_schema()
+                  AND t.table_type = 'BASE TABLE'
+                  AND c.table_name NOT LIKE '__matview_%'
+                  AND c.table_name NOT LIKE '__mv_%'
+                ORDER BY c.table_name, c.ordinal_position
                 """
             )
             grouped: Dict[str, Dict[str, ColumnDef]] = {}
-            for t_name, c_name, d_type, is_null in cur.fetchall():
+            for t_name, c_name, d_type, is_null in (cur.fetchall() or []):
                 if t_name == self.catalog_table or (
                     self.object_prefix and str(t_name).startswith(self.object_prefix)
                 ):
                     continue
+                is_pk = (str(t_name).lower(), str(c_name).lower()) in pk_pairs
                 grouped.setdefault(t_name, {})[c_name] = ColumnDef(
                     name=c_name,
                     data_type=str(d_type).upper(),
-                    not_null=(str(is_null).upper() == "NO"),
-                    primary_key=False,
+                    not_null=(str(is_null).upper() == "NO") or is_pk,
+                    primary_key=is_pk,
+                )
+            for t_name, cols in grouped.items():
+                schemas[t_name] = TableSchema(name=t_name, columns=cols)
+        else:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_key
+                FROM information_schema.columns c
+                JOIN information_schema.tables t
+                  ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+                WHERE c.table_schema = DATABASE()
+                  AND t.table_type = 'BASE TABLE'
+                  AND c.table_name NOT LIKE '__matview_%'
+                  AND c.table_name NOT LIKE '__mv_%'
+                ORDER BY c.table_name, c.ordinal_position
+                """
+            )
+            grouped = {}
+            for row in (cur.fetchall() or []):
+                t_name, c_name, d_type, is_null, col_key = row[0], row[1], row[2], row[3], row[4]
+                if t_name == self.catalog_table or (
+                    self.object_prefix and str(t_name).startswith(self.object_prefix)
+                ):
+                    continue
+                is_pk = str(col_key or "").upper() == "PRI"
+                grouped.setdefault(t_name, {})[c_name] = ColumnDef(
+                    name=c_name,
+                    data_type=str(d_type).upper(),
+                    not_null=(str(is_null).upper() == "NO") or is_pk,
+                    primary_key=is_pk,
                 )
             for t_name, cols in grouped.items():
                 schemas[t_name] = TableSchema(name=t_name, columns=cols)
@@ -7460,7 +7606,7 @@ class MaterializedViewManager:
         for stmt in _split_top_level(_strip_sql_comments(ddl_sql), ";"):
             if stmt.strip():
                 cur.execute(stmt)
-        self.conn.commit()
+        self._commit()
         if auto_sync_views:
             catalog = self.get_catalog()
             if catalog:
@@ -7536,7 +7682,7 @@ class MaterializedViewManager:
                 cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
             ph = self._param_placeholder()
             cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
-            self.conn.commit()
+            self._commit()
             return True
         else:
             raw_logical = (
@@ -7548,7 +7694,7 @@ class MaterializedViewManager:
             cur.execute(f"DROP VIEW IF EXISTS {db_v};")
             cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
             cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
-            self.conn.commit()
+            self._commit()
             return False
 
     def backfill_incrementally(
@@ -7574,7 +7720,7 @@ class MaterializedViewManager:
         if spec is None or batch_size <= 0:
             for s in plan.initial_populate_sqls:
                 cur.execute(s)
-            self.conn.commit()
+            self._commit()
             if on_progress:
                 on_progress(1, 1)
             return 1
@@ -7583,14 +7729,13 @@ class MaterializedViewManager:
         if spec.mode == "pk_range_fold" and spec.pk_column:
             base_t = plan.view_spec.base_table
             pk_col = spec.pk_column
-            row = cur.execute(
-                f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}"
-            ).fetchone()
+            cur.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}")
+            row = cur.fetchone()
             if not row or row[0] is None or row[1] is None:
                 if not plan.view_spec.group_by_cols and not plan.view_spec.has_top_level_distinct:
-                    for s in plan.initial_populate_sqls:
+                    for s in plan.get_populate_statements(incremental_backfill=False):
                         cur.execute(s)
-                    self.conn.commit()
+                    self._commit()
                 return 0
             min_pk, max_pk = int(row[0]), int(row[1])
             cursor_pk = min_pk - 1
@@ -7599,7 +7744,7 @@ class MaterializedViewManager:
                 upper_pk = min(max_pk, cursor_pk + batch_size)
                 for tmpl in spec.chunk_sql_templates:
                     cur.execute(tmpl, (cursor_pk, upper_pk))
-                self.conn.commit()
+                self._commit()
                 batches_run += 1
                 cursor_pk = upper_pk
                 if on_progress:
@@ -7608,7 +7753,8 @@ class MaterializedViewManager:
             return batches_run
 
         elif spec.mode == "group_key_batch" and spec.distinct_group_query:
-            all_keys = [r[0] for r in cur.execute(spec.distinct_group_query).fetchall()]
+            cur.execute(spec.distinct_group_query)
+            all_keys = [r[0] for r in (cur.fetchall() or [])]
             if not all_keys:
                 return 0
             ph = self._param_placeholder()
@@ -7618,7 +7764,7 @@ class MaterializedViewManager:
                 for tmpl in spec.chunk_sql_templates:
                     sql = tmpl.format(placeholders=placeholders)
                     cur.execute(sql, tuple(batch_keys))
-                self.conn.commit()
+                self._commit()
                 batches_run += 1
                 if on_progress:
                     on_progress(batches_run, min(len(all_keys), i + batch_size))
@@ -7626,10 +7772,12 @@ class MaterializedViewManager:
 
         elif spec.mode == "offset_batch" and spec.offset_insert_template:
             offset = 0
+            ph = self._param_placeholder()
+            tmpl_sql = spec.offset_insert_template.replace("LIMIT ? OFFSET ?", f"LIMIT {ph} OFFSET {ph}")
             while True:
-                cur.execute(spec.offset_insert_template, (batch_size, offset))
+                cur.execute(tmpl_sql, (batch_size, offset))
                 inserted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
-                self.conn.commit()
+                self._commit()
                 if inserted == 0:
                     break
                 batches_run += 1
@@ -7642,7 +7790,7 @@ class MaterializedViewManager:
 
         for s in plan.initial_populate_sqls:
             cur.execute(s)
-        self.conn.commit()
+        self._commit()
         return 1
 
     def _register_single_view_spec(
@@ -7660,6 +7808,7 @@ class MaterializedViewManager:
             schemas,
             v_spec,
             dialect=self.dialect,
+            pg_use_transition_tables=self.pg_use_transition_tables,
             ignore_limitations=effective_ignore,
             object_prefix=self.object_prefix,
         )
@@ -7680,7 +7829,7 @@ class MaterializedViewManager:
             cur.execute(stmt)
         for stmt in plan.trigger_ddls:
             cur.execute(stmt)
-        self.conn.commit()
+        self._commit()
 
         if populate:
             if incremental_backfill:
@@ -7690,7 +7839,7 @@ class MaterializedViewManager:
             else:
                 for stmt in plan.get_populate_statements(incremental_backfill=False):
                     cur.execute(stmt)
-                self.conn.commit()
+                self._commit()
 
         stored_view_sql = self._serialize_view_sql_with_indexes(plan)
         ph = self._param_placeholder()
@@ -7713,7 +7862,7 @@ class MaterializedViewManager:
                 json.dumps(plan.trigger_ddls),
             ),
         )
-        self.conn.commit()
+        self._commit()
         return plan
 
     def register_view(
@@ -7874,9 +8023,14 @@ class MaterializedViewManager:
 
         cur = self.conn.cursor()
         for entry in targets:
-            for t_name in entry["trigger_names"]:
-                if "__ro_" not in t_name and not t_name.endswith("__readonly"):
-                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+            if self.dialect == Dialect.POSTGRES:
+                for fn_name in entry["function_names"]:
+                    if "fn_readonly_" not in fn_name:
+                        cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+            else:
+                for t_name in entry["trigger_names"]:
+                    if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                        cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
         try:
             yield
         finally:
@@ -7886,6 +8040,7 @@ class MaterializedViewManager:
                     schemas,
                     entry["view_sql"],
                     dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
                     ignore_limitations=True,
                     object_prefix=self.object_prefix,
                 )
@@ -7896,7 +8051,7 @@ class MaterializedViewManager:
                     cur.execute(stmt)
                 for stmt in plan.get_populate_statements(incremental_backfill=False):
                     cur.execute(stmt)
-            self.conn.commit()
+            self._commit()
 
 
 # -----------------------------------------------------------------------------

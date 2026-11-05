@@ -35,12 +35,13 @@ python3 matview_sync.py \
   --incremental-backfill \
   --batch-size 500
 
+
 ```
 
 ## Running Tests
 
 ```
-# Run the full 5,142-view SQLite + cross-dialect test matrix
+# Run the full 6,200-view (52,633-assertion) SQLite + cross-dialect test matrix
 python3 test_matview_sync.py
 
 # Also run live integration tests against PostgreSQL, MySQL/MariaDB, or SQLite-compatible engines
@@ -49,6 +50,7 @@ MYSQL_DSN="mysql://root:root@127.0.0.1:3306/matview_test" \
 SQLITE_COMPAT_ENGINE="apsw" \
 python3 test_matview_sync.py
 
+
 ```
 
 ## CI Matrix (`.github/workflows/ci.yml`)
@@ -56,19 +58,35 @@ python3 test_matview_sync.py
 Runs 55 parallel jobs across all active non-EOL versions of SQLite-, PostgreSQL-, and MySQL-compatible engines:
 
 * **SQLite & SQLite-Compatible**:
+
   * **SQLite 3 (`sqlite3`)**: Python `3.11`, `3.12`, `3.13`, `3.14`, `3.15`
+
   * **APSW (`apsw`)**: Python `3.11`, `3.12`, `3.13`, `3.14`
+
   * **SQLite3 Multiple Ciphers (`apsw-sqlite3mc`)**: Python `3.11`, `3.12`, `3.13`, `3.14`
+
   * **SQLCipher 4 (`sqlcipher3`)**: Python `3.11`, `3.12`, `3.13`
+
   * **sqlean (`sqlean.py`)**: Python `3.11`, `3.12`
+
   * **Turso libSQL (`libsql-experimental`)**: Python `3.11`, `3.12`
+
 * **PostgreSQL & PostgreSQL-Compatible**:
+
   * **PostgreSQL**: `14`, `15`, `16`, `17`, `18`
+
   * **Percona Distribution for PostgreSQL**: `14`, `15`, `16`, `17`, `18`
+
   * **TimescaleDB**: `latest-pg14`, `latest-pg15`, `latest-pg16`, `latest-pg17`, `latest-pg18`
+
   * **PostGIS 3.6**: `14-3.6`, `15-3.6`, `16-3.6`, `17-3.6`, `18-3.6`
+
   * **pgvector**: `pg14`, `pg15`, `pg16`, `pg17`, `pg18`
+
 * **MySQL & MySQL-Compatible**:
+
   * **Oracle MySQL**: `8.4` (LTS), `9.7` (LTS), `26.10` (Innovation)
+
   * **MariaDB Server**: `10.11` (LTS), `11.4` (LTS), `11.8` (LTS), `12.3` (LTS), `13.0` (Rolling)
+
   * **Percona Server for MySQL**: `8.4` (LTS), `9.7` (`latest`)
