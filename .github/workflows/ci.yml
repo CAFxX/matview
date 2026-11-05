@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   sqlite:
     name: SQLite 3 (Python ${{ matrix.python-version }})
@@ -117,21 +120,21 @@ jobs:
         env:
           MYSQL_DSN: mysql://root:root@127.0.0.1:3306/matview_test
         run: |
-          python3 -c "
+          python3 - << 'EOF'
           import time, pymysql
           for i in range(30):
               try:
-                  conn = pymysql.connect(host='127.0.0.1', port=3306, user='root', password='root', database='matview_test')
+                  conn = pymysql.connect(host="127.0.0.1", port=3306, user="root", password="root", database="matview_test")
                   cur = conn.cursor()
-                  cur.execute('SELECT VERSION()')
-                  print('MySQL version:', cur.fetchone()[0])
+                  cur.execute("SELECT VERSION()")
+                  print("MySQL version:", cur.fetchone()[0])
                   conn.close()
                   break
-              except Exception as e:
+              except Exception:
                   if i == 29:
                       raise
                   time.sleep(2)
-          "
+          EOF
 
       - name: Run full test suite + live MySQL ${{ matrix.mysql-version }} integration tests
         env:

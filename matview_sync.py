@@ -3824,6 +3824,7 @@ class IncrementalViewCompiler:
             col_true_cnt_map=col_true_cnt_map,
             distinct_aux_tables=distinct_aux_tables,
             expr_key_fn=_expr_key,
+            initial_populate_sqls=initial_populate_sqls,
         )
 
         return MaterializedViewPlan(
@@ -5094,6 +5095,7 @@ class IncrementalViewCompiler:
         col_true_cnt_map: Dict[str, str],
         distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
         expr_key_fn: Callable[[SelectItem], str],
+        initial_populate_sqls: Optional[Sequence[str]] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         plus_new_stmts = self._build_plus_delta_statements(
             mv_table,
@@ -5145,6 +5147,8 @@ class IncrementalViewCompiler:
         trunc_stmts = [
             f"DELETE FROM {aux_tbl};" for aux_tbl, _, _ in distinct_aux_tables.values()
         ] + [f"DELETE FROM {mv_table};"]
+        if not self._effective_group_by_exprs and initial_populate_sqls:
+            trunc_stmts.extend(initial_populate_sqls)
 
         return self._emit_dialect_triggers_for_table(
             view_name=view_name,
@@ -5986,13 +5990,14 @@ class IncrementalViewCompiler:
                     f"    ON DUPLICATE KEY UPDATE\n"
                     f"        {', '.join(plus_assigns)};"
                 )
+                qual_minus_assigns = [f"{mv_table}.{a}" for a in minus_assigns]
                 minus_stmt = (
                     f"UPDATE {mv_table}\n"
                     f"    JOIN (\n"
                     f"        SELECT {aliased_select_csv}\n"
                     f"        FROM {delta_from_old}{where_sql}{delta_group_sql}\n"
                     f"    ) AS __mv_delta ON {mv_table}.{pk_col} = __mv_delta.{pk_col}\n"
-                    f"    SET {', '.join(minus_assigns)};"
+                    f"    SET {', '.join(qual_minus_assigns)};"
                 )
             else:
                 plus_stmt = (
@@ -6023,7 +6028,7 @@ class IncrementalViewCompiler:
                 upd_old_stmts=[minus_stmt],
                 upd_new_stmts=[plus_stmt],
                 upd_cleanup_old_stmts=cleanup_stmts,
-                trunc_stmts=[f"DELETE FROM {mv_table};"],
+                trunc_stmts=[f"DELETE FROM {mv_table};"] if grp_exprs else [f"DELETE FROM {mv_table};", initial_populate_sql],
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)
@@ -6249,7 +6254,7 @@ class IncrementalViewCompiler:
                 upd_old_stmts=u_old,
                 upd_new_stmts=u_new,
                 upd_cleanup_old_stmts=u_cln,
-                trunc_stmts=[f"DELETE FROM {mv_table};"],
+                trunc_stmts=[f"DELETE FROM {mv_table};", *initial_populate_sqls],
                 where_new=w_n,
                 where_old=w_o,
             )
@@ -6749,7 +6754,7 @@ class IncrementalViewCompiler:
                 upd_old_stmts=u_old,
                 upd_new_stmts=u_new,
                 upd_cleanup_old_stmts=u_cln,
-                trunc_stmts=[f"DELETE FROM {mv_table};"],
+                trunc_stmts=[f"DELETE FROM {mv_table};", initial_populate_sql],
                 where_new=w_n,
                 where_old=w_o,
             )

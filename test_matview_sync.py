@@ -600,7 +600,7 @@ def _translate_mysql_set_to_simultaneous_sql(
 
     for a in assigns:
         lhs, rhs = a.split("=", 1)
-        col = lhs.strip()
+        col = lhs.strip().split(".")[-1]
         expr = rhs.strip()
         # Substitute any previously mutated columns (MySQL left-to-right semantics)
         for prev_col, prev_expr in substituted_exprs.items():
@@ -1785,7 +1785,7 @@ def _translate_mysql_set_to_simultaneous_sql(set_clause: str, table_name: str) -
 
     for a in assigns:
         lhs, rhs = a.split("=", 1)
-        col = lhs.strip()
+        col = lhs.strip().split(".")[-1]
         expr = rhs.strip()
         for prev_col, prev_expr in substituted_exprs.items():
             expr = re.sub(
@@ -3162,7 +3162,7 @@ def test_incremental_backfill_sql_generation_and_trigger_ordering() -> None:
     assert "__mv_batches" in cli_out
 
 
-if __name__ == "__main__":
+def _run_all_tests() -> None:
     run_test_matrix()
     run_suite2_and_suite3()
     run_suite4_postgres_and_mysql_matrix()
@@ -3184,3 +3184,15 @@ if __name__ == "__main__":
     total_v = 192 + 134 + 132 + v5 + v6 + v7 + v8 + 20
     total_c = 1728 + 1667 + 1584 + c5 + c6 + c7 + c8 + 650
     print(f"GRAND TOTAL: {total_v} materialized views tested across {total_c} live time-series assertions — ALL PASSED!")
+
+
+if __name__ == "__main__":
+    try:
+        _run_all_tests()
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        if os.environ.get("GITHUB_ACTIONS"):
+            escaped_tb = tb.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"::error title=Test Suite Failure::{escaped_tb}", flush=True)
+        raise
