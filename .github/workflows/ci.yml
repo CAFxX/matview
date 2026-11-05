@@ -1,0 +1,139 @@
+name: CI — Multi-Engine Materialized View Tests
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sqlite:
+    name: SQLite 3 (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # All active non-EoL Python releases as of Nov 2026 (Python 3.10 reached EoL in Oct 2026)
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - name: Print Python & SQLite versions
+        run: |
+          python3 -c "import sys, sqlite3; print('Python:', sys.version); print('SQLite:', sqlite3.sqlite_version)"
+
+      - name: Run full materialized view test suite
+        run: python3 test_matview_sync.py
+
+  postgres:
+    name: PostgreSQL ${{ matrix.pg-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # All active non-EoL PostgreSQL major versions as of Nov 2026 (14, 15, 16, 17, 18)
+        pg-version: ["14", "15", "16", "17", "18"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg-version }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: matview_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d matview_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install PostgreSQL driver
+        run: pip install "psycopg[binary]" psycopg2-binary
+
+      - name: Verify PostgreSQL server version
+        env:
+          POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/matview_test
+        run: |
+          python3 -c "import os, psycopg2; conn = psycopg2.connect(os.environ['POSTGRES_DSN']); cur = conn.cursor(); cur.execute('SELECT version()'); print(cur.fetchone()[0])"
+
+      - name: Run full test suite + live PostgreSQL ${{ matrix.pg-version }} integration tests
+        env:
+          POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/matview_test
+        run: python3 test_matview_sync.py
+
+  mysql:
+    name: MySQL ${{ matrix.mysql-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # All active non-EoL MySQL release lines as of Nov 2026 (8.0 reached EoL in Apr 2026; 8.4 LTS, 9.7 LTS, 26.10 Innovation)
+        mysql-version: ["8.4", "9.7", "26.10"]
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql-version }}
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: matview_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install MySQL driver
+        run: pip install pymysql cryptography
+
+      - name: Wait for MySQL & print server version
+        env:
+          MYSQL_DSN: mysql://root:root@127.0.0.1:3306/matview_test
+        run: |
+          python3 -c "
+          import time, pymysql
+          for i in range(30):
+              try:
+                  conn = pymysql.connect(host='127.0.0.1', port=3306, user='root', password='root', database='matview_test')
+                  cur = conn.cursor()
+                  cur.execute('SELECT VERSION()')
+                  print('MySQL version:', cur.fetchone()[0])
+                  conn.close()
+                  break
+              except Exception as e:
+                  if i == 29:
+                      raise
+                  time.sleep(2)
+          "
+
+      - name: Run full test suite + live MySQL ${{ matrix.mysql-version }} integration tests
+        env:
+          MYSQL_DSN: mysql://root:root@127.0.0.1:3306/matview_test
+        run: python3 test_matview_sync.py
