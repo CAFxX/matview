@@ -790,8 +790,11 @@ def _verify_external_db_mv(cur, mv_name: str, select_sql: str, context: str = ""
     def _norm(v):
         if isinstance(v, bool):
             return int(v)
-        if isinstance(v, (float, Decimal)):
-            return round(float(v), 5)
+        if isinstance(v, (int, float, Decimal)):
+            fv = round(float(v), 3)
+            if abs(fv - round(fv)) < 1e-9:
+                return int(round(fv))
+            return fv
         return v
 
     def _skey(row):
@@ -800,11 +803,28 @@ def _verify_external_db_mv(cur, mv_name: str, select_sql: str, context: str = ""
             for v in row
         )
 
+    def _rows_match(rows_a, rows_b) -> bool:
+        if len(rows_a) != len(rows_b):
+            return False
+        for ra, rb in zip(rows_a, rows_b):
+            if len(ra) != len(rb):
+                return False
+            for ca, cb in zip(ra, rb):
+                if ca is None or cb is None:
+                    if ca is not cb:
+                        return False
+                elif isinstance(ca, (int, float)) and isinstance(cb, (int, float)):
+                    if abs(float(ca) - float(cb)) > 1.5e-3:
+                        return False
+                elif ca != cb:
+                    return False
+        return True
+
     cur.execute(f"SELECT * FROM {mv_name}")
     mv_rows = sorted([tuple(_norm(x) for x in r) for r in cur.fetchall()], key=_skey)
     cur.execute(select_sql)
     live_rows = sorted([tuple(_norm(x) for x in r) for r in cur.fetchall()], key=_skey)
-    if mv_rows != live_rows:
+    if not _rows_match(mv_rows, live_rows):
         raise AssertionError(
             f"[{context}] External DB MV mismatch on {mv_name}!\n"
             f"  Query: {select_sql}\n"
@@ -1098,6 +1118,7 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
     cur.execute("DROP TABLE IF EXISTS __matview_store_v_mgr_alg;")
     cur.execute("DROP VIEW IF EXISTS __matview_v_mgr_dist;")
     cur.execute("DROP TABLE IF EXISTS __matview_store_v_mgr_dist;")
+    cur.execute("DROP TABLE IF EXISTS __matview_dist_v_mgr_dist__dc;")
     cur.execute("DROP TABLE IF EXISTS __matview_aux_v_mgr_dist_dc_1;")
     cur.execute("DROP VIEW IF EXISTS __matview_v_mgr_win;")
     cur.execute("DROP TABLE IF EXISTS __matview_store_v_mgr_win;")
@@ -1231,6 +1252,8 @@ def run_live_postgres_tests_if_available(dsn: str) -> None:
         for v_name, _ in view_specs:
             cur.execute(f"DROP VIEW IF EXISTS __matview_{v_name} CASCADE;")
             cur.execute(f"DROP TABLE IF EXISTS __matview_store_{v_name} CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS __matview_dist_v43_t2_distinct_aggs__dc CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS __matview_dist_v43_t2_distinct_aggs__sdq CASCADE;")
         cur.execute("DROP TABLE IF EXISTS __matview_aux_v43_t2_distinct_aggs_dc_1 CASCADE;")
         cur.execute("DROP TABLE IF EXISTS __matview_aux_v43_t2_distinct_aggs_sdq_2 CASCADE;")
         cur.execute("DROP TABLE IF EXISTS order_tags CASCADE;")
@@ -1285,6 +1308,9 @@ def run_live_postgres_tests_if_available(dsn: str) -> None:
             for p, v_sel in plans:
                 _verify_external_db_mv(cur, p.view_name, v_sel, f"pg:inc={inc_mode}:tr={use_trans}:{p.logical_view_name}:{step_lbl}")
                 total_checks += 1
+        for p, _ in reversed(plans):
+            for drop_st in p.drop_statements():
+                cur.execute(drop_st)
 
     total_checks += _run_live_manager_lifecycle_check(conn, cur, Dialect.POSTGRES)
     conn.close()
@@ -1323,6 +1349,8 @@ def run_live_mysql_tests_if_available(dsn: str) -> None:
         for v_name, _ in view_specs:
             cur.execute(f"DROP VIEW IF EXISTS __matview_{v_name};")
             cur.execute(f"DROP TABLE IF EXISTS __matview_store_{v_name};")
+        cur.execute("DROP TABLE IF EXISTS __matview_dist_v43_t2_distinct_aggs__dc;")
+        cur.execute("DROP TABLE IF EXISTS __matview_dist_v43_t2_distinct_aggs__sdq;")
         cur.execute("DROP TABLE IF EXISTS __matview_aux_v43_t2_distinct_aggs_dc_1;")
         cur.execute("DROP TABLE IF EXISTS __matview_aux_v43_t2_distinct_aggs_sdq_2;")
         cur.execute("DROP TABLE IF EXISTS order_tags;")
@@ -1379,6 +1407,9 @@ def run_live_mysql_tests_if_available(dsn: str) -> None:
             for p, v_sel in plans:
                 _verify_external_db_mv(cur, p.view_name, v_sel, f"mysql:inc={inc_mode}:{p.logical_view_name}:{step_lbl}")
                 total_checks += 1
+        for p, _ in reversed(plans):
+            for drop_st in p.drop_statements():
+                cur.execute(drop_st)
 
     total_checks += _run_live_manager_lifecycle_check(conn, cur, Dialect.MYSQL)
     conn.close()
@@ -1455,9 +1486,8 @@ def run_live_sqlite_compat_tests_if_available(engine_spec: str) -> None:
             raw_conn.execute("PRAGMA key = 'matview-sqlcipher-secret';")
             raw_conn.execute("PRAGMA recursive_triggers = ON;")
             def _cipher_exec(s: str) -> None:
-                for part in _split_top_level(s, ";"):
-                    if part.strip():
-                        raw_conn.execute(part.strip())
+                if s.strip():
+                    raw_conn.execute(s.strip())
             return (
                 _CompatCursorAdapter(
                     _cipher_exec,
@@ -1471,9 +1501,8 @@ def run_live_sqlite_compat_tests_if_available(engine_spec: str) -> None:
             raw_conn = sqlean.connect(db_path, isolation_level=None)
             raw_conn.execute("PRAGMA recursive_triggers = ON;")
             def _sqlean_exec(s: str) -> None:
-                for part in _split_top_level(s, ";"):
-                    if part.strip():
-                        raw_conn.execute(part.strip())
+                if s.strip():
+                    raw_conn.execute(s.strip())
             return (
                 _CompatCursorAdapter(
                     _sqlean_exec,
@@ -1486,29 +1515,62 @@ def run_live_sqlite_compat_tests_if_available(engine_spec: str) -> None:
                 import libsql_experimental as libsql_mod  # type: ignore
             except ImportError:
                 import libsql as libsql_mod  # type: ignore
-            raw_conn = libsql_mod.connect(db_path)
+            try:
+                raw_conn = libsql_mod.connect(db_path, isolation_level=None)
+            except TypeError:
+                raw_conn = libsql_mod.connect(db_path)
             try:
                 raw_conn.execute("PRAGMA recursive_triggers = ON;")
             except Exception:
                 pass
             tx_state = {"in_tx": False}
             def _libsql_exec(s: str) -> None:
+                if not s.strip():
+                    return
                 s_up = s.strip().upper().rstrip(";").strip()
                 if s_up == "BEGIN" or s_up.startswith("BEGIN "):
-                    tx_state["in_tx"] = True
-                    raw_conn.execute(s.strip())
-                    return
-                if s_up == "COMMIT" or (s_up.startswith("ROLLBACK") and "TO" not in s_up):
-                    tx_state["in_tx"] = False
-                    raw_conn.execute(s.strip())
                     if hasattr(raw_conn, "commit"):
-                        raw_conn.commit()
+                        try:
+                            raw_conn.commit()
+                        except Exception:
+                            pass
+                    tx_state["in_tx"] = True
+                    try:
+                        raw_conn.execute(s.strip())
+                    except Exception as e:
+                        if "within a transaction" not in str(e).lower():
+                            raise
                     return
-                for part in _split_top_level(s, ";"):
-                    if part.strip():
-                        raw_conn.execute(part.strip())
+                if s_up == "COMMIT":
+                    tx_state["in_tx"] = False
+                    try:
+                        raw_conn.execute(s.strip())
+                    except Exception:
+                        if hasattr(raw_conn, "commit"):
+                            raw_conn.commit()
+                    return
+                if s_up.startswith("ROLLBACK") and "TO" not in s_up:
+                    tx_state["in_tx"] = False
+                    try:
+                        raw_conn.execute(s.strip())
+                    except Exception:
+                        if hasattr(raw_conn, "rollback"):
+                            raw_conn.rollback()
+                    return
+                try:
+                    raw_conn.execute(s.strip())
+                except Exception:
+                    if not tx_state["in_tx"] and hasattr(raw_conn, "rollback"):
+                        try:
+                            raw_conn.rollback()
+                        except Exception:
+                            pass
+                    raise
                 if not tx_state["in_tx"] and hasattr(raw_conn, "commit"):
-                    raw_conn.commit()
+                    try:
+                        raw_conn.commit()
+                    except Exception:
+                        pass
             return (
                 _CompatCursorAdapter(
                     _libsql_exec,

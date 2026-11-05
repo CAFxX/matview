@@ -2875,10 +2875,16 @@ class IncrementalViewCompiler:
 
     def _normalize_dialect_type(self, dt: str) -> str:
         u = dt.strip().upper()
-        if self.dialect == Dialect.POSTGRES and u == "DOUBLE":
-            return "DOUBLE PRECISION"
-        if self.dialect == Dialect.MYSQL and u == "DOUBLE PRECISION":
-            return "DOUBLE"
+        if self.dialect == Dialect.POSTGRES:
+            if u == "DOUBLE":
+                return "DOUBLE PRECISION"
+            if u == "CHARACTER VARYING":
+                return "VARCHAR(255)"
+        if self.dialect == Dialect.MYSQL:
+            if u == "DOUBLE PRECISION":
+                return "DOUBLE"
+            if u in ("VARCHAR", "CHAR", "CHARACTER VARYING", "CHARACTER"):
+                return "VARCHAR(255)"
         return dt
 
     def _infer_cte_or_subquery_col_type(self, col_name: str) -> Optional[str]:
@@ -5388,16 +5394,16 @@ class IncrementalViewCompiler:
                         f"        {old_section}\n"
                         f"    END LOOP;"
                     )
-                if new_section.strip():
-                    au_loops.append(
-                        f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
-                        f"        {new_section}\n"
-                        f"    END LOOP;"
-                    )
                 if clean_section.strip():
                     au_loops.append(
                         f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
                         f"        {clean_section.strip()}\n"
+                        f"    END LOOP;"
+                    )
+                if new_section.strip():
+                    au_loops.append(
+                        f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
+                        f"        {new_section}\n"
                         f"    END LOOP;"
                     )
                 au_body = "\n".join(au_loops)
@@ -7534,7 +7540,7 @@ class MaterializedViewManager:
             pk_pairs = {(str(r[0]).lower(), str(r[1]).lower()) for r in (cur.fetchall() or [])}
             cur.execute(
                 """
-                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable
+                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.character_maximum_length
                 FROM information_schema.columns c
                 JOIN information_schema.tables t
                   ON c.table_schema = t.table_schema AND c.table_name = t.table_name
@@ -7546,15 +7552,21 @@ class MaterializedViewManager:
                 """
             )
             grouped: Dict[str, Dict[str, ColumnDef]] = {}
-            for t_name, c_name, d_type, is_null in (cur.fetchall() or []):
+            for row in (cur.fetchall() or []):
+                t_name, c_name, d_type, is_null, char_len = row[0], row[1], row[2], row[3], row[4]
                 if t_name == self.catalog_table or (
                     self.object_prefix and str(t_name).startswith(self.object_prefix)
                 ):
                     continue
+                dt_up = str(d_type).upper()
+                if dt_up in ("CHARACTER VARYING", "VARCHAR") and char_len:
+                    dt_up = f"VARCHAR({int(char_len)})"
+                elif dt_up == "CHARACTER VARYING":
+                    dt_up = "TEXT"
                 is_pk = (str(t_name).lower(), str(c_name).lower()) in pk_pairs
                 grouped.setdefault(t_name, {})[c_name] = ColumnDef(
                     name=c_name,
-                    data_type=str(d_type).upper(),
+                    data_type=dt_up,
                     not_null=(str(is_null).upper() == "NO") or is_pk,
                     primary_key=is_pk,
                 )
@@ -7564,7 +7576,7 @@ class MaterializedViewManager:
             cur = self.conn.cursor()
             cur.execute(
                 """
-                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_key
+                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_key, c.column_type
                 FROM information_schema.columns c
                 JOIN information_schema.tables t
                   ON c.table_schema = t.table_schema AND c.table_name = t.table_name
@@ -7578,14 +7590,18 @@ class MaterializedViewManager:
             grouped = {}
             for row in (cur.fetchall() or []):
                 t_name, c_name, d_type, is_null, col_key = row[0], row[1], row[2], row[3], row[4]
+                col_type = row[5] if len(row) > 5 else None
                 if t_name == self.catalog_table or (
                     self.object_prefix and str(t_name).startswith(self.object_prefix)
                 ):
                     continue
+                dt_up = str(d_type).upper()
+                if dt_up in ("VARCHAR", "CHAR") and col_type:
+                    dt_up = str(col_type).upper()
                 is_pk = str(col_key or "").upper() == "PRI"
                 grouped.setdefault(t_name, {})[c_name] = ColumnDef(
                     name=c_name,
-                    data_type=str(d_type).upper(),
+                    data_type=dt_up,
                     not_null=(str(is_null).upper() == "NO") or is_pk,
                     primary_key=is_pk,
                 )
