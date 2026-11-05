@@ -1685,6 +1685,7 @@ class _RefBoolOr:
 
 def _register_reference_sim_functions(conn: sqlite3.Connection) -> None:
     conn.create_function("SQRT", 1, lambda x: math.sqrt(x) if x is not None and x >= 0 else None)
+    conn.create_function("ANY_VALUE", 1, lambda x: x)
     conn.create_aggregate("VAR_POP", 1, _RefVarPop)
     conn.create_aggregate("VARIANCE", 1, _RefVarPop)
     conn.create_aggregate("VAR_SAMP", 1, _RefVarSamp)

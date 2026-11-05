@@ -3006,10 +3006,21 @@ class IncrementalViewCompiler:
             ]
             return f"ROW({', '.join(pg_parts)})::TEXT"
         elif self.dialect == Dialect.MYSQL:
-            parts = [
-                f"IF({e} IS NULL, 'N', CONCAT('V', LENGTH(CAST({e} AS CHAR)), ':', CAST({e} AS CHAR)))"
-                for e in group_exprs
-            ]
+            parts = []
+            for e in group_exprs:
+                e_str = e.strip()
+                # Wrap non-simple-column expressions (that do not reference trigger NEW/OLD records)
+                # in ANY_VALUE(...) so MySQL sql_mode=only_full_group_by never rejects expression GROUP BY keys
+                if (
+                    not re.match(r"^(?:[A-Za-z_][A-Za-z0-9_.]*|'[^']*')$", e_str)
+                    and not re.search(r"\b(?:NEW|OLD)\.", e_str, re.IGNORECASE)
+                ):
+                    e_use = f"ANY_VALUE({e_str})"
+                else:
+                    e_use = e_str
+                parts.append(
+                    f"IF({e_use} IS NULL, 'N', CONCAT('V', LENGTH(CAST({e_use} AS CHAR)), ':', CAST({e_use} AS CHAR)))"
+                )
             return f"CONCAT_WS('|', {', '.join(parts)})"
         return " || '|' || ".join(f"COALESCE(CAST({e} AS TEXT), '__NULL__')" for e in group_exprs)
 
