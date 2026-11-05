@@ -13,9 +13,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  # ===========================================================================
+  # =========================================================================
   # 1. SQLite 3 (Standard Library across all non-EoL Python versions)
-  # ===========================================================================
+  # =========================================================================
   sqlite:
     name: SQLite 3 (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -34,92 +34,106 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
-      - name: Print Python & SQLite versions
-        run: |
-          python3 -c "import sys, sqlite3; print('Python:', sys.version); print('SQLite:', sqlite3.sqlite_version)"
+      - name: Verify SQLite library version
+        run: python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
 
-      - name: Run full materialized view test suite
+      - name: Run full test suite (SQLite + cross-dialect transpiled suites)
         run: python3 test_matview_sync.py
 
-  # ===========================================================================
-  # 2. SQLite-Compatible Databases (APSW, SQLite3MC, SQLCipher 4, sqlean, libSQL)
-  # ===========================================================================
-  sqlite-compatible:
+  # =========================================================================
+  # 2. SQLite-Compatible Engines & Distributions (APSW, SQLite3MC, SQLCipher, sqlean, Turso libSQL)
+  # =========================================================================
+  sqlite-compat:
     name: ${{ matrix.label }} (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # APSW (Another Python SQLite Wrapper — latest SQLite 3.54.x amalgamation)
-          - label: APSW SQLite
-            engine: apsw
+          # APSW (Another Python SQLite Wrapper)
+          - label: "APSW SQLite"
+            engine: "apsw"
+            pip-pkg: "apsw"
+            apt-pkg: ""
             python-version: "3.11"
-            install-cmd: pip install apsw
-          - label: APSW SQLite
-            engine: apsw
+          - label: "APSW SQLite"
+            engine: "apsw"
+            pip-pkg: "apsw"
+            apt-pkg: ""
             python-version: "3.12"
-            install-cmd: pip install apsw
-          - label: APSW SQLite
-            engine: apsw
+          - label: "APSW SQLite"
+            engine: "apsw"
+            pip-pkg: "apsw"
+            apt-pkg: ""
             python-version: "3.13"
-            install-cmd: pip install apsw
-          - label: APSW SQLite
-            engine: apsw
+          - label: "APSW SQLite"
+            engine: "apsw"
+            pip-pkg: "apsw"
+            apt-pkg: ""
             python-version: "3.14"
-            install-cmd: pip install apsw
 
-          # SQLite3 Multiple Ciphers (apsw-sqlite3mc — encrypted SQLite 3.54.x amalgamation)
-          - label: SQLite3 Multiple Ciphers
-            engine: sqlite3mc
+          # SQLite3 Multiple Ciphers (apsw-sqlite3mc)
+          - label: "SQLite3 Multiple Ciphers"
+            engine: "sqlite3mc"
+            pip-pkg: "apsw-sqlite3mc"
+            apt-pkg: ""
             python-version: "3.11"
-            install-cmd: pip install apsw-sqlite3mc
-          - label: SQLite3 Multiple Ciphers
-            engine: sqlite3mc
+          - label: "SQLite3 Multiple Ciphers"
+            engine: "sqlite3mc"
+            pip-pkg: "apsw-sqlite3mc"
+            apt-pkg: ""
             python-version: "3.12"
-            install-cmd: pip install apsw-sqlite3mc
-          - label: SQLite3 Multiple Ciphers
-            engine: sqlite3mc
+          - label: "SQLite3 Multiple Ciphers"
+            engine: "sqlite3mc"
+            pip-pkg: "apsw-sqlite3mc"
+            apt-pkg: ""
             python-version: "3.13"
-            install-cmd: pip install apsw-sqlite3mc
-          - label: SQLite3 Multiple Ciphers
-            engine: sqlite3mc
+          - label: "SQLite3 Multiple Ciphers"
+            engine: "sqlite3mc"
+            pip-pkg: "apsw-sqlite3mc"
+            apt-pkg: ""
             python-version: "3.14"
-            install-cmd: pip install apsw-sqlite3mc
 
-          # SQLCipher 4.x (256-bit AES encrypted SQLite fork)
-          - label: SQLCipher 4
-            engine: sqlcipher
+          # SQLCipher 4 (sqlcipher3)
+          - label: "SQLCipher 4"
+            engine: "sqlcipher"
+            pip-pkg: "sqlcipher3-binary"
+            apt-pkg: "libsqlcipher-dev sqlcipher"
             python-version: "3.11"
-            install-cmd: sudo apt-get update && sudo apt-get install -y sqlcipher libsqlcipher-dev && (pip install sqlcipher3-binary || pip install sqlcipher3)
-          - label: SQLCipher 4
-            engine: sqlcipher
+          - label: "SQLCipher 4"
+            engine: "sqlcipher"
+            pip-pkg: "sqlcipher3-binary"
+            apt-pkg: "libsqlcipher-dev sqlcipher"
             python-version: "3.12"
-            install-cmd: sudo apt-get update && sudo apt-get install -y sqlcipher libsqlcipher-dev && (pip install sqlcipher3-binary || pip install sqlcipher3)
-          - label: SQLCipher 4
-            engine: sqlcipher
+          - label: "SQLCipher 4"
+            engine: "sqlcipher"
+            pip-pkg: "sqlcipher3-binary"
+            apt-pkg: "libsqlcipher-dev sqlcipher"
             python-version: "3.13"
-            install-cmd: sudo apt-get update && sudo apt-get install -y sqlcipher libsqlcipher-dev && (pip install sqlcipher3-binary || pip install sqlcipher3)
 
-          # sqlean.py (SQLite 3 drop-in with standard extension suite)
-          - label: sqlean SQLite
-            engine: sqlean
+          # sqlean.py (SQLite with bundled extension suite)
+          - label: "sqlean SQLite"
+            engine: "sqlean"
+            pip-pkg: "sqlean.py"
+            apt-pkg: ""
             python-version: "3.11"
-            install-cmd: pip install sqlean.py
-          - label: sqlean SQLite
-            engine: sqlean
+          - label: "sqlean SQLite"
+            engine: "sqlean"
+            pip-pkg: "sqlean.py"
+            apt-pkg: ""
             python-version: "3.12"
-            install-cmd: pip install sqlean.py
 
-          # Turso libSQL (Open-source SQLite fork by Turso)
-          - label: Turso libSQL
-            engine: libsql
+          # Turso libSQL
+          - label: "Turso libSQL"
+            engine: "libsql"
+            pip-pkg: "libsql-experimental"
+            apt-pkg: ""
             python-version: "3.11"
-            install-cmd: pip install libsql-experimental
-          - label: Turso libSQL
-            engine: libsql
+          - label: "Turso libSQL"
+            engine: "libsql"
+            pip-pkg: "libsql-experimental"
+            apt-pkg: ""
             python-version: "3.12"
-            install-cmd: pip install libsql-experimental
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -128,41 +142,51 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          allow-prereleases: true
 
-      - name: Install ${{ matrix.label }} driver
-        run: ${{ matrix.install-cmd }}
+      - name: Install system & Python driver packages for ${{ matrix.label }}
+        run: |
+          if [ -n "${{ matrix.apt-pkg }}" ]; then
+            sudo apt-get update
+            sudo apt-get install -y ${{ matrix.apt-pkg }}
+          fi
+          python3 -m pip install --upgrade pip
+          if [ "${{ matrix.engine }}" = "sqlcipher" ]; then
+            python3 -m pip install sqlcipher3-binary || python3 -m pip install sqlcipher3
+          elif [ "${{ matrix.engine }}" = "libsql" ]; then
+            python3 -m pip install libsql-experimental || python3 -m pip install libsql
+          else
+            python3 -m pip install ${{ matrix.pip-pkg }}
+          fi
 
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
           SQLITE_COMPAT_ENGINE: ${{ matrix.engine }}
         run: python3 test_matview_sync.py
 
-  # ===========================================================================
-  # 3. Official PostgreSQL (All active non-EoL major versions: 14, 15, 16, 17, 18)
-  # ===========================================================================
+  # =========================================================================
+  # 3. PostgreSQL (All active non-EoL major versions: 14, 15, 16, 17, 18)
+  # =========================================================================
   postgres:
     name: PostgreSQL ${{ matrix.pg-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # All active non-EoL PostgreSQL major versions as of Nov 2026 (14, 15, 16, 17, 18)
         pg-version: ["14", "15", "16", "17", "18"]
     services:
       postgres:
         image: postgres:${{ matrix.pg-version }}
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_PASSWORD: password
           POSTGRES_DB: matview_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d matview_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+          --health-cmd="pg_isready -U postgres -d matview_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -170,89 +194,89 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
       - name: Install PostgreSQL driver
-        run: pip install "psycopg[binary]" psycopg2-binary
-
-      - name: Verify PostgreSQL server version
-        env:
-          POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/matview_test
         run: |
-          python3 -c "import os, psycopg2; conn = psycopg2.connect(os.environ['POSTGRES_DSN']); cur = conn.cursor(); cur.execute('SELECT version()'); print(cur.fetchone()[0])"
+          python3 -m pip install --upgrade pip
+          python3 -m pip install psycopg2-binary
 
       - name: Run full test suite + live PostgreSQL ${{ matrix.pg-version }} integration tests
         env:
-          POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/matview_test
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_matview_sync.py
 
-  # ===========================================================================
-  # 4. PostgreSQL-Compatible Databases (Percona PG, TimescaleDB, PostGIS, pgvector)
-  #    across all non-EoL PostgreSQL versions (14, 15, 16, 17, 18)
-  # ===========================================================================
-  postgres-compatible:
+  # =========================================================================
+  # 4. PostgreSQL-Compatible Engines (Percona PG, TimescaleDB, PostGIS, pgvector)
+  # =========================================================================
+  postgres-compat:
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Percona Distribution for PostgreSQL (all non-EoL major versions 14–18)
-          - label: Percona PostgreSQL 14
-            image: percona/percona-distribution-postgresql:14
-          - label: Percona PostgreSQL 15
-            image: percona/percona-distribution-postgresql:15
-          - label: Percona PostgreSQL 16
-            image: percona/percona-distribution-postgresql:16
-          - label: Percona PostgreSQL 17
-            image: percona/percona-distribution-postgresql:17
-          - label: Percona PostgreSQL 18
-            image: percona/percona-distribution-postgresql:18
+          # Percona Distribution for PostgreSQL (14–18)
+          - label: "Percona PostgreSQL 14"
+            image: "percona/percona-distribution-postgresql:14"
+          - label: "Percona PostgreSQL 15"
+            image: "percona/percona-distribution-postgresql:15"
+          - label: "Percona PostgreSQL 16"
+            image: "percona/percona-distribution-postgresql:16"
+          - label: "Percona PostgreSQL 17"
+            image: "percona/percona-distribution-postgresql:17"
+          - label: "Percona PostgreSQL 18"
+            image: "percona/percona-distribution-postgresql:18"
 
-          # TimescaleDB (all non-EoL PostgreSQL versions 14–18)
-          - label: TimescaleDB (PG 14)
-            image: timescale/timescaledb:latest-pg14
-          - label: TimescaleDB (PG 15)
-            image: timescale/timescaledb:latest-pg15
-          - label: TimescaleDB (PG 16)
-            image: timescale/timescaledb:latest-pg16
-          - label: TimescaleDB (PG 17)
-            image: timescale/timescaledb:latest-pg17
-          - label: TimescaleDB (PG 18)
-            image: timescale/timescaledb:latest-pg18
+          # TimescaleDB (14–18)
+          - label: "TimescaleDB (PG 14)"
+            image: "timescale/timescaledb:latest-pg14"
+          - label: "TimescaleDB (PG 15)"
+            image: "timescale/timescaledb:latest-pg15"
+          - label: "TimescaleDB (PG 16)"
+            image: "timescale/timescaledb:latest-pg16"
+          - label: "TimescaleDB (PG 17)"
+            image: "timescale/timescaledb:latest-pg17"
+          - label: "TimescaleDB (PG 18)"
+            image: "timescale/timescaledb:latest-pg18"
 
-          # PostGIS (PostGIS 3.6 across all non-EoL PostgreSQL versions 14–18)
-          - label: PostGIS 3.6 (PG 14)
-            image: postgis/postgis:14-3.6
-          - label: PostGIS 3.6 (PG 15)
-            image: postgis/postgis:15-3.6
-          - label: PostGIS 3.6 (PG 16)
-            image: postgis/postgis:16-3.6
-          - label: PostGIS 3.6 (PG 17)
-            image: postgis/postgis:17-3.6
-          - label: PostGIS 3.6 (PG 18)
-            image: postgis/postgis:18-3.6
+          # PostGIS 3.6 (14–18)
+          - label: "PostGIS 3.6 (PG 14)"
+            image: "postgis/postgis:14-3.6"
+          - label: "PostGIS 3.6 (PG 15)"
+            image: "postgis/postgis:15-3.6"
+          - label: "PostGIS 3.6 (PG 16)"
+            image: "postgis/postgis:16-3.6"
+          - label: "PostGIS 3.6 (PG 17)"
+            image: "postgis/postgis:17-3.6"
+          - label: "PostGIS 3.6 (PG 18)"
+            image: "postgis/postgis:18-3.6"
 
-          # pgvector (pgvector across all non-EoL PostgreSQL versions 14–18)
-          - label: pgvector (PG 14)
-            image: pgvector/pgvector:pg14
-          - label: pgvector (PG 15)
-            image: pgvector/pgvector:pg15
-          - label: pgvector (PG 16)
-            image: pgvector/pgvector:pg16
-          - label: pgvector (PG 17)
-            image: pgvector/pgvector:pg17
-          - label: pgvector (PG 18)
-            image: pgvector/pgvector:pg18
+          # pgvector (14–18)
+          - label: "pgvector (PG 14)"
+            image: "pgvector/pgvector:pg14"
+          - label: "pgvector (PG 15)"
+            image: "pgvector/pgvector:pg15"
+          - label: "pgvector (PG 16)"
+            image: "pgvector/pgvector:pg16"
+          - label: "pgvector (PG 17)"
+            image: "pgvector/pgvector:pg17"
+          - label: "pgvector (PG 18)"
+            image: "pgvector/pgvector:pg18"
     services:
       postgres:
         image: ${{ matrix.image }}
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_PASSWORD: password
           POSTGRES_DB: matview_test
         ports:
           - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -260,170 +284,139 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
       - name: Install PostgreSQL driver
-        run: pip install "psycopg[binary]" psycopg2-binary
-
-      - name: Wait for ${{ matrix.label }} & verify server version
         run: |
-          python3 - << 'EOF'
-          import time, psycopg2
-          for i in range(45):
-              try:
-                  conn = psycopg2.connect("postgresql://postgres:postgres@127.0.0.1:5432/postgres")
-                  conn.autocommit = True
-                  cur = conn.cursor()
-                  cur.execute("SELECT version()")
-                  print("Server version:", cur.fetchone()[0])
-                  cur.execute("SELECT 1 FROM pg_database WHERE datname = 'matview_test'")
-                  if not cur.fetchone():
-                      cur.execute("CREATE DATABASE matview_test")
-                  conn.close()
-                  break
-              except Exception:
-                  if i == 44:
-                      raise
-                  time.sleep(2)
-          EOF
+          python3 -m pip install --upgrade pip
+          python3 -m pip install psycopg2-binary
 
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
-          POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/matview_test
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_matview_sync.py
 
-  # ===========================================================================
-  # 5. Official MySQL (All active non-EoL versions: 8.4 LTS, 9.7 LTS, 26.10)
-  # ===========================================================================
+  # =========================================================================
+  # 5. Oracle MySQL (All active non-EoL versions: 8.4 LTS, 9.7 LTS, 26.10 Innovation)
+  # =========================================================================
   mysql:
     name: MySQL ${{ matrix.mysql-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # All active non-EoL MySQL release lines as of Nov 2026 (8.0 reached EoL in Apr 2026; 8.4 LTS, 9.7 LTS, 26.10 Innovation)
         mysql-version: ["8.4", "9.7", "26.10"]
-    services:
-      mysql:
-        image: mysql:${{ matrix.mysql-version }}
-        env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: matview_test
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Start MySQL ${{ matrix.mysql-version }} container
+        run: |
+          IMG="mysql:${{ matrix.mysql-version }}"
+          if ! docker pull "$IMG"; then
+            IMG="mysql:innovation"
+            docker pull "$IMG"
+          fi
+          docker run -d --name mysql-srv \
+            -e MYSQL_ROOT_PASSWORD=password \
+            -e MYSQL_DATABASE=matview_test \
+            -p 3306:3306 \
+            "$IMG" \
+            --character-set-server=utf8mb4 \
+            --collation-server=utf8mb4_unicode_ci
+          for i in $(seq 1 60); do
+            if docker exec mysql-srv mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent; then
+              echo "MySQL is ready!"
+              break
+            fi
+            sleep 2
+          done
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
-      - name: Install MySQL driver
-        run: pip install pymysql cryptography
-
-      - name: Wait for MySQL & print server version
-        env:
-          MYSQL_DSN: mysql://root:root@127.0.0.1:3306/matview_test
+      - name: Install PyMySQL driver
         run: |
-          python3 - << 'EOF'
-          import time, pymysql
-          for i in range(45):
-              try:
-                  conn = pymysql.connect(host="127.0.0.1", port=3306, user="root", password="root")
-                  cur = conn.cursor()
-                  cur.execute("SELECT VERSION()")
-                  print("MySQL version:", cur.fetchone()[0])
-                  cur.execute("CREATE DATABASE IF NOT EXISTS matview_test")
-                  conn.close()
-                  break
-              except Exception:
-                  if i == 44:
-                      raise
-                  time.sleep(2)
-          EOF
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pymysql cryptography
 
       - name: Run full test suite + live MySQL ${{ matrix.mysql-version }} integration tests
         env:
-          MYSQL_DSN: mysql://root:root@127.0.0.1:3306/matview_test
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_matview_sync.py
 
-  # ===========================================================================
-  # 6. MySQL-Compatible Databases (MariaDB Server & Percona Server for MySQL)
-  #    across all active non-EoL versions
-  # ===========================================================================
-  mysql-compatible:
+  # =========================================================================
+  # 6. MySQL-Compatible Engines (MariaDB 10.11–13.0, Percona Server 8.4 & 9.7)
+  # =========================================================================
+  mysql-compat:
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # MariaDB Server (all active non-EoL series as of Nov 2026; 10.6 reached EoL in Jul 2026)
-          - label: MariaDB 10.11 LTS
-            image: mariadb:10.11
-          - label: MariaDB 11.4 LTS
-            image: mariadb:11.4
-          - label: MariaDB 11.8 LTS
-            image: mariadb:11.8
-          - label: MariaDB 12.3 LTS
-            image: mariadb:12.3
-          - label: MariaDB 13.0 Rolling
-            image: mariadb:13.0
-
-          # Percona Server for MySQL (all active non-EoL series as of Nov 2026; 8.0 reached EoL in 2026)
-          - label: Percona Server for MySQL 8.4 LTS
-            image: percona/percona-server:8.4
-          - label: Percona Server for MySQL 9.7
-            image: percona/percona-server:latest
-    services:
-      mysql:
-        image: ${{ matrix.image }}
-        env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: matview_test
-          MARIADB_ROOT_PASSWORD: root
-          MARIADB_DATABASE: matview_test
-        ports:
-          - 3306:3306
+          - label: "MariaDB 10.11 LTS"
+            image: "mariadb:10.11"
+            fallback: "mariadb:10.11"
+          - label: "MariaDB 11.4 LTS"
+            image: "mariadb:11.4"
+            fallback: "mariadb:11.4"
+          - label: "MariaDB 11.8 LTS"
+            image: "mariadb:11.8"
+            fallback: "mariadb:11.8"
+          - label: "MariaDB 12.3 LTS"
+            image: "mariadb:12.3"
+            fallback: "mariadb:latest"
+          - label: "MariaDB 13.0 Rolling"
+            image: "mariadb:13.0"
+            fallback: "mariadb:lts"
+          - label: "Percona Server for MySQL 8.4 LTS"
+            image: "percona/percona-server:8.4"
+            fallback: "percona/percona-server:8.4"
+          - label: "Percona Server for MySQL 9.7"
+            image: "percona/percona-server:9.7"
+            fallback: "percona/percona-server:latest"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Start ${{ matrix.label }} container
+        run: |
+          IMG="${{ matrix.image }}"
+          if ! docker pull "$IMG"; then
+            IMG="${{ matrix.fallback }}"
+            docker pull "$IMG"
+          fi
+          docker run -d --name mysql-compat-srv \
+            -e MYSQL_ROOT_PASSWORD=password \
+            -e MARIADB_ROOT_PASSWORD=password \
+            -e MYSQL_DATABASE=matview_test \
+            -e MARIADB_DATABASE=matview_test \
+            -p 3306:3306 \
+            "$IMG" \
+            --character-set-server=utf8mb4 \
+            --collation-server=utf8mb4_unicode_ci
+          for i in $(seq 1 60); do
+            if docker exec mysql-compat-srv sh -c "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent || mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent" 2>/dev/null; then
+              echo "${{ matrix.label }} is ready!"
+              break
+            fi
+            sleep 2
+          done
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
-      - name: Install MySQL driver
-        run: pip install pymysql cryptography
-
-      - name: Wait for ${{ matrix.label }} & print server version
+      - name: Install PyMySQL driver
         run: |
-          python3 - << 'EOF'
-          import time, pymysql
-          for i in range(60):
-              try:
-                  conn = pymysql.connect(host="127.0.0.1", port=3306, user="root", password="root", autocommit=True)
-                  cur = conn.cursor()
-                  cur.execute("SELECT VERSION()")
-                  print("Server version:", cur.fetchone()[0])
-                  cur.execute("CREATE DATABASE IF NOT EXISTS matview_test")
-                  conn.close()
-                  break
-              except Exception:
-                  if i == 59:
-                      raise
-                  time.sleep(2)
-          EOF
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pymysql cryptography
 
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
-          MYSQL_DSN: mysql://root:root@127.0.0.1:3306/matview_test
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_matview_sync.py
