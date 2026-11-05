@@ -3006,22 +3006,26 @@ class IncrementalViewCompiler:
             ]
             return f"ROW({', '.join(pg_parts)})::TEXT"
         elif self.dialect == Dialect.MYSQL:
-            parts = []
-            for e in group_exprs:
-                e_str = e.strip()
-                # Wrap non-simple-column expressions (that do not reference trigger NEW/OLD records)
-                # in ANY_VALUE(...) so MySQL sql_mode=only_full_group_by never rejects expression GROUP BY keys
-                if (
-                    not re.match(r"^(?:[A-Za-z_][A-Za-z0-9_.]*|'[^']*')$", e_str)
-                    and not re.search(r"\b(?:NEW|OLD)\.", e_str, re.IGNORECASE)
-                ):
-                    e_use = f"ANY_VALUE({e_str})"
-                else:
-                    e_use = e_str
-                parts.append(
-                    f"IF({e_use} IS NULL, 'N', CONCAT('V', LENGTH(CAST({e_use} AS CHAR)), ':', CAST({e_use} AS CHAR)))"
-                )
+            parts = [
+                f"IF({e} IS NULL, 'N', CONCAT('V', LENGTH(CAST({e} AS CHAR)), ':', CAST({e} AS CHAR)))"
+                for e in group_exprs
+            ]
             return f"CONCAT_WS('|', {', '.join(parts)})"
+
+    def _group_by_exprs_for_query(
+        self, group_exprs: Sequence[str], include_canonical_pk: bool = True
+    ) -> List[str]:
+        if (
+            include_canonical_pk
+            and self.dialect == Dialect.MYSQL
+            and group_exprs
+            and any(
+                not re.match(r"^(?:[A-Za-z_][A-Za-z0-9_.]*|'[^']*')$", g.strip())
+                for g in group_exprs
+            )
+        ):
+            return [self._canonical_group_pk_expr(group_exprs), *group_exprs]
+        return list(group_exprs)
         return " || '|' || ".join(f"COALESCE(CAST({e} AS TEXT), '__NULL__')" for e in group_exprs)
 
     def _build_readonly_view_and_triggers(
@@ -3935,7 +3939,7 @@ class IncrementalViewCompiler:
             elif has_nullable_grp:
                 dist_cols.append("__mv_pk")
                 dist_sel.append(self._canonical_group_pk_expr(grp_exprs))
-                dist_grp.extend(grp_exprs)
+                dist_grp.extend(self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=True))
             else:
                 for g_expr in grp_exprs:
                     dist_cols.append(self._group_col_alias(g_expr))
@@ -4032,7 +4036,8 @@ class IncrementalViewCompiler:
 
         where_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
         if grp_exprs:
-            group_sql = f"\nGROUP BY {', '.join(grp_exprs)}"
+            grp_for_q = self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=has_nullable_grp)
+            group_sql = f"\nGROUP BY {', '.join(grp_for_q)}"
             having_sql = ""
         else:
             group_sql = ""
@@ -4124,7 +4129,7 @@ class IncrementalViewCompiler:
                 dist_grp_list = []
                 if has_nullable_grp:
                     dist_sel.append(grp_expr)
-                    dist_grp_list.extend(grp_exprs)
+                    dist_grp_list.extend(self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=True))
                 else:
                     for g_expr in grp_exprs:
                         dist_sel.append(g_expr)
@@ -5757,7 +5762,8 @@ class IncrementalViewCompiler:
         full_from_sql = _build_join_from_clause()
         qual_where = self._qualify_join_expr(self.view.where_clause) if self.view.where_clause else None
         where_sql = f"\nWHERE {qual_where}" if qual_where else ""
-        group_sql = f"\nGROUP BY {', '.join(qual_grp_exprs)}" if qual_grp_exprs else ""
+        qual_grp_for_q = self._group_by_exprs_for_query(qual_grp_exprs, include_canonical_pk=True)
+        group_sql = f"\nGROUP BY {', '.join(qual_grp_for_q)}" if qual_grp_for_q else ""
 
         initial_populate_sql = (
             f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
@@ -6632,7 +6638,8 @@ class IncrementalViewCompiler:
                 already_in_target.add(tcnt_col)
 
         where_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
-        group_sql = f"\nGROUP BY {', '.join(grp_exprs)}" if grp_exprs else ""
+        uall_grp_for_q = self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=True)
+        group_sql = f"\nGROUP BY {', '.join(uall_grp_for_q)}" if uall_grp_for_q else ""
         initial_populate_sql = (
             f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
             f"SELECT {', '.join(select_exprs)}\n"

@@ -858,13 +858,31 @@ def run_live_postgres_tests_if_available(dsn: str) -> None:
         ("v_pg_win", "SELECT id, region, amount, RANK() OVER (PARTITION BY region ORDER BY amount DESC, id ASC) AS rnk FROM orders"),
     ]
 
-    conn = pg_driver.connect(dsn)
+    from urllib.parse import urlparse, urlunparse
+    try:
+        conn = pg_driver.connect(dsn)
+    except Exception:
+        parsed_pg = urlparse(dsn)
+        target_db = (parsed_pg.path or "/matview_test").lstrip("/") or "matview_test"
+        admin_dsn = urlunparse(parsed_pg._replace(path="/postgres"))
+        admin_conn = pg_driver.connect(admin_dsn)
+        admin_conn.autocommit = True
+        admin_cur = admin_conn.cursor()
+        admin_cur.execute(f"SELECT 1 FROM pg_database WHERE datname = '{target_db}'")
+        if not admin_cur.fetchone():
+            admin_cur.execute(f"CREATE DATABASE {target_db}")
+        admin_conn.close()
+        conn = pg_driver.connect(dsn)
     conn.autocommit = True
     cur = conn.cursor()
     total_checks = 0
 
     for inc_mode in (False, True):
-        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        for v_name, _ in view_specs:
+            cur.execute(f"DROP VIEW IF EXISTS __matview_{v_name} CASCADE;")
+            cur.execute(f"DROP TABLE IF EXISTS __matview_store_{v_name} CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS orders CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS customers CASCADE;")
         for s in [st.strip() for st in schema.split(";") if st.strip()]:
             cur.execute(s)
         cur.execute("INSERT INTO customers VALUES (1, 'Alice', 'NA'), (2, 'Bob', 'VIP'), (3, 'Cara', 'EU');")
@@ -922,15 +940,17 @@ def run_live_mysql_tests_if_available(dsn: str) -> None:
 
     from urllib.parse import urlparse
     parsed = urlparse(dsn if "://" in dsn else f"mysql://{dsn}")
+    target_db = (parsed.path or "/matview_test").lstrip("/") or "matview_test"
     conn = pymysql.connect(
         host=parsed.hostname or "127.0.0.1",
         port=parsed.port or 3306,
         user=parsed.username or "root",
         password=parsed.password or "",
-        database=(parsed.path or "/test").lstrip("/") or "test",
         autocommit=True,
     )
     cur = conn.cursor()
+    cur.execute(f"CREATE DATABASE IF NOT EXISTS `{target_db}`;")
+    cur.execute(f"USE `{target_db}`;")
 
     schema = """
     CREATE TABLE customers (
@@ -1019,6 +1039,188 @@ def run_live_mysql_tests_if_available(dsn: str) -> None:
 
 
 
+
+
+
+
+def run_live_sqlite_compat_tests_if_available(engine_spec: str) -> None:
+    """
+    Runs comprehensive live integration tests against SQLite-compatible database engines:
+      - apsw (Another Python SQLite Wrapper)
+      - sqlite3mc (APSW with SQLite3 Multiple Ciphers encryption)
+      - sqlcipher (sqlcipher3 / SQLCipher 4 encrypted database engine)
+      - sqlean (sqlean.py drop-in SQLite + extensions distribution)
+      - libsql (Turso libsql / libsql_experimental engine)
+    """
+    import tempfile
+
+    eng = engine_spec.strip().lower()
+    schema = """
+    CREATE TABLE customers (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        tier TEXT NOT NULL
+    );
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        region TEXT,
+        amount REAL,
+        qty INTEGER NOT NULL,
+        flags INTEGER NOT NULL,
+        status TEXT NOT NULL
+    );
+    """
+    view_specs = [
+        ("v_sqc_alg", "SELECT region, COUNT(*) AS cnt, SUM(amount) AS s_amt, AVG(amount) AS a_amt, TOTAL(amount) AS tot_amt, MIN(qty) AS mn_q, MAX(qty) AS mx_q FROM orders WHERE status = 'settled' GROUP BY region HAVING COUNT(*) >= 1"),
+        ("v_sqc_expr", "SELECT COALESCE(region, 'UNK') AS reg_norm, COUNT(*) AS cnt, SUM(amount * qty) - SUM(amount) AS net_rev FROM orders GROUP BY COALESCE(region, 'UNK')"),
+        ("v_sqc_global", "SELECT COUNT(*) AS cnt, SUM(amount) AS s_amt, AVG(amount) AS a_amt, TOTAL(amount) AS tot_amt, MIN(qty) AS mn_q, MAX(qty) AS mx_q FROM orders"),
+        ("v_sqc_join", "SELECT c.tier, o.region, COUNT(*) AS cnt, SUM(o.amount * o.qty) AS rev, AVG(o.amount) AS avg_amt FROM orders o INNER JOIN customers c ON o.customer_id = c.id WHERE o.status = 'settled' GROUP BY c.tier, o.region"),
+        ("v_sqc_uall", "SELECT id, region FROM orders WHERE qty > 1 UNION ALL SELECT id, tier AS region FROM customers"),
+        ("v_sqc_union", "SELECT region FROM orders WHERE region IS NOT NULL UNION SELECT tier AS region FROM customers"),
+        ("v_sqc_inter", "SELECT region FROM orders WHERE region IS NOT NULL INTERSECT SELECT tier AS region FROM customers"),
+        ("v_sqc_exc", "SELECT region FROM orders WHERE region IS NOT NULL EXCEPT SELECT tier AS region FROM customers"),
+        ("v_sqc_dist", "SELECT DISTINCT region, status FROM orders WHERE region IS NOT NULL"),
+        ("v_sqc_proj", "SELECT id, region, amount * qty AS line_total FROM orders WHERE qty > 0"),
+        ("v_sqc_cte", "WITH u AS (SELECT region AS k, amount AS v FROM orders UNION ALL SELECT tier AS k, 10.0 AS v FROM customers) SELECT k, COUNT(*) AS cnt, SUM(v) AS sv FROM u GROUP BY k"),
+        ("v_sqc_win", "SELECT id, region, amount, RANK() OVER (PARTITION BY region ORDER BY amount DESC, id ASC) AS rnk FROM orders"),
+    ]
+
+    class _CompatCursorAdapter:
+        def __init__(self, exec_fn, query_fn):
+            self._exec = exec_fn
+            self._query = query_fn
+            self._last_rows = []
+
+        def execute(self, sql: str) -> None:
+            s = sql.strip()
+            if s.upper().startswith(("SELECT", "WITH", "PRAGMA")):
+                self._last_rows = list(self._query(sql))
+            else:
+                self._exec(sql)
+                self._last_rows = []
+
+        def fetchall(self):
+            return self._last_rows
+
+    def _open_compat_adapter(db_path: str):
+        if eng in ("apsw", "sqlite3mc"):
+            import apsw  # type: ignore
+            raw_conn = apsw.Connection(db_path)
+            raw_cur = raw_conn.cursor()
+            if eng == "sqlite3mc":
+                try:
+                    raw_cur.execute("PRAGMA cipher = 'chacha20';")
+                    raw_cur.execute("PRAGMA key = 'matview-sqlite3mc-secret';")
+                except Exception:
+                    pass
+            return (
+                _CompatCursorAdapter(
+                    lambda s: raw_cur.execute(s),
+                    lambda q: [tuple(r) for r in raw_cur.execute(q)],
+                ),
+                raw_conn.close,
+            )
+        elif eng == "sqlcipher":
+            try:
+                from sqlcipher3 import dbapi2 as sqlcipher_mod  # type: ignore
+            except ImportError:
+                import sqlcipher3 as sqlcipher_mod  # type: ignore
+            raw_conn = sqlcipher_mod.connect(db_path, isolation_level=None)
+            raw_conn.execute("PRAGMA key = 'matview-sqlcipher-secret';")
+            return (
+                _CompatCursorAdapter(
+                    lambda s: raw_conn.executescript(s),
+                    lambda q: [tuple(r) for r in raw_conn.execute(q).fetchall()],
+                ),
+                raw_conn.close,
+            )
+        elif eng == "sqlean":
+            import sqlean  # type: ignore
+            sqlean.extensions.enable_all()
+            raw_conn = sqlean.connect(db_path, isolation_level=None)
+            return (
+                _CompatCursorAdapter(
+                    lambda s: raw_conn.executescript(s),
+                    lambda q: [tuple(r) for r in raw_conn.execute(q).fetchall()],
+                ),
+                raw_conn.close,
+            )
+        elif eng == "libsql":
+            try:
+                import libsql_experimental as libsql_mod  # type: ignore
+            except ImportError:
+                import libsql as libsql_mod  # type: ignore
+            raw_conn = libsql_mod.connect(db_path)
+            def _libsql_exec(s: str) -> None:
+                if hasattr(raw_conn, "executescript"):
+                    raw_conn.executescript(s)
+                else:
+                    for part in _split_top_level(s, ";"):
+                        if part.strip():
+                            raw_conn.execute(part.strip())
+                if hasattr(raw_conn, "commit"):
+                    raw_conn.commit()
+            return (
+                _CompatCursorAdapter(
+                    _libsql_exec,
+                    lambda q: [tuple(r) for r in raw_conn.execute(q).fetchall()],
+                ),
+                lambda: raw_conn.close() if hasattr(raw_conn, "close") else None,
+            )
+        else:
+            raise ValueError(f"Unknown SQLITE_COMPAT_ENGINE: {engine_spec}")
+
+    total_checks = 0
+    for inc_mode in (False, True):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = os.path.join(tmpdir, f"compat_{eng}_{int(inc_mode)}.db")
+            cur, close_fn = _open_compat_adapter(db_file)
+            try:
+                for s in [st.strip() for st in schema.split(";") if st.strip()]:
+                    cur.execute(s + ";")
+                cur.execute("INSERT INTO customers VALUES (1, 'Alice', 'NA'), (2, 'Bob', 'VIP'), (3, 'Cara', 'EU');")
+                cur.execute(
+                    "INSERT INTO orders VALUES "
+                    "(1, 1, 'NA', 10.0, 2, 3, 'settled'),"
+                    "(2, 1, 'NA', 20.0, 4, 5, 'settled'),"
+                    "(3, 2, 'EU', 15.0, 1, 7, 'pending'),"
+                    "(4, 2, 'EU', 30.0, 3, 6, 'settled'),"
+                    "(5, 3, NULL, 50.0, 5, 1, 'settled');"
+                )
+                plans = []
+                for v_name, v_sel in view_specs:
+                    p = generate_materialized_view(
+                        schema,
+                        f"CREATE VIEW {v_name} AS {v_sel};",
+                        dialect=Dialect.SQLITE,
+                        incremental_backfill=inc_mode,
+                        batch_size=2,
+                    )
+                    for stmt in p.all_statements():
+                        cur.execute(stmt)
+                    plans.append((p, v_sel))
+                    _verify_external_db_mv(cur, p.view_name, v_sel, f"{eng}:inc={inc_mode}:{v_name}:init")
+                    total_checks += 1
+
+                mutations = [
+                    "INSERT INTO orders VALUES (6, 2, 'NA', NULL, 2, 4, 'settled'), (7, 3, 'APAC', 40.0, 2, 2, 'settled');",
+                    "UPDATE orders SET amount = 25.0, region = 'EU', qty = 5 WHERE id = 1;",
+                    "UPDATE orders SET status = 'settled' WHERE id = 3;",
+                    "UPDATE customers SET tier = 'APAC' WHERE id = 2;",
+                    "DELETE FROM orders WHERE id IN (2, 5);",
+                    "DELETE FROM customers WHERE id = 3;",
+                    "DELETE FROM orders;",
+                ]
+                for m_idx, m_sql in enumerate(mutations):
+                    cur.execute(m_sql)
+                    for p, v_sel in plans:
+                        _verify_external_db_mv(cur, p.view_name, v_sel, f"{eng}:inc={inc_mode}:{p.logical_view_name}:m{m_idx}")
+                        total_checks += 1
+            finally:
+                close_fn()
+
+    print(f"LIVE SQLite-compatible engine ({eng}) test PASSED ({len(view_specs) * 2} views, {total_checks} live assertions)!")
 
 
 def test_object_prefix_and_user_defined_indexes() -> None:
@@ -3178,6 +3380,8 @@ def _run_all_tests() -> None:
         run_live_postgres_tests_if_available(os.environ["POSTGRES_DSN"])
     if os.environ.get("MYSQL_DSN"):
         run_live_mysql_tests_if_available(os.environ["MYSQL_DSN"])
+    if os.environ.get("SQLITE_COMPAT_ENGINE"):
+        run_live_sqlite_compat_tests_if_available(os.environ["SQLITE_COMPAT_ENGINE"])
     test_postgres_and_mysql_generated_sql_and_algebraic_execution()
     test_zero_runtime_dependency_across_separate_connections()
     test_limitation_refusal_and_ignore_limitations_override()
