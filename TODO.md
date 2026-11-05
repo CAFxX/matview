@@ -1,0 +1,7 @@
+- I would like to avoid relying on regexes and other brittle manual parsing of the SQL, and instead use something proven like sqlglot
+- I would like the output SQL to be properly formatted (possibly by sqlglot itself) and possibly even optimized
+- I would like, when multiple views use the same base tables, to avoid redundant computations (e.g. in case two views both use the same aggregation over the same data)
+- I would like materialized view definitions to also be able to reference other materialized views, and their updates to still happen as efficiently as possible
+- I would like to be able to define, in addition to the default synchronously and atomically-updated MVs, also asynchronously, bulk-based, and atomically-updated materialized views
+- I would like the generated code to be optimal and as efficient as if it had been written as efficiently as possible for that specific view and that specific engine/version by a senior DBA
+- I would like the generator to be fuzzed by generating valid random schemas and views, as well as random DMLs, and then comparing the materialized view after each DML to the result of running the view directly
