@@ -64,7 +64,11 @@ from matview_sync import (
 def _norm_val(v: Any) -> Any:
     if isinstance(v, bool):
         return int(v)
-    if isinstance(v, (int, float, Decimal)):
+    if isinstance(v, int):
+        return v
+    if isinstance(v, (float, Decimal)):
+        if isinstance(v, Decimal) and v == int(v):
+            return int(v)
         fv = round(float(v), 4)
         if abs(fv - round(fv)) < 1e-9:
             return int(round(fv))
@@ -102,7 +106,7 @@ def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]]
     return True
 
 
-def _register_sqlite_compat_udfs(conn: sqlite3.Connection) -> None:
+def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Dialect.SQLITE) -> None:
     """Registers PostgreSQL/MySQL compatibility functions & aggregates on a SQLite connection for cross-dialect testing."""
     import math
 
@@ -168,6 +172,8 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection) -> None:
             if x is not None:
                 self.acc = int(x) if self.acc is None else (self.acc & int(x))
         def finalize(self) -> Optional[int]:
+            if self.acc is None and dialect == Dialect.MYSQL:
+                return -1
             return self.acc
 
     class _BitOrAgg:
@@ -177,6 +183,8 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection) -> None:
             if x is not None:
                 self.acc = int(x) if self.acc is None else (self.acc | int(x))
         def finalize(self) -> Optional[int]:
+            if self.acc is None and dialect == Dialect.MYSQL:
+                return 0
             return self.acc
 
     class _BitXorAgg:
@@ -186,6 +194,8 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection) -> None:
             if x is not None:
                 self.acc = int(x) if self.acc is None else (self.acc ^ int(x))
         def finalize(self) -> Optional[int]:
+            if self.acc is None and dialect == Dialect.MYSQL:
+                return 0
             return self.acc
 
     class _BoolAndAgg:
@@ -250,6 +260,10 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
     s = sql
     s = re.sub(r"\bCREATE\s+ALGORITHM\s*=\s*\w+\s+VIEW\b", "CREATE VIEW", s, flags=re.IGNORECASE)
     s = re.sub(r"\bBIGINT\s+UNSIGNED\b", "INTEGER", s, flags=re.IGNORECASE)
+    s = s.replace("18446744073709551615", "-1")
+    s = re.sub(r"(?<!ELSE )\bBIT_XOR\s*\(\s*([^()]+?)\s*\)", r"COALESCE(BIT_XOR(\1), 0)", s, flags=re.IGNORECASE)
+    s = re.sub(r"(?<!ELSE )\bBIT_OR\s*\(\s*([^()]+?)\s*\)", r"COALESCE(BIT_OR(\1), 0)", s, flags=re.IGNORECASE)
+    s = re.sub(r"(?<!ELSE )\bBIT_AND\s*\(\s*([^()]+?)\s*\)", r"COALESCE(BIT_AND(\1), -1)", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+FROM\s+DUAL\b", "", s, flags=re.IGNORECASE)
     s = s.replace("<=>", " IS ")
     s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR\s*\)", r"CAST(\1 AS TEXT)", s, flags=re.IGNORECASE)
@@ -274,7 +288,11 @@ def _verify_external_db_mv(cur, mv_name: str, select_sql: str, context: str = ""
     def _norm(v):
         if isinstance(v, bool):
             return int(v)
-        if isinstance(v, (int, float, Decimal)):
+        if isinstance(v, int):
+            return v
+        if isinstance(v, (float, Decimal)):
+            if isinstance(v, Decimal) and v == int(v):
+                return int(v)
             fv = round(float(v), 3)
             if abs(fv - round(fv)) < 1e-9:
                 return int(round(fv))
@@ -1181,7 +1199,7 @@ class TranspiledConnectionAdapter:
                 pass
         self._sq_conn = sqlite3.connect(":memory:", isolation_level=None)
         self._sq_conn.execute("PRAGMA recursive_triggers = ON;")
-        _register_sqlite_compat_udfs(self._sq_conn)
+        _register_sqlite_compat_udfs(self._sq_conn, dialect=self.dialect)
         self._pg_functions.clear()
         self._pg_fn_triggers.clear()
         self._mysql_procs.clear()
@@ -1325,6 +1343,7 @@ class TranspiledConnectionAdapter:
         )
         assert m_off_ins is not None
         ins_tmpl = m_off_ins.group(1).strip()
+        assert "ORDER BY" in ins_tmpl.upper(), f"Offset-paginated backfill query must include deterministic ORDER BY: {ins_tmpl}"
         offset = 0
         while True:
             stmt = ins_tmpl.replace("__mv_batch_size", str(batch_size)).replace("__mv_offset", str(offset))
@@ -3891,6 +3910,51 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 )
         self.assertGreaterEqual(local_runner.total_views, 72)
 
+    def test_10_fuzz_regression_corpus_invariants(self) -> None:
+        """
+        Verifies the structural invariants of every entry in the fuzzing regression corpus:
+        - Corpus #1 compiles as ALGEBRAIC_DELTA with pure-SQLite bitwise expressions.
+        - Corpus #2 includes deterministic ORDER BY in every offset_batch incremental backfill loop.
+        - Corpus #3 wraps MySQL BIT_OR/BIT_XOR in COALESCE(..., 0) and BIT_AND in COALESCE(..., 18446744073709551615).
+        - Corpus #4 parses FILTER (WHERE ...) with balanced parentheses and compiles as ALGEBRAIC_DELTA.
+        """
+        corpus = {c["id"]: c for c in get_fuzz_regression_corpus()}
+        self.assertGreaterEqual(len(corpus), 4)
+
+        # Corpus 1: pure-SQLite bitwise expressions in group_key_batch
+        c1 = corpus["corpus_01_sqlite_bitwise_distinct_and_delete_recompute"]
+        p1 = generate_materialized_view(
+            c1["schema"], c1["views"][0][1], dialect=Dialect.SQLITE, incremental_backfill=True, batch_size=2
+        )
+        self.assertEqual(p1.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+        self.assertIn(">> 0) & 1", "\n".join(p1.initial_populate_sqls))
+
+        # Corpus 2: deterministic ORDER BY in PostgreSQL and MySQL offset_batch loops
+        c2 = corpus["corpus_02_pg_mysql_offset_join_and_group_order" if "corpus_02_pg_mysql_offset_join_and_group_order" in corpus else "corpus_02_pg_mysql_offset_batch_left_join_and_group_order"]
+        for d in (Dialect.POSTGRES, Dialect.MYSQL):
+            for _, vddl in c2["views"]:
+                p2 = generate_materialized_view(
+                    c2["schema"], vddl, dialect=d, incremental_backfill=True, batch_size=2, ignore_limitations=True
+                )
+                for pop_sql in p2.initial_populate_sqls:
+                    if "OFFSET" in pop_sql.upper():
+                        self.assertIn("ORDER BY 1, 2", pop_sql.upper())
+
+        # Corpus 3: MySQL empty-set bitwise identity in reader view
+        c3 = corpus["corpus_03_mysql_empty_set_and_all_null_bitwise_identity"]
+        p3 = generate_materialized_view(
+            c3["schema"], c3["views"][0][1], dialect=Dialect.MYSQL, ignore_limitations=True
+        )
+        self.assertIn("COALESCE(bx, 0) AS bx", p3.reader_view_ddl)
+        self.assertIn("COALESCE(bo, 0) AS bo", p3.reader_view_ddl)
+        self.assertIn("COALESCE(ba, 18446744073709551615) AS ba", p3.reader_view_ddl)
+
+        # Corpus 4: FILTER (WHERE ...) compiles as ALGEBRAIC_DELTA
+        c4 = corpus["corpus_04_filter_where_greedy_regex_algebraic_delta"]
+        for d in (Dialect.SQLITE, Dialect.POSTGRES):
+            p4 = generate_materialized_view(c4["schema"], c4["views"][0][1], dialect=d)
+            self.assertEqual(p4.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+
 
 import random
 
@@ -4343,6 +4407,224 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
         )
 
 
+# ==============================================================================
+# SUITE 13: Permanent Fuzzing-Discovered Regression Corpus
+# ==============================================================================
+def get_fuzz_regression_corpus() -> List[Dict[str, Any]]:
+    """
+    Returns the permanent corpus of minimal, self-contained regression scenarios
+    for every failure uncovered by differential fuzzing across SQLite, PostgreSQL,
+    and MySQL/MariaDB. Every entry in this corpus is executed across all applicable
+    dialects and modes on every test and CI run to guarantee zero regressions.
+    """
+    return [
+        {
+            "id": "corpus_01_sqlite_bitwise_distinct_and_delete_recompute",
+            "description": (
+                "Discovered by DifferentialSQLFuzzer on SQLite: views combining BIT_XOR/BIT_AND/BIT_OR "
+                "with SUM(DISTINCT ...)/COUNT(DISTINCT ...) (group_key_batch backfill) or DELETE recomputation "
+                "previously fell through to SUM(...) in _sql_backfill_agg_expr on Dialect.SQLITE."
+            ),
+            "dialects": (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL),
+            "schema": """
+                CREATE TABLE fc1_t1 (
+                    id INTEGER PRIMARY KEY,
+                    grp_str TEXT NOT NULL,
+                    sub_cat TEXT,
+                    val_flt REAL,
+                    weight_cnt INTEGER NOT NULL,
+                    flag INTEGER NOT NULL
+                );
+            """,
+            "views": [
+                (
+                    "fc1_v_bit_dist",
+                    "CREATE VIEW fc1_v_bit_dist AS SELECT grp_str, SUM(val_flt) AS s_flt, BIT_XOR(weight_cnt) AS bx_qty, BIT_AND(weight_cnt) AS ba_qty, BIT_OR(weight_cnt) AS bo_qty, SUM(DISTINCT weight_cnt) AS sd_qty, COUNT(DISTINCT sub_cat) AS cd_sc, SUM(weight_cnt) AS s_qty FROM fc1_t1 WHERE (flag = 1 OR weight_cnt >= 4) AND weight_cnt <= 15 GROUP BY grp_str;",
+                ),
+            ],
+            "seed": [
+                "INSERT INTO fc1_t1 VALUES (1, 'alpha', 'hw', 100.0, 7, 1);",
+                "INSERT INTO fc1_t1 VALUES (2, 'alpha', 'hw', 100.0, 7, 1);",
+                "INSERT INTO fc1_t1 VALUES (3, 'alpha', 'sw', 50.0, 8, 1);",
+                "INSERT INTO fc1_t1 VALUES (4, 'beta', NULL, 25.0, 12, 1);",
+                "INSERT INTO fc1_t1 VALUES (5, 'beta', 'ai', 75.0, 5, 0);",
+            ],
+            "mutations": [
+                ("del_dup_1", "DELETE FROM fc1_t1 WHERE id = 1;"),
+                ("upd_bit", "UPDATE fc1_t1 SET weight_cnt = 11 WHERE id = 3;"),
+                ("ins_new", "INSERT INTO fc1_t1 VALUES (6, 'alpha', 'cloud', 30.0, 3, 1);"),
+                ("del_extrema", "DELETE FROM fc1_t1 WHERE id = 2;"),
+                ("tx_begin", "BEGIN;"),
+                ("tx_sp", "SAVEPOINT sp_fc1;"),
+                ("tx_del_beta", "DELETE FROM fc1_t1 WHERE grp_str = 'beta';"),
+                ("tx_rb", "ROLLBACK TO SAVEPOINT sp_fc1;"),
+                ("tx_commit", "COMMIT;"),
+            ],
+        },
+        {
+            "id": "corpus_02_pg_mysql_offset_batch_left_join_and_group_order",
+            "description": (
+                "Discovered by DifferentialSQLFuzzer in CI Run #15 on PostgreSQL 14..18 (fz2_v22_left_join_proj:init): "
+                "offset_batch incremental backfill loops (LIMIT batch_size OFFSET offset) over LEFT JOIN and GROUP BY "
+                "queries without an explicit ORDER BY caused PostgreSQL to switch between Nested Loop and Hash Right Join "
+                "mid-loop as OFFSET grew, duplicating (2, 'P_2', None, None, None) and skipping (4, 'P_4', 5, 'beta', 5)."
+            ),
+            "dialects": (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL),
+            "schema": """
+                CREATE TABLE fc2_orgs (
+                    id INTEGER PRIMARY KEY,
+                    pname TEXT NOT NULL,
+                    tier TEXT
+                );
+                CREATE TABLE fc2_events (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER,
+                    grp_str TEXT NOT NULL,
+                    weight_cnt INTEGER NOT NULL
+                );
+            """,
+            "views": [
+                (
+                    "fc2_v_left_join_proj",
+                    "CREATE VIEW fc2_v_left_join_proj AS SELECT p.id AS pid, p.pname, m.id AS mid, m.grp_str, m.weight_cnt FROM fc2_orgs p LEFT JOIN fc2_events m ON p.id = m.parent_id;",
+                ),
+                (
+                    "fc2_v_left_join_agg",
+                    "CREATE VIEW fc2_v_left_join_agg AS SELECT p.pname, p.tier, COUNT(*) AS row_cnt, COUNT(m.id) AS match_cnt, SUM(m.weight_cnt) AS sum_w, MIN(m.weight_cnt) AS min_w, MAX(m.weight_cnt) AS max_w FROM fc2_orgs p LEFT JOIN fc2_events m ON p.id = m.parent_id GROUP BY p.pname, p.tier;",
+                ),
+                (
+                    "fc2_v_right_join_proj",
+                    "CREATE VIEW fc2_v_right_join_proj AS SELECT m.id AS mid, m.grp_str, p.id AS pid, p.pname, p.tier FROM fc2_events m RIGHT JOIN fc2_orgs p ON m.parent_id = p.id;",
+                ),
+            ],
+            "seed": [
+                "INSERT INTO fc2_orgs VALUES (1, 'P_1', 'gold'), (2, 'P_2', 'silver'), (3, 'P_3', 'vip'), (4, 'P_4', NULL), (5, 'P_5', 'std');",
+                "INSERT INTO fc2_events VALUES (1, 3, 'omega', 11), (2, 3, 'omega', 11), (3, 3, 'gamma', 10), (4, 3, 'gamma', 10), (5, 4, 'beta', 5), (6, 4, 'alpha', 8), (7, NULL, 'alpha', 14), (8, 1, 'beta', 13), (9, 3, 'gamma', 13), (10, 3, 'omega', 1);",
+            ],
+            "mutations": [
+                ("ins_unmatched_org", "INSERT INTO fc2_orgs VALUES (6, 'P_6', 'gold');"),
+                ("attach_to_p2", "INSERT INTO fc2_events VALUES (11, 2, 'omega', 9);"),
+                ("detach_from_p4", "UPDATE fc2_events SET parent_id = NULL WHERE id = 5;"),
+                ("del_p3_events", "DELETE FROM fc2_events WHERE parent_id = 3 AND weight_cnt = 10;"),
+            ],
+        },
+        {
+            "id": "corpus_03_mysql_empty_set_and_all_null_bitwise_identity",
+            "description": (
+                "Discovered by DifferentialSQLFuzzer in CI Run #15 on MySQL 8.4..26.10 & MariaDB 10.11..13.0 "
+                "(fz1_v16_global_full:drain_main): when an ungrouped global aggregate or all-NULL group evaluates "
+                "BIT_XOR/BIT_OR/BIT_AND over 0 non-null rows, MySQL/MariaDB return 0 / 0 / 18446744073709551615 "
+                "whereas PostgreSQL/SQLite return NULL."
+            ),
+            "dialects": (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL),
+            "schema": """
+                CREATE TABLE fc3_txns (
+                    id INTEGER PRIMARY KEY,
+                    grp_str TEXT NOT NULL,
+                    val_int INTEGER,
+                    val_flt REAL,
+                    weight_cnt INTEGER NOT NULL,
+                    flag INTEGER NOT NULL
+                );
+            """,
+            "views": [
+                (
+                    "fc3_v_global_full",
+                    "CREATE VIEW fc3_v_global_full AS SELECT COUNT(*) AS cnt, COUNT(val_int) AS ci, SUM(val_int) AS si, AVG(val_flt) AS af, MIN(weight_cnt) AS mnw, MAX(weight_cnt) AS mxw, VAR_POP(val_flt) AS vp, BIT_XOR(weight_cnt) AS bx, BIT_OR(weight_cnt) AS bo, BIT_AND(weight_cnt) AS ba FROM fc3_txns;",
+                ),
+                (
+                    "fc3_v_grp_nullable_bit",
+                    "CREATE VIEW fc3_v_grp_nullable_bit AS SELECT grp_str, COUNT(*) AS cnt, COUNT(val_int) AS ci, BIT_XOR(val_int) AS bx_vi, BIT_OR(val_int) AS bo_vi, BIT_AND(val_int) AS ba_vi FROM fc3_txns GROUP BY grp_str;",
+                ),
+            ],
+            "seed": [
+                "INSERT INTO fc3_txns VALUES (1, 'alpha', NULL, 10.0, 6, 1);",
+                "INSERT INTO fc3_txns VALUES (2, 'alpha', NULL, 20.0, 3, 1);",
+                "INSERT INTO fc3_txns VALUES (3, 'beta', 12, 15.0, 5, 0);",
+            ],
+            "mutations": [
+                ("set_alpha_nonnull", "UPDATE fc3_txns SET val_int = 9 WHERE id = 1;"),
+                ("set_alpha_back_to_null", "UPDATE fc3_txns SET val_int = NULL WHERE id = 1;"),
+                ("drain_all_rows", "DELETE FROM fc3_txns;"),
+                ("reseed_after_drain", "INSERT INTO fc3_txns VALUES (4, 'gamma', NULL, 50.0, 12, 1);"),
+                ("drain_again", "DELETE FROM fc3_txns;"),
+            ],
+        },
+        {
+            "id": "corpus_04_filter_where_greedy_regex_algebraic_delta",
+            "description": (
+                "Discovered by DifferentialSQLFuzzer on SQLite & PostgreSQL (fz1_v05_alg_grp_1): "
+                "greedy (.*) in _parse_single_agg_expr swallowed the closing paren of fn(...) when "
+                "FILTER (WHERE ...) followed, demoting the view from ALGEBRAIC_DELTA to GROUP_SCOPED_DELTA."
+            ),
+            "dialects": (Dialect.SQLITE, Dialect.POSTGRES),
+            "schema": """
+                CREATE TABLE fc4_txns (
+                    id INTEGER PRIMARY KEY,
+                    grp_str TEXT NOT NULL,
+                    val_int INTEGER,
+                    val_flt REAL,
+                    weight_cnt INTEGER NOT NULL,
+                    flag INTEGER NOT NULL
+                );
+            """,
+            "views": [
+                (
+                    "fc4_v_filter_where_alg",
+                    "CREATE VIEW fc4_v_filter_where_alg AS SELECT LOWER(grp_str) AS l_grp, COUNT(*) AS c_all, MAX(weight_cnt) AS mx_w, VAR_POP(val_flt) AS vp_flt, SUM(val_int) AS s_int, SUM(weight_cnt) FILTER (WHERE flag = 1) AS filt_w, COUNT(*) FILTER (WHERE flag = 0) AS filt_c0, BIT_XOR(weight_cnt) AS bx_w, SUM(val_int * weight_cnt) AS w_sum FROM fc4_txns GROUP BY LOWER(grp_str) HAVING COALESCE(SUM(weight_cnt), 0) >= 5;",
+                ),
+            ],
+            "seed": [
+                "INSERT INTO fc4_txns VALUES (1, 'Alpha', 10, 5.0, 4, 1);",
+                "INSERT INTO fc4_txns VALUES (2, 'alpha', 20, 15.0, 6, 0);",
+                "INSERT INTO fc4_txns VALUES (3, 'Beta', 5, 8.0, 3, 1);",
+            ],
+            "mutations": [
+                ("upd_flag_flip", "UPDATE fc4_txns SET flag = 1 - flag, weight_cnt = weight_cnt + 3 WHERE id IN (1, 3);"),
+                ("ins_beta", "INSERT INTO fc4_txns VALUES (4, 'BETA', 15, 12.0, 8, 1);"),
+                ("del_alpha_1", "DELETE FROM fc4_txns WHERE id = 1;"),
+                ("del_alpha_2", "DELETE FROM fc4_txns WHERE id = 2;"),
+            ],
+        },
+    ]
+
+
+def run_suite_13_fuzz_regression_corpus(runner: MVTestRunner) -> None:
+    """
+    Suite 13: Executes every scenario in the permanent fuzzing-discovered regression
+    corpus across all applicable dialects and execution modes (standard, incremental
+    backfill, and PostgreSQL transition tables).
+    """
+    corpus = get_fuzz_regression_corpus()
+    for entry in corpus:
+        cid = entry["id"]
+        schema = entry["schema"]
+        views = entry["views"]
+        seed = entry["seed"]
+        muts = entry["mutations"]
+        for dialect in entry["dialects"]:
+            runner.run_batch(
+                f"Suite 13 (Fuzz Corpus: {cid} - {dialect.value} std)",
+                schema,
+                views,
+                seed,
+                muts,
+                dialect=dialect,
+                incremental_backfill=False,
+            )
+            runner.run_batch(
+                f"Suite 13 (Fuzz Corpus: {cid} - {dialect.value} inc)",
+                schema,
+                views,
+                seed,
+                muts,
+                dialect=dialect,
+                pg_use_transition_tables=(dialect == Dialect.POSTGRES),
+                incremental_backfill=True,
+                batch_size=2,
+            )
+
+
 def _run_all_tests() -> None:
     t0 = time.time()
     runner = MVTestRunner()
@@ -4363,6 +4645,7 @@ def _run_all_tests() -> None:
     run_suite_10_torture_dml_and_transactions(runner)
     run_suite_11_live_engine_50_view_battery_across_all_dialects(runner)
     run_suite_12_differential_random_fuzzer(runner)
+    run_suite_13_fuzz_regression_corpus(runner)
 
     print("-" * 84)
     print(f"COMBINATORIAL & TRANSACTIONAL SUITES PASSED: {runner.total_views} views, {runner.total_assertions} live SQL assertions!")

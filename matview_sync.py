@@ -956,23 +956,18 @@ def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
     if re.search(r"\bOVER\s*\(", s, flags=re.IGNORECASE):
         return None
 
-    m = re.match(
-        r"^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)(?:\s*FILTER\s*\(\s*WHERE\s+(.*)\))?$",
-        s,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not m:
+    m_head = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(", s)
+    if not m_head:
         return None
 
-    fn_raw = m.group(1).upper()
-    inside = m.group(2).strip()
-    filter_where = m.group(3).strip() if m.group(3) else None
-
-    # Ensure the closing paren of fn(...) was not prematurely matched across a compound expression like SUM(a) + SUM(b)
-    depth = 0
+    fn_raw = m_head.group(1).upper()
+    open_p = m_head.end() - 1
+    depth = 1
+    idx_p = open_p + 1
     in_single = False
     in_double = False
-    for ch in inside:
+    while idx_p < len(s) and depth > 0:
+        ch = s[idx_p]
         if ch == "'" and not in_double:
             in_single = not in_single
         elif ch == '"' and not in_single:
@@ -982,10 +977,39 @@ def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
                 depth += 1
             elif ch == ")":
                 depth -= 1
-                if depth < 0:
-                    return None
+        idx_p += 1
     if depth != 0:
         return None
+
+    inside = s[open_p + 1 : idx_p - 1].strip()
+    tail = s[idx_p:].strip()
+    filter_where: Optional[str] = None
+    if tail:
+        m_filt = re.match(
+            r"^FILTER\s*\(\s*WHERE\s+(.*)\)$",
+            tail,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not m_filt:
+            return None
+        filter_where = m_filt.group(1).strip()
+        f_depth = 0
+        f_s = False
+        f_d = False
+        for ch in filter_where:
+            if ch == "'" and not f_d:
+                f_s = not f_s
+            elif ch == '"' and not f_s:
+                f_d = not f_d
+            elif not f_s and not f_d:
+                if ch == "(":
+                    f_depth += 1
+                elif ch == ")":
+                    f_depth -= 1
+                    if f_depth < 0:
+                        return None
+        if f_depth != 0:
+            return None
 
     fn_map: Dict[str, AggFunc] = {
         "SUM": AggFunc.SUM,
@@ -2239,7 +2263,12 @@ class IncrementalViewCompiler:
         for it in v.select_items:
             if not it.is_aggregate or it.agg_func is not None:
                 work_items.append(it)
-                reader_exprs[it.alias] = it.alias
+                if self.dialect == Dialect.MYSQL and it.agg_func in (AggFunc.BIT_OR, AggFunc.BIT_XOR):
+                    reader_exprs[it.alias] = f"COALESCE({it.alias}, 0) AS {it.alias}"
+                elif self.dialect == Dialect.MYSQL and it.agg_func == AggFunc.BIT_AND:
+                    reader_exprs[it.alias] = f"COALESCE({it.alias}, 18446744073709551615) AS {it.alias}"
+                else:
+                    reader_exprs[it.alias] = it.alias
             else:
                 rewritten_e, ok = _extract_agg_calls_from_expr(it.raw_expr)
                 if not ok:
@@ -3525,6 +3554,8 @@ class IncrementalViewCompiler:
                         f"{tbl_pks[0]} = excluded.{tbl_pks[0]}"
                     ]
                     upsert_tail = f"\n        ON CONFLICT ({', '.join(tbl_pks)}) DO UPDATE SET {', '.join(upd_cols)}"
+                ord_cols = ", ".join(str(k) for k in range(1, len(cols) + 1))
+                ord_tail = f"\n        ORDER BY {ord_cols}" if not self.view.has_limit_or_order else f"\n        ORDER BY {ord_cols}"
                 inc_stmts.append(
                     f"DO $$\n"
                     f"DECLARE\n"
@@ -3537,7 +3568,7 @@ class IncrementalViewCompiler:
                     f"        SELECT {', '.join(cols)}\n"
                     f"        FROM (\n"
                     f"            {aliased_inner}\n"
-                    f"        ) AS __mv_init\n"
+                    f"        ) AS __mv_init{ord_tail}\n"
                     f"        LIMIT __mv_batch_size OFFSET __mv_offset{upsert_tail};\n"
                     f"        GET DIAGNOSTICS __mv_rows = ROW_COUNT;\n"
                     f"        EXIT WHEN __mv_rows < __mv_batch_size;\n"
@@ -3552,6 +3583,8 @@ class IncrementalViewCompiler:
                         f"{tbl_pks[0]} = VALUES({tbl_pks[0]})"
                     ]
                     upsert_tail = f"\n        ON DUPLICATE KEY UPDATE {', '.join(upd_cols)}"
+                ord_cols = ", ".join(str(k) for k in range(1, len(cols) + 1))
+                ord_tail = f"\n        ORDER BY {ord_cols}"
                 proc_name = f"{self.object_prefix}proc_backfill_{self.logical_view_name}_{idx_s}"
                 inc_stmts.extend([
                     f"DROP PROCEDURE IF EXISTS {proc_name};",
@@ -3566,7 +3599,7 @@ class IncrementalViewCompiler:
                         f"        SELECT {', '.join(cols)}\n"
                         f"        FROM (\n"
                         f"            {aliased_inner}\n"
-                        f"        ) AS __mv_init\n"
+                        f"        ) AS __mv_init{ord_tail}\n"
                         f"        LIMIT __mv_batch_size OFFSET __mv_offset{upsert_tail};\n"
                         f"        SET __mv_rows = ROW_COUNT();\n"
                         f"        SET __mv_offset = __mv_offset + __mv_batch_size;\n"
@@ -3976,7 +4009,7 @@ class IncrementalViewCompiler:
         backing_col_map = {
             u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
             for u_col, expr_s in self._compound_reader_exprs.items()
-            if expr_s != u_col
+            if expr_s != u_col and "__mv_elem_" in expr_s
         }
         index_ddls, index_names = self._build_all_index_ddls(
             mv_table=mv_table,
@@ -5827,7 +5860,7 @@ class IncrementalViewCompiler:
         backing_col_map = {
             u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
             for u_col, expr_s in self._compound_reader_exprs.items()
-            if expr_s != u_col
+            if expr_s != u_col and "__mv_elem_" in expr_s
         }
         index_ddls, index_names = self._build_all_index_ddls(
             mv_table=mv_table,
@@ -6905,7 +6938,7 @@ class IncrementalViewCompiler:
         backing_col_map = {
             u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
             for u_col, expr_s in self._compound_reader_exprs.items()
-            if expr_s != u_col
+            if expr_s != u_col and "__mv_elem_" in expr_s
         }
         index_ddls, index_names = self._build_all_index_ddls(
             mv_table=mv_table,
@@ -7636,11 +7669,13 @@ class IncrementalViewCompiler:
             f"INSERT INTO {mv_table} ({cols_csv})\n"
             f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init;"
         )
+        ord_t2 = ", ".join(str(k) for k in range(1, len(target_cols) + 1))
         inc_spec = IncrementalBackfillSpec(
             mode="offset_batch",
             offset_insert_template=(
                 f"INSERT INTO {mv_table} ({cols_csv})\n"
                 f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t2}\n"
                 f"LIMIT ? OFFSET ?;"
             ),
         )
@@ -7738,11 +7773,13 @@ class IncrementalViewCompiler:
         cols_csv = ", ".join(user_columns)
         initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"
 
+        ord_t3 = ", ".join(str(k) for k in range(1, len(user_columns) + 1))
         inc_spec = IncrementalBackfillSpec(
             mode="offset_batch",
             offset_insert_template=(
                 f"INSERT INTO {mv_table} ({cols_csv})\n"
                 f"SELECT {cols_csv} FROM (\n{raw_query}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t3}\n"
                 f"LIMIT ? OFFSET ?;"
             ),
         )

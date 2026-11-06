@@ -8,7 +8,7 @@ Zero-runtime-dependency incremental materialized view compiler and lifecycle man
 
 * **Granular** $O(1)$ **Algebraic Delta Maintenance (`ALGEBRAIC_DELTA`)**:
 
-  * Single-table aggregations with arbitrary column or expression `GROUP BY`, `WHERE`, and `HAVING` clauses (`COUNT(*)`, `COUNT(col)`, `SUM`, `TOTAL`, `AVG`, `MIN`, `MAX`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`, `BIT_AND`, `BIT_OR`, `BIT_XOR`, `BOOL_AND`, `BOOL_OR`, and compound aggregate arithmetic such as `SUM(a * b) - SUM(c)`).
+  * Single-table aggregations with arbitrary column or expression `GROUP BY`, `WHERE`, and `HAVING` clauses (`COUNT(*)`, `COUNT(col)`, `SUM`, `TOTAL`, `AVG`, `MIN`, `MAX`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`, `BIT_AND`, `BIT_OR`, `BIT_XOR`, `BOOL_AND`, `BOOL_OR`, `FILTER (WHERE ...)`, and compound aggregate arithmetic such as `SUM(a * b) - SUM(c)`).
 
   * Multi-table `INNER JOIN` and `CROSS JOIN` aggregations via per-table delta queries.
 
@@ -22,7 +22,7 @@ Zero-runtime-dependency incremental materialized view compiler and lifecycle man
 
 * **Live Database Schema Introspection**: Accepts either raw SQL DDL strings or a live PEP-249 database connection (`conn`) to automatically introspect existing base tables, column types, nullability, primary keys, and `ON DELETE CASCADE` foreign keys across SQLite, PostgreSQL, and MySQL/MariaDB.
 
-* **Differential Random Schema, View & DML Fuzzer**: Includes `DifferentialSQLFuzzer` (Suite 12), which generates valid random multi-table schemas, random views across all 7 SQL families, and random DML + nested `SAVEPOINT` / `ROLLBACK` / `COMMIT` sequences, verifying after every statement across SQLite, PostgreSQL, and MySQL that the materialized view matches the live view query.
+* **Differential Random Fuzzer & Permanent Fuzz Regression Corpus**: Includes `DifferentialSQLFuzzer` (Suite 12) and a permanent `get_fuzz_regression_corpus()` suite (Suite 13 + `test_10_fuzz_regression_corpus_invariants`) locking in every edge case uncovered by differential fuzzing across SQLite, PostgreSQL, and MySQL/MariaDB.
 
 * **Safety & Transparency Checks**: Refuses to install views on engine/schema combinations where transparency cannot be guaranteed for all mutations (such as MySQL `TRUNCATE TABLE` or `ON DELETE CASCADE` trigger limitations) unless `--ignore-limitations` (`ignore_limitations=True`) is explicitly passed.
 
@@ -49,7 +49,7 @@ python3 matview_sync.py \
 ## Running Tests
 
 ```bash
-# Run the full 3,543-view (71,238-assertion) combinatorial, transactional & fuzzer test suite
+# Run the full 3,583-view (71,480-assertion) combinatorial, transactional, fuzzer & regression corpus suite
 python3 test_matview_sync.py
 
 # Customize the differential fuzzer seed or number of random scenarios
