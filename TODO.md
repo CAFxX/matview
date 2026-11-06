@@ -12,4 +12,6 @@
 [ ] I would like the generator to automatically create indexes on the aux or materialized tables when creating them helps materialization efficiency
 [ ] I would like the generator to support as efficiently as possible every engine and engine version (possibly considering performance features specific to each)
 [ ] I would like the README (or other doc linked from the README) to showcase how each SQL construct/aggregation and their combinations is efficiently rendered as an incremental materialization
+[ ] I would like the repo to contain a Dockerfile/Docker compose that spins up all servers needed for integration testing (make docker-test)
+[ ] I would like the generator to support also modern newsql engines (cockroach, tidb, yugabyte, spanner, etc.) where possible
 
