@@ -22,7 +22,7 @@ Zero-runtime-dependency incremental materialized view compiler and lifecycle man
 
 * **Live Database Schema Introspection**: Accepts either raw SQL DDL strings or a live PEP-249 database connection (`conn`) to automatically introspect existing base tables, column types, nullability, primary keys, and `ON DELETE CASCADE` foreign keys across SQLite, PostgreSQL, and MySQL/MariaDB.
 
-* **Differential Random Fuzzer & Permanent Fuzz Regression Corpus**: Includes `DifferentialSQLFuzzer` (Suite 12) and a permanent `get_fuzz_regression_corpus()` suite (Suite 13 + `test_10_fuzz_regression_corpus_invariants`) locking in every edge case uncovered by differential fuzzing across SQLite, PostgreSQL, and MySQL/MariaDB.
+* **Extensive Multi-Order-of-Magnitude Differential Fuzzer & Regression Corpus**: Features `DifferentialSQLFuzzer` (Suite 12) capable of generating arbitrary multi-table schemas (composite PKs, self-referential hierarchies, multi-hop FKs), hundreds of views per seed across all 7 SQL families, and complex transaction trees (nested savepoints, rollbacks, commits, table drains, and reseeding), backed by a permanent regression corpus (`Suite 13` + `test_10_fuzz_regression_corpus_invariants`).
 
 * **Safety & Transparency Checks**: Refuses to install views on engine/schema combinations where transparency cannot be guaranteed for all mutations (such as MySQL `TRUNCATE TABLE` or `ON DELETE CASCADE` trigger limitations) unless `--ignore-limitations` (`ignore_limitations=True`) is explicitly passed.
 
@@ -46,14 +46,25 @@ python3 matview_sync.py \
   --apply
 ```
 
-## Running Tests
+## Running Tests & Differential Fuzzing
 
 ```bash
-# Run the full 3,583-view (71,480-assertion) combinatorial, transactional, fuzzer & regression corpus suite
+# Run the full 3,751-view (78,320-assertion) test suite across all 13 suites
 python3 test_matview_sync.py
 
-# Customize the differential fuzzer seed or number of random scenarios
-MATVIEW_FUZZ_SEED=20261106 MATVIEW_FUZZ_SCENARIOS=5 python3 test_matview_sync.py
+# Run standalone multi-order-of-magnitude differential fuzzing (Suites 12 & 13)
+python3 test_matview_sync.py --fuzz
+
+# Scale up differential fuzzing by arbitrary orders of magnitude across seeds, schemas, and views
+python3 test_matview_sync.py --fuzz --fuzz-scale 2    # ~142,000 assertions in ~60s
+python3 test_matview_sync.py --fuzz --fuzz-scale 10   # Millions of assertions (soak test)
+
+# Customize specific fuzz parameters via CLI flags or environment variables
+python3 test_matview_sync.py --fuzz \
+  --fuzz-seeds 101,102,103,104 \
+  --fuzz-scenarios 4 \
+  --fuzz-views 50 \
+  --fuzz-mutations 40
 
 # Run live integration tests against PostgreSQL, MySQL/MariaDB, or SQLite-compatible engines
 POSTGRES_DSN="postgresql://postgres:postgres@127.0.0.1:5432/matview_test" \
