@@ -1430,7 +1430,9 @@ class TranspiledConnectionAdapter:
             flags=re.I | re.S,
         )
         if m_proc:
-            self._mysql_procs[m_proc.group(1)] = m_proc.group(2).strip()
+            proc_ident = m_proc.group(1)
+            assert len(proc_ident) <= 64, f"MySQL procedure identifier exceeds 64-char limit ({len(proc_ident)} chars): {proc_ident}"
+            self._mysql_procs[proc_ident] = m_proc.group(2).strip()
             return [], 0
         m_call = re.match(r"CALL\s+([A-Za-z0-9_]+)\s*\(\)\s*;?", s, flags=re.I)
         if m_call:
@@ -1445,7 +1447,9 @@ class TranspiledConnectionAdapter:
             flags=re.I | re.S,
         )
         if m_pg_fn:
-            self._pg_functions[m_pg_fn.group(1)] = m_pg_fn.group(2).strip()
+            fn_ident = m_pg_fn.group(1)
+            assert len(fn_ident) <= 63, f"PostgreSQL function identifier exceeds 63-char NAMEDATALEN limit ({len(fn_ident)} chars): {fn_ident}"
+            self._pg_functions[fn_ident[:63]] = m_pg_fn.group(2).strip()
             return [], 0
 
         m_drop_fn = re.match(
@@ -3955,6 +3959,27 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             p4 = generate_materialized_view(c4["schema"], c4["views"][0][1], dialect=d)
             self.assertEqual(p4.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
 
+        # Corpus 5: PostgreSQL transition-table function & trigger names strictly <= 62 chars and distinct
+        c5 = corpus["corpus_05_pg_63char_identifier_truncation_collision"]
+        p5 = generate_materialized_view(
+            c5["schema"], c5["views"][0][1], dialect=Dialect.POSTGRES, pg_use_transition_tables=True
+        )
+        self.assertEqual(len(set(p5.function_names)), len(p5.function_names))
+        self.assertEqual(len(set(p5.trigger_names)), len(p5.trigger_names))
+        for fn_n in p5.function_names:
+            self.assertLessEqual(len(fn_n), 62, f"Function name too long: {fn_n}")
+        for tr_n in p5.trigger_names:
+            self.assertLessEqual(len(tr_n), 62, f"Trigger name too long: {tr_n}")
+
+        # Corpus 6: MariaDB NOT IN (SELECT ...) lowered to NOT EXISTS (...) in MySQL trigger SQL
+        c6 = corpus["corpus_06_mariadb_not_in_subquery_empty_transition_with_null_lhs"]
+        p6 = generate_materialized_view(
+            c6["schema"], c6["views"][0][1], dialect=Dialect.MYSQL, ignore_limitations=True
+        )
+        for tr_ddl in p6.trigger_ddls:
+            self.assertNotIn("NOT IN", tr_ddl.upper())
+            self.assertIn("NOT EXISTS", tr_ddl.upper())
+
 
 import random
 
@@ -4525,7 +4550,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
     else:
         det_seeds = [20261106, 1337]
         if scale > 1:
-            extra_det = [424242, 987654321, 104729, 314159]
+            extra_det = [424242, 992138513, 987654321, 104729, 314159]
             det_seeds.extend(extra_det[: min(len(extra_det), scale)])
         num_rand = int(os.environ.get("MATVIEW_FUZZ_RANDOM_SEEDS", str(2 * scale)))
         rand_seeds = [secrets.randbits(32) for _ in range(num_rand)]
@@ -4774,6 +4799,86 @@ def get_fuzz_regression_corpus() -> List[Dict[str, Any]]:
                 ("ins_beta", "INSERT INTO fc4_txns VALUES (4, 'BETA', 15, 12.0, 8, 1);"),
                 ("del_alpha_1", "DELETE FROM fc4_txns WHERE id = 1;"),
                 ("del_alpha_2", "DELETE FROM fc4_txns WHERE id = 2;"),
+            ],
+        },
+        {
+            "id": "corpus_05_pg_63char_identifier_truncation_collision",
+            "description": (
+                "Discovered by DifferentialSQLFuzzer in CI Run #18 on PostgreSQL 14..18 "
+                "(fz3_v046_global_filtered_nocnt on fz3_records with transition tables): "
+                "__matview_fn_sync_fz3_v046_global_filtered_nocnt__fz3_records_ai/_ad/_au were 64 characters long, "
+                "causing PostgreSQL to truncate all three to the same 63-char identifier (..._a) and overwrite "
+                "the INSERT trigger function with the UPDATE trigger function referencing __mv_old_rows."
+            ),
+            "dialects": (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL),
+            "schema": """
+                CREATE TABLE fz3_records (
+                    id INTEGER PRIMARY KEY,
+                    grp_str TEXT NOT NULL,
+                    val_int INTEGER,
+                    val_flt REAL,
+                    weight_cnt INTEGER NOT NULL,
+                    flag INTEGER NOT NULL
+                );
+            """,
+            "views": [
+                (
+                    "fz3_v046_global_filtered_nocnt",
+                    "CREATE VIEW fz3_v046_global_filtered_nocnt AS SELECT SUM(val_int) AS si, AVG(val_flt) AS af, MIN(weight_cnt) AS mnw, MAX(weight_cnt) AS mxw, COUNT(DISTINCT grp_str) AS cd_g FROM fz3_records WHERE flag = 1 AND weight_cnt >= 10;",
+                ),
+            ],
+            "seed": [
+                "INSERT INTO fz3_records VALUES (1, 'alpha', 10, 20.0, 12, 1);",
+                "INSERT INTO fz3_records VALUES (2, 'beta', 30, 40.0, 5, 1);",
+            ],
+            "mutations": [
+                ("ins_rec", "INSERT INTO fz3_records VALUES (3, 'gamma', 25, 15.0, 14, 1);"),
+                ("upd_rec", "UPDATE fz3_records SET weight_cnt = 18, val_int = 50 WHERE id = 2;"),
+                ("del_rec", "DELETE FROM fz3_records WHERE id = 1;"),
+            ],
+        },
+        {
+            "id": "corpus_06_mariadb_not_in_subquery_empty_transition_with_null_lhs",
+            "description": (
+                "Discovered by DifferentialSQLFuzzer in CI Run #18 on MariaDB 10.11 (seed=992138513, fz3_v069_subq_not_in:tx1_upd_after_rb) "
+                "and MariaDB 11.4 (seed=424242, fz3_v071_subq_not_in:m23_upd_dim): when a view with `parent_id NOT IN (SELECT id FROM merchants WHERE quota < 25 AND id IS NOT NULL)` "
+                "has NULL values in `parent_id` and an UPDATE on `merchants` causes the subquery to transition from 1 row to 0 rows (empty), "
+                "MariaDB's cached trigger Item_in_optimizer mis-evaluates `NULL NOT IN (empty)` as FALSE instead of TRUE unless lowered to NOT EXISTS."
+            ),
+            "dialects": (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL),
+            "schema": """
+                CREATE TABLE fc6_merchants (
+                    id INTEGER PRIMARY KEY,
+                    pname TEXT NOT NULL,
+                    tier TEXT,
+                    quota INTEGER NOT NULL
+                );
+                CREATE TABLE fc6_events (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER,
+                    grp_str TEXT NOT NULL,
+                    weight_cnt INTEGER NOT NULL
+                );
+            """,
+            "views": [
+                (
+                    "fc6_v_subq_not_in",
+                    "CREATE VIEW fc6_v_subq_not_in AS SELECT id, grp_str, weight_cnt FROM fc6_events WHERE parent_id NOT IN (SELECT id FROM fc6_merchants WHERE quota < 25 AND id IS NOT NULL);",
+                ),
+            ],
+            "seed": [
+                "INSERT INTO fc6_merchants VALUES (1, 'ORG_1', 'std', 63), (2, 'ORG_2', 'gold', 96), (3, 'ORG_3', 'core', 22), (4, 'ORG_4', NULL, 28);",
+                "INSERT INTO fc6_events VALUES (1, 1, 'alpha', 14), (2, NULL, 'gamma', 17), (3, 3, 'zeta', 3), (4, NULL, 'sigma', 6);",
+            ],
+            "mutations": [
+                # Updating id=3 from quota=22 to quota=38 empties the subquery (quota < 25) -> rows with parent_id IS NULL must now be INCLUDED!
+                ("empty_subq_upd", "UPDATE fc6_merchants SET tier = NULL, quota = quota + 16 WHERE id = 3;"),
+                # Updating id=3 back to quota=18 makes subquery non-empty again -> rows with parent_id IS NULL must now be EXCLUDED!
+                ("refill_subq_upd", "UPDATE fc6_merchants SET quota = 18 WHERE id = 3;"),
+                # Deleting id=3 empties the subquery again -> rows with parent_id IS NULL must be INCLUDED!
+                ("del_subq_row", "DELETE FROM fc6_merchants WHERE id = 3;"),
+                # Re-inserting id=3 with quota=20 makes subquery non-empty again!
+                ("ins_subq_row", "INSERT INTO fc6_merchants VALUES (3, 'ORG_3', 'core', 20);"),
             ],
         },
     ]

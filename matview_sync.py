@@ -1891,9 +1891,17 @@ class IncrementalViewCompiler:
         self._alg_mode: str = "single"
         self.strategy: MaintenanceStrategy = self._choose_strategy()
 
+    def _bounded_ident(self, prefix: str, stem: str, suffix: str = "", max_len: int = 62) -> str:
+        full = f"{prefix}{stem}{suffix}"
+        if len(full) <= max_len:
+            return full
+        h = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:8]
+        avail = max(4, max_len - len(prefix) - len(suffix) - 9)
+        return f"{prefix}{stem[:avail]}_{h}{suffix}"
+
     def _backing_table_name(self) -> str:
         p = self.object_prefix if self.object_prefix else "__matview_"
-        return f"{p}store_{self.logical_view_name}"
+        return self._bounded_ident(f"{p}store_", self.logical_view_name)
 
     def _enforce_or_warn(self) -> None:
         self._enforce_limitations()
@@ -2810,7 +2818,7 @@ class IncrementalViewCompiler:
         log_vname = self.logical_view_name
 
         if auto_group_cols and not has_pk_on_group_cols:
-            idx_name = f"{p}idx_{log_vname}__grp"
+            idx_name = self._bounded_ident(f"{p}idx_", log_vname, "__grp")
             ddls.append(f"CREATE INDEX {idx_name} ON {mv_table} ({', '.join(auto_group_cols)});")
             names.append(idx_name)
 
@@ -2823,7 +2831,7 @@ class IncrementalViewCompiler:
                     idx_name = raw_n
             else:
                 col_tag = "_".join(_sanitize_ident(self._extract_index_col_base_ident(c)) for c in idx_spec.columns)
-                idx_name = f"{p}idx_{log_vname}__{col_tag}_{i}"
+                idx_name = self._bounded_ident(f"{p}idx_", f"{log_vname}__{col_tag}", f"_{i}")
 
             mapped_cols: List[str] = []
             for col_spec in idx_spec.columns:
@@ -3307,7 +3315,7 @@ class IncrementalViewCompiler:
             ro_trigs: List[str] = []
             ro_names: List[str] = []
             for op, suf in (("INSERT", "ins"), ("UPDATE", "upd"), ("DELETE", "del")):
-                t_name = f"{p}trg_{log_vname}__ro_{suf}"
+                t_name = self._bounded_ident(f"{p}trg_", log_vname, f"__ro_{suf}")
                 ro_names.append(t_name)
                 ro_trigs.append(
                     f"CREATE TRIGGER {t_name}\n"
@@ -3319,8 +3327,8 @@ class IncrementalViewCompiler:
             return reader_view_ddl, ro_trigs, ro_names, []
 
         # PostgreSQL: INSTEAD OF trigger on view
-        fn_ro = f"{p}fn_readonly_{log_vname}"
-        t_ro = f"{p}trg_{log_vname}__readonly"
+        fn_ro = self._bounded_ident(f"{p}fn_readonly_", log_vname)
+        t_ro = self._bounded_ident(f"{p}trg_", log_vname, "__readonly")
         fn_ddl = (
             f"CREATE OR REPLACE FUNCTION {fn_ro}()\n"
             f"RETURNS TRIGGER AS $$\n"
@@ -3444,7 +3452,7 @@ class IncrementalViewCompiler:
                             f"        {p_clean};\n"
                             f"    END IF;"
                         )
-                proc_name = f"{self.object_prefix}proc_backfill_{self.logical_view_name}"
+                proc_name = self._bounded_ident(f"{self.object_prefix}proc_backfill_", self.logical_view_name)
                 return [
                     f"DROP PROCEDURE IF EXISTS {proc_name};",
                     (
@@ -3585,7 +3593,7 @@ class IncrementalViewCompiler:
                     upsert_tail = f"\n        ON DUPLICATE KEY UPDATE {', '.join(upd_cols)}"
                 ord_cols = ", ".join(str(k) for k in range(1, len(cols) + 1))
                 ord_tail = f"\n        ORDER BY {ord_cols}"
-                proc_name = f"{self.object_prefix}proc_backfill_{self.logical_view_name}_{idx_s}"
+                proc_name = self._bounded_ident(f"{self.object_prefix}proc_backfill_", self.logical_view_name, f"_{idx_s}")
                 inc_stmts.extend([
                     f"DROP PROCEDURE IF EXISTS {proc_name};",
                     (
@@ -3865,7 +3873,7 @@ class IncrementalViewCompiler:
                 col_sum_map[ekey] = item.alias
             if item.is_distinct and ekey not in distinct_aux_tables:
                 p = self.object_prefix if self.object_prefix else "__matview_"
-                aux_tbl = f"{p}dist_{self.logical_view_name}__{_sanitize_ident(item.alias)}"
+                aux_tbl = self._bounded_ident(f"{p}dist_", f"{self.logical_view_name}__{_sanitize_ident(item.alias)}")
                 c_arg = self._lookup_col_def(item.arg_expr)
                 val_dt = (
                     self._normalize_dialect_type(c_arg.data_type)
@@ -5356,7 +5364,12 @@ class IncrementalViewCompiler:
     ) -> Tuple[List[str], List[str], List[str]]:
         log_vname = self.logical_view_name
         p = self.object_prefix if self.object_prefix else "__matview_"
-        trig_prefix = f"{p}trg_{log_vname}__{base_t}"
+        stem = f"{log_vname}__{base_t}"
+        t_ai_name = self._bounded_ident(f"{p}trg_", stem, "_ai")
+        t_ad_name = self._bounded_ident(f"{p}trg_", stem, "_ad")
+        t_au_name = self._bounded_ident(f"{p}trg_", stem, "_au")
+        t_trunc_name = self._bounded_ident(f"{p}trg_", stem, "_trunc")
+        t_sync_name = self._bounded_ident(f"{p}trg_", stem, "_sync")
         ref_cols = self._referenced_columns_for_table(base_t)
         upd_of_clause = (
             f" OF {', '.join(ref_cols)}"
@@ -5381,7 +5394,7 @@ class IncrementalViewCompiler:
             when_ins = f"\nWHEN {where_new}" if where_new else ""
             ins_body = "\n    ".join(ins_stmts)
             trig_ins = (
-                f"CREATE TRIGGER {trig_prefix}_ai\n"
+                f"CREATE TRIGGER {t_ai_name}\n"
                 f"AFTER INSERT ON {base_t}\n"
                 f"FOR EACH ROW{when_ins}\n"
                 f"BEGIN\n"
@@ -5392,7 +5405,7 @@ class IncrementalViewCompiler:
             when_del = f"\nWHEN {where_old}" if where_old else ""
             del_body = "\n    ".join(del_stmts)
             trig_del = (
-                f"CREATE TRIGGER {trig_prefix}_ad\n"
+                f"CREATE TRIGGER {t_ad_name}\n"
                 f"AFTER DELETE ON {base_t}\n"
                 f"FOR EACH ROW{when_del}\n"
                 f"BEGIN\n"
@@ -5408,14 +5421,14 @@ class IncrementalViewCompiler:
             upd_body = "\n    ".join(upd_stmts)
             when_upd = f"\nWHEN {changed_guard}" if changed_guard else ""
             trig_upd = (
-                f"CREATE TRIGGER {trig_prefix}_au\n"
+                f"CREATE TRIGGER {t_au_name}\n"
                 f"AFTER UPDATE{upd_of_clause} ON {base_t}\n"
                 f"FOR EACH ROW{when_upd}\n"
                 f"BEGIN\n"
                 f"    {upd_body}\n"
                 f"END;"
             )
-            t_names = [f"{trig_prefix}_ai", f"{trig_prefix}_ad", f"{trig_prefix}_au"]
+            t_names = [t_ai_name, t_ad_name, t_au_name]
             return [trig_ins, trig_del, trig_upd], t_names, []
 
         elif self.dialect == Dialect.POSTGRES:
@@ -5452,7 +5465,7 @@ class IncrementalViewCompiler:
                 else del_full_block
             )
 
-            fn_trunc = f"{p}fn_sync_{log_vname}__{base_t}_trunc"
+            fn_trunc = self._bounded_ident(f"{p}fn_sync_", stem, "_trunc")
             fn_trunc_ddl = (
                 f"CREATE OR REPLACE FUNCTION {fn_trunc}()\n"
                 f"RETURNS TRIGGER AS $$\n"
@@ -5462,15 +5475,15 @@ class IncrementalViewCompiler:
                 f"END;\n$$ LANGUAGE plpgsql;"
             )
             t_trunc = (
-                f"CREATE TRIGGER {trig_prefix}_trunc\n"
+                f"CREATE TRIGGER {t_trunc_name}\n"
                 f"AFTER TRUNCATE ON {base_t}\n"
                 f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_trunc}();"
             )
 
             if self.pg_use_transition_tables:
-                fn_ai = f"{p}fn_sync_{log_vname}__{base_t}_ai"
-                fn_ad = f"{p}fn_sync_{log_vname}__{base_t}_ad"
-                fn_au = f"{p}fn_sync_{log_vname}__{base_t}_au"
+                fn_ai = self._bounded_ident(f"{p}fn_sync_", stem, "_ai")
+                fn_ad = self._bounded_ident(f"{p}fn_sync_", stem, "_ad")
+                fn_au = self._bounded_ident(f"{p}fn_sync_", stem, "_au")
                 fn_ai_ddl = (
                     f"CREATE OR REPLACE FUNCTION {fn_ai}()\n"
                     f"RETURNS TRIGGER AS $$\n"
@@ -5523,30 +5536,30 @@ class IncrementalViewCompiler:
                     f"END;\n$$ LANGUAGE plpgsql;"
                 )
                 t_ai = (
-                    f"CREATE TRIGGER {trig_prefix}_ai\n"
+                    f"CREATE TRIGGER {t_ai_name}\n"
                     f"AFTER INSERT ON {base_t}\n"
                     f"REFERENCING NEW TABLE AS __mv_new_rows\n"
                     f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_ai}();"
                 )
                 t_ad = (
-                    f"CREATE TRIGGER {trig_prefix}_ad\n"
+                    f"CREATE TRIGGER {t_ad_name}\n"
                     f"AFTER DELETE ON {base_t}\n"
                     f"REFERENCING OLD TABLE AS __mv_old_rows\n"
                     f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_ad}();"
                 )
                 t_au = (
-                    f"CREATE TRIGGER {trig_prefix}_au\n"
+                    f"CREATE TRIGGER {t_au_name}\n"
                     f"AFTER UPDATE ON {base_t}\n"
                     f"REFERENCING OLD TABLE AS __mv_old_rows NEW TABLE AS __mv_new_rows\n"
                     f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_au}();"
                 )
                 return (
                     [fn_ai_ddl, t_ai, fn_ad_ddl, t_ad, fn_au_ddl, t_au, fn_trunc_ddl, t_trunc],
-                    [f"{trig_prefix}_ai", f"{trig_prefix}_ad", f"{trig_prefix}_au", f"{trig_prefix}_trunc"],
+                    [t_ai_name, t_ad_name, t_au_name, t_trunc_name],
                     [fn_ai, fn_ad, fn_au, fn_trunc],
                 )
 
-            fn_name = f"{p}fn_sync_{log_vname}__{base_t}"
+            fn_name = self._bounded_ident(f"{p}fn_sync_", stem)
             upd_guard_open = f"IF ({changed_guard}) THEN\n        " if changed_guard else ""
             upd_guard_close = "\n        END IF;" if changed_guard else ""
             upd_inner = (
@@ -5571,13 +5584,13 @@ class IncrementalViewCompiler:
                 f"$$ LANGUAGE plpgsql;"
             )
             t_sync = (
-                f"CREATE TRIGGER {trig_prefix}_sync\n"
+                f"CREATE TRIGGER {t_sync_name}\n"
                 f"AFTER INSERT OR UPDATE{upd_of_clause} OR DELETE ON {base_t}\n"
                 f"FOR EACH ROW EXECUTE FUNCTION {fn_name}();"
             )
             return (
                 [fn_ddl, t_sync, fn_trunc_ddl, t_trunc],
-                [f"{trig_prefix}_sync", f"{trig_prefix}_trunc"],
+                [t_sync_name, t_trunc_name],
                 [fn_name, fn_trunc],
             )
 
@@ -5623,7 +5636,7 @@ class IncrementalViewCompiler:
             )
 
             trig_ins = (
-                f"CREATE TRIGGER {trig_prefix}_ai\n"
+                f"CREATE TRIGGER {t_ai_name}\n"
                 f"AFTER INSERT ON {base_t}\n"
                 f"FOR EACH ROW\n"
                 f"BEGIN\n"
@@ -5631,7 +5644,7 @@ class IncrementalViewCompiler:
                 f"END;"
             )
             trig_del = (
-                f"CREATE TRIGGER {trig_prefix}_ad\n"
+                f"CREATE TRIGGER {t_ad_name}\n"
                 f"AFTER DELETE ON {base_t}\n"
                 f"FOR EACH ROW\n"
                 f"BEGIN\n"
@@ -5639,14 +5652,14 @@ class IncrementalViewCompiler:
                 f"END;"
             )
             trig_upd = (
-                f"CREATE TRIGGER {trig_prefix}_au\n"
+                f"CREATE TRIGGER {t_au_name}\n"
                 f"AFTER UPDATE ON {base_t}\n"
                 f"FOR EACH ROW\n"
                 f"BEGIN\n"
                 f"    {upd_guard_open}{upd_inner}{upd_guard_close}\n"
                 f"END;"
             )
-            t_names = [f"{trig_prefix}_ai", f"{trig_prefix}_ad", f"{trig_prefix}_au"]
+            t_names = [t_ai_name, t_ad_name, t_au_name]
             return [trig_ins, trig_del, trig_upd], t_names, []
 
         return [], [], []
@@ -7524,6 +7537,62 @@ class IncrementalViewCompiler:
             trunc_stmts=full_refresh,
         )
 
+    def _rewrite_mysql_not_in_subquery(self, sql: str) -> str:
+        m_outer = re.search(
+            r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        if not m_outer:
+            return sql
+        outer_tbl = m_outer.group(1)
+        outer_alias = m_outer.group(2)
+        if outer_alias and outer_alias.upper() in {
+            "WHERE", "GROUP", "ORDER", "LIMIT", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "JOIN", "UNION", "EXCEPT", "INTERSECT", "HAVING"
+        }:
+            outer_alias = None
+        outer_ref = outer_alias or outer_tbl
+
+        pattern = re.compile(
+            r"\b([A-Za-z_][A-Za-z0-9_.]*)\s+NOT\s+IN\s*\(\s*SELECT\s+([A-Za-z_][A-Za-z0-9_.]*)\s+FROM\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?(?:\s+WHERE\s+((?:[^()]|\([^()]*\))+))?\s*\)",
+            flags=re.IGNORECASE,
+        )
+
+        def _repl(m: re.Match[str]) -> str:
+            lhs = m.group(1)
+            rhs = m.group(2)
+            in_tbl = m.group(3)
+            in_alias = m.group(4)
+            in_where = m.group(5)
+            if in_alias and in_alias.upper() == "WHERE":
+                in_alias = None
+            sub_alias = in_alias or "__mv_not_in"
+            lhs_q = lhs if "." in lhs else f"{outer_ref}.{lhs}"
+            rhs_col = rhs.split(".", 1)[1] if "." in rhs else rhs
+            rhs_q = f"{sub_alias}.{rhs_col}"
+            if in_where:
+                in_w = in_where
+                in_schema = self._schemas_lower.get(in_tbl.lower())
+                if in_schema and not in_alias:
+                    for c_n in in_schema.columns:
+                        in_w = re.sub(
+                            rf"(?<![A-Za-z0-9_.\"`\[])\b{re.escape(c_n)}\b(?!\s*\()",
+                            f"{sub_alias}.{c_n}",
+                            in_w,
+                            flags=re.IGNORECASE,
+                        )
+                w_empty = f" WHERE ({in_w})"
+                w_corr = f" WHERE ({in_w}) AND ({rhs_q} IS NULL OR {rhs_q} = {lhs_q})"
+            else:
+                w_empty = ""
+                w_corr = f" WHERE ({rhs_q} IS NULL OR {rhs_q} = {lhs_q})"
+            return (
+                f"(NOT EXISTS (SELECT 1 FROM {in_tbl} AS {sub_alias}{w_empty}) "
+                f"OR ({lhs_q} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {in_tbl} AS {sub_alias}{w_corr})))"
+            )
+
+        return pattern.sub(_repl, sql)
+
     def _rewrite_sqlite_total_in_sql(self, sql: str) -> str:
         if self.dialect == Dialect.SQLITE:
             s_sq = sql
@@ -7569,6 +7638,7 @@ class IncrementalViewCompiler:
             flags=re.IGNORECASE,
         )
         if self.dialect == Dialect.MYSQL:
+            s = self._rewrite_mysql_not_in_subquery(s)
             s = re.sub(
                 r"\b(LAG|LEAD)\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)\s+OVER\s*\(([^()]*)\)",
                 r"COALESCE(\1(\2, \3) OVER (\5), \4)",
