@@ -845,6 +845,8 @@ def _contains_aggregate_call(expr: str) -> bool:
     if re.search(r"\bOVER\s*\(", expr, flags=re.IGNORECASE):
         return False
     no_str = re.sub(r"'(?:''|[^'])*'", "''", expr)
+    if re.search(r"\(\s*SELECT\b", no_str, flags=re.IGNORECASE):
+        return False
     return bool(_AGG_FN_PATTERN.search(no_str))
 
 
@@ -1365,9 +1367,19 @@ def _parse_single_create_view_stmt(
 
     joins, has_subquery_in_from = _parse_from_and_joins(from_clause, cte_names)
     ref_tables = _extract_all_referenced_tables(raw_select, cte_names, known_tables=known_tables)
-    if not ref_tables and joins and joins[0].table_name not in cte_names and not joins[0].table_name.startswith("__mv_"):
-        ref_tables = [joins[0].table_name]
-    base_table = ref_tables[0] if ref_tables else (joins[0].table_name if joins else "unknown_table")
+    cte_lower = {c.lower() for c in cte_names}
+    if (
+        not has_subquery_in_from
+        and joins
+        and joins[0].table_name.lower() not in cte_lower
+        and not joins[0].table_name.startswith("__mv_")
+        and (not known_tables or joins[0].table_name.lower() in known_tables)
+    ):
+        primary_t = joins[0].table_name
+        ref_tables = [primary_t] + [t for t in ref_tables if t.lower() != primary_t.lower()]
+        base_table = primary_t
+    else:
+        base_table = ref_tables[0] if ref_tables else (joins[0].table_name if joins else "unknown_table")
 
     return ViewSpec(
         view_name=view_name,
@@ -2663,8 +2675,8 @@ class IncrementalViewCompiler:
         if self.dialect == Dialect.MYSQL:
             if u == "DOUBLE PRECISION":
                 return "DOUBLE"
-            if u in ("VARCHAR", "CHAR", "CHARACTER VARYING", "CHARACTER"):
-                return "VARCHAR(255)"
+            if u in ("VARCHAR", "CHAR", "CHARACTER VARYING", "CHARACTER", "TEXT"):
+                return "VARCHAR(191)"
         return dt
 
     def _infer_cte_or_subquery_col_type(self, col_name: str) -> Optional[str]:
@@ -2890,6 +2902,9 @@ class IncrementalViewCompiler:
         return list(group_exprs)
 
     def _group_col_alias(self, g_expr: str) -> str:
+        uall_map = getattr(self, "_uall_grp_alias_map", None)
+        if uall_map and g_expr in uall_map:
+            return uall_map[g_expr]
         for it in self.view.select_items:
             if not it.is_aggregate and (
                 it.raw_expr.strip().lower() == g_expr.strip().lower()
@@ -2910,6 +2925,8 @@ class IncrementalViewCompiler:
         grp_exprs = self._effective_group_by_exprs
         if not grp_exprs:
             return False
+        if getattr(self, "_alg_mode", None) in ("join", "union_all_agg"):
+            return True
         if len(grp_exprs) > 1 and self.dialect == Dialect.MYSQL:
             return True
         for g in grp_exprs:
@@ -3094,13 +3111,7 @@ class IncrementalViewCompiler:
                     f")\n"
                     f"{joined_tmpl};"
                 ]
-                if not raw_plan.view_spec.group_by_cols and not raw_plan.view_spec.has_top_level_distinct:
-                    # Global aggregate: ensure empty base table or all-filtered table still has its 1 global row
-                    for pop_s in raw_plan.initial_populate_sqls:
-                        p_clean = pop_s.strip().rstrip(";")
-                        out_stmts.append(
-                            f"{p_clean}\nWHERE NOT EXISTS (SELECT 1 FROM {raw_plan.backing_table_name});"
-                        )
+
                 return out_stmts
 
             elif self.dialect == Dialect.POSTGRES:
@@ -3469,7 +3480,7 @@ class IncrementalViewCompiler:
         if item.agg_func == AggFunc.TOTAL:
             if self.dialect == Dialect.SQLITE:
                 return f"TOTAL({dist}{eff})"
-            return f"COALESCE(SUM(1.0 * ({dist}{eff})), 0.0)"
+            return f"COALESCE(1.0 * SUM({dist}{eff}), 0.0)"
         if item.agg_func == AggFunc.AVG:
             if self.dialect == Dialect.SQLITE:
                 return f"AVG({dist}{eff})"
@@ -6749,6 +6760,7 @@ class IncrementalViewCompiler:
         orig_view = self.view
         orig_work_items = list(self._working_select_items)
         orig_grp_exprs = tuple(self._effective_group_by_exprs)
+        orig_grp_aliases = [self._group_col_alias(g) for g in orig_grp_exprs]
         orig_primary_schema = self.primary_schema
         self._uall_orig_grp_exprs = orig_grp_exprs
 
@@ -6847,6 +6859,7 @@ class IncrementalViewCompiler:
                 self.primary_schema = ts
                 self._working_select_items = mapped_work_items
                 self._effective_group_by_exprs = mapped_grps
+                self._uall_grp_alias_map = {mg: oa for mg, oa in zip(mapped_grps, orig_grp_aliases)}
                 self._uall_orig_item_map = orig_item_map
                 self.view = ViewSpec(
                     view_name=orig_view.view_name,
@@ -6910,6 +6923,7 @@ class IncrementalViewCompiler:
             self._working_select_items = orig_work_items
             self._effective_group_by_exprs = orig_grp_exprs
             self.primary_schema = orig_primary_schema
+            self._uall_grp_alias_map = None
 
             trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
@@ -7235,6 +7249,42 @@ class IncrementalViewCompiler:
             trunc_stmts=full_refresh,
         )
 
+    def _rewrite_sqlite_total_in_sql(self, sql: str) -> str:
+        if self.dialect == Dialect.SQLITE:
+            return sql
+        s = re.sub(
+            r"\bTOTAL\s*\(\s*DISTINCT\s+((?:[^()]|\([^()]*\))+)\)",
+            r"COALESCE(1.0 * SUM(DISTINCT \1), 0.0)",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        s = re.sub(
+            r"\bTOTAL\s*\(\s*((?:[^()]|\([^()]*\))+)\)",
+            r"COALESCE(1.0 * SUM(\1), 0.0)",
+            s,
+            flags=re.IGNORECASE,
+        )
+        if self.dialect == Dialect.MYSQL:
+            m_foj = re.match(
+                r'^SELECT\s+(.*?)\s+FROM\s+([A-Za-z0-9_."`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z0-9_"`\[\]]+)?)\s+FULL\s+(?:OUTER\s+)?JOIN\s+([A-Za-z0-9_."`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z0-9_"`\[\]]+)?)\s+ON\s+(([A-Za-z0-9_."`\[\]]+)\s*=\s*[A-Za-z0-9_."`\[\]]+)$',
+                s.strip(),
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if m_foj:
+                sel_p, t1_p, t2_p, on_p, lhs_col = (
+                    m_foj.group(1),
+                    m_foj.group(2),
+                    m_foj.group(3),
+                    m_foj.group(4),
+                    m_foj.group(5),
+                )
+                s = (
+                    f"SELECT {sel_p} FROM {t1_p} LEFT JOIN {t2_p} ON {on_p} "
+                    f"UNION ALL "
+                    f"SELECT {sel_p} FROM {t1_p} RIGHT JOIN {t2_p} ON {on_p} WHERE {lhs_col} IS NULL"
+                )
+        return s
+
     def _compile_tier2_group_scoped(self) -> MaterializedViewPlan:
         view_name = self.view.view_name
         mv_table = self._backing_table_name()
@@ -7295,7 +7345,7 @@ class IncrementalViewCompiler:
             self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
         )
 
-        raw_q = self.view.raw_select_sql.strip().rstrip(";")
+        raw_q = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
         if hidden_grp_defs:
             m_from = _find_top_level_keyword(raw_q, r"\bFROM\b")
             assert m_from is not None
@@ -7407,7 +7457,7 @@ class IncrementalViewCompiler:
             self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
         )
 
-        raw_query = self.view.raw_select_sql.strip().rstrip(";")
+        raw_query = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
         cols_csv = ", ".join(user_columns)
         initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"
 
@@ -7632,17 +7682,28 @@ class MaterializedViewManager:
                 """
             )
             grouped = {}
+            def _dec(val: Any) -> str:
+                if isinstance(val, (bytes, bytearray)):
+                    return val.decode("utf-8")
+                return "" if val is None else str(val)
+
             for row in (cur.fetchall() or []):
-                t_name, c_name, d_type, is_null, col_key = row[0], row[1], row[2], row[3], row[4]
-                col_type = row[5] if len(row) > 5 else None
+                t_name, c_name, d_type, is_null, col_key = (
+                    _dec(row[0]),
+                    _dec(row[1]),
+                    _dec(row[2]),
+                    _dec(row[3]),
+                    _dec(row[4]),
+                )
+                col_type = _dec(row[5]) if len(row) > 5 and row[5] is not None else None
                 if t_name == self.catalog_table or (
-                    self.object_prefix and str(t_name).startswith(self.object_prefix)
+                    self.object_prefix and t_name.startswith(self.object_prefix)
                 ):
                     continue
-                dt_up = str(d_type).upper()
+                dt_up = d_type.upper()
                 if dt_up in ("VARCHAR", "CHAR") and col_type:
-                    dt_up = str(col_type).upper()
-                is_pk = str(col_key or "").upper() == "PRI"
+                    dt_up = col_type.upper()
+                is_pk = col_key.upper() == "PRI"
                 grouped.setdefault(t_name, {})[c_name] = ColumnDef(
                     name=c_name,
                     data_type=dt_up,
@@ -7836,7 +7897,14 @@ class MaterializedViewManager:
             tmpl_sql = spec.offset_insert_template.replace("LIMIT ? OFFSET ?", f"LIMIT {ph} OFFSET {ph}")
             while True:
                 cur.execute(tmpl_sql, (batch_size, offset))
-                inserted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+                rc = getattr(cur, "rowcount", None)
+                if rc is not None and rc >= 0:
+                    inserted = int(rc)
+                else:
+                    cur.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name}")
+                    cnt_row = cur.fetchone()
+                    total_now = int(cnt_row[0]) if cnt_row and cnt_row[0] is not None else 0
+                    inserted = max(0, total_now - offset)
                 self._commit()
                 if inserted == 0:
                     break

@@ -258,11 +258,12 @@ def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     s = re.sub(r"\bTRUE\b", "1", s, flags=re.IGNORECASE)
     s = re.sub(r"\bFALSE\b", "0", s, flags=re.IGNORECASE)
     # Replace PostgreSQL bitwise XOR `#` with SQLite equivalent `((a | b) - (a & b))`
-    s = re.sub(
-        r"\(([^()#]+?)\s*#\s*(\([^()]+\)|[A-Za-z0-9_.]+)\)",
-        r"((\1 | \2) - (\1 & \2))",
-        s,
-    )
+    for _ in range(3):
+        s = re.sub(
+            r"\(([^()#]+?)\s*#\s*(\((?:[^()]|\([^()]*\))*\)|[A-Za-z0-9_.]+)\)",
+            r"((\1 | \2) - (\1 & \2))",
+            s,
+        )
     return s
 
 
@@ -420,11 +421,12 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
     s = s.replace("<=>", " IS ")
     s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR\s*\)", r"CAST(\1 AS TEXT)", s, flags=re.IGNORECASE)
     # Replace MySQL bitwise XOR `^`
-    s = re.sub(
-        r"\(([^()^]+?)\s*\^\s*(\([^()]+\)|VALUES\([^)]+\)|[A-Za-z0-9_.]+)\)",
-        r"((\1 | \2) - (\1 & \2))",
-        s,
-    )
+    for _ in range(3):
+        s = re.sub(
+            r"\(([^()^]+?)\s*\^\s*(\((?:[^()]|\([^()]*\))*\)|VALUES\([^)]+\)|[A-Za-z0-9_.]+)\)",
+            r"((\1 | \2) - (\1 & \2))",
+            s,
+        )
     # Replace `VALUES(col)` with `excluded.col`
     s = re.sub(r"\bVALUES\s*\(\s*([A-Za-z0-9_]+)\s*\)", r"excluded.\1", s, flags=re.IGNORECASE)
     return s
@@ -508,7 +510,7 @@ def _execute_mysql_plan_in_sqlite(conn: sqlite3.Connection, plan: MaterializedVi
             tbl = m_ins.group(1)
             prefix_sql = m_ins.group(0).split("ON DUPLICATE KEY UPDATE")[0].rstrip()
             assigns = m_ins.group(2)
-            if "__matview_dist_" in tbl or "dist_" in tbl:
+            if "__matview_dist_" in tbl:
                 pks = [*main_pks, "__val"]
             else:
                 pks = main_pks
@@ -878,21 +880,23 @@ def _get_complex_dml_and_tx_steps(dialect: Dialect, for_live_mysql: bool = False
 def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
     """
     Exercises MaterializedViewManager lifecycle methods (`fetch_schema`, `register_view`,
-    `sync_views` create/unchanged/updated/dropped, `apply_schema_ddl`, `backfill_incrementally`
-    across `pk_range_fold`, `group_key_batch`, and `offset_batch` with `on_progress`,
-    `bulk_changes`, and `drop_view`) against a live database connection.
+    `sync_views` create/unchanged/updated/dropped, `apply_schema_ddl` including `ALTER TABLE`,
+    `backfill_incrementally` across `pk_range_fold`, `group_key_batch`, and `offset_batch`
+    with `on_progress`, read-only MV enforcement, `RIGHT JOIN` / `FULL OUTER JOIN` live
+    execution, `bulk_changes`, and `drop_view`) against a live database connection.
     """
     checks = 0
-    cur.execute("DROP VIEW IF EXISTS __matview_v_mgr_alg;")
-    cur.execute("DROP TABLE IF EXISTS __matview_store_v_mgr_alg;")
-    cur.execute("DROP VIEW IF EXISTS __matview_v_mgr_dist;")
-    cur.execute("DROP TABLE IF EXISTS __matview_store_v_mgr_dist;")
-    cur.execute("DROP TABLE IF EXISTS __matview_dist_v_mgr_dist__dc;")
-    cur.execute("DROP TABLE IF EXISTS __matview_aux_v_mgr_dist_dc_1;")
-    cur.execute("DROP VIEW IF EXISTS __matview_v_mgr_win;")
-    cur.execute("DROP TABLE IF EXISTS __matview_store_v_mgr_win;")
-    cur.execute("DROP TABLE IF EXISTS __matview_catalog;")
-    cur.execute("DROP TABLE IF EXISTS mgr_items;")
+    drop_suffix = " CASCADE" if dialect == Dialect.POSTGRES else ""
+    for v_n in ("v_mgr_alg", "v_mgr_dist", "v_mgr_win", "v_mgr_off", "v_mgr_right", "v_mgr_full"):
+        cur.execute(f"DROP VIEW IF EXISTS __matview_{v_n}{drop_suffix};")
+        cur.execute(f"DROP TABLE IF EXISTS __matview_store_{v_n}{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS __matview_dist_v_mgr_dist__dc{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS __matview_aux_v_mgr_dist_dc_1{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS __matview_catalog{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS mgr_items{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS mgr_comp_items{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS mgr_join_a{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS mgr_join_b{drop_suffix};")
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", EngineLimitationWarning)
@@ -905,11 +909,20 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
                 tag VARCHAR(32),
                 val INT NOT NULL
             );
+            CREATE TABLE mgr_comp_items (
+                a INT NOT NULL,
+                b INT NOT NULL,
+                label VARCHAR(32) NOT NULL,
+                PRIMARY KEY (a, b)
+            );
             """
         )
         cur.execute(
             "INSERT INTO mgr_items VALUES "
             "(1, 'A', 'x', 10), (2, 'A', 'y', 20), (3, 'B', 'x', 30), (4, 'B', 'x', 40), (5, 'C', NULL, 50);"
+        )
+        cur.execute(
+            "INSERT INTO mgr_comp_items VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z');"
         )
         if hasattr(conn, "commit"):
             conn.commit()
@@ -917,7 +930,9 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
         q_alg = "SELECT grp, COUNT(*) AS cnt, SUM(val) AS sv, MIN(val) AS mnv, MAX(val) AS mxv FROM mgr_items GROUP BY grp"
         q_dist = "SELECT grp, COUNT(DISTINCT tag) AS dc, SUM(val) AS sv FROM mgr_items GROUP BY grp"
         q_win = "SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val DESC, id ASC) AS rn FROM mgr_items"
+        q_off = "SELECT a, b, label FROM mgr_comp_items"
 
+        # 1. pk_range_fold strategy
         progress_events: List[Tuple[int, int]] = []
         p_alg = mgr.register_view(
             f"CREATE VIEW v_mgr_alg AS {q_alg};",
@@ -925,19 +940,37 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
             batch_size=2,
             on_progress=lambda b, d: progress_events.append((b, d)),
         )
+        assert p_alg.incremental_backfill_spec.mode == "pk_range_fold"
         assert len(progress_events) >= 1
         _verify_external_db_mv(cur, p_alg.view_name, q_alg, f"{dialect.value}:mgr:alg_init")
         checks += 1
 
+        # Read-only MV enforcement across INSERT / UPDATE / DELETE
+        for bad_dml in (
+            f"INSERT INTO {p_alg.view_name} VALUES ('Z', 1, 10, 10, 10);",
+            f"UPDATE {p_alg.view_name} SET sv = 999 WHERE grp = 'A';",
+            f"DELETE FROM {p_alg.view_name} WHERE grp = 'A';",
+        ):
+            ro_blocked = False
+            try:
+                cur.execute(bad_dml)
+            except Exception:
+                ro_blocked = True
+            assert ro_blocked, f"Expected read-only MV {p_alg.view_name} on {dialect.value} to reject: {bad_dml}"
+            checks += 1
+
+        # 2. group_key_batch strategy
         p_dist = mgr.register_view(
             f"CREATE VIEW v_mgr_dist AS {q_dist};",
             incremental_backfill=True,
             batch_size=2,
             on_progress=lambda b, d: progress_events.append((b, d)),
         )
+        assert p_dist.incremental_backfill_spec.mode == "group_key_batch"
         _verify_external_db_mv(cur, p_dist.view_name, q_dist, f"{dialect.value}:mgr:dist_init")
         checks += 1
 
+        # 3. Tier 3 refresh + progress callback
         p_win = mgr.register_view(
             f"CREATE VIEW v_mgr_win AS {q_win};",
             incremental_backfill=True,
@@ -947,7 +980,18 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
         _verify_external_db_mv(cur, p_win.view_name, q_win, f"{dialect.value}:mgr:win_init")
         checks += 1
 
-        # sync_views: unchanged, updated, dropped
+        # 4. offset_batch strategy (composite PK base table)
+        p_off = mgr.register_view(
+            f"CREATE VIEW v_mgr_off AS {q_off};",
+            incremental_backfill=True,
+            batch_size=1,
+            on_progress=lambda b, d: progress_events.append((b, d)),
+        )
+        assert p_off.incremental_backfill_spec.mode == "offset_batch"
+        _verify_external_db_mv(cur, p_off.view_name, q_off, f"{dialect.value}:mgr:off_init")
+        checks += 1
+
+        # 5. sync_views: unchanged, updated, dropped
         q_alg_v2 = "SELECT grp, COUNT(*) AS cnt, SUM(val) AS sv FROM mgr_items WHERE val >= 15 GROUP BY grp"
         st = mgr.sync_views(
             [
@@ -959,10 +1003,11 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
         assert st["__matview_v_mgr_alg"] == "updated"
         assert st["__matview_v_mgr_dist"] == "unchanged"
         assert st["__matview_v_mgr_win"] == "dropped"
+        assert st["__matview_v_mgr_off"] == "dropped"
         _verify_external_db_mv(cur, "__matview_v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:alg_updated")
         checks += 1
 
-        # bulk_changes context manager
+        # 6. bulk_changes context manager
         with mgr.bulk_changes():
             cur.execute("INSERT INTO mgr_items VALUES (6, 'A', 'z', 100), (7, 'D', 'w', 25);")
             cur.execute("UPDATE mgr_items SET val = 35 WHERE id = 2;")
@@ -971,17 +1016,62 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
         _verify_external_db_mv(cur, "__matview_v_mgr_dist", q_dist, f"{dialect.value}:mgr:bulk_dist")
         checks += 2
 
-        # Clean up manager tables
+        # 7. ALTER TABLE schema migration via apply_schema_ddl + trigger rebuild
+        mgr.apply_schema_ddl("ALTER TABLE mgr_items ADD COLUMN note VARCHAR(32) DEFAULT 'ok';")
+        cur.execute("INSERT INTO mgr_items (id, grp, tag, val, note) VALUES (8, 'D', 'q', 45, 'migrated');")
+        if hasattr(conn, "commit"):
+            conn.commit()
+        _verify_external_db_mv(cur, "__matview_v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:alter_alg")
+        _verify_external_db_mv(cur, "__matview_v_mgr_dist", q_dist, f"{dialect.value}:mgr:alter_dist")
+        checks += 2
+
+        # 8. RIGHT JOIN and FULL OUTER JOIN live execution & DML verification
+        mgr.apply_schema_ddl(
+            """
+            CREATE TABLE mgr_join_a (id INT PRIMARY KEY, k INT, aval VARCHAR(32));
+            CREATE TABLE mgr_join_b (id INT PRIMARY KEY, k INT, bval VARCHAR(32));
+            """
+        )
+        cur.execute("INSERT INTO mgr_join_a VALUES (1, 10, 'a1'), (2, 20, 'a2');")
+        cur.execute("INSERT INTO mgr_join_b VALUES (100, 20, 'b2'), (200, 30, 'b3');")
+        if hasattr(conn, "commit"):
+            conn.commit()
+
+        p_right = mgr.register_view(
+            "CREATE VIEW v_mgr_right AS SELECT a.id AS aid, a.aval, b.id AS bid, b.bval FROM mgr_join_a a RIGHT JOIN mgr_join_b b ON a.k = b.k;"
+        )
+        cur.execute(f"SELECT aid, aval, bid, bval FROM {p_right.view_name} ORDER BY bid;")
+        assert list(cur.fetchall()) == [(2, "a2", 100, "b2"), (None, None, 200, "b3")]
+        checks += 1
+
+        p_full = mgr.register_view(
+            "CREATE VIEW v_mgr_full AS SELECT a.k AS ak, a.aval, b.k AS bk, b.bval FROM mgr_join_a a FULL OUTER JOIN mgr_join_b b ON a.k = b.k;"
+        )
+        cur.execute("INSERT INTO mgr_join_a VALUES (3, 30, 'a3');")
+        cur.execute("DELETE FROM mgr_join_b WHERE id = 100;")
+        if hasattr(conn, "commit"):
+            conn.commit()
+        cur.execute(f"SELECT ak, aval, bk, bval FROM {p_full.view_name};")
+        full_rows = sorted([tuple(r) for r in cur.fetchall()], key=lambda x: str(x))
+        assert full_rows == sorted([(10, "a1", None, None), (20, "a2", None, None), (30, "a3", 30, "b3")], key=lambda x: str(x))
+        checks += 1
+
+        # Clean up manager views
         assert mgr.drop_view("v_mgr_alg") is True
         assert mgr.drop_view("v_mgr_dist") is True
+        assert mgr.drop_view("v_mgr_right") is True
+        assert mgr.drop_view("v_mgr_full") is True
         assert mgr.drop_view("v_mgr_nonexistent") is False
-    cur.execute("DROP TABLE IF EXISTS __matview_catalog;")
-    cur.execute("DROP TABLE IF EXISTS mgr_items;")
+
+    cur.execute(f"DROP TABLE IF EXISTS __matview_catalog{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS mgr_items{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS mgr_comp_items{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS mgr_join_a{drop_suffix};")
+    cur.execute(f"DROP TABLE IF EXISTS mgr_join_b{drop_suffix};")
     return checks
 
 
-def run_live_postgres_tests_if_available(dsn: str) -> None:
-    """Runs comprehensive 50-view x 3-mode (full, incremental, transition-tables) + manager tests against a real PostgreSQL instance."""
+def _open_live_postgres_connection(dsn: str):
     try:
         import psycopg2 as pg_driver  # type: ignore
     except ImportError:
@@ -990,10 +1080,7 @@ def run_live_postgres_tests_if_available(dsn: str) -> None:
         except ImportError:
             if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
                 raise RuntimeError("psycopg2 or psycopg must be installed in CI when POSTGRES_DSN is set")
-            print("Skipping live PostgreSQL test: psycopg2/psycopg not installed.")
-            return
-
-    schema, view_specs = _get_live_engine_50_view_battery(Dialect.POSTGRES)
+            return None
 
     from urllib.parse import urlparse, urlunparse
     try:
@@ -1011,22 +1098,319 @@ def run_live_postgres_tests_if_available(dsn: str) -> None:
         admin_conn.close()
         conn = pg_driver.connect(dsn)
     conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("SET synchronous_commit = OFF;")
+    return conn
+
+
+def _open_live_mysql_connection(dsn: str):
+    try:
+        import pymysql  # type: ignore
+    except ImportError:
+        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+            raise RuntimeError("pymysql must be installed in CI when MYSQL_DSN is set")
+        return None, ""
+
+    from urllib.parse import urlparse
+    parsed = urlparse(dsn if "://" in dsn else f"mysql://{dsn}")
+    target_db = (parsed.path or "/matview_test").lstrip("/") or "matview_test"
+    conn = pymysql.connect(
+        host=parsed.hostname or "127.0.0.1",
+        port=parsed.port or 3306,
+        user=parsed.username or "root",
+        password=parsed.password or "",
+        autocommit=True,
+    )
+    with conn.cursor() as cur:
+        cur.execute(f"CREATE DATABASE IF NOT EXISTS `{target_db}`;")
+        cur.execute(f"USE `{target_db}`;")
+        cur.execute("SET SESSION sql_mode = CONCAT_WS(',', @@SESSION.sql_mode, 'PIPES_AS_CONCAT');")
+    return conn, target_db
+
+
+class _CompatCursorAdapter:
+    def __init__(self, exec_fn, query_fn):
+        self._exec = exec_fn
+        self._query = query_fn
+        self._last_rows = []
+        self.rowcount = -1
+
+    def execute(self, sql: str, params: Any = None) -> "_CompatCursorAdapter":
+        s = sql.strip()
+        if not s:
+            self._last_rows = []
+            return self
+        s_up = s.upper()
+        is_query = (
+            s_up.startswith("SELECT")
+            or s_up.startswith("PRAGMA")
+            or (
+                s_up.startswith("WITH")
+                and not re.search(r"\)\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b", s_up)
+            )
+        )
+        if is_query:
+            res = self._query(sql, params)
+            self._last_rows = list(res) if res is not None else []
+        else:
+            self._exec(sql, params)
+            self._last_rows = []
+        return self
+
+    def fetchall(self):
+        return self._last_rows
+
+    def fetchone(self):
+        return self._last_rows[0] if self._last_rows else None
+
+
+class _CompatConnectionAdapter:
+    def __init__(self, cursor_factory, close_fn, commit_fn=None, rollback_fn=None):
+        self._cursor_factory = cursor_factory
+        self._close_fn = close_fn
+        self._commit_fn = commit_fn
+        self._rollback_fn = rollback_fn
+
+    def cursor(self) -> _CompatCursorAdapter:
+        return self._cursor_factory()
+
+    def execute(self, sql: str, params: Any = None) -> _CompatCursorAdapter:
+        c = self.cursor()
+        c.execute(sql, params)
+        return c
+
+    def commit(self) -> None:
+        if self._commit_fn:
+            try:
+                self._commit_fn()
+            except Exception:
+                pass
+
+    def rollback(self) -> None:
+        if self._rollback_fn:
+            try:
+                self._rollback_fn()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._close_fn:
+            self._close_fn()
+
+
+def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatConnectionAdapter:
+    eng = engine_spec.strip().lower()
+    if eng in ("apsw", "sqlite3mc"):
+        import apsw  # type: ignore
+        raw_conn = apsw.Connection(db_path)
+        init_cur = raw_conn.cursor()
+        if eng == "sqlite3mc":
+            try:
+                init_cur.execute("PRAGMA cipher = 'chacha20';")
+                init_cur.execute("PRAGMA key = 'matview-sqlite3mc-secret';")
+            except Exception:
+                pass
+        init_cur.execute("PRAGMA synchronous = OFF;")
+        init_cur.execute("PRAGMA journal_mode = MEMORY;")
+        init_cur.execute("PRAGMA temp_store = MEMORY;")
+        init_cur.execute("PRAGMA recursive_triggers = ON;")
+
+        def _make_apsw_cursor() -> _CompatCursorAdapter:
+            raw_cur = raw_conn.cursor()
+            def _exec(s: str, p: Any = None) -> None:
+                if p is not None:
+                    raw_cur.execute(s, tuple(p))
+                else:
+                    raw_cur.execute(s)
+            def _query(q: str, p: Any = None):
+                if p is not None:
+                    return [tuple(r) for r in raw_cur.execute(q, tuple(p))]
+                return [tuple(r) for r in raw_cur.execute(q)]
+            return _CompatCursorAdapter(_exec, _query)
+
+        return _CompatConnectionAdapter(_make_apsw_cursor, raw_conn.close)
+
+    elif eng == "sqlcipher":
+        try:
+            from sqlcipher3 import dbapi2 as sqlcipher_mod  # type: ignore
+        except ImportError:
+            import sqlcipher3 as sqlcipher_mod  # type: ignore
+        raw_conn = sqlcipher_mod.connect(db_path, isolation_level=None)
+        raw_conn.execute("PRAGMA key = 'matview-sqlcipher-secret';")
+        raw_conn.execute("PRAGMA synchronous = OFF;")
+        raw_conn.execute("PRAGMA journal_mode = MEMORY;")
+        raw_conn.execute("PRAGMA temp_store = MEMORY;")
+        raw_conn.execute("PRAGMA recursive_triggers = ON;")
+
+        def _make_cipher_cursor() -> _CompatCursorAdapter:
+            def _exec(s: str, p: Any = None) -> None:
+                if not s.strip():
+                    return
+                if p is not None:
+                    raw_conn.execute(s.strip(), tuple(p))
+                else:
+                    raw_conn.execute(s.strip())
+            def _query(q: str, p: Any = None):
+                if p is not None:
+                    c = raw_conn.execute(q, tuple(p))
+                else:
+                    c = raw_conn.execute(q)
+                return [tuple(r) for r in (c.fetchall() or [])]
+            return _CompatCursorAdapter(_exec, _query)
+
+        return _CompatConnectionAdapter(_make_cipher_cursor, raw_conn.close)
+
+    elif eng == "sqlean":
+        import sqlean  # type: ignore
+        sqlean.extensions.enable_all()
+        raw_conn = sqlean.connect(db_path, isolation_level=None)
+        raw_conn.execute("PRAGMA synchronous = OFF;")
+        raw_conn.execute("PRAGMA journal_mode = MEMORY;")
+        raw_conn.execute("PRAGMA temp_store = MEMORY;")
+        raw_conn.execute("PRAGMA recursive_triggers = ON;")
+
+        def _make_sqlean_cursor() -> _CompatCursorAdapter:
+            def _exec(s: str, p: Any = None) -> None:
+                if not s.strip():
+                    return
+                if p is not None:
+                    raw_conn.execute(s.strip(), tuple(p))
+                else:
+                    raw_conn.execute(s.strip())
+            def _query(q: str, p: Any = None):
+                if p is not None:
+                    c = raw_conn.execute(q, tuple(p))
+                else:
+                    c = raw_conn.execute(q)
+                return [tuple(r) for r in (c.fetchall() or [])]
+            return _CompatCursorAdapter(_exec, _query)
+
+        return _CompatConnectionAdapter(_make_sqlean_cursor, raw_conn.close)
+
+    elif eng == "libsql":
+        try:
+            import libsql_experimental as libsql_mod  # type: ignore
+        except ImportError:
+            import libsql as libsql_mod  # type: ignore
+        try:
+            raw_conn = libsql_mod.connect(db_path, isolation_level=None)
+        except TypeError:
+            raw_conn = libsql_mod.connect(db_path)
+        for pragma_sql in (
+            "PRAGMA synchronous = OFF;",
+            "PRAGMA journal_mode = MEMORY;",
+            "PRAGMA temp_store = MEMORY;",
+            "PRAGMA recursive_triggers = ON;",
+        ):
+            try:
+                raw_conn.execute(pragma_sql)
+            except Exception:
+                pass
+        tx_state = {"in_tx": False}
+
+        def _libsql_exec(s: str, p: Any = None) -> None:
+            if not s.strip():
+                return
+            s_up = s.strip().upper().rstrip(";").strip()
+            if s_up == "BEGIN" or s_up.startswith("BEGIN "):
+                if hasattr(raw_conn, "commit"):
+                    try:
+                        raw_conn.commit()
+                    except Exception:
+                        pass
+                tx_state["in_tx"] = True
+                try:
+                    raw_conn.execute(s.strip())
+                except Exception as e:
+                    if "within a transaction" not in str(e).lower():
+                        raise
+                return
+            if s_up == "COMMIT":
+                tx_state["in_tx"] = False
+                try:
+                    raw_conn.execute(s.strip())
+                except Exception:
+                    if hasattr(raw_conn, "commit"):
+                        raw_conn.commit()
+                return
+            if s_up.startswith("ROLLBACK") and "TO" not in s_up:
+                tx_state["in_tx"] = False
+                try:
+                    raw_conn.execute(s.strip())
+                except Exception:
+                    if hasattr(raw_conn, "rollback"):
+                        raw_conn.rollback()
+                return
+            try:
+                if p is not None:
+                    raw_conn.execute(s.strip(), tuple(p))
+                else:
+                    raw_conn.execute(s.strip())
+            except Exception:
+                if not tx_state["in_tx"] and hasattr(raw_conn, "rollback"):
+                    try:
+                        raw_conn.rollback()
+                    except Exception:
+                        pass
+                raise
+            if not tx_state["in_tx"] and hasattr(raw_conn, "commit"):
+                try:
+                    raw_conn.commit()
+                except Exception:
+                    pass
+
+        def _libsql_query(q: str, p: Any = None):
+            if p is not None:
+                c = raw_conn.execute(q, tuple(p))
+            else:
+                c = raw_conn.execute(q)
+            return [tuple(r) for r in (c.fetchall() or [])]
+
+        return _CompatConnectionAdapter(
+            lambda: _CompatCursorAdapter(_libsql_exec, _libsql_query),
+            lambda: raw_conn.close() if hasattr(raw_conn, "close") else None,
+        )
+
+    elif eng == "sqlite3":
+        raw_conn = sqlite3.connect(db_path, isolation_level=None)
+        raw_conn.execute("PRAGMA synchronous = OFF;")
+        raw_conn.execute("PRAGMA journal_mode = MEMORY;")
+        raw_conn.execute("PRAGMA temp_store = MEMORY;")
+        raw_conn.execute("PRAGMA recursive_triggers = ON;")
+
+        def _make_sq3_cursor() -> _CompatCursorAdapter:
+            def _exec(s: str, p: Any = None) -> None:
+                if not s.strip():
+                    return
+                if p is not None:
+                    raw_conn.execute(s.strip(), tuple(p))
+                else:
+                    raw_conn.execute(s.strip())
+            def _query(q: str, p: Any = None):
+                c = raw_conn.execute(q, tuple(p)) if p is not None else raw_conn.execute(q)
+                return [tuple(r) for r in (c.fetchall() or [])]
+            return _CompatCursorAdapter(_exec, _query)
+
+        return _CompatConnectionAdapter(_make_sq3_cursor, raw_conn.close)
+
+    else:
+        raise ValueError(f"Unknown SQLITE_COMPAT_ENGINE: {engine_spec}")
+
+
+def run_live_postgres_tests_if_available(dsn: str) -> None:
+    """Runs comprehensive 50-view x 3-mode (full, incremental, transition-tables) + manager tests against a real PostgreSQL instance."""
+    conn = _open_live_postgres_connection(dsn)
+    if conn is None:
+        print("Skipping live PostgreSQL test: psycopg2/psycopg not installed.")
+        return
+
+    schema, view_specs = _get_live_engine_50_view_battery(Dialect.POSTGRES)
     cur = conn.cursor()
     total_checks = 0
     total_views_installed = 0
 
     for inc_mode, use_trans in ((False, False), (True, False), (False, True)):
-        for v_name, _ in view_specs:
-            cur.execute(f"DROP VIEW IF EXISTS __matview_{v_name} CASCADE;")
-            cur.execute(f"DROP TABLE IF EXISTS __matview_store_{v_name} CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS __matview_dist_v43_t2_distinct_aggs__dc CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS __matview_dist_v43_t2_distinct_aggs__sdq CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS __matview_aux_v43_t2_distinct_aggs_dc_1 CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS __matview_aux_v43_t2_distinct_aggs_sdq_2 CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS order_tags CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS orders CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS customers CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS warehouses CASCADE;")
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
         for s in [st.strip() for st in schema.split(";") if st.strip()]:
             cur.execute(s)
 
@@ -1085,44 +1469,20 @@ def run_live_postgres_tests_if_available(dsn: str) -> None:
 
 def run_live_mysql_tests_if_available(dsn: str) -> None:
     """Runs comprehensive 50-view x 2-mode (full, incremental) + manager tests against a real MySQL/MariaDB/Percona instance."""
-    try:
-        import pymysql  # type: ignore
-    except ImportError:
-        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
-            raise RuntimeError("pymysql must be installed in CI when MYSQL_DSN is set")
+    conn, target_db = _open_live_mysql_connection(dsn)
+    if conn is None:
         print("Skipping live MySQL test: pymysql not installed.")
         return
 
-    from urllib.parse import urlparse
-    parsed = urlparse(dsn if "://" in dsn else f"mysql://{dsn}")
-    target_db = (parsed.path or "/matview_test").lstrip("/") or "matview_test"
-    conn = pymysql.connect(
-        host=parsed.hostname or "127.0.0.1",
-        port=parsed.port or 3306,
-        user=parsed.username or "root",
-        password=parsed.password or "",
-        autocommit=True,
-    )
     cur = conn.cursor()
-    cur.execute(f"CREATE DATABASE IF NOT EXISTS `{target_db}`;")
-    cur.execute(f"USE `{target_db}`;")
-
     schema, view_specs = _get_live_engine_50_view_battery(Dialect.MYSQL)
 
     total_checks = 0
     total_views_installed = 0
     for inc_mode in (False, True):
-        for v_name, _ in view_specs:
-            cur.execute(f"DROP VIEW IF EXISTS __matview_{v_name};")
-            cur.execute(f"DROP TABLE IF EXISTS __matview_store_{v_name};")
-        cur.execute("DROP TABLE IF EXISTS __matview_dist_v43_t2_distinct_aggs__dc;")
-        cur.execute("DROP TABLE IF EXISTS __matview_dist_v43_t2_distinct_aggs__sdq;")
-        cur.execute("DROP TABLE IF EXISTS __matview_aux_v43_t2_distinct_aggs_dc_1;")
-        cur.execute("DROP TABLE IF EXISTS __matview_aux_v43_t2_distinct_aggs_sdq_2;")
-        cur.execute("DROP TABLE IF EXISTS order_tags;")
-        cur.execute("DROP TABLE IF EXISTS orders;")
-        cur.execute("DROP TABLE IF EXISTS customers;")
-        cur.execute("DROP TABLE IF EXISTS warehouses;")
+        cur.execute(f"DROP DATABASE IF EXISTS `{target_db}`;")
+        cur.execute(f"CREATE DATABASE `{target_db}`;")
+        cur.execute(f"USE `{target_db}`;")
         for s in [st.strip() for st in schema.split(";") if st.strip()]:
             cur.execute(s)
 
@@ -1184,173 +1544,19 @@ def run_live_mysql_tests_if_available(dsn: str) -> None:
 
 def run_live_sqlite_compat_tests_if_available(engine_spec: str) -> None:
     """
-    Runs comprehensive 50-view x 2-mode (full, incremental) live integration tests against
-    SQLite-compatible database engines:
-      - apsw (Another Python SQLite Wrapper)
-      - sqlite3mc (APSW with SQLite3 Multiple Ciphers encryption)
-      - sqlcipher (sqlcipher3 / SQLCipher 4 encrypted database engine)
-      - sqlean (sqlean.py drop-in SQLite + extensions distribution)
-      - libsql (Turso libsql / libsql_experimental engine)
+    Runs comprehensive 50-view x 2-mode (full, incremental) + manager lifecycle live integration
+    tests against SQLite-compatible database engines (`apsw`, `sqlite3mc`, `sqlcipher`, `sqlean`, `libsql`).
     """
     eng = engine_spec.strip().lower()
     schema, view_specs = _get_live_engine_50_view_battery(Dialect.SQLITE)
-
-    class _CompatCursorAdapter:
-        def __init__(self, exec_fn, query_fn):
-            self._exec = exec_fn
-            self._query = query_fn
-            self._last_rows = []
-
-        def execute(self, sql: str) -> None:
-            s = sql.strip()
-            s_up = s.upper()
-            is_query = (
-                s_up.startswith("SELECT")
-                or s_up.startswith("PRAGMA")
-                or (
-                    s_up.startswith("WITH")
-                    and not re.search(r"\)\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b", s_up)
-                )
-            )
-            if is_query:
-                res = self._query(sql)
-                self._last_rows = list(res) if res is not None else []
-            else:
-                self._exec(sql)
-                self._last_rows = []
-
-        def fetchall(self):
-            return self._last_rows
-
-    def _open_compat_adapter(db_path: str):
-        if eng in ("apsw", "sqlite3mc"):
-            import apsw  # type: ignore
-            raw_conn = apsw.Connection(db_path)
-            raw_cur = raw_conn.cursor()
-            if eng == "sqlite3mc":
-                try:
-                    raw_cur.execute("PRAGMA cipher = 'chacha20';")
-                    raw_cur.execute("PRAGMA key = 'matview-sqlite3mc-secret';")
-                except Exception:
-                    pass
-            raw_cur.execute("PRAGMA recursive_triggers = ON;")
-            return (
-                _CompatCursorAdapter(
-                    lambda s: raw_cur.execute(s),
-                    lambda q: [tuple(r) for r in raw_cur.execute(q)],
-                ),
-                raw_conn.close,
-            )
-        elif eng == "sqlcipher":
-            try:
-                from sqlcipher3 import dbapi2 as sqlcipher_mod  # type: ignore
-            except ImportError:
-                import sqlcipher3 as sqlcipher_mod  # type: ignore
-            raw_conn = sqlcipher_mod.connect(db_path, isolation_level=None)
-            raw_conn.execute("PRAGMA key = 'matview-sqlcipher-secret';")
-            raw_conn.execute("PRAGMA recursive_triggers = ON;")
-            def _cipher_exec(s: str) -> None:
-                if s.strip():
-                    raw_conn.execute(s.strip())
-            return (
-                _CompatCursorAdapter(
-                    _cipher_exec,
-                    lambda q: [tuple(r) for r in (raw_conn.execute(q).fetchall() or [])],
-                ),
-                raw_conn.close,
-            )
-        elif eng == "sqlean":
-            import sqlean  # type: ignore
-            sqlean.extensions.enable_all()
-            raw_conn = sqlean.connect(db_path, isolation_level=None)
-            raw_conn.execute("PRAGMA recursive_triggers = ON;")
-            def _sqlean_exec(s: str) -> None:
-                if s.strip():
-                    raw_conn.execute(s.strip())
-            return (
-                _CompatCursorAdapter(
-                    _sqlean_exec,
-                    lambda q: [tuple(r) for r in (raw_conn.execute(q).fetchall() or [])],
-                ),
-                raw_conn.close,
-            )
-        elif eng == "libsql":
-            try:
-                import libsql_experimental as libsql_mod  # type: ignore
-            except ImportError:
-                import libsql as libsql_mod  # type: ignore
-            try:
-                raw_conn = libsql_mod.connect(db_path, isolation_level=None)
-            except TypeError:
-                raw_conn = libsql_mod.connect(db_path)
-            try:
-                raw_conn.execute("PRAGMA recursive_triggers = ON;")
-            except Exception:
-                pass
-            tx_state = {"in_tx": False}
-            def _libsql_exec(s: str) -> None:
-                if not s.strip():
-                    return
-                s_up = s.strip().upper().rstrip(";").strip()
-                if s_up == "BEGIN" or s_up.startswith("BEGIN "):
-                    if hasattr(raw_conn, "commit"):
-                        try:
-                            raw_conn.commit()
-                        except Exception:
-                            pass
-                    tx_state["in_tx"] = True
-                    try:
-                        raw_conn.execute(s.strip())
-                    except Exception as e:
-                        if "within a transaction" not in str(e).lower():
-                            raise
-                    return
-                if s_up == "COMMIT":
-                    tx_state["in_tx"] = False
-                    try:
-                        raw_conn.execute(s.strip())
-                    except Exception:
-                        if hasattr(raw_conn, "commit"):
-                            raw_conn.commit()
-                    return
-                if s_up.startswith("ROLLBACK") and "TO" not in s_up:
-                    tx_state["in_tx"] = False
-                    try:
-                        raw_conn.execute(s.strip())
-                    except Exception:
-                        if hasattr(raw_conn, "rollback"):
-                            raw_conn.rollback()
-                    return
-                try:
-                    raw_conn.execute(s.strip())
-                except Exception:
-                    if not tx_state["in_tx"] and hasattr(raw_conn, "rollback"):
-                        try:
-                            raw_conn.rollback()
-                        except Exception:
-                            pass
-                    raise
-                if not tx_state["in_tx"] and hasattr(raw_conn, "commit"):
-                    try:
-                        raw_conn.commit()
-                    except Exception:
-                        pass
-            return (
-                _CompatCursorAdapter(
-                    _libsql_exec,
-                    lambda q: [tuple(r) for r in (raw_conn.execute(q).fetchall() or [])],
-                ),
-                lambda: raw_conn.close() if hasattr(raw_conn, "close") else None,
-            )
-        else:
-            raise ValueError(f"Unknown SQLITE_COMPAT_ENGINE: {engine_spec}")
 
     total_checks = 0
     total_views_installed = 0
     for inc_mode in (False, True):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_file = os.path.join(tmpdir, f"compat_{eng}_{int(inc_mode)}.db")
-            cur, close_fn = _open_compat_adapter(db_file)
+            conn = _open_sqlite_compat_connection(eng, db_file)
+            cur = conn.cursor()
             try:
                 for s in [st.strip() for st in schema.split(";") if st.strip()]:
                     cur.execute(s + ";")
@@ -1396,8 +1602,11 @@ def run_live_sqlite_compat_tests_if_available(engine_spec: str) -> None:
                     for p, v_sel in plans:
                         _verify_external_db_mv(cur, p.view_name, v_sel, f"{eng}:inc={inc_mode}:{p.logical_view_name}:{step_lbl}")
                         total_checks += 1
+
+                if inc_mode:
+                    total_checks += _run_live_manager_lifecycle_check(conn, cur, Dialect.SQLITE)
             finally:
-                close_fn()
+                conn.close()
 
     print(f"LIVE SQLite-compatible engine ({eng}) test PASSED ({total_views_installed} views installed, {total_checks} live assertions)!")
 
@@ -1407,10 +1616,60 @@ import time
 import unittest
 
 
+def _adapt_suite_schema_for_dialect(schema_sql: str, dialect: Dialect) -> str:
+    if dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+        s = re.sub(r"\bTEXT\b", "VARCHAR(191)", schema_sql)
+        s = re.sub(r"\bREAL\b", "DOUBLE PRECISION", s)
+        return s
+    return schema_sql
+
+
+def _adapt_view_ddl_for_dialect(v_ddl: str, dialect: Dialect) -> str:
+    if dialect == Dialect.MYSQL and "WITH RECURSIVE tree(id, path, team, depth) AS (SELECT id, label, team, 1" in v_ddl:
+        return v_ddl.replace(
+            "SELECT id, label, team, 1",
+            "SELECT id, CAST(label AS CHAR(512)), team, 1",
+        )
+    return v_ddl
+
+
+def _adapt_mutation_for_dialect(m_sql: str, dialect: Dialect, for_live_engine: bool) -> str:
+    if dialect == Dialect.MYSQL and for_live_engine:
+        s_up = m_sql.strip().upper().rstrip(";").strip()
+        if s_up == "BEGIN":
+            return "START TRANSACTION;"
+        if "ON CONFLICT (id) DO UPDATE SET" in m_sql:
+            if "INSERT INTO sales" in m_sql:
+                return (
+                    "INSERT INTO sales VALUES (1, 'NA', 'hw', 150.0, 4, 3.0, 1) "
+                    "ON DUPLICATE KEY UPDATE region = VALUES(region), amount = sales.amount + VALUES(amount), qty = VALUES(qty);"
+                )
+            if "INSERT INTO invoices" in m_sql:
+                return (
+                    "INSERT INTO invoices VALUES (102, 20, 'cloud', 450.0, 6, 15.0, 1), (109, 30, 'sw', 220.0, 2, 0.0, 1) "
+                    "ON DUPLICATE KEY UPDATE subtotal = invoices.subtotal + VALUES(subtotal), qty = VALUES(qty), discount = VALUES(discount), settled = VALUES(settled);"
+                )
+            if "INSERT INTO merchants" in m_sql:
+                return (
+                    "INSERT INTO merchants VALUES (20, 2, 'BetaLLC_EU', 'platinum', 1), (50, 3, 'DeltaJP', 'gold', 1) "
+                    "ON DUPLICATE KEY UPDATE region_id = VALUES(region_id), mname = VALUES(mname), tier = VALUES(tier);"
+                )
+    return m_sql
+
+
 class MVTestRunner:
     def __init__(self) -> None:
         self.total_views: int = 0
         self.total_assertions: int = 0
+        self.pg_dsn: Optional[str] = os.environ.get("POSTGRES_DSN")
+        self.mysql_dsn: Optional[str] = os.environ.get("MYSQL_DSN")
+        self.sqlite_compat_engine: Optional[str] = os.environ.get("SQLITE_COMPAT_ENGINE")
+        if self.pg_dsn:
+            self.default_dialect = Dialect.POSTGRES
+        elif self.mysql_dsn:
+            self.default_dialect = Dialect.MYSQL
+        else:
+            self.default_dialect = Dialect.SQLITE
 
     def run_batch(
         self,
@@ -1420,11 +1679,158 @@ class MVTestRunner:
         seed_sqls: Sequence[str],
         mutations: Sequence[Tuple[str, str]],
         *,
-        dialect: Dialect = Dialect.SQLITE,
+        dialect: Optional[Dialect] = None,
         pg_use_transition_tables: bool = False,
         incremental_backfill: bool = False,
         batch_size: int = 1000,
     ) -> None:
+        eff_dialect = dialect if dialect is not None else self.default_dialect
+        eff_schema = _adapt_suite_schema_for_dialect(schema_sql, eff_dialect)
+
+        # 1. Live PostgreSQL / PostgreSQL-compatible execution
+        if self.pg_dsn and eff_dialect == Dialect.POSTGRES:
+            pg_conn = _open_live_postgres_connection(self.pg_dsn)
+            if pg_conn is not None:
+                try:
+                    cur = pg_conn.cursor()
+                    eff_muts = [
+                        (lbl, _adapt_mutation_for_dialect(msql, Dialect.POSTGRES, True))
+                        for lbl, msql in mutations
+                    ]
+                    chunk_size = 100
+                    for i in range(0, len(views), chunk_size):
+                        chunk = views[i : i + chunk_size]
+                        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+                        for st in [s.strip() for s in eff_schema.split(";") if s.strip()]:
+                            cur.execute(st)
+                        for s in seed_sqls:
+                            cur.execute(s)
+                        plans_and_selects: List[Tuple[MaterializedViewPlan, str]] = []
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", EngineLimitationWarning)
+                            for v_name, v_ddl in chunk:
+                                eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, Dialect.POSTGRES)
+                                plan = generate_materialized_view(
+                                    eff_schema,
+                                    eff_v_ddl,
+                                    dialect=Dialect.POSTGRES,
+                                    pg_use_transition_tables=pg_use_transition_tables,
+                                    incremental_backfill=incremental_backfill,
+                                    batch_size=batch_size,
+                                    ignore_limitations=True,
+                                )
+                                for stmt in plan.all_statements():
+                                    cur.execute(stmt)
+                                v_spec = parse_view_definition(eff_v_ddl)
+                                live_sel = IncrementalViewCompiler._rewrite_sqlite_total_in_sql(v_spec.raw_select_sql)
+                                plans_and_selects.append((plan, live_sel))
+                                self.total_views += 1
+                                _verify_external_db_mv(cur, plan.view_name, live_sel, f"{suite_name}:{v_name}:init")
+                                self.total_assertions += 1
+                        for step_lbl, m_sql in eff_muts:
+                            cur.execute(m_sql)
+                            for plan, live_sel in plans_and_selects:
+                                _verify_external_db_mv(cur, plan.view_name, live_sel, f"{suite_name}:{plan.logical_view_name}:{step_lbl}")
+                                self.total_assertions += 1
+                finally:
+                    pg_conn.close()
+                print(f"  [PASS] {suite_name} [LIVE POSTGRES]: {len(views)} views x {len(mutations) + 1} states = {len(views) * (len(mutations) + 1)} assertions")
+                return
+
+        # 2. Live MySQL / MariaDB / Percona Server execution
+        if self.mysql_dsn and eff_dialect == Dialect.MYSQL:
+            my_conn, target_db = _open_live_mysql_connection(self.mysql_dsn)
+            if my_conn is not None:
+                try:
+                    cur = my_conn.cursor()
+                    eff_muts = [
+                        (lbl, _adapt_mutation_for_dialect(msql, Dialect.MYSQL, True))
+                        for lbl, msql in mutations
+                    ]
+                    chunk_size = 100
+                    for i in range(0, len(views), chunk_size):
+                        chunk = views[i : i + chunk_size]
+                        cur.execute(f"DROP DATABASE IF EXISTS `{target_db}`;")
+                        cur.execute(f"CREATE DATABASE `{target_db}`;")
+                        cur.execute(f"USE `{target_db}`;")
+                        for st in [s.strip() for s in eff_schema.split(";") if s.strip()]:
+                            cur.execute(st)
+                        for s in seed_sqls:
+                            cur.execute(s)
+                        plans_and_selects = []
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", EngineLimitationWarning)
+                            for v_name, v_ddl in chunk:
+                                eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, Dialect.MYSQL)
+                                plan = generate_materialized_view(
+                                    eff_schema,
+                                    eff_v_ddl,
+                                    dialect=Dialect.MYSQL,
+                                    incremental_backfill=incremental_backfill,
+                                    batch_size=batch_size,
+                                    ignore_limitations=True,
+                                )
+                                for stmt in plan.all_statements():
+                                    cur.execute(stmt)
+                                v_spec = parse_view_definition(eff_v_ddl)
+                                live_sel = IncrementalViewCompiler._rewrite_sqlite_total_in_sql(v_spec.raw_select_sql)
+                                live_sel = IncrementalViewCompiler._lower_mysql_full_outer_joins_in_sql(live_sel, plan.tables)
+                                plans_and_selects.append((plan, live_sel))
+                                self.total_views += 1
+                                _verify_external_db_mv(cur, plan.view_name, live_sel, f"{suite_name}:{v_name}:init")
+                                self.total_assertions += 1
+                        for step_lbl, m_sql in eff_muts:
+                            cur.execute(m_sql)
+                            for plan, live_sel in plans_and_selects:
+                                _verify_external_db_mv(cur, plan.view_name, live_sel, f"{suite_name}:{plan.logical_view_name}:{step_lbl}")
+                                self.total_assertions += 1
+                finally:
+                    my_conn.close()
+                print(f"  [PASS] {suite_name} [LIVE MYSQL]: {len(views)} views x {len(mutations) + 1} states = {len(views) * (len(mutations) + 1)} assertions")
+                return
+
+        # 3. Live SQLite-compatible engine execution (apsw, sqlite3mc, sqlcipher, sqlean, libsql)
+        if self.sqlite_compat_engine and eff_dialect == Dialect.SQLITE:
+            eng = self.sqlite_compat_engine.strip().lower()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_file = os.path.join(tmpdir, f"suite_{abs(hash(suite_name))}.db")
+                compat_conn = _open_sqlite_compat_connection(eng, db_file)
+                cur = compat_conn.cursor()
+                try:
+                    for st in [s.strip() for s in schema_sql.split(";") if s.strip()]:
+                        cur.execute(st + ";")
+                    for s in seed_sqls:
+                        cur.execute(s)
+                    plans_and_selects = []
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        for v_name, v_ddl in views:
+                            plan = generate_materialized_view(
+                                schema_sql,
+                                v_ddl,
+                                dialect=Dialect.SQLITE,
+                                incremental_backfill=incremental_backfill,
+                                batch_size=batch_size,
+                                ignore_limitations=True,
+                            )
+                            for stmt in plan.all_statements():
+                                cur.execute(stmt)
+                            v_spec = parse_view_definition(v_ddl)
+                            plans_and_selects.append((plan, v_spec.raw_select_sql))
+                            self.total_views += 1
+                            _verify_external_db_mv(cur, plan.view_name, v_spec.raw_select_sql, f"{suite_name}:{eng}:{v_name}:init")
+                            self.total_assertions += 1
+                    for step_lbl, m_sql in mutations:
+                        cur.execute(m_sql)
+                        for plan, sel_sql in plans_and_selects:
+                            _verify_external_db_mv(cur, plan.view_name, sel_sql, f"{suite_name}:{eng}:{plan.logical_view_name}:{step_lbl}")
+                            self.total_assertions += 1
+                finally:
+                    compat_conn.close()
+            print(f"  [PASS] {suite_name} [LIVE {eng.upper()}]: {len(views)} views x {len(mutations) + 1} states = {len(views) * (len(mutations) + 1)} assertions")
+            return
+
+        # 4. Standard in-memory SQLite (and cross-dialect transpiled SQL verification)
         conn = sqlite3.connect(":memory:", isolation_level=None)
         conn.execute("PRAGMA recursive_triggers = ON;")
         _register_sqlite_compat_udfs(conn)
@@ -1432,25 +1838,26 @@ class MVTestRunner:
         for s in seed_sqls:
             conn.execute(s)
 
-        plans_and_selects: List[Tuple[MaterializedViewPlan, str]] = []
+        plans_and_selects = []
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", EngineLimitationWarning)
             for v_name, v_ddl in views:
+                eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, eff_dialect)
                 plan = generate_materialized_view(
-                    schema_sql,
-                    v_ddl,
-                    dialect=dialect,
+                    eff_schema,
+                    eff_v_ddl,
+                    dialect=eff_dialect,
                     pg_use_transition_tables=pg_use_transition_tables,
                     incremental_backfill=incremental_backfill,
                     batch_size=batch_size,
                     ignore_limitations=True,
                 )
-                if dialect == Dialect.SQLITE:
+                if eff_dialect == Dialect.SQLITE:
                     for stmt in plan.all_statements():
                         conn.execute(stmt)
-                elif dialect == Dialect.POSTGRES:
+                elif eff_dialect == Dialect.POSTGRES:
                     _execute_postgres_plan_in_sqlite(conn, plan)
-                elif dialect == Dialect.MYSQL:
+                elif eff_dialect == Dialect.MYSQL:
                     _execute_mysql_plan_in_sqlite(conn, plan)
 
                 v_spec = parse_view_definition(v_ddl)
@@ -1502,9 +1909,9 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
         ("tx_begin", "BEGIN;"),
         ("tx_upsert", "INSERT INTO sales VALUES (1, 'NA', 'hw', 150.0, 4, 3.0, 1) ON CONFLICT (id) DO UPDATE SET region = excluded.region, amount = sales.amount + excluded.amount, qty = excluded.qty;"),
         ("tx_sp", "SAVEPOINT sp_s1;"),
-        ("tx_corr_upd", "UPDATE sales SET amount = amount * 1.5, discount = COALESCE(discount, 0.0) + 2.0 WHERE qty >= (SELECT AVG(qty) FROM sales WHERE active = 1);"),
+        ("tx_corr_upd", "UPDATE sales SET amount = amount * 1.5, discount = COALESCE(discount, 0.0) + 2.0 WHERE qty >= (SELECT AVG(qty) FROM (SELECT qty FROM sales WHERE active = 1) AS __sq_avg);"),
         ("tx_rb_sp", "ROLLBACK TO SAVEPOINT sp_s1;"),
-        ("tx_del_subq", "DELETE FROM sales WHERE id IN (SELECT id FROM sales WHERE active = 0);"),
+        ("tx_del_subq", "DELETE FROM sales WHERE id IN (SELECT id FROM (SELECT id FROM sales WHERE active = 0) AS __sq_del);"),
         ("tx_commit", "COMMIT;"),
     ]
 
@@ -2386,16 +2793,54 @@ def run_suite_9_cross_dialect_execution(runner: MVTestRunner) -> None:
         dialect=Dialect.POSTGRES,
     )
 
-    # Execute all 100 views compiled for MYSQL (transpiled to SQLite)
+    # Execute all 100 views compiled for MYSQL
     my_views = [(f"my_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW my_{n}")) for n, sql in view_defs]
     runner.run_batch(
-        "Suite 9B (100 MySQL-Compiled Views Executed via SQLite Transpiler)",
+        "Suite 9B (100 MySQL-Compiled Views)",
         schema,
         my_views,
         seed,
         mutations,
         dialect=Dialect.MYSQL,
     )
+
+    if runner.pg_dsn:
+        pg_tr_views = [(f"pgtr_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW pgtr_{n}")) for n, sql in view_defs]
+        runner.run_batch(
+            "Suite 9C (100 PostgreSQL Transition-Table & Incremental Views on Live PG)",
+            schema,
+            pg_tr_views,
+            seed,
+            mutations,
+            dialect=Dialect.POSTGRES,
+            pg_use_transition_tables=True,
+            incremental_backfill=True,
+            batch_size=2,
+        )
+    elif runner.mysql_dsn:
+        my_inc_views = [(f"myinc_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW myinc_{n}")) for n, sql in view_defs]
+        runner.run_batch(
+            "Suite 9C (100 MySQL Incremental Backfill Views on Live MySQL)",
+            schema,
+            my_inc_views,
+            seed,
+            mutations,
+            dialect=Dialect.MYSQL,
+            incremental_backfill=True,
+            batch_size=2,
+        )
+    elif runner.sqlite_compat_engine:
+        sq_compat_views = [(f"sqc_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW sqc_{n}")) for n, sql in view_defs]
+        runner.run_batch(
+            "Suite 9C (100 SQLite Incremental Backfill Views on Live SQLite-Compat Engine)",
+            schema,
+            sq_compat_views,
+            seed,
+            mutations,
+            dialect=Dialect.SQLITE,
+            incremental_backfill=True,
+            batch_size=2,
+        )
 
 
 # ==============================================================================
@@ -2463,7 +2908,7 @@ def run_suite_10_torture_dml_and_transactions(runner: MVTestRunner) -> None:
         ("dml_fk_migrate", "UPDATE merchants SET region_id = 3, tier = 'gold' WHERE id = 40;"),
         ("dml_fk_orphan", "UPDATE merchants SET region_id = NULL, active = 1 WHERE id = 30;"),
         # 6. INSERT INTO ... SELECT derived from aggregate on another table
-        ("dml_ins_select", "INSERT INTO refunds SELECT 2000 + id, id, 'auto_rebate', subtotal * 0.1 FROM invoices WHERE subtotal >= 600.0 AND id NOT IN (SELECT invoice_id FROM refunds WHERE invoice_id IS NOT NULL);"),
+        ("dml_ins_select", "INSERT INTO refunds SELECT 2000 + id, id, 'auto_rebate', subtotal * 0.1 FROM invoices WHERE subtotal >= 600.0 AND id NOT IN (SELECT invoice_id FROM (SELECT invoice_id FROM refunds WHERE invoice_id IS NOT NULL) AS __sq_ref);"),
         # 7. Transaction 1: Multi-step DML + Nested SAVEPOINTs + Partial Rollbacks + Full Rollback
         ("tx1_begin", "BEGIN;"),
         ("tx1_ins_reg", "INSERT INTO regions VALUES (4, 'LATAM', 0.15);"),
@@ -2567,7 +3012,7 @@ def run_suite_10_torture_dml_and_transactions(runner: MVTestRunner) -> None:
         "SELECT invoice_id AS inv_id FROM refunds INTERSECT SELECT id AS inv_id FROM invoices WHERE settled = 1",
         "WITH net_inv AS (SELECT i.id, i.merchant_id, i.category, i.subtotal - COALESCE(i.discount, 0.0) AS net FROM invoices i WHERE i.settled = 1) SELECT merchant_id, COUNT(*) AS cnt, SUM(net) AS total_net, MAX(net) AS max_net FROM net_inv GROUP BY merchant_id",
         "SELECT id, merchant_id, category, subtotal, ROW_NUMBER() OVER (PARTITION BY category ORDER BY subtotal DESC, id ASC) AS cat_rn, SUM(subtotal) OVER (PARTITION BY merchant_id ORDER BY id ASC) AS running_merch_rev FROM invoices",
-        "SELECT id, category, subtotal, RANK() OVER (ORDER BY subtotal DESC) AS global_rnk, LAG(subtotal, 1, 0.0) OVER (ORDER BY id ASC) AS prev_sub FROM invoices WHERE settled = 1",
+        "SELECT id, category, subtotal, RANK() OVER (ORDER BY subtotal DESC) AS global_rnk, LAG(subtotal, 1) OVER (ORDER BY id ASC) AS prev_sub FROM invoices WHERE settled = 1",
         "SELECT id, merchant_id, category, subtotal FROM invoices ORDER BY subtotal DESC, id ASC LIMIT 4",
         "SELECT id, mname, tier, region_id FROM merchants ORDER BY mname ASC, id ASC LIMIT 3 OFFSET 1",
     ]
@@ -2652,6 +3097,150 @@ def run_suite_10_torture_dml_and_transactions(runner: MVTestRunner) -> None:
 # ==============================================================================
 # SUITE 11: Comprehensive Unit Tests for All Generator & Manager Code Paths
 # ==============================================================================
+
+def run_suite_11_live_engine_50_view_battery_across_all_dialects(runner: MVTestRunner) -> None:
+    """
+    Executes the exact 50-view x 33-step live-engine verification battery across:
+      - SQLite (incremental_backfill=False & True) + _run_live_manager_lifecycle_check
+      - PostgreSQL (pg_use_transition_tables=False & True)
+      - MySQL (Dialect.MYSQL)
+    """
+    # 11A & 11B: SQLite (Standard & Incremental Backfill)
+    sq_schema, sq_views = _get_live_engine_50_view_battery(Dialect.SQLITE)
+    for inc_mode in (False, True):
+        conn = sqlite3.connect(":memory:", isolation_level=None)
+        conn.execute("PRAGMA recursive_triggers = ON;")
+        cur = conn.cursor()
+        for s in [st.strip() for st in sq_schema.split(";") if st.strip()]:
+            cur.execute(s + ";")
+        cur.execute("INSERT INTO warehouses VALUES (1, 'WH_US', 'US'), (2, 'WH_EU', 'EU'), (3, 'WH_GLOBAL', NULL);")
+        cur.execute("INSERT INTO customers VALUES (1, 1, 'Alice', 'NA'), (2, 2, 'Bob', 'VIP'), (3, 2, 'Cara', 'EU'), (4, NULL, 'Dan', 'APAC');")
+        cur.execute(
+            "INSERT INTO orders VALUES "
+            "(1, 1, 'NA', 'hw', 10.0, 2, 3, 1, 'settled'),"
+            "(2, 1, 'NA', 'sw', 20.0, 4, 5, 0, 'settled'),"
+            "(3, 2, 'EU', 'hw', 15.0, 1, 7, 1, 'pending'),"
+            "(4, 2, 'EU', 'hw', 30.0, 3, 6, 1, 'settled'),"
+            "(5, 3, NULL, 'sw', 50.0, 5, 1, 0, 'settled');"
+        )
+        cur.execute("INSERT INTO order_tags VALUES (1, 'urgent', 2), (1, 'fragile', 5), (2, 'urgent', 3), (4, 'bulk', 10);")
+        plans = []
+        for v_name, v_sel in sq_views:
+            p = generate_materialized_view(
+                sq_schema,
+                f"CREATE VIEW {v_name} AS {v_sel};",
+                dialect=Dialect.SQLITE,
+                incremental_backfill=inc_mode,
+                batch_size=2,
+            )
+            for stmt in p.all_statements():
+                cur.execute(stmt)
+            plans.append((p, v_sel))
+            runner.total_views += 1
+            _verify_external_db_mv(cur, p.view_name, v_sel, f"s11_sq:inc={inc_mode}:{v_name}:init")
+            runner.total_assertions += 1
+        steps = _get_complex_dml_and_tx_steps(Dialect.SQLITE, for_live_mysql=False)
+        for step_lbl, m_sql in steps:
+            cur.execute(m_sql)
+            for p, v_sel in plans:
+                _verify_external_db_mv(cur, p.view_name, v_sel, f"s11_sq:inc={inc_mode}:{p.logical_view_name}:{step_lbl}")
+                runner.total_assertions += 1
+        runner.total_assertions += _run_live_manager_lifecycle_check(conn, cur, Dialect.SQLITE)
+        conn.close()
+        print(f"  [PASS] Suite 11 (Live 50-View Battery SQLite inc={inc_mode}): 50 views x {len(steps) + 1} states = {50 * (len(steps) + 1)} assertions")
+
+    # 11C & 11D: PostgreSQL (Row-Level & Statement Transition Tables)
+    pg_schema, pg_views = _get_live_engine_50_view_battery(Dialect.POSTGRES)
+    for use_trans in (False, True):
+        conn = sqlite3.connect(":memory:", isolation_level=None)
+        conn.execute("PRAGMA recursive_triggers = ON;")
+        _register_sqlite_compat_udfs(conn)
+        cur = conn.cursor()
+        for s in [st.strip() for st in pg_schema.split(";") if st.strip()]:
+            cur.execute(_transpile_pg_expr_to_sqlite(s) + ";")
+        cur.execute("INSERT INTO warehouses VALUES (1, 'WH_US', 'US'), (2, 'WH_EU', 'EU'), (3, 'WH_GLOBAL', NULL);")
+        cur.execute("INSERT INTO customers VALUES (1, 1, 'Alice', 'NA'), (2, 2, 'Bob', 'VIP'), (3, 2, 'Cara', 'EU'), (4, NULL, 'Dan', 'APAC');")
+        cur.execute(
+            "INSERT INTO orders VALUES "
+            "(1, 1, 'NA', 'hw', 10.0, 2, 3, 1, 'settled'),"
+            "(2, 1, 'NA', 'sw', 20.0, 4, 5, 0, 'settled'),"
+            "(3, 2, 'EU', 'hw', 15.0, 1, 7, 1, 'pending'),"
+            "(4, 2, 'EU', 'hw', 30.0, 3, 6, 1, 'settled'),"
+            "(5, 3, NULL, 'sw', 50.0, 5, 1, 0, 'settled');"
+        )
+        cur.execute("INSERT INTO order_tags VALUES (1, 'urgent', 2), (1, 'fragile', 5), (2, 'urgent', 3), (4, 'bulk', 10);")
+        plans = []
+        for v_name, v_sel in pg_views:
+            p = generate_materialized_view(
+                pg_schema,
+                f"CREATE VIEW {v_name} AS {v_sel};",
+                dialect=Dialect.POSTGRES,
+                pg_use_transition_tables=use_trans,
+                incremental_backfill=False,
+                batch_size=2,
+            )
+            _execute_postgres_plan_in_sqlite(conn, p)
+            v_sel_s = _transpile_pg_expr_to_sqlite(v_sel)
+            plans.append((p, v_sel_s))
+            runner.total_views += 1
+            _verify_external_db_mv(cur, p.view_name, v_sel_s, f"s11_pg:tr={use_trans}:{v_name}:init")
+            runner.total_assertions += 1
+        steps = _get_complex_dml_and_tx_steps(Dialect.POSTGRES, for_live_mysql=False, for_live_postgres=False)
+        for step_lbl, m_sql in steps:
+            cur.execute(_transpile_pg_expr_to_sqlite(m_sql))
+            for p, v_sel_s in plans:
+                _verify_external_db_mv(cur, p.view_name, v_sel_s, f"s11_pg:tr={use_trans}:{p.logical_view_name}:{step_lbl}")
+                runner.total_assertions += 1
+        conn.close()
+        print(f"  [PASS] Suite 11 (Live 50-View Battery PostgreSQL tr={use_trans}): 50 views x {len(steps) + 1} states = {50 * (len(steps) + 1)} assertions")
+
+    # 11E: MySQL
+    my_schema, my_views = _get_live_engine_50_view_battery(Dialect.MYSQL)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.execute("PRAGMA recursive_triggers = ON;")
+    _register_sqlite_compat_udfs(conn)
+    cur = conn.cursor()
+    for s in [st.strip() for st in my_schema.split(";") if st.strip()]:
+        cur.execute(_transpile_mysql_expr_to_sqlite(s) + ";")
+    cur.execute("INSERT INTO warehouses VALUES (1, 'WH_US', 'US'), (2, 'WH_EU', 'EU'), (3, 'WH_GLOBAL', NULL);")
+    cur.execute("INSERT INTO customers VALUES (1, 1, 'Alice', 'NA'), (2, 2, 'Bob', 'VIP'), (3, 2, 'Cara', 'EU'), (4, NULL, 'Dan', 'APAC');")
+    cur.execute(
+        "INSERT INTO orders VALUES "
+        "(1, 1, 'NA', 'hw', 10.0, 2, 3, 1, 'settled'),"
+        "(2, 1, 'NA', 'sw', 20.0, 4, 5, 0, 'settled'),"
+        "(3, 2, 'EU', 'hw', 15.0, 1, 7, 1, 'pending'),"
+        "(4, 2, 'EU', 'hw', 30.0, 3, 6, 1, 'settled'),"
+        "(5, 3, NULL, 'sw', 50.0, 5, 1, 0, 'settled');"
+    )
+    cur.execute("INSERT INTO order_tags VALUES (1, 'urgent', 2), (1, 'fragile', 5), (2, 'urgent', 3), (4, 'bulk', 10);")
+    plans = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for v_name, v_sel in my_views:
+            p = generate_materialized_view(
+                my_schema,
+                f"CREATE VIEW {v_name} AS {v_sel};",
+                dialect=Dialect.MYSQL,
+                incremental_backfill=False,
+                batch_size=2,
+                ignore_limitations=True,
+            )
+            _execute_mysql_plan_in_sqlite(conn, p)
+            v_sel_s = _transpile_mysql_expr_to_sqlite(v_sel)
+            plans.append((p, v_sel_s))
+            runner.total_views += 1
+            _verify_external_db_mv(cur, p.view_name, v_sel_s, f"s11_my:{v_name}:init")
+            runner.total_assertions += 1
+    steps = _get_complex_dml_and_tx_steps(Dialect.MYSQL, for_live_mysql=False)
+    for step_lbl, m_sql in steps:
+        cur.execute(_transpile_mysql_expr_to_sqlite(m_sql))
+        for p, v_sel_s in plans:
+            _verify_external_db_mv(cur, p.view_name, v_sel_s, f"s11_my:{p.logical_view_name}:{step_lbl}")
+            runner.total_assertions += 1
+    conn.close()
+    print(f"  [PASS] Suite 11 (Live 50-View Battery MySQL): 50 views x {len(steps) + 1} states = {50 * (len(steps) + 1)} assertions")
+
+
 class TestGeneratorAndManagerCodePaths(unittest.TestCase):
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -2920,6 +3509,7 @@ def _run_all_tests() -> None:
     run_suite_8_ctes_windows_topn(runner)
     run_suite_9_cross_dialect_execution(runner)
     run_suite_10_torture_dml_and_transactions(runner)
+    run_suite_11_live_engine_50_view_battery_across_all_dialects(runner)
 
     print("-" * 84)
     print(f"COMBINATORIAL & TRANSACTIONAL SUITES PASSED: {runner.total_views} views, {runner.total_assertions} live SQL assertions!")

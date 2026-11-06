@@ -323,7 +323,10 @@ jobs:
             -p 3306:3306 \
             "$IMG" \
             --character-set-server=utf8mb4 \
-            --collation-server=utf8mb4_unicode_ci
+            --collation-server=utf8mb4_unicode_ci \
+            --innodb-flush-log-at-trx-commit=0 \
+            --sync-binlog=0 \
+            --skip-log-bin
           for i in $(seq 1 60); do
             if docker exec mysql-srv mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent; then
               echo "MySQL is ready!"
@@ -397,7 +400,10 @@ jobs:
             -p 3306:3306 \
             "$IMG" \
             --character-set-server=utf8mb4 \
-            --collation-server=utf8mb4_unicode_ci
+            --collation-server=utf8mb4_unicode_ci \
+            --innodb-flush-log-at-trx-commit=0 \
+            --sync-binlog=0 \
+            --skip-log-bin
           for i in $(seq 1 60); do
             if docker exec mysql-compat-srv sh -c "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent || mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent" 2>/dev/null; then
               echo "${{ matrix.label }} is ready!"
