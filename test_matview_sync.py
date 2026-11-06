@@ -1124,7 +1124,7 @@ def _open_live_mysql_connection(dsn: str):
     with conn.cursor() as cur:
         cur.execute(f"CREATE DATABASE IF NOT EXISTS `{target_db}`;")
         cur.execute(f"USE `{target_db}`;")
-        cur.execute("SET SESSION sql_mode = CONCAT_WS(',', @@SESSION.sql_mode, 'PIPES_AS_CONCAT');")
+        cur.execute("SET SESSION sql_mode = CONCAT_WS(',', REPLACE(@@SESSION.sql_mode, 'ONLY_FULL_GROUP_BY', ''), 'PIPES_AS_CONCAT');")
     return conn, target_db
 
 
@@ -1616,6 +1616,43 @@ import time
 import unittest
 
 
+def _rewrite_live_reference_select_for_dialect(raw_select_sql: str, dialect: Dialect) -> str:
+    if dialect == Dialect.SQLITE:
+        return raw_select_sql
+    s = re.sub(
+        r"\bTOTAL\s*\(\s*DISTINCT\s+((?:[^()]|\([^()]*\))+)\)",
+        r"COALESCE(1.0 * SUM(DISTINCT \1), 0.0)",
+        raw_select_sql,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"\bTOTAL\s*\(\s*((?:[^()]|\([^()]*\))+)\)",
+        r"COALESCE(1.0 * SUM(\1), 0.0)",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if dialect == Dialect.MYSQL:
+        m_foj = re.match(
+            r'^SELECT\s+(.*?)\s+FROM\s+([A-Za-z0-9_."`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z0-9_"`\[\]]+)?)\s+FULL\s+(?:OUTER\s+)?JOIN\s+([A-Za-z0-9_."`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z0-9_"`\[\]]+)?)\s+ON\s+(([A-Za-z0-9_."`\[\]]+)\s*=\s*[A-Za-z0-9_."`\[\]]+)$',
+            s.strip().rstrip(";"),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if m_foj:
+            sel_p, t1_p, t2_p, on_p, lhs_col = (
+                m_foj.group(1),
+                m_foj.group(2),
+                m_foj.group(3),
+                m_foj.group(4),
+                m_foj.group(5),
+            )
+            s = (
+                f"SELECT {sel_p} FROM {t1_p} LEFT JOIN {t2_p} ON {on_p} "
+                f"UNION ALL "
+                f"SELECT {sel_p} FROM {t1_p} RIGHT JOIN {t2_p} ON {on_p} WHERE {lhs_col} IS NULL"
+            )
+    return s
+
+
 def _adapt_suite_schema_for_dialect(schema_sql: str, dialect: Dialect) -> str:
     if dialect in (Dialect.POSTGRES, Dialect.MYSQL):
         s = re.sub(r"\bTEXT\b", "VARCHAR(191)", schema_sql)
@@ -1722,7 +1759,7 @@ class MVTestRunner:
                                 for stmt in plan.all_statements():
                                     cur.execute(stmt)
                                 v_spec = parse_view_definition(eff_v_ddl)
-                                live_sel = IncrementalViewCompiler._rewrite_sqlite_total_in_sql(v_spec.raw_select_sql)
+                                live_sel = _rewrite_live_reference_select_for_dialect(v_spec.raw_select_sql, Dialect.POSTGRES)
                                 plans_and_selects.append((plan, live_sel))
                                 self.total_views += 1
                                 _verify_external_db_mv(cur, plan.view_name, live_sel, f"{suite_name}:{v_name}:init")
@@ -1747,7 +1784,7 @@ class MVTestRunner:
                         (lbl, _adapt_mutation_for_dialect(msql, Dialect.MYSQL, True))
                         for lbl, msql in mutations
                     ]
-                    chunk_size = 100
+                    chunk_size = 50
                     for i in range(0, len(views), chunk_size):
                         chunk = views[i : i + chunk_size]
                         cur.execute(f"DROP DATABASE IF EXISTS `{target_db}`;")
@@ -1773,8 +1810,7 @@ class MVTestRunner:
                                 for stmt in plan.all_statements():
                                     cur.execute(stmt)
                                 v_spec = parse_view_definition(eff_v_ddl)
-                                live_sel = IncrementalViewCompiler._rewrite_sqlite_total_in_sql(v_spec.raw_select_sql)
-                                live_sel = IncrementalViewCompiler._lower_mysql_full_outer_joins_in_sql(live_sel, plan.tables)
+                                live_sel = _rewrite_live_reference_select_for_dialect(v_spec.raw_select_sql, Dialect.MYSQL)
                                 plans_and_selects.append((plan, live_sel))
                                 self.total_views += 1
                                 _verify_external_db_mv(cur, plan.view_name, live_sel, f"{suite_name}:{v_name}:init")
