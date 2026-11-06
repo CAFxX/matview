@@ -14,4 +14,4 @@
 [ ] I would like the README (or other doc linked from the README) to showcase how each SQL construct/aggregation and their combinations is efficiently rendered as an incremental materialization
 [ ] I would like the repo to contain a Dockerfile/Docker compose that spins up all servers needed for integration testing (make docker-test)
 [ ] I would like the generator to support also modern newsql engines (cockroach, tidb, yugabyte, spanner, etc.) where possible
-
+[ ] I would like all tests to be unified (taking care of using the right dialects) on top of the same shared testing infrastructure so that even when you're just running the sqlite tests in memory you exercise all the shared infrastructure used also when testing with other engines e.g. mysql/pg. This should avoid embarassing CI runs where you forget an argument to a function because that function was not exercised when testing with sqlite.
