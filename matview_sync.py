@@ -3751,7 +3751,11 @@ class IncrementalViewCompiler:
                 if self.dialect == Dialect.MYSQL:
                     return f"(CASE WHEN COUNT({eff}) = 0 THEN NULL ELSE {item.agg_func.value}({eff}) END)"
                 return f"{item.agg_func.value}({eff})"
-            return f"SUM({eff})"
+            if item.agg_func == AggFunc.BIT_AND:
+                return "(" + " | ".join(f"MIN(({eff}) & {1 << b})" for b in range(32)) + ")"
+            if item.agg_func == AggFunc.BIT_OR:
+                return "(" + " | ".join(f"MAX(({eff}) & {1 << b})" for b in range(32)) + ")"
+            return "(" + " | ".join(f"((SUM((({eff}) >> {b}) & 1) & 1) << {b})" for b in range(32)) + ")"
         if item.agg_func == AggFunc.BOOL_AND:
             if self.dialect == Dialect.POSTGRES:
                 return f"BOOL_AND({eff})"
@@ -7489,7 +7493,36 @@ class IncrementalViewCompiler:
 
     def _rewrite_sqlite_total_in_sql(self, sql: str) -> str:
         if self.dialect == Dialect.SQLITE:
-            return sql
+            s_sq = sql
+            s_sq = re.sub(
+                r"\bVAR_POP\s*\(\s*([^()]+?)\s*\)",
+                lambda m: (
+                    f"(CASE WHEN COUNT({m.group(1)}) < 1 THEN NULL "
+                    f"WHEN ((1.0 * SUM(1.0 * ({m.group(1)}) * ({m.group(1)})) - ((1.0 * SUM(1.0 * ({m.group(1)}))) * (1.0 * SUM(1.0 * ({m.group(1)})))) / COUNT({m.group(1)})) / COUNT({m.group(1)})) < 0.0 THEN 0.0 "
+                    f"ELSE ((1.0 * SUM(1.0 * ({m.group(1)}) * ({m.group(1)})) - ((1.0 * SUM(1.0 * ({m.group(1)}))) * (1.0 * SUM(1.0 * ({m.group(1)})))) / COUNT({m.group(1)})) / COUNT({m.group(1)})) END)"
+                ),
+                s_sq,
+                flags=re.IGNORECASE,
+            )
+            s_sq = re.sub(
+                r"\bBIT_AND\s*\(\s*([^()]+?)\s*\)",
+                lambda m: "(" + " | ".join(f"MIN(({m.group(1)}) & {1 << b})" for b in range(32)) + ")",
+                s_sq,
+                flags=re.IGNORECASE,
+            )
+            s_sq = re.sub(
+                r"\bBIT_OR\s*\(\s*([^()]+?)\s*\)",
+                lambda m: "(" + " | ".join(f"MAX(({m.group(1)}) & {1 << b})" for b in range(32)) + ")",
+                s_sq,
+                flags=re.IGNORECASE,
+            )
+            s_sq = re.sub(
+                r"\bBIT_XOR\s*\(\s*([^()]+?)\s*\)",
+                lambda m: "(" + " | ".join(f"((SUM((({m.group(1)}) >> {b}) & 1) & 1) << {b})" for b in range(32)) + ")",
+                s_sq,
+                flags=re.IGNORECASE,
+            )
+            return s_sq
         s = re.sub(
             r"\bTOTAL\s*\(\s*DISTINCT\s+((?:[^()]|\([^()]*\))+)\)",
             r"COALESCE(1.0 * SUM(DISTINCT \1), 0.0)",

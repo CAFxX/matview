@@ -1744,6 +1744,37 @@ class TranspiledConnectionAdapter:
 
 def _rewrite_live_reference_select_for_dialect(raw_select_sql: str, dialect: Dialect) -> str:
     if dialect == Dialect.SQLITE:
+        if os.environ.get("SQLITE_COMPAT_ENGINE", "").strip().lower() not in ("", "sqlite3"):
+            s_sq = raw_select_sql
+            s_sq = re.sub(
+                r"\bVAR_POP\s*\(\s*([^()]+?)\s*\)",
+                lambda m: (
+                    f"(CASE WHEN COUNT({m.group(1)}) < 1 THEN NULL "
+                    f"WHEN ((1.0 * SUM(1.0 * ({m.group(1)}) * ({m.group(1)})) - ((1.0 * SUM(1.0 * ({m.group(1)}))) * (1.0 * SUM(1.0 * ({m.group(1)})))) / COUNT({m.group(1)})) / COUNT({m.group(1)})) < 0.0 THEN 0.0 "
+                    f"ELSE ((1.0 * SUM(1.0 * ({m.group(1)}) * ({m.group(1)})) - ((1.0 * SUM(1.0 * ({m.group(1)}))) * (1.0 * SUM(1.0 * ({m.group(1)})))) / COUNT({m.group(1)})) / COUNT({m.group(1)})) END)"
+                ),
+                s_sq,
+                flags=re.IGNORECASE,
+            )
+            s_sq = re.sub(
+                r"\bBIT_AND\s*\(\s*([^()]+?)\s*\)",
+                lambda m: "(" + " | ".join(f"MIN(({m.group(1)}) & {1 << b})" for b in range(32)) + ")",
+                s_sq,
+                flags=re.IGNORECASE,
+            )
+            s_sq = re.sub(
+                r"\bBIT_OR\s*\(\s*([^()]+?)\s*\)",
+                lambda m: "(" + " | ".join(f"MAX(({m.group(1)}) & {1 << b})" for b in range(32)) + ")",
+                s_sq,
+                flags=re.IGNORECASE,
+            )
+            s_sq = re.sub(
+                r"\bBIT_XOR\s*\(\s*([^()]+?)\s*\)",
+                lambda m: "(" + " | ".join(f"((SUM((({m.group(1)}) >> {b}) & 1) & 1) << {b})" for b in range(32)) + ")",
+                s_sq,
+                flags=re.IGNORECASE,
+            )
+            return s_sq
         return raw_select_sql
     s = re.sub(
         r"\bTOTAL\s*\(\s*DISTINCT\s+((?:[^()]|\([^()]*\))+)\)",
@@ -3834,6 +3865,483 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             sq_c2.close()
             self.assertEqual(rows, [("north", 2, 22.5)])
 
+    def test_09_differential_fuzzer_multi_seed_and_reproducibility(self) -> None:
+        """
+        Tests that DifferentialSQLFuzzer is deterministically reproducible for any given seed
+        and verifies additional multi-seed random schemas, views, and DML sequences across
+        SQLite, PostgreSQL, and MySQL.
+        """
+        f1 = DifferentialSQLFuzzer(seed=987654321)
+        f2 = DifferentialSQLFuzzer(seed=987654321)
+        for d in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+            self.assertEqual(f1.generate_scenario(1, d), f2.generate_scenario(1, d))
+
+        local_runner = MVTestRunner()
+        for extra_seed in (1337, 424242):
+            fz = DifferentialSQLFuzzer(seed=extra_seed)
+            for dialect in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+                schema, views, seed_sqls, muts = fz.generate_scenario(1, dialect)
+                local_runner.run_batch(
+                    f"UnitFuzz(seed={extra_seed},{dialect.value})",
+                    schema,
+                    views[:12],
+                    seed_sqls,
+                    muts[:12],
+                    dialect=dialect,
+                )
+        self.assertGreaterEqual(local_runner.total_views, 72)
+
+
+import random
+
+class DifferentialSQLFuzzer:
+    """
+    Deterministic random SQL schema, view, and DML generator for differential fuzzing
+    of IncrementalViewCompiler across SQLite, PostgreSQL, and MySQL.
+    """
+
+    def __init__(self, seed: int = 20261106) -> None:
+        self.seed = seed
+        self.rng = random.Random(seed)
+
+    def generate_scenario(
+        self, scenario_idx: int, dialect: Dialect = Dialect.SQLITE
+    ) -> Tuple[str, List[Tuple[str, str]], List[str], List[Tuple[str, str]]]:
+        rng = random.Random(self.seed + scenario_idx * 9973)
+        p = f"fz{scenario_idx}"
+
+        t_main = f"{p}_{rng.choice(['orders', 'events', 'txns', 'records'])}"
+        t_parent = f"{p}_{rng.choice(['customers', 'accounts', 'orgs', 'merchants'])}"
+        t_root = f"{p}_{rng.choice(['regions', 'hubs', 'zones', 'sectors'])}"
+        t_comp = f"{p}_{rng.choice(['tags', 'items', 'allocs', 'badges'])}"
+
+        cats_a = rng.sample(["alpha", "beta", "gamma", "delta", "omega"], 4)
+        cats_b = rng.sample(["hw", "sw", "cloud", "ai", "sec"], 4)
+        tiers = rng.sample(["gold", "silver", "vip", "std"], 3)
+        codes = rng.sample(["NA", "EU", "APAC", "LATAM"], 3)
+        tags = rng.sample(["urgent", "bulk", "promo", "audit"], 3)
+
+        schema_sql = f"""
+        CREATE TABLE {t_root} (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL,
+            country TEXT
+        );
+        CREATE TABLE {t_parent} (
+            id INTEGER PRIMARY KEY,
+            root_id INTEGER,
+            pname TEXT NOT NULL,
+            tier TEXT,
+            quota INTEGER NOT NULL
+        );
+        CREATE TABLE {t_main} (
+            id INTEGER PRIMARY KEY,
+            parent_id INTEGER,
+            grp_str TEXT NOT NULL,
+            sub_cat TEXT,
+            val_int INTEGER,
+            val_flt REAL,
+            weight_cnt INTEGER NOT NULL,
+            flag INTEGER NOT NULL
+        );
+        CREATE TABLE {t_comp} (
+            ref_id INTEGER NOT NULL,
+            tag_key TEXT NOT NULL,
+            pts INTEGER NOT NULL,
+            PRIMARY KEY (ref_id, tag_key)
+        );
+        """
+
+        seed_sqls: List[str] = []
+        for rid in range(1, 4):
+            c_code = codes[(rid - 1) % len(codes)]
+            c_country = "NULL" if rid == 3 else f"'{c_code}_HQ'"
+            seed_sqls.append(f"INSERT INTO {t_root} VALUES ({rid}, '{c_code}', {c_country});")
+
+        for pid in range(1, 6):
+            r_ref = "NULL" if pid == 5 else str(((pid - 1) % 3) + 1)
+            t_val = "NULL" if pid == 4 else f"'{tiers[(pid - 1) % len(tiers)]}'"
+            quota = rng.randint(10, 100)
+            seed_sqls.append(f"INSERT INTO {t_parent} VALUES ({pid}, {r_ref}, 'P_{pid}', {t_val}, {quota});")
+
+        next_main_id = 1
+        for _ in range(10):
+            mid = next_main_id
+            next_main_id += 1
+            p_ref = "NULL" if rng.random() < 0.2 else str(rng.randint(1, 5))
+            g_str = rng.choice(cats_a)
+            s_cat = "NULL" if rng.random() < 0.25 else f"'{rng.choice(cats_b)}'"
+            v_int = "NULL" if rng.random() < 0.2 else str(rng.randint(1, 50))
+            v_flt = "NULL" if rng.random() < 0.2 else f"{rng.randint(1, 40) * 2.5:.1f}"
+            w_cnt = rng.randint(1, 15)
+            flg = rng.choice([0, 1])
+            seed_sqls.append(
+                f"INSERT INTO {t_main} VALUES ({mid}, {p_ref}, '{g_str}', {s_cat}, {v_int}, {v_flt}, {w_cnt}, {flg});"
+            )
+            if mid in (1, 3) and next_main_id <= 14:
+                dup_id = next_main_id
+                next_main_id += 1
+                seed_sqls.append(
+                    f"INSERT INTO {t_main} VALUES ({dup_id}, {p_ref}, '{g_str}', {s_cat}, {v_int}, {v_flt}, {w_cnt}, {flg});"
+                )
+
+        used_comp = set()
+        for _ in range(7):
+            rf = rng.randint(1, 6)
+            tk = rng.choice(tags)
+            if (rf, tk) not in used_comp:
+                used_comp.add((rf, tk))
+                pts = rng.randint(1, 20)
+                seed_sqls.append(f"INSERT INTO {t_comp} VALUES ({rf}, '{tk}', {pts});")
+
+        views: List[Tuple[str, str]] = []
+        v_counter = [0]
+
+        def add_v(tag: str, select_sql: str) -> None:
+            v_counter[0] += 1
+            vn = f"{p}_v{v_counter[0]:02d}_{tag}"
+            views.append((vn, f"CREATE VIEW {vn} AS {select_sql};"))
+
+        w_preds = [
+            "",
+            "WHERE flag = 1",
+            f"WHERE weight_cnt >= {rng.randint(3, 8)}",
+            f"WHERE grp_str IN ('{cats_a[0]}', '{cats_a[1]}')",
+            "WHERE sub_cat IS NOT NULL AND val_int IS NOT NULL",
+            f"WHERE (flag = 1 OR weight_cnt >= {rng.randint(4, 10)}) AND weight_cnt <= 20",
+        ]
+
+        # Family 1: Projections & SELECT DISTINCT
+        w1 = rng.choice(w_preds[1:])
+        add_v("proj_filter", f"SELECT id, grp_str, COALESCE(sub_cat, 'none') AS sc, weight_cnt * 2 AS w2, flag FROM {t_main} {w1}")
+        add_v("distinct_multi", f"SELECT DISTINCT grp_str, sub_cat, flag FROM {t_main} {rng.choice(w_preds)}")
+        add_v("distinct_expr", f"SELECT DISTINCT COALESCE(sub_cat, grp_str) AS merged_cat, flag FROM {t_main}")
+
+        # Family 2: Single-table Grouped Algebraic, Statistical, Bitwise & Compound Aggregates
+        grp_choices = [
+            ("grp_str", "grp_str"),
+            ("sub_cat", "sub_cat"),
+            ("grp_str, sub_cat", "grp_str, sub_cat"),
+            ("grp_str, flag", "grp_str, flag"),
+            ("COALESCE(sub_cat, 'UNK') AS sc_norm", "COALESCE(sub_cat, 'UNK')"),
+            ("LOWER(grp_str) AS l_grp", "LOWER(grp_str)"),
+            (f"CASE WHEN weight_cnt >= 6 THEN 'heavy' ELSE 'light' END AS w_bucket", f"CASE WHEN weight_cnt >= 6 THEN 'heavy' ELSE 'light' END"),
+        ]
+        for g_idx, (g_sel, g_by) in enumerate(rng.sample(grp_choices, 5)):
+            w_cl = rng.choice(w_preds)
+            w_sp = f" {w_cl}" if w_cl else ""
+            aggs = [
+                "COUNT(*) AS c_all",
+                "COUNT(val_int) AS c_int",
+                "SUM(val_int) AS s_int",
+                "AVG(val_flt) AS a_flt",
+                "MIN(weight_cnt) AS mn_w",
+                "MAX(weight_cnt) AS mx_w",
+                "SUM(val_int * weight_cnt) AS w_sum",
+                "VAR_POP(val_flt) AS vp_flt",
+                "BIT_AND(weight_cnt) AS ba_w",
+                "BIT_OR(weight_cnt) AS bo_w",
+                "BIT_XOR(weight_cnt) AS bx_w",
+            ]
+            if dialect == Dialect.SQLITE:
+                aggs.append("TOTAL(val_flt) AS tot_flt")
+                aggs.append("SUM(weight_cnt) FILTER (WHERE flag = 1) AS filt_w")
+            elif dialect == Dialect.POSTGRES:
+                aggs.extend([
+                    "STDDEV_POP(val_flt) AS sdp_flt",
+                    "SUM(weight_cnt) FILTER (WHERE flag = 1) AS filt_w",
+                ])
+            else:
+                aggs.append("STDDEV_POP(val_flt) AS sdp_flt")
+            chosen_aggs = rng.sample(aggs, rng.randint(4, min(7, len(aggs))))
+            hav = ""
+            if g_idx == 0:
+                hav = f" HAVING COUNT(*) >= {rng.randint(1, 2)}"
+            elif g_idx == 1:
+                hav = f" HAVING COALESCE(SUM(weight_cnt), 0) >= {rng.randint(5, 15)}"
+            add_v(f"alg_grp_{g_idx}", f"SELECT {g_sel}, {', '.join(chosen_aggs)} FROM {t_main}{w_sp} GROUP BY {g_by}{hav}")
+
+        # Hidden GROUP BY + No COUNT(*) + Compound Aggregate Arithmetic
+        add_v(
+            "alg_hidden_grp",
+            f"SELECT COUNT(*) AS cnt, SUM(val_int) AS si, MIN(weight_cnt) AS mnw, MAX(weight_cnt) AS mxw FROM {t_main} WHERE flag = 1 GROUP BY grp_str",
+        )
+        add_v(
+            "alg_no_cnt_star",
+            f"SELECT grp_str, SUM(val_flt) AS sf, AVG(val_int) AS ai, MIN(weight_cnt) AS mnw, MAX(weight_cnt) AS mxw, BIT_XOR(weight_cnt) AS bxw FROM {t_main} GROUP BY grp_str",
+        )
+        add_v(
+            "alg_compound",
+            f"SELECT grp_str, COUNT(*) AS cnt, COALESCE(SUM(val_int * weight_cnt), 0) - COALESCE(SUM(val_int), 0) AS net_v, COALESCE(MAX(weight_cnt) - MIN(weight_cnt), 0) AS span_w FROM {t_main} GROUP BY grp_str",
+        )
+        add_v(
+            "alg_comp_pk",
+            f"SELECT tag_key, COUNT(*) AS cnt, SUM(pts) AS s_pts, AVG(pts) AS a_pts, MIN(pts) AS mn_p, MAX(pts) AS mx_p FROM {t_comp} GROUP BY tag_key",
+        )
+
+        # Family 3: DISTINCT Aggregates (Reference Counted)
+        for d_idx in range(3):
+            g_sel, g_by = rng.choice(grp_choices[:4])
+            w_cl = rng.choice(w_preds[:4])
+            w_sp = f" {w_cl}" if w_cl else ""
+            d_aggs = rng.sample(
+                [
+                    "COUNT(DISTINCT sub_cat) AS cd_sc",
+                    "COUNT(DISTINCT val_int) AS cd_vi",
+                    "SUM(DISTINCT weight_cnt) AS sd_w",
+                    "AVG(DISTINCT val_flt) AS ad_vf",
+                    "SUM(weight_cnt) AS s_w",
+                    "BIT_XOR(weight_cnt) AS bx_w",
+                    "COUNT(*) AS cnt",
+                ],
+                4,
+            )
+            add_v(f"dist_agg_{d_idx}", f"SELECT {g_sel}, {', '.join(d_aggs)} FROM {t_main}{w_sp} GROUP BY {g_by}")
+
+        # Family 4: Ungrouped Global Aggregates (Zero-row vs Non-empty)
+        add_v(
+            "global_full",
+            f"SELECT COUNT(*) AS cnt, COUNT(val_int) AS ci, SUM(val_int) AS si, AVG(val_flt) AS af, MIN(weight_cnt) AS mnw, MAX(weight_cnt) AS mxw, VAR_POP(val_flt) AS vp, BIT_XOR(weight_cnt) AS bx FROM {t_main}",
+        )
+        add_v(
+            "global_filtered_nocnt",
+            f"SELECT SUM(val_int) AS si, AVG(val_flt) AS af, MIN(weight_cnt) AS mnw, MAX(weight_cnt) AS mxw, COUNT(DISTINCT grp_str) AS cd_g FROM {t_main} WHERE flag = 1 AND weight_cnt >= 10",
+        )
+
+        # Family 5: Joins (2-table INNER, 3-table chain, CROSS, Composite-PK, LEFT, RIGHT, FULL OUTER)
+        add_v(
+            "join_2t_agg",
+            f"SELECT p.tier, m.grp_str, COUNT(*) AS cnt, SUM(m.weight_cnt * p.quota) AS w_quota, AVG(m.val_flt) AS af, MIN(m.weight_cnt) AS mnw, MAX(m.weight_cnt) AS mxw, BIT_XOR(m.weight_cnt) AS bx FROM {t_main} m INNER JOIN {t_parent} p ON m.parent_id = p.id WHERE m.flag = 1 GROUP BY p.tier, m.grp_str",
+        )
+        add_v(
+            "join_3t_chain",
+            f"SELECT r.code, p.tier, COUNT(*) AS cnt, SUM(m.weight_cnt) AS sw, SUM(m.val_int) AS si FROM {t_main} m JOIN {t_parent} p ON m.parent_id = p.id JOIN {t_root} r ON p.root_id = r.id GROUP BY r.code, p.tier",
+        )
+        add_v(
+            "join_cross",
+            f"SELECT r.code, p.tier, COUNT(*) AS cnt, SUM(p.quota) AS sq FROM {t_root} r CROSS JOIN {t_parent} p GROUP BY r.code, p.tier",
+        )
+        add_v(
+            "join_comp_pk",
+            f"SELECT c.tag_key, m.grp_str, COUNT(*) AS cnt, SUM(c.pts * m.weight_cnt) AS total_pts FROM {t_comp} c JOIN {t_main} m ON c.ref_id = m.id GROUP BY c.tag_key, m.grp_str",
+        )
+        add_v(
+            "left_join_proj",
+            f"SELECT p.id AS pid, p.pname, m.id AS mid, m.grp_str, m.weight_cnt FROM {t_parent} p LEFT JOIN {t_main} m ON p.id = m.parent_id",
+        )
+        add_v(
+            "left_join_agg",
+            f"SELECT p.pname, p.tier, COUNT(*) AS row_cnt, COUNT(m.id) AS match_cnt, SUM(m.weight_cnt) AS sum_w, MIN(m.weight_cnt) AS min_w, MAX(m.weight_cnt) AS max_w FROM {t_parent} p LEFT JOIN {t_main} m ON p.id = m.parent_id GROUP BY p.pname, p.tier",
+        )
+        add_v(
+            "right_join_proj",
+            f"SELECT m.id AS mid, m.grp_str, p.id AS pid, p.pname, p.tier FROM {t_main} m RIGHT JOIN {t_parent} p ON m.parent_id = p.id",
+        )
+        add_v(
+            "full_outer_join_proj",
+            f"SELECT p.id AS pid, p.pname, r.id AS rid, r.code FROM {t_parent} p FULL OUTER JOIN {t_root} r ON p.root_id = r.id",
+        )
+
+        # Family 6: Subqueries (EXISTS, NOT EXISTS, IN, NOT IN)
+        add_v(
+            "subq_exists",
+            f"SELECT id, grp_str, weight_cnt FROM {t_main} WHERE EXISTS (SELECT 1 FROM {t_parent} p WHERE p.id = {t_main}.parent_id AND p.quota >= 30)",
+        )
+        add_v(
+            "subq_not_exists",
+            f"SELECT id, pname, tier, quota FROM {t_parent} WHERE NOT EXISTS (SELECT 1 FROM {t_main} m WHERE m.parent_id = {t_parent}.id AND m.flag = 1)",
+        )
+        add_v(
+            "subq_in_not_in",
+            f"SELECT id, grp_str, weight_cnt FROM {t_main} WHERE parent_id NOT IN (SELECT id FROM {t_parent} WHERE quota < 25 AND id IS NOT NULL)",
+        )
+
+        # Family 7: Set Operations (UNION ALL, UNION, INTERSECT, EXCEPT), CTEs, Windows & Top-N
+        add_v(
+            "set_union_all",
+            f"SELECT grp_str AS label, weight_cnt AS metric FROM {t_main} WHERE flag = 1 UNION ALL SELECT pname AS label, quota AS metric FROM {t_parent}",
+        )
+        add_v(
+            "set_union_dedup",
+            f"SELECT grp_str AS code_lbl FROM {t_main} UNION SELECT tier AS code_lbl FROM {t_parent} WHERE tier IS NOT NULL",
+        )
+        add_v(
+            "set_except",
+            f"SELECT id AS ref_key FROM {t_parent} EXCEPT SELECT parent_id AS ref_key FROM {t_main} WHERE parent_id IS NOT NULL",
+        )
+        add_v(
+            "cte_union_agg",
+            f"WITH u AS (SELECT grp_str AS k, weight_cnt AS v FROM {t_main} WHERE flag = 1 UNION ALL SELECT COALESCE(tier, 'NONE') AS k, quota AS v FROM {t_parent}) SELECT k, COUNT(*) AS cnt, SUM(v) AS sv, AVG(v) AS av, MIN(v) AS mnv, MAX(v) AS mxv FROM u GROUP BY k",
+        )
+        add_v(
+            "window_rank",
+            f"SELECT id, grp_str, weight_cnt, ROW_NUMBER() OVER (PARTITION BY grp_str ORDER BY weight_cnt DESC, id ASC) AS rn, SUM(weight_cnt) OVER (PARTITION BY grp_str ORDER BY id ASC) AS run_w, LAG(weight_cnt, 1, 0) OVER (PARTITION BY grp_str ORDER BY id ASC) AS prev_w FROM {t_main}",
+        )
+        add_v(
+            "topn_limit",
+            f"SELECT id, grp_str, weight_cnt, val_int FROM {t_main} WHERE flag = 1 ORDER BY weight_cnt DESC, id ASC LIMIT 5 OFFSET 1",
+        )
+
+        # Generate random DML + transactional sequence
+        mutations: List[Tuple[str, str]] = []
+        for s_idx in range(1, 10):
+            op = rng.choice(["ins_main", "upd_main_val", "upd_main_grp", "upd_parent", "del_dup_or_row", "upsert_comp"])
+            if op == "ins_main":
+                mid = next_main_id
+                next_main_id += 1
+                p_ref = "NULL" if rng.random() < 0.25 else str(rng.randint(1, 5))
+                g_str = rng.choice(cats_a)
+                s_cat = "NULL" if rng.random() < 0.3 else f"'{rng.choice(cats_b)}'"
+                v_int = "NULL" if rng.random() < 0.2 else str(rng.randint(1, 60))
+                v_flt = "NULL" if rng.random() < 0.2 else f"{rng.randint(1, 50) * 1.5:.1f}"
+                w_cnt = rng.randint(1, 25)
+                flg = rng.choice([0, 1])
+                mutations.append(
+                    (f"s{s_idx}_ins", f"INSERT INTO {t_main} VALUES ({mid}, {p_ref}, '{g_str}', {s_cat}, {v_int}, {v_flt}, {w_cnt}, {flg});")
+                )
+            elif op == "upd_main_val":
+                lo_id = rng.randint(1, max(1, next_main_id - 4))
+                hi_id = lo_id + rng.randint(1, 3)
+                delta_w = rng.randint(1, 7)
+                mutations.append(
+                    (
+                        f"s{s_idx}_upd_val",
+                        f"UPDATE {t_main} SET val_int = CASE WHEN val_int IS NULL THEN {rng.randint(5, 30)} ELSE NULL END, "
+                        f"val_flt = COALESCE(val_flt, 10.0) + 3.5, weight_cnt = weight_cnt + {delta_w}, flag = 1 - flag "
+                        f"WHERE id BETWEEN {lo_id} AND {hi_id};",
+                    )
+                )
+            elif op == "upd_main_grp":
+                target_id = rng.randint(1, next_main_id - 1)
+                new_g = rng.choice(cats_a)
+                new_sc = "NULL" if rng.random() < 0.35 else f"'{rng.choice(cats_b)}'"
+                new_p = "NULL" if rng.random() < 0.25 else str(rng.randint(1, 5))
+                mutations.append(
+                    (
+                        f"s{s_idx}_upd_grp",
+                        f"UPDATE {t_main} SET grp_str = '{new_g}', sub_cat = {new_sc}, parent_id = {new_p} WHERE id = {target_id};",
+                    )
+                )
+            elif op == "upd_parent":
+                pid = rng.randint(1, 5)
+                new_t = "NULL" if rng.random() < 0.25 else f"'{rng.choice(tiers)}'"
+                new_r = "NULL" if rng.random() < 0.25 else str(rng.randint(1, 3))
+                mutations.append(
+                    (
+                        f"s{s_idx}_upd_par",
+                        f"UPDATE {t_parent} SET tier = {new_t}, root_id = {new_r}, quota = quota + {rng.randint(5, 20)} WHERE id = {pid};",
+                    )
+                )
+            elif op == "del_dup_or_row":
+                del_id = rng.randint(1, next_main_id - 1)
+                mutations.append((f"s{s_idx}_del", f"DELETE FROM {t_main} WHERE id = {del_id};"))
+            elif op == "upsert_comp":
+                rf = rng.randint(1, 6)
+                tk = rng.choice(tags)
+                pts = rng.randint(5, 30)
+                if dialect == Dialect.MYSQL:
+                    mutations.append(
+                        (f"s{s_idx}_upsert", f"INSERT INTO {t_comp} VALUES ({rf}, '{tk}', {pts}) ON DUPLICATE KEY UPDATE pts = VALUES(pts);")
+                    )
+                else:
+                    mutations.append(
+                        (f"s{s_idx}_upsert", f"INSERT INTO {t_comp} VALUES ({rf}, '{tk}', {pts}) ON CONFLICT (ref_id, tag_key) DO UPDATE SET pts = excluded.pts;")
+                    )
+
+        # Nested savepoint & rollback transaction sequence
+        begin_sql = "START TRANSACTION;" if dialect == Dialect.MYSQL else "BEGIN;"
+        tx_mid1 = next_main_id
+        tx_mid2 = next_main_id + 1
+        next_main_id += 2
+        mutations.extend(
+            [
+                ("tx1_begin", begin_sql),
+                ("tx1_ins", f"INSERT INTO {t_main} VALUES ({tx_mid1}, 1, '{cats_a[0]}', '{cats_b[0]}', 42, 18.5, 9, 1);"),
+                ("tx1_sp1", "SAVEPOINT sp_fuzz_1;"),
+                ("tx1_upd_in_sp1", f"UPDATE {t_main} SET grp_str = '{cats_a[-1]}', weight_cnt = weight_cnt + 11 WHERE flag = 1;"),
+                ("tx1_sp2", "SAVEPOINT sp_fuzz_2;"),
+                ("tx1_del_in_sp2", f"DELETE FROM {t_main} WHERE grp_str = '{cats_a[0]}';"),
+                ("tx1_rb_sp2", "ROLLBACK TO SAVEPOINT sp_fuzz_2;"),
+                ("tx1_rb_sp1", "ROLLBACK TO SAVEPOINT sp_fuzz_1;"),
+                ("tx1_upd_after_rb", f"UPDATE {t_parent} SET quota = quota + 7 WHERE id IN (1, 2);"),
+                ("tx1_rel_sp1", "RELEASE SAVEPOINT sp_fuzz_1;"),
+                ("tx1_rollback", "ROLLBACK;"),
+                ("tx2_begin", begin_sql),
+                ("tx2_ins", f"INSERT INTO {t_main} VALUES ({tx_mid2}, 2, '{cats_a[1]}', NULL, 19, 7.5, 14, 1);"),
+                ("tx2_del_comp", f"DELETE FROM {t_comp} WHERE ref_id = 1;"),
+                ("tx2_commit", "COMMIT;"),
+                ("drain_main", f"DELETE FROM {t_main};"),
+                (
+                    "reseed_after_drain",
+                    f"INSERT INTO {t_main} VALUES ({next_main_id}, 1, '{cats_a[0]}', '{cats_b[0]}', 100, 50.0, 12, 1);",
+                ),
+            ]
+        )
+
+        return schema_sql, views, seed_sqls, mutations
+
+
+def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
+    """
+    Suite 12: Differential Random Schema, View & DML Fuzzer.
+    Generates valid random multi-table schemas, 34 random views across all 7 SQL families,
+    random seed data, and 26 random DML + nested SAVEPOINT/ROLLBACK/COMMIT steps per scenario,
+    verifying after every single DML statement across SQLite, PostgreSQL (row & transition tables
+    + incremental backfill), and MySQL (standard + incremental backfill) that the materialized
+    view matches the live view query 100%.
+    """
+    base_seed = int(os.environ.get("MATVIEW_FUZZ_SEED", "20261106"))
+    num_scenarios = int(os.environ.get("MATVIEW_FUZZ_SCENARIOS", "3"))
+    fuzzer = DifferentialSQLFuzzer(seed=base_seed)
+
+    for idx in range(1, num_scenarios + 1):
+        # 1. Default runner dialect (SQLite locally, or live Postgres/MySQL/SQLite-compat in CI)
+        s_def, v_def, seed_def, m_def = fuzzer.generate_scenario(idx, runner.default_dialect)
+        runner.run_batch(
+            f"Suite 12a (Differential Random Fuzzer #{idx} - Default Engine)",
+            s_def,
+            v_def,
+            seed_def,
+            m_def,
+            dialect=runner.default_dialect,
+        )
+
+        # 2. PostgreSQL dialect (row-level triggers & statement-level transition tables + incremental backfill)
+        s_pg, v_pg, seed_pg, m_pg = fuzzer.generate_scenario(idx, Dialect.POSTGRES)
+        runner.run_batch(
+            f"Suite 12b (Differential Random Fuzzer #{idx} - PostgreSQL Row Triggers)",
+            s_pg,
+            v_pg,
+            seed_pg,
+            m_pg,
+            dialect=Dialect.POSTGRES,
+            pg_use_transition_tables=False,
+        )
+        runner.run_batch(
+            f"Suite 12c (Differential Random Fuzzer #{idx} - PostgreSQL Transition Tables + Incremental)",
+            s_pg,
+            v_pg,
+            seed_pg,
+            m_pg,
+            dialect=Dialect.POSTGRES,
+            pg_use_transition_tables=True,
+            incremental_backfill=True,
+            batch_size=2,
+        )
+
+        # 3. MySQL dialect (incremental backfill + stored procedures + triggers)
+        s_my, v_my, seed_my, m_my = fuzzer.generate_scenario(idx, Dialect.MYSQL)
+        runner.run_batch(
+            f"Suite 12d (Differential Random Fuzzer #{idx} - MySQL Incremental & Triggers)",
+            s_my,
+            v_my,
+            seed_my,
+            m_my,
+            dialect=Dialect.MYSQL,
+            incremental_backfill=True,
+            batch_size=2,
+        )
+
 
 def _run_all_tests() -> None:
     t0 = time.time()
@@ -3854,6 +4362,7 @@ def _run_all_tests() -> None:
     run_suite_9_cross_dialect_execution(runner)
     run_suite_10_torture_dml_and_transactions(runner)
     run_suite_11_live_engine_50_view_battery_across_all_dialects(runner)
+    run_suite_12_differential_random_fuzzer(runner)
 
     print("-" * 84)
     print(f"COMBINATORIAL & TRANSACTIONAL SUITES PASSED: {runner.total_views} views, {runner.total_assertions} live SQL assertions!")

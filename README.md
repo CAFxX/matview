@@ -20,14 +20,18 @@ Zero-runtime-dependency incremental materialized view compiler and lifecycle man
 
 * **Reference-Counted Distinct & Holistic Fallbacks**: Automatic auxiliary reference-counting tables for `COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)`, plus atomic statement/row refresh for window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`), `LEFT JOIN`, and recursive CTEs.
 
+* **Live Database Schema Introspection**: Accepts either raw SQL DDL strings or a live PEP-249 database connection (`conn`) to automatically introspect existing base tables, column types, nullability, primary keys, and `ON DELETE CASCADE` foreign keys across SQLite, PostgreSQL, and MySQL/MariaDB.
+
+* **Differential Random Schema, View & DML Fuzzer**: Includes `DifferentialSQLFuzzer` (Suite 12), which generates valid random multi-table schemas, random views across all 7 SQL families, and random DML + nested `SAVEPOINT` / `ROLLBACK` / `COMMIT` sequences, verifying after every statement across SQLite, PostgreSQL, and MySQL that the materialized view matches the live view query.
+
 * **Safety & Transparency Checks**: Refuses to install views on engine/schema combinations where transparency cannot be guaranteed for all mutations (such as MySQL `TRUNCATE TABLE` or `ON DELETE CASCADE` trigger limitations) unless `--ignore-limitations` (`ignore_limitations=True`) is explicitly passed.
 
 * **Trigger-First Ordering & Dialect-Native Incremental Backfill**: Installs maintenance triggers before initial backfill so no concurrent base-table write is ever missed, and supports `--incremental-backfill --batch-size N` via recursive CTE chunking (SQLite), `DO $$ ... END $$;` blocks (PostgreSQL), and stored procedures (MySQL/MariaDB).
 
 ## Quick Start
 
-```
-# Generate a standalone SQL installation script
+```bash
+# Generate a standalone SQL installation script from a schema file
 python3 matview_sync.py \
   --schema schema.sql \
   --view view.sql \
@@ -35,36 +39,27 @@ python3 matview_sync.py \
   --incremental-backfill \
   --batch-size 500
 
-
-
-
-
-
-
-
-
+# Or pull the schema directly from an existing SQLite database and apply the materialized view
+python3 matview_sync.py \
+  --db app.db \
+  --view view.sql \
+  --apply
 ```
 
 ## Running Tests
 
-```
-# Run the full 6,200-view (52,633-assertion) SQLite + cross-dialect test matrix
+```bash
+# Run the full 3,543-view (71,238-assertion) combinatorial, transactional & fuzzer test suite
 python3 test_matview_sync.py
 
-# Also run live integration tests against PostgreSQL, MySQL/MariaDB, or SQLite-compatible engines
+# Customize the differential fuzzer seed or number of random scenarios
+MATVIEW_FUZZ_SEED=20261106 MATVIEW_FUZZ_SCENARIOS=5 python3 test_matview_sync.py
+
+# Run live integration tests against PostgreSQL, MySQL/MariaDB, or SQLite-compatible engines
 POSTGRES_DSN="postgresql://postgres:postgres@127.0.0.1:5432/matview_test" \
 MYSQL_DSN="mysql://root:root@127.0.0.1:3306/matview_test" \
 SQLITE_COMPAT_ENGINE="apsw" \
 python3 test_matview_sync.py
-
-
-
-
-
-
-
-
-
 ```
 
 ## CI Matrix (`.github/workflows/ci.yml`)
