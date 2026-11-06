@@ -40,6 +40,7 @@ python3 matview_sync.py \
 
 
 
+
 ```
 
 ## Running Tests
@@ -53,6 +54,7 @@ POSTGRES_DSN="postgresql://postgres:postgres@127.0.0.1:5432/matview_test" \
 MYSQL_DSN="mysql://root:root@127.0.0.1:3306/matview_test" \
 SQLITE_COMPAT_ENGINE="apsw" \
 python3 test_matview_sync.py
+
 
 
 

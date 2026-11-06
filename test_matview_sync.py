@@ -1122,8 +1122,10 @@ def _open_live_mysql_connection(dsn: str):
         autocommit=True,
     )
     with conn.cursor() as cur:
-        cur.execute(f"CREATE DATABASE IF NOT EXISTS `{target_db}`;")
+        cur.execute(f"CREATE DATABASE IF NOT EXISTS `{target_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
         cur.execute(f"USE `{target_db}`;")
+        cur.execute("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;")
+        cur.execute("SET SESSION collation_connection = @@collation_database;")
         cur.execute("SET SESSION sql_mode = CONCAT_WS(',', REPLACE(@@SESSION.sql_mode, 'ONLY_FULL_GROUP_BY', ''), 'PIPES_AS_CONCAT');")
     return conn, target_db
 
@@ -1481,8 +1483,10 @@ def run_live_mysql_tests_if_available(dsn: str) -> None:
     total_views_installed = 0
     for inc_mode in (False, True):
         cur.execute(f"DROP DATABASE IF EXISTS `{target_db}`;")
-        cur.execute(f"CREATE DATABASE `{target_db}`;")
+        cur.execute(f"CREATE DATABASE `{target_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
         cur.execute(f"USE `{target_db}`;")
+        cur.execute("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;")
+        cur.execute("SET SESSION collation_connection = @@collation_database;")
         for s in [st.strip() for st in schema.split(";") if st.strip()]:
             cur.execute(s)
 
@@ -1654,7 +1658,9 @@ def _rewrite_live_reference_select_for_dialect(raw_select_sql: str, dialect: Dia
 
 
 def _adapt_suite_schema_for_dialect(schema_sql: str, dialect: Dialect) -> str:
-    if dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+    if dialect == Dialect.POSTGRES:
+        return re.sub(r"\bREAL\b", "DOUBLE PRECISION", schema_sql)
+    if dialect == Dialect.MYSQL:
         s = re.sub(r"\bTEXT\b", "VARCHAR(191)", schema_sql)
         s = re.sub(r"\bREAL\b", "DOUBLE PRECISION", s)
         return s
@@ -1662,11 +1668,17 @@ def _adapt_suite_schema_for_dialect(schema_sql: str, dialect: Dialect) -> str:
 
 
 def _adapt_view_ddl_for_dialect(v_ddl: str, dialect: Dialect) -> str:
-    if dialect == Dialect.MYSQL and "WITH RECURSIVE tree(id, path, team, depth) AS (SELECT id, label, team, 1" in v_ddl:
-        return v_ddl.replace(
-            "SELECT id, label, team, 1",
-            "SELECT id, CAST(label AS CHAR(512)), team, 1",
-        )
+    if "WITH RECURSIVE tree(id, path, team, depth) AS (SELECT id, label, team, 1" in v_ddl:
+        if dialect == Dialect.MYSQL:
+            return v_ddl.replace(
+                "SELECT id, label, team, 1",
+                "SELECT id, CAST(label AS CHAR(191)), team, 1",
+            )
+        if dialect == Dialect.POSTGRES:
+            return v_ddl.replace(
+                "SELECT id, label, team, 1",
+                "SELECT id, CAST(label AS TEXT), team, 1",
+            )
     return v_ddl
 
 
@@ -1788,8 +1800,10 @@ class MVTestRunner:
                     for i in range(0, len(views), chunk_size):
                         chunk = views[i : i + chunk_size]
                         cur.execute(f"DROP DATABASE IF EXISTS `{target_db}`;")
-                        cur.execute(f"CREATE DATABASE `{target_db}`;")
+                        cur.execute(f"CREATE DATABASE `{target_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
                         cur.execute(f"USE `{target_db}`;")
+                        cur.execute("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;")
+                        cur.execute("SET SESSION collation_connection = @@collation_database;")
                         for st in [s.strip() for s in eff_schema.split(";") if s.strip()]:
                             cur.execute(st)
                         for s in seed_sqls:

@@ -7570,6 +7570,11 @@ class MaterializedViewManager:
                 cur.execute("PRAGMA recursive_triggers = ON;")
             except Exception:
                 pass
+        elif self.dialect == Dialect.MYSQL:
+            try:
+                cur.execute("SET SESSION collation_connection = @@collation_database;")
+            except Exception:
+                pass
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {self.catalog_table} (
