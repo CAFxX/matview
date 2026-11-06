@@ -426,3 +426,97 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_matview_sync.py
+
+  # =========================================================================
+  # 7. High-Intensity Multi-Engine Random Differential Fuzzing (SQLite, PG, MySQL, MariaDB)
+  # =========================================================================
+  fuzz-stress:
+    name: Differential Fuzzer Stress (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "SQLite 3 + Transpiled PG/MySQL (Scale 3)"
+            backend: "sqlite"
+            scale: "3"
+          - label: "APSW SQLite (Scale 3)"
+            backend: "apsw"
+            scale: "3"
+          - label: "PostgreSQL 17 Live Fuzzing (Scale 3)"
+            backend: "postgres"
+            pg-image: "postgres:17"
+            scale: "3"
+          - label: "PostgreSQL 18 Live Fuzzing (Scale 3)"
+            backend: "postgres"
+            pg-image: "postgres:18"
+            scale: "3"
+          - label: "MySQL 8.4 LTS Live Fuzzing (Scale 3)"
+            backend: "mysql"
+            mysql-image: "mysql:8.4"
+            scale: "3"
+          - label: "MariaDB 11.4 LTS Live Fuzzing (Scale 3)"
+            backend: "mysql"
+            mysql-image: "mariadb:11.4"
+            scale: "3"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start database container & install drivers (${{ matrix.label }})
+        run: |
+          python3 -m pip install --upgrade pip
+          if [ "${{ matrix.backend }}" = "apsw" ]; then
+            python3 -m pip install apsw
+          elif [ "${{ matrix.backend }}" = "postgres" ]; then
+            python3 -m pip install psycopg2-binary
+            docker run -d --name pg-fuzz-srv \
+              -e POSTGRES_USER=postgres \
+              -e POSTGRES_PASSWORD=password \
+              -e POSTGRES_DB=matview_test \
+              -p 5432:5432 \
+              "${{ matrix.pg-image }}"
+            for i in $(seq 1 40); do
+              if docker exec pg-fuzz-srv pg_isready -U postgres -d matview_test; then
+                break
+              fi
+              sleep 1
+            done
+          elif [ "${{ matrix.backend }}" = "mysql" ]; then
+            python3 -m pip install pymysql cryptography
+            docker run -d --name mysql-fuzz-srv \
+              -e MYSQL_ROOT_PASSWORD=password \
+              -e MARIADB_ROOT_PASSWORD=password \
+              -e MYSQL_DATABASE=matview_test \
+              -e MARIADB_DATABASE=matview_test \
+              -p 3306:3306 \
+              "${{ matrix.mysql-image }}" \
+              --character-set-server=utf8mb4 \
+              --collation-server=utf8mb4_unicode_ci \
+              --innodb-flush-log-at-trx-commit=0 \
+              --sync-binlog=0 \
+              --skip-log-bin
+            for i in $(seq 1 60); do
+              if docker exec mysql-fuzz-srv sh -c "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent || mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent" 2>/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+          fi
+
+      - name: Run high-intensity differential random SQL fuzzer (${{ matrix.label }})
+        run: |
+          if [ "${{ matrix.backend }}" = "apsw" ]; then
+            SQLITE_COMPAT_ENGINE=apsw python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
+          elif [ "${{ matrix.backend }}" = "postgres" ]; then
+            POSTGRES_DSN="postgresql://postgres:password@127.0.0.1:5432/matview_test" python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
+          elif [ "${{ matrix.backend }}" = "mysql" ]; then
+            MYSQL_DSN="mysql://root:password@127.0.0.1:3306/matview_test" python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
+          else
+            python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
+          fi
