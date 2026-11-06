@@ -1636,6 +1636,12 @@ def _rewrite_live_reference_select_for_dialect(raw_select_sql: str, dialect: Dia
         flags=re.IGNORECASE,
     )
     if dialect == Dialect.MYSQL:
+        s = re.sub(
+            r"\b(LAG|LEAD)\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)\s+OVER\s*\(([^()]*)\)",
+            r"COALESCE(\1(\2, \3) OVER (\5), \4)",
+            s,
+            flags=re.IGNORECASE,
+        )
         m_foj = re.match(
             r'^SELECT\s+(.*?)\s+FROM\s+([A-Za-z0-9_."`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z0-9_"`\[\]]+)?)\s+FULL\s+(?:OUTER\s+)?JOIN\s+([A-Za-z0-9_."`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z0-9_"`\[\]]+)?)\s+ON\s+(([A-Za-z0-9_."`\[\]]+)\s*=\s*[A-Za-z0-9_."`\[\]]+)$',
             s.strip().rstrip(";"),
