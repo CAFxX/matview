@@ -653,7 +653,7 @@ def parse_table_schema(schema_sql: str) -> Dict[str, TableSchema]:
 
 
 def introspect_sqlite_schemas(
-    conn: sqlite3.Connection,
+    conn: Any,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
 ) -> Dict[str, TableSchema]:
     """Introspects all non-internal base tables from a live SQLite connection."""
@@ -661,17 +661,255 @@ def introspect_sqlite_schemas(
     cur.execute(
         "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
     )
-    rows = cur.fetchall()
+    rows = cur.fetchall() or []
     ddl_parts: List[str] = []
+    table_names: List[str] = []
     for name, sql in rows:
-        if not sql:
+        if not name:
             continue
-        if name.startswith(("__matview_", "__mv_")) or (
-            object_prefix and name.startswith(object_prefix)
+        t_str = str(name)
+        if t_str.startswith(("__matview_", "__mv_")) or (
+            object_prefix and t_str.startswith(object_prefix)
         ):
             continue
-        ddl_parts.append(sql.rstrip(";") + ";")
-    return parse_table_schema("\n".join(ddl_parts))
+        table_names.append(t_str)
+        if sql:
+            ddl_parts.append(str(sql).rstrip(";") + ";")
+    schemas = parse_table_schema("\n".join(ddl_parts)) if ddl_parts else {}
+    low_known = {k.lower(): k for k in schemas}
+
+    # Fallback / enrichment via PRAGMA table_info & foreign_key_list for tables without standard DDL (e.g. CREATE TABLE AS)
+    for t_str in table_names:
+        existing = schemas.get(low_known.get(t_str.lower(), t_str))
+        if existing and existing.columns:
+            continue
+        try:
+            cur.execute(f'PRAGMA table_info("{t_str}")')
+            t_info = cur.fetchall() or []
+            if not t_info:
+                continue
+            cols: Dict[str, ColumnDef] = {}
+            for r in t_info:
+                c_name = str(r[1])
+                c_type = str(r[2]).upper() if r[2] else "TEXT"
+                c_notnull = bool(r[3]) or bool(r[5])
+                c_pk = bool(r[5])
+                cols[c_name] = ColumnDef(
+                    name=c_name,
+                    data_type=c_type,
+                    not_null=c_notnull,
+                    primary_key=c_pk,
+                )
+            fk_actions: List[str] = []
+            try:
+                cur.execute(f'PRAGMA foreign_key_list("{t_str}")')
+                for fk_r in (cur.fetchall() or []):
+                    on_upd = str(fk_r[5]).upper() if len(fk_r) > 5 and fk_r[5] else ""
+                    on_del = str(fk_r[6]).upper() if len(fk_r) > 6 and fk_r[6] else ""
+                    if on_del in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                        act = f"ON DELETE {on_del}"
+                        if act not in fk_actions:
+                            fk_actions.append(act)
+                    if on_upd in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                        act = f"ON UPDATE {on_upd}"
+                        if act not in fk_actions:
+                            fk_actions.append(act)
+            except Exception:
+                pass
+            schemas[t_str] = TableSchema(
+                name=t_str,
+                columns=cols,
+                fk_cascade_actions=tuple(fk_actions),
+            )
+        except Exception:
+            pass
+    return schemas
+
+
+def introspect_database_schemas(
+    conn: Any,
+    dialect: Dialect | str = Dialect.SQLITE,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+) -> Dict[str, TableSchema]:
+    """
+    Introspects all non-internal base tables from a live database connection
+    across SQLite, PostgreSQL, and MySQL/MariaDB.
+    """
+    if isinstance(dialect, str):
+        dialect = Dialect(dialect.lower())
+    catalog_table = f"{object_prefix}catalog" if object_prefix else "matview_catalog"
+
+    if dialect == Dialect.SQLITE:
+        schemas = introspect_sqlite_schemas(conn, object_prefix=object_prefix)
+        schemas.pop(catalog_table, None)
+        return schemas
+
+    schemas = {}
+    cur = conn.cursor()
+    if dialect == Dialect.POSTGRES:
+        cur.execute(
+            """
+            SELECT kcu.table_name, kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema = kcu.table_schema
+             AND tc.table_name = kcu.table_name
+            WHERE tc.constraint_type = 'PRIMARY KEY'
+              AND tc.table_schema = current_schema()
+            """
+        )
+        pk_pairs = {(str(r[0]).lower(), str(r[1]).lower()) for r in (cur.fetchall() or [])}
+        fk_by_table: Dict[str, List[str]] = {}
+        try:
+            cur.execute(
+                """
+                SELECT tc.table_name, rc.delete_rule, rc.update_rule
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.referential_constraints rc
+                  ON tc.constraint_name = rc.constraint_name
+                 AND tc.table_schema = rc.constraint_schema
+                WHERE tc.constraint_type = 'FOREIGN KEY'
+                  AND tc.table_schema = current_schema()
+                """
+            )
+            for fk_r in (cur.fetchall() or []):
+                t_low = str(fk_r[0]).lower()
+                del_r = str(fk_r[1]).upper() if fk_r[1] else ""
+                upd_r = str(fk_r[2]).upper() if fk_r[2] else ""
+                acts = fk_by_table.setdefault(t_low, [])
+                if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                    a_str = f"ON DELETE {del_r}"
+                    if a_str not in acts:
+                        acts.append(a_str)
+                if upd_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                    a_str = f"ON UPDATE {upd_r}"
+                    if a_str not in acts:
+                        acts.append(a_str)
+        except Exception:
+            pass
+
+        cur.execute(
+            """
+            SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.character_maximum_length
+            FROM information_schema.columns c
+            JOIN information_schema.tables t
+              ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+            WHERE c.table_schema = current_schema()
+              AND t.table_type = 'BASE TABLE'
+              AND c.table_name NOT LIKE '__matview_%'
+              AND c.table_name NOT LIKE '__mv_%'
+            ORDER BY c.table_name, c.ordinal_position
+            """
+        )
+        grouped: Dict[str, Dict[str, ColumnDef]] = {}
+        for row in (cur.fetchall() or []):
+            t_name, c_name, d_type, is_null, char_len = (
+                str(row[0]),
+                str(row[1]),
+                row[2],
+                row[3],
+                row[4],
+            )
+            if t_name == catalog_table or (
+                object_prefix and t_name.startswith(object_prefix)
+            ):
+                continue
+            dt_up = str(d_type).upper()
+            if dt_up in ("CHARACTER VARYING", "VARCHAR") and char_len:
+                dt_up = f"VARCHAR({int(char_len)})"
+            elif dt_up == "CHARACTER VARYING":
+                dt_up = "TEXT"
+            is_pk = (t_name.lower(), c_name.lower()) in pk_pairs
+            grouped.setdefault(t_name, {})[c_name] = ColumnDef(
+                name=c_name,
+                data_type=dt_up,
+                not_null=(str(is_null).upper() == "NO") or is_pk,
+                primary_key=is_pk,
+            )
+        for t_name, cols in grouped.items():
+            schemas[t_name] = TableSchema(
+                name=t_name,
+                columns=cols,
+                fk_cascade_actions=tuple(fk_by_table.get(t_name.lower(), ())),
+            )
+        return schemas
+
+    # MySQL / MariaDB
+    def _dec(val: Any) -> str:
+        if isinstance(val, (bytes, bytearray)):
+            return val.decode("utf-8")
+        return "" if val is None else str(val)
+
+    fk_by_table_my: Dict[str, List[str]] = {}
+    try:
+        cur.execute(
+            """
+            SELECT rc.table_name, rc.delete_rule, rc.update_rule
+            FROM information_schema.referential_constraints rc
+            WHERE rc.constraint_schema = DATABASE()
+            """
+        )
+        for fk_r in (cur.fetchall() or []):
+            t_low = _dec(fk_r[0]).lower()
+            del_r = _dec(fk_r[1]).upper()
+            upd_r = _dec(fk_r[2]).upper()
+            acts = fk_by_table_my.setdefault(t_low, [])
+            if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                a_str = f"ON DELETE {del_r}"
+                if a_str not in acts:
+                    acts.append(a_str)
+            if upd_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                a_str = f"ON UPDATE {upd_r}"
+                if a_str not in acts:
+                    acts.append(a_str)
+    except Exception:
+        pass
+
+    cur.execute(
+        """
+        SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_key, c.column_type
+        FROM information_schema.columns c
+        JOIN information_schema.tables t
+          ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+        WHERE c.table_schema = DATABASE()
+          AND t.table_type = 'BASE TABLE'
+          AND c.table_name NOT LIKE '__matview_%'
+          AND c.table_name NOT LIKE '__mv_%'
+        ORDER BY c.table_name, c.ordinal_position
+        """
+    )
+    grouped_my: Dict[str, Dict[str, ColumnDef]] = {}
+    for row in (cur.fetchall() or []):
+        t_name, c_name, d_type, is_null, col_key = (
+            _dec(row[0]),
+            _dec(row[1]),
+            _dec(row[2]),
+            _dec(row[3]),
+            _dec(row[4]),
+        )
+        col_type = _dec(row[5]) if len(row) > 5 and row[5] is not None else None
+        if t_name == catalog_table or (
+            object_prefix and t_name.startswith(object_prefix)
+        ):
+            continue
+        dt_up = d_type.upper()
+        if dt_up in ("VARCHAR", "CHAR", "TINYINT") and col_type:
+            dt_up = col_type.upper()
+        is_pk = col_key.upper() == "PRI"
+        grouped_my.setdefault(t_name, {})[c_name] = ColumnDef(
+            name=c_name,
+            data_type=dt_up,
+            not_null=(str(is_null).upper() == "NO") or is_pk,
+            primary_key=is_pk,
+        )
+    for t_name, cols in grouped_my.items():
+        schemas[t_name] = TableSchema(
+            name=t_name,
+            columns=cols,
+            fk_cascade_actions=tuple(fk_by_table_my.get(t_name.lower(), ())),
+        )
+    return schemas
 
 
 _SQL_EXPR_FUNCTIONS = {
@@ -7624,106 +7862,12 @@ class MaterializedViewManager:
 
     def fetch_schema(self, extra_schema_sql: Optional[str] = None) -> Dict[str, TableSchema]:
         """Fetches the live schema of all user base tables from the connected database."""
-        schemas: Dict[str, TableSchema] = {}
-        if self.dialect == Dialect.SQLITE:
-            schemas = introspect_sqlite_schemas(self.conn, object_prefix=self.object_prefix)
-            schemas.pop(self.catalog_table, None)
-        elif self.dialect == Dialect.POSTGRES:
-            cur = self.conn.cursor()
-            cur.execute(
-                """
-                SELECT kcu.table_name, kcu.column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                  ON tc.constraint_name = kcu.constraint_name
-                 AND tc.table_schema = kcu.table_schema
-                 AND tc.table_name = kcu.table_name
-                WHERE tc.constraint_type = 'PRIMARY KEY'
-                  AND tc.table_schema = current_schema()
-                """
-            )
-            pk_pairs = {(str(r[0]).lower(), str(r[1]).lower()) for r in (cur.fetchall() or [])}
-            cur.execute(
-                """
-                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.character_maximum_length
-                FROM information_schema.columns c
-                JOIN information_schema.tables t
-                  ON c.table_schema = t.table_schema AND c.table_name = t.table_name
-                WHERE c.table_schema = current_schema()
-                  AND t.table_type = 'BASE TABLE'
-                  AND c.table_name NOT LIKE '__matview_%'
-                  AND c.table_name NOT LIKE '__mv_%'
-                ORDER BY c.table_name, c.ordinal_position
-                """
-            )
-            grouped: Dict[str, Dict[str, ColumnDef]] = {}
-            for row in (cur.fetchall() or []):
-                t_name, c_name, d_type, is_null, char_len = row[0], row[1], row[2], row[3], row[4]
-                if t_name == self.catalog_table or (
-                    self.object_prefix and str(t_name).startswith(self.object_prefix)
-                ):
-                    continue
-                dt_up = str(d_type).upper()
-                if dt_up in ("CHARACTER VARYING", "VARCHAR") and char_len:
-                    dt_up = f"VARCHAR({int(char_len)})"
-                elif dt_up == "CHARACTER VARYING":
-                    dt_up = "TEXT"
-                is_pk = (str(t_name).lower(), str(c_name).lower()) in pk_pairs
-                grouped.setdefault(t_name, {})[c_name] = ColumnDef(
-                    name=c_name,
-                    data_type=dt_up,
-                    not_null=(str(is_null).upper() == "NO") or is_pk,
-                    primary_key=is_pk,
-                )
-            for t_name, cols in grouped.items():
-                schemas[t_name] = TableSchema(name=t_name, columns=cols)
-        else:
-            cur = self.conn.cursor()
-            cur.execute(
-                """
-                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_key, c.column_type
-                FROM information_schema.columns c
-                JOIN information_schema.tables t
-                  ON c.table_schema = t.table_schema AND c.table_name = t.table_name
-                WHERE c.table_schema = DATABASE()
-                  AND t.table_type = 'BASE TABLE'
-                  AND c.table_name NOT LIKE '__matview_%'
-                  AND c.table_name NOT LIKE '__mv_%'
-                ORDER BY c.table_name, c.ordinal_position
-                """
-            )
-            grouped = {}
-            def _dec(val: Any) -> str:
-                if isinstance(val, (bytes, bytearray)):
-                    return val.decode("utf-8")
-                return "" if val is None else str(val)
-
-            for row in (cur.fetchall() or []):
-                t_name, c_name, d_type, is_null, col_key = (
-                    _dec(row[0]),
-                    _dec(row[1]),
-                    _dec(row[2]),
-                    _dec(row[3]),
-                    _dec(row[4]),
-                )
-                col_type = _dec(row[5]) if len(row) > 5 and row[5] is not None else None
-                if t_name == self.catalog_table or (
-                    self.object_prefix and t_name.startswith(self.object_prefix)
-                ):
-                    continue
-                dt_up = d_type.upper()
-                if dt_up in ("VARCHAR", "CHAR") and col_type:
-                    dt_up = col_type.upper()
-                is_pk = col_key.upper() == "PRI"
-                grouped.setdefault(t_name, {})[c_name] = ColumnDef(
-                    name=c_name,
-                    data_type=dt_up,
-                    not_null=(str(is_null).upper() == "NO") or is_pk,
-                    primary_key=is_pk,
-                )
-            for t_name, cols in grouped.items():
-                schemas[t_name] = TableSchema(name=t_name, columns=cols)
-
+        schemas = introspect_database_schemas(
+            self.conn,
+            dialect=self.dialect,
+            object_prefix=self.object_prefix,
+        )
+        schemas.pop(self.catalog_table, None)
         if extra_schema_sql:
             schemas.update(parse_table_schema(extra_schema_sql))
         return schemas
@@ -8216,10 +8360,14 @@ def generate_materialized_view(
     if isinstance(dialect, str):
         dialect = Dialect(dialect.lower())
 
-    if isinstance(schema_sql_or_dict, sqlite3.Connection):
-        schemas = introspect_sqlite_schemas(schema_sql_or_dict, object_prefix=object_prefix)
-    elif isinstance(schema_sql_or_dict, str):
+    if isinstance(schema_sql_or_dict, str):
         schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=dialect,
+            object_prefix=object_prefix,
+        )
     else:
         schemas = dict(schema_sql_or_dict)
 
@@ -8288,10 +8436,14 @@ def generate_materialized_views(
     if isinstance(dialect, str):
         dialect = Dialect(dialect.lower())
 
-    if isinstance(schema_sql_or_dict, sqlite3.Connection):
-        schemas = introspect_sqlite_schemas(schema_sql_or_dict, object_prefix=object_prefix)
-    elif isinstance(schema_sql_or_dict, str):
+    if isinstance(schema_sql_or_dict, str):
         schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=dialect,
+            object_prefix=object_prefix,
+        )
     else:
         schemas = dict(schema_sql_or_dict)
 

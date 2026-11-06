@@ -46,6 +46,7 @@ from matview_sync import (
     generate_materialized_view,
     generate_materialized_views,
     install_materialized_view_sqlite,
+    introspect_database_schemas,
     introspect_sqlite_schemas,
     main as cli_main,
     parse_table_schema,
@@ -1352,6 +1353,20 @@ class TranspiledConnectionAdapter:
         ):
             return [], 0
 
+        if "INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS" in s_up:
+            schemas = introspect_sqlite_schemas(self._sq_conn)
+            rows = []
+            for t_name, ts in schemas.items():
+                del_rule = "NO ACTION"
+                upd_rule = "NO ACTION"
+                for act in ts.fk_cascade_actions:
+                    if act.startswith("ON DELETE "):
+                        del_rule = act[len("ON DELETE ") :]
+                    elif act.startswith("ON UPDATE "):
+                        upd_rule = act[len("ON UPDATE ") :]
+                if del_rule != "NO ACTION" or upd_rule != "NO ACTION":
+                    rows.append((t_name, del_rule, upd_rule))
+            return rows, len(rows)
         if "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" in s_up and "KEY_COLUMN_USAGE" in s_up:
             schemas = introspect_sqlite_schemas(self._sq_conn)
             rows = [
@@ -1860,9 +1875,10 @@ def _run_unified_50_view_battery(
     checks_run = 0
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", EngineLimitationWarning)
-        for v_name, v_sel in view_specs:
+        for v_idx, (v_name, v_sel) in enumerate(view_specs):
+            schema_source: Any = conn if (v_idx % 2 == 1) else schema
             p = generate_materialized_view(
-                schema,
+                schema_source,
                 f"CREATE VIEW {v_name} AS {v_sel};",
                 dialect=dialect,
                 pg_use_transition_tables=use_trans,
@@ -2094,10 +2110,11 @@ class MVTestRunner:
                 plans_and_selects: List[Tuple[MaterializedViewPlan, str]] = []
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", EngineLimitationWarning)
-                    for v_name, v_ddl in chunk:
+                    for v_idx, (v_name, v_ddl) in enumerate(chunk):
                         eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, eff_dialect)
+                        schema_source: Any = conn if (v_idx % 2 == 1) else eff_schema
                         plan = generate_materialized_view(
-                            eff_schema,
+                            schema_source,
                             eff_v_ddl,
                             dialect=eff_dialect,
                             pg_use_transition_tables=pg_use_transition_tables,
@@ -3686,6 +3703,136 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 self.assertGreaterEqual(checks, 14)
             finally:
                 close_fn()
+
+    def test_08_pull_schema_from_existing_database_across_all_dialects(self) -> None:
+        """
+        Exercises pulling base table schemas directly from existing databases across
+        SQLite, PostgreSQL, and MySQL via `introspect_database_schemas`,
+        `generate_materialized_view(conn, ...)`, `generate_materialized_views(conn, ...)`,
+        `MaterializedViewManager.fetch_schema()`, and CLI `--db` without `--schema`.
+        """
+        runner = MVTestRunner()
+        for dialect in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+            conn, cur, reset_sql, _, _, close_fn = runner._open_backend_session(
+                dialect, suite_tag=f"pull_schema_{dialect.value}"
+            )
+            try:
+                if reset_sql:
+                    for r_st in [s.strip() for s in reset_sql.split(";") if s.strip()]:
+                        cur.execute(r_st + ";")
+                str_t = "VARCHAR(64)" if dialect == Dialect.MYSQL else "TEXT"
+                flt_t = "DOUBLE PRECISION" if dialect in (Dialect.POSTGRES, Dialect.MYSQL) else "REAL"
+                cur.execute(
+                    f"CREATE TABLE parent_orgs (id INTEGER PRIMARY KEY, name {str_t} NOT NULL);"
+                )
+                cur.execute(
+                    f"CREATE TABLE child_members ("
+                    f"org_id INTEGER NOT NULL, "
+                    f"member_id INTEGER NOT NULL, "
+                    f"role {str_t} NOT NULL, "
+                    f"dues {flt_t} NOT NULL, "
+                    f"PRIMARY KEY (org_id, member_id), "
+                    f"FOREIGN KEY (org_id) REFERENCES parent_orgs(id) ON DELETE CASCADE"
+                    f");"
+                )
+                cur.execute("INSERT INTO parent_orgs VALUES (1, 'Alpha'), (2, 'Beta');")
+                cur.execute(
+                    "INSERT INTO child_members VALUES (1, 10, 'admin', 50.0), (1, 11, 'dev', 30.0), (2, 20, 'dev', 40.0);"
+                )
+
+                # 1. Direct schema introspection via introspect_database_schemas
+                pulled = introspect_database_schemas(conn, dialect=dialect)
+                self.assertIn("parent_orgs", {k.lower() for k in pulled})
+                self.assertIn("child_members", {k.lower() for k in pulled})
+                cm_schema = next(v for k, v in pulled.items() if k.lower() == "child_members")
+                self.assertEqual({c.name.lower() for c in cm_schema.columns.values() if c.primary_key}, {"org_id", "member_id"})
+                self.assertIn("ON DELETE CASCADE", cm_schema.fk_cascade_actions)
+
+                # 2. On MySQL, foreign key ON DELETE CASCADE pulled from the live database triggers EngineLimitationError
+                if dialect == Dialect.MYSQL:
+                    with self.assertRaises(EngineLimitationError):
+                        generate_materialized_view(
+                            conn,
+                            "CREATE VIEW v_pulled_fk AS SELECT role, COUNT(*) AS cnt FROM child_members GROUP BY role;",
+                            dialect=dialect,
+                            ignore_limitations=False,
+                        )
+
+                # 3. Compile & execute single view and multi-view bundle by pulling schema directly from `conn`
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                    plans = generate_materialized_views(
+                        conn,
+                        [
+                            "CREATE VIEW v_pulled_role AS SELECT role, COUNT(*) AS cnt, SUM(dues) AS total_dues FROM child_members GROUP BY role;",
+                            "CREATE VIEW v_pulled_join AS SELECT p.name AS org_name, COUNT(c.member_id) AS m_cnt, SUM(c.dues) AS org_dues FROM parent_orgs p LEFT JOIN child_members c ON p.id = c.org_id GROUP BY p.name;",
+                        ],
+                        dialect=dialect,
+                        ignore_limitations=True,
+                    )
+                for p in plans:
+                    for st in p.all_statements():
+                        cur.execute(st)
+                _verify_external_db_mv(
+                    cur,
+                    "__matview_v_pulled_role",
+                    "SELECT role, COUNT(*) AS cnt, SUM(dues) AS total_dues FROM child_members GROUP BY role",
+                    f"pull_schema:{dialect.value}:role_init",
+                )
+                _verify_external_db_mv(
+                    cur,
+                    "__matview_v_pulled_join",
+                    "SELECT p.name AS org_name, COUNT(c.member_id) AS m_cnt, SUM(c.dues) AS org_dues FROM parent_orgs p LEFT JOIN child_members c ON p.id = c.org_id GROUP BY p.name",
+                    f"pull_schema:{dialect.value}:join_init",
+                )
+
+                # 4. Alter table in database, pull updated schema from `conn`, and compile a view using the new column
+                cur.execute("ALTER TABLE parent_orgs ADD COLUMN bonus INTEGER DEFAULT 5;")
+                cur.execute("INSERT INTO parent_orgs (id, name, bonus) VALUES (3, 'Gamma', 15);")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                    p_after_alter = generate_materialized_view(
+                        conn,
+                        "CREATE VIEW v_pulled_bonus AS SELECT name, bonus FROM parent_orgs WHERE bonus >= 10;",
+                        dialect=dialect,
+                        ignore_limitations=True,
+                    )
+                for st in p_after_alter.all_statements():
+                    cur.execute(st)
+                _verify_external_db_mv(
+                    cur,
+                    "__matview_v_pulled_bonus",
+                    "SELECT name, bonus FROM parent_orgs WHERE bonus >= 10",
+                    f"pull_schema:{dialect.value}:after_alter",
+                )
+            finally:
+                close_fn()
+
+        # 5. CLI `--db <sqlite_file>` without `--schema` (pulls schema from existing SQLite file)
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "existing.db")
+            sq_c = sqlite3.connect(db_path)
+            sq_c.execute("CREATE TABLE cli_sensors (id INTEGER PRIMARY KEY, zone TEXT NOT NULL, temp REAL NOT NULL);")
+            sq_c.execute("INSERT INTO cli_sensors VALUES (1, 'north', 21.5), (2, 'north', 23.5);")
+            sq_c.commit()
+            sq_c.close()
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli_main(
+                    [
+                        "--db", db_path,
+                        "--view", "CREATE VIEW v_zone_temp AS SELECT zone, COUNT(*) AS n, AVG(temp) AS avg_t FROM cli_sensors GROUP BY zone;",
+                        "--apply",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            sq_c2 = sqlite3.connect(db_path)
+            rows = sq_c2.execute("SELECT zone, n, avg_t FROM __matview_v_zone_temp;").fetchall()
+            sq_c2.close()
+            self.assertEqual(rows, [("north", 2, 22.5)])
 
 
 def _run_all_tests() -> None:
