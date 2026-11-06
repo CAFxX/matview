@@ -39,10 +39,12 @@ from matview_sync import (
     MaintenanceStrategy,
     MaterializedViewManager,
     MaterializedViewPlan,
+    StrictCompilationError,
     TableSchema,
     ViewIndexSpec,
     ViewSpec,
     _split_top_level,
+    _strip_sql_comments,
     generate_materialized_view,
     generate_materialized_views,
     install_materialized_view_sqlite,
@@ -3979,6 +3981,167 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         for tr_ddl in p6.trigger_ddls:
             self.assertNotIn("NOT IN", tr_ddl.upper())
             self.assertIn("NOT EXISTS", tr_ddl.upper())
+
+    def test_11_independent_code_reviews_urgent_fixes(self) -> None:
+        """
+        Verifies all 11 urgent correctness, precision, concurrency, and robustness fixes
+        identified across the 3 independent code reviews (reviews/1.md, reviews/2.md, reviews/3.md).
+        """
+        schema = """
+            CREATE TABLE rev_items (
+                tenant_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                price REAL NOT NULL,
+                mask_64 INTEGER NOT NULL,
+                PRIMARY KEY (tenant_id, item_id)
+            );
+        """
+
+        # 1. Batch-size substitution in get_populate_statements must not corrupt user literals matching batch_size
+        p_batch = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_lit500 AS SELECT tenant_id, SUM(price) AS sp FROM rev_items WHERE price > 500 GROUP BY tenant_id;",
+            dialect=Dialect.POSTGRES,
+            incremental_backfill=True,
+            batch_size=500,
+        )
+        stmts_100 = p_batch.get_populate_statements(incremental_backfill=True, batch_size=100)
+        joined_100 = "\n".join(stmts_100)
+        self.assertIn("price > 500", joined_100)
+        self.assertIn("__mv_batch_size BIGINT := 100", joined_100)
+
+        # 2. _strip_sql_comments & _split_top_level handle PostgreSQL $$...$$ dollar-quoting and backtick identifiers
+        raw_dq = "SELECT $$keep -- not a comment; /* also not */$$ AS a, `col--2,x` AS b -- strip this\nFROM t;"
+        stripped_dq = _strip_sql_comments(raw_dq)
+        self.assertIn("$$keep -- not a comment; /* also not */$$", stripped_dq)
+        self.assertIn("`col--2,x`", stripped_dq)
+        self.assertNotIn("strip this", stripped_dq)
+        parts_dq = _split_top_level("$$a,b$$, `c,d`, 'e,f'", ",")
+        self.assertEqual(len(parts_dq), 3)
+
+        # 3. SELECT * and SELECT DISTINCT * on single-table views expand into Tier 1 ALGEBRAIC_DELTA
+        p_star = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_star AS SELECT * FROM rev_items WHERE price >= 10.0;",
+            dialect=Dialect.SQLITE,
+        )
+        self.assertEqual(p_star.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+        self.assertEqual(p_star.user_columns, ["tenant_id", "item_id", "category", "price", "mask_64"])
+        # And uses native composite primary key (tenant_id, item_id) without __mv_pk string concatenation
+        self.assertIn("PRIMARY KEY (tenant_id, item_id)", p_star.backing_table_ddl)
+        self.assertNotIn("__mv_pk ", p_star.backing_table_ddl)
+
+        p_dist_star = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_dist_star AS SELECT DISTINCT * FROM rev_items WHERE price >= 10.0;",
+            dialect=Dialect.SQLITE,
+        )
+        self.assertEqual(p_dist_star.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+
+        # 4. Native composite PKs on MySQL NOT NULL group columns and partial-PK projection views
+        p_my_grp = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_my_grp AS SELECT tenant_id, category, SUM(price) AS sp FROM rev_items GROUP BY tenant_id, category;",
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+        )
+        self.assertIn("PRIMARY KEY (tenant_id, category)", p_my_grp.backing_table_ddl)
+        self.assertNotIn("__mv_pk ", p_my_grp.backing_table_ddl)
+
+        p_proj_partial = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_proj_partial AS SELECT tenant_id, price FROM rev_items WHERE price > 0;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertIn("PRIMARY KEY (tenant_id, __mv_pk_item_id)", p_proj_partial.backing_table_ddl)
+
+        # 5. 63-bit SQLite BIT_AND, BIT_OR, BIT_XOR and nested parentheses in expressions
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema)
+        v_bit64 = (
+            "CREATE VIEW v_bit64 AS SELECT tenant_id, "
+            "BIT_AND(COALESCE(mask_64, 0)) AS ba, "
+            "BIT_OR(COALESCE(mask_64, 0)) AS bo, "
+            "BIT_XOR(COALESCE(mask_64, 0)) AS bx "
+            "FROM rev_items GROUP BY tenant_id;"
+        )
+        install_materialized_view_sqlite(conn, v_bit64)
+        v1 = (1 << 52) | (1 << 40) | 7
+        v2 = (1 << 60) | (1 << 40) | 3
+        conn.execute("INSERT INTO rev_items VALUES (1, 10, 'A', 20.0, ?);", (v1,))
+        conn.execute("INSERT INTO rev_items VALUES (1, 11, 'A', 30.0, ?);", (v2,))
+        row_mv = conn.execute("SELECT ba, bo, bx FROM __matview_v_bit64 WHERE tenant_id = 1;").fetchone()
+        self.assertEqual(row_mv, (v1 & v2, v1 | v2, v1 ^ v2))
+        conn.execute("DELETE FROM rev_items WHERE tenant_id = 1 AND item_id = 10;")
+        row_mv_after = conn.execute("SELECT ba, bo, bx FROM __matview_v_bit64 WHERE tenant_id = 1;").fetchone()
+        self.assertEqual(row_mv_after, (v2, v2, v2))
+
+        # 6. High-precision NUMERIC / DECIMAL accumulation for variance & stddev on Postgres & MySQL
+        p_pg_var = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_pg_var AS SELECT tenant_id, SUM(price) AS s, VAR_POP(price) AS vp, STDDEV_SAMP(price) AS ss FROM rev_items GROUP BY tenant_id;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertIn("NUMERIC", p_pg_var.backing_table_ddl)
+        self.assertIn("::NUMERIC", "\n".join(p_pg_var.trigger_ddls))
+
+        p_my_var = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_my_var AS SELECT tenant_id, SUM(price) AS s, VAR_POP(price) AS vp FROM rev_items GROUP BY tenant_id;",
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+        )
+        self.assertIn("DECIMAL(65, 12)", p_my_var.backing_table_ddl)
+
+        # 7. strict=True raises StrictCompilationError on fallback to Tier 2 or Tier 3
+        with self.assertRaises(StrictCompilationError):
+            generate_materialized_view(
+                schema,
+                "CREATE VIEW v_t3 AS SELECT tenant_id, item_id, ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY price) AS rn FROM rev_items;",
+                dialect=Dialect.SQLITE,
+                strict=True,
+            )
+        with self.assertRaises(StrictCompilationError):
+            generate_materialized_view(
+                schema,
+                "CREATE VIEW v_t2 AS SELECT tenant_id, GROUP_CONCAT(category) AS gc FROM rev_items GROUP BY tenant_id;",
+                dialect=Dialect.SQLITE,
+                strict=True,
+            )
+
+        # 8, 9, 10, 11. Manager exception-safe bulk_changes(), check_schema_drift(), repair_view(), and CLI flags
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            mgr = MaterializedViewManager(f"sqlite:///{tmp.name}")
+            mgr.apply_schema_ddl(schema, auto_sync_views=False)
+            mgr.conn.execute("INSERT INTO rev_items VALUES (1, 1, 'X', 100.0, 15);")
+            mgr.conn.commit()
+            mgr.register_view("CREATE VIEW v_star AS SELECT * FROM rev_items WHERE price >= 50.0;")
+            self.assertEqual(mgr.check_schema_drift(), {"__matview_v_star": "ok"})
+
+            # Exception inside bulk_changes() rolls back dirty DML and restores triggers cleanly
+            with self.assertRaises(RuntimeError):
+                with mgr.bulk_changes():
+                    mgr.conn.execute("INSERT INTO rev_items VALUES (1, 2, 'Y', 200.0, 31);")
+                    raise RuntimeError("simulated bulk failure")
+            rows_after_abort = mgr.conn.execute("SELECT item_id, price FROM __matview_v_star;").fetchall()
+            self.assertEqual(rows_after_abort, [(1, 100.0)])
+            # And triggers are restored so subsequent normal DML works
+            mgr.conn.execute("INSERT INTO rev_items VALUES (1, 3, 'Z', 300.0, 63);")
+            mgr.conn.commit()
+            rows_after_ins = mgr.conn.execute("SELECT item_id, price FROM __matview_v_star ORDER BY item_id;").fetchall()
+            self.assertEqual(rows_after_ins, [(1, 100.0), (3, 300.0)])
+
+            # Out-of-band schema change is detected by check_schema_drift() and repaired by repair_view()
+            mgr.conn.execute("ALTER TABLE rev_items ADD COLUMN extra_note TEXT;")
+            mgr.conn.commit()
+            self.assertEqual(mgr.check_schema_drift(), {"__matview_v_star": "drifted"})
+            rc_drift = cli_main(["--db", tmp.name, "--check-drift"])
+            self.assertEqual(rc_drift, 1)
+            rc_rep = cli_main(["--db", tmp.name, "--repair"])
+            self.assertEqual(rc_rep, 0)
+            self.assertEqual(mgr.check_schema_drift(), {"__matview_v_star": "ok"})
+            mgr.conn.close()
 
 
 import random

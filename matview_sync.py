@@ -121,6 +121,10 @@ class EngineLimitationWarning(UserWarning):
     """Emitted when proceeding with ignore_limitations=True despite engine transparency limitations."""
 
 
+class StrictCompilationError(ValueError):
+    """Raised when strict=True is enabled and a view cannot be compiled with Tier 1 ALGEBRAIC_DELTA."""
+
+
 @dataclass(frozen=True)
 class ColumnDef:
     name: str
@@ -257,12 +261,24 @@ class MaterializedViewPlan:
         eff_batch = self.batch_size if batch_size is None else batch_size
         if use_inc and self.incremental_populate_sqls:
             if eff_batch != self.batch_size and self.batch_size > 0:
-                old_b = str(self.batch_size)
+                old_b = re.escape(str(self.batch_size))
                 new_b = str(eff_batch)
-                return [
-                    re.sub(rf"\b{re.escape(old_b)}\b", new_b, s)
-                    for s in self.incremental_populate_sqls
-                ]
+                out_inc: List[str] = []
+                for s in self.incremental_populate_sqls:
+                    s_mod = re.sub(
+                        rf"(__mv_batch_size\s+BIGINT\s*(?:DEFAULT|:=)\s*){old_b}\b",
+                        rf"\g<1>{new_b}",
+                        s,
+                        flags=re.IGNORECASE,
+                    )
+                    s_mod = re.sub(
+                        rf"(\(\(ROW_NUMBER\(\)\s+OVER\s*\(\)\s*-\s*1\)\s*/\s*){old_b}(\)\s+AS\s+__mv_batch_id)",
+                        rf"\g<1>{new_b}\g<2>",
+                        s_mod,
+                        flags=re.IGNORECASE,
+                    )
+                    out_inc.append(s_mod)
+                return out_inc
             return list(self.incremental_populate_sqls)
         if not use_inc and self.full_populate_sqls:
             return list(self.full_populate_sqls)
@@ -408,16 +424,30 @@ class MaterializedViewPlan:
 # -----------------------------------------------------------------------------
 
 
+_DOLLAR_QUOTE_RE = re.compile(r"^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
 def _strip_sql_comments(sql: str) -> str:
-    """Strips `-- ...` line comments and `/* ... */` block comments outside string literals."""
+    """Strips `-- ...` line comments and `/* ... */` block comments outside string/quoted/dollar-quoted literals."""
     out: List[str] = []
     i = 0
     n = len(sql)
     in_single = False
     in_double = False
+    in_backtick = False
+    dollar_tag: Optional[str] = None
     while i < n:
         ch = sql[i]
-        if ch == "'" and not in_double:
+        if dollar_tag is not None:
+            if sql.startswith(dollar_tag, i):
+                out.append(dollar_tag)
+                i += len(dollar_tag)
+                dollar_tag = None
+            else:
+                out.append(ch)
+                i += 1
+            continue
+        if ch == "'" and not in_double and not in_backtick:
             out.append(ch)
             if in_single and i + 1 < n and sql[i + 1] == "'":
                 out.append("'")
@@ -425,22 +455,46 @@ def _strip_sql_comments(sql: str) -> str:
                 continue
             in_single = not in_single
             i += 1
-        elif ch == '"' and not in_single:
+        elif ch == '"' and not in_single and not in_backtick:
             out.append(ch)
+            if in_double and i + 1 < n and sql[i + 1] == '"':
+                out.append('"')
+                i += 2
+                continue
             in_double = not in_double
             i += 1
-        elif not in_single and not in_double and sql[i : i + 2] == "--":
-            nl = sql.find("\n", i + 2)
-            if nl == -1:
-                break
-            out.append("\n")
-            i = nl + 1
-        elif not in_single and not in_double and sql[i : i + 2] == "/*":
-            end = sql.find("*/", i + 2)
-            if end == -1:
-                break
-            out.append(" ")
-            i = end + 2
+        elif ch == "`" and not in_single and not in_double:
+            out.append(ch)
+            if in_backtick and i + 1 < n and sql[i + 1] == "`":
+                out.append("`")
+                i += 2
+                continue
+            in_backtick = not in_backtick
+            i += 1
+        elif not in_single and not in_double and not in_backtick:
+            if ch == "$":
+                m_dq = _DOLLAR_QUOTE_RE.match(sql[i:])
+                if m_dq:
+                    tag = m_dq.group(0)
+                    out.append(tag)
+                    dollar_tag = tag
+                    i += len(tag)
+                    continue
+            if sql[i : i + 2] == "--":
+                nl = sql.find("\n", i + 2)
+                if nl == -1:
+                    break
+                out.append("\n")
+                i = nl + 1
+            elif sql[i : i + 2] == "/*":
+                end = sql.find("*/", i + 2)
+                if end == -1:
+                    break
+                out.append(" ")
+                i = end + 2
+            else:
+                out.append(ch)
+                i += 1
         else:
             out.append(ch)
             i += 1
@@ -469,12 +523,23 @@ def _split_top_level(text: str, sep: str = ",") -> List[str]:
     depth = 0
     in_single = False
     in_double = False
+    in_backtick = False
+    dollar_tag: Optional[str] = None
     i = 0
     n = len(text)
     sep_len = len(sep)
     while i < n:
         ch = text[i]
-        if ch == "'" and not in_double:
+        if dollar_tag is not None:
+            if text.startswith(dollar_tag, i):
+                buf.append(dollar_tag)
+                i += len(dollar_tag)
+                dollar_tag = None
+            else:
+                buf.append(ch)
+                i += 1
+            continue
+        if ch == "'" and not in_double and not in_backtick:
             buf.append(ch)
             if in_single and i + 1 < n and text[i + 1] == "'":
                 buf.append("'")
@@ -482,11 +547,31 @@ def _split_top_level(text: str, sep: str = ",") -> List[str]:
                 continue
             in_single = not in_single
             i += 1
-        elif ch == '"' and not in_single:
+        elif ch == '"' and not in_single and not in_backtick:
             buf.append(ch)
+            if in_double and i + 1 < n and text[i + 1] == '"':
+                buf.append('"')
+                i += 2
+                continue
             in_double = not in_double
             i += 1
-        elif not in_single and not in_double:
+        elif ch == "`" and not in_single and not in_double:
+            buf.append(ch)
+            if in_backtick and i + 1 < n and text[i + 1] == "`":
+                buf.append("`")
+                i += 2
+                continue
+            in_backtick = not in_backtick
+            i += 1
+        elif not in_single and not in_double and not in_backtick:
+            if ch == "$":
+                m_dq = _DOLLAR_QUOTE_RE.match(text[i:])
+                if m_dq:
+                    tag = m_dq.group(0)
+                    buf.append(tag)
+                    dollar_tag = tag
+                    i += len(tag)
+                    continue
             if ch == "(":
                 depth += 1
                 buf.append(ch)
@@ -1846,6 +1931,7 @@ class IncrementalViewCompiler:
         object_prefix: str = DEFAULT_OBJECT_PREFIX,
         incremental_backfill: bool = False,
         batch_size: int = 1000,
+        strict: bool = False,
     ) -> None:
         self.schemas = dict(schemas)
         self._schemas_lower: Dict[str, TableSchema] = {
@@ -1858,6 +1944,7 @@ class IncrementalViewCompiler:
         self.object_prefix = object_prefix
         self.incremental_backfill = incremental_backfill
         self.batch_size = max(1, int(batch_size)) if batch_size else 1000
+        self.strict = strict
 
         raw_vname = view_spec.view_name
         if self.object_prefix and raw_vname.startswith(self.object_prefix):
@@ -1871,10 +1958,11 @@ class IncrementalViewCompiler:
             self.db_view_name = raw_vname
 
         self.user_indexes: List[ViewIndexSpec] = list(view_spec.user_indexes)
-        self.view = self._try_unwrap_simple_cte_or_derived_view(view_spec)
+        unwrapped_view = self._try_unwrap_simple_cte_or_derived_view(view_spec)
         self.primary_schema: Optional[TableSchema] = self._schemas_lower.get(
-            self.view.base_table.lower()
+            unwrapped_view.base_table.lower()
         )
+        self.view = self._try_expand_select_star(unwrapped_view)
 
         (
             self._working_select_items,
@@ -1890,6 +1978,11 @@ class IncrementalViewCompiler:
         self._validate_schema_and_view()
         self._alg_mode: str = "single"
         self.strategy: MaintenanceStrategy = self._choose_strategy()
+        if self.strict and self.strategy != MaintenanceStrategy.ALGEBRAIC_DELTA:
+            raise StrictCompilationError(
+                f"View '{self.logical_view_name}' cannot be compiled with Tier 1 ALGEBRAIC_DELTA "
+                f"maintenance (selected fallback strategy: {self.strategy.value}) under strict=True."
+            )
 
     def _bounded_ident(self, prefix: str, stem: str, suffix: str = "", max_len: int = 62) -> str:
         full = f"{prefix}{stem}{suffix}"
@@ -1972,6 +2065,82 @@ class IncrementalViewCompiler:
             f"with --ignore-limitations: {summary}",
             EngineLimitationWarning,
             stacklevel=2,
+        )
+
+    def _try_expand_select_star(self, v: ViewSpec) -> ViewSpec:
+        """
+        Expands `SELECT *` or `SELECT alias.*` on single-table views into explicit schema columns
+        so `SELECT * FROM t [WHERE ...]` and `SELECT DISTINCT * FROM t [WHERE ...]` compile with
+        Tier 1 O(1) ALGEBRAIC_DELTA maintenance instead of falling back to Tier 3.
+        """
+        if (
+            self.primary_schema is None
+            or len(v.joins) != 1
+            or len(v.referenced_tables) != 1
+            or v.has_cte
+            or v.has_compound_set_op
+            or v.has_subquery_in_from
+            or v.has_window_func
+            or v.has_limit_or_order
+        ):
+            return v
+        base_alias = v.joins[0].alias.lower() if v.joins else v.base_table.lower()
+        base_name = v.base_table.lower()
+        has_star = any(
+            it.raw_expr.strip() == "*"
+            or it.raw_expr.strip().lower() in (f"{base_alias}.*", f"{base_name}.*")
+            for it in v.select_items
+        )
+        if not has_star:
+            return v
+        expanded: List[SelectItem] = []
+        for it in v.select_items:
+            raw_s = it.raw_expr.strip()
+            if raw_s == "*" or raw_s.lower() in (f"{base_alias}.*", f"{base_name}.*"):
+                for c_def in self.primary_schema.columns.values():
+                    expanded.append(
+                        SelectItem(
+                            raw_expr=c_def.name,
+                            alias=c_def.name,
+                            is_aggregate=False,
+                            source_col=c_def.name,
+                        )
+                    )
+            else:
+                expanded.append(it)
+        sel_str = ", ".join(f"{it.raw_expr} AS {it.alias}" for it in expanded)
+        dist_kw = "DISTINCT " if v.has_top_level_distinct else ""
+        from_j = v.joins[0]
+        from_str = (
+            f"{from_j.table_name} AS {from_j.alias}"
+            if from_j.alias and from_j.alias.lower() != from_j.table_name.lower()
+            else from_j.table_name
+        )
+        rebuilt_sql = f"SELECT {dist_kw}{sel_str} FROM {from_str}"
+        if v.where_clause:
+            rebuilt_sql += f" WHERE {v.where_clause}"
+        if v.group_by_cols:
+            rebuilt_sql += f" GROUP BY {', '.join(v.group_by_cols)}"
+        if v.having_clause:
+            rebuilt_sql += f" HAVING {v.having_clause}"
+        return ViewSpec(
+            view_name=v.view_name,
+            raw_select_sql=rebuilt_sql,
+            base_table=v.base_table,
+            joins=v.joins,
+            referenced_tables=v.referenced_tables,
+            select_items=tuple(expanded),
+            where_clause=v.where_clause,
+            group_by_cols=v.group_by_cols,
+            having_clause=v.having_clause,
+            has_cte=v.has_cte,
+            has_window_func=v.has_window_func,
+            has_compound_set_op=v.has_compound_set_op,
+            has_top_level_distinct=v.has_top_level_distinct,
+            has_limit_or_order=v.has_limit_or_order,
+            has_subquery_in_from=v.has_subquery_in_from,
+            user_indexes=v.user_indexes,
+            additional_views=v.additional_views,
         )
 
     def _try_unwrap_simple_cte_or_derived_view(self, v: ViewSpec) -> ViewSpec:
@@ -2940,6 +3109,18 @@ class IncrementalViewCompiler:
             return "DOUBLE"
         return "REAL"
 
+    def _var_accum_type(self) -> str:
+        if self.dialect == Dialect.POSTGRES:
+            return "NUMERIC"
+        elif self.dialect == Dialect.MYSQL:
+            return "DECIMAL(65, 12)"
+        return "REAL"
+
+    def _var_sq_sql(self, expr: str) -> str:
+        if self.dialect == Dialect.POSTGRES:
+            return f"((1.0 * ({expr})::NUMERIC) * ({expr})::NUMERIC)"
+        return f"(1.0 * ({expr}) * ({expr}))"
+
     def _normalize_dialect_type(self, dt: str) -> str:
         u = dt.strip().upper()
         if self.dialect == Dialect.POSTGRES:
@@ -3202,12 +3383,15 @@ class IncrementalViewCompiler:
             return False
         if getattr(self, "_alg_mode", None) in ("join", "union_all_agg"):
             return True
-        if len(grp_exprs) > 1 and self.dialect == Dialect.MYSQL:
-            return True
+        seen_aliases: Set[str] = set()
         for g in grp_exprs:
             c_def = self._lookup_col_def(g)
             if c_def is None or not c_def.not_null:
                 return True
+            al = self._group_col_alias(g).lower()
+            if al in seen_aliases:
+                return True
+            seen_aliases.add(al)
         return False
 
     def _tier1_pk_cols(self) -> List[str]:
@@ -3216,7 +3400,7 @@ class IncrementalViewCompiler:
             return ["__mv_global_id"]
         if self._has_nullable_group_col():
             return ["__mv_pk"]
-        return [self._group_col_alias(g) for g in grp_exprs]
+        return list(dict.fromkeys(self._group_col_alias(g) for g in grp_exprs))
 
     def _rewrite_expr_for_record(self, expr: str, record_prefix: Optional[str]) -> str:
         if not record_prefix:
@@ -3484,8 +3668,10 @@ class IncrementalViewCompiler:
         if raw_plan.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA:
             if self._alg_mode in ("single", "join", "union_all_agg"):
                 main_pk_cols = self._tier1_pk_cols()
-            elif self._alg_mode in ("setop", "projection"):
+            elif self._alg_mode == "setop":
                 main_pk_cols = ["__mv_pk"]
+            elif self._alg_mode == "projection":
+                main_pk_cols = self._projection_pk_cols()
 
         for idx_s, pop_sql in enumerate(raw_plan.initial_populate_sqls):
             clean_pop = pop_sql.strip().rstrip(";")
@@ -3793,10 +3979,10 @@ class IncrementalViewCompiler:
                     return f"(CASE WHEN COUNT({eff}) = 0 THEN NULL ELSE {item.agg_func.value}({eff}) END)"
                 return f"{item.agg_func.value}({eff})"
             if item.agg_func == AggFunc.BIT_AND:
-                return "(" + " | ".join(f"MIN(({eff}) & {1 << b})" for b in range(32)) + ")"
+                return self._sqlite_bit_or_tree([f"MIN(({eff}) & {1 << b})" for b in range(63)])
             if item.agg_func == AggFunc.BIT_OR:
-                return "(" + " | ".join(f"MAX(({eff}) & {1 << b})" for b in range(32)) + ")"
-            return "(" + " | ".join(f"((SUM((({eff}) >> {b}) & 1) & 1) << {b})" for b in range(32)) + ")"
+                return self._sqlite_bit_or_tree([f"MAX(({eff}) & {1 << b})" for b in range(63)])
+            return self._sqlite_bit_or_tree([f"((SUM((({eff}) >> {b}) & 1) & 1) << {b})" for b in range(63)])
         if item.agg_func == AggFunc.BOOL_AND:
             if self.dialect == Dialect.POSTGRES:
                 return f"BOOL_AND({eff})"
@@ -3870,7 +4056,14 @@ class IncrementalViewCompiler:
             if item.agg_func == AggFunc.COUNT_COL:
                 col_nonnull_count_map[ekey] = item.alias
             elif item.agg_func == AggFunc.SUM:
-                col_sum_map[ekey] = item.alias
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = item.alias
             if item.is_distinct and ekey not in distinct_aux_tables:
                 p = self.object_prefix if self.object_prefix else "__matview_"
                 aux_tbl = self._bounded_ident(f"{p}dist_", f"{self.logical_view_name}__{_sanitize_ident(item.alias)}")
@@ -3953,7 +4146,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
                     col_sum_map[ekey] = sum_col
-                    col_defs_sql.append(f"{sum_col} {self._float_type()}")
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type()}")
 
             if item.agg_func in (
                 AggFunc.VAR_POP,
@@ -3965,7 +4158,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum2_col = f"__mv_sum2_{safe_id}_{aux_idx}"
                     col_sum2_map[ekey] = sum2_col
-                    col_defs_sql.append(f"{sum2_col} {self._float_type()}")
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type()}")
 
             if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
                 if ekey not in col_true_cnt_map:
@@ -4200,7 +4393,7 @@ class IncrementalViewCompiler:
                 it = ekey_to_item[ekey]
                 eff = self._effective_agg_value_expr(it, record_prefix=None)
                 target_cols.append(sum2_col)
-                select_exprs.append(f"SUM(1.0 * ({eff}) * ({eff}))")
+                select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
                 already_in_target.add(sum2_col)
 
         for ekey, tcnt_col in col_true_cnt_map.items():
@@ -4563,7 +4756,12 @@ class IncrementalViewCompiler:
     ) -> str:
         denom = f"({new_cnt} - 1)" if is_sample else new_cnt
         min_n = 2 if is_sample else 1
-        raw_var = f"((1.0 * {new_sum2}) - ((1.0 * {new_sum}) * (1.0 * {new_sum})) / {new_cnt}) / {denom}"
+        if self.dialect == Dialect.POSTGRES:
+            raw_var = (
+                f"(((1.0 * ({new_sum2})::NUMERIC) - ((1.0 * ({new_sum})::NUMERIC) * (1.0 * ({new_sum})::NUMERIC)) / {new_cnt}) / {denom})::DOUBLE PRECISION"
+            )
+        else:
+            raw_var = f"((1.0 * {new_sum2}) - ((1.0 * {new_sum}) * (1.0 * {new_sum})) / {new_cnt}) / {denom}"
         clamped_var = f"(CASE WHEN ({raw_var}) < 0.0 THEN 0.0 ELSE ({raw_var}) END)"
         val_expr = f"SQRT({clamped_var})" if is_stddev else clamped_var
         return f"(CASE WHEN {new_cnt} < {min_n} THEN NULL ELSE {val_expr} END)"
@@ -4667,7 +4865,7 @@ class IncrementalViewCompiler:
 
         def _plus_sum2_expr(item: SelectItem, col_alias: str) -> str:
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
-            sq = f"(1.0 * ({val_e}) * ({val_e}))"
+            sq = self._var_sq_sql(val_e)
             return (
                 f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
                 f"WHEN {mv_table}.{col_alias} IS NULL THEN {sq} "
@@ -4890,7 +5088,7 @@ class IncrementalViewCompiler:
             if sum2_col not in already_in_ins:
                 insert_cols.append(sum2_col)
                 insert_vals.append(
-                    f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 1.0 * ({val_e}) * ({val_e}) END)"
+                    f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE {self._var_sq_sql(val_e)} END)"
                 )
                 already_in_ins.add(sum2_col)
             if sum2_col not in updated_cols:
@@ -5006,7 +5204,7 @@ class IncrementalViewCompiler:
         def _minus_sum2_expr(item: SelectItem, col_alias: str, cnt_col: str) -> str:
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
             new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
-            sq = f"(1.0 * ({val_e}) * ({val_e}))"
+            sq = self._var_sq_sql(val_e)
             return (
                 f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
                 f"WHEN {new_cnt} <= 0 THEN NULL "
@@ -5776,7 +5974,14 @@ class IncrementalViewCompiler:
             if item.agg_func == AggFunc.COUNT_COL:
                 col_nonnull_count_map[ekey] = item.alias
             elif item.agg_func == AggFunc.SUM:
-                col_sum_map[ekey] = item.alias
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = item.alias
 
         group_mv_cols: List[str] = []
         for g in grp_exprs:
@@ -5846,7 +6051,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
                     col_sum_map[ekey] = sum_col
-                    col_defs_sql.append(f"{sum_col} {self._float_type()}")
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type()}")
 
             if item.agg_func in (
                 AggFunc.VAR_POP,
@@ -5858,7 +6063,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum2_col = f"__mv_sum2_{safe_id}_{aux_idx}"
                     col_sum2_map[ekey] = sum2_col
-                    col_defs_sql.append(f"{sum2_col} {self._float_type()}")
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type()}")
 
             if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
                 if ekey not in col_true_cnt_map:
@@ -5945,7 +6150,7 @@ class IncrementalViewCompiler:
                 it = ekey_to_item[ekey]
                 eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
                 target_cols.append(sum2_col)
-                select_exprs.append(f"SUM(1.0 * ({eff}) * ({eff}))")
+                select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
                 already_in_target.add(sum2_col)
 
         for ekey, tcnt_col in col_true_cnt_map.items():
@@ -6658,6 +6863,60 @@ class IncrementalViewCompiler:
         self._effective_group_by_exprs = tuple(it.raw_expr for it in self.view.select_items)
         return self._compile_tier1_algebraic()
 
+    def _projection_pk_mapping(self) -> Tuple[List[str], List[Tuple[str, str, str]], bool]:
+        """
+        Returns `(mv_pk_cols, hidden_pk_defs, uses_native_pk)` for `_compile_tier1_zset_projection`.
+        Preserves the base table's actual primary/composite key columns in the backing table
+        whenever all base PK columns are non-nullable.
+        """
+        assert self.primary_schema is not None
+        pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
+        can_native = bool(pk_defs) and all(
+            c.not_null
+            or "INT" in c.data_type.upper()
+            or self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+            for c in pk_defs
+        )
+        if not can_native:
+            return ["__mv_pk"], [], False
+
+        base_alias = self.view.joins[0].alias.lower() if self.view.joins else self.view.base_table.lower()
+        base_name = self.view.base_table.lower()
+        mv_pk_cols: List[str] = []
+        hidden_pk_defs: List[Tuple[str, str, str]] = []
+        used_user_aliases: Set[str] = set()
+
+        for c_def in pk_defs:
+            c_low = c_def.name.lower()
+            matched_alias: Optional[str] = None
+            for it in self.view.select_items:
+                raw_s = _unquote_ident(it.raw_expr.strip()).lower() if re.match(r'^[A-Za-z0-9_."`\[\]]+$', it.raw_expr.strip()) else ""
+                raw_full = it.raw_expr.strip().lower()
+                if (
+                    raw_full == c_low
+                    or raw_full == f"{base_alias}.{c_low}"
+                    or raw_full == f"{base_name}.{c_low}"
+                    or (raw_s == c_low and "." not in raw_full)
+                ) and it.alias.lower() not in used_user_aliases:
+                    matched_alias = it.alias
+                    used_user_aliases.add(it.alias.lower())
+                    break
+            if matched_alias is not None:
+                mv_pk_cols.append(matched_alias)
+            else:
+                hid_col = f"__mv_pk_{_sanitize_ident(c_def.name)}"
+                dt = self._normalize_dialect_type(c_def.data_type)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                hidden_pk_defs.append((hid_col, c_def.name, dt))
+                mv_pk_cols.append(hid_col)
+
+        return mv_pk_cols, hidden_pk_defs, True
+
+    def _projection_pk_cols(self) -> List[str]:
+        mv_pk_cols, _, _ = self._projection_pk_mapping()
+        return mv_pk_cols
+
     def _compile_tier1_zset_projection(self) -> MaterializedViewPlan:
         assert self.primary_schema is not None
         view_name = self.view.view_name
@@ -6668,14 +6927,28 @@ class IncrementalViewCompiler:
         from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
 
         pk_names = [c.name for c in self.primary_schema.columns.values() if c.primary_key]
-        col_defs_sql: List[str] = [f"__mv_pk {pk_type} NOT NULL PRIMARY KEY"]
-        indexed_cols_lower = self._indexed_column_names_lower()
+        mv_pk_cols, hidden_pk_defs, uses_native_pk = self._projection_pk_mapping()
+        pk_col_set_lower = {c.lower() for c in mv_pk_cols}
+
+        col_defs_sql: List[str] = []
+        if not uses_native_pk:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        indexed_cols_lower = self._indexed_column_names_lower(mv_pk_cols if uses_native_pk else ())
         for it in self.view.select_items:
             dt = self._infer_expr_storage_type(it)
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
-            col_defs_sql.append(f"{it.alias} {dt}")
-        col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
+            nn = " NOT NULL" if (uses_native_pk and it.alias.lower() in pk_col_set_lower) else ""
+            col_defs_sql.append(f"{it.alias} {dt}{nn}")
+
+        for hid_col, _, hid_dt in hidden_pk_defs:
+            col_defs_sql.append(f"{hid_col} {hid_dt} NOT NULL")
+
+        if uses_native_pk:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(mv_pk_cols)})")
+        else:
+            col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
 
         backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
         index_ddls, index_names = self._build_all_index_ddls(
@@ -6687,42 +6960,78 @@ class IncrementalViewCompiler:
             self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
         )
 
-        pk_expr_base = self._canonical_group_pk_expr(pk_names)
         sel_exprs = [it.raw_expr for it in self.view.select_items]
         w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
-        initial_populate_sql = (
-            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
-            f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {base_t}{w_sql};"
-        )
-
-        pk_new = self._canonical_group_pk_expr([f"NEW.{c}" for c in pk_names])
-        pk_old = self._canonical_group_pk_expr([f"OLD.{c}" for c in pk_names])
         new_vals = [self._rewrite_expr_for_record(it.raw_expr, "NEW") for it in self.view.select_items]
 
-        if self.dialect == Dialect.MYSQL:
-            upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
-            plus_stmt = (
-                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
-                f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
-                f"    WHERE TRUE\n"
-                f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+        if uses_native_pk:
+            all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
+            all_select_exprs = [*sel_exprs, *[h[1] for h in hidden_pk_defs]]
+            all_new_vals = [*new_vals, *[f"NEW.{h[1]}" for h in hidden_pk_defs]]
+            initial_populate_sql = (
+                f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                f"SELECT {', '.join(all_select_exprs)} FROM {base_t}{w_sql};"
             )
+            if self.dialect == Dialect.MYSQL:
+                upd_set = ", ".join(f"{c} = VALUES({c})" for c in all_backing_cols)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                    f"    SELECT {', '.join(all_new_vals)}{from_dual}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON DUPLICATE KEY UPDATE {upd_set};"
+                )
+            else:
+                upd_set = ", ".join(f"{c} = excluded.{c}" for c in all_backing_cols)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                    f"    SELECT {', '.join(all_new_vals)}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON CONFLICT ({', '.join(mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                )
+            pk_old_preds = [
+                f"{mv_table}.{mv_c} = OLD.{src_c}"
+                for mv_c, src_c in zip(mv_pk_cols, pk_names)
+            ]
+            del_where = " AND ".join(pk_old_preds)
+            del_stmt = f"DELETE FROM {mv_table}\n    WHERE {del_where};"
+            del_stmts_list = [del_stmt]
+            upd_old_list = [del_stmt]
+            upd_clean_list: List[str] = []
         else:
-            upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
-            plus_stmt = (
+            pk_expr_base = self._canonical_group_pk_expr(pk_names)
+            initial_populate_sql = (
                 f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
-                f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
-                f"    WHERE TRUE\n"
-                f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {base_t}{w_sql};"
             )
-        minus_stmt = (
-            f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
-            f"    WHERE {mv_table}.__mv_pk = ({pk_old});"
-        )
-        clean_stmt = (
-            f"DELETE FROM {mv_table}\n"
-            f"    WHERE ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
-        )
+            pk_new = self._canonical_group_pk_expr([f"NEW.{c}" for c in pk_names])
+            pk_old = self._canonical_group_pk_expr([f"OLD.{c}" for c in pk_names])
+            if self.dialect == Dialect.MYSQL:
+                upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            else:
+                upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            minus_stmt = (
+                f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                f"    WHERE {mv_table}.__mv_pk = ({pk_old});"
+            )
+            clean_stmt = (
+                f"DELETE FROM {mv_table}\n"
+                f"    WHERE ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+            )
+            del_stmts_list = [minus_stmt, clean_stmt]
+            upd_old_list = [minus_stmt]
+            upd_clean_list = [clean_stmt]
 
         where_new = (
             self._rewrite_expr_for_record(self.view.where_clause, "NEW")
@@ -6739,10 +7048,10 @@ class IncrementalViewCompiler:
             view_name=view_name,
             base_t=base_t,
             ins_stmts=[plus_stmt],
-            del_stmts=[minus_stmt, clean_stmt],
-            upd_old_stmts=[minus_stmt],
+            del_stmts=del_stmts_list,
+            upd_old_stmts=upd_old_list,
             upd_new_stmts=[plus_stmt],
-            upd_cleanup_old_stmts=[clean_stmt],
+            upd_cleanup_old_stmts=upd_clean_list,
             trunc_stmts=[f"DELETE FROM {mv_table};"],
             where_new=where_new,
             where_old=where_old,
@@ -6838,7 +7147,14 @@ class IncrementalViewCompiler:
             if item.agg_func == AggFunc.COUNT_COL:
                 col_nonnull_count_map[ekey] = item.alias
             elif item.agg_func == AggFunc.SUM:
-                col_sum_map[ekey] = item.alias
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = item.alias
 
         group_mv_cols: List[str] = []
         for g in grp_exprs:
@@ -6926,7 +7242,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
                     col_sum_map[ekey] = sum_col
-                    col_defs_sql.append(f"{sum_col} {self._float_type()}")
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type()}")
 
             if item.agg_func in (
                 AggFunc.VAR_POP,
@@ -6938,7 +7254,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum2_col = f"__mv_sum2_{safe_id}_{aux_idx}"
                     col_sum2_map[ekey] = sum2_col
-                    col_defs_sql.append(f"{sum2_col} {self._float_type()}")
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type()}")
 
             if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
                 if ekey not in col_true_cnt_map:
@@ -7019,7 +7335,7 @@ class IncrementalViewCompiler:
                 it = ekey_to_item[ekey]
                 eff = self._effective_agg_value_expr(it, record_prefix=None)
                 target_cols.append(sum2_col)
-                select_exprs.append(f"SUM(1.0 * ({eff}) * ({eff}))")
+                select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
                 already_in_target.add(sum2_col)
         for ekey, tcnt_col in col_true_cnt_map.items():
             if tcnt_col not in already_in_target:
@@ -7593,11 +7909,20 @@ class IncrementalViewCompiler:
 
         return pattern.sub(_repl, sql)
 
+    @staticmethod
+    def _sqlite_bit_or_tree(terms: Sequence[str]) -> str:
+        chunks = [
+            "(" + " | ".join(terms[i : i + 8]) + ")"
+            for i in range(0, len(terms), 8)
+        ]
+        return "(" + " | ".join(chunks) + ")"
+
     def _rewrite_sqlite_total_in_sql(self, sql: str) -> str:
         if self.dialect == Dialect.SQLITE:
             s_sq = sql
+            bal_arg = r"((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)"
             s_sq = re.sub(
-                r"\bVAR_POP\s*\(\s*([^()]+?)\s*\)",
+                rf"\bVAR_POP\s*\(\s*{bal_arg}\s*\)",
                 lambda m: (
                     f"(CASE WHEN COUNT({m.group(1)}) < 1 THEN NULL "
                     f"WHEN ((1.0 * SUM(1.0 * ({m.group(1)}) * ({m.group(1)})) - ((1.0 * SUM(1.0 * ({m.group(1)}))) * (1.0 * SUM(1.0 * ({m.group(1)})))) / COUNT({m.group(1)})) / COUNT({m.group(1)})) < 0.0 THEN 0.0 "
@@ -7607,20 +7932,20 @@ class IncrementalViewCompiler:
                 flags=re.IGNORECASE,
             )
             s_sq = re.sub(
-                r"\bBIT_AND\s*\(\s*([^()]+?)\s*\)",
-                lambda m: "(" + " | ".join(f"MIN(({m.group(1)}) & {1 << b})" for b in range(32)) + ")",
+                rf"\bBIT_AND\s*\(\s*{bal_arg}\s*\)",
+                lambda m: self._sqlite_bit_or_tree([f"MIN(({m.group(1)}) & {1 << b})" for b in range(63)]),
                 s_sq,
                 flags=re.IGNORECASE,
             )
             s_sq = re.sub(
-                r"\bBIT_OR\s*\(\s*([^()]+?)\s*\)",
-                lambda m: "(" + " | ".join(f"MAX(({m.group(1)}) & {1 << b})" for b in range(32)) + ")",
+                rf"\bBIT_OR\s*\(\s*{bal_arg}\s*\)",
+                lambda m: self._sqlite_bit_or_tree([f"MAX(({m.group(1)}) & {1 << b})" for b in range(63)]),
                 s_sq,
                 flags=re.IGNORECASE,
             )
             s_sq = re.sub(
-                r"\bBIT_XOR\s*\(\s*([^()]+?)\s*\)",
-                lambda m: "(" + " | ".join(f"((SUM((({m.group(1)}) >> {b}) & 1) & 1) << {b})" for b in range(32)) + ")",
+                rf"\bBIT_XOR\s*\(\s*{bal_arg}\s*\)",
+                lambda m: self._sqlite_bit_or_tree([f"((SUM((({m.group(1)}) >> {b}) & 1) & 1) << {b})" for b in range(63)]),
                 s_sq,
                 flags=re.IGNORECASE,
             )
@@ -7921,6 +8246,55 @@ class MaterializedViewManager:
 
     CATALOG_TABLE = f"{DEFAULT_OBJECT_PREFIX}catalog"
 
+    @staticmethod
+    def _connect_database_url(
+        conn_or_url: str, dialect: Optional[Dialect] = None
+    ) -> Tuple[Any, Dialect]:
+        u_low = conn_or_url.strip().lower()
+        if u_low.startswith(("postgresql://", "postgres://")):
+            eff_dialect = Dialect.POSTGRES
+            try:
+                import psycopg2  # type: ignore
+                return psycopg2.connect(conn_or_url), eff_dialect
+            except ImportError:
+                import psycopg  # type: ignore
+                return psycopg.connect(conn_or_url), eff_dialect
+        if u_low.startswith(("mysql://", "mariadb://")):
+            eff_dialect = Dialect.MYSQL
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(conn_or_url)
+            db_name = parsed.path.lstrip("/")
+            qs = parse_qs(parsed.query)
+            try:
+                import pymysql  # type: ignore
+                return (
+                    pymysql.connect(
+                        host=parsed.hostname or "127.0.0.1",
+                        port=parsed.port or 3306,
+                        user=parsed.username or "root",
+                        password=parsed.password or "",
+                        database=db_name,
+                         unix_socket=qs.get("unix_socket", [None])[0],
+                        autocommit=False,
+                    ),
+                    eff_dialect,
+                )
+            except ImportError:
+                import mysql.connector  # type: ignore
+                return (
+                    mysql.connector.connect(
+                        host=parsed.hostname or "127.0.0.1",
+                        port=parsed.port or 3306,
+                        user=parsed.username or "root",
+                        password=parsed.password or "",
+                        database=db_name,
+                    ),
+                    eff_dialect,
+                )
+        eff_dialect = dialect or Dialect.SQLITE
+        path = conn_or_url.replace("sqlite:///", "").replace("sqlite://", "")
+        return sqlite3.connect(path), eff_dialect
+
     def __init__(
         self,
         conn_or_url: sqlite3.Connection | str | Any,
@@ -7928,6 +8302,7 @@ class MaterializedViewManager:
         ignore_limitations: bool = False,
         object_prefix: str = DEFAULT_OBJECT_PREFIX,
         pg_use_transition_tables: bool = False,
+        strict: bool = False,
     ) -> None:
         if isinstance(dialect, str):
             dialect = Dialect(dialect.lower())
@@ -7935,13 +8310,15 @@ class MaterializedViewManager:
         self.ignore_limitations = ignore_limitations
         self.object_prefix = object_prefix
         self.pg_use_transition_tables = pg_use_transition_tables
+        self.strict = strict
         self.catalog_table = (
             f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
         )
 
         if isinstance(conn_or_url, str):
-            path = conn_or_url.replace("sqlite:///", "")
-            self.conn = sqlite3.connect(path)
+            self.conn, inferred_dialect = self._connect_database_url(conn_or_url, self.dialect)
+            if conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
+                self.dialect = inferred_dialect
         else:
             self.conn = conn_or_url
 
@@ -7979,6 +8356,13 @@ class MaterializedViewManager:
     def _commit(self) -> None:
         if hasattr(self.conn, "commit"):
             self.conn.commit()
+
+    def _rollback(self) -> None:
+        if hasattr(self.conn, "rollback"):
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
 
     def _param_placeholder(self) -> str:
         return "?" if self.dialect == Dialect.SQLITE else "%s"
@@ -8226,6 +8610,7 @@ class MaterializedViewManager:
         on_progress: Optional[Callable[[int, int], None]],
         force_rebuild: bool,
         effective_ignore: bool,
+        effective_strict: bool = False,
     ) -> MaterializedViewPlan:
         plan = generate_materialized_view(
             schemas,
@@ -8234,6 +8619,7 @@ class MaterializedViewManager:
             pg_use_transition_tables=self.pg_use_transition_tables,
             ignore_limitations=effective_ignore,
             object_prefix=self.object_prefix,
+            strict=effective_strict,
         )
         sig = self._compute_signature(plan, schemas)
 
@@ -8245,47 +8631,51 @@ class MaterializedViewManager:
         if existing:
             self.drop_view(plan.view_name)
 
-        # Install structure AND maintenance triggers BEFORE backfilling so no concurrent
-        # base-table DML can occur in an un-triggered window during or after backfill.
+        # Install structure, maintenance triggers, single-shot backfill, and catalog record
+        # inside a single atomic transaction so concurrent readers/writers never observe an
+        # un-triggered or double-counted window between trigger attachment and population.
         cur = self.conn.cursor()
-        for stmt in plan.create_structure_statements():
-            cur.execute(stmt)
-        for stmt in plan.trigger_ddls:
-            cur.execute(stmt)
-        self._commit()
+        try:
+            for stmt in plan.create_structure_statements():
+                cur.execute(stmt)
+            for stmt in plan.trigger_ddls:
+                cur.execute(stmt)
 
-        if populate:
-            if incremental_backfill:
-                self.backfill_incrementally(
-                    plan, batch_size=batch_size, on_progress=on_progress
-                )
-            else:
-                for stmt in plan.get_populate_statements(incremental_backfill=False):
-                    cur.execute(stmt)
-                self._commit()
+            if populate:
+                if incremental_backfill:
+                    self._commit()
+                    self.backfill_incrementally(
+                        plan, batch_size=batch_size, on_progress=on_progress
+                    )
+                else:
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
 
-        stored_view_sql = self._serialize_view_sql_with_indexes(plan)
-        ph = self._param_placeholder()
-        cur.execute(
-            f"""
-            INSERT INTO {self.catalog_table} (
-                view_name, view_sql, strategy, signature_hash, backing_table,
-                aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json
-            ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
-            """,
-            (
-                plan.view_name,
-                stored_view_sql,
-                plan.strategy.value,
-                sig,
-                plan.backing_table_name,
-                json.dumps(plan.auxiliary_table_names),
-                json.dumps(plan.trigger_names),
-                json.dumps(plan.function_names),
-                json.dumps(plan.trigger_ddls),
-            ),
-        )
-        self._commit()
+            stored_view_sql = self._serialize_view_sql_with_indexes(plan)
+            ph = self._param_placeholder()
+            cur.execute(
+                f"""
+                INSERT INTO {self.catalog_table} (
+                    view_name, view_sql, strategy, signature_hash, backing_table,
+                    aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json
+                ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                """,
+                (
+                    plan.view_name,
+                    stored_view_sql,
+                    plan.strategy.value,
+                    sig,
+                    plan.backing_table_name,
+                    json.dumps(plan.auxiliary_table_names),
+                    json.dumps(plan.trigger_names),
+                    json.dumps(plan.function_names),
+                    json.dumps(plan.trigger_ddls),
+                ),
+            )
+            self._commit()
+        except Exception:
+            self._rollback()
+            raise
         return plan
 
     def register_view(
@@ -8299,6 +8689,7 @@ class MaterializedViewManager:
         force_rebuild: bool = False,
         ignore_limitations: Optional[bool] = None,
         indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
     ) -> MaterializedViewPlan:
         """
         Safely installs or updates one or more materialized views on the connected database.
@@ -8307,6 +8698,7 @@ class MaterializedViewManager:
         effective_ignore = (
             self.ignore_limitations if ignore_limitations is None else ignore_limitations
         )
+        effective_strict = self.strict if strict is None else strict
         schemas = self.fetch_schema(extra_schema_sql=schema_sql)
         specs = parse_view_definitions(
             view_sql,
@@ -8325,6 +8717,7 @@ class MaterializedViewManager:
                     on_progress=on_progress,
                     force_rebuild=force_rebuild,
                     effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
                 )
             )
         if len(sub_plans) == 1:
@@ -8364,6 +8757,7 @@ class MaterializedViewManager:
         batch_size: int = 500,
         ignore_limitations: Optional[bool] = None,
         indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
     ) -> Dict[str, str]:
         """
         Declaratively synchronizes a collection of materialized view definitions against
@@ -8373,6 +8767,7 @@ class MaterializedViewManager:
         effective_ignore = (
             self.ignore_limitations if ignore_limitations is None else ignore_limitations
         )
+        effective_strict = self.strict if strict is None else strict
         schemas = self.fetch_schema(extra_schema_sql=schema_sql)
         catalog = self.get_catalog()
         status: Dict[str, str] = {}
@@ -8391,6 +8786,7 @@ class MaterializedViewManager:
                 dialect=self.dialect,
                 ignore_limitations=effective_ignore,
                 object_prefix=self.object_prefix,
+                strict=effective_strict,
             )
             v_name = plan.view_name
             desired_names.add(v_name)
@@ -8405,6 +8801,7 @@ class MaterializedViewManager:
                     on_progress=None,
                     force_rebuild=False,
                     effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
                 )
                 status[v_name] = "created"
             elif catalog[v_name]["signature_hash"] != sig:
@@ -8417,6 +8814,7 @@ class MaterializedViewManager:
                     on_progress=None,
                     force_rebuild=True,
                     effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
                 )
                 status[v_name] = "updated"
             else:
@@ -8430,12 +8828,93 @@ class MaterializedViewManager:
 
         return status
 
+    def check_schema_drift(self) -> Dict[str, str]:
+        """
+        Inspects all registered views in `__matview_catalog` against the current live base
+        table schemas and returns `{view_name: "ok" | "drifted" | "invalid"}`.
+        """
+        schemas = self.fetch_schema()
+        catalog = self.get_catalog()
+        report: Dict[str, str] = {}
+        for v_name, entry in catalog.items():
+            try:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                )
+                sig = self._compute_signature(plan, schemas)
+                report[v_name] = "ok" if sig == entry["signature_hash"] else "drifted"
+            except Exception:
+                report[v_name] = "invalid"
+        return report
+
+    def repair_view(
+        self,
+        view_name: Optional[str] = None,
+        rebuild_on_schema_drift: bool = True,
+    ) -> Dict[str, str]:
+        """
+        Reconciles and repairs one or all registered materialized views in an atomic pass,
+        eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
+        Returns `{view_name: "repaired" | "rebuilt"}`.
+        """
+        catalog = self.get_catalog()
+        if view_name:
+            resolved = self._resolve_catalog_name(view_name, catalog)
+            if resolved not in catalog:
+                raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
+            targets = [catalog[resolved]]
+        else:
+            targets = list(catalog.values())
+
+        schemas = self.fetch_schema()
+        results: Dict[str, str] = {}
+        cur = self.conn.cursor()
+        for entry in targets:
+            v_name = entry["view_name"]
+            plan = generate_materialized_view(
+                schemas,
+                entry["view_sql"],
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=True,
+                object_prefix=self.object_prefix,
+            )
+            sig = self._compute_signature(plan, schemas)
+            if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+                self.register_view(
+                    entry["view_sql"],
+                    populate=True,
+                    force_rebuild=True,
+                    ignore_limitations=True,
+                )
+                results[v_name] = "rebuilt"
+            else:
+                try:
+                    for aux_t in plan.auxiliary_table_names:
+                        cur.execute(f"DELETE FROM {aux_t};")
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+                    results[v_name] = "repaired"
+                except Exception:
+                    self._rollback()
+                    raise
+        return results
+
     @contextmanager
     def bulk_changes(self, view_names: Optional[Sequence[str]] = None) -> Iterator[None]:
         """
         Context manager for executing massive multi-statement bulk loads/mutations.
         Temporarily suspends maintenance triggers for the target views during the block,
-        and atomically recomputes the backing tables in a single set-based pass on exit.
+        and atomically recomputes the backing tables in a single set-based pass on clean exit.
+        If an exception is raised inside the `with` block, rolls back uncommitted changes
+        and restores triggers without committing dirty data.
         """
         catalog = self.get_catalog()
         if view_names:
@@ -8454,9 +8933,26 @@ class MaterializedViewManager:
                 for t_name in entry["trigger_names"]:
                     if "__ro_" not in t_name and not t_name.endswith("__readonly"):
                         cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+        self._commit()
         try:
             yield
-        finally:
+        except Exception:
+            self._rollback()
+            schemas = self.fetch_schema()
+            for entry in targets:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                )
+                for stmt in plan.trigger_ddls:
+                    cur.execute(stmt)
+            self._commit()
+            raise
+        else:
             schemas = self.fetch_schema()
             for entry in targets:
                 plan = generate_materialized_view(
@@ -8492,6 +8988,7 @@ def generate_materialized_view(
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     incremental_backfill: bool = False,
     batch_size: int = 1000,
+    strict: bool = False,
 ) -> MaterializedViewPlan:
     """
     Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
@@ -8554,6 +9051,7 @@ def generate_materialized_view(
         object_prefix=object_prefix,
         incremental_backfill=incremental_backfill,
         batch_size=batch_size,
+        strict=strict,
     )
     return compiler.compile()
 
@@ -8568,6 +9066,7 @@ def generate_materialized_views(
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     incremental_backfill: bool = False,
     batch_size: int = 1000,
+    strict: bool = False,
 ) -> List[MaterializedViewPlan]:
     """
     Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
@@ -8603,6 +9102,7 @@ def generate_materialized_views(
             object_prefix=object_prefix,
             incremental_backfill=incremental_backfill,
             batch_size=batch_size,
+            strict=strict,
         )
         plans.append(comp._compile_single_plan())
     return plans
@@ -8619,6 +9119,7 @@ def install_materialized_view_sqlite(
     ignore_limitations: bool = False,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    strict: bool = False,
 ) -> MaterializedViewPlan:
     """Installs one or more materialized views directly into a live SQLite connection."""
     mgr = MaterializedViewManager(
@@ -8626,6 +9127,7 @@ def install_materialized_view_sqlite(
         dialect=Dialect.SQLITE,
         ignore_limitations=ignore_limitations,
         object_prefix=object_prefix,
+        strict=strict,
     )
     return mgr.register_view(
         view_sql=view_sql,
@@ -8635,6 +9137,7 @@ def install_materialized_view_sqlite(
         batch_size=batch_size,
         on_progress=on_progress,
         indexes=indexes,
+        strict=strict,
     )
 
 
@@ -8643,8 +9146,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         description="Compile SQL CREATE VIEW definition(s) into zero-dependency incremental materialized view SQL."
     )
     parser.add_argument("--schema", help="Path to SQL file containing base table CREATE TABLE statements.")
-    parser.add_argument("--db", help="Path to live SQLite database file (for schema introspection or --apply).")
-    parser.add_argument("--view", required=True, help="Path to SQL file or inline CREATE VIEW statement(s).")
+    parser.add_argument("--db", help="Database path or DSN URL (sqlite:///..., postgresql://..., mysql://...).")
+    parser.add_argument("--view", help="Path to SQL file or inline CREATE VIEW statement(s).")
     parser.add_argument(
         "--dialect",
         choices=[d.value for d in Dialect],
@@ -8689,6 +9192,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Proceed with warning even if engine transparency limitations exist.",
     )
     parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail compilation if a view cannot use Tier 1 ALGEBRAIC_DELTA maintenance.",
+    )
+    parser.add_argument(
+        "--check-drift",
+        action="store_true",
+        help="Check registered views in --db for underlying base table schema drift.",
+    )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Atomically reconcile/repair registered views in --db from base tables.",
+    )
+    parser.add_argument(
         "--apply",
         action="store_true",
         help="Apply the generated materialized view directly to --db.",
@@ -8704,13 +9222,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 pass
         return val
 
-    view_sql = _read_sql_arg(args.view)
-    schema_sql = _read_sql_arg(args.schema) if args.schema else None
-
     try:
-        if args.apply:
+        if args.check_drift or args.repair:
             if not args.db:
-                print("ERROR: --apply requires --db <sqlite_db_path>", file=sys.stderr)
+                print("ERROR: --check-drift / --repair requires --db", file=sys.stderr)
                 return 2
             mgr = MaterializedViewManager(
                 args.db,
@@ -8718,6 +9233,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ignore_limitations=args.ignore_limitations,
                 object_prefix=args.object_prefix,
                 pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+            )
+            if args.check_drift:
+                drift = mgr.check_schema_drift()
+                print(json.dumps(drift, indent=2, sort_keys=True))
+                if any(v != "ok" for v in drift.values()) and not args.repair:
+                    return 1
+            if args.repair:
+                rep = mgr.repair_view()
+                print(json.dumps(rep, indent=2, sort_keys=True))
+            return 0
+
+        if not args.view:
+            print("ERROR: --view is required unless running --check-drift or --repair.", file=sys.stderr)
+            return 2
+
+        view_sql = _read_sql_arg(args.view)
+        schema_sql = _read_sql_arg(args.schema) if args.schema else None
+
+        if args.apply:
+            if not args.db:
+                print("ERROR: --apply requires --db <db_path_or_dsn>", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=Dialect(args.dialect),
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
             )
             if schema_sql:
                 mgr.apply_schema_ddl(schema_sql, auto_sync_views=False)
@@ -8727,6 +9272,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 incremental_backfill=args.incremental_backfill,
                 batch_size=args.batch_size,
                 indexes=args.indexes,
+                strict=args.strict,
             )
             print(
                 plan.render_sql_script(
@@ -8737,10 +9283,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 0
 
+        eff_dialect = Dialect(args.dialect)
         if args.db and not schema_sql:
-            conn = sqlite3.connect(args.db)
+            conn, eff_dialect = MaterializedViewManager._connect_database_url(args.db, eff_dialect)
             try:
-                schemas = introspect_sqlite_schemas(conn, object_prefix=args.object_prefix)
+                schemas = introspect_database_schemas(
+                    conn, dialect=eff_dialect, object_prefix=args.object_prefix
+                )
             finally:
                 conn.close()
         elif schema_sql:
@@ -8752,13 +9301,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plan = generate_materialized_view(
             schemas,
             view_sql,
-            dialect=Dialect(args.dialect),
+            dialect=eff_dialect,
             pg_use_transition_tables=args.pg_transition_tables,
             ignore_limitations=args.ignore_limitations,
             object_prefix=args.object_prefix,
             indexes=args.indexes,
             incremental_backfill=args.incremental_backfill,
             batch_size=args.batch_size,
+            strict=args.strict,
         )
         print(
             plan.render_sql_script(
@@ -8768,7 +9318,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         )
         return 0
-    except EngineLimitationError as exc:
+    except (EngineLimitationError, StrictCompilationError) as exc:
         print(f"WARNING: {exc}", file=sys.stderr)
         return 2
 
