@@ -6,6 +6,8 @@ Zero-runtime-dependency incremental materialized view compiler and lifecycle man
 
 * **Pure Native SQL Execution**: Compiles standard `CREATE VIEW` definitions (single or multi-view `.sql` bundles) into backing tables, user-defined and automatic indexes, read-only user views with write-protection triggers, atomic maintenance triggers, and initial or chunked incremental backfill statements. Once installed, materialized views are maintained entirely by native database triggers with zero Python runtime dependency.
 
+* **Automatic Engine & Version Detection (`detect_engine_version` / `--engine-version`)**: Automatically detects the target database dialect, subdialect (`sqlite`, `postgres`, `mysql`, `mariadb`), and exact `(major, minor, patch)` version from live database connections (`SELECT sqlite_version()`, `SHOW server_version_num` / `SELECT version()`, `SELECT VERSION()`), or accepts explicit version specs (`--engine-version postgres:17`, `--engine-version mariadb:11.4`, `--engine-version mysql:8.4`, `--engine-version sqlite:3.45`) to select version-optimal features such as PostgreSQL 15+ `UNIQUE ... NULLS NOT DISTINCT` indexes, PostgreSQL 10+ transition tables, and SQLite 3.24+ `UPSERT` / 3.25+ window-function checks.
+
 * **Granular** $O(1)$ **Algebraic Delta Maintenance (`ALGEBRAIC_DELTA`)**:
 
   * Single-table aggregations with arbitrary column or expression `GROUP BY`, `WHERE`, and `HAVING` clauses (`COUNT(*)`, `COUNT(col)`, `SUM`, `TOTAL`, `AVG`, `MIN`, `MAX`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`, `BIT_AND`, `BIT_OR`, `BIT_XOR`, `BOOL_AND`, `BOOL_OR`, `FILTER (WHERE ...)`, and compound aggregate arithmetic such as `SUM(a * b) - SUM(c)`).
@@ -14,13 +16,13 @@ Zero-runtime-dependency incremental materialized view compiler and lifecycle man
 
   * $\mathbb{Z}$-set `UNION`, `UNION ALL`, `INTERSECT`, and `EXCEPT` set operations.
 
-  * `SELECT DISTINCT` and primary-key lineage projections.
+  * `SELECT DISTINCT` and primary-key lineage projections (including automatic `SELECT *` expansion and native composite primary keys).
 
   * Aggregations over `UNION ALL` CTEs and derived tables.
 
-* **Reference-Counted Distinct & Holistic Fallbacks**: Automatic auxiliary reference-counting tables for `COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)`, plus atomic statement/row refresh for window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`), `LEFT JOIN`, and recursive CTEs.
+* **Reference-Counted Distinct & Holistic Fallbacks**: Automatic auxiliary reference-counting tables for `COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)`, plus group-scoped or atomic refresh for window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`), `LEFT JOIN`, and recursive CTEs (or fail-fast Tier 1 enforcement via `--strict` / `strict=True`).
 
-* **Live Database Schema Introspection**: Accepts either raw SQL DDL strings or a live PEP-249 database connection (`conn`) to automatically introspect existing base tables, column types, nullability, primary keys, and `ON DELETE CASCADE` foreign keys across SQLite, PostgreSQL, and MySQL/MariaDB.
+* **Live Database Schema Introspection & Drift Management**: Accepts either raw SQL DDL strings or a live PEP-249 database connection (`conn`) to automatically introspect existing base tables, column types, nullability, primary keys, and `ON DELETE CASCADE` foreign keys across SQLite, PostgreSQL, and MySQL/MariaDB, with built-in schema drift detection (`--check-drift` / `mgr.check_schema_drift()`) and atomic reconciliation (`--repair` / `mgr.repair_view()`).
 
 * **Extensive Multi-Order-of-Magnitude Differential Fuzzer & Regression Corpus**: Features `DifferentialSQLFuzzer` (Suite 12) generating 5-table schemas (single PK, 2-column & 3-column composite PKs, self-referential hierarchies, multi-hop FKs), up to 80 views per schema across all 7 SQL families, and 45–80+ DML & 3-level nested `SAVEPOINT` transaction steps across both deterministic seeds and fresh cryptographic random 32-bit seeds (`secrets.randbits(32)`), backed by a permanent regression corpus (`Suite 13` + `test_10_fuzz_regression_corpus_invariants`).
 
@@ -31,25 +33,28 @@ Zero-runtime-dependency incremental materialized view compiler and lifecycle man
 ## Quick Start
 
 ```bash
-# Generate a standalone SQL installation script from a schema file
+# Generate a standalone SQL installation script targeting a specific engine & version
 python3 matview_sync.py \
   --schema schema.sql \
   --view view.sql \
-  --dialect postgres \
+  --engine-version postgres:17 \
   --incremental-backfill \
   --batch-size 500
 
-# Or pull the schema directly from an existing SQLite database and apply the materialized view
+# Connect to a live database (SQLite, PostgreSQL, MySQL, or MariaDB), autodetect engine/version & schema, and apply
 python3 matview_sync.py \
-  --db app.db \
+  --db postgresql://postgres:postgres@127.0.0.1:5432/app \
   --view view.sql \
   --apply
+
+# Check for out-of-band base table schema drift and repair/reconcile registered views
+python3 matview_sync.py --db app.db --check-drift --repair
 ```
 
 ## Running Tests & Differential Fuzzing
 
 ```bash
-# Run the full 5,095-view (148,784-assertion) test suite across all 13 suites (automatically scales up further when CI=true)
+# Run the full 5,107-view (148,838-assertion) test suite across all 13 suites (automatically scales up further when CI=true)
 python3 test_matview_sync.py
 
 # Run standalone multi-order-of-magnitude differential fuzzing (Suites 12 & 13, including fresh cryptographic random seeds)

@@ -10,6 +10,8 @@ This document tracks all feature goals, architectural improvements, and verified
   I would like the tests to exercise also pulling the schema from an existing database (`introspect_database_schemas` tested across SQLite, PostgreSQL, and MySQL/MariaDB in `test_08_pull_schema_from_existing_database_across_all_dialects`).
 - [x] **Unified Multi-Dialect Testing Infrastructure**:
   I would like all tests to be unified (taking care of using the right dialects) on top of the same shared testing infrastructure so that even when you're just running the sqlite tests in memory you exercise all the shared infrastructure used also when testing with other engines e.g. mysql/pg (`TranspiledConnectionAdapter` + `MVTestRunner`).
+- [x] **Autodetect or Accept Target Engine & Version (`--engine-version` / `detect_engine_version`)**:
+  I would like the generator to autodetect (when connecting to the database) or accept as arg the engine and version, so that it can autoselect the correct and most efficient dialect/subdialect (`EngineSubdialect`, `EngineVersion`, `parse_engine_version`, `detect_engine_version`, and `--engine-version` across SQLite, PostgreSQL, MySQL, and MariaDB, including PostgreSQL 15+ `UNIQUE ... NULLS NOT DISTINCT` group indexes, PostgreSQL 10+ transition-table gating, MariaDB vs MySQL subdialect detection, and SQLite 3.24+ UPSERT / 3.25+ window-function version checks).
 - [x] **Atomic Single-Transaction Registration & Initial Backfill**:
   Wrap backing/auxiliary table creation, trigger installation, single-shot initial backfill, and `__matview_catalog` registration in a single atomic transaction (with rollback on error) in `MaterializedViewManager._register_single_view_spec` to close the concurrency window between trigger creation and single-shot population.
 - [x] **Safe Batch-Size Substitution in `MaterializedViewPlan.get_populate_statements`**:
@@ -43,14 +45,14 @@ This document tracks all feature goals, architectural improvements, and verified
   - Track the active backfill cursor watermark (`__mv_cursor_pk`) in `__matview_catalog` so concurrent row triggers ignore or coordinate rows above the watermark that have not yet been folded by the backfill cursor.
 - [ ] **Native Composite Keys for Nullable Group Columns, Joins & `UNION ALL` Views**:
   Eliminate remaining string-serialized `__mv_pk` surrogate keys (`quote(a) || '|' || quote(b)`, `ROW(...)::TEXT`, `CONCAT_WS('|', ...)`) where supported:
-  - Use `UNIQUE NULLS NOT DISTINCT (col1, col2, ...)` on PostgreSQL 15+ and SQLite `UNIQUE` indexes with null-coalesced or native composite keys, and
+  - Use `UNIQUE NULLS NOT DISTINCT (col1, col2, ...)` as the conflict target on PostgreSQL 15+ and SQLite `UNIQUE` indexes with null-coalesced or native composite keys, and
   - Ensure all backing and auxiliary tables index individual leading `GROUP BY` columns so engines can perform index range scans and MySQL never hits `VARCHAR(512)` key-length limits on wide group keys.
 - [ ] **Welford Running-Variance (`mean`, `M2`) Maintenance for IEEE-754 Float Engines**:
   Complement PostgreSQL `NUMERIC` and MySQL `DECIMAL` variance accumulators with Welford's running-variance update rules (`count`, `mean`, `M2`) for SQLite `REAL` and floating-point columns under high-churn updates/deletes.
 - [ ] **Session-Scoped or Shadow-Table Swap `bulk_changes()` Isolation**:
   Avoid dropping maintenance triggers globally across concurrent connections during `bulk_changes()` by supporting session-local trigger bypass flags (`SET LOCAL matview.skip_triggers = 'on'` in PostgreSQL, `@__matview_skip_triggers = 1` in MySQL, or a temp control table in SQLite) or rebuilding into a shadow table followed by an atomic `ALTER TABLE ... RENAME` swap.
 
-## P1 — Modular Architecture, Engine/Version Subdialects & Developer Experience
+## P1 — Modular Architecture, Engine/Version Optimizations & Developer Experience
 
 - [ ] **Refactor Monolithic `matview_sync.py` into a Modular Package with a Typed IR**:
   Split `matview_sync.py` into focused modules with a typed, immutable Intermediate Representation (`CompilationContext` / `LogicalIR`) between SQL parsing and dialect code generation instead of mutating compiler attributes (`self.view`, `self.primary_schema`, `self._working_select_items`) in place:
@@ -61,13 +63,11 @@ This document tracks all feature goals, architectural improvements, and verified
   - `matview/dialects/` — SQLite, PostgreSQL, MySQL, MariaDB, and NewSQL codegen
   - `matview/manager.py` — Catalog, backfill, schema drift, migration, and recovery
   - `matview/cli.py` — CLI commands (`compile`, `apply`, `diff`, `check-drift`, `repair`)
-- [ ] **Autodetect or Accept Target Engine & Version (`--engine-version`)**:
-  I would like the generator to autodetect (when connecting to the database) or accept as arg the engine and version, so that it can autoselect the correct and most efficient dialect/subdialect (`SELECT sqlite_version()`, `SHOW server_version_num`, `SELECT VERSION()`).
 - [ ] **Engine & Version-Specific Optimal Code Generation**:
   I would like the generator to support as efficiently as possible every engine and engine version (possibly considering performance features specific to each), and I would like the generated code to be optimal and as efficient as if it had been written as efficiently as possible for that specific view and that specific engine/version by a senior DBA:
-  - PostgreSQL 15+ `UNIQUE NULLS NOT DISTINCT`, PostgreSQL 10+ transition tables, `FILLFACTOR` tuning on high-churn backing tables.
-  - MySQL 8.0.19+ `AS new` row alias in `ON DUPLICATE KEY UPDATE` (replacing deprecated `VALUES(col)`), MariaDB vs MySQL optimizer-specific rewrites.
-  - SQLite 3.24+ `UPSERT`, 3.35+ `RETURNING`, and `WITHOUT ROWID` on clustered composite-PK backing/auxiliary tables.
+  - PostgreSQL `FILLFACTOR` tuning on high-churn backing tables and `MERGE` statements on PostgreSQL 15+.
+  - MySQL 8.0.19+ `AS new` row alias in `ON DUPLICATE KEY UPDATE` where supported, and MariaDB vs MySQL optimizer-specific rewrites.
+  - SQLite 3.35+ `RETURNING` and `WITHOUT ROWID` on clustered composite-PK backing/auxiliary tables.
 - [ ] **Vectorize PostgreSQL Transition-Table Triggers into Set-Based Delta Joins**:
   When `--pg-transition-tables` is enabled in `_emit_dialect_triggers_for_table`, replace the PL/pgSQL `FOR NEW IN SELECT * FROM __mv_new_rows LOOP ... END LOOP;` row loop with a single set-based delta aggregation over `__mv_new_rows` / `__mv_old_rows` merged via `INSERT ... ON CONFLICT DO UPDATE` and `UPDATE ... FROM` to avoid $O(N)$ statement executions on bulk DML.
 - [ ] **Add `matview diff` CLI Command & Compilation Plan Diagnostics**:

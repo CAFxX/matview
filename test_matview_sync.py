@@ -33,6 +33,10 @@ from matview_sync import (
     AggFunc,
     Dialect,
     EngineLimitationError,
+    EngineSubdialect,
+    EngineVersion,
+    detect_engine_version,
+    parse_engine_version,
     EngineLimitationWarning,
     IncrementalViewCompiler,
     LimitationSeverity,
@@ -1182,7 +1186,16 @@ class TranspiledConnectionAdapter:
     path whether connected to a live external server or in-memory SQLite.
     """
 
-    def __init__(self, dialect: Dialect) -> None:
+    def __init__(
+        self,
+        dialect: Dialect = Dialect.POSTGRES,
+        engine_version: Optional[EngineVersion | str] = None,
+    ) -> None:
+        if isinstance(engine_version, (EngineVersion, str)) and engine_version:
+            self._sim_engine_version = parse_engine_version(engine_version, default_dialect=dialect)
+            dialect = self._sim_engine_version.dialect
+        else:
+            self._sim_engine_version = parse_engine_version(dialect)
         assert dialect in (Dialect.POSTGRES, Dialect.MYSQL)
         self.dialect = dialect
         self.autocommit = True
@@ -1362,6 +1375,26 @@ class TranspiledConnectionAdapter:
         if not s:
             return [], 0
         s_up = s.upper().rstrip(";").strip()
+
+        if s_up == "SHOW SERVER_VERSION_NUM":
+            if self.dialect == Dialect.POSTGRES:
+                return [(str(self._sim_engine_version.pg_version_num),)], 1
+            raise sqlite3.OperationalError("unrecognized configuration parameter server_version_num")
+        if s_up == "SELECT VERSION()":
+            if self.dialect == Dialect.POSTGRES:
+                raw_v = self._sim_engine_version.raw_version or f"PostgreSQL {self._sim_engine_version.version_str}"
+                if "postgres" not in raw_v.lower():
+                    raw_v = f"PostgreSQL {self._sim_engine_version.version_str} ({raw_v})"
+                return [(raw_v,)], 1
+            else:
+                raw_v = self._sim_engine_version.raw_version
+                if self._sim_engine_version.is_mariadb and "mariadb" not in raw_v.lower():
+                    raw_v = f"{self._sim_engine_version.version_str}-MariaDB"
+                elif not raw_v:
+                    raw_v = self._sim_engine_version.version_str
+                return [(raw_v,)], 1
+        if s_up == "SELECT SQLITE_VERSION()":
+            raise sqlite3.OperationalError("function sqlite_version() does not exist")
 
         if s_up.startswith("DROP SCHEMA PUBLIC") or s_up.startswith("DROP DATABASE"):
             self._reset_sqlite()
@@ -1744,6 +1777,9 @@ class TranspiledConnectionAdapter:
                 s_exec = f"DELETE FROM {m_trunc.group(1)};"
             else:
                 s_exec = _transpile_pg_expr_to_sqlite(s)
+                if "NULLS NOT DISTINCT" in s_exec.upper():
+                    s_exec = re.sub(r"\s+NULLS\s+NOT\s+DISTINCT\b", "", s_exec, flags=re.I)
+                    s_exec = re.sub(r"^CREATE\s+UNIQUE\s+INDEX\b", "CREATE INDEX", s_exec, flags=re.I)
                 s_exec = re.sub(
                     r"\bDROP\s+(VIEW|TABLE)\s+IF\s+EXISTS\s+([A-Za-z0-9_]+)\s+CASCADE\s*;?",
                     r"DROP \1 IF EXISTS \2;",
@@ -4142,6 +4178,173 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             self.assertEqual(rc_rep, 0)
             self.assertEqual(mgr.check_schema_drift(), {"__matview_v_star": "ok"})
             mgr.conn.close()
+
+    def test_12_engine_and_version_autodetection_and_subdialect_codegen(self) -> None:
+        """
+        Tests engine & version parsing (`parse_engine_version`), live database connection
+        autodetection (`detect_engine_version`), subdialect differentiation (`sqlite`,
+        `postgres`, `mysql`, `mariadb`), and version-specific optimal code generation.
+        """
+        # 1. parse_engine_version across diverse strings & subdialects
+        ev_pg17 = parse_engine_version("postgres:17.2")
+        self.assertEqual(ev_pg17.dialect, Dialect.POSTGRES)
+        self.assertEqual(ev_pg17.subdialect, EngineSubdialect.POSTGRES)
+        self.assertEqual(ev_pg17.version, (17, 2, 0))
+        self.assertTrue(ev_pg17.supports_pg_transition_tables)
+        self.assertTrue(ev_pg17.supports_pg_nulls_not_distinct)
+
+        ev_pg14 = parse_engine_version("postgresql-14.11")
+        self.assertEqual(ev_pg14.version, (14, 11, 0))
+        self.assertTrue(ev_pg14.supports_pg_transition_tables)
+        self.assertFalse(ev_pg14.supports_pg_nulls_not_distinct)
+
+        ev_pg96 = parse_engine_version("pg9.6.24")
+        self.assertEqual(ev_pg96.version, (9, 6, 24))
+        self.assertFalse(ev_pg96.supports_pg_transition_tables)
+
+        ev_maria = parse_engine_version("5.5.5-10.11.8-MariaDB-1:10.11.8+maria~ubu2204")
+        self.assertEqual(ev_maria.dialect, Dialect.MYSQL)
+        self.assertEqual(ev_maria.subdialect, EngineSubdialect.MARIADB)
+        self.assertTrue(ev_maria.is_mariadb)
+        self.assertEqual(ev_maria.version, (10, 11, 8))
+        self.assertTrue(ev_maria.supports_mysql_window_functions)
+
+        ev_my84 = parse_engine_version("mysql:8.4.2")
+        self.assertEqual(ev_my84.dialect, Dialect.MYSQL)
+        self.assertEqual(ev_my84.subdialect, EngineSubdialect.MYSQL)
+        self.assertTrue(ev_my84.is_mysql)
+        self.assertEqual(ev_my84.version, (8, 4, 2))
+        self.assertTrue(ev_my84.supports_mysql_row_alias_upsert)
+
+        ev_my57 = parse_engine_version("mysql:5.7.44")
+        self.assertFalse(ev_my57.supports_mysql_window_functions)
+        self.assertFalse(ev_my57.supports_mysql_row_alias_upsert)
+
+        ev_sq320 = parse_engine_version("sqlite:3.20.0")
+        self.assertFalse(ev_sq320.supports_sqlite_upsert)
+        self.assertFalse(ev_sq320.supports_sqlite_window_functions)
+
+        # 2. Live connection autodetection via detect_engine_version() without hint_dialect
+        sq_conn = sqlite3.connect(":memory:")
+        det_sq = detect_engine_version(sq_conn)
+        self.assertEqual(det_sq.dialect, Dialect.SQLITE)
+        self.assertEqual(det_sq.subdialect, EngineSubdialect.SQLITE)
+        self.assertEqual(det_sq.version, sqlite3.sqlite_version_info[:3])
+        sq_conn.close()
+
+        tr_pg17 = TranspiledConnectionAdapter(Dialect.POSTGRES, engine_version="postgres:17.2")
+        det_pg17 = detect_engine_version(tr_pg17)
+        self.assertEqual(det_pg17.dialect, Dialect.POSTGRES)
+        self.assertEqual(det_pg17.subdialect, EngineSubdialect.POSTGRES)
+        self.assertEqual(det_pg17.version, (17, 2, 0))
+
+        tr_maria11 = TranspiledConnectionAdapter(Dialect.MYSQL, engine_version="11.4.3-MariaDB-ubu2404")
+        det_maria11 = detect_engine_version(tr_maria11)
+        self.assertEqual(det_maria11.dialect, Dialect.MYSQL)
+        self.assertEqual(det_maria11.subdialect, EngineSubdialect.MARIADB)
+        self.assertEqual(det_maria11.version, (11, 4, 3))
+
+        # Also test a generic DB-API 2.0 connection wrapper with NO .dialect attribute (probing via SQL)
+        class _OpaqueDBWrapper:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+            def cursor(self) -> Any:
+                return self._inner.cursor()
+            def commit(self) -> None:
+                self._inner.commit()
+            def rollback(self) -> None:
+                self._inner.rollback()
+
+        opaque_maria = _OpaqueDBWrapper(tr_maria11)
+        det_opaque = detect_engine_version(opaque_maria)
+        self.assertEqual(det_opaque.dialect, Dialect.MYSQL)
+        self.assertEqual(det_opaque.subdialect, EngineSubdialect.MARIADB)
+        self.assertEqual(det_opaque.version, (11, 4, 3))
+
+        # 3. Version-specific code generation differences
+        schema = """
+            CREATE TABLE ev_sales (
+                id INTEGER PRIMARY KEY,
+                region VARCHAR(64),
+                amount DOUBLE PRECISION NOT NULL
+            );
+        """
+        view_sql = "CREATE VIEW v_ev_reg AS SELECT region, COUNT(*) AS c, SUM(amount) AS s FROM ev_sales GROUP BY region;"
+
+        # PostgreSQL 14 vs PostgreSQL 17 on nullable GROUP BY column (`UNIQUE ... NULLS NOT DISTINCT`)
+        p_pg14 = generate_materialized_view(schema, view_sql, engine_version="postgres:14.5")
+        self.assertEqual(p_pg14.engine_version.version, (14, 5, 0))
+        self.assertTrue(any("CREATE INDEX __matview_idx_v_ev_reg__grp ON" in d for d in p_pg14.index_ddls))
+        self.assertFalse(any("NULLS NOT DISTINCT" in d for d in p_pg14.index_ddls))
+
+        p_pg17 = generate_materialized_view(schema, view_sql, engine_version="postgres:17.1")
+        self.assertEqual(p_pg17.engine_version.version, (17, 1, 0))
+        self.assertTrue(
+            any("CREATE UNIQUE INDEX __matview_idx_v_ev_reg__grp ON __matview_store_v_ev_reg (region) NULLS NOT DISTINCT;" in d for d in p_pg17.index_ddls)
+        )
+        self.assertIn("Engine: postgres 17.1.0", p_pg17.render_sql_script())
+
+        # PostgreSQL 9.6 automatically disables transition tables and falls back to FOR EACH ROW triggers
+        p_pg96 = generate_materialized_view(
+            schema, view_sql, engine_version="postgres:9.6", pg_use_transition_tables=True
+        )
+        self.assertNotIn("REFERENCING NEW TABLE", "\n".join(p_pg96.trigger_ddls))
+        self.assertIn("FOR EACH ROW EXECUTE FUNCTION", "\n".join(p_pg96.trigger_ddls))
+
+        # SQLite 3.20 (before 3.24 UPSERT) automatically selects GROUP_SCOPED_DELTA instead of ALGEBRAIC_DELTA
+        p_sq320 = generate_materialized_view(schema, view_sql, engine_version="sqlite:3.20.0")
+        self.assertEqual(p_sq320.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA)
+        self.assertNotIn("ON CONFLICT", "\n".join(p_sq320.trigger_ddls))
+
+        # Window functions on MySQL 5.7 or SQLite 3.24 raise EngineLimitationError
+        win_view = "CREATE VIEW v_win AS SELECT id, region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY id) AS rn FROM ev_sales;"
+        with self.assertRaises(EngineLimitationError) as ctx_my57:
+            generate_materialized_view(schema, win_view, engine_version="mysql:5.7")
+        self.assertIn("MYSQL_VERSION_NO_WINDOW_FUNC", str(ctx_my57.exception))
+
+        with self.assertRaises(EngineLimitationError) as ctx_sq324:
+            generate_materialized_view(schema, win_view, engine_version="sqlite:3.24.0")
+        self.assertIn("SQLITE_VERSION_NO_WINDOW_FUNC", str(ctx_sq324.exception))
+
+        # 4. MaterializedViewManager autodetects dialect & version when no dialect is passed
+        mgr_pg17 = MaterializedViewManager(tr_pg17)
+        self.assertEqual(mgr_pg17.dialect, Dialect.POSTGRES)
+        self.assertEqual(mgr_pg17.subdialect, EngineSubdialect.POSTGRES)
+        self.assertEqual(mgr_pg17.engine_version.version, (17, 2, 0))
+        mgr_pg17.apply_schema_ddl(schema, auto_sync_views=False)
+        tr_pg17.execute("INSERT INTO ev_sales VALUES (1, 'EU', 10.0), (2, NULL, 25.0);")
+        plan_reg = mgr_pg17.register_view(view_sql)
+        self.assertEqual(plan_reg.engine_version.version, (17, 2, 0))
+        self.assertTrue(any("NULLS NOT DISTINCT" in d for d in plan_reg.index_ddls))
+        tr_pg17.execute("INSERT INTO ev_sales VALUES (3, NULL, 15.0);")
+        rows_pg17 = tr_pg17.execute("SELECT region, c, s FROM __matview_v_ev_reg ORDER BY c;").fetchall()
+        self.assertEqual(rows_pg17, [("EU", 1, 10.0), (None, 2, 40.0)])
+        tr_pg17.close()
+
+        mgr_maria = MaterializedViewManager(tr_maria11, ignore_limitations=True)
+        self.assertEqual(mgr_maria.dialect, Dialect.MYSQL)
+        self.assertEqual(mgr_maria.subdialect, EngineSubdialect.MARIADB)
+        self.assertEqual(mgr_maria.engine_version.version, (11, 4, 3))
+        mgr_maria.apply_schema_ddl(schema, auto_sync_views=False)
+        plan_maria = mgr_maria.register_view(view_sql)
+        self.assertEqual(plan_maria.subdialect, EngineSubdialect.MARIADB)
+        self.assertIn("Engine: mariadb 11.4.3", plan_maria.render_sql_script())
+        tr_maria11.close()
+
+        # 5. CLI --engine-version and versioned --dialect flags
+        rc_ev = cli_main([
+            "--schema", schema,
+            "--view", view_sql,
+            "--engine-version", "postgres:17.2",
+        ])
+        self.assertEqual(rc_ev, 0)
+        rc_maria = cli_main([
+            "--schema", schema,
+            "--view", view_sql,
+            "--dialect", "mariadb:11.4",
+            "--ignore-limitations",
+        ])
+        self.assertEqual(rc_maria, 0)
 
 
 import random

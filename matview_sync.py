@@ -52,6 +52,349 @@ class Dialect(str, Enum):
     MYSQL = "mysql"
 
 
+class EngineSubdialect(str, Enum):
+    SQLITE = "sqlite"
+    POSTGRES = "postgres"
+    MYSQL = "mysql"
+    MARIADB = "mariadb"
+
+
+@dataclass(frozen=True, order=True)
+class EngineVersion:
+    """
+    Represents a specific database engine, subdialect (`sqlite`, `postgres`, `mysql`, `mariadb`),
+    and semantic version tuple `(major, minor, patch)` for version-optimal SQL generation.
+    """
+    dialect: Dialect
+    subdialect: EngineSubdialect
+    version: Tuple[int, int, int]
+    raw_version: str = field(default="", compare=False)
+
+    @property
+    def major(self) -> int:
+        return self.version[0]
+
+    @property
+    def minor(self) -> int:
+        return self.version[1]
+
+    @property
+    def patch(self) -> int:
+        return self.version[2]
+
+    @property
+    def version_str(self) -> str:
+        return f"{self.version[0]}.{self.version[1]}.{self.version[2]}"
+
+    @property
+    def pg_version_num(self) -> int:
+        return self.version[0] * 10000 + self.version[1] * 100 + self.version[2]
+
+    @property
+    def label(self) -> str:
+        return f"{self.subdialect.value} {self.version_str}"
+
+    @property
+    def is_sqlite(self) -> bool:
+        return self.dialect == Dialect.SQLITE
+
+    @property
+    def is_postgres(self) -> bool:
+        return self.dialect == Dialect.POSTGRES
+
+    @property
+    def is_mysql(self) -> bool:
+        return self.subdialect == EngineSubdialect.MYSQL
+
+    @property
+    def is_mariadb(self) -> bool:
+        return self.subdialect == EngineSubdialect.MARIADB
+
+    @property
+    def supports_pg_transition_tables(self) -> bool:
+        return self.is_postgres and self.version >= (10, 0, 0)
+
+    @property
+    def supports_pg_nulls_not_distinct(self) -> bool:
+        return self.is_postgres and self.version >= (15, 0, 0)
+
+    @property
+    def supports_pg_merge(self) -> bool:
+        return self.is_postgres and self.version >= (15, 0, 0)
+
+    @property
+    def supports_sqlite_upsert(self) -> bool:
+        return self.is_sqlite and self.version >= (3, 24, 0)
+
+    @property
+    def supports_sqlite_window_functions(self) -> bool:
+        return self.is_sqlite and self.version >= (3, 25, 0)
+
+    @property
+    def supports_sqlite_returning(self) -> bool:
+        return self.is_sqlite and self.version >= (3, 35, 0)
+
+    @property
+    def supports_mysql_window_functions(self) -> bool:
+        return (self.is_mysql and self.version >= (8, 0, 0)) or (
+            self.is_mariadb and self.version >= (10, 2, 0)
+        )
+
+    @property
+    def supports_mysql_row_alias_upsert(self) -> bool:
+        return self.is_mysql and self.version >= (8, 0, 19)
+
+
+def _extract_version_tuple(
+    text_s: str, default_ver: Tuple[int, int, int]
+) -> Tuple[int, int, int]:
+    # Handle 5- or 6-digit PostgreSQL server_version_num like 170002 or 90624
+    m_pgnum = re.search(r"\b(\d{5,6})\b", text_s)
+    if m_pgnum and "." not in text_s:
+        num = int(m_pgnum.group(1))
+        if num >= 100000:
+            return (num // 10000, (num % 10000) // 100, num % 100)
+        return (num // 10000, (num % 10000) // 100, num % 100)
+    # If MariaDB banner like '5.5.5-10.11.8-MariaDB' or '10.11.8-MariaDB-1:10.11.8'
+    m_maria = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?(?=-MariaDB)", text_s, flags=re.IGNORECASE)
+    if m_maria:
+        return (
+            int(m_maria.group(1)),
+            int(m_maria.group(2)),
+            int(m_maria.group(3)) if m_maria.group(3) is not None else 0,
+        )
+    # Strip 'sqlite3' prefix so '3' in 'sqlite3' is not mistaken for version 3.0.0
+    cleaned = re.sub(r"\bsqlite3\b", "sqlite", text_s, flags=re.IGNORECASE)
+    m_ver = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", cleaned)
+    if not m_ver:
+        return default_ver
+    maj = int(m_ver.group(1))
+    min_v = int(m_ver.group(2)) if m_ver.group(2) is not None else 0
+    pat = int(m_ver.group(3)) if m_ver.group(3) is not None else 0
+    return (maj, min_v, pat)
+
+
+def parse_engine_version(
+    spec: Optional[EngineVersion | str | Dialect] = None,
+    default_dialect: Optional[Dialect | str] = None,
+) -> EngineVersion:
+    """
+    Parses an engine/version specification (e.g. `'postgres:17'`, `'postgresql-16.4'`,
+    `'mariadb:11.4.2'`, `'mysql:8.4'`, `'sqlite:3.45.1'`, `'10.11.8-MariaDB'`, or a bare
+    version `'17.2'` with `default_dialect`) into a normalized `EngineVersion`.
+    """
+    if isinstance(spec, EngineVersion):
+        return spec
+
+    def_d: Optional[Dialect] = None
+    def_sub: Optional[EngineSubdialect] = None
+    if isinstance(default_dialect, Dialect):
+        def_d = default_dialect
+        def_sub = EngineSubdialect(default_dialect.value)
+    elif isinstance(default_dialect, str) and default_dialect.strip():
+        dl_s = default_dialect.strip().lower()
+        if "mariadb" in dl_s:
+            def_d = Dialect.MYSQL
+            def_sub = EngineSubdialect.MARIADB
+        elif any(k in dl_s for k in ("postgres", "pg")):
+            def_d = Dialect.POSTGRES
+            def_sub = EngineSubdialect.POSTGRES
+        elif "mysql" in dl_s:
+            def_d = Dialect.MYSQL
+            def_sub = EngineSubdialect.MYSQL
+        elif "sqlite" in dl_s:
+            def_d = Dialect.SQLITE
+            def_sub = EngineSubdialect.SQLITE
+
+    if isinstance(spec, Dialect):
+        if spec == Dialect.POSTGRES:
+            return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, (14, 0, 0), "14.0.0")
+        if spec == Dialect.MYSQL:
+            sub = def_sub if def_sub in (EngineSubdialect.MYSQL, EngineSubdialect.MARIADB) else EngineSubdialect.MYSQL
+            ver = (11, 4, 0) if sub == EngineSubdialect.MARIADB else (8, 0, 0)
+            return EngineVersion(Dialect.MYSQL, sub, ver, f"{ver[0]}.{ver[1]}.{ver[2]}")
+        sq_v = sqlite3.sqlite_version_info[:3]
+        return EngineVersion(Dialect.SQLITE, EngineSubdialect.SQLITE, (sq_v[0], sq_v[1], sq_v[2]), sqlite3.sqlite_version)
+
+    s = (spec or "").strip()
+    if not s:
+        target_d = def_d or Dialect.SQLITE
+        return parse_engine_version(target_d, default_dialect=default_dialect)
+
+    s_low = s.lower()
+    if "mariadb" in s_low:
+        ver = _extract_version_tuple(s, (11, 4, 0))
+        return EngineVersion(Dialect.MYSQL, EngineSubdialect.MARIADB, ver, s)
+    if any(k in s_low for k in ("postgres", "postgresql", "pg", "cockroach", "yugabyte")):
+        ver = _extract_version_tuple(s, (14, 0, 0))
+        return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, ver, s)
+    if any(k in s_low for k in ("mysql", "percona", "tidb")):
+        ver = _extract_version_tuple(s, (8, 0, 0))
+        return EngineVersion(Dialect.MYSQL, EngineSubdialect.MYSQL, ver, s)
+    if any(k in s_low for k in ("sqlite", "apsw", "sqlcipher", "sqlean", "libsql")):
+        sq_def = sqlite3.sqlite_version_info[:3]
+        ver = _extract_version_tuple(s, (sq_def[0], sq_def[1], sq_def[2]))
+        return EngineVersion(Dialect.SQLITE, EngineSubdialect.SQLITE, ver, s)
+
+    # Bare version string (e.g. '17.2', '8.4.0', '3.45.1')
+    if def_d is not None:
+        if def_d == Dialect.POSTGRES:
+            ver = _extract_version_tuple(s, (14, 0, 0))
+            return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, ver, s)
+        if def_d == Dialect.MYSQL:
+            sub = def_sub if def_sub in (EngineSubdialect.MYSQL, EngineSubdialect.MARIADB) else EngineSubdialect.MYSQL
+            def_v = (11, 4, 0) if sub == EngineSubdialect.MARIADB else (8, 0, 0)
+            ver = _extract_version_tuple(s, def_v)
+            return EngineVersion(Dialect.MYSQL, sub, ver, s)
+        sq_def = sqlite3.sqlite_version_info[:3]
+        ver = _extract_version_tuple(s, (sq_def[0], sq_def[1], sq_def[2]))
+        return EngineVersion(Dialect.SQLITE, EngineSubdialect.SQLITE, ver, s)
+
+    raise ValueError(
+        f"Cannot determine database dialect from engine/version specification {spec!r}; "
+        f"use '<engine>:<version>' (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45')."
+    )
+
+
+def detect_engine_version(
+    conn: Any,
+    hint_dialect: Optional[Dialect | str | EngineVersion] = None,
+) -> EngineVersion:
+    """
+    Autodetects the database engine (`Dialect`), subdialect (`sqlite`, `postgres`, `mysql`, `mariadb`),
+    and exact server version `(major, minor, patch)` from a live database connection.
+    """
+    if isinstance(hint_dialect, EngineVersion):
+        return hint_dialect
+
+    # 1. Explicit engine_version attribute on connection or adapter
+    conn_ev = getattr(conn, "engine_version", None)
+    if isinstance(conn_ev, EngineVersion):
+        return conn_ev
+    if isinstance(conn_ev, str) and conn_ev.strip():
+        return parse_engine_version(conn_ev, default_dialect=getattr(conn, "dialect", hint_dialect))
+
+    # 2. Determine candidate dialect from connection attributes, class/module name, or hint_dialect
+    cand_dialect: Optional[Dialect] = None
+    cand_sub: Optional[EngineSubdialect] = None
+    if isinstance(hint_dialect, Dialect):
+        cand_dialect = hint_dialect
+    elif isinstance(hint_dialect, str) and hint_dialect.strip():
+        parsed_hint = parse_engine_version(hint_dialect)
+        # If the hint string already contains an explicit version number (e.g. 'postgres:17'), honor it if query fails
+        cand_dialect = parsed_hint.dialect
+        cand_sub = parsed_hint.subdialect
+
+    conn_d = getattr(conn, "dialect", None)
+    if cand_dialect is None and conn_d is not None:
+        if isinstance(conn_d, Dialect):
+            cand_dialect = conn_d
+        elif isinstance(conn_d, str):
+            cand_dialect = parse_engine_version(conn_d).dialect
+
+    mod_cls = f"{type(conn).__module__}.{type(conn).__qualname__}".lower()
+    if cand_dialect is None:
+        if isinstance(conn, sqlite3.Connection) or any(
+            k in mod_cls for k in ("sqlite", "apsw", "sqlcipher", "sqlean", "libsql")
+        ):
+            cand_dialect = Dialect.SQLITE
+        elif any(k in mod_cls for k in ("psycopg", "pg8000", "asyncpg", "postgres", "pgsql")):
+            cand_dialect = Dialect.POSTGRES
+        elif any(k in mod_cls for k in ("pymysql", "mysqldb", "mariadb", "mysql")):
+            cand_dialect = Dialect.MYSQL
+
+    # 3. Query the live connection for its exact version string
+    try:
+        cur = conn.cursor()
+    except Exception:
+        return parse_engine_version(
+            hint_dialect if isinstance(hint_dialect, str) else None,
+            default_dialect=cand_dialect or Dialect.SQLITE,
+        )
+
+    if cand_dialect == Dialect.SQLITE:
+        try:
+            cur.execute("SELECT sqlite_version();")
+            row = cur.fetchone()
+            if row and row[0]:
+                v_str = str(row[0])
+                return parse_engine_version(f"sqlite:{v_str}", default_dialect=Dialect.SQLITE)
+        except Exception:
+            pass
+        return parse_engine_version("sqlite", default_dialect=Dialect.SQLITE)
+
+    if cand_dialect == Dialect.POSTGRES:
+        raw_v = ""
+        ver_tuple: Optional[Tuple[int, int, int]] = None
+        try:
+            cur.execute("SHOW server_version_num;")
+            r_num = cur.fetchone()
+            if r_num and r_num[0]:
+                num_s = str(r_num[0]).strip()
+                ver_tuple = _extract_version_tuple(num_s, (14, 0, 0))
+                raw_v = num_s
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT version();")
+            r_v = cur.fetchone()
+            if r_v and r_v[0]:
+                raw_v = str(r_v[0]).strip()
+                if ver_tuple is None:
+                    ver_tuple = _extract_version_tuple(raw_v, (14, 0, 0))
+        except Exception:
+            pass
+        if ver_tuple is not None:
+            return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, ver_tuple, raw_v)
+        return parse_engine_version(
+            hint_dialect if isinstance(hint_dialect, str) else None,
+            default_dialect=Dialect.POSTGRES,
+        )
+
+    if cand_dialect == Dialect.MYSQL:
+        try:
+            cur.execute("SELECT VERSION();")
+            row = cur.fetchone()
+            if row and row[0]:
+                v_str = str(row[0]).strip()
+                if "mariadb" in v_str.lower() or cand_sub == EngineSubdialect.MARIADB:
+                    ver = _extract_version_tuple(v_str, (11, 4, 0))
+                    return EngineVersion(Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str)
+                ver = _extract_version_tuple(v_str, (8, 0, 0))
+                return EngineVersion(Dialect.MYSQL, EngineSubdialect.MYSQL, ver, v_str)
+        except Exception:
+            pass
+        return parse_engine_version(
+            hint_dialect if isinstance(hint_dialect, str) else None,
+            default_dialect=cand_sub.value if cand_sub else Dialect.MYSQL,
+        )
+
+    # 4. Unknown connection class with no dialect hint: probe SQLite -> Postgres -> MySQL/MariaDB
+    try:
+        cur.execute("SELECT sqlite_version();")
+        row = cur.fetchone()
+        if row and row[0]:
+            return parse_engine_version(f"sqlite:{row[0]}", default_dialect=Dialect.SQLITE)
+    except Exception:
+        pass
+    try:
+        cur.execute("SELECT version();")
+        row = cur.fetchone()
+        if row and row[0]:
+            v_str = str(row[0]).strip()
+            if "postgres" in v_str.lower() or "cockroach" in v_str.lower() or "yugabyte" in v_str.lower():
+                ver = _extract_version_tuple(v_str, (14, 0, 0))
+                return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, ver, v_str)
+            if "mariadb" in v_str.lower():
+                ver = _extract_version_tuple(v_str, (11, 4, 0))
+                return EngineVersion(Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str)
+            ver = _extract_version_tuple(v_str, (8, 0, 0))
+            return EngineVersion(Dialect.MYSQL, EngineSubdialect.MYSQL, ver, v_str)
+    except Exception:
+        pass
+    return parse_engine_version("sqlite", default_dialect=Dialect.SQLITE)
+
+
 class MaintenanceStrategy(str, Enum):
     ALGEBRAIC_DELTA = "algebraic_delta"
     GROUP_SCOPED_DELTA = "group_scoped_delta"
@@ -231,6 +574,13 @@ class MaterializedViewPlan:
     batch_size: int = 1000
     full_populate_sqls: List[str] = field(default_factory=list)
     incremental_populate_sqls: List[str] = field(default_factory=list)
+    engine_version: Optional[EngineVersion] = None
+
+    @property
+    def subdialect(self) -> EngineSubdialect:
+        if self.engine_version is not None:
+            return self.engine_version.subdialect
+        return EngineSubdialect(self.dialect.value)
 
     @property
     def view_name(self) -> str:
@@ -376,11 +726,12 @@ class MaterializedViewPlan:
             batch_size=eff_batch,
         )
         bf_label = f"incremental (batch_size={eff_batch})" if use_inc else "full"
+        eng_label = f" | Engine: {self.engine_version.label}" if self.engine_version else ""
         lines: List[str] = [
             "-- =============================================================================",
             f"-- Incremental Materialized View: {self.view_name} (logical: {self.logical_view_name})",
             f"-- Backing Table: {self.backing_table_name}",
-            f"-- Base Tables: {', '.join(self.view_spec.referenced_tables)} | Dialect: {self.dialect.value} | Strategy: {self.strategy.value} | Backfill: {bf_label}",
+            f"-- Base Tables: {', '.join(self.view_spec.referenced_tables)} | Dialect: {self.dialect.value}{eng_label} | Strategy: {self.strategy.value} | Backfill: {bf_label}",
             "-- =============================================================================",
         ]
         if self.limitations:
@@ -813,15 +1164,20 @@ def introspect_sqlite_schemas(
 
 def introspect_database_schemas(
     conn: Any,
-    dialect: Dialect | str = Dialect.SQLITE,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
 ) -> Dict[str, TableSchema]:
     """
     Introspects all non-internal base tables from a live database connection
-    across SQLite, PostgreSQL, and MySQL/MariaDB.
+    across SQLite, PostgreSQL, and MySQL/MariaDB. Autodetects the engine dialect
+    from `conn` when `dialect` is omitted.
     """
-    if isinstance(dialect, str):
-        dialect = Dialect(dialect.lower())
+    if dialect is None:
+        dialect = detect_engine_version(conn).dialect
+    elif isinstance(dialect, EngineVersion):
+        dialect = dialect.dialect
+    elif isinstance(dialect, str):
+        dialect = parse_engine_version(dialect).dialect
     catalog_table = f"{object_prefix}catalog" if object_prefix else "matview_catalog"
 
     if dialect == Dialect.SQLITE:
@@ -1925,21 +2281,33 @@ class IncrementalViewCompiler:
         self,
         schemas: Dict[str, TableSchema],
         view_spec: ViewSpec,
-        dialect: Dialect = Dialect.SQLITE,
+        dialect: Dialect | str | EngineVersion = Dialect.SQLITE,
         pg_use_transition_tables: bool = False,
         ignore_limitations: bool = False,
         object_prefix: str = DEFAULT_OBJECT_PREFIX,
         incremental_backfill: bool = False,
         batch_size: int = 1000,
         strict: bool = False,
+        engine_version: Optional[EngineVersion | str] = None,
     ) -> None:
         self.schemas = dict(schemas)
         self._schemas_lower: Dict[str, TableSchema] = {
             k.lower(): v for k, v in self.schemas.items()
         }
         self.raw_view = view_spec
-        self.dialect = dialect
-        self.pg_use_transition_tables = pg_use_transition_tables
+        if engine_version is not None:
+            self.engine_version = parse_engine_version(
+                engine_version,
+                default_dialect=dialect if not isinstance(dialect, EngineVersion) else dialect.dialect,
+            )
+        else:
+            self.engine_version = parse_engine_version(dialect)
+        self.dialect: Dialect = self.engine_version.dialect
+        self.subdialect: EngineSubdialect = self.engine_version.subdialect
+        # Automatically disable transition tables if targeting PostgreSQL < 10.0
+        self.pg_use_transition_tables = bool(
+            pg_use_transition_tables and self.engine_version.supports_pg_transition_tables
+        )
         self.ignore_limitations = ignore_limitations
         self.object_prefix = object_prefix
         self.incremental_backfill = incremental_backfill
@@ -2052,6 +2420,35 @@ class IncrementalViewCompiler:
                             mitigation="Perform cascading deletes/updates explicitly in application SQL or use PostgreSQL/SQLite.",
                         )
                     )
+        if self.view.has_window_func:
+            if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_window_functions:
+                lims.append(
+                    TransparencyLimitation(
+                        code="SQLITE_VERSION_NO_WINDOW_FUNC",
+                        severity=LimitationSeverity.BLOCKER,
+                        dialect=Dialect.SQLITE,
+                        affected_object=self.logical_view_name,
+                        description=(
+                            f"View '{self.logical_view_name}' uses window functions, which require "
+                            f"SQLite >= 3.25.0 (target engine is {self.engine_version.label})."
+                        ),
+                        mitigation="Upgrade SQLite to >= 3.25.0 or rewrite the query without OVER (...).",
+                    )
+                )
+            elif self.dialect == Dialect.MYSQL and not self.engine_version.supports_mysql_window_functions:
+                lims.append(
+                    TransparencyLimitation(
+                        code="MYSQL_VERSION_NO_WINDOW_FUNC",
+                        severity=LimitationSeverity.BLOCKER,
+                        dialect=Dialect.MYSQL,
+                        affected_object=self.logical_view_name,
+                        description=(
+                            f"View '{self.logical_view_name}' uses window functions, which require "
+                            f"MySQL >= 8.0.0 or MariaDB >= 10.2.0 (target engine is {self.engine_version.label})."
+                        ),
+                        mitigation="Upgrade MySQL to >= 8.0.0 / MariaDB to >= 10.2.0 or rewrite the query.",
+                    )
+                )
         return lims
 
     def _enforce_limitations(self) -> None:
@@ -2793,6 +3190,20 @@ class IncrementalViewCompiler:
         return True
 
     def _choose_strategy(self) -> MaintenanceStrategy:
+        if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_upsert:
+            v = self.view
+            has_any_agg = any(it.is_aggregate for it in v.select_items)
+            if (
+                has_any_agg
+                and v.group_by_cols
+                and not v.has_cte
+                and not v.has_window_func
+                and not v.has_compound_set_op
+                and not v.has_limit_or_order
+                and not v.has_subquery_in_from
+            ):
+                return MaintenanceStrategy.GROUP_SCOPED_DELTA
+            return MaintenanceStrategy.ATOMIC_QUERY_SYNC
         if self._can_use_single_table_algebraic():
             self._alg_mode = "single"
             return MaintenanceStrategy.ALGEBRAIC_DELTA
@@ -2980,6 +3391,7 @@ class IncrementalViewCompiler:
         auto_group_cols: Sequence[str] = (),
         has_pk_on_group_cols: bool = False,
         backing_col_map: Optional[Dict[str, str]] = None,
+        unique_group_nulls_not_distinct: bool = False,
     ) -> Tuple[List[str], List[str]]:
         ddls: List[str] = []
         names: List[str] = []
@@ -2988,7 +3400,12 @@ class IncrementalViewCompiler:
 
         if auto_group_cols and not has_pk_on_group_cols:
             idx_name = self._bounded_ident(f"{p}idx_", log_vname, "__grp")
-            ddls.append(f"CREATE INDEX {idx_name} ON {mv_table} ({', '.join(auto_group_cols)});")
+            if unique_group_nulls_not_distinct and self.engine_version.supports_pg_nulls_not_distinct:
+                ddls.append(
+                    f"CREATE UNIQUE INDEX {idx_name} ON {mv_table} ({', '.join(auto_group_cols)}) NULLS NOT DISTINCT;"
+                )
+            else:
+                ddls.append(f"CREATE INDEX {idx_name} ON {mv_table} ({', '.join(auto_group_cols)});")
             names.append(idx_name)
 
         for i, idx_spec in enumerate(self.user_indexes, 1):
@@ -3836,6 +4253,7 @@ class IncrementalViewCompiler:
             batch_size=self.batch_size,
             full_populate_sqls=full_sqls,
             incremental_populate_sqls=inc_sqls,
+            engine_version=self.engine_version,
         )
 
     def _compile_single_plan(self) -> MaterializedViewPlan:
@@ -3874,6 +4292,8 @@ class IncrementalViewCompiler:
                 object_prefix=self.object_prefix,
                 incremental_backfill=self.incremental_backfill,
                 batch_size=self.batch_size,
+                strict=self.strict,
+                engine_version=self.engine_version,
             )
             sub_plans.append(sub_comp._compile_single_plan())
 
@@ -3904,6 +4324,7 @@ class IncrementalViewCompiler:
             batch_size=self.batch_size,
             full_populate_sqls=[d for sp in sub_plans for d in sp.full_populate_sqls],
             incremental_populate_sqls=[d for sp in sub_plans for d in sp.incremental_populate_sqls],
+            engine_version=self.engine_version,
         )
 
 
@@ -4212,11 +4633,23 @@ class IncrementalViewCompiler:
             for u_col, expr_s in self._compound_reader_exprs.items()
             if expr_s != u_col and "__mv_elem_" in expr_s
         }
+        can_pg15_unique_nnd = (
+            bool(grp_exprs)
+            and has_nullable_grp
+            and self._alg_mode in ("single", "distinct")
+            and len(set(c.lower() for c in group_mv_cols)) == len(grp_exprs)
+            and all(
+                (cd := self._lookup_col_def(g)) is not None
+                and any(tk in cd.data_type.upper() for tk in ("INT", "CHAR", "TEXT"))
+                for g in grp_exprs
+            )
+        )
         index_ddls, index_names = self._build_all_index_ddls(
             mv_table=mv_table,
             auto_group_cols=group_mv_cols,
             has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
             backing_col_map=backing_col_map,
+            unique_group_nulls_not_distinct=can_pg15_unique_nnd,
         )
 
         reader_select_override = [
@@ -8298,15 +8731,40 @@ class MaterializedViewManager:
     def __init__(
         self,
         conn_or_url: sqlite3.Connection | str | Any,
-        dialect: Dialect | str = Dialect.SQLITE,
+        dialect: Optional[Dialect | str | EngineVersion] = None,
         ignore_limitations: bool = False,
         object_prefix: str = DEFAULT_OBJECT_PREFIX,
         pg_use_transition_tables: bool = False,
         strict: bool = False,
+        engine_version: Optional[EngineVersion | str] = None,
     ) -> None:
-        if isinstance(dialect, str):
-            dialect = Dialect(dialect.lower())
-        self.dialect = dialect
+        hint_d: Optional[Dialect] = None
+        if isinstance(dialect, Dialect):
+            hint_d = dialect
+        elif isinstance(dialect, EngineVersion):
+            hint_d = dialect.dialect
+            if engine_version is None:
+                engine_version = dialect
+        elif isinstance(dialect, str) and dialect.strip():
+            parsed_d = parse_engine_version(dialect)
+            hint_d = parsed_d.dialect
+            if engine_version is None and (":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(ch.isdigit() for ch in dialect.replace("sqlite3", ""))):
+                engine_version = parsed_d
+
+        if isinstance(conn_or_url, str):
+            self.conn, inferred_dialect = self._connect_database_url(conn_or_url, hint_d)
+            if hint_d is None or conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
+                hint_d = inferred_dialect
+        else:
+            self.conn = conn_or_url
+
+        if engine_version is not None:
+            self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
+        else:
+            self.engine_version = detect_engine_version(self.conn, hint_dialect=hint_d)
+
+        self.dialect: Dialect = self.engine_version.dialect
+        self.subdialect: EngineSubdialect = self.engine_version.subdialect
         self.ignore_limitations = ignore_limitations
         self.object_prefix = object_prefix
         self.pg_use_transition_tables = pg_use_transition_tables
@@ -8314,13 +8772,6 @@ class MaterializedViewManager:
         self.catalog_table = (
             f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
         )
-
-        if isinstance(conn_or_url, str):
-            self.conn, inferred_dialect = self._connect_database_url(conn_or_url, self.dialect)
-            if conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
-                self.dialect = inferred_dialect
-        else:
-            self.conn = conn_or_url
 
         self._ensure_catalog()
 
@@ -8620,6 +9071,7 @@ class MaterializedViewManager:
             ignore_limitations=effective_ignore,
             object_prefix=self.object_prefix,
             strict=effective_strict,
+            engine_version=self.engine_version,
         )
         sig = self._compute_signature(plan, schemas)
 
@@ -8787,6 +9239,7 @@ class MaterializedViewManager:
                 ignore_limitations=effective_ignore,
                 object_prefix=self.object_prefix,
                 strict=effective_strict,
+                engine_version=self.engine_version,
             )
             v_name = plan.view_name
             desired_names.add(v_name)
@@ -8845,6 +9298,7 @@ class MaterializedViewManager:
                     pg_use_transition_tables=self.pg_use_transition_tables,
                     ignore_limitations=True,
                     object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
                 )
                 sig = self._compute_signature(plan, schemas)
                 report[v_name] = "ok" if sig == entry["signature_hash"] else "drifted"
@@ -8947,6 +9401,7 @@ class MaterializedViewManager:
                     pg_use_transition_tables=self.pg_use_transition_tables,
                     ignore_limitations=True,
                     object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
                 )
                 for stmt in plan.trigger_ddls:
                     cur.execute(stmt)
@@ -8962,6 +9417,7 @@ class MaterializedViewManager:
                     pg_use_transition_tables=self.pg_use_transition_tables,
                     ignore_limitations=True,
                     object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
                 )
                 for aux_t in plan.auxiliary_table_names:
                     cur.execute(f"DELETE FROM {aux_t};")
@@ -8978,10 +9434,36 @@ class MaterializedViewManager:
 # -----------------------------------------------------------------------------
 
 
+def _resolve_dialect_and_engine_version(
+    schema_sql_or_dict: Any,
+    dialect: Optional[Dialect | str | EngineVersion],
+    engine_version: Optional[EngineVersion | str],
+) -> EngineVersion:
+    is_conn = hasattr(schema_sql_or_dict, "cursor") or isinstance(
+        schema_sql_or_dict, sqlite3.Connection
+    )
+    if engine_version is not None:
+        def_d = dialect if not isinstance(dialect, EngineVersion) else dialect.dialect
+        return parse_engine_version(engine_version, default_dialect=def_d)
+    if isinstance(dialect, EngineVersion):
+        return dialect
+    if isinstance(dialect, str) and dialect.strip():
+        if ":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(
+            ch.isdigit() for ch in dialect.replace("sqlite3", "")
+        ):
+            return parse_engine_version(dialect)
+        if is_conn:
+            return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+        return parse_engine_version(dialect)
+    if is_conn:
+        return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+    return parse_engine_version(dialect or Dialect.SQLITE)
+
+
 def generate_materialized_view(
-    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection,
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
     view_sql_or_spec: str | ViewSpec,
-    dialect: Dialect | str = Dialect.SQLITE,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
     pg_use_transition_tables: bool = False,
     ignore_limitations: bool = False,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
@@ -8989,20 +9471,22 @@ def generate_materialized_view(
     incremental_backfill: bool = False,
     batch_size: int = 1000,
     strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
 ) -> MaterializedViewPlan:
     """
     Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
-    into a `MaterializedViewPlan`.
+    into a `MaterializedViewPlan`. Autodetects the database dialect and version when passed
+    a live connection, or accepts `engine_version` (e.g. `'postgres:17'`, `'mariadb:11.4'`, `'mysql:8.4'`).
     """
-    if isinstance(dialect, str):
-        dialect = Dialect(dialect.lower())
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
 
     if isinstance(schema_sql_or_dict, str):
         schemas = parse_table_schema(schema_sql_or_dict)
     elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
         schemas = introspect_database_schemas(
             schema_sql_or_dict,
-            dialect=dialect,
+            dialect=eff_dialect,
             object_prefix=object_prefix,
         )
     else:
@@ -9045,21 +9529,22 @@ def generate_materialized_view(
     compiler = IncrementalViewCompiler(
         schemas=schemas,
         view_spec=view_spec,
-        dialect=dialect,
+        dialect=eff_dialect,
         pg_use_transition_tables=pg_use_transition_tables,
         ignore_limitations=ignore_limitations,
         object_prefix=object_prefix,
         incremental_backfill=incremental_backfill,
         batch_size=batch_size,
         strict=strict,
+        engine_version=resolved_ev,
     )
     return compiler.compile()
 
 
 def generate_materialized_views(
-    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection,
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
     view_sqls: Sequence[str | ViewSpec] | str | ViewSpec,
-    dialect: Dialect | str = Dialect.SQLITE,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
     pg_use_transition_tables: bool = False,
     ignore_limitations: bool = False,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
@@ -9067,20 +9552,21 @@ def generate_materialized_views(
     incremental_backfill: bool = False,
     batch_size: int = 1000,
     strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
 ) -> List[MaterializedViewPlan]:
     """
     Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
     into a flat list of `MaterializedViewPlan` objects.
     """
-    if isinstance(dialect, str):
-        dialect = Dialect(dialect.lower())
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
 
     if isinstance(schema_sql_or_dict, str):
         schemas = parse_table_schema(schema_sql_or_dict)
     elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
         schemas = introspect_database_schemas(
             schema_sql_or_dict,
-            dialect=dialect,
+            dialect=eff_dialect,
             object_prefix=object_prefix,
         )
     else:
@@ -9096,13 +9582,14 @@ def generate_materialized_views(
         comp = IncrementalViewCompiler(
             schemas=schemas,
             view_spec=vs,
-            dialect=dialect,
+            dialect=eff_dialect,
             pg_use_transition_tables=pg_use_transition_tables,
             ignore_limitations=ignore_limitations,
             object_prefix=object_prefix,
             incremental_backfill=incremental_backfill,
             batch_size=batch_size,
             strict=strict,
+            engine_version=resolved_ev,
         )
         plans.append(comp._compile_single_plan())
     return plans
@@ -9150,9 +9637,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--view", help="Path to SQL file or inline CREATE VIEW statement(s).")
     parser.add_argument(
         "--dialect",
-        choices=[d.value for d in Dialect],
-        default=Dialect.SQLITE.value,
-        help="Target SQL dialect (sqlite, postgres, mysql).",
+        default=None,
+        help="Target SQL dialect or engine spec (sqlite, postgres, mysql, mariadb, or versioned e.g. postgres:17).",
+    )
+    parser.add_argument(
+        "--engine-version",
+        dest="engine_version",
+        default=None,
+        help="Target engine and version (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45').",
     )
     parser.add_argument(
         "--pg-transition-tables",
@@ -9229,11 +9721,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 2
             mgr = MaterializedViewManager(
                 args.db,
-                dialect=Dialect(args.dialect),
+                dialect=args.dialect,
                 ignore_limitations=args.ignore_limitations,
                 object_prefix=args.object_prefix,
                 pg_use_transition_tables=args.pg_transition_tables,
                 strict=args.strict,
+                engine_version=args.engine_version,
             )
             if args.check_drift:
                 drift = mgr.check_schema_drift()
@@ -9258,11 +9751,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 2
             mgr = MaterializedViewManager(
                 args.db,
-                dialect=Dialect(args.dialect),
+                dialect=args.dialect,
                 ignore_limitations=args.ignore_limitations,
                 object_prefix=args.object_prefix,
                 pg_use_transition_tables=args.pg_transition_tables,
                 strict=args.strict,
+                engine_version=args.engine_version,
             )
             if schema_sql:
                 mgr.apply_schema_ddl(schema_sql, auto_sync_views=False)
@@ -9283,17 +9777,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 0
 
-        eff_dialect = Dialect(args.dialect)
+        hint_d: Optional[Dialect] = None
+        if args.dialect:
+            hint_d = parse_engine_version(args.dialect).dialect
+        elif args.engine_version:
+            hint_d = parse_engine_version(args.engine_version).dialect
+
+        detected_ev: Optional[EngineVersion] = None
         if args.db and not schema_sql:
-            conn, eff_dialect = MaterializedViewManager._connect_database_url(args.db, eff_dialect)
+            conn, conn_d = MaterializedViewManager._connect_database_url(args.db, hint_d)
             try:
+                detected_ev = (
+                    parse_engine_version(args.engine_version, default_dialect=conn_d)
+                    if args.engine_version
+                    else detect_engine_version(conn, hint_dialect=args.dialect or conn_d)
+                )
                 schemas = introspect_database_schemas(
-                    conn, dialect=eff_dialect, object_prefix=args.object_prefix
+                    conn, dialect=detected_ev.dialect, object_prefix=args.object_prefix
                 )
             finally:
                 conn.close()
         elif schema_sql:
             schemas = parse_table_schema(schema_sql)
+            detected_ev = _resolve_dialect_and_engine_version(
+                schemas, args.dialect, args.engine_version
+            )
         else:
             print("ERROR: Either --schema or --db must be provided.", file=sys.stderr)
             return 2
@@ -9301,7 +9809,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plan = generate_materialized_view(
             schemas,
             view_sql,
-            dialect=eff_dialect,
+            dialect=detected_ev.dialect,
             pg_use_transition_tables=args.pg_transition_tables,
             ignore_limitations=args.ignore_limitations,
             object_prefix=args.object_prefix,
@@ -9309,6 +9817,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             incremental_backfill=args.incremental_backfill,
             batch_size=args.batch_size,
             strict=args.strict,
+            engine_version=detected_ev,
         )
         print(
             plan.render_sql_script(
