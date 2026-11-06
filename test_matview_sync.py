@@ -101,28 +101,6 @@ def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]]
     return True
 
 
-def _assert_mv_matches_live(
-    conn: sqlite3.Connection,
-    mv_name: str,
-    live_select_sql: str,
-    context: str = "",
-) -> None:
-    cur = conn.cursor()
-    cur.execute(f"SELECT * FROM {mv_name}")
-    mv_rows = cur.fetchall()
-    cur.execute(live_select_sql)
-    live_rows = cur.fetchall()
-    if not _rows_equal(mv_rows, live_rows):
-        sa = sorted([tuple(_norm_val(x) for x in r) for r in mv_rows], key=_row_sort_key)
-        sb = sorted([tuple(_norm_val(x) for x in r) for r in live_rows], key=_row_sort_key)
-        raise AssertionError(
-            f"[{context}] MV mismatch on {mv_name}!\n"
-            f"  Query: {live_select_sql}\n"
-            f"  MV ({len(sa)} rows):   {sa[:10]}\n"
-            f"  Live ({len(sb)} rows): {sb[:10]}"
-        )
-
-
 def _register_sqlite_compat_udfs(conn: sqlite3.Connection) -> None:
     """Registers PostgreSQL/MySQL compatibility functions & aggregates on a SQLite connection for cross-dialect testing."""
     import math
@@ -267,152 +245,6 @@ def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     return s
 
 
-def _execute_postgres_plan_in_sqlite(conn: sqlite3.Connection, plan: MaterializedViewPlan) -> None:
-    _register_sqlite_compat_udfs(conn)
-    cur = conn.cursor()
-    for aux_ddl in plan.auxiliary_table_ddls:
-        cur.execute(_transpile_pg_expr_to_sqlite(aux_ddl))
-    cur.execute(_transpile_pg_expr_to_sqlite(plan.backing_table_ddl))
-    for idx_ddl in plan.index_ddls:
-        cur.execute(_transpile_pg_expr_to_sqlite(idx_ddl))
-    if plan.reader_view_ddl:
-        cur.execute(_transpile_pg_expr_to_sqlite(plan.reader_view_ddl))
-
-    # Install read-only trigger on view in SQLite
-    cur.execute(
-        f"CREATE TRIGGER __ro_pg_{plan.logical_view_name}_del INSTEAD OF DELETE ON {plan.view_name} "
-        f"BEGIN SELECT RAISE(ABORT, 'read-only'); END;"
-    )
-
-    # Parse PL/pgSQL functions and convert to SQLite AFTER INSERT/DELETE/UPDATE triggers
-    fn_bodies: Dict[str, str] = {}
-    for ddl in plan.trigger_ddls:
-        m_fn = re.match(
-            r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\)\s+RETURNS\s+TRIGGER\s+AS\s+\$\$(.*)\$\$\s+LANGUAGE\s+plpgsql;",
-            ddl.strip(),
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if m_fn:
-            fn_bodies[m_fn.group(1)] = m_fn.group(2).strip()
-
-    for ddl in plan.trigger_ddls:
-        # Row-level combined trigger
-        m_tr = re.match(
-            r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+INSERT\s+OR\s+UPDATE(?:\s+OF\s+[^;]+?)?\s+OR\s+DELETE\s+ON\s+([A-Za-z0-9_]+)\s+FOR\s+EACH\s+ROW\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);",
-            ddl.strip(),
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if m_tr:
-            t_name, base_t, fn_name = m_tr.group(1), m_tr.group(2), m_tr.group(3)
-            body = fn_bodies.get(fn_name, "")
-            m_parts = re.search(
-                r"IF\s*\(TG_OP\s*=\s*'DELETE'\)\s*THEN\s*(.*?)\s*ELSIF\s*\(TG_OP\s*=\s*'INSERT'\)\s*THEN\s*(.*?)\s*ELSIF\s*\(TG_OP\s*=\s*'UPDATE'\)\s*THEN\s*(.*?)\s*END\s+IF;\s*RETURN\s+NULL;",
-                body,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            if m_parts:
-                del_b, ins_b, upd_b = m_parts.group(1).strip(), m_parts.group(2).strip(), m_parts.group(3).strip()
-                for op, b_raw, suf in (("DELETE", del_b, "ad"), ("INSERT", ins_b, "ai"), ("UPDATE", upd_b, "au")):
-                    b_clean = _transpile_pg_expr_to_sqlite(b_raw)
-                    # Convert outer IF (cond) THEN ... END IF; to WHEN (cond)
-                    when_cl = ""
-                    m_if = re.match(r"^IF\s*\(([^\n]+?)\)\s*THEN\s*(.*)\s*END\s+IF;$", b_clean.strip(), flags=re.IGNORECASE | re.DOTALL)
-                    if m_if:
-                        inner_s = m_if.group(2).strip()
-                        if m_if.group(1).strip().upper().startswith("NOT ") or "END IF;" not in inner_s.upper():
-                            when_cl = f" WHEN ({m_if.group(1)})"
-                            b_clean = inner_s
-                    # Convert any remaining inner `IF (cond) THEN stmt; END IF;`
-                    def _unwrap_if(m_inner: re.Match[str]) -> str:
-                        c_in = m_inner.group(1).strip()
-                        st_in = m_inner.group(2).strip()
-                        out_sts = []
-                        for st_p in _split_top_level(st_in, ";"):
-                            sp = st_p.strip()
-                            if not sp:
-                                continue
-                            if re.match(r"^INSERT\s+INTO\b", sp, flags=re.IGNORECASE):
-                                if re.search(r"\bWHERE\s+(?:TRUE|1)\b", sp, flags=re.IGNORECASE):
-                                    sp = re.sub(r"\bWHERE\s+(?:TRUE|1)\b", f"WHERE ({c_in})", sp, count=1, flags=re.IGNORECASE)
-                                else:
-                                    sp = re.sub(r"\n\s*WHERE\s+", f"\n    WHERE ({c_in}) AND ", sp, count=1, flags=re.IGNORECASE)
-                            elif re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", sp, flags=re.IGNORECASE):
-                                sp = re.sub(r"\n\s*WHERE\s+", f"\n    WHERE ({c_in}) AND ", sp, count=1, flags=re.IGNORECASE)
-                            out_sts.append(sp + ";")
-                        return "\n".join(out_sts)
-
-                    b_clean = re.sub(
-                        r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
-                        _unwrap_if,
-                        b_clean,
-                        flags=re.IGNORECASE | re.DOTALL,
-                    )
-                    # Unwrap outer changed_guard IF if still present
-                    m_outer_if = re.match(r"^IF\s*\(([^\n]+?)\)\s*THEN\s*(.*)\s*END\s+IF;$", b_clean.strip(), flags=re.IGNORECASE | re.DOTALL)
-                    if m_outer_if:
-                        when_cl = f" WHEN ({m_outer_if.group(1)})"
-                        b_clean = m_outer_if.group(2).strip()
-
-                    cur.execute(
-                        f"CREATE TRIGGER {t_name}_{suf} AFTER {op} ON {base_t} FOR EACH ROW{when_cl}\n"
-                        f"BEGIN\n{b_clean}\nEND;"
-                    )
-        else:
-            # Transition table trigger: `AFTER INSERT/DELETE/UPDATE ON base_t REFERENCING ...`
-            m_stmt_tr = re.match(
-                r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+(INSERT|DELETE|UPDATE)\s+ON\s+([A-Za-z0-9_]+)\s+REFERENCING\s+[^\n]+\s+FOR\s+EACH\s+STATEMENT\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);",
-                ddl.strip(),
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            if m_stmt_tr:
-                t_name, op, base_t, fn_name = (
-                    m_stmt_tr.group(1),
-                    m_stmt_tr.group(2).upper(),
-                    m_stmt_tr.group(3),
-                    m_stmt_tr.group(4),
-                )
-                body = fn_bodies.get(fn_name, "")
-                loop_bodies = re.findall(
-                    r"FOR\s+(?:NEW|OLD)\s+IN\s+SELECT\s+\*\s+FROM\s+__mv_(?:new|old)_rows\s+LOOP\s*(.*?)\s*END\s+LOOP;",
-                    body,
-                    flags=re.IGNORECASE | re.DOTALL,
-                )
-                combined = "\n".join(loop_bodies)
-                b_clean = _transpile_pg_expr_to_sqlite(combined)
-
-                def _unwrap_if_tr(m_inner: re.Match[str]) -> str:
-                    c_in = m_inner.group(1).strip()
-                    st_in = m_inner.group(2).strip()
-                    out_sts = []
-                    for st_p in _split_top_level(st_in, ";"):
-                        sp = st_p.strip()
-                        if not sp:
-                            continue
-                        if re.match(r"^INSERT\s+INTO\b", sp, flags=re.IGNORECASE):
-                            if re.search(r"\bWHERE\s+(?:TRUE|1)\b", sp, flags=re.IGNORECASE):
-                                sp = re.sub(r"\bWHERE\s+(?:TRUE|1)\b", f"WHERE ({c_in})", sp, count=1, flags=re.IGNORECASE)
-                            else:
-                                sp = re.sub(r"\n\s*WHERE\s+", f"\n    WHERE ({c_in}) AND ", sp, count=1, flags=re.IGNORECASE)
-                        elif re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", sp, flags=re.IGNORECASE):
-                            sp = re.sub(r"\n\s*WHERE\s+", f"\n    WHERE ({c_in}) AND ", sp, count=1, flags=re.IGNORECASE)
-                        out_sts.append(sp + ";")
-                    return "\n".join(out_sts)
-
-                b_clean = re.sub(
-                    r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
-                    _unwrap_if_tr,
-                    b_clean,
-                    flags=re.IGNORECASE | re.DOTALL,
-                )
-                cur.execute(
-                    f"CREATE TRIGGER {t_name} AFTER {op} ON {base_t} FOR EACH ROW\n"
-                    f"BEGIN\n{b_clean}\nEND;"
-                )
-
-    for pop_s in plan.get_populate_statements(incremental_backfill=False):
-        cur.execute(_transpile_pg_expr_to_sqlite(pop_s))
-
-
 def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk",)) -> str:
     s = sql
     s = re.sub(r"\bCREATE\s+ALGORITHM\s*=\s*\w+\s+VIEW\b", "CREATE VIEW", s, flags=re.IGNORECASE)
@@ -430,126 +262,6 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
     # Replace `VALUES(col)` with `excluded.col`
     s = re.sub(r"\bVALUES\s*\(\s*([A-Za-z0-9_]+)\s*\)", r"excluded.\1", s, flags=re.IGNORECASE)
     return s
-
-
-def _execute_mysql_plan_in_sqlite(conn: sqlite3.Connection, plan: MaterializedViewPlan) -> None:
-    _register_sqlite_compat_udfs(conn)
-    cur = conn.cursor()
-
-    for aux_ddl in plan.auxiliary_table_ddls:
-        cur.execute(_transpile_mysql_expr_to_sqlite(aux_ddl))
-    cur.execute(_transpile_mysql_expr_to_sqlite(plan.backing_table_ddl))
-    for idx_ddl in plan.index_ddls:
-        # Remove extra parens around MySQL functional index `((expr))` -> `(expr)`
-        cleaned_idx = _transpile_mysql_expr_to_sqlite(idx_ddl)
-        cleaned_idx = re.sub(r"\(\(\((.*?)\)\)\)", r"((\1))", cleaned_idx)
-        cur.execute(cleaned_idx)
-    if plan.reader_view_ddl:
-        cur.execute(_transpile_mysql_expr_to_sqlite(plan.reader_view_ddl))
-
-    cur.execute(
-        f"CREATE TRIGGER __ro_my_{plan.logical_view_name}_del INSTEAD OF DELETE ON {plan.view_name} "
-        f"BEGIN SELECT RAISE(ABORT, 'read-only'); END;"
-    )
-
-    # Determine primary key columns of backing table for ON DUPLICATE KEY UPDATE conversion
-    m_pk = re.search(r"PRIMARY\s+KEY\s*\(([^)]+)\)", plan.backing_table_ddl, flags=re.IGNORECASE)
-    if m_pk:
-        main_pks = [c.strip() for c in m_pk.group(1).split(",")]
-    elif "__mv_global_id" in plan.backing_table_ddl:
-        main_pks = ["__mv_global_id"]
-    else:
-        main_pks = ["__mv_pk"]
-
-    for ddl in plan.trigger_ddls:
-        m_tr = re.match(
-            r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+(INSERT|DELETE|UPDATE)\s+ON\s+([A-Za-z0-9_]+)\s+FOR\s+EACH\s+ROW\s+BEGIN\s*(.*)\s*END;",
-            ddl.strip(),
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if not m_tr:
-            continue
-        t_name, op, base_t, body = m_tr.group(1), m_tr.group(2).upper(), m_tr.group(3), m_tr.group(4).strip()
-        b_clean = _transpile_mysql_expr_to_sqlite(body, main_pks)
-
-        when_cl = ""
-        m_outer = re.match(r"^IF\s*\(([^\n]+?)\)\s*THEN\s*(.*)\s*END\s+IF;$", b_clean.strip(), flags=re.IGNORECASE | re.DOTALL)
-        if m_outer:
-            inner_my = m_outer.group(2).strip()
-            if m_outer.group(1).strip().upper().startswith("NOT ") or "END IF;" not in inner_my.upper():
-                when_cl = f" WHEN ({m_outer.group(1)})"
-                b_clean = inner_my
-
-        def _unwrap_my_if(m_inner: re.Match[str]) -> str:
-            c_in = m_inner.group(1).strip()
-            st_in = m_inner.group(2).strip()
-            out_sts = []
-            for st_p in _split_top_level(st_in, ";"):
-                sp = st_p.strip()
-                if not sp:
-                    continue
-                if re.match(r"^INSERT\s+INTO\b", sp, flags=re.IGNORECASE):
-                    if re.search(r"\bWHERE\s+TRUE\b", sp, flags=re.IGNORECASE):
-                        sp = re.sub(r"\bWHERE\s+TRUE\b", f"WHERE ({c_in})", sp, count=1, flags=re.IGNORECASE)
-                    else:
-                        sp = re.sub(r"\n\s*WHERE\s+", f"\n    WHERE ({c_in}) AND ", sp, count=1, flags=re.IGNORECASE)
-                elif re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", sp, flags=re.IGNORECASE):
-                    sp = re.sub(r"\n\s*WHERE\s+", f"\n    WHERE ({c_in}) AND ", sp, count=1, flags=re.IGNORECASE)
-                out_sts.append(sp + ";")
-            return "\n".join(out_sts)
-
-        b_clean = re.sub(
-            r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
-            _unwrap_my_if,
-            b_clean,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        # Convert `ON DUPLICATE KEY UPDATE` on auxiliary tables and backing table
-        def _repl_odku(m_ins: re.Match[str]) -> str:
-            tbl = m_ins.group(1)
-            prefix_sql = m_ins.group(0).split("ON DUPLICATE KEY UPDATE")[0].rstrip()
-            assigns = m_ins.group(2)
-            if "__matview_dist_" in tbl:
-                pks = [*main_pks, "__val"]
-            else:
-                pks = main_pks
-            return f"{prefix_sql}\n    ON CONFLICT ({', '.join(pks)}) DO UPDATE SET {assigns}"
-
-        b_clean = re.sub(
-            r"INSERT\s+INTO\s+([A-Za-z0-9_]+)\s*\([^;]+?\bON\s+DUPLICATE\s+KEY\s+UPDATE\s+([^;]+)",
-            _repl_odku,
-            b_clean,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        # Convert MySQL multi-table `UPDATE mv_table INNER JOIN (...) AS __mv_delta ON cond SET ...;` to SQLite `UPDATE mv_table SET ... FROM (...) AS __mv_delta WHERE cond;`
-        def _repl_multi_upd(m_u: re.Match[str]) -> str:
-            tbl = m_u.group(1)
-            subq = m_u.group(2)
-            on_c = m_u.group(3)
-            set_cl = m_u.group(4)
-            # Strip `tbl.` prefix from LHS of assignments in `set_cl`
-            cleaned_assigns = []
-            for a_part in _split_top_level(set_cl, ","):
-                ap = re.sub(rf"^\s*{re.escape(tbl)}\.", "", a_part.strip())
-                cleaned_assigns.append(ap)
-            return f"UPDATE {tbl}\n    SET {', '.join(cleaned_assigns)}\n    FROM ({subq}) AS __mv_delta\n    WHERE {on_c};"
-
-        b_clean = re.sub(
-            r"UPDATE\s+([A-Za-z0-9_]+)\s+INNER\s+JOIN\s*\((.*?)\)\s*AS\s+__mv_delta\s+ON\s+([^\n]+?)\s+SET\s+([^;]+);",
-            _repl_multi_upd,
-            b_clean,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        cur.execute(
-            f"CREATE TRIGGER {t_name} AFTER {op} ON {base_t} FOR EACH ROW{when_cl}\n"
-            f"BEGIN\n{b_clean}\nEND;"
-        )
-
-    for pop_s in plan.get_populate_statements(incremental_backfill=False):
-        cur.execute(_transpile_mysql_expr_to_sqlite(pop_s, main_pks))
 
 
 # -----------------------------------------------------------------------------
@@ -792,15 +504,15 @@ def _get_live_engine_50_view_battery(dialect: Dialect) -> Tuple[str, List[Tuple[
     return schema, view_specs
 
 
-def _get_complex_dml_and_tx_steps(dialect: Dialect, for_live_mysql: bool = False, for_live_postgres: bool = False) -> List[Tuple[str, str]]:
+def _get_complex_dml_and_tx_steps(dialect: Dialect) -> List[Tuple[str, str]]:
     """
-    Returns a 33-step sequence of complex single-statement DMLs and multi-statement
-    transactional workflows (with intermediate state verification inside open transactions,
-    nested SAVEPOINTs, ROLLBACK TO SAVEPOINT, RELEASE SAVEPOINT, full ROLLBACK, and COMMIT).
+    Returns a 34-step complex DML and transactional intermediate-state verification sequence
+    for `dialect`. Used identically by both in-memory transpiled backends and live external
+    database servers.
     """
     t_val = "TRUE" if dialect == Dialect.POSTGRES else "1"
     f_val = "FALSE" if dialect == Dialect.POSTGRES else "0"
-    if for_live_mysql:
+    if dialect == Dialect.MYSQL:
         upsert_ord = (
             "INSERT INTO orders VALUES (1, 1, 'EU', 'sw', 35.0, 7, 9, 1, 'settled'), "
             "(9, 4, 'LATAM', 'hw', 60.0, 3, 5, 1, 'settled') "
@@ -822,7 +534,7 @@ def _get_complex_dml_and_tx_steps(dialect: Dialect, for_live_mysql: bool = False
             "INSERT INTO order_tags VALUES (1, 'p0_urgent', 25), (4, 'replaced_bulk', 19) "
             "ON CONFLICT (order_id, tag) DO UPDATE SET weight = excluded.weight;"
         )
-        final_drain = "TRUNCATE TABLE orders;" if for_live_postgres else "DELETE FROM orders;"
+        final_drain = "TRUNCATE TABLE orders;"
     else:
         upsert_ord = (
             "INSERT INTO orders VALUES (1, 1, 'EU', 'sw', 35.0, 7, 9, 1, 'settled'), "
@@ -850,7 +562,7 @@ def _get_complex_dml_and_tx_steps(dialect: Dialect, for_live_mysql: bool = False
         ("upd_wh_multi", "UPDATE warehouses SET country = CASE WHEN country = 'US' THEN 'CA' WHEN country IS NULL THEN 'US' ELSE country END WHERE id IN (1, 2, 3);"),
 
         # Phase 2: Multi-Statement Transaction with Intermediate Verification, Nested Savepoints & Rollbacks
-        ("tx1_begin", "BEGIN;"),
+        ("tx1_begin", "START TRANSACTION;" if dialect == Dialect.MYSQL else "BEGIN;"),
         ("tx1_ins_in_tx", f"INSERT INTO orders VALUES (10, 2, 'NA', 'ai', 120.0, 9, 15, {t_val}, 'settled'), (11, 3, 'EU', 'ai', 80.0, 4, 6, {f_val}, 'settled');"),
         ("tx1_sp_alpha", "SAVEPOINT sp_alpha;"),
         ("tx1_sp_alpha_upd1", "UPDATE orders SET region = 'APAC', amount = 250.0, qty = 15 WHERE id IN (4, 10);"),
@@ -865,7 +577,7 @@ def _get_complex_dml_and_tx_steps(dialect: Dialect, for_live_mysql: bool = False
         ("tx1_full_rb", "ROLLBACK;"),
 
         # Phase 3: Multi-Statement Transaction with Intermediate Verification Before & After COMMIT
-        ("tx2_begin", "BEGIN;"),
+        ("tx2_begin", "START TRANSACTION;" if dialect == Dialect.MYSQL else "BEGIN;"),
         ("tx2_ins_wh", "INSERT INTO warehouses VALUES (4, 'WH_APAC', 'JP');"),
         ("tx2_ins_cust", "INSERT INTO customers VALUES (5, 4, 'Elena', 'VIP');"),
         ("tx2_ins_ord", f"INSERT INTO orders VALUES (12, 5, 'APAC', 'hw', 300.0, 10, 7, {t_val}, 'settled');"),
@@ -1143,6 +855,17 @@ class _CompatCursorAdapter:
             self._last_rows = []
             return self
         s_up = s.upper()
+        s_up_clean = s_up.rstrip(";").strip()
+        if s_up_clean.startswith("DROP SCHEMA PUBLIC") or s_up_clean == "CREATE SCHEMA PUBLIC":
+            if s_up_clean.startswith("DROP SCHEMA PUBLIC"):
+                objs = self._query(
+                    "SELECT type, name FROM sqlite_master WHERE type IN ('view', 'table') AND name NOT LIKE 'sqlite_%'",
+                    None,
+                )
+                for o_type, o_name in (objs or []):
+                    self._exec(f"DROP {str(o_type).upper()} IF EXISTS {o_name};", None)
+            self._last_rows = []
+            return self
         is_query = (
             s_up.startswith("SELECT")
             or s_up.startswith("PRAGMA")
@@ -1379,15 +1102,26 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
         raw_conn.execute("PRAGMA journal_mode = MEMORY;")
         raw_conn.execute("PRAGMA temp_store = MEMORY;")
         raw_conn.execute("PRAGMA recursive_triggers = ON;")
+        _register_sqlite_compat_udfs(raw_conn)
 
         def _make_sq3_cursor() -> _CompatCursorAdapter:
             def _exec(s: str, p: Any = None) -> None:
-                if not s.strip():
+                st = s.strip()
+                if not st:
+                    return
+                st_up = st.upper().rstrip(";").strip()
+                if st_up.startswith("DROP SCHEMA PUBLIC") or st_up == "CREATE SCHEMA PUBLIC":
+                    if st_up.startswith("DROP SCHEMA PUBLIC"):
+                        objs = raw_conn.execute(
+                            "SELECT type, name FROM sqlite_master WHERE type IN ('view', 'table') AND name NOT LIKE 'sqlite_%'"
+                        ).fetchall()
+                        for o_type, o_name in objs:
+                            raw_conn.execute(f"DROP {o_type.upper()} IF EXISTS {o_name};")
                     return
                 if p is not None:
-                    raw_conn.execute(s.strip(), tuple(p))
+                    raw_conn.execute(st, tuple(p))
                 else:
-                    raw_conn.execute(s.strip())
+                    raw_conn.execute(st)
             def _query(q: str, p: Any = None):
                 c = raw_conn.execute(q, tuple(p)) if p is not None else raw_conn.execute(q)
                 return [tuple(r) for r in (c.fetchall() or [])]
@@ -1399,225 +1133,598 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
         raise ValueError(f"Unknown SQLITE_COMPAT_ENGINE: {engine_spec}")
 
 
-def run_live_postgres_tests_if_available(dsn: str) -> None:
-    """Runs comprehensive 50-view x 3-mode (full, incremental, transition-tables) + manager tests against a real PostgreSQL instance."""
-    conn = _open_live_postgres_connection(dsn)
-    if conn is None:
-        print("Skipping live PostgreSQL test: psycopg2/psycopg not installed.")
-        return
+class TranspiledCursorAdapter:
+    def __init__(self, conn_adapter: "TranspiledConnectionAdapter") -> None:
+        self._ca = conn_adapter
+        self._last_rows: List[Tuple[Any, ...]] = []
+        self.rowcount: int = -1
 
-    schema, view_specs = _get_live_engine_50_view_battery(Dialect.POSTGRES)
-    cur = conn.cursor()
-    total_checks = 0
-    total_views_installed = 0
+    def execute(self, sql: str, params: Any = None) -> "TranspiledCursorAdapter":
+        rows, rc = self._ca._execute_sql(sql, params)
+        self._last_rows = rows
+        self.rowcount = rc
+        return self
 
-    for inc_mode, use_trans in ((False, False), (True, False), (False, True)):
-        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-        for s in [st.strip() for st in schema.split(";") if st.strip()]:
-            cur.execute(s)
+    def fetchall(self) -> List[Tuple[Any, ...]]:
+        return self._last_rows
 
-        cur.execute("INSERT INTO warehouses VALUES (1, 'WH_US', 'US'), (2, 'WH_EU', 'EU'), (3, 'WH_GLOBAL', NULL);")
-        cur.execute("INSERT INTO customers VALUES (1, 1, 'Alice', 'NA'), (2, 2, 'Bob', 'VIP'), (3, 2, 'Cara', 'EU'), (4, NULL, 'Dan', 'APAC');")
-        cur.execute(
-            "INSERT INTO orders VALUES "
-            "(1, 1, 'NA', 'hw', 10.0, 2, 3, TRUE, 'settled'),"
-            "(2, 1, 'NA', 'sw', 20.0, 4, 5, FALSE, 'settled'),"
-            "(3, 2, 'EU', 'hw', 15.0, 1, 7, TRUE, 'pending'),"
-            "(4, 2, 'EU', 'hw', 30.0, 3, 6, TRUE, 'settled'),"
-            "(5, 3, NULL, 'sw', 50.0, 5, 1, FALSE, 'settled');"
-        )
-        cur.execute(
-            "INSERT INTO order_tags VALUES "
-            "(1, 'urgent', 2), (1, 'fragile', 5), (2, 'urgent', 3), (4, 'bulk', 10);"
-        )
-
-        plans = []
-        for v_name, v_sel in view_specs:
-            p = generate_materialized_view(
-                schema,
-                f"CREATE VIEW {v_name} AS {v_sel};",
-                dialect=Dialect.POSTGRES,
-                pg_use_transition_tables=use_trans,
-                incremental_backfill=inc_mode,
-                batch_size=2,
-            )
-            for stmt in p.all_statements():
-                cur.execute(stmt)
-            plans.append((p, v_sel))
-            total_views_installed += 1
-            _verify_external_db_mv(cur, p.view_name, v_sel, f"pg:inc={inc_mode}:tr={use_trans}:{v_name}:init")
-            total_checks += 1
-
-        ro_raised = False
-        try:
-            cur.execute(f"DELETE FROM {plans[0][0].view_name};")
-        except Exception:
-            ro_raised = True
-        assert ro_raised, "Expected PostgreSQL read-only view trigger to block direct DELETE on MV"
-
-        for step_lbl, m_sql in _get_complex_dml_and_tx_steps(Dialect.POSTGRES, for_live_mysql=False, for_live_postgres=True):
-            cur.execute(m_sql)
-            for p, v_sel in plans:
-                _verify_external_db_mv(cur, p.view_name, v_sel, f"pg:inc={inc_mode}:tr={use_trans}:{p.logical_view_name}:{step_lbl}")
-                total_checks += 1
-        for p, _ in reversed(plans):
-            for drop_st in p.drop_statements():
-                cur.execute(drop_st)
-
-    total_checks += _run_live_manager_lifecycle_check(conn, cur, Dialect.POSTGRES)
-    conn.close()
-    print(f"LIVE PostgreSQL server test PASSED ({total_views_installed} views installed, {total_checks} live assertions)!")
+    def fetchone(self) -> Optional[Tuple[Any, ...]]:
+        return self._last_rows[0] if self._last_rows else None
 
 
-def run_live_mysql_tests_if_available(dsn: str) -> None:
-    """Runs comprehensive 50-view x 2-mode (full, incremental) + manager tests against a real MySQL/MariaDB/Percona instance."""
-    conn, target_db = _open_live_mysql_connection(dsn)
-    if conn is None:
-        print("Skipping live MySQL test: pymysql not installed.")
-        return
-
-    cur = conn.cursor()
-    schema, view_specs = _get_live_engine_50_view_battery(Dialect.MYSQL)
-
-    total_checks = 0
-    total_views_installed = 0
-    for inc_mode in (False, True):
-        cur.execute(f"DROP DATABASE IF EXISTS `{target_db}`;")
-        cur.execute(f"CREATE DATABASE `{target_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
-        cur.execute(f"USE `{target_db}`;")
-        cur.execute("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;")
-        cur.execute("SET SESSION collation_connection = @@collation_database;")
-        for s in [st.strip() for st in schema.split(";") if st.strip()]:
-            cur.execute(s)
-
-        cur.execute("INSERT INTO warehouses VALUES (1, 'WH_US', 'US'), (2, 'WH_EU', 'EU'), (3, 'WH_GLOBAL', NULL);")
-        cur.execute("INSERT INTO customers VALUES (1, 1, 'Alice', 'NA'), (2, 2, 'Bob', 'VIP'), (3, 2, 'Cara', 'EU'), (4, NULL, 'Dan', 'APAC');")
-        cur.execute(
-            "INSERT INTO orders VALUES "
-            "(1, 1, 'NA', 'hw', 10.0, 2, 3, 1, 'settled'),"
-            "(2, 1, 'NA', 'sw', 20.0, 4, 5, 0, 'settled'),"
-            "(3, 2, 'EU', 'hw', 15.0, 1, 7, 1, 'pending'),"
-            "(4, 2, 'EU', 'hw', 30.0, 3, 6, 1, 'settled'),"
-            "(5, 3, NULL, 'sw', 50.0, 5, 1, 0, 'settled');"
-        )
-        cur.execute(
-            "INSERT INTO order_tags VALUES "
-            "(1, 'urgent', 2), (1, 'fragile', 5), (2, 'urgent', 3), (4, 'bulk', 10);"
-        )
-
-        plans = []
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", EngineLimitationWarning)
-            for v_name, v_sel in view_specs:
-                p = generate_materialized_view(
-                    schema,
-                    f"CREATE VIEW {v_name} AS {v_sel};",
-                    dialect=Dialect.MYSQL,
-                    incremental_backfill=inc_mode,
-                    batch_size=2,
-                    ignore_limitations=True,
-                )
-                for stmt in p.all_statements():
-                    cur.execute(stmt)
-                plans.append((p, v_sel))
-                total_views_installed += 1
-                _verify_external_db_mv(cur, p.view_name, v_sel, f"mysql:inc={inc_mode}:{v_name}:init")
-                total_checks += 1
-
-        # Verify MySQL read-only view (ALGORITHM = TEMPTABLE makes view non-updatable)
-        ro_raised = False
-        try:
-            cur.execute(f"DELETE FROM {plans[0][0].view_name};")
-        except Exception:
-            ro_raised = True
-        assert ro_raised, "Expected MySQL read-only view to block direct DELETE on MV"
-
-        for step_lbl, m_sql in _get_complex_dml_and_tx_steps(Dialect.MYSQL, for_live_mysql=True):
-            cur.execute(m_sql)
-            for p, v_sel in plans:
-                _verify_external_db_mv(cur, p.view_name, v_sel, f"mysql:inc={inc_mode}:{p.logical_view_name}:{step_lbl}")
-                total_checks += 1
-        for p, _ in reversed(plans):
-            for drop_st in p.drop_statements():
-                cur.execute(drop_st)
-
-    total_checks += _run_live_manager_lifecycle_check(conn, cur, Dialect.MYSQL)
-    conn.close()
-    print(f"LIVE MySQL server test PASSED ({total_views_installed} views installed, {total_checks} live assertions)!")
-
-
-def run_live_sqlite_compat_tests_if_available(engine_spec: str) -> None:
+class TranspiledConnectionAdapter:
     """
-    Runs comprehensive 50-view x 2-mode (full, incremental) + manager lifecycle live integration
-    tests against SQLite-compatible database engines (`apsw`, `sqlite3mc`, `sqlcipher`, `sqlean`, `libsql`).
+    A full PEP-249 DB-API 2.0 connection adapter backed by in-memory SQLite that
+    accepts native PostgreSQL or MySQL DDL, triggers, PL/pgSQL DO blocks, MySQL
+    stored procedures, information_schema queries, and DML so that all test
+    suites and MaterializedViewManager methods run through the exact same code
+    path whether connected to a live external server or in-memory SQLite.
     """
-    eng = engine_spec.strip().lower()
-    schema, view_specs = _get_live_engine_50_view_battery(Dialect.SQLITE)
 
-    total_checks = 0
-    total_views_installed = 0
-    for inc_mode in (False, True):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_file = os.path.join(tmpdir, f"compat_{eng}_{int(inc_mode)}.db")
-            conn = _open_sqlite_compat_connection(eng, db_file)
-            cur = conn.cursor()
+    def __init__(self, dialect: Dialect) -> None:
+        assert dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+        self.dialect = dialect
+        self.autocommit = True
+        self._sq_conn: Optional[sqlite3.Connection] = None
+        self._pg_functions: Dict[str, str] = {}
+        self._pg_fn_triggers: Dict[str, List[str]] = {}
+        self._mysql_procs: Dict[str, str] = {}
+        self._table_pks: Dict[str, List[str]] = {}
+        self._reset_sqlite()
+
+    def _reset_sqlite(self) -> None:
+        if self._sq_conn is not None:
             try:
-                for s in [st.strip() for st in schema.split(";") if st.strip()]:
-                    cur.execute(s + ";")
-                cur.execute("INSERT INTO warehouses VALUES (1, 'WH_US', 'US'), (2, 'WH_EU', 'EU'), (3, 'WH_GLOBAL', NULL);")
-                cur.execute("INSERT INTO customers VALUES (1, 1, 'Alice', 'NA'), (2, 2, 'Bob', 'VIP'), (3, 2, 'Cara', 'EU'), (4, NULL, 'Dan', 'APAC');")
-                cur.execute(
-                    "INSERT INTO orders VALUES "
-                    "(1, 1, 'NA', 'hw', 10.0, 2, 3, 1, 'settled'),"
-                    "(2, 1, 'NA', 'sw', 20.0, 4, 5, 0, 'settled'),"
-                    "(3, 2, 'EU', 'hw', 15.0, 1, 7, 1, 'pending'),"
-                    "(4, 2, 'EU', 'hw', 30.0, 3, 6, 1, 'settled'),"
-                    "(5, 3, NULL, 'sw', 50.0, 5, 1, 0, 'settled');"
+                self._sq_conn.close()
+            except Exception:
+                pass
+        self._sq_conn = sqlite3.connect(":memory:", isolation_level=None)
+        self._sq_conn.execute("PRAGMA recursive_triggers = ON;")
+        _register_sqlite_compat_udfs(self._sq_conn)
+        self._pg_functions.clear()
+        self._pg_fn_triggers.clear()
+        self._mysql_procs.clear()
+        self._table_pks.clear()
+
+    def cursor(self) -> TranspiledCursorAdapter:
+        return TranspiledCursorAdapter(self)
+
+    def execute(self, sql: str, params: Any = None) -> TranspiledCursorAdapter:
+        c = self.cursor()
+        c.execute(sql, params)
+        return c
+
+    def commit(self) -> None:
+        pass
+
+    def rollback(self) -> None:
+        if self._sq_conn is not None:
+            try:
+                self._sq_conn.execute("ROLLBACK;")
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._sq_conn is not None:
+            self._sq_conn.close()
+            self._sq_conn = None
+
+    def _record_table_pks(self, ddl: str) -> None:
+        m_t = re.match(
+            r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_]+)\s*\((.*)\)\s*;?$",
+            ddl.strip(),
+            flags=re.I | re.S,
+        )
+        if not m_t:
+            return
+        t_name = m_t.group(1)
+        body = m_t.group(2)
+        m_pk = re.search(r"PRIMARY\s+KEY\s*\(([^)]+)\)", body, flags=re.I)
+        if m_pk:
+            self._table_pks[t_name.lower()] = [c.strip() for c in m_pk.group(1).split(",")]
+            return
+        for part in _split_top_level(body, ","):
+            if re.search(r"\bPRIMARY\s+KEY\b", part, flags=re.I):
+                col_n = part.strip().split()[0].strip('"`[]')
+                self._table_pks[t_name.lower()] = [col_n]
+                return
+
+    def _convert_mysql_dml_to_sqlite(self, sql: str, default_pks: Optional[Sequence[str]] = None) -> str:
+        s = _transpile_mysql_expr_to_sqlite(sql, default_pks or ("__mv_pk",))
+        s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR\s*\(\d+\)\)", r"CAST(\1 AS TEXT)", s, flags=re.I)
+        s = re.sub(r"\bINSERT\s+IGNORE\s+INTO\b", "INSERT OR IGNORE INTO", s, flags=re.I)
+
+        def _repl_odku(m_ins: re.Match[str]) -> str:
+            tbl = m_ins.group(1)
+            prefix_sql = re.split(r"\bON\s+DUPLICATE\s+KEY\s+UPDATE\b", m_ins.group(0), flags=re.I)[0].rstrip()
+            assigns = m_ins.group(2)
+            pks = self._table_pks.get(tbl.lower())
+            if not pks:
+                if "__matview_dist_" in tbl:
+                    pks = [*(default_pks or ["__mv_pk"]), "__val"]
+                elif "__mv_global_id" in prefix_sql:
+                    pks = ["__mv_global_id"]
+                else:
+                    pks = list(default_pks or ["id"])
+            return f"{prefix_sql}\n    ON CONFLICT ({', '.join(pks)}) DO UPDATE SET {assigns}"
+
+        s = re.sub(
+            r"INSERT\s+INTO\s+([A-Za-z0-9_]+)\s*[^;]+?\bON\s+DUPLICATE\s+KEY\s+UPDATE\s+([^;]+)",
+            _repl_odku,
+            s,
+            flags=re.I | re.S,
+        )
+
+        def _repl_multi_upd(m_u: re.Match[str]) -> str:
+            tbl, subq, on_c, set_cl = m_u.group(1), m_u.group(2), m_u.group(3), m_u.group(4)
+            cleaned_assigns = [
+                re.sub(rf"^\s*{re.escape(tbl)}\.", "", a_part.strip())
+                for a_part in _split_top_level(set_cl, ",")
+            ]
+            return f"UPDATE {tbl}\n    SET {', '.join(cleaned_assigns)}\n    FROM ({subq}) AS __mv_delta\n    WHERE {on_c};"
+
+        s = re.sub(
+            r"UPDATE\s+([A-Za-z0-9_]+)\s+INNER\s+JOIN\s*\((.*?)\)\s*AS\s+__mv_delta\s+ON\s+([^\n]+?)\s+SET\s+([^;]+);?",
+            _repl_multi_upd,
+            s,
+            flags=re.I | re.S,
+        )
+        return s
+
+    def _exec_loop_backfill_in_sqlite(self, body: str) -> None:
+        assert self._sq_conn is not None
+        m_minmax = re.search(
+            r"SELECT\s+MIN\(([A-Za-z0-9_]+)\),\s*MAX\([A-Za-z0-9_]+\)\s+INTO\s+__mv_min_pk,\s*__mv_max_pk\s+FROM\s+([A-Za-z0-9_]+);",
+            body,
+            flags=re.I,
+        )
+        m_bsize = re.search(r"__mv_batch_size\s+BIGINT\s*(?:DEFAULT|:=)\s*(\d+)\s*;", body, flags=re.I)
+        batch_size = int(m_bsize.group(1)) if m_bsize else 2
+
+        if m_minmax:
+            pk_col, base_t = m_minmax.group(1), m_minmax.group(2)
+            row = self._sq_conn.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}").fetchone()
+            if row and row[0] is not None and row[1] is not None:
+                min_pk, max_pk = int(row[0]), int(row[1])
+                cur_pk = min_pk - 1
+                m_loop_ins = re.search(
+                    r"(?:LOOP|DO)\s*SET\s+__mv_top_pk[^;]+;\s*(INSERT\s+INTO\s+.*?)\s*(?:SET\s+__mv_cur_pk|__mv_cur_pk\s*:=)",
+                    body,
+                    flags=re.I | re.S,
                 )
-                cur.execute(
-                    "INSERT INTO order_tags VALUES "
-                    "(1, 'urgent', 2), (1, 'fragile', 5), (2, 'urgent', 3), (4, 'bulk', 10);"
-                )
-                plans = []
-                for v_name, v_sel in view_specs:
-                    p = generate_materialized_view(
-                        schema,
-                        f"CREATE VIEW {v_name} AS {v_sel};",
-                        dialect=Dialect.SQLITE,
-                        incremental_backfill=inc_mode,
-                        batch_size=2,
+                if not m_loop_ins:
+                    m_loop_ins = re.search(
+                        r"__mv_top_pk\s*:=\s*LEAST[^;]+;\s*(INSERT\s+INTO\s+.*?)\s*__mv_cur_pk\s*:=",
+                        body,
+                        flags=re.I | re.S,
                     )
-                    for stmt in p.all_statements():
-                        cur.execute(stmt)
-                    plans.append((p, v_sel))
-                    total_views_installed += 1
-                    _verify_external_db_mv(cur, p.view_name, v_sel, f"{eng}:inc={inc_mode}:{v_name}:init")
-                    total_checks += 1
+                assert m_loop_ins is not None
+                ins_tmpl = m_loop_ins.group(1).strip()
+                while cur_pk < max_pk:
+                    top_pk = min(max_pk, cur_pk + batch_size)
+                    stmt = ins_tmpl.replace("__mv_cur_pk", str(cur_pk)).replace("__mv_top_pk", str(top_pk))
+                    self._execute_sql(stmt)
+                    cur_pk = top_pk
+            m_tail = re.search(
+                r"IF\s+NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+([A-Za-z0-9_]+)\s*\)\s*THEN\s*(INSERT\s+INTO\s+.*?)\s*END\s+IF;",
+                body,
+                flags=re.I | re.S,
+            )
+            if m_tail:
+                mv_t, tail_ins = m_tail.group(1), m_tail.group(2).strip()
+                has_r = self._sq_conn.execute(f"SELECT 1 FROM {mv_t} LIMIT 1").fetchone()
+                if not has_r:
+                    self._execute_sql(tail_ins)
+            return
 
-                ro_raised = False
-                try:
-                    cur.execute(f"DELETE FROM {plans[0][0].view_name};")
-                except Exception:
-                    ro_raised = True
-                assert ro_raised, f"Expected {eng} read-only view trigger to block direct DELETE on MV"
+        m_off_ins = re.search(
+            r"(?:LOOP|REPEAT)\s*(INSERT\s+INTO\s+.*?)\s*(?:GET\s+DIAGNOSTICS|SET\s+__mv_rows)",
+            body,
+            flags=re.I | re.S,
+        )
+        assert m_off_ins is not None
+        ins_tmpl = m_off_ins.group(1).strip()
+        offset = 0
+        while True:
+            stmt = ins_tmpl.replace("__mv_batch_size", str(batch_size)).replace("__mv_offset", str(offset))
+            _, rc = self._execute_sql(stmt)
+            if rc <= 0:
+                break
+            offset += batch_size if self.dialect == Dialect.MYSQL else rc
+            if self.dialect == Dialect.POSTGRES and rc < batch_size:
+                break
 
-                for step_lbl, m_sql in _get_complex_dml_and_tx_steps(Dialect.SQLITE, for_live_mysql=False):
-                    cur.execute(m_sql)
-                    for p, v_sel in plans:
-                        _verify_external_db_mv(cur, p.view_name, v_sel, f"{eng}:inc={inc_mode}:{p.logical_view_name}:{step_lbl}")
-                        total_checks += 1
+    def _execute_sql(self, sql: str, params: Any = None) -> Tuple[List[Tuple[Any, ...]], int]:
+        assert self._sq_conn is not None
+        s = sql.strip()
+        if not s:
+            return [], 0
+        s_up = s.upper().rstrip(";").strip()
 
-                if inc_mode:
-                    total_checks += _run_live_manager_lifecycle_check(conn, cur, Dialect.SQLITE)
-            finally:
-                conn.close()
+        if s_up.startswith("DROP SCHEMA PUBLIC") or s_up.startswith("DROP DATABASE"):
+            self._reset_sqlite()
+            return [], 0
+        if (
+            s_up.startswith("CREATE DATABASE")
+            or s_up.startswith("USE ")
+            or s_up.startswith("SET ")
+            or s_up == "CREATE SCHEMA PUBLIC"
+        ):
+            return [], 0
 
-    print(f"LIVE SQLite-compatible engine ({eng}) test PASSED ({total_views_installed} views installed, {total_checks} live assertions)!")
+        if "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" in s_up and "KEY_COLUMN_USAGE" in s_up:
+            schemas = introspect_sqlite_schemas(self._sq_conn)
+            rows = [
+                (t_name, c_name)
+                for t_name, ts in schemas.items()
+                for c_name, cd in ts.columns.items()
+                if cd.primary_key
+            ]
+            return rows, len(rows)
+        if "INFORMATION_SCHEMA.COLUMNS" in s_up and "INFORMATION_SCHEMA.TABLES" in s_up:
+            schemas = introspect_sqlite_schemas(self._sq_conn)
+            rows = []
+            for t_name, ts in schemas.items():
+                if t_name.startswith("__matview_") or t_name.startswith("__mv_"):
+                    continue
+                for c_name, cd in ts.columns.items():
+                    if self.dialect == Dialect.POSTGRES:
+                        rows.append((t_name, c_name, cd.data_type, "NO" if cd.not_null else "YES", None))
+                    else:
+                        base_dt = cd.data_type.split("(")[0].strip()
+                        rows.append(
+                            (
+                                t_name,
+                                c_name,
+                                base_dt,
+                                "NO" if cd.not_null else "YES",
+                                "PRI" if cd.primary_key else "",
+                                cd.data_type,
+                            )
+                        )
+            return rows, len(rows)
 
+        if s_up.startswith("DO $$"):
+            self._exec_loop_backfill_in_sqlite(s)
+            return [], 0
 
-import sys
-import time
-import unittest
+        if s_up.startswith("DROP PROCEDURE"):
+            return [], 0
+        m_proc = re.match(
+            r"CREATE\s+PROCEDURE\s+([A-Za-z0-9_]+)\s*\(\)\s*BEGIN\s*(.*)\s*END;?",
+            s,
+            flags=re.I | re.S,
+        )
+        if m_proc:
+            self._mysql_procs[m_proc.group(1)] = m_proc.group(2).strip()
+            return [], 0
+        m_call = re.match(r"CALL\s+([A-Za-z0-9_]+)\s*\(\)\s*;?", s, flags=re.I)
+        if m_call:
+            proc_body = self._mysql_procs.get(m_call.group(1), "")
+            if proc_body:
+                self._exec_loop_backfill_in_sqlite(proc_body)
+            return [], 0
+
+        m_pg_fn = re.match(
+            r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\)\s+RETURNS\s+TRIGGER\s+AS\s+\$\$(.*)\$\$\s+LANGUAGE\s+plpgsql;?",
+            s,
+            flags=re.I | re.S,
+        )
+        if m_pg_fn:
+            self._pg_functions[m_pg_fn.group(1)] = m_pg_fn.group(2).strip()
+            return [], 0
+
+        m_drop_fn = re.match(
+            r"DROP\s+FUNCTION\s+IF\s+EXISTS\s+([A-Za-z0-9_]+)\s*(?:\(\))?\s*(?:CASCADE)?\s*;?",
+            s,
+            flags=re.I,
+        )
+        if m_drop_fn:
+            fn_n = m_drop_fn.group(1)
+            for tr_n in self._pg_fn_triggers.pop(fn_n, []):
+                self._sq_conn.execute(f"DROP TRIGGER IF EXISTS {tr_n};")
+            return [], 0
+
+        if self.dialect == Dialect.POSTGRES and s_up.startswith("CREATE TRIGGER"):
+            if "AFTER TRUNCATE ON" in s_up:
+                return [], 0
+            m_ro = re.match(
+                r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+INSTEAD\s+OF\s+INSERT\s+OR\s+UPDATE\s+OR\s+DELETE\s+ON\s+([A-Za-z0-9_]+)\s+FOR\s+EACH\s+ROW\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);?",
+                s,
+                flags=re.I | re.S,
+            )
+            if m_ro:
+                t_name, v_name, fn_name = m_ro.group(1), m_ro.group(2), m_ro.group(3)
+                created = []
+                for op, suf in (("INSERT", "ins"), ("UPDATE", "upd"), ("DELETE", "del")):
+                    tn = f"{t_name}_{suf}"
+                    self._sq_conn.execute(
+                        f"CREATE TRIGGER {tn} INSTEAD OF {op} ON {v_name} BEGIN SELECT RAISE(ABORT, 'read-only'); END;"
+                    )
+                    created.append(tn)
+                self._pg_fn_triggers.setdefault(fn_name, []).extend(created)
+                return [], 0
+
+            m_tr = re.match(
+                r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+INSERT\s+OR\s+UPDATE(?:\s+OF\s+[^;]+?)?\s+OR\s+DELETE\s+ON\s+([A-Za-z0-9_]+)\s+FOR\s+EACH\s+ROW\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);?",
+                s,
+                flags=re.I | re.S,
+            )
+            if m_tr:
+                t_name, base_t, fn_name = m_tr.group(1), m_tr.group(2), m_tr.group(3)
+                body = self._pg_functions.get(fn_name, "")
+                m_parts = re.search(
+                    r"IF\s*\(TG_OP\s*=\s*'DELETE'\)\s*THEN\s*(.*?)\s*ELSIF\s*\(TG_OP\s*=\s*'INSERT'\)\s*THEN\s*(.*?)\s*ELSIF\s*\(TG_OP\s*=\s*'UPDATE'\)\s*THEN\s*(.*?)\s*END\s+IF;\s*RETURN\s+NULL;",
+                    body,
+                    flags=re.I | re.S,
+                )
+                if m_parts:
+                    del_b, ins_b, upd_b = (
+                        m_parts.group(1).strip(),
+                        m_parts.group(2).strip(),
+                        m_parts.group(3).strip(),
+                    )
+                    created = []
+                    for op, b_raw, suf in (("DELETE", del_b, "ad"), ("INSERT", ins_b, "ai"), ("UPDATE", upd_b, "au")):
+                        b_clean = _transpile_pg_expr_to_sqlite(b_raw)
+                        when_cl = ""
+                        m_if = re.match(
+                            r"^IF\s*\(([^\n]+?)\)\s*THEN\s*(.*)\s*END\s+IF;$",
+                            b_clean.strip(),
+                            flags=re.I | re.S,
+                        )
+                        if m_if:
+                            inner_s = m_if.group(2).strip()
+                            if m_if.group(1).strip().upper().startswith("NOT ") or "END IF;" not in inner_s.upper():
+                                when_cl = f" WHEN ({m_if.group(1)})"
+                                b_clean = inner_s
+
+                        def _unwrap_if(m_inner: re.Match[str]) -> str:
+                            c_in, st_in = m_inner.group(1).strip(), m_inner.group(2).strip()
+                            out_sts = []
+                            for st_p in _split_top_level(st_in, ";"):
+                                sp = st_p.strip()
+                                if not sp:
+                                    continue
+                                if re.match(r"^INSERT\s+INTO\b", sp, flags=re.I):
+                                    if re.search(r"\bWHERE\s+(?:TRUE|1)\b", sp, flags=re.I):
+                                        sp = re.sub(
+                                            r"\bWHERE\s+(?:TRUE|1)\b",
+                                            f"WHERE ({c_in})",
+                                            sp,
+                                            count=1,
+                                            flags=re.I,
+                                        )
+                                    else:
+                                        sp = re.sub(
+                                            r"\n\s*WHERE\s+",
+                                            f"\n    WHERE ({c_in}) AND ",
+                                            sp,
+                                            count=1,
+                                            flags=re.I,
+                                        )
+                                elif re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", sp, flags=re.I):
+                                    sp = re.sub(
+                                        r"\n\s*WHERE\s+",
+                                        f"\n    WHERE ({c_in}) AND ",
+                                        sp,
+                                        count=1,
+                                        flags=re.I,
+                                    )
+                                out_sts.append(sp + ";")
+                            return "\n".join(out_sts)
+
+                        b_clean = re.sub(
+                            r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
+                            _unwrap_if,
+                            b_clean,
+                            flags=re.I | re.S,
+                        )
+                        m_outer_if = re.match(
+                            r"^IF\s*\(([^\n]+?)\)\s*THEN\s*(.*)\s*END\s+IF;$",
+                            b_clean.strip(),
+                            flags=re.I | re.S,
+                        )
+                        if m_outer_if:
+                            when_cl = f" WHEN ({m_outer_if.group(1)})"
+                            b_clean = m_outer_if.group(2).strip()
+                        tn = f"{t_name}_{suf}"
+                        self._sq_conn.execute(
+                            f"CREATE TRIGGER {tn} AFTER {op} ON {base_t} FOR EACH ROW{when_cl}\nBEGIN\n{b_clean}\nEND;"
+                        )
+                        created.append(tn)
+                    self._pg_fn_triggers.setdefault(fn_name, []).extend(created)
+                return [], 0
+
+            m_stmt_tr = re.match(
+                r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+(INSERT|DELETE|UPDATE)\s+ON\s+([A-Za-z0-9_]+)\s+REFERENCING\s+[^\n]+\s+FOR\s+EACH\s+STATEMENT\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);?",
+                s,
+                flags=re.I | re.S,
+            )
+            if m_stmt_tr:
+                t_name, op, base_t, fn_name = (
+                    m_stmt_tr.group(1),
+                    m_stmt_tr.group(2).upper(),
+                    m_stmt_tr.group(3),
+                    m_stmt_tr.group(4),
+                )
+                body = self._pg_functions.get(fn_name, "")
+                loop_bodies = re.findall(
+                    r"FOR\s+(?:NEW|OLD)\s+IN\s+SELECT\s+\*\s+FROM\s+__mv_(?:new|old)_rows\s+LOOP\s*(.*?)\s*END\s+LOOP;",
+                    body,
+                    flags=re.I | re.S,
+                )
+                b_clean = _transpile_pg_expr_to_sqlite("\n".join(loop_bodies))
+
+                def _unwrap_if_tr(m_inner: re.Match[str]) -> str:
+                    c_in, st_in = m_inner.group(1).strip(), m_inner.group(2).strip()
+                    out_sts = []
+                    for st_p in _split_top_level(st_in, ";"):
+                        sp = st_p.strip()
+                        if not sp:
+                            continue
+                        if re.match(r"^INSERT\s+INTO\b", sp, flags=re.I):
+                            if re.search(r"\bWHERE\s+(?:TRUE|1)\b", sp, flags=re.I):
+                                sp = re.sub(
+                                    r"\bWHERE\s+(?:TRUE|1)\b",
+                                    f"WHERE ({c_in})",
+                                    sp,
+                                    count=1,
+                                    flags=re.I,
+                                )
+                            else:
+                                sp = re.sub(
+                                    r"\n\s*WHERE\s+",
+                                    f"\n    WHERE ({c_in}) AND ",
+                                    sp,
+                                    count=1,
+                                    flags=re.I,
+                                )
+                        elif re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", sp, flags=re.I):
+                            sp = re.sub(
+                                r"\n\s*WHERE\s+",
+                                f"\n    WHERE ({c_in}) AND ",
+                                sp,
+                                count=1,
+                                flags=re.I,
+                            )
+                        out_sts.append(sp + ";")
+                    return "\n".join(out_sts)
+
+                b_clean = re.sub(
+                    r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
+                    _unwrap_if_tr,
+                    b_clean,
+                    flags=re.I | re.S,
+                )
+                self._sq_conn.execute(
+                    f"CREATE TRIGGER {t_name} AFTER {op} ON {base_t} FOR EACH ROW\nBEGIN\n{b_clean}\nEND;"
+                )
+                self._pg_fn_triggers.setdefault(fn_name, []).append(t_name)
+                return [], 0
+
+        if self.dialect == Dialect.MYSQL and s_up.startswith("CREATE TRIGGER"):
+            m_tr = re.match(
+                r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+(INSERT|DELETE|UPDATE)\s+ON\s+([A-Za-z0-9_]+)\s+FOR\s+EACH\s+ROW\s+BEGIN\s*(.*)\s*END;?",
+                s,
+                flags=re.I | re.S,
+            )
+            if m_tr:
+                t_name, op, base_t, body = (
+                    m_tr.group(1),
+                    m_tr.group(2).upper(),
+                    m_tr.group(3),
+                    m_tr.group(4).strip(),
+                )
+                m_target = re.search(
+                    r"(?:INSERT\s+INTO|DELETE\s+FROM|UPDATE)\s+(__matview_store_[A-Za-z0-9_]+)",
+                    body,
+                    flags=re.I,
+                )
+                main_pks = self._table_pks.get(m_target.group(1).lower(), ["__mv_pk"]) if m_target else ["__mv_pk"]
+                b_clean = self._convert_mysql_dml_to_sqlite(body, main_pks)
+                when_cl = ""
+                m_outer = re.match(
+                    r"^IF\s*\(([^\n]+?)\)\s*THEN\s*(.*)\s*END\s+IF;$",
+                    b_clean.strip(),
+                    flags=re.I | re.S,
+                )
+                if m_outer:
+                    inner_my = m_outer.group(2).strip()
+                    if m_outer.group(1).strip().upper().startswith("NOT ") or "END IF;" not in inner_my.upper():
+                        when_cl = f" WHEN ({m_outer.group(1)})"
+                        b_clean = inner_my
+
+                def _unwrap_my_if(m_inner: re.Match[str]) -> str:
+                    c_in, st_in = m_inner.group(1).strip(), m_inner.group(2).strip()
+                    out_sts = []
+                    for st_p in _split_top_level(st_in, ";"):
+                        sp = st_p.strip()
+                        if not sp:
+                            continue
+                        if re.match(r"^INSERT\s+INTO\b", sp, flags=re.I):
+                            if re.search(r"\bWHERE\s+(?:TRUE|1)\b", sp, flags=re.I):
+                                sp = re.sub(
+                                    r"\bWHERE\s+(?:TRUE|1)\b",
+                                    f"WHERE ({c_in})",
+                                    sp,
+                                    count=1,
+                                    flags=re.I,
+                                )
+                            else:
+                                sp = re.sub(
+                                    r"\n\s*WHERE\s+",
+                                    f"\n    WHERE ({c_in}) AND ",
+                                    sp,
+                                    count=1,
+                                    flags=re.I,
+                                )
+                        elif re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", sp, flags=re.I):
+                            sp = re.sub(
+                                r"\n\s*WHERE\s+",
+                                f"\n    WHERE ({c_in}) AND ",
+                                sp,
+                                count=1,
+                                flags=re.I,
+                            )
+                        out_sts.append(sp + ";")
+                    return "\n".join(out_sts)
+
+                b_clean = re.sub(
+                    r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
+                    _unwrap_my_if,
+                    b_clean,
+                    flags=re.I | re.S,
+                )
+                self._sq_conn.execute(
+                    f"CREATE TRIGGER {t_name} AFTER {op} ON {base_t} FOR EACH ROW{when_cl}\nBEGIN\n{b_clean}\nEND;"
+                )
+                return [], 0
+
+        if self.dialect == Dialect.MYSQL and re.match(
+            r"^CREATE\s+ALGORITHM\s*=\s*TEMPTABLE\s+VIEW\s+([A-Za-z0-9_]+)", s, flags=re.I
+        ):
+            m_v = re.match(r"^CREATE\s+ALGORITHM\s*=\s*TEMPTABLE\s+VIEW\s+([A-Za-z0-9_]+)", s, flags=re.I)
+            assert m_v is not None
+            v_name = m_v.group(1)
+            s_v = self._convert_mysql_dml_to_sqlite(s)
+            self._sq_conn.execute(s_v)
+            for op, suf in (("INSERT", "ins"), ("UPDATE", "upd"), ("DELETE", "del")):
+                self._sq_conn.execute(
+                    f"CREATE TRIGGER __ro_my_{v_name}_{suf} INSTEAD OF {op} ON {v_name} BEGIN SELECT RAISE(ABORT, 'read-only'); END;"
+                )
+            return [], 0
+
+        if s_up.startswith("CREATE TABLE"):
+            self._record_table_pks(s)
+
+        if self.dialect == Dialect.POSTGRES:
+            m_trunc = re.match(r"^TRUNCATE\s+TABLE\s+([A-Za-z0-9_]+)\s*;?$", s, flags=re.I)
+            if m_trunc:
+                s_exec = f"DELETE FROM {m_trunc.group(1)};"
+            else:
+                s_exec = _transpile_pg_expr_to_sqlite(s)
+                s_exec = re.sub(
+                    r"\bDROP\s+(VIEW|TABLE)\s+IF\s+EXISTS\s+([A-Za-z0-9_]+)\s+CASCADE\s*;?",
+                    r"DROP \1 IF EXISTS \2;",
+                    s_exec,
+                    flags=re.I,
+                )
+        else:
+            if s_up == "START TRANSACTION":
+                s_exec = "BEGIN;"
+            else:
+                s_exec = self._convert_mysql_dml_to_sqlite(s)
+                if s_up.startswith("CREATE INDEX") or s_up.startswith("CREATE UNIQUE INDEX"):
+                    s_exec = re.sub(r"\(\(\((.*?)\)\)\)", r"((\1))", s_exec)
+
+        if params is not None:
+            s_exec = s_exec.replace("%s", "?")
+            cur = self._sq_conn.execute(s_exec, tuple(params))
+        else:
+            cur = self._sq_conn.execute(s_exec)
+        rows = cur.fetchall() or []
+        return rows, cur.rowcount
 
 
 def _rewrite_live_reference_select_for_dialect(raw_select_sql: str, dialect: Dialect) -> str:
@@ -1688,8 +1795,8 @@ def _adapt_view_ddl_for_dialect(v_ddl: str, dialect: Dialect) -> str:
     return v_ddl
 
 
-def _adapt_mutation_for_dialect(m_sql: str, dialect: Dialect, for_live_engine: bool) -> str:
-    if dialect == Dialect.MYSQL and for_live_engine:
+def _adapt_mutation_for_dialect(m_sql: str, dialect: Dialect) -> str:
+    if dialect == Dialect.MYSQL:
         s_up = m_sql.strip().upper().rstrip(";").strip()
         if s_up == "BEGIN":
             return "START TRANSACTION;"
@@ -1712,6 +1819,165 @@ def _adapt_mutation_for_dialect(m_sql: str, dialect: Dialect, for_live_engine: b
     return m_sql
 
 
+def _run_unified_50_view_battery(
+    conn: Any,
+    cur: Any,
+    dialect: Dialect,
+    *,
+    inc_mode: bool = False,
+    use_trans: bool = False,
+    label: str = "",
+    reset_sql: Optional[str] = None,
+) -> Tuple[int, int]:
+    """
+    Single unified runner for the 50-view x 35-state verification battery across
+    SQLite, PostgreSQL, and MySQL (used identically for both in-memory transpiled
+    runs and live external database servers).
+    """
+    schema, view_specs = _get_live_engine_50_view_battery(dialect)
+    if reset_sql:
+        for r_st in [st.strip() for st in reset_sql.split(";") if st.strip()]:
+            cur.execute(r_st + ";")
+    for s in [st.strip() for st in schema.split(";") if st.strip()]:
+        cur.execute(s + ";")
+
+    t_val = "TRUE" if dialect == Dialect.POSTGRES else "1"
+    f_val = "FALSE" if dialect == Dialect.POSTGRES else "0"
+    cur.execute("INSERT INTO warehouses VALUES (1, 'WH_US', 'US'), (2, 'WH_EU', 'EU'), (3, 'WH_GLOBAL', NULL);")
+    cur.execute("INSERT INTO customers VALUES (1, 1, 'Alice', 'NA'), (2, 2, 'Bob', 'VIP'), (3, 2, 'Cara', 'EU'), (4, NULL, 'Dan', 'APAC');")
+    cur.execute(
+        "INSERT INTO orders VALUES "
+        f"(1, 1, 'NA', 'hw', 10.0, 2, 3, {t_val}, 'settled'),"
+        f"(2, 1, 'NA', 'sw', 20.0, 4, 5, {f_val}, 'settled'),"
+        f"(3, 2, 'EU', 'hw', 15.0, 1, 7, {t_val}, 'pending'),"
+        f"(4, 2, 'EU', 'hw', 30.0, 3, 6, {t_val}, 'settled'),"
+        f"(5, 3, NULL, 'sw', 50.0, 5, 1, {f_val}, 'settled');"
+    )
+    cur.execute("INSERT INTO order_tags VALUES (1, 'urgent', 2), (1, 'fragile', 5), (2, 'urgent', 3), (4, 'bulk', 10);")
+
+    plans = []
+    views_installed = 0
+    checks_run = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", EngineLimitationWarning)
+        for v_name, v_sel in view_specs:
+            p = generate_materialized_view(
+                schema,
+                f"CREATE VIEW {v_name} AS {v_sel};",
+                dialect=dialect,
+                pg_use_transition_tables=use_trans,
+                incremental_backfill=inc_mode,
+                batch_size=2,
+                ignore_limitations=True,
+            )
+            for stmt in p.all_statements():
+                cur.execute(stmt)
+            live_sel = _rewrite_live_reference_select_for_dialect(v_sel, dialect)
+            plans.append((p, live_sel))
+            views_installed += 1
+            _verify_external_db_mv(cur, p.view_name, live_sel, f"{label}:inc={inc_mode}:tr={use_trans}:{v_name}:init")
+            checks_run += 1
+
+    ro_raised = False
+    try:
+        cur.execute(f"DELETE FROM {plans[0][0].view_name};")
+    except Exception:
+        ro_raised = True
+    assert ro_raised, f"Expected {label} read-only view to block direct DELETE on MV"
+
+    steps = _get_complex_dml_and_tx_steps(dialect)
+    for step_lbl, m_sql in steps:
+        cur.execute(m_sql)
+        for p, live_sel in plans:
+            _verify_external_db_mv(cur, p.view_name, live_sel, f"{label}:inc={inc_mode}:tr={use_trans}:{p.logical_view_name}:{step_lbl}")
+            checks_run += 1
+
+    for p, _ in reversed(plans):
+        for drop_st in p.drop_statements():
+            cur.execute(drop_st)
+
+    return views_installed, checks_run
+
+
+def run_live_postgres_tests_if_available(dsn: str) -> None:
+    """Runs comprehensive 50-view x 3-mode (full, incremental, transition-tables) + manager tests against a real PostgreSQL instance."""
+    conn = _open_live_postgres_connection(dsn)
+    if conn is None:
+        print("Skipping live PostgreSQL test: psycopg2/psycopg not installed.")
+        return
+    cur = conn.cursor()
+    total_views = 0
+    total_checks = 0
+    reset_sql = "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+    for inc_mode, use_trans in ((False, False), (True, False), (False, True)):
+        v_cnt, c_cnt = _run_unified_50_view_battery(
+            conn, cur, Dialect.POSTGRES, inc_mode=inc_mode, use_trans=use_trans, label="live_pg", reset_sql=reset_sql
+        )
+        total_views += v_cnt
+        total_checks += c_cnt
+    total_checks += _run_live_manager_lifecycle_check(conn, cur, Dialect.POSTGRES)
+    conn.close()
+    print(f"LIVE PostgreSQL server test PASSED ({total_views} views installed, {total_checks} live assertions)!")
+
+
+def run_live_mysql_tests_if_available(dsn: str) -> None:
+    """Runs comprehensive 50-view x 2-mode (full, incremental) + manager tests against a real MySQL/MariaDB/Percona instance."""
+    conn, target_db = _open_live_mysql_connection(dsn)
+    if conn is None:
+        print("Skipping live MySQL test: pymysql not installed.")
+        return
+    cur = conn.cursor()
+    total_views = 0
+    total_checks = 0
+    reset_sql = (
+        f"DROP DATABASE IF EXISTS `{target_db}`; "
+        f"CREATE DATABASE `{target_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; "
+        f"USE `{target_db}`; "
+        "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci; "
+        "SET SESSION collation_connection = @@collation_database;"
+    )
+    for inc_mode in (False, True):
+        v_cnt, c_cnt = _run_unified_50_view_battery(
+            conn, cur, Dialect.MYSQL, inc_mode=inc_mode, use_trans=False, label="live_mysql", reset_sql=reset_sql
+        )
+        total_views += v_cnt
+        total_checks += c_cnt
+    total_checks += _run_live_manager_lifecycle_check(conn, cur, Dialect.MYSQL)
+    conn.close()
+    print(f"LIVE MySQL server test PASSED ({total_views} views installed, {total_checks} live assertions)!")
+
+
+def run_live_sqlite_compat_tests_if_available(engine_spec: str) -> None:
+    """
+    Runs comprehensive 50-view x 2-mode (full, incremental) + manager lifecycle live integration
+    tests against SQLite-compatible database engines (`apsw`, `sqlite3mc`, `sqlcipher`, `sqlean`, `libsql`).
+    """
+    eng = engine_spec.strip().lower()
+    total_views = 0
+    total_checks = 0
+    for inc_mode in (False, True):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = os.path.join(tmpdir, f"compat_{eng}_{int(inc_mode)}.db")
+            conn = _open_sqlite_compat_connection(eng, db_file)
+            cur = conn.cursor()
+            try:
+                v_cnt, c_cnt = _run_unified_50_view_battery(
+                    conn, cur, Dialect.SQLITE, inc_mode=inc_mode, use_trans=False, label=f"live_{eng}"
+                )
+                total_views += v_cnt
+                total_checks += c_cnt
+                if inc_mode:
+                    total_checks += _run_live_manager_lifecycle_check(conn, cur, Dialect.SQLITE)
+            finally:
+                conn.close()
+    print(f"LIVE SQLite-compatible engine ({eng}) test PASSED ({total_views} views installed, {total_checks} live assertions)!")
+
+
+import sys
+import time
+import unittest
+
+
 class MVTestRunner:
     def __init__(self) -> None:
         self.total_views: int = 0
@@ -1725,6 +1991,73 @@ class MVTestRunner:
             self.default_dialect = Dialect.MYSQL
         else:
             self.default_dialect = Dialect.SQLITE
+
+    def _open_backend_session(
+        self, dialect: Dialect, suite_tag: str = "batch"
+    ) -> Tuple[Any, Any, Optional[str], int, str, Callable[[], None]]:
+        """
+        Opens a unified `(conn, cur, reset_sql, chunk_size, engine_label, close_fn)` session
+        for `dialect`. Every engine (live external PostgreSQL, live external MySQL/MariaDB,
+        live SQLite-compatible engines, in-memory SQLite, and in-memory transpiled PostgreSQL/MySQL)
+        exposes the exact same DB-API 2.0 connection/cursor interface so `run_batch` executes
+        a single unified code path with zero dialect branching.
+        """
+        if dialect == Dialect.POSTGRES and self.pg_dsn:
+            pg_conn = _open_live_postgres_connection(self.pg_dsn)
+            if pg_conn is not None:
+                return (
+                    pg_conn,
+                    pg_conn.cursor(),
+                    "DROP SCHEMA public CASCADE; CREATE SCHEMA public;",
+                    100,
+                    "LIVE POSTGRES",
+                    pg_conn.close,
+                )
+        if dialect == Dialect.MYSQL and self.mysql_dsn:
+            my_conn, target_db = _open_live_mysql_connection(self.mysql_dsn)
+            if my_conn is not None:
+                reset_sql = (
+                    f"DROP DATABASE IF EXISTS `{target_db}`; "
+                    f"CREATE DATABASE `{target_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; "
+                    f"USE `{target_db}`; "
+                    "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci; "
+                    "SET SESSION collation_connection = @@collation_database;"
+                )
+                return (
+                    my_conn,
+                    my_conn.cursor(),
+                    reset_sql,
+                    50,
+                    "LIVE MYSQL",
+                    my_conn.close,
+                )
+        if dialect == Dialect.SQLITE and self.sqlite_compat_engine:
+            eng = self.sqlite_compat_engine.strip().lower()
+            tmpdir = tempfile.TemporaryDirectory()
+            db_file = os.path.join(tmpdir.name, f"{suite_tag}.db")
+            compat_conn = _open_sqlite_compat_connection(eng, db_file)
+
+            def _close_compat() -> None:
+                try:
+                    compat_conn.close()
+                finally:
+                    tmpdir.cleanup()
+
+            return compat_conn, compat_conn.cursor(), None, 500, f"LIVE {eng.upper()}", _close_compat
+
+        if dialect == Dialect.SQLITE:
+            sq_conn = _open_sqlite_compat_connection("sqlite3", ":memory:")
+            return sq_conn, sq_conn.cursor(), None, 500, "SQLITE", sq_conn.close
+        else:
+            tr_conn = TranspiledConnectionAdapter(dialect)
+            return (
+                tr_conn,
+                tr_conn.cursor(),
+                "DROP SCHEMA public CASCADE;",
+                500,
+                f"TRANSPILED {dialect.value.upper()}",
+                tr_conn.close,
+            )
 
     def run_batch(
         self,
@@ -1741,195 +2074,64 @@ class MVTestRunner:
     ) -> None:
         eff_dialect = dialect if dialect is not None else self.default_dialect
         eff_schema = _adapt_suite_schema_for_dialect(schema_sql, eff_dialect)
-
-        # 1. Live PostgreSQL / PostgreSQL-compatible execution
-        if self.pg_dsn and eff_dialect == Dialect.POSTGRES:
-            pg_conn = _open_live_postgres_connection(self.pg_dsn)
-            if pg_conn is not None:
-                try:
-                    cur = pg_conn.cursor()
-                    eff_muts = [
-                        (lbl, _adapt_mutation_for_dialect(msql, Dialect.POSTGRES, True))
-                        for lbl, msql in mutations
-                    ]
-                    chunk_size = 100
-                    for i in range(0, len(views), chunk_size):
-                        chunk = views[i : i + chunk_size]
-                        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-                        for st in [s.strip() for s in eff_schema.split(";") if s.strip()]:
-                            cur.execute(st)
-                        for s in seed_sqls:
-                            cur.execute(s)
-                        plans_and_selects: List[Tuple[MaterializedViewPlan, str]] = []
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", EngineLimitationWarning)
-                            for v_name, v_ddl in chunk:
-                                eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, Dialect.POSTGRES)
-                                plan = generate_materialized_view(
-                                    eff_schema,
-                                    eff_v_ddl,
-                                    dialect=Dialect.POSTGRES,
-                                    pg_use_transition_tables=pg_use_transition_tables,
-                                    incremental_backfill=incremental_backfill,
-                                    batch_size=batch_size,
-                                    ignore_limitations=True,
-                                )
-                                for stmt in plan.all_statements():
-                                    cur.execute(stmt)
-                                v_spec = parse_view_definition(eff_v_ddl)
-                                live_sel = _rewrite_live_reference_select_for_dialect(v_spec.raw_select_sql, Dialect.POSTGRES)
-                                plans_and_selects.append((plan, live_sel))
-                                self.total_views += 1
-                                _verify_external_db_mv(cur, plan.view_name, live_sel, f"{suite_name}:{v_name}:init")
-                                self.total_assertions += 1
-                        for step_lbl, m_sql in eff_muts:
-                            cur.execute(m_sql)
-                            for plan, live_sel in plans_and_selects:
-                                _verify_external_db_mv(cur, plan.view_name, live_sel, f"{suite_name}:{plan.logical_view_name}:{step_lbl}")
-                                self.total_assertions += 1
-                finally:
-                    pg_conn.close()
-                print(f"  [PASS] {suite_name} [LIVE POSTGRES]: {len(views)} views x {len(mutations) + 1} states = {len(views) * (len(mutations) + 1)} assertions")
-                return
-
-        # 2. Live MySQL / MariaDB / Percona Server execution
-        if self.mysql_dsn and eff_dialect == Dialect.MYSQL:
-            my_conn, target_db = _open_live_mysql_connection(self.mysql_dsn)
-            if my_conn is not None:
-                try:
-                    cur = my_conn.cursor()
-                    eff_muts = [
-                        (lbl, _adapt_mutation_for_dialect(msql, Dialect.MYSQL, True))
-                        for lbl, msql in mutations
-                    ]
-                    chunk_size = 50
-                    for i in range(0, len(views), chunk_size):
-                        chunk = views[i : i + chunk_size]
-                        cur.execute(f"DROP DATABASE IF EXISTS `{target_db}`;")
-                        cur.execute(f"CREATE DATABASE `{target_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
-                        cur.execute(f"USE `{target_db}`;")
-                        cur.execute("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;")
-                        cur.execute("SET SESSION collation_connection = @@collation_database;")
-                        for st in [s.strip() for s in eff_schema.split(";") if s.strip()]:
-                            cur.execute(st)
-                        for s in seed_sqls:
-                            cur.execute(s)
-                        plans_and_selects = []
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", EngineLimitationWarning)
-                            for v_name, v_ddl in chunk:
-                                eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, Dialect.MYSQL)
-                                plan = generate_materialized_view(
-                                    eff_schema,
-                                    eff_v_ddl,
-                                    dialect=Dialect.MYSQL,
-                                    incremental_backfill=incremental_backfill,
-                                    batch_size=batch_size,
-                                    ignore_limitations=True,
-                                )
-                                for stmt in plan.all_statements():
-                                    cur.execute(stmt)
-                                v_spec = parse_view_definition(eff_v_ddl)
-                                live_sel = _rewrite_live_reference_select_for_dialect(v_spec.raw_select_sql, Dialect.MYSQL)
-                                plans_and_selects.append((plan, live_sel))
-                                self.total_views += 1
-                                _verify_external_db_mv(cur, plan.view_name, live_sel, f"{suite_name}:{v_name}:init")
-                                self.total_assertions += 1
-                        for step_lbl, m_sql in eff_muts:
-                            cur.execute(m_sql)
-                            for plan, live_sel in plans_and_selects:
-                                _verify_external_db_mv(cur, plan.view_name, live_sel, f"{suite_name}:{plan.logical_view_name}:{step_lbl}")
-                                self.total_assertions += 1
-                finally:
-                    my_conn.close()
-                print(f"  [PASS] {suite_name} [LIVE MYSQL]: {len(views)} views x {len(mutations) + 1} states = {len(views) * (len(mutations) + 1)} assertions")
-                return
-
-        # 3. Live SQLite-compatible engine execution (apsw, sqlite3mc, sqlcipher, sqlean, libsql)
-        if self.sqlite_compat_engine and eff_dialect == Dialect.SQLITE:
-            eng = self.sqlite_compat_engine.strip().lower()
-            with tempfile.TemporaryDirectory() as tmpdir:
-                db_file = os.path.join(tmpdir, f"suite_{abs(hash(suite_name))}.db")
-                compat_conn = _open_sqlite_compat_connection(eng, db_file)
-                cur = compat_conn.cursor()
-                try:
-                    for st in [s.strip() for s in schema_sql.split(";") if s.strip()]:
-                        cur.execute(st + ";")
-                    for s in seed_sqls:
-                        cur.execute(s)
-                    plans_and_selects = []
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", EngineLimitationWarning)
-                        for v_name, v_ddl in views:
-                            plan = generate_materialized_view(
-                                schema_sql,
-                                v_ddl,
-                                dialect=Dialect.SQLITE,
-                                incremental_backfill=incremental_backfill,
-                                batch_size=batch_size,
-                                ignore_limitations=True,
-                            )
-                            for stmt in plan.all_statements():
-                                cur.execute(stmt)
-                            v_spec = parse_view_definition(v_ddl)
-                            plans_and_selects.append((plan, v_spec.raw_select_sql))
-                            self.total_views += 1
-                            _verify_external_db_mv(cur, plan.view_name, v_spec.raw_select_sql, f"{suite_name}:{eng}:{v_name}:init")
-                            self.total_assertions += 1
-                    for step_lbl, m_sql in mutations:
-                        cur.execute(m_sql)
-                        for plan, sel_sql in plans_and_selects:
-                            _verify_external_db_mv(cur, plan.view_name, sel_sql, f"{suite_name}:{eng}:{plan.logical_view_name}:{step_lbl}")
-                            self.total_assertions += 1
-                finally:
-                    compat_conn.close()
-            print(f"  [PASS] {suite_name} [LIVE {eng.upper()}]: {len(views)} views x {len(mutations) + 1} states = {len(views) * (len(mutations) + 1)} assertions")
-            return
-
-        # 4. Standard in-memory SQLite (and cross-dialect transpiled SQL verification)
-        conn = sqlite3.connect(":memory:", isolation_level=None)
-        conn.execute("PRAGMA recursive_triggers = ON;")
-        _register_sqlite_compat_udfs(conn)
-        conn.executescript(schema_sql)
-        for s in seed_sqls:
-            conn.execute(s)
-
-        plans_and_selects = []
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", EngineLimitationWarning)
-            for v_name, v_ddl in views:
-                eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, eff_dialect)
-                plan = generate_materialized_view(
-                    eff_schema,
-                    eff_v_ddl,
-                    dialect=eff_dialect,
-                    pg_use_transition_tables=pg_use_transition_tables,
-                    incremental_backfill=incremental_backfill,
-                    batch_size=batch_size,
-                    ignore_limitations=True,
-                )
-                if eff_dialect == Dialect.SQLITE:
-                    for stmt in plan.all_statements():
-                        conn.execute(stmt)
-                elif eff_dialect == Dialect.POSTGRES:
-                    _execute_postgres_plan_in_sqlite(conn, plan)
-                elif eff_dialect == Dialect.MYSQL:
-                    _execute_mysql_plan_in_sqlite(conn, plan)
-
-                v_spec = parse_view_definition(v_ddl)
-                plans_and_selects.append((plan, v_spec.raw_select_sql))
-                self.total_views += 1
-                _assert_mv_matches_live(conn, plan.view_name, v_spec.raw_select_sql, f"{suite_name}:{v_name}:init")
-                self.total_assertions += 1
-
-        for step_lbl, m_sql in mutations:
-            conn.execute(m_sql)
-            for plan, sel_sql in plans_and_selects:
-                _assert_mv_matches_live(conn, plan.view_name, sel_sql, f"{suite_name}:{plan.logical_view_name}:{step_lbl}")
-                self.total_assertions += 1
-
-        conn.close()
-        print(f"  [PASS] {suite_name}: {len(views)} views x {len(mutations) + 1} states = {len(views) * (len(mutations) + 1)} assertions")
+        eff_muts = [
+            (lbl, _adapt_mutation_for_dialect(msql, eff_dialect))
+            for lbl, msql in mutations
+        ]
+        conn, cur, reset_sql, chunk_size, engine_label, close_fn = self._open_backend_session(
+            eff_dialect, suite_tag=f"suite_{abs(hash(suite_name))}"
+        )
+        try:
+            for i in range(0, len(views), chunk_size):
+                chunk = views[i : i + chunk_size]
+                if reset_sql:
+                    for r_st in [s.strip() for s in reset_sql.split(";") if s.strip()]:
+                        cur.execute(r_st + ";")
+                for st in [s.strip() for s in eff_schema.split(";") if s.strip()]:
+                    cur.execute(st + ";")
+                for s in seed_sqls:
+                    cur.execute(s)
+                plans_and_selects: List[Tuple[MaterializedViewPlan, str]] = []
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                    for v_name, v_ddl in chunk:
+                        eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, eff_dialect)
+                        plan = generate_materialized_view(
+                            eff_schema,
+                            eff_v_ddl,
+                            dialect=eff_dialect,
+                            pg_use_transition_tables=pg_use_transition_tables,
+                            incremental_backfill=incremental_backfill,
+                            batch_size=batch_size,
+                            ignore_limitations=True,
+                        )
+                        for stmt in plan.all_statements():
+                            cur.execute(stmt)
+                        v_spec = parse_view_definition(eff_v_ddl)
+                        live_sel = _rewrite_live_reference_select_for_dialect(
+                            v_spec.raw_select_sql, eff_dialect
+                        )
+                        plans_and_selects.append((plan, live_sel))
+                        self.total_views += 1
+                        _verify_external_db_mv(
+                            cur, plan.view_name, live_sel, f"{suite_name}:{engine_label}:{v_name}:init"
+                        )
+                        self.total_assertions += 1
+                for step_lbl, m_sql in eff_muts:
+                    cur.execute(m_sql)
+                    for plan, live_sel in plans_and_selects:
+                        _verify_external_db_mv(
+                            cur,
+                            plan.view_name,
+                            live_sel,
+                            f"{suite_name}:{engine_label}:{plan.logical_view_name}:{step_lbl}",
+                        )
+                        self.total_assertions += 1
+        finally:
+            close_fn()
+        print(
+            f"  [PASS] {suite_name} [{engine_label}]: {len(views)} views x {len(mutations) + 1} states = {len(views) * (len(mutations) + 1)} assertions"
+        )
 
 
 # ==============================================================================
@@ -2838,65 +3040,57 @@ def run_suite_9_cross_dialect_execution(runner: MVTestRunner) -> None:
 
     assert len(view_defs) == 100
 
-    # Execute all 100 views compiled for POSTGRES (transpiled to SQLite)
+    # 9A: PostgreSQL Row-Level Triggers
     pg_views = [(f"pg_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW pg_{n}")) for n, sql in view_defs]
     runner.run_batch(
-        "Suite 9A (100 PostgreSQL-Compiled Views Executed via SQLite Transpiler)",
+        "Suite 9A (100 PostgreSQL Row-Level Trigger Views)",
         schema,
         pg_views,
         seed,
         mutations,
         dialect=Dialect.POSTGRES,
+        pg_use_transition_tables=False,
+        incremental_backfill=False,
     )
 
-    # Execute all 100 views compiled for MYSQL
+    # 9B: PostgreSQL Statement-Level Transition Tables & Incremental DO-Block Backfill
+    pg_tr_views = [(f"pgtr_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW pgtr_{n}")) for n, sql in view_defs]
+    runner.run_batch(
+        "Suite 9B (100 PostgreSQL Transition-Table & Incremental Backfill Views)",
+        schema,
+        pg_tr_views,
+        seed,
+        mutations,
+        dialect=Dialect.POSTGRES,
+        pg_use_transition_tables=True,
+        incremental_backfill=True,
+        batch_size=2,
+    )
+
+    # 9C: MySQL Standard Backfill
     my_views = [(f"my_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW my_{n}")) for n, sql in view_defs]
     runner.run_batch(
-        "Suite 9B (100 MySQL-Compiled Views)",
+        "Suite 9C (100 MySQL Standard Trigger Views)",
         schema,
         my_views,
         seed,
         mutations,
         dialect=Dialect.MYSQL,
+        incremental_backfill=False,
     )
 
-    if runner.pg_dsn:
-        pg_tr_views = [(f"pgtr_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW pgtr_{n}")) for n, sql in view_defs]
-        runner.run_batch(
-            "Suite 9C (100 PostgreSQL Transition-Table & Incremental Views on Live PG)",
-            schema,
-            pg_tr_views,
-            seed,
-            mutations,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            incremental_backfill=True,
-            batch_size=2,
-        )
-    elif runner.mysql_dsn:
-        my_inc_views = [(f"myinc_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW myinc_{n}")) for n, sql in view_defs]
-        runner.run_batch(
-            "Suite 9C (100 MySQL Incremental Backfill Views on Live MySQL)",
-            schema,
-            my_inc_views,
-            seed,
-            mutations,
-            dialect=Dialect.MYSQL,
-            incremental_backfill=True,
-            batch_size=2,
-        )
-    elif runner.sqlite_compat_engine:
-        sq_compat_views = [(f"sqc_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW sqc_{n}")) for n, sql in view_defs]
-        runner.run_batch(
-            "Suite 9C (100 SQLite Incremental Backfill Views on Live SQLite-Compat Engine)",
-            schema,
-            sq_compat_views,
-            seed,
-            mutations,
-            dialect=Dialect.SQLITE,
-            incremental_backfill=True,
-            batch_size=2,
-        )
+    # 9D: MySQL Stored-Procedure Incremental Backfill
+    my_inc_views = [(f"myinc_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW myinc_{n}")) for n, sql in view_defs]
+    runner.run_batch(
+        "Suite 9D (100 MySQL Stored-Procedure Incremental Backfill Views)",
+        schema,
+        my_inc_views,
+        seed,
+        mutations,
+        dialect=Dialect.MYSQL,
+        incremental_backfill=True,
+        batch_size=2,
+    )
 
 
 # ==============================================================================
@@ -3156,145 +3350,46 @@ def run_suite_10_torture_dml_and_transactions(runner: MVTestRunner) -> None:
 
 def run_suite_11_live_engine_50_view_battery_across_all_dialects(runner: MVTestRunner) -> None:
     """
-    Executes the exact 50-view x 33-step live-engine verification battery across:
-      - SQLite (incremental_backfill=False & True) + _run_live_manager_lifecycle_check
-      - PostgreSQL (pg_use_transition_tables=False & True)
-      - MySQL (Dialect.MYSQL)
+    Executes the 50-view x 35-state verification battery AND `_run_live_manager_lifecycle_check`
+    through `runner._open_backend_session(dialect)` and `_run_unified_50_view_battery` across all
+    three dialects (`Dialect.SQLITE`, `Dialect.POSTGRES`, `Dialect.MYSQL`).
+    When `POSTGRES_DSN`, `MYSQL_DSN`, or `SQLITE_COMPAT_ENGINE` is set, the corresponding dialect
+    executes directly against that live database engine while the remaining dialects execute
+    through the unified in-memory transpiled adapters.
     """
-    # 11A & 11B: SQLite (Standard & Incremental Backfill)
-    sq_schema, sq_views = _get_live_engine_50_view_battery(Dialect.SQLITE)
-    for inc_mode in (False, True):
-        conn = sqlite3.connect(":memory:", isolation_level=None)
-        conn.execute("PRAGMA recursive_triggers = ON;")
-        cur = conn.cursor()
-        for s in [st.strip() for st in sq_schema.split(";") if st.strip()]:
-            cur.execute(s + ";")
-        cur.execute("INSERT INTO warehouses VALUES (1, 'WH_US', 'US'), (2, 'WH_EU', 'EU'), (3, 'WH_GLOBAL', NULL);")
-        cur.execute("INSERT INTO customers VALUES (1, 1, 'Alice', 'NA'), (2, 2, 'Bob', 'VIP'), (3, 2, 'Cara', 'EU'), (4, NULL, 'Dan', 'APAC');")
-        cur.execute(
-            "INSERT INTO orders VALUES "
-            "(1, 1, 'NA', 'hw', 10.0, 2, 3, 1, 'settled'),"
-            "(2, 1, 'NA', 'sw', 20.0, 4, 5, 0, 'settled'),"
-            "(3, 2, 'EU', 'hw', 15.0, 1, 7, 1, 'pending'),"
-            "(4, 2, 'EU', 'hw', 30.0, 3, 6, 1, 'settled'),"
-            "(5, 3, NULL, 'sw', 50.0, 5, 1, 0, 'settled');"
+    dialect_configs: List[Tuple[Dialect, List[Tuple[bool, bool]]]] = [
+        (Dialect.SQLITE, [(False, False), (True, False)]),
+        (Dialect.POSTGRES, [(False, False), (True, False), (False, True)]),
+        (Dialect.MYSQL, [(False, False), (True, False)]),
+    ]
+    for dialect, mode_list in dialect_configs:
+        conn, cur, reset_sql, _, engine_label, close_fn = runner._open_backend_session(
+            dialect, suite_tag=f"s11_{dialect.value}"
         )
-        cur.execute("INSERT INTO order_tags VALUES (1, 'urgent', 2), (1, 'fragile', 5), (2, 'urgent', 3), (4, 'bulk', 10);")
-        plans = []
-        for v_name, v_sel in sq_views:
-            p = generate_materialized_view(
-                sq_schema,
-                f"CREATE VIEW {v_name} AS {v_sel};",
-                dialect=Dialect.SQLITE,
-                incremental_backfill=inc_mode,
-                batch_size=2,
+        eff_reset = reset_sql or "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+        try:
+            for inc_mode, use_trans in mode_list:
+                v_cnt, c_cnt = _run_unified_50_view_battery(
+                    conn,
+                    cur,
+                    dialect,
+                    inc_mode=inc_mode,
+                    use_trans=use_trans,
+                    label=f"s11_{dialect.value}",
+                    reset_sql=eff_reset,
+                )
+                runner.total_views += v_cnt
+                runner.total_assertions += c_cnt
+                print(
+                    f"  [PASS] Suite 11 (Unified 50-View Battery {dialect.value.upper()} inc={inc_mode} tr={use_trans}) [{engine_label}]: {v_cnt} views, {c_cnt} assertions"
+                )
+            mgr_checks = _run_live_manager_lifecycle_check(conn, cur, dialect)
+            runner.total_assertions += mgr_checks
+            print(
+                f"  [PASS] Suite 11 (Unified Manager Lifecycle {dialect.value.upper()}) [{engine_label}]: {mgr_checks} assertions"
             )
-            for stmt in p.all_statements():
-                cur.execute(stmt)
-            plans.append((p, v_sel))
-            runner.total_views += 1
-            _verify_external_db_mv(cur, p.view_name, v_sel, f"s11_sq:inc={inc_mode}:{v_name}:init")
-            runner.total_assertions += 1
-        steps = _get_complex_dml_and_tx_steps(Dialect.SQLITE, for_live_mysql=False)
-        for step_lbl, m_sql in steps:
-            cur.execute(m_sql)
-            for p, v_sel in plans:
-                _verify_external_db_mv(cur, p.view_name, v_sel, f"s11_sq:inc={inc_mode}:{p.logical_view_name}:{step_lbl}")
-                runner.total_assertions += 1
-        runner.total_assertions += _run_live_manager_lifecycle_check(conn, cur, Dialect.SQLITE)
-        conn.close()
-        print(f"  [PASS] Suite 11 (Live 50-View Battery SQLite inc={inc_mode}): 50 views x {len(steps) + 1} states = {50 * (len(steps) + 1)} assertions")
-
-    # 11C & 11D: PostgreSQL (Row-Level & Statement Transition Tables)
-    pg_schema, pg_views = _get_live_engine_50_view_battery(Dialect.POSTGRES)
-    for use_trans in (False, True):
-        conn = sqlite3.connect(":memory:", isolation_level=None)
-        conn.execute("PRAGMA recursive_triggers = ON;")
-        _register_sqlite_compat_udfs(conn)
-        cur = conn.cursor()
-        for s in [st.strip() for st in pg_schema.split(";") if st.strip()]:
-            cur.execute(_transpile_pg_expr_to_sqlite(s) + ";")
-        cur.execute("INSERT INTO warehouses VALUES (1, 'WH_US', 'US'), (2, 'WH_EU', 'EU'), (3, 'WH_GLOBAL', NULL);")
-        cur.execute("INSERT INTO customers VALUES (1, 1, 'Alice', 'NA'), (2, 2, 'Bob', 'VIP'), (3, 2, 'Cara', 'EU'), (4, NULL, 'Dan', 'APAC');")
-        cur.execute(
-            "INSERT INTO orders VALUES "
-            "(1, 1, 'NA', 'hw', 10.0, 2, 3, 1, 'settled'),"
-            "(2, 1, 'NA', 'sw', 20.0, 4, 5, 0, 'settled'),"
-            "(3, 2, 'EU', 'hw', 15.0, 1, 7, 1, 'pending'),"
-            "(4, 2, 'EU', 'hw', 30.0, 3, 6, 1, 'settled'),"
-            "(5, 3, NULL, 'sw', 50.0, 5, 1, 0, 'settled');"
-        )
-        cur.execute("INSERT INTO order_tags VALUES (1, 'urgent', 2), (1, 'fragile', 5), (2, 'urgent', 3), (4, 'bulk', 10);")
-        plans = []
-        for v_name, v_sel in pg_views:
-            p = generate_materialized_view(
-                pg_schema,
-                f"CREATE VIEW {v_name} AS {v_sel};",
-                dialect=Dialect.POSTGRES,
-                pg_use_transition_tables=use_trans,
-                incremental_backfill=False,
-                batch_size=2,
-            )
-            _execute_postgres_plan_in_sqlite(conn, p)
-            v_sel_s = _transpile_pg_expr_to_sqlite(v_sel)
-            plans.append((p, v_sel_s))
-            runner.total_views += 1
-            _verify_external_db_mv(cur, p.view_name, v_sel_s, f"s11_pg:tr={use_trans}:{v_name}:init")
-            runner.total_assertions += 1
-        steps = _get_complex_dml_and_tx_steps(Dialect.POSTGRES, for_live_mysql=False, for_live_postgres=False)
-        for step_lbl, m_sql in steps:
-            cur.execute(_transpile_pg_expr_to_sqlite(m_sql))
-            for p, v_sel_s in plans:
-                _verify_external_db_mv(cur, p.view_name, v_sel_s, f"s11_pg:tr={use_trans}:{p.logical_view_name}:{step_lbl}")
-                runner.total_assertions += 1
-        conn.close()
-        print(f"  [PASS] Suite 11 (Live 50-View Battery PostgreSQL tr={use_trans}): 50 views x {len(steps) + 1} states = {50 * (len(steps) + 1)} assertions")
-
-    # 11E: MySQL
-    my_schema, my_views = _get_live_engine_50_view_battery(Dialect.MYSQL)
-    conn = sqlite3.connect(":memory:", isolation_level=None)
-    conn.execute("PRAGMA recursive_triggers = ON;")
-    _register_sqlite_compat_udfs(conn)
-    cur = conn.cursor()
-    for s in [st.strip() for st in my_schema.split(";") if st.strip()]:
-        cur.execute(_transpile_mysql_expr_to_sqlite(s) + ";")
-    cur.execute("INSERT INTO warehouses VALUES (1, 'WH_US', 'US'), (2, 'WH_EU', 'EU'), (3, 'WH_GLOBAL', NULL);")
-    cur.execute("INSERT INTO customers VALUES (1, 1, 'Alice', 'NA'), (2, 2, 'Bob', 'VIP'), (3, 2, 'Cara', 'EU'), (4, NULL, 'Dan', 'APAC');")
-    cur.execute(
-        "INSERT INTO orders VALUES "
-        "(1, 1, 'NA', 'hw', 10.0, 2, 3, 1, 'settled'),"
-        "(2, 1, 'NA', 'sw', 20.0, 4, 5, 0, 'settled'),"
-        "(3, 2, 'EU', 'hw', 15.0, 1, 7, 1, 'pending'),"
-        "(4, 2, 'EU', 'hw', 30.0, 3, 6, 1, 'settled'),"
-        "(5, 3, NULL, 'sw', 50.0, 5, 1, 0, 'settled');"
-    )
-    cur.execute("INSERT INTO order_tags VALUES (1, 'urgent', 2), (1, 'fragile', 5), (2, 'urgent', 3), (4, 'bulk', 10);")
-    plans = []
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        for v_name, v_sel in my_views:
-            p = generate_materialized_view(
-                my_schema,
-                f"CREATE VIEW {v_name} AS {v_sel};",
-                dialect=Dialect.MYSQL,
-                incremental_backfill=False,
-                batch_size=2,
-                ignore_limitations=True,
-            )
-            _execute_mysql_plan_in_sqlite(conn, p)
-            v_sel_s = _transpile_mysql_expr_to_sqlite(v_sel)
-            plans.append((p, v_sel_s))
-            runner.total_views += 1
-            _verify_external_db_mv(cur, p.view_name, v_sel_s, f"s11_my:{v_name}:init")
-            runner.total_assertions += 1
-    steps = _get_complex_dml_and_tx_steps(Dialect.MYSQL, for_live_mysql=False)
-    for step_lbl, m_sql in steps:
-        cur.execute(_transpile_mysql_expr_to_sqlite(m_sql))
-        for p, v_sel_s in plans:
-            _verify_external_db_mv(cur, p.view_name, v_sel_s, f"s11_my:{p.logical_view_name}:{step_lbl}")
-            runner.total_assertions += 1
-    conn.close()
-    print(f"  [PASS] Suite 11 (Live 50-View Battery MySQL): 50 views x {len(steps) + 1} states = {50 * (len(steps) + 1)} assertions")
+        finally:
+            close_fn()
 
 
 class TestGeneratorAndManagerCodePaths(unittest.TestCase):
@@ -3546,6 +3641,52 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             self.assertIn("__matview_store_v_cli", generated)
             self.assertIn("DO $$", generated)
 
+    def test_07_unified_multi_dialect_test_infrastructure_parity(self) -> None:
+        """
+        Verifies that the unified test runner (`MVTestRunner._open_backend_session`,
+        `MVTestRunner.run_batch`, and `_run_live_manager_lifecycle_check`) executes the
+        exact same code path across SQLite, PostgreSQL (row-level & transition tables),
+        and MySQL even when running purely in-memory without external servers.
+        """
+        runner = MVTestRunner()
+        schema = "CREATE TABLE u_items (id INTEGER PRIMARY KEY, grp TEXT, val REAL, qty INTEGER);"
+        seed = ["INSERT INTO u_items VALUES (1, 'a', 10.0, 2), (2, 'b', 20.0, 4);"]
+        views = [
+            (
+                "v_u_alg",
+                "CREATE VIEW v_u_alg AS SELECT grp, COUNT(*) AS c, SUM(val) AS sv, TOTAL(val) AS tv FROM u_items GROUP BY grp;",
+            ),
+            (
+                "v_u_win",
+                "CREATE VIEW v_u_win AS SELECT id, grp, val, LAG(qty, 1, -1) OVER (PARTITION BY grp ORDER BY id ASC) AS prev_q FROM u_items;",
+            ),
+        ]
+        mutations = [
+            ("ins", "INSERT INTO u_items VALUES (3, 'a', 30.0, 6);"),
+            ("tx_begin", "BEGIN;"),
+            ("upd", "UPDATE u_items SET val = val + 5.0 WHERE grp = 'a';"),
+            ("tx_commit", "COMMIT;"),
+        ]
+        for dialect in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+            for inc_mode in (False, True):
+                runner.run_batch(
+                    f"UnifiedParityCheck({dialect.value},inc={inc_mode})",
+                    schema,
+                    views,
+                    seed,
+                    mutations,
+                    dialect=dialect,
+                    pg_use_transition_tables=(dialect == Dialect.POSTGRES and inc_mode),
+                    incremental_backfill=inc_mode,
+                    batch_size=1,
+                )
+            conn, cur, _, _, _, close_fn = runner._open_backend_session(dialect, suite_tag=f"u_mgr_{dialect.value}")
+            try:
+                checks = _run_live_manager_lifecycle_check(conn, cur, dialect)
+                self.assertGreaterEqual(checks, 14)
+            finally:
+                close_fn()
+
 
 def _run_all_tests() -> None:
     t0 = time.time()
@@ -3570,17 +3711,6 @@ def _run_all_tests() -> None:
     print("-" * 84)
     print(f"COMBINATORIAL & TRANSACTIONAL SUITES PASSED: {runner.total_views} views, {runner.total_assertions} live SQL assertions!")
     print("-" * 84)
-
-    # Run live external database tests if configured via environment variables (used by GitHub Actions CI)
-    pg_dsn = os.environ.get("POSTGRES_DSN")
-    if pg_dsn:
-        run_live_postgres_tests_if_available(pg_dsn)
-    mysql_dsn = os.environ.get("MYSQL_DSN")
-    if mysql_dsn:
-        run_live_mysql_tests_if_available(mysql_dsn)
-    sqlite_compat_eng = os.environ.get("SQLITE_COMPAT_ENGINE")
-    if sqlite_compat_eng:
-        run_live_sqlite_compat_tests_if_available(sqlite_compat_eng)
 
     # Run unit tests for generator & manager API
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestGeneratorAndManagerCodePaths)
