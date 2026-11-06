@@ -11,5 +11,5 @@
 [ ] I would like the generator to propose additional indexes on the base tables, when adding them would yield most efficient materialization
 [ ] I would like the generator to automatically create indexes on the aux or materialized tables when creating them helps materialization efficiency
 [ ] I would like the generator to support as efficiently as possible every engine and engine version (possibly considering performance features specific to each)
-
+[ ] I would like the README (or other doc linked from the README) to showcase how each SQL construct/aggregation and their combinations is efficiently rendered as an incremental materialization
 
