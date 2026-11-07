@@ -38,7 +38,7 @@ This document tracks all feature goals, architectural improvements, and verified
 - [x] **Native Composite Primary Keys for Single-Table Projections & MySQL `NOT NULL` Group Keys**:
   Preserve the base table's actual primary/composite key columns in `_compile_tier1_zset_projection` and enable native composite `PRIMARY KEY (col1, col2, ...)` on MySQL `NOT NULL` `GROUP BY` views instead of synthesizing concatenated `__mv_pk` strings.
 - [x] **`SELECT *` and `SELECT DISTINCT *` Tier 1 Expansion**:
-  Expand `SELECT *` and `SELECT alias.*` on single-table views against `primary_schema.columns` so `SELECT * FROM t [WHERE ...]` and `SELECT DISTINCT * FROM t [WHERE ...]` compile with Tier 1 $O(1)$ `ALGEBRAIC_DELTA` maintenance instead of falling back to Tier 3.
+  Expand `SELECT *` and `SELECT alias.*` on single-table views against `primary_schema.columns` so `SELECT * FROM t [WHERE ...]` and `SELECT DISTINCT * FROM t [WHERE ...]` compile with Tier 1 $0(1)$ `ALGEBRAIC_DELTA` maintenance instead of falling back to Tier 3.
 - [x] **High-Precision `NUMERIC` / `DECIMAL` Accumulation for Variance & Standard Deviation**:
   Use exact `NUMERIC` (PostgreSQL) and `DECIMAL(65, 12)` (MySQL) backing columns (`__mv_sum_*`, `__mv_sum2_*`) for `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP` to prevent IEEE-754 catastrophic cancellation on high-offset values.
 - [x] **63-Bit SQLite Bitwise Aggregates & Nested-Parenthesis Lowering**:
@@ -50,7 +50,7 @@ This document tracks all feature goals, architectural improvements, and verified
 
 ## P0 — Test Correctness & Coverage Gaps
 
-The existing differential-testing harness is useful, but its current headline counts must not be treated as evidence of broad structural coverage. In particular, the schema/scenario generator is largely fixed-structure, DML is selected from a finite set of hardcoded operation templates, query generation recombines predefined patterns, some dialect paths are transpiled to SQLite, numerical comparisons normalize values too aggressively, and the backfill interleaving test does not use independent concurrent sessions. Keep the existing deterministic tests and regression corpus, but do not consider the fuzzing goal complete until the following are implemented and measured.
+The existing differential-testing harness is useful, but its current headline counts must not be treated as evidence of broad structural coverage. In particular, the schema/scenario generator is largely fixed-structure, DML is selected from a finite set of hardcoded operation templates, query generation recombines predefined patterns, some dialect paths are transpiled to SQLite, numerical comparisons normalize values too aggressively, and the backfill interleaving test does not use independent concurrent sessions. Keep the existing deterministic tests and regression corpus, but do not consider the fuzzing goal complete until the following are implemented and measured:
 
 - [ ] **Repair the Differential-Test Oracle (exact, type-aware comparisons)**:
   - Compare integers exactly without converting them to floating point; add boundary cases around and above 2^53 and the signed/unsigned limits supported by each engine.
@@ -127,7 +127,6 @@ The existing differential-testing harness is useful, but its current headline co
   Delegate semantic version parsing and comparison in `parse_engine_version` / `EngineVersion` to `packaging.version.Version`.
 - [ ] **Stateful Property-Based Fuzzing & Automatic Counterexample Shrinking (`hypothesis` + `pytest`)**:
   Complement `DifferentialSQLFuzzer` with a `hypothesis.stateful.RuleBasedStateMachine` test suite run via `pytest` so failing random schema/view/DML sequences are automatically shrunk to minimal reproducible counterexamples.
-
 - [ ] **Refactor Monolithic `matview_sync.py` into a Modular Package with a Typed IR**:
   Split `matview_sync.py` into focused modules with a typed, immutable Intermediate Representation (`CompilationContext` / `LogicalIR`) between SQL parsing and dialect code generation instead of mutating compiler attributes (`self.view`, `self.primary_schema`, `self._working_select_items`) in place:
   - `matview/sql_frontend.py` — SQL parsing, normalization, and AST validation
@@ -160,7 +159,7 @@ The existing differential-testing harness is useful, but its current headline co
 - [ ] **Tier 1 Algebraic Maintenance for `LEFT OUTER JOIN`**:
   Support $O(1)$ incremental delta maintenance for `LEFT JOIN` projections and aggregates by maintaining a right-side match counter (`__mv_right_cnt`) per left tuple/key to emit or retract the `NULL`-extended row when right-hand matches transition between `0` and `>0`.
 - [ ] **Optional Reference-Counted Auxiliary Tables for `MIN`/`MAX` and `BIT_AND`/`BIT_OR`**:
-  Allow configuring ordered value-count auxiliary tables (reusing the `__matview_dist_*` reference-count pattern) for `MIN`/`MAX` and per-bit counters for `BIT_AND`/`BIT_OR` to avoid $O(N_{\text{group}})$ correlated base-table scans on delete-heavy workloads.
+  Allow configuring ordered value-count auxiliary tables (reusing the `__matview_dist_*` reference-count pattern) for `MIN`/`MAX` and per-bit counters for `BIT_AND`/`BIT_OR` to avoid $O(N_{	ext{group}})$ correlated base-table scans on delete-heavy workloads.
 - [ ] **Partition-Scoped (Tier 2) Maintenance for Window Functions**:
   Scope window function refreshes (`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`) to only the affected `PARTITION BY` key(s) rather than falling back to a full-table Tier 3 rebuild when a `PARTITION BY` clause is present.
 

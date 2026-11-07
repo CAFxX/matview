@@ -20,4 +20,3 @@ The implementation must prioritize correctness, reliability, maintainability, an
 A feature is not done merely because its happy-path tests pass. Before marking it complete, verify its documented contract, relevant edge cases and interactions, failure behavior, and supported engine/version combinations. Record known exclusions explicitly. Review tests for independence, sensitivity, and false confidence as well as reviewing production code.
 
 Address identified technical debt proactively when it is relevant and safe to do so. Keep unrelated cleanup separate from feature changes; do not expand scope indiscriminately. Never claim a test, engine, version, configuration, or input class was covered unless it was actually exercised and verified.
-

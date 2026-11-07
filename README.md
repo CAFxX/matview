@@ -17,7 +17,7 @@ Given a definition such as:
 CREATE VIEW customer_sales AS
 SELECT customer_id, COUNT(*) AS order_count, SUM(amount) AS total_amount
 FROM orders
-WHERE status = 'paid'
+WHERE status = paid
 GROUP BY customer_id;
 ```
 
@@ -69,7 +69,7 @@ SELECT
     COUNT(*) AS order_count,
     SUM(amount) AS total_amount
 FROM orders
-WHERE status = 'paid'
+WHERE status = paid
 GROUP BY customer_id;
 ```
 
@@ -82,9 +82,9 @@ When applying against an existing database with `--db`, the source tables must a
 ```bash
 sqlite3 app.db < schema.sql  # create the example source table first
 python3 matview_sync.py \
-    --db app.db \
-    --view views.sql \
-    --apply
+  --db app.db \
+  --view views.sql \
+  --apply
 ```
 
 For PostgreSQL or MySQL/MariaDB, pass a connection URL instead of `app.db`, for example `postgresql://user:password@host:5432/database` or `mysql://user:password@host:3306/database`.
@@ -93,12 +93,12 @@ For PostgreSQL or MySQL/MariaDB, pass a connection URL instead of `app.db`, for 
 
 ```bash
 python3 matview_sync.py \
-    --schema schema.sql \
-    --view views.sql \
-    --engine-version postgres:17 \
-    --incremental-backfill \
-    --batch-size 500 \
-    > install.sql
+  --schema schema.sql \
+  --view views.sql \
+  --engine-version postgres:17 \
+  --incremental-backfill \
+  --batch-size 500 \
+  > install.sql
 ```
 
 Here, `schema.sql` contains the source tables' `CREATE TABLE` statements and is used to infer their schema; in this generation-only command it does not create the source tables. `--engine-version` selects the target dialect and version so the compiler can use version-specific features. Use `--dialect sqlite`, `--dialect postgres`, or `--dialect mysql` when the dialect is known but an exact version is not.
@@ -223,7 +223,7 @@ plan = manager.register_view(
     batch_size=500,
 )
 
-print(plan.view_name)          # __matview_customer_sales (default prefix)
+print(plan.view_name)        # __matview_customer_sales (default prefix)
 print(plan.strategy.value)     # selected maintenance strategy
 
 conn.close()
