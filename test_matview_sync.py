@@ -4720,22 +4720,34 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             self.assertGreaterEqual(len(views), shape["table_count"])
             self.assertGreater(len(seeds), shape["table_count"])
             self.assertGreaterEqual(len(mutations), 3)
+            self.assertEqual(
+                set(shape["dml_statement_kinds"]),
+                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "DELETE", "UPSERT"},
+            )
+            self.assertGreater(shape["max_expression_depth"], 0)
+            self.assertGreater(shape["max_predicate_depth"], 0)
         self.assertGreaterEqual(len(topologies), 4)
         self.assertGreaterEqual(len(table_counts), 4)
         self.assertGreaterEqual(len(set(shapes)), 48)
 
     def test_variable_schema_fuzzer_executes_across_dialects(self) -> None:
-        schema, views, seeds, mutations, shape = VariableSchemaDifferentialFuzzer(314159).generate_scenario(2)
         runner = MVTestRunner()
+        expected_views = 0
+        expected_assertions = 0
         for dialect in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+            schema, views, seeds, mutations, shape = VariableSchemaDifferentialFuzzer(
+                314159
+            ).generate_scenario(2, dialect=dialect)
             runner.run_batch(
                 f"VariableSchema(seed=314159,{dialect.value},{shape['topology']})",
                 schema, views[:8], seeds, mutations[:9], dialect=dialect,
             )
-        view_count = min(8, len(views))
-        mutation_count = min(9, len(mutations))
-        self.assertEqual(runner.total_views, view_count * 3)
-        self.assertEqual(runner.total_assertions, view_count * (mutation_count + 1) * 3)
+            view_count = min(8, len(views))
+            mutation_count = min(9, len(mutations))
+            expected_views += view_count
+            expected_assertions += view_count * (mutation_count + 1)
+        self.assertEqual(runner.total_views, expected_views)
+        self.assertEqual(runner.total_assertions, expected_assertions)
 
 
 import random
@@ -5295,8 +5307,72 @@ class VariableSchemaDifferentialFuzzer:
     def __init__(self, seed: int = 20261107) -> None:
         self.seed = seed
 
+    @staticmethod
+    def _numeric_expr(
+        rng: random.Random, column: str, depth: int, coverage: Dict[str, Any]
+    ) -> str:
+        coverage["max_expression_depth"] = max(coverage["max_expression_depth"], depth)
+        if depth <= 0:
+            kind = rng.choice(["coalesce", "literal"])
+            coverage["expression_nodes"].add(kind)
+            return f"COALESCE({column}, 0)" if kind == "coalesce" else str(rng.randint(1, 5))
+
+        kind = rng.choice(["add", "multiply", "case"])
+        coverage["expression_nodes"].add(kind)
+        if kind == "add":
+            return f"({VariableSchemaDifferentialFuzzer._numeric_expr(rng, column, depth - 1, coverage)} + {rng.randint(1, 5)})"
+        if kind == "multiply":
+            return f"({VariableSchemaDifferentialFuzzer._numeric_expr(rng, column, depth - 1, coverage)} * {rng.randint(1, 4)})"
+        return (
+            f"(CASE WHEN {column} IS NULL THEN {rng.randint(1, 5)} ELSE "
+            f"{VariableSchemaDifferentialFuzzer._numeric_expr(rng, column, depth - 1, coverage)} END)"
+        )
+
+    @staticmethod
+    def _predicate(
+        rng: random.Random,
+        prefix: str,
+        table_idx: int,
+        row_count: int,
+        depth: int,
+        coverage: Dict[str, Any],
+    ) -> str:
+        coverage["max_predicate_depth"] = max(coverage["max_predicate_depth"], depth)
+        if depth <= 0 or rng.random() < 0.35:
+            atom = rng.choice(["id_eq", "id_between", "qty_null", "qty_ge", "amount_le", "label_null", "label_eq"])
+            coverage["predicate_nodes"].add(atom)
+            if atom == "id_eq":
+                return f"id = {rng.randint(1, row_count + 2)}"
+            if atom == "id_between":
+                lo = rng.randint(1, row_count)
+                return f"id BETWEEN {lo} AND {lo + rng.randint(0, 3)}"
+            if atom == "qty_null":
+                return "qty IS NULL"
+            if atom == "qty_ge":
+                return f"COALESCE(qty, 0) >= {rng.randint(0, 60)}"
+            if atom == "amount_le":
+                return f"amount <= {rng.randint(0, 100)}"
+            if atom == "label_null":
+                return "label IS NULL"
+            return f"label = '{prefix}_{table_idx}_{rng.randint(1, row_count)}'"
+
+        operator = rng.choice(["AND", "OR", "NOT"])
+        coverage["predicate_nodes"].add(operator)
+        if operator == "NOT":
+            return (
+                f"(NOT {VariableSchemaDifferentialFuzzer._predicate(rng, prefix, table_idx, row_count, depth - 1, coverage)})"
+            )
+        left = VariableSchemaDifferentialFuzzer._predicate(
+            rng, prefix, table_idx, row_count, depth - 1, coverage
+        )
+        right = VariableSchemaDifferentialFuzzer._predicate(
+            rng, prefix, table_idx, row_count, depth - 1, coverage
+        )
+        return f"({left} {operator} {right})"
+
     def generate_scenario(
-        self, scenario_idx: int, *, views_count: int = 24, mutations_count: int = 24
+        self, scenario_idx: int, *, views_count: int = 24, mutations_count: int = 32,
+        dialect: Dialect = Dialect.SQLITE
     ) -> Tuple[str, List[Tuple[str, str]], List[str], List[Tuple[str, str]], Dict[str, Any]]:
         rng = random.Random((self.seed * 1000003) ^ (scenario_idx * 104729))
         prefix = f"vs{scenario_idx}"
@@ -5429,24 +5505,128 @@ class VariableSchemaDifferentialFuzzer:
             )
             views.append((view_name, f"CREATE VIEW {view_name} AS {select};"))
 
+        dml_coverage: Dict[str, Any] = {
+            "expression_nodes": set(),
+            "predicate_nodes": set(),
+            "max_expression_depth": 0,
+            "max_predicate_depth": 0,
+        }
         mutations: List[Tuple[str, str]] = []
+
+        def fields_for(meta: Dict[str, Any]) -> List[str]:
+            return ["id"] + (["slot"] if meta["composite"] else []) + [
+                "label", "qty", "amount",
+                *[extra[0] for extra in meta["extras"]],
+                *meta["fk_cols"],
+            ]
+
+        def values_for(table_idx: int, meta: Dict[str, Any], row_id: int, suffix: str) -> List[str]:
+            values = [str(row_id)] + ([str(row_id)] if meta["composite"] else [])
+            values += [
+                f"'{prefix}_{table_idx}_{suffix}'",
+                str(rng.randint(1, 100)),
+                str(rng.randint(1, 100)) if meta["amount_type"] == "INTEGER"
+                else f"{rng.randint(1, 100) + 0.375:.3f}",
+            ]
+            for extra_name, extra_type, nullable in meta["extras"]:
+                if nullable and rng.random() < 0.15:
+                    values.append("NULL")
+                elif extra_type in ("INTEGER", "REAL"):
+                    values.append(str(rng.randint(1, 20)))
+                else:
+                    values.append(f"'{prefix}_{extra_name}_{suffix}'")
+            values += ["NULL" if parent == table_idx else "1" for parent, _ in fks[table_idx]]
+            return values
+
+        statement_kinds = set()
         for i, meta in enumerate(metas):
-            if len(mutations) + 3 > mutations_count:
+            if len(mutations) + 4 > mutations_count:
                 break
+            fields = fields_for(meta)
             new_id = row_counts[i] + 1
-            fields = ["id"] + (["slot"] if meta["composite"] else [])
-            fields += ["label", "qty", "amount"] + [x[0] for x in meta["extras"]] + meta["fk_cols"]
-            vals = [str(new_id)] + ([str(new_id)] if meta["composite"] else [])
-            vals += [f"'{prefix}_{i}_inserted'", str(rng.randint(1, 100))]
-            vals.append(str(rng.randint(1, 100)) if meta["amount_type"] == "INTEGER" else f"{rng.randint(1, 100) + 0.375:.3f}")
-            for extra_name, extra_type, _ in meta["extras"]:
-                vals.append(str(rng.randint(1, 20)) if extra_type in ("INTEGER", "REAL") else f"'{prefix}_{extra_name}_inserted'")
-            vals += ["NULL" if parent == i else "1" for parent, _ in fks[i]]
-            mutations.extend([
-                (f"{prefix}_t{i}_insert", f"INSERT INTO {meta['name']} ({', '.join(fields)}) VALUES ({', '.join(vals)});"),
-                (f"{prefix}_t{i}_update", f"UPDATE {meta['name']} SET qty = COALESCE(qty, 0) + {rng.randint(1, 9)}, amount = COALESCE(amount, 0) + 1 WHERE id = 1;"),
-                (f"{prefix}_t{i}_delete", f"DELETE FROM {meta['name']} WHERE id = {row_counts[i]};"),
-            ])
+            insert_rows = [
+                values_for(i, meta, new_id, "insert_a"),
+                values_for(i, meta, new_id + 1, "insert_b"),
+            ]
+            insert_sql = (
+                f"INSERT INTO {meta['name']} ({', '.join(fields)}) VALUES "
+                + ", ".join("(" + ", ".join(values) + ")" for values in insert_rows)
+                + ";"
+            )
+            mutations.append((f"{prefix}_t{i}_insert_many", insert_sql))
+            statement_kinds.add("INSERT_VALUES")
+
+            numeric_columns = ["qty", "amount"] + [
+                name for name, data_type, _ in meta["extras"]
+                if data_type in ("INTEGER", "REAL")
+            ]
+            assignment_columns = rng.sample(
+                numeric_columns, k=rng.randint(2, min(4, len(numeric_columns)))
+            )
+            assignments = [
+                f"{column} = {self._numeric_expr(rng, column, rng.randint(1, 3), dml_coverage)}"
+                for column in assignment_columns
+            ]
+            update_predicate = self._predicate(
+                rng, prefix, i, row_counts[i], rng.randint(1, 3), dml_coverage
+            )
+            mutations.append((
+                f"{prefix}_t{i}_update",
+                f"UPDATE {meta['name']} SET {', '.join(assignments)} WHERE {update_predicate};",
+            ))
+            statement_kinds.add("UPDATE")
+
+            upsert_id = 1
+            upsert_values = values_for(i, meta, upsert_id, "upsert")
+            key_columns = ["id", "slot"] if meta["composite"] else ["id"]
+            if dialect == Dialect.MYSQL:
+                upsert_sql = (
+                    f"INSERT INTO {meta['name']} ({', '.join(fields)}) "
+                    f"VALUES ({', '.join(upsert_values)}) "
+                    "ON DUPLICATE KEY UPDATE qty = VALUES(qty), amount = VALUES(amount);"
+                )
+            else:
+                upsert_sql = (
+                    f"INSERT INTO {meta['name']} ({', '.join(fields)}) "
+                    f"VALUES ({', '.join(upsert_values)}) "
+                    f"ON CONFLICT ({', '.join(key_columns)}) DO UPDATE SET "
+                    "qty = excluded.qty, amount = excluded.amount;"
+                )
+            mutations.append((f"{prefix}_t{i}_upsert", upsert_sql))
+            statement_kinds.add("UPSERT")
+
+            delete_predicate = self._predicate(
+                rng, prefix, i, row_counts[i], rng.randint(1, 3), dml_coverage
+            )
+            mutations.append((
+                f"{prefix}_t{i}_delete",
+                f"DELETE FROM {meta['name']} WHERE {delete_predicate};",
+            ))
+            statement_kinds.add("DELETE")
+
+        # Add an INSERT ... SELECT that reads a row inserted earlier in the same
+        # sequence, so the source is guaranteed to exist when this statement runs.
+        if len(mutations) < mutations_count and len(metas) > 1:
+            i = 1
+            meta = metas[i]
+            fields = fields_for(meta)
+            source_id = row_counts[i] + 1
+            target_id = row_counts[i] + 3
+            select_values = [str(target_id)]
+            if meta["composite"]:
+                select_values.append(str(target_id))
+            select_values.append(f"'{prefix}_{i}_insert_select'")
+            select_values.extend(["qty", "amount"])
+            select_values.extend(extra[0] for extra in meta["extras"])
+            select_values.extend(meta["fk_cols"])
+            insert_select = (
+                f"INSERT INTO {meta['name']} ({', '.join(fields)}) "
+                f"SELECT {', '.join(select_values)} FROM {meta['name']} "
+                f"WHERE id = {source_id} LIMIT 1;"
+            )
+            mutations.append((f"{prefix}_t{i}_insert_select", insert_select))
+            statement_kinds.add("INSERT_SELECT")
+
 
         shape = {
             "topology": topology,
@@ -5466,6 +5646,11 @@ class VariableSchemaDifferentialFuzzer:
             "check_constraints": sum(
                 int(m["check_qty"]) + int(m["check_amount"]) for m in metas
             ),
+            "dml_statement_kinds": tuple(sorted(statement_kinds)),
+            "expression_nodes": tuple(sorted(dml_coverage["expression_nodes"])),
+            "predicate_nodes": tuple(sorted(dml_coverage["predicate_nodes"])),
+            "max_expression_depth": dml_coverage["max_expression_depth"],
+            "max_predicate_depth": dml_coverage["max_predicate_depth"],
         }
         return "\n".join(ddls), views, seed_sql, mutations, shape
 
