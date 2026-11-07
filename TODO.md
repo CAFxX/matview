@@ -80,6 +80,7 @@ The existing differential-testing harness is useful, but its current headline co
   - Preserve minimized failing queries as permanent regression cases.
 
 - [ ] **Separate Supported-Plan Tests from Best-Effort / Limitation-Override Tests**:
+  - Progress: The broad `MVTestRunner` and live 50-view battery now compile each view with default limitation enforcement first. They classify expected rejections by limitation code and only retry with `ignore_limitations=True` after validating the explicit warning and the override plan's limitation codes; reports distinguish supported plans from best-effort overrides. Remaining direct manager/corpus paths still need the same explicit classification and dedicated expected-code coverage.
   - Run supported generated plans with default options and assert that no limitation warning is emitted.
   - For unsupported plans, assert the expected rejection/limitation code and diagnostic under default options.
   - Test ignore_limitations=True separately, asserting the exact warning and documenting which correctness guarantees are intentionally waived.
