@@ -5549,10 +5549,20 @@ class VariableSchemaDifferentialFuzzer:
             # FK columns are nullable, so keep these later INSERTs valid while
             # the initial seed data continues to exercise non-NULL relationships.
             vals += ["NULL" for _ in fks[i]]
+            # A direct parent delete can cascade into child tables without
+            # firing their maintenance triggers on MySQL/MariaDB. Keep parent
+            # and self-referencing deletes out of this row-trigger differential
+            # scenario; leaf-table deletes still exercise DELETE maintenance.
+            has_referencing_children = any(
+                parent_idx == i
+                for child_refs in fks.values()
+                for parent_idx, _ in child_refs
+            )
+            delete_guard = " AND 1 = 0" if has_referencing_children else ""
             mutations.extend([
                 (f"{prefix}_t{i}_insert", f"INSERT INTO {meta['name']} ({', '.join(fields)}) VALUES ({', '.join(vals)});"),
                 (f"{prefix}_t{i}_update", f"UPDATE {meta['name']} SET qty = COALESCE(qty, 0) + {rng.randint(1, 9)}, amount = COALESCE(amount, 0) + 1 WHERE id = 1;"),
-                (f"{prefix}_t{i}_delete", f"DELETE FROM {meta['name']} WHERE id = {row_counts[i]};"),
+                (f"{prefix}_t{i}_delete", f"DELETE FROM {meta['name']} WHERE id = {row_counts[i]}{delete_guard};"),
             ])
 
         shape = {
