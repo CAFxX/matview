@@ -4781,6 +4781,54 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             _rows_equal([(1.0,)], [(1.0,)], tol=-1.0)
 
 
+    def test_variable_schema_fuzzer_produces_diverse_reproducible_structures(self) -> None:
+        self.assertEqual(
+            VariableSchemaDifferentialFuzzer(123).generate_scenario(4),
+            VariableSchemaDifferentialFuzzer(123).generate_scenario(4),
+        )
+        shapes = []
+        topologies, table_counts = set(), set()
+        for seed in range(64):
+            schema, views, seeds, mutations, shape = VariableSchemaDifferentialFuzzer(seed).generate_scenario(1)
+            shapes.append((
+                shape["topology"], shape["table_count"], shape["column_counts"],
+                shape["amount_types"], shape["foreign_key_count"],
+                shape["composite_primary_key_tables"], shape["nullable_columns"],
+            ))
+            topologies.add(shape["topology"])
+            table_counts.add(shape["table_count"])
+            self.assertGreaterEqual(len(views), shape["table_count"])
+            self.assertGreater(len(seeds), shape["table_count"])
+            self.assertGreaterEqual(len(mutations), 3)
+
+            # Validate generated DDL and seed rows with FK enforcement enabled.
+            conn = sqlite3.connect(":memory:")
+            try:
+                conn.execute("PRAGMA foreign_keys = ON;")
+                conn.executescript(schema)
+                for seed_sql in seeds:
+                    conn.execute(seed_sql)
+                conn.commit()
+            finally:
+                conn.close()
+        self.assertGreaterEqual(len(topologies), 4)
+        self.assertGreaterEqual(len(table_counts), 4)
+        self.assertGreaterEqual(len(set(shapes)), 48)
+
+    def test_variable_schema_fuzzer_executes_across_dialects(self) -> None:
+        schema, views, seeds, mutations, shape = VariableSchemaDifferentialFuzzer(314159).generate_scenario(2)
+        runner = MVTestRunner()
+        for dialect in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+            runner.run_batch(
+                f"VariableSchema(seed=314159,{dialect.value},{shape['topology']})",
+                schema, views[:8], seeds, mutations[:9], dialect=dialect,
+            )
+        view_count = min(8, len(views))
+        mutation_count = min(9, len(mutations))
+        self.assertEqual(runner.total_views, view_count * 3)
+        self.assertEqual(runner.total_assertions, view_count * (mutation_count + 1) * 3)
+
+
 import random
 
 import secrets
@@ -5332,6 +5380,193 @@ class DifferentialSQLFuzzer:
 
 
 
+class VariableSchemaDifferentialFuzzer:
+    """Deterministic schema-graph generator that supplements the legacy templates."""
+
+    def __init__(self, seed: int = 20261107) -> None:
+        self.seed = seed
+
+    def generate_scenario(
+        self, scenario_idx: int, *, views_count: int = 24, mutations_count: int = 24
+    ) -> Tuple[str, List[Tuple[str, str]], List[str], List[Tuple[str, str]], Dict[str, Any]]:
+        rng = random.Random((self.seed * 1000003) ^ (scenario_idx * 104729))
+        prefix = f"vs{scenario_idx}"
+        count = rng.randint(2, 6)
+        topology = rng.choice(["chain", "star", "disconnected", "self", "bridge"])
+        if topology == "bridge" and count < 3:
+            topology = "chain"
+        names = [f"{prefix}_t{i}" for i in range(count)]
+
+        edges: List[Tuple[int, int, str]] = []
+        if topology == "chain":
+            edges = [(i, i - 1, f"parent_{i - 1}_id") for i in range(1, count)]
+        elif topology == "star":
+            edges = [(i, 0, "parent_0_id") for i in range(1, count)]
+        elif topology == "disconnected":
+            # Leave table 0 isolated; later tables may form separate components.
+            edges = [(i, i - 1, f"parent_{i - 1}_id") for i in range(2, count) if i % 3 == 2]
+        elif topology == "self":
+            edges = [(0, 0, "parent_0_id")] + [
+                (i, i - 1, f"parent_{i - 1}_id") for i in range(2, count) if i % 2 == 0
+            ]
+        else:
+            edges = [(count - 1, 0, "ref_0_id"), (count - 1, 1, "ref_1_id")]
+
+        fks: Dict[int, List[Tuple[int, str]]] = {i: [] for i in range(count)}
+        for child, parent, col in edges:
+            fks[child].append((parent, col))
+
+        metas: List[Dict[str, Any]] = []
+        ddls: List[str] = []
+        for i, name in enumerate(names):
+            label_nn, qty_nn, amount_nn = (rng.choice([True, False]) for _ in range(3))
+            amount_type = rng.choice(["REAL", "NUMERIC(18, 4)", "INTEGER"])
+            composite = i == count - 1 and count > 2 and rng.random() < 0.5
+            unique_label, check_qty, check_amount = (
+                rng.choice([True, False]) for _ in range(3)
+            )
+            cols = [
+                "id INTEGER NOT NULL",
+                f"label VARCHAR(40){' NOT NULL' if label_nn else ''}",
+                f"qty INTEGER{' NOT NULL DEFAULT 0' if qty_nn else ''}",
+                f"amount {amount_type}{' NOT NULL DEFAULT 0' if amount_nn else ''}",
+            ]
+            extras = []
+            for extra_name, extra_type in rng.sample(
+                [("note", "VARCHAR(48)"), ("rank", "INTEGER"), ("ratio", "REAL"), ("tag", "VARCHAR(24)")],
+                rng.randint(0, 2),
+            ):
+                nullable = rng.choice([True, False])
+                default = ""
+                if not nullable and rng.random() < 0.5:
+                    default = " DEFAULT 0" if extra_type in ("INTEGER", "REAL") else " DEFAULT 'default'"
+                cols.append(f"{extra_name} {extra_type}{' NOT NULL' if not nullable else ''}{default}")
+                extras.append((extra_name, extra_type, nullable))
+
+            constraints: List[str] = []
+            if composite:
+                cols.append("slot INTEGER NOT NULL")
+                constraints.append("PRIMARY KEY (id, slot)")
+            else:
+                constraints.append("PRIMARY KEY (id)")
+            for parent, fk_col in fks[i]:
+                # Keep all column definitions before table-level constraints.
+                cols.append(f"{fk_col} INTEGER")
+                constraints.append(
+                    f"FOREIGN KEY ({fk_col}) REFERENCES {names[parent]} (id) ON DELETE CASCADE"
+                )
+            if unique_label:
+                constraints.append("UNIQUE (label)")
+            if check_qty:
+                constraints.append("CHECK (qty IS NULL OR qty >= 0)")
+            if check_amount:
+                constraints.append("CHECK (amount IS NULL OR amount >= 0)")
+            ddls.append(
+                "CREATE TABLE " + name + " (" + chr(10) + "    "
+                + ("," + chr(10) + "    ").join(cols + constraints)
+                + chr(10) + ");"
+            )
+            metas.append({
+                "name": name, "label_nn": label_nn, "qty_nn": qty_nn,
+                "amount_nn": amount_nn, "amount_type": amount_type,
+                "composite": composite, "extras": extras,
+                "fk_cols": [col for _, col in fks[i]],
+                "unique_label": unique_label, "check_qty": check_qty,
+                "check_amount": check_amount,
+            })
+
+        seed_sql: List[str] = []
+        row_counts: List[int] = []
+        for i, meta in enumerate(metas):
+            nrows = rng.randint(1, 4)
+            row_counts.append(nrows)
+            fields = ["id"] + (["slot"] if meta["composite"] else [])
+            fields += ["label", "qty", "amount"] + [x[0] for x in meta["extras"]] + meta["fk_cols"]
+            for rid in range(1, nrows + 1):
+                vals = [str(rid)] + ([str(rid)] if meta["composite"] else [])
+                vals.append("NULL" if not meta["label_nn"] and rng.random() < 0.2 else f"'{prefix}_{i}_{rid}'")
+                vals.append("NULL" if not meta["qty_nn"] and rng.random() < 0.25 else str(rng.randint(0, 100)))
+                if not meta["amount_nn"] and rng.random() < 0.2:
+                    vals.append("NULL")
+                elif meta["amount_type"] == "INTEGER":
+                    vals.append(str(rng.randint(0, 100)))
+                else:
+                    vals.append(f"{rng.randint(0, 100) + 0.125:.3f}")
+                for extra_name, extra_type, nullable in meta["extras"]:
+                    null_value = nullable and rng.random() < 0.2
+                    if null_value:
+                        vals.append("NULL")
+                    elif extra_type in ("INTEGER", "REAL"):
+                        vals.append(str(rng.randint(0, 20)))
+                    else:
+                        vals.append(f"'{prefix}_{extra_name}_{rid}'")
+                for parent, _ in fks[i]:
+                    vals.append("NULL" if parent == i else str(rng.randint(1, row_counts[parent])))
+                seed_sql.append(
+                    f"INSERT INTO {meta['name']} ({', '.join(fields)}) VALUES ({', '.join(vals)});"
+                )
+
+        views: List[Tuple[str, str]] = []
+        for i, meta in enumerate(metas):
+            for suffix, select in [
+                ("projection", f"SELECT * FROM {meta['name']}"),
+                ("group", f"SELECT label, COUNT(*) AS row_count, SUM(qty) AS total_qty, "
+                          f"AVG(amount) AS average_amount FROM {meta['name']} GROUP BY label"),
+            ]:
+                if len(views) < views_count:
+                    view_name = f"{prefix}_v{i}_{suffix}"
+                    views.append((view_name, f"CREATE VIEW {view_name} AS {select};"))
+        for edge_idx, (child, parent, fk_col) in enumerate(edges):
+            if len(views) >= views_count:
+                break
+            view_name = f"{prefix}_v_join_{edge_idx}"
+            select = (
+                f"SELECT p.id AS parent_id, c.id AS child_id, c.label, c.qty "
+                f"FROM {names[parent]} p LEFT JOIN {names[child]} c ON p.id = c.{fk_col}"
+            )
+            views.append((view_name, f"CREATE VIEW {view_name} AS {select};"))
+
+        mutations: List[Tuple[str, str]] = []
+        for i, meta in enumerate(metas):
+            if len(mutations) + 3 > mutations_count:
+                break
+            new_id = row_counts[i] + 1
+            fields = ["id"] + (["slot"] if meta["composite"] else [])
+            fields += ["label", "qty", "amount"] + [x[0] for x in meta["extras"]] + meta["fk_cols"]
+            vals = [str(new_id)] + ([str(new_id)] if meta["composite"] else [])
+            vals += [f"'{prefix}_{i}_inserted'", str(rng.randint(1, 100))]
+            vals.append(str(rng.randint(1, 100)) if meta["amount_type"] == "INTEGER" else f"{rng.randint(1, 100) + 0.375:.3f}")
+            for extra_name, extra_type, _ in meta["extras"]:
+                vals.append(str(rng.randint(1, 20)) if extra_type in ("INTEGER", "REAL") else f"'{prefix}_{extra_name}_inserted'")
+            vals += ["NULL" if parent == i else "1" for parent, _ in fks[i]]
+            mutations.extend([
+                (f"{prefix}_t{i}_insert", f"INSERT INTO {meta['name']} ({', '.join(fields)}) VALUES ({', '.join(vals)});"),
+                (f"{prefix}_t{i}_update", f"UPDATE {meta['name']} SET qty = COALESCE(qty, 0) + {rng.randint(1, 9)}, amount = COALESCE(amount, 0) + 1 WHERE id = 1;"),
+                (f"{prefix}_t{i}_delete", f"DELETE FROM {meta['name']} WHERE id = {row_counts[i]};"),
+            ])
+
+        shape = {
+            "topology": topology,
+            "table_count": count,
+            "column_counts": tuple(
+                4 + len(m["extras"]) + len(m["fk_cols"]) + int(m["composite"])
+                for m in metas
+            ),
+            "amount_types": tuple(sorted({m["amount_type"] for m in metas})),
+            "nullable_columns": sum(
+                int(not m["label_nn"]) + int(not m["qty_nn"]) + int(not m["amount_nn"])
+                for m in metas
+            ),
+            "foreign_key_count": len(edges),
+            "composite_primary_key_tables": sum(int(m["composite"]) for m in metas),
+            "unique_label_constraints": sum(int(m["unique_label"]) for m in metas),
+            "check_constraints": sum(
+                int(m["check_qty"]) + int(m["check_amount"]) for m in metas
+            ),
+        }
+        return "\n".join(ddls), views, seed_sql, mutations, shape
+
+
 def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
     """
     Suite 12: Extensive Multi-Order-of-Magnitude Differential Random SQL Fuzzer.
@@ -5419,6 +5654,23 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
                 dialect=Dialect.MYSQL,
                 incremental_backfill=True,
                 batch_size=2,
+            )
+
+
+            # 4. Run a separately generated schema graph to exercise variable
+            # table/column/key/constraint/FK structures beyond the legacy templates.
+            s_var, v_var, seed_var, m_var, shape_var = VariableSchemaDifferentialFuzzer(
+                seed=s_val
+            ).generate_scenario(sc_idx)
+            print(
+                f"  [SCHEMA SHAPE] seed={s_val} scenario={sc_idx}: "
+                f"tables={shape_var['table_count']} topology={shape_var['topology']} "
+                f"columns={shape_var['column_counts']} fks={shape_var['foreign_key_count']} "
+                f"composite_pks={shape_var['composite_primary_key_tables']}"
+            )
+            runner.run_batch(
+                f"Suite 12e (Variable Schema seed={s_val} sc={sc_idx})",
+                s_var, v_var, seed_var, m_var, dialect=Dialect.SQLITE,
             )
 
 
