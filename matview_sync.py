@@ -829,6 +829,19 @@ def _sqlglot_dialect(dialect: Dialect = Dialect.SQLITE) -> str:
         Dialect.MYSQL: "mysql",
     }.get(dialect, "sqlite")
 
+def _tokenize_sql(sql: str, read: str = "sqlite") -> List[Any]:
+    """Tokenize SQL while recognizing PostgreSQL dollar-quoted strings.
+
+    SQLGlot configures dollar-quoted strings in its PostgreSQL tokenizer, not
+    its SQLite tokenizer. Most compiler fragments use SQLite-compatible syntax,
+    but a fragment containing a dollar-quote delimiter must use the PostgreSQL
+    lexer so commas, semicolons, parentheses, and comment markers inside the
+    literal remain part of one token.
+    """
+    if re.search(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", sql):
+        read = "postgres"
+    return sqlglot.tokenize(sql, read=read)
+
 
 class SQLTokenType(str, Enum):
     WHITESPACE = "WHITESPACE"
@@ -889,7 +902,7 @@ def tokenize_sql(sql: str) -> List[SQLToken]:
     """
     if not sql:
         return []
-    sg_tokens = sqlglot.tokenize(sql, read="sqlite")
+    sg_tokens = _tokenize_sql(sql)
     tokens: List[SQLToken] = []
     cursor = 0
     n = len(sql)
@@ -990,7 +1003,7 @@ def _strip_sql_comments(sql: str) -> str:
     """Strips `-- ...` line comments and `/* ... */` block comments via `sqlglot.tokenize`."""
     if not sql:
         return ""
-    toks = sqlglot.tokenize(sql, read="sqlite")
+    toks = _tokenize_sql(sql)
     if not toks:
         return ""
     out: List[str] = []
@@ -1037,7 +1050,7 @@ def _split_top_level(text: str, sep: str = ",") -> List[str]:
     """Splits a SQL fragment at top-level separators outside parentheses and literals via `sqlglot.tokenize`."""
     if not text:
         return []
-    toks = sqlglot.tokenize(text, read="sqlite")
+    toks = _tokenize_sql(text)
     if not toks:
         return [text.strip()] if text.strip() else []
     parts: List[str] = []
@@ -1099,7 +1112,7 @@ def _extract_set_op_branches_from_ast(
     """
     if raw_sql:
         s = raw_sql.strip()
-        toks = sqlglot.tokenize(s, read="sqlite")
+        toks = _tokenize_sql(s)
         if toks:
             ops_t: List[str] = []
             branches_t: List[str] = []
@@ -1808,7 +1821,7 @@ def _parse_select_item(raw_item: str, idx: int) -> SelectItem:
 def _extract_verbatim_cte_or_subquery_sql(raw_select_sql: str, has_cte: bool) -> Optional[str]:
     """Slices the verbatim inner query of a single CTE (`WITH x AS (...)`) or `FROM (...)` subquery via `sqlglot.tokenize`."""
     s = raw_select_sql.strip()
-    toks = sqlglot.tokenize(s, read="sqlite")
+    toks = _tokenize_sql(s)
     if not toks:
         return None
     if has_cte:
