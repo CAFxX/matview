@@ -94,66 +94,98 @@ def _row_sort_key(row: Sequence[Any]) -> Tuple[Any, ...]:
         elif isinstance(value, bool):
             keys.append((1, int(value)))
         elif isinstance(value, (int, float, Decimal)):
-            keys.append((2, _numeric_sort_key(value)))
+            keys.append((2,) + _numeric_sort_key(value))
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            keys.append((3, bytes(value)))
+        elif isinstance(value, str):
+            keys.append((4, value))
         else:
-            keys.append((3, str(value)))
+            value_type = type(value)
+            keys.append((5, value_type.__module__, value_type.__qualname__, repr(value)))
     return tuple(keys)
 
 
-def _norm_rows(rows: List[Tuple[Any, ...]]) -> List[Tuple[Any, ...]]:
-    """Sort rows deterministically without rounding exact values."""
-    return sorted(rows, key=_row_sort_key)
+def _numeric_values_equal(a: Any, b: Any, tol: float) -> bool:
+    """Compare numerics exactly unless a floating-point result requires tolerance."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        if isinstance(a, bool) and isinstance(b, bool):
+            return a is b
+        boolean = a if isinstance(a, bool) else b
+        other = b if isinstance(a, bool) else a
+        # PostgreSQL BOOLEAN is commonly returned as bool while SQLite-compatible
+        # execution returns its 0/1 representation. Keep that one explicit bridge.
+        return isinstance(other, (int, Decimal)) and not isinstance(other, bool) and other == int(boolean)
 
+    if isinstance(a, (int, Decimal)) and isinstance(b, (int, Decimal)):
+        da, db = Decimal(a), Decimal(b)
+        if da.is_nan() or db.is_nan():
+            return da.is_nan() and db.is_nan()
+        return da == db
 
-def _compare_values(actual: Any, expected: Any) -> bool:
-    """Type-aware and precision-preserving value comparison."""
-    if actual is None or expected is None:
-        return actual is None and expected is None
+    if isinstance(a, float) and isinstance(b, float):
+        if math.isnan(a) or math.isnan(b):
+            return math.isnan(a) and math.isnan(b)
+        if math.isinf(a) or math.isinf(b):
+            return a == b
+        return abs(a - b) <= tol
 
-    if isinstance(actual, bool) or isinstance(expected, bool):
-        return isinstance(actual, bool) and isinstance(expected, bool) and actual == expected
+    floating = a if isinstance(a, float) else b
+    exact = b if isinstance(a, float) else a
+    if isinstance(exact, int):
+        # Never round an exact integer through binary64. In particular, this
+        # distinguishes adjacent integers above 2**53.
+        return (
+            math.isfinite(floating)
+            and floating.is_integer()
+            and Decimal.from_float(floating) == Decimal(exact)
+        )
 
-    if isinstance(actual, (int, float, Decimal)) and isinstance(expected, (int, float, Decimal)):
-        act_nan = (isinstance(actual, float) and math.isnan(actual)) or (isinstance(actual, Decimal) and actual.is_nan())
-        exp_nan = (isinstance(expected, float) and math.isnan(expected)) or (isinstance(expected, Decimal) and expected.is_nan())
-        if act_nan or exp_nan:
-            return act_nan and exp_nan
-
-        act_inf = (isinstance(actual, float) and math.isinf(actual)) or (isinstance(actual, Decimal) and actual.is_infinite())
-        exp_inf = (isinstance(expected, float) and math.isinf(expected)) or (isinstance(expected, Decimal) and expected.is_infinite())
-        if act_inf or exp_inf:
-            if not (act_inf and exp_inf):
-                return False
-            act_sign = (actual < 0) if isinstance(actual, float) else actual.is_signed()
-            exp_sign = (expected < 0) if isinstance(expected, float) else expected.is_signed()
-            return act_sign == exp_sign
-
-        try:
-            d_act = Decimal.from_float(actual) if isinstance(actual, float) else Decimal(actual)
-            d_exp = Decimal.from_float(expected) if isinstance(expected, float) else Decimal(expected)
-            return d_act == d_exp
-        except Exception:
-            return float(actual) == float(expected)
-
-    return str(actual) == str(expected)
-
-
-def _compare_rows(actual_row: Sequence[Any], expected_row: Sequence[Any]) -> bool:
-    if len(actual_row) != len(expected_row):
+    # A float can only approximate a Decimal result. Compare its exact binary
+    # value to the Decimal with an explicit absolute tolerance; do not round the
+    # Decimal or scale the tolerance with the magnitude of the result.
+    if math.isnan(floating):
+        return exact.is_nan()
+    if math.isinf(floating):
+        return exact.is_infinite() and exact.is_signed() == (floating < 0)
+    if exact.is_nan() or exact.is_infinite():
         return False
-    return all(_compare_values(a, e) for a, e in zip(actual_row, expected_row))
+    return abs(Decimal.from_float(floating) - exact) <= Decimal(str(tol))
 
 
-def _compare_results(actual: List[Tuple[Any, ...]], expected: List[Tuple[Any, ...]]) -> bool:
-    if len(actual) != len(expected):
-        return False
-    sorted_actual = _norm_rows(actual)
-    sorted_expected = _norm_rows(expected)
-    return all(_compare_rows(r1, r2) for r1, r2 in zip(sorted_actual, sorted_expected))
+def _values_equal(a: Any, b: Any, tol: float) -> bool:
+    if a is None or b is None:
+        return a is b
+
+    if isinstance(a, (bool, int, float, Decimal)) and isinstance(b, (bool, int, float, Decimal)):
+        return _numeric_values_equal(a, b, tol)
+
+    if isinstance(a, (bytes, bytearray, memoryview)) and isinstance(b, (bytes, bytearray, memoryview)):
+        return bytes(a) == bytes(b)
+
+    # Do not let Python's cross-type equality (for example, True == 1) make
+    # textual or engine-specific values compare equal accidentally.
+    return type(a) is type(b) and a == b
 
 
 def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]], tol: float = 1.5e-3) -> bool:
-    return _compare_results(list(rows_a), list(rows_b))
+    """Compare unordered row multisets, preserving duplicates and exact numerics.
+
+    Integers and Decimal values are compared exactly. The absolute tolerance is
+    used only when at least one compared numeric value is a float.
+    """
+    if tol < 0:
+        raise ValueError("tol must be non-negative")
+    if len(rows_a) != len(rows_b):
+        return False
+
+    sorted_a = sorted((tuple(row) for row in rows_a), key=_row_sort_key)
+    sorted_b = sorted((tuple(row) for row in rows_b), key=_row_sort_key)
+    for row_a, row_b in zip(sorted_a, sorted_b):
+        if len(row_a) != len(row_b):
+            return False
+        if not all(_values_equal(a, b, tol) for a, b in zip(row_a, row_b)):
+            return False
+    return True
 
 
 def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Dialect.SQLITE) -> None:
@@ -336,48 +368,11 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
 
 
 def _verify_external_db_mv(cur, mv_name: str, select_sql: str, context: str = "") -> None:
-    def _norm(v):
-        if isinstance(v, bool):
-            return int(v)
-        if isinstance(v, int):
-            return v
-        if isinstance(v, (float, Decimal)):
-            if isinstance(v, Decimal) and v == int(v):
-                return int(v)
-            fv = round(float(v), 3)
-            if abs(fv - round(fv)) < 1e-9:
-                return int(round(fv))
-            return fv
-        return v
-
-    def _skey(row):
-        return tuple(
-            (0 if v is None else (1 if isinstance(v, (int, float)) else 2), _norm(v) if v is not None else "")
-            for v in row
-        )
-
-    def _rows_match(rows_a, rows_b) -> bool:
-        if len(rows_a) != len(rows_b):
-            return False
-        for ra, rb in zip(rows_a, rows_b):
-            if len(ra) != len(rb):
-                return False
-            for ca, cb in zip(ra, rb):
-                if ca is None or cb is None:
-                    if ca is not cb:
-                        return False
-                elif isinstance(ca, (int, float)) and isinstance(cb, (int, float)):
-                    if abs(float(ca) - float(cb)) > 1.5e-3:
-                        return False
-                elif ca != cb:
-                    return False
-        return True
-
     cur.execute(f"SELECT * FROM {mv_name}")
-    mv_rows = sorted([tuple(_norm(x) for x in r) for r in cur.fetchall()], key=_skey)
+    mv_rows = [tuple(row) for row in cur.fetchall()]
     cur.execute(select_sql)
-    live_rows = sorted([tuple(_norm(x) for x in r) for r in cur.fetchall()], key=_skey)
-    if not _rows_match(mv_rows, live_rows):
+    live_rows = [tuple(row) for row in cur.fetchall()]
+    if not _rows_equal(mv_rows, live_rows):
         raise AssertionError(
             f"[{context}] External DB MV mismatch on {mv_name}!\n"
             f"  Query: {select_sql}\n"
@@ -4744,6 +4739,49 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             )
             if hasattr(conn_j, "close"):
                 conn_j.close()
+
+
+    def test_14_differential_oracle_preserves_exact_numeric_values(self) -> None:
+        # Adjacent integers beyond binary64's exact integer range must not collapse.
+        self.assertFalse(_rows_equal([(2**53 + 1,)], [(float(2**53 + 1),)]))
+        self.assertFalse(_rows_equal([(2**53 + 1,)], [(2**53,)]))
+        self.assertTrue(_rows_equal([(2**53,)], [(float(2**53),)]))
+        self.assertTrue(_rows_equal([(-(2**63),), (2**64 - 1,)], [(2**64 - 1,), (-(2**63),)]))
+
+        # Decimal-to-Decimal comparisons retain every digit, including trailing precision.
+        self.assertFalse(_rows_equal([(Decimal("1.00001"),)], [(Decimal("1.00002"),)]))
+        self.assertFalse(
+            _rows_equal(
+                [(Decimal("12345678901234567890.123456"),)],
+                [(Decimal("12345678901234567890.123457"),)],
+            )
+        )
+        self.assertTrue(_rows_equal([(Decimal("1.25"),)], [(Decimal("1.25"),)]))
+
+    def test_15_differential_oracle_handles_float_and_special_values(self) -> None:
+        self.assertTrue(_rows_equal([(1.0,)], [(1.001,)]))
+        self.assertFalse(_rows_equal([(1,)], [(1.001,)]))
+        self.assertTrue(_rows_equal([(Decimal("0.1"),)], [(0.1,)]))
+        self.assertFalse(_rows_equal([(float("nan"),)], [(1.0,)]))
+        self.assertTrue(_rows_equal([(float("nan"),)], [(float("nan"),)]))
+        self.assertTrue(_rows_equal([(float("inf"),)], [(float("inf"),)]))
+        self.assertFalse(_rows_equal([(float("inf"),)], [(float("-inf"),)]))
+        self.assertTrue(_rows_equal([(-0.0,)], [(0.0,)]))
+        self.assertTrue(_rows_equal([(Decimal("NaN"),)], [(Decimal("NaN"),)]))
+        self.assertFalse(_rows_equal([(Decimal("1.0"),)], [(Decimal("1.01"),)]))
+
+    def test_16_differential_oracle_preserves_types_and_row_multiplicity(self) -> None:
+        self.assertFalse(_rows_equal([("1",)], [(1,)]))
+        self.assertFalse(_rows_equal([(True,)], [(False,)]))
+        self.assertTrue(_rows_equal([(True,)], [(1,)]))
+        self.assertTrue(_rows_equal([(b"payload",)], [(bytearray(b"payload"),)]))
+        self.assertTrue(_rows_equal([("a",), ("b",), ("a",)], [("a",), ("a",), ("b",)]))
+        self.assertFalse(_rows_equal([("a",), ("a",)], [("a",), ("b",)]))
+        self.assertFalse(_rows_equal([("a",), ("a",)], [("a",)]))
+        with self.assertRaises(ValueError):
+            _rows_equal([(1.0,)], [(1.0,)], tol=-1.0)
+
+
 
 
 import random
