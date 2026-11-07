@@ -5538,7 +5538,10 @@ class VariableSchemaDifferentialFuzzer:
             vals.append(str(rng.randint(1, 100)) if meta["amount_type"] == "INTEGER" else f"{rng.randint(1, 100) + 0.375:.3f}")
             for extra_name, extra_type, _ in meta["extras"]:
                 vals.append(str(rng.randint(1, 20)) if extra_type in ("INTEGER", "REAL") else f"'{prefix}_{extra_name}_inserted'")
-            vals += ["NULL" if parent == i else "1" for parent, _ in fks[i]]
+            # Parent rows may have been removed by earlier generated DELETEs.
+            # FK columns are nullable, so keep these later INSERTs valid while
+            # the initial seed data continues to exercise non-NULL relationships.
+            vals += ["NULL" for _ in fks[i]]
             mutations.extend([
                 (f"{prefix}_t{i}_insert", f"INSERT INTO {meta['name']} ({', '.join(fields)}) VALUES ({', '.join(vals)});"),
                 (f"{prefix}_t{i}_update", f"UPDATE {meta['name']} SET qty = COALESCE(qty, 0) + {rng.randint(1, 9)}, amount = COALESCE(amount, 0) + 1 WHERE id = 1;"),
