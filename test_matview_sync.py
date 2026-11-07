@@ -4826,6 +4826,26 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertEqual([view.view_name for view in views], ["item_a", "item_b"])
 
+    def test_parser_scanners_preserve_postgres_dollar_quoted_literals(self) -> None:
+        fragment = "SELECT $$comma, semi; -- /* stays literal */$$, 7"
+        self.assertEqual(
+            _split_top_level(fragment),
+            ["SELECT $$comma, semi; -- /* stays literal */$$", "7"],
+        )
+        script = "SELECT $body$left; -- /* right */$body$; SELECT 2;"
+        self.assertEqual(
+            _split_top_level(script, ";"),
+            ["SELECT $body$left; -- /* right */$body$", "SELECT 2"],
+        )
+        commented = (
+            "SELECT $body$-- keep /* keep */; $body$, 1 "
+            "/* remove */ -- remove\\nFROM items"
+        )
+        self.assertEqual(
+            _strip_sql_comments(commented),
+            "SELECT $body$-- keep /* keep */; $body$, 1 FROM items",
+        )
+
 
 
 
