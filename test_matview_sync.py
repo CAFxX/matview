@@ -289,6 +289,7 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
 
 def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     s = sql
+    s = re.sub(r"\bCAST\s*\(\s*ROW\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)\)\s+AS\s+TEXT\s*\)", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
     s = re.sub(r"\bROW\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)\)\s*::\s*TEXT\b", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
     s = re.sub(r"::\s*(?:TEXT|BIGINT|DOUBLE\s+PRECISION|INTEGER|BOOLEAN|NUMERIC)\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\bIS\s+NOT\s+DISTINCT\s+FROM\b", "IS", s, flags=re.IGNORECASE)

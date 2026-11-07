@@ -1760,12 +1760,13 @@ def _extract_cte_names_and_strip_with(select_sql: str) -> Tuple[Set[str], str, b
         q_ast = parse_sql_ast(s)
     except sqlglot.errors.SqlglotError:
         return set(), s, False
-    with_node = q_ast.args.get("with_")
+    with_node = q_ast.args.get("with_") or q_ast.args.get("with")
     if not isinstance(with_node, sqlglot_exp.With):
         return set(), s, False
     cte_names = {cte.alias for cte in with_node.expressions if isinstance(cte, sqlglot_exp.CTE) and cte.alias}
     no_with = q_ast.copy()
     no_with.set("with_", None)
+    no_with.set("with", None)
     no_with.args.pop("_raw_sql", None)
     main_select = no_with.sql("sqlite").strip()
     return cte_names, (main_select if main_select else s), True
@@ -1792,7 +1793,7 @@ def _parse_from_and_joins(from_clause: str, cte_names: Set[str]) -> Tuple[List[J
     if not isinstance(sel_ast, sqlglot_exp.Select):
         return [], False
 
-    from_node = sel_ast.args.get("from_")
+    from_node = sel_ast.args.get("from_") or sel_ast.args.get("from")
     join_nodes = sel_ast.args.get("joins") or []
     if not isinstance(from_node, sqlglot_exp.From):
         return [], False
@@ -2706,7 +2707,7 @@ class IncrementalViewCompiler:
             return v
 
         if v.has_cte:
-            with_node = q_ast.args.get("with_")
+            with_node = q_ast.args.get("with_") or q_ast.args.get("with")
             if not isinstance(with_node, sqlglot_exp.With) or bool(with_node.args.get("recursive")) or len(with_node.expressions) != 1:
                 return v
             cte_node = with_node.expressions[0]
@@ -2719,10 +2720,11 @@ class IncrementalViewCompiler:
             cte_or_sub_alias = cte_node.alias
             no_with = q_ast.copy()
             no_with.set("with_", None)
+            no_with.set("with", None)
             no_with.args.pop("_raw_sql", None)
             outer_sql = no_with.sql("sqlite").strip()
         elif v.has_subquery_in_from and len(v.joins) == 1:
-            from_node = q_ast.args.get("from_")
+            from_node = q_ast.args.get("from_") or q_ast.args.get("from")
             if not isinstance(from_node, sqlglot_exp.From) or not isinstance(from_node.this, sqlglot_exp.Subquery):
                 return v
             sub_node = from_node.this
@@ -3265,7 +3267,7 @@ class IncrementalViewCompiler:
             return False
 
         if v.has_cte:
-            with_node = q_ast.args.get("with_")
+            with_node = q_ast.args.get("with_") or q_ast.args.get("with")
             if not isinstance(with_node, sqlglot_exp.With) or bool(with_node.args.get("recursive")) or len(with_node.expressions) != 1:
                 return False
             cte_node = with_node.expressions[0]
@@ -3276,7 +3278,7 @@ class IncrementalViewCompiler:
             inner_union_sql = inner_union_ast.sql("sqlite").strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None
             sub_alias = v.joins[0].alias or cte_name
         else:
-            from_node = q_ast.args.get("from_")
+            from_node = q_ast.args.get("from_") or q_ast.args.get("from")
             if not isinstance(from_node, sqlglot_exp.From) or not isinstance(from_node.this, sqlglot_exp.Subquery):
                 return False
             sub_node = from_node.this
@@ -3722,13 +3724,13 @@ class IncrementalViewCompiler:
                     if c_arg:
                         return self._normalize_dialect_type(c_arg.data_type)
                     return self._float_type()
-                if isinstance(inner, (sqlglot_exp.Avg, sqlglot_exp.VarPop, sqlglot_exp.Variance, sqlglot_exp.StddevPop, sqlglot_exp.Stddev)):
+                if isinstance(inner, sqlglot_exp.Avg):
                     return self._float_type()
-                if isinstance(inner, sqlglot_exp.Anonymous):
-                    fn_up = inner.name.upper()
-                    if fn_up in ("COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE"):
+                if isinstance(inner, (sqlglot_exp.AggFunc, sqlglot_exp.Func, sqlglot_exp.Anonymous)):
+                    fn_up = (inner.sql_name().upper() if hasattr(inner, "sql_name") else "") or inner.name.upper()
+                    if fn_up in ("COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "BIT_AND", "BIT_OR", "BIT_XOR", "BITWISEANDAGG", "BITWISEORAGG", "BITWISEXORAGG", "BOOL_AND", "BOOL_OR", "LOGICALAND", "LOGICALOR"):
                         return self._int_type()
-                    if fn_up in ("SUM", "TOTAL", "AVG", "VAR_POP", "VARIANCE", "STDDEV_POP", "STDDEV"):
+                    if fn_up in ("SUM", "TOTAL", "AVG", "VAR_POP", "VARIANCE", "VARIANCE_POP", "VARIANCEPOP", "VAR_SAMP", "VARSAMP", "STDDEV_POP", "STDDEV", "STD", "STDDEV_SAMP", "STDDEVSAMP"):
                         return self._float_type()
                 if isinstance(inner, sqlglot_exp.Column) and not isinstance(inner.this, sqlglot_exp.Star):
                     c_def = self._lookup_col_def(inner.name)
@@ -4278,10 +4280,11 @@ class IncrementalViewCompiler:
             elif self._alg_mode == "projection":
                 main_pk_cols = self._projection_pk_cols()
 
+        sg_dial = _sqlglot_dialect(self.dialect)
         for idx_s, pop_sql in enumerate(raw_plan.initial_populate_sqls):
             clean_pop = pop_sql.strip().rstrip(";")
             try:
-                pop_ast = parse_sql_ast(clean_pop)
+                pop_ast = parse_sql_ast(clean_pop, dialect=self.dialect)
             except sqlglot.errors.SqlglotError:
                 pop_ast = None
 
@@ -4299,21 +4302,21 @@ class IncrementalViewCompiler:
             if not isinstance(sel_node, sqlglot_exp.Select):
                 inc_stmts.append(pop_sql)
                 continue
-            select_body = sel_node.sql().strip()
+            select_body = sel_node.sql(sg_dial).strip()
 
             aliased_inner = select_body
-            if not sel_node.args.get("distinct") and not sel_node.args.get("with_") and sel_node.args.get("from_") is not None:
+            if not sel_node.args.get("distinct") and not (sel_node.args.get("with_") or sel_node.args.get("with")) and (sel_node.args.get("from_") or sel_node.args.get("from")) is not None:
                 if len(sel_node.expressions) == len(cols):
                     aliased_list = []
                     for c_name, proj_node in zip(cols, sel_node.expressions):
                         if isinstance(proj_node, sqlglot_exp.Alias) and proj_node.alias.lower() == _unquote_ident(c_name).lower():
-                            aliased_list.append(proj_node.sql())
+                            aliased_list.append(proj_node.sql(sg_dial))
                         else:
-                            aliased_list.append(f"{proj_node.sql()} AS {c_name}")
+                            aliased_list.append(f"{proj_node.sql(sg_dial)} AS {c_name}")
                     aliased_copy = sel_node.copy()
                     aliased_copy.args.pop("_raw_sql", None)
-                    aliased_copy.set("expressions", [parse_sql_ast(ae) for ae in aliased_list])
-                    aliased_inner = aliased_copy.sql()
+                    aliased_copy.set("expressions", [sqlglot.parse_one(f"SELECT {ae}", read=sg_dial).expressions[0] for ae in aliased_list])
+                    aliased_inner = aliased_copy.sql(sg_dial)
 
             is_aux_dist = "__val" in cols and "__ref_cnt" in cols
             tbl_pks = (
@@ -8909,8 +8912,8 @@ class IncrementalViewCompiler:
                         sub_ast = parse_sql_ast(inner_sql, dialect=Dialect.MYSQL)
                     except sqlglot.errors.SqlglotError:
                         sub_ast = None
-                    if isinstance(sub_ast, sqlglot_exp.Select) and sub_ast.args.get("from_"):
-                        in_from = sub_ast.args["from_"].this
+                    if isinstance(sub_ast, sqlglot_exp.Select) and (sub_ast.args.get("from_") or sub_ast.args.get("from")):
+                        in_from = (sub_ast.args.get("from_") or sub_ast.args.get("from")).this
                         in_tbl = in_from.name
                         in_alias = in_from.alias or "__mv_not_in"
                         rhs_col = sub_ast.expressions[0].name if sub_ast.expressions else "id"
@@ -9036,8 +9039,8 @@ class IncrementalViewCompiler:
                 sel_ast = None
             if isinstance(sel_ast, sqlglot_exp.Select) and sel_ast.args.get("joins"):
                 j0 = sel_ast.args["joins"][0]
-                if j0.side.upper() == "FULL" and sel_ast.args.get("from_") and j0.args.get("on"):
-                    from_t = sel_ast.args["from_"].this.sql("mysql")
+                if j0.side.upper() == "FULL" and (sel_ast.args.get("from_") or sel_ast.args.get("from")) and j0.args.get("on"):
+                    from_t = (sel_ast.args.get("from_") or sel_ast.args.get("from")).this.sql("mysql")
                     j0_t = j0.this.sql("mysql")
                     on_s = j0.args["on"].sql("mysql")
                     sel_s = ", ".join(e.sql("mysql") for e in sel_ast.expressions)
