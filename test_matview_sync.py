@@ -1989,6 +1989,77 @@ def _adapt_mutation_for_dialect(m_sql: str, dialect: Dialect) -> str:
     return m_sql
 
 
+def _compile_plan_for_test(
+    schema_source: Any, view_ddl: str, **compile_options: Any
+) -> Tuple[MaterializedViewPlan, bool, Tuple[str, ...]]:
+    """Exercise default limitation enforcement before any best-effort test override.
+
+    Returns (plan, used_override, limitation_codes). An unsupported plan is only
+    executed after the default compiler rejects it and the explicit override emits
+    the corresponding warning.
+    """
+    options = dict(compile_options)
+    options.pop("ignore_limitations", None)
+    try:
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter("always", EngineLimitationWarning)
+            plan = generate_materialized_view(
+                schema_source, view_ddl, ignore_limitations=False, **options
+            )
+        unexpected = [
+            warning for warning in emitted
+            if issubclass(warning.category, EngineLimitationWarning)
+        ]
+        if unexpected:
+            raise AssertionError(
+                "Default compilation emitted EngineLimitationWarning: "
+                + "; ".join(str(w.message) for w in unexpected)
+            )
+        if plan.limitations:
+            raise AssertionError(
+                "Default compilation returned a plan with limitations instead of rejecting it: "
+                + ", ".join(lim.code for lim in plan.limitations)
+            )
+        return plan, False, ()
+    except EngineLimitationError as default_error:
+        expected_codes = {lim.code for lim in default_error.limitations}
+        if not expected_codes or "" in expected_codes:
+            raise AssertionError(
+                "EngineLimitationError must expose non-empty, identifiable limitations"
+            ) from default_error
+
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter("always", EngineLimitationWarning)
+            plan = generate_materialized_view(
+                schema_source, view_ddl, ignore_limitations=True, **options
+            )
+        limitation_warnings = [
+            warning for warning in emitted
+            if issubclass(warning.category, EngineLimitationWarning)
+        ]
+        if len(limitation_warnings) != 1:
+            raise AssertionError(
+                f"Expected exactly one EngineLimitationWarning for {sorted(expected_codes)}, "
+                f"got {len(limitation_warnings)}"
+            )
+        plan_codes = {lim.code for lim in plan.limitations}
+        if not expected_codes.issubset(plan_codes):
+            raise AssertionError(
+                f"Override plan limitations {sorted(plan_codes)} do not include "
+                f"default rejection codes {sorted(expected_codes)}"
+            )
+        warning_text = "\n".join(str(w.message) for w in limitation_warnings)
+        missing_warning_codes = expected_codes - {
+            code for code in expected_codes if f"[{code}]" in warning_text
+        }
+        if missing_warning_codes:
+            raise AssertionError(
+                "Override warning omitted limitation codes: "
+                + ", ".join(sorted(missing_warning_codes))
+            )
+        return plan, True, tuple(sorted(expected_codes))
+
+
 def _run_unified_50_view_battery(
     conn: Any,
     cur: Any,
@@ -2028,26 +2099,30 @@ def _run_unified_50_view_battery(
     plans = []
     views_installed = 0
     checks_run = 0
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", EngineLimitationWarning)
-        for v_idx, (v_name, v_sel) in enumerate(view_specs):
-            schema_source: Any = conn if (v_idx % 2 == 1) else schema
-            p = generate_materialized_view(
-                schema_source,
-                f"CREATE VIEW {v_name} AS {v_sel};",
-                dialect=dialect,
-                pg_use_transition_tables=use_trans,
-                incremental_backfill=inc_mode,
-                batch_size=2,
-                ignore_limitations=True,
-            )
-            for stmt in p.all_statements():
-                cur.execute(stmt)
-            live_sel = _rewrite_live_reference_select_for_dialect(v_sel, dialect)
-            plans.append((p, live_sel))
-            views_installed += 1
-            _verify_external_db_mv(cur, p.view_name, live_sel, f"{label}:inc={inc_mode}:tr={use_trans}:{v_name}:init")
-            checks_run += 1
+    supported_views = 0
+    limitation_override_views = 0
+    for v_idx, (v_name, v_sel) in enumerate(view_specs):
+        schema_source: Any = conn if (v_idx % 2 == 1) else schema
+        p, used_override, limitation_codes = _compile_plan_for_test(
+            schema_source,
+            f"CREATE VIEW {v_name} AS {v_sel};",
+            dialect=dialect,
+            pg_use_transition_tables=use_trans,
+            incremental_backfill=inc_mode,
+            batch_size=2,
+        )
+        if used_override:
+            limitation_override_views += 1
+            print(f"  [BEST-EFFORT] {v_name}: {', '.join(limitation_codes)}")
+        else:
+            supported_views += 1
+        for stmt in p.all_statements():
+            cur.execute(stmt)
+        live_sel = _rewrite_live_reference_select_for_dialect(v_sel, dialect)
+        plans.append((p, live_sel))
+        views_installed += 1
+        _verify_external_db_mv(cur, p.view_name, live_sel, f"{label}:inc={inc_mode}:tr={use_trans}:{v_name}:init")
+        checks_run += 1
 
     ro_raised = False
     try:
@@ -2067,6 +2142,10 @@ def _run_unified_50_view_battery(
         for drop_st in p.drop_statements():
             cur.execute(drop_st)
 
+    print(
+        f"  [PLAN CLASSIFICATION] {label}: supported={supported_views}, "
+        f"best_effort_override={limitation_override_views}"
+    )
     return views_installed, checks_run
 
 
@@ -2153,6 +2232,8 @@ class MVTestRunner:
     def __init__(self) -> None:
         self.total_views: int = 0
         self.total_assertions: int = 0
+        self.supported_plans: int = 0
+        self.limitation_override_plans: int = 0
         self.pg_dsn: Optional[str] = os.environ.get("POSTGRES_DSN")
         self.mysql_dsn: Optional[str] = os.environ.get("MYSQL_DSN")
         self.sqlite_compat_engine: Optional[str] = os.environ.get("SQLITE_COMPAT_ENGINE")
@@ -2252,6 +2333,8 @@ class MVTestRunner:
         conn, cur, reset_sql, chunk_size, engine_label, close_fn = self._open_backend_session(
             eff_dialect, suite_tag=f"suite_{abs(hash(suite_name))}"
         )
+        suite_supported = 0
+        suite_overrides = 0
         try:
             for i in range(0, len(views), chunk_size):
                 chunk = views[i : i + chunk_size]
@@ -2263,32 +2346,41 @@ class MVTestRunner:
                 for s in seed_sqls:
                     cur.execute(s)
                 plans_and_selects: List[Tuple[MaterializedViewPlan, str]] = []
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", EngineLimitationWarning)
-                    for v_idx, (v_name, v_ddl) in enumerate(chunk):
-                        eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, eff_dialect)
-                        schema_source: Any = conn if (v_idx % 2 == 1) else eff_schema
-                        plan = generate_materialized_view(
-                            schema_source,
-                            eff_v_ddl,
-                            dialect=eff_dialect,
-                            pg_use_transition_tables=pg_use_transition_tables,
-                            incremental_backfill=incremental_backfill,
-                            batch_size=batch_size,
-                            ignore_limitations=True,
+                batch_supported = 0
+                batch_overrides = 0
+                for v_idx, (v_name, v_ddl) in enumerate(chunk):
+                    eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, eff_dialect)
+                    schema_source: Any = conn if (v_idx % 2 == 1) else eff_schema
+                    plan, used_override, limitation_codes = _compile_plan_for_test(
+                        schema_source,
+                        eff_v_ddl,
+                        dialect=eff_dialect,
+                        pg_use_transition_tables=pg_use_transition_tables,
+                        incremental_backfill=incremental_backfill,
+                        batch_size=batch_size,
+                    )
+                    if used_override:
+                        batch_overrides += 1
+                        self.limitation_override_plans += 1
+                        print(
+                            f"  [BEST-EFFORT] {v_name} [{engine_label}]: "
+                            f"{', '.join(limitation_codes)}"
                         )
-                        for stmt in plan.all_statements():
-                            cur.execute(stmt)
-                        v_spec = parse_view_definition(eff_v_ddl)
-                        live_sel = _rewrite_live_reference_select_for_dialect(
-                            v_spec.raw_select_sql, eff_dialect
-                        )
-                        plans_and_selects.append((plan, live_sel))
-                        self.total_views += 1
-                        _verify_external_db_mv(
-                            cur, plan.view_name, live_sel, f"{suite_name}:{engine_label}:{v_name}:init"
-                        )
-                        self.total_assertions += 1
+                    else:
+                        batch_supported += 1
+                        self.supported_plans += 1
+                    for stmt in plan.all_statements():
+                        cur.execute(stmt)
+                    v_spec = parse_view_definition(eff_v_ddl)
+                    live_sel = _rewrite_live_reference_select_for_dialect(
+                        v_spec.raw_select_sql, eff_dialect
+                    )
+                    plans_and_selects.append((plan, live_sel))
+                    self.total_views += 1
+                    _verify_external_db_mv(
+                        cur, plan.view_name, live_sel, f"{suite_name}:{engine_label}:{v_name}:init"
+                    )
+                    self.total_assertions += 1
                 for step_lbl, m_sql in eff_muts:
                     cur.execute(m_sql)
                     for plan, live_sel in plans_and_selects:
@@ -2299,10 +2391,13 @@ class MVTestRunner:
                             f"{suite_name}:{engine_label}:{plan.logical_view_name}:{step_lbl}",
                         )
                         self.total_assertions += 1
+                suite_supported += batch_supported
+                suite_overrides += batch_overrides
         finally:
             close_fn()
         print(
-            f"  [PASS] {suite_name} [{engine_label}]: {len(views)} views x {len(mutations) + 1} states = {len(views) * (len(mutations) + 1)} assertions"
+            f"  [PASS] {suite_name} [{engine_label}]: {len(views)} views x {len(mutations) + 1} states = {len(views) * (len(mutations) + 1)} assertions "
+            f"(supported={suite_supported}, best_effort_override={suite_overrides})"
         )
 
 
@@ -4779,6 +4874,25 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertFalse(_rows_equal([("a",), ("a",)], [("a",)]))
         with self.assertRaises(ValueError):
             _rows_equal([(1.0,)], [(1.0,)], tol=-1.0)
+
+
+    def test_limited_plan_helper_checks_default_contract_before_override(self) -> None:
+        schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);"
+        supported, was_overridden, codes = _compile_plan_for_test(
+            schema, "CREATE VIEW v_supported AS SELECT id, val FROM t;", dialect=Dialect.SQLITE
+        )
+        self.assertFalse(was_overridden)
+        self.assertEqual(codes, ())
+        self.assertFalse(supported.limitations)
+
+        best_effort, was_overridden, codes = _compile_plan_for_test(
+            schema,
+            "CREATE VIEW v_limited AS SELECT grp, COUNT(*) AS n FROM t GROUP BY grp;",
+            dialect=Dialect.MYSQL,
+        )
+        self.assertTrue(was_overridden)
+        self.assertTrue(codes)
+        self.assertTrue(set(codes).issubset({lim.code for lim in best_effort.limitations}))
 
 
 import random
