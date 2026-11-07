@@ -5371,6 +5371,7 @@ class VariableSchemaDifferentialFuzzer:
                 "amount_nn": amount_nn, "amount_type": amount_type,
                 "composite": composite, "extras": extras,
                 "fk_cols": [col for _, col in fks[i]],
+                "unique_label": unique_label, "check_qty": check_qty,
             })
 
         seed_sql: List[str] = []
@@ -5457,8 +5458,8 @@ class VariableSchemaDifferentialFuzzer:
             ),
             "foreign_key_count": len(edges),
             "composite_primary_key_tables": sum(int(m["composite"]) for m in metas),
-            "unique_label_constraints": sum(int(m["name"] and m["extras"] is not None and m["label_nn"]) for m in metas if m["label_nn"]),
-            "check_constraints": sum(int(m["name"] and m["qty_nn"]) for m in metas if m["qty_nn"]),
+            "unique_label_constraints": sum(int(m["unique_label"]) for m in metas),
+            "check_constraints": sum(int(m["check_qty"]) for m in metas),
         }
         return "\n".join(ddls), views, seed_sql, mutations, shape
 
