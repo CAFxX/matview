@@ -4839,7 +4839,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         commented = (
             "SELECT $body$-- keep /* keep */; $body$, 1 "
-            "/* remove */ -- remove\\nFROM items"
+            "/* remove */ -- remove\nFROM items"
         )
         self.assertEqual(
             _strip_sql_comments(commented),
