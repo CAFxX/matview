@@ -4785,7 +4785,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
     def test_parser_token_scanners_preserve_quoted_comment_markers(self) -> None:
         sql = (
             "SELECT '-- not a comment', '/* still a string */', "
-            "`column--name`, 1 /* remove this */ -- and this\\n"
+            "`column--name`, 1 /* remove this */ -- and this\n"
             "FROM items;"
         )
         self.assertEqual(
