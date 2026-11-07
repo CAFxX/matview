@@ -4782,6 +4782,51 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             _rows_equal([(1.0,)], [(1.0,)], tol=-1.0)
 
 
+    def test_parser_token_scanners_preserve_quoted_comment_markers(self) -> None:
+        sql = (
+            "SELECT '-- not a comment', '/* still a string */', "
+            "`column--name`, 1 /* remove this */ -- and this\\n"
+            "FROM items;"
+        )
+        self.assertEqual(
+            _strip_sql_comments(sql),
+            "SELECT '-- not a comment', '/* still a string */', `column--name`, 1 FROM items;",
+        )
+
+    def test_parser_top_level_split_ignores_nested_and_quoted_separators(self) -> None:
+        fragment = "COALESCE(a, 'x,y'), printf('semi;colon', b), `odd,name`"
+        self.assertEqual(
+            _split_top_level(fragment),
+            ["COALESCE(a, 'x,y')", "printf('semi;colon', b)", "`odd,name`"],
+        )
+        script = "CREATE TABLE a (v TEXT DEFAULT 'semi;colon'); CREATE TABLE b (id INTEGER);"
+        self.assertEqual(
+            _split_top_level(script, ";"),
+            [
+                "CREATE TABLE a (v TEXT DEFAULT 'semi;colon')",
+                "CREATE TABLE b (id INTEGER)",
+            ],
+        )
+
+    def test_parser_multiple_schema_and_view_statements_preserve_literal_contents(self) -> None:
+        schemas = parse_table_schema(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, "
+            "label TEXT DEFAULT 'semi;comma, -- literal /* text */'); "
+            "CREATE TABLE other_items (id INTEGER, label TEXT);"
+        )
+        self.assertEqual(set(schemas), {"items", "other_items"})
+        self.assertIn("label", schemas["items"].columns)
+
+        views = parse_view_definitions(
+            "CREATE VIEW item_a AS SELECT id FROM items "
+            "WHERE label = 'semi;colon'; "
+            "CREATE VIEW item_b AS SELECT id FROM items "
+            "WHERE label = 'comma,paren() -- literal';",
+            known_tables={"items"},
+        )
+        self.assertEqual([view.view_name for view in views], ["item_a", "item_b"])
+
+
 
 
 import random
