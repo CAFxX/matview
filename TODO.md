@@ -38,7 +38,7 @@ This document tracks all feature goals, architectural improvements, and verified
 - [x] **Native Composite Primary Keys for Single-Table Projections & MySQL `NOT NULL` Group Keys**:
   Preserve the base table's actual primary/composite key columns in `_compile_tier1_zset_projection` and enable native composite `PRIMARY KEY (col1, col2, ...)` on MySQL `NOT NULL` `GROUP BY` views instead of synthesizing concatenated `__mv_pk` strings.
 - [x] **`SELECT *` and `SELECT DISTINCT *` Tier 1 Expansion**:
-  Expand `SELECT *` and `SELECT alias.*` on single-table views against `primary_schema.columns` so `SELECT * FROM t [WHERE ...]` and `SELECT DISTINCT * FROM t [WHERE ...]` compile with Tier 1 $0(1)$ `ALGEBRAIC_DELTA` maintenance instead of falling back to Tier 3.
+  Expand `SELECT *` and `SELECT alias.*` on single-table views against `primary_schema.columns` so `SELECT * FROM t [WHERE ...]` and `SELECT DISTINCT * FROM t [WHERE ...]` compile with Tier 1 $O(1)$ `ALGEBRAIC_DELTA` maintenance instead of falling back to Tier 3.
 - [x] **High-Precision `NUMERIC` / `DECIMAL` Accumulation for Variance & Standard Deviation**:
   Use exact `NUMERIC` (PostgreSQL) and `DECIMAL(65, 12)` (MySQL) backing columns (`__mv_sum_*`, `__mv_sum2_*`) for `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP` to prevent IEEE-754 catastrophic cancellation on high-offset values.
 - [x] **63-Bit SQLite Bitwise Aggregates & Nested-Parenthesis Lowering**:
