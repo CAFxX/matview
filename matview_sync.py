@@ -803,6 +803,25 @@ _SIMPLE_IDENT_RE = re.compile(
 )
 
 
+def _is_word_or_ident_token(tk: Any) -> bool:
+    if tk.token_type == SQLGlotTokenType.IDENTIFIER:
+        return True
+    if tk.token_type in (
+        SQLGlotTokenType.STRING,
+        SQLGlotTokenType.NUMBER,
+        SQLGlotTokenType.RAW_STRING,
+        SQLGlotTokenType.HEX_STRING,
+        SQLGlotTokenType.BYTE_STRING,
+        SQLGlotTokenType.BIT_STRING,
+        SQLGlotTokenType.NATIONAL_STRING,
+        SQLGlotTokenType.NATIONAL_RAW_STRING,
+        SQLGlotTokenType.UNICODE_STRING,
+        SQLGlotTokenType.HEREDOC_STRING,
+    ):
+        return False
+    return bool(tk.text and (tk.text[0].isalpha() or tk.text[0] == "_"))
+
+
 def _sqlglot_dialect(dialect: Dialect = Dialect.SQLITE) -> str:
     return {
         Dialect.SQLITE: "sqlite",
@@ -1075,8 +1094,41 @@ def _extract_set_op_branches_from_ast(
 ) -> Tuple[List[str], List[str]]:
     """
     Traverses a `sqlglot.exp.SetOperation` AST (`Union`, `Intersect`, `Except`) in order,
-    returning `(operators, branch_sqls)`.
+    returning `(operators, branch_sqls)`. When `raw_sql` is provided, slices the verbatim
+    branch substrings using `sqlglot.tokenize` so original function names and syntax are preserved.
     """
+    if raw_sql:
+        s = raw_sql.strip()
+        toks = sqlglot.tokenize(s, read="sqlite")
+        if toks:
+            ops_t: List[str] = []
+            branches_t: List[str] = []
+            depth = 0
+            last_start = 0
+            i = 0
+            n = len(toks)
+            while i < n:
+                tk = toks[i]
+                if tk.token_type == SQLGlotTokenType.L_PAREN:
+                    depth += 1
+                elif tk.token_type == SQLGlotTokenType.R_PAREN and depth > 0:
+                    depth -= 1
+                elif depth == 0:
+                    w = tk.text.upper()
+                    if w in ("UNION", "INTERSECT", "EXCEPT"):
+                        branches_t.append(s[last_start : tk.start].strip())
+                        if w == "UNION" and i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.ALL:
+                            ops_t.append("UNION ALL")
+                            last_start = toks[i + 1].end + 1
+                            i += 2
+                            continue
+                        ops_t.append(w)
+                        last_start = tk.end + 1
+                i += 1
+            if ops_t:
+                branches_t.append(s[last_start:].strip())
+                return ops_t, branches_t
+
     ops: List[str] = []
     branches: List[str] = []
 
@@ -1569,7 +1621,7 @@ def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
         return None
 
     toks = sqlglot.tokenize(s, read="sqlite")
-    if len(toks) < 3 or toks[0].token_type not in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR) or toks[1].token_type != SQLGlotTokenType.L_PAREN:
+    if len(toks) < 3 or not toks[0].text or not (toks[0].text[0].isalpha() or toks[0].text[0] == "_") or toks[1].token_type != SQLGlotTokenType.L_PAREN:
         return None
 
     depth = 0
@@ -1753,8 +1805,54 @@ def _parse_select_item(raw_item: str, idx: int) -> SelectItem:
     )
 
 
+def _extract_verbatim_cte_or_subquery_sql(raw_select_sql: str, has_cte: bool) -> Optional[str]:
+    """Slices the verbatim inner query of a single CTE (`WITH x AS (...)`) or `FROM (...)` subquery via `sqlglot.tokenize`."""
+    s = raw_select_sql.strip()
+    toks = sqlglot.tokenize(s, read="sqlite")
+    if not toks:
+        return None
+    if has_cte:
+        depth = 0
+        for i, tk in enumerate(toks):
+            if depth == 0 and tk.token_type == SQLGlotTokenType.L_PAREN and i > 0 and toks[i - 1].token_type == SQLGlotTokenType.ALIAS:
+                start_char = tk.end + 1
+                p_depth = 1
+                for j in range(i + 1, len(toks)):
+                    if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                        p_depth += 1
+                    elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                        p_depth -= 1
+                        if p_depth == 0:
+                            return s[start_char : toks[j].start].strip()
+            elif tk.token_type == SQLGlotTokenType.L_PAREN:
+                depth += 1
+            elif tk.token_type == SQLGlotTokenType.R_PAREN and depth > 0:
+                depth -= 1
+    else:
+        depth = 0
+        seen_from = False
+        for i, tk in enumerate(toks):
+            if depth == 0 and tk.token_type == SQLGlotTokenType.FROM:
+                seen_from = True
+            elif seen_from and depth == 0 and tk.token_type == SQLGlotTokenType.L_PAREN:
+                start_char = tk.end + 1
+                p_depth = 1
+                for j in range(i + 1, len(toks)):
+                    if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                        p_depth += 1
+                    elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                        p_depth -= 1
+                        if p_depth == 0:
+                            return s[start_char : toks[j].start].strip()
+            elif tk.token_type == SQLGlotTokenType.L_PAREN:
+                depth += 1
+            elif tk.token_type == SQLGlotTokenType.R_PAREN and depth > 0:
+                depth -= 1
+    return None
+
+
 def _extract_cte_names_and_strip_with(select_sql: str) -> Tuple[Set[str], str, bool]:
-    """Extracts CTE names and the main SELECT body from a query using `sqlglot.parse_one` AST."""
+    """Extracts CTE names and the main SELECT body from a query using `sqlglot.parse_one` AST and `sqlglot.tokenize`."""
     s = select_sql.strip()
     try:
         q_ast = parse_sql_ast(s)
@@ -1764,6 +1862,16 @@ def _extract_cte_names_and_strip_with(select_sql: str) -> Tuple[Set[str], str, b
     if not isinstance(with_node, sqlglot_exp.With):
         return set(), s, False
     cte_names = {cte.alias for cte in with_node.expressions if isinstance(cte, sqlglot_exp.CTE) and cte.alias}
+    toks = sqlglot.tokenize(s, read="sqlite")
+    depth = 0
+    for tk in toks:
+        if tk.token_type == SQLGlotTokenType.L_PAREN:
+            depth += 1
+        elif tk.token_type == SQLGlotTokenType.R_PAREN and depth > 0:
+            depth -= 1
+        elif depth == 0 and tk.token_type == SQLGlotTokenType.SELECT:
+            main_select = s[tk.start:].strip()
+            return cte_names, (main_select if main_select else s), True
     no_with = q_ast.copy()
     no_with.set("with_", None)
     no_with.set("with", None)
@@ -1936,7 +2044,7 @@ def _extract_all_referenced_tables(
     for idx, tk in enumerate(toks):
         if tk.token_type in (SQLGlotTokenType.FROM, SQLGlotTokenType.JOIN) and idx + 1 < len(toks):
             nxt = toks[idx + 1]
-            if nxt.token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR):
+            if _is_word_or_ident_token(nxt):
                 _add_candidate(nxt.text, was_quoted=(nxt.token_type == SQLGlotTokenType.IDENTIFIER))
 
     return found
@@ -2716,13 +2824,9 @@ class IncrementalViewCompiler:
             cte_alias_node = cte_node.args.get("alias")
             if isinstance(cte_alias_node, sqlglot_exp.TableAlias) and cte_alias_node.columns:
                 return v
-            inner_sql = cte_node.this.sql("sqlite").strip()
+            inner_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, True) or cte_node.this.sql("sqlite").strip()
             cte_or_sub_alias = cte_node.alias
-            no_with = q_ast.copy()
-            no_with.set("with_", None)
-            no_with.set("with", None)
-            no_with.args.pop("_raw_sql", None)
-            outer_sql = no_with.sql("sqlite").strip()
+            _, outer_sql, _ = _extract_cte_names_and_strip_with(v.raw_select_sql)
         elif v.has_subquery_in_from and len(v.joins) == 1:
             from_node = q_ast.args.get("from_") or q_ast.args.get("from")
             if not isinstance(from_node, sqlglot_exp.From) or not isinstance(from_node.this, sqlglot_exp.Subquery):
@@ -2730,7 +2834,7 @@ class IncrementalViewCompiler:
             sub_node = from_node.this
             if not isinstance(sub_node.this, sqlglot_exp.Expr):
                 return v
-            inner_sql = sub_node.this.sql("sqlite").strip()
+            inner_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, False) or sub_node.this.sql("sqlite").strip()
             cte_or_sub_alias = sub_node.alias or "__mv_sub"
             outer_sql = v.raw_select_sql
         else:
@@ -2811,10 +2915,10 @@ class IncrementalViewCompiler:
             while i < n:
                 tk = toks[i]
                 if (
-                    tk.token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR)
+                    _is_word_or_ident_token(tk)
                     and i + 2 < n
                     and toks[i + 1].token_type == SQLGlotTokenType.DOT
-                    and toks[i + 2].token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR)
+                    and _is_word_or_ident_token(toks[i + 2])
                 ):
                     tbl_u = tk.text.lower()
                     col_u = toks[i + 2].text.lower()
@@ -2826,11 +2930,11 @@ class IncrementalViewCompiler:
                         cursor = toks[i + 2].end + 1
                         i += 3
                         continue
-                if tk.token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR):
+                if _is_word_or_ident_token(tk):
                     is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
                     is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
                     is_fn = (
-                        tk.token_type == SQLGlotTokenType.VAR
+                        tk.token_type != SQLGlotTokenType.IDENTIFIER
                         and i + 1 < n
                         and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN
                     )
@@ -3275,7 +3379,7 @@ class IncrementalViewCompiler:
             if len(v.joins) != 1 or v.joins[0].table_name.lower() != cte_name.lower():
                 return False
             inner_union_ast = cte_node.this
-            inner_union_sql = inner_union_ast.sql("sqlite").strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None
+            inner_union_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, True) or (inner_union_ast.sql("sqlite").strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None)
             sub_alias = v.joins[0].alias or cte_name
         else:
             from_node = q_ast.args.get("from_") or q_ast.args.get("from")
@@ -3283,7 +3387,7 @@ class IncrementalViewCompiler:
                 return False
             sub_node = from_node.this
             inner_union_ast = sub_node.this
-            inner_union_sql = inner_union_ast.sql("sqlite").strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None
+            inner_union_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, False) or (inner_union_ast.sql("sqlite").strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None)
             if sub_node.alias:
                 sub_alias = sub_node.alias
 
@@ -3994,10 +4098,10 @@ class IncrementalViewCompiler:
         while i < n:
             tk = toks[i]
             if (
-                tk.token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR)
+                _is_word_or_ident_token(tk)
                 and i + 2 < n
                 and toks[i + 1].token_type == SQLGlotTokenType.DOT
-                and toks[i + 2].token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR)
+                and _is_word_or_ident_token(toks[i + 2])
             ):
                 q_unq = tk.text.lower()
                 c_unq = toks[i + 2].text.lower()
@@ -4012,11 +4116,11 @@ class IncrementalViewCompiler:
                     cursor = toks[i + 2].end + 1
                     i += 3
                     continue
-            if tk.token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR):
+            if _is_word_or_ident_token(tk):
                 is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
                 is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
                 is_fn_call = (
-                    tk.token_type == SQLGlotTokenType.VAR
+                    tk.token_type != SQLGlotTokenType.IDENTIFIER
                     and i + 1 < n
                     and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN
                 )
@@ -4302,21 +4406,47 @@ class IncrementalViewCompiler:
             if not isinstance(sel_node, sqlglot_exp.Select):
                 inc_stmts.append(pop_sql)
                 continue
-            select_body = sel_node.sql(sg_dial).strip()
+
+            pop_toks = sqlglot.tokenize(clean_pop, read=sg_dial)
+            sel_tok_pos: Optional[int] = None
+            p_depth = 0
+            for ptk in pop_toks:
+                if ptk.token_type == SQLGlotTokenType.L_PAREN:
+                    p_depth += 1
+                elif ptk.token_type == SQLGlotTokenType.R_PAREN and p_depth > 0:
+                    p_depth -= 1
+                elif p_depth == 0 and ptk.token_type in (SQLGlotTokenType.SELECT, getattr(SQLGlotTokenType, "WITH", SQLGlotTokenType.SELECT)):
+                    sel_tok_pos = ptk.start
+                    break
+            select_body = clean_pop[sel_tok_pos:].strip() if sel_tok_pos is not None else sel_node.sql(sg_dial).strip()
 
             aliased_inner = select_body
-            if not sel_node.args.get("distinct") and not (sel_node.args.get("with_") or sel_node.args.get("with")) and (sel_node.args.get("from_") or sel_node.args.get("from")) is not None:
-                if len(sel_node.expressions) == len(cols):
-                    aliased_list = []
-                    for c_name, proj_node in zip(cols, sel_node.expressions):
-                        if isinstance(proj_node, sqlglot_exp.Alias) and proj_node.alias.lower() == _unquote_ident(c_name).lower():
-                            aliased_list.append(proj_node.sql(sg_dial))
-                        else:
-                            aliased_list.append(f"{proj_node.sql(sg_dial)} AS {c_name}")
-                    aliased_copy = sel_node.copy()
-                    aliased_copy.args.pop("_raw_sql", None)
-                    aliased_copy.set("expressions", [sqlglot.parse_one(f"SELECT {ae}", read=sg_dial).expressions[0] for ae in aliased_list])
-                    aliased_inner = aliased_copy.sql(sg_dial)
+            sb_toks = sqlglot.tokenize(select_body, read=sg_dial)
+            if (
+                sb_toks
+                and sb_toks[0].token_type == SQLGlotTokenType.SELECT
+                and not sel_node.args.get("distinct")
+                and not (sel_node.args.get("with_") or sel_node.args.get("with"))
+                and (sel_node.args.get("from_") or sel_node.args.get("from")) is not None
+            ):
+                from_tok_sb = _find_top_level_token(select_body, (SQLGlotTokenType.FROM,), dialect=self.dialect)
+                if from_tok_sb is not None:
+                    proj_slice = select_body[sb_toks[0].end + 1 : from_tok_sb.start].strip()
+                    from_and_rest = select_body[from_tok_sb.start :].strip()
+                    raw_projs = [p.strip() for p in _split_top_level(proj_slice, ",") if p.strip()]
+                    if len(raw_projs) == len(cols):
+                        aliased_list = []
+                        for c_name, r_proj in zip(cols, raw_projs):
+                            rp_toks = sqlglot.tokenize(r_proj, read=sg_dial)
+                            if (
+                                len(rp_toks) >= 2
+                                and rp_toks[-2].token_type == SQLGlotTokenType.ALIAS
+                                and _unquote_ident(rp_toks[-1].text).lower() == _unquote_ident(c_name).lower()
+                            ):
+                                aliased_list.append(r_proj)
+                            else:
+                                aliased_list.append(f"{r_proj} AS {c_name}")
+                        aliased_inner = f"SELECT {', '.join(aliased_list)}\n{from_and_rest}"
 
             is_aux_dist = "__val" in cols and "__ref_cnt" in cols
             tbl_pks = (
@@ -6659,10 +6789,10 @@ class IncrementalViewCompiler:
         while i < n:
             tk = toks[i]
             if (
-                tk.token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR)
+                _is_word_or_ident_token(tk)
                 and i + 2 < n
                 and toks[i + 1].token_type == SQLGlotTokenType.DOT
-                and toks[i + 2].token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR)
+                and _is_word_or_ident_token(toks[i + 2])
             ):
                 q_low = tk.text.lower()
                 c_unq = toks[i + 2].text
@@ -6680,11 +6810,11 @@ class IncrementalViewCompiler:
                     cursor = toks[i + 2].end + 1
                     i += 3
                     continue
-            if tk.token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR):
+            if _is_word_or_ident_token(tk):
                 is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
                 is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
                 is_fn_call = (
-                    tk.token_type == SQLGlotTokenType.VAR
+                    tk.token_type != SQLGlotTokenType.IDENTIFIER
                     and i + 1 < n
                     and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN
                 )
@@ -8385,10 +8515,10 @@ class IncrementalViewCompiler:
                     while i < n:
                         tk = toks[i]
                         if (
-                            tk.token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR)
+                            _is_word_or_ident_token(tk)
                             and i + 2 < n
                             and toks[i + 1].token_type == SQLGlotTokenType.DOT
-                            and toks[i + 2].token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR)
+                            and _is_word_or_ident_token(toks[i + 2])
                         ):
                             if tk.text.lower() == u_alias.lower():
                                 c_col = toks[i + 2].text.lower()
@@ -8398,11 +8528,11 @@ class IncrementalViewCompiler:
                                 cursor = toks[i + 2].end + 1
                                 i += 3
                                 continue
-                        if tk.token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR):
+                        if _is_word_or_ident_token(tk):
                             is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
                             is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
                             is_fn = (
-                                tk.token_type == SQLGlotTokenType.VAR
+                                tk.token_type != SQLGlotTokenType.IDENTIFIER
                                 and i + 1 < n
                                 and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN
                             )
@@ -8698,10 +8828,10 @@ class IncrementalViewCompiler:
             while i < n:
                 tk = toks[i]
                 if (
-                    tk.token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR)
+                    _is_word_or_ident_token(tk)
                     and i + 2 < n
                     and toks[i + 1].token_type == SQLGlotTokenType.DOT
-                    and toks[i + 2].token_type in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR)
+                    and _is_word_or_ident_token(toks[i + 2])
                 ):
                     tbl_low = tk.text.lower()
                     if tbl_low in alias_remap:
