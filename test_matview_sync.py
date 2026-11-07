@@ -2200,8 +2200,36 @@ class MVTestRunner:
                 for s in seed_sqls:
                     cur.execute(s)
                 plans_and_selects: List[Tuple[MaterializedViewPlan, str]] = []
+                running_schema_sql = eff_schema
+                gt_view_sql_map: Dict[str, str] = {}
+
+                def _expand_ground_truth_views(sql_s: str) -> str:
+                    if not gt_view_sql_map:
+                        return sql_s
+                    out_s = sql_s
+                    for v_key, v_gt_sql in sorted(gt_view_sql_map.items(), key=lambda x: len(x[0]), reverse=True):
+                        def _repl_fj(m_fj: re.Match[str], vk: str = v_key, vgt: str = v_gt_sql) -> str:
+                            kw = m_fj.group(1)
+                            al = m_fj.group(2)
+                            if al and al.upper() in {
+                                "WHERE", "GROUP", "ORDER", "LIMIT", "INNER", "LEFT", "RIGHT",
+                                "FULL", "CROSS", "JOIN", "ON", "UNION", "EXCEPT", "INTERSECT", "HAVING",
+                            }:
+                                return f"{kw} ({vgt}) AS {vk} {al}"
+                            eff_al = al or vk
+                            return f"{kw} ({vgt}) AS {eff_al}"
+
+                        out_s = re.sub(
+                            rf"\b(FROM|JOIN)\s+{re.escape(v_key)}(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?\b",
+                            _repl_fj,
+                            out_s,
+                            flags=re.IGNORECASE,
+                        )
+                    return out_s
+
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", EngineLimitationWarning)
+                    chunk_plans: List[MaterializedViewPlan] = []
                     for v_idx, (v_name, v_ddl) in enumerate(chunk):
                         eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, eff_dialect)
                         schema_source: Any = conn if (v_idx % 2 == 1) else eff_schema
@@ -2213,13 +2241,18 @@ class MVTestRunner:
                             incremental_backfill=incremental_backfill,
                             batch_size=batch_size,
                             ignore_limitations=True,
+                            upstream_plans=None if (v_idx % 2 == 1) else chunk_plans,
                         )
+                        chunk_plans.append(plan)
                         for stmt in plan.all_statements():
                             cur.execute(stmt)
                         v_spec = parse_view_definition(eff_v_ddl)
-                        live_sel = _rewrite_live_reference_select_for_dialect(
+                        raw_live_sel = _rewrite_live_reference_select_for_dialect(
                             v_spec.raw_select_sql, eff_dialect
                         )
+                        live_sel = _expand_ground_truth_views(raw_live_sel)
+                        gt_view_sql_map[plan.logical_view_name] = live_sel
+                        gt_view_sql_map[plan.view_name] = live_sel
                         plans_and_selects.append((plan, live_sel))
                         self.total_views += 1
                         _verify_external_db_mv(
@@ -4346,6 +4379,201 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         ])
         self.assertEqual(rc_maria, 0)
 
+    def test_13_cascading_materialized_views_dag_and_lifecycle(self) -> None:
+        """
+        Verifies cascading materialized views (MVs referencing other MVs):
+          1. Topological sorting of out-of-order multi-view scripts (`v3` -> `v2` -> `v1`).
+          2. Cycle detection for self-referencing (`v1 -> v1`) and multi-view cycles (`v1 -> v2 -> v1`).
+          3. Tier 1 ALGEBRAIC_DELTA compilation across 3-hop chains & diamond DAGs (`base -> (v1, v2) -> v3`).
+          4. Sequential `mgr.register_view(v1)` followed by `mgr.register_view(v2)` and `mgr.register_view(v3)`.
+          5. `mgr.sync_views` propagating upstream view updates to dependent downstream views.
+          6. `mgr.bulk_changes` and `mgr.repair_view` cascading to dependent downstream views in topological order.
+          7. `mgr.check_schema_drift` and `mgr.drop_view(cascade=True)` across cascading MV DAGs.
+        """
+        schema = """
+        CREATE TABLE depts (
+            id INTEGER PRIMARY KEY,
+            region TEXT NOT NULL
+        );
+        CREATE TABLE emp (
+            id INTEGER PRIMARY KEY,
+            dept_id INTEGER NOT NULL,
+            sal REAL NOT NULL,
+            bonus REAL,
+            active INTEGER NOT NULL
+        );
+        """
+
+        # 1. Cycle detection: self-reference and 2-view cycle must raise ValueError
+        with self.assertRaises(ValueError) as ctx_self:
+            parse_view_definitions("CREATE VIEW v_self AS SELECT * FROM v_self;")
+        self.assertIn("Circular view dependency", str(ctx_self.exception))
+
+        with self.assertRaises(ValueError) as ctx_cycle:
+            parse_view_definitions(
+                "CREATE VIEW v_a AS SELECT * FROM v_b; "
+                "CREATE VIEW v_b AS SELECT * FROM v_c; "
+                "CREATE VIEW v_c AS SELECT * FROM v_a;"
+            )
+        self.assertIn("Circular view dependency", str(ctx_cycle.exception))
+
+        # 2. Out-of-order 3-hop + diamond DAG compilation
+        out_of_order_views = """
+        CREATE VIEW v4_diamond AS
+        SELECT r.region, SUM(r.reg_double_net) AS sum_double_net, SUM(g.total_active_depts) AS sum_active_depts
+        FROM v3_region_rollup r
+        INNER JOIN v2_global_depts g ON r.active_depts <= g.total_active_depts
+        GROUP BY r.region;
+
+        CREATE VIEW v3_region_rollup AS
+        SELECT d.region, SUM(v2.double_net) AS reg_double_net, COUNT(*) AS active_depts
+        FROM depts d
+        INNER JOIN v2_high_depts v2 ON d.id = v2.dept_id
+        GROUP BY d.region;
+
+        CREATE VIEW v2_global_depts AS
+        SELECT COUNT(*) AS total_active_depts, SUM(net_comp) AS global_net
+        FROM v1_dept_comp;
+
+        CREATE VIEW v2_high_depts AS
+        SELECT dept_id, net_comp * 2.0 AS double_net, emp_cnt
+        FROM v1_dept_comp
+        WHERE net_comp >= 50.0;
+
+        CREATE VIEW v1_dept_comp AS
+        SELECT dept_id,
+               COALESCE(SUM(sal), 0.0) + COALESCE(SUM(bonus), 0.0) AS net_comp,
+               COUNT(*) AS emp_cnt
+        FROM emp
+        WHERE active = 1
+        GROUP BY dept_id
+        HAVING COUNT(*) >= 1;
+        """
+        plans = generate_materialized_views(schema, out_of_order_views, dialect=Dialect.SQLITE, strict=True)
+        self.assertEqual(
+            [p.logical_view_name for p in plans],
+            ["v1_dept_comp", "v2_global_depts", "v2_high_depts", "v3_region_rollup", "v4_diamond"],
+        )
+        for p in plans:
+            self.assertEqual(p.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+        self.assertEqual(plans[0].upstream_views, [])
+        self.assertEqual(plans[1].upstream_views, ["v1_dept_comp"])
+        self.assertEqual(plans[2].upstream_views, ["v1_dept_comp"])
+        self.assertEqual(plans[3].upstream_views, ["v1_dept_comp", "v2_high_depts"])
+        self.assertEqual(plans[4].upstream_views, ["v1_dept_comp", "v2_high_depts", "v3_region_rollup", "v2_global_depts"])
+
+        # Verify drop_statements on bundle drops in reverse topological order (v4 -> v3 -> v2 -> v1)
+        bundle_plan = generate_materialized_view(schema, out_of_order_views, dialect=Dialect.SQLITE)
+        drop_sql = "\n".join(bundle_plan.drop_statements())
+        self.assertLess(drop_sql.index("__matview_v4_diamond"), drop_sql.index("__matview_v3_region_rollup"))
+        self.assertLess(drop_sql.index("__matview_v3_region_rollup"), drop_sql.index("__matview_v2_high_depts"))
+        self.assertLess(drop_sql.index("__matview_v2_high_depts"), drop_sql.index("__matview_v1_dept_comp"))
+
+        # 3. Sequential registration & live execution via MaterializedViewManager
+        conn = sqlite3.connect(":memory:")
+        mgr = MaterializedViewManager(conn)
+        mgr.apply_schema_ddl(schema, auto_sync_views=False)
+        conn.execute("INSERT INTO depts VALUES (1, 'NA'), (2, 'NA'), (3, 'EU');")
+        conn.execute(
+            "INSERT INTO emp VALUES "
+            "(10, 1, 40.0, 20.0, 1), "
+            "(11, 1, 30.0, NULL, 1), "
+            "(12, 2, 25.0, 5.0, 1), "
+            "(13, 3, 100.0, 10.0, 1);"
+        )
+
+        # Register one by one sequentially
+        v1_sql = (
+            "CREATE VIEW v1_dept_comp AS "
+            "SELECT dept_id, COALESCE(SUM(sal), 0.0) + COALESCE(SUM(bonus), 0.0) AS net_comp, COUNT(*) AS emp_cnt "
+            "FROM emp WHERE active = 1 GROUP BY dept_id HAVING COUNT(*) >= 1;"
+        )
+        v2_sql = (
+            "CREATE VIEW v2_high_depts AS "
+            "SELECT dept_id, net_comp * 2.0 AS double_net, emp_cnt "
+            "FROM v1_dept_comp WHERE net_comp >= 50.0;"
+        )
+        v3_sql = (
+            "CREATE VIEW v3_region_rollup AS "
+            "SELECT d.region, SUM(v2.double_net) AS reg_double_net, COUNT(*) AS active_depts "
+            "FROM depts d INNER JOIN v2_high_depts v2 ON d.id = v2.dept_id GROUP BY d.region;"
+        )
+        mgr.register_view(v1_sql)
+        mgr.register_view(v2_sql)
+        mgr.register_view(v3_sql)
+
+        self.assertEqual(
+            conn.execute("SELECT * FROM __matview_v3_region_rollup ORDER BY region").fetchall(),
+            [("EU", 220.0, 1), ("NA", 180.0, 1)],
+        )
+
+        # Test bulk_changes(["v1_dept_comp"]) cascading to v2_high_depts and v3_region_rollup!
+        with mgr.bulk_changes(["v1_dept_comp"]):
+            conn.execute("UPDATE emp SET sal = 60.0 WHERE id = 12;")
+            conn.execute("UPDATE emp SET active = 0 WHERE id = 13;")
+
+        self.assertEqual(
+            conn.execute("SELECT * FROM __matview_v1_dept_comp ORDER BY dept_id").fetchall(),
+            [(1, 90.0, 2), (2, 65.0, 1)],
+        )
+        self.assertEqual(
+            conn.execute("SELECT * FROM __matview_v2_high_depts ORDER BY dept_id").fetchall(),
+            [(1, 180.0, 2), (2, 130.0, 1)],
+        )
+        self.assertEqual(
+            conn.execute("SELECT * FROM __matview_v3_region_rollup ORDER BY region").fetchall(),
+            [("NA", 310.0, 2)],
+        )
+
+        # Test repair_view("v1_dept_comp") cascading to v2_high_depts and v3_region_rollup
+        rep = mgr.repair_view("v1_dept_comp")
+        self.assertEqual(
+            rep,
+            {
+                "__matview_v1_dept_comp": "repaired",
+                "__matview_v2_high_depts": "repaired",
+                "__matview_v3_region_rollup": "repaired",
+            },
+        )
+        self.assertEqual(
+            conn.execute("SELECT * FROM __matview_v3_region_rollup ORDER BY region").fetchall(),
+            [("NA", 310.0, 2)],
+        )
+
+        # Test sync_views when v1_dept_comp changes definition -> v1, v2, and v3 all update!
+        v1_sql_updated = (
+            "CREATE VIEW v1_dept_comp AS "
+            "SELECT dept_id, COALESCE(SUM(sal), 0.0) + COALESCE(SUM(bonus), 0.0) AS net_comp, COUNT(*) AS emp_cnt "
+            "FROM emp WHERE active = 1 GROUP BY dept_id HAVING SUM(sal) >= 65.0;"
+        )
+        sync_status = mgr.sync_views([v3_sql, v2_sql, v1_sql_updated])
+        self.assertEqual(
+            sync_status,
+            {
+                "__matview_v1_dept_comp": "updated",
+                "__matview_v2_high_depts": "updated",
+                "__matview_v3_region_rollup": "updated",
+            },
+        )
+        # Only dept 1 has SUM(sal) = 70.0 >= 65.0 (dept 2 has SUM(sal) = 60.0 < 65.0)
+        self.assertEqual(
+            conn.execute("SELECT * FROM __matview_v3_region_rollup ORDER BY region").fetchall(),
+            [("NA", 180.0, 1)],
+        )
+
+        # Test check_schema_drift() and drop_view(..., cascade=True)
+        self.assertEqual(
+            mgr.check_schema_drift(),
+            {
+                "__matview_v1_dept_comp": "ok",
+                "__matview_v2_high_depts": "ok",
+                "__matview_v3_region_rollup": "ok",
+            },
+        )
+        mgr.drop_view("v1_dept_comp", cascade=True)
+        self.assertEqual(mgr.get_catalog(), {})
+        conn.close()
+
 
 import random
 
@@ -4495,16 +4723,20 @@ class DifferentialSQLFuzzer:
         seen_sqls = set()
         v_idx_holder = [0]
 
-        def add_v(tag: str, select_sql: str) -> None:
-            if len(views) >= views_count:
-                return
-            norm_s = select_sql.strip().lower()
-            if norm_s in seen_sqls:
-                return
-            seen_sqls.add(norm_s)
+        tag_to_vn: Dict[str, str] = {}
+
+        def add_v(tag: str, select_sql: str) -> str:
             v_idx_holder[0] += 1
             vn = f"{p}_v{v_idx_holder[0]:03d}_{tag}"
+            tag_to_vn[tag] = vn
+            if len(views) >= views_count:
+                return vn
+            norm_s = select_sql.strip().lower()
+            if norm_s in seen_sqls:
+                return vn
+            seen_sqls.add(norm_s)
             views.append((vn, f"CREATE VIEW {vn} AS {select_sql};"))
+            return vn
 
         w_filters = [
             "",
@@ -4685,6 +4917,37 @@ class DifferentialSQLFuzzer:
         add_v("window_rank_2", f"SELECT id, pname, tier, quota, DENSE_RANK() OVER (PARTITION BY tier ORDER BY quota DESC, id ASC) AS drk, LEAD(quota, 1, -1) OVER (PARTITION BY tier ORDER BY id ASC) AS next_q FROM {t_dim}")
         add_v("topn_limit_1", f"SELECT id, grp_str, weight_cnt, val_int FROM {t_fact} WHERE flag = 1 ORDER BY weight_cnt DESC, id ASC LIMIT 5 OFFSET 1")
         add_v("topn_limit_2", f"SELECT id, pname, quota, score FROM {t_dim} ORDER BY quota DESC, id ASC LIMIT 4 OFFSET 0")
+
+        # Family 8: Cascading Materialized Views & Multi-Hop DAGs (6 views)
+        vn_comp1 = tag_to_vn["alg_compound_1"]
+        vn_comp2 = tag_to_vn["alg_compound_2"]
+        vn_dim_tier = tag_to_vn["alg_dim_tier"]
+        vn_union_dedup = tag_to_vn["set_union_dedup"]
+        vn_except = tag_to_vn["set_except"]
+        vn_casc_rollup = add_v(
+            "cascade_grp_rollup",
+            f"SELECT grp_str, COUNT(*) AS flag_buckets, SUM(comb_w) AS total_comb_w, SUM(null_vi_cnt) AS total_nulls, MIN(comb_w) AS min_cw, MAX(comb_w) AS max_cw FROM {vn_comp2} GROUP BY grp_str",
+        )
+        add_v(
+            "cascade_global_compound",
+            f"SELECT COUNT(*) AS grp_cnt, SUM(cnt) AS total_rows, SUM(net_v) AS total_net_v, AVG(span_w) AS avg_span, MIN(net_v) AS min_nv, MAX(net_v) AS max_nv FROM {vn_comp1} WHERE cnt >= 1",
+        )
+        add_v(
+            "cascade_join_dim_mv",
+            f"SELECT d.root_id, COUNT(*) AS cnt, SUM(v.sq) AS total_tier_sq, MIN(v.mnq) AS min_tier_q, MAX(v.mxq) AS max_tier_q FROM {t_dim} d INNER JOIN {vn_dim_tier} v ON d.tier = v.tier GROUP BY d.root_id",
+        )
+        add_v(
+            "cascade_left_join_mv",
+            f"SELECT p.pname, COUNT(e.ref_key) AS unmatched_flag, COALESCE(SUM(p.quota), 0) AS q_sum FROM {t_dim} p LEFT JOIN {vn_except} e ON p.id = e.ref_key GROUP BY p.pname",
+        )
+        add_v(
+            "cascade_3hop_diamond",
+            f"SELECT u.code_lbl, SUM(c.total_comb_w) AS grand_w, COUNT(*) AS match_cnt FROM {vn_union_dedup} u INNER JOIN {vn_casc_rollup} c ON u.code_lbl = c.grp_str GROUP BY u.code_lbl",
+        )
+        add_v(
+            "cascade_subq_in_mv",
+            f"SELECT id, grp_str, weight_cnt FROM {t_fact} WHERE parent_id IN (SELECT ref_key FROM {vn_except})",
+        )
 
         views = views[:views_count]
 
@@ -4923,7 +5186,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
         seeds = det_seeds + rand_seeds
 
     num_scenarios = max(1, int(os.environ.get("MATVIEW_FUZZ_SCENARIOS", str(2 if scale == 1 else min(4, 1 + scale)))))
-    views_count = int(os.environ.get("MATVIEW_FUZZ_VIEWS_PER_SCHEMA", str(60 if scale == 1 else min(80, 50 + scale * 10))))
+    views_count = int(os.environ.get("MATVIEW_FUZZ_VIEWS_PER_SCHEMA", str(90 if scale == 1 else min(100, 80 + scale * 10))))
     mutations_count = int(os.environ.get("MATVIEW_FUZZ_MUTATIONS", str(45 if scale == 1 else min(80, 40 + scale * 10))))
 
     print(
@@ -5286,6 +5549,185 @@ def run_suite_13_fuzz_regression_corpus(runner: MVTestRunner) -> None:
             )
 
 
+
+
+# ==============================================================================
+# SUITE 14: Cascading Materialized Views & Multi-Hop DAGs Across All Dialects
+# ==============================================================================
+def run_suite_14_cascading_materialized_views_and_dags(runner: MVTestRunner) -> None:
+    """
+    Suite 14: Exhaustively tests 2-hop, 3-hop, and diamond cascading materialized views
+    (views referencing other views across single-table aggs, HAVING, compound aggs,
+    DISTINCT, projections, UNION ALL/UNION/INTERSECT/EXCEPT, INNER JOIN, LEFT JOIN,
+    EXISTS/NOT IN subqueries, UNION ALL CTE aggs, and window functions) across
+    SQLite, PostgreSQL (row-level & transition tables), and MySQL/MariaDB.
+    """
+    schema = """
+    CREATE TABLE regions (
+        id INTEGER PRIMARY KEY,
+        r_code TEXT NOT NULL,
+        tax_rate INTEGER NOT NULL
+    );
+    CREATE TABLE merchants (
+        id INTEGER PRIMARY KEY,
+        region_id INTEGER,
+        m_name TEXT NOT NULL,
+        tier TEXT,
+        quota INTEGER NOT NULL
+    );
+    CREATE TABLE invoices (
+        id INTEGER PRIMARY KEY,
+        merchant_id INTEGER,
+        category TEXT,
+        amount REAL,
+        qty INTEGER NOT NULL,
+        discount REAL,
+        settled INTEGER NOT NULL
+    );
+    """
+
+    views = [
+        # Hop 1: Base Materialized Views
+        (
+            "cmv_h1_merch_agg",
+            "CREATE VIEW cmv_h1_merch_agg AS SELECT merchant_id, COUNT(*) AS inv_cnt, SUM(amount) AS sum_amt, SUM(qty) AS sum_qty, MIN(qty) AS min_qty, MAX(qty) AS max_qty, COALESCE(SUM(amount * qty), 0.0) - COALESCE(SUM(discount), 0.0) AS net_rev FROM invoices WHERE settled = 1 GROUP BY merchant_id;",
+        ),
+        (
+            "cmv_h1_cat_having",
+            "CREATE VIEW cmv_h1_cat_having AS SELECT category, COUNT(*) AS cat_cnt, SUM(qty) AS cat_qty, SUM(amount) AS cat_amt FROM invoices WHERE category IS NOT NULL GROUP BY category HAVING SUM(qty) >= 3;",
+        ),
+        (
+            "cmv_h1_settled_proj",
+            "CREATE VIEW cmv_h1_settled_proj AS SELECT id, merchant_id, category, qty * 10 AS scaled_qty, settled FROM invoices WHERE settled = 1 AND qty >= 2;",
+        ),
+        (
+            "cmv_h1_distinct_cat",
+            "CREATE VIEW cmv_h1_distinct_cat AS SELECT DISTINCT merchant_id, category FROM invoices WHERE category IS NOT NULL;",
+        ),
+        (
+            "cmv_h1_union_tiers",
+            "CREATE VIEW cmv_h1_union_tiers AS SELECT category AS label FROM invoices WHERE category IS NOT NULL UNION SELECT tier AS label FROM merchants WHERE tier IS NOT NULL;",
+        ),
+        (
+            "cmv_h1_except_merch",
+            "CREATE VIEW cmv_h1_except_merch AS SELECT id AS m_id FROM merchants EXCEPT SELECT merchant_id AS m_id FROM invoices WHERE settled = 1 AND merchant_id IS NOT NULL;",
+        ),
+        (
+            "cmv_h1_intersect_merch",
+            "CREATE VIEW cmv_h1_intersect_merch AS SELECT id AS m_id FROM merchants WHERE quota >= 50 INTERSECT SELECT merchant_id AS m_id FROM invoices WHERE settled = 1 AND merchant_id IS NOT NULL;",
+        ),
+
+        # Hop 2: Downstream Views Referencing Hop 1 MVs
+        (
+            "cmv_h2_global_over_merch",
+            "CREATE VIEW cmv_h2_global_over_merch AS SELECT COUNT(*) AS active_merchants, SUM(inv_cnt) AS total_settled_inv, SUM(sum_qty) AS total_qty, SUM(net_rev) AS grand_net_rev, MIN(min_qty) AS global_min_qty, MAX(max_qty) AS global_max_qty FROM cmv_h1_merch_agg;",
+        ),
+        (
+            "cmv_h2_high_rev_proj",
+            "CREATE VIEW cmv_h2_high_rev_proj AS SELECT merchant_id, inv_cnt, sum_qty, net_rev FROM cmv_h1_merch_agg WHERE net_rev >= 100.0;",
+        ),
+        (
+            "cmv_h2_having_summary",
+            "CREATE VIEW cmv_h2_having_summary AS SELECT COUNT(*) AS hot_cats, SUM(cat_qty) AS hot_qty, MIN(cat_qty) AS min_hot_qty, MAX(cat_qty) AS max_hot_qty FROM cmv_h1_cat_having;",
+        ),
+        (
+            "cmv_h2_proj_agg",
+            "CREATE VIEW cmv_h2_proj_agg AS SELECT category, COUNT(*) AS cnt, SUM(scaled_qty) AS tot_scaled, MIN(scaled_qty) AS min_s, MAX(scaled_qty) AS max_s FROM cmv_h1_settled_proj GROUP BY category;",
+        ),
+        (
+            "cmv_h2_distinct_rollup",
+            "CREATE VIEW cmv_h2_distinct_rollup AS SELECT merchant_id, COUNT(*) AS distinct_cats FROM cmv_h1_distinct_cat GROUP BY merchant_id;",
+        ),
+        (
+            "cmv_h2_join_merch_h1",
+            "CREATE VIEW cmv_h2_join_merch_h1 AS SELECT m.region_id, m.tier, COUNT(*) AS merch_cnt, SUM(h1.sum_qty) AS reg_tier_qty, SUM(h1.net_rev) AS reg_tier_net, MIN(h1.min_qty) AS min_q, MAX(h1.max_qty) AS max_q FROM merchants m INNER JOIN cmv_h1_merch_agg h1 ON m.id = h1.merchant_id GROUP BY m.region_id, m.tier;",
+        ),
+        (
+            "cmv_h2_left_join_h1",
+            "CREATE VIEW cmv_h2_left_join_h1 AS SELECT m.m_name, m.tier, COUNT(h1.merchant_id) AS has_settled, COALESCE(SUM(h1.sum_qty), 0) AS settled_qty FROM merchants m LEFT JOIN cmv_h1_merch_agg h1 ON m.id = h1.merchant_id GROUP BY m.m_name, m.tier;",
+        ),
+        (
+            "cmv_h2_diamond_join_mvs",
+            "CREATE VIEW cmv_h2_diamond_join_mvs AS SELECT h1.merchant_id, h1.sum_qty, dr.distinct_cats FROM cmv_h1_merch_agg h1 INNER JOIN cmv_h2_distinct_rollup dr ON h1.merchant_id = dr.merchant_id;",
+        ),
+        (
+            "cmv_h2_setop_over_mvs",
+            "CREATE VIEW cmv_h2_setop_over_mvs AS SELECT m_id FROM cmv_h1_except_merch UNION ALL SELECT m_id FROM cmv_h1_intersect_merch;",
+        ),
+        (
+            "cmv_h2_cte_union_mvs",
+            "CREATE VIEW cmv_h2_cte_union_mvs AS WITH u AS (SELECT category AS k, cat_qty AS v FROM cmv_h1_cat_having UNION ALL SELECT category AS k, tot_scaled AS v FROM cmv_h2_proj_agg) SELECT k, COUNT(*) AS src_cnt, SUM(v) AS combined_v FROM u GROUP BY k;",
+        ),
+        (
+            "cmv_h2_subq_in_except",
+            "CREATE VIEW cmv_h2_subq_in_except AS SELECT id, m_name, quota FROM merchants WHERE id IN (SELECT m_id FROM cmv_h1_except_merch);",
+        ),
+        (
+            "cmv_h2_subq_not_in_intersect",
+            "CREATE VIEW cmv_h2_subq_not_in_intersect AS SELECT id, merchant_id, qty FROM invoices WHERE merchant_id NOT IN (SELECT m_id FROM cmv_h1_intersect_merch WHERE m_id IS NOT NULL);",
+        ),
+
+        # Hop 3: 3-Hop & Diamond Views Referencing Hop 2 MVs
+        (
+            "cmv_h3_region_rollup",
+            "CREATE VIEW cmv_h3_region_rollup AS SELECT r.r_code, COUNT(*) AS tier_groups, SUM(j.reg_tier_qty) AS total_reg_qty, SUM(j.reg_tier_net) AS total_reg_net, MIN(j.min_q) AS reg_min_q, MAX(j.max_q) AS reg_max_q FROM regions r INNER JOIN cmv_h2_join_merch_h1 j ON r.id = j.region_id GROUP BY r.r_code;",
+        ),
+        (
+            "cmv_h3_window_over_h2",
+            "CREATE VIEW cmv_h3_window_over_h2 AS SELECT merchant_id, net_rev, ROW_NUMBER() OVER (ORDER BY net_rev DESC, merchant_id ASC) AS rev_rank FROM cmv_h2_high_rev_proj;",
+        ),
+    ]
+
+    seed = [
+        "INSERT INTO regions VALUES (1, 'NA', 8), (2, 'EU', 20), (3, 'APAC', 10);",
+        "INSERT INTO merchants VALUES (10, 1, 'AlphaUS', 'gold', 80), (20, 1, 'BetaUS', 'silver', 40), (30, 2, 'GammaEU', 'gold', 120), (40, 3, 'DeltaAPAC', NULL, 60);",
+        "INSERT INTO invoices VALUES "
+        "(101, 10, 'hw', 50.0, 3, 5.0, 1), "
+        "(102, 10, 'sw', 80.0, 2, NULL, 1), "
+        "(103, 20, 'hw', 30.0, 1, 2.0, 1), "
+        "(104, 30, 'cloud', 200.0, 4, 20.0, 1), "
+        "(105, 30, NULL, 40.0, 2, 0.0, 0), "
+        "(106, NULL, 'sw', 60.0, 5, 10.0, 1);",
+    ]
+
+    mutations = [
+        ("ins_settled", "INSERT INTO invoices VALUES (107, 20, 'sw', 90.0, 4, 5.0, 1), (108, 40, 'ai', 150.0, 3, 0.0, 1);"),
+        ("upd_settle_flip", "UPDATE invoices SET settled = 1 - settled, qty = qty + 2 WHERE id IN (101, 105);"),
+        ("upd_merch_tier", "UPDATE merchants SET tier = 'vip', quota = 95 WHERE id = 20;"),
+        ("upd_merch_region", "UPDATE merchants SET region_id = 2 WHERE id = 40;"),
+        ("del_merch_30_invs", "DELETE FROM invoices WHERE merchant_id = 30;"),
+        ("reinsert_merch_30", "INSERT INTO invoices VALUES (109, 30, 'hw', 120.0, 5, 10.0, 1);"),
+        ("tx_begin", "BEGIN;"),
+        ("tx_sp1", "SAVEPOINT sp_cmv;"),
+        ("tx_wipe_invs", "DELETE FROM invoices;"),
+        ("tx_rb_sp1", "ROLLBACK TO SAVEPOINT sp_cmv;"),
+        ("tx_upd_qty", "UPDATE invoices SET qty = qty + 1, amount = amount + 15.0 WHERE settled = 1;"),
+        ("tx_commit", "COMMIT;"),
+    ]
+
+    for dialect in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+        runner.run_batch(
+            f"Suite 14a (Cascading MVs & 3-Hop DAGs - {dialect.value} std)",
+            schema,
+            views,
+            seed,
+            mutations,
+            dialect=dialect,
+            incremental_backfill=False,
+        )
+        runner.run_batch(
+            f"Suite 14b (Cascading MVs & 3-Hop DAGs - {dialect.value} inc/trans)",
+            schema,
+            views,
+            seed,
+            mutations,
+            dialect=dialect,
+            pg_use_transition_tables=(dialect == Dialect.POSTGRES),
+            incremental_backfill=True,
+            batch_size=2,
+        )
+
+
 def _run_all_tests() -> None:
     t0 = time.time()
     runner = MVTestRunner()
@@ -5343,6 +5785,7 @@ def _run_all_tests() -> None:
     run_suite_11_live_engine_50_view_battery_across_all_dialects(runner)
     run_suite_12_differential_random_fuzzer(runner)
     run_suite_13_fuzz_regression_corpus(runner)
+    run_suite_14_cascading_materialized_views_and_dags(runner)
 
     print("-" * 84)
     print(f"COMBINATORIAL & TRANSACTIONAL SUITES PASSED: {runner.total_views} views, {runner.total_assertions} live SQL assertions!")

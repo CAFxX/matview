@@ -12,6 +12,8 @@ This document tracks all feature goals, architectural improvements, and verified
   I would like all tests to be unified (taking care of using the right dialects) on top of the same shared testing infrastructure so that even when you're just running the sqlite tests in memory you exercise all the shared infrastructure used also when testing with other engines e.g. mysql/pg (`TranspiledConnectionAdapter` + `MVTestRunner`).
 - [x] **Autodetect or Accept Target Engine & Version (`--engine-version` / `detect_engine_version`)**:
   I would like the generator to autodetect (when connecting to the database) or accept as arg the engine and version, so that it can autoselect the correct and most efficient dialect/subdialect (`EngineSubdialect`, `EngineVersion`, `parse_engine_version`, `detect_engine_version`, and `--engine-version` across SQLite, PostgreSQL, MySQL, and MariaDB, including PostgreSQL 15+ `UNIQUE ... NULLS NOT DISTINCT` group indexes, PostgreSQL 10+ transition-table gating, MariaDB vs MySQL subdialect detection, and SQLite 3.24+ UPSERT / 3.25+ window-function version checks).
+- [x] **Cascading Materialized Views (MVs Referencing Other MVs)**:
+  I would like materialized view definitions to also be able to reference other materialized views, and their updates to still happen as efficiently as possible (building a topological dependency DAG over views with cycle detection, synthesizing `TableSchema`s for upstream `__matview_store_<v1>` backing tables with active-row visibility predicates `backing_visibility_where` and compound column expressions `reader_column_expr_map`, compiling downstream views into $O(1)$ Tier 1 `ALGEBRAIC_DELTA`, Tier 2 `GROUP_SCOPED_DELTA`, or Tier 3 `ATOMIC_QUERY_SYNC` plans with recursive trigger propagation, and cascading `register_view`, `sync_views`, `bulk_changes`, `repair_view`, `check_schema_drift`, and `drop_view` across multi-hop and diamond view DAGs).
 - [x] **Atomic Single-Transaction Registration & Initial Backfill**:
   Wrap backing/auxiliary table creation, trigger installation, single-shot initial backfill, and `__matview_catalog` registration in a single atomic transaction (with rollback on error) in `MaterializedViewManager._register_single_view_spec` to close the concurrency window between trigger creation and single-shot population.
 - [x] **Safe Batch-Size Substitution in `MaterializedViewPlan.get_populate_statements`**:
@@ -90,10 +92,8 @@ This document tracks all feature goals, architectural improvements, and verified
 - [ ] **Partition-Scoped (Tier 2) Maintenance for Window Functions**:
   Scope window function refreshes (`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`) to only the affected `PARTITION BY` key(s) rather than falling back to a full-table Tier 3 rebuild when a `PARTITION BY` clause is present.
 
-## P3 — Multi-View DAGs, Shared Computation, Async/Bulk MVs, Docs & NewSQL
+## P3 — Shared Computation, Async/Bulk MVs, Docs & NewSQL
 
-- [ ] **Cascading Materialized Views (MVs Referencing Other MVs)**:
-  I would like materialized view definitions to also be able to reference other materialized views, and their updates to still happen as efficiently as possible (building a dependency DAG over views and treating upstream `__matview_store_<v1>` backing tables as base tables for downstream views with recursive/cascading trigger propagation).
 - [ ] **Multi-View Trigger Consolidation & Shared Sub-Aggregation Deduplication**:
   I would like, when multiple views use the same base tables, to avoid redundant computations (e.g. in case two views both use the same aggregation over the same data):
   - Merge multiple triggers on the same `(base_table, event)` into a single consolidated trigger/function call per row mutation, and

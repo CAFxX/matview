@@ -482,6 +482,13 @@ class TableSchema:
     columns: Dict[str, ColumnDef]
     fk_cascade_actions: Tuple[str, ...] = ()
     has_on_conflict_replace: bool = False
+    exposed_columns: Optional[Tuple[str, ...]] = None
+
+    @property
+    def user_column_defs(self) -> List[ColumnDef]:
+        if self.exposed_columns is not None:
+            return [self.columns[c] for c in self.exposed_columns if c in self.columns]
+        return list(self.columns.values())
 
 
 @dataclass(frozen=True)
@@ -575,6 +582,10 @@ class MaterializedViewPlan:
     full_populate_sqls: List[str] = field(default_factory=list)
     incremental_populate_sqls: List[str] = field(default_factory=list)
     engine_version: Optional[EngineVersion] = None
+    backing_visibility_where: Optional[str] = None
+    reader_column_expr_map: Dict[str, str] = field(default_factory=dict)
+    upstream_views: List[str] = field(default_factory=list)
+    original_view_spec: Optional[ViewSpec] = None
 
     @property
     def subdialect(self) -> EngineSubdialect:
@@ -607,6 +618,16 @@ class MaterializedViewPlan:
         incremental_backfill: Optional[bool] = None,
         batch_size: Optional[int] = None,
     ) -> List[str]:
+        if self.sub_plans:
+            stmts: List[str] = []
+            for sp in self.sub_plans:
+                stmts.extend(
+                    sp.get_populate_statements(
+                        incremental_backfill=incremental_backfill,
+                        batch_size=batch_size,
+                    )
+                )
+            return stmts
         use_inc = self.incremental_backfill if incremental_backfill is None else incremental_backfill
         eff_batch = self.batch_size if batch_size is None else batch_size
         if use_inc and self.incremental_populate_sqls:
@@ -689,7 +710,7 @@ class MaterializedViewPlan:
         """Returns idempotent DROP statements for triggers, functions, view, and backing tables."""
         if self.sub_plans:
             stmts: List[str] = []
-            for sp in self.sub_plans:
+            for sp in reversed(self.sub_plans):
                 stmts.extend(sp.drop_statements())
             return stmts
         stmts = []
@@ -1000,7 +1021,7 @@ def _find_all_top_level_keywords(sql: str, keyword_regex: str) -> List[re.Match[
     return list(re.finditer(keyword_regex, masked_str, flags=re.IGNORECASE | re.DOTALL))
 
 
-def parse_table_schema(schema_sql: str) -> Dict[str, TableSchema]:
+def parse_table_schema(schema_sql: str, include_internal: bool = False) -> Dict[str, TableSchema]:
     """Parses one or more CREATE TABLE statements into TableSchema objects."""
     clean = _strip_sql_comments(schema_sql)
     pattern = re.compile(
@@ -1013,7 +1034,7 @@ def parse_table_schema(schema_sql: str) -> Dict[str, TableSchema]:
         if not m:
             continue
         table_name = _unquote_ident(m.group(1))
-        if table_name.startswith(("__matview_", "__mv_")):
+        if not include_internal and table_name.startswith(("__matview_", "__mv_")):
             continue
         body = m.group(2)
         items = _split_top_level(body, ",")
@@ -1807,9 +1828,12 @@ def _extract_all_referenced_tables(
     ):
         cand = _unquote_ident(m.group(1))
         c_low = cand.lower()
-        if c_low in sql_reserved or c_low in cte_lower or c_low.startswith(("__matview_", "__mv_")):
+        is_known = bool(known_tables and c_low in known_tables)
+        if c_low in sql_reserved or c_low in cte_lower:
             continue
-        if known_tables is not None and known_tables and c_low not in known_tables:
+        if c_low in ("__mv_new_rows", "__mv_old_rows") or (c_low.startswith("__mv_") and not is_known):
+            continue
+        if known_tables is not None and known_tables and not is_known:
             continue
         if c_low not in seen_lower:
             seen_lower.add(c_low)
@@ -1828,13 +1852,15 @@ def _extract_all_referenced_tables(
                 if toks:
                     cand = _unquote_ident(toks[0])
                     c_low = cand.lower()
+                    is_known = bool(known_tables and c_low in known_tables)
                     if (
                         re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", cand)
                         and c_low not in sql_reserved
                         and c_low not in cte_lower
-                        and not c_low.startswith(("__matview_", "__mv_"))
+                        and c_low not in ("__mv_new_rows", "__mv_old_rows")
+                        and (not c_low.startswith("__mv_") or is_known)
                     ):
-                        if known_tables is None or not known_tables or c_low in known_tables:
+                        if known_tables is None or not known_tables or is_known:
                             if c_low not in seen_lower:
                                 seen_lower.add(c_low)
                                 found.append(cand)
@@ -2075,7 +2101,7 @@ def _parse_single_create_view_stmt(
         not has_subquery_in_from
         and joins
         and joins[0].table_name.lower() not in cte_lower
-        and not joins[0].table_name.startswith("__mv_")
+        and (not joins[0].table_name.startswith("__mv_") or (known_tables and joins[0].table_name.lower() in known_tables))
         and (not known_tables or joins[0].table_name.lower() in known_tables)
     ):
         primary_t = joins[0].table_name
@@ -2104,6 +2130,86 @@ def _parse_single_create_view_stmt(
     )
 
 
+def _sort_view_specs_topologically(
+    specs: Sequence[ViewSpec],
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+) -> List[ViewSpec]:
+    """
+    Topologically sorts `ViewSpec` definitions so upstream views are compiled,
+    created, and populated before downstream views that reference them.
+    Preserves original declaration order as a tie-breaker and raises `ValueError`
+    on self-references or circular view dependencies (`v1 -> v2 -> v1`).
+    """
+    n = len(specs)
+    if n == 0:
+        return []
+
+    name_to_idx: Dict[str, int] = {}
+    for idx, vs in enumerate(specs):
+        raw_v = _unquote_ident(vs.view_name).lower()
+        unpref_v = (
+            raw_v[len(object_prefix.lower()) :]
+            if object_prefix and raw_v.startswith(object_prefix.lower())
+            else (
+                raw_v[len(DEFAULT_OBJECT_PREFIX) :]
+                if raw_v.startswith(DEFAULT_OBJECT_PREFIX)
+                else raw_v
+            )
+        )
+        for alias_n in {
+            raw_v,
+            unpref_v,
+            f"{object_prefix.lower()}{unpref_v}" if object_prefix else unpref_v,
+            f"{DEFAULT_OBJECT_PREFIX}{unpref_v}",
+        }:
+            if alias_n and alias_n not in name_to_idx:
+                name_to_idx[alias_n] = idx
+
+    adj: Dict[int, List[int]] = {i: [] for i in range(n)}
+    in_degree: Dict[int, int] = {i: 0 for i in range(n)}
+
+    for idx, vs in enumerate(specs):
+        cte_names, _, _ = _extract_cte_names_and_strip_with(vs.raw_select_sql)
+        all_refs = _extract_all_referenced_tables(vs.raw_select_sql, cte_names, known_tables=None)
+        seen_deps: Set[int] = set()
+        for ref_t in all_refs:
+            r_low = _unquote_ident(ref_t).lower()
+            dep_idx = name_to_idx.get(r_low)
+            if dep_idx is None and r_low.startswith(DEFAULT_OBJECT_PREFIX):
+                dep_idx = name_to_idx.get(r_low[len(DEFAULT_OBJECT_PREFIX) :])
+            if dep_idx is not None:
+                if dep_idx == idx:
+                    raise ValueError(
+                        f"Circular view dependency detected: view {vs.view_name!r} references itself."
+                    )
+                if dep_idx not in seen_deps:
+                    seen_deps.add(dep_idx)
+                    adj[dep_idx].append(idx)
+                    in_degree[idx] += 1
+
+    if all(deg == 0 for deg in in_degree.values()):
+        return list(specs)
+
+    ready = [i for i in range(n) if in_degree[i] == 0]
+    sorted_indices: List[int] = []
+    while ready:
+        ready.sort()
+        curr = ready.pop(0)
+        sorted_indices.append(curr)
+        for nxt in adj[curr]:
+            in_degree[nxt] -= 1
+            if in_degree[nxt] == 0:
+                ready.append(nxt)
+
+    if len(sorted_indices) < n:
+        cycle_views = [specs[i].view_name for i in range(n) if in_degree[i] > 0]
+        raise ValueError(
+            f"Circular view dependency detected among views: {', '.join(cycle_views)}"
+        )
+
+    return [specs[i] for i in sorted_indices]
+
+
 def parse_view_definitions(
     view_sql_or_list: Sequence[ViewSpec | str] | ViewSpec | str,
     known_tables: Optional[Set[str]] = None,
@@ -2111,13 +2217,37 @@ def parse_view_definitions(
 ) -> List[ViewSpec]:
     """
     Parses one or more CREATE VIEW statements (and optional inline `CREATE [UNIQUE] INDEX`
-    statements or programmatic `indexes`) into a list of `ViewSpec` objects.
+    statements or programmatic `indexes`) into a topologically sorted list of `ViewSpec` objects.
     """
     raw_inputs: List[ViewSpec | str]
     if isinstance(view_sql_or_list, (str, ViewSpec)):
         raw_inputs = [view_sql_or_list]
     else:
         raw_inputs = list(view_sql_or_list)
+
+    # First pass: collect declared view names so downstream views in the same script
+    # recognize upstream view names even when `known_tables` only lists base tables.
+    script_view_names: Set[str] = set()
+    for item in raw_inputs:
+        if isinstance(item, ViewSpec):
+            for v_obj in (item, *item.additional_views):
+                vn_low = v_obj.view_name.lower()
+                vn_unp = vn_low[len(DEFAULT_OBJECT_PREFIX) :] if vn_low.startswith(DEFAULT_OBJECT_PREFIX) else vn_low
+                script_view_names.update({vn_low, vn_unp, f"{DEFAULT_OBJECT_PREFIX}{vn_unp}"})
+        else:
+            clean_s = _strip_sql_comments(item).strip()
+            for st_s in _split_top_level(clean_s, ";"):
+                m_vn = re.match(
+                    r'^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?(?:MATERIALIZED\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_."`\[\]]+)',
+                    st_s,
+                    flags=re.IGNORECASE,
+                )
+                if m_vn:
+                    vn_low = _unquote_ident(m_vn.group(1)).lower()
+                    vn_unp = vn_low[len(DEFAULT_OBJECT_PREFIX) :] if vn_low.startswith(DEFAULT_OBJECT_PREFIX) else vn_low
+                    script_view_names.update({vn_low, vn_unp, f"{DEFAULT_OBJECT_PREFIX}{vn_unp}"})
+
+    eff_known_tables = (set(known_tables) | script_view_names) if known_tables is not None else None
 
     initial_specs: List[ViewSpec] = []
     pending_index_specs: List[ViewIndexSpec] = []
@@ -2138,7 +2268,7 @@ def parse_view_definitions(
                 st,
                 flags=re.IGNORECASE,
             ):
-                initial_specs.append(_parse_single_create_view_stmt(st, known_tables=known_tables))
+                initial_specs.append(_parse_single_create_view_stmt(st, known_tables=eff_known_tables))
             elif re.match(r"^CREATE\s+(?:UNIQUE\s+)?INDEX\b", st, flags=re.IGNORECASE):
                 pending_index_specs.append(parse_view_index_spec(st))
             else:
@@ -2153,7 +2283,7 @@ def parse_view_definitions(
             pending_index_specs.append(parse_view_index_spec(raw_idx, default_view_name=default_v))
 
     if not pending_index_specs:
-        return initial_specs
+        return _sort_view_specs_topologically(initial_specs)
 
     by_view_idx: Dict[int, List[ViewIndexSpec]] = {i: list(vs.user_indexes) for i, vs in enumerate(initial_specs)}
     for idx_spec in pending_index_specs:
@@ -2213,7 +2343,7 @@ def parse_view_definitions(
                 user_indexes=tuple(by_view_idx[i]),
             )
         )
-    return out_specs
+    return _sort_view_specs_topologically(out_specs)
 
 
 def parse_view_definition(
@@ -2257,6 +2387,886 @@ def parse_view_definition(
 # -----------------------------------------------------------------------------
 
 
+
+# In-process registry of compiled plans by (dialect.value, object_prefix, logical_view_name.lower())
+# and by (dialect.value, backing_table_name.lower()) so sequential `generate_materialized_view(conn, ...)`
+# calls on the same connection automatically resolve upstream materialized views even when
+# `MaterializedViewManager` / `__matview_catalog` was not used.
+_COMPILED_MV_PLANS_BY_KEY: Dict[Tuple[str, str], MaterializedViewPlan] = {}
+
+
+def _register_compiled_plan_in_cache(plan: MaterializedViewPlan) -> None:
+    d_key = plan.dialect.value
+    _COMPILED_MV_PLANS_BY_KEY[(d_key, plan.backing_table_name.lower())] = plan
+    _COMPILED_MV_PLANS_BY_KEY[(d_key, plan.view_name.lower())] = plan
+    _COMPILED_MV_PLANS_BY_KEY[(d_key, plan.logical_view_name.lower())] = plan
+
+
+def _build_upstream_plan_table_schema(plan: MaterializedViewPlan) -> TableSchema:
+    parsed = parse_table_schema(plan.backing_table_ddl, include_internal=True)
+    if parsed:
+        ts = next(iter(parsed.values()))
+        return TableSchema(
+            name=plan.backing_table_name,
+            columns=ts.columns,
+            fk_cascade_actions=ts.fk_cascade_actions,
+            has_on_conflict_replace=ts.has_on_conflict_replace,
+            exposed_columns=tuple(plan.user_columns),
+        )
+    return TableSchema(
+        name=plan.backing_table_name,
+        columns={
+            c: ColumnDef(name=c, data_type="TEXT")
+            for c in plan.user_columns
+        },
+        exposed_columns=tuple(plan.user_columns),
+    )
+
+
+def _qualify_backing_expr(
+    expr: str,
+    backing_schema: TableSchema,
+    alias: str,
+) -> str:
+    col_map = {c.lower(): c for c in backing_schema.columns}
+    tokens = re.split(r"('(?:''|[^'])*')", expr)
+    out: List[str] = []
+    for idx_t, tok in enumerate(tokens):
+        if idx_t % 2 == 1:
+            out.append(tok)
+            continue
+
+        def _repl_col(m_id: re.Match[str]) -> str:
+            w = m_id.group(1)
+            w_low = w.lower()
+            if w_low in col_map:
+                return f"{alias}.{col_map[w_low]}"
+            return w
+
+        mod = re.sub(
+            r"(?<![.\w])\b([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*[.(])",
+            _repl_col,
+            tok,
+        )
+        out.append(mod)
+    return "".join(out)
+
+
+def _record_used_upstream_plan(
+    u_plan: MaterializedViewPlan,
+    used_upstream_out: List[str],
+) -> None:
+    for dep_v in u_plan.upstream_views:
+        if dep_v not in used_upstream_out:
+            used_upstream_out.append(dep_v)
+    if u_plan.logical_view_name not in used_upstream_out:
+        used_upstream_out.append(u_plan.logical_view_name)
+
+
+def _rewrite_subqueries_in_sql_fragment(
+    frag: Optional[str],
+    upstream_by_name: Dict[str, MaterializedViewPlan],
+    schemas_lower: Dict[str, TableSchema],
+    used_upstream_out: List[str],
+    active_ctes: Set[str],
+    outer_qual_to_table: Optional[Dict[str, Tuple[str, MaterializedViewPlan, TableSchema]]] = None,
+) -> Optional[str]:
+    if frag is None:
+        return None
+    s = frag
+    out_chars: List[str] = []
+    i = 0
+    n = len(s)
+    in_single = False
+    in_double = False
+    while i < n:
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out_chars.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out_chars.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double and ch == "(":
+            m_sel = re.match(r"^\(\s*(?:SELECT|WITH)\b", s[i:], flags=re.IGNORECASE)
+            if m_sel:
+                depth = 1
+                j = i + 1
+                in_s2 = False
+                in_d2 = False
+                while j < n and depth > 0:
+                    c2 = s[j]
+                    if c2 == "'" and not in_d2:
+                        in_s2 = not in_s2
+                    elif c2 == '"' and not in_s2:
+                        in_d2 = not in_d2
+                    elif not in_s2 and not in_d2:
+                        if c2 == "(":
+                            depth += 1
+                        elif c2 == ")":
+                            depth -= 1
+                    j += 1
+                if depth == 0:
+                    inner_q = s[i + 1 : j - 1].strip()
+                    if outer_qual_to_table:
+                        for o_qual, (target_ref, o_plan, o_schema) in sorted(
+                            outer_qual_to_table.items(), key=lambda x: len(x[0]), reverse=True
+                        ):
+                            for u_col, r_expr in o_plan.reader_column_expr_map.items():
+                                qual_r = _qualify_backing_expr(r_expr, o_schema, target_ref)
+                                inner_q = re.sub(
+                                    rf"\b{re.escape(o_qual)}\.{re.escape(u_col)}\b",
+                                    f"({qual_r})",
+                                    inner_q,
+                                    flags=re.IGNORECASE,
+                                )
+                            inner_q = re.sub(
+                                rf"\b{re.escape(o_qual)}\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                                rf"{target_ref}.\1",
+                                inner_q,
+                                flags=re.IGNORECASE,
+                            )
+                    rw_inner = _rewrite_select_sql_for_upstream_plans(
+                        inner_q,
+                        upstream_by_name=upstream_by_name,
+                        schemas_lower=schemas_lower,
+                        used_upstream_out=used_upstream_out,
+                        outer_cte_names=active_ctes,
+                    )
+                    out_chars.append(f"({rw_inner})")
+                    i = j
+                    continue
+        out_chars.append(ch)
+        i += 1
+    return "".join(out_chars)
+
+
+def _rewrite_single_mv_expr(
+    expr: Optional[str],
+    u_plan: MaterializedViewPlan,
+    mv_schema: TableSchema,
+    quals: Set[str],
+    mv_table: str,
+    upstream_by_name: Dict[str, MaterializedViewPlan],
+    schemas_lower: Dict[str, TableSchema],
+    used_upstream_out: List[str],
+    active_ctes: Set[str],
+    skip_unqualified_cols_lower: Optional[Set[str]] = None,
+) -> Optional[str]:
+    if expr is None:
+        return None
+    outer_map = {q: (mv_table, u_plan, mv_schema) for q in quals if q}
+    s = _rewrite_subqueries_in_sql_fragment(
+        expr,
+        upstream_by_name=upstream_by_name,
+        schemas_lower=schemas_lower,
+        used_upstream_out=used_upstream_out,
+        active_ctes=active_ctes,
+        outer_qual_to_table=outer_map,
+    )
+    assert s is not None
+
+    # Mask any `(SELECT ...)` subqueries so outer qualifier stripping doesn't touch inner subqueries
+    subquery_placeholders: List[str] = []
+
+    def _mask_subqueries(text: str) -> str:
+        res: List[str] = []
+        idx = 0
+        ln = len(text)
+        in_s = False
+        in_d = False
+        while idx < ln:
+            c = text[idx]
+            if c == "'" and not in_d:
+                in_s = not in_s
+                res.append(c)
+                idx += 1
+                continue
+            if c == '"' and not in_s:
+                in_d = not in_d
+                res.append(c)
+                idx += 1
+                continue
+            if not in_s and not in_d and c == "(":
+                if re.match(r"^\(\s*(?:SELECT|WITH)\b", text[idx:], flags=re.IGNORECASE):
+                    d = 1
+                    k = idx + 1
+                    s2 = False
+                    d2 = False
+                    while k < ln and d > 0:
+                        ck = text[k]
+                        if ck == "'" and not d2:
+                            s2 = not s2
+                        elif ck == '"' and not s2:
+                            d2 = not d2
+                        elif not s2 and not d2:
+                            if ck == "(":
+                                d += 1
+                            elif ck == ")":
+                                d -= 1
+                        k += 1
+                    if d == 0:
+                        ph_idx = len(subquery_placeholders)
+                        subquery_placeholders.append(text[idx:k])
+                        res.append(f"__MV_SUBQ_PH_{ph_idx}__")
+                        idx = k
+                        continue
+            res.append(c)
+            idx += 1
+        return "".join(res)
+
+    masked = _mask_subqueries(s)
+    tokens = re.split(r"('(?:''|[^'])*')", masked)
+    out_toks: List[str] = []
+    reader_map_lower = {k.lower(): v for k, v in u_plan.reader_column_expr_map.items()}
+    skip_set = skip_unqualified_cols_lower or set()
+
+    for idx_t, tok in enumerate(tokens):
+        if idx_t % 2 == 1:
+            out_toks.append(tok)
+            continue
+        mod = tok
+        for q in sorted(quals, key=len, reverse=True):
+            if not q:
+                continue
+
+            def _repl_q(m_q: re.Match[str]) -> str:
+                col_n = m_q.group(1)
+                c_low = col_n.lower()
+                if c_low in reader_map_lower:
+                    return f"({reader_map_lower[c_low]})"
+                return col_n
+
+            mod = re.sub(
+                rf"\b{re.escape(q)}\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                _repl_q,
+                mod,
+                flags=re.IGNORECASE,
+            )
+
+        if reader_map_lower:
+            def _repl_unq(m_id: re.Match[str]) -> str:
+                w = m_id.group(1)
+                w_low = w.lower()
+                if w_low in reader_map_lower and w_low not in skip_set:
+                    return f"({reader_map_lower[w_low]})"
+                return w
+
+            mod = re.sub(
+                r"(?<![.\w])\b([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*[.(])",
+                _repl_unq,
+                mod,
+            )
+        out_toks.append(mod)
+
+    rebuilt = "".join(out_toks)
+    for ph_idx, orig_sub in enumerate(subquery_placeholders):
+        rebuilt = rebuilt.replace(f"__MV_SUBQ_PH_{ph_idx}__", orig_sub)
+    return rebuilt
+
+
+def _rewrite_select_sql_for_upstream_plans(
+    select_sql: str,
+    upstream_by_name: Dict[str, MaterializedViewPlan],
+    schemas_lower: Dict[str, TableSchema],
+    used_upstream_out: List[str],
+    outer_cte_names: Optional[Set[str]] = None,
+) -> str:
+    s = select_sql.strip().rstrip(";").strip()
+    active_ctes: Set[str] = set(outer_cte_names) if outer_cte_names else set()
+
+    # 1. Handle top-level WITH [RECURSIVE] CTEs
+    if re.match(r"^WITH\b", s, flags=re.IGNORECASE):
+        m_with = re.match(r"^(WITH(?:\s+RECURSIVE)?)\s+", s, flags=re.IGNORECASE)
+        assert m_with is not None
+        with_kw = m_with.group(1)
+        pos = m_with.end()
+        n = len(s)
+        rewritten_cte_defs: List[str] = []
+        while pos < n:
+            m_head = re.match(
+                r"^\s*([A-Za-z0-9_\"`\[\]]+)(\s*\([^)]*\))?\s+AS\s*((?:(?:MATERIALIZED|NOT\s+MATERIALIZED)\s*)?)\(",
+                s[pos:],
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not m_head:
+                break
+            cte_ident = m_head.group(1)
+            cte_cols_part = m_head.group(2) or ""
+            mat_hint = m_head.group(3) or ""
+            open_paren = pos + m_head.end() - 1
+            depth = 1
+            i = open_paren + 1
+            in_s = False
+            in_d = False
+            while i < n and depth > 0:
+                ch = s[i]
+                if ch == "'" and not in_d:
+                    in_s = not in_s
+                elif ch == '"' and not in_s:
+                    in_d = not in_d
+                elif not in_s and not in_d:
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                i += 1
+            cte_body = s[open_paren + 1 : i - 1].strip()
+            cte_unq = _unquote_ident(cte_ident)
+            rw_cte_body = _rewrite_select_sql_for_upstream_plans(
+                cte_body,
+                upstream_by_name=upstream_by_name,
+                schemas_lower=schemas_lower,
+                used_upstream_out=used_upstream_out,
+                outer_cte_names=active_ctes | {cte_unq},
+            )
+            active_ctes.add(cte_unq)
+            rewritten_cte_defs.append(f"{cte_ident}{cte_cols_part} AS {mat_hint}({rw_cte_body})")
+            pos = i
+            while pos < n and s[pos].isspace():
+                pos += 1
+            if pos < n and s[pos] == ",":
+                pos += 1
+            else:
+                break
+        main_q = s[pos:].strip()
+        rw_main_q = _rewrite_select_sql_for_upstream_plans(
+            main_q,
+            upstream_by_name=upstream_by_name,
+            schemas_lower=schemas_lower,
+            used_upstream_out=used_upstream_out,
+            outer_cte_names=active_ctes,
+        )
+        return f"{with_kw} {', '.join(rewritten_cte_defs)} {rw_main_q}"
+
+    # 2. Handle top-level UNION ALL / UNION / INTERSECT / EXCEPT
+    op_matches = _find_all_top_level_keywords(
+        s,
+        r"\b(?:UNION\s+ALL|UNION|INTERSECT|EXCEPT)\b",
+    )
+    if op_matches:
+        parts_out: List[str] = []
+        last_pos = 0
+        for m_op in op_matches:
+            branch_s = s[last_pos : m_op.start()].strip()
+            op_kw = re.sub(r"\s+", " ", m_op.group(0).strip().upper())
+            rw_b = _rewrite_select_sql_for_upstream_plans(
+                branch_s,
+                upstream_by_name=upstream_by_name,
+                schemas_lower=schemas_lower,
+                used_upstream_out=used_upstream_out,
+                outer_cte_names=active_ctes,
+            )
+            parts_out.append(f"{rw_b} {op_kw}")
+            last_pos = m_op.end()
+        tail_s = s[last_pos:].strip()
+        rw_tail = _rewrite_select_sql_for_upstream_plans(
+            tail_s,
+            upstream_by_name=upstream_by_name,
+            schemas_lower=schemas_lower,
+            used_upstream_out=used_upstream_out,
+            outer_cte_names=active_ctes,
+        )
+        parts_out.append(rw_tail)
+        return " ".join(parts_out)
+
+    # 3. Single SELECT block
+    m_from = _find_top_level_keyword(s, r"\bFROM\b")
+    if not m_from:
+        return s
+
+    select_prefix = s[: m_from.start()].strip()
+    from_and_rest = s[m_from.end() :].strip()
+
+    m_where = _find_top_level_keyword(from_and_rest, r"\bWHERE\b")
+    m_group = _find_top_level_keyword(from_and_rest, r"\bGROUP\s+BY\b")
+    m_having = _find_top_level_keyword(from_and_rest, r"\bHAVING\b")
+    m_order = _find_top_level_keyword(from_and_rest, r"\bORDER\s+BY\b")
+    m_limit = _find_top_level_keyword(from_and_rest, r"\bLIMIT\b")
+
+    kw_starts = [
+        m.start()
+        for m in (m_where, m_group, m_having, m_order, m_limit)
+        if m is not None
+    ]
+    from_clause = from_and_rest[: min(kw_starts)].strip() if kw_starts else from_and_rest.strip()
+
+    def _slice_clause(m_cur: Optional[re.Match[str]]) -> Optional[str]:
+        if m_cur is None:
+            return None
+        later = [p for p in kw_starts if p > m_cur.start()]
+        end_p = min(later) if later else len(from_and_rest)
+        return from_and_rest[m_cur.end() : end_p].strip()
+
+    where_clause = _slice_clause(m_where)
+    group_by_clause = _slice_clause(m_group)
+    having_clause = _slice_clause(m_having)
+    order_by_clause = _slice_clause(m_order)
+    limit_clause = _slice_clause(m_limit)
+
+    joins, has_sub = _parse_from_and_joins(from_clause, active_ctes)
+    active_ctes_lower = {c.lower() for c in active_ctes}
+
+    # Case 3A: Derived subquery in FROM (`FROM (SELECT ...) AS sub`)
+    if has_sub:
+        m_sub = re.match(
+            r"^\((.*)\)(?:\s+(?:AS\s+)?([A-Za-z0-9_\"`\[\]]+))?$",
+            from_clause.strip(),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if m_sub:
+            inner_q = m_sub.group(1).strip()
+            sub_al = m_sub.group(2)
+            rw_inner_q = _rewrite_select_sql_for_upstream_plans(
+                inner_q,
+                upstream_by_name=upstream_by_name,
+                schemas_lower=schemas_lower,
+                used_upstream_out=used_upstream_out,
+                outer_cte_names=active_ctes,
+            )
+            new_from = f"({rw_inner_q}) AS {sub_al}" if sub_al else f"({rw_inner_q})"
+            rw_sel = _rewrite_subqueries_in_sql_fragment(
+                select_prefix, upstream_by_name, schemas_lower, used_upstream_out, active_ctes
+            ) or select_prefix
+            rw_where = _rewrite_subqueries_in_sql_fragment(
+                where_clause, upstream_by_name, schemas_lower, used_upstream_out, active_ctes
+            )
+            rw_hav = _rewrite_subqueries_in_sql_fragment(
+                having_clause, upstream_by_name, schemas_lower, used_upstream_out, active_ctes
+            )
+            res = f"{rw_sel} FROM {new_from}"
+            if rw_where:
+                res += f" WHERE {rw_where}"
+            if group_by_clause:
+                res += f" GROUP BY {group_by_clause}"
+            if rw_hav:
+                res += f" HAVING {rw_hav}"
+            if order_by_clause:
+                res += f" ORDER BY {order_by_clause}"
+            if limit_clause:
+                res += f" LIMIT {limit_clause}"
+            return res
+        return s
+
+    # Case 3B: Single-table query
+    if len(joins) == 1:
+        j0 = joins[0]
+        t_low = _unquote_ident(j0.table_name).lower()
+        if t_low not in upstream_by_name or t_low in active_ctes_lower:
+            rw_sel = _rewrite_subqueries_in_sql_fragment(
+                select_prefix, upstream_by_name, schemas_lower, used_upstream_out, active_ctes
+            ) or select_prefix
+            rw_where = _rewrite_subqueries_in_sql_fragment(
+                where_clause, upstream_by_name, schemas_lower, used_upstream_out, active_ctes
+            )
+            rw_hav = _rewrite_subqueries_in_sql_fragment(
+                having_clause, upstream_by_name, schemas_lower, used_upstream_out, active_ctes
+            )
+            if rw_sel == select_prefix and rw_where == where_clause and rw_hav == having_clause:
+                return s
+            res = f"{rw_sel} FROM {from_clause}"
+            if rw_where:
+                res += f" WHERE {rw_where}"
+            if group_by_clause:
+                res += f" GROUP BY {group_by_clause}"
+            if rw_hav:
+                res += f" HAVING {rw_hav}"
+            if order_by_clause:
+                res += f" ORDER BY {order_by_clause}"
+            if limit_clause:
+                res += f" LIMIT {limit_clause}"
+            return res
+
+        u_plan = upstream_by_name[t_low]
+        _record_used_upstream_plan(u_plan, used_upstream_out)
+        mv_table = u_plan.backing_table_name
+        mv_schema = schemas_lower[mv_table.lower()]
+        quals = {
+            _unquote_ident(j0.table_name),
+            _unquote_ident(j0.alias),
+            u_plan.logical_view_name,
+            u_plan.db_view_name,
+        } - {""}
+
+        m_sel_head = re.match(
+            r"^SELECT\s+(DISTINCT\s+)?(.*)$",
+            select_prefix,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        assert m_sel_head is not None
+        dist_kw = "DISTINCT " if m_sel_head.group(1) else ""
+        raw_sel_items = _split_top_level(m_sel_head.group(2).strip(), ",")
+        new_sel_parts: List[str] = []
+        output_aliases_lower: Set[str] = set()
+
+        for idx_it, raw_it in enumerate(raw_sel_items):
+            r_clean = raw_it.strip()
+            if r_clean == "*" or r_clean.lower() in {f"{q.lower()}.*" for q in quals}:
+                for u_col in u_plan.user_columns:
+                    output_aliases_lower.add(u_col.lower())
+                    if u_col in u_plan.reader_column_expr_map:
+                        new_sel_parts.append(f"({u_plan.reader_column_expr_map[u_col]}) AS {u_col}")
+                    else:
+                        new_sel_parts.append(u_col)
+            else:
+                parsed_it = _parse_select_item(r_clean, idx_it)
+                output_aliases_lower.add(parsed_it.alias.lower())
+                rw_expr = _rewrite_single_mv_expr(
+                    parsed_it.raw_expr,
+                    u_plan=u_plan,
+                    mv_schema=mv_schema,
+                    quals=quals,
+                    mv_table=mv_table,
+                    upstream_by_name=upstream_by_name,
+                    schemas_lower=schemas_lower,
+                    used_upstream_out=used_upstream_out,
+                    active_ctes=active_ctes,
+                )
+                assert rw_expr is not None
+                if rw_expr.strip().lower() == parsed_it.alias.lower() and not re.search(
+                    r"\bAS\b", r_clean, flags=re.IGNORECASE
+                ):
+                    new_sel_parts.append(rw_expr.strip())
+                else:
+                    new_sel_parts.append(f"{rw_expr} AS {parsed_it.alias}")
+
+        rw_where = _rewrite_single_mv_expr(
+            where_clause,
+            u_plan=u_plan,
+            mv_schema=mv_schema,
+            quals=quals,
+            mv_table=mv_table,
+            upstream_by_name=upstream_by_name,
+            schemas_lower=schemas_lower,
+            used_upstream_out=used_upstream_out,
+            active_ctes=active_ctes,
+        )
+        if u_plan.backing_visibility_where and rw_where:
+            final_where = f"({u_plan.backing_visibility_where}) AND ({rw_where})"
+        elif u_plan.backing_visibility_where:
+            final_where = f"({u_plan.backing_visibility_where})"
+        else:
+            final_where = rw_where
+
+        rw_grp: Optional[str] = None
+        if group_by_clause:
+            grp_items = [
+                _rewrite_single_mv_expr(
+                    g.strip(),
+                    u_plan=u_plan,
+                    mv_schema=mv_schema,
+                    quals=quals,
+                    mv_table=mv_table,
+                    upstream_by_name=upstream_by_name,
+                    schemas_lower=schemas_lower,
+                    used_upstream_out=used_upstream_out,
+                    active_ctes=active_ctes,
+                )
+                or g.strip()
+                for g in _split_top_level(group_by_clause, ",")
+                if g.strip()
+            ]
+            rw_grp = ", ".join(grp_items)
+
+        rw_hav = _rewrite_single_mv_expr(
+            having_clause,
+            u_plan=u_plan,
+            mv_schema=mv_schema,
+            quals=quals,
+            mv_table=mv_table,
+            upstream_by_name=upstream_by_name,
+            schemas_lower=schemas_lower,
+            used_upstream_out=used_upstream_out,
+            active_ctes=active_ctes,
+        )
+        rw_ord = _rewrite_single_mv_expr(
+            order_by_clause,
+            u_plan=u_plan,
+            mv_schema=mv_schema,
+            quals=quals,
+            mv_table=mv_table,
+            upstream_by_name=upstream_by_name,
+            schemas_lower=schemas_lower,
+            used_upstream_out=used_upstream_out,
+            active_ctes=active_ctes,
+            skip_unqualified_cols_lower=output_aliases_lower,
+        )
+
+        res = f"SELECT {dist_kw}{', '.join(new_sel_parts)} FROM {mv_table}"
+        if final_where:
+            res += f" WHERE {final_where}"
+        if rw_grp:
+            res += f" GROUP BY {rw_grp}"
+        if rw_hav:
+            res += f" HAVING {rw_hav}"
+        if rw_ord:
+            res += f" ORDER BY {rw_ord}"
+        if limit_clause:
+            res += f" LIMIT {limit_clause}"
+        return res
+
+    # Case 3C: Multi-table JOIN (`len(joins) >= 2`)
+    has_upstream_join = any(
+        _unquote_ident(j.table_name).lower() in upstream_by_name
+        and _unquote_ident(j.table_name).lower() not in active_ctes_lower
+        for j in joins
+    )
+    if not has_upstream_join:
+        rw_sel = _rewrite_subqueries_in_sql_fragment(
+            select_prefix, upstream_by_name, schemas_lower, used_upstream_out, active_ctes
+        ) or select_prefix
+        rw_where = _rewrite_subqueries_in_sql_fragment(
+            where_clause, upstream_by_name, schemas_lower, used_upstream_out, active_ctes
+        )
+        rw_hav = _rewrite_subqueries_in_sql_fragment(
+            having_clause, upstream_by_name, schemas_lower, used_upstream_out, active_ctes
+        )
+        if rw_sel == select_prefix and rw_where == where_clause and rw_hav == having_clause:
+            return s
+        res = f"{rw_sel} FROM {from_clause}"
+        if rw_where:
+            res += f" WHERE {rw_where}"
+        if group_by_clause:
+            res += f" GROUP BY {group_by_clause}"
+        if rw_hav:
+            res += f" HAVING {rw_hav}"
+        if order_by_clause:
+            res += f" ORDER BY {order_by_clause}"
+        if limit_clause:
+            res += f" LIMIT {limit_clause}"
+        return res
+
+    # Count how many times each upstream plan appears in `joins` (to support self-joins of an MV)
+    plan_join_counts: Dict[str, int] = {}
+    for j in joins:
+        tl = _unquote_ident(j.table_name).lower()
+        if tl in upstream_by_name and tl not in active_ctes_lower:
+            up = upstream_by_name[tl]
+            plan_join_counts[up.logical_view_name.lower()] = (
+                plan_join_counts.get(up.logical_view_name.lower(), 0) + 1
+            )
+
+    join_entries: List[Tuple[JoinSpec, Optional[MaterializedViewPlan], str, str, Set[str]]] = []
+    for j in joins:
+        tl = _unquote_ident(j.table_name).lower()
+        eff_al = _unquote_ident(j.alias) if j.alias else _unquote_ident(j.table_name)
+        if tl in upstream_by_name and tl not in active_ctes_lower:
+            up = upstream_by_name[tl]
+            _record_used_upstream_plan(up, used_upstream_out)
+            new_tn = up.backing_table_name
+            if plan_join_counts.get(up.logical_view_name.lower(), 0) > 1:
+                q_set = {eff_al}
+            else:
+                q_set = {_unquote_ident(j.table_name), eff_al, up.logical_view_name, up.db_view_name} - {""}
+            join_entries.append((j, up, new_tn, eff_al, q_set))
+        else:
+            new_tn = _unquote_ident(j.table_name)
+            q_set = {new_tn, eff_al} - {""}
+            join_entries.append((j, None, new_tn, eff_al, q_set))
+
+    def _rewrite_join_expr(
+        frag: Optional[str],
+        skip_unqual_lower: Optional[Set[str]] = None,
+    ) -> Optional[str]:
+        if frag is None:
+            return None
+        s_f = _rewrite_subqueries_in_sql_fragment(
+            frag, upstream_by_name, schemas_lower, used_upstream_out, active_ctes
+        )
+        assert s_f is not None
+        tokens = re.split(r"('(?:''|[^'])*')", s_f)
+        out_t: List[str] = []
+        skip_s = skip_unqual_lower or set()
+        for idx_t, tok in enumerate(tokens):
+            if idx_t % 2 == 1:
+                out_t.append(tok)
+                continue
+            mod = tok
+            for _, up, new_tn, eff_al, q_set in join_entries:
+                if up is None:
+                    continue
+                mv_sc = schemas_lower[new_tn.lower()]
+                r_map_low = {
+                    k.lower(): _qualify_backing_expr(v, mv_sc, eff_al)
+                    for k, v in up.reader_column_expr_map.items()
+                }
+                for q in sorted(q_set, key=len, reverse=True):
+                    if not q:
+                        continue
+
+                    def _repl_jq(m_q: re.Match[str]) -> str:
+                        cn = m_q.group(1)
+                        cl = cn.lower()
+                        if cl in r_map_low:
+                            return f"({r_map_low[cl]})"
+                        return f"{eff_al}.{cn}"
+
+                    mod = re.sub(
+                        rf"\b{re.escape(q)}\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                        _repl_jq,
+                        mod,
+                        flags=re.IGNORECASE,
+                    )
+                if r_map_low and plan_join_counts.get(up.logical_view_name.lower(), 0) == 1:
+                    def _repl_junq(m_id: re.Match[str]) -> str:
+                        w = m_id.group(1)
+                        wl = w.lower()
+                        if wl in r_map_low and wl not in skip_s:
+                            return f"({r_map_low[wl]})"
+                        return w
+
+                    mod = re.sub(
+                        r"(?<![.\w])\b([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*[.(])",
+                        _repl_junq,
+                        mod,
+                    )
+            out_t.append(mod)
+        return "".join(out_t)
+
+    m_sel_head = re.match(
+        r"^SELECT\s+(DISTINCT\s+)?(.*)$",
+        select_prefix,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert m_sel_head is not None
+    dist_kw = "DISTINCT " if m_sel_head.group(1) else ""
+    raw_sel_items = _split_top_level(m_sel_head.group(2).strip(), ",")
+    new_sel_parts = []
+    output_aliases_lower = set()
+
+    for idx_it, raw_it in enumerate(raw_sel_items):
+        r_clean = raw_it.strip()
+        if r_clean == "*":
+            for _, up, new_tn, eff_al, _ in join_entries:
+                if up is not None:
+                    mv_sc = schemas_lower[new_tn.lower()]
+                    for u_col in up.user_columns:
+                        output_aliases_lower.add(u_col.lower())
+                        if u_col in up.reader_column_expr_map:
+                            qe = _qualify_backing_expr(up.reader_column_expr_map[u_col], mv_sc, eff_al)
+                            new_sel_parts.append(f"({qe}) AS {u_col}")
+                        else:
+                            new_sel_parts.append(f"{eff_al}.{u_col} AS {u_col}")
+                else:
+                    ts_b = schemas_lower.get(new_tn.lower())
+                    if ts_b:
+                        for cd in ts_b.user_column_defs:
+                            output_aliases_lower.add(cd.name.lower())
+                            new_sel_parts.append(f"{eff_al}.{cd.name} AS {cd.name}")
+        else:
+            matched_star_entry = None
+            for entry in join_entries:
+                if r_clean.lower() in {f"{q.lower()}.*" for q in entry[4]}:
+                    matched_star_entry = entry
+                    break
+            if matched_star_entry is not None:
+                _, up, new_tn, eff_al, _ = matched_star_entry
+                if up is not None:
+                    mv_sc = schemas_lower[new_tn.lower()]
+                    for u_col in up.user_columns:
+                        output_aliases_lower.add(u_col.lower())
+                        if u_col in up.reader_column_expr_map:
+                            qe = _qualify_backing_expr(up.reader_column_expr_map[u_col], mv_sc, eff_al)
+                            new_sel_parts.append(f"({qe}) AS {u_col}")
+                        else:
+                            new_sel_parts.append(f"{eff_al}.{u_col} AS {u_col}")
+                else:
+                    ts_b = schemas_lower.get(new_tn.lower())
+                    if ts_b:
+                        for cd in ts_b.user_column_defs:
+                            output_aliases_lower.add(cd.name.lower())
+                            new_sel_parts.append(f"{eff_al}.{cd.name} AS {cd.name}")
+            else:
+                parsed_it = _parse_select_item(r_clean, idx_it)
+                output_aliases_lower.add(parsed_it.alias.lower())
+                rw_e = _rewrite_join_expr(parsed_it.raw_expr) or parsed_it.raw_expr
+                new_sel_parts.append(f"{rw_e} AS {parsed_it.alias}")
+
+    has_full_join = any("FULL" in j.join_type.upper() for j in joins)
+    has_right_join = any("RIGHT" in j.join_type.upper() for j in joins)
+
+    rewritten_on_map: Dict[int, Optional[str]] = {
+        idx_j: _rewrite_join_expr(j.on_condition) for idx_j, (j, _, _, _, _) in enumerate(join_entries)
+    }
+    extra_where_conds: List[str] = []
+
+    for idx_j, (j, up, new_tn, eff_al, _) in enumerate(join_entries):
+        if up is None or not up.backing_visibility_where:
+            continue
+        mv_sc = schemas_lower[new_tn.lower()]
+        qual_vis = _qualify_backing_expr(up.backing_visibility_where, mv_sc, eff_al)
+        pk_cols_mv = [c.name for c in mv_sc.columns.values() if c.primary_key]
+        pk_check_col = pk_cols_mv[0] if pk_cols_mv else next(iter(mv_sc.columns.keys()))
+
+        if has_full_join:
+            target_on_idx = idx_j if idx_j > 0 else 1
+            prev_on = rewritten_on_map.get(target_on_idx)
+            rewritten_on_map[target_on_idx] = (
+                f"({prev_on}) AND ({qual_vis})" if prev_on else f"({qual_vis})"
+            )
+            extra_where_conds.append(f"(({qual_vis}) OR {eff_al}.{pk_check_col} IS NULL)")
+        elif idx_j == 0:
+            if has_right_join:
+                prev_on = rewritten_on_map.get(1)
+                rewritten_on_map[1] = (
+                    f"({prev_on}) AND ({qual_vis})" if prev_on else f"({qual_vis})"
+                )
+            else:
+                extra_where_conds.append(f"({qual_vis})")
+        else:
+            if j.join_type.upper() == "LEFT JOIN":
+                prev_on = rewritten_on_map.get(idx_j)
+                rewritten_on_map[idx_j] = (
+                    f"({prev_on}) AND ({qual_vis})" if prev_on else f"({qual_vis})"
+                )
+            else:
+                extra_where_conds.append(f"({qual_vis})")
+
+    from_parts_out: List[str] = []
+    for idx_j, (j, _, new_tn, eff_al, _) in enumerate(join_entries):
+        tbl_ref = f"{new_tn} AS {eff_al}"
+        if idx_j == 0:
+            from_parts_out.append(tbl_ref)
+        else:
+            on_c = rewritten_on_map.get(idx_j)
+            on_s = f" ON {on_c}" if on_c else ""
+            from_parts_out.append(f"{j.join_type} {tbl_ref}{on_s}")
+
+    rw_where = _rewrite_join_expr(where_clause)
+    if rw_where:
+        extra_where_conds.append(f"({rw_where})")
+    final_where = " AND ".join(extra_where_conds) if extra_where_conds else None
+
+    rw_grp = None
+    if group_by_clause:
+        grp_items = [
+            _rewrite_join_expr(g.strip()) or g.strip()
+            for g in _split_top_level(group_by_clause, ",")
+            if g.strip()
+        ]
+        rw_grp = ", ".join(grp_items)
+
+    rw_hav = _rewrite_join_expr(having_clause)
+    rw_ord = _rewrite_join_expr(order_by_clause, skip_unqual_lower=output_aliases_lower)
+
+    res = f"SELECT {dist_kw}{', '.join(new_sel_parts)} FROM {' '.join(from_parts_out)}"
+    if final_where:
+        res += f" WHERE {final_where}"
+    if rw_grp:
+        res += f" GROUP BY {rw_grp}"
+    if rw_hav:
+        res += f" HAVING {rw_hav}"
+    if rw_ord:
+        res += f" ORDER BY {rw_ord}"
+    if limit_clause:
+        res += f" LIMIT {limit_clause}"
+    return res
+
+
 class IncrementalViewCompiler:
     """
     Compiles a `ViewSpec` + `Dict[str, TableSchema]` into a `MaterializedViewPlan`.
@@ -2289,11 +3299,55 @@ class IncrementalViewCompiler:
         batch_size: int = 1000,
         strict: bool = False,
         engine_version: Optional[EngineVersion | str] = None,
+        upstream_plans: Optional[Sequence[MaterializedViewPlan]] = None,
     ) -> None:
         self.schemas = dict(schemas)
+        self.upstream_plans: List[MaterializedViewPlan] = list(upstream_plans) if upstream_plans else []
+        self._upstream_by_name: Dict[str, MaterializedViewPlan] = {}
+        for up in self.upstream_plans:
+            up_ts = _build_upstream_plan_table_schema(up)
+            self.schemas[up.backing_table_name] = up_ts
+            self._upstream_by_name[up.logical_view_name.lower()] = up
+            self._upstream_by_name[up.view_name.lower()] = up
+            if up.db_view_name:
+                self._upstream_by_name[up.db_view_name.lower()] = up
+
         self._schemas_lower: Dict[str, TableSchema] = {
             k.lower(): v for k, v in self.schemas.items()
         }
+        self.original_view_spec: ViewSpec = view_spec
+        self.upstream_view_names: List[str] = []
+        if self._upstream_by_name:
+            rw_sql = _rewrite_select_sql_for_upstream_plans(
+                view_spec.raw_select_sql,
+                upstream_by_name=self._upstream_by_name,
+                schemas_lower=self._schemas_lower,
+                used_upstream_out=self.upstream_view_names,
+            )
+            if self.upstream_view_names:
+                reparsed = _parse_single_create_view_stmt(
+                    f"CREATE VIEW {view_spec.view_name} AS {rw_sql}",
+                    known_tables=set(self._schemas_lower.keys()) | set(self._upstream_by_name.keys()),
+                )
+                view_spec = ViewSpec(
+                    view_name=view_spec.view_name,
+                    raw_select_sql=reparsed.raw_select_sql,
+                    base_table=reparsed.base_table,
+                    joins=reparsed.joins,
+                    referenced_tables=reparsed.referenced_tables,
+                    select_items=reparsed.select_items,
+                    where_clause=reparsed.where_clause,
+                    group_by_cols=reparsed.group_by_cols,
+                    having_clause=reparsed.having_clause,
+                    has_cte=reparsed.has_cte,
+                    has_window_func=reparsed.has_window_func,
+                    has_compound_set_op=reparsed.has_compound_set_op,
+                    has_top_level_distinct=reparsed.has_top_level_distinct,
+                    has_limit_or_order=reparsed.has_limit_or_order,
+                    has_subquery_in_from=reparsed.has_subquery_in_from,
+                    user_indexes=view_spec.user_indexes,
+                    additional_views=view_spec.additional_views,
+                )
         self.raw_view = view_spec
         if engine_version is not None:
             self.engine_version = parse_engine_version(
@@ -2494,7 +3548,7 @@ class IncrementalViewCompiler:
         for it in v.select_items:
             raw_s = it.raw_expr.strip()
             if raw_s == "*" or raw_s.lower() in (f"{base_alias}.*", f"{base_name}.*"):
-                for c_def in self.primary_schema.columns.values():
+                for c_def in self.primary_schema.user_column_defs:
                     expanded.append(
                         SelectItem(
                             raw_expr=c_def.name,
@@ -2636,8 +3690,8 @@ class IncrementalViewCompiler:
         for it in inner_spec.select_items:
             if it.raw_expr.strip() == "*":
                 ts = self._schemas_lower[inner_base.lower()]
-                for c_name in ts.columns:
-                    col_map[c_name.lower()] = c_name
+                for cd in ts.user_column_defs:
+                    col_map[cd.name.lower()] = cd.name
             else:
                 cleaned_e = re.sub(
                     rf"\b{re.escape(inner_alias)}\.",
@@ -3297,11 +4351,11 @@ class IncrementalViewCompiler:
             for j in self.view.joins or []:
                 t_schema = self._schemas_lower.get(j.table_name.lower())
                 if t_schema:
-                    for c_def in t_schema.columns.values():
+                    for c_def in t_schema.user_column_defs:
                         if c_def.name not in cols:
                             cols.append(c_def.name)
             if not cols and self.primary_schema:
-                for c_def in self.primary_schema.columns.values():
+                for c_def in self.primary_schema.user_column_defs:
                     cols.append(c_def.name)
             return cols
         return [item.alias for item in self.view.select_items]
@@ -3865,6 +4919,8 @@ class IncrementalViewCompiler:
         ts = self._schemas_lower.get(table_name.lower())
         if not ts:
             return []
+        if ts.exposed_columns is not None or table_name.lower().startswith((f"{self.object_prefix.lower()}store_", "__matview_store_", "__mv_store_")):
+            return list(ts.columns.keys())
         no_str = re.sub(r"'(?:''|[^'])*'", "''", self.view.raw_select_sql)
         if re.search(r"(?:SELECT\s+\*|,\s*\*|\.\*)", no_str, flags=re.IGNORECASE):
             return list(ts.columns.keys())
@@ -4222,11 +5278,34 @@ class IncrementalViewCompiler:
                 ])
         return inc_stmts
 
+    def _extract_reader_column_expr_map(self, user_columns: Sequence[str]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for u_col in user_columns:
+            expr_s = self._compound_reader_exprs.get(u_col, u_col)
+            if expr_s != u_col:
+                raw_e = re.sub(
+                    r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$",
+                    "",
+                    expr_s,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if raw_e != u_col:
+                    out[u_col] = raw_e
+        return out
+
+    def _build_tier1_visibility_where(self, row_count_col: str, has_groups: bool) -> Optional[str]:
+        parts: List[str] = []
+        if has_groups:
+            parts.append(f"{row_count_col} > 0")
+        if self._rewritten_having_clause:
+            parts.append(f"({self._rewritten_having_clause})")
+        return " AND ".join(parts) if parts else None
+
     def _finalize_plan_backfill(self, raw_plan: MaterializedViewPlan) -> MaterializedViewPlan:
         full_sqls = list(raw_plan.initial_populate_sqls)
         inc_sqls = self._build_dialect_incremental_populate_sqls(raw_plan)
         active_sqls = inc_sqls if self.incremental_backfill else full_sqls
-        return MaterializedViewPlan(
+        final_plan = MaterializedViewPlan(
             dialect=raw_plan.dialect,
             strategy=raw_plan.strategy,
             view_spec=raw_plan.view_spec,
@@ -4254,7 +5333,13 @@ class IncrementalViewCompiler:
             full_populate_sqls=full_sqls,
             incremental_populate_sqls=inc_sqls,
             engine_version=self.engine_version,
+            backing_visibility_where=raw_plan.backing_visibility_where,
+            reader_column_expr_map=dict(raw_plan.reader_column_expr_map),
+            upstream_views=list(self.upstream_view_names),
+            original_view_spec=self.original_view_spec,
         )
+        _register_compiled_plan_in_cache(final_plan)
+        return final_plan
 
     def _compile_single_plan(self) -> MaterializedViewPlan:
         if self.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA:
@@ -4282,9 +5367,13 @@ class IncrementalViewCompiler:
             return first_plan
 
         sub_plans: List[MaterializedViewPlan] = [first_plan]
+        running_schemas = dict(self.schemas)
+        running_schemas[first_plan.backing_table_name] = _build_upstream_plan_table_schema(first_plan)
+        running_upstreams = list(self.upstream_plans) + [first_plan]
+
         for extra_v in self.raw_view.additional_views:
             sub_comp = IncrementalViewCompiler(
-                schemas=self.schemas,
+                schemas=running_schemas,
                 view_spec=extra_v,
                 dialect=self.dialect,
                 pg_use_transition_tables=self.pg_use_transition_tables,
@@ -4294,8 +5383,12 @@ class IncrementalViewCompiler:
                 batch_size=self.batch_size,
                 strict=self.strict,
                 engine_version=self.engine_version,
+                upstream_plans=running_upstreams,
             )
-            sub_plans.append(sub_comp._compile_single_plan())
+            sp = sub_comp._compile_single_plan()
+            sub_plans.append(sp)
+            running_schemas[sp.backing_table_name] = _build_upstream_plan_table_schema(sp)
+            running_upstreams.append(sp)
 
         return MaterializedViewPlan(
             dialect=first_plan.dialect,
@@ -4713,6 +5806,8 @@ class IncrementalViewCompiler:
             db_view_name=self.db_view_name,
             index_names=index_names,
             user_indexes=list(self.user_indexes),
+            backing_visibility_where=self._build_tier1_visibility_where(row_count_col, bool(grp_exprs)),
+            reader_column_expr_map=self._extract_reader_column_expr_map(user_columns),
         )
 
     def _build_initial_populate_and_inc_spec_tier1(
@@ -6930,6 +8025,8 @@ class IncrementalViewCompiler:
             db_view_name=self.db_view_name,
             index_names=index_names,
             user_indexes=list(self.user_indexes),
+            backing_visibility_where=self._build_tier1_visibility_where(row_count_col, bool(grp_exprs)),
+            reader_column_expr_map=self._extract_reader_column_expr_map(user_columns),
         )
 
 
@@ -7289,6 +8386,7 @@ class IncrementalViewCompiler:
             db_view_name=self.db_view_name,
             index_names=index_names,
             user_indexes=list(self.user_indexes),
+            backing_visibility_where=extra_filter if extra_filter else "__mv_row_count > 0",
         )
 
     def _compile_tier1_zset_distinct(self) -> MaterializedViewPlan:
@@ -7515,6 +8613,7 @@ class IncrementalViewCompiler:
             db_view_name=self.db_view_name,
             index_names=index_names,
             user_indexes=list(self.user_indexes),
+            backing_visibility_where=None if uses_native_pk else "__mv_row_count > 0",
         )
 
     def _compile_tier1_union_all_agg(self) -> MaterializedViewPlan:
@@ -8002,6 +9101,8 @@ class IncrementalViewCompiler:
             db_view_name=self.db_view_name,
             index_names=index_names,
             user_indexes=list(self.user_indexes),
+            backing_visibility_where=self._build_tier1_visibility_where(row_count_col, bool(grp_exprs)),
+            reader_column_expr_map=self._extract_reader_column_expr_map(user_columns),
         )
 
 
@@ -8303,7 +9404,7 @@ class IncrementalViewCompiler:
         outer_ref = outer_alias or outer_tbl
 
         pattern = re.compile(
-            r"\b([A-Za-z_][A-Za-z0-9_.]*)\s+NOT\s+IN\s*\(\s*SELECT\s+([A-Za-z_][A-Za-z0-9_.]*)\s+FROM\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?(?:\s+WHERE\s+((?:[^()]|\([^()]*\))+))?\s*\)",
+            r"\b([A-Za-z_][A-Za-z0-9_.]*)\s+NOT\s+IN\s*\(\s*SELECT\s+([A-Za-z_][A-Za-z0-9_.]*)(?:\s+AS\s+[A-Za-z_][A-Za-z0-9_]*)?\s+FROM\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?(?:\s+WHERE\s+((?:[^()]|\((?:[^()]|\([^()]*\))*\))+))?\s*\)",
             flags=re.IGNORECASE,
         )
 
@@ -8404,22 +9505,25 @@ class IncrementalViewCompiler:
                 flags=re.IGNORECASE,
             )
             m_foj = re.match(
-                r'^SELECT\s+(.*?)\s+FROM\s+([A-Za-z0-9_."`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z0-9_"`\[\]]+)?)\s+FULL\s+(?:OUTER\s+)?JOIN\s+([A-Za-z0-9_."`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z0-9_"`\[\]]+)?)\s+ON\s+(([A-Za-z0-9_."`\[\]]+)\s*=\s*[A-Za-z0-9_."`\[\]]+)$',
+                r'^SELECT\s+(.*?)\s+FROM\s+([A-Za-z0-9_."`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z0-9_"`\[\]]+)?)\s+FULL\s+(?:OUTER\s+)?JOIN\s+([A-Za-z0-9_."`\[\]]+(?:\s+(?:AS\s+)?[A-Za-z0-9_"`\[\]]+)?)\s+ON\s+((?:\()?([A-Za-z0-9_."`\[\]]+)\s*=\s*[A-Za-z0-9_."`\[\]]+[^;]*?)(?:\s+WHERE\s+(.*))?$',
                 s.strip(),
                 flags=re.IGNORECASE | re.DOTALL,
             )
             if m_foj:
-                sel_p, t1_p, t2_p, on_p, lhs_col = (
+                sel_p, t1_p, t2_p, on_p, lhs_col, where_p = (
                     m_foj.group(1),
                     m_foj.group(2),
                     m_foj.group(3),
                     m_foj.group(4),
                     m_foj.group(5),
+                    m_foj.group(6),
                 )
+                w_left = f" WHERE {where_p}" if where_p else ""
+                w_right = f" WHERE ({lhs_col} IS NULL) AND ({where_p})" if where_p else f" WHERE {lhs_col} IS NULL"
                 s = (
-                    f"SELECT {sel_p} FROM {t1_p} LEFT JOIN {t2_p} ON {on_p} "
+                    f"SELECT {sel_p} FROM {t1_p} LEFT JOIN {t2_p} ON {on_p}{w_left} "
                     f"UNION ALL "
-                    f"SELECT {sel_p} FROM {t1_p} RIGHT JOIN {t2_p} ON {on_p} WHERE {lhs_col} IS NULL"
+                    f"SELECT {sel_p} FROM {t1_p} RIGHT JOIN {t2_p} ON {on_p}{w_right}"
                 )
         return s
 
@@ -8562,7 +9666,7 @@ class IncrementalViewCompiler:
             for j in self.view.joins or []:
                 t_schema = self._schemas_lower.get(j.table_name.lower())
                 if t_schema:
-                    for c_def in t_schema.columns.values():
+                    for c_def in t_schema.user_column_defs:
                         if c_def.name not in user_columns:
                             user_columns.append(c_def.name)
                             dt = self._normalize_dialect_type(c_def.data_type)
@@ -8570,7 +9674,7 @@ class IncrementalViewCompiler:
                                 dt = "VARCHAR(255)"
                             col_defs_sql.append(f"{c_def.name} {dt}")
             if not user_columns and self.primary_schema:
-                for c_def in self.primary_schema.columns.values():
+                for c_def in self.primary_schema.user_column_defs:
                     user_columns.append(c_def.name)
                     dt = self._normalize_dialect_type(c_def.data_type)
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
@@ -8903,7 +10007,8 @@ class MaterializedViewManager:
 
     @staticmethod
     def _serialize_view_sql_with_indexes(plan: MaterializedViewPlan, raw_view_sql: Optional[str] = None) -> str:
-        parts = [f"CREATE VIEW {plan.logical_view_name} AS {plan.view_spec.raw_select_sql.strip().rstrip(';')};"]
+        orig_vs = plan.original_view_spec or plan.view_spec
+        parts = [f"CREATE VIEW {plan.logical_view_name} AS {orig_vs.raw_select_sql.strip().rstrip(';')};"]
         for idx_spec in plan.user_indexes:
             u_kw = "UNIQUE " if idx_spec.unique else ""
             n_str = f"{idx_spec.name} " if idx_spec.name else ""
@@ -8915,11 +10020,90 @@ class MaterializedViewManager:
             )
         return "\n".join(parts)
 
-    def drop_view(self, view_name: str) -> bool:
+    def _compile_catalog_plans_in_order(
+        self,
+        schemas: Dict[str, TableSchema],
+        catalog: Optional[Dict[str, Dict[str, Any]]] = None,
+        exclude_view_names: Optional[Set[str]] = None,
+    ) -> Tuple[List[Tuple[Dict[str, Any], MaterializedViewPlan]], Dict[str, TableSchema]]:
+        cat = catalog if catalog is not None else self.get_catalog()
+        if not cat:
+            return [], dict(schemas)
+        excl_low = {n.lower() for n in (exclude_view_names or set())}
+        raw_specs: List[ViewSpec] = []
+        spec_to_entry: Dict[str, Dict[str, Any]] = {}
+        known_t = {k.lower() for k in schemas}
+        for v_name, entry in cat.items():
+            unp = (
+                v_name[len(self.object_prefix) :]
+                if self.object_prefix and v_name.startswith(self.object_prefix)
+                else v_name
+            )
+            if v_name.lower() in excl_low or unp.lower() in excl_low:
+                continue
+            known_t.update({v_name.lower(), unp.lower()})
+        for v_name, entry in cat.items():
+            unp = (
+                v_name[len(self.object_prefix) :]
+                if self.object_prefix and v_name.startswith(self.object_prefix)
+                else v_name
+            )
+            if v_name.lower() in excl_low or unp.lower() in excl_low:
+                continue
+            try:
+                vs = parse_view_definition(entry["view_sql"], known_tables=known_t)
+                raw_specs.append(vs)
+                spec_to_entry[vs.view_name.lower()] = entry
+                spec_to_entry[unp.lower()] = entry
+                spec_to_entry[v_name.lower()] = entry
+            except Exception:
+                pass
+        sorted_specs = _sort_view_specs_topologically(raw_specs, object_prefix=self.object_prefix)
+        running_schemas = dict(schemas)
+        running_plans: List[MaterializedViewPlan] = []
+        out_pairs: List[Tuple[Dict[str, Any], MaterializedViewPlan]] = []
+        for vs in sorted_specs:
+            entry = spec_to_entry.get(vs.view_name.lower())
+            if entry is None:
+                continue
+            plan = generate_materialized_view(
+                running_schemas,
+                vs,
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=True,
+                object_prefix=self.object_prefix,
+                engine_version=self.engine_version,
+                upstream_plans=running_plans,
+            )
+            running_schemas[plan.backing_table_name] = _build_upstream_plan_table_schema(plan)
+            running_plans.append(plan)
+            out_pairs.append((entry, plan))
+        return out_pairs, running_schemas
+
+    def drop_view(self, view_name: str, cascade: bool = False) -> bool:
         """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
         catalog = self.get_catalog()
         resolved_name = self._resolve_catalog_name(view_name, catalog)
         entry = catalog.get(resolved_name)
+        if entry and cascade:
+            try:
+                base_schemas = self.fetch_schema()
+                ordered_pairs, _ = self._compile_catalog_plans_in_order(base_schemas, catalog)
+                target_logical = (
+                    resolved_name[len(self.object_prefix) :]
+                    if self.object_prefix and resolved_name.startswith(self.object_prefix)
+                    else resolved_name
+                ).lower()
+                dependents = [
+                    e["view_name"]
+                    for e, p in reversed(ordered_pairs)
+                    if target_logical in {u.lower() for u in p.upstream_views}
+                ]
+                for dep_v in dependents:
+                    self.drop_view(dep_v, cascade=False)
+            except Exception:
+                pass
         cur = self.conn.cursor()
         if entry:
             for t_name in entry["trigger_names"]:
@@ -9062,6 +10246,7 @@ class MaterializedViewManager:
         force_rebuild: bool,
         effective_ignore: bool,
         effective_strict: bool = False,
+        upstream_plans: Optional[Sequence[MaterializedViewPlan]] = None,
     ) -> MaterializedViewPlan:
         plan = generate_materialized_view(
             schemas,
@@ -9072,7 +10257,9 @@ class MaterializedViewManager:
             object_prefix=self.object_prefix,
             strict=effective_strict,
             engine_version=self.engine_version,
+            upstream_plans=upstream_plans,
         )
+        schemas[plan.backing_table_name] = _build_upstream_plan_table_schema(plan)
         sig = self._compute_signature(plan, schemas)
 
         catalog = self.get_catalog()
@@ -9145,33 +10332,47 @@ class MaterializedViewManager:
     ) -> MaterializedViewPlan:
         """
         Safely installs or updates one or more materialized views on the connected database.
-        Supports both single-view and multi-view SQL scripts seamlessly.
+        Supports both single-view and multi-view SQL scripts seamlessly, including cascading
+        materialized views referencing views in the same script or already in `__matview_catalog`.
         """
         effective_ignore = (
             self.ignore_limitations if ignore_limitations is None else ignore_limitations
         )
         effective_strict = self.strict if strict is None else strict
         schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        catalog = self.get_catalog()
+        cat_pairs, running_schemas = self._compile_catalog_plans_in_order(schemas, catalog)
+        running_upstreams: List[MaterializedViewPlan] = [p for _, p in cat_pairs]
+
+        known_t = {k.lower() for k in running_schemas}
+        for up in running_upstreams:
+            known_t.update({up.logical_view_name.lower(), up.view_name.lower()})
+
         specs = parse_view_definitions(
             view_sql,
-            known_tables={k.lower() for k in schemas},
+            known_tables=known_t,
             indexes=indexes,
         )
         sub_plans: List[MaterializedViewPlan] = []
         for vs in specs:
-            sub_plans.append(
-                self._register_single_view_spec(
-                    vs,
-                    schemas=schemas,
-                    populate=populate,
-                    incremental_backfill=incremental_backfill,
-                    batch_size=batch_size,
-                    on_progress=on_progress,
-                    force_rebuild=force_rebuild,
-                    effective_ignore=effective_ignore,
-                    effective_strict=effective_strict,
-                )
+            sp = self._register_single_view_spec(
+                vs,
+                schemas=running_schemas,
+                populate=populate,
+                incremental_backfill=incremental_backfill,
+                batch_size=batch_size,
+                on_progress=on_progress,
+                force_rebuild=force_rebuild,
+                effective_ignore=effective_ignore,
+                effective_strict=effective_strict,
+                upstream_plans=running_upstreams,
             )
+            sub_plans.append(sp)
+            running_schemas[sp.backing_table_name] = _build_upstream_plan_table_schema(sp)
+            running_upstreams = [
+                u for u in running_upstreams if u.logical_view_name.lower() != sp.logical_view_name.lower()
+            ] + [sp]
+
         if len(sub_plans) == 1:
             return sub_plans[0]
         p0 = sub_plans[0]
@@ -9198,6 +10399,7 @@ class MaterializedViewManager:
             index_names=[n for sp in sub_plans for n in sp.index_names],
             user_indexes=p0.user_indexes,
             sub_plans=sub_plans,
+            engine_version=self.engine_version,
         )
 
     def sync_views(
@@ -9213,7 +10415,7 @@ class MaterializedViewManager:
     ) -> Dict[str, str]:
         """
         Declaratively synchronizes a collection of materialized view definitions against
-        the connected database (supporting multi-view SQL files/strings as well).
+        the connected database (supporting multi-view SQL files/strings and cascading MVs).
         Returns a status map `{view_name: "created" | "updated" | "unchanged" | "dropped"}`.
         """
         effective_ignore = (
@@ -9222,45 +10424,79 @@ class MaterializedViewManager:
         effective_strict = self.strict if strict is None else strict
         schemas = self.fetch_schema(extra_schema_sql=schema_sql)
         catalog = self.get_catalog()
+        cat_pairs, running_schemas = self._compile_catalog_plans_in_order(schemas, catalog)
+        running_upstreams: List[MaterializedViewPlan] = [p for _, p in cat_pairs]
+
+        known_t = {k.lower() for k in running_schemas}
+        for up in running_upstreams:
+            known_t.update({up.logical_view_name.lower(), up.view_name.lower()})
+
         status: Dict[str, str] = {}
         desired_names: Set[str] = set()
 
         all_specs = parse_view_definitions(
             view_sqls,
-            known_tables={k.lower() for k in schemas},
+            known_tables=known_t,
             indexes=indexes,
         )
 
+        # First pass: compile all desired specs in topological order and determine which need creation/rebuild
+        compiled_list: List[Tuple[ViewSpec, MaterializedViewPlan, str, bool]] = []
+        rebuilt_logical_lower: Set[str] = set()
         for v_spec in all_specs:
             plan = generate_materialized_view(
-                schemas,
+                running_schemas,
                 v_spec,
                 dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
                 ignore_limitations=effective_ignore,
                 object_prefix=self.object_prefix,
                 strict=effective_strict,
                 engine_version=self.engine_version,
+                upstream_plans=running_upstreams,
             )
+            running_schemas[plan.backing_table_name] = _build_upstream_plan_table_schema(plan)
+            running_upstreams = [
+                u for u in running_upstreams if u.logical_view_name.lower() != plan.logical_view_name.lower()
+            ] + [plan]
             v_name = plan.view_name
             desired_names.add(v_name)
-            sig = self._compute_signature(plan, schemas)
-            if v_name not in catalog:
-                self._register_single_view_spec(
+            sig = self._compute_signature(plan, running_schemas)
+            upstream_changed = any(u.lower() in rebuilt_logical_lower for u in plan.upstream_views)
+            needs_rebuild = (
+                v_name not in catalog
+                or catalog[v_name]["signature_hash"] != sig
+                or upstream_changed
+            )
+            if needs_rebuild:
+                rebuilt_logical_lower.add(plan.logical_view_name.lower())
+            compiled_list.append((v_spec, plan, sig, needs_rebuild))
+
+        # Drop any existing views that will be updated in reverse topological order first
+        # so rebuilding an upstream view does not fire stale triggers of a downstream view.
+        for _, plan, _, needs_rebuild in reversed(compiled_list):
+            if needs_rebuild and plan.view_name in catalog:
+                self.drop_view(plan.view_name)
+
+        # Second pass: install/update in topological order
+        exec_schemas = dict(schemas)
+        exec_upstreams: List[MaterializedViewPlan] = [
+            p for _, p in cat_pairs if p.view_name not in desired_names
+        ]
+        for up in exec_upstreams:
+            exec_schemas[up.backing_table_name] = _build_upstream_plan_table_schema(up)
+
+        for v_spec, plan, _, needs_rebuild in compiled_list:
+            v_name = plan.view_name
+            was_in_catalog = v_name in catalog
+            if not needs_rebuild:
+                status[v_name] = "unchanged"
+                exec_schemas[plan.backing_table_name] = _build_upstream_plan_table_schema(plan)
+                exec_upstreams.append(plan)
+            else:
+                reg_plan = self._register_single_view_spec(
                     v_spec,
-                    schemas=schemas,
-                    populate=True,
-                    incremental_backfill=incremental_backfill,
-                    batch_size=batch_size,
-                    on_progress=None,
-                    force_rebuild=False,
-                    effective_ignore=effective_ignore,
-                    effective_strict=effective_strict,
-                )
-                status[v_name] = "created"
-            elif catalog[v_name]["signature_hash"] != sig:
-                self._register_single_view_spec(
-                    v_spec,
-                    schemas=schemas,
+                    schemas=exec_schemas,
                     populate=True,
                     incremental_backfill=incremental_backfill,
                     batch_size=batch_size,
@@ -9268,13 +10504,14 @@ class MaterializedViewManager:
                     force_rebuild=True,
                     effective_ignore=effective_ignore,
                     effective_strict=effective_strict,
+                    upstream_plans=exec_upstreams,
                 )
-                status[v_name] = "updated"
-            else:
-                status[v_name] = "unchanged"
+                exec_schemas[reg_plan.backing_table_name] = _build_upstream_plan_table_schema(reg_plan)
+                exec_upstreams.append(reg_plan)
+                status[v_name] = "updated" if was_in_catalog else "created"
 
         if prune_removed:
-            for existing_name in list(catalog.keys()):
+            for existing_name in reversed(list(catalog.keys())):
                 if existing_name not in desired_names:
                     self.drop_view(existing_name)
                     status[existing_name] = "dropped"
@@ -9288,23 +10525,83 @@ class MaterializedViewManager:
         """
         schemas = self.fetch_schema()
         catalog = self.get_catalog()
+        if not catalog:
+            return {}
         report: Dict[str, str] = {}
+        known_t = {k.lower() for k in schemas}
+        raw_specs: List[ViewSpec] = []
+        spec_to_vname: Dict[str, str] = {}
+        for v_name in catalog:
+            unp = (
+                v_name[len(self.object_prefix) :]
+                if self.object_prefix and v_name.startswith(self.object_prefix)
+                else v_name
+            )
+            known_t.update({v_name.lower(), unp.lower()})
         for v_name, entry in catalog.items():
             try:
+                vs = parse_view_definition(entry["view_sql"], known_tables=known_t)
+                raw_specs.append(vs)
+                spec_to_vname[vs.view_name.lower()] = v_name
+            except Exception:
+                report[v_name] = "invalid"
+        try:
+            sorted_specs = _sort_view_specs_topologically(raw_specs, object_prefix=self.object_prefix)
+        except Exception:
+            sorted_specs = raw_specs
+
+        running_schemas = dict(schemas)
+        running_upstreams: List[MaterializedViewPlan] = []
+        drifted_logical: Set[str] = set()
+        for vs in sorted_specs:
+            v_name = spec_to_vname.get(vs.view_name.lower(), vs.view_name)
+            entry = catalog[v_name]
+            try:
                 plan = generate_materialized_view(
-                    schemas,
-                    entry["view_sql"],
+                    running_schemas,
+                    vs,
                     dialect=self.dialect,
                     pg_use_transition_tables=self.pg_use_transition_tables,
                     ignore_limitations=True,
                     object_prefix=self.object_prefix,
                     engine_version=self.engine_version,
+                    upstream_plans=running_upstreams,
                 )
-                sig = self._compute_signature(plan, schemas)
-                report[v_name] = "ok" if sig == entry["signature_hash"] else "drifted"
+                running_schemas[plan.backing_table_name] = _build_upstream_plan_table_schema(plan)
+                running_upstreams.append(plan)
+                sig = self._compute_signature(plan, running_schemas)
+                if sig != entry["signature_hash"] or any(
+                    u.lower() in drifted_logical for u in plan.upstream_views
+                ):
+                    report[v_name] = "drifted"
+                    drifted_logical.add(plan.logical_view_name.lower())
+                else:
+                    report[v_name] = "ok"
             except Exception:
                 report[v_name] = "invalid"
+                drifted_logical.add(vs.view_name.lower())
         return report
+
+    def _expand_targets_in_topological_order(
+        self,
+        catalog: Dict[str, Dict[str, Any]],
+        schemas: Dict[str, TableSchema],
+        requested_names: Optional[Sequence[str]],
+    ) -> Tuple[List[Tuple[Dict[str, Any], MaterializedViewPlan]], Dict[str, TableSchema]]:
+        ordered_pairs, full_schemas = self._compile_catalog_plans_in_order(schemas, catalog)
+        if not requested_names:
+            return ordered_pairs, full_schemas
+        resolved_set = {self._resolve_catalog_name(n, catalog) for n in requested_names}
+        selected_logical: Set[str] = set()
+        target_pairs: List[Tuple[Dict[str, Any], MaterializedViewPlan]] = []
+        for entry, plan in ordered_pairs:
+            v_name = entry["view_name"]
+            if v_name in resolved_set or any(
+                u.lower() in selected_logical for u in plan.upstream_views
+            ):
+                target_pairs.append((entry, plan))
+                selected_logical.add(plan.logical_view_name.lower())
+        return target_pairs, full_schemas
 
     def repair_view(
         self,
@@ -9314,6 +10611,7 @@ class MaterializedViewManager:
         """
         Reconciles and repairs one or all registered materialized views in an atomic pass,
         eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
+        Automatically repairs any dependent downstream materialized views in topological order.
         Returns `{view_name: "repaired" | "rebuilt"}`.
         """
         catalog = self.get_catalog()
@@ -9321,25 +10619,30 @@ class MaterializedViewManager:
             resolved = self._resolve_catalog_name(view_name, catalog)
             if resolved not in catalog:
                 raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
-            targets = [catalog[resolved]]
+            req_names: Optional[Sequence[str]] = [resolved]
         else:
-            targets = list(catalog.values())
+            req_names = None
 
         schemas = self.fetch_schema()
+        target_pairs, full_schemas = self._expand_targets_in_topological_order(
+            catalog, schemas, req_names
+        )
         results: Dict[str, str] = {}
         cur = self.conn.cursor()
-        for entry in targets:
-            v_name = entry["view_name"]
-            plan = generate_materialized_view(
-                schemas,
-                entry["view_sql"],
-                dialect=self.dialect,
-                pg_use_transition_tables=self.pg_use_transition_tables,
-                ignore_limitations=True,
-                object_prefix=self.object_prefix,
-            )
-            sig = self._compute_signature(plan, schemas)
+
+        # Check if any target needs a full schema-drift rebuild
+        any_drift = False
+        for entry, plan in target_pairs:
+            sig = self._compute_signature(plan, full_schemas)
             if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+                any_drift = True
+                break
+
+        if any_drift:
+            for entry, _ in reversed(target_pairs):
+                self.drop_view(entry["view_name"])
+            for entry, _ in target_pairs:
+                v_name = entry["view_name"]
                 self.register_view(
                     entry["view_sql"],
                     populate=True,
@@ -9347,35 +10650,54 @@ class MaterializedViewManager:
                     ignore_limitations=True,
                 )
                 results[v_name] = "rebuilt"
-            else:
-                try:
-                    for aux_t in plan.auxiliary_table_names:
-                        cur.execute(f"DELETE FROM {aux_t};")
-                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
-                    for stmt in plan.get_populate_statements(incremental_backfill=False):
-                        cur.execute(stmt)
-                    self._commit()
-                    results[v_name] = "repaired"
-                except Exception:
-                    self._rollback()
-                    raise
+            return results
+
+        # Suspend maintenance triggers across all target views before repopulating in topological order
+        try:
+            for entry, _ in target_pairs:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+
+            for entry, plan in target_pairs:
+                for aux_t in plan.auxiliary_table_names:
+                    cur.execute(f"DELETE FROM {aux_t};")
+                cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                for stmt in plan.get_populate_statements(incremental_backfill=False):
+                    cur.execute(stmt)
+                results[entry["view_name"]] = "repaired"
+
+            for _, plan in target_pairs:
+                for stmt in plan.trigger_ddls:
+                    cur.execute(stmt)
+
+            self._commit()
+        except Exception:
+            self._rollback()
+            raise
         return results
 
     @contextmanager
     def bulk_changes(self, view_names: Optional[Sequence[str]] = None) -> Iterator[None]:
         """
         Context manager for executing massive multi-statement bulk loads/mutations.
-        Temporarily suspends maintenance triggers for the target views during the block,
-        and atomically recomputes the backing tables in a single set-based pass on clean exit.
+        Temporarily suspends maintenance triggers for the target views (and any dependent
+        downstream views) during the block, and atomically recomputes the backing tables
+        in topological order on clean exit before re-attaching maintenance triggers.
         If an exception is raised inside the `with` block, rolls back uncommitted changes
         and restores triggers without committing dirty data.
         """
         catalog = self.get_catalog()
-        if view_names:
-            resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
-            targets = [catalog[n] for n in resolved if n in catalog]
-        else:
-            targets = list(catalog.values())
+        schemas = self.fetch_schema()
+        target_pairs, _ = self._expand_targets_in_topological_order(
+            catalog, schemas, view_names
+        )
+        targets = [entry for entry, _ in target_pairs]
 
         cur = self.conn.cursor()
         for entry in targets:
@@ -9392,39 +10714,28 @@ class MaterializedViewManager:
             yield
         except Exception:
             self._rollback()
-            schemas = self.fetch_schema()
-            for entry in targets:
-                plan = generate_materialized_view(
-                    schemas,
-                    entry["view_sql"],
-                    dialect=self.dialect,
-                    pg_use_transition_tables=self.pg_use_transition_tables,
-                    ignore_limitations=True,
-                    object_prefix=self.object_prefix,
-                    engine_version=self.engine_version,
-                )
+            fresh_schemas = self.fetch_schema()
+            fresh_pairs, _ = self._expand_targets_in_topological_order(
+                catalog, fresh_schemas, view_names
+            )
+            for _, plan in fresh_pairs:
                 for stmt in plan.trigger_ddls:
                     cur.execute(stmt)
             self._commit()
             raise
         else:
-            schemas = self.fetch_schema()
-            for entry in targets:
-                plan = generate_materialized_view(
-                    schemas,
-                    entry["view_sql"],
-                    dialect=self.dialect,
-                    pg_use_transition_tables=self.pg_use_transition_tables,
-                    ignore_limitations=True,
-                    object_prefix=self.object_prefix,
-                    engine_version=self.engine_version,
-                )
+            fresh_schemas = self.fetch_schema()
+            fresh_pairs, _ = self._expand_targets_in_topological_order(
+                catalog, fresh_schemas, view_names
+            )
+            for _, plan in fresh_pairs:
                 for aux_t in plan.auxiliary_table_names:
                     cur.execute(f"DELETE FROM {aux_t};")
                 cur.execute(f"DELETE FROM {plan.backing_table_name};")
-                for stmt in plan.trigger_ddls:
-                    cur.execute(stmt)
                 for stmt in plan.get_populate_statements(incremental_backfill=False):
+                    cur.execute(stmt)
+            for _, plan in fresh_pairs:
+                for stmt in plan.trigger_ddls:
                     cur.execute(stmt)
             self._commit()
 
@@ -9460,6 +10771,175 @@ def _resolve_dialect_and_engine_version(
     return parse_engine_version(dialect or Dialect.SQLITE)
 
 
+def _target_references_unknown_tables(
+    target_view_sql_or_spec: Any,
+    base_schemas: Dict[str, TableSchema],
+    explicit_upstreams: Sequence[MaterializedViewPlan],
+) -> bool:
+    base_lower = {k.lower() for k in base_schemas}
+    for up in explicit_upstreams:
+        base_lower.update({up.logical_view_name.lower(), up.view_name.lower(), up.backing_table_name.lower()})
+
+    raw_items: List[Any]
+    if isinstance(target_view_sql_or_spec, (str, ViewSpec)):
+        raw_items = [target_view_sql_or_spec]
+    else:
+        raw_items = list(target_view_sql_or_spec)
+
+    for item in raw_items:
+        if isinstance(item, ViewSpec):
+            for v_obj in (item, *item.additional_views):
+                cte_n, _, _ = _extract_cte_names_and_strip_with(v_obj.raw_select_sql)
+                refs = _extract_all_referenced_tables(v_obj.raw_select_sql, cte_n, known_tables=None)
+                if any(r.lower() not in base_lower for r in refs):
+                    return True
+        elif isinstance(item, str):
+            cte_n, _, _ = _extract_cte_names_and_strip_with(item)
+            refs = _extract_all_referenced_tables(item, cte_n, known_tables=None)
+            if any(r.lower() not in base_lower for r in refs):
+                return True
+    return False
+
+
+def _discover_upstream_plans_from_source(
+    schema_sql_or_dict: Any,
+    schemas: Dict[str, TableSchema],
+    resolved_ev: EngineVersion,
+    pg_use_transition_tables: bool,
+    object_prefix: str,
+    explicit_upstream_plans: Optional[Sequence[MaterializedViewPlan]] = None,
+    target_view_sql_or_spec: Any = None,
+) -> List[MaterializedViewPlan]:
+    upstreams: List[MaterializedViewPlan] = list(explicit_upstream_plans) if explicit_upstream_plans else []
+    if target_view_sql_or_spec is not None and not _target_references_unknown_tables(
+        target_view_sql_or_spec, schemas, upstreams
+    ):
+        return upstreams
+
+    seen_logical: Set[str] = {p.logical_view_name.lower() for p in upstreams}
+    eff_dialect = resolved_ev.dialect
+
+    # 1. If schema_sql_or_dict is a SQL string containing `CREATE VIEW` statements, compile them in topological order
+    if isinstance(schema_sql_or_dict, str):
+        clean_s = _strip_sql_comments(schema_sql_or_dict).strip()
+        view_stmts = [
+            st.strip()
+            for st in _split_top_level(clean_s, ";")
+            if st.strip()
+            and re.match(
+                r"^CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?(?:MATERIALIZED\s+)?VIEW\b",
+                st.strip(),
+                flags=re.IGNORECASE,
+            )
+        ]
+        if view_stmts:
+            known_t = {k.lower() for k in schemas}
+            v_specs = parse_view_definitions(";\n".join(view_stmts), known_tables=known_t)
+            for vs in v_specs:
+                comp = IncrementalViewCompiler(
+                    schemas=schemas,
+                    view_spec=vs,
+                    dialect=eff_dialect,
+                    pg_use_transition_tables=pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=object_prefix,
+                    engine_version=resolved_ev,
+                    upstream_plans=upstreams,
+                )
+                p = comp._compile_single_plan()
+                schemas[p.backing_table_name] = _build_upstream_plan_table_schema(p)
+                if p.logical_view_name.lower() not in seen_logical:
+                    upstreams.append(p)
+                    seen_logical.add(p.logical_view_name.lower())
+        return upstreams
+
+    # 2. If schema_sql_or_dict is a live DB connection, check `__matview_catalog` or installed `__matview_store_*` tables
+    if hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        conn = schema_sql_or_dict
+        sq_inner = getattr(conn, "_sq_conn", conn if eff_dialect == Dialect.SQLITE else None)
+        store_prefix = f"{object_prefix}store_".lower() if object_prefix else "__matview_store_"
+        installed_stores: Set[str] = set()
+        if sq_inner is not None:
+            try:
+                cur_sq = sq_inner.cursor()
+                cur_sq.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+                for r in cur_sq.fetchall() or []:
+                    if r and str(r[0]).lower().startswith(store_prefix):
+                        installed_stores.add(str(r[0]).lower())
+            except Exception:
+                pass
+        else:
+            try:
+                cur = conn.cursor()
+                if eff_dialect == Dialect.POSTGRES:
+                    cur.execute(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'"
+                    )
+                else:
+                    cur.execute(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'"
+                    )
+                for r in cur.fetchall() or []:
+                    tn = r[0].decode("utf-8") if isinstance(r[0], (bytes, bytearray)) else str(r[0])
+                    if tn.lower().startswith(store_prefix):
+                        installed_stores.add(tn.lower())
+            except Exception:
+                pass
+
+        for st_low in sorted(installed_stores):
+            cached_p = _COMPILED_MV_PLANS_BY_KEY.get((eff_dialect.value, st_low))
+            if cached_p and cached_p.logical_view_name.lower() not in seen_logical:
+                schemas[cached_p.backing_table_name] = _build_upstream_plan_table_schema(cached_p)
+                upstreams.append(cached_p)
+                seen_logical.add(cached_p.logical_view_name.lower())
+
+        # Also check catalog table if present on `conn`
+        cat_tbl = f"{object_prefix}catalog" if object_prefix else "matview_catalog"
+        try:
+            cur_c = conn.cursor()
+            cur_c.execute(f"SELECT view_name, view_sql FROM {cat_tbl}")
+            cat_rows = cur_c.fetchall() or []
+            if cat_rows:
+                raw_cat_sqls = [
+                    r[1].decode("utf-8") if isinstance(r[1], (bytes, bytearray)) else str(r[1])
+                    for r in cat_rows
+                ]
+                known_t = {k.lower() for k in schemas} | {p.logical_view_name.lower() for p in upstreams}
+                cat_specs = parse_view_definitions(raw_cat_sqls, known_tables=known_t)
+                for vs in cat_specs:
+                    log_n = (
+                        vs.view_name[len(object_prefix) :]
+                        if object_prefix and vs.view_name.startswith(object_prefix)
+                        else vs.view_name
+                    )
+                    if log_n.lower() in seen_logical:
+                        continue
+                    comp = IncrementalViewCompiler(
+                        schemas=schemas,
+                        view_spec=vs,
+                        dialect=eff_dialect,
+                        pg_use_transition_tables=pg_use_transition_tables,
+                        ignore_limitations=True,
+                        object_prefix=object_prefix,
+                        engine_version=resolved_ev,
+                        upstream_plans=upstreams,
+                    )
+                    p = comp._compile_single_plan()
+                    schemas[p.backing_table_name] = _build_upstream_plan_table_schema(p)
+                    upstreams.append(p)
+                    seen_logical.add(p.logical_view_name.lower())
+        except Exception:
+            if hasattr(conn, "rollback"):
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+    return upstreams
+
+
 def generate_materialized_view(
     schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
     view_sql_or_spec: str | ViewSpec,
@@ -9472,10 +10952,12 @@ def generate_materialized_view(
     batch_size: int = 1000,
     strict: bool = False,
     engine_version: Optional[EngineVersion | str] = None,
+    upstream_plans: Optional[Sequence[MaterializedViewPlan]] = None,
 ) -> MaterializedViewPlan:
     """
-    Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
-    into a `MaterializedViewPlan`. Autodetects the database dialect and version when passed
+    Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script, including cascading
+    materialized views referencing other materialized views) and base table schema into a
+    `MaterializedViewPlan`. Autodetects the database dialect and version when passed
     a live connection, or accepts `engine_version` (e.g. `'postgres:17'`, `'mariadb:11.4'`, `'mysql:8.4'`).
     """
     resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
@@ -9492,7 +10974,20 @@ def generate_materialized_view(
     else:
         schemas = dict(schema_sql_or_dict)
 
+    discovered_upstreams = _discover_upstream_plans_from_source(
+        schema_sql_or_dict=schema_sql_or_dict,
+        schemas=schemas,
+        resolved_ev=resolved_ev,
+        pg_use_transition_tables=pg_use_transition_tables,
+        object_prefix=object_prefix,
+        explicit_upstream_plans=upstream_plans,
+        target_view_sql_or_spec=view_sql_or_spec,
+    )
+
     known_tables = {k.lower() for k in schemas}
+    for up in discovered_upstreams:
+        known_tables.update({up.logical_view_name.lower(), up.view_name.lower()})
+
     if isinstance(view_sql_or_spec, str):
         view_spec = parse_view_definition(
             view_sql_or_spec,
@@ -9537,6 +11032,7 @@ def generate_materialized_view(
         batch_size=batch_size,
         strict=strict,
         engine_version=resolved_ev,
+        upstream_plans=discovered_upstreams,
     )
     return compiler.compile()
 
@@ -9553,10 +11049,11 @@ def generate_materialized_views(
     batch_size: int = 1000,
     strict: bool = False,
     engine_version: Optional[EngineVersion | str] = None,
+    upstream_plans: Optional[Sequence[MaterializedViewPlan]] = None,
 ) -> List[MaterializedViewPlan]:
     """
-    Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
-    into a flat list of `MaterializedViewPlan` objects.
+    Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts
+    and cascading materialized views) into a topologically ordered list of `MaterializedViewPlan` objects.
     """
     resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
     eff_dialect = resolved_ev.dialect
@@ -9572,15 +11069,29 @@ def generate_materialized_views(
     else:
         schemas = dict(schema_sql_or_dict)
 
+    running_upstreams = _discover_upstream_plans_from_source(
+        schema_sql_or_dict=schema_sql_or_dict,
+        schemas=schemas,
+        resolved_ev=resolved_ev,
+        pg_use_transition_tables=pg_use_transition_tables,
+        object_prefix=object_prefix,
+        explicit_upstream_plans=upstream_plans,
+        target_view_sql_or_spec=view_sqls,
+    )
+    known_tables = {k.lower() for k in schemas}
+    for up in running_upstreams:
+        known_tables.update({up.logical_view_name.lower(), up.view_name.lower()})
+
     specs = parse_view_definitions(
         view_sqls,
-        known_tables={k.lower() for k in schemas},
+        known_tables=known_tables,
         indexes=indexes,
     )
     plans: List[MaterializedViewPlan] = []
+    running_schemas = dict(schemas)
     for vs in specs:
         comp = IncrementalViewCompiler(
-            schemas=schemas,
+            schemas=running_schemas,
             view_spec=vs,
             dialect=eff_dialect,
             pg_use_transition_tables=pg_use_transition_tables,
@@ -9590,8 +11101,12 @@ def generate_materialized_views(
             batch_size=batch_size,
             strict=strict,
             engine_version=resolved_ev,
+            upstream_plans=running_upstreams,
         )
-        plans.append(comp._compile_single_plan())
+        p = comp._compile_single_plan()
+        plans.append(p)
+        running_schemas[p.backing_table_name] = _build_upstream_plan_table_schema(p)
+        running_upstreams.append(p)
     return plans
 
 
