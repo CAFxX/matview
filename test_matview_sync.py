@@ -5444,7 +5444,7 @@ class VariableSchemaDifferentialFuzzer:
             vals += ["NULL" if parent == i else "1" for parent, _ in fks[i]]
             mutations.extend([
                 (f"{prefix}_t{i}_insert", f"INSERT INTO {meta['name']} ({', '.join(fields)}) VALUES ({', '.join(vals)});"),
-                (f"{prefix}_t{i}_update", f"UPDATE {meta['name']} SET qty = COALESCE(qty, 0) + {rng.randint(1, 9)}, amount = COALESCE(amount, 0) + 0.125 WHERE id = 1;"),
+                (f"{prefix}_t{i}_update", f"UPDATE {meta['name']} SET qty = COALESCE(qty, 0) + {rng.randint(1, 9)}, amount = COALESCE(amount, 0) + 1 WHERE id = 1;"),
                 (f"{prefix}_t{i}_delete", f"DELETE FROM {meta['name']} WHERE id = {row_counts[i]};"),
             ])
 
