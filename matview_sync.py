@@ -832,9 +832,10 @@ class SQLToken:
     @property
     def unquoted(self) -> str:
         if self.kind == SQLTokenType.QUOTED_IDENT:
-            ident_node = sqlglot_exp.to_identifier(self.text)
-            if ident_node is not None:
-                return ident_node.name
+            sg_toks = sqlglot.tokenize(self.text, read="sqlite")
+            if len(sg_toks) == 1 and sg_toks[0].token_type == SQLGlotTokenType.IDENTIFIER:
+                return sg_toks[0].text
+            return _unquote_ident(self.text)
         return self.text
 
 
@@ -949,7 +950,7 @@ def quote_sql_identifier(
 def format_sql(
     sql: str,
     dialect: Dialect = Dialect.SQLITE,
-    pretty: bool = True,
+    pretty: bool = False,
 ) -> str:
     """
     Formats and normalizes a SQL statement or script using `sqlglot.transpile`.
@@ -958,7 +959,8 @@ def format_sql(
     try:
         transpiled = sqlglot.transpile(sql, read=sg_dialect, write=sg_dialect, pretty=pretty)
         if transpiled:
-            return ";\n".join(t.rstrip(";") for t in transpiled) + (";" if sql.strip().endswith(";") else "")
+            sep = ";\n" if pretty else "; "
+            return sep.join(t.rstrip(";") for t in transpiled) + (";" if sql.strip().endswith(";") else "")
     except sqlglot.errors.SqlglotError:
         pass
     lines = [re.sub(r"[ \t]+", " ", ln).rstrip() for ln in sql.strip().splitlines()]
@@ -1159,11 +1161,65 @@ def _find_top_level_token(
     return None
 
 
-def _extract_set_op_branches_from_ast(query_ast: sqlglot_exp.Expr) -> Tuple[List[str], List[str]]:
+def _extract_set_op_branches_from_ast(
+    query_ast: sqlglot_exp.Expr,
+    raw_sql: Optional[str] = None,
+) -> Tuple[List[str], List[str]]:
     """
     Traverses a `sqlglot.exp.SetOperation` AST (`Union`, `Intersect`, `Except`) in order,
-    returning `(operators, branch_sqls)`.
+    returning `(operators, branch_sqls)` while preserving exact branch SQL slices from `raw_sql`
+    when available.
     """
+    if raw_sql:
+        s = _unwrap_outer_parens(raw_sql.strip())
+        toks = sqlglot.tokenize(s, read="sqlite")
+        ops_tok: List[str] = []
+        branches_tok: List[str] = []
+        depth = 0
+        branch_start = 0
+        idx = 0
+        n = len(toks)
+        while idx < n:
+            tk = toks[idx]
+            if tk.token_type == SQLGlotTokenType.L_PAREN:
+                depth += 1
+            elif tk.token_type == SQLGlotTokenType.R_PAREN and depth > 0:
+                depth -= 1
+            elif depth == 0 and tk.token_type in (
+                SQLGlotTokenType.UNION,
+                SQLGlotTokenType.INTERSECT,
+                SQLGlotTokenType.EXCEPT,
+            ):
+                b_slice = _unwrap_outer_parens(s[branch_start : tk.start].strip())
+                if b_slice:
+                    branches_tok.append(b_slice)
+                base_kw = (
+                    "UNION"
+                    if tk.token_type == SQLGlotTokenType.UNION
+                    else ("INTERSECT" if tk.token_type == SQLGlotTokenType.INTERSECT else "EXCEPT")
+                )
+                next_idx = idx + 1
+                is_all = False
+                if next_idx < n and toks[next_idx].token_type in (
+                    SQLGlotTokenType.ALL,
+                    SQLGlotTokenType.DISTINCT,
+                ):
+                    is_all = toks[next_idx].token_type == SQLGlotTokenType.ALL
+                    branch_start = toks[next_idx].end + 1
+                    idx = next_idx + 1
+                else:
+                    branch_start = tk.end + 1
+                    idx += 1
+                ops_tok.append(f"{base_kw} ALL" if is_all else base_kw)
+                continue
+            idx += 1
+        if ops_tok:
+            last_b = _unwrap_outer_parens(s[branch_start:].strip())
+            if last_b:
+                branches_tok.append(last_b)
+            if len(branches_tok) == len(ops_tok) + 1:
+                return ops_tok, branches_tok
+
     ops: List[str] = []
     branches: List[str] = []
 
@@ -1211,7 +1267,14 @@ def parse_table_schema(schema_sql: str) -> Dict[str, TableSchema]:
     """Parses one or more CREATE TABLE statements into TableSchema objects via `sqlglot.parse`."""
     clean = _strip_sql_comments(schema_sql)
     schemas: Dict[str, TableSchema] = {}
-    for stmt_ast in sqlglot.parse(clean, read="sqlite"):
+    for st_raw in _split_top_level(clean, ";"):
+        st_sql = st_raw.strip()
+        if not st_sql:
+            continue
+        try:
+            stmt_ast = sqlglot.parse_one(st_sql, read="sqlite")
+        except sqlglot.errors.SqlglotError:
+            continue
         if not isinstance(stmt_ast, sqlglot_exp.Create) or stmt_ast.kind.upper() != "TABLE":
             continue
         schema_node = stmt_ast.this
@@ -1225,26 +1288,47 @@ def parse_table_schema(schema_sql: str) -> Dict[str, TableSchema]:
         fk_cascades: List[str] = []
         has_on_conflict_replace = False
 
-        for expr_item in schema_node.expressions:
-            if expr_item.args.get("on_conflict") == "REPLACE":
+        # Inspect AST & token stream of the CREATE TABLE statement for FK cascades and ON CONFLICT REPLACE
+        st_toks = sqlglot.tokenize(st_sql, read="sqlite")
+        for k_i in range(len(st_toks)):
+            if (
+                k_i + 2 < len(st_toks)
+                and st_toks[k_i].token_type == SQLGlotTokenType.ON
+                and st_toks[k_i + 1].text.upper() == "CONFLICT"
+                and st_toks[k_i + 2].token_type == SQLGlotTokenType.REPLACE
+            ):
                 has_on_conflict_replace = True
-            if isinstance(expr_item, sqlglot_exp.ForeignKey):
-                del_act = expr_item.args.get("delete")
-                upd_act = expr_item.args.get("update")
-                if del_act:
-                    act_s = f"ON DELETE {del_act}"
-                    if act_s not in fk_cascades:
-                        fk_cascades.append(act_s)
-                if upd_act:
-                    act_s = f"ON UPDATE {upd_act}"
-                    if act_s not in fk_cascades:
-                        fk_cascades.append(act_s)
-                continue
-            if isinstance(expr_item, sqlglot_exp.PrimaryKey):
-                for pk_id in expr_item.expressions:
-                    if pk_id.name:
-                        table_pk_cols.add(pk_id.name.lower())
-                continue
+            if (
+                k_i + 2 < len(st_toks)
+                and st_toks[k_i].token_type == SQLGlotTokenType.ON
+                and st_toks[k_i + 1].token_type in (SQLGlotTokenType.DELETE, SQLGlotTokenType.UPDATE)
+            ):
+                ev_type = st_toks[k_i + 1].text.upper()
+                act_w1 = st_toks[k_i + 2].text.upper()
+                act_str = act_w1
+                if act_w1 == "SET" and k_i + 3 < len(st_toks):
+                    act_str = f"SET {st_toks[k_i + 3].text.upper()}"
+                if act_str in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                    act_full = f"ON {ev_type} {act_str}"
+                    if act_full not in fk_cascades:
+                        fk_cascades.append(act_full)
+
+        for ref_node in stmt_ast.find_all(sqlglot_exp.Reference):
+            for opt in (ref_node.args.get("options") or []):
+                opt_s = str(opt).strip().upper()
+                if opt_s in (
+                    "ON DELETE CASCADE", "ON DELETE SET NULL", "ON DELETE SET DEFAULT",
+                    "ON UPDATE CASCADE", "ON UPDATE SET NULL", "ON UPDATE SET DEFAULT",
+                ) and opt_s not in fk_cascades:
+                    fk_cascades.append(opt_s)
+
+        for pk_node in schema_node.find_all(sqlglot_exp.PrimaryKey):
+            for pk_id in pk_node.expressions:
+                pk_name = pk_id.name or (pk_id.this.name if isinstance(pk_id.this, sqlglot_exp.Expr) else "")
+                if pk_name:
+                    table_pk_cols.add(pk_name.lower())
+
+        for expr_item in schema_node.expressions:
             if isinstance(expr_item, sqlglot_exp.ColumnDef):
                 col_name = expr_item.name
                 if not col_name:
@@ -1618,7 +1702,7 @@ def _unwrap_outer_parens(sql: str) -> str:
 
 
 def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
-    """Parses a single top-level aggregate function call using `sqlglot.parse_one`."""
+    """Parses a single top-level aggregate function call using `sqlglot.parse_one` and `sqlglot.tokenize`."""
     s = _unwrap_outer_parens(expr)
     if not s:
         return None
@@ -1630,51 +1714,90 @@ def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
     if isinstance(ast_node, sqlglot_exp.Window) or ast_node.find(sqlglot_exp.Window):
         return None
 
-    filter_where: Optional[str] = None
-    agg_node: sqlglot_exp.Expr = ast_node
-    if isinstance(ast_node, sqlglot_exp.Filter):
-        w_expr = ast_node.expression
-        if isinstance(w_expr, sqlglot_exp.Where) and w_expr.this is not None:
-            filter_where = w_expr.this.sql()
-        elif isinstance(w_expr, sqlglot_exp.Expr):
-            filter_where = w_expr.sql()
-        if not filter_where:
-            return None
-        # Validate balanced parentheses in filter_where via sqlglot tokenizer
-        f_toks = sqlglot.tokenize(filter_where, read="sqlite")
-        f_depth = 0
-        for ftk in f_toks:
-            if ftk.token_type == SQLGlotTokenType.L_PAREN:
-                f_depth += 1
-            elif ftk.token_type == SQLGlotTokenType.R_PAREN:
-                f_depth -= 1
-                if f_depth < 0:
-                    return None
-        if f_depth != 0:
-            return None
-        agg_node = ast_node.this
-
+    agg_node: sqlglot_exp.Expr = ast_node.this if isinstance(ast_node, sqlglot_exp.Filter) else ast_node
     if not isinstance(agg_node, (sqlglot_exp.AggFunc, sqlglot_exp.Func)):
         return None
 
-    fn_raw = agg_node.sql_name().upper()
-    is_dist = bool(agg_node.args.get("distinct")) or isinstance(agg_node.this, sqlglot_exp.Distinct)
-    if isinstance(agg_node.this, sqlglot_exp.Distinct):
-        arg_nodes = list(agg_node.this.expressions)
-    else:
-        arg_nodes = ([agg_node.this] if agg_node.this is not None else []) + list(agg_node.expressions)
+    toks = sqlglot.tokenize(s, read="sqlite")
+    if len(toks) < 3 or toks[0].token_type not in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR) or toks[1].token_type != SQLGlotTokenType.L_PAREN:
+        return None
 
-    first_node = arg_nodes[0] if arg_nodes else sqlglot_exp.Expr(_raw_sql="")
-    first_arg = first_node.sql().strip()
-    extra_args = ", ".join(a.sql().strip() for a in arg_nodes[1:]) if len(arg_nodes) > 1 else None
-    src_col = (
-        first_node.name
-        if isinstance(first_node, sqlglot_exp.Column) and not isinstance(first_node.this, sqlglot_exp.Star)
-        else None
-    )
+    depth = 0
+    close_idx = -1
+    for idx in range(1, len(toks)):
+        if toks[idx].token_type == SQLGlotTokenType.L_PAREN:
+            depth += 1
+        elif toks[idx].token_type == SQLGlotTokenType.R_PAREN:
+            depth -= 1
+            if depth == 0:
+                close_idx = idx
+                break
+    if close_idx == -1:
+        return None
+
+    filter_where: Optional[str] = None
+    if close_idx < len(toks) - 1:
+        # Must be `FILTER ( WHERE <filter_where> )` spanning to the end of `s`
+        if (
+            close_idx + 4 >= len(toks)
+            or toks[close_idx + 1].token_type != SQLGlotTokenType.FILTER
+            or toks[close_idx + 2].token_type != SQLGlotTokenType.L_PAREN
+            or toks[close_idx + 3].token_type != SQLGlotTokenType.WHERE
+            or toks[-1].token_type != SQLGlotTokenType.R_PAREN
+        ):
+            return None
+        f_depth = 0
+        f_close = -1
+        for idx in range(close_idx + 2, len(toks)):
+            if toks[idx].token_type == SQLGlotTokenType.L_PAREN:
+                f_depth += 1
+            elif toks[idx].token_type == SQLGlotTokenType.R_PAREN:
+                f_depth -= 1
+                if f_depth == 0:
+                    f_close = idx
+                    break
+        if f_close != len(toks) - 1:
+            return None
+        filter_where = s[toks[close_idx + 3].end + 1 : toks[-1].start].strip()
+        if not filter_where:
+            return None
+        fw_toks = sqlglot.tokenize(filter_where, read="sqlite")
+        fw_d = 0
+        for ftk in fw_toks:
+            if ftk.token_type == SQLGlotTokenType.L_PAREN:
+                fw_d += 1
+            elif ftk.token_type == SQLGlotTokenType.R_PAREN:
+                fw_d -= 1
+                if fw_d < 0:
+                    return None
+        if fw_d != 0:
+            return None
+
+    fn_raw = toks[0].text.upper()
+    inner_args_sql = s[toks[1].end + 1 : toks[close_idx].start].strip()
+    in_toks = sqlglot.tokenize(inner_args_sql, read="sqlite")
+    is_dist = bool(agg_node.args.get("distinct")) or isinstance(agg_node.this, sqlglot_exp.Distinct)
+    if in_toks and in_toks[0].token_type == SQLGlotTokenType.DISTINCT:
+        is_dist = True
+        inner_args_sql = inner_args_sql[in_toks[0].end + 1 :].strip()
+    elif in_toks and in_toks[0].token_type == SQLGlotTokenType.ALL:
+        is_dist = False
+        inner_args_sql = inner_args_sql[in_toks[0].end + 1 :].strip()
+
+    arg_parts = [p.strip() for p in _split_top_level(inner_args_sql, ",") if p.strip()] if inner_args_sql else []
+    first_arg = arg_parts[0] if arg_parts else ""
+    extra_args = ", ".join(arg_parts[1:]) if len(arg_parts) > 1 else None
+    src_col: Optional[str] = None
+    if first_arg and first_arg != "*":
+        try:
+            first_node = parse_sql_ast(first_arg)
+            if isinstance(first_node, sqlglot_exp.Column) and not isinstance(first_node.this, sqlglot_exp.Star):
+                src_col = first_node.name
+        except sqlglot.errors.SqlglotError:
+            pass
 
     if fn_raw == "COUNT":
-        if isinstance(first_node, sqlglot_exp.Star) or first_arg in ("*", ""):
+        if first_arg in ("*", ""):
             return SelectItem(
                 raw_expr=expr.strip(),
                 alias=alias,
@@ -1719,17 +1842,33 @@ def _contains_aggregate_call(expr: str) -> bool:
         return False
     if ast_node.find(sqlglot_exp.Window) or ast_node.find(sqlglot_exp.Subquery, sqlglot_exp.Select):
         return False
-    return bool(ast_node.find(sqlglot_exp.AggFunc))
+    if ast_node.find(sqlglot_exp.AggFunc):
+        return True
+    for anon_node in ast_node.find_all(sqlglot_exp.Anonymous):
+        if anon_node.name.upper() in _FN_TO_AGG_ENUM or anon_node.name.upper() == "COUNT":
+            return True
+    return False
 
 
 def _parse_select_item(raw_item: str, idx: int) -> SelectItem:
-    """Parses a single `SELECT` projection item via `sqlglot` AST."""
+    """Parses a single `SELECT` projection item via `sqlglot.parse_one`."""
     s = raw_item.strip()
-    proj_ast = sqlglot._parse_projection_item(s, dialect="sqlite")
+    try:
+        sel_ast = sqlglot.parse_one(f"SELECT {s}", read="sqlite")
+        proj_ast = sel_ast.expressions[0] if isinstance(sel_ast, sqlglot_exp.Select) and sel_ast.expressions else parse_sql_ast(s)
+    except sqlglot.errors.SqlglotError:
+        proj_ast = sqlglot_exp.Expr()
+
     if isinstance(proj_ast, sqlglot_exp.Alias):
         alias = proj_ast.alias
         inner_node = proj_ast.this
-        expr = inner_node.sql().strip() if isinstance(inner_node, sqlglot_exp.Expr) else str(inner_node or "").strip()
+        toks = sqlglot.tokenize(s, read="sqlite")
+        if len(toks) >= 2 and toks[-2].token_type == SQLGlotTokenType.ALIAS:
+            expr = s[: toks[-2].start].strip()
+        elif len(toks) >= 2:
+            expr = s[: toks[-1].start].strip()
+        else:
+            expr = inner_node.sql().strip() if isinstance(inner_node, sqlglot_exp.Expr) else str(inner_node or "").strip()
     else:
         inner_node = proj_ast
         expr = s
@@ -1765,7 +1904,7 @@ def _parse_select_item(raw_item: str, idx: int) -> SelectItem:
 
 
 def _extract_cte_names_and_strip_with(select_sql: str) -> Tuple[Set[str], str, bool]:
-    """Extracts CTE names and the main SELECT body from a query using `sqlglot.parse_one`."""
+    """Extracts CTE names and the main SELECT body from a query using `sqlglot.parse_one` and `sqlglot.tokenize`."""
     s = select_sql.strip()
     try:
         q_ast = parse_sql_ast(s)
@@ -1775,31 +1914,95 @@ def _extract_cte_names_and_strip_with(select_sql: str) -> Tuple[Set[str], str, b
     if not isinstance(with_node, sqlglot_exp.With):
         return set(), s, False
     cte_names = {cte.alias for cte in with_node.expressions if isinstance(cte, sqlglot_exp.CTE) and cte.alias}
-    main_select = str(q_ast.args.get("_main_select_sql") or s).strip()
+    toks = sqlglot.tokenize(s, read="sqlite")
+    depth = 0
+    seen_as = False
+    main_select = s
+    for idx, tk in enumerate(toks):
+        if tk.token_type == SQLGlotTokenType.L_PAREN:
+            depth += 1
+        elif tk.token_type == SQLGlotTokenType.R_PAREN:
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and seen_as:
+                    seen_as = False
+                    if idx + 1 < len(toks) and toks[idx + 1].token_type != SQLGlotTokenType.COMMA:
+                        main_select = s[toks[idx + 1].start :].strip()
+                        break
+        elif depth == 0 and tk.token_type == SQLGlotTokenType.ALIAS:
+            seen_as = True
     return cte_names, (main_select if main_select else s), True
 
 
 def _parse_from_and_joins(from_clause: str, cte_names: Set[str]) -> Tuple[List[JoinSpec], bool]:
-    """Parses a `FROM ... [JOIN ...]` clause into `JoinSpec` objects using `sqlglot` AST nodes."""
+    """Parses a `FROM ... [JOIN ...]` clause into `JoinSpec` objects using `sqlglot.parse_one`."""
     s = from_clause.strip()
     if not s:
         return [], False
-    from_node, join_nodes = sqlglot._parse_from_and_join_ast(s, dialect="sqlite")
-    if from_node is None:
+    toks = sqlglot.tokenize(s, read="sqlite")
+    if not toks:
         return [], False
+    if toks[0].token_type == SQLGlotTokenType.FROM:
+        s_body = s[toks[0].end + 1 :].strip()
+    else:
+        s_body = s
+    if not s_body:
+        return [], False
+    try:
+        sel_ast = sqlglot.parse_one(f"SELECT * FROM {s_body}", read="sqlite")
+    except sqlglot.errors.SqlglotError:
+        return [], False
+    if not isinstance(sel_ast, sqlglot_exp.Select):
+        return [], False
+
+    from_node = sel_ast.args.get("from_")
+    join_nodes = sel_ast.args.get("joins") or []
+    if not isinstance(from_node, sqlglot_exp.From):
+        return [], False
+
+    # Also extract raw ON condition slices from `s_body` via `sqlglot.tokenize`
+    body_toks = sqlglot.tokenize(s_body, read="sqlite")
+    raw_on_slices: List[Optional[str]] = []
+    b_depth = 0
+    join_kw_words = {"INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "JOIN"}
+    on_start_char: Optional[int] = None
+    in_join = False
+    b_idx = 0
+    while b_idx < len(body_toks):
+        btk = body_toks[b_idx]
+        if btk.token_type == SQLGlotTokenType.L_PAREN:
+            b_depth += 1
+        elif btk.token_type == SQLGlotTokenType.R_PAREN and b_depth > 0:
+            b_depth -= 1
+        elif b_depth == 0:
+            if btk.token_type == SQLGlotTokenType.COMMA or btk.text.upper() in join_kw_words:
+                if in_join:
+                    raw_on_slices.append(
+                        s_body[on_start_char : btk.start].strip() if on_start_char is not None else None
+                    )
+                    on_start_char = None
+                in_join = True
+                if btk.token_type != SQLGlotTokenType.COMMA:
+                    while b_idx + 1 < len(body_toks) and body_toks[b_idx + 1].text.upper() in (join_kw_words | {"OUTER"}):
+                        b_idx += 1
+            elif in_join and btk.token_type == SQLGlotTokenType.ON and on_start_char is None:
+                on_start_char = btk.end + 1
+        b_idx += 1
+    if in_join:
+        raw_on_slices.append(s_body[on_start_char:].strip() if on_start_char is not None else None)
 
     joins: List[JoinSpec] = []
     has_subquery = False
 
     first_target = from_node.this
-    if isinstance(first_target, sqlglot_exp.Subquery):
-        has_subquery = True
-        al = first_target.alias or "__mv_sub"
-        joins.append(JoinSpec(join_type="FROM", table_name=al, alias=al))
-    elif isinstance(first_target, sqlglot_exp.Table):
+    if isinstance(first_target, sqlglot_exp.Table):
         t_name = first_target.name or "t"
         al = first_target.alias or t_name
         joins.append(JoinSpec(join_type="FROM", table_name=t_name, alias=al))
+    else:
+        has_subquery = True
+        al = (first_target.alias if isinstance(first_target, sqlglot_exp.Expr) else "") or "__mv_sub"
+        joins.append(JoinSpec(join_type="FROM", table_name=al, alias=al))
 
     for idx, j_node in enumerate(join_nodes):
         side = j_node.side.upper()
@@ -1813,7 +2016,9 @@ def _parse_from_and_joins(from_clause: str, cte_names: Set[str]) -> Tuple[List[J
             j_type = "RIGHT JOIN"
         elif side == "FULL":
             j_type = "FULL JOIN"
-        elif kind == "CROSS":
+        elif kind == "CROSS" or (
+            not side and not kind and not method and not j_node.args.get("on") and not j_node.args.get("using")
+        ):
             j_type = "CROSS JOIN"
         else:
             j_type = "INNER JOIN"
@@ -1822,19 +2027,20 @@ def _parse_from_and_joins(from_clause: str, cte_names: Set[str]) -> Tuple[List[J
             has_subquery = True
 
         j_target = j_node.this
-        if isinstance(j_target, sqlglot_exp.Subquery):
-            has_subquery = True
-            t_name = j_target.alias or f"__mv_sub_{idx}"
-            al = t_name
-        elif isinstance(j_target, sqlglot_exp.Table):
+        if isinstance(j_target, sqlglot_exp.Table):
             t_name = j_target.name or f"t_{idx}"
             al = j_target.alias or t_name
         else:
-            t_name = f"t_{idx}"
+            has_subquery = True
+            t_name = (j_target.alias if isinstance(j_target, sqlglot_exp.Expr) else "") or f"__mv_sub_{idx}"
             al = t_name
 
         on_expr = j_node.args.get("on")
-        on_cond = on_expr.sql().strip() if isinstance(on_expr, sqlglot_exp.Expr) else None
+        on_cond: Optional[str] = None
+        if idx < len(raw_on_slices) and raw_on_slices[idx]:
+            on_cond = raw_on_slices[idx]
+        elif isinstance(on_expr, sqlglot_exp.Expr):
+            on_cond = on_expr.sql().strip()
         joins.append(
             JoinSpec(
                 join_type=j_type,
@@ -1952,15 +2158,26 @@ def parse_view_index_spec(
         idx_create = parse_sql_ast(s)
         if isinstance(idx_create, sqlglot_exp.Create) and idx_create.kind.upper() == "INDEX":
             idx_node = idx_create.this
-            if isinstance(idx_node, sqlglot_exp.Index) and idx_node.params is not None:
-                cols = tuple(c.sql().strip() for c in idx_node.params.columns if c.sql().strip())
+            params_node = idx_node.args.get("params") if isinstance(idx_node, sqlglot_exp.Index) else None
+            if isinstance(idx_node, sqlglot_exp.Index) and isinstance(params_node, sqlglot_exp.IndexParameters):
+                cols = tuple(c.sql().strip() for c in params_node.columns if c.sql().strip())
                 if not cols:
                     raise ValueError(f"CREATE INDEX statement has no columns: {spec!r}")
                 tbl_node = idx_node.args.get("table")
                 target_v = tbl_node.name if isinstance(tbl_node, sqlglot_exp.Table) else default_view_name
-                where_node = idx_node.params.where
-                where_c = where_node.this.sql().strip() if (where_node and where_node.this) else None
-                using_m = str(idx_node.params.using) if idx_node.params.using else None
+                where_node = params_node.args.get("where")
+                where_c: Optional[str] = None
+                where_tok_ci = _find_top_level_token(s, (SQLGlotTokenType.WHERE,))
+                if where_tok_ci is not None:
+                    where_c = s[where_tok_ci.end + 1 :].strip()
+                elif isinstance(where_node, sqlglot_exp.Where) and where_node.this is not None:
+                    where_c = where_node.this.sql().strip()
+                using_node = params_node.args.get("using")
+                using_m = (
+                    (using_node.name or using_node.sql().strip())
+                    if isinstance(using_node, sqlglot_exp.Expr)
+                    else (str(using_node) if using_node else None)
+                )
                 return ViewIndexSpec(
                     columns=cols,
                     name=idx_node.name or None,
@@ -2057,14 +2274,9 @@ def _parse_single_create_view_stmt(
     if not isinstance(query_ast, (sqlglot_exp.Select, sqlglot_exp.SetOperation)):
         raise ValueError(f"View body must start with SELECT or WITH: {stmt_sql!r}")
 
-    raw_select = query_ast.sql().strip()
-    with_node = query_ast.args.get("with_")
-    has_cte = isinstance(with_node, sqlglot_exp.With)
-    cte_names: Set[str] = (
-        {cte.alias for cte in with_node.expressions if isinstance(cte, sqlglot_exp.CTE) and cte.alias}
-        if isinstance(with_node, sqlglot_exp.With)
-        else set()
-    )
+    as_tok = _find_top_level_token(clean, (SQLGlotTokenType.ALIAS,))
+    raw_select = clean[as_tok.end + 1 :].strip() if as_tok is not None else query_ast.sql().strip()
+    cte_names, main_select_body, has_cte = _extract_cte_names_and_strip_with(raw_select)
 
     has_window = bool(query_ast.find(sqlglot_exp.Window))
     has_compound = isinstance(query_ast, sqlglot_exp.SetOperation)
@@ -2086,31 +2298,83 @@ def _parse_single_create_view_stmt(
     )
 
     has_top_distinct = bool(first_select.args.get("distinct"))
-    select_items = [
-        _parse_select_item(proj.sql(), idx)
-        for idx, proj in enumerate(first_select.expressions)
+
+    if has_compound:
+        _, setop_branches = _extract_set_op_branches_from_ast(query_ast, main_select_body)
+        first_branch_sql = setop_branches[0] if setop_branches else main_select_body
+    else:
+        first_branch_sql = _unwrap_outer_parens(main_select_body)
+
+    fb_toks = sqlglot.tokenize(first_branch_sql, read="sqlite")
+    fb_depth = 0
+    sel_tok_i = -1
+    from_tok_i = -1
+    where_tok_i = -1
+    group_tok_i = -1
+    having_tok_i = -1
+    trail_tok_i = -1
+    for t_i, ftk in enumerate(fb_toks):
+        if ftk.token_type == SQLGlotTokenType.L_PAREN:
+            fb_depth += 1
+        elif ftk.token_type == SQLGlotTokenType.R_PAREN and fb_depth > 0:
+            fb_depth -= 1
+        elif fb_depth == 0:
+            tt = ftk.token_type
+            if tt == SQLGlotTokenType.SELECT and sel_tok_i == -1:
+                sel_tok_i = t_i
+            elif sel_tok_i != -1:
+                if tt == SQLGlotTokenType.FROM and from_tok_i == -1:
+                    from_tok_i = t_i
+                elif tt == SQLGlotTokenType.WHERE and where_tok_i == -1:
+                    where_tok_i = t_i
+                elif tt == SQLGlotTokenType.GROUP_BY and group_tok_i == -1:
+                    group_tok_i = t_i
+                elif tt == SQLGlotTokenType.HAVING and having_tok_i == -1:
+                    having_tok_i = t_i
+                elif tt in (
+                    SQLGlotTokenType.WINDOW,
+                    SQLGlotTokenType.ORDER_BY,
+                    SQLGlotTokenType.LIMIT,
+                    SQLGlotTokenType.OFFSET,
+                    SQLGlotTokenType.FETCH,
+                ) and trail_tok_i == -1:
+                    trail_tok_i = t_i
+
+    clause_tok_positions = [
+        p for p in (from_tok_i, where_tok_i, group_tok_i, having_tok_i, trail_tok_i) if p != -1
     ]
 
-    from_node = first_select.args.get("from_")
-    join_nodes = first_select.args.get("joins") or []
-    if isinstance(from_node, sqlglot_exp.From):
-        from_parts = [from_node.sql()] + [j.sql() for j in join_nodes]
-        from_clause = " ".join(p for p in from_parts if p).strip()
+    def _slice_fb_clause(tok_idx: int) -> str:
+        if tok_idx == -1:
+            return ""
+        c_start = fb_toks[tok_idx].end + 1
+        later_pos = [p for p in clause_tok_positions if p > tok_idx]
+        c_end = fb_toks[min(later_pos)].start if later_pos else len(first_branch_sql)
+        return first_branch_sql[c_start:c_end].strip()
+
+    if sel_tok_i != -1:
+        p_start_i = sel_tok_i + 1
+        if p_start_i < len(fb_toks) and fb_toks[p_start_i].token_type in (SQLGlotTokenType.DISTINCT, SQLGlotTokenType.ALL):
+            p_start_i += 1
+        p_start_char = fb_toks[p_start_i].start if p_start_i < len(fb_toks) else len(first_branch_sql)
+        p_end_char = fb_toks[min(clause_tok_positions)].start if clause_tok_positions else len(first_branch_sql)
+        proj_list_sql = first_branch_sql[p_start_char:p_end_char].strip()
+        raw_proj_items = [p.strip() for p in _split_top_level(proj_list_sql, ",") if p.strip()]
     else:
-        from_clause = ""
+        raw_proj_items = [proj.sql() for proj in first_select.expressions]
 
-    where_node = first_select.args.get("where")
-    where_clause = where_node.this.sql().strip() if (isinstance(where_node, sqlglot_exp.Where) and where_node.this) else None
+    select_items = [
+        _parse_select_item(raw_p, idx)
+        for idx, raw_p in enumerate(raw_proj_items)
+    ]
 
-    group_node = first_select.args.get("group")
-    group_by_cols = (
-        [g.sql().strip() for g in group_node.expressions if g.sql().strip()]
-        if isinstance(group_node, sqlglot_exp.Group)
-        else []
-    )
-
-    having_node = first_select.args.get("having")
-    having_clause = having_node.this.sql().strip() if (isinstance(having_node, sqlglot_exp.Having) and having_node.this) else None
+    from_clause = _slice_fb_clause(from_tok_i)
+    where_raw = _slice_fb_clause(where_tok_i)
+    where_clause = where_raw if where_raw else None
+    group_raw = _slice_fb_clause(group_tok_i)
+    group_by_cols = [g.strip() for g in _split_top_level(group_raw, ",") if g.strip()] if group_raw else []
+    having_raw = _slice_fb_clause(having_tok_i)
+    having_clause = having_raw if having_raw else None
 
     joins, has_subquery_in_from = _parse_from_and_joins(from_clause, cte_names)
     ref_tables = _extract_all_referenced_tables(raw_select, cte_names, known_tables=known_tables)
@@ -2606,14 +2870,36 @@ class IncrementalViewCompiler:
 
         if v.has_cte:
             with_node = q_ast.args.get("with_")
-            if not isinstance(with_node, sqlglot_exp.With) or with_node.recursive or len(with_node.expressions) != 1:
+            if not isinstance(with_node, sqlglot_exp.With) or bool(with_node.args.get("recursive")) or len(with_node.expressions) != 1:
                 return v
             cte_node = with_node.expressions[0]
             if not isinstance(cte_node, sqlglot_exp.CTE) or not isinstance(cte_node.this, sqlglot_exp.Expr):
                 return v
-            inner_sql = cte_node.this.sql().strip()
+            cte_alias_node = cte_node.args.get("alias")
+            if isinstance(cte_alias_node, sqlglot_exp.TableAlias) and cte_alias_node.columns:
+                return v
+            toks_cte = sqlglot.tokenize(v.raw_select_sql, read="sqlite")
+            as_i = next((i for i, t in enumerate(toks_cte) if t.token_type == SQLGlotTokenType.ALIAS), -1)
+            if as_i == -1 or any(t.token_type == SQLGlotTokenType.L_PAREN for t in toks_cte[:as_i]):
+                return v
+            lp_i = next((i for i in range(as_i + 1, len(toks_cte)) if toks_cte[i].token_type == SQLGlotTokenType.L_PAREN), -1)
+            if lp_i == -1:
+                return v
+            d_c = 0
+            rp_i = -1
+            for i in range(lp_i, len(toks_cte)):
+                if toks_cte[i].token_type == SQLGlotTokenType.L_PAREN:
+                    d_c += 1
+                elif toks_cte[i].token_type == SQLGlotTokenType.R_PAREN:
+                    d_c -= 1
+                    if d_c == 0:
+                        rp_i = i
+                        break
+            if rp_i == -1 or rp_i + 1 >= len(toks_cte) or toks_cte[rp_i + 1].token_type == SQLGlotTokenType.COMMA:
+                return v
+            inner_sql = v.raw_select_sql[toks_cte[lp_i].end + 1 : toks_cte[rp_i].start].strip()
             cte_or_sub_alias = cte_node.alias
-            outer_sql = str(q_ast.args.get("_main_select_sql") or "").strip()
+            outer_sql = v.raw_select_sql[toks_cte[rp_i + 1].start :].strip()
         elif v.has_subquery_in_from and len(v.joins) == 1:
             from_node = q_ast.args.get("from_")
             if not isinstance(from_node, sqlglot_exp.From) or not isinstance(from_node.this, sqlglot_exp.Subquery):
@@ -2621,7 +2907,26 @@ class IncrementalViewCompiler:
             sub_node = from_node.this
             if not isinstance(sub_node.this, sqlglot_exp.Expr):
                 return v
-            inner_sql = sub_node.this.sql().strip()
+            toks_sub = sqlglot.tokenize(v.raw_select_sql, read="sqlite")
+            from_tok_s = _find_top_level_token(v.raw_select_sql, (SQLGlotTokenType.FROM,))
+            if from_tok_s is None:
+                return v
+            lp_sub = next((i for i, t in enumerate(toks_sub) if t.start > from_tok_s.start and t.token_type == SQLGlotTokenType.L_PAREN), -1)
+            if lp_sub == -1:
+                return v
+            d_s = 0
+            rp_sub = -1
+            for i in range(lp_sub, len(toks_sub)):
+                if toks_sub[i].token_type == SQLGlotTokenType.L_PAREN:
+                    d_s += 1
+                elif toks_sub[i].token_type == SQLGlotTokenType.R_PAREN:
+                    d_s -= 1
+                    if d_s == 0:
+                        rp_sub = i
+                        break
+            if rp_sub == -1:
+                return v
+            inner_sql = v.raw_select_sql[toks_sub[lp_sub].end + 1 : toks_sub[rp_sub].start].strip()
             cte_or_sub_alias = sub_node.alias or "__mv_sub"
             outer_sql = v.raw_select_sql
         else:
@@ -3145,14 +3450,32 @@ class IncrementalViewCompiler:
 
         if v.has_cte:
             with_node = q_ast.args.get("with_")
-            if not isinstance(with_node, sqlglot_exp.With) or with_node.recursive or len(with_node.expressions) != 1:
+            if not isinstance(with_node, sqlglot_exp.With) or bool(with_node.args.get("recursive")) or len(with_node.expressions) != 1:
                 return False
             cte_node = with_node.expressions[0]
             cte_name = cte_node.alias
             if len(v.joins) != 1 or v.joins[0].table_name.lower() != cte_name.lower():
                 return False
             inner_union_ast = cte_node.this
-            inner_union_sql = inner_union_ast.sql().strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None
+            toks_u = sqlglot.tokenize(v.raw_select_sql, read="sqlite")
+            as_u = next((i for i, t in enumerate(toks_u) if t.token_type == SQLGlotTokenType.ALIAS), -1)
+            lp_u = next((i for i in range(as_u + 1, len(toks_u)) if toks_u[i].token_type == SQLGlotTokenType.L_PAREN), -1) if as_u != -1 else -1
+            rp_u = -1
+            if lp_u != -1:
+                du = 0
+                for i in range(lp_u, len(toks_u)):
+                    if toks_u[i].token_type == SQLGlotTokenType.L_PAREN:
+                        du += 1
+                    elif toks_u[i].token_type == SQLGlotTokenType.R_PAREN:
+                        du -= 1
+                        if du == 0:
+                            rp_u = i
+                            break
+            inner_union_sql = (
+                v.raw_select_sql[toks_u[lp_u].end + 1 : toks_u[rp_u].start].strip()
+                if (lp_u != -1 and rp_u != -1)
+                else (inner_union_ast.sql().strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None)
+            )
             sub_alias = v.joins[0].alias or cte_name
         else:
             from_node = q_ast.args.get("from_")
@@ -3160,14 +3483,32 @@ class IncrementalViewCompiler:
                 return False
             sub_node = from_node.this
             inner_union_ast = sub_node.this
-            inner_union_sql = inner_union_ast.sql().strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None
+            toks_u = sqlglot.tokenize(v.raw_select_sql, read="sqlite")
+            from_tok_u = _find_top_level_token(v.raw_select_sql, (SQLGlotTokenType.FROM,))
+            lp_u = next((i for i, t in enumerate(toks_u) if from_tok_u is not None and t.start > from_tok_u.start and t.token_type == SQLGlotTokenType.L_PAREN), -1)
+            rp_u = -1
+            if lp_u != -1:
+                du = 0
+                for i in range(lp_u, len(toks_u)):
+                    if toks_u[i].token_type == SQLGlotTokenType.L_PAREN:
+                        du += 1
+                    elif toks_u[i].token_type == SQLGlotTokenType.R_PAREN:
+                        du -= 1
+                        if du == 0:
+                            rp_u = i
+                            break
+            inner_union_sql = (
+                v.raw_select_sql[toks_u[lp_u].end + 1 : toks_u[rp_u].start].strip()
+                if (lp_u != -1 and rp_u != -1)
+                else (inner_union_ast.sql().strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None)
+            )
             if sub_node.alias:
                 sub_alias = sub_node.alias
 
         if not inner_union_sql or not isinstance(inner_union_ast, sqlglot_exp.SetOperation):
             return False
 
-        ops, branch_sqls = _extract_set_op_branches_from_ast(inner_union_ast)
+        ops, branch_sqls = _extract_set_op_branches_from_ast(inner_union_ast, inner_union_sql)
         if not ops or any(op != "UNION ALL" for op in ops):
             return False
 
@@ -4180,18 +4521,26 @@ class IncrementalViewCompiler:
 
             # Ensure top-level SELECT expressions in `select_body` are aliased to `cols`
             aliased_inner = select_body
-            try:
-                sel_ast_top = parse_sql_ast(select_body)
-            except sqlglot.errors.SqlglotError:
-                sel_ast_top = None
+            sb_toks = sqlglot.tokenize(select_body, read="sqlite")
             from_tok_top = _find_top_level_token(select_body, (SQLGlotTokenType.FROM,))
-            if isinstance(sel_ast_top, sqlglot_exp.Select) and not sel_ast_top.args.get("with_") and from_tok_top is not None:
-                sel_exprs_raw = [e.sql().strip() for e in sel_ast_top.expressions]
+            if (
+                sb_toks
+                and sb_toks[0].token_type == SQLGlotTokenType.SELECT
+                and (len(sb_toks) < 2 or sb_toks[1].token_type != SQLGlotTokenType.DISTINCT)
+                and from_tok_top is not None
+            ):
+                proj_slice_top = select_body[sb_toks[0].end + 1 : from_tok_top.start].strip()
+                sel_exprs_raw = [e.strip() for e in _split_top_level(proj_slice_top, ",") if e.strip()]
                 from_tail = select_body[from_tok_top.start :]
                 if len(sel_exprs_raw) == len(cols):
                     aliased_list: List[str] = []
-                    for c_name, proj_node, raw_e in zip(cols, sel_ast_top.expressions, sel_exprs_raw):
-                        if isinstance(proj_node, sqlglot_exp.Alias) and proj_node.alias.lower() == _unquote_ident(c_name).lower():
+                    for c_name, raw_e in zip(cols, sel_exprs_raw):
+                        e_toks = sqlglot.tokenize(raw_e, read="sqlite")
+                        if (
+                            len(e_toks) >= 2
+                            and e_toks[-2].token_type == SQLGlotTokenType.ALIAS
+                            and e_toks[-1].text.lower() == _unquote_ident(c_name).lower()
+                        ):
                             aliased_list.append(raw_e)
                         else:
                             aliased_list.append(f"{raw_e} AS {c_name}")
@@ -7237,7 +7586,7 @@ class IncrementalViewCompiler:
         if not isinstance(q_ast, sqlglot_exp.SetOperation):
             return None
 
-        ops, branch_sqls = _extract_set_op_branches_from_ast(q_ast)
+        ops, branch_sqls = _extract_set_op_branches_from_ast(q_ast, raw)
         if not ops or len(set(ops)) != 1:
             return None
         op_type = ops[0]
