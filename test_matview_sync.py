@@ -5527,7 +5527,14 @@ class VariableSchemaDifferentialFuzzer:
             views.append((view_name, f"CREATE VIEW {view_name} AS {select};"))
 
         mutations: List[Tuple[str, str]] = []
-        for i, meta in enumerate(metas):
+        # Delete child tables before their parents. MySQL/MariaDB do not fire
+        # child-table triggers for FK-driven ON DELETE CASCADE actions, so a
+        # parent-first delete would test a documented engine limitation rather
+        # than the row-trigger DML path this differential scenario is intended
+        # to exercise. Inserts and updates remain schema-aware and use the
+        # same deterministic table order as before.
+        for i in reversed(range(len(metas))):
+            meta = metas[i]
             if len(mutations) + 3 > mutations_count:
                 break
             new_id = row_counts[i] + 1
