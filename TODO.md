@@ -12,6 +12,21 @@ This document tracks all feature goals, architectural improvements, and verified
   I would like all tests to be unified (taking care of using the right dialects) on top of the same shared testing infrastructure so that even when you're just running the sqlite tests in memory you exercise all the shared infrastructure used also when testing with other engines e.g. mysql/pg (`TranspiledConnectionAdapter` + `MVTestRunner`).
 - [x] **Autodetect or Accept Target Engine & Version (`--engine-version` / `detect_engine_version`)**:
   I would like the generator to autodetect (when connecting to the database) or accept as arg the engine and version, so that it can autoselect the correct and most efficient dialect/subdialect (`EngineSubdialect`, `EngineVersion`, `parse_engine_version`, `detect_engine_version`, and `--engine-version` across SQLite, PostgreSQL, MySQL, and MariaDB, including PostgreSQL 15+ `UNIQUE ... NULLS NOT DISTINCT` group indexes, PostgreSQL 10+ transition-table gating, MariaDB vs MySQL subdialect detection, and SQLite 3.24+ UPSERT / 3.25+ window-function version checks).
+- [x] **AST/Token-Backed SQL Parsing, Formatting & Strict Dialect Identifier Quoting (`sqlglot`)**:
+  Avoid brittle regex-only SQL parsing by delegating SQL tokenization, AST parsing, formatting, and dialect-specific identifier quoting (`"ident"` on SQLite/PostgreSQL, `` `ident` `` on MySQL/MariaDB) to `sqlglot` (`requirements.txt`, `parse_sql_ast`, `parse_view_ast`, `tokenize_sql`, `quote_sql_identifier`, `format_sql`) so base tables, columns, or aliases containing reserved keywords (`"order"`, `"group"`, `"select"`, `"where"`), spaces (`"unit price"`), or punctuation never break generated DDL or trigger SQL.
+- [x] **Snapshot-Isolated & Watermark-Gated Chunked Incremental Backfills (`incremental_backfill=True`)**:
+  Close the concurrency window during multi-batch chunked backfills (`backfill_incrementally`) that commit after each batch:
+  - Support snapshot-isolated backfills (`REPEATABLE READ` on PostgreSQL, `START TRANSACTION WITH CONSISTENT SNAPSHOT` on MySQL, `SAVEPOINT` on SQLite via `snapshot_isolation=True`), and
+  - Track the active backfill cursor watermark (`backfill_cursor_pk`, `backfill_max_pk`, `backfill_active`) in `__matview_catalog` so concurrent row triggers gate on the watermark and never double-count or under-count rows in the pending range.
+- [x] **Native Composite Keys & Group-Column Indexes for Nullable Group Columns, Joins & `UNION ALL` Views**:
+  Eliminate string-serialized `__mv_pk` surrogate keys (`quote(a) || '|' || quote(b)`, `ROW(...)::TEXT`, `CONCAT_WS('|', ...)`) where supported:
+  - Use native composite `PRIMARY KEY (col1, col2, ...)` whenever `GROUP BY` columns are `NOT NULL` across single-table, `INNER JOIN` / `CROSS JOIN`, and `UNION ALL` aggregate views, and native `PRIMARY KEY (__mv_branch_id, __mv_pk_0, ...)` on `UNION ALL` Z-set views,
+  - Use `UNIQUE NULLS NOT DISTINCT (col1, col2, ...)` on PostgreSQL 15+ for nullable group keys across single-table, Join, and `UNION ALL` views, and
+  - Index both composite group keys and individual non-leading `GROUP BY` columns so engines can perform index scans on any grouping column.
+- [x] **Welford Running-Variance (`mean`, `M2`) & Chan Parallel Merge for IEEE-754 Float Engines**:
+  Complement PostgreSQL `NUMERIC` and MySQL `DECIMAL(65, 12)` variance accumulators with Welford's centered sum-of-squares (`__mv_m2_*`) single-row update/downdate rules, Chan's parallel batch-merge formula, and anchor-shifted initial `M2` calculation for SQLite `REAL` columns, eliminating IEEE-754 catastrophic cancellation on high-offset values (e.g. `1e9 + delta` and `1e12 + delta`).
+- [x] **Session-Scoped & Shadow-Table Swap `bulk_changes()` Isolation**:
+  Avoid dropping maintenance triggers globally across concurrent connections during `bulk_changes()` by supporting session-local trigger bypass flags (`SET LOCAL matview.skip_triggers = 'on'` in PostgreSQL, `@__matview_skip_triggers = 1` in MySQL), transactional `SAVEPOINT` isolation in SQLite, and atomic shadow-table rebuild + `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
 - [x] **Atomic Single-Transaction Registration & Initial Backfill**:
   Wrap backing/auxiliary table creation, trigger installation, single-shot initial backfill, and `__matview_catalog` registration in a single atomic transaction (with rollback on error) in `MaterializedViewManager._register_single_view_spec` to close the concurrency window between trigger creation and single-shot population.
 - [x] **Safe Batch-Size Substitution in `MaterializedViewPlan.get_populate_statements`**:
@@ -33,26 +48,18 @@ This document tracks all feature goals, architectural improvements, and verified
 - [x] **Schema Drift Detection (`check_schema_drift`), Drift Repair (`repair_view`), and Multi-Dialect CLI DSNs**:
   Add `manager.check_schema_drift()` (`--check-drift`), `manager.repair_view()` (`--repair`), and `postgresql://` / `mysql://` / `mariadb://` / `sqlite:///` DSN connection support in `MaterializedViewManager` and the CLI.
 
-## P0 — Core AST Migration, Quoting Safety & Concurrency Hardening
-
-- [ ] **Replace Regex/Manual SQL Parsing with `sqlglot` AST**:
-  I would like to avoid relying on regexes and other brittle manual parsing of the SQL, and instead use something proven like `sqlglot` across view definition parsing (`_parse_single_create_view_stmt`), CTE/subquery unwrapping (`_try_unwrap_simple_cte_or_derived_view`), join qualification (`_qualify_join_expr`), record column rewriting (`_rewrite_expr_for_record`), and dialect expression lowering (`_rewrite_sqlite_total_in_sql`).
-- [ ] **Format, Optimize & Strictly Quote Emitted SQL via `sqlglot`**:
-  I would like the output SQL to be properly formatted (possibly by `sqlglot` itself) and possibly even optimized, with consistent dialect-specific identifier quoting (`"ident"` on SQLite/PostgreSQL, `` `ident` `` on MySQL/MariaDB) so base tables, columns, or aliases containing reserved keywords, spaces, or punctuation never break generated DDL or trigger SQL.
-- [ ] **Snapshot-Isolated & Watermark-Gated Chunked Incremental Backfills (`incremental_backfill=True`)**:
-  Close the concurrency window during multi-batch chunked backfills (`backfill_incrementally`) that commit after each batch:
-  - Support snapshot-isolated backfills (`REPEATABLE READ` on PostgreSQL, `START TRANSACTION WITH CONSISTENT SNAPSHOT` on MySQL, `BEGIN IMMEDIATE` on SQLite) where supported, and
-  - Track the active backfill cursor watermark (`__mv_cursor_pk`) in `__matview_catalog` so concurrent row triggers ignore or coordinate rows above the watermark that have not yet been folded by the backfill cursor.
-- [ ] **Native Composite Keys for Nullable Group Columns, Joins & `UNION ALL` Views**:
-  Eliminate remaining string-serialized `__mv_pk` surrogate keys (`quote(a) || '|' || quote(b)`, `ROW(...)::TEXT`, `CONCAT_WS('|', ...)`) where supported:
-  - Use `UNIQUE NULLS NOT DISTINCT (col1, col2, ...)` as the conflict target on PostgreSQL 15+ and SQLite `UNIQUE` indexes with null-coalesced or native composite keys, and
-  - Ensure all backing and auxiliary tables index individual leading `GROUP BY` columns so engines can perform index range scans and MySQL never hits `VARCHAR(512)` key-length limits on wide group keys.
-- [ ] **Welford Running-Variance (`mean`, `M2`) Maintenance for IEEE-754 Float Engines**:
-  Complement PostgreSQL `NUMERIC` and MySQL `DECIMAL` variance accumulators with Welford's running-variance update rules (`count`, `mean`, `M2`) for SQLite `REAL` and floating-point columns under high-churn updates/deletes.
-- [ ] **Session-Scoped or Shadow-Table Swap `bulk_changes()` Isolation**:
-  Avoid dropping maintenance triggers globally across concurrent connections during `bulk_changes()` by supporting session-local trigger bypass flags (`SET LOCAL matview.skip_triggers = 'on'` in PostgreSQL, `@__matview_skip_triggers = 1` in MySQL, or a temp control table in SQLite) or rebuilding into a shadow table followed by an atomic `ALTER TABLE ... RENAME` swap.
-
 ## P1 — Modular Architecture, Engine/Version Optimizations & Developer Experience
+
+- [ ] **AST-Based SQL Code Generation via `sqlglot` (`sqlglot.exp` Builders)**:
+  Replace string-interpolated DML/DDL construction (`CREATE TABLE`, `CREATE INDEX`, `CREATE VIEW`, `SELECT`, `INSERT ... ON CONFLICT / ON DUPLICATE KEY UPDATE`, `UPDATE`, `DELETE`) with `sqlglot.exp` AST builders (`sqlglot.select`, `exp.insert`, `exp.update`, `exp.delete`, `exp.Create`, `.sql(dialect=..., identify=..., pretty=True)`) so generated SQL is guaranteed well-formed and dialect-accurate by construction.
+- [ ] **Template-Driven Procedural Trigger & Backfill Codegen (`Jinja2`)**:
+  Delegate multi-statement procedural trigger and backfill wrappers (SQLite `CREATE TRIGGER ... BEGIN ... END`, PostgreSQL PL/pgSQL `CREATE OR REPLACE FUNCTION ... RETURNS TRIGGER`, and MySQL/MariaDB `CREATE TRIGGER` / `CREATE PROCEDURE` blocks) to structured `Jinja2` templates instead of nested Python f-strings.
+- [ ] **Unified Database Connectivity, DB-API Normalization & Schema Introspection (`SQLAlchemy`)**:
+  Consider adopting `SQLAlchemy` (`sqlalchemy.create_engine`, `sqlalchemy.inspect`) to unify connection URL handling, parameter binding (`?` vs `%s`), transaction/savepoint management, and cross-engine table/column/PK/FK/index introspection across SQLite, PostgreSQL, MySQL, and MariaDB.
+- [ ] **Standardized Engine Version Parsing (`packaging`)**:
+  Delegate semantic version parsing and comparison in `parse_engine_version` / `EngineVersion` to `packaging.version.Version`.
+- [ ] **Stateful Property-Based Fuzzing & Automatic Counterexample Shrinking (`hypothesis` + `pytest`)**:
+  Complement `DifferentialSQLFuzzer` with a `hypothesis.stateful.RuleBasedStateMachine` test suite run via `pytest` so failing random schema/view/DML sequences are automatically shrunk to minimal reproducible counterexamples.
 
 - [ ] **Refactor Monolithic `matview_sync.py` into a Modular Package with a Typed IR**:
   Split `matview_sync.py` into focused modules with a typed, immutable Intermediate Representation (`CompilationContext` / `LogicalIR`) between SQL parsing and dialect code generation instead of mutating compiler attributes (`self.view`, `self.primary_schema`, `self._working_select_items`) in place:
@@ -90,10 +97,10 @@ This document tracks all feature goals, architectural improvements, and verified
 - [ ] **Partition-Scoped (Tier 2) Maintenance for Window Functions**:
   Scope window function refreshes (`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`) to only the affected `PARTITION BY` key(s) rather than falling back to a full-table Tier 3 rebuild when a `PARTITION BY` clause is present.
 
-## P3 — Multi-View DAGs, Shared Computation, Async/Bulk MVs, Docs & NewSQL
+## P3 — Cascading MVs, Shared Computation, Async/Bulk MVs, Docs & NewSQL
 
 - [ ] **Cascading Materialized Views (MVs Referencing Other MVs)**:
-  I would like materialized view definitions to also be able to reference other materialized views, and their updates to still happen as efficiently as possible (building a dependency DAG over views and treating upstream `__matview_store_<v1>` backing tables as base tables for downstream views with recursive/cascading trigger propagation). Note: already implemented in branch cascading-mvs.
+  I would like materialized view definitions to also be able to reference other materialized views, and their updates to still happen as efficiently as possible (building a topological dependency DAG over views and compiling downstream MVs against upstream `__matview_store_<v1>` backing tables with recursive trigger propagation).  Note: already implemented in branch cascading-mvs.
 - [ ] **Multi-View Trigger Consolidation & Shared Sub-Aggregation Deduplication**:
   I would like, when multiple views use the same base tables, to avoid redundant computations (e.g. in case two views both use the same aggregation over the same data):
   - Merge multiple triggers on the same `(base_table, event)` into a single consolidated trigger/function call per row mutation, and

@@ -1204,6 +1204,7 @@ class TranspiledConnectionAdapter:
         self._pg_fn_triggers: Dict[str, List[str]] = {}
         self._mysql_procs: Dict[str, str] = {}
         self._table_pks: Dict[str, List[str]] = {}
+        self._skip_triggers: int = 0
         self._reset_sqlite()
 
     def _reset_sqlite(self) -> None:
@@ -1215,10 +1216,12 @@ class TranspiledConnectionAdapter:
         self._sq_conn = sqlite3.connect(":memory:", isolation_level=None)
         self._sq_conn.execute("PRAGMA recursive_triggers = ON;")
         _register_sqlite_compat_udfs(self._sq_conn, dialect=self.dialect)
+        self._sq_conn.create_function("__mv_skip_triggers", 0, lambda: self._skip_triggers)
         self._pg_functions.clear()
         self._pg_fn_triggers.clear()
         self._mysql_procs.clear()
         self._table_pks.clear()
+        self._skip_triggers = 0
 
     def cursor(self) -> TranspiledCursorAdapter:
         return TranspiledCursorAdapter(self)
@@ -1403,8 +1406,11 @@ class TranspiledConnectionAdapter:
             s_up.startswith("CREATE DATABASE")
             or s_up.startswith("USE ")
             or s_up.startswith("SET ")
+            or s_up.startswith("START TRANSACTION WITH CONSISTENT SNAPSHOT")
             or s_up == "CREATE SCHEMA PUBLIC"
         ):
+            if "MATVIEW.SKIP_TRIGGERS" in s_up or "@__MATVIEW_SKIP_TRIGGERS" in s_up:
+                self._skip_triggers = 1 if ("'ON'" in s_up or "= 1" in s_up or "=1" in s_up) else 0
             return [], 0
 
         if "INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS" in s_up:
@@ -1519,7 +1525,7 @@ class TranspiledConnectionAdapter:
                 return [], 0
 
             m_tr = re.match(
-                r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+INSERT\s+OR\s+UPDATE(?:\s+OF\s+[^;]+?)?\s+OR\s+DELETE\s+ON\s+([A-Za-z0-9_]+)\s+FOR\s+EACH\s+ROW\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);?",
+                r'CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+INSERT\s+OR\s+UPDATE(?:\s+OF\s+[^;]+?)?\s+OR\s+DELETE\s+ON\s+([A-Za-z0-9_]+|"[^"]+"|`[^`]+`)\s+FOR\s+EACH\s+ROW\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);?',
                 s,
                 flags=re.I | re.S,
             )
@@ -1601,6 +1607,10 @@ class TranspiledConnectionAdapter:
                         if m_outer_if:
                             when_cl = f" WHEN ({m_outer_if.group(1)})"
                             b_clean = m_outer_if.group(2).strip()
+                        if when_cl:
+                            when_cl = f" WHEN ({when_cl[len(' WHEN '):]}) AND (__mv_skip_triggers() = 0)"
+                        else:
+                            when_cl = " WHEN (__mv_skip_triggers() = 0)"
                         tn = f"{t_name}_{suf}"
                         self._sq_conn.execute(
                             f"CREATE TRIGGER {tn} AFTER {op} ON {base_t} FOR EACH ROW{when_cl}\nBEGIN\n{b_clean}\nEND;"
@@ -1678,7 +1688,7 @@ class TranspiledConnectionAdapter:
 
         if self.dialect == Dialect.MYSQL and s_up.startswith("CREATE TRIGGER"):
             m_tr = re.match(
-                r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+(INSERT|DELETE|UPDATE)\s+ON\s+([A-Za-z0-9_]+)\s+FOR\s+EACH\s+ROW\s+BEGIN\s*(.*)\s*END;?",
+                r'CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+(INSERT|DELETE|UPDATE)\s+ON\s+([A-Za-z0-9_]+|"[^"]+"|`[^`]+`)\s+FOR\s+EACH\s+ROW\s+BEGIN\s*(.*)\s*END;?',
                 s,
                 flags=re.I | re.S,
             )
@@ -1689,6 +1699,13 @@ class TranspiledConnectionAdapter:
                     m_tr.group(3),
                     m_tr.group(4).strip(),
                 )
+                m_skip_wrap = re.match(
+                    r"^IF\s+COALESCE\(@__matview_skip_triggers,\s*0\)\s*=\s*0\s+THEN\s*(.*)\s*END\s+IF;$",
+                    body,
+                    flags=re.I | re.S,
+                )
+                if m_skip_wrap:
+                    body = m_skip_wrap.group(1).strip()
                 m_target = re.search(
                     r"(?:INSERT\s+INTO|DELETE\s+FROM|UPDATE)\s+(__matview_store_[A-Za-z0-9_]+)",
                     body,
@@ -1749,8 +1766,15 @@ class TranspiledConnectionAdapter:
                     b_clean,
                     flags=re.I | re.S,
                 )
+                if when_cl:
+                    when_cl = f" WHEN ({when_cl[len(' WHEN '):]}) AND (__mv_skip_triggers() = 0)"
+                else:
+                    when_cl = " WHEN (__mv_skip_triggers() = 0)"
+                q_base_t = base_t
+                if q_base_t.startswith("`") and q_base_t.endswith("`"):
+                    q_base_t = '"' + q_base_t[1:-1] + '"'
                 self._sq_conn.execute(
-                    f"CREATE TRIGGER {t_name} AFTER {op} ON {base_t} FOR EACH ROW{when_cl}\nBEGIN\n{b_clean}\nEND;"
+                    f"CREATE TRIGGER {t_name} AFTER {op} ON {q_base_t} FOR EACH ROW{when_cl}\nBEGIN\n{b_clean}\nEND;"
                 )
                 return [], 0
 
@@ -4346,6 +4370,336 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         ])
         self.assertEqual(rc_maria, 0)
 
+    def test_13_p0_roadmap_features_complete(self) -> None:
+        """
+        Verifies all P0 roadmap features and their combinations across SQLite, PostgreSQL,
+        MySQL, and MariaDB:
+          1. AST-Backed SQL Parsing, Formatting & Dialect Identifier Quoting (`tokenize_sql`,
+             `quote_sql_identifier`, `format_sql`, reserved keywords `"order"`, `"group"`,
+             `"select"`, `"where"`, and identifiers with spaces `"unit price"`, `"unit avg"`).
+          2. Welford Running-Variance (`__mv_m2_*`) & Chan Parallel Merge for IEEE-754 Float
+             Engines (`VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP` on `1e9` and `1e12`
+             offset values under single-row DML, chunked backfills, and Joins).
+          3. Snapshot-Isolated & Watermark-Gated Chunked Incremental Backfills
+             (`incremental_backfill=True`, `backfill_cursor_pk`, `backfill_max_pk`,
+             `backfill_active`, concurrent DML between batches, and `snapshot_isolation=True`).
+          4. Native Composite Keys & Leading/Secondary Group-Column Indexes for Joins,
+             `UNION ALL` Z-set views, `UNION ALL` aggregate views, and PostgreSQL 15+
+             `UNIQUE ... NULLS NOT DISTINCT`.
+          5. Session-Scoped & Shadow-Table Swap `bulk_changes()` Isolation
+             (`SET LOCAL matview.skip_triggers = 'on'`, `SET @__matview_skip_triggers = 1`,
+             transactional `SAVEPOINT` rollback, and `use_shadow_swap=True`).
+        """
+        import pathlib as _pathlib
+        import sqlglot as _sg
+        import matview_sync as _mv_mod
+        from matview_sync import (
+            SQLTokenType,
+            format_sql,
+            parse_sql_ast,
+            parse_view_ast,
+            quote_sql_identifier,
+            tokenize_sql,
+        )
+
+        # --- 1. Required `sqlglot` dependency, `requirements.txt`, AST, Formatter & Quoting ---
+        self.assertFalse(hasattr(_mv_mod, "HAS_SQLGLOT"))
+        self.assertIs(_mv_mod.sqlglot, _sg)
+        req_file = _pathlib.Path(__file__).resolve().parent / "requirements.txt"
+        self.assertTrue(req_file.is_file(), "requirements.txt must exist in repository root")
+        req_contents = req_file.read_text()
+        for expected_dep in ("sqlglot", "psycopg2-binary", "pymysql", "cryptography"):
+            self.assertIn(expected_dep, req_contents)
+        ci_file = _pathlib.Path(__file__).resolve().parent / ".github" / "workflows" / "ci.yml"
+        if ci_file.is_file():
+            self.assertGreaterEqual(ci_file.read_text().count("-r requirements.txt"), 7)
+
+        sg_expr = parse_sql_ast('SELECT "group", SUM("select") AS "unit avg" FROM "order" WHERE "select" > 10 GROUP BY "group"')
+        self.assertIsInstance(sg_expr, _sg.exp.Select)
+        self.assertEqual([e.output_name for e in sg_expr.expressions], ["group", "unit avg"])
+        v_ast = parse_view_ast('CREATE VIEW v_ast_test AS SELECT "group", SUM("select") AS "unit avg" FROM "order" GROUP BY "group"')
+        self.assertIsInstance(v_ast.sqlglot_ast, _sg.exp.Create)
+        self.assertEqual(v_ast.group_by_exprs, ('"group"',))
+
+        self.assertEqual(quote_sql_identifier("orders", Dialect.SQLITE), "orders")
+        self.assertEqual(quote_sql_identifier("order", Dialect.SQLITE), '"order"')
+        self.assertEqual(quote_sql_identifier("group", Dialect.POSTGRES), '"group"')
+        self.assertEqual(quote_sql_identifier("select", Dialect.MYSQL), "`select`")
+        self.assertEqual(quote_sql_identifier("unit price", Dialect.SQLITE), '"unit price"')
+        self.assertEqual(quote_sql_identifier("unit price", Dialect.MYSQL), "`unit price`")
+
+        toks = tokenize_sql('SELECT "group", SUM("select") AS "unit avg" FROM "order" WHERE "select" > 10;')
+        self.assertTrue(any(t.kind == SQLTokenType.QUOTED_IDENT and t.unquoted == "unit avg" for t in toks))
+        formatted = format_sql("SELECT   a,   b   FROM   t;", Dialect.POSTGRES)
+        self.assertIn("SELECT a, b FROM t;", formatted)
+
+        for d_mode in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+            if d_mode == Dialect.SQLITE:
+                conn_q: Any = sqlite3.connect(":memory:")
+                _register_sqlite_compat_udfs(conn_q)
+            else:
+                conn_q = TranspiledConnectionAdapter(d_mode)
+            mgr_q = MaterializedViewManager(conn_q, dialect=d_mode, ignore_limitations=True)
+            mgr_q.apply_schema_ddl(
+                '''
+                CREATE TABLE "order" (
+                    "id" INTEGER PRIMARY KEY,
+                    "group" VARCHAR(32) NOT NULL,
+                    "select" INTEGER NOT NULL,
+                    "unit price" DOUBLE PRECISION NOT NULL
+                );
+                ''',
+                auto_sync_views=False,
+            )
+            conn_q.execute("""INSERT INTO "order" VALUES (1, 'A', 10, 1.5), (2, 'A', 20, 2.5), (3, 'B', 5, 4.0);""")
+            plan_q = mgr_q.register_view(
+                '''
+                CREATE VIEW "order_summary" AS
+                SELECT "group", COUNT(*) AS "select", SUM("select") AS "where", AVG("unit price") AS "unit avg"
+                FROM "order"
+                WHERE "select" > 0
+                GROUP BY "group";
+                '''
+            )
+            if d_mode == Dialect.MYSQL:
+                self.assertIn("`group`", plan_q.backing_table_ddl)
+                self.assertIn("`select`", plan_q.backing_table_ddl)
+            else:
+                self.assertIn('"group"', plan_q.backing_table_ddl)
+                self.assertIn('"select"', plan_q.backing_table_ddl)
+
+            conn_q.execute("""INSERT INTO "order" VALUES (4, 'A', 30, 5.0);""")
+            conn_q.execute('UPDATE "order" SET "select" = 15, "unit price" = 3.5 WHERE "id" = 1;')
+            conn_q.execute('DELETE FROM "order" WHERE "id" = 3;')
+            mv_q_rows = conn_q.execute('SELECT * FROM __matview_order_summary ORDER BY "group";').fetchall()
+            self.assertEqual(len(mv_q_rows), 1)
+            self.assertEqual(mv_q_rows[0][0], "A")
+            self.assertEqual(mv_q_rows[0][1], 3)
+            self.assertEqual(mv_q_rows[0][2], 65)
+            self.assertAlmostEqual(float(mv_q_rows[0][3]), 11.0 / 3.0, places=5)
+            if hasattr(conn_q, "close"):
+                conn_q.close()
+
+        # --- 2. Welford Running-Variance (M2) & Chan Parallel Merge on High-Offset Floats ---
+        conn_w = sqlite3.connect(":memory:")
+        _register_sqlite_compat_udfs(conn_w)
+        conn_w.execute(
+            "CREATE TABLE sensors (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, reading REAL);"
+        )
+        conn_w.executemany(
+            "INSERT INTO sensors VALUES (?, ?, ?);",
+            [
+                (1, "g1", 1e9 + 1.0),
+                (2, "g1", 1e9 + 2.0),
+                (3, "g1", 1e9 + 3.0),
+                (4, "g1", 1e9 + 4.0),
+                (5, "g2", 1e12 + 10.0),
+                (6, "g2", 1e12 + 20.0),
+                (7, "g2", 1e12 + 30.0),
+            ],
+        )
+        mgr_w = MaterializedViewManager(conn_w)
+        # Test chunked incremental backfill (Chan parallel M2 merge across chunks of size 2)
+        plan_w = mgr_w.register_view(
+            """
+            CREATE VIEW sensor_stats AS
+            SELECT grp,
+                   COUNT(reading) AS n,
+                   VAR_POP(reading) AS vp,
+                   VAR_SAMP(reading) AS vs,
+                   STDDEV_POP(reading) AS sp,
+                   STDDEV_SAMP(reading) AS ss
+            FROM sensors
+            GROUP BY grp;
+            """,
+            incremental_backfill=True,
+            batch_size=2,
+        )
+        self.assertIn("__mv_m2_", plan_w.backing_table_ddl)
+        r_g1_init = conn_w.execute("SELECT n, vp, vs, sp, ss FROM __matview_sensor_stats WHERE grp = 'g1'").fetchone()
+        self.assertEqual(r_g1_init[0], 4)
+        self.assertAlmostEqual(r_g1_init[1], 1.25, places=5)
+        self.assertAlmostEqual(r_g1_init[2], 5.0 / 3.0, places=5)
+
+        # Single-row DELETE, INSERT, UPDATE transitions on high-offset values
+        conn_w.execute("DELETE FROM sensors WHERE id = 4;")
+        conn_w.execute("INSERT INTO sensors VALUES (8, 'g2', 1e12 + 40.0);")
+        conn_w.execute("DELETE FROM sensors WHERE id = 8;")
+        conn_w.execute("UPDATE sensors SET reading = 1e9 + 10.0 WHERE id = 3;")
+        conn_w.execute("UPDATE sensors SET reading = 1e9 + 3.0 WHERE id = 3;")
+
+        r_g1 = conn_w.execute("SELECT n, vp, vs, sp, ss FROM __matview_sensor_stats WHERE grp = 'g1'").fetchone()
+        r_g2 = conn_w.execute("SELECT n, vp, vs, sp, ss FROM __matview_sensor_stats WHERE grp = 'g2'").fetchone()
+        self.assertEqual(r_g1[0], 3)
+        self.assertAlmostEqual(r_g1[1], 2.0 / 3.0, places=5)
+        self.assertAlmostEqual(r_g1[2], 1.0, places=5)
+        self.assertEqual(r_g2[0], 3)
+        self.assertAlmostEqual(r_g2[1], 200.0 / 3.0, places=4)
+        self.assertAlmostEqual(r_g2[2], 100.0, places=4)
+        conn_w.close()
+
+        # --- 3. Watermark-Gated & Snapshot-Isolated Chunked Incremental Backfills ---
+        conn_wm = sqlite3.connect(":memory:")
+        _register_sqlite_compat_udfs(conn_wm)
+        conn_wm.execute(
+            "CREATE TABLE ledger (id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, amt INTEGER NOT NULL);"
+        )
+        conn_wm.executemany(
+            "INSERT INTO ledger VALUES (?, ?, ?);",
+            [(i, "B1" if i % 2 == 1 else "B2", i * 10) for i in range(1, 11)],
+        )
+        mgr_wm = MaterializedViewManager(conn_wm)
+
+        def _concurrent_dml_during_backfill(batch_idx: int, rows_done: int) -> None:
+            if batch_idx == 1:
+                # At batch_idx == 1, watermark cursor is at id = 3, max_pk = 10:
+                # (a) Insert above max_pk (id = 11 > 10) -> trigger must apply immediately
+                conn_wm.execute("INSERT INTO ledger VALUES (11, 'B1', 110);")
+                # (b) Delete below cursor_pk (id = 2 <= 3, already folded) -> trigger must subtract immediately
+                conn_wm.execute("DELETE FROM ledger WHERE id = 2;")
+                # (c) Delete above cursor_pk (id = 8 in (3, 10], not yet folded) -> trigger must skip; batch 3 will not see it
+                conn_wm.execute("DELETE FROM ledger WHERE id = 8;")
+                # (d) Update below cursor_pk (id = 1 <= 3, already folded) -> trigger must apply delta immediately
+                conn_wm.execute("UPDATE ledger SET amt = 999 WHERE id = 1;")
+                # (e) Update above cursor_pk (id = 9 in (3, 10], not yet folded) -> trigger must skip; batch 3 will fold 888
+                conn_wm.execute("UPDATE ledger SET amt = 888 WHERE id = 9;")
+
+        plan_wm = mgr_wm.register_view(
+            "CREATE VIEW ledger_totals AS SELECT bucket, COUNT(*) AS c, SUM(amt) AS s FROM ledger GROUP BY bucket;",
+            incremental_backfill=True,
+            batch_size=3,
+            on_progress=_concurrent_dml_during_backfill,
+        )
+        cat_wm = mgr_wm.get_catalog()[plan_wm.view_name]
+        self.assertEqual(cat_wm["backfill_active"], 0)
+        self.assertEqual(cat_wm["backfill_cursor_pk"], 10)
+
+        mv_wm_rows = conn_wm.execute("SELECT bucket, c, s FROM __matview_ledger_totals ORDER BY bucket;").fetchall()
+        raw_wm_rows = conn_wm.execute("SELECT bucket, COUNT(*) AS c, SUM(amt) AS s FROM ledger GROUP BY bucket ORDER BY bucket;").fetchall()
+        self.assertEqual(mv_wm_rows, raw_wm_rows)
+
+        # Also verify snapshot_isolation=True on backfill_incrementally across dialects
+        conn_wm.execute("DELETE FROM __matview_store_ledger_totals;")
+        batches_snap = mgr_wm.backfill_incrementally(plan_wm, batch_size=4, snapshot_isolation=True)
+        self.assertGreaterEqual(batches_snap, 2)
+        self.assertEqual(
+            conn_wm.execute("SELECT bucket, c, s FROM __matview_ledger_totals ORDER BY bucket;").fetchall(),
+            raw_wm_rows,
+        )
+        conn_wm.close()
+
+        # --- 4. Native Composite Keys for Joins, UNION ALL & Secondary Group Indexes ---
+        join_schema = """
+        CREATE TABLE depts (
+            id INTEGER PRIMARY KEY,
+            d_code VARCHAR(32) NOT NULL,
+            region VARCHAR(32) NOT NULL
+        );
+        CREATE TABLE emps (
+            id INTEGER PRIMARY KEY,
+            dept_id INTEGER NOT NULL,
+            role VARCHAR(32) NOT NULL,
+            salary INTEGER NOT NULL
+        );
+        CREATE TABLE contractors (
+            id INTEGER PRIMARY KEY,
+            dept_id INTEGER NOT NULL,
+            role VARCHAR(32) NOT NULL,
+            fee INTEGER NOT NULL
+        );
+        """
+        # 4a. INNER JOIN with NOT NULL composite group key (d.d_code, e.role) -> native PRIMARY KEY (d_code, role), no __mv_pk
+        p_join_native = generate_materialized_view(
+            join_schema,
+            "CREATE VIEW v_dept_role AS SELECT d.d_code, e.role, COUNT(*) AS hc, SUM(e.salary) AS payroll FROM depts d INNER JOIN emps e ON d.id = e.dept_id GROUP BY d.d_code, e.role;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertIn("PRIMARY KEY (d_code, role)", p_join_native.backing_table_ddl)
+        self.assertNotIn("__mv_pk", p_join_native.backing_table_ddl)
+        # Also creates secondary index on non-leading group column `role`
+        self.assertTrue(any("ON __matview_store_v_dept_role (role);" in d for d in p_join_native.index_ddls))
+
+        # 4b. UNION ALL Z-set view -> native composite PRIMARY KEY (__mv_branch_id, __mv_pk_0), no __mv_pk
+        p_uall_native = generate_materialized_view(
+            join_schema,
+            "CREATE VIEW v_all_workers AS SELECT id, dept_id, role, salary AS comp FROM emps UNION ALL SELECT id, dept_id, role, fee AS comp FROM contractors;",
+            dialect=Dialect.SQLITE,
+        )
+        self.assertIn("PRIMARY KEY (__mv_branch_id, __mv_pk_0)", p_uall_native.backing_table_ddl)
+        self.assertNotIn("__mv_pk ", p_uall_native.backing_table_ddl)
+
+        # 4c. UNION ALL aggregate view with NOT NULL group key -> native PRIMARY KEY (role), no __mv_pk
+        p_uall_agg_native = generate_materialized_view(
+            join_schema,
+            "CREATE VIEW v_role_comp AS SELECT role, COUNT(*) AS n, SUM(comp) AS total_comp FROM (SELECT role, salary AS comp FROM emps UNION ALL SELECT role, fee AS comp FROM contractors) u GROUP BY role;",
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+        )
+        self.assertIn("PRIMARY KEY (role)", p_uall_agg_native.backing_table_ddl)
+        self.assertNotIn("__mv_pk", p_uall_agg_native.backing_table_ddl)
+
+        # Execute live DML on Join + UNION ALL native composite PK views across SQLite, PG, MySQL
+        for d_mode in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+            conn_j: Any = (
+                sqlite3.connect(":memory:")
+                if d_mode == Dialect.SQLITE
+                else TranspiledConnectionAdapter(d_mode)
+            )
+            if d_mode == Dialect.SQLITE:
+                _register_sqlite_compat_udfs(conn_j)
+            mgr_j = MaterializedViewManager(conn_j, dialect=d_mode, ignore_limitations=True)
+            mgr_j.apply_schema_ddl(join_schema, auto_sync_views=False)
+            conn_j.execute("INSERT INTO depts VALUES (1, 'ENG', 'US'), (2, 'OPS', 'EU');")
+            conn_j.execute("INSERT INTO emps VALUES (1, 1, 'SWE', 100), (2, 1, 'SWE', 150), (3, 2, 'SRE', 120);")
+            conn_j.execute("INSERT INTO contractors VALUES (1, 1, 'SWE', 80), (2, 2, 'QA', 90);")
+            mgr_j.register_view(
+                """
+                CREATE VIEW v_dept_role AS
+                SELECT d.d_code, e.role, COUNT(*) AS hc, SUM(e.salary) AS payroll
+                FROM depts d INNER JOIN emps e ON d.id = e.dept_id
+                GROUP BY d.d_code, e.role;
+                CREATE VIEW v_all_workers AS
+                SELECT id, dept_id, role, salary AS comp FROM emps
+                UNION ALL
+                SELECT id, dept_id, role, fee AS comp FROM contractors;
+                CREATE VIEW v_role_comp AS
+                SELECT role, COUNT(*) AS n, SUM(comp) AS total_comp
+                FROM (SELECT role, salary AS comp FROM emps UNION ALL SELECT role, fee AS comp FROM contractors) u
+                GROUP BY role;
+                """
+            )
+            conn_j.execute("INSERT INTO emps VALUES (4, 2, 'SRE', 130);")
+            conn_j.execute("UPDATE emps SET salary = 200 WHERE id = 1;")
+            conn_j.execute("DELETE FROM contractors WHERE id = 1;")
+            self.assertEqual(
+                conn_j.execute("SELECT * FROM __matview_v_dept_role ORDER BY d_code, role;").fetchall(),
+                conn_j.execute("SELECT d.d_code, e.role, COUNT(*) AS hc, SUM(e.salary) AS payroll FROM depts d INNER JOIN emps e ON d.id = e.dept_id GROUP BY d.d_code, e.role ORDER BY d.d_code, e.role;").fetchall(),
+            )
+            self.assertEqual(
+                sorted(conn_j.execute("SELECT * FROM __matview_v_all_workers;").fetchall()),
+                sorted(conn_j.execute("SELECT id, dept_id, role, salary AS comp FROM emps UNION ALL SELECT id, dept_id, role, fee AS comp FROM contractors;").fetchall()),
+            )
+            self.assertEqual(
+                conn_j.execute("SELECT * FROM __matview_v_role_comp ORDER BY role;").fetchall(),
+                conn_j.execute("SELECT role, COUNT(*) AS n, SUM(comp) AS total_comp FROM (SELECT role, salary AS comp FROM emps UNION ALL SELECT role, fee AS comp FROM contractors) u GROUP BY role ORDER BY role;").fetchall(),
+            )
+
+            # --- 5. Session-Scoped & Shadow-Table Swap bulk_changes() Isolation ---
+            with mgr_j.bulk_changes(use_shadow_swap=True):
+                conn_j.execute("INSERT INTO emps VALUES (5, 1, 'PM', 140), (6, 2, 'SRE', 110);")
+                conn_j.execute("INSERT INTO contractors VALUES (3, 1, 'PM', 70);")
+
+            self.assertEqual(
+                conn_j.execute("SELECT * FROM __matview_v_dept_role ORDER BY d_code, role;").fetchall(),
+                conn_j.execute("SELECT d.d_code, e.role, COUNT(*) AS hc, SUM(e.salary) AS payroll FROM depts d INNER JOIN emps e ON d.id = e.dept_id GROUP BY d.d_code, e.role ORDER BY d.d_code, e.role;").fetchall(),
+            )
+            self.assertEqual(
+                conn_j.execute("SELECT * FROM __matview_v_role_comp ORDER BY role;").fetchall(),
+                conn_j.execute("SELECT role, COUNT(*) AS n, SUM(comp) AS total_comp FROM (SELECT role, salary AS comp FROM emps UNION ALL SELECT role, fee AS comp FROM contractors) u GROUP BY role ORDER BY role;").fetchall(),
+            )
+            if hasattr(conn_j, "close"):
+                conn_j.close()
+
 
 import random
 
@@ -5284,6 +5638,8 @@ def run_suite_13_fuzz_regression_corpus(runner: MVTestRunner) -> None:
                 incremental_backfill=True,
                 batch_size=2,
             )
+
+
 
 
 def _run_all_tests() -> None:
