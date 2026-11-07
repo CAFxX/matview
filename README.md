@@ -17,7 +17,7 @@ Given a definition such as:
 CREATE VIEW customer_sales AS
 SELECT customer_id, COUNT(*) AS order_count, SUM(amount) AS total_amount
 FROM orders
-WHERE status = paid
+WHERE status = 'paid'
 GROUP BY customer_id;
 ```
 
@@ -69,7 +69,7 @@ SELECT
     COUNT(*) AS order_count,
     SUM(amount) AS total_amount
 FROM orders
-WHERE status = paid
+WHERE status = 'paid'
 GROUP BY customer_id;
 ```
 
