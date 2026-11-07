@@ -4,8 +4,8 @@ This document tracks all feature goals, architectural improvements, and verified
 
 ## Completed (`[x]`)
 
-- [x] **Differential Random SQL Fuzzing & Regression Corpus**:
-  I would like the generator to be fuzzed by generating valid random schemas and views, as well as random DMLs, and then comparing the materialized view after each DML to the result of running the view directly (`DifferentialSQLFuzzer` in Suite 12 + permanent fuzzing regression corpus in Suite 13).
+- [x] **Baseline Differential Test Harness & Regression Corpus (limited coverage; expansion tracked below)**:
+  A deterministic differential-testing harness and permanent regression corpus exist (`DifferentialSQLFuzzer` in Suite 12 + Suite 13). This is only infrastructure, not completion of comprehensive schema/query/DML fuzzing: the current scenario structure and DML operations are template-driven, schema topology is largely fixed, and the oracle/engine simulation/concurrency coverage still need the work listed under P0.
 - [x] **Live Database Schema Introspection Tests**:
   I would like the tests to exercise also pulling the schema from an existing database (`introspect_database_schemas` tested across SQLite, PostgreSQL, and MySQL/MariaDB in `test_08_pull_schema_from_existing_database_across_all_dialects`).
 - [x] **Unified Multi-Dialect Testing Infrastructure**:
@@ -47,6 +47,73 @@ This document tracks all feature goals, architectural improvements, and verified
   Handle `$tag$...$tag$` dollar-quoted string literals and `` `...` `` backtick identifiers in `_strip_sql_comments` and `_split_top_level`.
 - [x] **Schema Drift Detection (`check_schema_drift`), Drift Repair (`repair_view`), and Multi-Dialect CLI DSNs**:
   Add `manager.check_schema_drift()` (`--check-drift`), `manager.repair_view()` (`--repair`), and `postgresql://` / `mysql://` / `mariadb://` / `sqlite:///` DSN connection support in `MaterializedViewManager` and the CLI.
+
+## P0 — Test Correctness & Coverage Gaps
+
+The existing differential-testing harness is useful, but its current headline counts must not be treated as evidence of broad structural coverage. In particular, the schema/scenario generator is largely fixed-structure, DML is selected from a finite set of hardcoded operation templates, query generation recombines predefined patterns, some dialect paths are transpiled to SQLite, numerical comparisons normalize values too aggressively, and the backfill interleaving test does not use independent concurrent sessions. Keep the existing deterministic tests and regression corpus, but do not consider the fuzzing goal complete until the following are implemented and measured.
+
+- [ ] **Repair the Differential-Test Oracle (exact, type-aware comparisons)**:
+  - Compare integers exactly without converting them to floating point; add boundary cases around and above 2^53 and the signed/unsigned limits supported by each engine.
+  - Compare DECIMAL / NUMERIC values using exact decimal semantics wherever the engine returns exact values; do not round away meaningful digits before comparison.
+  - Use explicit, operation-appropriate absolute/relative (and, where useful, ULP-based) tolerances only for approximate floating-point results. Handle NaN, infinities, signed zero, NULL, booleans, text, binary values, and engine-specific result types deliberately.
+  - Add adversarial cases for cancellation, high offsets, tiny magnitudes, overflow/underflow, large aggregates, and values differing only beyond the current rounding precision.
+  - Ensure row-multiset comparison preserves duplicate multiplicity and does not hide type or collation differences unintentionally.
+
+- [ ] **Replace Fixed-Structure Scenario Generation with Genuine Schema Generation**:
+  - Generate variable numbers of tables and columns, data types, nullability, defaults, generated columns where supported, primary and composite keys, unique constraints, foreign keys, referential actions, checks, and indexes.
+  - Generate varied relationship graphs: disconnected tables, chains, stars, many-to-many bridges, self-references, and cycles where legal.
+  - Populate schemas with constraint-aware data, including empty/sparse/dense tables, duplicate values, NULL distributions, skew, boundary values, and varying cardinalities.
+  - Track and report structural schema coverage (not just schema count or randomized identifiers/data); retain seeds and shrink failing schemas.
+
+- [ ] **Replace Template-List DML Fuzzing with a Schema-Aware Recursive DML AST Generator**:
+  - Generate valid INSERT (single/multi-row, DEFAULT, INSERT ... SELECT), UPDATE (arbitrary multi-column assignments and expressions), DELETE, and UPSERT/conflict-handling statements from the actual schema and target dialect.
+  - Generate recursively composed expressions, predicates, Boolean combinations, CASE, casts, functions, scalar and correlated subqueries, EXISTS/IN, joins and dialect-specific forms where supported.
+  - Exercise key changes, composite/unique conflict targets, NULL transitions, no-op updates, updates affecting join/group/filter keys, deletes with cascades/restrictions, and statements affecting zero, one, or many rows.
+  - Generate sequences and combinations of statements rather than only independent template instances. Preserve validity through schema-aware generation or classify expected constraint failures explicitly.
+  - Every supported DML grammar production must be reachable without adding a new hardcoded SQL template. Report production, depth, operator, clause, and combination coverage; use coverage feedback to bias generation toward unexplored structures.
+  - Add grammar-preserving mutation of previously successful statements (operator/operand/predicate/assignment/target/shape changes), while retaining deterministic replay and regression promotion.
+
+- [ ] **Upgrade Query Generation to Recursive, Schema-Aware SQL AST Generation**:
+  - Generate supported SELECT structures recursively from generated schemas, including projections, joins, filters, grouping, HAVING, aggregates, DISTINCT, CTEs, subqueries, set operations, windows, ordering, limits, and their meaningful combinations.
+  - Cover each supported grammar production in multiple contexts and combinations; distinguish generated structural diversity from the number of query instances.
+  - Keep unsupported constructs explicit: verify that they are rejected or reported as limitations under default settings rather than silently treating best-effort compilation as supported behavior.
+  - Preserve minimized failing queries as permanent regression cases.
+
+- [ ] **Separate Supported-Plan Tests from Best-Effort / Limitation-Override Tests**:
+  - Run supported generated plans with default options and assert that no limitation warning is emitted.
+  - For unsupported plans, assert the expected rejection/limitation code and diagnostic under default options.
+  - Test ignore_limitations=True separately, asserting the exact warning and documenting which correctness guarantees are intentionally waived.
+  - Do not let broad differential suites suppress EngineLimitationWarning and thereby stand in for tests of the default safety contract.
+
+- [ ] **Add Genuine Multi-Connection Concurrency and Isolation Tests**:
+  - Use independent database connections/processes and synchronization barriers; do not describe same-connection callback interleaving as concurrent DML.
+  - Exercise writes immediately before/during/after trigger installation, initial backfill, every chunk boundary, watermark advancement, and finalization.
+  - Cover concurrent INSERT/UPDATE/DELETE, key changes, rows on both sides of the watermark, commits, rollbacks, reader visibility, and competing writers.
+  - Test each engine's actual isolation/locking semantics on native SQLite, PostgreSQL, and MySQL/MariaDB configurations where supported.
+  - Assert both the final materialized result and intermediate transactional visibility; add bounded stress/repetition runs and deterministic reproduction traces.
+
+- [ ] **Make Native Engine Coverage Explicit and Verifiable**:
+  - Label every test result as native-engine execution or dialect simulation/transpilation; local output must make the distinction unmistakable.
+  - Treat transpiled SQLite execution as a fast auxiliary test only, never as evidence of native PostgreSQL/MySQL/MariaDB semantics.
+  - In CI, query and assert the actual server product/version against the requested matrix entry; fail or explicitly mark a fallback as a different target instead of silently counting it as the requested version.
+  - Execute dialect-specific triggers, procedures, conflict handling, transaction behavior, isolation, types, collations, and generated SQL on the actual engine.
+  - Test minimum supported versions and feature boundaries, including real SQLite runtime versions rather than only simulated version metadata.
+
+- [ ] **Add Mutation Testing for Test-Suite Sensitivity**:
+  - Introduce targeted mutations to trigger predicates/actions, delta signs, aggregate maintenance, NULL handling, group/key handling, watermark comparisons, transaction boundaries, rollback/recovery, and dialect/version branches.
+  - Require the relevant tests to kill each curated non-equivalent mutant; record surviving mutants and justify exclusions.
+  - Use mutation testing to find blind spots, not as a substitute for semantic test design or as an unqualified global percentage target.
+
+- [ ] **Add Metamorphic and Invariant-Based Tests**:
+  - Check insert-then-delete restoration, no-op updates, rollback restoration, rebuild-versus-incremental equivalence, and equivalent mutation orderings where operations commute.
+  - Check consistency between base tables, backing tables, auxiliary tables, catalog metadata, and installed triggers after success and failure.
+  - Keep these properties independent of the implementation's own delta-generation logic.
+
+- [ ] **Measure Test Strength and Publish Honest Coverage Statistics**:
+  - Report distinct schema structures, query AST structures, DML AST structures, grammar-production coverage, operator/clause combinations, mutation sequence lengths, native versus simulated engine executions, and concurrency scenarios.
+  - Keep raw test/view/assertion counts as workload statistics only; do not present them as proxies for structural or semantic coverage.
+  - Reconcile README, module docstrings, runner output, and CI matrix descriptions from one generated source of truth.
+  - Remove brittle workflow-text-count assertions; validate workflow structure semantically where needed and rely on actual CI execution for runtime behavior.
 
 ## P1 — Modular Architecture, Engine/Version Optimizations & Developer Experience
 
