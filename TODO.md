@@ -60,6 +60,7 @@ The existing differential-testing harness is useful, but its current headline co
   - Ensure row-multiset comparison preserves duplicate multiplicity and does not hide type or collation differences unintentionally.
 
 - [ ] **Replace Fixed-Structure Scenario Generation with Genuine Schema Generation**:
+  - Progress: Suite 12 now supplements the legacy fixed schema with a deterministic schema-graph generator varying 2–6 tables, per-table column count and numeric types, nullability/defaults, optional unique/check constraints, single/composite primary keys, and chain/star/disconnected/self-reference/bridge-style foreign-key topologies. It emits schema-shaped seed data, projections, grouped queries, joins, and basic DML. This is an initial structural-diversity layer, not completion: richer type/constraint/relationship combinations, structural coverage feedback, and schema shrinking remain outstanding.
   - Generate variable numbers of tables and columns, data types, nullability, defaults, generated columns where supported, primary and composite keys, unique constraints, foreign keys, referential actions, checks, and indexes.
   - Generate varied relationship graphs: disconnected tables, chains, stars, many-to-many bridges, self-references, and cycles where legal.
   - Populate schemas with constraint-aware data, including empty/sparse/dense tables, duplicate values, NULL distributions, skew, boundary values, and varying cardinalities.
