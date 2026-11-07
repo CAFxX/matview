@@ -5331,7 +5331,9 @@ class VariableSchemaDifferentialFuzzer:
             label_nn, qty_nn, amount_nn = (rng.choice([True, False]) for _ in range(3))
             amount_type = rng.choice(["REAL", "NUMERIC(18, 4)", "INTEGER"])
             composite = i == count - 1 and count > 2 and rng.random() < 0.5
-            unique_label, check_qty = rng.choice([True, False]), rng.choice([True, False])
+            unique_label, check_qty, check_amount = (
+                rng.choice([True, False]) for _ in range(3)
+            )
             cols = [
                 "id INTEGER NOT NULL",
                 f"label VARCHAR(40){' NOT NULL' if label_nn else ''}",
@@ -5364,7 +5366,7 @@ class VariableSchemaDifferentialFuzzer:
                 cols.append("UNIQUE (label)")
             if check_qty:
                 cols.append("CHECK (qty IS NULL OR qty >= 0)")
-            if rng.random() < 0.5:
+            if check_amount:
                 cols.append("CHECK (amount IS NULL OR amount >= 0)")
             ddls.append(f"CREATE TABLE {name} (\n    " + ",\n    ".join(cols) + "\n);")
             metas.append({
@@ -5373,6 +5375,7 @@ class VariableSchemaDifferentialFuzzer:
                 "composite": composite, "extras": extras,
                 "fk_cols": [col for _, col in fks[i]],
                 "unique_label": unique_label, "check_qty": check_qty,
+                "check_amount": check_amount,
             })
 
         seed_sql: List[str] = []
@@ -5460,7 +5463,9 @@ class VariableSchemaDifferentialFuzzer:
             "foreign_key_count": len(edges),
             "composite_primary_key_tables": sum(int(m["composite"]) for m in metas),
             "unique_label_constraints": sum(int(m["unique_label"]) for m in metas),
-            "check_constraints": sum(int(m["check_qty"]) for m in metas),
+            "check_constraints": sum(
+                int(m["check_qty"]) + int(m["check_amount"]) for m in metas
+            ),
         }
         return "\n".join(ddls), views, seed_sql, mutations, shape
 
