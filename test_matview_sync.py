@@ -5312,7 +5312,8 @@ class VariableSchemaDifferentialFuzzer:
         elif topology == "star":
             edges = [(i, 0, "parent_0_id") for i in range(1, count)]
         elif topology == "disconnected":
-            edges = [(i, i - 1, f"parent_{i - 1}_id") for i in range(1, count) if i % 3 == 1]
+            # Leave table 0 isolated; later tables may form separate components.
+            edges = [(i, i - 1, f"parent_{i - 1}_id") for i in range(2, count) if i % 3 == 2]
         elif topology == "self":
             edges = [(0, 0, "parent_0_id")] + [
                 (i, i - 1, f"parent_{i - 1}_id") for i in range(2, count) if i % 2 == 0
@@ -5538,6 +5539,22 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
                 batch_size=2,
             )
 
+            # 3. MySQL dialect (incremental backfill + stored procedures + triggers)
+            s_my, v_my, seed_my, m_my = fuzzer.generate_scenario(
+                sc_idx, Dialect.MYSQL, views_count=views_count, mutations_count=mutations_count
+            )
+            runner.run_batch(
+                f"Suite 12d (Differential Fuzzer seed={s_val} sc={sc_idx} - MySQL Incremental & Triggers)",
+                s_my,
+                v_my,
+                seed_my,
+                m_my,
+                dialect=Dialect.MYSQL,
+                incremental_backfill=True,
+                batch_size=2,
+            )
+
+
             # 4. Run a separately generated schema graph to exercise variable
             # table/column/key/constraint/FK structures beyond the legacy templates.
             s_var, v_var, seed_var, m_var, shape_var = VariableSchemaDifferentialFuzzer(
@@ -5552,21 +5569,6 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
             runner.run_batch(
                 f"Suite 12e (Variable Schema seed={s_val} sc={sc_idx})",
                 s_var, v_var, seed_var, m_var, dialect=Dialect.SQLITE,
-            )
-
-            # 3. MySQL dialect (incremental backfill + stored procedures + triggers)
-            s_my, v_my, seed_my, m_my = fuzzer.generate_scenario(
-                sc_idx, Dialect.MYSQL, views_count=views_count, mutations_count=mutations_count
-            )
-            runner.run_batch(
-                f"Suite 12d (Differential Fuzzer seed={s_val} sc={sc_idx} - MySQL Incremental & Triggers)",
-                s_my,
-                v_my,
-                seed_my,
-                m_my,
-                dialect=Dialect.MYSQL,
-                incremental_backfill=True,
-                batch_size=2,
             )
 
 
