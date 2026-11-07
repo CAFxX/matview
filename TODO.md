@@ -93,7 +93,7 @@ This document tracks all feature goals, architectural improvements, and verified
 ## P3 — Multi-View DAGs, Shared Computation, Async/Bulk MVs, Docs & NewSQL
 
 - [ ] **Cascading Materialized Views (MVs Referencing Other MVs)**:
-  I would like materialized view definitions to also be able to reference other materialized views, and their updates to still happen as efficiently as possible (building a dependency DAG over views and treating upstream `__matview_store_<v1>` backing tables as base tables for downstream views with recursive/cascading trigger propagation).
+  I would like materialized view definitions to also be able to reference other materialized views, and their updates to still happen as efficiently as possible (building a dependency DAG over views and treating upstream `__matview_store_<v1>` backing tables as base tables for downstream views with recursive/cascading trigger propagation). Note: already implemented in branch cascading-mvs.
 - [ ] **Multi-View Trigger Consolidation & Shared Sub-Aggregation Deduplication**:
   I would like, when multiple views use the same base tables, to avoid redundant computations (e.g. in case two views both use the same aggregation over the same data):
   - Merge multiple triggers on the same `(base_table, event)` into a single consolidated trigger/function call per row mutation, and
