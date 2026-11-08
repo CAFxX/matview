@@ -52,6 +52,15 @@ jobs:
 
       - name: Run full test suite (SQLite + cross-dialect transpiled suites)
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
+
 
   # =========================================================================
   # 2. SQLite-Compatible Engines & Distributions (APSW, SQLite3MC, SQLCipher, sqlean, Turso libSQL)
@@ -176,6 +185,15 @@ jobs:
         env:
           SQLITE_COMPAT_ENGINE: ${{ matrix.engine }}
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
+
 
   # =========================================================================
   # 3. PostgreSQL (All active non-EoL major versions: 14, 15, 16, 17, 18)
@@ -219,6 +237,15 @@ jobs:
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
+
 
   # =========================================================================
   # 4. PostgreSQL-Compatible Engines (Percona PG, TimescaleDB, PostGIS, pgvector)
@@ -309,6 +336,15 @@ jobs:
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
+
 
   # =========================================================================
   # 5. Oracle MySQL (All active non-EoL versions: 8.4 LTS, 9.7 LTS, 26.10 Innovation)
@@ -363,6 +399,15 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
+
 
   # =========================================================================
   # 6. MySQL-Compatible Engines (MariaDB 10.11–13.0, Percona Server 8.4 & 9.7)
@@ -440,6 +485,15 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
+
 
   # =========================================================================
   # 7. High-Intensity Multi-Engine Random Differential Fuzzing (SQLite, PG, MySQL, MariaDB)
@@ -533,6 +587,15 @@ jobs:
           else
             python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
           fi
+
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   # =========================================================================
   # Required branch-protection check: one stable result for the full matrix
