@@ -1,0 +1,56 @@
+name: CI Matrix Efficacy Audit
+
+on:
+  schedule:
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      audit_days:
+        description: "Lookback window in days"
+        required: false
+        default: "30"
+        type: string
+      max_runs:
+        description: "Maximum workflow runs to inspect"
+        required: false
+        default: "50"
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  audit:
+    name: Analyze CI matrix value and cost
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install audit dependency
+        run: python3 -m pip install PyYAML
+
+      - name: Collect matrix coverage, outcomes, and durations
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AUDIT_DAYS: ${{ inputs.audit_days || '30' }}
+          AUDIT_MAX_RUNS: ${{ inputs.max_runs || '50' }}
+        run: python3 scripts/audit_ci_matrix.py
+
+      - name: Upload machine-readable and Markdown reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-matrix-efficacy-audit
+          path: |
+            ci-matrix-audit.json
+            ci-matrix-audit.md
+          if-no-files-found: error
+          retention-days: 90
