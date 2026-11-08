@@ -51,6 +51,9 @@ jobs:
       - name: Test recursive schema-aware SELECT AST generation
         run: python3 test_query_ast_fuzzer.py
 
+      - name: Differentially test generated SELECT materialized views
+        run: python3 test_query_ast_materialization.py
+
   # =========================================================================
   # 2. SQLite-Compatible Engines & Distributions (APSW, SQLite3MC, SQLCipher, sqlean, Turso libSQL)
   # =========================================================================
