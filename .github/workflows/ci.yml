@@ -19,6 +19,9 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # Keep per-engine matrix fuzzing broad but bounded; the dedicated fuzz-stress
+  # matrix overrides this to scale 3 for deeper randomized testing.
+  MATVIEW_FUZZ_SCALE: "1"
 
 jobs:
   # =========================================================================
