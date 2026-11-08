@@ -213,6 +213,12 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
 
+      - name: Verify actual PostgreSQL server version
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+          EXPECTED_PG_MAJOR: ${{ matrix.pg-version }}
+        run: python3 verify_engine_matrix.py
+
       - name: Run full test suite + live PostgreSQL ${{ matrix.pg-version }} integration tests
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
@@ -303,6 +309,12 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
 
+      - name: Verify actual PostgreSQL-compatible server version and extensions
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+          EXPECTED_PG_LABEL: ${{ matrix.label }}
+        run: python3 verify_engine_matrix.py
+
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
@@ -324,10 +336,19 @@ jobs:
 
       - name: Start MySQL ${{ matrix.mysql-version }} container
         run: |
-          IMG="mysql:${{ matrix.mysql-version }}"
+          REQUESTED_IMG="mysql:${{ matrix.mysql-version }}"
+          IMG="$REQUESTED_IMG"
+          FALLBACK=false
           if ! docker pull "$IMG"; then
             IMG="mysql:innovation"
+            FALLBACK=true
             docker pull "$IMG"
+          fi
+          echo "MATVIEW_CI_REQUESTED_IMAGE=$REQUESTED_IMG" >> "$GITHUB_ENV"
+          echo "MATVIEW_CI_ACTUAL_IMAGE=$IMG" >> "$GITHUB_ENV"
+          echo "MATVIEW_CI_FALLBACK=$FALLBACK" >> "$GITHUB_ENV"
+          if [ "$FALLBACK" = "true" ]; then
+            echo "::notice::Requested $REQUESTED_IMG unavailable; using fallback $IMG. Runtime version will be verified."
           fi
           docker run -d --name mysql-srv \
             -e MYSQL_ROOT_PASSWORD=password \
@@ -357,6 +378,13 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
 
+      - name: Verify actual MySQL server product and version
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          EXPECTED_MYSQL_PRODUCT: mysql
+          EXPECTED_MYSQL_VERSION: ${{ matrix.mysql-version }}
+        run: python3 verify_engine_matrix.py
+
       - name: Run full test suite + live MySQL ${{ matrix.mysql-version }} integration tests
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
@@ -375,34 +403,57 @@ jobs:
           - label: "MariaDB 10.11 LTS"
             image: "mariadb:10.11"
             fallback: "mariadb:10.11"
+            expected-product: "mariadb"
+            expected-version: "10.11"
           - label: "MariaDB 11.4 LTS"
             image: "mariadb:11.4"
             fallback: "mariadb:11.4"
+            expected-product: "mariadb"
+            expected-version: "11.4"
           - label: "MariaDB 11.8 LTS"
             image: "mariadb:11.8"
             fallback: "mariadb:11.8"
+            expected-product: "mariadb"
+            expected-version: "11.8"
           - label: "MariaDB 12.3 LTS"
             image: "mariadb:12.3"
             fallback: "mariadb:latest"
+            expected-product: "mariadb"
+            expected-version: "12.3"
           - label: "MariaDB 13.0 Rolling"
             image: "mariadb:13.0"
             fallback: "mariadb:lts"
+            expected-product: "mariadb"
+            expected-version: "13.0"
           - label: "Percona Server for MySQL 8.4 LTS"
             image: "percona/percona-server:8.4"
             fallback: "percona/percona-server:8.4"
+            expected-product: "percona"
+            expected-version: "8.4"
           - label: "Percona Server for MySQL 9.7"
             image: "percona/percona-server:9.7"
             fallback: "percona/percona-server:latest"
+            expected-product: "percona"
+            expected-version: "9.7"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Start ${{ matrix.label }} container
         run: |
-          IMG="${{ matrix.image }}"
+          REQUESTED_IMG="${{ matrix.image }}"
+          IMG="$REQUESTED_IMG"
+          FALLBACK=false
           if ! docker pull "$IMG"; then
             IMG="${{ matrix.fallback }}"
+            FALLBACK=true
             docker pull "$IMG"
+          fi
+          echo "MATVIEW_CI_REQUESTED_IMAGE=$REQUESTED_IMG" >> "$GITHUB_ENV"
+          echo "MATVIEW_CI_ACTUAL_IMAGE=$IMG" >> "$GITHUB_ENV"
+          echo "MATVIEW_CI_FALLBACK=$FALLBACK" >> "$GITHUB_ENV"
+          if [ "$FALLBACK" = "true" ]; then
+            echo "::notice::Requested $REQUESTED_IMG unavailable; using fallback $IMG. Runtime version will be verified."
           fi
           docker run -d --name mysql-compat-srv \
             -e MYSQL_ROOT_PASSWORD=password \
@@ -433,6 +484,13 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
+
+      - name: Verify actual MySQL-compatible product and version
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          EXPECTED_MYSQL_PRODUCT: ${{ matrix.expected-product }}
+          EXPECTED_MYSQL_VERSION: ${{ matrix.expected-version }}
+        run: python3 verify_engine_matrix.py
 
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
