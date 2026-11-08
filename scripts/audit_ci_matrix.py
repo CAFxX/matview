@@ -95,6 +95,9 @@ def main() -> int:
                 key: len(value) if isinstance(value, list) else "include"
                 for key, value in matrix.items()
             },
+            "matrix_values": {
+                key: value for key, value in matrix.items()
+            },
             "runs_on": definition.get("runs-on"),
             "commands": run_commands(definition),
             "name_pattern": expanded_name_pattern(job_id, definition),
@@ -163,6 +166,7 @@ def main() -> int:
             "runs_on": profile["runs_on"],
             "commands": profile["commands"],
             "matrix_axes_detail": profile["matrix_axes"],
+            "matrix_values": profile["matrix_values"],
         })
 
     total_matrix_entries = sum(row["matrix_entries"] for row in rows)
@@ -216,6 +220,7 @@ def main() -> int:
             f"### {row['job_id']}: {row['name_template']}",
             f"- Runner: `{row['runs_on']}`",
             f"- Matrix axes/cardinalities: `{json.dumps(row['matrix_axes_detail'], sort_keys=True)}`",
+            f"- Matrix values: `{json.dumps(row['matrix_values'], sort_keys=True)}`",
             f"- Test/setup commands: `{' ; '.join(row['commands']) or '(none found)'}`",
             f"- Historical evidence: {row['runs_observed']} executions; "
             f"{row['median_minutes'] if row['median_minutes'] is not None else 'no'} median minutes; "
