@@ -4901,6 +4901,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         shapes = []
         topologies, table_counts = set(), set()
+        expression_coverage, predicate_coverage = set(), set()
         for seed in range(64):
             schema, views, seeds, mutations, shape = VariableSchemaDifferentialFuzzer(seed).generate_scenario(1)
             shapes.append((
@@ -4912,9 +4913,18 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             table_counts.add(shape["table_count"])
             self.assertGreaterEqual(len(views), shape["table_count"])
             self.assertGreater(len(seeds), shape["table_count"])
-            self.assertGreaterEqual(len(mutations), 3)
+            self.assertGreaterEqual(len(mutations), 5)
+            self.assertEqual(
+                set(shape["dml_statement_kinds"]),
+                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "DELETE", "UPSERT"},
+            )
+            self.assertGreater(shape["max_expression_depth"], 0)
+            self.assertGreater(shape["max_predicate_depth"], 0)
+            self.assertTrue(shape["expression_nodes"])
+            self.assertTrue(shape["predicate_nodes"])
+            expression_coverage.update(shape["expression_nodes"])
+            predicate_coverage.update(shape["predicate_nodes"])
 
-            # Validate generated DDL and seed rows with FK enforcement enabled.
             conn = sqlite3.connect(":memory:")
             try:
                 conn.execute("PRAGMA foreign_keys = ON;")
@@ -4922,24 +4932,52 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 for seed_sql in seeds:
                     conn.execute(seed_sql)
                 conn.commit()
+                # Execute the complete generated DML sequence with real FK checks.
+                for _, mutation_sql in mutations:
+                    conn.execute(mutation_sql)
+                conn.commit()
             finally:
                 conn.close()
         self.assertGreaterEqual(len(topologies), 4)
         self.assertGreaterEqual(len(table_counts), 4)
         self.assertGreaterEqual(len(set(shapes)), 48)
+        self.assertTrue({"add", "multiply", "case", "coalesce", "literal"} <= expression_coverage)
+        self.assertTrue(
+            {"and", "or", "not", "id_eq", "id_between", "qty_null", "qty_ge",
+             "amount_le", "label_null", "label_eq"} <= predicate_coverage
+        )
 
     def test_variable_schema_fuzzer_executes_across_dialects(self) -> None:
-        schema, views, seeds, mutations, shape = VariableSchemaDifferentialFuzzer(314159).generate_scenario(2)
         runner = MVTestRunner()
+        expected_views = 0
+        expected_assertions = 0
         for dialect in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+            schema, views, seeds, mutations, shape = VariableSchemaDifferentialFuzzer(
+                314159
+            ).generate_scenario(2, dialect=dialect)
+            self.assertEqual(
+                set(shape["dml_statement_kinds"]),
+                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "DELETE", "UPSERT"},
+            )
+            upserts = [
+                mutation_sql
+                for mutation_label, mutation_sql in mutations
+                if "upsert" in mutation_label
+            ]
+            if dialect == Dialect.MYSQL:
+                self.assertTrue(all("ON DUPLICATE KEY UPDATE" in sql for sql in upserts))
+            else:
+                self.assertTrue(all("ON CONFLICT" in sql for sql in upserts))
             runner.run_batch(
                 f"VariableSchema(seed=314159,{dialect.value},{shape['topology']})",
                 schema, views[:8], seeds, mutations[:9], dialect=dialect,
             )
-        view_count = min(8, len(views))
-        mutation_count = min(9, len(mutations))
-        self.assertEqual(runner.total_views, view_count * 3)
-        self.assertEqual(runner.total_assertions, view_count * (mutation_count + 1) * 3)
+            view_count = min(8, len(views))
+            mutation_count = min(9, len(mutations))
+            expected_views += view_count
+            expected_assertions += view_count * (mutation_count + 1)
+        self.assertEqual(runner.total_views, expected_views)
+        self.assertEqual(runner.total_assertions, expected_assertions)
 
 
 import random
@@ -5499,8 +5537,162 @@ class VariableSchemaDifferentialFuzzer:
     def __init__(self, seed: int = 20261107) -> None:
         self.seed = seed
 
+    @staticmethod
+    def _numeric_expr(
+        rng: random.Random, column: str, depth: int, coverage: Dict[str, Any]
+    ) -> Tuple[Any, ...]:
+        """Build a bounded numeric-expression AST from schema-known numeric columns."""
+        coverage["max_expression_depth"] = max(coverage["max_expression_depth"], depth)
+        if depth <= 0:
+            kind = rng.choice(["coalesce", "literal"])
+            coverage["expression_nodes"].add(kind)
+            if kind == "coalesce":
+                return ("coalesce", ("column", column), ("literal", 0))
+            return ("literal", rng.randint(1, 5))
+
+        kind = rng.choice(["add", "multiply", "case"])
+        coverage["expression_nodes"].add(kind)
+        if kind == "add":
+            return (
+                "add",
+                VariableSchemaDifferentialFuzzer._numeric_expr(
+                    rng, column, depth - 1, coverage
+                ),
+                ("literal", rng.randint(1, 5)),
+            )
+        if kind == "multiply":
+            return (
+                "multiply",
+                VariableSchemaDifferentialFuzzer._numeric_expr(
+                    rng, column, depth - 1, coverage
+                ),
+                ("literal", rng.randint(1, 4)),
+            )
+        return (
+            "case",
+            ("is_null", ("column", column)),
+            ("literal", rng.randint(1, 5)),
+            VariableSchemaDifferentialFuzzer._numeric_expr(
+                rng, column, depth - 1, coverage
+            ),
+        )
+
+    @staticmethod
+    def _predicate(
+        rng: random.Random,
+        prefix: str,
+        table_idx: int,
+        row_count: int,
+        depth: int,
+        coverage: Dict[str, Any],
+    ) -> Tuple[Any, ...]:
+        """Build a recursively composed predicate AST using only table columns."""
+        coverage["max_predicate_depth"] = max(coverage["max_predicate_depth"], depth)
+        if depth <= 0 or rng.random() < 0.35:
+            atom = rng.choice([
+                "id_eq", "id_between", "qty_null", "qty_ge",
+                "amount_le", "label_null", "label_eq",
+            ])
+            coverage["predicate_nodes"].add(atom)
+            if atom == "id_eq":
+                return ("compare", ("column", "id"), "=", ("literal", rng.randint(1, row_count + 2)))
+            if atom == "id_between":
+                lo = rng.randint(1, row_count)
+                return ("between", ("column", "id"), lo, lo + rng.randint(0, 3))
+            if atom == "qty_null":
+                return ("is_null", ("column", "qty"))
+            if atom == "qty_ge":
+                return (
+                    "compare",
+                    ("coalesce", ("column", "qty"), ("literal", 0)),
+                    ">=",
+                    ("literal", rng.randint(0, 60)),
+                )
+            if atom == "amount_le":
+                return ("compare", ("column", "amount"), "<=", ("literal", rng.randint(0, 100)))
+            if atom == "label_null":
+                return ("is_null", ("column", "label"))
+            return (
+                "compare",
+                ("column", "label"),
+                "=",
+                ("literal", f"{prefix}_{table_idx}_{rng.randint(1, row_count)}"),
+            )
+
+        operator = rng.choice(["and", "or", "not"])
+        coverage["predicate_nodes"].add(operator)
+        if operator == "not":
+            return (
+                "not",
+                VariableSchemaDifferentialFuzzer._predicate(
+                    rng, prefix, table_idx, row_count, depth - 1, coverage
+                ),
+            )
+        return (
+            operator,
+            VariableSchemaDifferentialFuzzer._predicate(
+                rng, prefix, table_idx, row_count, depth - 1, coverage
+            ),
+            VariableSchemaDifferentialFuzzer._predicate(
+                rng, prefix, table_idx, row_count, depth - 1, coverage
+            ),
+        )
+
+    @staticmethod
+    def _render_numeric_expr(node: Tuple[Any, ...]) -> str:
+        kind = node[0]
+        if kind == "column":
+            return node[1]
+        if kind == "literal":
+            value = node[1]
+            return "'" + value.replace("'", "''") + "'" if isinstance(value, str) else str(value)
+        if kind == "coalesce":
+            return (
+                f"COALESCE({VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])}, "
+                f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[2])})"
+            )
+        if kind in ("add", "multiply"):
+            operator = "+" if kind == "add" else "*"
+            return (
+                f"({VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])} "
+                f"{operator} {VariableSchemaDifferentialFuzzer._render_numeric_expr(node[2])})"
+            )
+        if kind == "case":
+            return (
+                f"(CASE WHEN {VariableSchemaDifferentialFuzzer._render_predicate(node[1])} "
+                f"THEN {VariableSchemaDifferentialFuzzer._render_numeric_expr(node[2])} "
+                f"ELSE {VariableSchemaDifferentialFuzzer._render_numeric_expr(node[3])} END)"
+            )
+        raise ValueError(f"Unknown numeric-expression AST node: {kind}")
+
+    @staticmethod
+    def _render_predicate(node: Tuple[Any, ...]) -> str:
+        kind = node[0]
+        if kind == "is_null":
+            return f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])} IS NULL"
+        if kind == "compare":
+            return (
+                f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])} "
+                f"{node[2]} {VariableSchemaDifferentialFuzzer._render_numeric_expr(node[3])}"
+            )
+        if kind == "between":
+            return (
+                f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])} "
+                f"BETWEEN {node[2]} AND {node[3]}"
+            )
+        if kind == "not":
+            return f"(NOT {VariableSchemaDifferentialFuzzer._render_predicate(node[1])})"
+        if kind in ("and", "or"):
+            operator = "AND" if kind == "and" else "OR"
+            return (
+                f"({VariableSchemaDifferentialFuzzer._render_predicate(node[1])} "
+                f"{operator} {VariableSchemaDifferentialFuzzer._render_predicate(node[2])})"
+            )
+        raise ValueError(f"Unknown predicate AST node: {kind}")
+
     def generate_scenario(
-        self, scenario_idx: int, *, views_count: int = 24, mutations_count: int = 24
+        self, scenario_idx: int, *, views_count: int = 24, mutations_count: int = 32,
+        dialect: Dialect = Dialect.SQLITE
     ) -> Tuple[str, List[Tuple[str, str]], List[str], List[Tuple[str, str]], Dict[str, Any]]:
         rng = random.Random((self.seed * 1000003) ^ (scenario_idx * 104729))
         prefix = f"vs{scenario_idx}"
@@ -5563,7 +5755,6 @@ class VariableSchemaDifferentialFuzzer:
             else:
                 constraints.append("PRIMARY KEY (id)")
             for parent, fk_col in fks[i]:
-                # Keep all column definitions before table-level constraints.
                 cols.append(f"{fk_col} INTEGER")
                 constraints.append(
                     f"FOREIGN KEY ({fk_col}) REFERENCES {names[parent]} (id) ON DELETE CASCADE"
@@ -5639,44 +5830,143 @@ class VariableSchemaDifferentialFuzzer:
             )
             views.append((view_name, f"CREATE VIEW {view_name} AS {select};"))
 
+        dml_coverage: Dict[str, Any] = {
+            "expression_nodes": set(),
+            "predicate_nodes": set(),
+            "max_expression_depth": 0,
+            "max_predicate_depth": 0,
+        }
         mutations: List[Tuple[str, str]] = []
-        # Delete child tables before their parents. MySQL/MariaDB do not fire
-        # child-table triggers for FK-driven ON DELETE CASCADE actions, so a
-        # parent-first delete would test a documented engine limitation rather
-        # than the row-trigger DML path this differential scenario is intended
-        # to exercise. Inserts and updates remain schema-aware and use the
-        # same deterministic table order as before.
+
+        def fields_for(meta: Dict[str, Any]) -> List[str]:
+            return ["id"] + (["slot"] if meta["composite"] else []) + [
+                "label", "qty", "amount",
+                *[extra[0] for extra in meta["extras"]],
+                *meta["fk_cols"],
+            ]
+
+        def values_for(table_idx: int, meta: Dict[str, Any], row_id: int, suffix: str) -> List[str]:
+            values = [str(row_id)] + ([str(row_id)] if meta["composite"] else [])
+            values += [
+                f"'{prefix}_{table_idx}_{suffix}'",
+                str(rng.randint(1, 100)),
+                str(rng.randint(1, 100)) if meta["amount_type"] == "INTEGER"
+                else f"{rng.randint(1, 100) + 0.375:.3f}",
+            ]
+            for extra_name, extra_type, nullable in meta["extras"]:
+                if nullable and rng.random() < 0.15:
+                    values.append("NULL")
+                elif extra_type in ("INTEGER", "REAL"):
+                    values.append(str(rng.randint(1, 20)))
+                else:
+                    values.append(f"'{prefix}_{extra_name}_{suffix}'")
+            # Nullable FK columns use NULL so an earlier generated parent DELETE
+            # cannot make a later child INSERT/UPSERT violate the FK constraint.
+            values += ["NULL" for _ in fks[table_idx]]
+            return values
+
+        statement_kinds = set()
+        # Execute generated deletes child-first. MySQL/MariaDB do not invoke
+        # child-table triggers for FK-driven ON DELETE CASCADE actions; a
+        # parent-first delete would therefore test that documented limitation
+        # rather than the DML-trigger maintenance path under test. All tables
+        # still receive generated INSERT/UPDATE/UPSERT/DELETE statements.
         for i in reversed(range(len(metas))):
             meta = metas[i]
-            if len(mutations) + 3 > mutations_count:
+            required_mutations = 4 + int(i == 1 and len(metas) > 1)
+            if len(mutations) + required_mutations > mutations_count:
                 break
+            fields = fields_for(meta)
             new_id = row_counts[i] + 1
-            fields = ["id"] + (["slot"] if meta["composite"] else [])
-            fields += ["label", "qty", "amount"] + [x[0] for x in meta["extras"]] + meta["fk_cols"]
-            vals = [str(new_id)] + ([str(new_id)] if meta["composite"] else [])
-            vals += [f"'{prefix}_{i}_inserted'", str(rng.randint(1, 100))]
-            vals.append(str(rng.randint(1, 100)) if meta["amount_type"] == "INTEGER" else f"{rng.randint(1, 100) + 0.375:.3f}")
-            for extra_name, extra_type, _ in meta["extras"]:
-                vals.append(str(rng.randint(1, 20)) if extra_type in ("INTEGER", "REAL") else f"'{prefix}_{extra_name}_inserted'")
-            # Parent rows may have been removed by earlier generated DELETEs.
-            # FK columns are nullable, so keep these later INSERTs valid while
-            # the initial seed data continues to exercise non-NULL relationships.
-            vals += ["NULL" for _ in fks[i]]
-            # A direct parent delete can cascade into child tables without
-            # firing their maintenance triggers on MySQL/MariaDB. Keep parent
-            # and self-referencing deletes out of this row-trigger differential
-            # scenario; leaf-table deletes still exercise DELETE maintenance.
+            insert_rows = [
+                values_for(i, meta, new_id, "insert_a"),
+                values_for(i, meta, new_id + 1, "insert_b"),
+            ]
+            insert_sql = (
+                f"INSERT INTO {meta['name']} ({', '.join(fields)}) VALUES "
+                + ", ".join("(" + ", ".join(values) + ")" for values in insert_rows)
+                + ";"
+            )
+            mutations.append((f"{prefix}_t{i}_insert_many", insert_sql))
+            statement_kinds.add("INSERT_VALUES")
+
+            if i == 1 and len(mutations) < mutations_count:
+                # Read the first row added above before UPDATE/DELETE can remove it.
+                source_id = new_id
+                target_id = new_id + 2
+                select_values = [str(target_id)]
+                if meta["composite"]:
+                    select_values.append(str(target_id))
+                select_values.append(f"'{prefix}_{i}_insert_select'")
+                select_values.extend(["qty", "amount"])
+                select_values.extend(extra[0] for extra in meta["extras"])
+                select_values.extend(meta["fk_cols"])
+                insert_select_sql = (
+                    f"INSERT INTO {meta['name']} ({', '.join(fields)}) "
+                    f"SELECT {', '.join(select_values)} FROM {meta['name']} "
+                    f"WHERE id = {source_id} LIMIT 1;"
+                )
+                mutations.append((f"{prefix}_t{i}_insert_select", insert_select_sql))
+                statement_kinds.add("INSERT_SELECT")
+
+            numeric_columns = ["qty", "amount"] + [
+                name for name, data_type, _ in meta["extras"]
+                if data_type in ("INTEGER", "REAL")
+            ]
+            assignment_columns = rng.sample(
+                numeric_columns, k=rng.randint(2, min(4, len(numeric_columns)))
+            )
+            assignments = [
+                f"{column} = {self._render_numeric_expr(self._numeric_expr(rng, column, rng.randint(1, 3), dml_coverage))}"
+                for column in assignment_columns
+            ]
+            update_predicate_ast = self._predicate(
+                rng, prefix, i, row_counts[i], rng.randint(1, 3), dml_coverage
+            )
+            update_predicate = self._render_predicate(update_predicate_ast)
+            mutations.append((
+                f"{prefix}_t{i}_update",
+                f"UPDATE {meta['name']} SET {', '.join(assignments)} WHERE {update_predicate};",
+            ))
+            statement_kinds.add("UPDATE")
+
+            upsert_id = 1
+            upsert_values = values_for(i, meta, upsert_id, "upsert")
+            key_columns = ["id", "slot"] if meta["composite"] else ["id"]
+            if dialect == Dialect.MYSQL:
+                upsert_sql = (
+                    f"INSERT INTO {meta['name']} ({', '.join(fields)}) "
+                    f"VALUES ({', '.join(upsert_values)}) "
+                    "ON DUPLICATE KEY UPDATE qty = VALUES(qty), amount = VALUES(amount);"
+                )
+            else:
+                upsert_sql = (
+                    f"INSERT INTO {meta['name']} ({', '.join(fields)}) "
+                    f"VALUES ({', '.join(upsert_values)}) "
+                    f"ON CONFLICT ({', '.join(key_columns)}) DO UPDATE SET "
+                    "qty = excluded.qty, amount = excluded.amount;"
+                )
+            mutations.append((f"{prefix}_t{i}_upsert", upsert_sql))
+            statement_kinds.add("UPSERT")
+
+            delete_predicate_ast = self._predicate(
+                rng, prefix, i, row_counts[i], rng.randint(1, 3), dml_coverage
+            )
+            delete_predicate = self._render_predicate(delete_predicate_ast)
+            # FK cascades do not invoke child-table triggers on MySQL/MariaDB.
+            # Suppress parent/self deletes in this row-trigger differential
+            # scenario rather than silently treating cascade semantics as tested.
             has_referencing_children = any(
                 parent_idx == i
                 for child_refs in fks.values()
                 for parent_idx, _ in child_refs
             )
             delete_guard = " AND 1 = 0" if has_referencing_children else ""
-            mutations.extend([
-                (f"{prefix}_t{i}_insert", f"INSERT INTO {meta['name']} ({', '.join(fields)}) VALUES ({', '.join(vals)});"),
-                (f"{prefix}_t{i}_update", f"UPDATE {meta['name']} SET qty = COALESCE(qty, 0) + {rng.randint(1, 9)}, amount = COALESCE(amount, 0) + 1 WHERE id = 1;"),
-                (f"{prefix}_t{i}_delete", f"DELETE FROM {meta['name']} WHERE id = {row_counts[i]}{delete_guard};"),
-            ])
+            mutations.append((
+                f"{prefix}_t{i}_delete",
+                f"DELETE FROM {meta['name']} WHERE ({delete_predicate}){delete_guard};",
+            ))
+            statement_kinds.add("DELETE")
 
         shape = {
             "topology": topology,
@@ -5696,6 +5986,11 @@ class VariableSchemaDifferentialFuzzer:
             "check_constraints": sum(
                 int(m["check_qty"]) + int(m["check_amount"]) for m in metas
             ),
+            "dml_statement_kinds": tuple(sorted(statement_kinds)),
+            "expression_nodes": tuple(sorted(dml_coverage["expression_nodes"])),
+            "predicate_nodes": tuple(sorted(dml_coverage["predicate_nodes"])),
+            "max_expression_depth": dml_coverage["max_expression_depth"],
+            "max_predicate_depth": dml_coverage["max_predicate_depth"],
         }
         return "\n".join(ddls), views, seed_sql, mutations, shape
 
