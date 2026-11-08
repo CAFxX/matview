@@ -51,6 +51,8 @@ jobs:
         run: python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
 
       - name: Run full test suite (SQLite + cross-dialect transpiled suites)
+        env:
+          MATVIEW_FUZZ_TARGET: "SQLite / Python ${{ matrix.python-version }}"
         run: python3 test_matview_sync.py
       - name: Archive fuzz campaign manifest
         if: always()
@@ -184,6 +186,7 @@ jobs:
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
           SQLITE_COMPAT_ENGINE: ${{ matrix.engine }}
+          MATVIEW_FUZZ_TARGET: "${{ matrix.label }} / Python ${{ matrix.python-version }}"
         run: python3 test_matview_sync.py
       - name: Archive fuzz campaign manifest
         if: always()
@@ -236,6 +239,7 @@ jobs:
       - name: Run full test suite + live PostgreSQL ${{ matrix.pg-version }} integration tests
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+          MATVIEW_FUZZ_TARGET: "PostgreSQL ${{ matrix.pg-version }}"
         run: python3 test_matview_sync.py
       - name: Archive fuzz campaign manifest
         if: always()
@@ -335,6 +339,7 @@ jobs:
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+          MATVIEW_FUZZ_TARGET: "${{ matrix.label }}"
         run: python3 test_matview_sync.py
       - name: Archive fuzz campaign manifest
         if: always()
@@ -398,6 +403,7 @@ jobs:
       - name: Run full test suite + live MySQL ${{ matrix.mysql-version }} integration tests
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          MATVIEW_FUZZ_TARGET: "MySQL ${{ matrix.mysql-version }}"
         run: python3 test_matview_sync.py
       - name: Archive fuzz campaign manifest
         if: always()
@@ -484,6 +490,7 @@ jobs:
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          MATVIEW_FUZZ_TARGET: "${{ matrix.label }}"
         run: python3 test_matview_sync.py
       - name: Archive fuzz campaign manifest
         if: always()
@@ -577,6 +584,8 @@ jobs:
           fi
 
       - name: Run high-intensity differential random SQL fuzzer (${{ matrix.label }})
+        env:
+          MATVIEW_FUZZ_TARGET: "${{ matrix.label }}"
         run: |
           if [ "${{ matrix.backend }}" = "apsw" ]; then
             SQLITE_COMPAT_ENGINE=apsw python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
