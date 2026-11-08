@@ -48,6 +48,9 @@ jobs:
       - name: Test independent-session backfill concurrency
         run: python3 test_concurrent_backfill.py
 
+      - name: Test recursive schema-aware SELECT AST generation
+        run: python3 test_query_ast_fuzzer.py
+
   # =========================================================================
   # 2. SQLite-Compatible Engines & Distributions (APSW, SQLite3MC, SQLCipher, sqlean, Turso libSQL)
   # =========================================================================
