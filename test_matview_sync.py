@@ -321,6 +321,7 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
 
 def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     s = sql
+    s = re.sub(r"\bCAST\s*\(\s*ROW\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)\)\s+AS\s+TEXT\s*\)", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
     s = re.sub(r"\bROW\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)\)\s*::\s*TEXT\b", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
     s = re.sub(r"::\s*(?:TEXT|BIGINT|DOUBLE\s+PRECISION|INTEGER|BOOLEAN|NUMERIC)\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\bIS\s+NOT\s+DISTINCT\s+FROM\b", "IS", s, flags=re.IGNORECASE)
@@ -3122,8 +3123,8 @@ def run_suite_8_ctes_windows_topn(runner: MVTestRunner) -> None:
         "DENSE_RANK() OVER (PARTITION BY team ORDER BY score DESC) AS drnk",
         "SUM(score) OVER (PARTITION BY team ORDER BY id ASC) AS running_sum",
         "AVG(score) OVER (PARTITION BY team ORDER BY id ASC) AS running_avg",
-        "LAG(score, 1, -1) OVER (PARTITION BY team ORDER BY id ASC) AS prev_score",
-        "LEAD(score, 1, -1) OVER (PARTITION BY team ORDER BY id ASC) AS next_score",
+        "CASE WHEN ROW_NUMBER() OVER (PARTITION BY team ORDER BY id ASC) = 1 THEN -1 ELSE LAG(score, 1) OVER (PARTITION BY team ORDER BY id ASC) END AS prev_score",
+        "CASE WHEN ROW_NUMBER() OVER (PARTITION BY team ORDER BY id DESC) = 1 THEN -1 ELSE LEAD(score, 1) OVER (PARTITION BY team ORDER BY id ASC) END AS next_score",
         "FIRST_VALUE(label) OVER (PARTITION BY team ORDER BY score DESC, id ASC) AS top_label",
         "COUNT(*) OVER (PARTITION BY team) AS team_total",
         "ROW_NUMBER() OVER (ORDER BY score DESC, id ASC) AS global_rn",
@@ -3925,7 +3926,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             ),
             (
                 "v_u_win",
-                "CREATE VIEW v_u_win AS SELECT id, grp, val, LAG(qty, 1, -1) OVER (PARTITION BY grp ORDER BY id ASC) AS prev_q FROM u_items;",
+                "CREATE VIEW v_u_win AS SELECT id, grp, val, CASE WHEN ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id ASC) = 1 THEN -1 ELSE LAG(qty, 1) OVER (PARTITION BY grp ORDER BY id ASC) END AS prev_q FROM u_items;",
             ),
         ]
         mutations = [
@@ -4942,6 +4943,74 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(runner.total_assertions, view_count * (mutation_count + 1) * 3)
 
 
+    def test_parser_token_scanners_preserve_quoted_comment_markers(self) -> None:
+        sql = (
+            "SELECT '-- not a comment', '/* still a string */', "
+            "`column--name`, 1 /* remove this */ -- and this\n"
+            "FROM items;"
+        )
+        self.assertEqual(
+            _strip_sql_comments(sql),
+            "SELECT '-- not a comment', '/* still a string */', `column--name`, 1 FROM items;",
+        )
+
+    def test_parser_top_level_split_ignores_nested_and_quoted_separators(self) -> None:
+        fragment = "COALESCE(a, 'x,y'), printf('semi;colon', b), `odd,name`"
+        self.assertEqual(
+            _split_top_level(fragment),
+            ["COALESCE(a, 'x,y')", "printf('semi;colon', b)", "`odd,name`"],
+        )
+        script = "CREATE TABLE a (v TEXT DEFAULT 'semi;colon'); CREATE TABLE b (id INTEGER);"
+        self.assertEqual(
+            _split_top_level(script, ";"),
+            [
+                "CREATE TABLE a (v TEXT DEFAULT 'semi;colon')",
+                "CREATE TABLE b (id INTEGER)",
+            ],
+        )
+
+    def test_parser_multiple_schema_and_view_statements_preserve_literal_contents(self) -> None:
+        schemas = parse_table_schema(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, "
+            "label TEXT DEFAULT 'semi;comma, -- literal /* text */'); "
+            "CREATE TABLE other_items (id INTEGER, label TEXT);"
+        )
+        self.assertEqual(set(schemas), {"items", "other_items"})
+        self.assertIn("label", schemas["items"].columns)
+
+        views = parse_view_definitions(
+            "CREATE VIEW item_a AS SELECT id FROM items "
+            "WHERE label = 'semi;colon'; "
+            "CREATE VIEW item_b AS SELECT id FROM items "
+            "WHERE label = 'comma,paren() -- literal';",
+            known_tables={"items"},
+        )
+        self.assertEqual([view.view_name for view in views], ["item_a", "item_b"])
+
+    def test_parser_scanners_preserve_postgres_dollar_quoted_literals(self) -> None:
+        fragment = "SELECT $$comma, semi; -- /* stays literal */$$, 7"
+        self.assertEqual(
+            _split_top_level(fragment),
+            ["SELECT $$comma, semi; -- /* stays literal */$$", "7"],
+        )
+        script = "SELECT $body$left; -- /* right */$body$; SELECT 2;"
+        self.assertEqual(
+            _split_top_level(script, ";"),
+            ["SELECT $body$left; -- /* right */$body$", "SELECT 2"],
+        )
+        commented = (
+            "SELECT $body$-- keep /* keep */; $body$, 1 "
+            "/* remove */ -- remove\nFROM items"
+        )
+        self.assertEqual(
+            _strip_sql_comments(commented),
+            "SELECT $body$-- keep /* keep */; $body$, 1 FROM items",
+        )
+
+
+
+
+
 import random
 
 import secrets
@@ -5276,8 +5345,8 @@ class DifferentialSQLFuzzer:
         add_v("set_except", f"SELECT id AS ref_key FROM {t_dim} EXCEPT SELECT parent_id AS ref_key FROM {t_fact} WHERE parent_id IS NOT NULL")
         add_v("cte_union_agg_1", f"WITH u AS (SELECT grp_str AS k, weight_cnt AS v FROM {t_fact} WHERE flag = 1 UNION ALL SELECT COALESCE(tier, 'NONE') AS k, quota AS v FROM {t_dim}) SELECT k, COUNT(*) AS cnt, SUM(v) AS sv, AVG(v) AS av, MIN(v) AS mnv, MAX(v) AS mxv FROM u GROUP BY k")
         add_v("cte_union_agg_2", f"WITH u AS (SELECT tag_key AS k, pts AS v FROM {t_comp1} UNION ALL SELECT alloc_code AS k, slot_no * 5 AS v FROM {t_comp2}) SELECT k, COUNT(*) AS cnt, SUM(v) AS sv, MIN(v) AS mnv, MAX(v) AS mxv FROM u GROUP BY k")
-        add_v("window_rank_1", f"SELECT id, grp_str, weight_cnt, ROW_NUMBER() OVER (PARTITION BY grp_str ORDER BY weight_cnt DESC, id ASC) AS rn, SUM(weight_cnt) OVER (PARTITION BY grp_str ORDER BY id ASC) AS run_w, LAG(weight_cnt, 1, 0) OVER (PARTITION BY grp_str ORDER BY id ASC) AS prev_w FROM {t_fact}")
-        add_v("window_rank_2", f"SELECT id, pname, tier, quota, DENSE_RANK() OVER (PARTITION BY tier ORDER BY quota DESC, id ASC) AS drk, LEAD(quota, 1, -1) OVER (PARTITION BY tier ORDER BY id ASC) AS next_q FROM {t_dim}")
+        add_v("window_rank_1", f"SELECT id, grp_str, weight_cnt, ROW_NUMBER() OVER (PARTITION BY grp_str ORDER BY weight_cnt DESC, id ASC) AS rn, SUM(weight_cnt) OVER (PARTITION BY grp_str ORDER BY id ASC) AS run_w, CASE WHEN ROW_NUMBER() OVER (PARTITION BY grp_str ORDER BY id ASC) = 1 THEN 0 ELSE LAG(weight_cnt, 1) OVER (PARTITION BY grp_str ORDER BY id ASC) END AS prev_w FROM {t_fact}")
+        add_v("window_rank_2", f"SELECT id, pname, tier, quota, DENSE_RANK() OVER (PARTITION BY tier ORDER BY quota DESC, id ASC) AS drk, CASE WHEN ROW_NUMBER() OVER (PARTITION BY tier ORDER BY id DESC) = 1 THEN -1 ELSE LEAD(quota, 1) OVER (PARTITION BY tier ORDER BY id ASC) END AS next_q FROM {t_dim}")
         add_v("topn_limit_1", f"SELECT id, grp_str, weight_cnt, val_int FROM {t_fact} WHERE flag = 1 ORDER BY weight_cnt DESC, id ASC LIMIT 5 OFFSET 1")
         add_v("topn_limit_2", f"SELECT id, pname, quota, score FROM {t_dim} ORDER BY quota DESC, id ASC LIMIT 4 OFFSET 0")
 
