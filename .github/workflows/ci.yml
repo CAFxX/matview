@@ -221,7 +221,7 @@ jobs:
         run: python3 test_matview_sync.py
 
   # =========================================================================
-  # 4. PostgreSQL-Compatible Engines (Percona PG, TimescaleDB, PostGIS, pgvector)
+  # 4. PostgreSQL-Compatible Images (Percona PG 14–18; extension images on PG18)
   # =========================================================================
   postgres-compat:
     name: ${{ matrix.label }}
@@ -230,7 +230,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Percona Distribution for PostgreSQL (14–18)
+          # Percona Distribution for PostgreSQL (14–18): retain version coverage
+          # because it is a distinct server distribution across supported majors.
           - label: "Percona PostgreSQL 14"
             image: "percona/percona-distribution-postgresql:14"
           - label: "Percona PostgreSQL 15"
@@ -242,39 +243,13 @@ jobs:
           - label: "Percona PostgreSQL 18"
             image: "percona/percona-distribution-postgresql:18"
 
-          # TimescaleDB (14–18)
-          - label: "TimescaleDB (PG 14)"
-            image: "timescale/timescaledb:latest-pg14"
-          - label: "TimescaleDB (PG 15)"
-            image: "timescale/timescaledb:latest-pg15"
-          - label: "TimescaleDB (PG 16)"
-            image: "timescale/timescaledb:latest-pg16"
-          - label: "TimescaleDB (PG 17)"
-            image: "timescale/timescaledb:latest-pg17"
+          # The current suite does not CREATE EXTENSION or exercise extension APIs.
+          # PostgreSQL 14–18 are already covered by the native postgres matrix, so
+          # keep one PG18 image smoke/integration target per extension distribution.
           - label: "TimescaleDB (PG 18)"
             image: "timescale/timescaledb:latest-pg18"
-
-          # PostGIS 3.6 (14–18)
-          - label: "PostGIS 3.6 (PG 14)"
-            image: "postgis/postgis:14-3.6"
-          - label: "PostGIS 3.6 (PG 15)"
-            image: "postgis/postgis:15-3.6"
-          - label: "PostGIS 3.6 (PG 16)"
-            image: "postgis/postgis:16-3.6"
-          - label: "PostGIS 3.6 (PG 17)"
-            image: "postgis/postgis:17-3.6"
           - label: "PostGIS 3.6 (PG 18)"
             image: "postgis/postgis:18-3.6"
-
-          # pgvector (14–18)
-          - label: "pgvector (PG 14)"
-            image: "pgvector/pgvector:pg14"
-          - label: "pgvector (PG 15)"
-            image: "pgvector/pgvector:pg15"
-          - label: "pgvector (PG 16)"
-            image: "pgvector/pgvector:pg16"
-          - label: "pgvector (PG 17)"
-            image: "pgvector/pgvector:pg17"
           - label: "pgvector (PG 18)"
             image: "pgvector/pgvector:pg18"
     services:
