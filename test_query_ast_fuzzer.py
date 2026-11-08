@@ -52,6 +52,8 @@ def _render_expr(node: tuple[Any, ...]) -> str:
     kind = node[0]
     if kind == "column":
         return f"{_ident(node[1])}.{_ident(node[2])}"
+    if kind == "bare_column":
+        return _ident(node[1])
     if kind == "literal":
         return _literal(node[1])
     if kind == "star":
@@ -153,6 +155,8 @@ def _shape_expr(node: tuple[Any, ...]) -> tuple[Any, ...]:
     kind = node[0]
     if kind == "column":
         return ("column",)
+    if kind == "bare_column":
+        return ("bare_column",)
     if kind == "literal":
         return ("literal", type(node[1]).__name__)
     return (kind,) + tuple(
@@ -387,7 +391,12 @@ class SchemaAwareSelectFuzzer:
             set_operation = (rng.choice(("UNION", "UNION ALL", "INTERSECT", "EXCEPT")), right)
             self.features.update(("set_operation", set_operation[0].lower()))
 
-        order_by = () if simple or rng.random() < 0.22 else (("column", available_alias, "id"),)
+        if set_operation is not None:
+            # Compound SELECT ordering is expressed against the result column,
+            # not a table-qualified name from either branch.
+            order_by = (("bare_column", "id"),)
+        else:
+            order_by = () if simple or rng.random() < 0.22 else (("column", available_alias, "id"),)
         if order_by:
             self.features.add("order_by")
         limit = None if simple or rng.random() < 0.30 else rng.randint(2, 8)
