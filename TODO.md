@@ -98,6 +98,7 @@ The existing differential-testing harness is useful, but its current headline co
   - Assert both the final materialized result and intermediate transactional visibility; add bounded stress/repetition runs and deterministic reproduction traces.
 
 - [ ] **Make Native Engine Coverage Explicit and Verifiable**:
+  - Progress: Native PostgreSQL jobs now assert the connected server major; PostgreSQL-compatible jobs also assert the requested major and availability of the expected TimescaleDB/PostGIS/pgvector extension. MySQL-family jobs assert the actual product and major/minor version. Requested and fallback image references are recorded, and a fallback cannot silently pass as a different runtime version. Native dialect-feature coverage and actual SQLite runtime-boundary tests remain outstanding.
   - Label every test result as native-engine execution or dialect simulation/transpilation; local output must make the distinction unmistakable.
   - Treat transpiled SQLite execution as a fast auxiliary test only, never as evidence of native PostgreSQL/MySQL/MariaDB semantics.
   - In CI, query and assert the actual server product/version against the requested matrix entry; fail or explicitly mark a fallback as a different target instead of silently counting it as the requested version.
