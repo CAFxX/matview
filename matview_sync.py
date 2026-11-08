@@ -830,18 +830,153 @@ def _sqlglot_dialect(dialect: Dialect = Dialect.SQLITE) -> str:
     }.get(dialect, "sqlite")
 
 def _tokenize_sql(sql: str, read: str = "sqlite") -> List[Any]:
-    """Tokenize SQL while recognizing PostgreSQL dollar-quoted strings.
+    """Tokenize SQL while preserving dollar-quoted strings and dialect quoting rules.
 
-    SQLGlot configures dollar-quoted strings in its PostgreSQL tokenizer, not
-    its SQLite tokenizer. Most compiler fragments use SQLite-compatible syntax,
-    but a fragment containing a dollar-quote delimiter must use the PostgreSQL
-    lexer so commas, semicolons, parentheses, and comment markers inside the
-    literal remain part of one token.
+    SQLGlot's PostgreSQL lexer understands dollar-quoted strings but treats
+    backtick-quoted identifiers differently from SQLite/MySQL. Tokenize ordinary
+    SQL segments with the requested dialect and represent each dollar-quoted
+    literal as one synthetic token, preserving source offsets for the scanner.
     """
-    if re.search(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", sql):
-        read = "postgres"
-    return sqlglot.tokenize(sql, read=read)
+    class _TokenSpan:
+        __slots__ = ("token_type", "text", "start", "end")
 
+        def __init__(self, token_type: Any, text: str, start: int, end: int) -> None:
+            self.token_type = token_type
+            self.text = text
+            self.start = start
+            self.end = end
+
+    def _dollar_spans() -> List[Tuple[int, int]]:
+        spans: List[Tuple[int, int]] = []
+        i = 0
+        n = len(sql)
+        state = ""
+        block_depth = 0
+        while i < n:
+            ch = sql[i]
+            if state == "single":
+                if read == "postgres" and ch == "\\":
+                    i += 2
+                    continue
+                if ch == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        i += 2
+                        continue
+                    state = ""
+                i += 1
+                continue
+            if state == "double":
+                if ch == '"':
+                    if i + 1 < n and sql[i + 1] == '"':
+                        i += 2
+                        continue
+                    state = ""
+                i += 1
+                continue
+            if state == "backtick":
+                if ch == chr(96):
+                    if i + 1 < n and sql[i + 1] == chr(96):
+                        i += 2
+                        continue
+                    state = ""
+                i += 1
+                continue
+            if state == "bracket":
+                if ch == "]":
+                    state = ""
+                i += 1
+                continue
+            if state == "line_comment":
+                if ch == "\n":
+                    state = ""
+                i += 1
+                continue
+            if state == "block_comment":
+                if sql.startswith("/*", i):
+                    block_depth += 1
+                    i += 2
+                    continue
+                if sql.startswith("*/", i):
+                    block_depth -= 1
+                    i += 2
+                    if block_depth == 0:
+                        state = ""
+                    continue
+                i += 1
+                continue
+
+            if sql.startswith("--", i):
+                state = "line_comment"
+                i += 2
+                continue
+            if sql.startswith("/*", i):
+                state = "block_comment"
+                block_depth = 1
+                i += 2
+                continue
+            if ch == "'":
+                state = "single"
+                i += 1
+                continue
+            if ch == '"':
+                state = "double"
+                i += 1
+                continue
+            if ch == chr(96):
+                state = "backtick"
+                i += 1
+                continue
+            if ch == "[":
+                state = "bracket"
+                i += 1
+                continue
+            if ch == "$":
+                delimiter_match = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", sql[i:])
+                if delimiter_match:
+                    delimiter = delimiter_match.group(0)
+                    content_start = i + len(delimiter)
+                    close_at = sql.find(delimiter, content_start)
+                    if close_at >= 0:
+                        end_at = close_at + len(delimiter)
+                        spans.append((i, end_at))
+                        i = end_at
+                        continue
+            i += 1
+        return spans
+
+    spans = _dollar_spans()
+    if not spans:
+        return sqlglot.tokenize(sql, read=read)
+
+    tokens: List[Any] = []
+
+    def _append_segment(start: int, end: int) -> None:
+        if start >= end:
+            return
+        for token in sqlglot.tokenize(sql[start:end], read=read):
+            tokens.append(
+                _TokenSpan(
+                    token.token_type,
+                    token.text,
+                    token.start + start,
+                    token.end + start,
+                )
+            )
+
+    cursor = 0
+    for start, end in spans:
+        _append_segment(cursor, start)
+        tokens.append(
+            _TokenSpan(
+                SQLGlotTokenType.HEREDOC_STRING,
+                sql[start:end],
+                start,
+                end - 1,
+            )
+        )
+        cursor = end
+    _append_segment(cursor, len(sql))
+    return tokens
 
 class SQLTokenType(str, Enum):
     WHITESPACE = "WHITESPACE"
