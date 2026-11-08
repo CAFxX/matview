@@ -76,6 +76,7 @@ The existing differential-testing harness is useful, but its current headline co
   - Add grammar-preserving mutation of previously successful statements (operator/operand/predicate/assignment/target/shape changes), while retaining deterministic replay and regression promotion.
 
 - [ ] **Upgrade Query Generation to Recursive, Schema-Aware SQL AST Generation**:
+  - Progress: A bounded schema-aware SELECT AST fuzzer now generates and executes projections, recursive predicates/expressions, FK joins, grouping/HAVING/aggregates, DISTINCT, CTEs, derived tables, set operations, windows, EXISTS/IN, and scalar/correlated subqueries across 32 deterministic variable schemas. This validates generated SQL and records structural shapes, but is not yet differential MV execution, grammar-complete coverage, coverage-guided generation, or automatic shrinking.
   - Generate supported SELECT structures recursively from generated schemas, including projections, joins, filters, grouping, HAVING, aggregates, DISTINCT, CTEs, subqueries, set operations, windows, ordering, limits, and their meaningful combinations.
   - Cover each supported grammar production in multiple contexts and combinations; distinguish generated structural diversity from the number of query instances.
   - Keep unsupported constructs explicit: verify that they are rejected or reported as limitations under default settings rather than silently treating best-effort compilation as supported behavior.
