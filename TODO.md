@@ -120,6 +120,9 @@ The existing differential-testing harness is useful, but its current headline co
 
 ## P1 — Modular Architecture, Engine/Version Optimizations & Developer Experience
 
+- [ ] **Keep User-Accessible Materialized Views Free of the Internal Object Prefix**:
+  User-facing views created/exposed by the library should retain clean, natural names and must not inherit the internal `__matview_` prefix used by catalog, backing, delta, and auxiliary objects. Define the naming contract clearly, preserve collision safety and dialect constraints, and add cross-engine tests proving internal objects remain namespaced while the user-accessible view name does not.
+
 - [ ] **AST-Based SQL Code Generation via `sqlglot` (`sqlglot.exp` Builders)**:
   Replace string-interpolated DML/DDL construction (`CREATE TABLE`, `CREATE INDEX`, `CREATE VIEW`, `SELECT`, `INSERT ... ON CONFLICT / ON DUPLICATE KEY UPDATE`, `UPDATE`, `DELETE`) with `sqlglot.exp` AST builders (`sqlglot.select`, `exp.insert`, `exp.update`, `exp.delete`, `exp.Create`, `.sql(dialect=..., identify=..., pretty=True)`) so generated SQL is guaranteed well-formed and dialect-accurate by construction.
 - [ ] **Template-Driven Procedural Trigger & Backfill Codegen (`Jinja2`)**:

@@ -1,9 +1,75 @@
 name: CI — Multi-Engine Materialized View Tests
 
+# Matrix policy — keep this block and ci-deferred.yml in sync.
+#
+# PR-gate selection criteria:
+# - Every row must exercise a distinct engine implementation, a materially
+#   different supported major-version boundary, or a declared runtime boundary.
+# - Keep the oldest supported stable line and the newest stable/LTS line where
+#   their behavior can differ. Keep one representative for each genuinely
+#   distinct engine family; do not build a Cartesian product of every engine,
+#   engine version, Python version, driver version, and distribution.
+# - Run the full deterministic suite and normal-scale fuzz campaign for every
+#   PR-gate row. The stable CI success job aggregates only these required jobs.
+#
+# PR-gate dimensions:
+# - Python: CPython 3.11 (oldest supported) and 3.15 (newest released) on the
+#   standard SQLite path; Python 3.12 is used for every live-engine job. Python
+#   3.13–3.14 are exercised in ci-deferred.yml.
+# - SQLite: CPython's bundled sqlite3 plus one current representative of APSW,
+#   SQLCipher, and libSQL. The alternative drivers run on Python 3.12, not across
+#   every Python version.
+# - PostgreSQL: native upstream 15 (oldest supported major) and 18 (newest).
+#   PostgreSQL 16–17 and one Percona PostgreSQL 18 build are deferred weekly.
+#   PostgreSQL 14 is removed: upstream support ends 2026-11-12.
+# - MySQL: upstream 8.4 and 9.7 LTS lines are both required. Innovation 26.10
+#   and Percona Server 8.4/9.7 are deferred weekly.
+# - MariaDB: 10.11 (oldest selected LTS), 11.8, and 12.3 (newest LTS) are
+#   required. LTS 11.4 and current rolling 13.1 are deferred weekly. MariaDB
+#   13.0 is not carried forward because its community maintenance ends Q4 2026.
+# - Vendor/extension images: Percona distributions are deferred as representative
+#   vendor-build checks, not repeated for every upstream major. TimescaleDB,
+#   PostGIS, and pgvector images are excluded from CI until tests actually create
+#   and exercise their extensions; image startup alone is not extension coverage.
+# - Fuzzing: normal-scale differential fuzzing remains in every full-suite job.
+#   Scale-3 stress campaigns are deferred weekly, not repeated on each PR.
+#
+# Dependency and environment dimensions:
+# - requirements.txt declares sqlglot>=25.0.0, psycopg2-binary>=2.9.9 and
+#   cryptography>=41.0.0 for Python <3.15, and pymysql>=1.1.0. PR jobs resolve
+#   the newest compatible releases; ci-deferred.yml tests these declared lower
+#   bounds on Python 3.11 against live PostgreSQL and MySQL.
+# - Optional SQLite drivers (apsw, apsw-sqlite3mc, sqlcipher3-binary,
+#   sqlean.py, libsql-experimental) have no declared lower bounds. CI therefore
+#   tests the newest installable release only; it makes no oldest-driver-version
+#   compatibility claim. Define a minimum before adding such a version lane.
+# - Docker tags select a server major/LTS/rolling line and therefore its current
+#   patch release; patch versions are not a separate matrix dimension. No silent
+#   image fallback is allowed: a missing requested tag must fail the job.
+# - Runner/OS is ubuntu-latest (GitHub-hosted x64); Windows, macOS, other Linux
+#   distributions, and other architectures are not currently CI support claims.
+#   Action versions are pinned by major (checkout v4, setup-python v5), not
+#   cross-producted. Review action upgrades separately.
+#
+# Deferred weekly coverage is implemented in ci-deferred.yml:
+# Python 3.13–3.14; PostgreSQL 16–17 and Percona PostgreSQL 18; MySQL 26.10
+# Innovation; MariaDB 11.4 and 13.1 rolling; Percona MySQL 8.4 and 9.7;
+# SQLite3MC and sqlean; minimum declared Python dependency versions; and all
+# six scale-3 fuzz campaigns. Extensions without feature tests are excluded,
+# not deferred.
+
+# Keep only the newest run for a given workflow + source branch. Using the
+# same branch key for push and pull_request events also deduplicates those
+# event types when both apply to the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: ["main", "master"]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -13,17 +79,14 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  # =========================================================================
-  # 1. SQLite 3 (Standard Library across all non-EoL Python versions)
-  # =========================================================================
+  # Standard-library SQLite at the oldest and newest supported CPython ends.
   sqlite:
     name: SQLite 3 (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # All active non-EoL Python releases as of Nov 2026 (Python 3.10 reached EoL in Oct 2026)
-        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+        python-version: ["3.11", "3.15"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,7 +95,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          allow-prereleases: true
 
       - name: Install Python dependencies
         run: |
@@ -45,123 +107,47 @@ jobs:
       - name: Run full test suite (SQLite + cross-dialect transpiled suites)
         run: python3 test_matview_sync.py
 
-  # =========================================================================
-  # 2. SQLite-Compatible Engines & Distributions (APSW, SQLite3MC, SQLCipher, sqlean, Turso libSQL)
-  # =========================================================================
+  # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
-    name: ${{ matrix.label }} (Python ${{ matrix.python-version }})
+    name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # APSW (Another Python SQLite Wrapper)
           - label: "APSW SQLite"
             engine: "apsw"
             pip-pkg: "apsw"
-            apt-pkg: ""
-            python-version: "3.11"
-          - label: "APSW SQLite"
-            engine: "apsw"
-            pip-pkg: "apsw"
-            apt-pkg: ""
-            python-version: "3.12"
-          - label: "APSW SQLite"
-            engine: "apsw"
-            pip-pkg: "apsw"
-            apt-pkg: ""
-            python-version: "3.13"
-          - label: "APSW SQLite"
-            engine: "apsw"
-            pip-pkg: "apsw"
-            apt-pkg: ""
-            python-version: "3.14"
-
-          # SQLite3 Multiple Ciphers (apsw-sqlite3mc)
-          - label: "SQLite3 Multiple Ciphers"
-            engine: "sqlite3mc"
-            pip-pkg: "apsw-sqlite3mc"
-            apt-pkg: ""
-            python-version: "3.11"
-          - label: "SQLite3 Multiple Ciphers"
-            engine: "sqlite3mc"
-            pip-pkg: "apsw-sqlite3mc"
-            apt-pkg: ""
-            python-version: "3.12"
-          - label: "SQLite3 Multiple Ciphers"
-            engine: "sqlite3mc"
-            pip-pkg: "apsw-sqlite3mc"
-            apt-pkg: ""
-            python-version: "3.13"
-          - label: "SQLite3 Multiple Ciphers"
-            engine: "sqlite3mc"
-            pip-pkg: "apsw-sqlite3mc"
-            apt-pkg: ""
-            python-version: "3.14"
-
-          # SQLCipher 4 (sqlcipher3)
           - label: "SQLCipher 4"
             engine: "sqlcipher"
             pip-pkg: "sqlcipher3-binary"
-            apt-pkg: "libsqlcipher-dev sqlcipher"
-            python-version: "3.11"
-          - label: "SQLCipher 4"
-            engine: "sqlcipher"
-            pip-pkg: "sqlcipher3-binary"
-            apt-pkg: "libsqlcipher-dev sqlcipher"
-            python-version: "3.12"
-          - label: "SQLCipher 4"
-            engine: "sqlcipher"
-            pip-pkg: "sqlcipher3-binary"
-            apt-pkg: "libsqlcipher-dev sqlcipher"
-            python-version: "3.13"
-
-          # sqlean.py (SQLite with bundled extension suite)
-          - label: "sqlean SQLite"
-            engine: "sqlean"
-            pip-pkg: "sqlean.py"
-            apt-pkg: ""
-            python-version: "3.11"
-          - label: "sqlean SQLite"
-            engine: "sqlean"
-            pip-pkg: "sqlean.py"
-            apt-pkg: ""
-            python-version: "3.12"
-
-          # Turso libSQL
           - label: "Turso libSQL"
             engine: "libsql"
             pip-pkg: "libsql-experimental"
-            apt-pkg: ""
-            python-version: "3.11"
-          - label: "Turso libSQL"
-            engine: "libsql"
-            pip-pkg: "libsql-experimental"
-            apt-pkg: ""
-            python-version: "3.12"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
 
-      - name: Install system & Python driver packages for ${{ matrix.label }}
+      - name: Install Python dependencies and SQLite driver
+        env:
+          ENGINE: ${{ matrix.engine }}
+          PIP_PACKAGE: ${{ matrix.pip-pkg }}
         run: |
-          if [ -n "${{ matrix.apt-pkg }}" ]; then
-            sudo apt-get update
-            sudo apt-get install -y ${{ matrix.apt-pkg }}
-          fi
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
-          if [ "${{ matrix.engine }}" = "sqlcipher" ]; then
+          if [ "$ENGINE" = "sqlcipher" ]; then
+            sudo apt-get update
+            sudo apt-get install -y libsqlcipher-dev sqlcipher
             python3 -m pip install sqlcipher3-binary || python3 -m pip install sqlcipher3
-          elif [ "${{ matrix.engine }}" = "libsql" ]; then
+          elif [ "$ENGINE" = "libsql" ]; then
             python3 -m pip install libsql-experimental || python3 -m pip install libsql
           else
-            python3 -m pip install ${{ matrix.pip-pkg }}
+            python3 -m pip install "$PIP_PACKAGE"
           fi
 
       - name: Run full test suite + live ${{ matrix.label }} integration tests
@@ -169,16 +155,14 @@ jobs:
           SQLITE_COMPAT_ENGINE: ${{ matrix.engine }}
         run: python3 test_matview_sync.py
 
-  # =========================================================================
-  # 3. PostgreSQL (All active non-EoL major versions: 14, 15, 16, 17, 18)
-  # =========================================================================
+  # Oldest and newest supported upstream PostgreSQL major versions.
   postgres:
     name: PostgreSQL ${{ matrix.pg-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        pg-version: ["14", "15", "16", "17", "18"]
+        pg-version: ["15", "18"]
     services:
       postgres:
         image: postgres:${{ matrix.pg-version }}
@@ -212,122 +196,28 @@ jobs:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_matview_sync.py
 
-  # =========================================================================
-  # 4. PostgreSQL-Compatible Engines (Percona PG, TimescaleDB, PostGIS, pgvector)
-  # =========================================================================
-  postgres-compat:
-    name: ${{ matrix.label }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Percona Distribution for PostgreSQL (14–18)
-          - label: "Percona PostgreSQL 14"
-            image: "percona/percona-distribution-postgresql:14"
-          - label: "Percona PostgreSQL 15"
-            image: "percona/percona-distribution-postgresql:15"
-          - label: "Percona PostgreSQL 16"
-            image: "percona/percona-distribution-postgresql:16"
-          - label: "Percona PostgreSQL 17"
-            image: "percona/percona-distribution-postgresql:17"
-          - label: "Percona PostgreSQL 18"
-            image: "percona/percona-distribution-postgresql:18"
-
-          # TimescaleDB (14–18)
-          - label: "TimescaleDB (PG 14)"
-            image: "timescale/timescaledb:latest-pg14"
-          - label: "TimescaleDB (PG 15)"
-            image: "timescale/timescaledb:latest-pg15"
-          - label: "TimescaleDB (PG 16)"
-            image: "timescale/timescaledb:latest-pg16"
-          - label: "TimescaleDB (PG 17)"
-            image: "timescale/timescaledb:latest-pg17"
-          - label: "TimescaleDB (PG 18)"
-            image: "timescale/timescaledb:latest-pg18"
-
-          # PostGIS 3.6 (14–18)
-          - label: "PostGIS 3.6 (PG 14)"
-            image: "postgis/postgis:14-3.6"
-          - label: "PostGIS 3.6 (PG 15)"
-            image: "postgis/postgis:15-3.6"
-          - label: "PostGIS 3.6 (PG 16)"
-            image: "postgis/postgis:16-3.6"
-          - label: "PostGIS 3.6 (PG 17)"
-            image: "postgis/postgis:17-3.6"
-          - label: "PostGIS 3.6 (PG 18)"
-            image: "postgis/postgis:18-3.6"
-
-          # pgvector (14–18)
-          - label: "pgvector (PG 14)"
-            image: "pgvector/pgvector:pg14"
-          - label: "pgvector (PG 15)"
-            image: "pgvector/pgvector:pg15"
-          - label: "pgvector (PG 16)"
-            image: "pgvector/pgvector:pg16"
-          - label: "pgvector (PG 17)"
-            image: "pgvector/pgvector:pg17"
-          - label: "pgvector (PG 18)"
-            image: "pgvector/pgvector:pg18"
-    services:
-      postgres:
-        image: ${{ matrix.image }}
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: matview_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd="pg_isready -U postgres"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Python dependencies
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -r requirements.txt
-
-      - name: Run full test suite + live ${{ matrix.label }} integration tests
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_matview_sync.py
-
-  # =========================================================================
-  # 5. Oracle MySQL (All active non-EoL versions: 8.4 LTS, 9.7 LTS, 26.10 Innovation)
-  # =========================================================================
+  # Both supported Oracle MySQL LTS series are required on every PR.
   mysql:
     name: MySQL ${{ matrix.mysql-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        mysql-version: ["8.4", "9.7", "26.10"]
+        mysql-version: ["8.4", "9.7"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Start MySQL ${{ matrix.mysql-version }} container
+        env:
+          MYSQL_IMAGE: mysql:${{ matrix.mysql-version }}
         run: |
-          IMG="mysql:${{ matrix.mysql-version }}"
-          if ! docker pull "$IMG"; then
-            IMG="mysql:innovation"
-            docker pull "$IMG"
-          fi
+          docker pull "$MYSQL_IMAGE"
           docker run -d --name mysql-srv \
             -e MYSQL_ROOT_PASSWORD=password \
             -e MYSQL_DATABASE=matview_test \
             -p 3306:3306 \
-            "$IMG" \
+            "$MYSQL_IMAGE" \
             --character-set-server=utf8mb4 \
             --collation-server=utf8mb4_unicode_ci \
             --innodb-flush-log-at-trx-commit=0 \
@@ -336,10 +226,12 @@ jobs:
           for i in $(seq 1 60); do
             if docker exec mysql-srv mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent; then
               echo "MySQL is ready!"
-              break
+              exit 0
             fi
             sleep 2
           done
+          docker logs mysql-srv
+          exit 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -356,9 +248,7 @@ jobs:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_matview_sync.py
 
-  # =========================================================================
-  # 6. MySQL-Compatible Engines (MariaDB 10.11–13.0, Percona Server 8.4 & 9.7)
-  # =========================================================================
+  # Representative LTS boundaries for MariaDB: oldest, previous, newest LTS.
   mysql-compat:
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
@@ -368,43 +258,26 @@ jobs:
         include:
           - label: "MariaDB 10.11 LTS"
             image: "mariadb:10.11"
-            fallback: "mariadb:10.11"
-          - label: "MariaDB 11.4 LTS"
-            image: "mariadb:11.4"
-            fallback: "mariadb:11.4"
           - label: "MariaDB 11.8 LTS"
             image: "mariadb:11.8"
-            fallback: "mariadb:11.8"
           - label: "MariaDB 12.3 LTS"
             image: "mariadb:12.3"
-            fallback: "mariadb:latest"
-          - label: "MariaDB 13.0 Rolling"
-            image: "mariadb:13.0"
-            fallback: "mariadb:lts"
-          - label: "Percona Server for MySQL 8.4 LTS"
-            image: "percona/percona-server:8.4"
-            fallback: "percona/percona-server:8.4"
-          - label: "Percona Server for MySQL 9.7"
-            image: "percona/percona-server:9.7"
-            fallback: "percona/percona-server:latest"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Start ${{ matrix.label }} container
+        env:
+          MYSQL_IMAGE: ${{ matrix.image }}
         run: |
-          IMG="${{ matrix.image }}"
-          if ! docker pull "$IMG"; then
-            IMG="${{ matrix.fallback }}"
-            docker pull "$IMG"
-          fi
+          docker pull "$MYSQL_IMAGE"
           docker run -d --name mysql-compat-srv \
             -e MYSQL_ROOT_PASSWORD=password \
             -e MARIADB_ROOT_PASSWORD=password \
             -e MYSQL_DATABASE=matview_test \
             -e MARIADB_DATABASE=matview_test \
             -p 3306:3306 \
-            "$IMG" \
+            "$MYSQL_IMAGE" \
             --character-set-server=utf8mb4 \
             --collation-server=utf8mb4_unicode_ci \
             --innodb-flush-log-at-trx-commit=0 \
@@ -413,10 +286,12 @@ jobs:
           for i in $(seq 1 60); do
             if docker exec mysql-compat-srv sh -c "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent || mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent" 2>/dev/null; then
               echo "${{ matrix.label }} is ready!"
-              break
+              exit 0
             fi
             sleep 2
           done
+          docker logs mysql-compat-srv
+          exit 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -433,95 +308,38 @@ jobs:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_matview_sync.py
 
-  # =========================================================================
-  # 7. High-Intensity Multi-Engine Random Differential Fuzzing (SQLite, PG, MySQL, MariaDB)
-  # =========================================================================
-  fuzz-stress:
-    name: Differential Fuzzer Stress (${{ matrix.label }})
+  # Stable branch-protection check. Only the required PR gate is aggregated;
+  # scheduled/deferred compatibility jobs live in the separate workflow.
+  ci-success:
+    name: CI success
+    if: ${{ always() }}
+    needs:
+      - sqlite
+      - sqlite-compat
+      - postgres
+      - mysql
+      - mysql-compat
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: "SQLite 3 + Transpiled PG/MySQL (Scale 3)"
-            backend: "sqlite"
-            scale: "3"
-          - label: "APSW SQLite (Scale 3)"
-            backend: "apsw"
-            scale: "3"
-          - label: "PostgreSQL 17 Live Fuzzing (Scale 3)"
-            backend: "postgres"
-            pg-image: "postgres:17"
-            scale: "3"
-          - label: "PostgreSQL 18 Live Fuzzing (Scale 3)"
-            backend: "postgres"
-            pg-image: "postgres:18"
-            scale: "3"
-          - label: "MySQL 8.4 LTS Live Fuzzing (Scale 3)"
-            backend: "mysql"
-            mysql-image: "mysql:8.4"
-            scale: "3"
-          - label: "MariaDB 11.4 LTS Live Fuzzing (Scale 3)"
-            backend: "mysql"
-            mysql-image: "mariadb:11.4"
-            scale: "3"
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Start database container & install dependencies (${{ matrix.label }})
+      - name: Require every CI gate job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -r requirements.txt
-          if [ "${{ matrix.backend }}" = "apsw" ]; then
-            python3 -m pip install apsw
-          elif [ "${{ matrix.backend }}" = "postgres" ]; then
-            docker run -d --name pg-fuzz-srv \
-              -e POSTGRES_USER=postgres \
-              -e POSTGRES_PASSWORD=password \
-              -e POSTGRES_DB=matview_test \
-              -p 5432:5432 \
-              "${{ matrix.pg-image }}"
-            for i in $(seq 1 40); do
-              if docker exec pg-fuzz-srv pg_isready -U postgres -d matview_test; then
-                break
-              fi
-              sleep 1
-            done
-          elif [ "${{ matrix.backend }}" = "mysql" ]; then
-            docker run -d --name mysql-fuzz-srv \
-              -e MYSQL_ROOT_PASSWORD=password \
-              -e MARIADB_ROOT_PASSWORD=password \
-              -e MYSQL_DATABASE=matview_test \
-              -e MARIADB_DATABASE=matview_test \
-              -p 3306:3306 \
-              "${{ matrix.mysql-image }}" \
-              --character-set-server=utf8mb4 \
-              --collation-server=utf8mb4_unicode_ci \
-              --innodb-flush-log-at-trx-commit=0 \
-              --sync-binlog=0 \
-              --skip-log-bin
-            for i in $(seq 1 60); do
-              if docker exec mysql-fuzz-srv sh -c "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent || mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent" 2>/dev/null; then
-                break
-              fi
-              sleep 2
-            done
-          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
 
-      - name: Run high-intensity differential random SQL fuzzer (${{ matrix.label }})
-        run: |
-          if [ "${{ matrix.backend }}" = "apsw" ]; then
-            SQLITE_COMPAT_ENGINE=apsw python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
-          elif [ "${{ matrix.backend }}" = "postgres" ]; then
-            POSTGRES_DSN="postgresql://postgres:password@127.0.0.1:5432/matview_test" python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
-          elif [ "${{ matrix.backend }}" = "mysql" ]; then
-            MYSQL_DSN="mysql://root:password@127.0.0.1:3306/matview_test" python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
-          else
-            python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
-          fi
+          results = json.loads(os.environ["NEEDS_JSON"])
+          unsuccessful = {
+              name: result["result"]
+              for name, result in results.items()
+              if result["result"] != "success"
+          }
+          if unsuccessful:
+              for name, result in sorted(unsuccessful.items()):
+                  print(f"::error::{name} did not succeed (result: {result})")
+              sys.exit(1)
+
+          print(f"All {len(results)} required CI jobs succeeded.")
+          PY
