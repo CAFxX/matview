@@ -130,6 +130,7 @@ def main() -> int:
         })
         for job in jobs:
             duration = minutes_between(job.get("started_at"), job.get("completed_at"))
+            queue_wait = minutes_between(run.get("created_at"), job.get("started_at"))
             matched = [
                 job_id for job_id, profile in profiles.items()
                 if profile["name_pattern"].match(job.get("name", ""))
@@ -139,6 +140,7 @@ def main() -> int:
                 "name": job.get("name"),
                 "conclusion": job.get("conclusion") or job.get("status"),
                 "minutes": duration,
+                "queue_wait_minutes": queue_wait,
                 "run_id": run["id"],
             })
 
@@ -146,6 +148,7 @@ def main() -> int:
     for job_id, profile in profiles.items():
         samples = observations.get(job_id, [])
         durations = [item["minutes"] for item in samples if item["minutes"] is not None]
+        queue_waits = [item["queue_wait_minutes"] for item in samples if item["queue_wait_minutes"] is not None]
         counts = collections.Counter(item["conclusion"] for item in samples)
         completed = sum(counts[key] for key in ("success", "failure", "cancelled", "timed_out", "action_required"))
         success_rate = (counts["success"] / completed * 100) if completed else None
@@ -163,6 +166,8 @@ def main() -> int:
             "success_rate_pct": round(success_rate, 1) if success_rate is not None else None,
             "median_minutes": round(statistics.median(durations), 1) if durations else None,
             "p90_minutes": round(sorted(durations)[max(0, int(len(durations) * .9) - 1)], 1) if durations else None,
+            "median_queue_wait_minutes": round(statistics.median(queue_waits), 1) if queue_waits else None,
+            "p90_queue_wait_minutes": round(sorted(queue_waits)[max(0, int(len(queue_waits) * .9) - 1)], 1) if queue_waits else None,
             "runs_on": profile["runs_on"],
             "commands": profile["commands"],
             "matrix_axes_detail": profile["matrix_axes"],
@@ -199,16 +204,16 @@ def main() -> int:
         f"- Declared matrix entries per full run: **{total_matrix_entries}**",
         f"- Observed job executions: **{total_samples}**",
         "",
-        "| Job group | Matrix entries | Observed | Pass | Fail | Cancel | Success % | Median min | P90 min |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Job group | Matrix entries | Observed | Pass | Fail | Cancel | Success % | Median queue min | Median run min | P90 run min |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         fmt = lambda value: "—" if value is None else str(value)
         lines.append(
             f"| {row['job_id']} | {row['matrix_entries']} | {row['runs_observed']} "
             f"| {row['success']} | {row['failure']} | {row['cancelled']} "
-            f"| {fmt(row['success_rate_pct'])} | {fmt(row['median_minutes'])} "
-            f"| {fmt(row['p90_minutes'])} |"
+            f"| {fmt(row['success_rate_pct'])} | {fmt(row['median_queue_wait_minutes'])} "
+            f"| {fmt(row['median_minutes'])} | {fmt(row['p90_minutes'])} |"
         )
     lines += [
         "",
@@ -223,7 +228,8 @@ def main() -> int:
             f"- Matrix values: `{json.dumps(row['matrix_values'], sort_keys=True)}`",
             f"- Test/setup commands: `{' ; '.join(row['commands']) or '(none found)'}`",
             f"- Historical evidence: {row['runs_observed']} executions; "
-            f"{row['median_minutes'] if row['median_minutes'] is not None else 'no'} median minutes; "
+            f"{row['median_queue_wait_minutes'] if row['median_queue_wait_minutes'] is not None else 'no'} median queue-wait minutes; "
+            f"{row['median_minutes'] if row['median_minutes'] is not None else 'no'} median execution minutes; "
             f"{row['success_rate_pct'] if row['success_rate_pct'] is not None else 'no'}% success among completed jobs.",
             "- Review question: what unique engine/version/runtime/feature contract does each matrix entry protect, and can a representative subset preserve it?",
             "",
