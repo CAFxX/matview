@@ -336,7 +336,13 @@ class SchemaAwareSelectFuzzer:
         distinct = not simple and not group and rng.random() < 0.26
         group_by: tuple[tuple[Any, ...], ...] = ()
         having = None
-        if group:
+        if simple:
+            # Nested sources expose a stable, schema-known projection to their parent.
+            projections = tuple(
+                ("column", available_alias, name)
+                for name in ("id", "label", "qty", "amount")
+            )
+        elif group:
             group_by = (("column", available_alias, "label"),)
             projections = (
                 ("column", available_alias, "label"),
@@ -357,7 +363,7 @@ class SchemaAwareSelectFuzzer:
                 ("column", available_alias, "label"),
                 self._expression(available_alias, 2, tables),
             ]
-            if not simple and depth > 0 and rng.random() < 0.24:
+            if depth > 0 and rng.random() < 0.24:
                 projections_list.append(
                     ("window", "ROW_NUMBER", ("column", available_alias, "label"),
                      ("column", available_alias, "id"))
