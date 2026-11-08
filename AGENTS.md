@@ -35,3 +35,21 @@ Address identified technical debt proactively when it is relevant and safe to do
 - Before opening a PR, inspect the branch comparison against its intended base and confirm the commit range and file diff are correct. Include a concise summary, validation performed, remaining limitations, and explicit stack/base relationship in the PR description.
 - Do not report work as pushed, updated, rebased, or ready until the remote ref, PR metadata, intended base, diff, and relevant CI state have been independently checked.
 
+## Strict linear PR queue (required for auto-merge)
+
+The repository must have **one globally ordered PR queue represented by one linear branch chain**. Do not create multiple roots, parallel stack forks, or sibling PRs in the queue, even when their work is logically independent. Parallel CI execution is fine; parallel branch ancestry is not.
+
+For the current queue order `PR[1], PR[2], ..., PR[n]`, enforce all of these invariants:
+
+- `PR[1]` is the only root and targets `master`.
+- For every `i > 1`, `PR[i]` targets the head branch of exactly `PR[i-1]`. It must not target `master`, an earlier ancestor, or a separate root.
+- The head commit of each PR is based on the exact current head of its immediate predecessor. Its comparison against that base must contain only that PR's own logical commits and file changes; no copied parent commits, duplicate diffs, or unrelated changes.
+- The ordered PR queue and actual GitHub base-branch relationships must agree at all times. A list or report that looks ordered is not enough: verify every adjacent pair's base branch, head SHA, commit ancestry, and diff.
+- If a new PR is added, insert it at an explicit position and restack the entire suffix so every next PR still targets its immediate predecessor. Reordering, removing, closing, or merging a PR likewise requires immediate reconciliation of the whole affected suffix.
+- Do not skip a blocked PR by creating a new root or branching from a later ancestor. Resolve the blocker, or deliberately reorder the queue and restack all later PRs.
+- Keep each PR's own diff isolated when rebasing/restacking. Never change only the PR base pointer when the head does not contain the intended predecessor ancestry.
+- After a predecessor merges, rebase/retarget the next PR onto the actual resulting `master` state as appropriate for GitHub auto-merge, then rebuild and verify the remaining single chain from that new root. Do not assume a topic branch was merged just because a descendant targets it.
+- Before enabling auto-merge, verify the PR is the next queue item, its immediate predecessor is already merged (or it is the root), its exact-head required checks are green, and the required base/ruleset safeguards apply. Never enable auto-merge on multiple sibling branches or on a PR that violates the chain.
+- CI may run concurrently across the linear chain as soon as each child is based on its predecessor's current head. This does not authorize independent branch roots.
+
+A queue is **not** a clean linear stack if two PRs share the same base branch, if any non-root PR targets `master`, or if a PR skips its immediate predecessor. Treat any such state as a queue-integrity defect and repair it before claiming the queue is ready for auto-merge.
