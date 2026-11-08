@@ -533,3 +533,42 @@ jobs:
           else
             python3 test_matview_sync.py --fuzz --fuzz-scale "${{ matrix.scale }}"
           fi
+
+  # =========================================================================
+  # Required branch-protection check: one stable result for the full matrix
+  # =========================================================================
+  ci-success:
+    name: CI success
+    if: ${{ always() }}
+    needs:
+      - sqlite
+      - sqlite-compat
+      - postgres
+      - postgres-compat
+      - mysql
+      - mysql-compat
+      - fuzz-stress
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          results = json.loads(os.environ["NEEDS_JSON"])
+          unsuccessful = {
+              name: result["result"]
+              for name, result in results.items()
+              if result["result"] != "success"
+          }
+          if unsuccessful:
+              for name, result in sorted(unsuccessful.items()):
+                  print(f"::error::{name} did not succeed (result: {result})")
+              sys.exit(1)
+
+          print(f"All {len(results)} required CI jobs succeeded.")
+          PY
