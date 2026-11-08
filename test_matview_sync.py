@@ -5623,7 +5623,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
         "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
         "commit": os.environ.get("GITHUB_SHA"),
         "job": os.environ.get("GITHUB_JOB"),
-        "target": os.environ.get("MATVIEW_FUZZ_TARGET"),
+        "target": os.environ.get("MATVIEW_FUZZ_TARGET") or os.environ.get("GITHUB_JOB"),
         "python": __import__("sys").version.split()[0],
         "default_dialect": runner.default_dialect.value,
         "scale": scale,
