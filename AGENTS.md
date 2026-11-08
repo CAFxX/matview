@@ -21,3 +21,17 @@ A feature is not done merely because its happy-path tests pass. Before marking i
 
 Address identified technical debt proactively when it is relevant and safe to do so. Keep unrelated cleanup separate from feature changes; do not expand scope indiscriminately. Never claim a test, engine, version, configuration, or input class was covered unless it was actually exercised and verified.
 
+## Git and push workflow
+
+- Make changes on a dedicated topic branch, never directly on `master`. Use a short, descriptive branch name and keep each branch scoped to one coherent change.
+- Before editing, fetch the latest repository refs and inspect the target branch and its open PR. Base new work on the intended branch, not automatically on `master`: when extending a PR stack, branch from the immediate predecessor and target that predecessor's branch. Keep independent work based on `master`.
+- Prefer a local Git working tree for multi-file changes: fetch, check out the intended base, create or switch to the topic branch, make and review the complete change, run focused tests, then create coherent commits. Push the branch once the change is internally consistent. Avoid a series of GitHub Contents API writes for related files because each write creates a separate commit and can trigger redundant CI runs.
+- Push with an explicit upstream, for example `git push --set-upstream origin <branch>`. Do not push to `master` or another PR's branch unless that is the explicitly intended target.
+- Never force-push by default. If rewriting a branch is necessary (for example, to restack or remove accidental commits), first inspect the remote branch and all dependent PRs, coordinate the rewrite, and use `--force-with-lease` rather than `--force`. Do not rewrite a branch that others may be updating without checking its latest remote SHA.
+- Keep PR stacks clean and linear: each stacked PR should contain only its own logical change relative to its immediate base PR. When a predecessor is merged or its base changes, restack descendants in dependency order, verify each diff contains only its intended changes, and update each PR's base branch accordingly. Do not merge a descendant before its prerequisites.
+- After every push, verify the remote branch head SHA and the PR's head SHA match the commit just pushed. Check that the PR targets the intended base and that its diff contains only the intended changes. Treat a successful API write or local push response as insufficient proof that the PR was updated correctly.
+- CI results apply only to the exact commit SHA tested. After any push, rebase, restack, or other head change, wait for CI on the new head; never use a green result from an older SHA as merge authorization.
+- Avoid unnecessary pushes and CI runs. Batch related edits into one coherent commit before pushing; do not push intermediate or speculative states unless early review is specifically useful. Do not cancel useful CI runs merely to reduce queue length; cancel only demonstrably obsolete or duplicate runs after checking their head SHA and purpose.
+- Before opening a PR, inspect the branch comparison against its intended base and confirm the commit range and file diff are correct. Include a concise summary, validation performed, remaining limitations, and explicit stack/base relationship in the PR description.
+- Do not report work as pushed, updated, rebased, or ready until the remote ref, PR metadata, intended base, diff, and relevant CI state have been independently checked.
+
