@@ -119,6 +119,11 @@ def main() -> int:
         jobs = api_get(
             f"/repos/{REPOSITORY}/actions/runs/{run['id']}/jobs?per_page=100"
         ).get("jobs", [])
+        created_at = dt.datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+        pending_age = (
+            round((dt.datetime.now(dt.timezone.utc) - created_at).total_seconds() / 60, 1)
+            if run.get("status") in {"queued", "in_progress"} else None
+        )
         run_summaries.append({
             "id": run["id"],
             "event": run.get("event"),
@@ -127,6 +132,7 @@ def main() -> int:
             "status": run.get("status"),
             "conclusion": run.get("conclusion"),
             "created_at": run.get("created_at"),
+            "pending_age_minutes": pending_age,
         })
         for job in jobs:
             duration = minutes_between(job.get("started_at"), job.get("completed_at"))
@@ -215,6 +221,17 @@ def main() -> int:
             f"| {fmt(row['success_rate_pct'])} | {fmt(row['median_queue_wait_minutes'])} "
             f"| {fmt(row['median_minutes'])} | {fmt(row['p90_minutes'])} |"
         )
+    lines += [
+        "",
+        "## Current queued/in-progress runs",
+        "",
+    ]
+    for run in run_summaries:
+        if run["pending_age_minutes"] is not None:
+            lines.append(
+                f"- Run {run['id']} ({run['branch']}, {run['status']}): "
+                f"{run['pending_age_minutes']} minutes since workflow creation."
+            )
     lines += [
         "",
         "## Per-group justification evidence",
