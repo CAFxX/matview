@@ -3926,11 +3926,341 @@ class IncrementalViewCompiler:
             return "DOUBLE"
         return "REAL"
 
-    def _var_accum_type(self) -> str:
+    def _sum_result_storage_type(self, item: SelectItem) -> str:
+        """Preserve the engine's native SUM result type for direct numeric columns."""
+        source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
+        source_type = source.data_type.strip().upper() if source else ""
+        if not source_type:
+            exact_type = self._exact_numeric_precision_scale(item.arg_expr or "")
+            if exact_type is not None:
+                if self.dialect == Dialect.MYSQL:
+                    return f"DECIMAL(65, {exact_type[1]})"
+                if self.dialect == Dialect.POSTGRES:
+                    return "NUMERIC"
+                return "NUMERIC"
+            return self._float_type()
+
+        is_approximate = any(token in source_type for token in ("FLOAT", "DOUBLE", "REAL"))
+        is_integer = any(
+            token in source_type
+            for token in ("TINYINT", "SMALLINT", "MEDIUMINT", "INTEGER", "INT", "BIGINT", "SERIAL")
+        )
+        is_exact_decimal = any(token in source_type for token in ("DECIMAL", "NUMERIC"))
+
+        if self.dialect == Dialect.MYSQL:
+            # MySQL SUM returns DECIMAL for exact-value arguments (integers
+            # included) and DOUBLE for approximate-value arguments.
+            if is_approximate:
+                return "DOUBLE"
+            if is_integer or is_exact_decimal:
+                match = re.search(
+                    r"\b(?:DECIMAL|NUMERIC)\s*\(\s*\d+\s*,\s*(\d+)\s*\)",
+                    source_type,
+                )
+                scale = int(match.group(1)) if match else 0
+                return f"DECIMAL(65, {scale})"
+        elif self.dialect == Dialect.POSTGRES:
+            # PostgreSQL widens smallint/integer SUM to bigint and bigint /
+            # numeric SUM to numeric; approximate SUM retains its input family.
+            if is_exact_decimal or "BIGINT" in source_type:
+                return "NUMERIC"
+            if is_integer:
+                return "BIGINT"
+            if "REAL" in source_type:
+                return "REAL"
+            if is_approximate:
+                return "DOUBLE PRECISION"
+        else:
+            if is_integer:
+                return "INTEGER"
+            if is_exact_decimal:
+                return "NUMERIC"
+            if is_approximate:
+                return "REAL"
+        return self._float_type()
+
+    def _statistical_result_storage_type(self, item: SelectItem) -> str:
+        """Match native VAR/STDDEV result types for exact versus approximate inputs."""
+        source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
+        source_type = source.data_type.strip().upper() if source else ""
+        is_exact_numeric = bool(
+            (
+                source_type
+                and any(token in source_type for token in ("INT", "DECIMAL", "NUMERIC", "SERIAL"))
+                and not any(token in source_type for token in ("FLOAT", "DOUBLE", "REAL"))
+            )
+            or (
+                not source_type
+                and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+            )
+        )
+        if self.dialect == Dialect.POSTGRES:
+            # PostgreSQL statistical aggregates over integer/numeric inputs
+            # return NUMERIC; floating inputs return DOUBLE PRECISION.
+            return "NUMERIC" if is_exact_numeric else "DOUBLE PRECISION"
+        if self.dialect == Dialect.MYSQL:
+            # MySQL VAR_POP / STDDEV_* return DOUBLE for both exact and
+            # approximate numeric argument families.
+            return "DOUBLE"
+        return "REAL"
+
+    def _max_decimal_scale(self) -> int:
+        if (
+            self.subdialect == EngineSubdialect.MARIADB
+            and self.engine_version.version >= (10, 2, 1)
+        ):
+            return 38
+        return 30
+
+    def _numeric_precision_scale_from_type(self, data_type: str) -> Optional[Tuple[int, int]]:
+        upper = data_type.strip().upper()
+        decimal_match = re.search(
+            r"\b(?:DECIMAL|NUMERIC|DEC|FIXED)\s*(?:\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?",
+            upper,
+        )
+        if decimal_match:
+            return int(decimal_match.group(1) or 10), int(decimal_match.group(2) or 0)
+        if re.search(r"\bTINYINT\b", upper):
+            return 3, 0
+        if re.search(r"\bSMALLINT\b", upper):
+            return 5, 0
+        if re.search(r"\bMEDIUMINT\b", upper):
+            return 7, 0
+        if re.search(r"\b(?:BIGINT|BIGSERIAL)\b", upper):
+            return (20 if "UNSIGNED" in upper or "SERIAL" in upper else 19), 0
+        if re.search(r"\b(?:INTEGER|INT)\b", upper):
+            return 10, 0
+        if re.search(r"\bSERIAL\b", upper):
+            return (20 if self.dialect == Dialect.MYSQL else 10), 0
+        if re.search(r"\bSMALLSERIAL\b", upper):
+            return 5, 0
+        return None
+
+    def _resolve_cte_column_expression(self, column: Any) -> Optional[Any]:
+        """Resolve a projected CTE column through chained CTEs to its source expression."""
+        if not isinstance(column, sqlglot_exp.Column):
+            return None
+        try:
+            query_ast = parse_sql_ast(self.view.raw_select_sql)
+        except sqlglot.errors.SqlglotError:
+            return None
+
+        cte_queries: Dict[str, Any] = {}
+        for cte in query_ast.find_all(sqlglot_exp.CTE):
+            cte_name = cte.alias
+            if cte_name:
+                cte_queries[cte_name.lower()] = cte.this
+        def unwrap_select(query: Any) -> Any:
+            while isinstance(query, sqlglot_exp.SetOperation):
+                query = query.this
+            return query
+
+        def source_cte_name(select: Any) -> Optional[str]:
+            from_clause = select.args.get("from_") if hasattr(select, "args") else None
+            source = getattr(from_clause, "this", None)
+            if isinstance(source, sqlglot_exp.Table):
+                return source.name.lower()
+            return None
+
+        root_select = unwrap_select(query_ast)
+        if not isinstance(root_select, sqlglot_exp.Select):
+            return None
+
+        def resolve(relation: Optional[str], name: str, seen: set[Tuple[str, str]]) -> Optional[Any]:
+            if not relation:
+                return None
+            relation = relation.lower()
+            key = (relation, name.lower())
+            if key in seen:
+                return None
+            cte_query = cte_queries.get(relation)
+            if cte_query is None:
+                return None
+            select = unwrap_select(cte_query)
+            if not isinstance(select, sqlglot_exp.Select):
+                return None
+            next_seen = set(seen)
+            next_seen.add(key)
+            for projection in select.expressions:
+                output_name = projection.alias
+                if not output_name and isinstance(projection, sqlglot_exp.Column):
+                    output_name = projection.name
+                if output_name.lower() != name.lower():
+                    continue
+                expression = projection.this if isinstance(projection, sqlglot_exp.Alias) else projection
+                if isinstance(expression, sqlglot_exp.Column):
+                    upstream = expression.table.lower() if expression.table else source_cte_name(select)
+                    resolved = resolve(upstream, expression.name, next_seen)
+                    if resolved is not None:
+                        return resolved
+                return expression
+            return None
+
+        root_relation = column.table.lower() if column.table else source_cte_name(root_select)
+        resolved_cte = resolve(root_relation, column.name, set())
+        if resolved_cte is not None:
+            return resolved_cte
+
+        # Resolve projected columns of derived tables as well as named CTEs.
+        # In particular, UNION/UNION ALL must merge the numeric types of every
+        # arm; looking only at the left-most SELECT can incorrectly turn an
+        # exact MySQL AVG argument into an approximate DOUBLE.
+        from_clause = root_select.args.get("from_")
+        derived = getattr(from_clause, "this", None)
+        if isinstance(derived, sqlglot_exp.Subquery):
+            derived_alias = derived.alias
+            if not column.table or (derived_alias and derived_alias.lower() == column.table.lower()):
+                query = derived.this
+
+                def set_operation_arms(node: Any) -> List[Any]:
+                    if isinstance(node, sqlglot_exp.SetOperation):
+                        return set_operation_arms(node.this) + set_operation_arms(node.expression)
+                    return [node]
+
+                arms = set_operation_arms(query)
+                expressions: List[Any] = []
+                for arm in arms:
+                    if not isinstance(arm, sqlglot_exp.Select):
+                        continue
+                    for projection in arm.expressions:
+                        output_name = projection.alias
+                        if not output_name and isinstance(projection, sqlglot_exp.Column):
+                            output_name = projection.name
+                        if output_name.lower() == column.name.lower():
+                            expressions.append(
+                                projection.this if isinstance(projection, sqlglot_exp.Alias) else projection
+                            )
+                            break
+                if expressions:
+                    if len(expressions) == 1:
+                        return expressions[0]
+                    return sqlglot_exp.Coalesce(this=expressions[0], expressions=expressions[1:])
+        return None
+
+    def _exact_numeric_precision_scale(self, expr: str) -> Optional[Tuple[int, int]]:
+        """Infer exact numeric precision/scale for AVG arguments conservatively."""
+        if not expr or not expr.strip():
+            return None
+
+        def merge_types(values: Sequence[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+            if not values:
+                return None
+            scale = min(self._max_decimal_scale(), max(value[1] for value in values))
+            integer_digits = max(value[0] - value[1] for value in values)
+            return min(65, max(scale, integer_digits + scale)), scale
+
+        def infer(node: Any) -> Optional[Tuple[int, int]]:
+            kind = node.__class__.__name__
+            if kind == "Column":
+                column = self._lookup_col_def(node.sql())
+                if column:
+                    return self._numeric_precision_scale_from_type(column.data_type)
+                cte_expression = self._resolve_cte_column_expression(node)
+                return infer(cte_expression) if cte_expression is not None else None
+            if kind == "Literal":
+                if node.args.get("is_string"):
+                    return None
+                value = str(node.this)
+                if not re.fullmatch(r"(?:\d+(?:\.\d*)?|\.\d+)", value):
+                    return None
+                whole, dot, fraction = value.partition(".")
+                scale = len(fraction) if dot else 0
+                precision = max(1, len((whole + fraction).lstrip("0")), scale)
+                return precision, min(self._max_decimal_scale(), scale)
+            if kind in ("Paren", "Neg", "Abs", "Floor", "Ceil", "Ceiling", "Sign", "Trunc"):
+                return infer(node.this)
+            if kind == "Cast":
+                target = node.args.get("to")
+                return self._numeric_precision_scale_from_type(target.sql()) if target is not None else None
+            if kind in ("Add", "Sub", "Mul", "Div"):
+                left, right = infer(node.this), infer(node.expression)
+                if left is None or right is None:
+                    return None
+                p1, s1 = left
+                p2, s2 = right
+                if kind in ("Add", "Sub"):
+                    scale = max(s1, s2)
+                    precision = max(p1 - s1, p2 - s2) + scale + 1
+                elif kind == "Mul":
+                    scale, precision = s1 + s2, p1 + p2
+                else:
+                    scale = s1 + 4
+                    precision = (p1 - s1) + s2 + scale
+                scale = min(self._max_decimal_scale(), scale)
+                return min(65, max(scale, precision)), scale
+            if kind in ("Coalesce", "IfNull", "Nullif", "Greatest", "Least"):
+                values = [infer(child) for child in node.iter_expressions()]
+                if not values or any(value is None for value in values):
+                    return None
+                return merge_types([value for value in values if value is not None])
+            if kind == "Case":
+                branches = []
+                for branch in node.args.get("ifs") or ():
+                    value = branch.args.get("true")
+                    if value is not None:
+                        branches.append(infer(value))
+                default = node.args.get("default")
+                if default is not None:
+                    branches.append(infer(default))
+                if not branches or any(value is None for value in branches):
+                    return None
+                return merge_types([value for value in branches if value is not None])
+            if kind == "Round":
+                value = infer(node.this)
+                scale_node = node.expression
+                if value is None or scale_node is None or scale_node.__class__.__name__ != "Literal":
+                    return value
+                try:
+                    requested_scale = max(0, int(scale_node.this))
+                except (TypeError, ValueError):
+                    return value
+                requested_scale = min(self._max_decimal_scale(), requested_scale)
+                return min(65, max(requested_scale, value[0] - value[1] + requested_scale + 1)), requested_scale
+            return None
+
+        try:
+            return infer(parse_sql_ast(expr))
+        except (sqlglot.errors.SqlglotError, AttributeError, TypeError, ValueError):
+            return None
+
+    def _avg_result_storage_type_for_expr(self, expr: str) -> str:
+        exact_type = self._exact_numeric_precision_scale(expr)
+        if exact_type is None:
+            return self._float_type()
+        if self.dialect == Dialect.POSTGRES:
+            return "NUMERIC"
+        if self.dialect == Dialect.MYSQL:
+            precision, scale = exact_type
+            result_scale = min(self._max_decimal_scale(), max(4, scale + 4))
+            result_precision = min(65, precision + 4)
+            return f"DECIMAL({max(result_precision, result_scale)}, {result_scale})"
+        return self._float_type()
+
+    def _avg_result_storage_type(self, item: SelectItem) -> str:
+        """Match the native AVG result family and fixed-point precision/scale."""
+        return self._avg_result_storage_type_for_expr(item.arg_expr or "")
+
+    def _requires_native_avg_recompute(self, item: SelectItem) -> bool:
+        return (
+            self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+            and item.agg_func == AggFunc.AVG
+            and self._exact_numeric_precision_scale(item.arg_expr or "") is None
+        )
+
+    def _var_accum_type(
+        self, item: Optional[SelectItem] = None, *, squared: bool = False
+    ) -> str:
         if self.dialect == Dialect.POSTGRES:
             return "NUMERIC"
         elif self.dialect == Dialect.MYSQL:
-            return "DECIMAL(65, 12)"
+            scale = 12
+            if item is not None and item.arg_expr:
+                exact_type = self._exact_numeric_precision_scale(item.arg_expr)
+                if exact_type is not None:
+                    scale = max(scale, exact_type[1])
+            if squared:
+                scale = min(self._max_decimal_scale(), max(12, scale * 2))
+            return f"DECIMAL(65, {scale})"
         return "REAL"
 
     def _var_sq_sql(self, expr: str) -> str:
@@ -3967,17 +4297,23 @@ class IncrementalViewCompiler:
                 if isinstance(inner, (sqlglot_exp.Count, sqlglot_exp.Window)):
                     return self._int_type()
                 if isinstance(inner, sqlglot_exp.Sum):
-                    c_arg = self._lookup_col_def(inner.this.sql().strip() if isinstance(inner.this, sqlglot_exp.Expr) else None)
-                    if c_arg and "INT" in c_arg.data_type.upper():
-                        return self._int_type()
-                    return self._float_type()
+                    arg_expr = inner.this.sql() if inner.this is not None else ""
+                    sum_item = SelectItem(
+                        raw_expr=inner.sql(),
+                        alias=ident,
+                        is_aggregate=True,
+                        agg_func=AggFunc.SUM,
+                        arg_expr=arg_expr,
+                    )
+                    return self._sum_result_storage_type(sum_item)
                 if isinstance(inner, (sqlglot_exp.Min, sqlglot_exp.Max)):
                     c_arg = self._lookup_col_def(inner.this.sql().strip() if isinstance(inner.this, sqlglot_exp.Expr) else None)
                     if c_arg:
                         return self._normalize_dialect_type(c_arg.data_type)
                     return self._float_type()
                 if isinstance(inner, sqlglot_exp.Avg):
-                    return self._float_type()
+                    arg_expr = inner.this.sql() if inner.this is not None else ""
+                    return self._avg_result_storage_type_for_expr(arg_expr)
                 if isinstance(inner, (sqlglot_exp.AggFunc, sqlglot_exp.Func, sqlglot_exp.Anonymous)):
                     fn_up = (inner.sql_name().upper() if hasattr(inner, "sql_name") else "") or inner.name.upper()
                     if fn_up in ("COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "BIT_AND", "BIT_OR", "BIT_XOR", "BITWISEANDAGG", "BITWISEORAGG", "BITWISEXORAGG", "BOOL_AND", "BOOL_OR", "LOGICALAND", "LOGICALOR"):
@@ -4120,15 +4456,17 @@ class IncrementalViewCompiler:
             return self._int_type()
         if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
             return "BOOLEAN" if self.dialect == Dialect.POSTGRES else "INTEGER"
+        if item.agg_func == AggFunc.AVG:
+            return self._avg_result_storage_type(item)
+        if item.agg_func == AggFunc.TOTAL:
+            return self._float_type()
         if item.agg_func in (
-            AggFunc.AVG,
-            AggFunc.TOTAL,
             AggFunc.VAR_POP,
             AggFunc.VAR_SAMP,
             AggFunc.STDDEV_POP,
             AggFunc.STDDEV_SAMP,
         ):
-            return self._float_type()
+            return self._statistical_result_storage_type(item)
         if item.agg_func in (
             AggFunc.GROUP_CONCAT,
             AggFunc.STRING_AGG,
@@ -4138,12 +4476,7 @@ class IncrementalViewCompiler:
         ):
             return "TEXT"
         if item.agg_func == AggFunc.SUM:
-            if item.arg_expr:
-                c_def = self._lookup_col_def(item.arg_expr)
-                if c_def and any(k in c_def.data_type.upper() for k in ("INT", "SERIAL")):
-                    if not any(op in item.arg_expr for op in (".", "/")):
-                        return self._int_type()
-            return self._float_type()
+            return self._sum_result_storage_type(item)
         if item.agg_func in (AggFunc.MIN, AggFunc.MAX) and item.arg_expr:
             c_def = self._lookup_col_def(item.arg_expr)
             if c_def:
@@ -4924,9 +5257,11 @@ class IncrementalViewCompiler:
                 return f"TOTAL({dist}{eff})"
             return f"COALESCE(1.0 * SUM({dist}{eff}), 0.0)"
         if item.agg_func == AggFunc.AVG:
-            if self.dialect == Dialect.SQLITE:
-                return f"AVG({dist}{eff})"
-            return f"AVG(1.0 * ({dist}{eff}))" if not item.is_distinct else f"AVG({dist}{eff})"
+            # Preserve the argument's SQL type: MySQL AVG(exact) returns
+            # DECIMAL, PostgreSQL AVG(integer/numeric) returns NUMERIC, while
+            # approximate arguments remain floating-point. Multiplying by 1.0
+            # would silently convert MySQL exact AVG into DOUBLE.
+            return f"AVG({dist}{eff})"
         if item.agg_func == AggFunc.MIN:
             return f"MIN({eff})"
         if item.agg_func == AggFunc.MAX:
@@ -5123,7 +5458,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
                     col_sum_map[ekey] = sum_col
-                    col_defs_sql.append(f"{sum_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
 
             if item.agg_func in (
                 AggFunc.VAR_POP,
@@ -5136,7 +5471,7 @@ class IncrementalViewCompiler:
                     s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
                     sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
                     col_sum2_map[ekey] = sum2_col
-                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
 
             if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
                 if ekey not in col_true_cnt_map:
@@ -5286,6 +5621,7 @@ class IncrementalViewCompiler:
     ) -> Tuple[List[str], IncrementalBackfillSpec]:
         stmts: List[str] = []
         has_nullable_grp = self._has_nullable_group_col()
+        q_base_t = self._q(self.view.base_table)
         pk_cols = self._tier1_pk_cols()
         work_items = self._working_select_items
         grp_exprs = self._effective_group_by_exprs
@@ -5320,7 +5656,7 @@ class IncrementalViewCompiler:
             stmts.append(
                 f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
                 f"SELECT {', '.join(dist_sel)}\n"
-                f"FROM {self.view.base_table}{where_sql}{group_sql};"
+                f"FROM {q_base_t}{where_sql}{group_sql};"
             )
 
         target_cols: List[str] = []
@@ -5485,7 +5821,7 @@ class IncrementalViewCompiler:
             grp_expr = self._canonical_group_pk_expr(grp_exprs)
             w_grp = f" WHERE {self.view.where_clause}" if self.view.where_clause else ""
             dist_grp_query = (
-                f"SELECT DISTINCT {grp_expr} AS __gkey FROM {self.view.base_table}{w_grp} ORDER BY __gkey"
+                f"SELECT DISTINCT {grp_expr} AS __gkey FROM {q_base_t}{w_grp} ORDER BY __gkey"
             )
             chunk_templates: List[str] = []
             for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
@@ -5517,7 +5853,7 @@ class IncrementalViewCompiler:
                 chunk_templates.append(
                     f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
                     f"SELECT {', '.join(dist_sel)}\n"
-                    f"FROM {self.view.base_table}\n"
+                    f"FROM {q_base_t}\n"
                     f"WHERE {' AND '.join(w_p)}\n"
                     f"GROUP BY {', '.join(dist_grp_list)}{aux_conflict};"
                 )
@@ -5533,7 +5869,7 @@ class IncrementalViewCompiler:
             chunk_templates.append(
                 f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
                 f"SELECT {', '.join(select_exprs)}\n"
-                f"FROM {self.view.base_table}\n"
+                f"FROM {q_base_t}\n"
                 f"WHERE {' AND '.join(w_main)}{group_sql}{having_sql}{main_conflict};"
             )
             inc_spec = IncrementalBackfillSpec(
@@ -5606,8 +5942,13 @@ class IncrementalViewCompiler:
                 sum_c = col_sum_map[ekey]
                 new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
                 new_sum = _merged_sum(sum_c)
+                exact_avg = (
+                    self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                    and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                )
+                dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
                 assignments.append(
-                    f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE (1.0 * {new_sum}) / {new_cnt} END"
+                    f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE {dividend} / {new_cnt} END"
                 )
             elif item.agg_func in (
                 AggFunc.VAR_POP,
@@ -5615,20 +5956,28 @@ class IncrementalViewCompiler:
                 AggFunc.STDDEV_POP,
                 AggFunc.STDDEV_SAMP,
             ):
-                cnt_c = col_nonnull_count_map[ekey]
-                sum_c = col_sum_map[ekey]
-                sum2_c = col_sum2_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
-                new_sum = _merged_sum(sum_c)
-                new_sum2 = _merged_sum2(ekey, sum2_c)
-                formula = self._variance_formula_sql(
-                    new_cnt=new_cnt,
-                    new_sum=new_sum,
-                    new_sum2=new_sum2,
-                    is_sample=item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
-                    is_stddev=item.agg_func in (AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP),
+                exact_pg_input = (
+                    self.dialect == Dialect.POSTGRES
+                    and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
                 )
-                assignments.append(f"{c} = {formula}")
+                if exact_pg_input:
+                    recomputed = self._build_recompute_subquery_raw(item, mv_table)
+                    assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    sum2_c = col_sum2_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
+                    new_sum = _merged_sum(sum_c)
+                    new_sum2 = _merged_sum2(ekey, sum2_c)
+                    formula = self._variance_formula_sql(
+                        new_cnt=new_cnt,
+                        new_sum=new_sum,
+                        new_sum2=new_sum2,
+                        is_sample=item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
+                        is_stddev=item.agg_func in (AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP),
+                    )
+                    assignments.append(f"{c} = {formula}")
             elif item.agg_func == AggFunc.MIN:
                 assignments.append(
                     f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
@@ -5741,11 +6090,12 @@ class IncrementalViewCompiler:
             u_agg_sql = self._sql_backfill_agg_expr(orig_item)
             return f"(SELECT {u_agg_sql} FROM ({inner_u}) AS {u_alias}{w_u})"
         base_t = self.view.base_table
+        q_base_t = self._q(base_t)
         conds: List[str] = []
         if self.view.where_clause:
             conds.append(f"({self.view.where_clause})")
         for g_expr in self._effective_group_by_exprs:
-            lhs_g = self._rewrite_expr_for_record(g_expr, base_t)
+            lhs_g = self._rewrite_expr_for_record(g_expr, q_base_t)
             rhs_g = self._rewrite_expr_for_record(g_expr, record_prefix)
             is_nn = self._is_simple_col_ref(g_expr) and self._col_def(g_expr).not_null
             conds.append(
@@ -5757,7 +6107,7 @@ class IncrementalViewCompiler:
             )
         where_part = f" WHERE {' AND '.join(conds)}" if conds else ""
         agg_sql = self._sql_backfill_agg_expr(item)
-        return f"(SELECT {agg_sql} FROM {base_t}{where_part})"
+        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part})"
 
     def _variance_formula_sql(
         self,
@@ -5983,34 +6333,36 @@ class IncrementalViewCompiler:
                     inc_val = f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)"
                 update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} + {inc_val}")
             elif item.agg_func == AggFunc.AVG:
-                cnt_col = col_nonnull_count_map[ekey]
-                sum_col = col_sum_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
-                new_sum = _plus_sum_expr(item, sum_col)
-                update_assignments.append(
-                    f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
-                    f"ELSE (1.0 * {new_sum}) / {new_cnt} END"
-                )
+                if self._requires_native_avg_recompute(item):
+                    recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                    update_assignments.append(f"{col_alias} = {recomputed}")
+                else:
+                    cnt_col = col_nonnull_count_map[ekey]
+                    sum_col = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
+                    new_sum = _plus_sum_expr(item, sum_col)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    update_assignments.append(
+                        f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                        f"ELSE {dividend} / {new_cnt} END"
+                    )
             elif item.agg_func in (
                 AggFunc.VAR_POP,
                 AggFunc.VAR_SAMP,
                 AggFunc.STDDEV_POP,
                 AggFunc.STDDEV_SAMP,
             ):
-                cnt_col = col_nonnull_count_map[ekey]
-                sum_col = col_sum_map[ekey]
-                sum2_col = col_sum2_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
-                new_sum = _plus_sum_expr(item, sum_col)
-                new_sum2 = _plus_sum2_expr(item, sum2_col)
-                formula = self._variance_formula_sql(
-                    new_cnt=new_cnt,
-                    new_sum=new_sum,
-                    new_sum2=new_sum2,
-                    is_sample=item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
-                    is_stddev=item.agg_func in (AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP),
-                )
-                update_assignments.append(f"{col_alias} = {formula}")
+                # Backfill uses the engine's native statistical aggregate.
+                # A Welford/raw-moment delta update uses a different floating
+                # operation order and is not bit-identical for approximate
+                # inputs. Re-evaluate the affected group with the same native
+                # aggregate so the materialized result matches the live view.
+                recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomputed}")
             elif item.agg_func == AggFunc.MIN:
                 update_assignments.append(
                     f"{col_alias} = CASE "
@@ -6285,34 +6637,31 @@ class IncrementalViewCompiler:
                     dec_val = f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)"
                 update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} - {dec_val}")
             elif item.agg_func == AggFunc.AVG:
-                cnt_col = col_nonnull_count_map[ekey]
-                sum_col = col_sum_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
-                new_sum = _minus_sum_expr(item, sum_col, cnt_col)
-                update_assignments.append(
-                    f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
-                    f"ELSE (1.0 * {new_sum}) / {new_cnt} END"
-                )
+                if self._requires_native_avg_recompute(item):
+                    recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                    update_assignments.append(f"{col_alias} = {recomputed}")
+                else:
+                    cnt_col = col_nonnull_count_map[ekey]
+                    sum_col = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+                    new_sum = _minus_sum_expr(item, sum_col, cnt_col)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    update_assignments.append(
+                        f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                        f"ELSE {dividend} / {new_cnt} END"
+                    )
             elif item.agg_func in (
                 AggFunc.VAR_POP,
                 AggFunc.VAR_SAMP,
                 AggFunc.STDDEV_POP,
                 AggFunc.STDDEV_SAMP,
             ):
-                cnt_col = col_nonnull_count_map[ekey]
-                sum_col = col_sum_map[ekey]
-                sum2_col = col_sum2_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
-                new_sum = _minus_sum_expr(item, sum_col, cnt_col)
-                new_sum2 = _minus_sum2_expr(item, sum2_col, cnt_col)
-                formula = self._variance_formula_sql(
-                    new_cnt=new_cnt,
-                    new_sum=new_sum,
-                    new_sum2=new_sum2,
-                    is_sample=item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
-                    is_stddev=item.agg_func in (AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP),
-                )
-                update_assignments.append(f"{col_alias} = {formula}")
+                recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomputed}")
             elif item.agg_func == AggFunc.MIN:
                 recomp = self._build_recompute_subquery_raw(item, record_prefix)
                 update_assignments.append(
@@ -7156,7 +7505,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
                     col_sum_map[ekey] = sum_col
-                    col_defs_sql.append(f"{sum_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
 
             if item.agg_func in (
                 AggFunc.VAR_POP,
@@ -7169,7 +7518,7 @@ class IncrementalViewCompiler:
                     s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
                     sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
                     col_sum2_map[ekey] = sum2_col
-                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
 
             if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
                 if ekey not in col_true_cnt_map:
@@ -7374,6 +7723,36 @@ class IncrementalViewCompiler:
             expr_key_fn=_expr_key,
             use_mysql_values=(self.dialect == Dialect.MYSQL),
         )
+        # Native approximate aggregates must preserve the engine's operation
+        # order; algebraically equivalent sum/count updates can differ by ULPs.
+        native_recompute_aliases = {
+            self._q(item.alias)
+            for item in work_items
+            if item.is_aggregate
+            and (
+                item.agg_func in (
+                    AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                    AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                )
+                or self._requires_native_avg_recompute(item)
+            )
+        }
+        if native_recompute_aliases:
+            plus_merge_assignments = [
+                assignment for assignment in plus_merge_assignments
+                if assignment.split("=", 1)[0].strip() not in native_recompute_aliases
+            ]
+            for item in work_items:
+                if item.is_aggregate and (
+                    item.agg_func in (
+                        AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                        AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                    )
+                    or self._requires_native_avg_recompute(item)
+                ):
+                    plus_merge_assignments.append(
+                        f"{self._q(item.alias)} = {_build_join_recompute_subquery(item)}"
+                    )
 
         # Build minus assignments from `__mv_delta`
         minus_assignments: List[str] = []
@@ -7412,33 +7791,30 @@ class IncrementalViewCompiler:
                 cnt_c = col_nonnull_count_map[ekey]
                 minus_assignments.append(f"{c} = {_delta_sum_minus(c, cnt_c)}")
             elif item.agg_func == AggFunc.AVG:
-                cnt_c = col_nonnull_count_map[ekey]
-                sum_c = col_sum_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
-                new_sum = _delta_sum_minus(sum_c, cnt_c)
-                minus_assignments.append(
-                    f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL ELSE (1.0 * {new_sum}) / {new_cnt} END"
-                )
+                if self._requires_native_avg_recompute(item):
+                    recomputed = _build_join_recompute_subquery(item)
+                    minus_assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                    new_sum = _delta_sum_minus(sum_c, cnt_c)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    minus_assignments.append(
+                        f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL ELSE {dividend} / {new_cnt} END"
+                    )
             elif item.agg_func in (
                 AggFunc.VAR_POP,
                 AggFunc.VAR_SAMP,
                 AggFunc.STDDEV_POP,
                 AggFunc.STDDEV_SAMP,
             ):
-                cnt_c = col_nonnull_count_map[ekey]
-                sum_c = col_sum_map[ekey]
-                sum2_c = col_sum2_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
-                new_sum = _delta_sum_minus(sum_c, cnt_c)
-                new_sum2 = _delta_sum2_minus(ekey, sum2_c, cnt_c)
-                formula = self._variance_formula_sql(
-                    new_cnt=new_cnt,
-                    new_sum=new_sum,
-                    new_sum2=new_sum2,
-                    is_sample=item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
-                    is_stddev=item.agg_func in (AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP),
-                )
-                minus_assignments.append(f"{c} = {formula}")
+                recomputed = _build_join_recompute_subquery(item)
+                minus_assignments.append(f"{c} = {recomputed}")
             elif item.agg_func == AggFunc.MIN:
                 recomp = _build_join_recompute_subquery(item)
                 minus_assignments.append(
@@ -8158,6 +8534,7 @@ class IncrementalViewCompiler:
         view_name = self.view.view_name
         mv_table = self._backing_table_name()
         base_t = self.view.base_table
+        q_base_t = self._q(base_t)
         user_columns = [it.alias for it in self.view.select_items]
         pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
         from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
@@ -8206,7 +8583,7 @@ class IncrementalViewCompiler:
             all_new_vals = [*new_vals, *[f"NEW.{h[1]}" for h in hidden_pk_defs]]
             initial_populate_sql = (
                 f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
-                f"SELECT {', '.join(all_select_exprs)} FROM {base_t}{w_sql};"
+                f"SELECT {', '.join(all_select_exprs)} FROM {q_base_t}{w_sql};"
             )
             if self.dialect == Dialect.MYSQL:
                 upd_set = ", ".join(f"{c} = VALUES({c})" for c in all_backing_cols)
@@ -8237,7 +8614,7 @@ class IncrementalViewCompiler:
             pk_expr_base = self._canonical_group_pk_expr(pk_names)
             initial_populate_sql = (
                 f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
-                f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {base_t}{w_sql};"
+                f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_sql};"
             )
             pk_new = self._canonical_group_pk_expr([f"NEW.{c}" for c in pk_names])
             pk_old = self._canonical_group_pk_expr([f"OLD.{c}" for c in pk_names])
@@ -8509,7 +8886,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
                     col_sum_map[ekey] = sum_col
-                    col_defs_sql.append(f"{sum_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
 
             if item.agg_func in (
                 AggFunc.VAR_POP,
@@ -8522,7 +8899,7 @@ class IncrementalViewCompiler:
                     s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
                     sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
                     col_sum2_map[ekey] = sum2_col
-                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
 
             if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
                 if ekey not in col_true_cnt_map:
