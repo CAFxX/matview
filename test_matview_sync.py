@@ -20,13 +20,15 @@ or `SQLITE_COMPAT_ENGINE` is set:
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from dataclasses import dataclass
 import json
 import math
 import os
 import re
 import sqlite3
+import sqlglot
+from sqlglot import exp as sqlglot_exp
 import struct
 import tempfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -212,16 +214,23 @@ def _numeric_values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool
             and Decimal.from_float(floating) == Decimal(exact)
         )
 
-    # A float can only approximate a Decimal result. Compare its exact binary
-    # value to the Decimal with an explicit absolute tolerance; do not round the
-    # Decimal or scale the tolerance with the magnitude of the result.
+    # A float can only approximate a Decimal result. Decimal subtraction
+    # must not inherit the process-wide precision (normally 28 digits), or a
+    # small but meaningful difference at a large offset can round to zero.
     if math.isnan(floating):
         return exact.is_nan()
     if math.isinf(floating):
         return exact.is_infinite() and exact.is_signed() == (floating < 0)
     if exact.is_nan() or exact.is_infinite():
         return False
-    return tolerance.allows_float_decimal(floating, exact)
+    with localcontext() as context:
+        float_decimal = Decimal.from_float(floating)
+        context.prec = max(
+            1200,
+            len(exact.as_tuple().digits) + 120,
+            len(float_decimal.as_tuple().digits) + 120,
+        )
+        return tolerance.allows_float_decimal(floating, exact)
 
 
 def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
@@ -239,7 +248,96 @@ def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
     return type(a) is type(b) and a == b
 
 
-def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]], tol: float | NumericTolerance = 1.5e-3, *, column_tolerances: Optional[Sequence[NumericTolerance]] = None) -> bool:
+# Arithmetic aggregates have different numerical error profiles. The budgets
+# are intentionally expressed in a few ULPs with only a tiny absolute floor;
+# exact aggregates (COUNT/MIN/MAX and unrecognized functions) remain strict.
+_AGGREGATE_NUMERIC_TOLERANCES = {
+    "SUM": NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=8),
+    "TOTAL": NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=8),
+    "AVG": NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=8),
+    "VAR_POP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    "VAR_SAMP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    "VARIANCE": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    "STDDEV": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    "STDDEV_POP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    "STDDEV_SAMP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+}
+
+
+def _query_column_tolerances(select_sql: str) -> Optional[Tuple[NumericTolerance, ...]]:
+    """Infer conservative per-output comparison budgets from top-level SELECT expressions.
+
+    The inference is deliberately whitelist-based: only known arithmetic
+    aggregates receive a floating-point budget. COUNT, MIN/MAX, grouping keys,
+    text/binary values, and unknown expressions remain exact. Callers with
+    stronger input-type/scale information can supply explicit overrides.
+    """
+    try:
+        tree = sqlglot.parse_one(select_sql)
+    except sqlglot.errors.ParseError:
+        return None
+
+    select = tree if isinstance(tree, sqlglot_exp.Select) else tree.find(sqlglot_exp.Select)
+    if select is None or not select.expressions:
+        return None
+
+    # A top-level star expands to an unknown number of result columns. COUNT(*)
+    # is an aggregate expression, not a top-level star, and remains supported.
+    for projection in select.expressions:
+        if isinstance(projection, sqlglot_exp.Star):
+            return None
+        if (
+            isinstance(projection, sqlglot_exp.Column)
+            and isinstance(projection.this, sqlglot_exp.Star)
+        ):
+            return None
+
+    policies: List[NumericTolerance] = []
+    scalar_arithmetic_names = {
+        "ADD", "SUB", "MUL", "DIV", "POW", "SQRT", "POWER",
+        "EXP", "LN", "LOG", "LOG2", "LOG10", "SIN", "COS", "TAN",
+    }
+    scalar_arithmetic = NumericTolerance(
+        absolute=1e-12, relative=4.5e-16, max_ulps=4
+    )
+    for projection in select.expressions:
+        matching = []
+        for node in projection.walk():
+            if not isinstance(node, sqlglot_exp.Func):
+                continue
+            function_names = {node.sql_name().upper()}
+            # Some supported aggregate dialect spellings are parsed as
+            # Anonymous/AnonymousAggFunc nodes. sql_name() then reports the
+            # generic class name, while .name retains the SQL function name.
+            if type(node).__name__ in ("Anonymous", "AnonymousAggFunc"):
+                raw_name = getattr(node, "name", "")
+                if raw_name:
+                    function_names.add(str(raw_name).upper())
+            for function_name in function_names:
+                normalized_name = {
+                    "VARIANCE_POP": "VAR_POP",
+                    "VARIANCE_SAMP": "VAR_SAMP",
+                }.get(function_name, function_name)
+                policy = _AGGREGATE_NUMERIC_TOLERANCES.get(normalized_name)
+                if policy is not None:
+                    matching.append(policy)
+                    break
+        if any(type(node).__name__.upper() in scalar_arithmetic_names for node in projection.walk()):
+            matching.append(scalar_arithmetic)
+        if matching:
+            policies.append(
+                NumericTolerance(
+                    absolute=max(policy.absolute for policy in matching),
+                    relative=max(policy.relative for policy in matching),
+                    max_ulps=max(policy.max_ulps for policy in matching),
+                )
+            )
+        else:
+            policies.append(NumericTolerance())
+    return tuple(policies)
+
+
+def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]], tol: float | NumericTolerance = NumericTolerance(), *, column_tolerances: Optional[Sequence[NumericTolerance]] = None) -> bool:
     """Compare unordered row multisets, preserving duplicates and exact numerics.
 
     Integers and Decimal values are compared exactly against each other. A
@@ -538,7 +636,14 @@ def _verify_external_db_mv(cur, mv_name: str, select_sql: str, context: str = ""
     mv_rows = [tuple(row) for row in cur.fetchall()]
     cur.execute(select_sql)
     live_rows = [tuple(row) for row in cur.fetchall()]
-    if not _rows_equal(mv_rows, live_rows):
+    # Keep integer, Decimal, text, binary, grouping-key and unknown outputs
+    # exact. Only recognized floating arithmetic/aggregate projections receive
+    # their narrowly scoped per-column budget; _values_equal applies that budget
+    # only when at least one returned value is a float.
+    column_policies = _query_column_tolerances(select_sql)
+    if not _rows_equal(
+        mv_rows, live_rows, column_tolerances=column_policies
+    ):
         raise AssertionError(
             f"[{context}] External DB MV mismatch on {mv_name}!\n"
             f"  Query: {select_sql}\n"
@@ -2478,6 +2583,24 @@ class MVTestRunner:
                 tr_conn.close,
             )
 
+    @staticmethod
+    def _reset_sqlite_schema(cur: Any) -> None:
+        """Drop user schema objects between oversized SQLite view batches."""
+        cur.execute("PRAGMA foreign_keys = OFF;")
+        cur.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE type IN ('trigger', 'view', 'table') "
+            "AND name NOT LIKE 'sqlite_%';"
+        )
+        objects = cur.fetchall()
+        for object_type in ("trigger", "view", "table"):
+            for row in objects:
+                if str(row[0]).lower() != object_type:
+                    continue
+                name = str(row[1]).replace('"', '""')
+                cur.execute(f'DROP {object_type.upper()} IF EXISTS "{name}";')
+        cur.execute("PRAGMA foreign_keys = ON;")
+
     def run_batch(
         self,
         suite_name: str,
@@ -2508,6 +2631,11 @@ class MVTestRunner:
                 if reset_sql:
                     for r_st in [s.strip() for s in reset_sql.split(";") if s.strip()]:
                         cur.execute(r_st + ";")
+                elif eff_dialect == Dialect.SQLITE and i > 0:
+                    # SQLite batches share one connection but have no schema-reset
+                    # DDL equivalent to DROP SCHEMA ... CASCADE. A new chunk must
+                    # start from a clean database, just like the other dialects.
+                    self._reset_sqlite_schema(cur)
                 for st in [s.strip() for s in eff_schema.split(";") if s.strip()]:
                     cur.execute(st + ";")
                 for s in seed_sqls:
@@ -2582,6 +2710,13 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
         discount REAL,
         active INTEGER
     );
+    CREATE TABLE avg_precision (
+        id INTEGER PRIMARY KEY,
+        grp TEXT,
+        whole INTEGER,
+        exact_value DECIMAL(18, 8),
+        approx_value DOUBLE PRECISION
+    );
     """
     seed = [
         "INSERT INTO sales VALUES (1, 'NA', 'hw', 100.0, 2, 5.0, 1);",
@@ -2589,6 +2724,10 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
         "INSERT INTO sales VALUES (3, 'EU', 'hw', 50.0, 4, 2.5, 0);",
         "INSERT INTO sales VALUES (4, NULL, 'hw', 75.0, 3, 0.0, 1);",
         "INSERT INTO sales VALUES (5, 'EU', NULL, 120.0, 2, 10.0, 1);",
+        "INSERT INTO avg_precision VALUES (1, 'g1', 2, 1.12345678, 0.1);",
+        "INSERT INTO avg_precision VALUES (2, 'g1', 1, 2.87654321, 0.2);",
+        "INSERT INTO avg_precision VALUES (3, 'g2', 5, 1000000.12345678, 0.3);",
+        "INSERT INTO avg_precision VALUES (4, 'g2', 8, 999999.87654321, 0.4);",
     ]
     mutations = [
         ("ins_batch", "INSERT INTO sales VALUES (6, 'NA', 'hw', 300.0, 5, 15.0, 1), (7, NULL, NULL, 40.0, 1, NULL, 0);"),
@@ -2605,6 +2744,9 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
         ("tx_rb_sp", "ROLLBACK TO SAVEPOINT sp_s1;"),
         ("tx_del_subq", "DELETE FROM sales WHERE id IN (SELECT id FROM (SELECT id FROM sales WHERE active = 0) AS __sq_del);"),
         ("tx_commit", "COMMIT;"),
+        ("avg_precision_insert", "INSERT INTO avg_precision VALUES (5, 'g1', 4, 1.00000009, 0.5);"),
+        ("avg_precision_update", "UPDATE avg_precision SET whole = whole + 1, exact_value = exact_value + 0.00000001 WHERE id = 2;"),
+        ("avg_precision_delete", "DELETE FROM avg_precision WHERE id = 3;"),
     ]
 
     group_patterns = [
@@ -2652,6 +2794,15 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
                 v_sql = f"CREATE VIEW {v_name} AS SELECT {g_proj}, {a_bundle} FROM sales{w_sql} GROUP BY {g_by};"
                 views.append((v_name, v_sql))
 
+    views.append((
+        "s1_avg_native_types",
+        "CREATE VIEW s1_avg_native_types AS "
+        "SELECT grp, SUM(whole) AS sum_integer, SUM(exact_value) AS sum_decimal, "
+        "AVG(whole) AS avg_integer, AVG(exact_value) AS avg_decimal, "
+        "AVG(approx_value) AS avg_approximate, VAR_POP(exact_value) AS variance_decimal, "
+        "STDDEV_SAMP(exact_value) AS stddev_decimal, "
+        "VAR_POP(approx_value) AS variance_approximate FROM avg_precision GROUP BY grp;",
+    ))
     runner.run_batch("Suite 1 (Single-Table Algebraic Aggregates)", schema, views, seed, mutations)
 
 
@@ -5020,9 +5171,14 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertTrue(_rows_equal([(Decimal("1.25"),)], [(Decimal("1.25"),)]))
 
     def test_15_differential_oracle_handles_float_and_special_values(self) -> None:
-        self.assertTrue(_rows_equal([(1.0,)], [(1.001,)]))
+        self.assertTrue(
+            _rows_equal([(1.0,)], [(1.001,)], tol=NumericTolerance(absolute=1.5e-3))
+        )
+        self.assertFalse(_rows_equal([(1.0,)], [(1.001,)]))
         self.assertFalse(_rows_equal([(1,)], [(1.001,)]))
-        self.assertTrue(_rows_equal([(Decimal("0.1"),)], [(0.1,)]))
+        self.assertTrue(
+            _rows_equal([(Decimal("0.1"),)], [(0.1,)], tol=NumericTolerance(absolute=1e-16))
+        )
         self.assertFalse(_rows_equal([(float("nan"),)], [(1.0,)]))
         self.assertTrue(_rows_equal([(float("nan"),)], [(float("nan"),)]))
         self.assertTrue(_rows_equal([(float("inf"),)], [(float("inf"),)]))
@@ -5084,12 +5240,12 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         tiny = 1e-300
         tiny_two_ulps = math.nextafter(math.nextafter(tiny, math.inf), math.inf)
         rows_b = [
-            (3, 12.5000001, 0.12500000000000003, "Group-A"),
+            (3, 12.500000001, 0.12500000000000003, "Group-A"),
             (7, 1e9 + 0.25, tiny_two_ulps, "Group-B"),
         ]
         policies = (
             NumericTolerance(),  # COUNT-like exact integer output
-            NumericTolerance(relative=1e-8),  # SUM-like approximate output
+            NumericTolerance(relative=1e-9),  # SUM-like approximate output
             NumericTolerance(max_ulps=2),  # small-magnitude arithmetic output
             NumericTolerance(),  # grouping text remains exact
         )
@@ -5097,7 +5253,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertFalse(
             _rows_equal(
                 rows_a,
-                [(3.5, 12.5000001, 0.12500000000000003, "Group-A"),
+                [(3.5, 12.500000001, 0.12500000000000003, "Group-A"),
                  (7, 1e9 + 0.25, tiny_two_ulps, "Group-B")],
                 column_tolerances=policies,
             )
@@ -5105,13 +5261,101 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertFalse(
             _rows_equal(
                 rows_a,
-                [(3, 12.5000001, 0.12500000000000003, "group-a"),
+                [(3, 12.500000001, 0.12500000000000003, "group-a"),
                  (7, 1e9 + 0.25, tiny_two_ulps, "Group-B")],
                 column_tolerances=policies,
             )
         )
         with self.assertRaises(TypeError):
             _rows_equal([(1,)], [(1,)], column_tolerances=(1e-3,))  # type: ignore[arg-type]
+
+    def test_query_oracle_tolerance_inference_handles_stars_and_scalar_ops(self) -> None:
+        self.assertIsNone(_query_column_tolerances("SELECT * FROM items"))
+        self.assertIsNone(_query_column_tolerances("SELECT i.* FROM items AS i"))
+        count_policy = _query_column_tolerances("SELECT COUNT(*) FROM items")
+        self.assertEqual(count_policy, (NumericTolerance(),))
+        arithmetic = _query_column_tolerances("SELECT amount * 1.25 AS scaled FROM items")
+        self.assertEqual(arithmetic, (NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=4),))
+        arithmetic_aggregate = _query_column_tolerances("SELECT SUM(amount * 1.25) FROM items")
+        self.assertEqual(
+            arithmetic_aggregate,
+            (_AGGREGATE_NUMERIC_TOLERANCES["SUM"],),
+        )
+
+    def test_query_tolerance_recognizes_native_variance_and_stddev_functions(self) -> None:
+        for function_name, expected in (
+            ("VAR_POP", "VAR_POP"),
+            ("VAR_SAMP", "VAR_SAMP"),
+            ("VARIANCE", "VARIANCE"),
+            ("STDDEV", "STDDEV"),
+            ("STDDEV_POP", "STDDEV_POP"),
+            ("STDDEV_SAMP", "STDDEV_SAMP"),
+        ):
+            with self.subTest(function=function_name):
+                policies = _query_column_tolerances(
+                    f"SELECT {function_name}(amount) AS value FROM orders"
+                )
+                self.assertEqual(
+                    policies,
+                    (_AGGREGATE_NUMERIC_TOLERANCES[expected],),
+                )
+
+        policies = _query_column_tolerances(
+            "SELECT COUNT(*) AS n, VAR_POP(amount) AS vp, "
+            "STDDEV_SAMP(amount) AS sd FROM orders"
+        )
+        self.assertEqual(
+            policies,
+            (
+                NumericTolerance(),
+                _AGGREGATE_NUMERIC_TOLERANCES["VAR_POP"],
+                _AGGREGATE_NUMERIC_TOLERANCES["STDDEV_SAMP"],
+            ),
+        )
+
+    def test_20_differential_oracle_derives_tolerances_from_select_operations(self) -> None:
+        policies = _query_column_tolerances(
+            "SELECT region, COUNT(*) AS n, SUM(amount) AS total, "
+            "AVG(amount) AS average, VAR_POP(amount) AS variance, MIN(amount) AS minimum "
+            "FROM orders GROUP BY region"
+        )
+        self.assertIsNotNone(policies)
+        assert policies is not None
+        self.assertEqual(len(policies), 6)
+        self.assertEqual(policies[0], NumericTolerance())
+        self.assertEqual(policies[1], NumericTolerance())  # COUNT stays exact.
+        self.assertEqual(policies[2], _AGGREGATE_NUMERIC_TOLERANCES["SUM"])
+        self.assertEqual(policies[3], _AGGREGATE_NUMERIC_TOLERANCES["AVG"])
+        self.assertEqual(policies[4], _AGGREGATE_NUMERIC_TOLERANCES["VAR_POP"])
+        self.assertEqual(policies[5], NumericTolerance())  # MIN is a selection, not arithmetic.
+
+        self.assertTrue(
+            _rows_equal(
+                [("A", 10, 12.5, 1.25, 0.125, 2.0)],
+                [("A", 10, 12.500000000000002, 1.2500000000000002, 0.125000000000001, 2.0)],
+                column_tolerances=policies,
+            )
+        )
+        self.assertFalse(
+            _rows_equal(
+                [("A", 10, 12.5, 1.25, 0.125, 2.0)],
+                [("A", 10, 12.5001, 1.25, 0.125, 2.0)],
+                column_tolerances=policies,
+            )
+        )
+        self.assertIsNone(_query_column_tolerances("SELECT ("))
+
+    def test_21_differential_oracle_decimal_float_comparison_uses_full_precision(self) -> None:
+        with localcontext() as context:
+            context.prec = 220
+            exact = Decimal.from_float(1e100) + Decimal("1e50")
+        self.assertFalse(
+            _rows_equal(
+                [(exact,)],
+                [(1e100,)],
+                tol=NumericTolerance(absolute=1e40),
+            )
+        )
 
     def test_19_differential_oracle_numeric_adversarial_boundaries(self) -> None:
         exact = NumericTolerance()
@@ -5126,16 +5370,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         largest = float.fromhex("0x1.fffffffffffffp+1023")
         self.assertFalse(_rows_equal([(smallest,)], [(0.0,)], tol=exact))
         self.assertFalse(_rows_equal([(largest,)], [(float("inf"),)], tol=exact))
-        two_ulps_above = math.nextafter(
-            math.nextafter(math.nextafter(1.0, math.inf), math.inf), math.inf
-        )
-        self.assertFalse(
-            _rows_equal(
-                [(math.nextafter(1.0, math.inf),)],
-                [(two_ulps_above,)],
-                tol=NumericTolerance(max_ulps=1),
-            )
-        )
+        self.assertFalse(_rows_equal([(1.0,)], [(math.nextafter(math.nextafter(1.0, math.inf), math.inf),)], tol=NumericTolerance(max_ulps=1)))
         self.assertTrue(_rows_equal([(-0.0,)], [(0.0,)], tol=exact))
         self.assertTrue(_rows_equal([(float("nan"),)], [(float("nan"),)], tol=exact))
 
@@ -5164,6 +5399,187 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertFalse(_rows_equal([("a",), ("a",)], [("a",)]))
         with self.assertRaises(ValueError):
             _rows_equal([(1.0,)], [(1.0,)], tol=-1.0)
+
+    def test_22_avg_backing_types_preserve_native_engine_result_families(self) -> None:
+        schema = """
+        CREATE TABLE avg_source (
+            id INTEGER PRIMARY KEY,
+            whole INTEGER,
+            exact_value DECIMAL(18, 8),
+            approximate_value DOUBLE PRECISION
+        );
+        """
+        view = """
+        CREATE VIEW avg_types AS
+        SELECT SUM(whole) AS sum_integer,
+               SUM(exact_value) AS sum_decimal,
+               AVG(whole) AS avg_integer,
+               AVG(exact_value) AS avg_decimal,
+               AVG(approximate_value) AS avg_approximate,
+               VAR_POP(exact_value) AS variance_decimal,
+               STDDEV_SAMP(exact_value) AS stddev_decimal,
+               VAR_POP(approximate_value) AS variance_approximate
+        FROM avg_source;
+        """
+
+        mysql = generate_materialized_view(
+            schema, view, dialect="mysql", ignore_limitations=True
+        )
+        self.assertIn("sum_integer DECIMAL(65, 0)", mysql.backing_table_ddl)
+        self.assertIn("sum_decimal DECIMAL(65, 8)", mysql.backing_table_ddl)
+        self.assertIn("avg_integer DECIMAL(14, 4)", mysql.backing_table_ddl)
+        self.assertIn("avg_decimal DECIMAL(22, 12)", mysql.backing_table_ddl)
+        self.assertIn("AVG_APPROXIMATE DOUBLE", mysql.backing_table_ddl.upper())
+        self.assertIn("VARIANCE_DECIMAL DOUBLE", mysql.backing_table_ddl.upper())
+        self.assertIn("STDDEV_DECIMAL DOUBLE", mysql.backing_table_ddl.upper())
+        self.assertIn("VARIANCE_APPROXIMATE DOUBLE", mysql.backing_table_ddl.upper())
+
+        postgres = generate_materialized_view(schema, view, dialect="postgres")
+        self.assertIn("sum_integer BIGINT", postgres.backing_table_ddl)
+        self.assertIn("sum_decimal NUMERIC", postgres.backing_table_ddl)
+        self.assertIn("avg_integer NUMERIC", postgres.backing_table_ddl)
+        self.assertIn("avg_decimal NUMERIC", postgres.backing_table_ddl)
+        self.assertIn("avg_approximate DOUBLE PRECISION", postgres.backing_table_ddl)
+        self.assertIn("variance_decimal NUMERIC", postgres.backing_table_ddl)
+        self.assertIn("stddev_decimal NUMERIC", postgres.backing_table_ddl)
+        self.assertIn("variance_approximate DOUBLE PRECISION", postgres.backing_table_ddl)
+
+        sqlite = generate_materialized_view(schema, view, dialect="sqlite")
+        self.assertIn("sum_integer INTEGER", sqlite.backing_table_ddl)
+        self.assertIn("sum_decimal NUMERIC", sqlite.backing_table_ddl)
+        self.assertIn("avg_integer REAL", sqlite.backing_table_ddl)
+        self.assertIn("avg_decimal REAL", sqlite.backing_table_ddl)
+        self.assertIn("avg_approximate REAL", sqlite.backing_table_ddl)
+        self.assertIn("variance_decimal REAL", sqlite.backing_table_ddl)
+        self.assertIn("stddev_decimal REAL", sqlite.backing_table_ddl)
+        self.assertIn("variance_approximate REAL", sqlite.backing_table_ddl)
+
+        # Numeric expressions retain exactness and derive their native precision.
+        expression_view = """
+        CREATE VIEW avg_expression AS
+        SELECT AVG(exact_value * 2) AS avg_expression,
+               AVG(COALESCE(exact_value, 0)) AS avg_coalesce
+        FROM avg_source;
+        """
+        mysql_expression = generate_materialized_view(
+            schema, expression_view, dialect="mysql", ignore_limitations=True
+        )
+        self.assertIn("avg_expression DECIMAL(23, 12)", mysql_expression.backing_table_ddl)
+        self.assertIn("avg_coalesce DECIMAL(22, 12)", mysql_expression.backing_table_ddl)
+
+        # Exact numeric type inference must follow aliases through chained CTEs.
+        cte_schema = """
+        CREATE TABLE nodes (id INTEGER PRIMARY KEY, team TEXT, score INTEGER);
+        """
+        cte_view = """
+        CREATE VIEW cte_avg AS
+        WITH step1 AS (
+            SELECT id, team, score, score * 2 AS s2 FROM nodes
+        ), step2 AS (
+            SELECT id, team, s2 FROM step1 WHERE s2 >= 100
+        )
+        SELECT team, COUNT(*) AS cnt, AVG(s2) AS avg_s2
+        FROM step2 GROUP BY team;
+        """
+        pg_cte = generate_materialized_view(cte_schema, cte_view, dialect="postgres")
+        self.assertIn("avg_s2 NUMERIC", pg_cte.backing_table_ddl)
+
+        # Derived UNION ALL relations must merge every arm's exact numeric
+        # precision/scale instead of inferring from only the first projection.
+        union_schema = """
+        CREATE TABLE orders (id INTEGER PRIMARY KEY, category TEXT, qty DECIMAL(18, 4));
+        CREATE TABLE order_tags (id INTEGER PRIMARY KEY, tag TEXT, weight DECIMAL(18, 4));
+        """
+        union_view = """
+        CREATE VIEW union_avg AS
+        SELECT k, AVG(v) AS average
+        FROM (
+            SELECT category AS k, qty AS v FROM orders
+            UNION ALL
+            SELECT tag AS k, weight AS v FROM order_tags
+        ) AS sub
+        GROUP BY k;
+        """
+        union_mysql = generate_materialized_view(
+            union_schema, union_view, dialect="mysql", ignore_limitations=True
+        )
+        self.assertIn("average DECIMAL(22, 8)", union_mysql.backing_table_ddl)
+
+        # Exact-value AVG must never be forced to DOUBLE in its population SQL.
+        mysql_population = "\\n".join(mysql.initial_populate_sqls)
+        self.assertIn("SUM(whole)", mysql_population)
+        self.assertIn("SUM(exact_value)", mysql_population)
+        self.assertIn("AVG(whole)", mysql_population)
+        self.assertIn("AVG(exact_value)", mysql_population)
+        self.assertNotIn("AVG(1.0 *", mysql_population)
+
+    def test_23_statistical_delta_triggers_recompute_native_aggregates(self) -> None:
+        single_schema = """
+        CREATE TABLE measurements (
+            id INTEGER PRIMARY KEY,
+            grp TEXT,
+            value DOUBLE PRECISION
+        );
+        """
+        single_view = """
+        CREATE VIEW measurement_stats AS
+        SELECT grp, AVG(value) AS average, VAR_POP(value) AS variance,
+               STDDEV_SAMP(value) AS deviation
+        FROM measurements GROUP BY grp;
+        """
+        single = generate_materialized_view(
+            single_schema, single_view, dialect="postgres"
+        )
+        single_triggers = "\\n".join(single.trigger_ddls).upper()
+        self.assertGreaterEqual(single_triggers.count("SELECT VAR_POP("), 2)
+        self.assertGreaterEqual(single_triggers.count("SELECT AVG("), 2)
+        self.assertGreaterEqual(single_triggers.count("SELECT STDDEV_SAMP("), 2)
+
+        join_schema = """
+        CREATE TABLE categories (id INTEGER PRIMARY KEY, label TEXT);
+        CREATE TABLE measurements (
+            id INTEGER PRIMARY KEY,
+            category_id INTEGER,
+            value DOUBLE PRECISION
+        );
+        """
+        join_view = """
+        CREATE VIEW joined_measurement_stats AS
+        SELECT c.label, AVG(m.value) AS average, VAR_POP(m.value) AS variance,
+               STDDEV_SAMP(m.value) AS deviation
+        FROM categories AS c
+        JOIN measurements AS m ON m.category_id = c.id
+        GROUP BY c.label;
+        """
+        joined = generate_materialized_view(
+            join_schema, join_view, dialect="postgres"
+        )
+        join_triggers = "\\n".join(joined.trigger_ddls).upper()
+        self.assertIn("SELECT VAR_POP(", join_triggers)
+        self.assertIn("SELECT AVG(", join_triggers)
+        self.assertIn("SELECT STDDEV_SAMP(", join_triggers)
+
+        exact_schema = """
+        CREATE TABLE exact_measurements (
+            id INTEGER PRIMARY KEY,
+            grp TEXT NOT NULL,
+            value NUMERIC
+        );
+        """
+        exact_view = """
+        CREATE VIEW exact_measurement_stats AS
+        SELECT grp, VAR_POP(value) AS variance, STDDEV_SAMP(value) AS deviation
+        FROM exact_measurements GROUP BY grp;
+        """
+        exact_plan = generate_materialized_view(
+            exact_schema, exact_view, dialect="postgres"
+        )
+        self.assertIn("variance NUMERIC", exact_plan.backing_table_ddl)
+        chunk_sql = "\\n".join(
+            exact_plan.incremental_backfill_spec.chunk_sql_templates
+        )
+        self.assertIn("SELECT VAR_POP(", chunk_sql)
+        self.assertIn("SELECT STDDEV_SAMP(", chunk_sql)
 
     def test_limited_plan_helper_checks_default_contract_before_override(self) -> None:
         schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);"
