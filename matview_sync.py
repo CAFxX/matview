@@ -4241,10 +4241,17 @@ class IncrementalViewCompiler:
         return self._avg_result_storage_type_for_expr(item.arg_expr or "")
 
     def _requires_native_avg_recompute(self, item: SelectItem) -> bool:
+        """Use the engine aggregate for AVG on engines with native exact semantics.
+
+        A SUM/COUNT maintenance fold is not equivalent for every exact input:
+        PostgreSQL integer division can truncate, and derived UNION projections
+        can have a native result type that is lost by the fold. Recomputing the
+        affected group preserves the source view's exact precision/scale and
+        approximate rounding semantics.
+        """
         return (
             self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
             and item.agg_func == AggFunc.AVG
-            and self._exact_numeric_precision_scale(item.arg_expr or "") is None
         )
 
     def _var_accum_type(
