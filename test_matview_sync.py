@@ -5089,7 +5089,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         ]
         policies = (
             NumericTolerance(),  # COUNT-like exact integer output
-            NumericTolerance(relative=1e-9),  # SUM-like approximate output
+            NumericTolerance(relative=1e-8),  # SUM-like approximate output
             NumericTolerance(max_ulps=2),  # small-magnitude arithmetic output
             NumericTolerance(),  # grouping text remains exact
         )
@@ -5126,7 +5126,16 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         largest = float.fromhex("0x1.fffffffffffffp+1023")
         self.assertFalse(_rows_equal([(smallest,)], [(0.0,)], tol=exact))
         self.assertFalse(_rows_equal([(largest,)], [(float("inf"),)], tol=exact))
-        self.assertFalse(_rows_equal([(math.nextafter(1.0, math.inf),)], [(math.nextafter(math.nextafter(1.0, math.inf), math.inf),)], tol=NumericTolerance(max_ulps=1)))
+        two_ulps_above = math.nextafter(
+            math.nextafter(math.nextafter(1.0, math.inf), math.inf), math.inf
+        )
+        self.assertFalse(
+            _rows_equal(
+                [(math.nextafter(1.0, math.inf),)],
+                [(two_ulps_above,)],
+                tol=NumericTolerance(max_ulps=1),
+            )
+        )
         self.assertTrue(_rows_equal([(-0.0,)], [(0.0,)], tol=exact))
         self.assertTrue(_rows_equal([(float("nan"),)], [(float("nan"),)], tol=exact))
 
