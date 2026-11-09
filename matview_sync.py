@@ -4035,7 +4035,34 @@ class IncrementalViewCompiler:
             cte_t = self._infer_cte_or_subquery_col_type(item.raw_expr)
             if cte_t:
                 return cte_t
-            raw_u = item.raw_expr.strip().upper()
+            # Remove only balanced outer parentheses before applying the simple
+            # expression-type heuristics below. CASE expressions emitted by the
+            # AST generators are parenthesized, and leaving those wrappers in
+            # place incorrectly falls through to TEXT affinity on SQLite.
+            raw_expr = item.raw_expr.strip()
+            while raw_expr.startswith("(") and raw_expr.endswith(")"):
+                try:
+                    tokens = _tokenize_sql(
+                        raw_expr, read=_sqlglot_dialect(self.dialect)
+                    )
+                except sqlglot.errors.SqlglotError:
+                    break
+                if not tokens or tokens[0].text != "(" or tokens[-1].text != ")":
+                    break
+                depth = 0
+                closes_before_end = False
+                for token_idx, token in enumerate(tokens):
+                    if token.text == "(":
+                        depth += 1
+                    elif token.text == ")":
+                        depth -= 1
+                        if depth == 0 and token_idx != len(tokens) - 1:
+                            closes_before_end = True
+                            break
+                if closes_before_end or depth != 0:
+                    break
+                raw_expr = raw_expr[tokens[0].end + 1:tokens[-1].start].strip()
+            raw_u = raw_expr.upper()
             m_coal = re.match(
                 r'^(?:COALESCE|IFNULL)\s*\(\s*([A-Za-z0-9_."`\[\]]+)\s*,',
                 item.raw_expr.strip(),
