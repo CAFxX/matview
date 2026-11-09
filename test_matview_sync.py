@@ -6242,23 +6242,24 @@ class VariableSchemaDifferentialFuzzer:
                 return ("coalesce", ("column", column), ("literal", 0))
             return ("literal", rng.randint(1, 5))
 
-        kind = rng.choice(["add", "multiply", "case"])
+        kind = rng.choice([
+            "add", "safe_subtract", "multiply", "divide", "modulo",
+            "abs", "round", "case",
+        ])
         coverage["expression_nodes"].add(kind)
-        if kind == "add":
-            return (
-                "add",
-                VariableSchemaDifferentialFuzzer._numeric_expr(
-                    rng, column, depth - 1, coverage
-                ),
-                ("literal", rng.randint(1, 5)),
+        if kind in ("add", "safe_subtract", "multiply", "divide", "modulo"):
+            left = VariableSchemaDifferentialFuzzer._numeric_expr(
+                rng, column, depth - 1, coverage
             )
-        if kind == "multiply":
+            right = ("literal", rng.randint(1, 5))
+            return (kind, left, right)
+        if kind in ("abs", "round"):
             return (
-                "multiply",
+                kind,
                 VariableSchemaDifferentialFuzzer._numeric_expr(
                     rng, column, depth - 1, coverage
                 ),
-                ("literal", rng.randint(1, 4)),
+                2 if kind == "round" else None,
             )
         return (
             "case",
@@ -6282,35 +6283,52 @@ class VariableSchemaDifferentialFuzzer:
         coverage["max_predicate_depth"] = max(coverage["max_predicate_depth"], depth)
         if depth <= 0 or rng.random() < 0.35:
             atom = rng.choice([
-                "id_eq", "id_between", "qty_null", "qty_ge",
-                "amount_le", "label_null", "label_eq",
+                "id_eq", "id_ne", "id_gt", "id_lt", "id_between", "id_in",
+                "qty_null", "qty_not_null", "qty_ge", "qty_le", "qty_between",
+                "amount_null", "amount_le", "amount_gt",
+                "label_null", "label_eq", "label_ne", "label_like",
             ])
             coverage["predicate_nodes"].add(atom)
-            if atom == "id_eq":
-                return ("compare", ("column", "id"), "=", ("literal", rng.randint(1, max(1, row_count) + 2)))
+            id_value = rng.randint(1, max(1, row_count) + 2)
+            label_value = f"{prefix}_{table_idx}_{rng.randint(1, max(1, row_count))}"
+            if atom in ("id_eq", "id_ne", "id_gt", "id_lt"):
+                operator = {
+                    "id_eq": "=", "id_ne": "!=", "id_gt": ">", "id_lt": "<",
+                }[atom]
+                return ("compare", ("column", "id"), operator, ("literal", id_value))
             if atom == "id_between":
-                upper = max(1, row_count)
-                lo = rng.randint(1, upper)
+                lo = rng.randint(1, max(1, row_count))
                 return ("between", ("column", "id"), lo, lo + rng.randint(0, 3))
+            if atom == "id_in":
+                values = tuple(sorted({id_value, rng.randint(1, max(1, row_count) + 3)}))
+                return ("in", ("column", "id"), values)
             if atom == "qty_null":
                 return ("is_null", ("column", "qty"))
-            if atom == "qty_ge":
+            if atom == "qty_not_null":
+                return ("is_not_null", ("column", "qty"))
+            if atom in ("qty_ge", "qty_le"):
+                operator = ">=" if atom == "qty_ge" else "<="
                 return (
                     "compare",
                     ("coalesce", ("column", "qty"), ("literal", 0)),
-                    ">=",
+                    operator,
                     ("literal", rng.randint(0, 60)),
                 )
-            if atom == "amount_le":
-                return ("compare", ("column", "amount"), "<=", ("literal", rng.randint(0, 100)))
+            if atom == "qty_between":
+                lo = rng.randint(0, 20)
+                return ("between", ("coalesce", ("column", "qty"), ("literal", 0)), lo, lo + rng.randint(0, 20))
+            if atom == "amount_null":
+                return ("is_null", ("column", "amount"))
+            if atom in ("amount_le", "amount_gt"):
+                operator = "<=" if atom == "amount_le" else ">"
+                return ("compare", ("column", "amount"), operator, ("literal", rng.randint(0, 100)))
             if atom == "label_null":
                 return ("is_null", ("column", "label"))
-            return (
-                "compare",
-                ("column", "label"),
-                "=",
-                ("literal", f"{prefix}_{table_idx}_{rng.randint(1, max(1, row_count))}"),
-            )
+            if atom == "label_ne":
+                return ("compare", ("column", "label"), "!=", ("literal", label_value))
+            if atom == "label_like":
+                return ("like", ("column", "label"), ("literal", f"{prefix}_{table_idx}_%"))
+            return ("compare", ("column", "label"), "=", ("literal", label_value))
 
         operator = rng.choice(["and", "or", "not"])
         coverage["predicate_nodes"].add(operator)
@@ -6344,12 +6362,20 @@ class VariableSchemaDifferentialFuzzer:
                 f"COALESCE({VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])}, "
                 f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[2])})"
             )
-        if kind in ("add", "multiply"):
-            operator = "+" if kind == "add" else "*"
-            return (
-                f"({VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])} "
-                f"{operator} {VariableSchemaDifferentialFuzzer._render_numeric_expr(node[2])})"
-            )
+        if kind in ("add", "safe_subtract", "multiply", "divide", "modulo"):
+            operator = {
+                "add": "+", "safe_subtract": "-", "multiply": "*",
+                "divide": "/", "modulo": "%",
+            }[kind]
+            left = VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])
+            right = VariableSchemaDifferentialFuzzer._render_numeric_expr(node[2])
+            if kind == "safe_subtract":
+                return f"(CASE WHEN ({left}) >= ({right}) THEN ({left}) - ({right}) ELSE ({left}) END)"
+            return f"({left} {operator} {right})"
+        if kind == "abs":
+            return f"ABS({VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])})"
+        if kind == "round":
+            return f"ROUND({VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])}, {node[2]})"
         if kind == "case":
             return (
                 f"(CASE WHEN {VariableSchemaDifferentialFuzzer._render_predicate(node[1])} "
@@ -6363,6 +6389,19 @@ class VariableSchemaDifferentialFuzzer:
         kind = node[0]
         if kind == "is_null":
             return f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])} IS NULL"
+        if kind == "is_not_null":
+            return f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])} IS NOT NULL"
+        if kind == "like":
+            return (
+                f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])} LIKE "
+                f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[2])}"
+            )
+        if kind == "in":
+            values = ", ".join(
+                VariableSchemaDifferentialFuzzer._render_numeric_expr(("literal", value))
+                for value in node[2]
+            )
+            return f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])} IN ({values})"
         if kind == "compare":
             return (
                 f"{VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])} "
