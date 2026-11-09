@@ -2683,6 +2683,13 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
         discount REAL,
         active INTEGER
     );
+    CREATE TABLE avg_precision (
+        id INTEGER PRIMARY KEY,
+        grp TEXT,
+        whole INTEGER,
+        exact_value DECIMAL(18, 8),
+        approx_value DOUBLE PRECISION
+    );
     """
     seed = [
         "INSERT INTO sales VALUES (1, 'NA', 'hw', 100.0, 2, 5.0, 1);",
@@ -2690,6 +2697,10 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
         "INSERT INTO sales VALUES (3, 'EU', 'hw', 50.0, 4, 2.5, 0);",
         "INSERT INTO sales VALUES (4, NULL, 'hw', 75.0, 3, 0.0, 1);",
         "INSERT INTO sales VALUES (5, 'EU', NULL, 120.0, 2, 10.0, 1);",
+        "INSERT INTO avg_precision VALUES (1, 'g1', 2, 1.12345678, 0.1);",
+        "INSERT INTO avg_precision VALUES (2, 'g1', 1, 2.87654321, 0.2);",
+        "INSERT INTO avg_precision VALUES (3, 'g2', 5, 1000000.12345678, 0.3);",
+        "INSERT INTO avg_precision VALUES (4, 'g2', 8, 999999.87654321, 0.4);",
     ]
     mutations = [
         ("ins_batch", "INSERT INTO sales VALUES (6, 'NA', 'hw', 300.0, 5, 15.0, 1), (7, NULL, NULL, 40.0, 1, NULL, 0);"),
@@ -2706,6 +2717,9 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
         ("tx_rb_sp", "ROLLBACK TO SAVEPOINT sp_s1;"),
         ("tx_del_subq", "DELETE FROM sales WHERE id IN (SELECT id FROM (SELECT id FROM sales WHERE active = 0) AS __sq_del);"),
         ("tx_commit", "COMMIT;"),
+        ("avg_precision_insert", "INSERT INTO avg_precision VALUES (5, 'g1', 4, 1.00000009, 0.5);"),
+        ("avg_precision_update", "UPDATE avg_precision SET whole = whole + 1, exact_value = exact_value + 0.00000001 WHERE id = 2;"),
+        ("avg_precision_delete", "DELETE FROM avg_precision WHERE id = 3;"),
     ]
 
     group_patterns = [
@@ -2753,6 +2767,12 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
                 v_sql = f"CREATE VIEW {v_name} AS SELECT {g_proj}, {a_bundle} FROM sales{w_sql} GROUP BY {g_by};"
                 views.append((v_name, v_sql))
 
+    views.append((
+        "s1_avg_native_types",
+        "CREATE VIEW s1_avg_native_types AS "
+        "SELECT grp, AVG(whole) AS avg_integer, AVG(exact_value) AS avg_decimal, "
+        "AVG(approx_value) AS avg_approximate FROM avg_precision GROUP BY grp;",
+    ))
     runner.run_batch("Suite 1 (Single-Table Algebraic Aggregates)", schema, views, seed, mutations)
 
 
