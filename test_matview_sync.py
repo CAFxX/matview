@@ -301,11 +301,27 @@ def _query_column_tolerances(select_sql: str) -> Optional[Tuple[NumericTolerance
         absolute=1e-12, relative=4.5e-16, max_ulps=4
     )
     for projection in select.expressions:
-        matching = [
-            _AGGREGATE_NUMERIC_TOLERANCES[node.sql_name().upper()]
-            for node in projection.find_all(sqlglot_exp.AggFunc)
-            if node.sql_name().upper() in _AGGREGATE_NUMERIC_TOLERANCES
-        ]
+        matching = []
+        for node in projection.walk():
+            if not isinstance(node, sqlglot_exp.Func):
+                continue
+            function_names = {node.sql_name().upper()}
+            # Some supported aggregate dialect spellings are parsed as
+            # Anonymous/AnonymousAggFunc nodes. sql_name() then reports the
+            # generic class name, while .name retains the SQL function name.
+            if type(node).__name__ in ("Anonymous", "AnonymousAggFunc"):
+                raw_name = getattr(node, "name", "")
+                if raw_name:
+                    function_names.add(str(raw_name).upper())
+            for function_name in function_names:
+                normalized_name = {
+                    "VARIANCE_POP": "VAR_POP",
+                    "VARIANCE_SAMP": "VAR_SAMP",
+                }.get(function_name, function_name)
+                policy = _AGGREGATE_NUMERIC_TOLERANCES.get(normalized_name)
+                if policy is not None:
+                    matching.append(policy)
+                    break
         if any(type(node).__name__.upper() in scalar_arithmetic_names for node in projection.walk()):
             matching.append(scalar_arithmetic)
         if matching:
@@ -5210,6 +5226,37 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(
             arithmetic_aggregate,
             (_AGGREGATE_NUMERIC_TOLERANCES["SUM"],),
+        )
+
+    def test_query_tolerance_recognizes_native_variance_and_stddev_functions(self) -> None:
+        for function_name, expected in (
+            ("VAR_POP", "VAR_POP"),
+            ("VAR_SAMP", "VAR_SAMP"),
+            ("VARIANCE", "VARIANCE"),
+            ("STDDEV", "STDDEV"),
+            ("STDDEV_POP", "STDDEV_POP"),
+            ("STDDEV_SAMP", "STDDEV_SAMP"),
+        ):
+            with self.subTest(function=function_name):
+                policies = _query_column_tolerances(
+                    f"SELECT {function_name}(amount) AS value FROM orders"
+                )
+                self.assertEqual(
+                    policies,
+                    (_AGGREGATE_NUMERIC_TOLERANCES[expected],),
+                )
+
+        policies = _query_column_tolerances(
+            "SELECT COUNT(*) AS n, VAR_POP(amount) AS vp, "
+            "STDDEV_SAMP(amount) AS sd FROM orders"
+        )
+        self.assertEqual(
+            policies,
+            (
+                NumericTolerance(),
+                _AGGREGATE_NUMERIC_TOLERANCES["VAR_POP"],
+                _AGGREGATE_NUMERIC_TOLERANCES["STDDEV_SAMP"],
+            ),
         )
 
     def test_20_differential_oracle_derives_tolerances_from_select_operations(self) -> None:
