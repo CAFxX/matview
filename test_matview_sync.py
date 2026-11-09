@@ -27,6 +27,8 @@ import math
 import os
 import re
 import sqlite3
+import sqlglot
+from sqlglot import exp as sqlglot_exp
 import struct
 import tempfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
