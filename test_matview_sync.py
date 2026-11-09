@@ -20,7 +20,7 @@ or `SQLITE_COMPAT_ENGINE` is set:
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from dataclasses import dataclass
 import json
 import math
@@ -212,16 +212,23 @@ def _numeric_values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool
             and Decimal.from_float(floating) == Decimal(exact)
         )
 
-    # A float can only approximate a Decimal result. Compare its exact binary
-    # value to the Decimal with an explicit absolute tolerance; do not round the
-    # Decimal or scale the tolerance with the magnitude of the result.
+    # A float can only approximate a Decimal result. Decimal subtraction
+    # must not inherit the process-wide precision (normally 28 digits), or a
+    # small but meaningful difference at a large offset can round to zero.
     if math.isnan(floating):
         return exact.is_nan()
     if math.isinf(floating):
         return exact.is_infinite() and exact.is_signed() == (floating < 0)
     if exact.is_nan() or exact.is_infinite():
         return False
-    return tolerance.allows_float_decimal(floating, exact)
+    with localcontext() as context:
+        float_decimal = Decimal.from_float(floating)
+        context.prec = max(
+            1200,
+            len(exact.as_tuple().digits) + 120,
+            len(float_decimal.as_tuple().digits) + 120,
+        )
+        return tolerance.allows_float_decimal(floating, exact)
 
 
 def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
@@ -239,7 +246,60 @@ def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
     return type(a) is type(b) and a == b
 
 
-def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]], tol: float | NumericTolerance = 1.5e-3, *, column_tolerances: Optional[Sequence[NumericTolerance]] = None) -> bool:
+# Arithmetic aggregates have different numerical error profiles. The budgets
+# are intentionally expressed in a few ULPs with only a tiny absolute floor;
+# exact aggregates (COUNT/MIN/MAX and unrecognized functions) remain strict.
+_AGGREGATE_NUMERIC_TOLERANCES = {
+    "SUM": NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=8),
+    "TOTAL": NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=8),
+    "AVG": NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=8),
+    "VAR_POP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    "VAR_SAMP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    "VARIANCE": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    "STDDEV": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    "STDDEV_POP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    "STDDEV_SAMP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+}
+
+
+def _query_column_tolerances(select_sql: str) -> Optional[Tuple[NumericTolerance, ...]]:
+    """Infer conservative per-output comparison budgets from top-level SELECT expressions.
+
+    The inference is deliberately whitelist-based: only known arithmetic
+    aggregates receive a floating-point budget. COUNT, MIN/MAX, grouping keys,
+    text/binary values, and unknown expressions remain exact. Callers with
+    stronger input-type/scale information can supply explicit overrides.
+    """
+    try:
+        tree = sqlglot.parse_one(select_sql)
+    except sqlglot.errors.ParseError:
+        return None
+
+    select = tree if isinstance(tree, sqlglot_exp.Select) else tree.find(sqlglot_exp.Select)
+    if select is None or not select.expressions:
+        return None
+
+    policies: List[NumericTolerance] = []
+    for projection in select.expressions:
+        matching = [
+            _AGGREGATE_NUMERIC_TOLERANCES[node.sql_name().upper()]
+            for node in projection.find_all(sqlglot_exp.AggFunc)
+            if node.sql_name().upper() in _AGGREGATE_NUMERIC_TOLERANCES
+        ]
+        if matching:
+            policies.append(
+                NumericTolerance(
+                    absolute=max(policy.absolute for policy in matching),
+                    relative=max(policy.relative for policy in matching),
+                    max_ulps=max(policy.max_ulps for policy in matching),
+                )
+            )
+        else:
+            policies.append(NumericTolerance())
+    return tuple(policies)
+
+
+def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]], tol: float | NumericTolerance = NumericTolerance(), *, column_tolerances: Optional[Sequence[NumericTolerance]] = None) -> bool:
     """Compare unordered row multisets, preserving duplicates and exact numerics.
 
     Integers and Decimal values are compared exactly against each other. A
@@ -538,7 +598,8 @@ def _verify_external_db_mv(cur, mv_name: str, select_sql: str, context: str = ""
     mv_rows = [tuple(row) for row in cur.fetchall()]
     cur.execute(select_sql)
     live_rows = [tuple(row) for row in cur.fetchall()]
-    if not _rows_equal(mv_rows, live_rows):
+    policies = _query_column_tolerances(select_sql)
+    if not _rows_equal(mv_rows, live_rows, column_tolerances=policies):
         raise AssertionError(
             f"[{context}] External DB MV mismatch on {mv_name}!\n"
             f"  Query: {select_sql}\n"
@@ -5020,9 +5081,14 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertTrue(_rows_equal([(Decimal("1.25"),)], [(Decimal("1.25"),)]))
 
     def test_15_differential_oracle_handles_float_and_special_values(self) -> None:
-        self.assertTrue(_rows_equal([(1.0,)], [(1.001,)]))
+        self.assertTrue(
+            _rows_equal([(1.0,)], [(1.001,)], tol=NumericTolerance(absolute=1.5e-3))
+        )
+        self.assertFalse(_rows_equal([(1.0,)], [(1.001,)]))
         self.assertFalse(_rows_equal([(1,)], [(1.001,)]))
-        self.assertTrue(_rows_equal([(Decimal("0.1"),)], [(0.1,)]))
+        self.assertTrue(
+            _rows_equal([(Decimal("0.1"),)], [(0.1,)], tol=NumericTolerance(absolute=1e-16))
+        )
         self.assertFalse(_rows_equal([(float("nan"),)], [(1.0,)]))
         self.assertTrue(_rows_equal([(float("nan"),)], [(float("nan"),)]))
         self.assertTrue(_rows_equal([(float("inf"),)], [(float("inf"),)]))
@@ -5110,6 +5176,50 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         with self.assertRaises(TypeError):
             _rows_equal([(1,)], [(1,)], column_tolerances=(1e-3,))  # type: ignore[arg-type]
+
+    def test_20_differential_oracle_derives_tolerances_from_select_operations(self) -> None:
+        policies = _query_column_tolerances(
+            "SELECT region, COUNT(*) AS n, SUM(amount) AS total, "
+            "AVG(amount) AS average, VAR_POP(amount) AS variance, MIN(amount) AS minimum "
+            "FROM orders GROUP BY region"
+        )
+        self.assertIsNotNone(policies)
+        assert policies is not None
+        self.assertEqual(len(policies), 6)
+        self.assertEqual(policies[0], NumericTolerance())
+        self.assertEqual(policies[1], NumericTolerance())  # COUNT stays exact.
+        self.assertEqual(policies[2], _AGGREGATE_NUMERIC_TOLERANCES["SUM"])
+        self.assertEqual(policies[3], _AGGREGATE_NUMERIC_TOLERANCES["AVG"])
+        self.assertEqual(policies[4], _AGGREGATE_NUMERIC_TOLERANCES["VAR_POP"])
+        self.assertEqual(policies[5], NumericTolerance())  # MIN is a selection, not arithmetic.
+
+        self.assertTrue(
+            _rows_equal(
+                [("A", 10, 12.5, 1.25, 0.125, 2.0)],
+                [("A", 10, 12.500000000000002, 1.2500000000000002, 0.125000000000001, 2.0)],
+                column_tolerances=policies,
+            )
+        )
+        self.assertFalse(
+            _rows_equal(
+                [("A", 10, 12.5, 1.25, 0.125, 2.0)],
+                [("A", 10, 12.5001, 1.25, 0.125, 2.0)],
+                column_tolerances=policies,
+            )
+        )
+        self.assertIsNone(_query_column_tolerances("SELECT ("))
+
+    def test_21_differential_oracle_decimal_float_comparison_uses_full_precision(self) -> None:
+        with localcontext() as context:
+            context.prec = 220
+            exact = Decimal.from_float(1e100) + Decimal("1e50")
+        self.assertFalse(
+            _rows_equal(
+                [(exact,)],
+                [(1e100,)],
+                tol=NumericTolerance(absolute=1e40),
+            )
+        )
 
     def test_19_differential_oracle_numeric_adversarial_boundaries(self) -> None:
         exact = NumericTolerance()
