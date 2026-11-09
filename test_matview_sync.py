@@ -5475,6 +5475,182 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("SELECT VAR_POP(", join_triggers)
         self.assertIn("SELECT STDDEV_SAMP(", join_triggers)
 
+    def test_24_metamorphic_mv_invariants_and_rebuild_consistency(self) -> None:
+        schema = """
+        CREATE TABLE invariant_items (
+            id INTEGER PRIMARY KEY,
+            grp TEXT NOT NULL,
+            tag TEXT,
+            value INTEGER NOT NULL
+        );
+        INSERT INTO invariant_items VALUES
+            (1, 'A', 'x', 10),
+            (2, 'A', 'x', 20),
+            (3, 'A', 'y', 30),
+            (4, 'B', 'x', 5),
+            (5, 'B', NULL, 7);
+        """
+        view_sql = """
+        CREATE VIEW invariant_summary AS
+        SELECT grp, COUNT(*) AS row_count,
+               COUNT(DISTINCT tag) AS distinct_tags,
+               SUM(value) AS total_value,
+               MIN(value) AS minimum_value,
+               MAX(value) AS maximum_value
+        FROM invariant_items
+        GROUP BY grp;
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.execute("PRAGMA foreign_keys = ON;")
+        try:
+            manager = MaterializedViewManager(conn, dialect="sqlite")
+            manager.apply_schema_ddl(schema)
+            plan = manager.register_view(
+                view_sql, incremental_backfill=True, batch_size=2
+            )
+
+            live_sql = (
+                "SELECT grp, COUNT(*) AS row_count, COUNT(DISTINCT tag) AS distinct_tags, "
+                "SUM(value) AS total_value, MIN(value) AS minimum_value, "
+                "MAX(value) AS maximum_value FROM invariant_items GROUP BY grp"
+            )
+
+            def assert_consistent(label: str) -> List[Tuple[Any, ...]]:
+                visible = [
+                    tuple(row)
+                    for row in conn.execute(
+                        f"SELECT grp, row_count, distinct_tags, total_value, "
+                        f"minimum_value, maximum_value FROM {plan.view_name}"
+                    ).fetchall()
+                ]
+                live = [tuple(row) for row in conn.execute(live_sql).fetchall()]
+                self.assertTrue(
+                    _rows_equal(visible, live),
+                    f"{label}: materialized reader view diverged from the live SELECT",
+                )
+
+                backing = [
+                    tuple(row)
+                    for row in conn.execute(
+                        f"SELECT grp, row_count, distinct_tags, total_value, "
+                        f"minimum_value, maximum_value FROM {plan.backing_table_name}"
+                    ).fetchall()
+                ]
+                self.assertTrue(
+                    _rows_equal(visible, backing),
+                    f"{label}: reader view and backing table diverged",
+                )
+
+                catalog = manager.get_catalog()
+                self.assertIn(plan.view_name, catalog, f"{label}: catalog entry missing")
+                entry = catalog[plan.view_name]
+                self.assertEqual(entry["backing_table"], plan.backing_table_name)
+                self.assertEqual(set(entry["aux_tables"]), set(plan.auxiliary_table_names))
+                self.assertEqual(set(entry["trigger_names"]), set(plan.trigger_names))
+
+                objects = {
+                    (name, kind)
+                    for name, kind in conn.execute(
+                        "SELECT name, type FROM sqlite_master"
+                    ).fetchall()
+                }
+                self.assertIn((plan.view_name, "view"), objects)
+                self.assertIn((plan.backing_table_name, "table"), objects)
+                for aux_name in plan.auxiliary_table_names:
+                    self.assertIn((aux_name, "table"), objects)
+                for trigger_name in plan.trigger_names:
+                    self.assertIn((trigger_name, "trigger"), objects)
+
+                # DISTINCT support is maintained in a reference-counted
+                # auxiliary table. Every retained key must have a positive
+                # count and must correspond exactly to one live (group, tag).
+                for aux_name in plan.auxiliary_table_names:
+                    aux_rows = conn.execute(
+                        f"SELECT grp, __val, __ref_cnt FROM {aux_name}"
+                    ).fetchall()
+                    self.assertTrue(
+                        all(int(row[2]) > 0 for row in aux_rows),
+                        f"{label}: non-positive DISTINCT reference count in {aux_name}",
+                    )
+                    expected_aux = conn.execute(
+                        "SELECT grp, tag, COUNT(*) FROM invariant_items "
+                        "WHERE tag IS NOT NULL GROUP BY grp, tag"
+                    ).fetchall()
+                    self.assertTrue(
+                        _rows_equal(
+                            [(row[0], row[1], row[2]) for row in aux_rows],
+                            [tuple(row) for row in expected_aux],
+                        ),
+                        f"{label}: DISTINCT auxiliary state diverged",
+                    )
+                return visible
+
+            initial = assert_consistent("initial incremental backfill")
+
+            # Insert followed by delete must be the identity transformation on
+            # every visible aggregate and on the DISTINCT auxiliary state.
+            conn.execute(
+                "INSERT INTO invariant_items VALUES (10, 'A', 'z', 40)"
+            )
+            assert_consistent("insert before inverse delete")
+            conn.execute("DELETE FROM invariant_items WHERE id = 10")
+            after_inverse = assert_consistent("insert-delete restoration")
+            self.assertTrue(_rows_equal(initial, after_inverse))
+
+            # An UPDATE that assigns each column its current value is a
+            # semantic no-op, including for groups and DISTINCT ref-counts.
+            conn.execute("UPDATE invariant_items SET value = value, tag = tag WHERE id = 2")
+            after_noop = assert_consistent("no-op update")
+            self.assertTrue(_rows_equal(initial, after_noop))
+
+            # Trigger effects and auxiliary ref-count changes must roll back
+            # atomically with the base-table transaction.
+            conn.execute("BEGIN")
+            conn.execute("INSERT INTO invariant_items VALUES (11, 'A', 'rollback', 99)")
+            conn.execute("UPDATE invariant_items SET grp = 'C', tag = 'changed' WHERE id = 1")
+            conn.execute("DELETE FROM invariant_items WHERE id = 4")
+            conn.rollback()
+            after_rollback = assert_consistent("transaction rollback restoration")
+            self.assertTrue(_rows_equal(initial, after_rollback))
+
+            # Apply committed changes, then force a full rebuild. The rebuilt
+            # materialization must equal the incrementally maintained result.
+            conn.execute("UPDATE invariant_items SET value = value + 3 WHERE id IN (1, 5)")
+            incremental_result = assert_consistent("committed multi-row update")
+            rebuilt = manager.register_view(
+                view_sql,
+                incremental_backfill=False,
+                force_rebuild=True,
+            )
+            self.assertEqual(rebuilt.view_name, plan.view_name)
+            rebuilt_visible = [
+                tuple(row)
+                for row in conn.execute(
+                    f"SELECT grp, row_count, distinct_tags, total_value, "
+                    f"minimum_value, maximum_value FROM {rebuilt.view_name}"
+                ).fetchall()
+            ]
+            rebuilt_live = [tuple(row) for row in conn.execute(live_sql).fetchall()]
+            self.assertTrue(_rows_equal(rebuilt_visible, rebuilt_live))
+            self.assertTrue(_rows_equal(incremental_result, rebuilt_visible))
+
+            # The manager's catalog and all physical objects must be coherent
+            # after replacement, not just the user-facing SELECT result.
+            rebuilt_catalog = manager.get_catalog()[rebuilt.view_name]
+            self.assertEqual(rebuilt_catalog["backing_table"], rebuilt.backing_table_name)
+            rebuilt_objects = {
+                (name, kind)
+                for name, kind in conn.execute(
+                    "SELECT name, type FROM sqlite_master"
+                ).fetchall()
+            }
+            for trigger_name in rebuilt.trigger_names:
+                self.assertIn((trigger_name, "trigger"), rebuilt_objects)
+            for aux_name in rebuilt.auxiliary_table_names:
+                self.assertIn((aux_name, "table"), rebuilt_objects)
+        finally:
+            conn.close()
+
     def test_limited_plan_helper_checks_default_contract_before_override(self) -> None:
         schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);"
         supported, was_overridden, codes = _compile_plan_for_test(
