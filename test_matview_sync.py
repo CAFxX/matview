@@ -5538,9 +5538,33 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 conn.commit()
             finally:
                 conn.close()
-        self.assertGreaterEqual(len(topologies), 4)
+        self.assertGreaterEqual(len(topologies), 6)
         self.assertGreaterEqual(len(table_counts), 4)
         self.assertGreaterEqual(len(set(shapes)), 48)
+        generated_features = set()
+        action_coverage = set()
+        density_coverage = set()
+        for seed in range(64):
+            _, _, _, _, shape = VariableSchemaDifferentialFuzzer(seed).generate_scenario(1)
+            generated_features.add(shape["topology"])
+            generated_features.update(shape["amount_types"])
+            generated_features.add("generated" if shape["generated_columns"] else "plain")
+            generated_features.add("indexed" if shape["index_count"] else "unindexed")
+            action_coverage.update(shape["fk_delete_actions"])
+            density_coverage.update(
+                name for name, key in (("empty", "empty_tables"), ("sparse", "sparse_tables"), ("dense", "dense_tables"))
+                if shape[key]
+            )
+        self.assertTrue({"cycle", "mixed"} <= generated_features)
+        self.assertTrue({"CASCADE", "SET NULL", "RESTRICT"} <= action_coverage)
+        self.assertTrue({"empty", "sparse", "dense"} <= density_coverage)
+
+        campaign, coverage = VariableSchemaDifferentialFuzzer(991).generate_campaign(
+            12, candidates_per_scenario=6
+        )
+        self.assertEqual(len(campaign), 12)
+        self.assertGreaterEqual(coverage["distinct_structures"], 10)
+        self.assertGreaterEqual(coverage["feature_count"], 15)
         self.assertTrue({"add", "multiply", "case", "coalesce", "literal"} <= expression_coverage)
         self.assertTrue(
             {"and", "or", "not", "id_eq", "id_between", "qty_null", "qty_ge",
@@ -6263,9 +6287,10 @@ class VariableSchemaDifferentialFuzzer:
             ])
             coverage["predicate_nodes"].add(atom)
             if atom == "id_eq":
-                return ("compare", ("column", "id"), "=", ("literal", rng.randint(1, row_count + 2)))
+                return ("compare", ("column", "id"), "=", ("literal", rng.randint(1, max(1, row_count) + 2)))
             if atom == "id_between":
-                lo = rng.randint(1, row_count)
+                upper = max(1, row_count)
+                lo = rng.randint(1, upper)
                 return ("between", ("column", "id"), lo, lo + rng.randint(0, 3))
             if atom == "qty_null":
                 return ("is_null", ("column", "qty"))
@@ -6284,7 +6309,7 @@ class VariableSchemaDifferentialFuzzer:
                 "compare",
                 ("column", "label"),
                 "=",
-                ("literal", f"{prefix}_{table_idx}_{rng.randint(1, row_count)}"),
+                ("literal", f"{prefix}_{table_idx}_{rng.randint(1, max(1, row_count))}"),
             )
 
         operator = rng.choice(["and", "or", "not"])
@@ -6365,7 +6390,7 @@ class VariableSchemaDifferentialFuzzer:
         rng = random.Random((self.seed * 1000003) ^ (scenario_idx * 104729))
         prefix = f"vs{scenario_idx}"
         count = rng.randint(2, 6)
-        topology = rng.choice(["chain", "star", "disconnected", "self", "bridge"])
+        topology = rng.choice(["chain", "star", "disconnected", "self", "bridge", "cycle", "mixed"])
         if topology == "bridge" and count < 3:
             topology = "chain"
         names = [f"{prefix}_t{i}" for i in range(count)]
@@ -6376,38 +6401,68 @@ class VariableSchemaDifferentialFuzzer:
         elif topology == "star":
             edges = [(i, 0, "parent_0_id") for i in range(1, count)]
         elif topology == "disconnected":
-            # Leave table 0 isolated; later tables may form separate components.
             edges = [(i, i - 1, f"parent_{i - 1}_id") for i in range(2, count) if i % 3 == 2]
         elif topology == "self":
             edges = [(0, 0, "parent_0_id")] + [
                 (i, i - 1, f"parent_{i - 1}_id") for i in range(2, count) if i % 2 == 0
             ]
-        else:
+        elif topology == "bridge":
             edges = [(count - 1, 0, "ref_0_id"), (count - 1, 1, "ref_1_id")]
+        elif topology == "cycle":
+            edges = [(i, (i + 1) % count, f"ref_{(i + 1) % count}_id") for i in range(count)]
+        else:
+            for child in range(1, count):
+                parents = list(range(child))
+                rng.shuffle(parents)
+                for parent in parents[:rng.randint(1, min(2, len(parents)))]:
+                    edges.append((child, parent, f"ref_{parent}_id"))
+            if rng.random() < 0.6:
+                child = rng.randrange(count)
+                edges.append((child, child, f"self_{child}_id"))
 
         fks: Dict[int, List[Tuple[int, str]]] = {i: [] for i in range(count)}
+        fk_actions: Dict[Tuple[int, int, str], Tuple[str, str]] = {}
         for child, parent, col in edges:
             fks[child].append((parent, col))
+            fk_actions[(child, parent, col)] = (
+                rng.choice(["CASCADE", "SET NULL", "RESTRICT"]),
+                rng.choice(["CASCADE", "RESTRICT", "SET NULL"]),
+            )
 
         metas: List[Dict[str, Any]] = []
         ddls: List[str] = []
+        index_ddls: List[str] = []
+        if dialect == Dialect.POSTGRES:
+            amount_types = ["DOUBLE PRECISION", "NUMERIC(18, 4)", "NUMERIC(38, 12)", "INTEGER", "BIGINT"]
+        elif dialect == Dialect.MYSQL:
+            amount_types = ["DOUBLE", "DECIMAL(18, 4)", "DECIMAL(38, 12)", "INTEGER", "BIGINT"]
+        else:
+            amount_types = ["REAL", "NUMERIC(18, 4)", "NUMERIC(38, 12)", "INTEGER", "BIGINT"]
+
         for i, name in enumerate(names):
             label_nn, qty_nn, amount_nn = (rng.choice([True, False]) for _ in range(3))
-            amount_type = rng.choice(["REAL", "NUMERIC(18, 4)", "INTEGER"])
-            composite = i == count - 1 and count > 2 and rng.random() < 0.5
-            unique_label, check_qty, check_amount = (
-                rng.choice([True, False]) for _ in range(3)
-            )
+            amount_type = rng.choice(amount_types)
+            # Columns targeted by a single-column FK must remain unique.
+            # Put composite PKs only on tables that are not FK parents.
+            referenced_parents = {parent for _, parent, _ in edges}
+            composite = i not in referenced_parents and count > 2 and rng.random() < 0.35
+            unique_mode = rng.choice(["none", "label", "label_qty"])
+            unique_label = unique_mode == "label"
+            unique_label_qty = unique_mode == "label_qty"
+            check_qty, check_amount = (rng.choice([True, False]) for _ in range(2))
+            generated_column = rng.random() < 0.3
+            qty_type = rng.choice(["INTEGER", "BIGINT"])
             cols = [
                 "id INTEGER NOT NULL",
                 f"label VARCHAR(40){' NOT NULL' if label_nn else ''}",
-                f"qty INTEGER{' NOT NULL DEFAULT 0' if qty_nn else ''}",
+                f"qty {qty_type}{' NOT NULL DEFAULT 0' if qty_nn else ''}",
                 f"amount {amount_type}{' NOT NULL DEFAULT 0' if amount_nn else ''}",
             ]
             extras = []
             for extra_name, extra_type in rng.sample(
-                [("note", "VARCHAR(48)"), ("rank", "INTEGER"), ("ratio", "REAL"), ("tag", "VARCHAR(24)")],
-                rng.randint(0, 2),
+                [("note", "VARCHAR(48)"), ("rank", "INTEGER"), ("ratio", "REAL"),
+                 ("tag", "VARCHAR(24)"), ("code", "VARCHAR(12)")],
+                rng.randint(0, 3),
             ):
                 nullable = rng.choice([True, False])
                 default = ""
@@ -6415,6 +6470,8 @@ class VariableSchemaDifferentialFuzzer:
                     default = " DEFAULT 0" if extra_type in ("INTEGER", "REAL") else " DEFAULT 'default'"
                 cols.append(f"{extra_name} {extra_type}{' NOT NULL' if not nullable else ''}{default}")
                 extras.append((extra_name, extra_type, nullable))
+            if generated_column:
+                cols.append("derived_qty INTEGER GENERATED ALWAYS AS (COALESCE(qty, 0) + 1) STORED")
 
             constraints: List[str] = []
             if composite:
@@ -6423,12 +6480,16 @@ class VariableSchemaDifferentialFuzzer:
             else:
                 constraints.append("PRIMARY KEY (id)")
             for parent, fk_col in fks[i]:
+                on_delete, on_update = fk_actions[(i, parent, fk_col)]
                 cols.append(f"{fk_col} INTEGER")
                 constraints.append(
-                    f"FOREIGN KEY ({fk_col}) REFERENCES {names[parent]} (id) ON DELETE CASCADE"
+                    f"FOREIGN KEY ({fk_col}) REFERENCES {names[parent]} (id) "
+                    f"ON DELETE {on_delete} ON UPDATE {on_update}"
                 )
             if unique_label:
                 constraints.append("UNIQUE (label)")
+            elif unique_label_qty:
+                constraints.append("UNIQUE (label, qty)")
             if check_qty:
                 constraints.append("CHECK (qty IS NULL OR qty >= 0)")
             if check_amount:
@@ -6438,29 +6499,57 @@ class VariableSchemaDifferentialFuzzer:
                 + ("," + chr(10) + "    ").join(cols + constraints)
                 + chr(10) + ");"
             )
+            index_cols = rng.choice([["qty"], ["label"], ["qty", "label"], [col for _, col in fks[i]][:1]])
+            if index_cols and index_cols[0]:
+                index_ddls.append(f"CREATE INDEX ix_{prefix}_{i} ON {name} ({', '.join(index_cols)});")
+            if fks[i] and rng.random() < 0.6:
+                index_ddls.append(f"CREATE INDEX ix_{prefix}_{i}_fk ON {name} ({fks[i][0][1]});")
             metas.append({
                 "name": name, "label_nn": label_nn, "qty_nn": qty_nn,
                 "amount_nn": amount_nn, "amount_type": amount_type,
-                "composite": composite, "extras": extras,
+                "amount_integer": amount_type in ("INTEGER", "BIGINT"),
+                "qty_type": qty_type, "composite": composite, "extras": extras,
                 "fk_cols": [col for _, col in fks[i]],
-                "unique_label": unique_label, "check_qty": check_qty,
-                "check_amount": check_amount,
+                "unique_label": unique_label, "unique_label_qty": unique_label_qty,
+                "check_qty": check_qty, "check_amount": check_amount,
+                "generated_column": generated_column,
             })
+        ddls.extend(index_ddls)
 
         seed_sql: List[str] = []
-        row_counts: List[int] = []
+        row_counts = [
+            rng.choices([0, 1, 3, 8, 24], weights=[1, 2, 5, 3, 1], k=1)[0]
+            for _ in range(count)
+        ]
+        while sum(row_counts) <= count:
+            index = rng.randrange(count)
+            row_counts[index] = max(3, row_counts[index])
+
+        duplicate_label_rows = 0
+        null_label_rows = 0
+        seen_labels: Dict[int, set] = {i: set() for i in range(count)}
         for i, meta in enumerate(metas):
-            nrows = rng.randint(1, 4)
-            row_counts.append(nrows)
+            nrows = row_counts[i]
             fields = ["id"] + (["slot"] if meta["composite"] else [])
             fields += ["label", "qty", "amount"] + [x[0] for x in meta["extras"]] + meta["fk_cols"]
             for rid in range(1, nrows + 1):
                 vals = [str(rid)] + ([str(rid)] if meta["composite"] else [])
-                vals.append("NULL" if not meta["label_nn"] and rng.random() < 0.2 else f"'{prefix}_{i}_{rid}'")
+                if not meta["label_nn"] and rng.random() < 0.22:
+                    label_value = "NULL"
+                    null_label_rows += 1
+                elif meta["unique_label"] or meta["unique_label_qty"]:
+                    label_value = f"'{prefix}_{i}_unique_{rid}'"
+                else:
+                    bucket = rng.choices(["hot", "warm", "cold", "rare"], weights=[65, 20, 10, 5], k=1)[0]
+                    label_value = f"'{prefix}_{i}_{bucket}'"
+                    if bucket in seen_labels[i]:
+                        duplicate_label_rows += 1
+                    seen_labels[i].add(bucket)
+                vals.append(label_value)
                 vals.append("NULL" if not meta["qty_nn"] and rng.random() < 0.25 else str(rng.randint(0, 100)))
                 if not meta["amount_nn"] and rng.random() < 0.2:
                     vals.append("NULL")
-                elif meta["amount_type"] == "INTEGER":
+                elif meta["amount_integer"]:
                     vals.append(str(rng.randint(0, 100)))
                 else:
                     vals.append(f"{rng.randint(0, 100) + 0.125:.3f}")
@@ -6473,7 +6562,13 @@ class VariableSchemaDifferentialFuzzer:
                     else:
                         vals.append(f"'{prefix}_{extra_name}_{rid}'")
                 for parent, _ in fks[i]:
-                    vals.append("NULL" if parent == i else str(rng.randint(1, row_counts[parent])))
+                    if parent == i:
+                        fk_value = str(rng.randint(1, rid - 1)) if rid > 1 and rng.random() < 0.35 else "NULL"
+                    elif parent < i and row_counts[parent] > 0 and rng.random() < 0.8:
+                        fk_value = str(rng.randint(1, row_counts[parent]))
+                    else:
+                        fk_value = "NULL"
+                    vals.append(fk_value)
                 seed_sql.append(
                     f"INSERT INTO {meta['name']} ({', '.join(fields)}) VALUES ({', '.join(vals)});"
                 )
@@ -6518,7 +6613,7 @@ class VariableSchemaDifferentialFuzzer:
             values += [
                 f"'{prefix}_{table_idx}_{suffix}'",
                 str(rng.randint(1, 100)),
-                str(rng.randint(1, 100)) if meta["amount_type"] == "INTEGER"
+                str(rng.randint(1, 100)) if meta["amount_integer"]
                 else f"{rng.randint(1, 100) + 0.375:.3f}",
             ]
             for extra_name, extra_type, nullable in meta["extras"]:
@@ -6640,10 +6735,23 @@ class VariableSchemaDifferentialFuzzer:
             "topology": topology,
             "table_count": count,
             "column_counts": tuple(
-                4 + len(m["extras"]) + len(m["fk_cols"]) + int(m["composite"])
+                4 + len(m["extras"]) + len(m["fk_cols"]) + int(m["composite"]) + int(m["generated_column"])
                 for m in metas
             ),
             "amount_types": tuple(sorted({m["amount_type"] for m in metas})),
+            "qty_types": tuple(sorted({m["qty_type"] for m in metas})),
+            "row_counts": tuple(row_counts),
+            "empty_tables": sum(value == 0 for value in row_counts),
+            "sparse_tables": sum(0 < value <= 3 for value in row_counts),
+            "dense_tables": sum(value >= 8 for value in row_counts),
+            "duplicate_label_rows": duplicate_label_rows,
+            "null_label_rows": null_label_rows,
+            "generated_columns": sum(int(m["generated_column"]) for m in metas),
+            "index_count": len(index_ddls),
+            "unique_label_qty_constraints": sum(int(m["unique_label_qty"]) for m in metas),
+            "fk_delete_actions": tuple(sorted({actions[0] for actions in fk_actions.values()})),
+            "fk_update_actions": tuple(sorted({actions[1] for actions in fk_actions.values()})),
+            "relationship_cycle": topology == "cycle",
             "nullable_columns": sum(
                 int(not m["label_nn"]) + int(not m["qty_nn"]) + int(not m["amount_nn"])
                 for m in metas
@@ -6661,6 +6769,85 @@ class VariableSchemaDifferentialFuzzer:
             "max_predicate_depth": dml_coverage["max_predicate_depth"],
         }
         return "\n".join(ddls), views, seed_sql, mutations, shape
+
+    def generate_campaign(
+        self, scenario_count: int, *, candidates_per_scenario: int = 6
+    ) -> Tuple[List[Tuple[str, List[Tuple[str, str]], List[str], List[Tuple[str, str]], Dict[str, Any]]], Dict[str, Any]]:
+        """Generate a deterministic, structure-coverage-guided schema campaign."""
+        if scenario_count < 1:
+            raise ValueError("scenario_count must be positive")
+        if candidates_per_scenario < 1:
+            raise ValueError("candidates_per_scenario must be positive")
+        tracker = SchemaCoverageTracker()
+        selected = []
+        for scenario_idx in range(1, scenario_count + 1):
+            candidates = []
+            for candidate_idx in range(candidates_per_scenario):
+                candidate_seed = (
+                    self.seed * 1000003
+                    ^ scenario_idx * 104729
+                    ^ candidate_idx * 15485863
+                ) & 0xFFFFFFFF
+                candidate = VariableSchemaDifferentialFuzzer(candidate_seed).generate_scenario(
+                    scenario_idx
+                )
+                features = SchemaCoverageTracker.features(candidate[4])
+                candidates.append((tracker.score(features), -candidate_idx, candidate, features))
+            _, _, best, features = max(candidates, key=lambda entry: (entry[0], entry[1]))
+            tracker.observe(best[4])
+            selected.append(best)
+        return selected, tracker.summary()
+
+
+class SchemaCoverageTracker:
+    """Tracks structural features and rewards under-exercised schema shapes."""
+
+    @staticmethod
+    def features(shape: Dict[str, Any]) -> Tuple[str, ...]:
+        features = {
+            f"topology:{shape['topology']}",
+            f"tables:{shape['table_count']}",
+            f"pk:composite:{shape['composite_primary_key_tables'] > 0}",
+            f"generated:{shape['generated_columns'] > 0}",
+            f"indexes:{shape['index_count'] > 0}",
+            f"empty_tables:{shape['empty_tables'] > 0}",
+            f"dense_tables:{shape['dense_tables'] > 0}",
+            f"duplicate_labels:{shape['duplicate_label_rows'] > 0}",
+            f"nullable_labels:{shape['null_label_rows'] > 0}",
+            f"unique_label_qty:{shape['unique_label_qty_constraints'] > 0}",
+            f"relationship_cycle:{shape['relationship_cycle']}",
+        }
+        features.update(f"amount_type:{value}" for value in shape["amount_types"])
+        features.update(f"fk_delete:{value}" for value in shape["fk_delete_actions"])
+        features.update(f"fk_update:{value}" for value in shape["fk_update_actions"])
+        return tuple(sorted(features))
+
+    def __init__(self) -> None:
+        self.feature_counts: Dict[str, int] = {}
+        self.signatures: set = set()
+
+    def score(self, features: Sequence[str]) -> float:
+        return sum(1.0 / (1 + self.feature_counts.get(feature, 0)) for feature in features)
+
+    def observe(self, shape: Dict[str, Any]) -> None:
+        features = self.features(shape)
+        for feature in features:
+            self.feature_counts[feature] = self.feature_counts.get(feature, 0) + 1
+        signature = (
+            shape["topology"], shape["table_count"], shape["column_counts"],
+            shape["amount_types"], shape["qty_types"], shape["row_counts"],
+            shape["foreign_key_count"], shape["fk_delete_actions"],
+            shape["fk_update_actions"], shape["generated_columns"], shape["index_count"],
+            shape["unique_label_constraints"], shape["unique_label_qty_constraints"],
+        )
+        self.signatures.add(signature)
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "distinct_structures": len(self.signatures),
+            "feature_count": len(self.feature_counts),
+            "feature_occurrences": dict(sorted(self.feature_counts.items())),
+        }
 
 
 def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
@@ -6812,9 +6999,18 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
 
             # 4. Run a separately generated schema graph to exercise variable
             # table/column/key/constraint/FK structures beyond the legacy templates.
-            s_var, v_var, seed_var, m_var, shape_var = VariableSchemaDifferentialFuzzer(
-                seed=s_val
-            ).generate_scenario(sc_idx)
+            # Coverage-guided candidates are selected once per deterministic
+            # campaign; the best under-covered structure is executed each round.
+            if sc_idx == 1:
+                variable_campaign, variable_coverage = VariableSchemaDifferentialFuzzer(
+                    seed=s_val
+                ).generate_campaign(num_scenarios, candidates_per_scenario=6)
+                print(
+                    f"  [SCHEMA COVERAGE] seed={s_val}: "
+                    f"distinct_structures={variable_coverage['distinct_structures']} "
+                    f"features={variable_coverage['feature_count']}"
+                )
+            s_var, v_var, seed_var, m_var, shape_var = variable_campaign[sc_idx - 1]
             print(
                 f"  [SCHEMA SHAPE] seed={s_val} scenario={sc_idx}: "
                 f"tables={shape_var['table_count']} topology={shape_var['topology']} "
