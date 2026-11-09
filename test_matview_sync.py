@@ -5504,6 +5504,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             union_schema, union_view, dialect="mysql", ignore_limitations=True
         )
         self.assertIn("average DECIMAL(22, 8)", union_mysql.backing_table_ddl)
+        union_mysql_triggers = "\\n".join(union_mysql.trigger_ddls).upper()
+        self.assertIn("SELECT AVG(", union_mysql_triggers)
+        self.assertIn("UNION ALL", union_mysql_triggers)
 
         # Exact-value AVG must never be forced to DOUBLE in its population SQL.
         mysql_population = "\\n".join(mysql.initial_populate_sqls)
@@ -5518,12 +5521,17 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         CREATE TABLE measurements (
             id INTEGER PRIMARY KEY,
             grp TEXT,
+            whole INTEGER,
+            exact_value NUMERIC,
             value DOUBLE PRECISION
         );
         """
         single_view = """
         CREATE VIEW measurement_stats AS
-        SELECT grp, AVG(value) AS average, VAR_POP(value) AS variance,
+        SELECT grp, AVG(whole) AS integer_average,
+               AVG(exact_value) AS decimal_average,
+               AVG(value) AS approximate_average,
+               VAR_POP(value) AS variance,
                STDDEV_SAMP(value) AS deviation
         FROM measurements GROUP BY grp;
         """
@@ -5532,8 +5540,19 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         single_triggers = "\\n".join(single.trigger_ddls).upper()
         self.assertGreaterEqual(single_triggers.count("SELECT VAR_POP("), 2)
-        self.assertGreaterEqual(single_triggers.count("SELECT AVG("), 2)
+        self.assertGreaterEqual(single_triggers.count("SELECT AVG("), 6)
+        self.assertGreaterEqual(single_triggers.count("SELECT AVG(WHOLE)"), 2)
+        self.assertGreaterEqual(single_triggers.count("SELECT AVG(EXACT_VALUE)"), 2)
         self.assertGreaterEqual(single_triggers.count("SELECT STDDEV_SAMP("), 2)
+
+        # MySQL exact-value AVG must also use the native engine result rather
+        # than relying on a scale-changing SUM/COUNT fold.
+        mysql_single = generate_materialized_view(
+            single_schema, single_view, dialect="mysql", ignore_limitations=True
+        )
+        mysql_triggers = "\\n".join(mysql_single.trigger_ddls).upper()
+        self.assertGreaterEqual(mysql_triggers.count("SELECT AVG(WHOLE)"), 2)
+        self.assertGreaterEqual(mysql_triggers.count("SELECT AVG(EXACT_VALUE)"), 2)
 
         join_schema = """
         CREATE TABLE categories (id INTEGER PRIMARY KEY, label TEXT);
