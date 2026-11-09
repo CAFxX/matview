@@ -5408,6 +5408,48 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("AVG(exact_value)", mysql_population)
         self.assertNotIn("AVG(1.0 *", mysql_population)
 
+    def test_23_statistical_delta_triggers_recompute_native_aggregates(self) -> None:
+        single_schema = """
+        CREATE TABLE measurements (
+            id INTEGER PRIMARY KEY,
+            grp TEXT,
+            value DOUBLE PRECISION
+        );
+        """
+        single_view = """
+        CREATE VIEW measurement_stats AS
+        SELECT grp, VAR_POP(value) AS variance, STDDEV_SAMP(value) AS deviation
+        FROM measurements GROUP BY grp;
+        """
+        single = generate_materialized_view(
+            single_schema, single_view, dialect="postgres"
+        )
+        single_triggers = "\\n".join(single.trigger_ddls).upper()
+        self.assertGreaterEqual(single_triggers.count("SELECT VAR_POP("), 2)
+        self.assertGreaterEqual(single_triggers.count("SELECT STDDEV_SAMP("), 2)
+
+        join_schema = """
+        CREATE TABLE categories (id INTEGER PRIMARY KEY, label TEXT);
+        CREATE TABLE measurements (
+            id INTEGER PRIMARY KEY,
+            category_id INTEGER,
+            value DOUBLE PRECISION
+        );
+        """
+        join_view = """
+        CREATE VIEW joined_measurement_stats AS
+        SELECT c.label, VAR_POP(m.value) AS variance, STDDEV_SAMP(m.value) AS deviation
+        FROM categories AS c
+        JOIN measurements AS m ON m.category_id = c.id
+        GROUP BY c.label;
+        """
+        joined = generate_materialized_view(
+            join_schema, join_view, dialect="postgres"
+        )
+        join_triggers = "\\n".join(joined.trigger_ddls).upper()
+        self.assertIn("SELECT VAR_POP(", join_triggers)
+        self.assertIn("SELECT STDDEV_SAMP(", join_triggers)
+
     def test_limited_plan_helper_checks_default_contract_before_override(self) -> None:
         schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);"
         supported, was_overridden, codes = _compile_plan_for_test(
