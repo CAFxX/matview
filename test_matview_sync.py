@@ -27,6 +27,7 @@ import math
 import os
 import re
 import sqlite3
+import struct
 import tempfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import warnings
@@ -140,7 +141,7 @@ class NumericTolerance:
         if difference <= self.absolute + self.relative * scale:
             return True
         if self.max_ulps:
-            return difference <= self.max_ulps * max(math.ulp(a), math.ulp(b))
+            return _float_ulp_distance(a, b) <= self.max_ulps
         return False
 
     def allows_float_decimal(self, floating: float, exact: Decimal) -> bool:
@@ -155,6 +156,18 @@ class NumericTolerance:
         return False
 
 
+def _float_ulp_distance(a: float, b: float) -> int:
+    """Return the exact distance between finite IEEE-754 binary64 values."""
+    sign = 1 << 63
+    mask = (1 << 64) - 1
+
+    def ordered(value: float) -> int:
+        bits = struct.unpack(">Q", struct.pack(">d", value))[0]
+        return (~bits & mask) if bits & sign else (bits | sign)
+
+    return abs(ordered(a) - ordered(b))
+
+
 def _coerce_numeric_tolerance(tol: float | NumericTolerance) -> NumericTolerance:
     if isinstance(tol, NumericTolerance):
         return tol
@@ -166,7 +179,6 @@ def _coerce_numeric_tolerance(tol: float | NumericTolerance) -> NumericTolerance
 def _numeric_values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
     """Compare exact numerics exactly and floats under an explicit error budget."""
     tolerance = _coerce_numeric_tolerance(tol)
-    """Compare numerics exactly unless a floating-point result requires tolerance."""
     if isinstance(a, bool) or isinstance(b, bool):
         if isinstance(a, bool) and isinstance(b, bool):
             return a is b
@@ -230,10 +242,10 @@ def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
 def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]], tol: float | NumericTolerance = 1.5e-3) -> bool:
     """Compare unordered row multisets, preserving duplicates and exact numerics.
 
-    Integers and Decimal values are compared exactly. The absolute tolerance is
-    used only when at least one compared numeric value is a float. A sorted
-    comparison is the fast path; ambiguous approximate matches use a one-to-one
-    bipartite match so row order cannot create false negatives.
+    Integers and Decimal values are compared exactly against each other. A
+    NumericTolerance applies only when at least one compared value is a float.
+    A sorted comparison is the fast path; ambiguous approximate matches use a
+    one-to-one bipartite match so row order cannot create false negatives.
     """
     tolerance = _coerce_numeric_tolerance(tol)
     if len(rows_a) != len(rows_b):
