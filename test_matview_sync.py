@@ -92,10 +92,11 @@ def _row_sort_key(row: Sequence[Any]) -> Tuple[Any, ...]:
     for value in row:
         if value is None:
             keys.append((0,))
-        elif isinstance(value, bool):
-            keys.append((1, int(value)))
-        elif isinstance(value, (int, float, Decimal)):
-            keys.append((2,) + _numeric_sort_key(value))
+        elif isinstance(value, (bool, int, float, Decimal)):
+            # Boolean results from PostgreSQL may be compared with SQLite's
+            # integer 0/1 representation, so keep equivalent values adjacent.
+            numeric = int(value) if isinstance(value, bool) else value
+            keys.append((2,) + _numeric_sort_key(numeric))
         elif isinstance(value, (bytes, bytearray, memoryview)):
             keys.append((3, bytes(value)))
         elif isinstance(value, str):
@@ -172,7 +173,9 @@ def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]]
     """Compare unordered row multisets, preserving duplicates and exact numerics.
 
     Integers and Decimal values are compared exactly. The absolute tolerance is
-    used only when at least one compared numeric value is a float.
+    used only when at least one compared numeric value is a float. A sorted
+    comparison is the fast path; ambiguous approximate matches use a one-to-one
+    bipartite match so row order cannot create false negatives.
     """
     if tol < 0:
         raise ValueError("tol must be non-negative")
@@ -181,12 +184,93 @@ def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]]
 
     sorted_a = sorted((tuple(row) for row in rows_a), key=_row_sort_key)
     sorted_b = sorted((tuple(row) for row in rows_b), key=_row_sort_key)
-    for row_a, row_b in zip(sorted_a, sorted_b):
-        if len(row_a) != len(row_b):
+    if all(
+        len(row_a) == len(row_b)
+        and all(_values_equal(a, b, tol) for a, b in zip(row_a, row_b))
+        for row_a, row_b in zip(sorted_a, sorted_b)
+    ):
+        return True
+
+    # Without floats, the comparison is an equivalence relation and the
+    # canonical sort order is sufficient. Float tolerance is not transitive:
+    # two valid pairings can cross in lexicographic row order.
+    if not any(
+        isinstance(value, float)
+        for rows in (sorted_a, sorted_b)
+        for row in rows
+        for value in row
+    ):
+        return False
+
+    adjacency: List[List[int]] = []
+    for row_a in sorted_a:
+        candidates = [
+            index
+            for index, row_b in enumerate(sorted_b)
+            if len(row_a) == len(row_b)
+            and all(_values_equal(a, b, tol) for a, b in zip(row_a, row_b))
+        ]
+        if not candidates:
             return False
-        if not all(_values_equal(a, b, tol) for a, b in zip(row_a, row_b)):
-            return False
-    return True
+        adjacency.append(candidates)
+
+    # Find a maximum bipartite matching. Each row on the right can satisfy
+    # exactly one row on the left, preserving duplicate multiplicity.
+    count = len(sorted_a)
+    infinity = count + 1
+    pair_left = [-1] * count
+    pair_right = [-1] * count
+    distance = [infinity] * count
+
+    def breadth_first_search() -> int:
+        queue: List[int] = []
+        for left in range(count):
+            if pair_left[left] == -1:
+                distance[left] = 0
+                queue.append(left)
+            else:
+                distance[left] = infinity
+
+        shortest = infinity
+        cursor = 0
+        while cursor < len(queue):
+            left = queue[cursor]
+            cursor += 1
+            if distance[left] >= shortest:
+                continue
+            for right in adjacency[left]:
+                mate = pair_right[right]
+                if mate == -1:
+                    shortest = distance[left] + 1
+                elif distance[mate] == infinity:
+                    distance[mate] = distance[left] + 1
+                    queue.append(mate)
+        return shortest
+
+    def depth_first_search(left: int, shortest: int) -> bool:
+        for right in adjacency[left]:
+            mate = pair_right[right]
+            if mate == -1:
+                if distance[left] + 1 == shortest:
+                    pair_left[left] = right
+                    pair_right[right] = left
+                    return True
+            elif distance[mate] == distance[left] + 1 and depth_first_search(mate, shortest):
+                pair_left[left] = right
+                pair_right[right] = left
+                return True
+        distance[left] = infinity
+        return False
+
+    matched = 0
+    while True:
+        shortest = breadth_first_search()
+        if shortest == infinity:
+            break
+        for left in range(count):
+            if pair_left[left] == -1 and depth_first_search(left, shortest):
+                matched += 1
+    return matched == count
 
 
 def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Dialect.SQLITE) -> None:
@@ -4866,10 +4950,22 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertTrue(_rows_equal([(Decimal("NaN"),)], [(Decimal("NaN"),)]))
         self.assertFalse(_rows_equal([(Decimal("1.0"),)], [(Decimal("1.01"),)]))
 
+        # Approximate equality is not transitive across rows. A valid matching
+        # can cross lexicographic order when different columns trade off.
+        self.assertTrue(
+            _rows_equal(
+                [(0.0, 0.0), (0.0, 0.5)],
+                [(0.0, 1.5), (0.5, 0.0)],
+                tol=1.0,
+            )
+        )
+
     def test_16_differential_oracle_preserves_types_and_row_multiplicity(self) -> None:
         self.assertFalse(_rows_equal([("1",)], [(1,)]))
         self.assertFalse(_rows_equal([(True,)], [(False,)]))
         self.assertTrue(_rows_equal([(True,)], [(1,)]))
+        # Equivalent bool/int values must remain pairable after row sorting.
+        self.assertTrue(_rows_equal([(True,), (0,)], [(1,), (False,)]))
         self.assertTrue(_rows_equal([(b"payload",)], [(bytearray(b"payload"),)]))
         self.assertTrue(_rows_equal([("a",), ("b",), ("a",)], [("a",), ("a",), ("b",)]))
         self.assertFalse(_rows_equal([("a",), ("a",)], [("a",), ("b",)]))
