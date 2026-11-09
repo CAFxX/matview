@@ -105,7 +105,17 @@ jobs:
         run: python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
 
       - name: Run full test suite (SQLite + cross-dialect transpiled suites)
+        env:
+          MATVIEW_FUZZ_TARGET: "SQLite / Python ${{ matrix.python-version }}"
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: Test independent-session backfill concurrency
         run: python3 test_concurrent_backfill.py
@@ -162,7 +172,16 @@ jobs:
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
           SQLITE_COMPAT_ENGINE: ${{ matrix.engine }}
+          MATVIEW_FUZZ_TARGET: "${{ matrix.label }} / Python ${{ matrix.python-version }}"
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   # Oldest and newest supported upstream PostgreSQL major versions.
   postgres:
@@ -209,7 +228,16 @@ jobs:
       - name: Run full test suite + live PostgreSQL ${{ matrix.pg-version }} integration tests
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+          MATVIEW_FUZZ_TARGET: "PostgreSQL ${{ matrix.pg-version }}"
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   # Both supported Oracle MySQL LTS series are required on every PR.
   mysql:
@@ -270,7 +298,16 @@ jobs:
       - name: Run full test suite + live MySQL ${{ matrix.mysql-version }} integration tests
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          MATVIEW_FUZZ_TARGET: "MySQL ${{ matrix.mysql-version }}"
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   # Representative LTS boundaries for MariaDB: oldest, previous, newest LTS.
   mysql-compat:
@@ -345,7 +382,16 @@ jobs:
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          MATVIEW_FUZZ_TARGET: "${{ matrix.label }}"
         run: python3 test_matview_sync.py
+      - name: Archive fuzz campaign manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: fuzz-campaign.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   # Stable branch-protection check. Only the required PR gate is aggregated;
   # scheduled/deferred compatibility jobs live in the separate workflow.

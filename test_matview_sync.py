@@ -21,6 +21,7 @@ or `SQLITE_COMPAT_ENGINE` is set:
 from __future__ import annotations
 
 from decimal import Decimal
+import json
 import math
 import os
 import re
@@ -6092,19 +6093,76 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
     views_count = int(os.environ.get("MATVIEW_FUZZ_VIEWS_PER_SCHEMA", str(60 if scale == 1 else min(80, 50 + scale * 10))))
     mutations_count = int(os.environ.get("MATVIEW_FUZZ_MUTATIONS", str(45 if scale == 1 else min(80, 40 + scale * 10))))
 
+    manifest_path = os.environ.get("MATVIEW_FUZZ_MANIFEST", "fuzz-campaign.json")
+    manifest = {
+        "schema_version": 1,
+        "run_id": os.environ.get("GITHUB_RUN_ID"),
+        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+        "commit": os.environ.get("GITHUB_SHA"),
+        "job": os.environ.get("GITHUB_JOB"),
+        "target": os.environ.get("MATVIEW_FUZZ_TARGET") or os.environ.get("GITHUB_JOB"),
+        "python": __import__("sys").version.split()[0],
+        "default_dialect": runner.default_dialect.value,
+        "scale": scale,
+        "seeds": seeds,
+        "scenarios_per_seed": num_scenarios,
+        "views_per_schema": views_count,
+        "mutations_per_scenario": mutations_count,
+        "runs": [],
+    }
+
+    def write_manifest() -> None:
+        tmp_path = manifest_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as manifest_file:
+            json.dump(manifest, manifest_file, indent=2, sort_keys=True)
+            manifest_file.write("\n")
+        os.replace(tmp_path, manifest_path)
+
+    def run_fuzz_batch(suite_name: str, schema_sql: str, views: Sequence[Tuple[str, str]],
+                       seed_sqls: Sequence[str], mutations: Sequence[Tuple[str, str]], **kwargs: Any) -> None:
+        dialect = kwargs.get("dialect", runner.default_dialect)
+        record = {
+            "suite": suite_name,
+            "seed": current_seed,
+            "scenario": current_scenario,
+            "dialect": dialect.value,
+            "transition_tables": bool(kwargs.get("pg_use_transition_tables", False)),
+            "incremental_backfill": bool(kwargs.get("incremental_backfill", False)),
+            "status": "running",
+        }
+        manifest["runs"].append(record)
+        write_manifest()
+        try:
+            runner.run_batch(suite_name, schema_sql, views, seed_sqls, mutations, **kwargs)
+        except Exception as exc:
+            record["status"] = "failed"
+            record["error_type"] = type(exc).__name__
+            record["error"] = str(exc)
+            write_manifest()
+            raise
+        else:
+            record["status"] = "passed"
+            write_manifest()
+
     print(
         f"  [FUZZ CONFIG] scale={scale}, seeds={seeds} ({len(seeds)} seeds x {num_scenarios} schemas x {views_count} views x {mutations_count} mutations)"
     )
 
+    current_seed = None
+    current_scenario = None
+    write_manifest()
+
     for s_val in seeds:
+        current_seed = s_val
         print(f"  [FUZZ SEED] seed={s_val} (reproduce with: MATVIEW_FUZZ_SEEDS={s_val} python3 test_matview_sync.py --fuzz)")
         fuzzer = DifferentialSQLFuzzer(seed=s_val)
         for sc_idx in range(1, num_scenarios + 1):
+            current_scenario = sc_idx
             # 1. Default runner dialect (SQLite locally, or live Postgres/MySQL/SQLite-compat in CI)
             s_def, v_def, seed_def, m_def = fuzzer.generate_scenario(
                 sc_idx, runner.default_dialect, views_count=views_count, mutations_count=mutations_count
             )
-            runner.run_batch(
+            run_fuzz_batch(
                 f"Suite 12a (Differential Fuzzer seed={s_val} sc={sc_idx} - Default Engine)",
                 s_def,
                 v_def,
@@ -6117,7 +6175,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
             s_pg, v_pg, seed_pg, m_pg = fuzzer.generate_scenario(
                 sc_idx, Dialect.POSTGRES, views_count=views_count, mutations_count=mutations_count
             )
-            runner.run_batch(
+            run_fuzz_batch(
                 f"Suite 12b (Differential Fuzzer seed={s_val} sc={sc_idx} - PostgreSQL Row Triggers)",
                 s_pg,
                 v_pg,
@@ -6126,7 +6184,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
                 dialect=Dialect.POSTGRES,
                 pg_use_transition_tables=False,
             )
-            runner.run_batch(
+            run_fuzz_batch(
                 f"Suite 12c (Differential Fuzzer seed={s_val} sc={sc_idx} - PostgreSQL Transition Tables + Incremental)",
                 s_pg,
                 v_pg,
@@ -6142,7 +6200,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
             s_my, v_my, seed_my, m_my = fuzzer.generate_scenario(
                 sc_idx, Dialect.MYSQL, views_count=views_count, mutations_count=mutations_count
             )
-            runner.run_batch(
+            run_fuzz_batch(
                 f"Suite 12d (Differential Fuzzer seed={s_val} sc={sc_idx} - MySQL Incremental & Triggers)",
                 s_my,
                 v_my,
@@ -6165,7 +6223,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
                 f"columns={shape_var['column_counts']} fks={shape_var['foreign_key_count']} "
                 f"composite_pks={shape_var['composite_primary_key_tables']}"
             )
-            runner.run_batch(
+            run_fuzz_batch(
                 f"Suite 12e (Variable Schema seed={s_val} sc={sc_idx})",
                 s_var, v_var, seed_var, m_var, dialect=Dialect.SQLITE,
             )
