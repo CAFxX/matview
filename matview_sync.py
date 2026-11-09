@@ -3926,6 +3926,52 @@ class IncrementalViewCompiler:
             return "DOUBLE"
         return "REAL"
 
+    def _sum_result_storage_type(self, item: SelectItem) -> str:
+        """Preserve the engine's native SUM result type for direct numeric columns."""
+        source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
+        source_type = source.data_type.strip().upper() if source else ""
+        if not source_type:
+            return self._float_type()
+
+        is_approximate = any(token in source_type for token in ("FLOAT", "DOUBLE", "REAL"))
+        is_integer = any(
+            token in source_type
+            for token in ("TINYINT", "SMALLINT", "MEDIUMINT", "INTEGER", "INT", "BIGINT", "SERIAL")
+        )
+        is_exact_decimal = any(token in source_type for token in ("DECIMAL", "NUMERIC"))
+
+        if self.dialect == Dialect.MYSQL:
+            # MySQL SUM returns DECIMAL for exact-value arguments (integers
+            # included) and DOUBLE for approximate-value arguments.
+            if is_approximate:
+                return "DOUBLE"
+            if is_integer or is_exact_decimal:
+                match = re.search(
+                    r"\\b(?:DECIMAL|NUMERIC)\\s*\\(\\s*\\d+\\s*,\\s*(\\d+)\\s*\\)",
+                    source_type,
+                )
+                scale = int(match.group(1)) if match else 0
+                return f"DECIMAL(65, {scale})"
+        elif self.dialect == Dialect.POSTGRES:
+            # PostgreSQL widens smallint/integer SUM to bigint and bigint /
+            # numeric SUM to numeric; approximate SUM retains its input family.
+            if is_exact_decimal or "BIGINT" in source_type:
+                return "NUMERIC"
+            if is_integer:
+                return "BIGINT"
+            if "REAL" in source_type:
+                return "REAL"
+            if is_approximate:
+                return "DOUBLE PRECISION"
+        else:
+            if is_integer:
+                return "INTEGER"
+            if is_exact_decimal:
+                return "NUMERIC"
+            if is_approximate:
+                return "REAL"
+        return self._float_type()
+
     def _avg_result_storage_type(self, item: SelectItem) -> str:
         """Return the native engine's AVG result family for the argument type."""
         source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
@@ -4185,12 +4231,7 @@ class IncrementalViewCompiler:
         ):
             return "TEXT"
         if item.agg_func == AggFunc.SUM:
-            if item.arg_expr:
-                c_def = self._lookup_col_def(item.arg_expr)
-                if c_def and any(k in c_def.data_type.upper() for k in ("INT", "SERIAL")):
-                    if not any(op in item.arg_expr for op in (".", "/")):
-                        return self._int_type()
-            return self._float_type()
+            return self._sum_result_storage_type(item)
         if item.agg_func in (AggFunc.MIN, AggFunc.MAX) and item.arg_expr:
             c_def = self._lookup_col_def(item.arg_expr)
             if c_def:
