@@ -21,11 +21,13 @@ or `SQLITE_COMPAT_ENGINE` is set:
 from __future__ import annotations
 
 from decimal import Decimal
+from dataclasses import dataclass
 import json
 import math
 import os
 import re
 import sqlite3
+import struct
 import tempfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import warnings
@@ -107,8 +109,76 @@ def _row_sort_key(row: Sequence[Any]) -> Tuple[Any, ...]:
     return tuple(keys)
 
 
-def _numeric_values_equal(a: Any, b: Any, tol: float) -> bool:
-    """Compare numerics exactly unless a floating-point result requires tolerance."""
+@dataclass(frozen=True)
+class NumericTolerance:
+    """Explicit error budget for approximate floating-point result comparison.
+
+    Absolute and relative bounds are combined; an optional ULP bound provides
+    a scale-aware alternative for operations whose expected rounding error is
+    naturally measured in representable floating-point steps.
+    """
+
+    absolute: float = 0.0
+    relative: float = 0.0
+    max_ulps: int = 0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.absolute) or self.absolute < 0:
+            raise ValueError("absolute tolerance must be finite and non-negative")
+        if not math.isfinite(self.relative) or self.relative < 0:
+            raise ValueError("relative tolerance must be finite and non-negative")
+        if type(self.max_ulps) is not int or self.max_ulps < 0:
+            raise ValueError("max_ulps must be a non-negative integer")
+
+    @classmethod
+    def absolute_only(cls, value: float) -> "NumericTolerance":
+        # Compatibility for existing call sites using the historical tol arg.
+        return cls(absolute=value)
+
+    def allows_float_pair(self, a: float, b: float) -> bool:
+        difference = abs(a - b)
+        scale = max(abs(a), abs(b))
+        if difference <= self.absolute + self.relative * scale:
+            return True
+        if self.max_ulps:
+            return _float_ulp_distance(a, b) <= self.max_ulps
+        return False
+
+    def allows_float_decimal(self, floating: float, exact: Decimal) -> bool:
+        difference = abs(Decimal.from_float(floating) - exact)
+        scale = max(abs(Decimal.from_float(floating)), abs(exact))
+        bound = Decimal(str(self.absolute)) + Decimal(str(self.relative)) * scale
+        if difference <= bound:
+            return True
+        if self.max_ulps:
+            ulp = Decimal.from_float(math.ulp(floating))
+            return difference <= self.max_ulps * ulp
+        return False
+
+
+def _float_ulp_distance(a: float, b: float) -> int:
+    """Return the exact distance between finite IEEE-754 binary64 values."""
+    sign = 1 << 63
+    mask = (1 << 64) - 1
+
+    def ordered(value: float) -> int:
+        bits = struct.unpack(">Q", struct.pack(">d", value))[0]
+        return (~bits & mask) if bits & sign else (bits | sign)
+
+    return abs(ordered(a) - ordered(b))
+
+
+def _coerce_numeric_tolerance(tol: float | NumericTolerance) -> NumericTolerance:
+    if isinstance(tol, NumericTolerance):
+        return tol
+    if not math.isfinite(tol) or tol < 0:
+        raise ValueError("tol must be finite and non-negative")
+    return NumericTolerance.absolute_only(tol)
+
+
+def _numeric_values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
+    """Compare exact numerics exactly and floats under an explicit error budget."""
+    tolerance = _coerce_numeric_tolerance(tol)
     if isinstance(a, bool) or isinstance(b, bool):
         if isinstance(a, bool) and isinstance(b, bool):
             return a is b
@@ -129,7 +199,7 @@ def _numeric_values_equal(a: Any, b: Any, tol: float) -> bool:
             return math.isnan(a) and math.isnan(b)
         if math.isinf(a) or math.isinf(b):
             return a == b
-        return abs(a - b) <= tol
+        return tolerance.allows_float_pair(a, b)
 
     floating = a if isinstance(a, float) else b
     exact = b if isinstance(a, float) else a
@@ -151,10 +221,10 @@ def _numeric_values_equal(a: Any, b: Any, tol: float) -> bool:
         return exact.is_infinite() and exact.is_signed() == (floating < 0)
     if exact.is_nan() or exact.is_infinite():
         return False
-    return abs(Decimal.from_float(floating) - exact) <= Decimal(str(tol))
+    return tolerance.allows_float_decimal(floating, exact)
 
 
-def _values_equal(a: Any, b: Any, tol: float) -> bool:
+def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
     if a is None or b is None:
         return a is b
 
@@ -169,16 +239,15 @@ def _values_equal(a: Any, b: Any, tol: float) -> bool:
     return type(a) is type(b) and a == b
 
 
-def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]], tol: float = 1.5e-3) -> bool:
+def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]], tol: float | NumericTolerance = 1.5e-3) -> bool:
     """Compare unordered row multisets, preserving duplicates and exact numerics.
 
-    Integers and Decimal values are compared exactly. The absolute tolerance is
-    used only when at least one compared numeric value is a float. A sorted
-    comparison is the fast path; ambiguous approximate matches use a one-to-one
-    bipartite match so row order cannot create false negatives.
+    Integers and Decimal values are compared exactly against each other. A
+    NumericTolerance applies only when at least one compared value is a float.
+    A sorted comparison is the fast path; ambiguous approximate matches use a
+    one-to-one bipartite match so row order cannot create false negatives.
     """
-    if tol < 0:
-        raise ValueError("tol must be non-negative")
+    tolerance = _coerce_numeric_tolerance(tol)
     if len(rows_a) != len(rows_b):
         return False
 
@@ -186,7 +255,7 @@ def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]]
     sorted_b = sorted((tuple(row) for row in rows_b), key=_row_sort_key)
     if all(
         len(row_a) == len(row_b)
-        and all(_values_equal(a, b, tol) for a, b in zip(row_a, row_b))
+        and all(_values_equal(a, b, tolerance) for a, b in zip(row_a, row_b))
         for row_a, row_b in zip(sorted_a, sorted_b)
     ):
         return True
@@ -208,7 +277,7 @@ def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]]
             index
             for index, row_b in enumerate(sorted_b)
             if len(row_a) == len(row_b)
-            and all(_values_equal(a, b, tol) for a, b in zip(row_a, row_b))
+            and all(_values_equal(a, b, tolerance) for a, b in zip(row_a, row_b))
         ]
         if not candidates:
             return False
@@ -4959,6 +5028,41 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 tol=1.0,
             )
         )
+
+    def test_17_differential_oracle_supports_explicit_numeric_error_budgets(self) -> None:
+        absolute = NumericTolerance(absolute=1e-3)
+        self.assertTrue(_rows_equal([(1.0,)], [(1.0009,)], tol=absolute))
+        self.assertFalse(_rows_equal([(1.0,)], [(1.0011,)], tol=absolute))
+
+        relative = NumericTolerance(relative=1e-9)
+        self.assertTrue(_rows_equal([(1e9,)], [(1e9 + 0.5,)], tol=relative))
+        self.assertFalse(_rows_equal([(1e9,)], [(1e9 + 2.0,)], tol=relative))
+        self.assertFalse(_rows_equal([(1.0,)], [(1.0001,)], tol=relative))
+
+        one_ulp = NumericTolerance(max_ulps=1)
+        adjacent = math.nextafter(1.0, math.inf)
+        two_steps = math.nextafter(adjacent, math.inf)
+        self.assertTrue(_rows_equal([(1.0,)], [(adjacent,)], tol=one_ulp))
+        self.assertFalse(_rows_equal([(1.0,)], [(two_steps,)], tol=one_ulp))
+
+        # The approximate policy must never weaken exact integer comparison.
+        self.assertFalse(
+            _rows_equal([(2**53 + 1,)], [(float(2**53 + 1),)], tol=NumericTolerance(relative=1.0))
+        )
+        self.assertTrue(
+            _rows_equal(
+                [(Decimal("1000000000.05"),)],
+                [(1e9,)],
+                tol=NumericTolerance(relative=1e-10),
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            NumericTolerance(absolute=float("inf"))
+        with self.assertRaises(ValueError):
+            NumericTolerance(relative=-1.0)
+        with self.assertRaises(ValueError):
+            NumericTolerance(max_ulps=-1)
 
     def test_16_differential_oracle_preserves_types_and_row_multiplicity(self) -> None:
         self.assertFalse(_rows_equal([("1",)], [(1,)]))
