@@ -197,6 +197,12 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
 
+      - name: Verify actual PostgreSQL server version
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+          EXPECTED_PG_MAJOR: ${{ matrix.pg-version }}
+        run: python3 verify_engine_matrix.py
+
       - name: Run full test suite + live PostgreSQL ${{ matrix.pg-version }} integration tests
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
@@ -249,6 +255,15 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
 
+      - name: Verify actual MySQL server product and version
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          EXPECTED_MYSQL_PRODUCT: mysql
+          EXPECTED_MYSQL_VERSION: ${{ matrix.mysql-version }}
+          MATVIEW_CI_REQUESTED_IMAGE: mysql:${{ matrix.mysql-version }}
+          MATVIEW_CI_ACTUAL_IMAGE: mysql:${{ matrix.mysql-version }}
+        run: python3 verify_engine_matrix.py
+
       - name: Run full test suite + live MySQL ${{ matrix.mysql-version }} integration tests
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
@@ -264,10 +279,16 @@ jobs:
         include:
           - label: "MariaDB 10.11 LTS"
             image: "mariadb:10.11"
+            expected-product: "mariadb"
+            expected-version: "10.11"
           - label: "MariaDB 11.8 LTS"
             image: "mariadb:11.8"
+            expected-product: "mariadb"
+            expected-version: "11.8"
           - label: "MariaDB 12.3 LTS"
             image: "mariadb:12.3"
+            expected-product: "mariadb"
+            expected-version: "12.3"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -308,6 +329,15 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
+
+      - name: Verify actual MariaDB product and version
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          EXPECTED_MYSQL_PRODUCT: ${{ matrix.expected-product }}
+          EXPECTED_MYSQL_VERSION: ${{ matrix.expected-version }}
+          MATVIEW_CI_REQUESTED_IMAGE: ${{ matrix.image }}
+          MATVIEW_CI_ACTUAL_IMAGE: ${{ matrix.image }}
+        run: python3 verify_engine_matrix.py
 
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
