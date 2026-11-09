@@ -239,7 +239,7 @@ def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
     return type(a) is type(b) and a == b
 
 
-def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]], tol: float | NumericTolerance = 1.5e-3) -> bool:
+def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]], tol: float | NumericTolerance = 1.5e-3, *, column_tolerances: Optional[Sequence[NumericTolerance]] = None) -> bool:
     """Compare unordered row multisets, preserving duplicates and exact numerics.
 
     Integers and Decimal values are compared exactly against each other. A
@@ -251,13 +251,26 @@ def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]]
     if len(rows_a) != len(rows_b):
         return False
 
+    if column_tolerances is not None:
+        policies = tuple(column_tolerances)
+        if any(not isinstance(policy, NumericTolerance) for policy in policies):
+            raise TypeError("column_tolerances must contain NumericTolerance values")
+        if any(len(row) != len(policies) for rows in (rows_a, rows_b) for row in rows):
+            return False
+    else:
+        policies = None
+
+    def row_matches(row_a: Sequence[Any], row_b: Sequence[Any]) -> bool:
+        if len(row_a) != len(row_b):
+            return False
+        return all(
+            _values_equal(a, b, policies[index] if policies is not None else tolerance)
+            for index, (a, b) in enumerate(zip(row_a, row_b))
+        )
+
     sorted_a = sorted((tuple(row) for row in rows_a), key=_row_sort_key)
     sorted_b = sorted((tuple(row) for row in rows_b), key=_row_sort_key)
-    if all(
-        len(row_a) == len(row_b)
-        and all(_values_equal(a, b, tolerance) for a, b in zip(row_a, row_b))
-        for row_a, row_b in zip(sorted_a, sorted_b)
-    ):
+    if all(row_matches(row_a, row_b) for row_a, row_b in zip(sorted_a, sorted_b)):
         return True
 
     # Without floats, the comparison is an equivalence relation and the
@@ -276,8 +289,7 @@ def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]]
         candidates = [
             index
             for index, row_b in enumerate(sorted_b)
-            if len(row_a) == len(row_b)
-            and all(_values_equal(a, b, tolerance) for a, b in zip(row_a, row_b))
+            if row_matches(row_a, row_b)
         ]
         if not candidates:
             return False
@@ -5063,6 +5075,82 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             NumericTolerance(relative=-1.0)
         with self.assertRaises(ValueError):
             NumericTolerance(max_ulps=-1)
+
+    def test_18_differential_oracle_uses_independent_column_error_budgets(self) -> None:
+        rows_a = [
+            (3, 12.5, 0.125, "Group-A"),
+            (7, 1e9, 1e-300, "Group-B"),
+        ]
+        tiny = 1e-300
+        tiny_two_ulps = math.nextafter(math.nextafter(tiny, math.inf), math.inf)
+        rows_b = [
+            (3, 12.5000001, 0.12500000000000003, "Group-A"),
+            (7, 1e9 + 0.25, tiny_two_ulps, "Group-B"),
+        ]
+        policies = (
+            NumericTolerance(),  # COUNT-like exact integer output
+            NumericTolerance(relative=1e-8),  # SUM-like approximate output
+            NumericTolerance(max_ulps=2),  # small-magnitude arithmetic output
+            NumericTolerance(),  # grouping text remains exact
+        )
+        self.assertTrue(_rows_equal(rows_a, rows_b, column_tolerances=policies))
+        self.assertFalse(
+            _rows_equal(
+                rows_a,
+                [(3.5, 12.5000001, 0.12500000000000003, "Group-A"),
+                 (7, 1e9 + 0.25, tiny_two_ulps, "Group-B")],
+                column_tolerances=policies,
+            )
+        )
+        self.assertFalse(
+            _rows_equal(
+                rows_a,
+                [(3, 12.5000001, 0.12500000000000003, "group-a"),
+                 (7, 1e9 + 0.25, tiny_two_ulps, "Group-B")],
+                column_tolerances=policies,
+            )
+        )
+        with self.assertRaises(TypeError):
+            _rows_equal([(1,)], [(1,)], column_tolerances=(1e-3,))  # type: ignore[arg-type]
+
+    def test_19_differential_oracle_numeric_adversarial_boundaries(self) -> None:
+        exact = NumericTolerance()
+        # Signed/unsigned integer extremes and adjacent large Decimal values.
+        self.assertTrue(_rows_equal([(-(2**63),), (2**64 - 1,)], [(2**64 - 1,), (-(2**63),)], tol=exact))
+        self.assertFalse(_rows_equal([(Decimal("1" + ("0" * 100) + "1"),)], [(Decimal("1" + ("0" * 100)),)], tol=exact))
+        self.assertFalse(_rows_equal([(Decimal("1.00000000000000000001"),)], [(Decimal("1.00000000000000000002"),)], tol=exact))
+
+        # The exact comparator must distinguish finite extrema, subnormals,
+        # overflow to infinity, and adjacent representable values.
+        smallest = float.fromhex("0x0.0000000000001p-1022")
+        largest = float.fromhex("0x1.fffffffffffffp+1023")
+        self.assertFalse(_rows_equal([(smallest,)], [(0.0,)], tol=exact))
+        self.assertFalse(_rows_equal([(largest,)], [(float("inf"),)], tol=exact))
+        two_ulps_above = math.nextafter(
+            math.nextafter(math.nextafter(1.0, math.inf), math.inf), math.inf
+        )
+        self.assertFalse(
+            _rows_equal(
+                [(math.nextafter(1.0, math.inf),)],
+                [(two_ulps_above,)],
+                tol=NumericTolerance(max_ulps=1),
+            )
+        )
+        self.assertTrue(_rows_equal([(-0.0,)], [(0.0,)], tol=exact))
+        self.assertTrue(_rows_equal([(float("nan"),)], [(float("nan"),)], tol=exact))
+
+        # Cancellation and high-offset cases require a caller-selected absolute
+        # budget; a relative-only tolerance cannot hide a near-zero discrepancy.
+        cancellation = NumericTolerance(absolute=1e-12)
+        self.assertTrue(_rows_equal([(1e-13,)], [(-1e-13,)], tol=cancellation))
+        self.assertFalse(_rows_equal([(1e-13,)], [(1e-9,)], tol=cancellation))
+        high_offset = NumericTolerance(relative=1e-12)
+        self.assertTrue(_rows_equal([(1e12,)], [(1e12 + 0.5,)], tol=high_offset))
+        self.assertFalse(_rows_equal([(1e12,)], [(1e12 + 2.0,)], tol=high_offset))
+
+        # Collation-equivalent strings are not silently collapsed by the oracle.
+        self.assertFalse(_rows_equal([("Résumé",)], [("résumé",)], tol=exact))
+        self.assertFalse(_rows_equal([("é",)], [("e\\u0301",)], tol=exact))
 
     def test_16_differential_oracle_preserves_types_and_row_multiplicity(self) -> None:
         self.assertFalse(_rows_equal([("1",)], [(1,)]))
