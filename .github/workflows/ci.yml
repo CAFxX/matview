@@ -76,13 +76,79 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # Only an explicitly whitelisted documentation-only PR may skip the matrix.
+  # Other events (including merge_group) always run the full required CI gate.
+  classify:
+    name: Classify changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.paths.outputs.docs_only }}
+    steps:
+      - name: Classify pull request paths
+        id: paths
+        uses: actions/github-script@v8
+        with:
+          script: |
+            if (context.eventName !== "pull_request") {
+              core.setOutput("docs_only", "false");
+              return;
+            }
+
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                per_page: 100,
+              }
+            );
+
+            // Keep this whitelist conservative: source, tests, workflows,
+            // dependency/build configuration, generated artifacts, and
+            // executable examples all force the normal matrix.
+            const documentationPaths = [
+              /^README(?:\.(?:md|mdx|rst|txt))?$/i,
+              /^AGENTS\.md$/i,
+              /^TODO\.md$/i,
+              /^CHANGELOG(?:\.(?:md|mdx|rst|txt))?$/i,
+              /^CONTRIBUTING(?:\.(?:md|mdx|rst|txt))?$/i,
+              /^CODE_OF_CONDUCT\.md$/i,
+              /^SECURITY\.md$/i,
+              /^LICENSE(?:\.(?:md|rst|txt))?$/i,
+              /^docs\/.*\.(?:md|mdx|rst|txt|png|jpe?g|gif|webp|svg|pdf|ico)$/i,
+              /^\.github\/.*\.md$/i,
+            ];
+
+            const docsOnly =
+              files.length > 0 &&
+              files.length < 3000 &&
+              files.every(file =>
+                documentationPaths.some(pattern => pattern.test(file.filename))
+              );
+
+            core.setOutput("docs_only", docsOnly ? "true" : "false");
+            core.info(`Classified ${files.length} changed path(s): docs_only=${docsOnly}`);
+
+  docs-only:
+    name: Documentation-only fast path
+    needs: classify
+    if: needs.classify.outputs.docs_only == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Accept the whitelisted documentation-only change
+        run: echo "Only explicitly whitelisted documentation paths changed."
+
   # Standard-library SQLite at the oldest and newest supported CPython ends.
   sqlite:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     name: SQLite 3 (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
@@ -130,6 +196,8 @@ jobs:
 
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
@@ -187,6 +255,8 @@ jobs:
 
   # Oldest and newest supported upstream PostgreSQL major versions.
   postgres:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     name: PostgreSQL ${{ matrix.pg-version }}
     runs-on: ubuntu-latest
     strategy:
@@ -243,6 +313,8 @@ jobs:
 
   # Both supported Oracle MySQL LTS series are required on every PR.
   mysql:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     name: MySQL ${{ matrix.mysql-version }}
     runs-on: ubuntu-latest
     strategy:
@@ -313,6 +385,8 @@ jobs:
 
   # Representative LTS boundaries for MariaDB: oldest, previous, newest LTS.
   mysql-compat:
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
@@ -401,6 +475,8 @@ jobs:
     name: CI success
     if: ${{ always() }}
     needs:
+      - classify
+      - docs-only
       - sqlite
       - sqlite-compat
       - postgres
@@ -418,15 +494,24 @@ jobs:
           import sys
 
           results = json.loads(os.environ["NEEDS_JSON"])
+          docs_only = results["classify"]["outputs"].get("docs_only") == "true"
+          required_jobs = (
+              ["classify", "docs-only"]
+              if docs_only
+              else ["classify", "sqlite", "sqlite-compat", "postgres", "mysql", "mysql-compat"]
+          )
           unsuccessful = {
-              name: result["result"]
-              for name, result in results.items()
-              if result["result"] != "success"
+              name: results[name]["result"]
+              for name in required_jobs
+              if results[name]["result"] != "success"
           }
           if unsuccessful:
               for name, result in sorted(unsuccessful.items()):
                   print(f"::error::{name} did not succeed (result: {result})")
               sys.exit(1)
 
-          print(f"All {len(results)} required CI jobs succeeded.")
+          if docs_only:
+              print("Documentation-only PR: matrix skipped; docs-only gate succeeded.")
+          else:
+              print("All required CI jobs succeeded.")
           PY
