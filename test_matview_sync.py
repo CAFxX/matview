@@ -5565,10 +5565,18 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(len(campaign), 12)
         self.assertGreaterEqual(coverage["distinct_structures"], 10)
         self.assertGreaterEqual(coverage["feature_count"], 15)
-        self.assertTrue({"add", "multiply", "case", "coalesce", "literal"} <= expression_coverage)
+        self.assertTrue({
+            "add", "safe_subtract", "multiply", "divide", "modulo",
+            "abs", "round", "case", "coalesce", "literal",
+        } <= expression_coverage)
         self.assertTrue(
-            {"and", "or", "not", "id_eq", "id_between", "qty_null", "qty_ge",
-             "amount_le", "label_null", "label_eq"} <= predicate_coverage
+            {
+                "and", "or", "not",
+                "id_eq", "id_ne", "id_gt", "id_lt", "id_between", "id_in",
+                "qty_null", "qty_not_null", "qty_ge", "qty_le", "qty_between",
+                "amount_null", "amount_le", "amount_gt",
+                "label_null", "label_eq", "label_ne", "label_like",
+            } <= predicate_coverage
         )
 
     def test_variable_schema_fuzzer_executes_across_dialects(self) -> None:
@@ -6375,7 +6383,9 @@ class VariableSchemaDifferentialFuzzer:
         if kind == "abs":
             return f"ABS({VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])})"
         if kind == "round":
-            return f"ROUND({VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])}, {node[2]})"
+            # One-argument ROUND is supported for both exact and approximate
+            # numeric inputs on SQLite, PostgreSQL, MySQL and MariaDB.
+            return f"ROUND({VariableSchemaDifferentialFuzzer._render_numeric_expr(node[1])})"
         if kind == "case":
             return (
                 f"(CASE WHEN {VariableSchemaDifferentialFuzzer._render_predicate(node[1])} "
