@@ -3926,11 +3926,57 @@ class IncrementalViewCompiler:
             return "DOUBLE"
         return "REAL"
 
-    def _var_accum_type(self) -> str:
+    def _avg_result_storage_type(self, item: SelectItem) -> str:
+        """Return the native engine's AVG result family for the argument type."""
+        source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
+        source_type = source.data_type.strip().upper() if source else ""
+        is_exact_numeric = bool(
+            source_type
+            and any(token in source_type for token in ("INT", "DECIMAL", "NUMERIC", "SMALLINT", "BIGINT"))
+            and not any(token in source_type for token in ("FLOAT", "DOUBLE", "REAL"))
+        )
+
+        if self.dialect == Dialect.POSTGRES:
+            # PostgreSQL AVG(smallint/integer/bigint/numeric) returns NUMERIC;
+            # AVG(real/double precision) returns DOUBLE PRECISION.
+            return "NUMERIC" if is_exact_numeric else "DOUBLE PRECISION"
+        if self.dialect == Dialect.MYSQL:
+            # MySQL returns DECIMAL for exact-value arguments (including
+            # integers), and DOUBLE for approximate-value arguments. The
+            # default div_precision_increment contributes four fractional
+            # digits to AVG's result scale.
+            if is_exact_numeric:
+                match = re.search(
+                    r"\\b(?:DECIMAL|NUMERIC)\\s*\\(\\s*\\d+\\s*,\\s*(\\d+)\\s*\\)",
+                    source_type,
+                )
+                input_scale = int(match.group(1)) if match else 0
+                result_scale = min(30, max(4, input_scale + 4))
+                return f"DECIMAL(65, {result_scale})"
+            return self._float_type()
+        # SQLite AVG() returns REAL, including for integer inputs.
+        return self._float_type()
+
+    def _var_accum_type(
+        self, item: Optional[SelectItem] = None, *, squared: bool = False
+    ) -> str:
         if self.dialect == Dialect.POSTGRES:
             return "NUMERIC"
         elif self.dialect == Dialect.MYSQL:
-            return "DECIMAL(65, 12)"
+            scale = 12
+            if item is not None and item.arg_expr:
+                source = self._lookup_col_def(item.arg_expr)
+                if source:
+                    match = re.search(
+                        r"\\b(?:DECIMAL|NUMERIC)\\s*\\(\\s*\\d+\\s*,\\s*(\\d+)\\s*\\)",
+                        source.data_type,
+                        flags=re.IGNORECASE,
+                    )
+                    if match:
+                        scale = max(scale, int(match.group(1)))
+            if squared:
+                scale = min(30, max(12, scale * 2))
+            return f"DECIMAL(65, {scale})"
         return "REAL"
 
     def _var_sq_sql(self, expr: str) -> str:
@@ -4120,8 +4166,9 @@ class IncrementalViewCompiler:
             return self._int_type()
         if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
             return "BOOLEAN" if self.dialect == Dialect.POSTGRES else "INTEGER"
+        if item.agg_func == AggFunc.AVG:
+            return self._avg_result_storage_type(item)
         if item.agg_func in (
-            AggFunc.AVG,
             AggFunc.TOTAL,
             AggFunc.VAR_POP,
             AggFunc.VAR_SAMP,
@@ -4924,9 +4971,11 @@ class IncrementalViewCompiler:
                 return f"TOTAL({dist}{eff})"
             return f"COALESCE(1.0 * SUM({dist}{eff}), 0.0)"
         if item.agg_func == AggFunc.AVG:
-            if self.dialect == Dialect.SQLITE:
-                return f"AVG({dist}{eff})"
-            return f"AVG(1.0 * ({dist}{eff}))" if not item.is_distinct else f"AVG({dist}{eff})"
+            # Preserve the argument's SQL type: MySQL AVG(exact) returns
+            # DECIMAL, PostgreSQL AVG(integer/numeric) returns NUMERIC, while
+            # approximate arguments remain floating-point. Multiplying by 1.0
+            # would silently convert MySQL exact AVG into DOUBLE.
+            return f"AVG({dist}{eff})"
         if item.agg_func == AggFunc.MIN:
             return f"MIN({eff})"
         if item.agg_func == AggFunc.MAX:
@@ -5123,7 +5172,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
                     col_sum_map[ekey] = sum_col
-                    col_defs_sql.append(f"{sum_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
 
             if item.agg_func in (
                 AggFunc.VAR_POP,
@@ -5136,7 +5185,7 @@ class IncrementalViewCompiler:
                     s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
                     sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
                     col_sum2_map[ekey] = sum2_col
-                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
 
             if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
                 if ekey not in col_true_cnt_map:
@@ -7156,7 +7205,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
                     col_sum_map[ekey] = sum_col
-                    col_defs_sql.append(f"{sum_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
 
             if item.agg_func in (
                 AggFunc.VAR_POP,
@@ -7169,7 +7218,7 @@ class IncrementalViewCompiler:
                     s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
                     sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
                     col_sum2_map[ekey] = sum2_col
-                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
 
             if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
                 if ekey not in col_true_cnt_map:
@@ -8509,7 +8558,7 @@ class IncrementalViewCompiler:
                     aux_idx += 1
                     sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
                     col_sum_map[ekey] = sum_col
-                    col_defs_sql.append(f"{sum_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
 
             if item.agg_func in (
                 AggFunc.VAR_POP,
@@ -8522,7 +8571,7 @@ class IncrementalViewCompiler:
                     s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
                     sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
                     col_sum2_map[ekey] = sum2_col
-                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type()}")
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
 
             if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
                 if ekey not in col_true_cnt_map:
