@@ -6046,20 +6046,13 @@ class IncrementalViewCompiler:
                 AggFunc.STDDEV_POP,
                 AggFunc.STDDEV_SAMP,
             ):
-                cnt_col = col_nonnull_count_map[ekey]
-                sum_col = col_sum_map[ekey]
-                sum2_col = col_sum2_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
-                new_sum = _plus_sum_expr(item, sum_col)
-                new_sum2 = _plus_sum2_expr(item, sum2_col)
-                formula = self._variance_formula_sql(
-                    new_cnt=new_cnt,
-                    new_sum=new_sum,
-                    new_sum2=new_sum2,
-                    is_sample=item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
-                    is_stddev=item.agg_func in (AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP),
-                )
-                update_assignments.append(f"{col_alias} = {formula}")
+                # Backfill uses the engine's native statistical aggregate.
+                # A Welford/raw-moment delta update uses a different floating
+                # operation order and is not bit-identical for approximate
+                # inputs. Re-evaluate the affected group with the same native
+                # aggregate so the materialized result matches the live view.
+                recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomputed}")
             elif item.agg_func == AggFunc.MIN:
                 update_assignments.append(
                     f"{col_alias} = CASE "
@@ -6348,20 +6341,8 @@ class IncrementalViewCompiler:
                 AggFunc.STDDEV_POP,
                 AggFunc.STDDEV_SAMP,
             ):
-                cnt_col = col_nonnull_count_map[ekey]
-                sum_col = col_sum_map[ekey]
-                sum2_col = col_sum2_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
-                new_sum = _minus_sum_expr(item, sum_col, cnt_col)
-                new_sum2 = _minus_sum2_expr(item, sum2_col, cnt_col)
-                formula = self._variance_formula_sql(
-                    new_cnt=new_cnt,
-                    new_sum=new_sum,
-                    new_sum2=new_sum2,
-                    is_sample=item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
-                    is_stddev=item.agg_func in (AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP),
-                )
-                update_assignments.append(f"{col_alias} = {formula}")
+                recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomputed}")
             elif item.agg_func == AggFunc.MIN:
                 recomp = self._build_recompute_subquery_raw(item, record_prefix)
                 update_assignments.append(
@@ -7423,6 +7404,29 @@ class IncrementalViewCompiler:
             expr_key_fn=_expr_key,
             use_mysql_values=(self.dialect == Dialect.MYSQL),
         )
+        # Existing join groups must use the same native aggregate as SELECT;
+        # merging floating moment states changes operation order and result bits.
+        statistical_aliases = {
+            self._q(item.alias)
+            for item in work_items
+            if item.is_aggregate and item.agg_func in (
+                AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+            )
+        }
+        if statistical_aliases:
+            plus_merge_assignments = [
+                assignment for assignment in plus_merge_assignments
+                if assignment.split("=", 1)[0].strip() not in statistical_aliases
+            ]
+            for item in work_items:
+                if item.is_aggregate and item.agg_func in (
+                    AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                    AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                ):
+                    plus_merge_assignments.append(
+                        f"{self._q(item.alias)} = {_build_join_recompute_subquery(item)}"
+                    )
 
         # Build minus assignments from `__mv_delta`
         minus_assignments: List[str] = []
@@ -7474,20 +7478,8 @@ class IncrementalViewCompiler:
                 AggFunc.STDDEV_POP,
                 AggFunc.STDDEV_SAMP,
             ):
-                cnt_c = col_nonnull_count_map[ekey]
-                sum_c = col_sum_map[ekey]
-                sum2_c = col_sum2_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
-                new_sum = _delta_sum_minus(sum_c, cnt_c)
-                new_sum2 = _delta_sum2_minus(ekey, sum2_c, cnt_c)
-                formula = self._variance_formula_sql(
-                    new_cnt=new_cnt,
-                    new_sum=new_sum,
-                    new_sum2=new_sum2,
-                    is_sample=item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
-                    is_stddev=item.agg_func in (AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP),
-                )
-                minus_assignments.append(f"{c} = {formula}")
+                recomputed = _build_join_recompute_subquery(item)
+                minus_assignments.append(f"{c} = {recomputed}")
             elif item.agg_func == AggFunc.MIN:
                 recomp = _build_join_recompute_subquery(item)
                 minus_assignments.append(
