@@ -5370,6 +5370,44 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         with self.assertRaises(ValueError):
             _rows_equal([(1.0,)], [(1.0,)], tol=-1.0)
 
+    def test_22_avg_backing_types_preserve_native_engine_result_families(self) -> None:
+        schema = """
+        CREATE TABLE avg_source (
+            id INTEGER PRIMARY KEY,
+            whole INTEGER,
+            exact_value DECIMAL(18, 8),
+            approximate_value DOUBLE PRECISION
+        );
+        """
+        view = """
+        CREATE VIEW avg_types AS
+        SELECT AVG(whole) AS avg_integer,
+               AVG(exact_value) AS avg_decimal,
+               AVG(approximate_value) AS avg_approximate
+        FROM avg_source;
+        """
+
+        mysql = generate_materialized_view(schema, view, dialect="mysql")
+        self.assertIn("avg_integer DECIMAL(65, 4)", mysql.backing_table_ddl)
+        self.assertIn("avg_decimal DECIMAL(65, 12)", mysql.backing_table_ddl)
+        self.assertIn("avg_approximate DOUBLE", mysql.backing_table_ddl.upper())
+
+        postgres = generate_materialized_view(schema, view, dialect="postgres")
+        self.assertIn("avg_integer NUMERIC", postgres.backing_table_ddl)
+        self.assertIn("avg_decimal NUMERIC", postgres.backing_table_ddl)
+        self.assertIn("avg_approximate DOUBLE PRECISION", postgres.backing_table_ddl)
+
+        sqlite = generate_materialized_view(schema, view, dialect="sqlite")
+        self.assertIn("avg_integer REAL", sqlite.backing_table_ddl)
+        self.assertIn("avg_decimal REAL", sqlite.backing_table_ddl)
+        self.assertIn("avg_approximate REAL", sqlite.backing_table_ddl)
+
+        # Exact-value AVG must never be forced to DOUBLE in its population SQL.
+        mysql_population = "\\n".join(mysql.initial_populate_sqls)
+        self.assertIn("AVG(whole)", mysql_population)
+        self.assertIn("AVG(exact_value)", mysql_population)
+        self.assertNotIn("AVG(1.0 *", mysql_population)
+
     def test_limited_plan_helper_checks_default_contract_before_override(self) -> None:
         schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);"
         supported, was_overridden, codes = _compile_plan_for_test(
