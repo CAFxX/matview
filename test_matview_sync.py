@@ -279,13 +279,33 @@ def _query_column_tolerances(select_sql: str) -> Optional[Tuple[NumericTolerance
     if select is None or not select.expressions:
         return None
 
+    # A top-level star expands to an unknown number of result columns. COUNT(*)
+    # is an aggregate expression, not a top-level star, and remains supported.
+    for projection in select.expressions:
+        if isinstance(projection, sqlglot_exp.Star):
+            return None
+        if (
+            isinstance(projection, sqlglot_exp.Column)
+            and isinstance(projection.this, sqlglot_exp.Star)
+        ):
+            return None
+
     policies: List[NumericTolerance] = []
+    scalar_arithmetic_names = {
+        "ADD", "SUB", "MUL", "DIV", "POW", "SQRT", "POWER",
+        "EXP", "LN", "LOG", "LOG2", "LOG10", "SIN", "COS", "TAN",
+    }
+    scalar_arithmetic = NumericTolerance(
+        absolute=1e-12, relative=4.5e-16, max_ulps=4
+    )
     for projection in select.expressions:
         matching = [
             _AGGREGATE_NUMERIC_TOLERANCES[node.sql_name().upper()]
             for node in projection.find_all(sqlglot_exp.AggFunc)
             if node.sql_name().upper() in _AGGREGATE_NUMERIC_TOLERANCES
         ]
+        if any(type(node).__name__.upper() in scalar_arithmetic_names for node in projection.walk()):
+            matching.append(scalar_arithmetic)
         if matching:
             policies.append(
                 NumericTolerance(
@@ -5176,6 +5196,19 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         with self.assertRaises(TypeError):
             _rows_equal([(1,)], [(1,)], column_tolerances=(1e-3,))  # type: ignore[arg-type]
+
+    def test_query_oracle_tolerance_inference_handles_stars_and_scalar_ops(self) -> None:
+        self.assertIsNone(_query_column_tolerances("SELECT * FROM items"))
+        self.assertIsNone(_query_column_tolerances("SELECT i.* FROM items AS i"))
+        count_policy = _query_column_tolerances("SELECT COUNT(*) FROM items")
+        self.assertEqual(count_policy, (NumericTolerance(),))
+        arithmetic = _query_column_tolerances("SELECT amount * 1.25 AS scaled FROM items")
+        self.assertEqual(arithmetic, (NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=4),))
+        arithmetic_aggregate = _query_column_tolerances("SELECT SUM(amount * 1.25) FROM items")
+        self.assertEqual(
+            arithmetic_aggregate,
+            (_AGGREGATE_NUMERIC_TOLERANCES["SUM"],),
+        )
 
     def test_20_differential_oracle_derives_tolerances_from_select_operations(self) -> None:
         policies = _query_column_tolerances(
