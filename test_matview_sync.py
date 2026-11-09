@@ -5081,9 +5081,11 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             (3, 12.5, 0.125, "Group-A"),
             (7, 1e9, 1e-300, "Group-B"),
         ]
+        tiny = 1e-300
+        tiny_two_ulps = math.nextafter(math.nextafter(tiny, math.inf), math.inf)
         rows_b = [
             (3, 12.5000001, 0.12500000000000003, "Group-A"),
-            (7, 1e9 + 0.25, 1.0001e-300, "Group-B"),
+            (7, 1e9 + 0.25, tiny_two_ulps, "Group-B"),
         ]
         policies = (
             NumericTolerance(),  # COUNT-like exact integer output
@@ -5096,7 +5098,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             _rows_equal(
                 rows_a,
                 [(3.5, 12.5000001, 0.12500000000000003, "Group-A"),
-                 (7, 1e9 + 0.25, 1.0001e-300, "Group-B")],
+                 (7, 1e9 + 0.25, tiny_two_ulps, "Group-B")],
                 column_tolerances=policies,
             )
         )
@@ -5104,7 +5106,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             _rows_equal(
                 rows_a,
                 [(3, 12.5000001, 0.12500000000000003, "group-a"),
-                 (7, 1e9 + 0.25, 1.0001e-300, "Group-B")],
+                 (7, 1e9 + 0.25, tiny_two_ulps, "Group-B")],
                 column_tolerances=policies,
             )
         )
@@ -5115,7 +5117,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         exact = NumericTolerance()
         # Signed/unsigned integer extremes and adjacent large Decimal values.
         self.assertTrue(_rows_equal([(-(2**63),), (2**64 - 1,)], [(2**64 - 1,), (-(2**63),)], tol=exact))
-        self.assertFalse(_rows_equal([(Decimal("1" + ("0" * 100) + "1")),], [(Decimal("1" + ("0" * 100))),], tol=exact))
+        self.assertFalse(_rows_equal([(Decimal("1" + ("0" * 100) + "1"),)], [(Decimal("1" + ("0" * 100)),)], tol=exact))
         self.assertFalse(_rows_equal([(Decimal("1.00000000000000000001"),)], [(Decimal("1.00000000000000000002"),)], tol=exact))
 
         # The exact comparator must distinguish finite extrema, subnormals,
