@@ -113,6 +113,9 @@ jobs:
       - name: Test recursive SELECT AST generator
         run: python3 test_query_ast_fuzzer.py
 
+      - name: Differentially test generated SELECT materialized views
+        run: python3 test_query_ast_materialization.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     name: ${{ matrix.label }}
