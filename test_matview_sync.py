@@ -2772,7 +2772,9 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
         "CREATE VIEW s1_avg_native_types AS "
         "SELECT grp, SUM(whole) AS sum_integer, SUM(exact_value) AS sum_decimal, "
         "AVG(whole) AS avg_integer, AVG(exact_value) AS avg_decimal, "
-        "AVG(approx_value) AS avg_approximate FROM avg_precision GROUP BY grp;",
+        "AVG(approx_value) AS avg_approximate, VAR_POP(exact_value) AS variance_decimal, "
+        "STDDEV_SAMP(exact_value) AS stddev_decimal, "
+        "VAR_POP(approx_value) AS variance_approximate FROM avg_precision GROUP BY grp;",
     ))
     runner.run_batch("Suite 1 (Single-Table Algebraic Aggregates)", schema, views, seed, mutations)
 
@@ -5386,7 +5388,10 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                SUM(exact_value) AS sum_decimal,
                AVG(whole) AS avg_integer,
                AVG(exact_value) AS avg_decimal,
-               AVG(approximate_value) AS avg_approximate
+               AVG(approximate_value) AS avg_approximate,
+               VAR_POP(exact_value) AS variance_decimal,
+               STDDEV_SAMP(exact_value) AS stddev_decimal,
+               VAR_POP(approximate_value) AS variance_approximate
         FROM avg_source;
         """
 
@@ -5396,6 +5401,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("avg_integer DECIMAL(65, 4)", mysql.backing_table_ddl)
         self.assertIn("avg_decimal DECIMAL(65, 12)", mysql.backing_table_ddl)
         self.assertIn("AVG_APPROXIMATE DOUBLE", mysql.backing_table_ddl.upper())
+        self.assertIn("VARIANCE_DECIMAL DOUBLE", mysql.backing_table_ddl.upper())
+        self.assertIn("STDDEV_DECIMAL DOUBLE", mysql.backing_table_ddl.upper())
+        self.assertIn("VARIANCE_APPROXIMATE DOUBLE", mysql.backing_table_ddl.upper())
 
         postgres = generate_materialized_view(schema, view, dialect="postgres")
         self.assertIn("sum_integer BIGINT", postgres.backing_table_ddl)
@@ -5403,6 +5411,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("avg_integer NUMERIC", postgres.backing_table_ddl)
         self.assertIn("avg_decimal NUMERIC", postgres.backing_table_ddl)
         self.assertIn("avg_approximate DOUBLE PRECISION", postgres.backing_table_ddl)
+        self.assertIn("variance_decimal NUMERIC", postgres.backing_table_ddl)
+        self.assertIn("stddev_decimal NUMERIC", postgres.backing_table_ddl)
+        self.assertIn("variance_approximate DOUBLE PRECISION", postgres.backing_table_ddl)
 
         sqlite = generate_materialized_view(schema, view, dialect="sqlite")
         self.assertIn("sum_integer INTEGER", sqlite.backing_table_ddl)
@@ -5410,6 +5421,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("avg_integer REAL", sqlite.backing_table_ddl)
         self.assertIn("avg_decimal REAL", sqlite.backing_table_ddl)
         self.assertIn("avg_approximate REAL", sqlite.backing_table_ddl)
+        self.assertIn("variance_decimal REAL", sqlite.backing_table_ddl)
+        self.assertIn("stddev_decimal REAL", sqlite.backing_table_ddl)
+        self.assertIn("variance_approximate REAL", sqlite.backing_table_ddl)
 
         # Exact-value AVG must never be forced to DOUBLE in its population SQL.
         mysql_population = "\\n".join(mysql.initial_populate_sqls)
