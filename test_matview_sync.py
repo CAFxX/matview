@@ -5390,7 +5390,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         mysql = generate_materialized_view(schema, view, dialect="mysql")
         self.assertIn("avg_integer DECIMAL(65, 4)", mysql.backing_table_ddl)
         self.assertIn("avg_decimal DECIMAL(65, 12)", mysql.backing_table_ddl)
-        self.assertIn("avg_approximate DOUBLE", mysql.backing_table_ddl.upper())
+        self.assertIn("AVG_APPROXIMATE DOUBLE", mysql.backing_table_ddl.upper())
 
         postgres = generate_materialized_view(schema, view, dialect="postgres")
         self.assertIn("avg_integer NUMERIC", postgres.backing_table_ddl)
