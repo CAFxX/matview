@@ -3972,6 +3972,25 @@ class IncrementalViewCompiler:
                 return "REAL"
         return self._float_type()
 
+    def _statistical_result_storage_type(self, item: SelectItem) -> str:
+        """Match native VAR/STDDEV result types for exact versus approximate inputs."""
+        source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
+        source_type = source.data_type.strip().upper() if source else ""
+        is_exact_numeric = bool(
+            source_type
+            and any(token in source_type for token in ("INT", "DECIMAL", "NUMERIC", "SERIAL"))
+            and not any(token in source_type for token in ("FLOAT", "DOUBLE", "REAL"))
+        )
+        if self.dialect == Dialect.POSTGRES:
+            # PostgreSQL statistical aggregates over integer/numeric inputs
+            # return NUMERIC; floating inputs return DOUBLE PRECISION.
+            return "NUMERIC" if is_exact_numeric else "DOUBLE PRECISION"
+        if self.dialect == Dialect.MYSQL:
+            # MySQL VAR_POP / STDDEV_* return DOUBLE for both exact and
+            # approximate numeric argument families.
+            return "DOUBLE"
+        return "REAL"
+
     def _avg_result_storage_type(self, item: SelectItem) -> str:
         """Return the native engine's AVG result family for the argument type."""
         source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
@@ -4214,14 +4233,15 @@ class IncrementalViewCompiler:
             return "BOOLEAN" if self.dialect == Dialect.POSTGRES else "INTEGER"
         if item.agg_func == AggFunc.AVG:
             return self._avg_result_storage_type(item)
+        if item.agg_func == AggFunc.TOTAL:
+            return self._float_type()
         if item.agg_func in (
-            AggFunc.TOTAL,
             AggFunc.VAR_POP,
             AggFunc.VAR_SAMP,
             AggFunc.STDDEV_POP,
             AggFunc.STDDEV_SAMP,
         ):
-            return self._float_type()
+            return self._statistical_result_storage_type(item)
         if item.agg_func in (
             AggFunc.GROUP_CONCAT,
             AggFunc.STRING_AGG,
