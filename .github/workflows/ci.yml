@@ -107,6 +107,9 @@ jobs:
       - name: Run full test suite (SQLite + cross-dialect transpiled suites)
         run: python3 test_matview_sync.py
 
+      - name: Test independent-session backfill concurrency
+        run: python3 test_concurrent_backfill.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     name: ${{ matrix.label }}

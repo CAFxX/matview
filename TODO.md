@@ -89,6 +89,7 @@ The existing differential-testing harness is useful, but its current headline co
   - Do not let broad differential suites suppress EngineLimitationWarning and thereby stand in for tests of the default safety contract.
 
 - [ ] **Add Genuine Multi-Connection Concurrency and Isolation Tests**:
+  - Progress: A focused file-backed SQLite test now performs INSERT/UPDATE/DELETE from a second thread and independent connection after a committed backfill chunk, exercises rows on both sides of the watermark, checks rollback of trigger effects, and compares the final materialized result. This is real independent-session interleaving on SQLite, not simultaneous statement execution; native PostgreSQL/MySQL isolation, broader race windows, and stress coverage remain outstanding.
   - Use independent database connections/processes and synchronization barriers; do not describe same-connection callback interleaving as concurrent DML.
   - Exercise writes immediately before/during/after trigger installation, initial backfill, every chunk boundary, watermark advancement, and finalization.
   - Cover concurrent INSERT/UPDATE/DELETE, key changes, rows on both sides of the watermark, commits, rollbacks, reader visibility, and competing writers.
