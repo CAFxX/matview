@@ -5612,8 +5612,8 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("coalesce(bit_or_value, cast(0 as unsigned))", reader_sql)
         self.assertIn("coalesce(bit_xor_value, cast(0 as unsigned))", reader_sql)
 
-        # MariaDB's VAR/STDDEV result metadata uses input-scale + 4 for exact
-        # decimals (or four places for integer inputs); MySQL keeps full DOUBLE.
+        # MariaDB's VAR/STDDEV result metadata uses input-scale plus the
+        # session div_precision_increment for exact inputs; MySQL keeps full DOUBLE.
         mariadb_variance_schema = """
         CREATE TABLE variance_values (
             id INTEGER PRIMARY KEY,
@@ -5638,10 +5638,45 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         mariadb_reader_sql = (mariadb_variance.reader_view_ddl or "").lower().replace("`", "")
         self.assertIn("round(vp_integer, 4) as vp_integer", mariadb_reader_sql)
         self.assertIn("round(sd_integer, 4) as sd_integer", mariadb_reader_sql)
-        self.assertIn(
-            "round(vp_decimal, least(30, 2 + @@div_precision_increment)) as vp_decimal",
-            mariadb_reader_sql,
+        self.assertIn("round(vp_decimal, 6) as vp_decimal", mariadb_reader_sql)
+        self.assertNotIn("@@", mariadb_reader_sql)
+
+        class _MariaDBCursor:
+            def __init__(self) -> None:
+                self.row = None
+
+            def execute(self, sql: str) -> None:
+                if sql == "SELECT VERSION();":
+                    self.row = ("11.8.9-MariaDB",)
+                elif sql == "SELECT @@SESSION.div_precision_increment;":
+                    self.row = (6,)
+                else:
+                    raise AssertionError(f"Unexpected engine-detection query: {sql}")
+
+            def fetchone(self):
+                return self.row
+
+        class _MariaDBConnection:
+            dialect = Dialect.MYSQL
+
+            def cursor(self):
+                return _MariaDBCursor()
+
+        detected_mariadb = detect_engine_version(_MariaDBConnection(), Dialect.MYSQL)
+        self.assertEqual(detected_mariadb.subdialect, EngineSubdialect.MARIADB)
+        self.assertEqual(detected_mariadb.mariadb_div_precision_increment, 6)
+        custom_mariadb = generate_materialized_view(
+            mariadb_variance_schema,
+            mariadb_variance_view,
+            dialect="mysql",
+            engine_version=detected_mariadb,
+            ignore_limitations=True,
         )
+        custom_reader_sql = (custom_mariadb.reader_view_ddl or "").lower().replace("`", "")
+        self.assertIn("round(vp_integer, 6) as vp_integer", custom_reader_sql)
+        self.assertIn("round(sd_integer, 6) as sd_integer", custom_reader_sql)
+        self.assertIn("round(vp_decimal, 8) as vp_decimal", custom_reader_sql)
+        self.assertNotIn("@@", custom_reader_sql)
 
         mysql_variance = generate_materialized_view(
             mariadb_variance_schema,
