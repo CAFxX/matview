@@ -73,6 +73,10 @@ class EngineVersion:
     subdialect: EngineSubdialect
     version: Tuple[int, int, int]
     raw_version: str = field(default="", compare=False)
+    # MariaDB fixes VAR/STDDEV result scale using this session setting at
+    # parse/prepare time. Capture it as a literal: MariaDB forbids system-variable
+    # references in CREATE VIEW definitions.
+    mariadb_div_precision_increment: int = field(default=4, compare=False)
 
     @property
     def major(self) -> int:
@@ -260,6 +264,20 @@ def parse_engine_version(
     )
 
 
+def _read_mariadb_div_precision_increment(cur: Any) -> int:
+    """Read MariaDB session precision increment, falling back to its default."""
+    try:
+        cur.execute("SELECT @@SESSION.div_precision_increment;")
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            value = int(row[0])
+            if 0 <= value <= 30:
+                return value
+    except Exception:
+        pass
+    return 4
+
+
 def detect_engine_version(
     conn: Any,
     hint_dialect: Optional[Dialect | str | EngineVersion] = None,
@@ -363,7 +381,10 @@ def detect_engine_version(
                 v_str = str(row[0]).strip()
                 if "mariadb" in v_str.lower() or cand_sub == EngineSubdialect.MARIADB:
                     ver = _extract_version_tuple(v_str, (11, 4, 0))
-                    return EngineVersion(Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str)
+                    div_increment = _read_mariadb_div_precision_increment(cur)
+                    return EngineVersion(
+                        Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str, div_increment
+                    )
                 ver = _extract_version_tuple(v_str, (8, 0, 0))
                 return EngineVersion(Dialect.MYSQL, EngineSubdialect.MYSQL, ver, v_str)
         except Exception:
@@ -391,7 +412,10 @@ def detect_engine_version(
                 return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, ver, v_str)
             if "mariadb" in v_str.lower():
                 ver = _extract_version_tuple(v_str, (11, 4, 0))
-                return EngineVersion(Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str)
+                div_increment = _read_mariadb_div_precision_increment(cur)
+                return EngineVersion(
+                    Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str, div_increment
+                )
             ver = _extract_version_tuple(v_str, (8, 0, 0))
             return EngineVersion(Dialect.MYSQL, EngineSubdialect.MYSQL, ver, v_str)
     except Exception:
@@ -4018,13 +4042,12 @@ class IncrementalViewCompiler:
         return "REAL"
 
     def _mariadb_statistical_result_scale(self, item: SelectItem) -> str:
-        """Return MariaDB's native VAR/STDDEV result scale expression.
+        """Return MariaDB's native VAR/STDDEV result scale as a view-safe literal.
 
-        MariaDB exposes these DOUBLE results with decimals derived from the
-        argument metadata: integer inputs use four places, DECIMAL inputs add
-        @@div_precision_increment (capped at 30), and approximate inputs retain
-        up to the full DOUBLE display precision. The reader view must preserve
-        that metadata/rounding instead of exposing the wider accumulator value.
+        MariaDB derives exact-input scale from argument scale plus the session's
+        div_precision_increment (capped at 30). Capture that setting during engine
+        detection: CREATE VIEW rejects system-variable references. Approximate
+        inputs retain their native DOUBLE display precision.
         """
         source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
         source_type = source.data_type.strip().upper() if source else ""
@@ -4032,10 +4055,10 @@ class IncrementalViewCompiler:
         if re.search(r"\b(?:DECIMAL|NUMERIC|DEC|FIXED)\b", source_type):
             precision_scale = self._numeric_precision_scale_from_type(source_type)
             scale = precision_scale[1] if precision_scale else 0
-            return f"LEAST(30, {scale} + @@div_precision_increment)"
+            return str(min(30, scale + self.engine_version.mariadb_div_precision_increment))
 
         if re.search(r"\b(?:TINYINT|SMALLINT|MEDIUMINT|INTEGER|INT|BIGINT|SERIAL)\b", source_type):
-            return "4"
+            return str(min(30, self.engine_version.mariadb_div_precision_increment))
 
         float_match = re.search(
             r"\b(?:FLOAT|DOUBLE|REAL)\s*\(\s*\d+\s*,\s*(\d+)\s*\)",
@@ -4048,7 +4071,7 @@ class IncrementalViewCompiler:
 
         exact_type = self._exact_numeric_precision_scale(item.arg_expr or "")
         if exact_type is not None:
-            return f"LEAST(30, {exact_type[1]} + @@div_precision_increment)"
+            return str(min(30, exact_type[1] + self.engine_version.mariadb_div_precision_increment))
         return "31"
 
     def _max_decimal_scale(self) -> int:
