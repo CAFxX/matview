@@ -2642,6 +2642,16 @@ class MVTestRunner:
         conn, cur, reset_sql, chunk_size, engine_label, close_fn = self._open_backend_session(
             eff_dialect, suite_tag=f"suite_{abs(hash(suite_name))}"
         )
+        # The SQL dialect alone cannot distinguish MySQL from MariaDB or capture
+        # the server's exact version. Native engines can expose different result
+        # metadata (notably MariaDB VAR/STDDEV scale), so compile every live batch
+        # against the engine actually connected to. Simulated paths keep their
+        # deterministic configured dialect defaults.
+        engine_version = (
+            detect_engine_version(conn, eff_dialect)
+            if engine_label.startswith("LIVE ")
+            else parse_engine_version(eff_dialect)
+        )
         suite_supported = 0
         suite_overrides = 0
         try:
@@ -2669,6 +2679,7 @@ class MVTestRunner:
                         schema_source,
                         eff_v_ddl,
                         dialect=eff_dialect,
+                        engine_version=engine_version,
                         pg_use_transition_tables=pg_use_transition_tables,
                         incremental_backfill=incremental_backfill,
                         batch_size=batch_size,
