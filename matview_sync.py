@@ -5966,11 +5966,8 @@ class IncrementalViewCompiler:
                 AggFunc.STDDEV_POP,
                 AggFunc.STDDEV_SAMP,
             ):
-                exact_pg_input = (
-                    self.dialect == Dialect.POSTGRES
-                    and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
-                )
-                if exact_pg_input:
+                native_stat_input = self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+                if native_stat_input:
                     recomputed = self._build_recompute_subquery_raw(item, mv_table)
                     assignments.append(f"{c} = {recomputed}")
                 else:
