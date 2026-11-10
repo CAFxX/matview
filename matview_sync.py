@@ -4029,16 +4029,16 @@ class IncrementalViewCompiler:
         source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
         source_type = source.data_type.strip().upper() if source else ""
 
-        if re.search(r"\\b(?:DECIMAL|NUMERIC|DEC|FIXED)\\b", source_type):
+        if re.search(r"\b(?:DECIMAL|NUMERIC|DEC|FIXED)\b", source_type):
             precision_scale = self._numeric_precision_scale_from_type(source_type)
             scale = precision_scale[1] if precision_scale else 0
             return f"LEAST(30, {scale} + @@div_precision_increment)"
 
-        if re.search(r"\\b(?:TINYINT|SMALLINT|MEDIUMINT|INTEGER|INT|BIGINT|SERIAL)\\b", source_type):
+        if re.search(r"\b(?:TINYINT|SMALLINT|MEDIUMINT|INTEGER|INT|BIGINT|SERIAL)\b", source_type):
             return "4"
 
         float_match = re.search(
-            r"\\b(?:FLOAT|DOUBLE|REAL)\\s*\\(\\s*\\d+\\s*,\\s*(\\d+)\\s*\\)",
+            r"\b(?:FLOAT|DOUBLE|REAL)\s*\(\s*\d+\s*,\s*(\d+)\s*\)",
             source_type,
         )
         if float_match:
