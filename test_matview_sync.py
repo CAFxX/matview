@@ -5601,6 +5601,48 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("coalesce(bit_or_value, cast(0 as unsigned))", reader_sql)
         self.assertIn("coalesce(bit_xor_value, cast(0 as unsigned))", reader_sql)
 
+        # MariaDB's VAR/STDDEV result metadata uses input-scale + 4 for exact
+        # decimals (or four places for integer inputs); MySQL keeps full DOUBLE.
+        mariadb_variance_schema = """
+        CREATE TABLE variance_values (
+            id INTEGER PRIMARY KEY,
+            integer_value INTEGER,
+            decimal_value DECIMAL(10, 2)
+        );
+        """
+        mariadb_variance_view = """
+        CREATE VIEW variance_summary AS
+        SELECT VAR_POP(integer_value) AS vp_integer,
+               STDDEV_POP(integer_value) AS sd_integer,
+               VAR_POP(decimal_value) AS vp_decimal
+        FROM variance_values;
+        """
+        mariadb_variance = generate_materialized_view(
+            mariadb_variance_schema,
+            mariadb_variance_view,
+            dialect="mysql",
+            engine_version="mariadb:10.11",
+            ignore_limitations=True,
+        )
+        mariadb_reader_sql = (mariadb_variance.reader_view_ddl or "").lower().replace("`", "")
+        self.assertIn("round(vp_integer, 4) as vp_integer", mariadb_reader_sql)
+        self.assertIn("round(sd_integer, 4) as sd_integer", mariadb_reader_sql)
+        self.assertIn(
+            "round(vp_decimal, least(30, 2 + @@div_precision_increment)) as vp_decimal",
+            mariadb_reader_sql,
+        )
+
+        mysql_variance = generate_materialized_view(
+            mariadb_variance_schema,
+            mariadb_variance_view,
+            dialect="mysql",
+            engine_version="mysql:8.4",
+            ignore_limitations=True,
+        )
+        mysql_reader_sql = (mysql_variance.reader_view_ddl or "").lower().replace("`", "")
+        self.assertNotIn("round(vp_integer", mysql_reader_sql)
+        self.assertNotIn("round(vp_decimal", mysql_reader_sql)
+
         join_schema = """
         CREATE TABLE categories (id INTEGER PRIMARY KEY, label TEXT);
         CREATE TABLE measurements (
