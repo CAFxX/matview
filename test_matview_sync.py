@@ -5632,6 +5632,19 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("SELECT AVG(whole)", chunk_sql)
         self.assertIn("SELECT AVG(value)", chunk_sql)
 
+        # MariaDB's native VAR_POP/STDDEV result can have different rounding
+        # from a raw-moment fold. The chunk merge must call the native aggregate
+        # for MySQL-family engines too, not only PostgreSQL.
+        mysql_exact_plan = generate_materialized_view(
+            exact_schema, exact_view, dialect="mysql", ignore_limitations=True
+        )
+        mysql_chunk_sql = "\\n".join(
+            mysql_exact_plan.incremental_backfill_spec.chunk_sql_templates
+        )
+        self.assertIn("SELECT VAR_POP(", mysql_chunk_sql)
+        self.assertIn("SELECT STDDEV_SAMP(", mysql_chunk_sql)
+        self.assertIn("SELECT AVG(whole)", mysql_chunk_sql)
+
         # Chunk-fold recomputation must correlate an expression group against
         # its materialized projection alias, not a base-table column that the
         # backing table does not contain.
