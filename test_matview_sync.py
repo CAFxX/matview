@@ -5580,6 +5580,27 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertGreaterEqual(mysql_triggers.count("SELECT AVG(WHOLE)"), 2)
         self.assertGreaterEqual(mysql_triggers.count("SELECT AVG(EXACT_VALUE)"), 2)
 
+        # MySQL BIT_* aggregates return unsigned 64-bit integers. The reader
+        # view's neutral values must preserve that signedness; otherwise
+        # COALESCE can promote the public result to DECIMAL.
+        bitwise_schema = """
+        CREATE TABLE bitwise_values (id INTEGER PRIMARY KEY, value BIGINT);
+        """
+        bitwise_view = """
+        CREATE VIEW bitwise_summary AS
+        SELECT BIT_AND(value) AS bit_and_value,
+               BIT_OR(value) AS bit_or_value,
+               BIT_XOR(value) AS bit_xor_value
+        FROM bitwise_values;
+        """
+        mysql_bitwise = generate_materialized_view(
+            bitwise_schema, bitwise_view, dialect="mysql", ignore_limitations=True
+        )
+        reader_sql = (mysql_bitwise.reader_view_ddl or "").lower().replace("`", "")
+        self.assertIn("coalesce(bit_and_value, cast(18446744073709551615 as unsigned))", reader_sql)
+        self.assertIn("coalesce(bit_or_value, cast(0 as unsigned))", reader_sql)
+        self.assertIn("coalesce(bit_xor_value, cast(0 as unsigned))", reader_sql)
+
         join_schema = """
         CREATE TABLE categories (id INTEGER PRIMARY KEY, label TEXT);
         CREATE TABLE measurements (
