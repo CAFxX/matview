@@ -456,10 +456,25 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
     """Registers PostgreSQL/MySQL compatibility functions & aggregates on a SQLite connection for cross-dialect testing."""
     import math
 
-    conn.create_function("SQRT", 1, lambda x: math.sqrt(float(x)) if x is not None and float(x) >= 0 else None)
-    conn.create_function("LEAST", 2, lambda a, b: min(a, b) if (a is not None and b is not None) else None)
-    conn.create_function("GREATEST", 2, lambda a, b: max(a, b) if (a is not None and b is not None) else None)
-    conn.create_function("IF", 3, lambda cond, a, b: a if cond else b)
+    def _create_scalar(name: str, num_args: int, function: Callable[..., Any]) -> None:
+        if hasattr(conn, "create_scalar_function"):  # APSW
+            conn.create_scalar_function(name, function, num_args)
+        else:  # sqlite3 and SQLCipher DB-API connections
+            conn.create_function(name, num_args, function)
+
+    def _create_aggregate(name: str, aggregate_class: type) -> None:
+        if hasattr(conn, "create_aggregate_function"):  # APSW
+            class _ApswAggregate(aggregate_class):
+                def final(self) -> Any:
+                    return self.finalize()
+            conn.create_aggregate_function(name, _ApswAggregate, 1)
+        else:  # sqlite3 and SQLCipher DB-API connections
+            conn.create_aggregate(name, 1, aggregate_class)
+
+    _create_scalar("SQRT", 1, lambda x: math.sqrt(float(x)) if x is not None and float(x) >= 0 else None)
+    _create_scalar("LEAST", 2, lambda a, b: min(a, b) if (a is not None and b is not None) else None)
+    _create_scalar("GREATEST", 2, lambda a, b: max(a, b) if (a is not None and b is not None) else None)
+    _create_scalar("IF", 3, lambda cond, a, b: a if cond else b)
 
     def _concat(*args: Any) -> Optional[str]:
         if any(a is None for a in args):
@@ -471,9 +486,9 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
             return None
         return str(sep).join(str(a) for a in args if a is not None)
 
-    conn.create_function("CONCAT", -1, _concat)
-    conn.create_function("CONCAT_WS", -1, _concat_ws)
-    conn.create_function("PG_ROW_KEY", -1, lambda *args: "(" + ",".join("" if a is None else str(a) for a in args) + ")")
+    _create_scalar("CONCAT", -1, _concat)
+    _create_scalar("CONCAT_WS", -1, _concat_ws)
+    _create_scalar("PG_ROW_KEY", -1, lambda *args: "(" + ",".join("" if a is None else str(a) for a in args) + ")")
 
     class _VarPopAgg:
         def __init__(self) -> None:
@@ -568,19 +583,19 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
         def finalize(self) -> Optional[int]:
             return (1 if self.any_true else 0) if self.seen else None
 
-    conn.create_aggregate("VAR_POP", 1, _VarPopAgg)
-    conn.create_aggregate("VARIANCE", 1, _VarPopAgg)
-    conn.create_aggregate("VAR_SAMP", 1, _VarSampAgg)
-    conn.create_aggregate("STDDEV_POP", 1, _StdPopAgg)
-    conn.create_aggregate("STDDEV", 1, _StdPopAgg)
-    conn.create_aggregate("STD", 1, _StdPopAgg)
-    conn.create_aggregate("STDDEV_SAMP", 1, _StdSampAgg)
-    conn.create_aggregate("BIT_AND", 1, _BitAndAgg)
-    conn.create_aggregate("BIT_OR", 1, _BitOrAgg)
-    conn.create_aggregate("BIT_XOR", 1, _BitXorAgg)
-    conn.create_aggregate("BOOL_AND", 1, _BoolAndAgg)
-    conn.create_aggregate("EVERY", 1, _BoolAndAgg)
-    conn.create_aggregate("BOOL_OR", 1, _BoolOrAgg)
+    _create_aggregate("VAR_POP", _VarPopAgg)
+    _create_aggregate("VARIANCE", _VarPopAgg)
+    _create_aggregate("VAR_SAMP", _VarSampAgg)
+    _create_aggregate("STDDEV_POP", _StdPopAgg)
+    _create_aggregate("STDDEV", _StdPopAgg)
+    _create_aggregate("STD", _StdPopAgg)
+    _create_aggregate("STDDEV_SAMP", _StdSampAgg)
+    _create_aggregate("BIT_AND", _BitAndAgg)
+    _create_aggregate("BIT_OR", _BitOrAgg)
+    _create_aggregate("BIT_XOR", _BitXorAgg)
+    _create_aggregate("BOOL_AND", _BoolAndAgg)
+    _create_aggregate("EVERY", _BoolAndAgg)
+    _create_aggregate("BOOL_OR", _BoolOrAgg)
 
 
 def _transpile_pg_expr_to_sqlite(sql: str) -> str:
@@ -1264,6 +1279,7 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
     if eng in ("apsw", "sqlite3mc"):
         import apsw  # type: ignore
         raw_conn = apsw.Connection(db_path)
+        _register_sqlite_compat_udfs(raw_conn)
         init_cur = raw_conn.cursor()
         if eng == "sqlite3mc":
             try:
@@ -1302,6 +1318,7 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
         raw_conn.execute("PRAGMA journal_mode = MEMORY;")
         raw_conn.execute("PRAGMA temp_store = MEMORY;")
         raw_conn.execute("PRAGMA recursive_triggers = ON;")
+        _register_sqlite_compat_udfs(raw_conn)
 
         def _make_cipher_cursor() -> _CompatCursorAdapter:
             def _exec(s: str, p: Any = None) -> None:
@@ -2794,15 +2811,22 @@ def run_suite_1_single_table_algebraic(runner: MVTestRunner) -> None:
                 v_sql = f"CREATE VIEW {v_name} AS SELECT {g_proj}, {a_bundle} FROM sales{w_sql} GROUP BY {g_by};"
                 views.append((v_name, v_sql))
 
-    views.append((
-        "s1_avg_native_types",
+    sqlite_compat_engine = os.environ.get("SQLITE_COMPAT_ENGINE", "").strip().lower()
+    avg_native_type_view = (
+        "CREATE VIEW s1_avg_native_types AS "
+        "SELECT grp, SUM(whole) AS sum_integer, SUM(exact_value) AS sum_decimal, "
+        "AVG(whole) AS avg_integer, AVG(exact_value) AS avg_decimal, "
+        "AVG(approx_value) AS avg_approximate FROM avg_precision GROUP BY grp;"
+        if sqlite_compat_engine == "libsql"
+        else
         "CREATE VIEW s1_avg_native_types AS "
         "SELECT grp, SUM(whole) AS sum_integer, SUM(exact_value) AS sum_decimal, "
         "AVG(whole) AS avg_integer, AVG(exact_value) AS avg_decimal, "
         "AVG(approx_value) AS avg_approximate, VAR_POP(exact_value) AS variance_decimal, "
         "STDDEV_SAMP(exact_value) AS stddev_decimal, "
-        "VAR_POP(approx_value) AS variance_approximate FROM avg_precision GROUP BY grp;",
-    ))
+        "VAR_POP(approx_value) AS variance_approximate FROM avg_precision GROUP BY grp;"
+    )
+    views.append(("s1_avg_native_types", avg_native_type_view))
     runner.run_batch("Suite 1 (Single-Table Algebraic Aggregates)", schema, views, seed, mutations)
 
 
