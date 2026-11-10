@@ -3249,9 +3249,11 @@ class IncrementalViewCompiler:
             if not it.is_aggregate or it.agg_func is not None:
                 work_items.append(it)
                 if self.dialect == Dialect.MYSQL and it.agg_func in (AggFunc.BIT_OR, AggFunc.BIT_XOR):
-                    reader_exprs[it.alias] = f"COALESCE({it.alias}, 0) AS {it.alias}"
+                    # Keep COALESCE's result type unsigned, matching MySQL's
+                    # BIT_* aggregate contract (unsigned 64-bit integer).
+                    reader_exprs[it.alias] = f"COALESCE({it.alias}, CAST(0 AS UNSIGNED)) AS {it.alias}"
                 elif self.dialect == Dialect.MYSQL and it.agg_func == AggFunc.BIT_AND:
-                    reader_exprs[it.alias] = f"COALESCE({it.alias}, 18446744073709551615) AS {it.alias}"
+                    reader_exprs[it.alias] = f"COALESCE({it.alias}, CAST(18446744073709551615 AS UNSIGNED)) AS {it.alias}"
                 else:
                     reader_exprs[it.alias] = it.alias
             else:
