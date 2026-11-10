@@ -6082,6 +6082,16 @@ class IncrementalViewCompiler:
         ]
 
     def _build_recompute_subquery_raw(self, item: SelectItem, record_prefix: str) -> str:
+        def _group_record_expr(group_expr: str) -> str:
+            # Chunk-fold recomputation reads the current aggregate row from the
+            # backing table. A projected group expression may have a different
+            # stored alias (for example COALESCE(sub_cat, 'UNK') AS sc_norm),
+            # so correlate against that stored column rather than the original
+            # base-table column, which does not exist in the backing table.
+            if record_prefix == self._backing_table_name():
+                return f"{record_prefix}.{self._q(self._group_col_alias(group_expr))}"
+            return self._rewrite_expr_for_record(group_expr, record_prefix)
+
         if getattr(self, "_alg_mode", None) == "union_all_agg":
             inner_u = getattr(self, "_union_all_inner_sql", "")
             u_alias = getattr(self, "_union_all_sub_alias", "__mv_u")
@@ -6091,7 +6101,7 @@ class IncrementalViewCompiler:
             if self.view.where_clause:
                 u_conds.append(f"({self.view.where_clause})")
             for orig_g, branch_g in zip(orig_grps, self._effective_group_by_exprs):
-                rhs_g = self._rewrite_expr_for_record(branch_g, record_prefix)
+                rhs_g = _group_record_expr(branch_g)
                 u_conds.append(self._null_safe_eq(f"({orig_g})", f"({rhs_g})", is_nullable=True))
             w_u = f" WHERE {' AND '.join(u_conds)}" if u_conds else ""
             u_agg_sql = self._sql_backfill_agg_expr(orig_item)
@@ -6103,7 +6113,7 @@ class IncrementalViewCompiler:
             conds.append(f"({self.view.where_clause})")
         for g_expr in self._effective_group_by_exprs:
             lhs_g = self._rewrite_expr_for_record(g_expr, q_base_t)
-            rhs_g = self._rewrite_expr_for_record(g_expr, record_prefix)
+            rhs_g = _group_record_expr(g_expr)
             is_nn = self._is_simple_col_ref(g_expr) and self._col_def(g_expr).not_null
             conds.append(
                 self._null_safe_eq(

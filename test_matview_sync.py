@@ -5600,6 +5600,36 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("SELECT VAR_POP(", chunk_sql)
         self.assertIn("SELECT STDDEV_SAMP(", chunk_sql)
 
+        # Chunk-fold recomputation must correlate an expression group against
+        # its materialized projection alias, not a base-table column that the
+        # backing table does not contain.
+        derived_group_schema = """
+        CREATE TABLE derived_group_rows (
+            id INTEGER PRIMARY KEY,
+            sub_cat TEXT,
+            weight_cnt INTEGER
+        );
+        """
+        derived_group_view = """
+        CREATE VIEW derived_group_stats AS
+        SELECT COALESCE(sub_cat, 'UNK') AS sc_norm,
+               VAR_POP(weight_cnt) AS variance
+        FROM derived_group_rows
+        GROUP BY COALESCE(sub_cat, 'UNK');
+        """
+        derived_group_plan = generate_materialized_view(
+            derived_group_schema, derived_group_view, dialect="postgres"
+        )
+        derived_group_chunk = "\\n".join(
+            derived_group_plan.incremental_backfill_spec.chunk_sql_templates
+        )
+        backing_name = (
+            derived_group_plan.backing_table_name.lower().replace('"', '').replace('`', '')
+        )
+        normalized_chunk = derived_group_chunk.lower().replace('"', '').replace('`', '')
+        self.assertIn(f"{backing_name}.sc_norm", normalized_chunk)
+        self.assertNotIn(f"{backing_name}.sub_cat", normalized_chunk)
+
     def test_limited_plan_helper_checks_default_contract_before_override(self) -> None:
         schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);"
         supported, was_overridden, codes = _compile_plan_for_test(
