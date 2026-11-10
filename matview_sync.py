@@ -3248,7 +3248,18 @@ class IncrementalViewCompiler:
         for it in v.select_items:
             if not it.is_aggregate or it.agg_func is not None:
                 work_items.append(it)
-                if self.dialect == Dialect.MYSQL and it.agg_func in (AggFunc.BIT_OR, AggFunc.BIT_XOR):
+                if (
+                    self.subdialect == EngineSubdialect.MARIADB
+                    and it.agg_func in (
+                        AggFunc.VAR_POP,
+                        AggFunc.VAR_SAMP,
+                        AggFunc.STDDEV_POP,
+                        AggFunc.STDDEV_SAMP,
+                    )
+                ):
+                    result_scale = self._mariadb_statistical_result_scale(it)
+                    reader_exprs[it.alias] = f"ROUND({it.alias}, {result_scale}) AS {it.alias}"
+                elif self.dialect == Dialect.MYSQL and it.agg_func in (AggFunc.BIT_OR, AggFunc.BIT_XOR):
                     # Keep COALESCE's result type unsigned, matching MySQL's
                     # BIT_* aggregate contract (unsigned 64-bit integer).
                     reader_exprs[it.alias] = f"COALESCE({it.alias}, CAST(0 AS UNSIGNED)) AS {it.alias}"
@@ -4005,6 +4016,40 @@ class IncrementalViewCompiler:
             # approximate numeric argument families.
             return "DOUBLE"
         return "REAL"
+
+    def _mariadb_statistical_result_scale(self, item: SelectItem) -> str:
+        """Return MariaDB's native VAR/STDDEV result scale expression.
+
+        MariaDB exposes these DOUBLE results with decimals derived from the
+        argument metadata: integer inputs use four places, DECIMAL inputs add
+        @@div_precision_increment (capped at 30), and approximate inputs retain
+        up to the full DOUBLE display precision. The reader view must preserve
+        that metadata/rounding instead of exposing the wider accumulator value.
+        """
+        source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
+        source_type = source.data_type.strip().upper() if source else ""
+
+        if re.search(r"\\b(?:DECIMAL|NUMERIC|DEC|FIXED)\\b", source_type):
+            precision_scale = self._numeric_precision_scale_from_type(source_type)
+            scale = precision_scale[1] if precision_scale else 0
+            return f"LEAST(30, {scale} + @@div_precision_increment)"
+
+        if re.search(r"\\b(?:TINYINT|SMALLINT|MEDIUMINT|INTEGER|INT|BIGINT|SERIAL)\\b", source_type):
+            return "4"
+
+        float_match = re.search(
+            r"\\b(?:FLOAT|DOUBLE|REAL)\\s*\\(\\s*\\d+\\s*,\\s*(\\d+)\\s*\\)",
+            source_type,
+        )
+        if float_match:
+            return str(min(int(float_match.group(1)) + 4, 31))
+        if any(token in source_type for token in ("FLOAT", "DOUBLE", "REAL")):
+            return "31"
+
+        exact_type = self._exact_numeric_precision_scale(item.arg_expr or "")
+        if exact_type is not None:
+            return f"LEAST(30, {exact_type[1]} + @@div_precision_increment)"
+        return "31"
 
     def _max_decimal_scale(self) -> int:
         if (
