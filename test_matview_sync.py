@@ -2157,7 +2157,9 @@ class TranspiledConnectionAdapter:
 
 def _rewrite_live_reference_select_for_dialect(raw_select_sql: str, dialect: Dialect) -> str:
     if dialect == Dialect.SQLITE:
-        if os.environ.get("SQLITE_COMPAT_ENGINE", "").strip().lower() not in ("", "sqlite3"):
+        if os.environ.get("SQLITE_COMPAT_ENGINE", "").strip().lower() not in (
+            "", "sqlite3", "apsw", "sqlite3mc", "sqlcipher"
+        ):
             s_sq = raw_select_sql
             s_sq = re.sub(
                 r"\bVAR_POP\s*\(\s*([^()]+?)\s*\)",
@@ -5606,12 +5608,14 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         CREATE TABLE exact_measurements (
             id INTEGER PRIMARY KEY,
             grp TEXT NOT NULL,
+            whole INTEGER,
             value NUMERIC
         );
         """
         exact_view = """
         CREATE VIEW exact_measurement_stats AS
-        SELECT grp, VAR_POP(value) AS variance, STDDEV_SAMP(value) AS deviation
+        SELECT grp, AVG(whole) AS integer_average, AVG(value) AS decimal_average,
+               VAR_POP(value) AS variance, STDDEV_SAMP(value) AS deviation
         FROM exact_measurements GROUP BY grp;
         """
         exact_plan = generate_materialized_view(
@@ -5623,6 +5627,10 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertIn("SELECT VAR_POP(", chunk_sql)
         self.assertIn("SELECT STDDEV_SAMP(", chunk_sql)
+        # PostgreSQL AVG(integer) returns NUMERIC; a BIGINT / BIGINT fold
+        # truncates and must not be used for incremental chunk merges.
+        self.assertIn("SELECT AVG(whole)", chunk_sql)
+        self.assertIn("SELECT AVG(value)", chunk_sql)
 
         # Chunk-fold recomputation must correlate an expression group against
         # its materialized projection alias, not a base-table column that the

@@ -5945,18 +5945,21 @@ class IncrementalViewCompiler:
             elif item.agg_func == AggFunc.SUM:
                 assignments.append(f"{c} = {_merged_sum(c)}")
             elif item.agg_func == AggFunc.AVG:
-                cnt_c = col_nonnull_count_map[ekey]
-                sum_c = col_sum_map[ekey]
-                new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
-                new_sum = _merged_sum(sum_c)
-                exact_avg = (
-                    self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
-                    and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
-                )
-                dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
-                assignments.append(
-                    f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE {dividend} / {new_cnt} END"
-                )
+                if self._requires_native_avg_recompute(item):
+                    # The native AVG result family is not reproduced by a
+                    # SUM/COUNT fold for integer inputs (PostgreSQL integer
+                    # division truncates) or for engine-specific DECIMAL scale.
+                    recomputed = self._build_recompute_subquery_raw(item, mv_table)
+                    assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
+                    new_sum = _merged_sum(sum_c)
+                    dividend = f"(1.0 * {new_sum})"
+                    assignments.append(
+                        f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE {dividend} / {new_cnt} END"
+                    )
             elif item.agg_func in (
                 AggFunc.VAR_POP,
                 AggFunc.VAR_SAMP,
