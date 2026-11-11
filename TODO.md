@@ -93,7 +93,7 @@ The existing differential-testing harness is useful, but its current headline co
   - Do not let broad differential suites suppress EngineLimitationWarning and thereby stand in for tests of the default safety contract.
 
 - [ ] **Add Genuine Multi-Connection Concurrency and Isolation Tests**:
-  - Progress: A focused file-backed SQLite test performs INSERT/UPDATE/DELETE from a second thread and independent connection after a committed backfill chunk. New native PostgreSQL and MySQL/MariaDB integration checks perform the same independent-session interleaving across both sides of the primary-key watermark, including rollback of trigger effects; the new CI steps are pending verification. Broader race windows, concurrent readers, isolation-level variations, bounded stress/repetition, and engine-specific deadlock/serialization behavior remain open.
+  - Progress: A focused file-backed SQLite test performs INSERT/UPDATE/DELETE from a second thread and independent connection after a committed backfill chunk. New native PostgreSQL and MySQL/MariaDB integration checks perform the same independent-session interleaving across both sides of the primary-key watermark, including rollback of trigger effects; native CI results are pending. Snapshot-isolated transaction boundaries are now preserved across primary-key, group-key and offset batches, and every completed path clears its catalog watermark/active state. Broader race windows, concurrent readers, isolation-level variations, bounded stress/repetition, and engine-specific deadlock/serialization behavior remain open.
   - Use independent database connections/processes and synchronization barriers; do not describe same-connection callback interleaving as concurrent DML.
   - Exercise writes immediately before/during/after trigger installation, initial backfill, every chunk boundary, watermark advancement, and finalization.
   - Cover concurrent INSERT/UPDATE/DELETE, key changes, rows on both sides of the watermark, commits, rollbacks, reader visibility, and competing writers.
@@ -127,8 +127,8 @@ The existing differential-testing harness is useful, but its current headline co
 
 ## P1 — Modular Architecture, Engine/Version Optimizations & Developer Experience
 
-- [ ] **Keep User-Accessible Materialized Views Free of the Internal Object Prefix**:
-  User-facing views created/exposed by the library should retain clean, natural names and must not inherit the internal `__matview_` prefix used by catalog, backing, delta, and auxiliary objects. Define the naming contract clearly, preserve collision safety and dialect constraints, and add cross-engine tests proving internal objects remain namespaced while the user-accessible view name does not.
+- [x] **Keep User-Accessible Materialized Views Free of the Internal Object Prefix**:
+  - Progress: Compiler plans and installed reader views now use the SQL-declared logical name without the internal `__matview_` prefix. Catalog, backing, delta, trigger, and auxiliary objects remain prefixed. Explicit legacy prefixed view names normalize to the same clean reader name; `drop_view` continues resolving prefixed aliases for compatibility. Compilation rejects collisions between the clean reader name and an existing base table. Cross-engine suite expectations and plan assertions verify the contract.
 
 - [ ] **AST-Based SQL Code Generation via `sqlglot` (`sqlglot.exp` Builders)**:
   Replace string-interpolated DML/DDL construction (`CREATE TABLE`, `CREATE INDEX`, `CREATE VIEW`, `SELECT`, `INSERT ... ON CONFLICT / ON DUPLICATE KEY UPDATE`, `UPDATE`, `DELETE`) with `sqlglot.exp` AST builders (`sqlglot.select`, `exp.insert`, `exp.update`, `exp.delete`, `exp.Create`, `.sql(dialect=..., identify=..., pretty=True)`) so generated SQL is guaranteed well-formed and dialect-accurate by construction.

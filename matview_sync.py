@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import hashlib
 import json
@@ -612,12 +612,9 @@ class MaterializedViewPlan:
 
     @property
     def view_name(self) -> str:
-        if self.db_view_name:
-            return self.db_view_name
-        raw = self.view_spec.view_name
-        if self.object_prefix and not raw.startswith(self.object_prefix):
-            return f"{self.object_prefix}{raw}"
-        return raw
+        # The SQL view name is user-facing; object_prefix is reserved for
+        # catalog, backing, trigger, and auxiliary implementation objects.
+        return self.logical_view_name
 
     @property
     def logical_view_name(self) -> str:
@@ -2740,22 +2737,31 @@ class IncrementalViewCompiler:
         self.watermark_catalog_table = watermark_catalog_table
 
         raw_vname = view_spec.view_name
-        if self.object_prefix and raw_vname.startswith(self.object_prefix):
-            self.logical_view_name = raw_vname[len(self.object_prefix) :]
-            self.db_view_name = raw_vname
-        elif self.object_prefix:
-            self.logical_view_name = raw_vname
-            self.db_view_name = f"{self.object_prefix}{raw_vname}"
-        else:
-            self.logical_view_name = raw_vname
-            self.db_view_name = raw_vname
+        self.logical_view_name = (
+            raw_vname[len(self.object_prefix) :]
+            if self.object_prefix and raw_vname.startswith(self.object_prefix)
+            else raw_vname
+        )
+        if not self.logical_view_name:
+            raise ValueError("A materialized view must have a non-empty user-facing name.")
+        # Retain db_view_name for plan serialization compatibility, but it is
+        # deliberately the clean SQL name rather than an internal namespace.
+        self.db_view_name = self.logical_view_name
 
         self.user_indexes: List[ViewIndexSpec] = list(view_spec.user_indexes)
         unwrapped_view = self._try_unwrap_simple_cte_or_derived_view(view_spec)
         self.primary_schema: Optional[TableSchema] = self._schemas_lower.get(
             unwrapped_view.base_table.lower()
         )
-        self.view = self._try_expand_select_star(unwrapped_view)
+        if self.logical_view_name.lower() in self._schemas_lower:
+            raise ValueError(
+                f"User-facing materialized view name '{self.logical_view_name}' "
+                "conflicts with an existing base table. Choose a distinct view name."
+            )
+        self.view = replace(
+            self._try_expand_select_star(unwrapped_view),
+            view_name=self.logical_view_name,
+        )
 
         (
             self._working_select_items,
@@ -10417,6 +10423,7 @@ class MaterializedViewManager:
         if spec is None or batch_size <= 0:
             for s in plan.initial_populate_sqls:
                 cur.execute(s)
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
             if snapshot_isolation and self.dialect == Dialect.SQLITE:
                 try:
                     cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
@@ -10477,6 +10484,10 @@ class MaterializedViewManager:
             cur.execute(spec.distinct_group_query)
             all_keys = [r[0] for r in (cur.fetchall() or [])]
             if not all_keys:
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
                 return 0
             ph = self._param_placeholder()
             for i in range(0, len(all_keys), batch_size):
@@ -10485,10 +10496,15 @@ class MaterializedViewManager:
                 for tmpl in spec.chunk_sql_templates:
                     sql = tmpl.format(placeholders=placeholders)
                     cur.execute(sql, tuple(batch_keys))
-                self._commit()
+                if not snapshot_isolation:
+                    self._commit()
                 batches_run += 1
                 if on_progress:
                     on_progress(batches_run, min(len(all_keys), i + batch_size))
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
             return batches_run
 
         elif spec.mode == "offset_batch" and spec.offset_insert_template:
@@ -10505,7 +10521,8 @@ class MaterializedViewManager:
                     cnt_row = cur.fetchone()
                     total_now = int(cnt_row[0]) if cnt_row and cnt_row[0] is not None else 0
                     inserted = max(0, total_now - offset)
-                self._commit()
+                if not snapshot_isolation:
+                    self._commit()
                 if inserted == 0:
                     break
                 batches_run += 1
@@ -10514,10 +10531,17 @@ class MaterializedViewManager:
                     on_progress(batches_run, offset)
                 if inserted < batch_size:
                     break
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
             return batches_run
 
         for s in plan.initial_populate_sqls:
             cur.execute(s)
+        self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+        if snapshot_isolation and self.dialect == Dialect.SQLITE:
+            cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
         self._commit()
         return 1
 

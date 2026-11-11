@@ -1063,11 +1063,11 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
             ],
             prune_removed=True,
         )
-        assert st["__matview_v_mgr_alg"] == "updated"
-        assert st["__matview_v_mgr_dist"] == "unchanged"
-        assert st["__matview_v_mgr_win"] == "dropped"
-        assert st["__matview_v_mgr_off"] == "dropped"
-        _verify_external_db_mv(cur, "__matview_v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:alg_updated")
+        assert st["v_mgr_alg"] == "updated"
+        assert st["v_mgr_dist"] == "unchanged"
+        assert st["v_mgr_win"] == "dropped"
+        assert st["v_mgr_off"] == "dropped"
+        _verify_external_db_mv(cur, "v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:alg_updated")
         checks += 1
 
         # 6. bulk_changes context manager
@@ -1075,8 +1075,8 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
             cur.execute("INSERT INTO mgr_items VALUES (6, 'A', 'z', 100), (7, 'D', 'w', 25);")
             cur.execute("UPDATE mgr_items SET val = 35 WHERE id = 2;")
             cur.execute("DELETE FROM mgr_items WHERE id = 3;")
-        _verify_external_db_mv(cur, "__matview_v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:bulk_alg")
-        _verify_external_db_mv(cur, "__matview_v_mgr_dist", q_dist, f"{dialect.value}:mgr:bulk_dist")
+        _verify_external_db_mv(cur, "v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:bulk_alg")
+        _verify_external_db_mv(cur, "v_mgr_dist", q_dist, f"{dialect.value}:mgr:bulk_dist")
         checks += 2
 
         # 7. ALTER TABLE schema migration via apply_schema_ddl + trigger rebuild
@@ -1084,8 +1084,8 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
         cur.execute("INSERT INTO mgr_items (id, grp, tag, val, note) VALUES (8, 'D', 'q', 45, 'migrated');")
         if hasattr(conn, "commit"):
             conn.commit()
-        _verify_external_db_mv(cur, "__matview_v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:alter_alg")
-        _verify_external_db_mv(cur, "__matview_v_mgr_dist", q_dist, f"{dialect.value}:mgr:alter_dist")
+        _verify_external_db_mv(cur, "v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:alter_alg")
+        _verify_external_db_mv(cur, "v_mgr_dist", q_dist, f"{dialect.value}:mgr:alter_dist")
         checks += 2
 
         # 8. RIGHT JOIN and FULL OUTER JOIN live execution & DML verification
@@ -4033,18 +4033,20 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         plan = mgr.register_view(
             "CREATE VIEW item_summary AS SELECT category, COUNT(*) AS cnt, SUM(price) AS total FROM items GROUP BY category;"
         )
-        self.assertEqual(plan.view_name, "__matview_item_summary")
+        self.assertEqual(plan.view_name, "item_summary")
+        self.assertFalse(plan.view_name.startswith("__matview_"))
+        self.assertIn("CREATE VIEW item_summary", plan.reader_view_ddl)
         self.assertEqual(plan.backing_table_name, "__matview_store_item_summary")
 
         # Reading from the read-only view works
-        rows = conn.execute("SELECT category, cnt, total FROM __matview_item_summary ORDER BY category;").fetchall()
+        rows = conn.execute("SELECT category, cnt, total FROM item_summary ORDER BY category;").fetchall()
         self.assertEqual(rows, [("book", 2, 40.0), ("game", 1, 60.0)])
 
         # Direct INSERT / UPDATE / DELETE on the read-only view is blocked!
         for bad_dml in [
-            "INSERT INTO __matview_item_summary VALUES ('music', 1, 10.0);",
-            "UPDATE __matview_item_summary SET total = 999.0 WHERE category = 'book';",
-            "DELETE FROM __matview_item_summary WHERE category = 'game';",
+            "INSERT INTO item_summary VALUES ('music', 1, 10.0);",
+            "UPDATE item_summary SET total = 999.0 WHERE category = 'book';",
+            "DELETE FROM item_summary WHERE category = 'game';",
         ]:
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(bad_dml)
@@ -4070,7 +4072,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(p1.incremental_backfill_spec.mode, "pk_range_fold")
         self.assertGreaterEqual(len(progress_calls), 2)
         self.assertEqual(
-            conn.execute("SELECT svc, cnt, s_lat FROM __matview_v_pk_fold ORDER BY svc;").fetchall(),
+            conn.execute("SELECT svc, cnt, s_lat FROM v_pk_fold ORDER BY svc;").fetchall(),
             [("auth", 2, 30), ("pay", 2, 70), ("web", 1, 50)],
         )
 
@@ -4099,7 +4101,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertEqual(p2.incremental_backfill_spec.mode, "group_key_batch")
         self.assertEqual(
-            conn.execute("SELECT svc, dl, s_lat FROM __matview_v_grp_batch ORDER BY svc;").fetchall(),
+            conn.execute("SELECT svc, dl, s_lat FROM v_grp_batch ORDER BY svc;").fetchall(),
             [("auth", 2, 30), ("pay", 2, 70), ("web", 1, 50)],
         )
 
@@ -4117,7 +4119,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertEqual(p3.incremental_backfill_spec.mode, "offset_batch")
         self.assertEqual(
-            conn.execute("SELECT a, b, val FROM __matview_v_off_batch ORDER BY a, b;").fetchall(),
+            conn.execute("SELECT a, b, val FROM v_off_batch ORDER BY a, b;").fetchall(),
             [(1, 1, "x"), (1, 2, "y"), (2, 1, "z")],
         )
         conn.close()
@@ -4137,7 +4139,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 "CREATE VIEW v_expensive AS SELECT id, dept, price FROM products WHERE price >= 100.0;",
             ]
         )
-        self.assertEqual(status1, {"__matview_v_dept": "created", "__matview_v_expensive": "created"})
+        self.assertEqual(status1, {"v_dept": "created", "v_expensive": "created"})
 
         status2 = mgr.sync_views(
             [
@@ -4146,27 +4148,27 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             ],
             prune_removed=False,
         )
-        self.assertEqual(status2["__matview_v_dept"], "unchanged")
-        self.assertEqual(status2["__matview_v_expensive"], "updated")
+        self.assertEqual(status2["v_dept"], "unchanged")
+        self.assertEqual(status2["v_expensive"], "updated")
 
         status3 = mgr.sync_views(
             ["CREATE VIEW v_dept AS SELECT dept, COUNT(*) AS cnt, SUM(price) AS sum_p FROM products GROUP BY dept;"],
             prune_removed=True,
         )
-        self.assertEqual(status3["__matview_v_expensive"], "dropped")
+        self.assertEqual(status3["v_expensive"], "dropped")
 
         with mgr.bulk_changes():
             conn.execute("INSERT INTO products VALUES (4, 'elec', 300.0), (5, 'toys', 25.0);")
             conn.execute("DELETE FROM products WHERE id = 1;")
         self.assertEqual(
-            conn.execute("SELECT dept, cnt, sum_p FROM __matview_v_dept ORDER BY dept;").fetchall(),
+            conn.execute("SELECT dept, cnt, sum_p FROM v_dept ORDER BY dept;").fetchall(),
             [("elec", 2, 500.0), ("home", 1, 50.0), ("toys", 1, 25.0)],
         )
 
         mgr.apply_schema_ddl("ALTER TABLE products ADD COLUMN note TEXT DEFAULT 'ok';")
         conn.execute("INSERT INTO products (id, dept, price, note) VALUES (6, 'toys', 75.0, 'new');")
         self.assertEqual(
-            conn.execute("SELECT dept, cnt, sum_p FROM __matview_v_dept ORDER BY dept;").fetchall(),
+            conn.execute("SELECT dept, cnt, sum_p FROM v_dept ORDER BY dept;").fetchall(),
             [("elec", 2, 500.0), ("home", 1, 50.0), ("toys", 2, 100.0)],
         )
         conn.close()
@@ -4223,7 +4225,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         for st in p_right.all_statements():
             conn.execute(st)
         self.assertEqual(
-            conn.execute("SELECT aid, aval, bid, bval FROM __matview_v_right ORDER BY bid;").fetchall(),
+            conn.execute("SELECT aid, aval, bid, bval FROM v_right ORDER BY bid;").fetchall(),
             [(2, "a2", 100, "b2"), (None, None, 200, "b3")],
         )
 
@@ -4237,7 +4239,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         conn.execute("INSERT INTO a VALUES (3, 30, 'a3');")
         conn.execute("DELETE FROM b WHERE id = 100;")
         self.assertEqual(
-            sorted(conn.execute("SELECT ak, aval, bk, bval FROM __matview_v_full;").fetchall(), key=lambda x: str(x)),
+            sorted(conn.execute("SELECT ak, aval, bk, bval FROM v_full;").fetchall(), key=lambda x: str(x)),
             sorted([(10, "a1", None, None), (20, "a2", None, None), (30, "a3", 30, "b3")], key=lambda x: str(x)),
         )
         conn.close()
@@ -4386,13 +4388,13 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                         cur.execute(st)
                 _verify_external_db_mv(
                     cur,
-                    "__matview_v_pulled_role",
+                    "v_pulled_role",
                     "SELECT role, COUNT(*) AS cnt, SUM(dues) AS total_dues FROM child_members GROUP BY role",
                     f"pull_schema:{dialect.value}:role_init",
                 )
                 _verify_external_db_mv(
                     cur,
-                    "__matview_v_pulled_join",
+                    "v_pulled_join",
                     "SELECT p.name AS org_name, COUNT(c.member_id) AS m_cnt, SUM(c.dues) AS org_dues FROM parent_orgs p LEFT JOIN child_members c ON p.id = c.org_id GROUP BY p.name",
                     f"pull_schema:{dialect.value}:join_init",
                 )
@@ -4412,7 +4414,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     cur.execute(st)
                 _verify_external_db_mv(
                     cur,
-                    "__matview_v_pulled_bonus",
+                    "v_pulled_bonus",
                     "SELECT name, bonus FROM parent_orgs WHERE bonus >= 10",
                     f"pull_schema:{dialect.value}:after_alter",
                 )
@@ -4441,7 +4443,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 )
             self.assertEqual(rc, 0)
             sq_c2 = sqlite3.connect(db_path)
-            rows = sq_c2.execute("SELECT zone, n, avg_t FROM __matview_v_zone_temp;").fetchall()
+            rows = sq_c2.execute("SELECT zone, n, avg_t FROM v_zone_temp;").fetchall()
             sq_c2.close()
             self.assertEqual(rows, [("north", 2, 22.5)])
 
@@ -4626,10 +4628,10 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         v2 = (1 << 60) | (1 << 40) | 3
         conn.execute("INSERT INTO rev_items VALUES (1, 10, 'A', 20.0, ?);", (v1,))
         conn.execute("INSERT INTO rev_items VALUES (1, 11, 'A', 30.0, ?);", (v2,))
-        row_mv = conn.execute("SELECT ba, bo, bx FROM __matview_v_bit64 WHERE tenant_id = 1;").fetchone()
+        row_mv = conn.execute("SELECT ba, bo, bx FROM v_bit64 WHERE tenant_id = 1;").fetchone()
         self.assertEqual(row_mv, (v1 & v2, v1 | v2, v1 ^ v2))
         conn.execute("DELETE FROM rev_items WHERE tenant_id = 1 AND item_id = 10;")
-        row_mv_after = conn.execute("SELECT ba, bo, bx FROM __matview_v_bit64 WHERE tenant_id = 1;").fetchone()
+        row_mv_after = conn.execute("SELECT ba, bo, bx FROM v_bit64 WHERE tenant_id = 1;").fetchone()
         self.assertEqual(row_mv_after, (v2, v2, v2))
 
         # 6. High-precision NUMERIC / DECIMAL accumulation for variance & stddev on Postgres & MySQL
@@ -4672,30 +4674,30 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             mgr.conn.execute("INSERT INTO rev_items VALUES (1, 1, 'X', 100.0, 15);")
             mgr.conn.commit()
             mgr.register_view("CREATE VIEW v_star AS SELECT * FROM rev_items WHERE price >= 50.0;")
-            self.assertEqual(mgr.check_schema_drift(), {"__matview_v_star": "ok"})
+            self.assertEqual(mgr.check_schema_drift(), {"v_star": "ok"})
 
             # Exception inside bulk_changes() rolls back dirty DML and restores triggers cleanly
             with self.assertRaises(RuntimeError):
                 with mgr.bulk_changes():
                     mgr.conn.execute("INSERT INTO rev_items VALUES (1, 2, 'Y', 200.0, 31);")
                     raise RuntimeError("simulated bulk failure")
-            rows_after_abort = mgr.conn.execute("SELECT item_id, price FROM __matview_v_star;").fetchall()
+            rows_after_abort = mgr.conn.execute("SELECT item_id, price FROM v_star;").fetchall()
             self.assertEqual(rows_after_abort, [(1, 100.0)])
             # And triggers are restored so subsequent normal DML works
             mgr.conn.execute("INSERT INTO rev_items VALUES (1, 3, 'Z', 300.0, 63);")
             mgr.conn.commit()
-            rows_after_ins = mgr.conn.execute("SELECT item_id, price FROM __matview_v_star ORDER BY item_id;").fetchall()
+            rows_after_ins = mgr.conn.execute("SELECT item_id, price FROM v_star ORDER BY item_id;").fetchall()
             self.assertEqual(rows_after_ins, [(1, 100.0), (3, 300.0)])
 
             # Out-of-band schema change is detected by check_schema_drift() and repaired by repair_view()
             mgr.conn.execute("ALTER TABLE rev_items ADD COLUMN extra_note TEXT;")
             mgr.conn.commit()
-            self.assertEqual(mgr.check_schema_drift(), {"__matview_v_star": "drifted"})
+            self.assertEqual(mgr.check_schema_drift(), {"v_star": "drifted"})
             rc_drift = cli_main(["--db", tmp.name, "--check-drift"])
             self.assertEqual(rc_drift, 1)
             rc_rep = cli_main(["--db", tmp.name, "--repair"])
             self.assertEqual(rc_rep, 0)
-            self.assertEqual(mgr.check_schema_drift(), {"__matview_v_star": "ok"})
+            self.assertEqual(mgr.check_schema_drift(), {"v_star": "ok"})
             mgr.conn.close()
 
     def test_12_engine_and_version_autodetection_and_subdialect_codegen(self) -> None:
@@ -4836,7 +4838,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(plan_reg.engine_version.version, (17, 2, 0))
         self.assertTrue(any("NULLS NOT DISTINCT" in d for d in plan_reg.index_ddls))
         tr_pg17.execute("INSERT INTO ev_sales VALUES (3, NULL, 15.0);")
-        rows_pg17 = tr_pg17.execute("SELECT region, c, s FROM __matview_v_ev_reg ORDER BY c;").fetchall()
+        rows_pg17 = tr_pg17.execute("SELECT region, c, s FROM v_ev_reg ORDER BY c;").fetchall()
         self.assertEqual(rows_pg17, [("EU", 1, 10.0), (None, 2, 40.0)])
         tr_pg17.close()
 
@@ -6089,6 +6091,79 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 1,
             )
             sync_manager.drop_view("limited_window")
+        finally:
+            conn.close()
+
+    def test_snapshot_isolation_spans_group_key_and_offset_backfill_batches(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE snapshot_rows (id INTEGER, bucket TEXT NOT NULL, value INTEGER NOT NULL);"
+        )
+        conn.executemany(
+            "INSERT INTO snapshot_rows VALUES (?, ?, ?);",
+            [(i, f"b{i % 3}", i * 10) for i in range(1, 10)],
+        )
+        conn.commit()
+        manager = MaterializedViewManager(conn)
+        cases = (
+            (
+                "CREATE VIEW snapshot_grouped AS "
+                "SELECT bucket, COUNT(DISTINCT value) AS n "
+                "FROM snapshot_rows GROUP BY bucket;",
+                "group_key_batch",
+                "SELECT bucket, COUNT(DISTINCT value) AS n "
+                "FROM snapshot_rows GROUP BY bucket;",
+            ),
+            (
+                "CREATE VIEW snapshot_ranked AS "
+                "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS row_num "
+                "FROM snapshot_rows;",
+                "offset_batch",
+                "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS row_num "
+                "FROM snapshot_rows;",
+            ),
+        )
+        try:
+            for view_sql, expected_mode, live_sql in cases:
+                with self.subTest(mode=expected_mode):
+                    plan = manager.register_view(view_sql, populate=False)
+                    self.assertIsNotNone(plan.incremental_backfill_spec)
+                    self.assertEqual(plan.incremental_backfill_spec.mode, expected_mode)
+                    transaction_states: list[bool] = []
+
+                    def on_progress(batch_idx: int, rows_done: int) -> None:
+                        transaction_states.append(conn.in_transaction)
+
+                    batches = manager.backfill_incrementally(
+                        plan,
+                        batch_size=2,
+                        on_progress=on_progress,
+                        snapshot_isolation=True,
+                    )
+                    self.assertGreaterEqual(batches, 2)
+                    self.assertEqual(len(transaction_states), batches)
+                    self.assertTrue(
+                        all(transaction_states),
+                        "snapshot mode committed between chunks and lost its transaction",
+                    )
+                    self.assertFalse(conn.in_transaction)
+                    catalog_entry = manager.get_catalog()[plan.view_name]
+                    self.assertEqual(catalog_entry["backfill_active"], 0)
+                    self.assertIsNone(catalog_entry["backfill_cursor_pk"])
+                    self.assertIsNone(catalog_entry["backfill_max_pk"])
+
+                    actual = [
+                        tuple(row)
+                        for row in conn.execute(
+                            f"SELECT * FROM {plan.view_name} ORDER BY 1;"
+                        ).fetchall()
+                    ]
+                    expected = [
+                        tuple(row)
+                        for row in conn.execute(live_sql.rstrip(";") + " ORDER BY 1;").fetchall()
+                    ]
+                    self.assertEqual(actual, expected)
+                    manager.drop_view(plan.view_name)
         finally:
             conn.close()
 
