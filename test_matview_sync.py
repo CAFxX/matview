@@ -4470,7 +4470,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         Verifies the structural invariants of every entry in the fuzzing regression corpus:
         - Corpus #1 compiles as ALGEBRAIC_DELTA with pure-SQLite bitwise expressions.
         - Corpus #2 includes deterministic ORDER BY in every offset_batch incremental backfill loop.
-        - Corpus #3 wraps MySQL BIT_OR/BIT_XOR in COALESCE(..., 0) and BIT_AND in COALESCE(..., 18446744073709551615).
+        - Corpus #3 preserves unsigned MySQL BIT_OR/BIT_XOR and BIT_AND empty-set identities with explicitly unsigned CAST literals in COALESCE.
         - Corpus #4 parses FILTER (WHERE ...) with balanced parentheses and compiles as ALGEBRAIC_DELTA.
         """
         corpus = {c["id"]: c for c in get_fuzz_regression_corpus()}
@@ -4500,9 +4500,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         p3 = generate_materialized_view(
             c3["schema"], c3["views"][0][1], dialect=Dialect.MYSQL, ignore_limitations=True
         )
-        self.assertIn("COALESCE(bx, 0) AS bx", p3.reader_view_ddl)
-        self.assertIn("COALESCE(bo, 0) AS bo", p3.reader_view_ddl)
-        self.assertIn("COALESCE(ba, 18446744073709551615) AS ba", p3.reader_view_ddl)
+        self.assertIn("COALESCE(bx, CAST(0 AS UNSIGNED)) AS bx", p3.reader_view_ddl)
+        self.assertIn("COALESCE(bo, CAST(0 AS UNSIGNED)) AS bo", p3.reader_view_ddl)
+        self.assertIn("COALESCE(ba, CAST(18446744073709551615 AS UNSIGNED)) AS ba", p3.reader_view_ddl)
 
         # Corpus 4: FILTER (WHERE ...) compiles as ALGEBRAIC_DELTA
         c4 = corpus["corpus_04_filter_where_greedy_regex_algebraic_delta"]
