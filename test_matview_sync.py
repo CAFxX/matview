@@ -4966,7 +4966,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             conn_q.execute("""INSERT INTO "order" VALUES (4, 'A', 30, 5.0);""")
             conn_q.execute('UPDATE "order" SET "select" = 15, "unit price" = 3.5 WHERE "id" = 1;')
             conn_q.execute('DELETE FROM "order" WHERE "id" = 3;')
-            mv_q_rows = conn_q.execute('SELECT * FROM __matview_order_summary ORDER BY "group";').fetchall()
+            mv_q_rows = conn_q.execute('SELECT * FROM order_summary ORDER BY "group";').fetchall()
             self.assertEqual(len(mv_q_rows), 1)
             self.assertEqual(mv_q_rows[0][0], "A")
             self.assertEqual(mv_q_rows[0][1], 3)
@@ -5011,7 +5011,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             batch_size=2,
         )
         self.assertIn("__mv_m2_", plan_w.backing_table_ddl)
-        r_g1_init = conn_w.execute("SELECT n, vp, vs, sp, ss FROM __matview_sensor_stats WHERE grp = 'g1'").fetchone()
+        r_g1_init = conn_w.execute("SELECT n, vp, vs, sp, ss FROM sensor_stats WHERE grp = 'g1'").fetchone()
         self.assertEqual(r_g1_init[0], 4)
         self.assertAlmostEqual(r_g1_init[1], 1.25, places=5)
         self.assertAlmostEqual(r_g1_init[2], 5.0 / 3.0, places=5)
@@ -5023,8 +5023,8 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         conn_w.execute("UPDATE sensors SET reading = 1e9 + 10.0 WHERE id = 3;")
         conn_w.execute("UPDATE sensors SET reading = 1e9 + 3.0 WHERE id = 3;")
 
-        r_g1 = conn_w.execute("SELECT n, vp, vs, sp, ss FROM __matview_sensor_stats WHERE grp = 'g1'").fetchone()
-        r_g2 = conn_w.execute("SELECT n, vp, vs, sp, ss FROM __matview_sensor_stats WHERE grp = 'g2'").fetchone()
+        r_g1 = conn_w.execute("SELECT n, vp, vs, sp, ss FROM sensor_stats WHERE grp = 'g1'").fetchone()
+        r_g2 = conn_w.execute("SELECT n, vp, vs, sp, ss FROM sensor_stats WHERE grp = 'g2'").fetchone()
         self.assertEqual(r_g1[0], 3)
         self.assertAlmostEqual(r_g1[1], 2.0 / 3.0, places=5)
         self.assertAlmostEqual(r_g1[2], 1.0, places=5)
@@ -5069,7 +5069,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(cat_wm["backfill_active"], 0)
         self.assertEqual(cat_wm["backfill_cursor_pk"], 10)
 
-        mv_wm_rows = conn_wm.execute("SELECT bucket, c, s FROM __matview_ledger_totals ORDER BY bucket;").fetchall()
+        mv_wm_rows = conn_wm.execute("SELECT bucket, c, s FROM ledger_totals ORDER BY bucket;").fetchall()
         raw_wm_rows = conn_wm.execute("SELECT bucket, COUNT(*) AS c, SUM(amt) AS s FROM ledger GROUP BY bucket ORDER BY bucket;").fetchall()
         self.assertEqual(mv_wm_rows, raw_wm_rows)
 
@@ -5078,7 +5078,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         batches_snap = mgr_wm.backfill_incrementally(plan_wm, batch_size=4, snapshot_isolation=True)
         self.assertGreaterEqual(batches_snap, 2)
         self.assertEqual(
-            conn_wm.execute("SELECT bucket, c, s FROM __matview_ledger_totals ORDER BY bucket;").fetchall(),
+            conn_wm.execute("SELECT bucket, c, s FROM ledger_totals ORDER BY bucket;").fetchall(),
             raw_wm_rows,
         )
         conn_wm.close()
@@ -5167,15 +5167,15 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             conn_j.execute("UPDATE emps SET salary = 200 WHERE id = 1;")
             conn_j.execute("DELETE FROM contractors WHERE id = 1;")
             self.assertEqual(
-                conn_j.execute("SELECT * FROM __matview_v_dept_role ORDER BY d_code, role;").fetchall(),
+                conn_j.execute("SELECT * FROM v_dept_role ORDER BY d_code, role;").fetchall(),
                 conn_j.execute("SELECT d.d_code, e.role, COUNT(*) AS hc, SUM(e.salary) AS payroll FROM depts d INNER JOIN emps e ON d.id = e.dept_id GROUP BY d.d_code, e.role ORDER BY d.d_code, e.role;").fetchall(),
             )
             self.assertEqual(
-                sorted(conn_j.execute("SELECT * FROM __matview_v_all_workers;").fetchall()),
+                sorted(conn_j.execute("SELECT * FROM v_all_workers;").fetchall()),
                 sorted(conn_j.execute("SELECT id, dept_id, role, salary AS comp FROM emps UNION ALL SELECT id, dept_id, role, fee AS comp FROM contractors;").fetchall()),
             )
             self.assertEqual(
-                conn_j.execute("SELECT * FROM __matview_v_role_comp ORDER BY role;").fetchall(),
+                conn_j.execute("SELECT * FROM v_role_comp ORDER BY role;").fetchall(),
                 conn_j.execute("SELECT role, COUNT(*) AS n, SUM(comp) AS total_comp FROM (SELECT role, salary AS comp FROM emps UNION ALL SELECT role, fee AS comp FROM contractors) u GROUP BY role ORDER BY role;").fetchall(),
             )
 
@@ -5185,11 +5185,11 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 conn_j.execute("INSERT INTO contractors VALUES (3, 1, 'PM', 70);")
 
             self.assertEqual(
-                conn_j.execute("SELECT * FROM __matview_v_dept_role ORDER BY d_code, role;").fetchall(),
+                conn_j.execute("SELECT * FROM v_dept_role ORDER BY d_code, role;").fetchall(),
                 conn_j.execute("SELECT d.d_code, e.role, COUNT(*) AS hc, SUM(e.salary) AS payroll FROM depts d INNER JOIN emps e ON d.id = e.dept_id GROUP BY d.d_code, e.role ORDER BY d.d_code, e.role;").fetchall(),
             )
             self.assertEqual(
-                conn_j.execute("SELECT * FROM __matview_v_role_comp ORDER BY role;").fetchall(),
+                conn_j.execute("SELECT * FROM v_role_comp ORDER BY role;").fetchall(),
                 conn_j.execute("SELECT role, COUNT(*) AS n, SUM(comp) AS total_comp FROM (SELECT role, salary AS comp FROM emps UNION ALL SELECT role, fee AS comp FROM contractors) u GROUP BY role ORDER BY role;").fetchall(),
             )
             if hasattr(conn_j, "close"):
@@ -5997,7 +5997,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
 
             codes = {lim.code for lim in raised.exception.limitations}
             self.assertEqual(codes, {"SQLITE_VERSION_NO_WINDOW_FUNC"})
-            self.assertNotIn("__matview_limited_window", manager.get_catalog())
+            self.assertNotIn("limited_window", manager.get_catalog())
             objects_after_rejection = {
                 (name, kind)
                 for name, kind in conn.execute(
@@ -6005,7 +6005,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 ).fetchall()
             }
             self.assertNotIn(("__matview_store_limited_window", "table"), objects_after_rejection)
-            self.assertNotIn(("__matview_limited_window", "view"), objects_after_rejection)
+            self.assertNotIn(("limited_window", "view"), objects_after_rejection)
 
             override_manager = MaterializedViewManager(
                 conn,
@@ -6053,7 +6053,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 {lim.code for lim in sync_raised.exception.limitations},
                 {"SQLITE_VERSION_NO_WINDOW_FUNC"},
             )
-            self.assertNotIn("__matview_limited_window", sync_manager.get_catalog())
+            self.assertNotIn("limited_window", sync_manager.get_catalog())
 
             with warnings.catch_warnings(record=True) as sync_warnings:
                 warnings.simplefilter("always", EngineLimitationWarning)
@@ -6063,7 +6063,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     batch_size=1,
                     ignore_limitations=True,
                 )
-            self.assertEqual(created, {"__matview_limited_window": "created"})
+            self.assertEqual(created, {"limited_window": "created"})
             self.assertEqual(
                 sum(
                     issubclass(warning.category, EngineLimitationWarning)
@@ -6080,7 +6080,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     batch_size=1,
                     ignore_limitations=True,
                 )
-            self.assertEqual(unchanged, {"__matview_limited_window": "unchanged"})
+            self.assertEqual(unchanged, {"limited_window": "unchanged"})
             self.assertEqual(
                 sum(
                     issubclass(warning.category, EngineLimitationWarning)
@@ -6088,7 +6088,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 ),
                 1,
             )
-            sync_manager.drop_view("__matview_limited_window")
+            sync_manager.drop_view("limited_window")
         finally:
             conn.close()
 
