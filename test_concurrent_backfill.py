@@ -8,10 +8,11 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+import warnings
 import uuid
 from urllib.parse import urlparse
 
-from matview_sync import Dialect, MaterializedViewManager
+from matview_sync import Dialect, EngineLimitationWarning, MaterializedViewManager
 from test_matview_sync import _register_sqlite_compat_udfs
 
 
@@ -243,12 +244,35 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 f"SELECT bucket, COUNT(*) AS c, SUM(amt) AS s "
                 f"FROM {table_name} GROUP BY bucket;"
             )
-            plan = manager.register_view(
-                view_sql,
-                incremental_backfill=True,
-                batch_size=3,
-                on_progress=on_progress,
+            # This interleaving test never uses TRUNCATE. Explicitly override
+            # the unrelated MySQL limitation while keeping the warning and
+            # limitation metadata observable to the test.
+            with warnings.catch_warnings(record=True) as emitted:
+                warnings.simplefilter("always", EngineLimitationWarning)
+                plan = manager.register_view(
+                    view_sql,
+                    incremental_backfill=True,
+                    batch_size=3,
+                    on_progress=on_progress,
+                    ignore_limitations=True,
+                )
+            limitation_warnings = [
+                warning for warning in emitted
+                if issubclass(warning.category, EngineLimitationWarning)
+            ]
+            expected_limitation_codes = (
+                {"MYSQL_NO_TRUNCATE_TRIGGER"} if engine == Dialect.MYSQL else set()
             )
+            self.assertEqual(
+                {lim.code for lim in plan.limitations},
+                expected_limitation_codes,
+            )
+            self.assertEqual(len(limitation_warnings), len(expected_limitation_codes))
+            if expected_limitation_codes:
+                self.assertIn(
+                    "MYSQL_NO_TRUNCATE_TRIGGER",
+                    str(limitation_warnings[0].message),
+                )
 
             self.assertTrue(
                 progress_calls,
