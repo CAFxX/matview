@@ -7076,7 +7076,7 @@ class VariableSchemaDifferentialFuzzer:
             column_name: str, column_type: str, table_idx: int, suffix: str
         ) -> str:
             """Generate a deterministic string that respects VARCHAR(n)."""
-            width_match = re.search(r"\\bVARCHAR\\s*\\(\\s*(\\d+)\\s*\\)", column_type, re.IGNORECASE)
+            width_match = re.search(r"\bVARCHAR\s*\(\s*(\d+)\s*\)", column_type, re.IGNORECASE)
             width = int(width_match.group(1)) if width_match else None
             candidate = f"{prefix}_{column_name}_{suffix}"
             if width is None or len(candidate) <= width:
