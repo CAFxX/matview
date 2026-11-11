@@ -10532,8 +10532,9 @@ class MaterializedViewManager:
         force_rebuild: bool,
         effective_ignore: bool,
         effective_strict: bool = False,
+        compiled_plan: Optional[MaterializedViewPlan] = None,
     ) -> MaterializedViewPlan:
-        plan = generate_materialized_view(
+        plan = compiled_plan or generate_materialized_view(
             schemas,
             v_spec,
             dialect=self.dialect,
@@ -10714,10 +10715,12 @@ class MaterializedViewManager:
                 schemas,
                 v_spec,
                 dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
                 ignore_limitations=effective_ignore,
                 object_prefix=self.object_prefix,
                 strict=effective_strict,
                 engine_version=self.engine_version,
+                watermark_catalog_table=self.catalog_table if incremental_backfill else None,
             )
             v_name = plan.view_name
             desired_names.add(v_name)
@@ -10733,6 +10736,7 @@ class MaterializedViewManager:
                     force_rebuild=False,
                     effective_ignore=effective_ignore,
                     effective_strict=effective_strict,
+                    compiled_plan=plan,
                 )
                 status[v_name] = "created"
             elif catalog[v_name]["signature_hash"] != sig:
@@ -10746,6 +10750,7 @@ class MaterializedViewManager:
                     force_rebuild=True,
                     effective_ignore=effective_ignore,
                     effective_strict=effective_strict,
+                    compiled_plan=plan,
                 )
                 status[v_name] = "updated"
             else:

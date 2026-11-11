@@ -5977,6 +5977,121 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_manager_register_view_enforces_limitations_before_install_and_warns_on_override(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE limitation_source (id INTEGER PRIMARY KEY, value INTEGER);")
+        conn.executemany(
+            "INSERT INTO limitation_source VALUES (?, ?);",
+            [(1, 10), (2, 20)],
+        )
+        conn.commit()
+        view_sql = (
+            "CREATE VIEW limited_window AS "
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn "
+            "FROM limitation_source;"
+        )
+        try:
+            manager = MaterializedViewManager(conn, engine_version="sqlite:3.24.0")
+            with self.assertRaises(EngineLimitationError) as raised:
+                manager.register_view(view_sql)
+
+            codes = {lim.code for lim in raised.exception.limitations}
+            self.assertEqual(codes, {"SQLITE_VERSION_NO_WINDOW_FUNC"})
+            self.assertNotIn("__matview_limited_window", manager.get_catalog())
+            objects_after_rejection = {
+                (name, kind)
+                for name, kind in conn.execute(
+                    "SELECT name, type FROM sqlite_master"
+                ).fetchall()
+            }
+            self.assertNotIn(("__matview_store_limited_window", "table"), objects_after_rejection)
+            self.assertNotIn(("__matview_limited_window", "view"), objects_after_rejection)
+
+            override_manager = MaterializedViewManager(
+                conn,
+                engine_version="sqlite:3.24.0",
+                ignore_limitations=True,
+            )
+            with warnings.catch_warnings(record=True) as emitted:
+                warnings.simplefilter("always", EngineLimitationWarning)
+                plan = override_manager.register_view(view_sql)
+
+            limitation_warnings = [
+                warning for warning in emitted
+                if issubclass(warning.category, EngineLimitationWarning)
+            ]
+            self.assertEqual(len(limitation_warnings), 1)
+            self.assertIn("SQLITE_VERSION_NO_WINDOW_FUNC", str(limitation_warnings[0].message))
+            self.assertEqual(
+                {lim.code for lim in plan.limitations},
+                {"SQLITE_VERSION_NO_WINDOW_FUNC"},
+            )
+            self.assertIn(plan.view_name, override_manager.get_catalog())
+
+            # The override really installed a usable plan on this runtime, but
+            # the warning and limitation metadata remain visible to the caller.
+            rows = conn.execute(
+                f"SELECT id, rn FROM {plan.view_name} ORDER BY id;"
+            ).fetchall()
+            self.assertEqual(rows, [(1, 1), (2, 2)])
+            override_manager.drop_view(plan.view_name)
+            self.assertNotIn(plan.view_name, override_manager.get_catalog())
+
+            # The declarative API must enforce the same default/override contract.
+            # Reusing one compiled plan is important: compiling once to compare
+            # signatures and again to install used to duplicate warnings and
+            # could compute a different signature when watermark columns were
+            # included for incremental backfills.
+            sync_manager = MaterializedViewManager(
+                conn, engine_version="sqlite:3.24.0"
+            )
+            with self.assertRaises(EngineLimitationError) as sync_raised:
+                sync_manager.sync_views(
+                    view_sql, incremental_backfill=True, batch_size=1
+                )
+            self.assertEqual(
+                {lim.code for lim in sync_raised.exception.limitations},
+                {"SQLITE_VERSION_NO_WINDOW_FUNC"},
+            )
+            self.assertNotIn("__matview_limited_window", sync_manager.get_catalog())
+
+            with warnings.catch_warnings(record=True) as sync_warnings:
+                warnings.simplefilter("always", EngineLimitationWarning)
+                created = sync_manager.sync_views(
+                    view_sql,
+                    incremental_backfill=True,
+                    batch_size=1,
+                    ignore_limitations=True,
+                )
+            self.assertEqual(created, {"__matview_limited_window": "created"})
+            self.assertEqual(
+                sum(
+                    issubclass(warning.category, EngineLimitationWarning)
+                    for warning in sync_warnings
+                ),
+                1,
+            )
+
+            with warnings.catch_warnings(record=True) as repeat_warnings:
+                warnings.simplefilter("always", EngineLimitationWarning)
+                unchanged = sync_manager.sync_views(
+                    view_sql,
+                    incremental_backfill=True,
+                    batch_size=1,
+                    ignore_limitations=True,
+                )
+            self.assertEqual(unchanged, {"__matview_limited_window": "unchanged"})
+            self.assertEqual(
+                sum(
+                    issubclass(warning.category, EngineLimitationWarning)
+                    for warning in repeat_warnings
+                ),
+                1,
+            )
+            sync_manager.drop_view("__matview_limited_window")
+        finally:
+            conn.close()
+
     def test_limited_plan_helper_checks_default_contract_before_override(self) -> None:
         schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);"
         supported, was_overridden, codes = _compile_plan_for_test(
