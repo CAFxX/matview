@@ -6098,6 +6098,11 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 for mutation_label, mutation_sql in mutations
                 if "upsert" in mutation_label
             ]
+            if "code VARCHAR(12)" in schema:
+                generated_dml = "\\n".join(sql for _, sql in mutations)
+                self.assertIn("'c0_insert_a'", generated_dml)
+                self.assertNotIn("'vs2_code_insert_a'", generated_dml)
+                self.assertLessEqual(len("c0_insert_a"), 12)
             if dialect == Dialect.MYSQL:
                 self.assertTrue(all("ON DUPLICATE KEY UPDATE" in sql for sql in upserts))
             else:
@@ -7067,6 +7072,27 @@ class VariableSchemaDifferentialFuzzer:
             })
         ddls.extend(index_ddls)
 
+        def _generated_string_value(
+            column_name: str, column_type: str, table_idx: int, suffix: str
+        ) -> str:
+            """Generate a deterministic string that respects VARCHAR(n)."""
+            width_match = re.search(r"\\bVARCHAR\\s*\\(\\s*(\\d+)\\s*\\)", column_type, re.IGNORECASE)
+            width = int(width_match.group(1)) if width_match else None
+            candidate = f"{prefix}_{column_name}_{suffix}"
+            if width is None or len(candidate) <= width:
+                return candidate
+            # Keep operation/table distinction while adapting to narrow columns.
+            compact = f"{column_name[:1]}{table_idx}_{suffix}"
+            if len(compact) <= width:
+                return compact
+            compact = f"{table_idx}_{suffix}"
+            if len(compact) <= width:
+                return compact
+            raise ValueError(
+                f"Cannot encode generated value for {column_name} {column_type}: "
+                f"table={table_idx}, suffix={suffix!r}"
+            )
+
         seed_sql: List[str] = []
         row_counts = [
             rng.choices([0, 1, 3, 8, 24], weights=[1, 2, 5, 3, 1], k=1)[0]
@@ -7111,7 +7137,10 @@ class VariableSchemaDifferentialFuzzer:
                     elif extra_type in ("INTEGER", "REAL"):
                         vals.append(str(rng.randint(0, 20)))
                     else:
-                        vals.append(f"'{prefix}_{extra_name}_{rid}'")
+                        string_value = _generated_string_value(
+                            extra_name, extra_type, i, str(rid)
+                        )
+                        vals.append("'" + string_value.replace("'", "''") + "'")
                 for parent, _ in fks[i]:
                     if parent == i:
                         fk_value = str(rng.randint(1, rid - 1)) if rid > 1 and rng.random() < 0.35 else "NULL"
@@ -7173,7 +7202,10 @@ class VariableSchemaDifferentialFuzzer:
                 elif extra_type in ("INTEGER", "REAL"):
                     values.append(str(rng.randint(1, 20)))
                 else:
-                    values.append(f"'{prefix}_{extra_name}_{suffix}'")
+                    string_value = _generated_string_value(
+                        extra_name, extra_type, table_idx, suffix
+                    )
+                    values.append("'" + string_value.replace("'", "''") + "'")
             # Nullable FK columns use NULL so an earlier generated parent DELETE
             # cannot make a later child INSERT/UPSERT violate the FK constraint.
             values += ["NULL" for _ in fks[table_idx]]
