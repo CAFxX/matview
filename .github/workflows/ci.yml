@@ -311,6 +311,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      - name: Test independent-session PostgreSQL backfill concurrency
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+        run: python3 test_concurrent_backfill.py
   # Both supported Oracle MySQL LTS series are required on every PR.
   mysql:
     needs: classify
@@ -383,6 +387,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      - name: Test independent-session MySQL backfill concurrency
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_concurrent_backfill.py
   # Representative LTS boundaries for MariaDB: oldest, previous, newest LTS.
   mysql-compat:
     needs: classify
@@ -469,6 +477,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      - name: Test independent-session MariaDB backfill concurrency
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_concurrent_backfill.py
   # Stable branch-protection check. Only the required PR gate is aggregated;
   # scheduled/deferred compatibility jobs live in the separate workflow.
   ci-success:
