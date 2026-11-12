@@ -101,7 +101,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             self.assertNotEqual(worker_thread_ids[0], threading.get_ident())
 
             actual = conn.execute(
-                "SELECT bucket, c, s FROM __matview_ledger_totals ORDER BY bucket;"
+                "SELECT bucket, c, s FROM ledger_totals ORDER BY bucket;"
             ).fetchall()
             expected = conn.execute(
                 "SELECT bucket, COUNT(*) AS c, SUM(amt) AS s "
