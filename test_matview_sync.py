@@ -6167,6 +6167,31 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_snapshot_isolation_setup_failure_is_not_silently_ignored(self) -> None:
+        class FailingCursor:
+            def execute(self, statement: str) -> None:
+                raise RuntimeError("isolation setup rejected")
+
+        class FailingConnection:
+            def cursor(self) -> FailingCursor:
+                return FailingCursor()
+
+        conn = sqlite3.connect(":memory:")
+        manager = MaterializedViewManager(conn)
+        original_conn = manager.conn
+        original_dialect = manager.dialect
+        try:
+            manager.conn = FailingConnection()
+            manager.dialect = Dialect.POSTGRES
+            with self.assertRaisesRegex(
+                RuntimeError, "Unable to establish snapshot isolation for postgres backfill"
+            ):
+                manager.backfill_incrementally(None, snapshot_isolation=True)
+        finally:
+            manager.conn = original_conn
+            manager.dialect = original_dialect
+            conn.close()
+
     def test_limited_plan_helper_checks_default_contract_before_override(self) -> None:
         schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);"
         supported, was_overridden, codes = _compile_plan_for_test(

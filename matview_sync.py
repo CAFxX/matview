@@ -10417,8 +10417,14 @@ class MaterializedViewManager:
                     cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
                 elif self.dialect == Dialect.SQLITE:
                     cur.execute("SAVEPOINT __mv_backfill_snap;")
-            except Exception:
-                pass
+                else:
+                    raise RuntimeError(
+                        f"Snapshot isolation is not implemented for {self.dialect.value}"
+                    )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
+                ) from exc
 
         if spec is None or batch_size <= 0:
             for s in plan.initial_populate_sqls:
