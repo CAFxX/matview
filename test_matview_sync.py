@@ -6169,24 +6169,61 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
 
     def test_snapshot_isolation_setup_failure_is_not_silently_ignored(self) -> None:
         class FailingCursor:
+            def __init__(self, fail_on: str) -> None:
+                self.fail_on = fail_on
+                self.statements: list[str] = []
+
             def execute(self, statement: str) -> None:
-                raise RuntimeError("isolation setup rejected")
+                self.statements.append(statement)
+                if statement == self.fail_on:
+                    raise RuntimeError("isolation setup rejected")
 
         class FailingConnection:
+            def __init__(self, fail_on: str) -> None:
+                self.cursor_instance = FailingCursor(fail_on)
+
             def cursor(self) -> FailingCursor:
-                return FailingCursor()
+                return self.cursor_instance
 
         conn = sqlite3.connect(":memory:")
         manager = MaterializedViewManager(conn)
         original_conn = manager.conn
         original_dialect = manager.dialect
+        cases = (
+            (
+                Dialect.POSTGRES,
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;",
+                ["SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;"],
+            ),
+            (
+                Dialect.MYSQL,
+                "START TRANSACTION WITH CONSISTENT SNAPSHOT;",
+                [
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;",
+                    "START TRANSACTION WITH CONSISTENT SNAPSHOT;",
+                ],
+            ),
+            (
+                Dialect.SQLITE,
+                "SAVEPOINT __mv_backfill_snap;",
+                ["SAVEPOINT __mv_backfill_snap;"],
+            ),
+        )
         try:
-            manager.conn = FailingConnection()
-            manager.dialect = Dialect.POSTGRES
-            with self.assertRaisesRegex(
-                RuntimeError, "Unable to establish snapshot isolation for postgres backfill"
-            ):
-                manager.backfill_incrementally(None, snapshot_isolation=True)
+            for dialect, fail_on, expected_statements in cases:
+                with self.subTest(dialect=dialect.value):
+                    failing_conn = FailingConnection(fail_on)
+                    manager.conn = failing_conn
+                    manager.dialect = dialect
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        f"Unable to establish snapshot isolation for {dialect.value} backfill",
+                    ):
+                        manager.backfill_incrementally(None, snapshot_isolation=True)
+                    self.assertEqual(
+                        failing_conn.cursor_instance.statements,
+                        expected_statements,
+                    )
         finally:
             manager.conn = original_conn
             manager.dialect = original_dialect
