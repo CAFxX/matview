@@ -159,6 +159,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 with self.subTest(mode=expected_mode):
                     writer_started = threading.Event()
                     statement_started = threading.Event()
+                    traced_statements: list[str] = []
                     writer_finished = threading.Event()
                     writer_errors: list[BaseException] = []
                     writer_thread_ids: list[int] = []
@@ -178,6 +179,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                                 if statement.lstrip().upper().startswith(
                                     "INSERT INTO SNAPSHOT_ROWS"
                                 ):
+                                    traced_statements.append(statement)
                                     statement_started.set()
 
                             second.set_trace_callback(trace_statement)
@@ -234,6 +236,12 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                     if writer_errors:
                         raise writer_errors[0]
                     self.assertTrue(writer_finished.is_set())
+                    self.assertEqual(len(traced_statements), 1)
+                    self.assertTrue(
+                        traced_statements[0].lstrip().upper().startswith(
+                            "INSERT INTO SNAPSHOT_ROWS"
+                        )
+                    )
                     self.assertTrue(writer_thread_ids)
                     self.assertNotEqual(writer_thread_ids[0], threading.get_ident())
 
