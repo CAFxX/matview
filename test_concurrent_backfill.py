@@ -158,7 +158,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             for view_sql, expected_mode, live_sql, mutation_sql in cases:
                 with self.subTest(mode=expected_mode):
                     writer_started = threading.Event()
-                    writer_attempting = threading.Event()
+                    statement_started = threading.Event()
                     writer_finished = threading.Event()
                     writer_errors: list[BaseException] = []
                     writer_thread_ids: list[int] = []
@@ -169,9 +169,20 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                         try:
                             second.execute("PRAGMA busy_timeout=10000;")
                             _register_sqlite_compat_udfs(second)
+
+                            # sqlite3's trace callback fires when the INSERT is
+                            # actually handed to SQLite, before lock waiting. This
+                            # distinguishes a blocked statement from a worker that
+                            # was merely scheduled but had not reached execute().
+                            def trace_statement(statement: str) -> None:
+                                if statement.lstrip().upper().startswith(
+                                    "INSERT INTO SNAPSHOT_ROWS"
+                                ):
+                                    statement_started.set()
+
+                            second.set_trace_callback(trace_statement)
                             writer_thread_ids.append(threading.get_ident())
                             writer_started.set()
-                            writer_attempting.set()
                             second.execute(mutation_sql)
                             second.commit()
                         except BaseException as exc:
@@ -194,8 +205,10 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                         writer_thread.start()
                         if not writer_started.wait(timeout=10):
                             raise AssertionError("independent snapshot writer did not start")
-                        if not writer_attempting.wait(timeout=10):
-                            raise AssertionError("independent snapshot writer did not attempt DML")
+                        if not statement_started.wait(timeout=10):
+                            raise AssertionError(
+                                "independent snapshot writer never entered its INSERT statement"
+                            )
                         if writer_finished.wait(timeout=0.5):
                             raise AssertionError(
                                 "independent writer committed before the snapshot backfill finished"
