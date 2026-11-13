@@ -6181,9 +6181,13 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         class FailingConnection:
             def __init__(self, fail_on: str) -> None:
                 self.cursor_instance = FailingCursor(fail_on)
+                self.rollback_calls = 0
 
             def cursor(self) -> FailingCursor:
                 return self.cursor_instance
+
+            def rollback(self) -> None:
+                self.rollback_calls += 1
 
         conn = sqlite3.connect(":memory:")
         manager = MaterializedViewManager(conn)
@@ -6224,6 +6228,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                         failing_conn.cursor_instance.statements,
                         expected_statements,
                     )
+                    self.assertEqual(failing_conn.rollback_calls, 1)
         finally:
             manager.conn = original_conn
             manager.dialect = original_dialect
