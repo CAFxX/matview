@@ -10406,35 +10406,68 @@ class MaterializedViewManager:
                 )
             return total_b
 
-        spec = plan.incremental_backfill_spec
         cur = self.conn.cursor()
-        if snapshot_isolation:
-            try:
-                if self.dialect == Dialect.POSTGRES:
-                    cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
-                elif self.dialect == Dialect.MYSQL:
-                    cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
-                    cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
-                elif self.dialect == Dialect.SQLITE:
-                    cur.execute("SAVEPOINT __mv_backfill_snap;")
-                else:
+        try:
+            if snapshot_isolation:
+                try:
+                    if self.dialect == Dialect.POSTGRES:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                    elif self.dialect == Dialect.MYSQL:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                        cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
+                    elif self.dialect == Dialect.SQLITE:
+                        cur.execute("SAVEPOINT __mv_backfill_snap;")
+                    else:
+                        raise RuntimeError(
+                            f"Snapshot isolation is not implemented for {self.dialect.value}"
+                        )
+                except Exception as exc:
                     raise RuntimeError(
-                        f"Snapshot isolation is not implemented for {self.dialect.value}"
-                    )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
-                ) from exc
+                        f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
+                    ) from exc
 
+            return self._backfill_incrementally_with_cursor(
+                plan, batch_size, on_progress, snapshot_isolation, cur
+            )
+        except BaseException:
+            if snapshot_isolation:
+                self._rollback_snapshot_backfill(cur)
+            raise
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _rollback_snapshot_backfill(self, cur: Any) -> None:
+        """Roll back a failed snapshot backfill without leaving its transaction open."""
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT __mv_backfill_snap;")
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                return
+            except Exception:
+                # If the savepoint no longer exists or the connection is already
+                # in an error state, a full rollback is the safest recovery.
+                self._rollback()
+                return
+        self._rollback()
+
+    def _backfill_incrementally_with_cursor(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        snapshot_isolation: bool,
+        cur: Any,
+    ) -> int:
+        spec = plan.incremental_backfill_spec
         if spec is None or batch_size <= 0:
             for s in plan.initial_populate_sqls:
                 cur.execute(s)
             self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
             if snapshot_isolation and self.dialect == Dialect.SQLITE:
-                try:
-                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
-                except Exception:
-                    pass
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
             self._commit()
             if on_progress:
                 on_progress(1, 1)
@@ -10452,10 +10485,7 @@ class MaterializedViewManager:
                         cur.execute(s)
                 self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
                 if snapshot_isolation and self.dialect == Dialect.SQLITE:
-                    try:
-                        cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
-                    except Exception:
-                        pass
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
                 self._commit()
                 return 0
             min_pk, max_pk = int(row[0]), int(row[1])
@@ -10479,10 +10509,7 @@ class MaterializedViewManager:
                     on_progress(batches_run, done)
             self._update_backfill_watermark(cur, plan.view_name, max_pk, max_pk, 0)
             if snapshot_isolation and self.dialect == Dialect.SQLITE:
-                try:
-                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
-                except Exception:
-                    pass
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
             self._commit()
             return batches_run
 

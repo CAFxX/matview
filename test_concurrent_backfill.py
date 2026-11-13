@@ -267,6 +267,94 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             conn.close()
             os.unlink(db_path)
 
+
+    def test_snapshot_backfill_failure_rolls_back_partial_batches_and_allows_retry(self) -> None:
+        fd, db_path = tempfile.mkstemp(prefix="matview-snapshot-rollback-", suffix=".sqlite")
+        os.close(fd)
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=10000;")
+        _register_sqlite_compat_udfs(conn)
+        conn.execute(
+            "CREATE TABLE rollback_rows (id INTEGER, bucket TEXT NOT NULL, value INTEGER NOT NULL);"
+        )
+        conn.executemany(
+            "INSERT INTO rollback_rows VALUES (?, ?, ?);",
+            [(i, f"b{i % 3}", i * 10) for i in range(1, 10)],
+        )
+        conn.commit()
+        manager = MaterializedViewManager(conn)
+        cases = (
+            (
+                "CREATE VIEW rollback_grouped AS "
+                "SELECT bucket, COUNT(DISTINCT value) AS n "
+                "FROM rollback_rows GROUP BY bucket;",
+                "group_key_batch",
+                "SELECT bucket, COUNT(DISTINCT value) AS n FROM rollback_rows GROUP BY bucket;",
+            ),
+            (
+                "CREATE VIEW rollback_ranked AS "
+                "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS row_num "
+                "FROM rollback_rows;",
+                "offset_batch",
+                "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS row_num FROM rollback_rows;",
+            ),
+        )
+        try:
+            for view_sql, expected_mode, live_sql in cases:
+                with self.subTest(mode=expected_mode):
+                    plan = manager.register_view(view_sql, populate=False)
+                    self.assertIsNotNone(plan.incremental_backfill_spec)
+                    self.assertEqual(plan.incremental_backfill_spec.mode, expected_mode)
+
+                    def fail_after_first_batch(batch_idx: int, rows_done: int) -> None:
+                        if batch_idx == 1:
+                            raise RuntimeError("injected snapshot backfill failure")
+
+                    with self.assertRaisesRegex(
+                        RuntimeError, "injected snapshot backfill failure"
+                    ):
+                        manager.backfill_incrementally(
+                            plan,
+                            batch_size=2,
+                            on_progress=fail_after_first_batch,
+                            snapshot_isolation=True,
+                        )
+
+                    self.assertFalse(
+                        conn.in_transaction,
+                        "failed snapshot backfill left its transaction/savepoint open",
+                    )
+                    backing_rows = conn.execute(
+                        f"SELECT COUNT(*) FROM {plan.backing_table_name};"
+                    ).fetchone()[0]
+                    self.assertEqual(
+                        backing_rows,
+                        0,
+                        "partial rows from the failed snapshot backfill were not rolled back",
+                    )
+                    catalog_entry = manager.get_catalog()[plan.view_name]
+                    self.assertEqual(catalog_entry["backfill_active"], 0)
+                    self.assertIsNone(catalog_entry["backfill_cursor_pk"])
+                    self.assertIsNone(catalog_entry["backfill_max_pk"])
+                    self.assertEqual(conn.execute("SELECT 1;").fetchone()[0], 1)
+
+                    batches = manager.backfill_incrementally(
+                        plan, batch_size=2, snapshot_isolation=True
+                    )
+                    self.assertGreaterEqual(batches, 2)
+                    actual = conn.execute(
+                        f"SELECT * FROM {plan.view_name} ORDER BY 1;"
+                    ).fetchall()
+                    expected = conn.execute(
+                        live_sql.rstrip(";") + " ORDER BY 1;"
+                    ).fetchall()
+                    self.assertEqual(actual, expected)
+                    manager.drop_view(plan.view_name)
+        finally:
+            conn.close()
+            os.unlink(db_path)
+
     @staticmethod
     def _connect_native(engine: Dialect, dsn: str):
         if engine == Dialect.POSTGRES:
