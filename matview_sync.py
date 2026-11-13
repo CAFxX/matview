@@ -10407,6 +10407,7 @@ class MaterializedViewManager:
             return total_b
 
         cur = self.conn.cursor()
+        snapshot_started = False
         try:
             if snapshot_isolation:
                 try:
@@ -10422,15 +10423,17 @@ class MaterializedViewManager:
                             f"Snapshot isolation is not implemented for {self.dialect.value}"
                         )
                 except Exception as exc:
+                    self._rollback()
                     raise RuntimeError(
                         f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
                     ) from exc
+                snapshot_started = True
 
             return self._backfill_incrementally_with_cursor(
                 plan, batch_size, on_progress, snapshot_isolation, cur
             )
         except BaseException:
-            if snapshot_isolation:
+            if snapshot_isolation and snapshot_started:
                 self._rollback_snapshot_backfill(cur)
             raise
         finally:
