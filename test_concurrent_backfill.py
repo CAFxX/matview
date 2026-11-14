@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import os
 import sqlite3
 import tempfile
@@ -399,12 +401,13 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 f"CREATE TABLE {table_name} ("
                 "id BIGINT PRIMARY KEY, "
                 "bucket VARCHAR(16) NOT NULL, "
-                "amt BIGINT NOT NULL"
+                "amt BIGINT NOT NULL, "
+                "approx_amt DOUBLE PRECISION NOT NULL"
                 f"){engine_suffix};"
             )
             cur.executemany(
-                f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
-                [(i, "B1" if i % 2 else "B2", i * 10) for i in range(1, 11)],
+                f"INSERT INTO {table_name} (id, bucket, amt, approx_amt) VALUES (%s, %s, %s, %s)",
+                [(i, "B1" if i % 2 else "B2", i * 10, i * 0.125 + 0.1) for i in range(1, 11)],
             )
             conn.commit()
 
@@ -426,16 +429,18 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                     # beyond max_pk, mutations below the cursor, and mutations
                     # in the not-yet-backfilled range.
                     second_cur.execute(
-                        f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
-                        (11, "B1", 110),
+                        f"INSERT INTO {table_name} (id, bucket, amt, approx_amt) VALUES (%s, %s, %s, %s)",
+                        (11, "B1", 110, 1.475),
                     )
                     second_cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (2,))
                     second_cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (8,))
                     second_cur.execute(
-                        f"UPDATE {table_name} SET amt = %s WHERE id = %s", (999, 1)
+                        f"UPDATE {table_name} SET amt = %s, approx_amt = %s WHERE id = %s",
+                        (999, 12.3456789, 1),
                     )
                     second_cur.execute(
-                        f"UPDATE {table_name} SET amt = %s WHERE id = %s", (888, 9)
+                        f"UPDATE {table_name} SET amt = %s, approx_amt = %s WHERE id = %s",
+                        (888, 9.87654321, 9),
                     )
                     second.commit()
 
@@ -443,8 +448,8 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                     # row: the insert below is intentionally rolled back.
                     second_cur.execute("BEGIN;")
                     second_cur.execute(
-                        f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
-                        (12, "B2", 120),
+                        f"INSERT INTO {table_name} (id, bucket, amt, approx_amt) VALUES (%s, %s, %s, %s)",
+                        (12, "B2", 120, 1.625),
                     )
                     second.rollback()
                 except BaseException as exc:
@@ -480,7 +485,8 @@ class IndependentSessionBackfillTests(unittest.TestCase):
 
             view_sql = (
                 f"CREATE VIEW {view_name} AS "
-                f"SELECT bucket, COUNT(*) AS c, SUM(amt) AS s "
+                f"SELECT bucket, COUNT(*) AS c, SUM(amt) AS s, "
+                f"AVG(amt) AS avg_amt, AVG(approx_amt) AS avg_approx_amt "
                 f"FROM {table_name} GROUP BY bucket;"
             )
             # This interleaving test never uses TRUNCATE. Explicitly override
@@ -521,14 +527,21 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             self.assertNotEqual(worker_thread_ids[0], threading.get_ident())
             self.assertEqual(progress_calls[0][0], 1)
 
-            cur.execute(f"SELECT bucket, c, s FROM {plan.view_name} ORDER BY bucket;")
+            cur.execute(
+                f"SELECT bucket, c, s, avg_amt, avg_approx_amt "
+                f"FROM {plan.view_name} ORDER BY bucket;"
+            )
             actual = [tuple(row) for row in cur.fetchall()]
             cur.execute(
-                f"SELECT bucket, COUNT(*) AS c, SUM(amt) AS s "
+                f"SELECT bucket, COUNT(*) AS c, SUM(amt) AS s, "
+                f"AVG(amt) AS avg_amt, AVG(approx_amt) AS avg_approx_amt "
                 f"FROM {table_name} GROUP BY bucket ORDER BY bucket;"
             )
             expected = [tuple(row) for row in cur.fetchall()]
             self.assertEqual(actual, expected)
+            for row in actual:
+                self.assertIsInstance(row[3], Decimal)
+                self.assertIsInstance(row[4], float)
             cur.execute(f"SELECT COUNT(*) FROM {table_name} WHERE id = 12;")
             self.assertEqual(
                 cur.fetchone()[0], 0,
