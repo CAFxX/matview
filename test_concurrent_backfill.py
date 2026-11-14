@@ -159,7 +159,10 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 with self.subTest(mode=expected_mode):
                     writer_started = threading.Event()
                     statement_started = threading.Event()
-                    traced_statements: list[str] = []
+                    # sqlite3 may invoke the trace callback repeatedly while the same
+                    # top-level statement is replayed through trigger programs. Track
+                    # distinct SQL statements, not callback invocations.
+                    traced_statements: set[str] = set();
                     writer_finished = threading.Event()
                     writer_errors: list[BaseException] = []
                     writer_thread_ids: list[int] = []
@@ -179,7 +182,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                                 if statement.lstrip().upper().startswith(
                                     "INSERT INTO SNAPSHOT_ROWS"
                                 ):
-                                    traced_statements.append(statement)
+                                    traced_statements.add(statement)
                                     statement_started.set()
 
                             second.set_trace_callback(trace_statement)
@@ -237,8 +240,9 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                         raise writer_errors[0]
                     self.assertTrue(writer_finished.is_set())
                     self.assertEqual(len(traced_statements), 1)
+                    traced_statement = next(iter(traced_statements))
                     self.assertTrue(
-                        traced_statements[0].lstrip().upper().startswith(
+                        traced_statement.lstrip().upper().startswith(
                             "INSERT INTO SNAPSHOT_ROWS"
                         )
                     )
