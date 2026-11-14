@@ -6191,6 +6191,15 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
 
         conn = sqlite3.connect(":memory:")
         manager = MaterializedViewManager(conn)
+        # Exercise the isolation-setup failure with a valid, non-composite plan.
+        # Passing None tested an invalid argument and failed before the setup path.
+        plan = generate_materialized_view(
+            "CREATE TABLE snapshot_setup_failure_source (id INTEGER PRIMARY KEY);",
+            "CREATE VIEW snapshot_setup_failure_view AS "
+            "SELECT id FROM snapshot_setup_failure_source;",
+            dialect=Dialect.SQLITE,
+        )
+        self.assertFalse(plan.sub_plans)
         original_conn = manager.conn
         original_dialect = manager.dialect
         cases = (
@@ -6223,7 +6232,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                         RuntimeError,
                         f"Unable to establish snapshot isolation for {dialect.value} backfill",
                     ):
-                        manager.backfill_incrementally(None, snapshot_isolation=True)
+                        manager.backfill_incrementally(plan, snapshot_isolation=True)
                     self.assertEqual(
                         failing_conn.cursor_instance.statements,
                         expected_statements,
