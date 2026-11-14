@@ -5979,6 +5979,89 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_25_join_aggregate_decrement_and_group_key_invariants(self) -> None:
+        """Exercise join-delta retractions against an independent live SELECT oracle."""
+        schema = """
+        CREATE TABLE join_customers (
+            id INTEGER PRIMARY KEY,
+            segment TEXT NOT NULL
+        );
+        CREATE TABLE join_orders (
+            id INTEGER PRIMARY KEY,
+            customer_id INTEGER NOT NULL REFERENCES join_customers(id),
+            amount INTEGER
+        );
+        INSERT INTO join_customers VALUES (1, 'A'), (2, 'A'), (3, 'B');
+        INSERT INTO join_orders VALUES
+            (10, 1, 11), (11, 1, 13), (12, 2, 17), (13, 3, 19),
+            (14, 3, NULL);
+        """
+        view_sql = (
+            "CREATE VIEW join_segment_totals AS "
+            "SELECT c.segment, COUNT(*) AS joined_rows, COUNT(o.amount) AS valued_rows, "
+            "SUM(o.amount) AS total_amount "
+            "FROM join_customers c INNER JOIN join_orders o ON o.customer_id = c.id "
+            "GROUP BY c.segment;"
+        )
+        live_sql = (
+            "SELECT c.segment, COUNT(*) AS joined_rows, COUNT(o.amount) AS valued_rows, "
+            "SUM(o.amount) AS total_amount "
+            "FROM join_customers c INNER JOIN join_orders o ON o.customer_id = c.id "
+            "GROUP BY c.segment"
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.execute("PRAGMA foreign_keys = ON;")
+        try:
+            manager = MaterializedViewManager(conn, dialect="sqlite")
+            manager.apply_schema_ddl(schema)
+            plan = manager.register_view(view_sql)
+
+            def assert_matches_live(label: str) -> List[Tuple[Any, ...]]:
+                actual = [
+                    tuple(row)
+                    for row in conn.execute(
+                        f"SELECT segment, joined_rows, valued_rows, total_amount "
+                        f"FROM {plan.view_name} ORDER BY segment"
+                    ).fetchall()
+                ]
+                expected = [
+                    tuple(row)
+                    for row in conn.execute(live_sql + " ORDER BY segment").fetchall()
+                ]
+                self.assertTrue(
+                    _rows_equal(actual, expected),
+                    f"{label}: join aggregate delta differs from live SELECT; "
+                    f"actual={actual!r}, expected={expected!r}",
+                )
+                return actual
+
+            initial = assert_matches_live("initial")
+            # Retraction from a group with multiple joined rows exercises SUM
+            # decrement while the group remains present.
+            conn.execute("DELETE FROM join_orders WHERE id = 10")
+            after_one_delete = assert_matches_live("delete one contributing row")
+            self.assertNotEqual(initial, after_one_delete)
+
+            # A key-changing update must retract from A and add to B.
+            conn.execute(
+                "UPDATE join_customers SET segment = 'B' WHERE id = 2"
+            )
+            after_group_move = assert_matches_live("move joined rows between groups")
+
+            # Deleting the final matching row removes that group; NULL-valued
+            # rows still contribute to COUNT(*) but not COUNT/SUM(value).
+            conn.execute("DELETE FROM join_orders WHERE customer_id = 1")
+            after_last_delete = assert_matches_live("delete final matching rows")
+            self.assertNotEqual(after_group_move, after_last_delete)
+
+            # Restore the data through inserts and verify aggregate state
+            # returns to the independently computed relation.
+            conn.execute("INSERT INTO join_orders VALUES (20, 1, 23)")
+            conn.execute("INSERT INTO join_orders VALUES (21, 1, NULL)")
+            assert_matches_live("reinsert into emptied group")
+        finally:
+            conn.close()
+
     def test_manager_register_view_enforces_limitations_before_install_and_warns_on_override(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.execute("CREATE TABLE limitation_source (id INTEGER PRIMARY KEY, value INTEGER);")
