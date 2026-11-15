@@ -242,6 +242,9 @@ jobs:
       - name: Test PostgreSQL statement transition-table vectorization
         run: python3 test_p1_pg_transition_vectorization.py
 
+      - name: Test dialect-aware AST expression storage type inference
+        run: python3 test_p1_expr_storage_types.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify

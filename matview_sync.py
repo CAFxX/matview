@@ -5310,11 +5310,8 @@ class IncrementalViewCompiler:
 
         return None
 
-    def _postgres_case_result_storage_type(self, expr: str) -> Optional[str]:
-        """Infer CASE common types (Postgres & MariaDB), including nested column branches."""
-        is_mariadb = self.dialect == Dialect.MYSQL and self.subdialect == EngineSubdialect.MARIADB
-        if self.dialect != Dialect.POSTGRES and not is_mariadb:
-            return None
+    def _infer_ast_expr_storage_type(self, expr: str) -> Optional[str]:
+        """Infer storage type across dialects from AST nodes (CASE, COALESCE, arithmetic, scalars)."""
         try:
             root = parse_sql_ast(expr, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
@@ -5328,21 +5325,29 @@ class IncrementalViewCompiler:
             "REAL": 5,
             "DOUBLE PRECISION": 6,
         }
+        str_fn_names = {"UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM", "SUBSTR", "SUBSTRING", "CONCAT", "CONCAT_WS", "REPLACE"}
+        int_fn_names = {"LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "INSTR", "STRPOS"}
 
         def canonical_type(data_type: str) -> Optional[str]:
             upper = re.sub(r"\s*\(.*\)\s*$", "", data_type.upper()).strip()
             if upper in ("SMALLINT", "INT2"):
                 return "SMALLINT"
-            if upper in ("INTEGER", "INT", "INT4"):
+            if upper in ("INTEGER", "INT", "INT4", "MEDIUMINT", "TINYINT"):
                 return "INTEGER"
-            if upper in ("BIGINT", "INT8"):
+            if upper in ("BIGINT", "INT8", "BIGINT UNSIGNED", "INT UNSIGNED"):
                 return "BIGINT"
-            if upper in ("NUMERIC", "DECIMAL"):
+            if upper in ("NUMERIC", "DECIMAL", "DEC", "FIXED"):
                 return "NUMERIC"
             if upper in ("REAL", "FLOAT4"):
                 return "REAL"
             if upper in ("DOUBLE PRECISION", "DOUBLE", "FLOAT8", "FLOAT"):
                 return "DOUBLE PRECISION"
+            if upper in ("TEXT", "VARCHAR", "CHAR", "CHARACTER VARYING", "CHARACTER", "NVARCHAR", "NCHAR", "CLOB"):
+                return "TEXT"
+            if upper in ("BOOLEAN", "BOOL"):
+                return "BOOLEAN"
+            if upper in ("DATE", "DATETIME", "TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITHOUT TIME ZONE"):
+                return upper
             return None
 
         def merge(types: Sequence[Optional[str]]) -> Optional[str]:
@@ -5350,7 +5355,11 @@ class IncrementalViewCompiler:
             if not known:
                 return None
             if any(value not in ranks for value in known):
-                return known[0] if all(value == known[0] for value in known) else None
+                if all(value == known[0] for value in known):
+                    return known[0]
+                if all(value in ("TEXT", "VARCHAR") for value in known):
+                    return "TEXT"
+                return None
             return max(known, key=lambda value: ranks[value])
 
         def infer(node: Any) -> Optional[str]:
@@ -5361,6 +5370,8 @@ class IncrementalViewCompiler:
                 return infer(node.this)
             if kind == "Null":
                 return "UNKNOWN"
+            if kind == "Boolean":
+                return "BOOLEAN"
             if kind == "Column":
                 column = self._lookup_col_def(node.sql())
                 if column is None:
@@ -5371,7 +5382,7 @@ class IncrementalViewCompiler:
                 return canonical_type(cte_t) if cte_t else None
             if kind == "Literal":
                 if node.args.get("is_string"):
-                    return None
+                    return "TEXT"
                 value = str(node.this)
                 if re.fullmatch(r"[+-]?\d+", value):
                     number = int(value)
@@ -5381,7 +5392,7 @@ class IncrementalViewCompiler:
                         return "BIGINT"
                     return "NUMERIC"
                 if re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?", value):
-                    return "NUMERIC"
+                    return "DOUBLE PRECISION" if ("e" in value.lower() or self.dialect == Dialect.SQLITE) else "NUMERIC"
                 return None
             if kind in ("Neg", "Positive"):
                 return infer(node.this)
@@ -5389,7 +5400,14 @@ class IncrementalViewCompiler:
                 target = node.args.get("to")
                 return canonical_type(target.sql()) if target is not None else None
             if kind in ("Coalesce", "IfNull"):
-                return merge([infer(ch) for ch in node.iter_expressions()])
+                vals = [infer(ch) for ch in node.iter_expressions()]
+                return merge(vals)
+            if kind == "Nullif":
+                return infer(node.this)
+            if kind == "If":
+                t_br = infer(node.args.get("true"))
+                f_br = infer(node.args.get("false"))
+                return merge((t_br, f_br))
             if kind == "Case":
                 branches: List[Optional[str]] = []
                 for branch in node.args.get("ifs") or ():
@@ -5411,21 +5429,54 @@ class IncrementalViewCompiler:
                 if left is None or right is None:
                     return None
                 merged = merge((left, right))
-                if is_mariadb and kind in ("Add", "Sub", "Mul") and merged in ("SMALLINT", "INTEGER"):
+                if kind == "Div" and merged in ("SMALLINT", "INTEGER", "BIGINT") and self.dialect != Dialect.POSTGRES:
+                    return "DOUBLE PRECISION"
+                if kind in ("Add", "Sub", "Mul") and merged in ("SMALLINT", "INTEGER"):
                     return "BIGINT"
+                if merged == "REAL":
+                    return "DOUBLE PRECISION"
                 return merged
+            if isinstance(node, sqlglot_exp.Func):
+                fn_name = (node.sql_name() or kind).upper()
+                if fn_name in str_fn_names:
+                    return "TEXT"
+                if fn_name in int_fn_names:
+                    return "BIGINT"
+                if fn_name in ("LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE"):
+                    return infer(node.this)
             return None
 
         inferred = infer(root)
         if inferred is None or inferred == "UNKNOWN":
             return None
-        if is_mariadb:
-            if inferred == "INTEGER":
+        if inferred == "NUMERIC":
+            if self.dialect == Dialect.POSTGRES:
+                return "NUMERIC"
+            if self.dialect == Dialect.MYSQL:
+                ps = self._exact_numeric_precision_scale(expr)
+                if ps is not None:
+                    return f"DECIMAL({ps[0]}, {ps[1]})"
+                return "DECIMAL(38, 10)"
+            return "NUMERIC"
+        if inferred == "BOOLEAN":
+            return "BOOLEAN" if self.dialect == Dialect.POSTGRES else "INTEGER"
+        if inferred in ("SMALLINT", "INTEGER", "BIGINT") and self.dialect != Dialect.POSTGRES:
+            if (
+                self.dialect == Dialect.MYSQL
+                and self.subdialect == EngineSubdialect.MARIADB
+                and inferred == "INTEGER"
+            ):
                 return "INT"
-            if inferred == "BIGINT":
-                return "BIGINT"
+            return self._int_type()
+        if inferred in ("REAL", "DOUBLE PRECISION") and self.dialect != Dialect.POSTGRES:
+            return self._float_type()
+        return self._normalize_dialect_type(inferred)
+
+    def _postgres_case_result_storage_type(self, expr: str) -> Optional[str]:
+        """Infer PostgreSQL CASE common types, including nested column branches."""
+        if self.dialect != Dialect.POSTGRES:
             return None
-        return inferred
+        return self._infer_ast_expr_storage_type(expr)
 
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
         if not item.is_aggregate:
@@ -5463,6 +5514,9 @@ class IncrementalViewCompiler:
                     break
                 raw_expr = raw_expr[tokens[0].end + 1:tokens[-1].start].strip()
             raw_u = raw_expr.upper()
+            ast_inferred = self._infer_ast_expr_storage_type(raw_expr)
+            if ast_inferred is not None:
+                return ast_inferred
             m_coal = re.match(
                 r'^(?:COALESCE|IFNULL)\s*\(\s*([A-Za-z0-9_."`\[\]]+)\s*,',
                 item.raw_expr.strip(),
@@ -5552,6 +5606,11 @@ class IncrementalViewCompiler:
             c_def = self._lookup_col_def(item.arg_expr)
             if c_def:
                 return self._normalize_dialect_type(c_def.data_type)
+            arg_inferred = self._infer_expr_storage_type(
+                SelectItem(raw_expr=item.arg_expr, alias=item.alias, is_aggregate=False)
+            )
+            if arg_inferred:
+                return arg_inferred
         return self._float_type()
 
     def _null_safe_eq(self, left_expr: str, right_expr: str, is_nullable: bool = True) -> str:
