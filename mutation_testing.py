@@ -39,11 +39,10 @@ MUTANTS = (
     Mutant(
         name="filtered-projection-uses-new-predicate-for-old-row-retraction",
         source_path="matview_sync.py",
-        original="            del_stmts=minus_old_del_stmts,\n            upd_old_stmts=minus_old_upd_stmts,\n            upd_new_stmts=plus_new_stmts,\n            upd_cleanup_old_stmts=[delete_zero_mv_stmt] if delete_zero_mv_stmt else [],\n            trunc_stmts=trunc_stmts,\n            where_new=where_new,\n            where_old=where_old,",
-        replacement="            del_stmts=minus_old_del_stmts,\n            upd_old_stmts=minus_old_upd_stmts,\n            upd_new_stmts=plus_new_stmts,\n            upd_cleanup_old_stmts=[delete_zero_mv_stmt] if delete_zero_mv_stmt else [],\n            trunc_stmts=trunc_stmts,\n            where_new=where_new,\n            where_old=where_new,",
+        original="            upd_old_stmts=upd_old_list,\\n            upd_new_stmts=[plus_stmt],\\n            upd_cleanup_old_stmts=upd_clean_list,\\n            trunc_stmts=[f\"DELETE FROM {mv_table};\"],\\n            where_new=where_new,\\n            where_old=where_old,",
+        replacement="            upd_old_stmts=upd_old_list,\\n            upd_new_stmts=[plus_stmt],\\n            upd_cleanup_old_stmts=upd_clean_list,\\n            trunc_stmts=[f\"DELETE FROM {mv_table};\"],\\n            where_new=where_new,\\n            where_old=where_new,",
         target_test="test_matview_sync.TestGeneratorAndManagerCodePaths.test_filtered_projection_retracts_old_membership_on_update_and_delete",
-    ),
-    Mutant(
+    ),    Mutant(
         name="join-sum-retraction-adds-instead-of-subtracting",
         source_path="matview_sync.py",
         original='f"ELSE {mv_table}.{col} - __mv_delta.{col} END)"',
