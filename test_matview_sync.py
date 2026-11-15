@@ -4021,6 +4021,53 @@ def run_suite_11_live_engine_50_view_battery_across_all_dialects(runner: MVTestR
 
 
 class TestGeneratorAndManagerCodePaths(unittest.TestCase):
+    def test_00_mysql_bulk_changes_rejects_active_or_unknown_transaction_state(self) -> None:
+        class Connection:
+            def __init__(self, **attrs: Any) -> None:
+                self.__dict__.update(attrs)
+                self.cursor_calls = 0
+
+            def cursor(self) -> Any:
+                self.cursor_calls += 1
+                raise AssertionError("bulk_changes must reject before issuing SQL")
+
+        def make_manager(conn: Any) -> MaterializedViewManager:
+            mgr = MaterializedViewManager.__new__(MaterializedViewManager)
+            mgr.conn = conn
+            mgr.dialect = Dialect.MYSQL
+            return mgr
+
+        # Driver-level in_transaction and both common server-status attribute
+        # spellings must detect an already-open transaction without a SQL probe.
+        active_connections = (
+            Connection(in_transaction=True),
+            Connection(server_status=0x0001),
+            Connection(_server_status=0x0001),
+        )
+        for conn in active_connections:
+            mgr = make_manager(conn)
+            for options in ({}, {"drop_triggers": True}, {"use_shadow_swap": True}):
+                with self.subTest(options=options, attrs=conn.__dict__):
+                    with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
+                        with mgr.bulk_changes(**options):
+                            self.fail("active transaction must be rejected")
+            self.assertEqual(conn.cursor_calls, 0)
+
+        # An adapter with no reliable state API is rejected closed: guessing
+        # that the connection is idle could let MySQL DDL/commit caller work.
+        unknown_conn = Connection()
+        mgr = make_manager(unknown_conn)
+        with self.assertRaisesRegex(RuntimeError, "cannot safely determine"):
+            with mgr.bulk_changes(use_shadow_swap=True):
+                self.fail("unknown transaction state must be rejected")
+        self.assertEqual(unknown_conn.cursor_calls, 0)
+
+        # The server-status bit is a bitmask, not a truthy/falsy transaction
+        # flag: unrelated status bits must not be mistaken for an open tx.
+        idle_conn = Connection(server_status=0x0002)
+        idle_mgr = make_manager(idle_conn)
+        self.assertIs(idle_mgr._mysql_transaction_state(), False)
+
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
