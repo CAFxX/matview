@@ -187,6 +187,8 @@ jobs:
 
       - name: Test independent-session backfill concurrency
         run: python3 test_concurrent_backfill.py
+      - name: Test metamorphic commuting-DML invariants
+        run: python3 test_metamorphic_invariants.py
 
       - name: Test recursive SELECT AST generator
         run: python3 test_query_ast_fuzzer.py
