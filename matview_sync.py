@@ -11039,15 +11039,20 @@ class MaterializedViewManager:
         try:
             if self.dialect == Dialect.SQLITE:
                 if not getattr(self.conn, "in_transaction", False):
-                    try:
-                        cur.execute("BEGIN IMMEDIATE;")
-                    except Exception:
-                        pass
-            try:
+                    # A deferred transaction would allow another writer to race
+                    # trigger suspension. Never continue without the reservation.
+                    cur.execute("BEGIN IMMEDIATE;")
                 cur.execute("SAVEPOINT __mv_bulk_sp;")
                 sp_active = True
-            except Exception:
-                pass
+            else:
+                try:
+                    cur.execute("SAVEPOINT __mv_bulk_sp;")
+                    sp_active = True
+                except Exception:
+                    # Session-local bypass can still be safe without a savepoint
+                    # on PostgreSQL/MySQL; any fallback that drops triggers is
+                    # guarded below.
+                    pass
 
             session_bypass_ok = False
             if self.dialect == Dialect.POSTGRES and not drop_triggers:
@@ -11062,6 +11067,17 @@ class MaterializedViewManager:
                     session_bypass_ok = True
                 except Exception:
                     pass
+
+            if (
+                self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+                and not session_bypass_ok
+                and not sp_active
+                and not drop_triggers
+            ):
+                raise RuntimeError(
+                    "bulk_changes could not establish either session-local trigger bypass "
+                    "or transactional savepoint; refusing to suspend maintenance triggers"
+                )
 
             if (
                 self.dialect == Dialect.MYSQL
