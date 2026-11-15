@@ -3096,10 +3096,16 @@ def run_suite_5_joins(runner: MVTestRunner) -> None:
     """
     seed = [
         "INSERT INTO depts VALUES (10, 'Eng', 1000.0), (20, 'Sales', 500.0), (30, 'EmptyDept', 200.0);",
-        "INSERT INTO users VALUES (1, 10, NULL, 'Alice', 'gold', 1), (2, 10, 1, 'Bob', 'silver', 1), (3, 20, 1, 'Cara', 'gold', 0), (4, 99, 2, 'OrphanDeptUser', 'bronze', 1), (5, NULL, NULL, 'NoDeptUser', 'silver', 1);",
-        "INSERT INTO orders VALUES (100, 1, 'laptop', 1200.0, 'paid'), (101, 1, 'mouse', 50.0, 'paid'), (102, 2, 'monitor', 300.0, 'pending'), (103, 4, 'keyboard', 80.0, 'paid'), (104, 999, 'ghost', 999.0, 'paid');",
+        "INSERT INTO users VALUES (1, 10, NULL, 'Alice', 'gold', 1), (2, 10, 1, 'Bob', 'silver', 1), (3, 20, 1, 'Cara', 'gold', 0), (4, 99, 2, 'OrphanDeptUser', 'bronze', 1), (5, NULL, NULL, 'NoDeptUser', 'silver', 1), (7, 10, NULL, 'Delta', 'diamond', 1);",
+        "INSERT INTO orders VALUES (100, 1, 'laptop', 1200.0, 'paid'), (101, 1, 'mouse', 50.0, 'paid'), (102, 2, 'monitor', 300.0, 'pending'), (103, 4, 'keyboard', 80.0, 'paid'), (104, 999, 'ghost', 999.0, 'paid'), (107, 7, 'probe_a', 11.0, 'paid'), (108, 7, 'probe_null', NULL, 'paid');",
     ]
     mutations = [
+        # Dedicated join-aggregate retraction sequence: retain a group, move its
+        # key, remove its final matches, then recreate it. One row has NULL total.
+        ("del_join_agg_one", "DELETE FROM orders WHERE id = 107;"),
+        ("move_join_agg_group", "UPDATE users SET tier = 'platinum' WHERE id = 7;"),
+        ("del_join_agg_group", "DELETE FROM orders WHERE user_id = 7;"),
+        ("reinsert_join_agg_group", "INSERT INTO orders VALUES (109, 7, 'probe_reinsert', 23.0, 'paid');"),
         # Insert department 99 so user 4 is no longer an orphan in depts!
         ("ins_missing_dept", "INSERT INTO depts VALUES (99, 'Ops', 750.0);"),
         # Insert order for user 3 (who previously had 0 orders -> tests LEFT JOIN NULL-to-matched transition!)
@@ -3192,6 +3198,7 @@ def run_suite_5_joins(runner: MVTestRunner) -> None:
         "SELECT d.dname, COUNT(u.id) AS u_cnt, COUNT(DISTINCT u.tier) AS d_tiers FROM depts d LEFT JOIN users u ON d.id = u.dept_id GROUP BY d.dname",
         "SELECT d.id AS did, d.dname, COUNT(o.id) AS o_cnt, SUM(o.total) AS rev FROM depts d LEFT JOIN users u ON d.id = u.dept_id LEFT JOIN orders o ON u.id = o.user_id GROUP BY d.id, d.dname",
         "SELECT u.tier, o.status, COUNT(*) AS cnt, SUM(o.total) AS sum_t FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.tier, o.status",
+        "SELECT u.tier, COUNT(*) AS joined_rows, COUNT(o.total) AS valued_rows, SUM(o.total) AS total_amount FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.tier",
     ]
     for base_q in join_agg_queries:
         for w in ["", " WHERE u.active = 1", " WHERE u.id >= 1"]:
