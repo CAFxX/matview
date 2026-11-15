@@ -1128,13 +1128,14 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
                 )
                 manager.conn.execute("PRAGMA busy_timeout = 0;")
 
-                with self.assertRaises(sqlite3.OperationalError):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
                     with manager.bulk_changes():
                         self.fail(
                             "bulk_changes must not enter the user block while "
                             "another connection owns the SQLite writer reservation"
                         )
 
+                self.assertFalse(manager.conn.in_transaction)
                 self.assertTrue(competing.in_transaction)
                 self.assertEqual(
                     competing.execute(
