@@ -4789,6 +4789,60 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     plan.reader_view_ddl or "",
                 )
 
+    def test_preparsed_view_spec_resolves_statistical_aliases_for_target_dialect(self) -> None:
+        schema = """
+        CREATE TABLE measurements (
+            id INTEGER PRIMARY KEY,
+            grp TEXT,
+            value DOUBLE PRECISION
+        );
+        """
+        view = """
+        CREATE VIEW measurement_preparsed_aliases AS
+        SELECT grp,
+               VARIANCE(value) AS variance_alias,
+               STDDEV(value) AS stddev_alias,
+               COALESCE(VARIANCE(value), 0) AS nested_variance,
+               COALESCE(STDDEV(value), 0) AS nested_stddev
+        FROM measurements
+        GROUP BY grp;
+        """
+
+        parsed = parse_view_definition(view, known_tables={"measurements"})
+        self.assertEqual(parsed.select_items[1].agg_func, AggFunc.VAR_POP)
+        self.assertEqual(parsed.select_items[2].agg_func, AggFunc.STDDEV_POP)
+
+        postgres = generate_materialized_view(
+            schema, parsed, dialect=Dialect.POSTGRES, ignore_limitations=True
+        )
+        postgres_sql = "\n".join(postgres.initial_populate_sqls).upper()
+        self.assertIn("VAR_SAMP(", postgres_sql)
+        self.assertIn("STDDEV_SAMP(", postgres_sql)
+        self.assertNotIn("VAR_POP(", postgres_sql)
+        self.assertNotIn("STDDEV_POP(", postgres_sql)
+
+        mysql = generate_materialized_view(
+            schema, parsed, dialect=Dialect.MYSQL, ignore_limitations=True
+        )
+        mysql_sql = "\n".join(mysql.initial_populate_sqls).upper()
+        self.assertIn("VAR_POP(", mysql_sql)
+        self.assertIn("STDDEV_POP(", mysql_sql)
+        self.assertNotIn("VAR_SAMP(", mysql_sql)
+        self.assertNotIn("STDDEV_SAMP(", mysql_sql)
+
+        unsupported_std = parse_view_definition(
+            """
+            CREATE VIEW measurement_preparsed_std AS
+            SELECT grp, COALESCE(STD(value), 0) AS deviation
+            FROM measurements GROUP BY grp;
+            """,
+            known_tables={"measurements"},
+        )
+        with self.assertRaisesRegex(ValueError, r"STD\(\) is not a PostgreSQL"):
+            generate_materialized_view(
+                schema, unsupported_std, dialect=Dialect.POSTGRES, ignore_limitations=True
+            )
+
     def test_statistical_aliases_compile_with_target_engine_semantics(self) -> None:
         schema = (
             "CREATE TABLE alias_values ("
