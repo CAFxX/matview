@@ -10325,7 +10325,11 @@ class MaterializedViewManager:
             )
             has_wm_cols = True
         except Exception:
-            self._rollback()
+            # A missing watermark column is recoverable on MySQL without
+            # aborting the transaction. Do not roll back a caller-owned
+            # transaction merely to retry the legacy catalog projection.
+            if self.dialect != Dialect.MYSQL:
+                self._rollback()
             cur.execute(
                 f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
                 f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
