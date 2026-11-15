@@ -65,6 +65,20 @@ class MySQLTransactionStateGuardTests(unittest.TestCase):
             MaterializedViewManager(connection, engine_version="mysql:8.4")
         self.assertEqual(connection.cursor_calls, 0)
 
+    def test_explicit_engine_version_takes_precedence_over_conflicting_dialect_hint(self):
+        class GenericConnectionWrapper:
+            in_transaction = True
+
+            def cursor(self):
+                raise AssertionError("constructor must reject before SQL access")
+
+        with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
+            MaterializedViewManager(
+                GenericConnectionWrapper(),
+                dialect=Dialect.SQLITE,
+                engine_version="mysql:8.4",
+            )
+
     def test_explicit_mysql_engine_version_accepts_idle_generic_wrapper(self):
         class GenericConnectionWrapper:
             in_transaction = False
