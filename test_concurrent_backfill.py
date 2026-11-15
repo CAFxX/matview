@@ -582,7 +582,9 @@ class IndependentSessionBackfillTests(unittest.TestCase):
         self._run_native_watermark_interleaving(Dialect.MYSQL, dsn)
 
 
-    def _run_native_transaction_visibility_invariant(self, engine: Dialect, dsn: str) -> None:
+    def _run_native_transaction_visibility_invariant(
+        self, engine: Dialect, dsn: str, *, repeatable_read: bool = False
+    ) -> None:
         """Verify MV trigger effects share the base transaction's visibility boundary."""
         suffix = uuid.uuid4().hex[:10]
         schema_name = f"mv_visibility_{suffix}"
@@ -600,7 +602,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             cursor.close()
             return result
 
-        def assert_reader_matches_committed_state(expected):
+        def assert_reader_matches_committed_state(expected, *, end_transaction: bool = True):
             visible = rows(
                 reader,
                 f"SELECT grp, row_count, total FROM {view_name} ORDER BY grp",
@@ -612,9 +614,8 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             )
             self.assertEqual(visible, expected, "reader saw uncommitted or stale MV state")
             self.assertEqual(live, expected, "reader's committed base-table state was unexpected")
-            # End the read transaction so the next assertion obtains a fresh
-            # READ COMMITTED statement snapshot (and a new InnoDB snapshot).
-            reader.commit()
+            if end_transaction:
+                reader.commit()
 
         try:
             writer_cursor = writer.cursor()
@@ -639,6 +640,16 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             reader_cursor = reader.cursor()
             if engine == Dialect.POSTGRES:
                 reader_cursor.execute(f'SET search_path TO "{schema_name}";')
+                reader.commit()
+            if repeatable_read:
+                if engine == Dialect.POSTGRES:
+                    reader_cursor.execute(
+                        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ;"
+                    )
+                else:
+                    reader_cursor.execute(
+                        "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;"
+                    )
                 reader.commit()
 
             manager = MaterializedViewManager(writer, dialect=engine)
@@ -678,7 +689,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             writer.commit()
             self.assertEqual(plan.view_name, view_name)
             initial = [("A", 2, 30), ("B", 1, 5)]
-            assert_reader_matches_committed_state(initial)
+            assert_reader_matches_committed_state(initial, end_transaction=not repeatable_read)
 
             # The writer must see its own trigger-maintained changes, while an
             # independent reader must continue to see the last committed state.
@@ -700,11 +711,19 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 uncommitted,
                 "writer did not see its own materialized trigger effects",
             )
-            assert_reader_matches_committed_state(initial)
+            assert_reader_matches_committed_state(initial, end_transaction=not repeatable_read)
 
             writer.commit()
             committed = [("A", 2, 50), ("B", 1, 7)]
-            assert_reader_matches_committed_state(committed)
+            if repeatable_read:
+                # REPEATABLE READ must retain the original snapshot even after
+                # the writer commits; both the base query and MV stay on that
+                # same committed version until the reader ends its transaction.
+                assert_reader_matches_committed_state(initial, end_transaction=False)
+                reader.commit()
+            assert_reader_matches_committed_state(
+                committed, end_transaction=not repeatable_read
+            )
 
             # A second transaction exercises both insertion and retraction,
             # then rolls back. Neither the base rows nor MV trigger effects may
@@ -722,9 +741,13 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 rows(writer, f"SELECT grp, row_count, total FROM {view_name} ORDER BY grp"),
                 [("A", 2, 1040), ("B", 1, 7), ("C", 1, 99)],
             )
-            assert_reader_matches_committed_state(committed)
+            assert_reader_matches_committed_state(
+                committed, end_transaction=not repeatable_read
+            )
             writer.rollback()
-            assert_reader_matches_committed_state(committed)
+            assert_reader_matches_committed_state(
+                committed, end_transaction=not repeatable_read
+            )
         finally:
             if reader is not None:
                 try:
@@ -761,6 +784,22 @@ class IndependentSessionBackfillTests(unittest.TestCase):
         if not dsn:
             self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
         self._run_native_transaction_visibility_invariant(Dialect.MYSQL, dsn)
+
+    def test_native_postgres_repeatable_read_preserves_mv_snapshot(self) -> None:
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN is not set; native PostgreSQL test only")
+        self._run_native_transaction_visibility_invariant(
+            Dialect.POSTGRES, dsn, repeatable_read=True
+        )
+
+    def test_native_mysql_family_repeatable_read_preserves_mv_snapshot(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
+        self._run_native_transaction_visibility_invariant(
+            Dialect.MYSQL, dsn, repeatable_read=True
+        )
 
 
 if __name__ == "__main__":
