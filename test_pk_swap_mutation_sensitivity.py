@@ -34,7 +34,7 @@ def _run_swap(mutant: bool) -> tuple[list[tuple[object, ...]], list[tuple[object
             conn.execute(statement)
 
         guard_re = re.compile(
-            r"\\s+AND NOT EXISTS\\s*\\(\\s*SELECT 1 FROM\\s+.*?\\s+WHERE\\s+.*?\\)",
+            r"\s+AND NOT EXISTS\s*\(\s*SELECT 1 FROM\\s+.*?\\s+WHERE\\s+.*?\)",
             re.IGNORECASE | re.DOTALL,
         )
         changed = 0
