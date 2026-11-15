@@ -646,11 +646,74 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
 # -----------------------------------------------------------------------------
 
 
+def _dbapi_description_field(column: Any, field_name: str, tuple_index: int) -> Any:
+    """Read a PEP 249 description field from tuple- or object-style drivers."""
+    value = getattr(column, field_name, None)
+    if value is not None:
+        return value
+    try:
+        return column[tuple_index]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _result_description_mismatches(
+    mv_description: Optional[Sequence[Any]],
+    live_description: Optional[Sequence[Any]],
+) -> List[str]:
+    """Compare result shape and available native type metadata from one DB session.
+
+    SQLite's DB-API does not expose result type codes, so unavailable metadata is
+    deliberately skipped. When both sides expose a field, however, it must match.
+    """
+    if mv_description is None or live_description is None:
+        return []
+    if len(mv_description) != len(live_description):
+        return [
+            f"column count differs (materialized={len(mv_description)}, "
+            f"live={len(live_description)})"
+        ]
+
+    mismatches: List[str] = []
+    fields = (
+        ("name", 0),
+        ("type_code", 1),
+        ("scale", 5),
+    )
+    for index, (mv_column, live_column) in enumerate(
+        zip(mv_description, live_description)
+    ):
+        for field_name, tuple_index in fields:
+            mv_value = _dbapi_description_field(mv_column, field_name, tuple_index)
+            live_value = _dbapi_description_field(live_column, field_name, tuple_index)
+            if mv_value is not None and live_value is not None and mv_value != live_value:
+                mismatches.append(
+                    f"column {index} {field_name} differs "
+                    f"(materialized={mv_value!r}, live={live_value!r})"
+                )
+    return mismatches
+
+
 def _verify_external_db_mv(cur, mv_name: str, select_sql: str, context: str = "") -> None:
     cur.execute(f"SELECT * FROM {mv_name}")
+    mv_desc = getattr(cur, "description", None)
+    mv_description = tuple(mv_desc) if mv_desc is not None else None
     mv_rows = [tuple(row) for row in cur.fetchall()]
     cur.execute(select_sql)
+    live_desc = getattr(cur, "description", None)
+    live_description = tuple(live_desc) if live_desc is not None else None
     live_rows = [tuple(row) for row in cur.fetchall()]
+
+    metadata_mismatches = _result_description_mismatches(
+        mv_description, live_description
+    )
+    if metadata_mismatches:
+        raise AssertionError(
+            f"[{context}] External DB MV result metadata mismatch on {mv_name}!\n"
+            f"  Query: {select_sql}\n"
+            f"  Differences: {'; '.join(metadata_mismatches)}"
+        )
+
     # Keep integer, Decimal, text, binary, grouping-key and unknown outputs
     # exact. Only recognized floating arithmetic/aggregate projections receive
     # their narrowly scoped per-column budget; _values_equal applies that budget
@@ -1199,6 +1262,7 @@ class _CompatCursorAdapter:
         self._query = query_fn
         self._last_rows = []
         self.rowcount = -1
+        self.description = None
 
     def execute(self, sql: str, params: Any = None) -> "_CompatCursorAdapter":
         s = sql.strip()
@@ -6449,13 +6513,56 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "SELECT $body$-- keep /* keep */; $body$, 1 FROM items",
         )
 
+    def test_10_differential_oracle_rejects_result_type_and_empty_shape_mismatches(self) -> None:
+        """The live-view oracle must detect metadata-only divergences, even for empty sets."""
+        class FakeCursor:
+            def __init__(self, materialized_description, live_description):
+                self.materialized_description = materialized_description
+                self.live_description = live_description
+                self.description = None
 
+            def execute(self, sql):
+                self.description = (
+                    self.materialized_description
+                    if sql == "SELECT * FROM mv"
+                    else self.live_description
+                )
 
+            def fetchall(self):
+                # Empty results ensure these checks cannot be satisfied by row values.
+                return []
+
+        integer_column = ("value", 23, None, None, 10, 0, None)
+        decimal_column = ("value", 1700, None, None, 12, 2, None)
+        cases = (
+            ((integer_column,), (decimal_column,), "type_code"),
+            ((integer_column,), (("value", 23, None, None, 12, 2, None),), "scale"),
+            ((integer_column,), (("other", 23, None, None, 10, 0, None),), "name"),
+            ((integer_column,), (integer_column, integer_column), "column count"),
+        )
+        for materialized_description, live_description, expected_difference in cases:
+            with self.subTest(expected_difference=expected_difference):
+                cursor = FakeCursor(materialized_description, live_description)
+                with self.assertRaisesRegex(AssertionError, expected_difference):
+                    _verify_external_db_mv(
+                        cursor, "mv", "SELECT 1 AS value", "metadata-regression"
+                    )
+
+        # When a driver does not expose type metadata (as with SQLite), equal
+        # result shapes remain comparable through the ordinary row oracle.
+        cursor = FakeCursor(
+            (("value", None, None, None, None, None, None),),
+            (("value", None, None, None, None, None, None),),
+        )
+        _verify_external_db_mv(
+            cursor, "mv", "SELECT 1 AS value", "metadata-unavailable"
+        )
 
 
 import random
 
 import secrets
+
 
 class DifferentialSQLFuzzer:
     def __init__(self, seed: int = 20261106) -> None:
