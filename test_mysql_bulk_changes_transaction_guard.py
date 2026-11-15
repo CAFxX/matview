@@ -51,6 +51,7 @@ def main() -> None:
             cur.execute(f"INSERT INTO {table} VALUES (1)")
         assert manager._mysql_transaction_state() is True
         with observer.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
             assert cur.fetchone()[0] == 0
 
         try:
