@@ -14,8 +14,8 @@ This document tracks all feature goals, architectural improvements, and verified
   I would like the generator to autodetect (when connecting to the database) or accept as arg the engine and version, so that it can autoselect the correct and most efficient dialect/subdialect (`EngineSubdialect`, `EngineVersion`, `parse_engine_version`, `detect_engine_version`, and `--engine-version` across SQLite, PostgreSQL, MySQL, and MariaDB, including PostgreSQL 15+ `UNIQUE ... NULLS NOT DISTINCT` group indexes, PostgreSQL 10+ transition-table gating, MariaDB vs MySQL subdialect detection, and SQLite 3.24+ UPSERT / 3.25+ window-function version checks).
 - [x] **AST/Token-Backed SQL Parsing, Formatting & Strict Dialect Identifier Quoting (`sqlglot`)**:
   Avoid brittle regex-only SQL parsing by delegating SQL tokenization, AST parsing, formatting, and dialect-specific identifier quoting (`"ident"` on SQLite/PostgreSQL, `` `ident` `` on MySQL/MariaDB) to `sqlglot` (`requirements.txt`, `parse_sql_ast`, `parse_view_ast`, `tokenize_sql`, `quote_sql_identifier`, `format_sql`) so base tables, columns, or aliases containing reserved keywords (`"order"`, `"group"`, `"select"`, `"where"`), spaces (`"unit price"`), or punctuation never break generated DDL or trigger SQL.
-- [x] **Snapshot-Isolated & Watermark-Gated Chunked Incremental Backfills (`incremental_backfill=True`)**:
-  Close the concurrency window during multi-batch chunked backfills (`backfill_incrementally`) that commit after each batch:
+- [x] **Snapshot-Isolated & Watermark-Gated Chunked Incremental Backfills (`incremental_backfill=True`; mechanism implemented, correctness/recovery still P0)**:
+  The snapshot and watermark mechanisms exist, but their complete correctness is not established: initialization ordering, NULL watermark state, failed non-snapshot batches, incomplete-registration visibility, resume/retry, and watermark persistence still have explicit P0 work below. Do not interpret this infrastructure as a completed concurrency guarantee. Original design:
   - Support snapshot-isolated backfills (`REPEATABLE READ` on PostgreSQL, `START TRANSACTION WITH CONSISTENT SNAPSHOT` on MySQL, `SAVEPOINT` on SQLite via `snapshot_isolation=True`), and
   - Track the active backfill cursor watermark (`backfill_cursor_pk`, `backfill_max_pk`, `backfill_active`) in `__matview_catalog` so concurrent row triggers gate on the watermark and never double-count or under-count rows in the pending range.
 - [x] **Native Composite Keys & Group-Column Indexes for Nullable Group Columns, Joins & `UNION ALL` Views**:
@@ -25,8 +25,10 @@ This document tracks all feature goals, architectural improvements, and verified
   - Index both composite group keys and individual non-leading `GROUP BY` columns so engines can perform index scans on any grouping column.
 - [x] **Welford Running-Variance (`mean`, `M2`) & Chan Parallel Merge for IEEE-754 Float Engines**:
   Complement PostgreSQL `NUMERIC` and MySQL `DECIMAL(65, 12)` variance accumulators with Welford's centered sum-of-squares (`__mv_m2_*`) single-row update/downdate rules, Chan's parallel batch-merge formula, and anchor-shifted initial `M2` calculation for SQLite `REAL` columns, eliminating IEEE-754 catastrophic cancellation on high-offset values (e.g. `1e9 + delta` and `1e12 + delta`).
-- [x] **Session-Scoped & Shadow-Table Swap `bulk_changes()` Isolation**:
-  Avoid dropping maintenance triggers globally across concurrent connections during `bulk_changes()` by supporting session-local trigger bypass flags (`SET LOCAL matview.skip_triggers = 'on'` in PostgreSQL, `@__matview_skip_triggers = 1` in MySQL), transactional `SAVEPOINT` isolation in SQLite, and atomic shadow-table rebuild + `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
+- [x] **Session-Scoped & Shadow-Table Swap `bulk_changes()` Isolation (mechanisms implemented; fail-closed and transaction guarantees remain P0)**:
+  Session-local bypass and shadow-swap mechanisms exist, but the current fallback/restoration and transaction-ownership paths are not yet proven safe. In particular, do not claim global-trigger-drop is impossible until the P0 acceptance tests below pass. Original design: Avoid dropping maintenance triggers globally across concurrent connections during `bulk_changes()` by supporting session-local trigger bypass flags (`SET LOCAL matview.skip_triggers = 'on'` in PostgreSQL, `@__matview_skip_triggers = 1` in MySQL), transactional `SAVEPOINT` isolation in SQLite, and atomic shadow-table rebuild + `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
+- [x] **Atomic Single-Transaction Registration & Single-Shot Initial Backfill (not incremental/replacement lifecycle; remaining gaps are P0)**:
+  The single-shot path has an atomic transaction mechanism. This does not establish atomic replacement, atomic DDL on MySQL, incremental-backfill atomicity/recovery, or reader invisibility during incremental population; those remain explicit P0 requirements below.
 - [ ] **Serialize Initial Registration & Backfill Across Engine-Specific DDL Boundaries**:
   Registration must not expose an unpopulated reader view or allow a concurrent base-table write to be omitted or counted twice while backing/auxiliary structures and maintenance triggers are installed and the initial population runs.
   - Progress: PostgreSQL can use transactional DDL for single-shot registration. SQLite requires an explicit write reservation before DDL because its Python driver does not automatically transact DDL; PR #90 adds `BEGIN IMMEDIATE` and an independent-connection regression (exact-head CI pending).
@@ -135,6 +137,86 @@ The existing differential-testing harness is useful, but its current headline co
   - Reconcile README, module docstrings, runner output, and CI matrix descriptions from one generated source of truth.
   - Remove brittle workflow-text-count assertions; validate workflow structure semantically where needed and rely on actual CI execution for runtime behavior.
 
+
+- [ ] **Make Registration, Replacement, Backfill, Publication and Recovery One Explicit Lifecycle Protocol**:
+  - Define and persist explicit states for planned/installed, backfill-initializing, backfill-active, ready/published, failed/recoverable, and dropped registrations. A catalog row with an incomplete or failed backfill must never be treated as a successfully registered view.
+  - Fix the initial watermark race: establish the cursor/max-PK boundary and trigger gating state under the same protected initialization protocol as trigger activation. Never expose an active backfill with NULL cursor/max values if trigger predicates then fail open or double-apply deltas.
+  - Make watermark writes fail closed. Remove blanket exception suppression in `_update_backfill_watermark()`; verify the expected catalog row and state transition were updated before proceeding. Distinguish optional legacy metadata from required protocol state.
+  - On failure after committed incremental batches, either resume from a durable, validated cursor with an idempotent protocol or rebuild from a clean shadow installation. Do not leave a partial backing table marked active and then return it from the unchanged-signature fast path.
+  - Ensure repeated `register_view()` / `sync_views()` calls detect incomplete/failed registrations and perform the documented recovery action. Do not restart from the minimum PK while retaining earlier committed contributions unless the rebuild protocol first clears/reconciles them.
+  - Prevent readers from observing partially populated backing tables. Build privately and publish via an engine-appropriate atomic swap/view switch, or use a documented readiness gate that cannot expose partial rows.
+  - Preserve the previous working reader and backing objects until a replacement is fully built and validated. A failed replacement must leave the old installation usable and its catalog metadata intact.
+  - Handle MySQL/MariaDB implicit DDL commits explicitly: do not describe DDL sequences as transactionally atomic where the engine cannot provide that guarantee. Use shadow objects plus a recoverable publication protocol, and test failures after every DDL boundary.
+  - Acceptance tests: inject failures after each registration/replacement/backfill stage; verify old-reader availability, catalog state, trigger state, retry/resume behavior, and equality with the live SELECT on every supported native engine.
+
+- [ ] **Make `bulk_changes()` Fail-Closed, Exception-Safe and Transaction-Ownership-Safe**:
+  - Remove any fallback that globally drops maintenance triggers/functions when session-local bypass cannot be established. Refuse to enter the context before yielding if a safe, connection-local isolation mechanism is unavailable.
+  - Treat partial trigger/function disablement as a failure requiring deterministic restoration. Put the entire disable/yield/rebuild/restore protocol under one exception-safe state machine; cover failures before `yield`, during user DML, during rebuild, and during restoration.
+  - Restore state for `BaseException` paths as well as ordinary exceptions (including interruption/cancellation), without silently swallowing restoration failures. Report catastrophic restoration failure distinctly and preserve enough state for explicit recovery.
+  - Never commit or roll back unrelated caller work. A savepoint release is not permission to commit the caller's outer transaction; define and enforce connection/transaction ownership for SQLite, PostgreSQL, MySQL and MariaDB.
+  - Account for MySQL/MariaDB implicit commits caused by trigger DDL; do not promise savepoint isolation around non-transactional DDL.
+  - Validate shadow-table swaps against concurrent readers/writers, all registered views, rollback, and failures during rename/publication.
+  - Acceptance tests must use independent connections and verify that triggers remain effective for other sessions throughout, caller-owned uncommitted work remains uncommitted, and every exit path restores the original maintenance state.
+
+- [ ] **Preserve Caller Transaction Ownership Across Every Manager Lifecycle Operation**:
+  - Audit constructor/catalog initialization, registration, backfill, sync, drop, repair, rebuild and bulk operations for unconditional `commit()` / `rollback()` calls on caller-supplied connections.
+  - Define an explicit contract: either the manager owns a connection/transaction, or it participates in a caller-owned transaction using savepoints without committing/rolling back unrelated work. Make this distinction observable and consistent.
+  - In particular, `_ensure_catalog()` must not commit unrelated work merely because the manager was initialized on an existing connection.
+  - Test pre-existing uncommitted writes before and after each API call, nested transactions/savepoints, exceptions, and multiple managers sharing a connection on all native engines. Document engine limitations where DDL prevents full participation.
+
+- [ ] **Close Unsafe DML Paths That Bypass Trigger-Based Maintenance**:
+  - SQLite: `PRAGMA recursive_triggers` is connection-local. Do not rely on setting it only on the manager connection to make application connections safe. Detect/reject `INSERT OR REPLACE` / `REPLACE` where implicit deletes can bypass delete triggers, or provide an enforceable connection policy and prove it applies to every writer. Use the existing `has_on_conflict_replace` schema information in a real safety decision or remove the unused field.
+  - PostgreSQL: detect `TRUNCATE`, which does not execute ordinary row-level DELETE triggers. Either generate and validate appropriate statement-level TRUNCATE maintenance or reject it as an unsupported mutation while the view is registered.
+  - Audit other trigger-bypassing operations and referential actions per engine (including FK cascades, partition operations, bulk/load modes, disabled triggers, replication/session flags, and schema changes). Explicitly reject unsupported paths rather than silently diverging.
+  - Add native tests proving both the rejection/limitation behavior and correct maintenance for every supported path.
+
+- [ ] **Make Schema Introspection and Drift Signatures Semantically Complete and Fail-Closed**:
+  - Stop swallowing FK/introspection query errors that can hide unsafe referential actions (notably MySQL/MariaDB cascading updates/deletes). Distinguish an engine-confirmed absence of metadata from an introspection failure; fail closed when required metadata is unavailable.
+  - Include all semantics that can change query or trigger behavior in the schema signature and drift model: schema/catalog qualification, column collation/charset, nullability, generated/identity properties where relevant, primary/unique constraints, FK columns and ON UPDATE/ON DELETE actions, relevant indexes/expressions, and engine-specific attributes.
+  - Preserve schema-qualified table identities end-to-end. Do not discard qualifiers in `_unquote_ident()`; resolve names according to the target engine's search path/schema rules or reject ambiguous/unqualified references explicitly.
+  - Detect physical drift independently of logical definition drift: missing/modified reader views, backing/auxiliary tables, triggers, trigger functions/procedures, indexes and catalog objects. Compare normalized installed definitions or stable fingerprints, not merely object existence.
+  - Make `repair_view()` recreate missing/modified physical objects as well as repair data; pass the actual detected `engine_version` through every recompilation path. Do not claim multi-view atomic repair if each view is committed independently.
+  - Test adding/changing a cascading FK, changing collation, dropping/modifying triggers or reader objects, and changing schema-qualified dependencies; each must be detected and repaired or rejected predictably.
+
+- [ ] **Preserve Dialect-Native SQL Semantics, Types, Collations and Volatility**:
+  - Keep original SQL function spelling and resolve aliases against the actual engine/subdialect. In particular, PostgreSQL `VARIANCE` / `STDDEV` are sample statistics while MySQL aliases are population statistics; native initial and incremental results and result types must match.
+  - Parse and analyze with the target dialect throughout. Remove SQLite-dialect parsing fallbacks for PostgreSQL/MySQL/MariaDB expressions where they can alter AST interpretation or accepted syntax.
+  - Model source/result types, precision/scale, nullability, collation/charset and aggregate semantics explicitly. Preserve native result metadata, not only numerical equality of sample values.
+  - Replace regex-only nondeterminism detection with dialect-aware function/expression volatility classification. Cover transaction-, statement- and volatile functions and session-dependent expressions (e.g. `CURRENT_USER`, `CURRENT_ROLE`, `LOCALTIME`, `LOCALTIMESTAMP`, PostgreSQL timestamp functions, SQLite date/time functions using `'now'`, and engine-specific equivalents). Reject unsupported volatile/session-dependent views unless their semantics can genuinely be maintained.
+  - Correct SQLite signed 64-bit bitwise aggregate semantics, including the sign bit and negative values; otherwise explicitly reject/document the unsupported domain. Do not describe 63 positive bits as the complete signed 64-bit domain.
+  - Handle SQLite `WITHOUT ROWID` sources: select a valid stable key for backfill or reject incremental strategies that require `rowid`.
+  - Use engine-version capability flags in code generation. In particular, actually select MySQL 8.0.19+ row-alias upsert syntax where supported and avoid deprecated `VALUES()` references on versions that support aliases; test MySQL and MariaDB separately.
+
+- [ ] **Strengthen Numeric and Result-Metadata Oracle Against False Equivalence**:
+  - Revisit fixed absolute tolerances for variance/stddev. A tolerance floor such as `1e-12` can accept zero in place of a genuinely nonzero variance around `1e-15`; derive bounds from input type, scale, magnitude, conditioning and the engine's documented approximate semantics.
+  - Add tiny nonzero variance/stddev cases, near-constant groups, large offsets, cancellation, subnormals, overflow/underflow and exact-vs-approximate inputs. Require the oracle to reject material relative errors even when absolute values are small.
+  - Compare result-column metadata (native type, precision, scale, nullability where observable, collation/charset where relevant) as part of observational equivalence. Numeric equality between INTEGER/DECIMAL/FLOAT values is not sufficient if applications can observe different result types or downstream behavior.
+  - Keep exact numeric types exact; use only narrowly justified engine-specific tolerances for approximate results. Never allow tolerance policy to mask loss of a nonzero result or a type-family change.
+
+- [ ] **Prove Backfill Algorithm Correctness for Every Strategy and Concurrent Mutation Pattern**:
+  - Audit PK-range, group-key and OFFSET strategies separately. Bound memory use: do not materialize every distinct group key in a Python list when the backfill is meant to be chunked.
+  - Do not use DB-API `rowcount` as a source-row pagination count for MySQL upserts, where affected-row semantics can count inserts and updates differently. Track source rows/keys explicitly.
+  - Prove OFFSET pagination cannot skip/repeat rows under concurrent inserts/deletes/updates; otherwise require a stable snapshot or replace OFFSET with a stable keyset strategy.
+  - Test cursor/max boundary inclusivity, PK changes, deleted cursor rows, inserts below/inside/above the captured range, concurrent group-key changes, duplicate group keys, empty tables and keyless/without-rowid tables.
+  - Test snapshot isolation and lock behavior on actual engine versions; verify failure to establish requested isolation never falls back silently. Verify cleanup/retry for both snapshot and non-snapshot modes.
+
+- [ ] **Make Standalone SQL Generation and Manager-Driven Installation Guarantees Consistent**:
+  - The CLI/standalone incremental SQL path must either implement the same complete trigger/backfill coordination protocol as the manager path or explicitly require a write freeze/transaction boundary that prevents concurrent double counting and is enforced/documented.
+  - Do not advertise equivalent concurrency guarantees for generated SQL and manager registration when the generated SQL omits the manager's watermark catalog/protocol.
+  - Add native two-session tests that interleave writes with each standalone backfill strategy and compare the result to the live SELECT.
+
+- [ ] **Complete the Differential Oracle's Semantic and Fault-Detection Contract**:
+  - Preserve duplicate multiplicity and exact values while comparing native result metadata; test collation-sensitive equality/order/grouping separately from byte/text identity.
+  - Make the oracle execute the original view natively on the same database state, without relying on compiler-produced SQL or implementation-specific backing structures.
+  - Add curated mutations for trigger predicates/actions, delta signs, aggregate state updates, NULL handling, key/group transitions, watermark bounds, transaction commits, rollback, restoration and dialect/version branches. Require relevant tests to kill each non-equivalent mutant and retain surviving-mutant explanations.
+  - Ensure each generated test records whether execution was native or simulated; simulated SQLite results never count as native dialect semantic proof.
+
+- [ ] **Complete Native Query-AST and Concurrency Coverage Before Claiming Full Fuzz Coverage**:
+  - Execute generated SELECT ASTs and their materialized-view mutations natively on PostgreSQL, MySQL and MariaDB, not only through SQLite transpilation. Track AST production and combination coverage per engine/version.
+  - Expand independent-session concurrency tests to cover trigger installation, watermark initialization, every backfill batch boundary, finalization, reader visibility, replacement, failure/retry, multiple writers, transaction isolation variants and deadlock/serialization outcomes.
+  - Add bounded repeated stress campaigns with deterministic seeds/traces and promote minimized failures to permanent regressions.
+  - Keep same-connection callback interleavings classified as deterministic sequencing tests, not concurrency tests.
+
 ## P1 — Modular Architecture, Engine/Version Optimizations & Developer Experience
 
 - [x] **Keep User-Accessible Materialized Views Free of the Internal Object Prefix**:
@@ -171,6 +253,33 @@ The existing differential-testing harness is useful, but its current headline co
   Provide a `matview diff` command to inspect pending trigger/table DDL changes against `__matview_catalog` before execution, and emit structured plan diagnostics explaining strategy selection and fallback reasons.
 - [ ] **Docker / Docker Compose Integration Test Environment (`make docker-test`)**:
   I would like the repo to contain a `Dockerfile`/`docker-compose.yml` that spins up all servers needed for integration testing (`make docker-test`) matching the PostgreSQL, MySQL, and MariaDB versions in CI.
+
+
+- [ ] **Correct README Claims and Make Documentation Executable**:
+  - Correct the examples that still show the internal `__matview_` prefix for user-accessible reader views; the logical SQL-declared view name is public, while backing/catalog/trigger/auxiliary objects remain internal.
+  - Document the different guarantees of manager registration versus standalone generated SQL, single-shot versus incremental backfill, snapshot versus non-snapshot operation, replacement/publication, MySQL/MariaDB implicit DDL commits, and the actual `bulk_changes()` safety contract.
+  - Separate supported, natively tested, simulated/transpiled, best-effort and unsupported engine/version/extension claims. Do not list extension compatibility as tested unless CI actually installs and exercises that extension.
+  - Add complete test instructions for every test module, native DSN requirements, engine/version verification, deferred/stress campaigns, and one canonical command that runs the full local suite.
+  - Make examples executable in CI and derive compatibility/test-matrix documentation from the actual workflow configuration where practical.
+
+- [ ] **Align AGENTS.md, PR Stacking and Merge/CI Policy with the Actual Repository Rules**:
+  - Reconcile the documented rebase-only merge behavior with the project's required true fast-forward-only policy; do not document a merge method that the repository ruleset or project policy forbids.
+  - Define how the single native PR stack is identified and verified (including exact head/base SHAs and dependency ordering); PR base relationships alone do not prove membership or freshness.
+  - Require every stacked descendant to be restacked and revalidated when a predecessor head changes. A green check on an old SHA is not validation of the current head.
+  - Require documentation-only changes to follow the explicitly configured lightweight CI policy, while all code-bearing PRs retain the required current-head checks.
+  - Require unresolved review threads/required approvals only if the repository ruleset is updated to enforce them; keep AGENTS.md synchronized with actual branch protection/ruleset configuration.
+
+- [ ] **Add Packaging, Licensing, Static Analysis and Release Hygiene**:
+  - Add an explicit open-source LICENSE after choosing the intended license; do not leave reuse terms ambiguous.
+  - Add `pyproject.toml` with package metadata, supported Python/dependency ranges, build backend, CLI entry point and development/test extras; define versioning and release policy.
+  - Add linting, formatting and static type-checking gates with focused initial baselines; avoid introducing noisy, non-actionable gates.
+  - Add a reproducible install/test workflow and verify that the published package contains the intended modules, templates and runtime dependencies.
+
+- [ ] **Make Drift Repair and Operational Diagnostics Trustworthy**:
+  - Document the distinction between logical schema drift, physical object drift and materialized-data drift.
+  - Provide diagnostics that identify the exact missing/modified object and whether repair can be performed online, requires a write freeze, or requires shadow publication.
+  - Make repair idempotent and failure-recoverable; expose per-view outcomes rather than claiming all-view atomicity when commits occur per view.
+  - Add tests for dropped/modified triggers, functions, reader views, backing/auxiliary tables and indexes, and for repair under concurrent readers/writers.
 
 ## P2 — Index Intelligence & Incremental SQL Feature Coverage
 
