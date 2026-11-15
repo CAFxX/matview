@@ -40,6 +40,12 @@ MUTANTS = (
         original='f"ELSE {mv_table}.{col} - __mv_delta.{col} END)"',
         replacement='f"ELSE {mv_table}.{col} + __mv_delta.{col} END)"',
     ),
+    Mutant(
+        name="join-count-retraction-adds-instead-of-subtracting",
+        source_path="matview_sync.py",
+        original='minus_assignments.append(f"{c} = {mv_table}.{c} - __mv_delta.{c}")',
+        replacement='minus_assignments.append(f"{c} = {mv_table}.{c} + __mv_delta.{c}")',
+    ),
 )
 
 
