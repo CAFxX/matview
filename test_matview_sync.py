@@ -5563,6 +5563,18 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("stddev_decimal NUMERIC", postgres.backing_table_ddl)
         self.assertIn("variance_approximate DOUBLE PRECISION", postgres.backing_table_ddl)
 
+        expression_type_view = """
+        CREATE VIEW expression_types AS
+        SELECT COALESCE(id, -1) AS aid,
+               COALESCE(1.0 * SUM(DISTINCT whole), 0.0) AS exact_total
+        FROM avg_source;
+        """
+        mysql_expression_types = generate_materialized_view(
+            schema, expression_type_view, dialect="mysql", ignore_limitations=True
+        )
+        self.assertIn("aid BIGINT", mysql_expression_types.backing_table_ddl)
+        self.assertIn("exact_total DECIMAL(65, 1)", mysql_expression_types.backing_table_ddl)
+
         sqlite = generate_materialized_view(schema, view, dialect="sqlite")
         self.assertIn("sum_integer INTEGER", sqlite.backing_table_ddl)
         self.assertIn("sum_decimal NUMERIC", sqlite.backing_table_ddl)
