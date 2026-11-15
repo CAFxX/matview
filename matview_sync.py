@@ -10373,7 +10373,11 @@ class MaterializedViewManager:
             # A missing watermark column is recoverable on MySQL without
             # aborting the transaction. Do not roll back a caller-owned
             # transaction merely to retry the legacy catalog projection.
-            if self.dialect != Dialect.MYSQL:
+            # SQLite statement errors do not abort the surrounding transaction;
+            # retain a BEGIN IMMEDIATE reservation held by bulk_changes(). MySQL's
+            # failed projection is likewise recoverable without rolling back a
+            # caller-owned transaction. PostgreSQL needs rollback after an error.
+            if self.dialect not in (Dialect.MYSQL, Dialect.SQLITE):
                 self._rollback()
             cur.execute(
                 f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
