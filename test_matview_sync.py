@@ -5979,6 +5979,102 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_25_commuting_dml_orders_preserve_distinct_aggregate_state(self) -> None:
+        """Equivalent disjoint DML permutations must produce identical MV and DISTINCT state."""
+        schema = """
+        CREATE TABLE commuting_items (
+            id INTEGER PRIMARY KEY,
+            grp TEXT NOT NULL,
+            tag TEXT,
+            value INTEGER NOT NULL
+        );
+        INSERT INTO commuting_items VALUES
+            (1, 'A', 'x', 10),
+            (2, 'A', 'x', 20),
+            (3, 'A', 'y', 30),
+            (4, 'B', 'x', 5),
+            (5, 'B', NULL, 7);
+        """
+        view_sql = (
+            "CREATE VIEW commuting_summary AS "
+            "SELECT grp, COUNT(*) AS row_count, COUNT(DISTINCT tag) AS distinct_tags, "
+            "SUM(value) AS total_value FROM commuting_items GROUP BY grp;"
+        )
+        live_sql = (
+            "SELECT grp, COUNT(*) AS row_count, COUNT(DISTINCT tag) AS distinct_tags, "
+            "SUM(value) AS total_value FROM commuting_items GROUP BY grp"
+        )
+        mutations = {
+            "insert": "INSERT INTO commuting_items VALUES (10, 'A', 'z', 13)",
+            "update": "UPDATE commuting_items SET grp = 'B', tag = 'z', value = 31 WHERE id = 2",
+            "delete": "DELETE FROM commuting_items WHERE id = 4",
+        }
+
+        def run_order(order: List[str]) -> Tuple[List[Tuple[Any, ...]], List[List[Tuple[Any, ...]]]]:
+            conn = sqlite3.connect(":memory:")
+            try:
+                manager = MaterializedViewManager(conn, dialect="sqlite")
+                manager.apply_schema_ddl(schema)
+                plan = manager.register_view(view_sql)
+                auxiliary_snapshots: List[List[Tuple[Any, ...]]] = []
+
+                def assert_live_after(label: str) -> None:
+                    visible = [
+                        tuple(row)
+                        for row in conn.execute(
+                            f"SELECT grp, row_count, distinct_tags, total_value "
+                            f"FROM {plan.view_name} ORDER BY grp"
+                        ).fetchall()
+                    ]
+                    expected = [
+                        tuple(row)
+                        for row in conn.execute(live_sql + " ORDER BY grp").fetchall()
+                    ]
+                    self.assertTrue(
+                        _rows_equal(visible, expected),
+                        f"{label}: materialized result differs from live SELECT; "
+                        f"actual={visible!r}, expected={expected!r}",
+                    )
+                    aux_rows: List[Tuple[Any, ...]] = []
+                    for aux_name in plan.auxiliary_table_names:
+                        aux_rows.extend(
+                            tuple(row)
+                            for row in conn.execute(
+                                f"SELECT grp, __val, __ref_cnt FROM {aux_name}"
+                            ).fetchall()
+                        )
+                    auxiliary_snapshots.append(aux_rows)
+
+                assert_live_after("initial")
+                for mutation_name in order:
+                    conn.execute(mutations[mutation_name])
+                    assert_live_after(f"after {mutation_name}")
+                final_rows = [
+                    tuple(row)
+                    for row in conn.execute(
+                        f"SELECT grp, row_count, distinct_tags, total_value "
+                        f"FROM {plan.view_name} ORDER BY grp"
+                    ).fetchall()
+                ]
+                return final_rows, auxiliary_snapshots
+            finally:
+                conn.close()
+
+        forward, forward_aux = run_order(["insert", "update", "delete"])
+        reverse, reverse_aux = run_order(["delete", "update", "insert"])
+        self.assertTrue(
+            _rows_equal(forward, reverse),
+            f"commuting DML permutations produced different reader results: "
+            f"forward={forward!r}, reverse={reverse!r}",
+        )
+        self.assertEqual(len(forward_aux), len(reverse_aux))
+        for step, (left, right) in enumerate(zip(forward_aux, reverse_aux)):
+            self.assertTrue(
+                _rows_equal(left, right),
+                f"commuting DML permutations produced different DISTINCT auxiliary "
+                f"state at checkpoint {step}: forward={left!r}, reverse={right!r}",
+            )
+
     def test_manager_register_view_enforces_limitations_before_install_and_warns_on_override(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.execute("CREATE TABLE limitation_source (id INTEGER PRIMARY KEY, value INTEGER);")
