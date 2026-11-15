@@ -200,6 +200,9 @@ jobs:
       - name: Report test strength and honest coverage statistics
         run: python3 test_strength_reporting.py
 
+      - name: Test differential oracle adversarial boundaries
+        run: python3 test_oracle_adversarial_boundaries.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
