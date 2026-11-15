@@ -4340,6 +4340,40 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
 
+        # A reset failure leaves a session-scoped user variable in an unknown
+        # state. Mark the connection unsafe and reject future reuse.
+        cursor = Cursor(fail_reset=True)
+        conn = Connection(cursor)
+        mgr = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "connection must be discarded") as caught:
+            with mgr.bulk_changes():
+                pass
+        self.assertTrue(caught.exception.connection_unsafe)
+        self.assertTrue(mgr._mysql_bulk_connection_unsafe)
+        self.assertTrue(conn._matview_bulk_connection_unsafe)
+        statements_before_reuse = list(cursor.statements)
+        with self.assertRaisesRegex(RuntimeError, "must be discarded"):
+            with mgr.bulk_changes():
+                self.fail("unsafe manager must not be reused")
+        other_manager = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "must be discarded"):
+            with other_manager.bulk_changes():
+                self.fail("unsafe connection must not be reused through another manager")
+        self.assertEqual(cursor.statements, statements_before_reuse)
+
+        # A reset failure while unwinding a body exception must preserve the
+        # original failure as a note while marking the connection unsafe.
+        cursor = Cursor(fail_reset=True)
+        conn = Connection(cursor)
+        mgr = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "connection must be discarded") as caught:
+            with mgr.bulk_changes():
+                raise ValueError("original body failure")
+        self.assertTrue(caught.exception.connection_unsafe)
+        self.assertTrue(any("original body failure" in note for note in caught.exception.__notes__))
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
+
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
