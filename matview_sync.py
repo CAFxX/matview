@@ -52,6 +52,14 @@ import sqlglot
 from sqlglot import exp as sqlglot_exp
 from sqlglot.tokens import TokenType as SQLGlotTokenType
 
+from sqlalchemy import create_engine as _sa_create_engine, event as _sa_event, inspect as _sa_inspect
+from sqlalchemy.engine import (
+    Connection as _SAConnection,
+    Engine as _SAEngine,
+)
+from sqlalchemy.engine.url import URL as _SAURL, make_url as _sa_make_url
+from sqlalchemy.pool import NullPool as _SANullPool
+
 DEFAULT_OBJECT_PREFIX = "__matview_"
 
 
@@ -773,6 +781,13 @@ def detect_engine_version(
     """
     if isinstance(hint_dialect, EngineVersion):
         return hint_dialect
+
+    unwrapped_conn, _, _, sa_dialect = unwrap_dbapi_connection(conn)
+    if unwrapped_conn is not conn:
+        return detect_engine_version(
+            unwrapped_conn,
+            hint_dialect=hint_dialect if hint_dialect is not None else sa_dialect,
+        )
 
     # 1. Explicit engine_version attribute on connection or adapter
     conn_ev = getattr(conn, "engine_version", None)
@@ -2596,6 +2611,303 @@ def parse_table_schema(
     return schemas
 
 
+def normalize_sqlalchemy_url(
+    conn_or_url: str, dialect: Optional[Dialect] = None
+) -> Tuple[_SAURL, Dialect, Dict[str, Any]]:
+    """
+    Normalize a database URL or SQLite path into a SQLAlchemy `URL`, inferred
+    `Dialect`, and keyword `connect_args` for `sqlalchemy.create_engine`.
+    """
+    raw = conn_or_url.strip()
+    u_low = raw.lower()
+    connect_args: Dict[str, Any] = {}
+
+    if "://" in raw:
+        normalized_str = raw
+        if u_low.startswith("postgres://"):
+            normalized_str = "postgresql+psycopg2://" + raw[len("postgres://") :]
+        elif u_low.startswith("postgresql://"):
+            normalized_str = "postgresql+psycopg2://" + raw[len("postgresql://") :]
+        elif u_low.startswith("mariadb://"):
+            normalized_str = "mysql+pymysql://" + raw[len("mariadb://") :]
+        elif u_low.startswith("mysql://"):
+            normalized_str = "mysql+pymysql://" + raw[len("mysql://") :]
+        sa_url = _sa_make_url(normalized_str)
+    else:
+        db_path = raw
+        if db_path == ":memory:":
+            sa_url = _sa_make_url("sqlite:///:memory:")
+        else:
+            sa_url = _SAURL.create(drivername="sqlite", database=db_path)
+
+    backend = sa_url.get_backend_name().lower()
+    if backend in ("postgresql", "postgres"):
+        eff_dialect = Dialect.POSTGRES
+    elif backend in ("mysql", "mariadb"):
+        eff_dialect = Dialect.MYSQL
+        query_map = dict(sa_url.query)
+        if "unix_socket" in query_map:
+            sock_val = query_map.pop("unix_socket")
+            connect_args["unix_socket"] = sock_val[-1] if isinstance(sock_val, tuple) else sock_val
+            sa_url = sa_url.set(query=query_map)
+    else:
+        eff_dialect = dialect or Dialect.SQLITE
+
+    return sa_url, eff_dialect, connect_args
+
+
+def connect_database_via_sqlalchemy(
+    conn_or_url: str, dialect: Optional[Dialect] = None
+) -> Tuple[Any, Dialect, _SAEngine]:
+    """
+    Connect to SQLite, PostgreSQL, or MySQL/MariaDB using SQLAlchemy's unified
+    URL parser and `create_engine`, returning `(raw_dbapi_conn, dialect, engine)`.
+    """
+    sa_url, eff_dialect, connect_args = normalize_sqlalchemy_url(conn_or_url, dialect=dialect)
+    engine_kwargs: Dict[str, Any] = {"poolclass": _SANullPool}
+    if connect_args:
+        engine_kwargs["connect_args"] = connect_args
+    engine = _sa_create_engine(sa_url, **engine_kwargs)
+    try:
+        raw_conn = engine.raw_connection()
+    except Exception:
+        engine.dispose()
+        raise
+    return raw_conn, eff_dialect, engine
+
+
+def unwrap_dbapi_connection(
+    conn_or_sa: Any,
+) -> Tuple[Any, Optional[_SAEngine], Optional[_SAConnection], Optional[Dialect]]:
+    """
+    Unwrap a SQLAlchemy `Engine`, `Connection`, or pool `_ConnectionFairy` into
+    `(dbapi_conn, owned_engine_to_dispose, sa_conn_if_any, inferred_dialect)`.
+    Plain DB-API connections are returned unchanged with `None` SQLAlchemy handles.
+    """
+    def _dialect_from_sa_name(name: str) -> Optional[Dialect]:
+        n = (name or "").lower()
+        if "postgres" in n:
+            return Dialect.POSTGRES
+        if "mysql" in n or "mariadb" in n:
+            return Dialect.MYSQL
+        if "sqlite" in n:
+            return Dialect.SQLITE
+        return None
+
+    if isinstance(conn_or_sa, _SAEngine):
+        inferred = _dialect_from_sa_name(conn_or_sa.dialect.name)
+        raw_conn = conn_or_sa.raw_connection()
+        return raw_conn, None, None, inferred
+    if isinstance(conn_or_sa, _SAConnection):
+        inferred = _dialect_from_sa_name(conn_or_sa.dialect.name)
+        fairy = conn_or_sa.connection
+        inner = getattr(fairy, "dbapi_connection", None) or getattr(fairy, "driver_connection", None) or fairy
+        return inner, None, conn_or_sa, inferred
+    if hasattr(conn_or_sa, "driver_connection") and hasattr(conn_or_sa, "detach"):
+        inner = getattr(conn_or_sa, "dbapi_connection", None) or getattr(conn_or_sa, "driver_connection", None)
+        if inner is not None:
+            return inner, None, None, None
+    return conn_or_sa, None, None, None
+
+
+def render_parameterized_sql(qmark_sql: str, dialect: Dialect) -> str:
+    """
+    Convert a `?`-placeholder SQL query into the dialect's DB-API bind syntax
+    without modifying `?` characters inside string literals or comments.
+    """
+    if dialect == Dialect.SQLITE or "?" not in qmark_sql:
+        return qmark_sql
+    out: List[str] = []
+    i = 0
+    n = len(qmark_sql)
+    in_sq = False
+    in_dq = False
+    while i < n:
+        ch = qmark_sql[i]
+        if in_sq:
+            out.append(ch)
+            if ch == "'" and i + 1 < n and qmark_sql[i + 1] == "'":
+                out.append("'")
+                i += 2
+                continue
+            if ch == "'":
+                in_sq = False
+            i += 1
+        elif in_dq:
+            out.append(ch)
+            if ch == '"' and i + 1 < n and qmark_sql[i + 1] == '"':
+                out.append('"')
+                i += 2
+                continue
+            if ch == '"':
+                in_dq = False
+            i += 1
+        elif ch == "'":
+            in_sq = True
+            out.append(ch)
+            i += 1
+        elif ch == '"':
+            in_dq = True
+            out.append(ch)
+            i += 1
+        elif ch == "?":
+            out.append("%s")
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+class _NonClosingConnectionProxy:
+    """
+    Read-only connection proxy for SQLAlchemy schema inspection that keeps
+    caller connections open and suppresses pool-level commit/rollback resets.
+    """
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def commit(self) -> None:
+        return None
+
+    def rollback(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _can_use_sqlalchemy_inspector(conn: Any) -> bool:
+    if isinstance(conn, (_SAEngine, _SAConnection, sqlite3.Connection)):
+        return True
+    if hasattr(conn, "driver_connection") and hasattr(conn, "detach"):
+        return True
+    mod_cls = f"{type(conn).__module__}.{type(conn).__qualname__}".lower()
+    return any(k in mod_cls for k in ("psycopg", "pymysql"))
+
+
+def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
+    precision = getattr(col_type, "precision", None)
+    scale = getattr(col_type, "scale", None)
+    raw_str = str(col_type).upper()
+    if precision is not None and scale is not None and (
+        "NUMERIC" in raw_str or "DECIMAL" in raw_str
+    ):
+        raw_str = f"DECIMAL({int(precision)}, {int(scale)})"
+    elif dialect == Dialect.POSTGRES and raw_str.startswith("VARCHAR") and not getattr(col_type, "length", None):
+        raw_str = "TEXT"
+    if getattr(col_type, "unsigned", False) and "UNSIGNED" not in raw_str:
+        raw_str = f"{raw_str} UNSIGNED"
+    return raw_str
+
+
+def introspect_schemas_with_sqlalchemy(
+    bind_or_conn: Any,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+) -> Dict[str, TableSchema]:
+    """
+    Introspect base table schemas via `sqlalchemy.inspect(...)` across SQLite,
+    PostgreSQL, and MySQL/MariaDB, enriching FK cascade metadata where needed.
+    """
+    eff_dialect: Optional[Dialect] = None
+    if isinstance(dialect, Dialect):
+        eff_dialect = dialect
+    elif isinstance(dialect, EngineVersion):
+        eff_dialect = dialect.dialect
+    elif isinstance(dialect, str):
+        eff_dialect = parse_engine_version(dialect).dialect
+    else:
+        eff_dialect = detect_engine_version(bind_or_conn).dialect
+
+    catalog_table = f"{object_prefix}catalog" if object_prefix else "matview_catalog"
+    owned_engine: Optional[_SAEngine] = None
+    raw_conn, _, _, _ = unwrap_dbapi_connection(bind_or_conn)
+
+    if isinstance(bind_or_conn, (_SAEngine, _SAConnection)):
+        insp_target = bind_or_conn
+    else:
+        url_str = {
+            Dialect.POSTGRES: "postgresql+psycopg2://",
+            Dialect.MYSQL: "mysql+pymysql://",
+        }.get(eff_dialect, "sqlite://")
+        owned_engine = _sa_create_engine(
+            url_str,
+            creator=lambda: _NonClosingConnectionProxy(raw_conn),
+            poolclass=_SANullPool,
+            pool_reset_on_return=None,
+        )
+        # Skip `create_engine`'s `on_connect` listener (e.g. `psycopg2.extras.register_uuid`)
+        # which type-checks the raw C connection and rejects `_NonClosingConnectionProxy`.
+        for _conn_fn in list(owned_engine.pool.dispatch.connect):
+            if getattr(_conn_fn, "__name__", "") == "on_connect":
+                _sa_event.remove(owned_engine.pool, "connect", _conn_fn)
+        insp_target = owned_engine
+
+    try:
+        insp = _sa_inspect(insp_target)
+        sqlite_ddl_schemas: Dict[str, TableSchema] = {}
+        if eff_dialect == Dialect.SQLITE:
+            try:
+                sqlite_ddl_schemas = introspect_sqlite_schemas(raw_conn, object_prefix=object_prefix)
+            except Exception:
+                sqlite_ddl_schemas = {}
+        sqlite_low = {k.lower(): v for k, v in sqlite_ddl_schemas.items()}
+
+        schemas: Dict[str, TableSchema] = {}
+        for t_name in insp.get_table_names():
+            if t_name.startswith(("__matview_", "__mv_")) or (
+                object_prefix and t_name.startswith(object_prefix)
+            ) or t_name == catalog_table:
+                continue
+
+            if eff_dialect == Dialect.SQLITE:
+                sq_existing = sqlite_low.get(t_name.lower())
+                if sq_existing and sq_existing.columns:
+                    schemas[sq_existing.name] = sq_existing
+                    continue
+
+            pk_info = insp.get_pk_constraint(t_name) or {}
+            pk_cols_low = {str(c).lower() for c in (pk_info.get("constrained_columns") or ())}
+            cols_info = insp.get_columns(t_name) or []
+            col_defs: Dict[str, ColumnDef] = {}
+            for col in cols_info:
+                c_name = str(col["name"])
+                c_type = _format_sa_column_type(col.get("type", "TEXT"), eff_dialect)
+                is_pk = c_name.lower() in pk_cols_low
+                is_notnull = (not bool(col.get("nullable", True))) or is_pk
+                col_defs[c_name] = ColumnDef(
+                    name=c_name,
+                    data_type=c_type,
+                    not_null=is_notnull,
+                    primary_key=is_pk,
+                )
+
+            fk_actions: List[str] = []
+            for fk in (insp.get_foreign_keys(t_name) or []):
+                opts = fk.get("options") or {}
+                for opt_key, sql_kw in (("ondelete", "ON DELETE"), ("onupdate", "ON UPDATE")):
+                    act_val = str(opts.get(opt_key) or "").upper()
+                    if act_val in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                        act_str = f"{sql_kw} {act_val}"
+                        if act_str not in fk_actions:
+                            fk_actions.append(act_str)
+
+            schemas[t_name] = TableSchema(
+                name=t_name,
+                columns=col_defs,
+                fk_cascade_actions=tuple(fk_actions),
+            )
+        return schemas
+    finally:
+        if owned_engine is not None:
+            owned_engine.dispose()
+
+
 def introspect_sqlite_schemas(
     conn: Any,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
@@ -2699,6 +3011,15 @@ def introspect_database_schemas(
     elif isinstance(dialect, str):
         dialect = parse_engine_version(dialect).dialect
     catalog_table = f"{object_prefix}catalog" if object_prefix else "matview_catalog"
+
+    if _can_use_sqlalchemy_inspector(conn):
+        schemas = introspect_schemas_with_sqlalchemy(
+            conn,
+            dialect=dialect,
+            object_prefix=object_prefix,
+        )
+        schemas.pop(catalog_table, None)
+        return schemas
 
     if dialect == Dialect.SQLITE:
         schemas = introspect_sqlite_schemas(conn, object_prefix=object_prefix)
@@ -13094,31 +13415,15 @@ class MaterializedViewManager:
     def _connect_database_url(
         conn_or_url: str, dialect: Optional[Dialect] = None
     ) -> Tuple[Any, Dialect]:
-        u_low = conn_or_url.strip().lower()
-        if u_low.startswith(("postgresql://", "postgres://")):
-            import psycopg2  # type: ignore
-            return psycopg2.connect(conn_or_url), Dialect.POSTGRES
-        if u_low.startswith(("mysql://", "mariadb://")):
-            import pymysql  # type: ignore
-            from urllib.parse import urlparse, parse_qs
-            parsed = urlparse(conn_or_url)
-            db_name = parsed.path.lstrip("/")
-            qs = parse_qs(parsed.query)
-            return (
-                pymysql.connect(
-                    host=parsed.hostname or "127.0.0.1",
-                    port=parsed.port or 3306,
-                    user=parsed.username or "root",
-                    password=parsed.password or "",
-                    database=db_name,
-                    unix_socket=qs.get("unix_socket", [None])[0],
-                    autocommit=False,
-                ),
-                Dialect.MYSQL,
-            )
-        eff_dialect = dialect or Dialect.SQLITE
-        path = conn_or_url.replace("sqlite:///", "").replace("sqlite://", "")
-        return sqlite3.connect(path), eff_dialect
+        raw_conn, eff_dialect, owned_engine = connect_database_via_sqlalchemy(
+            conn_or_url, dialect=dialect
+        )
+        if owned_engine is not None:
+            try:
+                setattr(raw_conn, "_matview_sa_engine", owned_engine)
+            except Exception:
+                pass
+        return raw_conn, eff_dialect
 
     @contextmanager
     def _cursor(self) -> Iterator[Any]:
@@ -13156,12 +13461,22 @@ class MaterializedViewManager:
             if engine_version is None and (":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(ch.isdigit() for ch in dialect.replace("sqlite3", ""))):
                 engine_version = parsed_d
 
+        self._owned_sa_engine: Optional[_SAEngine] = None
+        self.sa_connection: Optional[_SAConnection] = None
         if isinstance(conn_or_url, str):
             self.conn, inferred_dialect = self._connect_database_url(conn_or_url, hint_d)
+            self._owned_sa_engine = getattr(self.conn, "_matview_sa_engine", None)
+            self._owns_raw_conn = True
             if hint_d is None or conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
                 hint_d = inferred_dialect
         else:
-            self.conn = conn_or_url
+            dbapi_conn, owned_eng, sa_conn, sa_dialect = unwrap_dbapi_connection(conn_or_url)
+            self.conn = dbapi_conn
+            self._owned_sa_engine = owned_eng
+            self.sa_connection = sa_conn
+            self._owns_raw_conn = isinstance(conn_or_url, _SAEngine)
+            if hint_d is None and sa_dialect is not None:
+                hint_d = sa_dialect
 
         if engine_version is not None:
             self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
@@ -13238,6 +13553,39 @@ class MaterializedViewManager:
 
     def _param_placeholder(self) -> str:
         return "?" if self.dialect == Dialect.SQLITE else "%s"
+
+    def _execute_param(self, cur: Any, qmark_sql: str, params: Sequence[Any]) -> Any:
+        return cur.execute(render_parameterized_sql(qmark_sql, self.dialect), params)
+
+    @staticmethod
+    def _savepoint_create(cur: Any, name: str) -> None:
+        cur.execute(f"SAVEPOINT {name};")
+
+    @staticmethod
+    def _savepoint_release(cur: Any, name: str) -> None:
+        cur.execute(f"RELEASE SAVEPOINT {name};")
+
+    @staticmethod
+    def _savepoint_rollback_and_release(cur: Any, name: str) -> None:
+        cur.execute(f"ROLLBACK TO SAVEPOINT {name};")
+        cur.execute(f"RELEASE SAVEPOINT {name};")
+
+    def close(self) -> None:
+        """Close any connection and dispose any SQLAlchemy engine owned by this manager."""
+        owned_engine = getattr(self, "_owned_sa_engine", None)
+        if getattr(self, "_owns_raw_conn", False):
+            close_fn = getattr(self.conn, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+        if owned_engine is not None:
+            try:
+                owned_engine.dispose()
+            except Exception:
+                pass
+            self._owned_sa_engine = None
 
     def _resolve_catalog_name(self, name: str, catalog: Dict[str, Dict[str, Any]]) -> str:
         if name in catalog:
@@ -13371,10 +13719,10 @@ class MaterializedViewManager:
                 cur.execute(build_drop_sql("TABLE", entry["backing_table"], dialect=self.dialect))
                 for aux_t in entry["aux_tables"]:
                     cur.execute(build_drop_sql("TABLE", aux_t, dialect=self.dialect))
-                ph = self._param_placeholder()
                 if self.dialect == Dialect.SQLITE and self.engine_version.supports_sqlite_returning:
-                    cur.execute(
-                        f"DELETE FROM {self.catalog_table} WHERE view_name = {ph} RETURNING view_name;",
+                    self._execute_param(
+                        cur,
+                        f"DELETE FROM {self.catalog_table} WHERE view_name = ? RETURNING view_name;",
                         (resolved_name,),
                     )
                     try:
@@ -13382,7 +13730,11 @@ class MaterializedViewManager:
                     except Exception:
                         pass
                 else:
-                    cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph};", (resolved_name,))
+                    self._execute_param(
+                        cur,
+                        f"DELETE FROM {self.catalog_table} WHERE view_name = ?;",
+                        (resolved_name,),
+                    )
                 self._commit()
                 return True
             else:
@@ -13406,11 +13758,11 @@ class MaterializedViewManager:
         max_pk: Optional[int],
         active: int,
     ) -> None:
-        ph = self._param_placeholder()
-        cur.execute(
+        self._execute_param(
+            cur,
             f"UPDATE {self.catalog_table} "
-            f"SET backfill_cursor_pk = {ph}, backfill_max_pk = {ph}, backfill_active = {ph} "
-            f"WHERE view_name = {ph}",
+            f"SET backfill_cursor_pk = ?, backfill_max_pk = ?, backfill_active = ? "
+            f"WHERE view_name = ?",
             (cursor_pk, max_pk, active, view_name),
         )
 
@@ -13463,7 +13815,7 @@ class MaterializedViewManager:
                         cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
                         cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
                     elif self.dialect == Dialect.SQLITE:
-                        cur.execute("SAVEPOINT __mv_backfill_snap;")
+                        self._savepoint_create(cur, "__mv_backfill_snap")
                     else:
                         raise RuntimeError(
                             f"Snapshot isolation is not implemented for {self.dialect.value}"
@@ -13505,8 +13857,7 @@ class MaterializedViewManager:
         """Roll back a failed snapshot backfill without leaving its transaction open."""
         if self.dialect == Dialect.SQLITE:
             try:
-                cur.execute("ROLLBACK TO SAVEPOINT __mv_backfill_snap;")
-                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._savepoint_rollback_and_release(cur, "__mv_backfill_snap")
                 return
             except Exception:
                 # If the savepoint no longer exists or the connection is already
@@ -13523,11 +13874,11 @@ class MaterializedViewManager:
         try:
             reset_cur = self.conn.cursor()
             try:
-                ph = self._param_placeholder()
-                reset_cur.execute(
+                self._execute_param(
+                    reset_cur,
                     f"UPDATE {self.catalog_table} "
                     f"SET backfill_cursor_pk = NULL, backfill_max_pk = NULL, backfill_active = 0 "
-                    f"WHERE view_name = {ph}",
+                    f"WHERE view_name = ?",
                     (view_name,),
                 )
                 self._commit()
@@ -13553,7 +13904,7 @@ class MaterializedViewManager:
                 cur.execute(s)
             self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
             if snapshot_isolation and self.dialect == Dialect.SQLITE:
-                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._savepoint_release(cur, "__mv_backfill_snap")
             self._commit()
             if on_progress:
                 on_progress(1, 1)
@@ -13580,15 +13931,15 @@ class MaterializedViewManager:
             self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, 1)
             if not snapshot_isolation:
                 self._commit()
-            ph = self._param_placeholder()
             while cursor_pk < max_pk:
                 upper_pk = min(max_pk, cursor_pk + batch_size)
                 sqlite_chunk_tx_began = False
                 if not snapshot_isolation:
                     if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
                         try:
-                            cur.execute(
-                                f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > {ph} AND {pk_col} <= {ph} FOR UPDATE",
+                            self._execute_param(
+                                cur,
+                                f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > ? AND {pk_col} <= ? FOR UPDATE",
                                 (cursor_pk, upper_pk),
                             )
                         except Exception:
@@ -13621,7 +13972,7 @@ class MaterializedViewManager:
                     on_progress(batches_run, done)
             self._update_backfill_watermark(cur, plan.view_name, max_pk, max_pk, 0)
             if snapshot_isolation and self.dialect == Dialect.SQLITE:
-                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._savepoint_release(cur, "__mv_backfill_snap")
             self._commit()
             return batches_run
 
@@ -13648,16 +13999,14 @@ class MaterializedViewManager:
                     on_progress(batches_run, min(len(all_keys), i + batch_size))
             self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
             if snapshot_isolation and self.dialect == Dialect.SQLITE:
-                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._savepoint_release(cur, "__mv_backfill_snap")
             self._commit()
             return batches_run
 
         elif spec.mode == "offset_batch" and spec.offset_insert_template:
             offset = 0
-            ph = self._param_placeholder()
-            tmpl_sql = spec.offset_insert_template.replace("LIMIT ? OFFSET ?", f"LIMIT {ph} OFFSET {ph}")
             while True:
-                cur.execute(tmpl_sql, (batch_size, offset))
+                self._execute_param(cur, spec.offset_insert_template, (batch_size, offset))
                 rc = getattr(cur, "rowcount", None)
                 if rc is not None and rc >= 0:
                     inserted = int(rc)
@@ -13678,7 +14027,7 @@ class MaterializedViewManager:
                     break
             self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
             if snapshot_isolation and self.dialect == Dialect.SQLITE:
-                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._savepoint_release(cur, "__mv_backfill_snap")
             self._commit()
             return batches_run
 
@@ -13745,15 +14094,15 @@ class MaterializedViewManager:
                         created_objects.append(obj)
 
                 stored_view_sql = self._serialize_view_sql_with_indexes(plan)
-                ph = self._param_placeholder()
                 init_active = 1 if (populate and incremental_backfill) else 0
-                cur.execute(
+                self._execute_param(
+                    cur,
                     f"""
                     INSERT INTO {self.catalog_table} (
                         view_name, view_sql, strategy, signature_hash, backing_table,
                         aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
                         backfill_cursor_pk, backfill_max_pk, backfill_active
-                    ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         plan.view_name,
@@ -13797,9 +14146,9 @@ class MaterializedViewManager:
                 if self.dialect == Dialect.MYSQL:
                     if catalog_inserted:
                         try:
-                            ph = self._param_placeholder()
-                            cur.execute(
-                                f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}",
+                            self._execute_param(
+                                cur,
+                                f"DELETE FROM {self.catalog_table} WHERE view_name = ?",
                                 (plan.view_name,),
                             )
                             self._commit()
@@ -14189,11 +14538,11 @@ class MaterializedViewManager:
                     cur.execute("BEGIN IMMEDIATE;")
                 # A failed savepoint is equally unsafe: do not fall back to trigger
                 # removal without transactional protection.
-                cur.execute("SAVEPOINT __mv_bulk_sp;")
+                self._savepoint_create(cur, "__mv_bulk_sp")
                 sp_active = True
             else:
                 try:
-                    cur.execute("SAVEPOINT __mv_bulk_sp;")
+                    self._savepoint_create(cur, "__mv_bulk_sp")
                     sp_active = True
                 except Exception:
                     pass
@@ -14226,8 +14575,7 @@ class MaterializedViewManager:
             def _cleanup_and_restore() -> None:
                 if sp_active:
                     try:
-                        cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
-                        cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                        self._savepoint_rollback_and_release(cur, "__mv_bulk_sp")
                     except Exception:
                         self._rollback()
                 else:
@@ -14447,7 +14795,7 @@ class MaterializedViewManager:
 
                 if sp_active:
                     try:
-                        cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                        self._savepoint_release(cur, "__mv_bulk_sp")
                     except Exception:
                         pass
                 self._commit()

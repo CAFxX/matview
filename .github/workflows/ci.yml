@@ -251,6 +251,9 @@ jobs:
       - name: Test Jinja2 procedural trigger and backfill templates
         run: python3 test_p1_jinja2_templates.py
 
+      - name: Test SQLAlchemy unified connectivity and schema introspection
+        run: python3 test_p1_sqlalchemy_integration.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
@@ -392,6 +395,11 @@ jobs:
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_p1_pg_transition_vectorization.py
+
+      - name: Test SQLAlchemy connectivity & introspection on PostgreSQL
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+        run: python3 test_p1_sqlalchemy_integration.py
   # Both supported Oracle MySQL LTS series are required on every PR.
   mysql:
     needs: classify
@@ -478,6 +486,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_p1_manager_safety.py
+
+      - name: Test SQLAlchemy connectivity & introspection on MySQL
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_p1_sqlalchemy_integration.py
   # Representative LTS boundaries for MariaDB: oldest, previous, newest LTS.
   mysql-compat:
     needs: classify
@@ -578,6 +591,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_p1_manager_safety.py
+
+      - name: Test SQLAlchemy connectivity & introspection on MariaDB
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_p1_sqlalchemy_integration.py
   # Stable branch-protection check. Only the required PR gate is aggregated;
   # scheduled/deferred compatibility jobs live in the separate workflow.
   ci-success:
