@@ -5566,7 +5566,8 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         expression_type_view = """
         CREATE VIEW expression_types AS
         SELECT COALESCE(id, -1) AS aid,
-               COALESCE(1.0 * SUM(DISTINCT whole), 0.0) AS exact_total
+               COALESCE(1.0 * SUM(DISTINCT whole), 0.0) AS exact_total,
+               CASE WHEN id IS NULL THEN 0 ELSE 1 END AS case_flag
         FROM avg_source;
         """
         mysql_expression_types = generate_materialized_view(
@@ -5574,6 +5575,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertIn("aid BIGINT", mysql_expression_types.backing_table_ddl)
         self.assertIn("exact_total DECIMAL(65, 1)", mysql_expression_types.backing_table_ddl)
+        self.assertIn("case_flag INT", mysql_expression_types.backing_table_ddl)
 
         sqlite = generate_materialized_view(schema, view, dialect="sqlite")
         self.assertIn("sum_integer INTEGER", sqlite.backing_table_ddl)
