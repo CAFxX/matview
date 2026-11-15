@@ -869,7 +869,7 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
             }
         }
 
-        with self.assertRaisesRegex(RuntimeError, "neither session-local trigger bypass nor transactional savepoint"):
+        with self.assertRaisesRegex(RuntimeError, "could not establish either session-local trigger bypass"):
             with manager.bulk_changes():
                 self.fail("bulk_changes must fail before entering the user block")
 
