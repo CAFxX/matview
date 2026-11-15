@@ -8901,6 +8901,51 @@ class WrappedConnectionTransactionStateTests(unittest.TestCase):
         self.assertEqual(connection.commit_calls, 0)
         self.assertEqual(connection.rollback_calls, 0)
 
+    def test_mysql_bulk_changes_fails_closed_when_driver_leaf_state_is_unknown(self):
+        class UnknownDriver:
+            pass
+
+        class IdleFacade:
+            in_transaction = False
+            autocommit = False
+
+            def __init__(self):
+                self.driver_connection = UnknownDriver()
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = IdleFacade()
+        self.assertIsNone(manager._mysql_transaction_state())
+        self.assertIsNone(manager._mysql_autocommit_state())
+
+    def test_postgres_bulk_changes_fails_closed_when_driver_leaf_state_is_unknown(self):
+        class UnknownDriver:
+            autocommit = False
+
+        class IdleFacade:
+            in_transaction = False
+            autocommit = False
+
+            def __init__(self):
+                self.driver_connection = UnknownDriver()
+
+        with self.assertRaisesRegex(RuntimeError, "physical DB-API connection"):
+            MaterializedViewManager._require_idle_postgres_connection(IdleFacade())
+
+    def test_postgres_bulk_changes_fails_closed_when_driver_leaf_autocommit_is_unknown(self):
+        class Driver:
+            in_transaction = False
+
+        class IdleFacade:
+            in_transaction = False
+            autocommit = False
+
+            def __init__(self):
+                self.driver_connection = Driver()
+
+        with self.assertRaisesRegex(RuntimeError, "physical DB-API connection"):
+            MaterializedViewManager._require_idle_postgres_connection(IdleFacade())
+
+
     def test_postgres_bulk_changes_rejects_transaction_hidden_by_facade(self):
         connection = self.PostgresFacade()
         manager = MaterializedViewManager.__new__(MaterializedViewManager)
