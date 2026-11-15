@@ -124,6 +124,7 @@ def main() -> None:
             conn.autocommit = False
             with conn.cursor() as cur:
                 cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+                cur.execute(f'DROP TABLE IF EXISTS "{constructor_table}"')
                 cur.execute(f'DROP VIEW IF EXISTS "{view}"')
             conn.commit()
         finally:
