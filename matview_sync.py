@@ -1753,15 +1753,23 @@ def _resolve_statistical_aggregate_alias_item(
     item: SelectItem, dialect: Dialect
 ) -> SelectItem:
     """Resolve statistical aliases using the target engine's SQL contract."""
+    if dialect == Dialect.POSTGRES:
+        # Also validate aliases nested inside scalar expressions, where the
+        # projection itself is not represented as a top-level aggregate item.
+        tokens = sqlglot.tokenize(item.raw_expr, read="sqlite")
+        for index, token in enumerate(tokens[:-1]):
+            if (
+                token.text.upper() == "STD"
+                and tokens[index + 1].token_type == SQLGlotTokenType.L_PAREN
+            ):
+                raise ValueError(
+                    "STD() is not a PostgreSQL aggregate alias; use STDDEV_SAMP() or STDDEV()"
+                )
     if not item.is_aggregate:
         return item
     match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", item.raw_expr)
     alias_func = match.group(1).upper() if match else ""
     if dialect == Dialect.POSTGRES:
-        if alias_func == "STD":
-            raise ValueError(
-                "STD() is not a PostgreSQL aggregate alias; use STDDEV_SAMP() or STDDEV()"
-            )
         aliases = {
             "VARIANCE": AggFunc.VAR_SAMP,
             "STDDEV": AggFunc.STDDEV_SAMP,
@@ -3309,6 +3317,9 @@ class IncrementalViewCompiler:
                             parsed_el = _parse_single_agg_expr(full_call, col_al)
                             if parsed_el is None:
                                 return expr_str, False
+                            parsed_el = _resolve_statistical_aggregate_alias_item(
+                                parsed_el, self.dialect
+                            )
                             agg_call_to_alias[norm_key] = col_al
                             work_items.append(parsed_el)
                             extra_having_items.append(parsed_el)

@@ -5630,6 +5630,41 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 ast = parse_view_ast(view_with_std, dialect=Dialect(dialect))
                 self.assertEqual(ast.select_items[3].agg_func, AggFunc.STDDEV_POP)
 
+        nested_view = """
+        CREATE VIEW measurement_nested_aliases AS
+        SELECT grp,
+               COALESCE(VARIANCE(value), 0) AS variance_default,
+               COALESCE(STDDEV(value), 0) AS stddev_default
+        FROM measurements GROUP BY grp;
+        """
+        nested_postgres = generate_materialized_view(
+            schema, nested_view, dialect="postgres"
+        )
+        nested_postgres_sql = "\n".join(nested_postgres.initial_populate_sqls).upper()
+        self.assertIn("VAR_SAMP(", nested_postgres_sql)
+        self.assertIn("STDDEV_SAMP(", nested_postgres_sql)
+        self.assertNotIn("VAR_POP(", nested_postgres_sql)
+        self.assertNotIn("STDDEV_POP(", nested_postgres_sql)
+
+        nested_mysql = generate_materialized_view(
+            schema, nested_view, dialect="mysql", ignore_limitations=True
+        )
+        nested_mysql_sql = "\n".join(nested_mysql.initial_populate_sqls).upper()
+        self.assertIn("VAR_POP(", nested_mysql_sql)
+        self.assertIn("STDDEV_POP(", nested_mysql_sql)
+        self.assertNotIn("VAR_SAMP(", nested_mysql_sql)
+        self.assertNotIn("STDDEV_SAMP(", nested_mysql_sql)
+
+        nested_std_view = """
+        CREATE VIEW measurement_nested_std AS
+        SELECT grp, COALESCE(STD(value), 0) AS std_default
+        FROM measurements GROUP BY grp;
+        """
+        with self.assertRaisesRegex(ValueError, r"STD\(\) is not a PostgreSQL"):
+            generate_materialized_view(schema, nested_std_view, dialect="postgres")
+        with self.assertRaisesRegex(ValueError, r"STD\(\) is not a PostgreSQL"):
+            parse_view_ast(nested_std_view, dialect=Dialect.POSTGRES)
+
         unsupported_postgres_alias = """
         CREATE VIEW measurement_std AS
         SELECT grp, STD(value) AS deviation
