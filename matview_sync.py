@@ -10328,8 +10328,12 @@ class MaterializedViewManager:
             )
         return "\n".join(parts)
 
-    def drop_view(self, view_name: str) -> bool:
-        """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
+    def drop_view(self, view_name: str, _commit_transaction: bool = True) -> bool:
+        """Drops a registered materialized view, its triggers, read-only view, and backing tables.
+
+        Internal callers may defer the commit when composing this operation into a
+        larger transaction on engines with transactional DDL.
+        """
         catalog = self.get_catalog()
         resolved_name = self._resolve_catalog_name(view_name, catalog)
         entry = catalog.get(resolved_name)
@@ -10613,7 +10617,28 @@ class MaterializedViewManager:
             return plan
 
         if existing:
-            self.drop_view(plan.view_name)
+            # SQLite and PostgreSQL support transactional DDL. For a single-shot
+            # replacement, keep removal of the old reader/backing objects in the
+            # same transaction as creation and population of the replacement, so
+            # a failed rebuild restores the previously working materialized view.
+            # SQLite needs an explicit writer reservation because sqlite3 does not
+            # automatically wrap DDL in a transaction. MySQL/MariaDB implicitly
+            # commit DDL, and incremental backfills intentionally commit chunks;
+            # those paths still require a future shadow-generation publication
+            # protocol before replacement can be made failure-atomic.
+            transactional_replacement = (
+                not incremental_backfill
+                and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES)
+            )
+            if transactional_replacement:
+                if (
+                    self.dialect == Dialect.SQLITE
+                    and not self.conn.in_transaction
+                ):
+                    self.conn.cursor().execute("BEGIN IMMEDIATE;")
+                self.drop_view(plan.view_name, _commit_transaction=False)
+            else:
+                self.drop_view(plan.view_name)
 
         # Install structure, maintenance triggers, single-shot backfill, and catalog record
         # inside a single atomic transaction so concurrent readers/writers never observe an
