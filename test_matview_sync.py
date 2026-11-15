@@ -6015,6 +6015,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             manager = MaterializedViewManager(conn, dialect="sqlite")
             manager.apply_schema_ddl(schema)
             plan = manager.register_view(view_sql)
+            self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
 
             def assert_matches_live(label: str) -> List[Tuple[Any, ...]]:
                 actual = [
