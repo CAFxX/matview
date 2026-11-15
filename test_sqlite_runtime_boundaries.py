@@ -69,6 +69,13 @@ class SQLiteRuntimeBoundaryTests(unittest.TestCase):
                     "INSERT INTO upsert_probe VALUES (2, 30) RETURNING k, value;"
                 ).fetchall()
                 self.assertEqual(returned, [(2, 30)])
+            else:
+                # Keep the negative branch executable too: a version gate that
+                # claims RETURNING is unavailable must agree with the engine.
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute(
+                        "INSERT INTO upsert_probe VALUES (2, 30) RETURNING k, value;"
+                    )
         finally:
             conn.close()
 
