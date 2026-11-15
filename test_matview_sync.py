@@ -8769,7 +8769,7 @@ class MySQLBulkSavepointCleanupFailureTests(unittest.TestCase):
         manager.fetch_schema = lambda: {}
         return manager, conn
 
-    def _assert_discarded(self, manager, conn, cursor, original_error: str) -> None:
+    def _assert_discarded(self, manager, conn, cursor) -> None:
         self.assertEqual(conn.close_calls, 1)
         self.assertEqual(conn.rollback_calls, 0)
         self.assertEqual(conn.commit_calls, 0)
@@ -8778,9 +8778,6 @@ class MySQLBulkSavepointCleanupFailureTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "connection was discarded"):
             with manager.bulk_changes():
                 self.fail("discarded manager must not be reusable")
-        # The original operation failure and the failed savepoint cleanup must
-        # both remain visible to the caller.
-        self.assertTrue(original_error)
 
     def test_caller_body_error_plus_rollback_to_failure_discards_connection(self) -> None:
         cursor = self.Cursor(fail_rollback=True)
@@ -8789,7 +8786,7 @@ class MySQLBulkSavepointCleanupFailureTests(unittest.TestCase):
             with manager.bulk_changes():
                 raise ValueError("body operation failed")
         self.assertIn("body operation failed", str(caught.exception))
-        self._assert_discarded(manager, conn, cursor, "body operation failed")
+        self._assert_discarded(manager, conn, cursor)
 
     def test_caller_body_error_plus_release_failure_discards_connection(self) -> None:
         cursor = self.Cursor(fail_release=True)
@@ -8798,7 +8795,7 @@ class MySQLBulkSavepointCleanupFailureTests(unittest.TestCase):
             with manager.bulk_changes():
                 raise ValueError("body release operation failed")
         self.assertIn("body release operation failed", str(caught.exception))
-        self._assert_discarded(manager, conn, cursor, "body release operation failed")
+        self._assert_discarded(manager, conn, cursor)
 
     def test_refresh_error_plus_rollback_to_failure_discards_connection(self) -> None:
         cursor = self.Cursor(fail_rollback=True)
@@ -8810,7 +8807,7 @@ class MySQLBulkSavepointCleanupFailureTests(unittest.TestCase):
             with manager.bulk_changes():
                 pass
         self.assertIn("refresh operation failed", str(caught.exception))
-        self._assert_discarded(manager, conn, cursor, "refresh operation failed")
+        self._assert_discarded(manager, conn, cursor)
 
     def test_bypass_setup_error_plus_rollback_failure_discards_connection(self) -> None:
         cursor = self.Cursor(fail_bypass=True, fail_rollback=True)
@@ -8819,7 +8816,7 @@ class MySQLBulkSavepointCleanupFailureTests(unittest.TestCase):
             with manager.bulk_changes():
                 self.fail("must fail before yielding")
         self.assertIn("injected bypass setup failure", str(caught.exception))
-        self._assert_discarded(manager, conn, cursor, "injected bypass setup failure")
+        self._assert_discarded(manager, conn, cursor)
 
 
 def _run_all_tests() -> None:
@@ -8885,7 +8882,13 @@ def _run_all_tests() -> None:
     print("-" * 84)
 
     # Run unit tests for generator & manager API
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestGeneratorAndManagerCodePaths)
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite(
+        [
+            loader.loadTestsFromTestCase(TestGeneratorAndManagerCodePaths),
+            loader.loadTestsFromTestCase(MySQLBulkSavepointCleanupFailureTests),
+        ]
+    )
     res = unittest.TextTestRunner(verbosity=2).run(suite)
     if not res.wasSuccessful():
         sys.exit(1)
