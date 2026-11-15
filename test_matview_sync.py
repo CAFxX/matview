@@ -4050,6 +4050,13 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, message):
                     manager.register_view("CREATE VIEW v AS SELECT 1 AS value;")
 
+        # Declarative sync enters the same registration path directly, so it
+        # must enforce transaction ownership before its own schema/catalog reads.
+        conn = Connection(False, 2)
+        manager = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
+            manager.sync_views("CREATE VIEW v AS SELECT 1 AS value;")
+
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
