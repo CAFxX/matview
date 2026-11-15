@@ -11040,7 +11040,13 @@ class MaterializedViewManager:
         if self.dialect == Dialect.MYSQL and not session_bypass_ok and targets:
             # Falling back to DROP/CREATE TRIGGER would implicitly commit the
             # transaction. Refuse before any such DDL rather than silently
-            # weakening the context manager's rollback guarantee.
+            # weakening the context manager's rollback guarantee. Clear the
+            # session variable defensively in case the failed SET reached the
+            # server but its response was lost.
+            try:
+                cur.execute("SET @__matview_skip_triggers = 0;")
+            except Exception:
+                pass
             self._rollback()
             raise RuntimeError(
                 "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
