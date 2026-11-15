@@ -488,6 +488,12 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
 
     _create_scalar("CONCAT", -1, _concat)
     _create_scalar("CONCAT_WS", -1, _concat_ws)
+    _create_scalar("OCTET_LENGTH", 1, lambda s: len(str(s).encode("utf-8")) if s is not None else None)
+    try:
+        conn.create_collation("utf8mb4_bin", lambda a, b: (a > b) - (a < b))
+        conn.create_collation("utf8mb4_unicode_ci", lambda a, b: (a.lower() > b.lower()) - (a.lower() < b.lower()))
+    except Exception:
+        pass
     _create_scalar("PG_ROW_KEY", -1, lambda *args: "(" + ",".join("" if a is None else str(a) for a in args) + ")")
 
     class _VarPopAgg:
@@ -628,7 +634,9 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
     s = re.sub(r"(?<!ELSE )\bBIT_AND\s*\(\s*([^()]+?)\s*\)", r"COALESCE(BIT_AND(\1), -1)", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+FROM\s+DUAL\b", "", s, flags=re.IGNORECASE)
     s = s.replace("<=>", " IS ")
-    s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR\s*\)", r"CAST(\1 AS TEXT)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR(?:\(\d+\))?(?:\s+CHARACTER\s+SET\s+\w+)?\s*\)", r"CAST(\1 AS TEXT)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bCHARACTER\s+SET\s+\w+\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bCOLLATE\s+\w+\b", "", s, flags=re.IGNORECASE)
     # Replace MySQL bitwise XOR `^`
     for _ in range(3):
         s = re.sub(
@@ -1615,7 +1623,7 @@ class TranspiledConnectionAdapter:
 
     def _convert_mysql_dml_to_sqlite(self, sql: str, default_pks: Optional[Sequence[str]] = None) -> str:
         s = _transpile_mysql_expr_to_sqlite(sql, default_pks or ("__mv_pk",))
-        s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR\s*\(\d+\)\)", r"CAST(\1 AS TEXT)", s, flags=re.I)
+        s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR(?:\(\d+\))?(?:\s+CHARACTER\s+SET\s+\w+)?\s*\)", r"CAST(\1 AS TEXT)", s, flags=re.I)
         s = re.sub(r"\bINSERT\s+IGNORE\s+INTO\b", "INSERT OR IGNORE INTO", s, flags=re.I)
 
         def _repl_odku(m_ins: re.Match[str]) -> str:
