@@ -67,7 +67,9 @@ CREATE INDEX ix_leaf_value ON leaf (value);
                 return ("same-defect", "root-update")
             return None
 
+        original_signature = signature(original)
         minimized = minimize_schema_graph(original, signature)
+        self.assertEqual(signature(minimized), original_signature)
         schema, views, seed, mutations, shape = minimized
         self.assertIn("CREATE TABLE root", schema)
         self.assertNotIn("CREATE TABLE middle", schema)
