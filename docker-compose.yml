@@ -1,0 +1,160 @@
+services:
+  postgres15:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: matview_test
+    ports:
+      - "${POSTGRES15_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d matview_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  postgres18:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: matview_test
+    ports:
+      - "${POSTGRES18_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d matview_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  mysql84:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: matview_test
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-flush-log-at-trx-commit=0
+      - --sync-binlog=0
+      - --skip-log-bin
+    ports:
+      - "${MYSQL84_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mysql97:
+    image: mysql:9.7
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: matview_test
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-flush-log-at-trx-commit=0
+      - --sync-binlog=0
+      - --skip-log-bin
+    ports:
+      - "${MYSQL97_PORT:-3307}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mariadb1011:
+    image: mariadb:10.11
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MARIADB_ROOT_PASSWORD: password
+      MYSQL_DATABASE: matview_test
+      MARIADB_DATABASE: matview_test
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-flush-log-at-trx-commit=0
+      - --sync-binlog=0
+      - --skip-log-bin
+    ports:
+      - "${MARIADB1011_PORT:-3308}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent || mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mariadb118:
+    image: mariadb:11.8
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MARIADB_ROOT_PASSWORD: password
+      MYSQL_DATABASE: matview_test
+      MARIADB_DATABASE: matview_test
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-flush-log-at-trx-commit=0
+      - --sync-binlog=0
+      - --skip-log-bin
+    ports:
+      - "${MARIADB118_PORT:-3309}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent || mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mariadb123:
+    image: mariadb:12.3
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MARIADB_ROOT_PASSWORD: password
+      MYSQL_DATABASE: matview_test
+      MARIADB_DATABASE: matview_test
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-flush-log-at-trx-commit=0
+      - --sync-binlog=0
+      - --skip-log-bin
+    ports:
+      - "${MARIADB123_PORT:-3310}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent || mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app
+    environment:
+      POSTGRES15_DSN: postgresql://postgres:password@postgres15:5432/matview_test
+      POSTGRES18_DSN: postgresql://postgres:password@postgres18:5432/matview_test
+      MYSQL84_DSN: mysql://root:password@mysql84:3306/matview_test
+      MYSQL97_DSN: mysql://root:password@mysql97:3306/matview_test
+      MARIADB1011_DSN: mysql://root:password@mariadb1011:3306/matview_test
+      MARIADB118_DSN: mysql://root:password@mariadb118:3306/matview_test
+      MARIADB123_DSN: mysql://root:password@mariadb123:3306/matview_test
+    depends_on:
+      postgres15:
+        condition: service_healthy
+      postgres18:
+        condition: service_healthy
+      mysql84:
+        condition: service_healthy
+      mysql97:
+        condition: service_healthy
+      mariadb1011:
+        condition: service_healthy
+      mariadb118:
+        condition: service_healthy
+      mariadb123:
+        condition: service_healthy
+    command: ["python3", "run_docker_tests.py"]

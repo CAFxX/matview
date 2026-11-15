@@ -218,6 +218,9 @@ jobs:
       - name: Test dialect-aware SQLGlot AST parsing
         run: python3 test_p1_dialect_parsing.py
 
+      - name: Verify Docker test environment and configuration
+        run: python3 test_docker_test_env.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
