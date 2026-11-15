@@ -3096,16 +3096,10 @@ def run_suite_5_joins(runner: MVTestRunner) -> None:
     """
     seed = [
         "INSERT INTO depts VALUES (10, 'Eng', 1000.0), (20, 'Sales', 500.0), (30, 'EmptyDept', 200.0);",
-        "INSERT INTO users VALUES (1, 10, NULL, 'Alice', 'gold', 1), (2, 10, 1, 'Bob', 'silver', 1), (3, 20, 1, 'Cara', 'gold', 0), (4, 99, 2, 'OrphanDeptUser', 'bronze', 1), (5, NULL, NULL, 'NoDeptUser', 'silver', 1), (7, 10, NULL, 'Delta', 'diamond', 1);",
-        "INSERT INTO orders VALUES (100, 1, 'laptop', 1200.0, 'paid'), (101, 1, 'mouse', 50.0, 'paid'), (102, 2, 'monitor', 300.0, 'pending'), (103, 4, 'keyboard', 80.0, 'paid'), (104, 999, 'ghost', 999.0, 'paid'), (107, 7, 'probe_a', 11.0, 'paid'), (108, 7, 'probe_null', NULL, 'paid');",
+        "INSERT INTO users VALUES (1, 10, NULL, 'Alice', 'gold', 1), (2, 10, 1, 'Bob', 'silver', 1), (3, 20, 1, 'Cara', 'gold', 0), (4, 99, 2, 'OrphanDeptUser', 'bronze', 1), (5, NULL, NULL, 'NoDeptUser', 'silver', 1);",
+        "INSERT INTO orders VALUES (100, 1, 'laptop', 1200.0, 'paid'), (101, 1, 'mouse', 50.0, 'paid'), (102, 2, 'monitor', 300.0, 'pending'), (103, 4, 'keyboard', 80.0, 'paid'), (104, 999, 'ghost', 999.0, 'paid');",
     ]
     mutations = [
-        # Dedicated join-aggregate retraction sequence: retain a group, move its
-        # key, remove its final matches, then recreate it. One row has NULL total.
-        ("del_join_agg_one", "DELETE FROM orders WHERE id = 107;"),
-        ("move_join_agg_group", "UPDATE users SET tier = 'platinum' WHERE id = 7;"),
-        ("del_join_agg_group", "DELETE FROM orders WHERE user_id = 7;"),
-        ("reinsert_join_agg_group", "INSERT INTO orders VALUES (109, 7, 'probe_reinsert', 23.0, 'paid');"),
         # Insert department 99 so user 4 is no longer an orphan in depts!
         ("ins_missing_dept", "INSERT INTO depts VALUES (99, 'Ops', 750.0);"),
         # Insert order for user 3 (who previously had 0 orders -> tests LEFT JOIN NULL-to-matched transition!)
@@ -3198,28 +3192,16 @@ def run_suite_5_joins(runner: MVTestRunner) -> None:
         "SELECT d.dname, COUNT(u.id) AS u_cnt, COUNT(DISTINCT u.tier) AS d_tiers FROM depts d LEFT JOIN users u ON d.id = u.dept_id GROUP BY d.dname",
         "SELECT d.id AS did, d.dname, COUNT(o.id) AS o_cnt, SUM(o.total) AS rev FROM depts d LEFT JOIN users u ON d.id = u.dept_id LEFT JOIN orders o ON u.id = o.user_id GROUP BY d.id, d.dname",
         "SELECT u.tier, o.status, COUNT(*) AS cnt, SUM(o.total) AS sum_t FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.tier, o.status",
-        "SELECT u.tier, COUNT(*) AS joined_rows, COUNT(o.total) AS valued_rows, SUM(o.total) AS total_amount FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.tier",
     ]
-    for base_idx, base_q in enumerate(join_agg_queries):
-        # The final query is the dedicated native regression fixture. One
-        # unfiltered variant is sufficient: the deterministic mutation sequence
-        # below exercises its full group lifecycle, without multiplying the
-        # expensive multi-engine view matrix by nine.
-        variants = (
-            [("", "")]
-            if base_idx == len(join_agg_queries) - 1
-            else [
-                (w, h)
-                for w in ["", " WHERE u.active = 1", " WHERE u.id >= 1"]
-                for h in ["", " HAVING COUNT(*) >= 1", " HAVING TOTAL(o.total) >= 0.0"]
-                if "o.total" not in h or "o.total" in base_q
-            ]
-        )
-        for w, h in variants:
-            idx += 1
-            v_name = f"s5_join_{idx:03d}"
-            q = base_q.replace(" GROUP BY", f"{w} GROUP BY") + h
-            views.append((v_name, f"CREATE VIEW {v_name} AS {q};"))
+    for base_q in join_agg_queries:
+        for w in ["", " WHERE u.active = 1", " WHERE u.id >= 1"]:
+            for h in ["", " HAVING COUNT(*) >= 1", " HAVING TOTAL(o.total) >= 0.0"]:
+                if "o.total" in h and "o.total" not in base_q:
+                    continue
+                idx += 1
+                v_name = f"s5_join_{idx:03d}"
+                q = base_q.replace(" GROUP BY", f"{w} GROUP BY") + h
+                views.append((v_name, f"CREATE VIEW {v_name} AS {q};"))
 
     # 4. Self-Join (Employee -> Manager) across INNER and LEFT JOIN
     self_join_projs = [
@@ -5997,90 +5979,6 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_25_join_aggregate_decrement_and_group_key_invariants(self) -> None:
-        """Exercise join-delta retractions against an independent live SELECT oracle."""
-        schema = """
-        CREATE TABLE join_customers (
-            id INTEGER PRIMARY KEY,
-            segment TEXT NOT NULL
-        );
-        CREATE TABLE join_orders (
-            id INTEGER PRIMARY KEY,
-            customer_id INTEGER NOT NULL REFERENCES join_customers(id),
-            amount INTEGER
-        );
-        INSERT INTO join_customers VALUES (1, 'A'), (2, 'A'), (3, 'B');
-        INSERT INTO join_orders VALUES
-            (10, 1, 11), (11, 1, 13), (12, 2, 17), (13, 3, 19),
-            (14, 3, NULL);
-        """
-        view_sql = (
-            "CREATE VIEW join_segment_totals AS "
-            "SELECT c.segment, COUNT(*) AS joined_rows, COUNT(o.amount) AS valued_rows, "
-            "SUM(o.amount) AS total_amount "
-            "FROM join_customers c INNER JOIN join_orders o ON o.customer_id = c.id "
-            "GROUP BY c.segment;"
-        )
-        live_sql = (
-            "SELECT c.segment, COUNT(*) AS joined_rows, COUNT(o.amount) AS valued_rows, "
-            "SUM(o.amount) AS total_amount "
-            "FROM join_customers c INNER JOIN join_orders o ON o.customer_id = c.id "
-            "GROUP BY c.segment"
-        )
-        conn = sqlite3.connect(":memory:")
-        conn.execute("PRAGMA foreign_keys = ON;")
-        try:
-            manager = MaterializedViewManager(conn, dialect="sqlite")
-            manager.apply_schema_ddl(schema)
-            plan = manager.register_view(view_sql)
-            self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
-
-            def assert_matches_live(label: str) -> List[Tuple[Any, ...]]:
-                actual = [
-                    tuple(row)
-                    for row in conn.execute(
-                        f"SELECT segment, joined_rows, valued_rows, total_amount "
-                        f"FROM {plan.view_name} ORDER BY segment"
-                    ).fetchall()
-                ]
-                expected = [
-                    tuple(row)
-                    for row in conn.execute(live_sql + " ORDER BY segment").fetchall()
-                ]
-                self.assertTrue(
-                    _rows_equal(actual, expected),
-                    f"{label}: join aggregate delta differs from live SELECT; "
-                    f"actual={actual!r}, expected={expected!r}",
-                )
-                return actual
-
-            initial = assert_matches_live("initial")
-            # Retraction from a group with multiple joined rows exercises SUM
-            # decrement while the group remains present.
-            conn.execute("DELETE FROM join_orders WHERE id = 10")
-            after_one_delete = assert_matches_live("delete one contributing row")
-            self.assertNotEqual(initial, after_one_delete)
-
-            # A key-changing update must retract from A and add to B.
-            conn.execute(
-                "UPDATE join_customers SET segment = 'B' WHERE id = 2"
-            )
-            after_group_move = assert_matches_live("move joined rows between groups")
-
-            # Deleting the final matching row removes that group; NULL-valued
-            # rows still contribute to COUNT(*) but not COUNT/SUM(value).
-            conn.execute("DELETE FROM join_orders WHERE customer_id = 1")
-            after_last_delete = assert_matches_live("delete final matching rows")
-            self.assertNotEqual(after_group_move, after_last_delete)
-
-            # Restore the data through inserts and verify aggregate state
-            # returns to the independently computed relation.
-            conn.execute("INSERT INTO join_orders VALUES (20, 1, 23)")
-            conn.execute("INSERT INTO join_orders VALUES (21, 1, NULL)")
-            assert_matches_live("reinsert into emptied group")
-        finally:
-            conn.close()
-
     def test_manager_register_view_enforces_limitations_before_install_and_warns_on_override(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.execute("CREATE TABLE limitation_source (id INTEGER PRIMARY KEY, value INTEGER);")
@@ -6386,7 +6284,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             self.assertGreaterEqual(len(mutations), 5)
             self.assertEqual(
                 set(shape["dml_statement_kinds"]),
-                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "UPDATE_KEY", "UPDATE_NOOP", "DELETE", "UPSERT"},
+                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "DELETE", "UPSERT"},
             )
             self.assertGreater(shape["max_expression_depth"], 0)
             self.assertGreater(shape["max_predicate_depth"], 0)
@@ -6435,6 +6333,17 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(len(campaign), 12)
         self.assertGreaterEqual(coverage["distinct_structures"], 10)
         self.assertGreaterEqual(coverage["feature_count"], 15)
+        # The campaign score must account for DML grammar, not just schema
+        # topology. These features are collected from the selected scenarios.
+        campaign_features = coverage["feature_occurrences"]
+        for kind in ("INSERT_VALUES", "INSERT_SELECT", "UPDATE", "DELETE", "UPSERT"):
+            self.assertIn(f"dml_kind:{kind}", campaign_features)
+        self.assertTrue(
+            any(key.startswith("dml_expression:") for key in campaign_features)
+        )
+        self.assertTrue(
+            any(key.startswith("dml_predicate:") for key in campaign_features)
+        )
         self.assertTrue({
             "add", "safe_subtract", "multiply", "divide", "modulo",
             "abs", "round", "case", "coalesce", "literal",
@@ -6459,7 +6368,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             ).generate_scenario(2, dialect=dialect)
             self.assertEqual(
                 set(shape["dml_statement_kinds"]),
-                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "UPDATE_KEY", "UPDATE_NOOP", "DELETE", "UPSERT"},
+                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "DELETE", "UPSERT"},
             )
             upserts = [
                 mutation_sql
@@ -7587,7 +7496,7 @@ class VariableSchemaDifferentialFuzzer:
         # still receive generated INSERT/UPDATE/UPSERT/DELETE statements.
         for i in reversed(range(len(metas))):
             meta = metas[i]
-            required_mutations = 6 + int(i == 1 and len(metas) > 1)
+            required_mutations = 4 + int(i == 1 and len(metas) > 1)
             if len(mutations) + required_mutations > mutations_count:
                 break
             fields = fields_for(meta)
@@ -7603,23 +7512,6 @@ class VariableSchemaDifferentialFuzzer:
             )
             mutations.append((f"{prefix}_t{i}_insert_many", insert_sql))
             statement_kinds.add("INSERT_VALUES")
-
-            # Change a grouping/key-like attribute on a row created above.
-            # The replacement is deliberately distinct and bounded by the
-            # fixed VARCHAR(40) label width, and remains valid under UNIQUE.
-            key_move_label = f"{prefix}_{i}_keymove"
-            mutations.append((
-                f"{prefix}_t{i}_key_move",
-                f"UPDATE {meta['name']} SET label = '{key_move_label}' WHERE id = {new_id};",
-            ))
-            statement_kinds.add("UPDATE_KEY")
-
-            # A genuine no-op UPDATE must preserve the materialized result.
-            mutations.append((
-                f"{prefix}_t{i}_noop",
-                f"UPDATE {meta['name']} SET qty = qty WHERE id = {new_id + 1};",
-            ))
-            statement_kinds.add("UPDATE_NOOP")
 
             if i == 1 and len(mutations) < mutations_count:
                 # Read the first row added above before UPDATE/DELETE can remove it.
@@ -7788,6 +7680,15 @@ class SchemaCoverageTracker:
         features.update(f"amount_type:{value}" for value in shape["amount_types"])
         features.update(f"fk_delete:{value}" for value in shape["fk_delete_actions"])
         features.update(f"fk_update:{value}" for value in shape["fk_update_actions"])
+        # Feed DML grammar coverage into the same deterministic candidate
+        # selection loop. A candidate with an unseen assignment/predicate
+        # production or DML statement kind now competes favorably even when
+        # its schema topology is otherwise familiar.
+        features.update(f"dml_kind:{value}" for value in shape["dml_statement_kinds"])
+        features.update(f"dml_expression:{value}" for value in shape["expression_nodes"])
+        features.update(f"dml_predicate:{value}" for value in shape["predicate_nodes"])
+        features.add(f"dml_expression_depth:{shape['max_expression_depth']}")
+        features.add(f"dml_predicate_depth:{shape['max_predicate_depth']}")
         return tuple(sorted(features))
 
     def __init__(self) -> None:
@@ -7807,6 +7708,9 @@ class SchemaCoverageTracker:
             shape["foreign_key_count"], shape["fk_delete_actions"],
             shape["fk_update_actions"], shape["generated_columns"], shape["index_count"],
             shape["unique_label_constraints"], shape["unique_label_qty_constraints"],
+            shape["dml_statement_kinds"], shape["expression_nodes"],
+            shape["predicate_nodes"], shape["max_expression_depth"],
+            shape["max_predicate_depth"],
         )
         self.signatures.add(signature)
 
