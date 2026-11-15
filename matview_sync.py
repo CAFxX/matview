@@ -10174,13 +10174,18 @@ class MaterializedViewManager:
         if not callable(getattr(connection, "cursor", None)):
             raise TypeError("connection must provide a DB-API cursor() method")
         cursor = connection.cursor()
-        cursor.execute("PRAGMA recursive_triggers = ON;")
-        row = cursor.execute("PRAGMA recursive_triggers;").fetchone()
-        if row is None or int(row[0]) != 1:
-            raise RuntimeError(
-                "SQLite recursive_triggers could not be enabled on this connection; "
-                "REPLACE may bypass materialized-view DELETE maintenance"
-            )
+        try:
+            cursor.execute("PRAGMA recursive_triggers = ON;")
+            row = cursor.execute("PRAGMA recursive_triggers;").fetchone()
+            if row is None or int(row[0]) != 1:
+                raise RuntimeError(
+                    "SQLite recursive_triggers could not be enabled on this connection; "
+                    "REPLACE may bypass materialized-view DELETE maintenance"
+                )
+        finally:
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
         return connection
 
     def _ensure_catalog(self) -> None:
