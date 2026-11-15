@@ -36,9 +36,9 @@ name: CI — Multi-Engine Materialized View Tests
 #
 # Dependency and environment dimensions:
 # - requirements.txt declares packaging>=23.0, sqlglot>=25.0.0, psycopg2-binary>=2.9.9 and
-#   cryptography>=41.0.0 for Python <3.15, and pymysql>=1.1.0. PR jobs resolve
-#   the newest compatible releases; ci-deferred.yml tests these declared lower
-#   bounds on Python 3.11 against live PostgreSQL and MySQL.
+#   cryptography>=41.0.0 for Python <3.15, pymysql>=1.1.0, hypothesis>=6.100, and
+#   pytest>=8.0. PR jobs resolve the newest compatible releases; ci-deferred.yml tests
+#   these declared lower bounds on Python 3.11 against live PostgreSQL and MySQL.
 # - Optional SQLite drivers (apsw, apsw-sqlite3mc, sqlcipher3-binary,
 #   sqlean.py, libsql-experimental) have no declared lower bounds. CI therefore
 #   tests the newest installable release only; it makes no oldest-driver-version
@@ -232,6 +232,9 @@ jobs:
 
       - name: Test engine and version-specific optimal codegen
         run: python3 test_p1_engine_codegen.py
+
+      - name: Test stateful property-based fuzzing and shrinking (Hypothesis + pytest)
+        run: pytest -v test_p1_hypothesis_stateful.py
 
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
