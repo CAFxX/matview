@@ -78,6 +78,7 @@ def main() -> None:
             "SELECT id, value FROM replacement_reader ORDER BY id;"
         ).fetchall()
         assert after_write == [(1, 10), (2, 20), (3, 30), (4, 40)], after_write
+        conn.commit()
         # A failure partway through dropping the old generation must roll
         # back the already-dropped trigger and leave the same connection usable.
         original_drop = manager.drop_view
@@ -131,6 +132,19 @@ def main() -> None:
         ).fetchall() == [
             (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
         ]
+
+        conn.execute("BEGIN;")
+        conn.execute("INSERT INTO replacement_rows VALUES (7, 70);")
+        try:
+            manager.sync_views([view_sql])
+        except RuntimeError as exc:
+            assert "idle SQLite connection" in str(exc)
+        else:
+            raise AssertionError("sync_views accepted a caller-owned SQLite transaction")
+        conn.rollback()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM replacement_rows WHERE id=7;"
+        ).fetchone()[0] == 0
 
         # Unsupported replacement modes fail before drop_view is called.
         schemas_for_test = manager.fetch_schema()
