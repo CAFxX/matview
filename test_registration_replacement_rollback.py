@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from matview_sync import Dialect, MaterializedViewManager
+from matview_sync import Dialect, MaterializedViewManager, MaterializedViewPlan
 
 
 def main() -> None:
@@ -23,12 +23,11 @@ def main() -> None:
             "INSERT INTO replacement_rows VALUES (?, ?);",
             [(1, 10), (2, 20), (3, 30)],
         )
-        conn.create_function("maybe_fail", 1, lambda value: value)
         manager = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
 
         view_sql = (
             "CREATE VIEW replacement_reader AS "
-            "SELECT id, maybe_fail(value) AS value FROM replacement_rows;"
+            "SELECT id, value FROM replacement_rows;"
         )
         plan = manager.register_view(view_sql)
         original_catalog = manager.get_catalog()[plan.view_name]
@@ -37,16 +36,24 @@ def main() -> None:
         ).fetchall()
         assert original_rows == [(1, 10), (2, 20), (3, 30)]
 
-        def fail_population(_value: int) -> int:
+        # Fail exactly when the replacement reaches its population phase. At
+        # this point the old generation has already been dropped and the new
+        # structure, triggers, and catalog row have been installed.
+        original_populate = MaterializedViewPlan.get_populate_statements
+
+        def fail_population(self, *args, **kwargs):
             raise RuntimeError("injected replacement population failure")
 
-        conn.create_function("maybe_fail", 1, fail_population)
+        MaterializedViewPlan.get_populate_statements = fail_population
         try:
-            manager.register_view(view_sql, force_rebuild=True)
-        except (sqlite3.Error, RuntimeError):
-            pass
-        else:
-            raise AssertionError("replacement unexpectedly succeeded")
+            try:
+                manager.register_view(view_sql, force_rebuild=True)
+            except RuntimeError as exc:
+                assert "injected replacement population failure" in str(exc)
+            else:
+                raise AssertionError("replacement unexpectedly succeeded")
+        finally:
+            MaterializedViewPlan.get_populate_statements = original_populate
 
         restored_rows = conn.execute(
             "SELECT id, value FROM replacement_reader ORDER BY id;"
@@ -66,7 +73,6 @@ def main() -> None:
             ).fetchone()[0]
             assert found == 1, f"old maintenance trigger {trigger_name} was not restored"
 
-        conn.create_function("maybe_fail", 1, lambda value: value)
         conn.execute("INSERT INTO replacement_rows VALUES (4, 40);")
         after_write = conn.execute(
             "SELECT id, value FROM replacement_reader ORDER BY id;"
