@@ -10301,11 +10301,28 @@ class MaterializedViewManager:
                     pending.append(nested)
         return candidates
 
+    @staticmethod
+    def _connection_wrapper_leaves(candidates: Sequence[Any]) -> List[Any]:
+        """Return deepest discovered connection layers, which must expose state."""
+        candidate_ids = {id(candidate) for candidate in candidates}
+        parents = set()
+        for candidate in candidates:
+            for attr in ("connection", "driver_connection", "dbapi_connection", "_connection"):
+                try:
+                    nested = getattr(candidate, attr, None)
+                except Exception:
+                    nested = None
+                if nested is not None and nested is not candidate and id(nested) in candidate_ids:
+                    parents.add(id(candidate))
+        return [candidate for candidate in candidates if id(candidate) not in parents]
+
     def _mysql_transaction_state(self) -> Optional[bool]:
         """Return MySQL transaction state across facade and wrapped DB-API layers."""
-        observed = False
+        candidates = self._connection_wrapper_chain()
+        leaves = self._connection_wrapper_leaves(candidates)
+        observed_layers = set()
         active = False
-        for candidate in self._connection_wrapper_chain():
+        for candidate in candidates:
             try:
                 state = getattr(candidate, "in_transaction", None)
             except Exception:
@@ -10318,7 +10335,7 @@ class MaterializedViewManager:
             if isinstance(state, bool) or (
                 isinstance(state, int) and not isinstance(state, bool) and state in (0, 1)
             ):
-                observed = True
+                observed_layers.add(id(candidate))
                 active = active or bool(state)
             for attr in ("server_status", "_server_status"):
                 try:
@@ -10326,14 +10343,19 @@ class MaterializedViewManager:
                 except Exception:
                     status = None
                 if isinstance(status, int) and not isinstance(status, bool):
-                    observed = True
+                    observed_layers.add(id(candidate))
                     active = active or bool(status & 0x0001)
-        return active if observed else None
+        if not leaves or any(id(leaf) not in observed_layers for leaf in leaves):
+            return None
+        return active if observed_layers else None
 
     def _mysql_autocommit_state(self) -> Optional[bool]:
         """Return MySQL autocommit mode across facade and wrapped driver layers."""
+        candidates = self._connection_wrapper_chain()
+        leaves = self._connection_wrapper_leaves(candidates)
+        observed_layers = set()
         observed = []
-        for candidate in self._connection_wrapper_chain():
+        for candidate in candidates:
             try:
                 getter = getattr(candidate, "get_autocommit", None)
             except Exception:
@@ -10343,6 +10365,7 @@ class MaterializedViewManager:
                     value = getter()
                     if isinstance(value, bool):
                         observed.append(value)
+                        observed_layers.add(id(candidate))
                 except Exception:
                     pass
             for attr in ("autocommit", "autocommit_mode"):
@@ -10352,7 +10375,8 @@ class MaterializedViewManager:
                     continue
                 if isinstance(value, bool):
                     observed.append(value)
-        if not observed:
+                    observed_layers.add(id(candidate))
+        if not observed or not leaves or any(id(leaf) not in observed_layers for leaf in leaves):
             return None
         return any(observed)
 
@@ -10389,23 +10413,25 @@ class MaterializedViewManager:
                 if nested is not None and nested is not candidate:
                     pending.append(nested)
 
-        observed_autocommit = False
+        leaves = MaterializedViewManager._connection_wrapper_leaves(candidates)
+        observed_autocommit_layers = set()
         for candidate in candidates:
             autocommit = getattr(candidate, "autocommit", None)
+            if isinstance(autocommit, bool):
+                observed_autocommit_layers.add(id(candidate))
             if autocommit is not None:
-                observed_autocommit = True
                 if autocommit is not False:
                     raise RuntimeError(
                         "bulk_changes() on PostgreSQL requires autocommit=False "
                         "to preserve transactional DDL atomicity"
                     )
-        if not observed_autocommit:
+        if not leaves or any(id(leaf) not in observed_autocommit_layers for leaf in leaves):
             raise RuntimeError(
-                "bulk_changes() on PostgreSQL requires an adapter that exposes "
-                "autocommit state; cannot safely guarantee transactional DDL"
+                "bulk_changes() on PostgreSQL requires every wrapped driver layer "
+                "to expose autocommit state; cannot safely guarantee transactional DDL"
             )
 
-        observed_transaction_state = False
+        observed_transaction_layers = set()
         for candidate in candidates:
             state = getattr(candidate, "in_transaction", None)
             if callable(state):
@@ -10414,7 +10440,7 @@ class MaterializedViewManager:
                 except Exception:
                     state = None
             if isinstance(state, bool):
-                observed_transaction_state = True
+                observed_transaction_layers.add(id(candidate))
                 if state:
                     raise RuntimeError(
                         "bulk_changes() on PostgreSQL cannot run inside an active caller "
@@ -10445,18 +10471,18 @@ class MaterializedViewManager:
                         "bulk_changes() on PostgreSQL could not interpret "
                         "the connection transaction state"
                     )
-            observed_transaction_state = True
+            observed_transaction_layers.add(id(candidate))
             if state:
                 raise RuntimeError(
                     "bulk_changes() on PostgreSQL cannot run inside an active caller "
                     "transaction; commit or roll back that transaction first"
                 )
 
-        if not observed_transaction_state:
+        if not leaves or any(id(leaf) not in observed_transaction_layers for leaf in leaves):
             raise RuntimeError(
-                "bulk_changes() on PostgreSQL requires an adapter that exposes "
-                "transaction state; cannot safely determine whether a caller transaction "
-                "would be committed"
+                "bulk_changes() on PostgreSQL requires every wrapped driver layer "
+                "to expose transaction state; cannot safely determine whether a caller "
+                "transaction would be committed"
             )
 
     def _param_placeholder(self) -> str:
