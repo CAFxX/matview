@@ -7,9 +7,11 @@ Comprehensive tests for Engine & Version-Specific Optimal Code Generation:
 """
 
 import math
+import os
 import sqlite3
 import unittest
 from typing import Dict
+from urllib.parse import urlparse
 
 from matview_sync import (
     Dialect,
@@ -197,21 +199,40 @@ class TestMySQLRowAliasUpsertCodegen(unittest.TestCase):
             self.assertNotIn("VALUES(", chunk_sql, f"Deprecated VALUES() found in {ver_str}")
 
     def test_mysql_84_and_97_incremental_populate_statements_use_mv_init_alias(self):
-        """MySQL >= 8.0.19 get_populate_statements uses __mv_init alias without VALUES()."""
-        view_sql = "CREATE VIEW mv_proj AS SELECT id, dept, amount FROM sales;"
+        """MySQL >= 8.0.19 get_populate_statements uses __mv_src (pk_range_fold) or __mv_init (offset_batch) without VALUES()."""
+        # Non-INT PK projection exercises offset_batch (__mv_init)
+        schemas_str_pk = parse_table_schema(
+            "CREATE TABLE sales_str (id VARCHAR(32) PRIMARY KEY, dept VARCHAR(32), amount INT);"
+        )
+        view_str = "CREATE VIEW mv_proj_str AS SELECT id, dept, amount FROM sales_str;"
+        # INT PK projection exercises pk_range_fold (__mv_src)
+        view_int = "CREATE VIEW mv_proj AS SELECT id, dept, amount FROM sales;"
         for ver_str in ("mysql:8.4.0", "mysql:9.7.0"):
-            plan = generate_materialized_view(
-                self.schemas,
-                view_sql,
+            plan_str = generate_materialized_view(
+                schemas_str_pk,
+                view_str,
                 dialect=Dialect.MYSQL,
                 engine_version=ver_str,
                 incremental_backfill=True,
                 ignore_limitations=True,
             )
-            pop_stmts = plan.get_populate_statements(incremental_backfill=True)
-            pop_sql = "\n".join(pop_stmts)
-            self.assertIn("__mv_init.", pop_sql, f"Expected __mv_init column reference in {ver_str}")
-            self.assertNotIn("VALUES(", pop_sql, f"Deprecated VALUES() found in {ver_str}")
+            pop_str = "\n".join(plan_str.get_populate_statements(incremental_backfill=True))
+            self.assertIn("__mv_init.", pop_str, f"Expected __mv_init column reference in {ver_str}")
+            self.assertNotIn("VALUES(", pop_str, f"Deprecated VALUES() found in {ver_str}")
+
+            plan_int = generate_materialized_view(
+                self.schemas,
+                view_int,
+                dialect=Dialect.MYSQL,
+                engine_version=ver_str,
+                incremental_backfill=True,
+                ignore_limitations=True,
+            )
+            pop_int = "\n".join(plan_int.get_populate_statements(incremental_backfill=True))
+            self.assertIn("AS __mv_src", pop_int, f"Expected __mv_src derived alias in {ver_str}")
+            self.assertIn("__mv_src.", pop_int, f"Expected __mv_src column reference in {ver_str}")
+            self.assertNotIn("__mv_new.", pop_int, f"Dangling __mv_new in chunk SELECT in {ver_str}")
+            self.assertNotIn("VALUES(", pop_int, f"Deprecated VALUES() found in {ver_str}")
 
     def test_mysql_57_retains_legacy_values_syntax(self):
         """MySQL 5.7 (which lacks row alias upsert) must retain VALUES() for compatibility."""
@@ -470,6 +491,328 @@ class TestSQLiteWithoutRowidAndReturning(unittest.TestCase):
         res_nonexistent = manager.drop_view("mv_nonexistent")
         self.assertFalse(res_nonexistent)
         conn.close()
+
+
+class TestDerivedAliasContractValidation(unittest.TestCase):
+    """Validates via sqlglot AST that every __mv_src / __mv_new ref matches an inner SELECT alias."""
+
+    def _assert_subquery_aliases_cover_refs(self, sql_stmt: str, alias_name: str, sg_dialect: str) -> None:
+        import re
+        import sqlglot
+        from sqlglot import exp
+
+        parsed = sqlglot.parse_one(sql_stmt.replace("%s", "0"), read=sg_dialect)
+        subq = None
+        for node in parsed.find_all(exp.Subquery):
+            if node.alias == alias_name:
+                subq = node
+                break
+        self.assertIsNotNone(subq, f"Missing subquery alias {alias_name} in:\n{sql_stmt}")
+        sel = subq.this
+        self.assertIsInstance(sel, exp.Select, f"Expected SELECT inside {alias_name}:\n{sql_stmt}")
+        projected_aliases = {expr.alias for expr in sel.expressions if expr.alias}
+        refs = set(re.findall(rf"\b{re.escape(alias_name)}\.([A-Za-z_][A-Za-z0-9_]*|`[^`]+`|\"[^\"]+\")", sql_stmt))
+        cleaned_refs = {r.strip('`"') for r in refs}
+        self.assertGreater(len(cleaned_refs), 0, f"Expected column references to {alias_name} in:\n{sql_stmt}")
+        self.assertTrue(
+            cleaned_refs.issubset(projected_aliases),
+            f"Missing inner aliases for {alias_name}: refs={cleaned_refs}, aliases={projected_aliases}\nSQL:\n{sql_stmt}",
+        )
+
+    def test_mysql_84_derived_table_aliases_and_global_having_placement(self) -> None:
+        schemas = parse_table_schema(
+            "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(32) NOT NULL, tag VARCHAR(32), val INT NOT NULL);"
+        )
+        # 1. pk_range_fold
+        p_grp = generate_materialized_view(
+            schemas,
+            "CREATE VIEW mv_grp AS SELECT grp, SUM(val) AS tot FROM items GROUP BY grp;",
+            dialect=Dialect.MYSQL,
+            engine_version="mysql:8.4.0",
+            incremental_backfill=True,
+            ignore_limitations=True,
+        )
+        self._assert_subquery_aliases_cover_refs(p_grp.incremental_backfill_spec.chunk_sql_templates[0], "__mv_src", "mysql")
+
+        # 2. global aggregate incremental populate HAVING placement
+        p_glob = generate_materialized_view(
+            schemas,
+            "CREATE VIEW mv_glob AS SELECT SUM(val) AS tot FROM items;",
+            dialect=Dialect.MYSQL,
+            engine_version="mysql:8.4.0",
+            incremental_backfill=True,
+            ignore_limitations=True,
+        )
+        pop_sql = "\n".join(p_glob.get_populate_statements(incremental_backfill=True))
+        self.assertIn("HAVING COUNT(*) > 0\n) AS __mv_src\nON DUPLICATE KEY UPDATE", pop_sql)
+        self.assertNotIn(") AS __mv_src\nHAVING COUNT(*) > 0", pop_sql)
+
+        # 3. group_key_batch distinct aux + main
+        p_dist = generate_materialized_view(
+            schemas,
+            "CREATE VIEW mv_dist AS SELECT grp, COUNT(DISTINCT tag) AS dc, SUM(val) AS sv FROM items GROUP BY grp;",
+            dialect=Dialect.MYSQL,
+            engine_version="mysql:8.4.0",
+            incremental_backfill=True,
+            ignore_limitations=True,
+        )
+        for tmpl in p_dist.incremental_backfill_spec.chunk_sql_templates:
+            self._assert_subquery_aliases_cover_refs(tmpl.format(placeholders="'A'"), "__mv_src", "mysql")
+
+    def test_postgres_15_merge_using_aliases_across_pk_and_group_key_batch(self) -> None:
+        schemas = parse_table_schema(
+            "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(32) NOT NULL, tag VARCHAR(32), val INT NOT NULL);"
+        )
+        for view_sql, fmt_ph in (
+            ("CREATE VIEW mv_grp AS SELECT grp, SUM(val) AS tot FROM items GROUP BY grp;", False),
+            ("CREATE VIEW mv_dist AS SELECT grp, COUNT(DISTINCT tag) AS dc, SUM(val) AS sv FROM items GROUP BY grp;", True),
+        ):
+            plan = generate_materialized_view(
+                schemas,
+                view_sql,
+                dialect=Dialect.POSTGRES,
+                engine_version="postgres:15.0",
+                incremental_backfill=True,
+            )
+            for tmpl in plan.incremental_backfill_spec.chunk_sql_templates:
+                sql = tmpl.format(placeholders="'A'") if fmt_ph else tmpl
+                self._assert_subquery_aliases_cover_refs(sql, "__mv_src", "postgres")
+
+    def test_mysql_84_projection_chunk_upsert_aliases(self) -> None:
+        schemas = parse_table_schema(
+            "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(32) NOT NULL, val INT NOT NULL);"
+        )
+        schemas_no_pk = parse_table_schema(
+            "CREATE TABLE logs (grp VARCHAR(32) NOT NULL, val INT NOT NULL);"
+        )
+        p_proj = generate_materialized_view(
+            schemas,
+            "CREATE VIEW mv_proj_pk AS SELECT id, grp, val FROM items;",
+            dialect=Dialect.MYSQL,
+            engine_version="mysql:8.4.0",
+            incremental_backfill=True,
+            ignore_limitations=True,
+        )
+        self._assert_subquery_aliases_cover_refs(p_proj.incremental_backfill_spec.chunk_sql_templates[0], "__mv_src", "mysql")
+        p_proj_bag = generate_materialized_view(
+            schemas,
+            "CREATE VIEW mv_proj_bag AS SELECT grp, val FROM items;",
+            dialect=Dialect.MYSQL,
+            engine_version="mysql:8.4.0",
+            incremental_backfill=True,
+            ignore_limitations=True,
+        )
+        self._assert_subquery_aliases_cover_refs(p_proj_bag.incremental_backfill_spec.chunk_sql_templates[0], "__mv_src", "mysql")
+        p_no_pk = generate_materialized_view(
+            schemas_no_pk,
+            "CREATE VIEW mv_proj_npk AS SELECT grp, val FROM logs;",
+            dialect=Dialect.MYSQL,
+            engine_version="mysql:8.4.0",
+            incremental_backfill=True,
+            ignore_limitations=True,
+        )
+        pop_sql = "\n".join(p_no_pk.get_populate_statements(incremental_backfill=True))
+        self.assertIn("AS __mv_init", pop_sql)
+        self.assertNotIn("VALUES(", pop_sql)
+
+
+class TestNativeEngineCodegenExecution(unittest.TestCase):
+    """Live PostgreSQL & MySQL/MariaDB native codegen verification when DSN env vars are set."""
+
+    def test_native_mysql_row_alias_upsert_and_codegen_dml(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; skipping live MySQL/MariaDB codegen execution test")
+
+        import pymysql
+
+        parsed = urlparse(dsn)
+        conn = pymysql.connect(
+            host=parsed.hostname or "127.0.0.1",
+            port=parsed.port or 3306,
+            user=parsed.username or "root",
+            password=parsed.password or "",
+            database=parsed.path.lstrip("/"),
+            autocommit=False,
+        )
+        base_tbl = "t_cg_my_sales"
+        mv_proj = "t_cg_my_mv_proj"
+        mv_agg = "t_cg_my_mv_agg"
+        mgr = MaterializedViewManager(conn, dialect=Dialect.MYSQL, ignore_limitations=True)
+        cur = conn.cursor()
+        try:
+            for vn in (mv_proj, mv_agg):
+                try:
+                    mgr.drop_view(vn)
+                except Exception:
+                    pass
+                cur.execute(f"DROP VIEW IF EXISTS {vn};")
+                cur.execute(f"DROP TABLE IF EXISTS {mgr.object_prefix}store_{vn};")
+            cur.execute(f"DROP TABLE IF EXISTS {base_tbl};")
+            cur.execute(
+                f"CREATE TABLE {base_tbl} (id INT PRIMARY KEY, dept VARCHAR(32) NOT NULL, tag VARCHAR(32), amount INT NOT NULL);"
+            )
+            cur.executemany(
+                f"INSERT INTO {base_tbl} VALUES (%s, %s, %s, %s);",
+                [(1, "eng", "t1", 10), (2, "eng", "t1", 30), (3, "eng", "t2", 20), (4, "ops", "t1", 50), (5, "hr", None, 100)],
+            )
+            conn.commit()
+
+            p_proj = mgr.register_view(
+                f"CREATE VIEW {mv_proj} AS SELECT id, dept, amount FROM {base_tbl};",
+                populate=True,
+                incremental_backfill=True,
+                batch_size=2,
+            )
+            p_agg = mgr.register_view(
+                f"CREATE VIEW {mv_agg} AS SELECT dept, SUM(amount) AS s, STDDEV_SAMP(amount) AS sd, COUNT(DISTINCT tag) AS dc FROM {base_tbl} GROUP BY dept;",
+                populate=True,
+                incremental_backfill=True,
+                batch_size=2,
+            )
+
+            ev = mgr.engine_version
+            if ev.supports_mysql_row_alias_upsert:
+                self.assertIn("AS __mv_new", "\n".join(p_proj.trigger_ddls))
+                self.assertIn("AS __mv_src", "\n".join(p_proj.incremental_backfill_spec.chunk_sql_templates))
+                self.assertIn("AS __mv_init", "\n".join(p_agg.get_populate_statements(incremental_backfill=True)))
+                self.assertNotIn("VALUES(", "\n".join(p_proj.trigger_ddls))
+            else:
+                self.assertIn("VALUES(", "\n".join(p_proj.trigger_ddls))
+
+            cur.execute(f"INSERT INTO {base_tbl} VALUES (6, 'ops', 't2', 90), (7, 'hr', 't9', 200);")
+            cur.execute(f"UPDATE {base_tbl} SET amount = 40 WHERE id = 1;")
+            cur.execute(f"DELETE FROM {base_tbl} WHERE id = 5;")
+            conn.commit()
+
+            cur.execute(f"SELECT id, dept, amount FROM {mv_proj} ORDER BY id;")
+            mv_proj_rows = cur.fetchall()
+            cur.execute(f"SELECT id, dept, amount FROM {base_tbl} ORDER BY id;")
+            self.assertEqual(mv_proj_rows, cur.fetchall())
+
+            cur.execute(f"SELECT dept, s, sd, dc FROM {mv_agg} ORDER BY dept;")
+            mv_agg_rows = cur.fetchall()
+            cur.execute(
+                f"SELECT dept, SUM(amount) AS s, STDDEV_SAMP(amount) AS sd, COUNT(DISTINCT tag) AS dc FROM {base_tbl} GROUP BY dept ORDER BY dept;"
+            )
+            ora_agg_rows = cur.fetchall()
+            self.assertEqual(len(mv_agg_rows), len(ora_agg_rows))
+            for r_mv, r_ora in zip(mv_agg_rows, ora_agg_rows):
+                self.assertEqual(r_mv[0], r_ora[0])
+                self.assertEqual(r_mv[1], r_ora[1])
+                self.assertEqual(r_mv[3], r_ora[3])
+                if r_ora[2] is None:
+                    self.assertIsNone(r_mv[2])
+                else:
+                    self.assertAlmostEqual(float(r_mv[2]), float(r_ora[2]), places=6)
+        finally:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            for vn in (mv_proj, mv_agg):
+                try:
+                    mgr.drop_view(vn)
+                except Exception:
+                    pass
+            try:
+                cur.execute(f"DROP TABLE IF EXISTS {base_tbl};")
+                conn.commit()
+            except Exception:
+                pass
+            cur.close()
+            conn.close()
+
+    def test_native_postgres_merge_and_nullif_variance_execution(self) -> None:
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN is not set; skipping live PostgreSQL codegen execution test")
+
+        import psycopg2
+
+        conn = psycopg2.connect(dsn)
+        base_tbl = "t_cg_pg_sales"
+        mv_proj = "t_cg_pg_mv_proj"
+        mv_agg = "t_cg_pg_mv_agg"
+        mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES, ignore_limitations=True)
+        cur = conn.cursor()
+        try:
+            for vn in (mv_proj, mv_agg):
+                try:
+                    mgr.drop_view(vn)
+                except Exception:
+                    pass
+                cur.execute(f"DROP VIEW IF EXISTS {vn} CASCADE;")
+                cur.execute(f"DROP TABLE IF EXISTS {mgr.object_prefix}store_{vn} CASCADE;")
+            cur.execute(f"DROP TABLE IF EXISTS {base_tbl} CASCADE;")
+            cur.execute(
+                f"CREATE TABLE {base_tbl} (id INT PRIMARY KEY, dept TEXT NOT NULL, tag TEXT, amount DOUBLE PRECISION NOT NULL);"
+            )
+            cur.executemany(
+                f"INSERT INTO {base_tbl} VALUES (%s, %s, %s, %s);",
+                [(1, "eng", "t1", 10.0), (2, "eng", "t1", 30.0), (3, "eng", "t2", 20.0), (4, "ops", "t1", 50.0), (5, "hr", None, 100.0)],
+            )
+            conn.commit()
+
+            p_proj = mgr.register_view(
+                f"CREATE VIEW {mv_proj} AS SELECT id, dept, amount FROM {base_tbl};",
+                populate=True,
+                incremental_backfill=True,
+                batch_size=2,
+            )
+            p_agg = mgr.register_view(
+                f"CREATE VIEW {mv_agg} AS SELECT dept, SUM(amount) AS s, STDDEV_SAMP(amount) AS sd, COUNT(DISTINCT tag) AS dc FROM {base_tbl} GROUP BY dept;",
+                populate=True,
+                incremental_backfill=True,
+                batch_size=2,
+            )
+
+            if mgr.engine_version.supports_pg_merge:
+                self.assertIn("MERGE INTO", "\n".join(p_agg.incremental_backfill_spec.chunk_sql_templates))
+                self.assertIn("fillfactor = 80", "\n".join(p_agg.backing_table_ddls))
+
+            cur.execute(f"INSERT INTO {base_tbl} VALUES (6, 'ops', 't2', 90.0), (7, 'solo', 's1', 42.0);")
+            cur.execute(f"UPDATE {base_tbl} SET amount = 40.0 WHERE id = 1;")
+            cur.execute(f"DELETE FROM {base_tbl} WHERE id = 5;")
+            conn.commit()
+
+            cur.execute(f"SELECT id, dept, amount FROM {mv_proj} ORDER BY id;")
+            mv_proj_rows = cur.fetchall()
+            cur.execute(f"SELECT id, dept, amount FROM {base_tbl} ORDER BY id;")
+            self.assertEqual(mv_proj_rows, cur.fetchall())
+
+            cur.execute(f"SELECT dept, s, sd, dc FROM {mv_agg} ORDER BY dept;")
+            mv_agg_rows = cur.fetchall()
+            cur.execute(
+                f"SELECT dept, SUM(amount) AS s, STDDEV_SAMP(amount) AS sd, COUNT(DISTINCT tag) AS dc FROM {base_tbl} GROUP BY dept ORDER BY dept;"
+            )
+            ora_agg_rows = cur.fetchall()
+            self.assertEqual(len(mv_agg_rows), len(ora_agg_rows))
+            for r_mv, r_ora in zip(mv_agg_rows, ora_agg_rows):
+                self.assertEqual(r_mv[0], r_ora[0])
+                self.assertAlmostEqual(float(r_mv[1]), float(r_ora[1]), places=6)
+                self.assertEqual(r_mv[3], r_ora[3])
+                if r_ora[2] is None:
+                    self.assertIsNone(r_mv[2])
+                else:
+                    self.assertAlmostEqual(float(r_mv[2]), float(r_ora[2]), places=6)
+        finally:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            for vn in (mv_proj, mv_agg):
+                try:
+                    mgr.drop_view(vn)
+                except Exception:
+                    pass
+            try:
+                cur.execute(f"DROP TABLE IF EXISTS {base_tbl} CASCADE;")
+                conn.commit()
+            except Exception:
+                pass
+            cur.close()
+            conn.close()
 
 
 if __name__ == "__main__":
