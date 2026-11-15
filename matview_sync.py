@@ -11058,9 +11058,8 @@ class MaterializedViewManager:
                     cur.execute("SAVEPOINT __mv_bulk_sp;")
                     sp_active = True
                 except Exception:
-                    # Session-local bypass can still be safe without a savepoint
-                    # on PostgreSQL/MySQL; any fallback that drops triggers is
-                    # guarded below.
+                    # The isolation guard below requires a savepoint before
+                    # either bypassed DML or trigger-removal fallback can proceed.
                     pass
 
             session_bypass_ok = False
@@ -11078,8 +11077,7 @@ class MaterializedViewManager:
                     pass
 
             if (
-                not drop_triggers
-                and self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+                self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
                 and not sp_active
             ):
                 raise RuntimeError(
