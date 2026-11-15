@@ -6457,6 +6457,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             # An independent connection defaults recursive_triggers OFF. REPLACE
             # deletes the conflicting row without firing the MV DELETE trigger.
             unsafe_writer = sqlite3.connect(db_path)
+            # Force the documented unsafe setting so the regression is independent
+            # of the SQLite library's compile-time default.
+            unsafe_writer.execute("PRAGMA recursive_triggers = OFF;")
             self.assertEqual(
                 unsafe_writer.execute("PRAGMA recursive_triggers;").fetchone()[0], 0
             )
