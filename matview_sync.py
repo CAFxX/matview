@@ -1749,6 +1749,44 @@ _FN_TO_AGG_ENUM: Dict[str, AggFunc] = {
 }
 
 
+def _resolve_statistical_aggregate_aliases(
+    view_spec: ViewSpec, dialect: Dialect
+) -> ViewSpec:
+    """Resolve VARIANCE/STDDEV aliases according to the target engine."""
+    if dialect != Dialect.POSTGRES:
+        return view_spec
+
+    aliases = {
+        "VARIANCE": AggFunc.VAR_SAMP,
+        "STDDEV": AggFunc.STDDEV_SAMP,
+        "STD": AggFunc.STDDEV_SAMP,
+    }
+    resolved_items = []
+    for item in view_spec.select_items:
+        if not item.is_aggregate:
+            resolved_items.append(item)
+            continue
+        match = re.match(r"^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(", item.raw_expr)
+        alias_func = match.group(1).upper() if match else ""
+        resolved_func = aliases.get(alias_func)
+        if resolved_func is not None:
+            resolved_items.append(replace(item, agg_func=resolved_func))
+        else:
+            resolved_items.append(item)
+
+    resolved_additional = tuple(
+        _resolve_statistical_aggregate_aliases(extra, dialect)
+        for extra in view_spec.additional_views
+    )
+    if tuple(resolved_items) == view_spec.select_items and resolved_additional == view_spec.additional_views:
+        return view_spec
+    return replace(
+        view_spec,
+        select_items=tuple(resolved_items),
+        additional_views=resolved_additional,
+    )
+
+
 def _unwrap_outer_parens(sql: str) -> str:
     s = sql.strip()
     while s.startswith("(") and s.endswith(")"):
@@ -2715,7 +2753,6 @@ class IncrementalViewCompiler:
         self._schemas_lower: Dict[str, TableSchema] = {
             k.lower(): v for k, v in self.schemas.items()
         }
-        self.raw_view = view_spec
         if engine_version is not None:
             self.engine_version = parse_engine_version(
                 engine_version,
@@ -2725,6 +2762,8 @@ class IncrementalViewCompiler:
             self.engine_version = parse_engine_version(dialect)
         self.dialect: Dialect = self.engine_version.dialect
         self.subdialect: EngineSubdialect = self.engine_version.subdialect
+        view_spec = _resolve_statistical_aggregate_aliases(view_spec, self.dialect)
+        self.raw_view = view_spec
         # Automatically disable transition tables if targeting PostgreSQL < 10.0
         self.pg_use_transition_tables = bool(
             pg_use_transition_tables and self.engine_version.supports_pg_transition_tables
