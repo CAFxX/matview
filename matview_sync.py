@@ -10973,8 +10973,9 @@ class MaterializedViewManager:
         on PostgreSQL, `SET @__matview_skip_triggers = 1` on MySQL) so triggers are never dropped
         globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
         optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
-        On MySQL/MariaDB, the connection must expose reliable transaction and autocommit state
-        and have autocommit disabled. The DML-only path uses a savepoint: it commits a transaction
+        On MySQL/MariaDB, the connection must expose reliable transaction state. If no caller
+        transaction is active, autocommit must be disabled; an explicit caller transaction may
+        use either autocommit mode. The DML-only path uses a savepoint: it commits a transaction
         it starts itself, but leaves a caller-owned transaction open and rollback-able by the caller.
         MySQL DDL paths are rejected because DDL can implicitly commit even when the context fails.
         """
