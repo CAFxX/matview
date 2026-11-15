@@ -11047,12 +11047,22 @@ class MaterializedViewManager:
 
         try:
             if self.dialect == Dialect.SQLITE:
+                started_writer_transaction = False
                 if not getattr(self.conn, "in_transaction", False):
                     # A deferred transaction would allow another writer to race
                     # trigger suspension. Never continue without the reservation.
                     cur.execute("BEGIN IMMEDIATE;")
-                cur.execute("SAVEPOINT __mv_bulk_sp;")
-                sp_active = True
+                    started_writer_transaction = True
+                try:
+                    cur.execute("SAVEPOINT __mv_bulk_sp;")
+                    sp_active = True
+                except Exception:
+                    # If this context acquired the writer reservation, release
+                    # it before propagating a failed savepoint setup. Do not
+                    # roll back a transaction already owned by the caller.
+                    if started_writer_transaction:
+                        self._rollback()
+                    raise
             else:
                 try:
                     cur.execute("SAVEPOINT __mv_bulk_sp;")
