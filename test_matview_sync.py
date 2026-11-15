@@ -5571,7 +5571,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("AVG(exact_value)", mysql_population)
         self.assertNotIn("AVG(1.0 *", mysql_population)
 
-    def test_22_statistical_aliases_follow_target_dialect(self) -> None:
+    def test_statistical_aliases_follow_target_dialect(self) -> None:
         schema = """
         CREATE TABLE measurements (
             id INTEGER PRIMARY KEY,
