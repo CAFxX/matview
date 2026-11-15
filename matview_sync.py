@@ -1767,7 +1767,12 @@ def _resolve_statistical_aggregate_alias_item(
                 )
     if not item.is_aggregate:
         return item
-    match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", item.raw_expr)
+    # The parser accepts redundant outer parentheses around aggregate calls,
+    # but keeps the original expression text in SelectItem.raw_expr. Normalize
+    # those parentheses before resolving dialect-specific aliases so
+    # (VARIANCE(...)) and ((STDDEV(...))) retain PostgreSQL sample semantics.
+    alias_expr = _unwrap_outer_parens(item.raw_expr)
+    match = re.match(r"^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(", alias_expr)
     alias_func = match.group(1).upper() if match else ""
     if dialect == Dialect.POSTGRES:
         aliases = {

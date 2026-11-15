@@ -5677,6 +5677,54 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"STD\(\) is not a PostgreSQL"):
             parse_view_ast(unsupported_postgres_alias, dialect=Dialect.POSTGRES)
 
+    def test_parenthesized_statistical_aliases_follow_target_dialect(self) -> None:
+        schema = """
+        CREATE TABLE measurements (
+            id INTEGER PRIMARY KEY,
+            grp TEXT,
+            value DOUBLE PRECISION
+        );
+        """
+        view = """
+        CREATE VIEW measurement_parenthesized_aliases AS
+        SELECT grp,
+               (VARIANCE(value)) AS variance_alias,
+               ((STDDEV(value))) AS stddev_alias
+        FROM measurements
+        GROUP BY grp;
+        """
+
+        postgres = generate_materialized_view(
+            schema, view, dialect="postgres", ignore_limitations=True
+        )
+        aggregates = {
+            item.alias: item.agg_func
+            for item in postgres.view_spec.select_items
+            if item.is_aggregate
+        }
+        self.assertEqual(aggregates["variance_alias"], AggFunc.VAR_SAMP)
+        self.assertEqual(aggregates["stddev_alias"], AggFunc.STDDEV_SAMP)
+        postgres_sql = "\\n".join(postgres.initial_populate_sqls).upper()
+        self.assertIn("VAR_SAMP(", postgres_sql)
+        self.assertIn("STDDEV_SAMP(", postgres_sql)
+        self.assertNotIn("VAR_POP(", postgres_sql)
+        self.assertNotIn("STDDEV_POP(", postgres_sql)
+
+        parsed_ast = parse_view_ast(view, dialect=Dialect.POSTGRES)
+        self.assertEqual(parsed_ast.select_items[1].agg_func, AggFunc.VAR_SAMP)
+        self.assertEqual(parsed_ast.select_items[2].agg_func, AggFunc.STDDEV_SAMP)
+
+        mysql = generate_materialized_view(
+            schema, view, dialect="mysql", ignore_limitations=True
+        )
+        mysql_aggregates = {
+            item.alias: item.agg_func
+            for item in mysql.view_spec.select_items
+            if item.is_aggregate
+        }
+        self.assertEqual(mysql_aggregates["variance_alias"], AggFunc.VAR_POP)
+        self.assertEqual(mysql_aggregates["stddev_alias"], AggFunc.STDDEV_POP)
+
     def test_preparsed_view_spec_resolves_statistical_aliases_for_target_dialect(
         self,
     ) -> None:
