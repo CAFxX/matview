@@ -4381,6 +4381,20 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
 
+        # If enabling bypass fails ambiguously and the defensive reset also
+        # fails, the connection must be marked unsafe before returning.
+        cursor = Cursor(fail_bypass=True, fail_reset=True)
+        conn = Connection(cursor)
+        mgr = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "connection must be discarded") as caught:
+            with mgr.bulk_changes():
+                self.fail("failed bypass setup must not enter the user block")
+        self.assertTrue(caught.exception.connection_unsafe)
+        self.assertTrue(mgr._mysql_bulk_connection_unsafe)
+        self.assertTrue(conn._matview_bulk_connection_unsafe)
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
+
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
