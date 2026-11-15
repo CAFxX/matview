@@ -264,8 +264,8 @@ The existing differential-testing harness is useful, but its current headline co
   - **Testing and benchmarking:** Add native-engine differential tests for multi-row INSERT/UPDATE/DELETE, mixed/key-changing updates, empty and repeated groups, NULLs, rollback, concurrent sessions, and bulk-context failures on SQLite, PostgreSQL, MySQL, and MariaDB. Compare against the live original view and benchmark increasing batch sizes against current row-level maintenance, reporting statement counts and throughput separately by engine/version.
 - [ ] **Add `matview diff` CLI Command & Compilation Plan Diagnostics**:
   Provide a `matview diff` command to inspect pending trigger/table DDL changes against `__matview_catalog` before execution, and emit structured plan diagnostics explaining strategy selection and fallback reasons.
-- [ ] **Docker / Docker Compose Integration Test Environment (`make docker-test`)**:
-  I would like the repo to contain a `Dockerfile`/`docker-compose.yml` that spins up all servers needed for integration testing (`make docker-test`) matching the PostgreSQL, MySQL, and MariaDB versions in CI.
+- [x] **Docker / Docker Compose Integration Test Environment (`make docker-test`)**:
+  - Progress: Added `Dockerfile` (Python 3.12 with optional SQLite drivers `apsw`, `sqlcipher3-binary`, `libsql-experimental`), `docker-compose.yml` defining live integration test services matching CI (`postgres:15`, `postgres:18`, `mysql:8.4`, `mysql:9.7`, `mariadb:10.11`, `mariadb:11.8`, `mariadb:12.3`) on distinct configurable host ports with UTF-8 collations and healthchecks, `run_docker_tests.py` orchestrating native engine verification and test execution across the matrix, `Makefile` providing `test`, `docker-up`, `docker-down`, and `docker-test` with clean teardown, and unit tests in `test_docker_test_env.py`.
 
 
 - [ ] **Correct README Claims and Make Documentation Executable**:
