@@ -8914,27 +8914,46 @@ class WrappedConnectionTransactionStateTests(unittest.TestCase):
         self.assertEqual(connection.cursor_calls, 0)
 
 
-    def test_bulk_changes_closes_cursor_after_success_and_body_failure(self):
-        for fail_body in (False, True):
-            with self.subTest(fail_body=fail_body):
+    def test_bulk_changes_closes_cursor_on_success_and_all_failure_stages(self):
+        for fail_stage in ("none", "body", "catalog", "refresh"):
+            with self.subTest(fail_stage=fail_stage):
                 connection = self.MySQLFacade()
                 manager = MaterializedViewManager.__new__(MaterializedViewManager)
                 manager.conn = connection
                 manager.dialect = Dialect.MYSQL
-                manager.get_catalog = lambda: {}
-                manager.fetch_schema = lambda: {}
 
-                if fail_body:
+                def get_catalog():
+                    if fail_stage == "catalog":
+                        raise ValueError("injected catalog failure")
+                    return {}
+
+                def fetch_schema():
+                    if fail_stage == "refresh":
+                        raise ValueError("injected refresh failure")
+                    return {}
+
+                manager.get_catalog = get_catalog
+                manager.fetch_schema = fetch_schema
+
+                if fail_stage == "body":
                     with self.assertRaisesRegex(ValueError, "injected body failure"):
                         with manager.bulk_changes():
                             raise ValueError("injected body failure")
+                elif fail_stage == "catalog":
+                    with self.assertRaisesRegex(ValueError, "injected catalog failure"):
+                        with manager.bulk_changes():
+                            self.fail("catalog failure must occur before yielding")
+                elif fail_stage == "refresh":
+                    with self.assertRaisesRegex(ValueError, "injected refresh failure"):
+                        with manager.bulk_changes():
+                            pass
                 else:
                     with manager.bulk_changes():
                         pass
 
                 self.assertTrue(
                     connection._cursor.closed,
-                    "bulk_changes must close its DB-API cursor on every exit path",
+                    f"bulk_changes must close its DB-API cursor after {fail_stage}",
                 )
 
 
