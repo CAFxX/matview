@@ -6430,6 +6430,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual([view.view_name for view in views], ["item_a", "item_b"])
 
     def test_sqlite_writer_connection_initializer_protects_replace_maintenance(self) -> None:
+        import os
+        import tempfile
+
         schema = """
             CREATE TABLE source_rows (
                 id INTEGER PRIMARY KEY,
@@ -6437,35 +6440,22 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 bucket TEXT NOT NULL
             );
             INSERT INTO source_rows VALUES (1, 'same', 'old');
-            CREATE VIEW source_counts AS
-            SELECT bucket, COUNT(*) AS n FROM source_rows GROUP BY bucket;
         """
-
-        # An independent connection defaults recursive_triggers OFF. REPLACE deletes
-        # the conflicting row without firing the MV's DELETE maintenance trigger.
-        conn = sqlite3.connect(":memory:")
-        manager = MaterializedViewManager(conn)
-        manager.apply_schema_ddl(schema)
-        manager.register_view(
+        view_sql = (
             "CREATE VIEW source_counts AS "
             "SELECT bucket, COUNT(*) AS n FROM source_rows GROUP BY bucket;"
         )
-        writer = sqlite3.connect(":memory:")
-        # Use a shared file for genuinely independent connections.
-        import tempfile
-        import os
+
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as db_file:
             db_path = db_file.name
         try:
-            conn.close()
-            writer.close()
             setup = sqlite3.connect(db_path)
             manager = MaterializedViewManager(setup)
             manager.apply_schema_ddl(schema)
-            manager.register_view(
-                "CREATE VIEW source_counts AS "
-                "SELECT bucket, COUNT(*) AS n FROM source_rows GROUP BY bucket;"
-            )
+            manager.register_view(view_sql)
+
+            # An independent connection defaults recursive_triggers OFF. REPLACE
+            # deletes the conflicting row without firing the MV DELETE trigger.
             unsafe_writer = sqlite3.connect(db_path)
             self.assertEqual(
                 unsafe_writer.execute("PRAGMA recursive_triggers;").fetchone()[0], 0
@@ -6475,20 +6465,18 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             )
             unsafe_writer.commit()
             stale = setup.execute(
-                "SELECT bucket, n FROM source_counts ORDER BY bucket;"
+                "SELECT bucket, n FROM __matview_source_counts ORDER BY bucket;"
             ).fetchall()
             self.assertEqual(stale, [("new", 1), ("old", 1)])
             unsafe_writer.close()
             setup.close()
 
             # Recreate a clean database and configure the independent writer.
+            os.unlink(db_path)
             safe_setup = sqlite3.connect(db_path)
             safe_manager = MaterializedViewManager(safe_setup)
             safe_manager.apply_schema_ddl(schema)
-            safe_manager.register_view(
-                "CREATE VIEW source_counts AS "
-                "SELECT bucket, COUNT(*) AS n FROM source_rows GROUP BY bucket;"
-            )
+            safe_manager.register_view(view_sql)
             safe_writer = sqlite3.connect(db_path)
             returned = MaterializedViewManager.configure_sqlite_connection(safe_writer)
             self.assertIs(returned, safe_writer)
@@ -6502,7 +6490,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             )
             safe_writer.commit()
             actual = safe_setup.execute(
-                "SELECT bucket, n FROM source_counts ORDER BY bucket;"
+                "SELECT bucket, n FROM __matview_source_counts ORDER BY bucket;"
             ).fetchall()
             self.assertEqual(actual, [("new", 1)])
             safe_writer.close()
