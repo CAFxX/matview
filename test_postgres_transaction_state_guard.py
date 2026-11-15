@@ -50,6 +50,25 @@ class PostgresTransactionStateGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "cannot safely determine"):
             MaterializedViewManager._require_idle_postgres_connection(Connection())
 
+    def test_idle_facade_cannot_hide_unknown_driver_transaction_state(self):
+        class Driver:
+            autocommit = False
+
+        class PoolProxy:
+            driver_connection = Driver()
+
+        class SQLAlchemyConnection:
+            autocommit = False
+            connection = PoolProxy()
+
+            def in_transaction(self):
+                return False
+
+        with self.assertRaisesRegex(RuntimeError, "every underlying driver"):
+            MaterializedViewManager._require_idle_postgres_connection(
+                SQLAlchemyConnection()
+            )
+
     def test_driver_autocommit_is_checked_even_when_facade_is_idle(self):
         class Driver:
             autocommit = True
