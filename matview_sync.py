@@ -11002,6 +11002,11 @@ class MaterializedViewManager:
                     "bulk_changes() on MySQL/MariaDB requires autocommit to be disabled "
                     "so the context can roll back its own DML on failure"
                 )
+            if drop_triggers or use_shadow_swap:
+                raise RuntimeError(
+                    "bulk_changes() on MySQL/MariaDB cannot use drop_triggers or "
+                    "use_shadow_swap: those options execute DDL that implicitly commits"
+                )
 
         catalog = self.get_catalog()
         if view_names:
@@ -11031,6 +11036,15 @@ class MaterializedViewManager:
                 session_bypass_ok = True
             except Exception:
                 pass
+
+        if self.dialect == Dialect.MYSQL and not session_bypass_ok and targets:
+            # Falling back to DROP/CREATE TRIGGER would implicitly commit the
+            # transaction. Refuse before any such DDL rather than silently
+            # weakening the context manager's rollback guarantee.
+            raise RuntimeError(
+                "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
+                "the trigger-DDL fallback is unsafe because MySQL implicitly commits DDL"
+            )
 
         if not session_bypass_ok:
             for entry in targets:
@@ -11065,6 +11079,14 @@ class MaterializedViewManager:
                     cur.execute("SET @__matview_skip_triggers = 0;")
                 except Exception:
                     pass
+            if self.dialect == Dialect.MYSQL:
+                # The MySQL path is guaranteed to use the session-local bypass
+                # (and no DDL). Roll back the complete context-owned transaction;
+                # recreating triggers here would implicitly commit and is neither
+                # necessary nor safe.
+                self._rollback()
+                raise
+
             schemas = self.fetch_schema()
             for entry in targets:
                 if self.dialect == Dialect.POSTGRES:
