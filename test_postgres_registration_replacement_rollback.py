@@ -103,6 +103,7 @@ def main() -> None:
                 assert cur.fetchone()[0] == 1, (
                     f"old maintenance trigger {trigger_name} was not restored"
                 )
+        conn.commit()
         # Inject a failure after the old reader has been dropped but before
         # catalog cleanup. Transactional PostgreSQL DDL must restore it.
         original_drop = manager.drop_view
@@ -143,6 +144,7 @@ def main() -> None:
                 assert cur.fetchone()[0] == 1, (
                     f"old maintenance trigger {trigger_name} was not restored after mid-drop"
                 )
+        conn.commit()
 
         # An unrelated caller transaction must not be committed by registration.
         with conn.cursor() as cur:
