@@ -11119,10 +11119,10 @@ class MaterializedViewManager:
                     except Exception:
                         pass
                 elif self.dialect == Dialect.MYSQL:
-                    try:
-                        cur.execute("SET @__matview_skip_triggers = 0;")
-                    except Exception:
-                        pass
+                    # Do not commit if the session flag cannot be cleared:
+                    # it would suppress maintenance on later statements using
+                    # this pooled connection.
+                    cur.execute("SET @__matview_skip_triggers = 0;")
                 schemas = self.fetch_schema()
                 for entry in targets:
                     plan = generate_materialized_view(
