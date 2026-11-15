@@ -10992,10 +10992,10 @@ class MaterializedViewManager:
                     "bulk_changes() on MySQL/MariaDB requires a connection adapter "
                     "that exposes its autocommit mode; cannot guarantee context rollback"
                 )
-            if autocommit:
+            if autocommit and not mysql_caller_transaction:
                 raise RuntimeError(
                     "bulk_changes() on MySQL/MariaDB requires autocommit to be disabled "
-                    "so the context can roll back its own DML on failure"
+                    "unless the caller has explicitly started a transaction"
                 )
             if drop_triggers or use_shadow_swap:
                 raise RuntimeError(
