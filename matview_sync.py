@@ -10149,18 +10149,32 @@ class MaterializedViewManager:
         # Version detection and catalog initialization both execute SQL and
         # catalog initialization commits. Refuse a pre-existing PostgreSQL
         # transaction before either can touch or commit caller-owned work.
+        # An explicit engine_version is authoritative even when the supplied
+        # DB-API connection is wrapped by an application adapter whose class and
+        # dialect attributes do not reveal the underlying server. Determine its
+        # dialect before the guards, because detection/catalog setup execute SQL.
+        explicit_engine_dialect = (
+            parse_engine_version(engine_version, default_dialect=hint_d).dialect
+            if engine_version is not None
+            else None
+        )
+        effective_hint_dialect = hint_d or explicit_engine_dialect
+
         connection_module = (
             f"{type(self.conn).__module__}.{type(self.conn).__qualname__}".lower()
         )
         connection_dialect = getattr(self.conn, "dialect", None)
         connection_dialect_name = getattr(connection_dialect, "name", connection_dialect)
         postgres_candidate = (
-            hint_d == Dialect.POSTGRES
+            effective_hint_dialect == Dialect.POSTGRES
             or (isinstance(connection_dialect_name, str) and "postgres" in connection_dialect_name.lower())
             or any(name in connection_module for name in ("psycopg", "pg8000", "asyncpg", "postgres", "pgsql"))
         )
         if postgres_candidate:
             self._require_idle_postgres_connection(self.conn)
+        elif mysql_candidate:
+            # MySQL/MariaDB DDL can implicitly commit caller work.
+            self._require_idle_mysql_connection(self.conn)
 
         if engine_version is not None:
             self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
@@ -10231,6 +10245,34 @@ class MaterializedViewManager:
                 self.conn.rollback()
             except Exception:
                 pass
+
+    @staticmethod
+    def _require_idle_mysql_connection(conn: Any) -> None:
+        """Fail closed unless a MySQL/MariaDB connection is outside a transaction."""
+        state = getattr(conn, "in_transaction", None)
+        if callable(state):
+            try:
+                state = state()
+            except Exception:
+                state = None
+        if not isinstance(state, bool):
+            # PyMySQL and mysqlclient expose SERVER_STATUS_IN_TRANS in server_status.
+            status = getattr(conn, "server_status", None)
+            if status is None:
+                status = getattr(conn, "_server_status", None)
+            if isinstance(status, int):
+                state = bool(status & 0x0001)
+        if not isinstance(state, bool):
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization requires an adapter that "
+                "exposes transaction state; cannot safely determine whether "
+                "catalog initialization would commit caller work"
+            )
+        if state:
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization cannot run inside an active "
+                "caller transaction; commit or roll back that transaction first"
+            )
 
     @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
