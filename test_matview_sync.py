@@ -8887,6 +8887,7 @@ def _run_all_tests() -> None:
         [
             loader.loadTestsFromTestCase(TestGeneratorAndManagerCodePaths),
             loader.loadTestsFromTestCase(MySQLBulkSavepointCleanupFailureTests),
+            loader.loadTestsFromTestCase(SQLiteBulkSavepointRollbackFailureTests),
         ]
     )
     res = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -8897,6 +8898,71 @@ def _run_all_tests() -> None:
     print("=" * 84)
     print(f"ALL TESTS PASSED SUCCESSFULLY in {elapsed:.2f}s ({runner.total_views} views, {runner.total_assertions} assertions)!")
     print("=" * 84)
+
+
+
+class SQLiteBulkSavepointRollbackFailureTests(unittest.TestCase):
+    class Cursor:
+        def __init__(self):
+            self.statements = []
+            self.closed = False
+
+        def execute(self, statement, params=None):
+            sql = str(statement).strip()
+            self.statements.append(sql)
+            if sql == "SAVEPOINT __mv_bulk_sp;":
+                raise RuntimeError("injected savepoint failure")
+            return self
+
+        def close(self):
+            self.closed = True
+
+    class Connection:
+        in_transaction = False
+
+        def __init__(self):
+            self._cursor = SQLiteBulkSavepointRollbackFailureTests.Cursor()
+            self.rollback_calls = 0
+            self.close_calls = 0
+
+        def cursor(self):
+            if self.close_calls:
+                raise RuntimeError("connection is closed")
+            return self._cursor
+
+        def rollback(self):
+            self.rollback_calls += 1
+            raise RuntimeError("injected writer rollback failure")
+
+        def close(self):
+            self.close_calls += 1
+
+    def test_failed_writer_rollback_invalidates_connection_and_manager(self):
+        conn = self.Connection()
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = conn
+        manager.dialect = Dialect.SQLITE
+        manager.get_catalog = lambda: {}
+
+        with self.assertRaisesRegex(
+            RuntimeError, "manager connection was invalidated"
+        ) as raised:
+            with manager.bulk_changes():
+                self.fail("bulk_changes must not enter after setup failure")
+
+        self.assertEqual(
+            conn._cursor.statements,
+            ["BEGIN IMMEDIATE;", "SAVEPOINT __mv_bulk_sp;"],
+        )
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.close_calls, 1)
+        self.assertTrue(conn._cursor.closed)
+        self.assertTrue(manager._sqlite_connection_discarded)
+        with self.assertRaisesRegex(RuntimeError, "SQLite manager connection was discarded"):
+            with manager.bulk_changes():
+                self.fail("a manager with unknown transaction state must not be reused")
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertIn("injected writer rollback failure", str(raised.exception.__cause__))
 
 
 if __name__ == "__main__":
