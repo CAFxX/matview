@@ -6438,8 +6438,25 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         # The campaign score must account for DML grammar, not just schema
         # topology. These features are collected from the selected scenarios.
         campaign_features = coverage["feature_occurrences"]
+        self.assertEqual(
+            coverage["dml_statement_kinds"],
+            sorted(key.removeprefix("dml_kind:") for key in campaign_features
+                   if key.startswith("dml_kind:")),
+        )
+        self.assertEqual(
+            coverage["dml_expression_productions"],
+            sorted(key.removeprefix("dml_expression:") for key in campaign_features
+                   if key.startswith("dml_expression:")),
+        )
+        self.assertEqual(
+            coverage["dml_predicate_productions"],
+            sorted(key.removeprefix("dml_predicate:") for key in campaign_features
+                   if key.startswith("dml_predicate:")),
+        )
+        self.assertTrue(coverage["dml_expression_depths"])
+        self.assertTrue(coverage["dml_predicate_depths"])
         for kind in ("INSERT_VALUES", "INSERT_SELECT", "UPDATE", "DELETE", "UPSERT"):
-            self.assertIn(f"dml_kind:{kind}", campaign_features)
+            self.assertIn(kind, coverage["dml_statement_kinds"])
         self.assertTrue(
             any(key.startswith("dml_expression:") for key in campaign_features)
         )
@@ -7834,10 +7851,34 @@ class SchemaCoverageTracker:
         self.signatures.add(signature)
 
     def summary(self) -> Dict[str, Any]:
+        # Report selected-campaign grammar coverage separately from the
+        # aggregate feature count: consumers should not have to infer DML
+        # productions by parsing diagnostic strings.
+        features = self.feature_counts
         return {
             "distinct_structures": len(self.signatures),
-            "feature_count": len(self.feature_counts),
-            "feature_occurrences": dict(sorted(self.feature_counts.items())),
+            "feature_count": len(features),
+            "feature_occurrences": dict(sorted(features.items())),
+            "dml_statement_kinds": sorted(
+                key.removeprefix("dml_kind:")
+                for key in features if key.startswith("dml_kind:")
+            ),
+            "dml_expression_productions": sorted(
+                key.removeprefix("dml_expression:")
+                for key in features if key.startswith("dml_expression:")
+            ),
+            "dml_predicate_productions": sorted(
+                key.removeprefix("dml_predicate:")
+                for key in features if key.startswith("dml_predicate:")
+            ),
+            "dml_expression_depths": sorted(
+                int(key.removeprefix("dml_expression_depth:"))
+                for key in features if key.startswith("dml_expression_depth:")
+            ),
+            "dml_predicate_depths": sorted(
+                int(key.removeprefix("dml_predicate_depth:"))
+                for key in features if key.startswith("dml_predicate_depth:")
+            ),
         }
 
 
@@ -7999,7 +8040,12 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
                 print(
                     f"  [SCHEMA COVERAGE] seed={s_val}: "
                     f"distinct_structures={variable_coverage['distinct_structures']} "
-                    f"features={variable_coverage['feature_count']}"
+                    f"features={variable_coverage['feature_count']} "
+                    f"dml_kinds={len(variable_coverage['dml_statement_kinds'])} "
+                    f"dml_expr={len(variable_coverage['dml_expression_productions'])} "
+                    f"dml_predicates={len(variable_coverage['dml_predicate_productions'])} "
+                    f"dml_expr_depths={variable_coverage['dml_expression_depths']} "
+                    f"dml_predicate_depths={variable_coverage['dml_predicate_depths']}"
                 )
             s_var, v_var, seed_var, m_var, shape_var = variable_campaign[sc_idx - 1]
             print(
