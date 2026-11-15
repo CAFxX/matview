@@ -10165,8 +10165,21 @@ class MaterializedViewManager:
             or (isinstance(connection_dialect_name, str) and "postgres" in connection_dialect_name.lower())
             or any(name in connection_module for name in ("psycopg", "pg8000", "asyncpg", "postgres", "pgsql"))
         )
+        mysql_candidate = (
+            effective_hint_dialect == Dialect.MYSQL
+            or (
+                isinstance(connection_dialect_name, str)
+                and any(token in connection_dialect_name.lower() for token in ("mysql", "maria"))
+            )
+            or any(
+                name in connection_module
+                for name in ("pymysql", "mysql", "mariadb", "mysqldb")
+            )
+        )
         if postgres_candidate:
             self._require_idle_postgres_connection(self.conn)
+        elif mysql_candidate:
+            self._require_idle_mysql_connection(self.conn)
 
         if engine_version is not None:
             self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
@@ -10237,6 +10250,71 @@ class MaterializedViewManager:
                 self.conn.rollback()
             except Exception:
                 pass
+
+    @staticmethod
+    def _require_idle_mysql_connection(conn: Any) -> None:
+        """Fail closed unless every wrapped MySQL/MariaDB driver is outside a transaction."""
+        candidates = []
+        leaves = []
+        pending = [conn]
+        seen = set()
+        while pending:
+            candidate = pending.pop()
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            candidates.append(candidate)
+            has_nested = False
+            for attr in ("connection", "driver_connection", "dbapi_connection", "_connection"):
+                try:
+                    nested = getattr(candidate, attr, None)
+                except Exception:
+                    nested = None
+                if nested is not None and nested is not candidate:
+                    pending.append(nested)
+                    has_nested = True
+            if not has_nested:
+                leaves.append(candidate)
+
+        leaf_ids = {id(leaf) for leaf in leaves}
+        checked_leaves = set()
+        for candidate in candidates:
+            state = getattr(candidate, "in_transaction", None)
+            if callable(state):
+                try:
+                    state = state()
+                except Exception:
+                    state = None
+            if isinstance(state, bool) or (
+                isinstance(state, int) and not isinstance(state, bool) and state in (0, 1)
+            ):
+                state = bool(state)
+                if id(candidate) in leaf_ids:
+                    checked_leaves.add(id(candidate))
+                if state:
+                    raise RuntimeError(
+                        "MySQL/MariaDB manager initialization cannot run inside an active "
+                        "caller transaction; commit or roll back that transaction first"
+                    )
+                continue
+
+            status = getattr(candidate, "server_status", None)
+            if status is None:
+                status = getattr(candidate, "_server_status", None)
+            if isinstance(status, int) and not isinstance(status, bool):
+                if id(candidate) in leaf_ids:
+                    checked_leaves.add(id(candidate))
+                if status & 0x0001:
+                    raise RuntimeError(
+                        "MySQL/MariaDB manager initialization cannot run inside an active "
+                        "caller transaction; commit or roll back that transaction first"
+                    )
+
+        if checked_leaves != leaf_ids:
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization requires transaction state from every "
+                "underlying driver; cannot safely determine whether caller work would be committed"
+            )
 
     @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
