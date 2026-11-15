@@ -4190,11 +4190,18 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         cursor = Cursor(fail_reset=True)
         conn = Connection(cursor)
         mgr = make_manager(conn)
-        with self.assertRaisesRegex(RuntimeError, "cannot reset session variable"):
+        with self.assertRaisesRegex(RuntimeError, "connection must be discarded") as caught:
             with mgr.bulk_changes():
                 pass
+        self.assertTrue(caught.exception.connection_unsafe)
+        self.assertTrue(mgr._mysql_bulk_connection_unsafe)
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
+        statements_before_reuse = list(cursor.statements)
+        with self.assertRaisesRegex(RuntimeError, "discard the connection"):
+            with mgr.bulk_changes():
+                self.fail("a connection with unknown trigger-bypass state must never be reused")
+        self.assertEqual(cursor.statements, statements_before_reuse)
 
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
