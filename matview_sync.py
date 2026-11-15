@@ -1341,11 +1341,13 @@ def _is_simple_column_expr(expr_sql: str) -> bool:
     return isinstance(node, sqlglot_exp.Column) and not isinstance(node.this, sqlglot_exp.Star)
 
 
-def parse_table_schema(schema_sql: str) -> Dict[str, TableSchema]:
+def parse_table_schema(
+    schema_sql: str, dialect: Dialect = Dialect.SQLITE
+) -> Dict[str, TableSchema]:
     """Parses one or more CREATE TABLE statements into TableSchema objects via `sqlglot.parse`."""
     clean = _strip_sql_comments(schema_sql)
     schemas: Dict[str, TableSchema] = {}
-    for stmt_ast in sqlglot.parse(clean, read="sqlite"):
+    for stmt_ast in sqlglot.parse(clean, read=_sqlglot_dialect(dialect)):
         if not isinstance(stmt_ast, sqlglot_exp.Create) or stmt_ast.kind.upper() != "TABLE":
             continue
         schema_node = stmt_ast.this

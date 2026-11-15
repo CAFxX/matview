@@ -4765,6 +4765,106 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             self.assertEqual(mgr.check_schema_drift(), {"v_star": "ok"})
             mgr.conn.close()
 
+    def test_scalar_expression_storage_types_match_native_engines(self) -> None:
+        pg_schema = parse_table_schema(
+            "CREATE TABLE sales (qty INTEGER PRIMARY KEY, wide_qty BIGINT NOT NULL, "
+            "exact_qty NUMERIC(12, 2) NOT NULL, amount NUMERIC(12, 2));",
+            dialect=Dialect.POSTGRES,
+        )
+        pg_view = parse_view_definition(
+            "CREATE VIEW parity_stats AS SELECT qty % 2 AS parity, "
+            "wide_qty % 2 AS wide_parity, exact_qty % 2.0 AS decimal_parity, "
+            "SUM(amount) AS total FROM sales "
+            "GROUP BY qty % 2, wide_qty % 2, exact_qty % 2.0;",
+            known_tables={name.lower() for name in pg_schema},
+        )
+        pg_compiler = IncrementalViewCompiler(
+            pg_schema, pg_view, dialect=Dialect.POSTGRES
+        )
+        pg_items = {item.alias: item for item in pg_compiler.view.select_items}
+        # PostgreSQL resolves the modulo result from the native operand types:
+        # INTEGER stays INTEGER, BIGINT stays BIGINT, and NUMERIC stays NUMERIC.
+        self.assertEqual(pg_compiler._infer_expr_storage_type(pg_items["parity"]), "INTEGER")
+        self.assertEqual(pg_compiler._infer_expr_storage_type(pg_items["wide_parity"]), "BIGINT")
+        self.assertEqual(pg_compiler._infer_expr_storage_type(pg_items["decimal_parity"]), "NUMERIC")
+
+        # Nested CASE branches use PostgreSQL's common result type. All
+        # integer literals and the INTEGER column resolve to INTEGER.
+        case_view = parse_view_definition(
+            "CREATE VIEW case_result AS SELECT "
+            "(CASE WHEN qty IS NULL THEN -1 ELSE "
+            "(CASE WHEN qty IS NULL THEN 4 ELSE qty END) END) AS case_value "
+            "FROM sales;",
+            known_tables={name.lower() for name in pg_schema},
+        )
+        case_compiler = IncrementalViewCompiler(
+            pg_schema, case_view, dialect=Dialect.POSTGRES
+        )
+        case_item = next(
+            item for item in case_compiler.view.select_items
+            if item.alias == "case_value"
+        )
+        self.assertEqual(
+            case_compiler._infer_expr_storage_type(case_item), "INTEGER"
+        )
+
+        mysql_schema = parse_table_schema(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, tenant INTEGER NOT NULL, "
+            "latency INTEGER NOT NULL);",
+            dialect=Dialect.MYSQL,
+        )
+        mysql_view = parse_view_definition(
+            "CREATE VIEW tenant_latency AS SELECT tenant, "
+            "COALESCE(1.0 * SUM(DISTINCT latency), 0.0) AS tdl "
+            "FROM events GROUP BY tenant;",
+            known_tables={name.lower() for name in mysql_schema},
+        )
+        mysql_compiler = IncrementalViewCompiler(
+            mysql_schema,
+            mysql_view,
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+        )
+        total_item = next(
+            item for item in mysql_compiler.view.select_items if item.alias == "tdl"
+        )
+        # MySQL's exact SUM multiplied by a DECIMAL literal remains DECIMAL.
+        self.assertEqual(
+            mysql_compiler._infer_expr_storage_type(total_item),
+            "DECIMAL(65, 1)",
+        )
+
+        # Qualified DECIMAL references must retain their source scale when
+        # inferring MySQL AVG's native result type (input scale + 4).
+        mysql_decimal_schema = parse_table_schema(
+            "CREATE TABLE decimal_events (id INTEGER PRIMARY KEY, "
+            "tenant INTEGER NOT NULL, amount DECIMAL(20, 12) NOT NULL);",
+            dialect=Dialect.MYSQL,
+        )
+        mysql_decimal_view = parse_view_definition(
+            "CREATE VIEW decimal_avg AS SELECT e.tenant, AVG(e.amount) AS avg_amount "
+            "FROM decimal_events e GROUP BY e.tenant;",
+            known_tables={name.lower() for name in mysql_decimal_schema},
+        )
+        mysql_decimal_compiler = IncrementalViewCompiler(
+            mysql_decimal_schema,
+            mysql_decimal_view,
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+        )
+        avg_item = next(
+            item for item in mysql_decimal_compiler.view.select_items
+            if item.alias == "avg_amount"
+        )
+        self.assertEqual(
+            mysql_decimal_compiler._exact_numeric_precision_scale("e.amount"),
+            (20, 12),
+        )
+        self.assertEqual(
+            mysql_decimal_compiler._infer_expr_storage_type(avg_item),
+            "DECIMAL(24, 16)",
+        )
+
     def test_reparsed_aggregate_aliases_quote_reserved_keywords(self) -> None:
         schema = "CREATE TABLE alias_source (id INTEGER PRIMARY KEY);"
         view_sql = (
