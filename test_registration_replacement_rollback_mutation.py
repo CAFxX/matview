@@ -20,7 +20,7 @@ SOURCE = "matview_sync.py"
 REGRESSION = "test_registration_replacement_rollback.py"
 ORIGINAL = "self.drop_view(plan.view_name, _commit_transaction=False)"
 MUTANT = "self.drop_view(plan.view_name)"
-BASELINE_MARKER = "PASS: replacement rollback and fail-closed unsupported replacement checks"
+BASELINE_MARKER = "PASS: failed replacement rolled back to the prior live materialized view"
 EXPECTED_FAILURE = "no such table: replacement_reader"
 
 
