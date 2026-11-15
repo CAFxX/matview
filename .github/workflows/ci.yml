@@ -400,6 +400,11 @@ jobs:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_concurrent_backfill.py
 
+      - name: Verify native MySQL bulk transaction ownership
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_mysql_bulk_changes_transaction_guard.py
+
       - name: Test MySQL session-bypass reset failure invalidates physical connection
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
@@ -494,6 +499,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_concurrent_backfill.py
+
+      - name: Verify native MariaDB bulk transaction ownership
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_mysql_bulk_changes_transaction_guard.py
 
       - name: Test MariaDB session-bypass reset failure invalidates physical connection
         env:
