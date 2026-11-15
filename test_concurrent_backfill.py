@@ -568,23 +568,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             self.assertEqual(catalog["backfill_active"], 0)
             conn.commit()
         finally:
-            try:
-                conn.rollback()
-                cur = conn.cursor()
-                if engine == Dialect.POSTGRES:
-                    cur.execute("SET search_path TO public;")
-                    cur.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE;')
-                else:
-                    if manager is not None and plan is not None:
-                        try:
-                            manager.drop_view(plan.view_name)
-                        except Exception:
-                            pass
-                    cur.execute(f"DROP TABLE IF EXISTS {table_name};")
-                conn.commit()
-            except Exception:
-                conn.rollback()
-            conn.close()
+            self._cleanup_native_fixture(conn, engine, schema_name, table_name, manager, plan)
 
     def test_native_postgres_watermark_gates_independent_session_dml(self) -> None:
         dsn = os.environ.get("POSTGRES_DSN")
@@ -597,6 +581,323 @@ class IndependentSessionBackfillTests(unittest.TestCase):
         if not dsn:
             self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
         self._run_native_watermark_interleaving(Dialect.MYSQL, dsn)
+
+    def test_sqlite_barrier_concurrent_multi_writer_backfill(self) -> None:
+        """Exercise genuine multi-writer WAL overlap across chunked backfill without synchronous joins."""
+        fd, db_path = tempfile.mkstemp(prefix="matview-barrier-backfill-", suffix=".sqlite")
+        os.close(fd)
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=10000;")
+        _register_sqlite_compat_udfs(conn)
+        conn.execute(
+            "CREATE TABLE ledger_concurrent ("
+            "id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, amt INTEGER NOT NULL);"
+        )
+        conn.executemany(
+            "INSERT INTO ledger_concurrent VALUES (?, ?, ?);",
+            [(i, f"B{(i % 4) + 1}", i * 10) for i in range(1, 61)],
+        )
+        conn.commit()
+
+        start_barrier = threading.Barrier(3)
+        mid_barrier = threading.Barrier(3)
+        backfill_done = threading.Event()
+        worker_errors: list[BaseException] = []
+        overlap_commits: list[int] = []
+        overlap_lock = threading.Lock()
+        barrier_released = False
+        mid_released = False
+
+        def concurrent_writer(writer_id: int) -> None:
+            second = sqlite3.connect(db_path, timeout=10, isolation_level=None)
+            try:
+                second.execute("PRAGMA busy_timeout=10000;")
+                _register_sqlite_compat_udfs(second)
+                start_barrier.wait(timeout=10)
+                base_pk = 1000 * writer_id
+                target_pk = 10 + writer_id * 5
+                for step in range(12):
+                    bucket = f"B{((writer_id + step) % 4) + 1}"
+                    new_pk = base_pk + step
+                    second.execute("BEGIN IMMEDIATE;")
+                    second.execute(
+                        "INSERT INTO ledger_concurrent VALUES (?, ?, ?);",
+                        (new_pk, bucket, (step + 1) * 17),
+                    )
+                    second.execute(
+                        "UPDATE ledger_concurrent SET amt = amt + ? WHERE id = ?;",
+                        (writer_id + 1, target_pk + (step % 4)),
+                    )
+                    if step % 4 == 3:
+                        second.execute(
+                            "DELETE FROM ledger_concurrent WHERE id = ?;",
+                            (base_pk + step - 1,),
+                        )
+                    second.execute("COMMIT;")
+                    if not backfill_done.is_set():
+                        with overlap_lock:
+                            overlap_commits.append(writer_id)
+
+                    # Exercise concurrent rolled-back DML while backfill runs.
+                    second.execute("BEGIN IMMEDIATE;")
+                    second.execute(
+                        "INSERT INTO ledger_concurrent VALUES (?, ?, ?);",
+                        (base_pk + 500 + step, bucket, 99999),
+                    )
+                    second.execute("ROLLBACK;")
+                    if step == 0:
+                        mid_barrier.wait(timeout=10)
+            except BaseException as exc:
+                worker_errors.append(exc)
+            finally:
+                second.close()
+
+        def on_progress(batch_idx: int, _rows_done: int) -> None:
+            nonlocal barrier_released, mid_released
+            if batch_idx == 1 and not barrier_released:
+                barrier_released = True
+                start_barrier.wait(timeout=10)
+            elif batch_idx == 3 and not mid_released:
+                mid_released = True
+                mid_barrier.wait(timeout=10)
+
+        w1 = threading.Thread(target=concurrent_writer, args=(1,), daemon=True)
+        w2 = threading.Thread(target=concurrent_writer, args=(2,), daemon=True)
+        w1.start()
+        w2.start()
+        try:
+            manager = MaterializedViewManager(conn)
+            plan = manager.register_view(
+                "CREATE VIEW ledger_concurrent_totals AS "
+                "SELECT bucket, COUNT(*) AS c, SUM(amt) AS s, AVG(amt) AS avg_amt "
+                "FROM ledger_concurrent GROUP BY bucket;",
+                populate=False,
+            )
+            batches = manager.backfill_incrementally(
+                plan,
+                batch_size=4,
+                on_progress=on_progress,
+                snapshot_isolation=False,
+            )
+            backfill_done.set()
+            w1.join(timeout=20)
+            w2.join(timeout=20)
+            self.assertFalse(w1.is_alive())
+            self.assertFalse(w2.is_alive())
+            if worker_errors:
+                raise worker_errors[0]
+            self.assertGreaterEqual(batches, 10)
+            self.assertTrue(barrier_released)
+            self.assertEqual(
+                set(overlap_commits), {1, 2},
+                "Expected both concurrent writers to commit overlapping chunks before backfill completion",
+            )
+            actual = conn.execute(
+                f"SELECT bucket, c, s, ROUND(avg_amt, 8) FROM {plan.view_name} ORDER BY bucket;"
+            ).fetchall()
+            expected = conn.execute(
+                "SELECT bucket, COUNT(*) AS c, SUM(amt) AS s, ROUND(AVG(amt), 8) AS avg_amt "
+                "FROM ledger_concurrent GROUP BY bucket ORDER BY bucket;"
+            ).fetchall()
+            self.assertEqual(actual, expected)
+            self.assertEqual(manager.get_catalog()[plan.view_name]["backfill_active"], 0)
+            manager.drop_view(plan.view_name)
+        finally:
+            backfill_done.set()
+            start_barrier.abort()
+            mid_barrier.abort()
+            conn.close()
+            os.unlink(db_path)
+
+    def _run_native_barrier_concurrent_writers(self, engine: Dialect, dsn: str) -> None:
+        suffix = uuid.uuid4().hex[:10]
+        schema_name = f"mv_barrier_{suffix}"
+        table_name = f"ledger_barrier_{suffix}"
+        view_name = f"ledger_barrier_totals_{suffix}"
+        conn = self._connect_native(engine, dsn)
+        manager = None
+        plan = None
+        start_barrier = threading.Barrier(3)
+        mid_barrier = threading.Barrier(3)
+        backfill_done = threading.Event()
+        worker_errors: list[BaseException] = []
+        overlap_commits: list[int] = []
+        overlap_lock = threading.Lock()
+        barrier_released = False
+        mid_released = False
+
+        try:
+            cur = conn.cursor()
+            if engine == Dialect.POSTGRES:
+                cur.execute(f'CREATE SCHEMA "{schema_name}";')
+                cur.execute(f'SET search_path TO "{schema_name}";')
+            engine_suffix = " ENGINE=InnoDB" if engine == Dialect.MYSQL else ""
+            cur.execute(
+                f"CREATE TABLE {table_name} ("
+                "id BIGINT PRIMARY KEY, "
+                "bucket VARCHAR(16) NOT NULL, "
+                "amt BIGINT NOT NULL"
+                f"){engine_suffix};"
+            )
+            cur.executemany(
+                f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
+                [(i, f"B{(i % 4) + 1}", i * 10) for i in range(1, 61)],
+            )
+            conn.commit()
+
+            def concurrent_writer(writer_id: int) -> None:
+                second = None
+                try:
+                    second = self._connect_native(engine, dsn)
+                    second_cur = second.cursor()
+                    if engine == Dialect.POSTGRES:
+                        second_cur.execute(f'SET search_path TO "{schema_name}";')
+                        second.commit()
+                    start_barrier.wait(timeout=20)
+                    base_pk = 1000 * writer_id
+                    target_pk = 10 + writer_id * 5
+                    for step in range(10):
+                        bucket = f"B{((writer_id + step) % 4) + 1}"
+                        new_pk = base_pk + step
+                        second_cur.execute(
+                            f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
+                            (new_pk, bucket, (step + 1) * 19),
+                        )
+                        second_cur.execute(
+                            f"UPDATE {table_name} SET amt = amt + %s WHERE id = %s",
+                            (writer_id + 1, target_pk + (step % 4)),
+                        )
+                        if step % 3 == 2:
+                            second_cur.execute(
+                                f"DELETE FROM {table_name} WHERE id = %s",
+                                (base_pk + step - 1,),
+                            )
+                        second.commit()
+                        if not backfill_done.is_set():
+                            with overlap_lock:
+                                overlap_commits.append(writer_id)
+
+                        second_cur.execute(
+                            f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
+                            (base_pk + 500 + step, bucket, 99999),
+                        )
+                        second.rollback()
+                        if step == 0:
+                            mid_barrier.wait(timeout=20)
+                except BaseException as exc:
+                    worker_errors.append(exc)
+                finally:
+                    if second is not None:
+                        second.close()
+
+            def on_progress(batch_idx: int, _rows_done: int) -> None:
+                nonlocal barrier_released, mid_released
+                if batch_idx == 1 and not barrier_released:
+                    barrier_released = True
+                    start_barrier.wait(timeout=20)
+                elif batch_idx == 3 and not mid_released:
+                    mid_released = True
+                    mid_barrier.wait(timeout=20)
+
+            w1 = threading.Thread(target=concurrent_writer, args=(1,), daemon=True)
+            w2 = threading.Thread(target=concurrent_writer, args=(2,), daemon=True)
+            w1.start()
+            w2.start()
+
+            manager = MaterializedViewManager(conn, dialect=engine)
+            with warnings.catch_warnings(record=True) as emitted:
+                warnings.simplefilter("always", EngineLimitationWarning)
+                plan = manager.register_view(
+                    f"CREATE VIEW {view_name} AS "
+                    f"SELECT bucket, COUNT(*) AS c, SUM(amt) AS s, AVG(amt) AS avg_amt "
+                    f"FROM {table_name} GROUP BY bucket;",
+                    populate=False,
+                    ignore_limitations=True,
+                )
+            limitation_warnings = [
+                warning for warning in emitted
+                if issubclass(warning.category, EngineLimitationWarning)
+            ]
+            expected_limitation_codes = (
+                {"MYSQL_NO_TRUNCATE_TRIGGER"} if engine == Dialect.MYSQL else set()
+            )
+            self.assertEqual(
+                {lim.code for lim in plan.limitations},
+                expected_limitation_codes,
+            )
+            self.assertEqual(len(limitation_warnings), len(expected_limitation_codes))
+            batches = manager.backfill_incrementally(
+                plan,
+                batch_size=4,
+                on_progress=on_progress,
+                snapshot_isolation=False,
+            )
+            backfill_done.set()
+            w1.join(timeout=30)
+            w2.join(timeout=30)
+            self.assertFalse(w1.is_alive())
+            self.assertFalse(w2.is_alive())
+            if worker_errors:
+                raise worker_errors[0]
+            self.assertGreaterEqual(batches, 10)
+            self.assertTrue(barrier_released)
+            self.assertEqual(
+                set(overlap_commits), {1, 2},
+                f"{engine.value}: expected both concurrent writers to commit before backfill completion",
+            )
+            cur.execute(
+                f"SELECT bucket, c, s, avg_amt FROM {plan.view_name} ORDER BY bucket;"
+            )
+            actual = [tuple(row) for row in cur.fetchall()]
+            cur.execute(
+                f"SELECT bucket, COUNT(*) AS c, SUM(amt) AS s, AVG(amt) AS avg_amt "
+                f"FROM {table_name} GROUP BY bucket ORDER BY bucket;"
+            )
+            expected = [tuple(row) for row in cur.fetchall()]
+            self.assertEqual(actual, expected)
+            self.assertEqual(manager.get_catalog()[plan.view_name]["backfill_active"], 0)
+            conn.commit()
+        finally:
+            backfill_done.set()
+            start_barrier.abort()
+            mid_barrier.abort()
+            self._cleanup_native_fixture(conn, engine, schema_name, table_name, manager, plan)
+
+    @staticmethod
+    def _cleanup_native_fixture(
+        conn, engine: Dialect, schema_name: str, table_name: str, manager, plan
+    ) -> None:
+        """Tear down temporary native schema, table, and materialized view cleanly."""
+        try:
+            conn.rollback()
+            cur = conn.cursor()
+            if engine == Dialect.POSTGRES:
+                cur.execute("SET search_path TO public;")
+                cur.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE;')
+            else:
+                if manager is not None and plan is not None:
+                    try:
+                        manager.drop_view(plan.view_name)
+                    except Exception:
+                        pass
+                cur.execute(f"DROP TABLE IF EXISTS {table_name};")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        conn.close()
+
+    def test_native_postgres_barrier_concurrent_multi_writer_backfill(self) -> None:
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN is not set; native PostgreSQL test only")
+        self._run_native_barrier_concurrent_writers(Dialect.POSTGRES, dsn)
+
+    def test_native_mysql_family_barrier_concurrent_multi_writer_backfill(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
+        self._run_native_barrier_concurrent_writers(Dialect.MYSQL, dsn)
 
 
 if __name__ == "__main__":
