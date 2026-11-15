@@ -1687,7 +1687,14 @@ def introspect_database_schemas(
         ):
             continue
         dt_up = d_type.upper()
-        if dt_up in ("VARCHAR", "CHAR", "TINYINT") and col_type:
+        # information_schema.DATA_TYPE drops numeric precision/scale and
+        # integer signedness. COLUMN_TYPE is the native declaration (for
+        # example DECIMAL(20,12)); retain it for every numeric family so AVG
+        # and expression result types match the live server metadata.
+        if dt_up in (
+            "VARCHAR", "CHAR", "TINYINT", "DECIMAL", "NUMERIC", "DEC", "FIXED",
+            "INT", "INTEGER", "SMALLINT", "MEDIUMINT", "BIGINT", "FLOAT", "DOUBLE", "REAL",
+        ) and col_type:
             dt_up = col_type.upper()
         is_pk = col_key.upper() == "PRI"
         grouped_my.setdefault(t_name, {})[c_name] = ColumnDef(
@@ -4446,6 +4453,106 @@ class IncrementalViewCompiler:
 
         return None
 
+    def _postgres_case_result_storage_type(self, expr: str) -> Optional[str]:
+        """Infer PostgreSQL CASE common types, including nested column branches."""
+        if self.dialect != Dialect.POSTGRES:
+            return None
+        try:
+            root = parse_sql_ast(expr)
+        except sqlglot.errors.SqlglotError:
+            return None
+
+        ranks = {
+            "SMALLINT": 1,
+            "INTEGER": 2,
+            "BIGINT": 3,
+            "NUMERIC": 4,
+            "REAL": 5,
+            "DOUBLE PRECISION": 6,
+        }
+
+        def canonical_type(data_type: str) -> Optional[str]:
+            upper = re.sub(r"\s*\(.*\)\s*$", "", data_type.upper()).strip()
+            if upper in ("SMALLINT", "INT2"):
+                return "SMALLINT"
+            if upper in ("INTEGER", "INT", "INT4"):
+                return "INTEGER"
+            if upper in ("BIGINT", "INT8"):
+                return "BIGINT"
+            if upper in ("NUMERIC", "DECIMAL"):
+                return "NUMERIC"
+            if upper in ("REAL", "FLOAT4"):
+                return "REAL"
+            if upper in ("DOUBLE PRECISION", "DOUBLE", "FLOAT8", "FLOAT"):
+                return "DOUBLE PRECISION"
+            return None
+
+        def merge(types: Sequence[Optional[str]]) -> Optional[str]:
+            known = [value for value in types if value is not None and value != "UNKNOWN"]
+            if not known:
+                return None
+            if any(value not in ranks for value in known):
+                return known[0] if all(value == known[0] for value in known) else None
+            return max(known, key=lambda value: ranks[value])
+
+        def infer(node: Any) -> Optional[str]:
+            if node is None:
+                return "UNKNOWN"
+            kind = node.__class__.__name__
+            if kind == "Paren":
+                return infer(node.this)
+            if kind == "Null":
+                return "UNKNOWN"
+            if kind == "Column":
+                column = self._lookup_col_def(node.sql())
+                if column is None:
+                    column = self._lookup_col_def(node.name)
+                return canonical_type(column.data_type) if column else None
+            if kind == "Literal":
+                if node.args.get("is_string"):
+                    return None
+                value = str(node.this)
+                if re.fullmatch(r"[+-]?\d+", value):
+                    number = int(value)
+                    if -(2 ** 31) <= number < 2 ** 31:
+                        return "INTEGER"
+                    if -(2 ** 63) <= number < 2 ** 63:
+                        return "BIGINT"
+                    return "NUMERIC"
+                if re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?", value):
+                    return "NUMERIC"
+                return None
+            if kind in ("Neg", "Positive"):
+                return infer(node.this)
+            if kind == "Cast":
+                target = node.args.get("to")
+                return canonical_type(target.sql()) if target is not None else None
+            if kind == "Case":
+                branches: List[Optional[str]] = []
+                for branch in node.args.get("ifs") or ():
+                    value = branch.args.get("true")
+                    if value is not None:
+                        inferred = infer(value)
+                        if inferred is None:
+                            return None
+                        branches.append(inferred)
+                default = node.args.get("default")
+                if default is not None:
+                    inferred = infer(default)
+                    if inferred is None:
+                        return None
+                    branches.append(inferred)
+                return merge(branches)
+            if kind in ("Add", "Sub", "Mul", "Div", "Mod"):
+                left, right = infer(node.this), infer(node.expression)
+                if left is None or right is None:
+                    return None
+                return merge((left, right))
+            return None
+
+        inferred = infer(root)
+        return None if inferred == "UNKNOWN" else inferred
+
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
         if not item.is_aggregate:
             c_def = self._lookup_col_def(item.raw_expr)
@@ -4500,6 +4607,10 @@ class IncrementalViewCompiler:
                 c_win = self._lookup_col_def(m_win_col.group(1))
                 if c_win:
                     return self._normalize_dialect_type(c_win.data_type)
+            if raw_u.startswith("CASE ") and self.dialect == Dialect.POSTGRES:
+                native_case_type = self._postgres_case_result_storage_type(raw_expr)
+                if native_case_type is not None:
+                    return native_case_type
             if raw_u.startswith("CASE ") and not re.search(r"\b(?:THEN|ELSE)\s*'", raw_u):
                 num_branches = re.findall(r"\b(?:THEN|ELSE)\s+(-?\d+(?:\.\d+)?)\b", raw_u)
                 if num_branches:
