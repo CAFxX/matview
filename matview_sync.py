@@ -11038,6 +11038,7 @@ class MaterializedViewManager:
         triggers_dropped = False
         created_shadow_tables: List[str] = []
 
+        session_bypass_ok = False
         try:
             if self.dialect == Dialect.SQLITE:
                 if not getattr(self.conn, "in_transaction", False):
@@ -11051,12 +11052,10 @@ class MaterializedViewManager:
                     cur.execute("SAVEPOINT __mv_bulk_sp;")
                     sp_active = True
                 except Exception:
-                    # Session-local bypass can still be safe without a savepoint
-                    # on PostgreSQL/MySQL; any fallback that drops triggers is
-                    # guarded below.
+                    # The checks below decide whether session-local bypass alone
+                    # is sufficient for this engine and operation.
                     pass
 
-            session_bypass_ok = False
             if self.dialect == Dialect.POSTGRES and not drop_triggers:
                 try:
                     cur.execute("SET LOCAL matview.skip_triggers = 'on';")
@@ -11070,29 +11069,71 @@ class MaterializedViewManager:
                 except Exception:
                     pass
 
+            setup_failure = None
             if (
                 not drop_triggers
                 and self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
                 and not sp_active
             ):
-                raise RuntimeError(
+                setup_failure = (
                     "bulk_changes could not establish the required transactional savepoint; "
                     "refusing to suspend maintenance triggers"
                 )
-
-            if (
+            elif (
                 self.dialect == Dialect.MYSQL
                 and not drop_triggers
                 and not session_bypass_ok
             ):
                 # MySQL/MariaDB trigger DDL implicitly commits. Falling back to
-                # DROP TRIGGER would expose base-table writes without maintenance,
-                # and a later rollback cannot restore atomicity. Fail before any
-                # trigger DDL rather than silently weakening the isolation contract.
-                raise RuntimeError(
+                # DROP TRIGGER would expose base-table writes without maintenance.
+                setup_failure = (
                     "bulk_changes requires the MySQL session trigger-bypass variable; "
                     "refusing to drop maintenance triggers because MySQL/MariaDB DDL commits implicitly"
                 )
+
+            if setup_failure:
+                reset_error = None
+                if session_bypass_ok:
+                    try:
+                        cur.execute("SET @__matview_skip_triggers = 0;")
+                    except Exception as exc:
+                        reset_error = exc
+                if sp_active:
+                    try:
+                        cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                        cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                    except Exception:
+                        self._rollback()
+                else:
+                    self._rollback()
+                if reset_error is not None:
+                    raise RuntimeError(
+                        "bulk_changes could not establish safe isolation and could not clear "
+                        "the session-local trigger bypass; discard the connection before reuse"
+                    ) from reset_error
+                raise RuntimeError(setup_failure)
+        except Exception:
+            # Setup must be all-or-nothing. In particular, a SQLite reservation
+            # followed by a failed SAVEPOINT must not leave the writer lock held,
+            # and a MySQL bypass flag set before a savepoint failure must be reset.
+            if session_bypass_ok:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    self._rollback()
+                    raise RuntimeError(
+                        "bulk_changes setup failed and the session-local trigger bypass "
+                        "could not be cleared; discard the connection before reuse"
+                    )
+            if sp_active:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    self._rollback()
+            else:
+                self._rollback()
+            raise
 
             if session_bypass_ok:
                 trigger_suspension_started = True
