@@ -10642,26 +10642,22 @@ class MaterializedViewManager:
                     raise
             return True
 
+        # Reject unsupported replacement before entering the transactional
+        # cleanup path: its exception handler must not roll back a caller-owned
+        # transaction on a dialect where this operation is unsupported.
+        if existing and (
+            incremental_backfill
+            or self.dialect not in (Dialect.SQLITE, Dialect.POSTGRES)
+        ):
+            raise RuntimeError(
+                "Replacing an existing materialized view is unsupported for "
+                "MySQL/MariaDB and incremental backfills until atomic shadow-generation "
+                "publication is implemented; the existing view was left untouched"
+            )
+
         try:
             if existing:
-                # Never destroy the currently published generation unless the
-                # entire replacement can be rolled back atomically. MySQL/MariaDB
-                # implicitly commit DDL, and incremental backfills commit chunks;
-                # both require shadow-generation publication, which is not yet
-                # implemented. Reject before opening a cursor or issuing any DDL.
-                if (
-                    incremental_backfill
-                    or self.dialect not in (Dialect.SQLITE, Dialect.POSTGRES)
-                ):
-                    raise RuntimeError(
-                        "Replacing an existing materialized view is unsupported for "
-                        "MySQL/MariaDB and incremental backfills until atomic shadow-generation "
-                        "publication is implemented; the existing view was left untouched"
-                    )
-
-                # Open the cursor only after unsupported replacement modes have
-                # been rejected; cursor acquisition itself may start or alter a
-                # transaction for some adapters.
+                # Cursor acquisition follows the side-effect-free preflight above.
                 cur = self.conn.cursor()
                 # SQLite and PostgreSQL support transactional DDL.
                 sqlite_writer_reserved = reserve_sqlite_writer()
