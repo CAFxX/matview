@@ -11056,6 +11056,7 @@ class MaterializedViewManager:
             self.dialect == Dialect.SQLITE and sqlite_transaction_state is True
         )
         sqlite_started_writer_transaction = False
+        sqlite_writer_rollback_failed = False
 
         try:
             if self.dialect == Dialect.SQLITE:
@@ -11083,12 +11084,24 @@ class MaterializedViewManager:
                 try:
                     cur.execute("SAVEPOINT __mv_bulk_sp;")
                     sp_active = True
-                except Exception:
+                except Exception as savepoint_error:
                     # Release only a writer reservation acquired by this context.
                     # A caller-owned transaction must remain open for its owner.
                     if sqlite_started_writer_transaction:
-                        self._rollback()
-                        sqlite_started_writer_transaction = False
+                        try:
+                            self.conn.rollback()
+                        except Exception as rollback_error:
+                            # Do not let the outer cleanup silently retry/swallow
+                            # this failure: the physical connection may still hold
+                            # SQLite's single-writer reservation and must be discarded.
+                            sqlite_writer_rollback_failed = True
+                            raise RuntimeError(
+                                "bulk_changes could not release its SQLite writer reservation "
+                                "after SAVEPOINT setup failed; discard the connection or "
+                                "explicitly recover its transaction before reuse"
+                            ) from rollback_error
+                        else:
+                            sqlite_started_writer_transaction = False
                     raise
             else:
                 try:
@@ -11402,7 +11415,7 @@ class MaterializedViewManager:
                                     "the caller-owned transaction remains open and must be "
                                     "rolled back by its owner"
                                 ) from savepoint_error
-                    if sqlite_started_writer_transaction:
+                    if sqlite_started_writer_transaction and not sqlite_writer_rollback_failed:
                         self._rollback()
                 else:
                     self._rollback()
