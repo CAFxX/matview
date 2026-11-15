@@ -75,6 +75,12 @@ class MySQLTransactionStateGuardTests(unittest.TestCase):
             def cursor(self):
                 return Cursor(self)
 
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
         class Cursor:
             def __init__(self, connection):
                 self.connection = connection
