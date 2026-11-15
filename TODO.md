@@ -121,6 +121,7 @@ The existing differential-testing harness is useful, but its current headline co
   - Keep these properties independent of the implementation's own delta-generation logic.
 
 - [ ] **Measure Test Strength and Publish Honest Coverage Statistics**:
+  - Progress: The deterministic variable-schema campaign now reports selected schema structures plus explicit DML statement-kind, expression-production, predicate-production, and observed-depth coverage. These are selected-campaign grammar observations, not claims of full grammar coverage; query AST structure counts, operator/clause combinations, mutation-sequence lengths, native-versus-simulated engine execution counts, and concurrency scenario metrics remain open.
   - Report distinct schema structures, query AST structures, DML AST structures, grammar-production coverage, operator/clause combinations, mutation sequence lengths, native versus simulated engine executions, and concurrency scenarios.
   - Keep raw test/view/assertion counts as workload statistics only; do not present them as proxies for structural or semantic coverage.
   - Reconcile README, module docstrings, runner output, and CI matrix descriptions from one generated source of truth.
