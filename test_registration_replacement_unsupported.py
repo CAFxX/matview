@@ -24,9 +24,11 @@ class NonTransactionalReplacementTests(unittest.TestCase):
         manager.conn = conn
         manager.dialect = dialect
         manager._compute_signature = lambda plan, schemas: "new-signature"
-        manager.get_catalog = lambda: {
-            "reader": {"signature_hash": "old-signature"}
-        }
+        catalog_reads = []
+        manager.get_catalog = lambda: (
+            catalog_reads.append("inspected"),
+            {"reader": {"signature_hash": "old-signature"}},
+        )[1]
         drop_calls = []
         manager.drop_view = lambda *args, **kwargs: drop_calls.append((args, kwargs))
 
@@ -43,6 +45,9 @@ class NonTransactionalReplacementTests(unittest.TestCase):
                 effective_ignore=False,
                 compiled_plan=plan,
             )
+        # Catalog inspection is required to identify an existing view. The
+        # refusal must then happen before the replacement cursor/DDL path.
+        self.assertEqual(catalog_reads, ["inspected"])
         self.assertEqual(drop_calls, [])
         self.assertEqual(conn.cursor_calls, 0)
 
