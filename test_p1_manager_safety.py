@@ -342,6 +342,41 @@ class TestManagerCursorSafety(unittest.TestCase):
         with manager._cursor() as cur:
             self.assertIsInstance(cur, NonCallableCloseCursor)
 
+    def test_diff_views_zero_leaks_and_dropped_object_detection(self) -> None:
+        manager = MaterializedViewManager(self.tracked_conn, dialect=Dialect.SQLITE)
+        view_sql = "CREATE VIEW mv_diff_test AS SELECT dept, SUM(amt) AS tot FROM sales GROUP BY dept;"
+        plan = manager.register_view(view_sql)
+        self.tracked_conn.reset_tracking()
+
+        # 1. Clean state -> NOOP and zero leaked cursors
+        rep_noop = manager.diff_views([view_sql])
+        self.assertEqual(rep_noop["mv_diff_test"].status, "NOOP")
+        self.tracked_conn.assert_zero_leaked("diff_views clean NOOP must not leak cursors")
+
+        # 2. Drop all maintenance triggers out-of-band -> must NOT report false NOOP
+        for t in plan.trigger_names:
+            self.tracked_conn._real_conn.execute(f"DROP TRIGGER IF EXISTS {t};")
+        self.tracked_conn._real_conn.commit()
+        rep_alt = manager.diff_views([view_sql])
+        self.assertEqual(rep_alt["mv_diff_test"].status, "ALTER")
+        self.assertEqual(
+            set(rep_alt["mv_diff_test"].pending_changes["triggers"]["to_create"]),
+            set(plan.trigger_names),
+        )
+        self.tracked_conn.assert_zero_leaked("diff_views trigger ALTER must not leak cursors")
+
+        # 3. Drop reader view out-of-band -> must report ALTER (recreate reader view without rebuild) and include reader view DDL
+        self.tracked_conn._real_conn.execute("DROP VIEW IF EXISTS mv_diff_test;")
+        self.tracked_conn._real_conn.commit()
+        rep_rep = manager.diff_views([view_sql])
+        self.assertEqual(rep_rep["mv_diff_test"].status, "ALTER")
+        self.assertEqual(rep_rep["mv_diff_test"].pending_changes["reader_view"]["action"], "CREATE")
+        self.assertTrue(
+            any("CREATE VIEW" in s and "mv_diff_test" in s for s in rep_rep["mv_diff_test"].pending_ddls),
+            "ALTER for dropped reader view must include reader view DDL",
+        )
+        self.tracked_conn.assert_zero_leaked("diff_views reader ALTER must not leak cursors")
+
 
 class TestMySqlNonAtomicRegistrationRollback(unittest.TestCase):
     """
@@ -517,13 +552,16 @@ class TestNativeEngineManagerSafety(unittest.TestCase):
         view_name = f"{prefix}mv_items"
         backing_tbl = f"{manager.object_prefix}store_{view_name}"
 
-        with tracked.cursor() as cur:
+        cur = tracked.cursor()
+        try:
             cur.execute(f"DROP VIEW IF EXISTS {view_name};")
             cur.execute(f"DROP TABLE IF EXISTS {backing_tbl};")
             cur.execute(f"DROP TABLE IF EXISTS {base_tbl};")
             cur.execute(f"CREATE TABLE {base_tbl} (id INT PRIMARY KEY, grp VARCHAR(32), qty INT);")
             cur.execute(f"INSERT INTO {base_tbl} VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5);")
             tracked.commit()
+        finally:
+            cur.close()
         tracked.reset_tracking()
 
         try:
@@ -550,11 +588,14 @@ class TestNativeEngineManagerSafety(unittest.TestCase):
             # 2. Pre-existing table collision: verify pre-existing table is NOT dropped
             collide_tbl = f"{manager.object_prefix}store_{prefix}mv_col"
             col_view = f"{prefix}mv_col"
-            with tracked.cursor() as cur:
+            cur = tracked.cursor()
+            try:
                 cur.execute(f"DROP TABLE IF EXISTS {collide_tbl};")
                 cur.execute(f"CREATE TABLE {collide_tbl} (id INT PRIMARY KEY, data_str VARCHAR(64));")
                 cur.execute(f"INSERT INTO {collide_tbl} VALUES (99, 'KEEP_SAFE');")
                 tracked.commit()
+            finally:
+                cur.close()
             tracked.reset_tracking()
 
             col_view_sql = f"CREATE VIEW {col_view} AS SELECT grp, COUNT(*) AS c FROM {base_tbl} GROUP BY grp;"
@@ -575,32 +616,34 @@ class TestNativeEngineManagerSafety(unittest.TestCase):
             tracked.cursor_factory = col_fail_cursor
             manager_col = MaterializedViewManager(tracked, dialect=Dialect.MYSQL, ignore_limitations=True)
             with self.assertRaises(pymysql.err.OperationalError):
-                manager_col._register_single_view_spec(
-                    v_spec=manager_col.fetch_schema()[base_tbl],  # placeholder spec
-                    schemas=manager_col.fetch_schema(),
+                manager_col.register_view(
+                    col_view_sql,
                     populate=False,
                     incremental_backfill=False,
                     batch_size=500,
-                    on_progress=None,
-                    force_rebuild=False,
-                    effective_ignore=True,
                 )
             tracked.cursor_factory = None
 
-            with tracked.cursor() as cur:
+            cur = tracked.cursor()
+            try:
                 cur.execute(f"SELECT data_str FROM {collide_tbl} WHERE id = 99;")
                 row = cur.fetchone()
                 self.assertIsNotNone(row)
                 self.assertEqual(row[0], "KEEP_SAFE")
                 cur.execute(f"DROP TABLE IF EXISTS {collide_tbl};")
                 tracked.commit()
+            finally:
+                cur.close()
             tracked.assert_zero_leaked("Zero leaks after collision test")
         finally:
-            with tracked.cursor() as cur:
+            cur = tracked.cursor()
+            try:
                 cur.execute(f"DROP VIEW IF EXISTS {view_name};")
                 cur.execute(f"DROP TABLE IF EXISTS {backing_tbl};")
                 cur.execute(f"DROP TABLE IF EXISTS {base_tbl};")
                 tracked.commit()
+            finally:
+                cur.close()
             tracked.close()
 
     def test_native_postgres_zero_leaks(self) -> None:
@@ -618,13 +661,16 @@ class TestNativeEngineManagerSafety(unittest.TestCase):
         view_name = f"{prefix}mv_items"
         backing_tbl = f"{manager.object_prefix}store_{view_name}"
 
-        with tracked.cursor() as cur:
+        cur = tracked.cursor()
+        try:
             cur.execute(f"DROP VIEW IF EXISTS {view_name} CASCADE;")
             cur.execute(f"DROP TABLE IF EXISTS {backing_tbl} CASCADE;")
             cur.execute(f"DROP TABLE IF EXISTS {base_tbl} CASCADE;")
             cur.execute(f"CREATE TABLE {base_tbl} (id INT PRIMARY KEY, grp TEXT, val INT);")
             cur.execute(f"INSERT INTO {base_tbl} VALUES (1, 'x', 10), (2, 'x', 20);")
             tracked.commit()
+        finally:
+            cur.close()
         tracked.reset_tracking()
 
         try:
@@ -647,11 +693,14 @@ class TestNativeEngineManagerSafety(unittest.TestCase):
             manager.drop_view(view_name)
             tracked.assert_zero_leaked("Native PostgreSQL drop_view must not leak cursors")
         finally:
-            with tracked.cursor() as cur:
+            cur = tracked.cursor()
+            try:
                 cur.execute(f"DROP VIEW IF EXISTS {view_name} CASCADE;")
                 cur.execute(f"DROP TABLE IF EXISTS {backing_tbl} CASCADE;")
                 cur.execute(f"DROP TABLE IF EXISTS {base_tbl} CASCADE;")
                 tracked.commit()
+            finally:
+                cur.close()
             tracked.close()
 
 
