@@ -79,40 +79,103 @@ def main() -> None:
         ).fetchall()
         assert after_write == [(1, 10), (2, 20), (3, 30), (4, 40)], after_write
         conn.commit()
-        # A failure partway through dropping the old generation must roll
-        # back the already-dropped trigger and leave the same connection usable.
-        original_drop = manager.drop_view
+        # Exercise the earlier failure boundary too: fail only after drop_view
+        # has removed the reader/backing objects but before it deletes the
+        # catalog row. The whole DDL sequence must roll back on the same
+        # connection, and that connection must remain usable afterwards.
+        raw_conn = conn
+        executed = []
+        injected = {"fail": True}
 
-        def fail_mid_drop(view_name, _commit_transaction=True):
-            conn.execute(f"DROP TRIGGER IF EXISTS {original_catalog['trigger_names'][0]};")
-            raise RuntimeError("injected mid-drop failure")
+        class CursorProxy:
+            def __init__(self, cursor):
+                self._cursor = cursor
 
-        manager.drop_view = fail_mid_drop
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                normalized = " ".join(sql.upper().split())
+                if (
+                    injected["fail"]
+                    and normalized.startswith(
+                        f"DELETE FROM {manager.catalog_table.upper()}"
+                    )
+                ):
+                    assert any(
+                        item.upper().startswith(
+                            f"DROP VIEW IF EXISTS {plan.view_name.upper()}"
+                        )
+                        for item in executed
+                    ), executed
+                    injected["fail"] = False
+                    raise sqlite3.OperationalError(
+                        "injected failure after reader/backing drop"
+                    )
+                if params is None:
+                    return self._cursor.execute(statement)
+                return self._cursor.execute(statement, params)
+
+            def __getattr__(self, name):
+                return getattr(self._cursor, name)
+
+        class ConnectionProxy:
+            def cursor(self, *args, **kwargs):
+                return CursorProxy(raw_conn.cursor(*args, **kwargs))
+
+            def __getattr__(self, name):
+                return getattr(raw_conn, name)
+
+        manager.conn = ConnectionProxy()
         try:
-            try:
-                manager.register_view(view_sql, force_rebuild=True)
-            except RuntimeError as exc:
-                assert "injected mid-drop failure" in str(exc)
-            else:
-                raise AssertionError("mid-drop failure was not injected")
+            manager.register_view(view_sql, force_rebuild=True)
+        except sqlite3.OperationalError as exc:
+            assert "injected failure after reader/backing drop" in str(exc), exc
+        else:
+            raise AssertionError("drop-stage replacement unexpectedly succeeded")
         finally:
-            manager.drop_view = original_drop
+            manager.conn = raw_conn
 
-        assert conn.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?;",
-            (original_catalog["trigger_names"][0],),
-        ).fetchone()[0] == 1
-        assert conn.execute(
+        assert not injected["fail"], "fault injection did not reach catalog cleanup"
+        restored_rows = raw_conn.execute(
             "SELECT id, value FROM replacement_reader ORDER BY id;"
-        ).fetchall() == after_write
-        assert manager.get_catalog()[plan.view_name]["signature_hash"] == original_catalog["signature_hash"]
-        conn.execute("INSERT INTO replacement_rows VALUES (5, 50);")
-        conn.commit()
-        assert conn.execute(
+        ).fetchall()
+        assert restored_rows == [(1, 10), (2, 20), (3, 30), (4, 40)], restored_rows
+        restored_catalog = manager.get_catalog()[plan.view_name]
+        assert restored_catalog["signature_hash"] == original_catalog["signature_hash"]
+
+        # A restored reader/catalog entry is insufficient if its physical
+        # generation is missing. Check the backing and every auxiliary table.
+        physical_tables = {
+            row[0]
+            for row in raw_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        }
+        assert plan.backing_table_name in physical_tables, (
+            f"backing table {plan.backing_table_name} was not restored"
+        )
+        for auxiliary_name in plan.auxiliary_table_names:
+            assert auxiliary_name in physical_tables, (
+                f"auxiliary table {auxiliary_name} was not restored"
+            )
+
+        for trigger_name in original_catalog["trigger_names"]:
+            found = raw_conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?;",
+                (trigger_name,),
+            ).fetchone()[0]
+            assert found == 1, f"old maintenance trigger {trigger_name} was not restored"
+
+        # Prove the failed DDL transaction did not poison the connection.
+        raw_conn.execute("BEGIN;")
+        raw_conn.execute("INSERT INTO replacement_rows VALUES (5, 50);")
+        raw_conn.commit()
+        after_recovery = raw_conn.execute(
             "SELECT id, value FROM replacement_reader ORDER BY id;"
-        ).fetchall() == [
+        ).fetchall()
+        assert after_recovery == [
             (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
-        ]
+        ], after_recovery
 
         # Caller-owned transactions are rejected before schema/catalog reads or
         # DDL; registration must never commit unrelated caller work.
