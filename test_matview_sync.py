@@ -4539,6 +4539,83 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             self.assertNotIn("NOT IN", tr_ddl.upper())
             self.assertIn("NOT EXISTS", tr_ddl.upper())
 
+    def test_postgres_nested_case_result_types_follow_native_common_type(self) -> None:
+        schema = """
+        CREATE TABLE case_types (
+            id INTEGER PRIMARY KEY,
+            qty INTEGER,
+            wide_qty BIGINT,
+            exact_qty NUMERIC(18, 4)
+        );
+        """
+        schemas = parse_table_schema(schema)
+        view = parse_view_definition(
+            """
+            CREATE VIEW case_results AS
+            SELECT
+                (CASE WHEN qty IS NULL THEN 1
+                      ELSE (CASE WHEN qty IS NULL THEN 4 ELSE qty END)
+                 END) AS integer_case,
+                (CASE WHEN wide_qty IS NULL THEN 1 ELSE wide_qty END) AS bigint_case,
+                (CASE WHEN exact_qty IS NULL THEN 1 ELSE exact_qty END) AS numeric_case
+            FROM case_types;
+            """,
+            known_tables={name.lower() for name in schemas},
+        )
+        compiler = IncrementalViewCompiler(schemas, view, dialect=Dialect.POSTGRES)
+        inferred = {
+            item.alias: compiler._infer_expr_storage_type(item)
+            for item in compiler.view.select_items
+        }
+        self.assertEqual(inferred["integer_case"], "INTEGER")
+        self.assertEqual(inferred["bigint_case"], "BIGINT")
+        self.assertEqual(inferred["numeric_case"], "NUMERIC")
+
+    def test_mysql_live_schema_introspection_preserves_decimal_avg_scale(self) -> None:
+        class FakeCursor:
+            def __init__(self) -> None:
+                self.sql = ""
+
+            def execute(self, sql: str) -> None:
+                self.sql = sql
+
+            def fetchall(self) -> list[tuple[Any, ...]]:
+                if "referential_constraints" in self.sql:
+                    return []
+                if "information_schema.columns" in self.sql:
+                    return [
+                        ("decimal_events", "id", "bigint", "NO", "PRI", "bigint"),
+                        ("decimal_events", "tenant", "int", "NO", "", "int"),
+                        ("decimal_events", "amount", "decimal", "NO", "", "decimal(20,12)"),
+                    ]
+                return []
+
+        class FakeConnection:
+            def cursor(self) -> FakeCursor:
+                return FakeCursor()
+
+        schemas = introspect_database_schemas(FakeConnection(), dialect=Dialect.MYSQL)
+        amount_type = schemas["decimal_events"].columns["amount"].data_type
+        self.assertEqual(amount_type, "DECIMAL(20,12)")
+
+        view = parse_view_definition(
+            """
+            CREATE VIEW decimal_avg AS
+            SELECT e.tenant, AVG(e.amount) AS avg_amount
+            FROM decimal_events e
+            GROUP BY e.tenant;
+            """,
+            known_tables={name.lower() for name in schemas},
+        )
+        compiler = IncrementalViewCompiler(
+            schemas, view, dialect=Dialect.MYSQL, ignore_limitations=True
+        )
+        avg_item = next(
+            item for item in compiler.view.select_items if item.alias == "avg_amount"
+        )
+        self.assertEqual(compiler._exact_numeric_precision_scale("e.amount"), (20, 12))
+        self.assertEqual(compiler._infer_expr_storage_type(avg_item), "DECIMAL(24, 16)")
+
     def test_11_independent_code_reviews_urgent_fixes(self) -> None:
         """
         Verifies all 11 urgent correctness, precision, concurrency, and robustness fixes
