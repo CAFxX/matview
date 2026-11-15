@@ -4062,11 +4062,30 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 self.fail("unknown transaction state must be rejected")
         self.assertEqual(unknown_conn.cursor_calls, 0)
 
+        # An idle connection in autocommit mode still cannot provide the
+        # rollback semantics promised by this context manager.
+        autocommit_conn = Connection(in_transaction=False, autocommit=True)
+        mgr = make_manager(autocommit_conn)
+        with self.assertRaisesRegex(RuntimeError, "autocommit to be disabled"):
+            with mgr.bulk_changes():
+                self.fail("autocommit connection must be rejected")
+        self.assertEqual(autocommit_conn.cursor_calls, 0)
+
         # The server-status bit is a bitmask, not a truthy/falsy transaction
         # flag: unrelated status bits must not be mistaken for an open tx.
         idle_conn = Connection(server_status=0x0002)
         idle_mgr = make_manager(idle_conn)
         self.assertIs(idle_mgr._mysql_transaction_state(), False)
+        self.assertIs(idle_mgr._mysql_autocommit_state(), None)
+
+        class GetterConnection:
+            in_transaction = False
+
+            def get_autocommit(self) -> bool:
+                return False
+
+        getter_mgr = make_manager(GetterConnection())
+        self.assertIs(getter_mgr._mysql_autocommit_state(), False)
 
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
