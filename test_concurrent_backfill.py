@@ -440,7 +440,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 "concurrent DML workers deadlocked or exceeded the timeout",
             )
             self.assertEqual(errors, [], f"concurrent writer errors: {errors!r}")
-            self.assertEqual(completed, list(range(worker_count)))
+            self.assertEqual(sorted(completed), list(range(worker_count)))
 
             actual = conn.execute(
                 f"SELECT bucket, row_count, valued_count, total_amount "
