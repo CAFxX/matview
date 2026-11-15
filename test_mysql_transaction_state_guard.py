@@ -79,6 +79,49 @@ class MySQLTransactionStateGuardTests(unittest.TestCase):
                 engine_version="mysql:8.4",
             )
 
+    def test_sqlalchemy_facade_idle_but_underlying_mysql_driver_active_is_rejected(self):
+        class DriverConnection:
+            in_transaction = True
+
+        class PoolConnection:
+            def __init__(self):
+                self.driver_connection = DriverConnection()
+
+        class SQLAlchemyConnection:
+            in_transaction = False
+
+            def __init__(self):
+                self.connection = PoolConnection()
+                self.cursor_calls = 0
+
+            def cursor(self):
+                self.cursor_calls += 1
+                raise AssertionError("constructor must reject before SQL access")
+
+        connection = SQLAlchemyConnection()
+        with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
+            MaterializedViewManager(connection, engine_version="mysql:8.4")
+        self.assertEqual(connection.cursor_calls, 0)
+
+    def test_sqlalchemy_facade_idle_but_underlying_mysql_server_status_active_is_rejected(self):
+        class DriverConnection:
+            _server_status = 0x0001
+
+        class SQLAlchemyConnection:
+            in_transaction = False
+
+            def __init__(self):
+                self.connection = DriverConnection()
+
+            def cursor(self):
+                raise AssertionError("constructor must reject before SQL access")
+
+        with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
+            MaterializedViewManager(
+                SQLAlchemyConnection(),
+                engine_version="mysql:8.4",
+            )
+
     def test_explicit_mysql_engine_version_accepts_idle_generic_wrapper(self):
         class GenericConnectionWrapper:
             in_transaction = False
