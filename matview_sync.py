@@ -10334,7 +10334,10 @@ class MaterializedViewManager:
         """Return MySQL autocommit mode across facade and wrapped driver layers."""
         observed = []
         for candidate in self._connection_wrapper_chain():
-            getter = getattr(candidate, "get_autocommit", None)
+            try:
+                getter = getattr(candidate, "get_autocommit", None)
+            except Exception:
+                getter = None
             if callable(getter):
                 try:
                     value = getter()
@@ -10393,12 +10396,12 @@ class MaterializedViewManager:
                 observed_autocommit = True
                 if autocommit is not False:
                     raise RuntimeError(
-                        "PostgreSQL manager initialization requires autocommit=False "
+                        "bulk_changes() on PostgreSQL requires autocommit=False "
                         "to preserve transactional DDL atomicity"
                     )
         if not observed_autocommit:
             raise RuntimeError(
-                "PostgreSQL manager initialization requires an adapter that exposes "
+                "bulk_changes() on PostgreSQL requires an adapter that exposes "
                 "autocommit state; cannot safely guarantee transactional DDL"
             )
 
@@ -10414,7 +10417,7 @@ class MaterializedViewManager:
                 observed_transaction_state = True
                 if state:
                     raise RuntimeError(
-                        "PostgreSQL manager initialization cannot run inside an active caller "
+                        "bulk_changes() on PostgreSQL cannot run inside an active caller "
                         "transaction; commit or roll back that transaction first"
                     )
                 continue
@@ -10439,19 +10442,19 @@ class MaterializedViewManager:
                     state = False
                 else:
                     raise RuntimeError(
-                        "PostgreSQL manager initialization could not interpret "
+                        "bulk_changes() on PostgreSQL could not interpret "
                         "the connection transaction state"
                     )
             observed_transaction_state = True
             if state:
                 raise RuntimeError(
-                    "PostgreSQL manager initialization cannot run inside an active caller "
+                    "bulk_changes() on PostgreSQL cannot run inside an active caller "
                     "transaction; commit or roll back that transaction first"
                 )
 
         if not observed_transaction_state:
             raise RuntimeError(
-                "PostgreSQL manager initialization requires an adapter that exposes "
+                "bulk_changes() on PostgreSQL requires an adapter that exposes "
                 "transaction state; cannot safely determine whether a caller transaction "
                 "would be committed"
             )
