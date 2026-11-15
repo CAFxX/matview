@@ -257,6 +257,9 @@ jobs:
       - name: Test modular matview package and immutable IR compilation
         run: python3 test_p1_modular_package.py
 
+      - name: Verify CI matrix definitions and engine verification
+        run: python3 test_p2_ci_matrix_verification.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
@@ -270,20 +273,23 @@ jobs:
           - label: "APSW SQLite"
             engine: "apsw"
             pip-pkg: "apsw"
+            python-version: "3.12"
           - label: "SQLCipher 4"
             engine: "sqlcipher"
             pip-pkg: "sqlcipher3-binary"
+            python-version: "3.12"
           - label: "Turso libSQL"
             engine: "libsql"
             pip-pkg: "libsql-experimental"
+            python-version: "3.12"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install Python dependencies and SQLite driver
         env:
@@ -394,6 +400,11 @@ jobs:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_p1_manager_safety.py
 
+      - name: Test native PostgreSQL codegen execution
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+        run: python3 test_p1_engine_codegen.py
+
       - name: Test PostgreSQL statement transition-table vectorization
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
@@ -494,6 +505,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_p1_sqlalchemy_integration.py
+
+      - name: Test native MySQL codegen execution
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_p1_engine_codegen.py
   # Representative LTS boundaries for MariaDB: oldest, previous, newest LTS.
   mysql-compat:
     needs: classify
@@ -599,6 +615,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_p1_sqlalchemy_integration.py
+
+      - name: Test native MariaDB codegen execution
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_p1_engine_codegen.py
   # Stable branch-protection check. Only the required PR gate is aggregated;
   # scheduled/deferred compatibility jobs live in the separate workflow.
   ci-success:
