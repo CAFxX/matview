@@ -10213,7 +10213,8 @@ class MaterializedViewManager:
         cursor = connection.cursor()
         try:
             cursor.execute("PRAGMA recursive_triggers = ON;")
-            row = cursor.execute("PRAGMA recursive_triggers;").fetchone()
+            cursor.execute("PRAGMA recursive_triggers;")
+            row = cursor.fetchone()
             if row is None or int(row[0]) != 1:
                 raise RuntimeError(
                     "SQLite recursive_triggers could not be enabled on this connection; "
