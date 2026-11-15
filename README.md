@@ -301,3 +301,9 @@ The CI workflow runs a broader engine/version matrix and a dedicated high-intens
 ## Roadmap
 
 See [`TODO.md`](TODO.md) for planned work, completed items, and known follow-ups.
+
+## SQLite writer connections
+
+For SQLite, call `MaterializedViewManager.configure_sqlite_connection(connection)` on **every connection that can write to a source table**. The helper enables and verifies the connection-local `PRAGMA recursive_triggers = ON` setting and returns the same connection, so it can be used in a connection-pool initialization hook. The manager configures its own connection automatically, but SQLite does not share this setting with other connections to the same database.
+
+This is required when using `INSERT OR REPLACE` / `REPLACE INTO`: SQLite fires the DELETE triggers for rows implicitly removed by REPLACE only when recursive triggers are enabled on the connection executing the statement. A writer that skips initialization can bypass materialized-view DELETE maintenance. When update semantics are intended, prefer explicit `INSERT ... ON CONFLICT (...) DO UPDATE SET ...` instead of REPLACE.
