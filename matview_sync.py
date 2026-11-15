@@ -10198,6 +10198,7 @@ class MaterializedViewManager:
 
         self._ensure_catalog()
 
+    @staticmethod
     def configure_sqlite_connection(connection: Any) -> Any:
         """Enable and verify SQLite settings required by matview maintenance triggers.
 
@@ -10230,7 +10231,7 @@ class MaterializedViewManager:
         if self.dialect == Dialect.SQLITE:
             self.configure_sqlite_connection(self.conn)
         cur = self.conn.cursor()
-        elif self.dialect == Dialect.MYSQL:
+        if self.dialect == Dialect.MYSQL:
             try:
                 cur.execute("SET SESSION collation_connection = @@collation_database;")
             except Exception:
