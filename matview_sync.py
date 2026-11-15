@@ -41,6 +41,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Union,
 )
 
 import sqlglot
@@ -853,14 +854,55 @@ def _is_word_or_ident_token(tk: Any) -> bool:
     return bool(tk.text and (tk.text[0].isalpha() or tk.text[0] == "_"))
 
 
-def _sqlglot_dialect(dialect: Dialect = Dialect.SQLITE) -> str:
-    return {
-        Dialect.SQLITE: "sqlite",
-        Dialect.POSTGRES: "postgres",
-        Dialect.MYSQL: "mysql",
-    }.get(dialect, "sqlite")
+try:
+    from sqlglot.dialects.mysql import MySQL as _SQLGlotMySQL
+    from sqlglot.dialects.dialect import Dialect as _SQLGlotDialectBase
 
-def _tokenize_sql(sql: str, read: str = "sqlite") -> List[Any]:
+    class _MySQLDialect(_SQLGlotMySQL):
+        class Tokenizer(_SQLGlotMySQL.Tokenizer):
+            IDENTIFIERS = ["`", '"']
+            QUOTES = ["'"]
+
+    _SQLGlotDialectBase.classes["mysql"] = _MySQLDialect
+    _SQLGlotDialectBase.classes["mariadb"] = _MySQLDialect
+except Exception:
+    pass
+
+
+def _sqlglot_dialect(
+    dialect: Union[Dialect, EngineSubdialect, EngineVersion, str, None] = Dialect.SQLITE,
+) -> str:
+    if dialect is None:
+        return "sqlite"
+    if isinstance(dialect, EngineVersion):
+        dialect = dialect.subdialect
+    if isinstance(dialect, (Dialect, EngineSubdialect)):
+        dialect_val = dialect.value
+    elif isinstance(dialect, str):
+        dialect_val = dialect.lower().strip()
+    else:
+        dialect_val = str(dialect).lower().strip()
+
+    if dialect_val in ("postgres", "postgresql", "pgsql"):
+        return "postgres"
+    if dialect_val in ("mysql", "mariadb"):
+        # Note: sqlglot parses MariaDB using its 'mysql' dialect.
+        try:
+            from sqlglot import Dialects
+            if "mariadb" in Dialects.__members__:
+                return "mariadb"
+        except Exception:
+            pass
+        return "mysql"
+    if dialect_val == "sqlite":
+        return "sqlite"
+    return dialect_val
+
+
+def _tokenize_sql(
+    sql: str,
+    read: Union[str, Dialect, EngineSubdialect, EngineVersion, None] = "sqlite",
+) -> List[Any]:
     """Tokenize SQL while preserving dollar-quoted strings and dialect quoting rules.
 
     SQLGlot's PostgreSQL lexer understands dollar-quoted strings but treats
@@ -868,6 +910,8 @@ def _tokenize_sql(sql: str, read: str = "sqlite") -> List[Any]:
     SQL segments with the requested dialect and represent each dollar-quoted
     literal as one synthetic token, preserving source offsets for the scanner.
     """
+    sg_read = _sqlglot_dialect(read)
+
     class _TokenSpan:
         __slots__ = ("token_type", "text", "start", "end")
 
@@ -886,7 +930,7 @@ def _tokenize_sql(sql: str, read: str = "sqlite") -> List[Any]:
         while i < n:
             ch = sql[i]
             if state == "single":
-                if read == "postgres" and ch == "\\":
+                if sg_read == "postgres" and ch == "\\":
                     i += 2
                     continue
                 if ch == "'":
@@ -977,14 +1021,14 @@ def _tokenize_sql(sql: str, read: str = "sqlite") -> List[Any]:
 
     spans = _dollar_spans()
     if not spans:
-        return sqlglot.tokenize(sql, read=read)
+        return sqlglot.tokenize(sql, read=sg_read)
 
     tokens: List[Any] = []
 
     def _append_segment(start: int, end: int) -> None:
         if start >= end:
             return
-        for token in sqlglot.tokenize(sql[start:end], read=read):
+        for token in sqlglot.tokenize(sql[start:end], read=sg_read):
             tokens.append(
                 _TokenSpan(
                     token.token_type,
@@ -1030,9 +1074,6 @@ class SQLToken:
     @property
     def unquoted(self) -> str:
         if self.kind == SQLTokenType.QUOTED_IDENT:
-            sg_toks = sqlglot.tokenize(self.text, read="sqlite")
-            if len(sg_toks) == 1 and sg_toks[0].token_type == SQLGlotTokenType.IDENTIFIER:
-                return sg_toks[0].text
             return _unquote_ident(self.text)
         return self.text
 
@@ -1062,13 +1103,16 @@ def parse_sql_ast(sql: str, dialect: Dialect = Dialect.SQLITE) -> sqlglot_exp.Ex
     return sqlglot.parse_one(sql, read=_sqlglot_dialect(dialect))
 
 
-def tokenize_sql(sql: str) -> List[SQLToken]:
+def tokenize_sql(
+    sql: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> List[SQLToken]:
     """
     Tokenizes a SQL fragment into lossless typed `SQLToken` nodes backed by `sqlglot.tokenize`.
     """
     if not sql:
         return []
-    sg_tokens = _tokenize_sql(sql)
+    sg_tokens = _tokenize_sql(sql, read=_sqlglot_dialect(dialect))
     tokens: List[SQLToken] = []
     cursor = 0
     n = len(sql)
@@ -1165,11 +1209,14 @@ def format_sql(
     return "\n".join(ln for ln in lines if ln or lines)
 
 
-def _strip_sql_comments(sql: str) -> str:
+def _strip_sql_comments(
+    sql: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> str:
     """Strips `-- ...` line comments and `/* ... */` block comments via `sqlglot.tokenize`."""
     if not sql:
         return ""
-    toks = _tokenize_sql(sql)
+    toks = _tokenize_sql(sql, read=_sqlglot_dialect(dialect))
     if not toks:
         return ""
     out: List[str] = []
@@ -1186,7 +1233,10 @@ def _strip_sql_comments(sql: str) -> str:
     return "".join(out).strip()
 
 
-def _unquote_ident(ident: str) -> str:
+def _unquote_ident(
+    ident: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> str:
     """Unquotes a SQL identifier or extracts the last component of a qualified name via `sqlglot.tokenize`."""
     s = ident.strip()
     if not s:
@@ -1196,7 +1246,7 @@ def _unquote_ident(ident: str) -> str:
         or (s.startswith("`") and s.endswith("`") and "`." not in s)
         or (s.startswith("[") and s.endswith("]") and "]." not in s)
     ):
-        parts = _split_top_level(s, ".")
+        parts = _split_top_level(s, ".", dialect=dialect)
         s = parts[-1].strip()
     if s.startswith('"') and s.endswith('"') and len(s) >= 2:
         return s[1:-1].replace('""', '"')
@@ -1212,11 +1262,15 @@ def _sanitize_ident(raw: str) -> str:
     return cleaned.strip("_") or "col"
 
 
-def _split_top_level(text: str, sep: str = ",") -> List[str]:
+def _split_top_level(
+    text: str,
+    sep: str = ",",
+    dialect: Dialect = Dialect.SQLITE,
+) -> List[str]:
     """Splits a SQL fragment at top-level separators outside parentheses and literals via `sqlglot.tokenize`."""
     if not text:
         return []
-    toks = _tokenize_sql(text)
+    toks = _tokenize_sql(text, read=_sqlglot_dialect(dialect))
     if not toks:
         return [text.strip()] if text.strip() else []
     parts: List[str] = []
@@ -1254,7 +1308,7 @@ def _find_top_level_token(
     dialect: Dialect = Dialect.SQLITE,
 ) -> Optional[Any]:
     """Finds the first top-level (depth == 0) `sqlglot` token matching `target_types`."""
-    toks = sqlglot.tokenize(sql, read=_sqlglot_dialect(dialect))
+    toks = _tokenize_sql(sql, read=_sqlglot_dialect(dialect))
     depth = 0
     target_set = set(target_types)
     for tk in toks:
@@ -1270,15 +1324,17 @@ def _find_top_level_token(
 def _extract_set_op_branches_from_ast(
     query_ast: sqlglot_exp.Expr,
     raw_sql: Optional[str] = None,
+    dialect: Dialect = Dialect.SQLITE,
 ) -> Tuple[List[str], List[str]]:
     """
     Traverses a `sqlglot.exp.SetOperation` AST (`Union`, `Intersect`, `Except`) in order,
     returning `(operators, branch_sqls)`. When `raw_sql` is provided, slices the verbatim
     branch substrings using `sqlglot.tokenize` so original function names and syntax are preserved.
     """
+    sg_d = _sqlglot_dialect(dialect)
     if raw_sql:
         s = raw_sql.strip()
-        toks = _tokenize_sql(s)
+        toks = _tokenize_sql(s, read=sg_d)
         if toks:
             ops_t: List[str] = []
             branches_t: List[str] = []
@@ -1325,27 +1381,33 @@ def _extract_set_op_branches_from_ast(
                 ops.append(node.key.upper())
             _walk(node.expression)
         else:
-            branches.append(node.sql("sqlite"))
+            branches.append(node.sql(sg_d))
 
     _walk(query_ast)
     return ops, branches
 
 
-def _has_subquery_ast(expr_or_sql: Optional[str | sqlglot_exp.Expr]) -> bool:
+def _has_subquery_ast(
+    expr_or_sql: Optional[str | sqlglot_exp.Expr],
+    dialect: Dialect = Dialect.SQLITE,
+) -> bool:
     """Returns True if the SQL expression or AST contains a `SELECT` or `EXISTS` subquery."""
     if not expr_or_sql:
         return False
-    node = parse_sql_ast(expr_or_sql) if isinstance(expr_or_sql, str) else expr_or_sql
+    node = parse_sql_ast(expr_or_sql, dialect=dialect) if isinstance(expr_or_sql, str) else expr_or_sql
     return bool(node.find(sqlglot_exp.Subquery, sqlglot_exp.Select, sqlglot_exp.Exists))
 
 
-def _is_simple_column_expr(expr_sql: str) -> bool:
+def _is_simple_column_expr(
+    expr_sql: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> bool:
     """Returns True if `expr_sql` parses as a single `sqlglot.exp.Column` (`col` or `tbl.col`)."""
     s = expr_sql.strip()
     if not s:
         return False
     try:
-        node = parse_sql_ast(s)
+        node = parse_sql_ast(s, dialect=dialect)
     except sqlglot.errors.SqlglotError:
         return False
     return isinstance(node, sqlglot_exp.Column) and not isinstance(node.this, sqlglot_exp.Star)
@@ -1411,17 +1473,19 @@ def _extract_sqlite_raw_declared_types(stmt_sql: str) -> Dict[str, str]:
 
 def parse_table_schema(
     schema_sql: str,
-    dialect: Optional[Dialect] = None,
+    dialect: Dialect = Dialect.SQLITE,
 ) -> Dict[str, TableSchema]:
     """Parses one or more CREATE TABLE statements into TableSchema objects via `sqlglot.parse`."""
-    clean = _strip_sql_comments(schema_sql)
+    eff_dialect = dialect if dialect is not None else Dialect.SQLITE
+    clean = _strip_sql_comments(schema_sql, dialect=eff_dialect)
+    sg_d = _sqlglot_dialect(eff_dialect)
     schemas: Dict[str, TableSchema] = {}
-    for raw_stmt in _split_top_level(clean, ";"):
+    for raw_stmt in _split_top_level(clean, ";", dialect=eff_dialect):
         raw_stmt_s = raw_stmt.strip()
         if not raw_stmt_s:
             continue
         try:
-            stmt_ast = parse_sql_ast(raw_stmt_s)
+            stmt_ast = parse_sql_ast(raw_stmt_s, dialect=eff_dialect)
         except sqlglot.errors.SqlglotError:
             continue
         if not isinstance(stmt_ast, sqlglot_exp.Create) or stmt_ast.kind.upper() != "TABLE":
@@ -1442,8 +1506,8 @@ def parse_table_schema(
         fk_cascades: List[str] = []
         has_on_conflict_replace = False
 
-        st_sql = stmt_ast.sql("sqlite")
-        st_toks = sqlglot.tokenize(st_sql, read="sqlite")
+        st_sql = stmt_ast.sql(sg_d)
+        st_toks = _tokenize_sql(st_sql, read=sg_d)
         for k_i in range(len(st_toks)):
             if (
                 k_i + 2 < len(st_toks)
@@ -1492,7 +1556,10 @@ def parse_table_schema(
                 col_name = expr_item.name
                 if not col_name:
                     continue
-                data_type = expr_item.kind.sql() if expr_item.kind is not None else "TEXT"
+                if expr_item.kind is not None:
+                    data_type = expr_item.kind.sql() if sg_d == "sqlite" else expr_item.kind.sql(sg_d)
+                else:
+                    data_type = "TEXT"
                 is_pk = any(
                     isinstance(c.kind, sqlglot_exp.PrimaryKeyColumnConstraint)
                     for c in expr_item.constraints
@@ -1861,10 +1928,14 @@ _FN_TO_AGG_ENUM: Dict[str, AggFunc] = {
 }
 
 
-def _unwrap_outer_parens(sql: str) -> str:
+def _unwrap_outer_parens(
+    sql: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> str:
     s = sql.strip()
+    sg_d = _sqlglot_dialect(dialect)
     while s.startswith("(") and s.endswith(")"):
-        toks = sqlglot.tokenize(s, read="sqlite")
+        toks = _tokenize_sql(s, read=sg_d)
         if not toks or toks[0].token_type != SQLGlotTokenType.L_PAREN:
             break
         depth = 0
@@ -1884,13 +1955,17 @@ def _unwrap_outer_parens(sql: str) -> str:
     return s
 
 
-def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
+def _parse_single_agg_expr(
+    expr: str,
+    alias: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> Optional[SelectItem]:
     """Parses a single top-level aggregate function call using `sqlglot.parse_one` and `sqlglot.tokenize`."""
-    s = _unwrap_outer_parens(expr)
+    s = _unwrap_outer_parens(expr, dialect=dialect)
     if not s:
         return None
     try:
-        ast_node = parse_sql_ast(s)
+        ast_node = parse_sql_ast(s, dialect=dialect)
     except sqlglot.errors.SqlglotError:
         return None
 
@@ -1901,7 +1976,8 @@ def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
     if not isinstance(agg_node, (sqlglot_exp.AggFunc, sqlglot_exp.Func)):
         return None
 
-    toks = sqlglot.tokenize(s, read="sqlite")
+    sg_d = _sqlglot_dialect(dialect)
+    toks = _tokenize_sql(s, read=sg_d)
     if len(toks) < 3 or not toks[0].text or not (toks[0].text[0].isalpha() or toks[0].text[0] == "_") or toks[1].token_type != SQLGlotTokenType.L_PAREN:
         return None
 
@@ -1944,7 +2020,7 @@ def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
         filter_where = s[toks[close_idx + 3].end + 1 : toks[-1].start].strip()
         if not filter_where:
             return None
-        fw_toks = sqlglot.tokenize(filter_where, read="sqlite")
+        fw_toks = _tokenize_sql(filter_where, read=sg_d)
         fw_d = 0
         for ftk in fw_toks:
             if ftk.token_type == SQLGlotTokenType.L_PAREN:
@@ -1958,7 +2034,7 @@ def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
 
     fn_raw = toks[0].text.upper()
     inner_args_sql = s[toks[1].end + 1 : toks[close_idx].start].strip()
-    in_toks = sqlglot.tokenize(inner_args_sql, read="sqlite")
+    in_toks = _tokenize_sql(inner_args_sql, read=sg_d)
     is_dist = bool(agg_node.args.get("distinct")) or isinstance(agg_node.this, sqlglot_exp.Distinct)
     if in_toks and in_toks[0].token_type == SQLGlotTokenType.DISTINCT:
         is_dist = True
@@ -1967,13 +2043,13 @@ def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
         is_dist = False
         inner_args_sql = inner_args_sql[in_toks[0].end + 1 :].strip()
 
-    arg_parts = [p.strip() for p in _split_top_level(inner_args_sql, ",") if p.strip()] if inner_args_sql else []
+    arg_parts = [p.strip() for p in _split_top_level(inner_args_sql, ",", dialect=dialect) if p.strip()] if inner_args_sql else []
     first_arg = arg_parts[0] if arg_parts else ""
     extra_args = ", ".join(arg_parts[1:]) if len(arg_parts) > 1 else None
     src_col: Optional[str] = None
     if first_arg and first_arg != "*":
         try:
-            first_node = parse_sql_ast(first_arg)
+            first_node = parse_sql_ast(first_arg, dialect=dialect)
             if isinstance(first_node, sqlglot_exp.Column) and not isinstance(first_node.this, sqlglot_exp.Star):
                 src_col = first_node.name
         except sqlglot.errors.SqlglotError:
@@ -2017,10 +2093,13 @@ def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
     )
 
 
-def _contains_aggregate_call(expr: str) -> bool:
+def _contains_aggregate_call(
+    expr: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> bool:
     """Checks via `sqlglot.parse_one` whether `expr` contains an aggregate function call (excluding window functions and subqueries)."""
     try:
-        ast_node = parse_sql_ast(expr)
+        ast_node = parse_sql_ast(expr, dialect=dialect)
     except sqlglot.errors.SqlglotError:
         return False
     if ast_node.find(sqlglot_exp.Window) or ast_node.find(sqlglot_exp.Subquery, sqlglot_exp.Select):
@@ -2033,25 +2112,30 @@ def _contains_aggregate_call(expr: str) -> bool:
     return False
 
 
-def _parse_select_item(raw_item: str, idx: int) -> SelectItem:
+def _parse_select_item(
+    raw_item: str,
+    idx: int,
+    dialect: Dialect = Dialect.SQLITE,
+) -> SelectItem:
     """Parses a single `SELECT` projection item via `sqlglot.parse_one`."""
     s = raw_item.strip()
+    sg_d = _sqlglot_dialect(dialect)
     try:
-        sel_ast = sqlglot.parse_one(f"SELECT {s}", read="sqlite")
-        proj_ast = sel_ast.expressions[0] if isinstance(sel_ast, sqlglot_exp.Select) and sel_ast.expressions else parse_sql_ast(s)
+        sel_ast = sqlglot.parse_one(f"SELECT {s}", read=sg_d)
+        proj_ast = sel_ast.expressions[0] if isinstance(sel_ast, sqlglot_exp.Select) and sel_ast.expressions else parse_sql_ast(s, dialect=dialect)
     except sqlglot.errors.SqlglotError:
         proj_ast = sqlglot_exp.Expr()
 
     if isinstance(proj_ast, sqlglot_exp.Alias):
         alias = proj_ast.alias
         inner_node = proj_ast.this
-        toks = sqlglot.tokenize(s, read="sqlite")
+        toks = _tokenize_sql(s, read=sg_d)
         if len(toks) >= 2 and toks[-2].token_type == SQLGlotTokenType.ALIAS:
             expr = s[: toks[-2].start].strip()
         elif len(toks) >= 2:
             expr = s[: toks[-1].start].strip()
         else:
-            expr = inner_node.sql().strip() if isinstance(inner_node, sqlglot_exp.Expr) else str(inner_node or "").strip()
+            expr = inner_node.sql(sg_d).strip() if isinstance(inner_node, sqlglot_exp.Expr) else str(inner_node or "").strip()
     else:
         inner_node = proj_ast
         expr = s
@@ -2060,11 +2144,11 @@ def _parse_select_item(raw_item: str, idx: int) -> SelectItem:
         else:
             alias = f"col_{idx}"
 
-    parsed_agg = _parse_single_agg_expr(expr, alias)
+    parsed_agg = _parse_single_agg_expr(expr, alias, dialect=dialect)
     if parsed_agg is not None:
         return parsed_agg
 
-    if _contains_aggregate_call(expr):
+    if _contains_aggregate_call(expr, dialect=dialect):
         return SelectItem(
             raw_expr=expr,
             alias=alias,
@@ -2086,10 +2170,14 @@ def _parse_select_item(raw_item: str, idx: int) -> SelectItem:
     )
 
 
-def _extract_verbatim_cte_or_subquery_sql(raw_select_sql: str, has_cte: bool) -> Optional[str]:
+def _extract_verbatim_cte_or_subquery_sql(
+    raw_select_sql: str,
+    has_cte: bool,
+    dialect: Dialect = Dialect.SQLITE,
+) -> Optional[str]:
     """Slices the verbatim inner query of a single CTE (`WITH x AS (...)`) or `FROM (...)` subquery via `sqlglot.tokenize`."""
     s = raw_select_sql.strip()
-    toks = _tokenize_sql(s)
+    toks = _tokenize_sql(s, read=_sqlglot_dialect(dialect))
     if not toks:
         return None
     if has_cte:
@@ -2132,18 +2220,22 @@ def _extract_verbatim_cte_or_subquery_sql(raw_select_sql: str, has_cte: bool) ->
     return None
 
 
-def _extract_cte_names_and_strip_with(select_sql: str) -> Tuple[Set[str], str, bool]:
+def _extract_cte_names_and_strip_with(
+    select_sql: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> Tuple[Set[str], str, bool]:
     """Extracts CTE names and the main SELECT body from a query using `sqlglot.parse_one` AST and `sqlglot.tokenize`."""
     s = select_sql.strip()
+    sg_d = _sqlglot_dialect(dialect)
     try:
-        q_ast = parse_sql_ast(s)
+        q_ast = parse_sql_ast(s, dialect=dialect)
     except sqlglot.errors.SqlglotError:
         return set(), s, False
     with_node = q_ast.args.get("with_") or q_ast.args.get("with")
     if not isinstance(with_node, sqlglot_exp.With):
         return set(), s, False
     cte_names = {cte.alias for cte in with_node.expressions if isinstance(cte, sqlglot_exp.CTE) and cte.alias}
-    toks = sqlglot.tokenize(s, read="sqlite")
+    toks = _tokenize_sql(s, read=sg_d)
     depth = 0
     for tk in toks:
         if tk.token_type == SQLGlotTokenType.L_PAREN:
@@ -2157,16 +2249,21 @@ def _extract_cte_names_and_strip_with(select_sql: str) -> Tuple[Set[str], str, b
     no_with.set("with_", None)
     no_with.set("with", None)
     no_with.args.pop("_raw_sql", None)
-    main_select = no_with.sql("sqlite").strip()
+    main_select = no_with.sql(sg_d).strip()
     return cte_names, (main_select if main_select else s), True
 
 
-def _parse_from_and_joins(from_clause: str, cte_names: Set[str]) -> Tuple[List[JoinSpec], bool]:
+def _parse_from_and_joins(
+    from_clause: str,
+    cte_names: Set[str],
+    dialect: Dialect = Dialect.SQLITE,
+) -> Tuple[List[JoinSpec], bool]:
     """Parses a `FROM ... [JOIN ...]` clause into `JoinSpec` objects using `sqlglot.parse_one`."""
     s = from_clause.strip()
     if not s:
         return [], False
-    toks = sqlglot.tokenize(s, read="sqlite")
+    sg_d = _sqlglot_dialect(dialect)
+    toks = _tokenize_sql(s, read=sg_d)
     if not toks:
         return [], False
     if toks[0].token_type == SQLGlotTokenType.FROM:
@@ -2176,7 +2273,7 @@ def _parse_from_and_joins(from_clause: str, cte_names: Set[str]) -> Tuple[List[J
     if not s_body:
         return [], False
     try:
-        sel_ast = sqlglot.parse_one(f"SELECT * FROM {s_body}", read="sqlite")
+        sel_ast = sqlglot.parse_one(f"SELECT * FROM {s_body}", read=sg_d)
     except sqlglot.errors.SqlglotError:
         return [], False
     if not isinstance(sel_ast, sqlglot_exp.Select):
@@ -2187,8 +2284,8 @@ def _parse_from_and_joins(from_clause: str, cte_names: Set[str]) -> Tuple[List[J
     if not isinstance(from_node, sqlglot_exp.From):
         return [], False
 
-    # Also extract raw ON condition slices from `s_body` via `sqlglot.tokenize`
-    body_toks = sqlglot.tokenize(s_body, read="sqlite")
+    # Also extract raw ON condition slices from `s_body` via `_tokenize_sql`
+    body_toks = _tokenize_sql(s_body, read=sg_d)
     raw_on_slices: List[Optional[str]] = []
     b_depth = 0
     join_kw_words = {"INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "JOIN"}
@@ -2267,7 +2364,7 @@ def _parse_from_and_joins(from_clause: str, cte_names: Set[str]) -> Tuple[List[J
         if idx < len(raw_on_slices) and raw_on_slices[idx]:
             on_cond = raw_on_slices[idx]
         elif isinstance(on_expr, sqlglot_exp.Expr):
-            on_cond = on_expr.sql().strip()
+            on_cond = on_expr.sql(sg_d).strip()
         joins.append(
             JoinSpec(
                 join_type=j_type,
@@ -2284,6 +2381,7 @@ def _extract_all_referenced_tables(
     select_sql: str,
     cte_names: Set[str],
     known_tables: Optional[Set[str]] = None,
+    dialect: Dialect = Dialect.SQLITE,
 ) -> List[str]:
     """Extracts all referenced base tables across CTEs, FROM/JOIN clauses, set operations, and subqueries via `sqlglot` AST."""
     cte_lower = {c.lower() for c in cte_names}
@@ -2311,8 +2409,9 @@ def _extract_all_referenced_tables(
             seen_lower.add(c_low)
             found.append(cand)
 
+    sg_d = _sqlglot_dialect(dialect)
     try:
-        q_ast = parse_sql_ast(select_sql)
+        q_ast = parse_sql_ast(select_sql, dialect=dialect)
         for tbl_node in q_ast.find_all(sqlglot_exp.Table):
             id_node = tbl_node.this
             was_q = isinstance(id_node, sqlglot_exp.Identifier) and id_node.quoted
@@ -2321,7 +2420,7 @@ def _extract_all_referenced_tables(
         pass
 
     # Also scan token stream for any `FROM <ident>` / `JOIN <ident>` inside nested expressions
-    toks = sqlglot.tokenize(select_sql, read="sqlite")
+    toks = _tokenize_sql(select_sql, read=sg_d)
     for idx, tk in enumerate(toks):
         if tk.token_type in (SQLGlotTokenType.FROM, SQLGlotTokenType.JOIN) and idx + 1 < len(toks):
             nxt = toks[idx + 1]
@@ -2334,6 +2433,7 @@ def _extract_all_referenced_tables(
 def parse_view_index_spec(
     spec: ViewIndexSpec | str | Sequence[str] | Dict[str, Any],
     default_view_name: Optional[str] = None,
+    dialect: Dialect = Dialect.SQLITE,
 ) -> ViewIndexSpec:
     """Parses a user-defined index specification (`CREATE [UNIQUE] INDEX ...`, tuple/list, dict, or ViewIndexSpec) via `sqlglot` AST."""
     if isinstance(spec, ViewIndexSpec):
@@ -2376,32 +2476,33 @@ def parse_view_index_spec(
     if not isinstance(spec, str):
         raise ValueError(f"Unsupported index specification type: {type(spec).__name__}")
 
-    s = _strip_sql_comments(spec).strip().rstrip(";").strip()
+    s = _strip_sql_comments(spec, dialect=dialect).strip().rstrip(";").strip()
     if not s:
         raise ValueError(f"Empty index specification: {spec!r}")
 
-    toks = sqlglot.tokenize(s, read="sqlite")
+    sg_d = _sqlglot_dialect(dialect)
+    toks = _tokenize_sql(s, read=sg_d)
     if toks and toks[0].token_type == SQLGlotTokenType.CREATE:
-        idx_create = parse_sql_ast(s)
+        idx_create = parse_sql_ast(s, dialect=dialect)
         if isinstance(idx_create, sqlglot_exp.Create) and idx_create.kind.upper() == "INDEX":
             idx_node = idx_create.this
             params_node = idx_node.args.get("params") if isinstance(idx_node, sqlglot_exp.Index) else None
             if isinstance(idx_node, sqlglot_exp.Index) and isinstance(params_node, sqlglot_exp.IndexParameters):
-                cols = tuple(c.sql().strip() for c in params_node.columns if c.sql().strip())
+                cols = tuple(c.sql(sg_d).strip() for c in params_node.columns if c.sql(sg_d).strip())
                 if not cols:
                     raise ValueError(f"CREATE INDEX statement has no columns: {spec!r}")
                 tbl_node = idx_node.args.get("table")
                 target_v = tbl_node.name if isinstance(tbl_node, sqlglot_exp.Table) else default_view_name
                 where_node = params_node.args.get("where")
                 where_c: Optional[str] = None
-                where_tok_ci = _find_top_level_token(s, (SQLGlotTokenType.WHERE,))
+                where_tok_ci = _find_top_level_token(s, (SQLGlotTokenType.WHERE,), dialect=dialect)
                 if where_tok_ci is not None:
                     where_c = s[where_tok_ci.end + 1 :].strip()
                 elif isinstance(where_node, sqlglot_exp.Where) and where_node.this is not None:
-                    where_c = where_node.this.sql().strip()
+                    where_c = where_node.this.sql(sg_d).strip()
                 using_node = params_node.args.get("using")
                 using_m = (
-                    (using_node.name or using_node.sql().strip())
+                    (using_node.name or using_node.sql(sg_d).strip())
                     if isinstance(using_node, sqlglot_exp.Expr)
                     else (str(using_node) if using_node else None)
                 )
@@ -2421,7 +2522,7 @@ def parse_view_index_spec(
         s = s[toks[1].end + 1 :].strip()
 
     where_sh: Optional[str] = None
-    where_tok = _find_top_level_token(s, (SQLGlotTokenType.WHERE,))
+    where_tok = _find_top_level_token(s, (SQLGlotTokenType.WHERE,), dialect=dialect)
     if where_tok is not None:
         where_sh = s[where_tok.end + 1 :].strip()
         s = s[: where_tok.start].strip()
@@ -2429,7 +2530,7 @@ def parse_view_index_spec(
     if s.startswith("(") and s.endswith(")"):
         s = s[1:-1].strip()
 
-    cols_sh = tuple(c.strip() for c in _split_top_level(s, ",") if c.strip())
+    cols_sh = tuple(c.strip() for c in _split_top_level(s, ",", dialect=dialect) if c.strip())
     if not cols_sh:
         raise ValueError(f"Invalid index specification: {spec!r}")
     return ViewIndexSpec(
@@ -2449,14 +2550,14 @@ def parse_view_ast(
     Parses a `CREATE VIEW ... AS SELECT ...` or standalone `SELECT ...` query into
     a `SQLSelectAST` backed by `sqlglot.parse_one`.
     """
-    clean = _strip_sql_comments(view_or_select_sql).strip().rstrip(";").strip()
+    clean = _strip_sql_comments(view_or_select_sql, dialect=dialect).strip().rstrip(";").strip()
     sg_ast = parse_sql_ast(clean, dialect=dialect)
-    toks = sqlglot.tokenize(clean, read="sqlite")
+    toks = _tokenize_sql(clean, read=_sqlglot_dialect(dialect))
     if toks and toks[0].token_type == SQLGlotTokenType.CREATE:
-        vs = _parse_single_create_view_stmt(clean, known_tables=known_tables)
+        vs = _parse_single_create_view_stmt(clean, known_tables=known_tables, dialect=dialect)
     else:
-        vs = _parse_single_create_view_stmt(f"CREATE VIEW __mv_ast_tmp AS {clean}", known_tables=known_tables)
-    cte_names, main_sel, has_cte = _extract_cte_names_and_strip_with(vs.raw_select_sql)
+        vs = _parse_single_create_view_stmt(f"CREATE VIEW __mv_ast_tmp AS {clean}", known_tables=known_tables, dialect=dialect)
+    cte_names, main_sel, has_cte = _extract_cte_names_and_strip_with(vs.raw_select_sql, dialect=dialect)
     return SQLSelectAST(
         raw_sql=vs.raw_select_sql,
         cte_names=tuple(sorted(cte_names)),
@@ -2481,11 +2582,12 @@ def _parse_single_create_view_stmt(
     stmt_sql: str,
     known_tables: Optional[Set[str]] = None,
     extra_indexes: Sequence[ViewIndexSpec] = (),
+    dialect: Dialect = Dialect.SQLITE,
 ) -> ViewSpec:
     """Parses a single `CREATE VIEW ... AS SELECT ...` statement into a `ViewSpec` using `sqlglot.parse_one`."""
-    clean = _strip_sql_comments(stmt_sql).strip().rstrip(";").strip()
+    clean = _strip_sql_comments(stmt_sql, dialect=dialect).strip().rstrip(";").strip()
     try:
-        create_ast = parse_sql_ast(clean)
+        create_ast = parse_sql_ast(clean, dialect=dialect)
     except sqlglot.errors.SqlglotError as exc:
         raise ValueError(f"Invalid CREATE VIEW syntax: {stmt_sql!r}") from exc
 
@@ -2501,9 +2603,10 @@ def _parse_single_create_view_stmt(
     if not isinstance(query_ast, (sqlglot_exp.Select, sqlglot_exp.SetOperation)):
         raise ValueError(f"View body must start with SELECT or WITH: {stmt_sql!r}")
 
-    as_tok = _find_top_level_token(clean, (SQLGlotTokenType.ALIAS,))
-    raw_select = clean[as_tok.end + 1 :].strip() if as_tok is not None else query_ast.sql().strip()
-    cte_names, main_select_body, has_cte = _extract_cte_names_and_strip_with(raw_select)
+    sg_d = _sqlglot_dialect(dialect)
+    as_tok = _find_top_level_token(clean, (SQLGlotTokenType.ALIAS,), dialect=dialect)
+    raw_select = clean[as_tok.end + 1 :].strip() if as_tok is not None else query_ast.sql(sg_d).strip()
+    cte_names, main_select_body, has_cte = _extract_cte_names_and_strip_with(raw_select, dialect=dialect)
 
     has_window = bool(query_ast.find(sqlglot_exp.Window))
     has_compound = isinstance(query_ast, sqlglot_exp.SetOperation)
@@ -2527,12 +2630,12 @@ def _parse_single_create_view_stmt(
     has_top_distinct = bool(first_select.args.get("distinct"))
 
     if has_compound:
-        _, setop_branches = _extract_set_op_branches_from_ast(query_ast, main_select_body)
+        _, setop_branches = _extract_set_op_branches_from_ast(query_ast, main_select_body, dialect=dialect)
         first_branch_sql = setop_branches[0] if setop_branches else main_select_body
     else:
-        first_branch_sql = _unwrap_outer_parens(main_select_body)
+        first_branch_sql = _unwrap_outer_parens(main_select_body, dialect=dialect)
 
-    fb_toks = sqlglot.tokenize(first_branch_sql, read="sqlite")
+    fb_toks = _tokenize_sql(first_branch_sql, read=sg_d)
     fb_depth = 0
     sel_tok_i = -1
     from_tok_i = -1
@@ -2586,12 +2689,12 @@ def _parse_single_create_view_stmt(
         p_start_char = fb_toks[p_start_i].start if p_start_i < len(fb_toks) else len(first_branch_sql)
         p_end_char = fb_toks[min(clause_tok_positions)].start if clause_tok_positions else len(first_branch_sql)
         proj_list_sql = first_branch_sql[p_start_char:p_end_char].strip()
-        raw_proj_items = [p.strip() for p in _split_top_level(proj_list_sql, ",") if p.strip()]
+        raw_proj_items = [p.strip() for p in _split_top_level(proj_list_sql, ",", dialect=dialect) if p.strip()]
     else:
-        raw_proj_items = [proj.sql() for proj in first_select.expressions]
+        raw_proj_items = [proj.sql(sg_d) for proj in first_select.expressions]
 
     select_items = [
-        _parse_select_item(raw_p, idx)
+        _parse_select_item(raw_p, idx, dialect=dialect)
         for idx, raw_p in enumerate(raw_proj_items)
     ]
 
@@ -2599,12 +2702,12 @@ def _parse_single_create_view_stmt(
     where_raw = _slice_fb_clause(where_tok_i)
     where_clause = where_raw if where_raw else None
     group_raw = _slice_fb_clause(group_tok_i)
-    group_by_cols = [g.strip() for g in _split_top_level(group_raw, ",") if g.strip()] if group_raw else []
+    group_by_cols = [g.strip() for g in _split_top_level(group_raw, ",", dialect=dialect) if g.strip()] if group_raw else []
     having_raw = _slice_fb_clause(having_tok_i)
     having_clause = having_raw if having_raw else None
 
-    joins, has_subquery_in_from = _parse_from_and_joins(from_clause, cte_names)
-    ref_tables = _extract_all_referenced_tables(raw_select, cte_names, known_tables=known_tables)
+    joins, has_subquery_in_from = _parse_from_and_joins(from_clause, cte_names, dialect=dialect)
+    ref_tables = _extract_all_referenced_tables(raw_select, cte_names, known_tables=known_tables, dialect=dialect)
     cte_lower = {c.lower() for c in cte_names}
     if (
         not has_subquery_in_from
@@ -2643,6 +2746,7 @@ def parse_view_definitions(
     view_sql_or_list: Sequence[ViewSpec | str] | ViewSpec | str,
     known_tables: Optional[Set[str]] = None,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    dialect: Dialect = Dialect.SQLITE,
 ) -> List[ViewSpec]:
     """
     Parses one or more CREATE VIEW statements (and optional inline `CREATE [UNIQUE] INDEX`
@@ -2663,16 +2767,16 @@ def parse_view_definitions(
             for av in item.additional_views:
                 initial_specs.append(av)
             continue
-        clean = _strip_sql_comments(item).strip()
-        stmts = [st.strip() for st in _split_top_level(clean, ";") if st.strip()]
+        clean = _strip_sql_comments(item, dialect=dialect).strip()
+        stmts = [st.strip() for st in _split_top_level(clean, ";", dialect=dialect) if st.strip()]
         if not stmts:
             raise ValueError(f"Invalid CREATE VIEW syntax: {item!r}")
         for st in stmts:
-            st_ast = parse_sql_ast(st)
+            st_ast = parse_sql_ast(st, dialect=dialect)
             if isinstance(st_ast, sqlglot_exp.Create) and st_ast.kind.upper() == "VIEW":
-                initial_specs.append(_parse_single_create_view_stmt(st, known_tables=known_tables))
+                initial_specs.append(_parse_single_create_view_stmt(st, known_tables=known_tables, dialect=dialect))
             elif isinstance(st_ast, sqlglot_exp.Create) and st_ast.kind.upper() == "INDEX":
-                pending_index_specs.append(parse_view_index_spec(st))
+                pending_index_specs.append(parse_view_index_spec(st, dialect=dialect))
             else:
                 raise ValueError(f"Unsupported statement in view definition script: {st!r}")
 
@@ -2682,7 +2786,7 @@ def parse_view_definitions(
     if indexes:
         default_v = initial_specs[0].view_name if len(initial_specs) == 1 else None
         for raw_idx in indexes:
-            pending_index_specs.append(parse_view_index_spec(raw_idx, default_view_name=default_v))
+            pending_index_specs.append(parse_view_index_spec(raw_idx, default_view_name=default_v, dialect=dialect))
 
     if not pending_index_specs:
         return initial_specs
@@ -2714,7 +2818,7 @@ def parse_view_definitions(
             for i, vs in enumerate(initial_specs):
                 exposed_low = {it.alias.lower() for it in vs.select_items}
                 cols_low = {
-                    _unquote_ident(re.sub(r"\b(?:ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST)\b", "", c, flags=re.IGNORECASE).strip()).lower()
+                    _unquote_ident(re.sub(r"\b(?:ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST)\b", "", c, flags=re.IGNORECASE).strip(), dialect=dialect).lower()
                     for c in idx_spec.columns
                 }
                 if cols_low and cols_low.issubset(exposed_low):
@@ -2752,6 +2856,7 @@ def parse_view_definition(
     view_sql: str | ViewSpec,
     known_tables: Optional[Set[str]] = None,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    dialect: Dialect = Dialect.SQLITE,
 ) -> ViewSpec:
     """
     Parses a single-view or multi-view SQL script into a `ViewSpec`.
@@ -2759,7 +2864,7 @@ def parse_view_definition(
     carries the remaining views in `additional_views` so both `parse_view_definition`
     and `generate_materialized_view` handle multi-view `.sql` files seamlessly.
     """
-    specs = parse_view_definitions(view_sql, known_tables=known_tables, indexes=indexes)
+    specs = parse_view_definitions(view_sql, known_tables=known_tables, indexes=indexes, dialect=dialect)
     if len(specs) == 1:
         return specs[0]
     first = specs[0]
@@ -3098,12 +3203,13 @@ class IncrementalViewCompiler:
         outer_sql: Optional[str] = None
 
         try:
-            q_ast = parse_sql_ast(v.raw_select_sql)
+            q_ast = parse_sql_ast(v.raw_select_sql, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
             return v
         if not isinstance(q_ast, sqlglot_exp.Select):
             return v
 
+        sg_d = _sqlglot_dialect(self.dialect)
         if v.has_cte:
             with_node = q_ast.args.get("with_") or q_ast.args.get("with")
             if not isinstance(with_node, sqlglot_exp.With) or bool(with_node.args.get("recursive")) or len(with_node.expressions) != 1:
@@ -3114,9 +3220,9 @@ class IncrementalViewCompiler:
             cte_alias_node = cte_node.args.get("alias")
             if isinstance(cte_alias_node, sqlglot_exp.TableAlias) and cte_alias_node.columns:
                 return v
-            inner_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, True) or cte_node.this.sql("sqlite").strip()
+            inner_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, True, dialect=self.dialect) or cte_node.this.sql(sg_d).strip()
             cte_or_sub_alias = cte_node.alias
-            _, outer_sql, _ = _extract_cte_names_and_strip_with(v.raw_select_sql)
+            _, outer_sql, _ = _extract_cte_names_and_strip_with(v.raw_select_sql, dialect=self.dialect)
         elif v.has_subquery_in_from and len(v.joins) == 1:
             from_node = q_ast.args.get("from_") or q_ast.args.get("from")
             if not isinstance(from_node, sqlglot_exp.From) or not isinstance(from_node.this, sqlglot_exp.Subquery):
@@ -3124,7 +3230,7 @@ class IncrementalViewCompiler:
             sub_node = from_node.this
             if not isinstance(sub_node.this, sqlglot_exp.Expr):
                 return v
-            inner_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, False) or sub_node.this.sql("sqlite").strip()
+            inner_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, False, dialect=self.dialect) or sub_node.this.sql(sg_d).strip()
             cte_or_sub_alias = sub_node.alias or "__mv_sub"
             outer_sql = v.raw_select_sql
         else:
@@ -3133,7 +3239,7 @@ class IncrementalViewCompiler:
         if not inner_sql or not outer_sql:
             return v
         try:
-            inner_ast_check = parse_sql_ast(inner_sql)
+            inner_ast_check = parse_sql_ast(inner_sql, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
             return v
         if not isinstance(inner_ast_check, sqlglot_exp.Select) or any(
@@ -3145,6 +3251,7 @@ class IncrementalViewCompiler:
             inner_spec = _parse_single_create_view_stmt(
                 f"CREATE VIEW __inner_tmp AS {inner_sql}",
                 known_tables=set(self._schemas_lower.keys()),
+                dialect=self.dialect,
             )
         except Exception:
             return v
@@ -3195,7 +3302,7 @@ class IncrementalViewCompiler:
         def _subst(frag: Optional[str]) -> Optional[str]:
             if frag is None:
                 return None
-            toks = sqlglot.tokenize(frag, read="sqlite")
+            toks = _tokenize_sql(frag, read=sg_d)
             if not toks:
                 return frag
             out: List[str] = []
@@ -3245,7 +3352,7 @@ class IncrementalViewCompiler:
         new_items: List[SelectItem] = []
         for it in v.select_items:
             sub_raw = _subst(it.raw_expr) or it.raw_expr
-            parsed = _parse_select_item(f"{sub_raw} AS {it.alias}", 0)
+            parsed = _parse_select_item(f"{sub_raw} AS {it.alias}", 0, dialect=self.dialect)
             new_items.append(parsed)
 
         inner_w = None
@@ -3309,14 +3416,15 @@ class IncrementalViewCompiler:
         elem_counter = 0
 
         # Map canonical aggregate call string -> backing column alias
+        sg_d = _sqlglot_dialect(self.dialect)
         agg_call_to_alias: Dict[str, str] = {}
         for it in v.select_items:
             if it.is_aggregate and it.agg_func is not None:
-                agg_call_to_alias[" ".join(t.text.upper() for t in sqlglot.tokenize(it.raw_expr.strip(), read="sqlite"))] = it.alias
+                agg_call_to_alias[" ".join(t.text.upper() for t in _tokenize_sql(it.raw_expr.strip(), read=sg_d))] = it.alias
 
         def _extract_agg_calls_from_expr(expr_str: str) -> Tuple[str, bool]:
             nonlocal elem_counter
-            toks = sqlglot.tokenize(expr_str, read="sqlite")
+            toks = _tokenize_sql(expr_str, read=sg_d)
             if not toks:
                 return expr_str, True
             out_parts: List[str] = []
@@ -3363,13 +3471,13 @@ class IncrementalViewCompiler:
                             if f_rp != -1:
                                 end_tok_idx = f_rp
                         full_call = expr_str[tk.start : toks[end_tok_idx].end + 1]
-                        norm_key = " ".join(t.text.upper() for t in sqlglot.tokenize(full_call, read="sqlite"))
+                        norm_key = " ".join(t.text.upper() for t in _tokenize_sql(full_call, read=sg_d))
                         if norm_key in agg_call_to_alias:
                             col_al = agg_call_to_alias[norm_key]
                         else:
                             elem_counter += 1
                             col_al = f"__mv_elem_{elem_counter}"
-                            parsed_el = _parse_single_agg_expr(full_call, col_al)
+                            parsed_el = _parse_single_agg_expr(full_call, col_al, dialect=self.dialect)
                             if parsed_el is None:
                                 return expr_str, False
                             agg_call_to_alias[norm_key] = col_al
@@ -3479,7 +3587,7 @@ class IncrementalViewCompiler:
             or len(v.referenced_tables) != 1
         ):
             return False
-        if v.where_clause and _has_subquery_ast(v.where_clause):
+        if v.where_clause and _has_subquery_ast(v.where_clause, dialect=self.dialect):
             return False
 
         allowed_aggs = {
@@ -3501,7 +3609,7 @@ class IncrementalViewCompiler:
             AggFunc.BOOL_OR,
         }
         for it in self._working_select_items:
-            if _has_subquery_ast(it.raw_expr):
+            if _has_subquery_ast(it.raw_expr, dialect=self.dialect):
                 return False
             if it.is_aggregate:
                 if it.agg_func not in allowed_aggs:
@@ -3528,7 +3636,7 @@ class IncrementalViewCompiler:
             or len(v.joins) < 2
         ):
             return False
-        if v.where_clause and _has_subquery_ast(v.where_clause):
+        if v.where_clause and _has_subquery_ast(v.where_clause, dialect=self.dialect):
             return False
 
         # Only INNER JOIN and CROSS JOIN are algebraically linear
@@ -3558,7 +3666,7 @@ class IncrementalViewCompiler:
             AggFunc.BOOL_OR,
         }
         for it in self._working_select_items:
-            if _has_subquery_ast(it.raw_expr):
+            if _has_subquery_ast(it.raw_expr, dialect=self.dialect):
                 return False
             if it.is_aggregate:
                 if it.is_distinct or it.agg_func not in allowed_aggs:
@@ -3593,9 +3701,9 @@ class IncrementalViewCompiler:
             or len(v.referenced_tables) != 1
         ):
             return False
-        if v.where_clause and _has_subquery_ast(v.where_clause):
+        if v.where_clause and _has_subquery_ast(v.where_clause, dialect=self.dialect):
             return False
-        if any(it.raw_expr.strip() == "*" or _has_subquery_ast(it.raw_expr) for it in v.select_items):
+        if any(it.raw_expr.strip() == "*" or _has_subquery_ast(it.raw_expr, dialect=self.dialect) for it in v.select_items):
             return False
         return True
 
@@ -3616,14 +3724,14 @@ class IncrementalViewCompiler:
             or self.primary_schema is None
         ):
             return False
-        if v.where_clause and _has_subquery_ast(v.where_clause):
+        if v.where_clause and _has_subquery_ast(v.where_clause, dialect=self.dialect):
             return False
         if len(v.select_items) == 1 and v.select_items[0].raw_expr.strip() == "*":
             return False
         if not any(c.primary_key for c in self.primary_schema.columns.values()):
             return False
         for it in v.select_items:
-            if _has_subquery_ast(it.raw_expr):
+            if _has_subquery_ast(it.raw_expr, dialect=self.dialect):
                 return False
         return True
 
@@ -3639,7 +3747,7 @@ class IncrementalViewCompiler:
             or v.has_top_level_distinct
         ):
             return False
-        if v.where_clause and _has_subquery_ast(v.where_clause):
+        if v.where_clause and _has_subquery_ast(v.where_clause, dialect=self.dialect):
             return False
 
         allowed_aggs = {
@@ -3659,7 +3767,7 @@ class IncrementalViewCompiler:
             AggFunc.BOOL_OR,
         }
         for it in self._working_select_items:
-            if _has_subquery_ast(it.raw_expr):
+            if _has_subquery_ast(it.raw_expr, dialect=self.dialect):
                 return False
             if it.is_aggregate and (it.is_distinct or it.agg_func not in allowed_aggs):
                 return False
@@ -3667,12 +3775,13 @@ class IncrementalViewCompiler:
         inner_union_sql: Optional[str] = None
         sub_alias: str = "__mv_u"
         try:
-            q_ast = parse_sql_ast(v.raw_select_sql)
+            q_ast = parse_sql_ast(v.raw_select_sql, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
             return False
         if not isinstance(q_ast, sqlglot_exp.Select):
             return False
 
+        sg_d = _sqlglot_dialect(self.dialect)
         if v.has_cte:
             with_node = q_ast.args.get("with_") or q_ast.args.get("with")
             if not isinstance(with_node, sqlglot_exp.With) or bool(with_node.args.get("recursive")) or len(with_node.expressions) != 1:
@@ -3682,7 +3791,7 @@ class IncrementalViewCompiler:
             if len(v.joins) != 1 or v.joins[0].table_name.lower() != cte_name.lower():
                 return False
             inner_union_ast = cte_node.this
-            inner_union_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, True) or (inner_union_ast.sql("sqlite").strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None)
+            inner_union_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, True, dialect=self.dialect) or (inner_union_ast.sql(sg_d).strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None)
             sub_alias = v.joins[0].alias or cte_name
         else:
             from_node = q_ast.args.get("from_") or q_ast.args.get("from")
@@ -3690,14 +3799,14 @@ class IncrementalViewCompiler:
                 return False
             sub_node = from_node.this
             inner_union_ast = sub_node.this
-            inner_union_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, False) or (inner_union_ast.sql("sqlite").strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None)
+            inner_union_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, False, dialect=self.dialect) or (inner_union_ast.sql(sg_d).strip() if isinstance(inner_union_ast, sqlglot_exp.Expr) else None)
             if sub_node.alias:
                 sub_alias = sub_node.alias
 
         if not inner_union_sql or not isinstance(inner_union_ast, sqlglot_exp.SetOperation):
             return False
 
-        ops, branch_sqls = _extract_set_op_branches_from_ast(inner_union_ast, inner_union_sql)
+        ops, branch_sqls = _extract_set_op_branches_from_ast(inner_union_ast, inner_union_sql, dialect=self.dialect)
         if not ops or any(op != "UNION ALL" for op in ops):
             return False
 
@@ -3707,6 +3816,7 @@ class IncrementalViewCompiler:
                 bs = _parse_single_create_view_stmt(
                     f"CREATE VIEW __uall_b_{idx_b} AS {b_sql}",
                     known_tables=set(self._schemas_lower.keys()),
+                    dialect=self.dialect,
                 )
             except Exception:
                 return False
@@ -3723,7 +3833,7 @@ class IncrementalViewCompiler:
                 or bs.base_table.lower() not in self._schemas_lower
             ):
                 return False
-            if bs.where_clause and _has_subquery_ast(bs.where_clause):
+            if bs.where_clause and _has_subquery_ast(bs.where_clause, dialect=self.dialect):
                 return False
             branch_specs.append(bs)
 
@@ -3801,18 +3911,18 @@ class IncrementalViewCompiler:
             assert self.primary_schema is not None
             col_map = {k.lower(): v for k, v in self.primary_schema.columns.items()}
             for g_expr in self._effective_group_by_exprs:
-                if _is_simple_column_expr(g_expr.strip()):
-                    g_col = _unquote_ident(g_expr)
+                if _is_simple_column_expr(g_expr.strip(), dialect=self.dialect):
+                    g_col = _unquote_ident(g_expr, dialect=self.dialect)
                     if g_col.lower() not in col_map:
                         raise ValueError(
                             f"GROUP BY column {g_col!r} does not exist on table {self.primary_schema.name!r}"
                         )
             grp_exprs_lower = {g.strip().lower() for g in self._effective_group_by_exprs}
-            grp_cols_lower = {_unquote_ident(g).lower() for g in self._effective_group_by_exprs}
+            grp_cols_lower = {_unquote_ident(g, dialect=self.dialect).lower() for g in self._effective_group_by_exprs}
             has_any_agg = any(it.is_aggregate for it in self._working_select_items)
             for item in self._working_select_items:
                 if not item.is_aggregate:
-                    if item.source_col is not None and _is_simple_column_expr(item.raw_expr.strip()):
+                    if item.source_col is not None and _is_simple_column_expr(item.raw_expr.strip(), dialect=self.dialect):
                         if item.source_col.lower() not in col_map:
                             raise ValueError(
                                 f"Selected column {item.source_col!r} does not exist on table {self.primary_schema.name!r}"
@@ -3825,8 +3935,8 @@ class IncrementalViewCompiler:
                             raise ValueError(
                                 f"Non-aggregated column {item.source_col!r} must appear in GROUP BY clause"
                             )
-                elif item.arg_expr and _is_simple_column_expr(item.arg_expr.strip()):
-                    col_ident = _unquote_ident(item.arg_expr)
+                elif item.arg_expr and _is_simple_column_expr(item.arg_expr.strip(), dialect=self.dialect):
+                    col_ident = _unquote_ident(item.arg_expr, dialect=self.dialect)
                     if col_ident.lower() not in col_map:
                         raise ValueError(
                             f"Aggregate argument column {col_ident!r} does not exist on table {self.primary_schema.name!r}"
@@ -3857,7 +3967,7 @@ class IncrementalViewCompiler:
             col_spec,
             flags=re.IGNORECASE,
         ).strip()
-        return _unquote_ident(cleaned)
+        return _unquote_ident(cleaned, dialect=self.dialect)
 
     def _validate_user_indexes(self) -> None:
         if not self.user_indexes:
@@ -3895,7 +4005,7 @@ class IncrementalViewCompiler:
                     flags=re.IGNORECASE,
                 ).strip()
                 if re.match(r"^[A-Za-z0-9_\"`\[\]]+$", base_expr):
-                    c_ident = _unquote_ident(base_expr)
+                    c_ident = _unquote_ident(base_expr, dialect=self.dialect)
                     if c_ident.lower() not in exposed_lower:
                         raise ValueError(
                             f"Index on view '{self.logical_view_name}' references unknown column "
@@ -4029,13 +4139,13 @@ class IncrementalViewCompiler:
         if not expr:
             return None
         s = expr.strip()
-        if not _is_simple_column_expr(s):
+        if not _is_simple_column_expr(s, dialect=self.dialect):
             return None
-        parts = _split_top_level(s, ".")
+        parts = _split_top_level(s, ".", dialect=self.dialect)
         if len(parts) == 2:
             prefix, col_part = parts[0], parts[1]
-            prefix_clean = _unquote_ident(prefix).lower()
-            col_clean = _unquote_ident(col_part).lower()
+            prefix_clean = _unquote_ident(prefix, dialect=self.dialect).lower()
+            col_clean = _unquote_ident(col_part, dialect=self.dialect).lower()
             for j in self.view.joins:
                 if j.alias.lower() == prefix_clean or j.table_name.lower() == prefix_clean:
                     ts = self._schemas_lower.get(j.table_name.lower())
@@ -4050,7 +4160,7 @@ class IncrementalViewCompiler:
                         return c_def
             return None
 
-        col_clean = _unquote_ident(s).lower()
+        col_clean = _unquote_ident(s, dialect=self.dialect).lower()
         if self.primary_schema:
             for c_def in self.primary_schema.columns.values():
                 if c_def.name.lower() == col_clean:
@@ -4244,7 +4354,7 @@ class IncrementalViewCompiler:
         if not isinstance(column, sqlglot_exp.Column):
             return None
         try:
-            query_ast = parse_sql_ast(self.view.raw_select_sql)
+            query_ast = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
             return None
 
@@ -4461,7 +4571,7 @@ class IncrementalViewCompiler:
             return None
 
         try:
-            return infer(parse_sql_ast(expr))
+            return infer(parse_sql_ast(expr, dialect=self.dialect))
         except (sqlglot.errors.SqlglotError, AttributeError, TypeError, ValueError):
             return None
 
@@ -4532,11 +4642,11 @@ class IncrementalViewCompiler:
         return dt
 
     def _infer_cte_or_subquery_col_type(self, col_name: str) -> Optional[str]:
-        ident = _unquote_ident(col_name).strip()
+        ident = _unquote_ident(col_name, dialect=self.dialect).strip()
         if not ident:
             return None
         try:
-            q_ast = parse_sql_ast(self.view.raw_select_sql)
+            q_ast = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
             return None
 
@@ -4618,7 +4728,7 @@ class IncrementalViewCompiler:
         if self.dialect != Dialect.POSTGRES and not is_mariadb:
             return None
         try:
-            root = parse_sql_ast(expr)
+            root = parse_sql_ast(expr, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
             return None
 
@@ -4921,14 +5031,14 @@ class IncrementalViewCompiler:
                 or (
                     it.source_col
                     and self._is_simple_col_ref(g_expr)
-                    and it.source_col.lower() == _unquote_ident(g_expr).lower()
+                    and it.source_col.lower() == _unquote_ident(g_expr, dialect=self.dialect).lower()
                 )
             ):
                 return it.alias
         if self._is_simple_col_ref(g_expr):
             if "." in g_expr.strip():
                 return f"__mv_grp_{_sanitize_ident(g_expr)}"
-            return f"__mv_grp_{_unquote_ident(g_expr)}"
+            return f"__mv_grp_{_unquote_ident(g_expr, dialect=self.dialect)}"
         return f"__mv_grp_{_sanitize_ident(g_expr)}"
 
     def _has_nullable_group_col(self) -> bool:
@@ -4974,7 +5084,7 @@ class IncrementalViewCompiler:
             else {}
         )
         try:
-            toks = sqlglot.tokenize(expr, read="sqlite")
+            toks = _tokenize_sql(expr, read=_sqlglot_dialect(self.dialect))
         except Exception:
             return expr
         out: List[str] = []
@@ -5040,7 +5150,7 @@ class IncrementalViewCompiler:
         if not ts:
             return []
         try:
-            q_ast = parse_sql_ast(self.view.raw_select_sql)
+            q_ast = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
             if q_ast.find(sqlglot_exp.Star):
                 return list(ts.columns.keys())
             cols_in_ast = {c.name.lower() for c in q_ast.find_all(sqlglot_exp.Column)}
@@ -5298,7 +5408,7 @@ class IncrementalViewCompiler:
                 inc_stmts.append(pop_sql)
                 continue
 
-            pop_toks = sqlglot.tokenize(clean_pop, read=sg_dial)
+            pop_toks = _tokenize_sql(clean_pop, read=sg_dial)
             sel_tok_pos: Optional[int] = None
             p_depth = 0
             for ptk in pop_toks:
@@ -5312,7 +5422,7 @@ class IncrementalViewCompiler:
             select_body = clean_pop[sel_tok_pos:].strip() if sel_tok_pos is not None else sel_node.sql(sg_dial).strip()
 
             aliased_inner = select_body
-            sb_toks = sqlglot.tokenize(select_body, read=sg_dial)
+            sb_toks = _tokenize_sql(select_body, read=sg_dial)
             if (
                 sb_toks
                 and sb_toks[0].token_type == SQLGlotTokenType.SELECT
@@ -5324,15 +5434,15 @@ class IncrementalViewCompiler:
                 if from_tok_sb is not None:
                     proj_slice = select_body[sb_toks[0].end + 1 : from_tok_sb.start].strip()
                     from_and_rest = select_body[from_tok_sb.start :].strip()
-                    raw_projs = [p.strip() for p in _split_top_level(proj_slice, ",") if p.strip()]
+                    raw_projs = [p.strip() for p in _split_top_level(proj_slice, ",", dialect=self.dialect) if p.strip()]
                     if len(raw_projs) == len(cols):
                         aliased_list = []
                         for c_name, r_proj in zip(cols, raw_projs):
-                            rp_toks = sqlglot.tokenize(r_proj, read=sg_dial)
+                            rp_toks = _tokenize_sql(r_proj, read=sg_dial)
                             if (
                                 len(rp_toks) >= 2
                                 and rp_toks[-2].token_type == SQLGlotTokenType.ALIAS
-                                and _unquote_ident(rp_toks[-1].text).lower() == _unquote_ident(c_name).lower()
+                                and _unquote_ident(rp_toks[-1].text, dialect=self.dialect).lower() == _unquote_ident(c_name, dialect=self.dialect).lower()
                             ):
                                 aliased_list.append(r_proj)
                             else:
@@ -7737,7 +7847,7 @@ class IncrementalViewCompiler:
             alias_remap[j.alias.lower()] = (j.alias, ts)
 
         try:
-            toks = sqlglot.tokenize(expr, read="sqlite")
+            toks = _tokenize_sql(expr, read=_sqlglot_dialect(self.dialect))
         except Exception:
             return expr
         out: List[str] = []
@@ -7782,7 +7892,7 @@ class IncrementalViewCompiler:
                     if als and (
                         len(als) == 1
                         or any(
-                            j.on_condition and c_low in {t.text.lower() for t in sqlglot.tokenize(j.on_condition, read="sqlite")}
+                            j.on_condition and c_low in {t.text.lower() for t in _tokenize_sql(j.on_condition, read=_sqlglot_dialect(self.dialect))}
                             for j in self.view.joins
                         )
                     ):
@@ -8431,13 +8541,13 @@ class IncrementalViewCompiler:
     def _parse_setop_branches(self) -> Optional[List[Tuple[str, ViewSpec]]]:
         raw = self.view.raw_select_sql.strip()
         try:
-            q_ast = parse_sql_ast(raw)
+            q_ast = parse_sql_ast(raw, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
             return None
         if not isinstance(q_ast, sqlglot_exp.SetOperation):
             return None
 
-        ops, branch_sqls = _extract_set_op_branches_from_ast(q_ast, raw)
+        ops, branch_sqls = _extract_set_op_branches_from_ast(q_ast, raw, dialect=self.dialect)
         if not ops or len(set(ops)) != 1:
             return None
         op_type = ops[0]
@@ -8452,6 +8562,7 @@ class IncrementalViewCompiler:
                 bs = _parse_single_create_view_stmt(
                     f"CREATE VIEW __set_b_{idx} AS {b_sql}",
                     known_tables=set(self._schemas_lower.keys()),
+                    dialect=self.dialect,
                 )
             except Exception:
                 return None
@@ -8468,7 +8579,7 @@ class IncrementalViewCompiler:
                 or bs.base_table.lower() not in self._schemas_lower
             ):
                 return None
-            if bs.where_clause and _has_subquery_ast(bs.where_clause):
+            if bs.where_clause and _has_subquery_ast(bs.where_clause, dialect=self.dialect):
                 return None
             if col_count is None:
                 col_count = len(bs.select_items)
@@ -8484,7 +8595,7 @@ class IncrementalViewCompiler:
     def _rewrite_branch_expr(self, expr: str, ts: TableSchema, alias: str, record_prefix: Optional[str]) -> str:
         col_map = {c.lower(): c for c in ts.columns}
         quals_lower = {q.lower() for q in (ts.name, alias) if q}
-        toks = tokenize_sql(expr)
+        toks = tokenize_sql(expr, dialect=self.dialect)
         out: List[str] = []
         i = 0
         n = len(toks)
@@ -8917,7 +9028,7 @@ class IncrementalViewCompiler:
             c_low = c_def.name.lower()
             matched_alias: Optional[str] = None
             for it in self.view.select_items:
-                raw_s = _unquote_ident(it.raw_expr.strip()).lower() if re.match(r'^[A-Za-z0-9_."`\[\]]+$', it.raw_expr.strip()) else ""
+                raw_s = _unquote_ident(it.raw_expr.strip(), dialect=self.dialect).lower() if re.match(r'^[A-Za-z0-9_."`\[\]]+$', it.raw_expr.strip()) else ""
                 raw_full = it.raw_expr.strip().lower()
                 if (
                     raw_full == c_low
@@ -9248,7 +9359,7 @@ class IncrementalViewCompiler:
             first_b_aliases = [it.alias.lower() for it in branch_specs[0].select_items]
             seen_g_al: Set[str] = set()
             for g_expr in grp_exprs:
-                g_id = _unquote_ident(g_expr.split(".")[-1]).lower() if _is_simple_column_expr(g_expr.strip()) else ""
+                g_id = _unquote_ident(g_expr.split(".")[-1], dialect=self.dialect).lower() if _is_simple_column_expr(g_expr.strip(), dialect=self.dialect) else ""
                 if not g_id or g_id not in first_b_aliases:
                     uall_has_nullable = True
                     break
@@ -9342,7 +9453,7 @@ class IncrementalViewCompiler:
                 # Check if arg_expr maps to an integer column across all branches
                 storage_type = self._infer_expr_storage_type(item)
                 if item.agg_func in (AggFunc.SUM, AggFunc.MIN, AggFunc.MAX) and item.arg_expr:
-                    arg_id = _unquote_ident(item.arg_expr).lower()
+                    arg_id = _unquote_ident(item.arg_expr, dialect=self.dialect).lower()
                     if arg_id in first_b_map:
                         b_types = []
                         for bs in branch_specs:
@@ -9555,7 +9666,7 @@ class IncrementalViewCompiler:
                 def _subst_u(frag: Optional[str]) -> Optional[str]:
                     if frag is None:
                         return None
-                    toks = sqlglot.tokenize(frag, read="sqlite")
+                    toks = _tokenize_sql(frag, read=_sqlglot_dialect(self.dialect))
                     if not toks:
                         return frag
                     out = []
@@ -9767,12 +9878,12 @@ class IncrementalViewCompiler:
     def _can_push_down_group_filter_into_where(self) -> bool:
         if not self.view.where_clause:
             return True
-        return not _has_subquery_ast(self.view.where_clause)
+        return not _has_subquery_ast(self.view.where_clause, dialect=self.dialect)
 
     def _inject_where_into_source_query(self, source_query_sql: str, extra_predicate: str) -> str:
         s = source_query_sql.strip().rstrip(";")
-        tok_where = _find_top_level_token(s, (SQLGlotTokenType.WHERE,))
-        tok_group = _find_top_level_token(s, (SQLGlotTokenType.GROUP_BY,))
+        tok_where = _find_top_level_token(s, (SQLGlotTokenType.WHERE,), dialect=self.dialect)
+        tok_group = _find_top_level_token(s, (SQLGlotTokenType.GROUP_BY,), dialect=self.dialect)
         if tok_where is not None:
             insert_pos = tok_where.end + 1
             before = s[: tok_where.start].rstrip()
@@ -9837,18 +9948,18 @@ class IncrementalViewCompiler:
                     direct_conds.append(
                         self._null_safe_eq(
                             _lhs_expr(g_expr, mv_col),
-                            f"({record_prefix}.{_unquote_ident(c_part)})",
+                            f"({record_prefix}.{_unquote_ident(c_part, dialect=self.dialect)})",
                             is_nullable=True,
                         )
                     )
                 else:
                     all_owned = False
                     break
-            elif _unquote_ident(gs) in ts_target.columns:
+            elif _unquote_ident(gs, dialect=self.dialect) in ts_target.columns:
                 direct_conds.append(
                     self._null_safe_eq(
                         _lhs_expr(g_expr, mv_col),
-                        f"({record_prefix}.{_unquote_ident(gs)})",
+                        f"({record_prefix}.{_unquote_ident(gs, dialect=self.dialect)})",
                         is_nullable=True,
                     )
                 )
@@ -9868,7 +9979,7 @@ class IncrementalViewCompiler:
             alias_remap[j.table_name.lower()] = f"__mv_j_{j.alias}"
 
         def _remap_aliases_in_sql(frag: str) -> str:
-            toks = sqlglot.tokenize(frag, read="sqlite")
+            toks = _tokenize_sql(frag, read=_sqlglot_dialect(self.dialect))
             if not toks:
                 return frag
             out: List[str] = []
@@ -10137,7 +10248,7 @@ class IncrementalViewCompiler:
                 )
 
             s_sq = sql
-            toks = sqlglot.tokenize(s_sq, read="sqlite")
+            toks = _tokenize_sql(s_sq, read=_sqlglot_dialect(self.dialect))
             idx = 0
             sq_fn_targets = {
                 "VAR_POP", "VARIANCE", "VAR_SAMP", "STDDEV_POP", "STDDEV", "STD", "STDDEV_SAMP",
@@ -10178,7 +10289,7 @@ class IncrementalViewCompiler:
                         else:
                             rep = f"(CASE WHEN COUNT({arg_s}) = 0 THEN NULL WHEN MAX(CASE WHEN ({arg_s}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
                         s_sq = s_sq[: tk.start] + rep + s_sq[toks[rp_idx].end + 1 :]
-                        toks = sqlglot.tokenize(s_sq, read="sqlite")
+                        toks = _tokenize_sql(s_sq, read=_sqlglot_dialect(self.dialect))
                         idx = 0
                         continue
                 idx += 1
@@ -10186,7 +10297,7 @@ class IncrementalViewCompiler:
 
         # Non-SQLite dialects
         s = sql
-        toks = sqlglot.tokenize(s, read="sqlite")
+        toks = _tokenize_sql(s, read=_sqlglot_dialect(self.dialect))
         idx = 0
         while idx < len(toks) - 2:
             tk = toks[idx]
@@ -10205,7 +10316,7 @@ class IncrementalViewCompiler:
                     inner_arg = s[toks[idx + 1].end + 1 : toks[rp_idx].start].strip()
                     rep = f"COALESCE(1.0 * SUM({inner_arg}), 0.0)"
                     s = s[: tk.start] + rep + s[toks[rp_idx].end + 1 :]
-                    toks = sqlglot.tokenize(s, read="sqlite")
+                    toks = _tokenize_sql(s, read=_sqlglot_dialect(self.dialect))
                     idx = 0
                     continue
             idx += 1
@@ -10252,7 +10363,7 @@ class IncrementalViewCompiler:
 
         for idx_g, g_expr in enumerate(grp_exprs):
             g_low = g_expr.strip().lower()
-            g_unq = _unquote_ident(g_expr).lower() if self._is_simple_col_ref(g_expr) else ""
+            g_unq = _unquote_ident(g_expr, dialect=self.dialect).lower() if self._is_simple_col_ref(g_expr) else ""
             if g_low in non_agg_map:
                 mv_c = non_agg_map[g_low]
             elif g_unq and g_unq in non_agg_map:
@@ -10295,7 +10406,7 @@ class IncrementalViewCompiler:
 
         raw_q = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
         if hidden_grp_defs:
-            tok_from = _find_top_level_token(raw_q, (SQLGlotTokenType.FROM,))
+            tok_from = _find_top_level_token(raw_q, (SQLGlotTokenType.FROM,), dialect=self.dialect)
             assert tok_from is not None
             extra_sel = ", ".join(f"{g_e} AS {mv_c}" for mv_c, g_e, _ in hidden_grp_defs)
             source_query_sql = f"{raw_q[:tok_from.start].rstrip()}, {extra_sel} {raw_q[tok_from.start:]}"
@@ -10655,7 +10766,7 @@ class MaterializedViewManager:
         )
         schemas.pop(self.catalog_table, None)
         if extra_schema_sql:
-            schemas.update(parse_table_schema(extra_schema_sql))
+            schemas.update(parse_table_schema(extra_schema_sql, dialect=self.dialect))
         return schemas
 
     def apply_schema_ddl(self, ddl_sql: str, auto_sync_views: bool = True) -> None:
@@ -10665,7 +10776,7 @@ class MaterializedViewManager:
         base table schema changed.
         """
         cur = self.conn.cursor()
-        for stmt in _split_top_level(_strip_sql_comments(ddl_sql), ";"):
+        for stmt in _split_top_level(_strip_sql_comments(ddl_sql, dialect=self.dialect), ";", dialect=self.dialect):
             if stmt.strip():
                 cur.execute(stmt)
         self._commit()
@@ -11187,6 +11298,7 @@ class MaterializedViewManager:
             view_sql,
             known_tables={k.lower() for k in schemas},
             indexes=indexes,
+            dialect=self.dialect,
         )
         sub_plans: List[MaterializedViewPlan] = []
         for vs in specs:
@@ -11260,6 +11372,7 @@ class MaterializedViewManager:
             view_sqls,
             known_tables={k.lower() for k in schemas},
             indexes=indexes,
+            dialect=self.dialect,
         )
 
         for v_spec in all_specs:
@@ -11857,10 +11970,11 @@ def generate_materialized_view(
             view_sql_or_spec,
             known_tables=known_tables,
             indexes=indexes,
+            dialect=eff_dialect,
         )
     elif indexes:
         parsed_idxs = tuple(
-            parse_view_index_spec(ix, default_view_name=view_sql_or_spec.view_name)
+            parse_view_index_spec(ix, default_view_name=view_sql_or_spec.view_name, dialect=eff_dialect)
             for ix in indexes
         )
         view_spec = ViewSpec(
@@ -11936,6 +12050,7 @@ def generate_materialized_views(
         view_sqls,
         known_tables={k.lower() for k in schemas},
         indexes=indexes,
+        dialect=eff_dialect,
     )
     plans: List[MaterializedViewPlan] = []
     for vs in specs:
@@ -12158,10 +12273,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             finally:
                 conn.close()
         elif schema_sql:
-            schemas = parse_table_schema(schema_sql, dialect=hint_d)
             detected_ev = _resolve_dialect_and_engine_version(
-                schemas, args.dialect, args.engine_version
+                {}, args.dialect, args.engine_version
             )
+            schemas = parse_table_schema(schema_sql, dialect=detected_ev.dialect)
         else:
             print("ERROR: Either --schema or --db must be provided.", file=sys.stderr)
             return 2
