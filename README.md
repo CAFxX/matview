@@ -301,3 +301,14 @@ The CI workflow runs a broader engine/version matrix and a dedicated high-intens
 ## Roadmap
 
 See [`TODO.md`](TODO.md) for planned work, completed items, and known follow-ups.
+
+## SQLite writer-connection requirement
+
+SQLite's `REPLACE` conflict algorithm may delete an existing source-table row before inserting its replacement. SQLite fires the delete triggers for those implicit deletes only when `PRAGMA recursive_triggers = ON` is enabled **on the connection executing the statement**. The setting is connection-local: enabling it on the connection used by `MaterializedViewManager` does not enable it on other application connections to the same database.
+
+Until matview provides and verifies a supported initialization mechanism for every writer connection, applications must either:
+
+- Execute `PRAGMA recursive_triggers = ON` on **each SQLite connection that can write source tables**, before issuing writes; or
+- Avoid `INSERT OR REPLACE` / `REPLACE INTO` against source tables and use explicit `INSERT ... ON CONFLICT (...) DO UPDATE SET ...` when update semantics are intended.
+
+Do not assume that a connection configured by matview protects independent writers. A writer that uses REPLACE with recursive triggers disabled can bypass DELETE maintenance and leave materialized results stale. This requirement applies to all relevant unique-conflict paths, not only the primary key.
