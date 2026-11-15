@@ -10350,7 +10350,8 @@ class MaterializedViewManager:
                 cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
             ph = self._param_placeholder()
             cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
-            self._commit()
+            if _commit_transaction:
+                self._commit()
             return True
         else:
             raw_logical = (
@@ -10362,7 +10363,8 @@ class MaterializedViewManager:
             cur.execute(f"DROP VIEW IF EXISTS {db_v};")
             cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
             cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
-            self._commit()
+            if _commit_transaction:
+                self._commit()
             return False
 
     def _update_backfill_watermark(
