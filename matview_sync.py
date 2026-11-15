@@ -10717,6 +10717,48 @@ class MaterializedViewManager:
         Safely installs or updates one or more materialized views on the connected database.
         Supports both single-view and multi-view SQL scripts seamlessly.
         """
+        # Registration uses transactional DDL as its failure-atomicity
+        # boundary on PostgreSQL. Reject autocommit connections and caller-owned
+        # transactions before schema/catalog reads can change transaction state.
+        if self.dialect == Dialect.POSTGRES:
+            autocommit = getattr(self.conn, "autocommit", None)
+            if autocommit is not False:
+                raise RuntimeError(
+                    "PostgreSQL materialized-view registration requires autocommit=False "
+                    "to preserve transactional DDL atomicity"
+                )
+
+            transaction_state = getattr(self.conn, "in_transaction", None)
+            if not isinstance(transaction_state, bool):
+                status = None
+                get_status = getattr(self.conn, "get_transaction_status", None)
+                if callable(get_status):
+                    try:
+                        status = get_status()
+                    except Exception:
+                        status = None
+                if status is None:
+                    info = getattr(self.conn, "info", None)
+                    status = getattr(info, "transaction_status", None)
+                if status is None:
+                    raise RuntimeError(
+                        "PostgreSQL materialized-view registration requires a connection "
+                        "adapter that exposes transaction state; cannot safely determine "
+                        "whether a caller transaction would be committed"
+                    )
+                try:
+                    transaction_state = int(status) != 0
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        "PostgreSQL materialized-view registration could not interpret "
+                        "the connection transaction state"
+                    )
+            if transaction_state:
+                raise RuntimeError(
+                    "PostgreSQL materialized-view registration cannot run inside an "
+                    "active caller transaction; commit or roll back that transaction first"
+                )
+
         effective_ignore = (
             self.ignore_limitations if ignore_limitations is None else ignore_limitations
         )
