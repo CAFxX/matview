@@ -11070,14 +11070,22 @@ class MaterializedViewManager:
                     pass
 
             if (
-                self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
-                and not session_bypass_ok
-                and not sp_active
-                and not drop_triggers
+                not drop_triggers
+                and (
+                    (
+                        self.dialect == Dialect.POSTGRES
+                        and not session_bypass_ok
+                        and not sp_active
+                    )
+                    or (
+                        self.dialect == Dialect.MYSQL
+                        and not sp_active
+                    )
+                )
             ):
                 raise RuntimeError(
-                    "bulk_changes could not establish either session-local trigger bypass "
-                    "or transactional savepoint; refusing to suspend maintenance triggers"
+                    "bulk_changes could not establish the required transactional savepoint "
+                    "and trigger-bypass configuration; refusing to suspend maintenance triggers"
                 )
 
             if (
