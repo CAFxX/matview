@@ -11007,7 +11007,12 @@ class MaterializedViewManager:
                     "use_shadow_swap: those options execute DDL that implicitly commits"
                 )
 
-        catalog = self.get_catalog()
+        try:
+            catalog = self.get_catalog()
+        except Exception:
+            if self.dialect == Dialect.MYSQL and not mysql_caller_transaction:
+                self._rollback()
+            raise
         if view_names:
             resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
             targets = [catalog[n] for n in resolved if n in catalog]
