@@ -10165,8 +10165,21 @@ class MaterializedViewManager:
             or (isinstance(connection_dialect_name, str) and "postgres" in connection_dialect_name.lower())
             or any(name in connection_module for name in ("psycopg", "pg8000", "asyncpg", "postgres", "pgsql"))
         )
+        mysql_candidate = (
+            effective_hint_dialect == Dialect.MYSQL
+            or (
+                isinstance(connection_dialect_name, str)
+                and any(token in connection_dialect_name.lower() for token in ("mysql", "maria"))
+            )
+            or any(
+                name in connection_module
+                for name in ("pymysql", "mysql", "mariadb", "mysqldb")
+            )
+        )
         if postgres_candidate:
             self._require_idle_postgres_connection(self.conn)
+        elif mysql_candidate:
+            self._require_idle_mysql_connection(self.conn)
 
         if engine_version is not None:
             self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
@@ -10237,6 +10250,133 @@ class MaterializedViewManager:
                 self.conn.rollback()
             except Exception:
                 pass
+
+    @staticmethod
+    def _connection_chain(conn: Any) -> Tuple[List[Any], List[Any]]:
+        """Return all discoverable wrappers and their physical driver leaves."""
+        candidates = []
+        pending = [conn]
+        seen = set()
+        child_ids = set()
+        while pending:
+            candidate = pending.pop()
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            candidates.append(candidate)
+            for attr in ("connection", "driver_connection", "dbapi_connection", "_connection"):
+                try:
+                    nested = getattr(candidate, attr, None)
+                except Exception:
+                    nested = None
+                if nested is not None and nested is not candidate:
+                    child_ids.add(id(nested))
+                    pending.append(nested)
+        leaves = [candidate for candidate in candidates if id(candidate) not in child_ids]
+        return candidates, leaves
+
+    @staticmethod
+    def _require_idle_mysql_connection(conn: Any) -> None:
+        """Fail closed unless every physical MySQL/MariaDB driver leaf is idle."""
+        candidates, leaves = MaterializedViewManager._connection_chain(conn)
+        if not leaves:
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization requires a discoverable physical "
+                "DB-API connection"
+            )
+        active = False
+        observed_leaf_ids = set()
+        for candidate in candidates:
+            known = False
+            state = getattr(candidate, "in_transaction", None)
+            if callable(state):
+                try:
+                    state = state()
+                except Exception:
+                    state = None
+            if isinstance(state, bool) or (
+                isinstance(state, int) and not isinstance(state, bool) and state in (0, 1)
+            ):
+                known = True
+                active = active or bool(state)
+            for attr in ("server_status", "_server_status"):
+                status = getattr(candidate, attr, None)
+                if isinstance(status, int) and not isinstance(status, bool):
+                    known = True
+                    active = active or bool(status & 0x0001)
+            if known and any(candidate is leaf for leaf in leaves):
+                observed_leaf_ids.add(id(candidate))
+        if active:
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization cannot run inside an active "
+                "caller transaction; commit or roll back that transaction first"
+            )
+        if len(observed_leaf_ids) != len(leaves):
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization requires transaction state on every "
+                "physical DB-API connection; refusing to trust an idle facade"
+            )
+
+        """Fail closed unless every physical PostgreSQL driver leaf is idle and non-autocommit."""
+        candidates, leaves = MaterializedViewManager._connection_chain(conn)
+        if not leaves:
+                "PostgreSQL manager initialization requires a discoverable physical DB-API connection"
+        active = False
+        observed_leaf_ids = set()
+        for candidate in candidates:
+            autocommit = getattr(candidate, "autocommit", None)
+            if autocommit is not None and autocommit is not False:
+                    "PostgreSQL manager initialization requires autocommit=False "
+                    "to preserve transactional DDL atomicity"
+
+            state = getattr(candidate, "in_transaction", None)
+            if callable(state):
+                try:
+                    state = state()
+                except Exception:
+                    state = None
+            known = isinstance(state, bool)
+            if known:
+                active = active or state
+            else:
+                status = None
+                getter = getattr(candidate, "get_transaction_status", None)
+                if callable(getter):
+                    try:
+                        status = getter()
+                    except Exception:
+                        status = None
+                if status is None:
+                    info = getattr(candidate, "info", None)
+                    status = getattr(info, "transaction_status", None)
+                if status is not None:
+                    try:
+                        state = int(status) != 0
+                    except (TypeError, ValueError):
+                        state_text = str(status).lower()
+                        if state_text.endswith("idle"):
+                            state = False
+                        else:
+                            raise RuntimeError(
+                                "PostgreSQL manager initialization could not interpret "
+                                "the connection transaction state"
+                            )
+                    known = True
+                    active = active or bool(state)
+            if known and any(candidate is leaf for leaf in leaves):
+                observed_leaf_ids.add(id(candidate))
+
+        if active:
+        if len(observed_leaf_ids) != len(leaves):
+            raise RuntimeError(
+                "PostgreSQL manager initialization requires transaction state on every "
+                "physical DB-API connection; refusing to trust an idle facade"
+            )
+        for leaf in leaves:
+            if getattr(leaf, "autocommit", None) is not False:
+                raise RuntimeError(
+                    "PostgreSQL manager initialization requires autocommit=False "
+                    "on the physical DB-API connection"
 
     @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
