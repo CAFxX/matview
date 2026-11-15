@@ -1286,5 +1286,54 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
                 manager.conn.close()
 
 
+    def test_sqlite_savepoint_setup_and_writer_rollback_failure_is_reported(self) -> None:
+        """A failed rollback must not be swallowed after SAVEPOINT setup fails."""
+        executed = []
+        rollback_calls = []
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                if sql == "SAVEPOINT __mv_bulk_sp;":
+                    raise sqlite3.OperationalError("injected savepoint failure")
+                return self
+
+            def close(self):
+                pass
+
+        class RecordingConnection:
+            in_transaction = False
+
+            def cursor(self):
+                return RecordingCursor()
+
+            def rollback(self):
+                rollback_calls.append(True)
+                raise sqlite3.OperationalError("injected rollback failure")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.SQLITE
+        manager.get_catalog = lambda: {}
+
+        with self.assertRaisesRegex(
+            RuntimeError, "could not release its SQLite writer reservation"
+        ) as raised:
+            with manager.bulk_changes():
+                self.fail("bulk_changes must not enter the user block after setup failure")
+
+        self.assertEqual(executed, ["BEGIN IMMEDIATE;", "SAVEPOINT __mv_bulk_sp;"])
+        self.assertEqual(len(rollback_calls), 1)
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+        self.assertIn("injected rollback failure", str(raised.exception.__cause__))
+        # The SAVEPOINT error remains in the chained exception context.
+        self.assertIsInstance(raised.exception.__cause__.__context__, sqlite3.OperationalError)
+        self.assertIn(
+            "injected savepoint failure",
+            str(raised.exception.__cause__.__context__),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
