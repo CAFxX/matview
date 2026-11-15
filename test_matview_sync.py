@@ -6437,72 +6437,90 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             CREATE TABLE source_rows (
                 id INTEGER PRIMARY KEY,
                 unique_code TEXT NOT NULL UNIQUE,
+                unique_tag TEXT NOT NULL UNIQUE,
                 bucket TEXT NOT NULL
             );
-            INSERT INTO source_rows VALUES (1, 'same', 'old');
+            INSERT INTO source_rows VALUES (1, 'code-1', 'tag-1', 'old');
         """
         view_sql = (
-            "CREATE VIEW source_counts AS "
-            "SELECT bucket, COUNT(*) AS n FROM source_rows GROUP BY bucket;"
+            "CREATE VIEW source_rows_materialized AS "
+            "SELECT id, unique_code, unique_tag, bucket FROM source_rows;"
         )
 
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as db_file:
-            db_path = db_file.name
-        try:
-            setup = sqlite3.connect(db_path)
-            manager = MaterializedViewManager(setup)
-            manager.apply_schema_ddl(schema)
-            manager.register_view(view_sql)
-
-            # An independent connection defaults recursive_triggers OFF. REPLACE
-            # deletes the conflicting row without firing the MV DELETE trigger.
-            unsafe_writer = sqlite3.connect(db_path)
-            # Force the documented unsafe setting so the regression is independent
-            # of the SQLite library's compile-time default.
-            unsafe_writer.execute("PRAGMA recursive_triggers = OFF;")
-            self.assertEqual(
-                unsafe_writer.execute("PRAGMA recursive_triggers;").fetchone()[0], 0
-            )
-            unsafe_writer.execute(
-                "INSERT OR REPLACE INTO source_rows VALUES (2, 'same', 'new');"
-            )
-            unsafe_writer.commit()
-            stale = setup.execute(
-                "SELECT bucket, n FROM source_counts ORDER BY bucket;"
-            ).fetchall()
-            self.assertEqual(stale, [("new", 1), ("old", 1)])
-            unsafe_writer.close()
-            setup.close()
-
-            # Recreate a clean database and configure the independent writer.
-            os.unlink(db_path)
-            safe_setup = sqlite3.connect(db_path)
-            safe_manager = MaterializedViewManager(safe_setup)
-            safe_manager.apply_schema_ddl(schema)
-            safe_manager.register_view(view_sql)
-            safe_writer = sqlite3.connect(db_path)
-            returned = MaterializedViewManager.configure_sqlite_connection(safe_writer)
-            self.assertIs(returned, safe_writer)
-            self.assertEqual(
-                safe_writer.execute("PRAGMA recursive_triggers;").fetchone()[0], 1
-            )
-            # Idempotence matters for connection-pool initialization hooks.
-            MaterializedViewManager.configure_sqlite_connection(safe_writer)
-            safe_writer.execute(
-                "INSERT OR REPLACE INTO source_rows VALUES (2, 'same', 'new');"
-            )
-            safe_writer.commit()
-            actual = safe_setup.execute(
-                "SELECT bucket, n FROM source_counts ORDER BY bucket;"
-            ).fetchall()
-            self.assertEqual(actual, [("new", 1)])
-            safe_writer.close()
-            safe_setup.close()
-        finally:
+        def assert_replace_behavior(
+            conflict_target: str, replacement: tuple, initialized: bool
+        ) -> None:
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as db_file:
+                db_path = db_file.name
+            setup = None
+            writer = None
             try:
-                os.unlink(db_path)
-            except FileNotFoundError:
-                pass
+                setup = sqlite3.connect(db_path)
+                manager = MaterializedViewManager(setup)
+                manager.apply_schema_ddl(schema)
+                manager.register_view(view_sql)
+
+                writer = sqlite3.connect(db_path)
+                if initialized:
+                    returned = MaterializedViewManager.configure_sqlite_connection(
+                        writer
+                    )
+                    self.assertIs(returned, writer)
+                    # Idempotence matters for connection-pool initialization hooks.
+                    MaterializedViewManager.configure_sqlite_connection(writer)
+                else:
+                    # Force the documented unsafe setting independent of SQLite's
+                    # compile-time default.
+                    writer.execute("PRAGMA recursive_triggers = OFF;")
+                    self.assertEqual(
+                        writer.execute("PRAGMA recursive_triggers;").fetchone()[0], 0
+                    )
+
+                writer.execute(
+                    "INSERT OR REPLACE INTO source_rows VALUES (?, ?, ?, ?);",
+                    replacement,
+                )
+                writer.commit()
+
+                rows = setup.execute(
+                    "SELECT id, unique_code, unique_tag, bucket "
+                    "FROM source_rows_materialized ORDER BY id;"
+                ).fetchall()
+                if initialized:
+                    self.assertEqual(rows, [replacement])
+                else:
+                    # The INSERT trigger adds the replacement, but with recursive
+                    # triggers OFF SQLite omits the implicit-conflict DELETE trigger.
+                    self.assertEqual(
+                        rows,
+                        [
+                            (1, "code-1", "tag-1", "old"),
+                            replacement,
+                        ] if replacement[0] != 1 else [
+                            (1, "code-1", "tag-1", "old"),
+                        ],
+                    )
+            finally:
+                if writer is not None:
+                    writer.close()
+                if setup is not None:
+                    setup.close()
+                try:
+                    os.unlink(db_path)
+                except FileNotFoundError:
+                    pass
+
+        # Exercise every independent uniqueness path: rowid primary key and both
+        # declared UNIQUE constraints. Each case gets an isolated file-backed DB.
+        for target, replacement in (
+            ("primary key", (1, "code-2", "tag-2", "new")),
+            ("unique_code", (2, "code-1", "tag-2", "new")),
+            ("unique_tag", (2, "code-2", "tag-1", "new")),
+        ):
+            with self.subTest(conflict_target=target, initialized=False):
+                assert_replace_behavior(target, replacement, initialized=False)
+            with self.subTest(conflict_target=target, initialized=True):
+                assert_replace_behavior(target, replacement, initialized=True)
 
     def test_parser_scanners_preserve_postgres_dollar_quoted_literals(self) -> None:
         fragment = "SELECT $$comma, semi; -- /* stays literal */$$, 7"
