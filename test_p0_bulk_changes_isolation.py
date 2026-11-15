@@ -637,6 +637,79 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         # 4. Assert DROP VIEW was NEVER called
         self.assertFalse(any(re.search(r"\bDROP\s+VIEW\b", s, re.IGNORECASE) for s in executed_sqls))
 
+    def test_restoration_failure_is_reported_and_transactional_ddl_is_rolled_back(self) -> None:
+        """A failed trigger reinstall must never be silently committed as a clean rollback."""
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            mgr = MaterializedViewManager(f"sqlite:///{tmp.name}")
+            schema = "CREATE TABLE restore_items (id INT PRIMARY KEY, grp TEXT, amount INT);"
+            mgr.apply_schema_ddl(schema, auto_sync_views=False)
+            mgr.conn.execute("INSERT INTO restore_items VALUES (1, 'A', 10);")
+            mgr.conn.commit()
+            mgr.register_view(
+                "CREATE VIEW restore_totals AS SELECT grp, SUM(amount) AS total "
+                "FROM restore_items GROUP BY grp;"
+            )
+
+            raw_conn = mgr.conn
+            original_cursor = raw_conn.cursor
+            injected = {"fail": False}
+
+            class CursorProxy:
+                def __init__(self, cursor):
+                    self._cursor = cursor
+
+                def execute(self, statement, params=None):
+                    if injected["fail"] and str(statement).lstrip().upper().startswith("CREATE TRIGGER"):
+                        injected["fail"] = False
+                        raise sqlite3.OperationalError("injected trigger recreation failure")
+                    if params is None:
+                        return self._cursor.execute(statement)
+                    return self._cursor.execute(statement, params)
+
+                def __getattr__(self, name):
+                    return getattr(self._cursor, name)
+
+            class ConnectionProxy:
+                def cursor(self, *args, **kwargs):
+                    return CursorProxy(original_cursor(*args, **kwargs))
+
+                def __getattr__(self, name):
+                    return getattr(raw_conn, name)
+
+            mgr.conn = ConnectionProxy()
+            injected["fail"] = True
+            with self.assertRaisesRegex(RuntimeError, "operation failed and maintenance-trigger restoration failed"):
+                with mgr.bulk_changes():
+                    mgr.conn.cursor().execute(
+                        "INSERT INTO restore_items VALUES (2, 'A', 20);"
+                    )
+                    raise ValueError("injected user failure")
+
+            # SQLite DDL is transactional: rollback of the restoration savepoint
+            # must leave the original triggers installed and the user's DML undone.
+            mgr.conn = raw_conn
+            self.assertEqual(
+                raw_conn.execute("SELECT id FROM restore_items ORDER BY id").fetchall(),
+                [(1,)],
+            )
+            trigger_names = {
+                row[0] for row in raw_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                ).fetchall()
+            }
+            self.assertTrue(trigger_names, "original maintenance triggers must survive failed restoration")
+
+            raw_conn.execute("INSERT INTO restore_items VALUES (3, 'B', 7);")
+            raw_conn.commit()
+            live = raw_conn.execute(
+                "SELECT grp, SUM(amount) FROM restore_items GROUP BY grp ORDER BY grp"
+            ).fetchall()
+            reader = raw_conn.execute(
+                "SELECT grp, total FROM restore_totals ORDER BY grp"
+            ).fetchall()
+            self.assertEqual(reader, live)
+            mgr.close()
+
     def test_postgres_bulk_changes_execution_avoids_pre_delete_and_view_drop(self) -> None:
         """Executing bulk_changes(use_shadow_swap=True) on PostgreSQL recording mock verifies
 
