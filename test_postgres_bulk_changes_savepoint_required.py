@@ -38,6 +38,21 @@ def main() -> None:
         original_catalog = manager.get_catalog()[plan.view_name]
         conn.commit()
 
+        # Do not commit an already-active application transaction. The
+        # trigger-maintained reader change must remain rollback-able by caller.
+        with conn.cursor() as cur:
+            cur.execute("UPDATE source_rows SET value = 11 WHERE id = 1")
+        try:
+            with manager.bulk_changes():
+                raise AssertionError("bulk_changes joined a caller-owned PostgreSQL transaction")
+        except RuntimeError as exc:
+            assert "active caller transaction" in str(exc), str(exc)
+        assert conn.get_transaction_status() != 0
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, value FROM savepoint_guard_reader ORDER BY id")
+            assert cur.fetchall() == [(1, 10), (2, 20)]
+
         # In autocommit mode, SAVEPOINT fails and SET LOCAL outside a
         # transaction emits a warning/no-op rather than raising. The manager
         # must reject before entering the user block or dropping functions.
