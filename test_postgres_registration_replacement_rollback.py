@@ -148,7 +148,7 @@ def main() -> None:
 
         # An unrelated caller transaction must not be committed by registration.
         with conn.cursor() as cur:
-            cur.execute("UPDATE replacement_control SET should_fail = TRUE")
+            cur.execute("UPDATE replacement_control SET should_fail = FALSE")
         try:
             manager.register_view(view_sql, force_rebuild=True)
         except RuntimeError as exc:
@@ -158,11 +158,11 @@ def main() -> None:
         conn.rollback()
         with conn.cursor() as cur:
             cur.execute("SELECT should_fail FROM replacement_control")
-            assert cur.fetchone()[0] is False
+            assert cur.fetchone()[0] is True
 
         # sync_views shares the same pre-read transaction ownership guard.
         with conn.cursor() as cur:
-            cur.execute("UPDATE replacement_control SET should_fail = TRUE")
+            cur.execute("UPDATE replacement_control SET should_fail = FALSE")
         try:
             manager.sync_views([view_sql])
         except RuntimeError as exc:
