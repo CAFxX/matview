@@ -10717,7 +10717,7 @@ class MaterializedViewManager:
         if existing and existing["signature_hash"] == sig and not force_rebuild:
             return plan
 
-        cur = self.conn.cursor()
+        cur = None
         sqlite_writer_reserved = False
 
         def reserve_sqlite_writer() -> bool:
@@ -10734,19 +10734,23 @@ class MaterializedViewManager:
             cur.execute("BEGIN IMMEDIATE;")
             return True
 
+        # Reject unsupported replacement before entering the cleanup path;
+        # its exception handler must not roll back a caller-owned transaction.
+        if existing and (
+            incremental_backfill
+            or self.dialect not in (Dialect.SQLITE, Dialect.POSTGRES)
+        ):
+            raise RuntimeError(
+                "Replacing an existing materialized view is unsupported for "
+                f"{self.dialect.value} with incremental_backfill={incremental_backfill}; "
+                "a shadow-generation publication protocol is required"
+            )
+
         try:
             if existing:
-                # Never destroy the currently published generation unless all
-                # replacement DDL/population can be rolled back as one transaction.
-                if incremental_backfill or self.dialect not in (
-                    Dialect.SQLITE,
-                    Dialect.POSTGRES,
-                ):
-                    raise RuntimeError(
-                        "Replacing an existing materialized view is unsupported for "
-                        f"{self.dialect.value} with incremental_backfill={incremental_backfill}; "
-                        "a shadow-generation publication protocol is required"
-                    )
+                cur = self.conn.cursor()
+                if cur is None:
+                    cur = self.conn.cursor()
                 if (
                     self.dialect == Dialect.POSTGRES
                     and bool(getattr(self.conn, "autocommit", False))
@@ -10756,6 +10760,9 @@ class MaterializedViewManager:
                     )
                 sqlite_writer_reserved = reserve_sqlite_writer()
                 self.drop_view(plan.view_name, _commit_transaction=False)
+
+            if cur is None:
+                cur = self.conn.cursor()
 
             # Reserve before the first structure/trigger DDL on new registrations.
             # For SQLite this also closes the trigger-installation/backfill writer
