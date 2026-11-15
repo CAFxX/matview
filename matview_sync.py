@@ -10154,8 +10154,14 @@ class MaterializedViewManager:
         )
         connection_dialect = getattr(self.conn, "dialect", None)
         connection_dialect_name = getattr(connection_dialect, "name", connection_dialect)
+        explicit_engine_dialect = (
+            parse_engine_version(engine_version, default_dialect=hint_d).dialect
+            if engine_version is not None
+            else None
+        )
+        effective_hint_dialect = explicit_engine_dialect or hint_d
         postgres_candidate = (
-            hint_d == Dialect.POSTGRES
+            effective_hint_dialect == Dialect.POSTGRES
             or (isinstance(connection_dialect_name, str) and "postgres" in connection_dialect_name.lower())
             or any(name in connection_module for name in ("psycopg", "pg8000", "asyncpg", "postgres", "pgsql"))
         )
