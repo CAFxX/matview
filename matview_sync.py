@@ -10170,6 +10170,17 @@ class MaterializedViewManager:
             or (isinstance(connection_dialect_name, str) and "postgres" in connection_dialect_name.lower())
             or any(name in connection_module for name in ("psycopg", "pg8000", "asyncpg", "postgres", "pgsql"))
         )
+        mysql_candidate = (
+            effective_hint_dialect == Dialect.MYSQL
+            or (
+                isinstance(connection_dialect_name, str)
+                and any(token in connection_dialect_name.lower() for token in ("mysql", "maria"))
+            )
+            or any(
+                name in connection_module
+                for name in ("pymysql", "mysql", "mariadb", "mysqldb")
+            )
+        )
         if postgres_candidate:
             self._require_idle_postgres_connection(self.conn)
         elif mysql_candidate:
