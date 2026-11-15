@@ -38,7 +38,7 @@ class MySQLTransactionStateGuardTests(unittest.TestCase):
         class Connection:
             pass
 
-        with self.assertRaisesRegex(RuntimeError, "cannot safely determine"):
+        with self.assertRaisesRegex(RuntimeError, "transaction state on every physical DB-API connection"):
             MaterializedViewManager._require_idle_mysql_connection(Connection())
 
     def test_callable_transaction_state_is_supported(self):
@@ -61,6 +61,20 @@ class MySQLTransactionStateGuardTests(unittest.TestCase):
             connection = PoolProxy()
 
         with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
+            MaterializedViewManager._require_idle_mysql_connection(SQLAlchemyConnection())
+
+    def test_wrapped_idle_facade_with_unknown_driver_state_fails_closed(self):
+        class UnknownDriver:
+            pass
+
+        class PoolProxy:
+            driver_connection = UnknownDriver()
+
+        class SQLAlchemyConnection:
+            in_transaction = False
+            connection = PoolProxy()
+
+        with self.assertRaisesRegex(RuntimeError, "every physical DB-API connection"):
             MaterializedViewManager._require_idle_mysql_connection(SQLAlchemyConnection())
 
     def test_wrapped_idle_driver_state_is_accepted(self):
