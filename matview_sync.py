@@ -10364,6 +10364,21 @@ class MaterializedViewManager:
             except Exception:
                 pass
 
+    def _invalidate_sqlite_connection_after_rollback_failure(self) -> Optional[BaseException]:
+        """Make a SQLite manager unusable when transaction state cannot be recovered."""
+        self._sqlite_connection_discarded = True
+        try:
+            setattr(self.conn, "_matview_connection_discarded", True)
+        except Exception:
+            pass
+        try:
+            close = getattr(self.conn, "close", None)
+            if callable(close):
+                close()
+        except Exception as close_error:
+            return close_error
+        return None
+
     @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
         """Fail closed unless the PostgreSQL connection and wrapped driver are idle."""
@@ -11173,6 +11188,14 @@ class MaterializedViewManager:
         it starts itself, but leaves a caller-owned transaction open and rollback-able by the caller.
         MySQL DDL paths are rejected because DDL can implicitly commit even when the context fails.
         """
+        if self.dialect == Dialect.SQLITE and (
+            getattr(self, "_sqlite_connection_discarded", False)
+            or getattr(self.conn, "_matview_connection_discarded", False)
+        ):
+            raise RuntimeError(
+                "this SQLite manager connection was discarded after an "
+                "unrecoverable writer-transaction rollback failure"
+            )
         if self.dialect == Dialect.MYSQL and (
             getattr(self, "_mysql_connection_discarded", False)
             or getattr(self.conn, "_matview_connection_discarded", False)
@@ -11280,7 +11303,19 @@ class MaterializedViewManager:
                 ) from exc
             if self.dialect == Dialect.SQLITE:
                 if sqlite_writer_reserved:
-                    self._rollback()
+                    try:
+                        self.conn.rollback()
+                    except Exception as rollback_error:
+                        close_error = self._invalidate_sqlite_connection_after_rollback_failure()
+                        detail = (
+                            "bulk_changes() could not release its SQLite writer reservation "
+                            "after SAVEPOINT setup failed; the manager connection was "
+                            "invalidated and must not be reused"
+                        )
+                        if close_error is not None:
+                            detail += f"; closing the physical connection also failed: {close_error!r}"
+                        close_cursor()
+                        raise RuntimeError(detail) from rollback_error
                 close_cursor()
                 raise RuntimeError(
                     "bulk_changes() on SQLite requires SAVEPOINT support "
