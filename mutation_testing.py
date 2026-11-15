@@ -44,9 +44,9 @@ MUTANTS = (
         name="join-sum-retraction-keeps-value-when-nonnull-count-reaches-zero",
         source_path="matview_sync.py",
         original='                f"(CASE WHEN __mv_delta.{col} IS NULL THEN {mv_table}.{col} "'
-        + '\\n                f"WHEN {new_c} <= 0 THEN NULL "',
+        + '\n                f"WHEN {new_c} <= 0 THEN NULL "',
         replacement='                f"(CASE WHEN __mv_delta.{col} IS NULL THEN {mv_table}.{col} "'
-        + '\\n                f"WHEN {new_c} < 0 THEN NULL "',
+        + '\n                f"WHEN {new_c} < 0 THEN NULL "',
     ),
     Mutant(
         name="join-count-retraction-adds-instead-of-subtracting",
