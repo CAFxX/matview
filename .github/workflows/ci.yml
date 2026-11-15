@@ -197,6 +197,9 @@ jobs:
       - name: Differentially test generated SELECT materialized views
         run: python3 test_query_ast_materialization.py
 
+      - name: Report test strength and honest coverage statistics
+        run: python3 test_strength_reporting.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
