@@ -10139,10 +10139,34 @@ class MaterializedViewManager:
 
         if isinstance(conn_or_url, str):
             self.conn, inferred_dialect = self._connect_database_url(conn_or_url, hint_d)
+            if hint_d is None:
+                hint_d = inferred_dialect
             if hint_d is None or conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
                 hint_d = inferred_dialect
         else:
             self.conn = conn_or_url
+
+        # Version detection and catalog initialization both execute SQL and
+        # catalog initialization commits. Refuse a pre-existing PostgreSQL
+        # transaction before either can touch or commit caller-owned work.
+        connection_module = (
+            f"{type(self.conn).__module__}.{type(self.conn).__qualname__}".lower()
+        )
+        connection_dialect = getattr(self.conn, "dialect", None)
+        connection_dialect_name = getattr(connection_dialect, "name", connection_dialect)
+        explicit_engine_dialect = (
+            parse_engine_version(engine_version, default_dialect=hint_d).dialect
+            if engine_version is not None
+            else None
+        )
+        effective_hint_dialect = explicit_engine_dialect or hint_d
+        postgres_candidate = (
+            effective_hint_dialect == Dialect.POSTGRES
+            or (isinstance(connection_dialect_name, str) and "postgres" in connection_dialect_name.lower())
+            or any(name in connection_module for name in ("psycopg", "pg8000", "asyncpg", "postgres", "pgsql"))
+        )
+        if postgres_candidate:
+            self._require_idle_postgres_connection(self.conn)
 
         if engine_version is not None:
             self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
@@ -10214,6 +10238,103 @@ class MaterializedViewManager:
             except Exception:
                 pass
 
+    @staticmethod
+    def _require_idle_postgres_connection(conn: Any) -> None:
+        """Fail closed unless every wrapped PostgreSQL driver is idle and non-autocommit."""
+        candidates = []
+        leaves = []
+        pending = [conn]
+        seen = set()
+        while pending:
+            candidate = pending.pop()
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            candidates.append(candidate)
+            has_nested = False
+            for attr in ("connection", "driver_connection", "dbapi_connection", "_connection"):
+                try:
+                    nested = getattr(candidate, attr, None)
+                except Exception:
+                    nested = None
+                if nested is not None and nested is not candidate:
+                    pending.append(nested)
+                    has_nested = True
+            if not has_nested:
+                leaves.append(candidate)
+
+        # The outer facade can be idle while a caller has opened a transaction
+        # directly on the raw driver. Require authoritative state on every leaf.
+        for candidate in candidates:
+            autocommit = getattr(candidate, "autocommit", None)
+            if autocommit is True:
+                raise RuntimeError(
+                    "PostgreSQL manager initialization requires autocommit=False "
+                    "to preserve transactional DDL atomicity"
+                )
+        for leaf in leaves:
+            if getattr(leaf, "autocommit", None) is not False:
+                raise RuntimeError(
+                    "PostgreSQL manager initialization requires the underlying driver "
+                    "to expose autocommit=False; cannot safely guarantee transactional DDL"
+                )
+
+        checked_leaves = set()
+        leaf_ids = {id(leaf) for leaf in leaves}
+        for candidate in candidates:
+            state = getattr(candidate, "in_transaction", None)
+            if callable(state):
+                try:
+                    state = state()
+                except Exception:
+                    state = None
+            if isinstance(state, bool):
+                if id(candidate) in leaf_ids:
+                    checked_leaves.add(id(candidate))
+                if state:
+                    raise RuntimeError(
+                        "PostgreSQL manager initialization cannot run inside an active caller "
+                        "transaction; commit or roll back that transaction first"
+                    )
+                continue
+
+            status = None
+            getter = getattr(candidate, "get_transaction_status", None)
+            if callable(getter):
+                try:
+                    status = getter()
+                except Exception:
+                    status = None
+            if status is None:
+                info = getattr(candidate, "info", None)
+                status = getattr(info, "transaction_status", None)
+            if status is None:
+                continue
+            try:
+                state = int(status) != 0
+            except (TypeError, ValueError):
+                state_text = str(status).lower()
+                if state_text.endswith("idle"):
+                    state = False
+                else:
+                    raise RuntimeError(
+                        "PostgreSQL manager initialization could not interpret "
+                        "the connection transaction state"
+                    )
+            if id(candidate) in leaf_ids:
+                checked_leaves.add(id(candidate))
+            if state:
+                raise RuntimeError(
+                    "PostgreSQL manager initialization cannot run inside an active caller "
+                    "transaction; commit or roll back that transaction first"
+                )
+
+        if checked_leaves != leaf_ids:
+            raise RuntimeError(
+                "PostgreSQL manager initialization requires transaction state from every "
+                "underlying driver; cannot safely determine whether caller work would be committed"
+            )
+
     def _assert_registration_transaction_ownership(self) -> None:
         """Reject transaction modes that registration cannot safely own.
 
@@ -10237,43 +10358,7 @@ class MaterializedViewManager:
                 )
 
         if self.dialect == Dialect.POSTGRES:
-            autocommit = getattr(self.conn, "autocommit", None)
-            if autocommit is not False:
-                raise RuntimeError(
-                    "register_view/sync_views require PostgreSQL autocommit=False "
-                    "for transactional DDL"
-                )
-
-            transaction_state = getattr(self.conn, "in_transaction", None)
-            if not isinstance(transaction_state, bool):
-                status = None
-                status_getter = getattr(self.conn, "get_transaction_status", None)
-                if callable(status_getter):
-                    try:
-                        status = status_getter()
-                    except Exception:
-                        status = None
-                if status is None:
-                    info = getattr(self.conn, "info", None)
-                    status = getattr(info, "transaction_status", None)
-                if status is None:
-                    raise RuntimeError(
-                        "register_view/sync_views require a connection adapter that exposes "
-                        "transaction state; cannot safely determine whether a caller "
-                        "transaction would be committed"
-                    )
-                try:
-                    transaction_state = int(status) != 0
-                except (TypeError, ValueError):
-                    raise RuntimeError(
-                        "register_view/sync_views could not interpret PostgreSQL "
-                        "connection transaction state"
-                    )
-            if transaction_state:
-                raise RuntimeError(
-                    "register_view/sync_views cannot run inside an active caller "
-                    "transaction; commit or roll back that transaction first"
-                )
+            self._require_idle_postgres_connection(self.conn)
 
     def _param_placeholder(self) -> str:
         return "?" if self.dialect == Dialect.SQLITE else "%s"
