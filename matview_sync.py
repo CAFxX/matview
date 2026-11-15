@@ -10644,7 +10644,27 @@ class MaterializedViewManager:
 
         try:
             if existing:
+                # Never destroy the currently published generation unless the
+                # entire replacement can be rolled back atomically. MySQL/MariaDB
+                # implicitly commit DDL, and incremental backfills commit chunks;
+                # both require shadow-generation publication, which is not yet
+                # implemented. Reject before opening a cursor or issuing any DDL.
+                if incremental_backfill or self.dialect not in (Dialect.SQLITE, Dialect.POSTGRES):
+                    raise RuntimeError(
+                        "Replacing an existing materialized view is unsupported for "
+                        "MySQL/MariaDB and incremental backfills until atomic shadow-generation "
+                        "publication is implemented; the existing view was left untouched"
+                    )
+
                 # SQLite and PostgreSQL support transactional DDL. For a single-shot
+                # replacement, keep removal of the old reader/backing objects in the
+                # same transaction as creation and population of the replacement, so
+                # a failed rebuild restores the previously working materialized view.
+                transactional_replacement = True
+                if transactional_replacement:
+                    sqlite_writer_reserved = reserve_sqlite_writer()
+                    self.drop_view(plan.view_name, _commit_transaction=False)
+ For a single-shot
                 # replacement, keep removal of the old reader/backing objects in the
                 # same transaction as creation and population of the replacement, so
                 # a failed rebuild restores the previously working materialized view.
