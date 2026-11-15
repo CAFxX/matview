@@ -11034,6 +11034,7 @@ class MaterializedViewManager:
 
         cur = self.conn.cursor()
         sp_active = False
+        trigger_suspension_started = False
         created_shadow_tables: List[str] = []
 
         try:
@@ -11093,7 +11094,13 @@ class MaterializedViewManager:
                     "refusing to drop maintenance triggers because MySQL/MariaDB DDL commits implicitly"
                 )
 
+            if session_bypass_ok:
+                trigger_suspension_started = True
+
             if not session_bypass_ok:
+                # From this point a partial trigger-removal failure needs the
+                # restoration path, so mark it before issuing the first DDL.
+                trigger_suspension_started = True
                 for entry in targets:
                     if self.dialect == Dialect.POSTGRES:
                         for fn_name in entry["function_names"]:
@@ -11332,7 +11339,10 @@ class MaterializedViewManager:
                         pass
                 self._commit()
             except Exception:
-                _cleanup_and_restore()
+                if trigger_suspension_started:
+                    _cleanup_and_restore()
+                else:
+                    self._rollback()
                 raise
         finally:
             if hasattr(cur, "close"):
