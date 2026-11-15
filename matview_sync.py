@@ -10212,6 +10212,19 @@ class MaterializedViewManager:
         returned to a pool as healthy.
         """
         self._mysql_connection_discarded = True
+        # Best-effort poison markers also protect a second manager wrapping the
+        # same DB-API object if close/invalidate fails or a wrapper is reused.
+        candidates = (
+            self.conn,
+            getattr(self.conn, "_connection", None),
+            getattr(self.conn, "connection", None),
+        )
+        for candidate in candidates:
+            if candidate is not None:
+                try:
+                    setattr(candidate, "_matview_connection_discarded", True)
+                except Exception:
+                    pass
         invalidated = False
         invalidator = getattr(self.conn, "invalidate", None)
         if callable(invalidator):
@@ -11011,8 +11024,9 @@ class MaterializedViewManager:
         it starts itself, but leaves a caller-owned transaction open and rollback-able by the caller.
         MySQL DDL paths are rejected because DDL can implicitly commit even when the context fails.
         """
-        if self.dialect == Dialect.MYSQL and getattr(
-            self, "_mysql_connection_discarded", False
+        if self.dialect == Dialect.MYSQL and (
+            getattr(self, "_mysql_connection_discarded", False)
+            or getattr(self.conn, "_matview_connection_discarded", False)
         ):
             raise RuntimeError(
                 "this MySQL/MariaDB manager connection was discarded after an "
