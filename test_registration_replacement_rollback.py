@@ -3,8 +3,8 @@
 
 SQLite's transactional DDL requires an explicit BEGIN IMMEDIATE before dropping
 the old generation. PostgreSQL's DDL is transactional under the connection's
-normal transaction. MySQL/MariaDB and chunk-committing incremental replacement
-are deliberately outside this regression's claimed scope.
+normal transaction. MySQL/MariaDB and chunk-committing incremental replacements are rejected
+before the existing generation is dropped until atomic publication is available.
 """
 from __future__ import annotations
 
@@ -123,7 +123,7 @@ def main() -> None:
             manager._compute_signature = original_signature
             manager.drop_view = original_drop_view
 
-        print("PASS: failed replacement rolled back to the prior live materialized view")
+        print("PASS: replacement rollback and fail-closed unsupported replacement checks")
     finally:
         conn.close()
 
