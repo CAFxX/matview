@@ -4163,13 +4163,21 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
 
     def test_00a_mysql_bulk_changes_never_uses_implicit_commit_ddl(self) -> None:
         class Cursor:
-            def __init__(self, fail_bypass: bool = False, fail_reset: bool = False) -> None:
+            def __init__(
+                self,
+                fail_bypass: bool = False,
+                fail_reset: bool = False,
+                fail_savepoint: bool = False,
+            ) -> None:
                 self.statements: List[str] = []
                 self.fail_bypass = fail_bypass
                 self.fail_reset = fail_reset
+                self.fail_savepoint = fail_savepoint
 
             def execute(self, statement: str) -> None:
                 self.statements.append(statement)
+                if self.fail_savepoint and statement == "SAVEPOINT __mv_bulk_sp;":
+                    raise RuntimeError("savepoints unavailable")
                 if self.fail_bypass and statement == "SET @__matview_skip_triggers = 1;":
                     raise RuntimeError("session variables unavailable")
                 if self.fail_reset and statement == "SET @__matview_skip_triggers = 0;":
@@ -4236,6 +4244,28 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(conn.rollback_calls, 0)
         self.assertEqual(conn.commit_calls, 0)
         self.assertIs(conn.in_transaction, True)
+
+        # A missing savepoint must fail closed. It must not roll back a
+        # caller-owned transaction, but it must roll back a transaction that
+        # the context itself started.
+        cursor = Cursor(fail_savepoint=True)
+        conn = Connection(cursor)
+        conn.in_transaction = True
+        mgr = make_manager(conn, catalog={})
+        with self.assertRaisesRegex(RuntimeError, "requires SAVEPOINT support"):
+            with mgr.bulk_changes():
+                self.fail("caller transaction without savepoint must be rejected")
+        self.assertEqual(conn.rollback_calls, 0)
+        self.assertEqual(conn.commit_calls, 0)
+
+        cursor = Cursor(fail_savepoint=True)
+        conn = Connection(cursor)
+        mgr = make_manager(conn, catalog={})
+        with self.assertRaisesRegex(RuntimeError, "requires SAVEPOINT support"):
+            with mgr.bulk_changes():
+                self.fail("context transaction without savepoint must be rejected")
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
 
         # Explicit DDL options must fail before even reading the catalog.
         for options in ({"drop_triggers": True}, {"use_shadow_swap": True}):
