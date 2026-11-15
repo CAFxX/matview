@@ -10221,6 +10221,12 @@ class MaterializedViewManager:
                 self._discard_mysql_connection()
             except Exception as exc:
                 discard_error = exc
+            try:
+                close_cursor = getattr(cur, "close", None)
+                if callable(close_cursor):
+                    close_cursor()
+            except Exception:
+                pass
             detail = (
                 f"bulk_changes() could not restore its MySQL/MariaDB savepoint during {stage}; "
                 "the connection has been marked unusable and discarded because the caller "
