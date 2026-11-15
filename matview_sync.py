@@ -5902,12 +5902,19 @@ class IncrementalViewCompiler:
                     f"({pk_col} > __mv_cur_pk AND {pk_col} <= __mv_top_pk)",
                 )
                 if is_global_agg:
-                    my_chunk = re.sub(
-                        r"\nON DUPLICATE KEY UPDATE\b",
-                        "\nHAVING COUNT(*) > 0\nON DUPLICATE KEY UPDATE",
-                        my_chunk,
-                        count=1,
-                    )
+                    if "\n) AS __mv_src\nON DUPLICATE KEY UPDATE" in my_chunk:
+                        my_chunk = my_chunk.replace(
+                            "\n) AS __mv_src\nON DUPLICATE KEY UPDATE",
+                            "\n    HAVING COUNT(*) > 0\n) AS __mv_src\nON DUPLICATE KEY UPDATE",
+                            1,
+                        )
+                    else:
+                        my_chunk = re.sub(
+                            r"\nON DUPLICATE KEY UPDATE\b",
+                            "\nHAVING COUNT(*) > 0\nON DUPLICATE KEY UPDATE",
+                            my_chunk,
+                            count=1,
+                        )
                 fallback_global = ""
                 if is_global_agg:
                     for pop_s in raw_plan.initial_populate_sqls:
@@ -7055,12 +7062,15 @@ class IncrementalViewCompiler:
                 incoming_alias=incoming_alias,
             )
             q_pk_cols = [self._q(c) for c in pk_cols]
+            aliased_select_exprs = [
+                f"{expr} AS {col}" for expr, col in zip(select_exprs, q_target_cols)
+            ]
             if self.dialect == Dialect.MYSQL:
                 if is_mysql_alias:
                     chunk_upsert_sql = (
                         f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
                         f"SELECT * FROM (\n"
-                        f"    SELECT {', '.join(select_exprs)}\n"
+                        f"    SELECT {', '.join(aliased_select_exprs)}\n"
                         f"    FROM {q_base_t}\n"
                         f"    WHERE {chunk_where}{group_sql}{having_sql}\n"
                         f") AS __mv_src\n"
@@ -7080,7 +7090,7 @@ class IncrementalViewCompiler:
                 chunk_upsert_sql = (
                     f"MERGE INTO {mv_table}\n"
                     f"USING (\n"
-                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    SELECT {', '.join(aliased_select_exprs)}\n"
                     f"    FROM {q_base_t}\n"
                     f"    WHERE {chunk_where}{group_sql}{having_sql}\n"
                     f") AS __mv_src\n"
@@ -7131,6 +7141,10 @@ class IncrementalViewCompiler:
                         dist_grp_list.append(g_expr)
                 dist_sel.extend([eff, "COUNT(*)"])
                 dist_grp_list.append(eff)
+                dist_cols_flat = [*pk_cols, "__val", "__ref_cnt"]
+                dist_aliased_sel = [
+                    f"{expr} AS {col}" for expr, col in zip(dist_sel, dist_cols_flat)
+                ]
                 w_p = [f"({eff}) IS NOT NULL", f"({grp_expr}) IN ({{placeholders}})"]
                 if self.view.where_clause:
                     w_p.insert(0, f"({self.view.where_clause})")
@@ -7139,7 +7153,7 @@ class IncrementalViewCompiler:
                         chunk_templates.append(
                             f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
                             f"SELECT * FROM (\n"
-                            f"    SELECT {', '.join(dist_sel)}\n"
+                            f"    SELECT {', '.join(dist_aliased_sel)}\n"
                             f"    FROM {q_base_t}\n"
                             f"    WHERE {' AND '.join(w_p)}\n"
                             f"    GROUP BY {', '.join(dist_grp_list)}\n"
@@ -7159,7 +7173,7 @@ class IncrementalViewCompiler:
                     chunk_templates.append(
                         f"MERGE INTO {aux_tbl}\n"
                         f"USING (\n"
-                        f"    SELECT {', '.join(dist_sel)}\n"
+                        f"    SELECT {', '.join(dist_aliased_sel)}\n"
                         f"    FROM {q_base_t}\n"
                         f"    WHERE {' AND '.join(w_p)}\n"
                         f"    GROUP BY {', '.join(dist_grp_list)}\n"
@@ -7169,7 +7183,7 @@ class IncrementalViewCompiler:
                         f"    UPDATE SET __ref_cnt = __mv_src.__ref_cnt\n"
                         f"WHEN NOT MATCHED THEN\n"
                         f"    INSERT ({', '.join(dist_cols)})\n"
-                        f"    VALUES ({', '.join(f'__mv_src.{c}' for c in dist_cols)});"
+                        f"    VALUES ({', '.join(f'__mv_src.{c}' for c in dist_cols_flat)});"
                     )
                 else:
                     aux_conflict = f"\nON CONFLICT ({', '.join(pk_cols)}, __val) DO UPDATE SET __ref_cnt = excluded.__ref_cnt"
@@ -7186,13 +7200,14 @@ class IncrementalViewCompiler:
             q_pk_cols = [self._q(c) for c in pk_cols]
             q_pk_set = set(q_pk_cols)
             non_pk_target = [c for c in q_target_cols if c not in q_pk_set] or list(q_pk_cols)
+            aliased_main_sel = [f"{expr} AS {col}" for expr, col in zip(select_exprs, q_target_cols)]
             if self.dialect == Dialect.MYSQL:
                 if self.engine_version.supports_mysql_row_alias_upsert:
                     main_conflict = f"\nON DUPLICATE KEY UPDATE {', '.join(f'{c} = __mv_src.{c}' for c in non_pk_target)}"
                     chunk_templates.append(
                         f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
                         f"SELECT * FROM (\n"
-                        f"    SELECT {', '.join(select_exprs)}\n"
+                        f"    SELECT {', '.join(aliased_main_sel)}\n"
                         f"    FROM {q_base_t}\n"
                         f"    WHERE {' AND '.join(w_main)}{group_sql}{having_sql}\n"
                         f") AS __mv_src{main_conflict};"
@@ -7209,7 +7224,7 @@ class IncrementalViewCompiler:
                 chunk_templates.append(
                     f"MERGE INTO {mv_table}\n"
                     f"USING (\n"
-                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    SELECT {', '.join(aliased_main_sel)}\n"
                     f"    FROM {q_base_t}\n"
                     f"    WHERE {' AND '.join(w_main)}{group_sql}{having_sql}\n"
                     f") AS __mv_src\n"
@@ -9674,10 +9689,15 @@ class IncrementalViewCompiler:
                         if self.dialect == Dialect.MYSQL:
                             if self.engine_version.supports_mysql_row_alias_upsert:
                                 upd_set = ", ".join(f"{c} = __mv_new.{c}" for c in user_columns)
+                                aliased_uall_sel = [
+                                    *[f"{expr} AS {col}" for expr, col in zip(new_pk_vals, uall_pk_cols)],
+                                    *[f"{expr} AS {col}" for expr, col in zip(new_vals, user_columns)],
+                                    "1 AS __mv_row_count",
+                                ]
                                 plus_s = (
                                     f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
                                     f"    SELECT * FROM (\n"
-                                    f"        SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                    f"        SELECT {', '.join(aliased_uall_sel)}{from_dual}\n"
                                     f"        WHERE {w_new}\n"
                                     f"    ) AS __mv_new\n"
                                     f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
@@ -9712,10 +9732,15 @@ class IncrementalViewCompiler:
                         if self.dialect == Dialect.MYSQL:
                             if self.engine_version.supports_mysql_row_alias_upsert:
                                 upd_set = ", ".join(f"{c} = __mv_new.{c}" for c in user_columns)
+                                aliased_uall_sel = [
+                                    f"{pk_new} AS __mv_pk",
+                                    *[f"{expr} AS {col}" for expr, col in zip(new_vals, user_columns)],
+                                    "1 AS __mv_row_count",
+                                ]
                                 plus_s = (
                                     f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
                                     f"    SELECT * FROM (\n"
-                                    f"        SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                    f"        SELECT {', '.join(aliased_uall_sel)}{from_dual}\n"
                                     f"        WHERE {w_new}\n"
                                     f"    ) AS __mv_new\n"
                                     f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
@@ -10015,12 +10040,27 @@ class IncrementalViewCompiler:
                     else f"({wm_pk_col} > {ph} AND {wm_pk_col} <= {ph})"
                 )
                 if self.dialect == Dialect.MYSQL:
-                    chunk_upsert_sql: Optional[str] = (
-                        f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
-                        f"SELECT {', '.join(all_select_exprs)}\nFROM {q_base_t}\n"
-                        f"WHERE {chunk_w}\n"
-                        f"ON DUPLICATE KEY UPDATE {upd_set};"
-                    )
+                    if self.engine_version.supports_mysql_row_alias_upsert:
+                        aliased_chunk_sel = [
+                            f"{expr} AS {col}" for expr, col in zip(all_select_exprs, all_backing_cols)
+                        ]
+                        chunk_upd = ", ".join(f"{c} = __mv_src.{c}" for c in all_backing_cols)
+                        chunk_upsert_sql: Optional[str] = (
+                            f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                            f"SELECT * FROM (\n"
+                            f"    SELECT {', '.join(aliased_chunk_sel)}\n"
+                            f"    FROM {q_base_t}\n"
+                            f"    WHERE {chunk_w}\n"
+                            f") AS __mv_src\n"
+                            f"ON DUPLICATE KEY UPDATE {chunk_upd};"
+                        )
+                    else:
+                        chunk_upsert_sql = (
+                            f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                            f"SELECT {', '.join(all_select_exprs)}\nFROM {q_base_t}\n"
+                            f"WHERE {chunk_w}\n"
+                            f"ON DUPLICATE KEY UPDATE {upd_set};"
+                        )
                 else:
                     chunk_upsert_sql = (
                         f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
@@ -10107,12 +10147,29 @@ class IncrementalViewCompiler:
                     else f"({wm_pk_col} > {ph} AND {wm_pk_col} <= {ph})"
                 )
                 if self.dialect == Dialect.MYSQL:
-                    chunk_upsert_sql = (
-                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
-                        f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1\nFROM {q_base_t}\n"
-                        f"WHERE {chunk_w}\n"
-                        f"ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
-                    )
+                    if self.engine_version.supports_mysql_row_alias_upsert:
+                        aliased_chunk_sel = [
+                            f"{pk_expr_base} AS __mv_pk",
+                            *[f"{expr} AS {col}" for expr, col in zip(sel_exprs, user_columns)],
+                            "1 AS __mv_row_count",
+                        ]
+                        chunk_upd = ", ".join(f"{c} = __mv_src.{c}" for c in user_columns)
+                        chunk_upsert_sql = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"SELECT * FROM (\n"
+                            f"    SELECT {', '.join(aliased_chunk_sel)}\n"
+                            f"    FROM {q_base_t}\n"
+                            f"    WHERE {chunk_w}\n"
+                            f") AS __mv_src\n"
+                            f"ON DUPLICATE KEY UPDATE {chunk_upd}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                    else:
+                        chunk_upsert_sql = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1\nFROM {q_base_t}\n"
+                            f"WHERE {chunk_w}\n"
+                            f"ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
                 else:
                     chunk_upsert_sql = (
                         f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
@@ -12995,6 +13052,7 @@ class MaterializedViewManager:
                 object_prefix=self.object_prefix,
                 strict=effective_strict,
                 engine_version=self.engine_version,
+                pg_fillfactor=getattr(self, "pg_fillfactor", 80),
                 watermark_catalog_table=self.catalog_table if incremental_backfill else None,
             )
             v_name = plan.view_name
