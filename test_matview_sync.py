@@ -6461,6 +6461,21 @@ class DifferentialSQLFuzzer:
     def __init__(self, seed: int = 20261106) -> None:
         self.seed = seed
 
+    @staticmethod
+    def generate_variable_schema_scenario(
+        seed: int = 20261107,
+        scenario_idx: int = 1,
+        dialect: Dialect = Dialect.SQLITE,
+        views_count: int = 24,
+        mutations_count: int = 32,
+    ) -> Tuple[str, List[Tuple[str, str]], List[str], List[Tuple[str, str]], Dict[str, Any]]:
+        return VariableSchemaDifferentialFuzzer(seed).generate_scenario(
+            scenario_idx,
+            views_count=views_count,
+            mutations_count=mutations_count,
+            dialect=dialect,
+        )
+
     def generate_scenario(
         self,
         scenario_idx: int,
