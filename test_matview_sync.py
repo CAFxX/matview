@@ -6513,6 +6513,55 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "SELECT $body$-- keep /* keep */; $body$, 1 FROM items",
         )
 
+
+    def test_schema_preserving_mutation_minimizer_keeps_failure_identity(self) -> None:
+        schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER);"
+        views = [("v", "CREATE VIEW v AS SELECT * FROM t;")]
+        seeds = ["INSERT INTO t VALUES (1, 0);"]
+        mutations = [
+            ("irrelevant_before", "UPDATE t SET value = 1 WHERE id = 1;"),
+            ("target_left", "UPDATE t SET value = 2 WHERE id = 1;"),
+            ("irrelevant_middle", "UPDATE t SET value = 3 WHERE id = 1;"),
+            ("target_right", "DELETE FROM t WHERE id = 1;"),
+            ("irrelevant_after", "INSERT INTO t VALUES (2, 0);"),
+        ]
+        shape = {"topology": "chain", "table_count": 1}
+        scenario = (schema, views, seeds, mutations, shape)
+
+        def failure_signature(candidate):
+            labels = {label for label, _ in candidate[3]}
+            return "target-delta-regression" if {
+                "target_left", "target_right"
+            } <= labels else None
+
+        minimized = VariableSchemaDifferentialFuzzer.minimize_mutation_sequence(
+            scenario, failure_signature
+        )
+        self.assertEqual(
+            [label for label, _ in minimized[3]],
+            ["target_left", "target_right"],
+        )
+        self.assertEqual(failure_signature(minimized), "target-delta-regression")
+        # The reducer is deliberately schema-preserving: no DDL, view, seed,
+        # or structural metadata is regenerated or silently simplified.
+        self.assertIs(minimized[0], scenario[0])
+        self.assertIs(minimized[1], scenario[1])
+        self.assertIs(minimized[2], scenario[2])
+        self.assertIs(minimized[4], scenario[4])
+
+    def test_schema_preserving_mutation_minimizer_leaves_nonreproducing_case_untouched(self) -> None:
+        scenario = (
+            "CREATE TABLE t (id INTEGER PRIMARY KEY);",
+            [],
+            [],
+            [("one", "INSERT INTO t VALUES (1);")],
+            {"table_count": 1},
+        )
+        minimized = VariableSchemaDifferentialFuzzer.minimize_mutation_sequence(
+            scenario, lambda candidate: None
+        )
+        self.assertIs(minimized, scenario)
+
     def test_10_differential_oracle_rejects_result_type_and_empty_shape_mismatches(self) -> None:
         """The live-view oracle must detect metadata-only divergences, even for empty sets."""
         class FakeCursor:
@@ -7753,6 +7802,50 @@ class VariableSchemaDifferentialFuzzer:
             tracker.observe(best[4])
             selected.append(best)
         return selected, tracker.summary()
+
+
+    @staticmethod
+    def minimize_mutation_sequence(
+        scenario: Tuple[
+            str, List[Tuple[str, str]], List[str], List[Tuple[str, str]], Dict[str, Any]
+        ],
+        failure_signature: Callable[[Tuple[
+            str, List[Tuple[str, str]], List[str], List[Tuple[str, str]], Dict[str, Any]
+        ]], Optional[str]],
+    ) -> Tuple[
+        str, List[Tuple[str, str]], List[str], List[Tuple[str, str]], Dict[str, Any]
+    ]:
+        """Minimize DML while preserving the exact schema, view, seed, and failure identity.
+
+        The callback must return a stable non-empty identifier only when the same
+        target failure is reproduced; invalid candidates and different failures
+        must return None or a different identifier.
+        """
+        schema_sql, views, seed_sql, mutations, shape = scenario
+        original_signature = failure_signature(scenario)
+        if not original_signature or not mutations:
+            return scenario
+
+        current = list(mutations)
+        granularity = 2
+        while current:
+            chunk_size = (len(current) + granularity - 1) // granularity
+            reduced = False
+            for start in range(0, len(current), chunk_size):
+                candidate_mutations = current[:start] + current[start + chunk_size:]
+                candidate = (schema_sql, views, seed_sql, candidate_mutations, shape)
+                if failure_signature(candidate) == original_signature:
+                    current = candidate_mutations
+                    granularity = max(2, granularity - 1)
+                    reduced = True
+                    break
+            if reduced:
+                continue
+            if granularity >= len(current):
+                break
+            granularity = min(len(current), granularity * 2)
+
+        return schema_sql, views, seed_sql, current, shape
 
 
 class SchemaCoverageTracker:
