@@ -8257,6 +8257,15 @@ def run_suite_13_fuzz_regression_corpus(runner: MVTestRunner) -> None:
 
 
 def _run_all_tests() -> None:
+    probe = unittest.TestSuite([
+        TestGeneratorAndManagerCodePaths(
+            "test_25_join_aggregate_decrement_and_group_key_invariants"
+        )
+    ])
+    probe_result = unittest.TextTestRunner(verbosity=2).run(probe)
+    if not probe_result.wasSuccessful():
+        raise SystemExit(1)
+
     t0 = time.time()
     runner = MVTestRunner()
 
