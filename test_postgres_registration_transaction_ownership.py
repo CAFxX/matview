@@ -28,13 +28,13 @@ def main() -> None:
     suffix = uuid.uuid4().hex[:16]
     table = "mv_tx_owner_" + suffix
     view = "mv_tx_owner_view_" + suffix
+    constructor_table = "mv_constructor_owner_" + suffix
     try:
         # Construction itself must not commit an already-active caller
         # transaction: it performs version detection and catalog initialization.
         with conn.cursor() as cur:
             cur.execute(f'CREATE TABLE "mv_constructor_owner_{suffix}" (id INTEGER PRIMARY KEY)')
         conn.commit()
-        constructor_table = "mv_constructor_owner_" + suffix
         with conn.cursor() as cur:
             cur.execute("BEGIN")
             cur.execute(f'INSERT INTO "{constructor_table}" VALUES (1)')
