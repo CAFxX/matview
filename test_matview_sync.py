@@ -1098,9 +1098,10 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
         # Native MySQL/MariaDB: a caller-owned transaction must survive the
         # context uncommitted, and rolling it back must undo both base-table
         # changes and the DML refresh of every materialized reader.
-        if dialect == Dialect.MYSQL and callable(getattr(conn, "begin", None)):
+        begin_transaction = getattr(conn, "begin", None) or getattr(conn, "start_transaction", None)
+        if dialect == Dialect.MYSQL and callable(begin_transaction):
             conn.commit()
-            conn.begin()
+            begin_transaction()
             # This name deliberately matches the manager's old fixed
             # savepoint name. bulk_changes() must not shadow caller savepoints.
             cur.execute("SAVEPOINT __mv_bulk_sp;")
