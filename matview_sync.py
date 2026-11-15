@@ -11063,6 +11063,20 @@ class MaterializedViewManager:
                 except Exception:
                     pass
 
+            if (
+                self.dialect == Dialect.MYSQL
+                and not drop_triggers
+                and not session_bypass_ok
+            ):
+                # MySQL/MariaDB trigger DDL implicitly commits. Falling back to
+                # DROP TRIGGER would expose base-table writes without maintenance,
+                # and a later rollback cannot restore atomicity. Fail before any
+                # trigger DDL rather than silently weakening the isolation contract.
+                raise RuntimeError(
+                    "bulk_changes requires the MySQL session trigger-bypass variable; "
+                    "refusing to drop maintenance triggers because MySQL/MariaDB DDL commits implicitly"
+                )
+
             if not session_bypass_ok:
                 for entry in targets:
                     if self.dialect == Dialect.POSTGRES:
