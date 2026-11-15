@@ -6375,7 +6375,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             self.assertGreaterEqual(len(mutations), 5)
             self.assertEqual(
                 set(shape["dml_statement_kinds"]),
-                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "DELETE", "UPSERT"},
+                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "UPDATE_KEY", "UPDATE_NOOP", "DELETE", "UPSERT"},
             )
             self.assertGreater(shape["max_expression_depth"], 0)
             self.assertGreater(shape["max_predicate_depth"], 0)
@@ -6448,7 +6448,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             ).generate_scenario(2, dialect=dialect)
             self.assertEqual(
                 set(shape["dml_statement_kinds"]),
-                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "DELETE", "UPSERT"},
+                {"INSERT_VALUES", "INSERT_SELECT", "UPDATE", "UPDATE_KEY", "UPDATE_NOOP", "DELETE", "UPSERT"},
             )
             upserts = [
                 mutation_sql
@@ -7576,7 +7576,7 @@ class VariableSchemaDifferentialFuzzer:
         # still receive generated INSERT/UPDATE/UPSERT/DELETE statements.
         for i in reversed(range(len(metas))):
             meta = metas[i]
-            required_mutations = 4 + int(i == 1 and len(metas) > 1)
+            required_mutations = 6 + int(i == 1 and len(metas) > 1)
             if len(mutations) + required_mutations > mutations_count:
                 break
             fields = fields_for(meta)
@@ -7592,6 +7592,23 @@ class VariableSchemaDifferentialFuzzer:
             )
             mutations.append((f"{prefix}_t{i}_insert_many", insert_sql))
             statement_kinds.add("INSERT_VALUES")
+
+            # Change a grouping/key-like attribute on a row created above.
+            # The replacement is deliberately distinct and bounded by the
+            # fixed VARCHAR(40) label width, and remains valid under UNIQUE.
+            key_move_label = f"{prefix}_{i}_keymove"
+            mutations.append((
+                f"{prefix}_t{i}_key_move",
+                f"UPDATE {meta['name']} SET label = '{key_move_label}' WHERE id = {new_id};",
+            ))
+            statement_kinds.add("UPDATE_KEY")
+
+            # A genuine no-op UPDATE must preserve the materialized result.
+            mutations.append((
+                f"{prefix}_t{i}_noop",
+                f"UPDATE {meta['name']} SET qty = qty WHERE id = {new_id + 1};",
+            ))
+            statement_kinds.add("UPDATE_NOOP")
 
             if i == 1 and len(mutations) < mutations_count:
                 # Read the first row added above before UPDATE/DELETE can remove it.
