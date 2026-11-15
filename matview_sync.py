@@ -5448,7 +5448,9790 @@ class IncrementalViewCompiler:
             mv_col = self._group_col_alias(g_expr)
             if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
                 seen_hidden_grp.add(mv_col.lower())
-                c_def = self._lookup_col_def(g_expr)
+                collation_match = re.search(
+                    r'\bCOLLATE\s+((?:"[^"]+")|(?:`[^`]+`)|(?:\[[^\]]+\])|(?:[A-Za-z_][A-Za-z0-9_.$]*))\s*                nn = " NOT NULL" if not has_nullable_grp else ""
+                col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
+
+        def _expr_key(item: SelectItem) -> str:
+            eff = self._effective_agg_value_expr(item, record_prefix=None).strip().lower()
+            return f"{'dist:' if item.is_distinct else ''}{eff}"
+
+        col_nonnull_count_map: Dict[str, str] = {}
+        col_sum_map: Dict[str, str] = {}
+        col_sum2_map: Dict[str, str] = {}
+        col_true_cnt_map: Dict[str, str] = {}
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]] = {}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            ekey = _expr_key(item)
+            if item.agg_func == AggFunc.COUNT_COL:
+                col_nonnull_count_map[ekey] = self._q(item.alias)
+            elif item.agg_func == AggFunc.SUM:
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = self._q(item.alias)
+            if item.is_distinct and ekey not in distinct_aux_tables:
+                p = self.object_prefix if self.object_prefix else "__matview_"
+                aux_tbl = self._bounded_ident(f"{p}dist_", f"{self.logical_view_name}__{_sanitize_ident(item.alias)}")
+                c_arg = self._lookup_col_def(item.arg_expr)
+                val_dt = (
+                    self._normalize_dialect_type(c_arg.data_type)
+                    if c_arg
+                    else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
+                )
+                if self.dialect == Dialect.MYSQL and val_dt.upper() == "TEXT":
+                    val_dt = "VARCHAR(255)"
+                distinct_aux_tables[ekey] = (aux_tbl, item, val_dt)
+
+        group_mv_cols: List[str] = []
+        for g in grp_exprs:
+            mc = self._group_col_alias(g)
+            if mc not in group_mv_cols:
+                group_mv_cols.append(mc)
+        indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
+
+        for item in work_items:
+            if not item.is_aggregate:
+                c_def = self._lookup_col_def(item.raw_expr)
+                dt = (
+                    self._normalize_dialect_type(c_def.data_type)
+                    if c_def
+                    else self._infer_expr_storage_type(item)
+                )
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
+                col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
+            else:
+                storage_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    storage_type = "VARCHAR(255)"
+                if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
+                elif item.agg_func == AggFunc.TOTAL:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0.0")
+                else:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type}")
+
+        if count_star_alias is None:
+            col_defs_sql.append(f"{row_count_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        aux_idx = 0
+        for item in work_items:
+            if not item.is_aggregate or item.agg_func is None:
+                continue
+            ekey = _expr_key(item)
+            safe_id = _sanitize_ident(item.alias)
+            if item.agg_func in (
+                AggFunc.SUM,
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            ) or (item.agg_func == AggFunc.COUNT_STAR and item.filter_where):
+                if item.agg_func == AggFunc.COUNT_STAR and item.filter_where:
+                    col_nonnull_count_map[ekey] = self._q(item.alias)
+                elif ekey not in col_nonnull_count_map:
+                    aux_idx += 1
+                    cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
+                    col_nonnull_count_map[ekey] = cnt_col
+                    col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+            if item.agg_func in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum_map:
+                    aux_idx += 1
+                    sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
+                    col_sum_map[ekey] = sum_col
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
+
+            if item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum2_map:
+                    aux_idx += 1
+                    s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
+                    sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
+                    col_sum2_map[ekey] = sum2_col
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
+
+            if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if ekey not in col_true_cnt_map:
+                    aux_idx += 1
+                    tcnt_col = f"__mv_tcnt_{safe_id}_{aux_idx}"
+                    col_true_cnt_map[ekey] = tcnt_col
+                    col_defs_sql.append(f"{tcnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        pk_cols = self._tier1_pk_cols()
+        if grp_exprs and not has_nullable_grp:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        aux_ddls: List[str] = []
+        aux_names: List[str] = []
+        for ekey, (aux_tbl, rep_item, val_dt) in distinct_aux_tables.items():
+            aux_names.append(aux_tbl)
+            aux_col_defs: List[str] = []
+            if not grp_exprs:
+                aux_col_defs.append("__mv_global_id INTEGER NOT NULL")
+                aux_pk = ["__mv_global_id", "__val"]
+            elif has_nullable_grp:
+                aux_col_defs.append(f"__mv_pk {pk_type} NOT NULL")
+                aux_pk = ["__mv_pk", "__val"]
+            else:
+                aux_pk = []
+                for g_expr in grp_exprs:
+                    mc = self._group_col_alias(g_expr)
+                    c_def = self._lookup_col_def(g_expr)
+                    dt = (
+                        self._normalize_dialect_type(c_def.data_type)
+                        if c_def
+                        else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
+                    )
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                        dt = "VARCHAR(255)"
+                    aux_col_defs.append(f"{mc} {dt} NOT NULL")
+                    aux_pk.append(mc)
+                aux_pk.append("__val")
+            aux_col_defs.append(f"__val {val_dt} NOT NULL")
+            aux_col_defs.append(f"__ref_cnt {self._int_type()} NOT NULL DEFAULT 0")
+            aux_col_defs.append(f"PRIMARY KEY ({', '.join(aux_pk)})")
+            aux_ddls.append(
+                f"CREATE TABLE {aux_tbl} (\n    " + ",\n    ".join(aux_col_defs) + "\n);"
+            )
+
+        backing_col_map = {
+            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            for u_col, expr_s in self._compound_reader_exprs.items()
+            if expr_s != u_col and "__mv_elem_" in expr_s
+        }
+        can_pg15_unique_nnd = (
+            bool(grp_exprs)
+            and has_nullable_grp
+            and self._alg_mode in ("single", "distinct")
+            and len(set(c.lower() for c in group_mv_cols)) == len(grp_exprs)
+            and all(
+                (cd := self._lookup_col_def(g)) is not None
+                and any(tk in cd.data_type.upper() for tk in ("INT", "CHAR", "TEXT"))
+                for g in grp_exprs
+            )
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=group_mv_cols,
+            has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
+            backing_col_map=backing_col_map,
+            unique_group_nulls_not_distinct=can_pg15_unique_nnd,
+        )
+
+        reader_select_override = [
+            self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
+        ]
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                select_exprs_override=reader_select_override,
+                extra_where_filter=self._rewritten_having_clause,
+            )
+        )
+
+        initial_populate_sqls, inc_spec = self._build_initial_populate_and_inc_spec_tier1(
+            mv_table=mv_table,
+            count_star_alias=count_star_alias,
+            row_count_col=row_count_col,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            distinct_aux_tables=distinct_aux_tables,
+            expr_key_fn=_expr_key,
+        )
+
+        trigger_ddls, trig_names, fn_names = self._build_tier1_triggers(
+            view_name=view_name,
+            mv_table=mv_table,
+            base_t=self.view.base_table,
+            row_count_col=row_count_col,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            distinct_aux_tables=distinct_aux_tables,
+            expr_key_fn=_expr_key,
+            initial_populate_sqls=initial_populate_sqls,
+        )
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=aux_ddls,
+            index_ddls=index_ddls,
+            initial_populate_sqls=initial_populate_sqls,
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            auxiliary_table_names=aux_names,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    def _build_initial_populate_and_inc_spec_tier1(
+        self,
+        mv_table: str,
+        count_star_alias: Optional[str],
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+    ) -> Tuple[List[str], IncrementalBackfillSpec]:
+        stmts: List[str] = []
+        has_nullable_grp = self._has_nullable_group_col()
+        q_base_t = self._q(self.view.base_table)
+        pk_cols = self._tier1_pk_cols()
+        work_items = self._working_select_items
+        grp_exprs = self._effective_group_by_exprs
+
+        for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
+            eff = self._effective_agg_value_expr(rep_item, record_prefix=None)
+            dist_cols: List[str] = []
+            dist_sel: List[str] = []
+            dist_grp: List[str] = []
+            if not grp_exprs:
+                dist_cols.append("__mv_global_id")
+                dist_sel.append("1")
+            elif has_nullable_grp:
+                dist_cols.append("__mv_pk")
+                dist_sel.append(self._canonical_group_pk_expr(grp_exprs))
+                dist_grp.extend(self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=True))
+            else:
+                for g_expr in grp_exprs:
+                    dist_cols.append(self._group_col_alias(g_expr))
+                    dist_sel.append(g_expr)
+                    dist_grp.append(g_expr)
+            dist_cols.extend(["__val", "__ref_cnt"])
+            dist_sel.extend([eff, "COUNT(*)"])
+            dist_grp.append(eff)
+
+            w_parts: List[str] = []
+            if self.view.where_clause:
+                w_parts.append(f"({self.view.where_clause})")
+            w_parts.append(f"({eff}) IS NOT NULL")
+            where_sql = f"\nWHERE {' AND '.join(w_parts)}"
+            group_sql = f"\nGROUP BY {', '.join(dist_grp)}"
+            stmts.append(
+                f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                f"SELECT {', '.join(dist_sel)}\n"
+                f"FROM {q_base_t}{where_sql}{group_sql};"
+            )
+
+        target_cols: List[str] = []
+        select_exprs: List[str] = []
+
+        if not grp_exprs:
+            target_cols.append("__mv_global_id")
+            select_exprs.append("1")
+        elif has_nullable_grp:
+            target_cols.append("__mv_pk")
+            select_exprs.append(self._canonical_group_pk_expr(grp_exprs))
+
+        non_agg_aliases_lower = {
+            item.alias.lower() for item in work_items if not item.is_aggregate
+        }
+        seen_hidden: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                target_cols.append(mv_col)
+                select_exprs.append(g_expr)
+
+        for item in work_items:
+            target_cols.append(item.alias)
+            if not item.is_aggregate:
+                select_exprs.append(self._rewrite_expr_for_record(item.raw_expr, None))
+            else:
+                select_exprs.append(self._sql_backfill_agg_expr(item))
+
+        if count_star_alias is None:
+            target_cols.append(row_count_col)
+            select_exprs.append("COUNT(*)")
+
+        already_in_target = set(target_cols)
+        ekey_to_item: Dict[str, SelectItem] = {
+            expr_key_fn(it): it for it in work_items if it.is_aggregate
+        }
+
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            if cnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                dist = "DISTINCT " if it.is_distinct else ""
+                target_cols.append(cnt_col)
+                select_exprs.append(f"COUNT({dist}{eff})")
+                already_in_target.add(cnt_col)
+
+        for ekey, sum_col in col_sum_map.items():
+            if sum_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                dist = "DISTINCT " if it.is_distinct else ""
+                target_cols.append(sum_col)
+                select_exprs.append(f"SUM({dist}{eff})")
+                already_in_target.add(sum_col)
+
+        for ekey, sum2_col in col_sum2_map.items():
+            if sum2_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(sum2_col)
+                if self.dialect == Dialect.SQLITE:
+                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
+                else:
+                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
+                already_in_target.add(sum2_col)
+
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            if tcnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(tcnt_col)
+                select_exprs.append(
+                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
+                )
+                already_in_target.add(tcnt_col)
+
+        norm_where = self._rewrite_expr_for_record(self.view.where_clause, None) if self.view.where_clause else None
+        where_sql = f"\nWHERE {norm_where}" if norm_where else ""
+        if grp_exprs:
+            norm_grps = [self._rewrite_expr_for_record(g, None) for g in grp_exprs]
+            grp_for_q = self._group_by_exprs_for_query(norm_grps, include_canonical_pk=has_nullable_grp)
+            group_sql = f"\nGROUP BY {', '.join(grp_for_q)}"
+            having_sql = ""
+        else:
+            group_sql = ""
+            having_sql = ""
+
+        q_target_cols = [self._q(c) for c in target_cols]
+        q_base_t = self._q(self.view.base_table)
+        main_backfill_sql = (
+            f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+            f"SELECT {', '.join(select_exprs)}\n"
+            f"FROM {q_base_t}{where_sql}{group_sql}{having_sql};"
+        )
+        stmts.append(main_backfill_sql)
+
+        holistic_funcs = {
+            AggFunc.GROUP_CONCAT,
+            AggFunc.STRING_AGG,
+            AggFunc.JSON_GROUP_ARRAY,
+            AggFunc.JSON_GROUP_OBJECT,
+            AggFunc.ARRAY_AGG,
+        }
+        has_holistic_or_distinct = bool(distinct_aux_tables) or any(
+            it.is_aggregate and it.agg_func in holistic_funcs for it in work_items
+        )
+
+        has_int_pk = bool(
+            self.primary_schema
+            and any(c.primary_key and "INT" in c.data_type.upper() for c in self.primary_schema.columns.values())
+        )
+        if not has_holistic_or_distinct and (self.dialect == Dialect.SQLITE or has_int_pk):
+            pk_col = "rowid"
+            if self.primary_schema:
+                for c_def in self.primary_schema.columns.values():
+                    if c_def.primary_key and "INT" in c_def.data_type.upper():
+                        pk_col = c_def.name
+                        break
+            ph = "?" if self.dialect == Dialect.SQLITE else "%s"
+            chunk_where = (
+                f"({self.view.where_clause}) AND ({pk_col} > {ph} AND {pk_col} <= {ph})"
+                if self.view.where_clause
+                else f"({pk_col} > {ph} AND {pk_col} <= {ph})"
+            )
+            merge_assignments = self._build_tier1_chunk_merge_assignments(
+                mv_table=mv_table,
+                row_count_col=row_count_col,
+                col_nonnull_count_map=col_nonnull_count_map,
+                col_sum_map=col_sum_map,
+                col_sum2_map=col_sum2_map,
+                col_true_cnt_map=col_true_cnt_map,
+                expr_key_fn=expr_key_fn,
+                use_mysql_values=(self.dialect == Dialect.MYSQL),
+            )
+            q_pk_cols = [self._q(c) for c in pk_cols]
+            if self.dialect == Dialect.MYSQL:
+                chunk_upsert_sql = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                    f"SELECT {', '.join(select_exprs)}\n"
+                    f"FROM {q_base_t}\n"
+                    f"WHERE {chunk_where}{group_sql}{having_sql}\n"
+                    f"ON DUPLICATE KEY UPDATE\n"
+                    f"    {', '.join(merge_assignments)};"
+                )
+            else:
+                chunk_upsert_sql = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                    f"SELECT {', '.join(select_exprs)}\n"
+                    f"FROM {q_base_t}\n"
+                    f"WHERE {chunk_where}{group_sql}{having_sql}\n"
+                    f"ON CONFLICT ({', '.join(q_pk_cols)}) DO UPDATE SET\n"
+                    f"    {', '.join(merge_assignments)};"
+                )
+            inc_spec = IncrementalBackfillSpec(
+                mode="pk_range_fold",
+                pk_column=pk_col,
+                chunk_sql_templates=[chunk_upsert_sql],
+            )
+        elif grp_exprs:
+            grp_expr = self._canonical_group_pk_expr(grp_exprs)
+            w_grp = f" WHERE {self.view.where_clause}" if self.view.where_clause else ""
+            dist_grp_query = (
+                f"SELECT DISTINCT {grp_expr} AS __gkey FROM {q_base_t}{w_grp} ORDER BY __gkey"
+            )
+            chunk_templates: List[str] = []
+            for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
+                eff = self._effective_agg_value_expr(rep_item, record_prefix=None)
+                dist_cols = [
+                    pk_cols[0] if len(pk_cols) == 1 else ", ".join(pk_cols),
+                    "__val",
+                    "__ref_cnt",
+                ]
+                dist_sel = []
+                dist_grp_list = []
+                if has_nullable_grp:
+                    dist_sel.append(grp_expr)
+                    dist_grp_list.extend(self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=True))
+                else:
+                    for g_expr in grp_exprs:
+                        dist_sel.append(g_expr)
+                        dist_grp_list.append(g_expr)
+                dist_sel.extend([eff, "COUNT(*)"])
+                dist_grp_list.append(eff)
+                w_p = [f"({eff}) IS NOT NULL", f"({grp_expr}) IN ({{placeholders}})"]
+                if self.view.where_clause:
+                    w_p.insert(0, f"({self.view.where_clause})")
+                aux_conflict = (
+                    "\nON DUPLICATE KEY UPDATE __ref_cnt = VALUES(__ref_cnt)"
+                    if self.dialect == Dialect.MYSQL
+                    else f"\nON CONFLICT ({', '.join(pk_cols)}, __val) DO UPDATE SET __ref_cnt = excluded.__ref_cnt"
+                )
+                chunk_templates.append(
+                    f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                    f"SELECT {', '.join(dist_sel)}\n"
+                    f"FROM {q_base_t}\n"
+                    f"WHERE {' AND '.join(w_p)}\n"
+                    f"GROUP BY {', '.join(dist_grp_list)}{aux_conflict};"
+                )
+            w_main = [f"({grp_expr}) IN ({{placeholders}})"]
+            if self.view.where_clause:
+                w_main.insert(0, f"({self.view.where_clause})")
+            non_pk_target = [c for c in target_cols if c not in pk_cols] or list(pk_cols)
+            main_conflict = (
+                f"\nON DUPLICATE KEY UPDATE {', '.join(f'{c} = VALUES({c})' for c in non_pk_target)}"
+                if self.dialect == Dialect.MYSQL
+                else f"\nON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {', '.join(f'{c} = excluded.{c}' for c in non_pk_target)}"
+            )
+            chunk_templates.append(
+                f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                f"SELECT {', '.join(select_exprs)}\n"
+                f"FROM {q_base_t}\n"
+                f"WHERE {' AND '.join(w_main)}{group_sql}{having_sql}{main_conflict};"
+            )
+            inc_spec = IncrementalBackfillSpec(
+                mode="group_key_batch",
+                distinct_group_query=dist_grp_query,
+                chunk_sql_templates=chunk_templates,
+            )
+        else:
+            inc_spec = IncrementalBackfillSpec(
+                mode="offset_batch",
+                chunk_sql_templates=stmts,
+            )
+
+        return stmts, inc_spec
+
+    def _build_tier1_chunk_merge_assignments(
+        self,
+        mv_table: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        expr_key_fn: Callable[[SelectItem], str],
+        use_mysql_values: bool = False,
+    ) -> List[str]:
+        assignments: List[str] = []
+        updated: Set[str] = set()
+        work_items = self._working_select_items
+
+        def _incoming(col: str) -> str:
+            return f"VALUES({col})" if use_mysql_values else f"excluded.{col}"
+
+        def _merged_sum(col: str) -> str:
+            inc = _incoming(col)
+            return (
+                f"(CASE WHEN {inc} IS NULL THEN {mv_table}.{col} "
+                f"WHEN {mv_table}.{col} IS NULL THEN {inc} "
+                f"ELSE {mv_table}.{col} + {inc} END)"
+            )
+
+        def _merged_sum2(ekey: str, sum2_col: str) -> str:
+            if self.dialect != Dialect.SQLITE:
+                return _merged_sum(sum2_col)
+            cnt_c = col_nonnull_count_map[ekey]
+            sum_c = col_sum_map[ekey]
+            inc_cnt = _incoming(cnt_c)
+            inc_sum = _incoming(sum_c)
+            inc_m2 = _incoming(sum2_col)
+            d_mu = f"(((1.0 * {inc_sum}) / {inc_cnt}) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_c}))"
+            return (
+                f"(CASE WHEN {inc_cnt} <= 0 OR {inc_m2} IS NULL THEN {mv_table}.{sum2_col} "
+                f"WHEN {mv_table}.{cnt_c} <= 0 OR {mv_table}.{sum2_col} IS NULL THEN {inc_m2} "
+                f"ELSE {mv_table}.{sum2_col} + {inc_m2} + ({d_mu} * {d_mu} * ((1.0 * {mv_table}.{cnt_c} * {inc_cnt}) / ({mv_table}.{cnt_c} + {inc_cnt}))) END)"
+            )
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            c = self._q(item.alias)
+            updated.add(c)
+            ekey = expr_key_fn(item)
+            inc_c = _incoming(c)
+            if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
+                assignments.append(f"{c} = {mv_table}.{c} + {inc_c}")
+            elif item.agg_func == AggFunc.SUM:
+                assignments.append(f"{c} = {_merged_sum(c)}")
+            elif item.agg_func == AggFunc.AVG:
+                if self._requires_native_avg_recompute(item):
+                    # The native AVG result family is not reproduced by a
+                    # SUM/COUNT fold for integer inputs (PostgreSQL integer
+                    # division truncates) or for engine-specific DECIMAL scale.
+                    recomputed = self._build_recompute_subquery_raw(item, mv_table)
+                    assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
+                    new_sum = _merged_sum(sum_c)
+                    dividend = f"(1.0 * {new_sum})"
+                    assignments.append(
+                        f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE {dividend} / {new_cnt} END"
+                    )
+            elif item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                native_stat_input = self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+                if native_stat_input:
+                    recomputed = self._build_recompute_subquery_raw(item, mv_table)
+                    assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    sum2_c = col_sum2_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
+                    new_sum = _merged_sum(sum_c)
+                    new_sum2 = _merged_sum2(ekey, sum2_c)
+                    formula = self._variance_formula_sql(
+                        new_cnt=new_cnt,
+                        new_sum=new_sum,
+                        new_sum2=new_sum2,
+                        is_sample=item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
+                        is_stddev=item.agg_func in (AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP),
+                    )
+                    assignments.append(f"{c} = {formula}")
+            elif item.agg_func == AggFunc.MIN:
+                assignments.append(
+                    f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {mv_table}.{c} IS NULL OR {inc_c} < {mv_table}.{c} "
+                    f"THEN {inc_c} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.MAX:
+                assignments.append(
+                    f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {mv_table}.{c} IS NULL OR {inc_c} > {mv_table}.{c} "
+                    f"THEN {inc_c} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.BIT_AND:
+                assignments.append(
+                    f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {mv_table}.{c} IS NULL THEN {inc_c} "
+                    f"ELSE ({mv_table}.{c} & {inc_c}) END"
+                )
+            elif item.agg_func == AggFunc.BIT_OR:
+                assignments.append(
+                    f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {mv_table}.{c} IS NULL THEN {inc_c} "
+                    f"ELSE ({mv_table}.{c} | {inc_c}) END"
+                )
+            elif item.agg_func == AggFunc.BIT_XOR:
+                xor_e = self._bitwise_xor_sql(f"{mv_table}.{c}", f"({inc_c})")
+                assignments.append(
+                    f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {mv_table}.{c} IS NULL THEN {inc_c} "
+                    f"ELSE {xor_e} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_AND:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
+                new_tcnt = f"({mv_table}.{tcnt_c} + {_incoming(tcnt_c)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                    f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_OR:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
+                new_tcnt = f"({mv_table}.{tcnt_c} + {_incoming(tcnt_c)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                    f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
+                )
+
+        if row_count_col not in updated:
+            assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} + {_incoming(row_count_col)}")
+            updated.add(row_count_col)
+
+        for cnt_c in col_nonnull_count_map.values():
+            if cnt_c not in updated:
+                assignments.append(f"{cnt_c} = {mv_table}.{cnt_c} + {_incoming(cnt_c)}")
+                updated.add(cnt_c)
+        for sum_c in col_sum_map.values():
+            if sum_c not in updated:
+                assignments.append(f"{sum_c} = {_merged_sum(sum_c)}")
+                updated.add(sum_c)
+        for ekey, sum2_c in col_sum2_map.items():
+            if sum2_c not in updated:
+                assignments.append(f"{sum2_c} = {_merged_sum2(ekey, sum2_c)}")
+                updated.add(sum2_c)
+        for tcnt_c in col_true_cnt_map.values():
+            if tcnt_c not in updated:
+                assignments.append(f"{tcnt_c} = {mv_table}.{tcnt_c} + {_incoming(tcnt_c)}")
+                updated.add(tcnt_c)
+
+        derived_aliases = {
+            self._q(it.alias)
+            for it in work_items
+            if it.is_aggregate
+            and it.agg_func
+            in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            )
+        }
+        return [
+            a for a in assignments if a.split("=")[0].strip() in derived_aliases
+        ] + [
+            a for a in assignments if a.split("=")[0].strip() not in derived_aliases
+        ]
+
+    def _build_recompute_subquery_raw(self, item: SelectItem, record_prefix: str) -> str:
+        def _group_record_expr(group_expr: str) -> str:
+            # Chunk-fold recomputation reads the current aggregate row from the
+            # backing table. A projected group expression may have a different
+            # stored alias (for example COALESCE(sub_cat, 'UNK') AS sc_norm),
+            # so correlate against that stored column rather than the original
+            # base-table column, which does not exist in the backing table.
+            if record_prefix == self._backing_table_name():
+                return f"{record_prefix}.{self._q(self._group_col_alias(group_expr))}"
+            return self._rewrite_expr_for_record(group_expr, record_prefix)
+
+        if getattr(self, "_alg_mode", None) == "union_all_agg":
+            inner_u = getattr(self, "_union_all_inner_sql", "")
+            u_alias = getattr(self, "_union_all_sub_alias", "__mv_u")
+            orig_item = getattr(self, "_uall_orig_item_map", {}).get(id(item), item)
+            orig_grps = getattr(self, "_uall_orig_grp_exprs", self._effective_group_by_exprs)
+            u_conds: List[str] = []
+            if self.view.where_clause:
+                u_conds.append(f"({self.view.where_clause})")
+            for orig_g, branch_g in zip(orig_grps, self._effective_group_by_exprs):
+                rhs_g = _group_record_expr(branch_g)
+                u_conds.append(self._null_safe_eq(f"({orig_g})", f"({rhs_g})", is_nullable=True))
+            w_u = f" WHERE {' AND '.join(u_conds)}" if u_conds else ""
+            u_agg_sql = self._sql_backfill_agg_expr(orig_item)
+            return f"(SELECT {u_agg_sql} FROM ({inner_u}) AS {u_alias}{w_u})"
+        base_t = self.view.base_table
+        q_base_t = self._q(base_t)
+        conds: List[str] = []
+        if self.view.where_clause:
+            conds.append(f"({self.view.where_clause})")
+        for g_expr in self._effective_group_by_exprs:
+            lhs_g = self._rewrite_expr_for_record(g_expr, q_base_t)
+            rhs_g = _group_record_expr(g_expr)
+            is_nn = self._is_simple_col_ref(g_expr) and self._col_def(g_expr).not_null
+            conds.append(
+                self._null_safe_eq(
+                    f"({lhs_g})",
+                    f"({rhs_g})",
+                    is_nullable=not is_nn,
+                )
+            )
+        where_part = f" WHERE {' AND '.join(conds)}" if conds else ""
+        agg_sql = self._sql_backfill_agg_expr(item)
+        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part})"
+
+    def _variance_formula_sql(
+        self,
+        new_cnt: str,
+        new_sum: str,
+        new_sum2: str,
+        is_sample: bool,
+        is_stddev: bool,
+    ) -> str:
+        denom = f"({new_cnt} - 1)" if is_sample else new_cnt
+        min_n = 2 if is_sample else 1
+        if self.dialect == Dialect.SQLITE:
+            raw_var = f"((1.0 * ({new_sum2})) / {denom})"
+        elif self.dialect == Dialect.POSTGRES:
+            raw_var = (
+                f"(((1.0 * ({new_sum2})::NUMERIC) - ((1.0 * ({new_sum})::NUMERIC) * (1.0 * ({new_sum})::NUMERIC)) / {new_cnt}) / {denom})::DOUBLE PRECISION"
+            )
+        else:
+            raw_var = f"((1.0 * {new_sum2}) - ((1.0 * {new_sum}) * (1.0 * {new_sum})) / {new_cnt}) / {denom}"
+        clamped_var = f"(CASE WHEN ({raw_var}) < 0.0 THEN 0.0 ELSE ({raw_var}) END)"
+        val_expr = f"SQRT({clamped_var})" if is_stddev else clamped_var
+        return f"(CASE WHEN {new_cnt} < {min_n} THEN NULL ELSE {val_expr} END)"
+
+    def _group_match_predicate_tier1(self, target_table: str, record_prefix: str) -> str:
+        grp_exprs = self._effective_group_by_exprs
+        if not grp_exprs:
+            return f"{target_table}.__mv_global_id = 1"
+        if self._has_nullable_group_col():
+            rec_exprs = [self._rewrite_expr_for_record(g, record_prefix) for g in grp_exprs]
+            return f"{target_table}.__mv_pk = ({self._canonical_group_pk_expr(rec_exprs)})"
+        preds: List[str] = []
+        for g_expr in grp_exprs:
+            mv_col = self._q(self._group_col_alias(g_expr))
+            rec_e = self._rewrite_expr_for_record(g_expr, record_prefix)
+            preds.append(f"{target_table}.{mv_col} = {rec_e}")
+        return " AND ".join(preds)
+
+    def _distinct_match_predicate(self, aux_tbl: str, val_expr: str, record_prefix: str) -> str:
+        grp_pred = self._group_match_predicate_tier1(aux_tbl, record_prefix)
+        return f"{grp_pred} AND {aux_tbl}.__val = ({val_expr})"
+
+    def _build_plus_delta_statements(
+        self,
+        mv_table: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+        record_prefix: str = "NEW",
+    ) -> List[str]:
+        stmts: List[str] = []
+        has_nullable_grp = self._has_nullable_group_col()
+        pk_cols = self._tier1_pk_cols()
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+        work_items = self._working_select_items
+        grp_exprs = self._effective_group_by_exprs
+
+        for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
+            val_expr = self._effective_agg_value_expr(rep_item, record_prefix=record_prefix)
+            ins_cols: List[str] = []
+            ins_vals: List[str] = []
+            if not grp_exprs:
+                ins_cols.append("__mv_global_id")
+                ins_vals.append("1")
+            elif has_nullable_grp:
+                ins_cols.append("__mv_pk")
+                rec_exprs = [self._rewrite_expr_for_record(g, record_prefix) for g in grp_exprs]
+                ins_vals.append(self._canonical_group_pk_expr(rec_exprs))
+            else:
+                for g_expr in grp_exprs:
+                    ins_cols.append(self._group_col_alias(g_expr))
+                    ins_vals.append(self._rewrite_expr_for_record(g_expr, record_prefix))
+            ins_cols.extend(["__val", "__ref_cnt"])
+            ins_vals.extend([val_expr, "1"])
+            if self.dialect == Dialect.MYSQL:
+                stmts.append(
+                    f"INSERT INTO {aux_tbl} ({', '.join(ins_cols)})\n"
+                    f"    SELECT {', '.join(ins_vals)}{from_dual}\n"
+                    f"    WHERE ({val_expr}) IS NOT NULL\n"
+                    f"    ON DUPLICATE KEY UPDATE __ref_cnt = __ref_cnt + 1;"
+                )
+            else:
+                stmts.append(
+                    f"INSERT INTO {aux_tbl} ({', '.join(ins_cols)})\n"
+                    f"    SELECT {', '.join(ins_vals)}\n"
+                    f"    WHERE ({val_expr}) IS NOT NULL\n"
+                    f"    ON CONFLICT ({', '.join(pk_cols)}, __val) DO UPDATE SET\n"
+                    f"        __ref_cnt = {aux_tbl}.__ref_cnt + 1;"
+                )
+
+        def _is_newly_distinct_cond(item: SelectItem) -> str:
+            ekey = expr_key_fn(item)
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if not item.is_distinct:
+                return f"({val_e}) IS NOT NULL"
+            aux_tbl = distinct_aux_tables[ekey][0]
+            match_p = self._distinct_match_predicate(aux_tbl, val_e, record_prefix)
+            return f"({val_e}) IS NOT NULL AND (SELECT {aux_tbl}.__ref_cnt FROM {aux_tbl} WHERE {match_p}) = 1"
+
+        def _plus_inc_expr(item: SelectItem) -> str:
+            return f"(CASE WHEN {_is_newly_distinct_cond(item)} THEN 1 ELSE 0 END)"
+
+        def _plus_sum_expr(item: SelectItem, col_alias: str) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if item.is_distinct:
+                cond = _is_newly_distinct_cond(item)
+                return (
+                    f"(CASE WHEN NOT ({cond}) THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
+                    f"ELSE {mv_table}.{col_alias} + ({val_e}) END)"
+                )
+            return (
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
+                f"ELSE {mv_table}.{col_alias} + ({val_e}) END)"
+            )
+
+        def _plus_sum2_expr(item: SelectItem, col_alias: str) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if self.dialect == Dialect.SQLITE:
+                ekey = expr_key_fn(item)
+                cnt_c = col_nonnull_count_map[ekey]
+                sum_c = col_sum_map[ekey]
+                delta = f"((1.0 * ({val_e})) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_c}))"
+                return (
+                    f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{cnt_c} <= 0 OR {mv_table}.{sum_c} IS NULL THEN 0.0 "
+                    f"ELSE COALESCE({mv_table}.{col_alias}, 0.0) + ({delta} * {delta} * ((1.0 * {mv_table}.{cnt_c}) / ({mv_table}.{cnt_c} + 1))) END)"
+                )
+            sq = self._var_sq_sql(val_e)
+            return (
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                f"WHEN {mv_table}.{col_alias} IS NULL THEN {sq} "
+                f"ELSE {mv_table}.{col_alias} + {sq} END)"
+            )
+
+        def _plus_tcnt_expr(item: SelectItem) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if self.dialect == Dialect.POSTGRES:
+                return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) THEN 1 ELSE 0 END)"
+            return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) != 0 THEN 1 ELSE 0 END)"
+
+        insert_cols: List[str] = []
+        insert_vals: List[str] = []
+        update_assignments: List[str] = []
+        updated_cols: Set[str] = set()
+
+        if not grp_exprs:
+            insert_cols.append("__mv_global_id")
+            insert_vals.append("1")
+        elif has_nullable_grp:
+            insert_cols.append("__mv_pk")
+            rec_exprs = [self._rewrite_expr_for_record(g, record_prefix) for g in grp_exprs]
+            insert_vals.append(self._canonical_group_pk_expr(rec_exprs))
+
+        non_agg_aliases_lower = {
+            item.alias.lower() for item in work_items if not item.is_aggregate
+        }
+        seen_hidden: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                insert_cols.append(mv_col)
+                insert_vals.append(self._rewrite_expr_for_record(g_expr, record_prefix))
+
+        for item in work_items:
+            col_alias = self._q(item.alias)
+            insert_cols.append(col_alias)
+            if not item.is_aggregate:
+                insert_vals.append(self._rewrite_expr_for_record(item.raw_expr, record_prefix))
+                continue
+
+            updated_cols.add(col_alias)
+            ekey = expr_key_fn(item)
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+
+            if item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
+                insert_vals.append("1")
+            elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NOT NULL THEN 1 ELSE 0 END)")
+            elif item.agg_func == AggFunc.SUM:
+                insert_vals.append(f"({val_e})")
+            elif item.agg_func == AggFunc.TOTAL:
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)")
+            elif item.agg_func == AggFunc.AVG:
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 1.0 * ({val_e}) END)")
+            elif item.agg_func in (AggFunc.VAR_POP, AggFunc.STDDEV_POP):
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 0.0 END)")
+            elif item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP):
+                insert_vals.append("NULL")
+            elif item.agg_func in (AggFunc.MIN, AggFunc.MAX, AggFunc.BIT_AND, AggFunc.BIT_OR, AggFunc.BIT_XOR):
+                insert_vals.append(f"({val_e})")
+            elif item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if self.dialect == Dialect.POSTGRES:
+                    insert_vals.append(
+                        f"(CASE WHEN ({val_e}) IS NULL THEN NULL WHEN ({val_e}) THEN TRUE ELSE FALSE END)"
+                    )
+                else:
+                    insert_vals.append(
+                        f"(CASE WHEN ({val_e}) IS NULL THEN NULL WHEN ({val_e}) != 0 THEN 1 ELSE 0 END)"
+                    )
+            else:
+                insert_vals.append(f"({val_e})")
+
+            if item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
+                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} + 1")
+            elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                update_assignments.append(
+                    f"{col_alias} = {mv_table}.{col_alias} + {_plus_inc_expr(item)}"
+                )
+            elif item.agg_func == AggFunc.SUM:
+                new_sum = _plus_sum_expr(item, col_alias)
+                update_assignments.append(f"{col_alias} = {new_sum}")
+            elif item.agg_func == AggFunc.TOTAL:
+                if item.is_distinct:
+                    cond = _is_newly_distinct_cond(item)
+                    inc_val = f"(CASE WHEN ({cond}) THEN 1.0 * ({val_e}) ELSE 0.0 END)"
+                else:
+                    inc_val = f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)"
+                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} + {inc_val}")
+            elif item.agg_func == AggFunc.AVG:
+                if self._requires_native_avg_recompute(item):
+                    recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                    update_assignments.append(f"{col_alias} = {recomputed}")
+                else:
+                    cnt_col = col_nonnull_count_map[ekey]
+                    sum_col = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
+                    new_sum = _plus_sum_expr(item, sum_col)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    update_assignments.append(
+                        f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                        f"ELSE {dividend} / {new_cnt} END"
+                    )
+            elif item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                # Backfill uses the engine's native statistical aggregate.
+                # A Welford/raw-moment delta update uses a different floating
+                # operation order and is not bit-identical for approximate
+                # inputs. Re-evaluate the affected group with the same native
+                # aggregate so the materialized result matches the live view.
+                recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomputed}")
+            elif item.agg_func == AggFunc.MIN:
+                update_assignments.append(
+                    f"{col_alias} = CASE "
+                    f"WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL OR ({val_e}) < {mv_table}.{col_alias} "
+                    f"THEN ({val_e}) ELSE {mv_table}.{col_alias} END"
+                )
+            elif item.agg_func == AggFunc.MAX:
+                update_assignments.append(
+                    f"{col_alias} = CASE "
+                    f"WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL OR ({val_e}) > {mv_table}.{col_alias} "
+                    f"THEN ({val_e}) ELSE {mv_table}.{col_alias} END"
+                )
+            elif item.agg_func == AggFunc.BIT_AND:
+                update_assignments.append(
+                    f"{col_alias} = CASE "
+                    f"WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
+                    f"ELSE ({mv_table}.{col_alias} & ({val_e})) END"
+                )
+            elif item.agg_func == AggFunc.BIT_OR:
+                update_assignments.append(
+                    f"{col_alias} = CASE "
+                    f"WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
+                    f"ELSE ({mv_table}.{col_alias} | ({val_e})) END"
+                )
+            elif item.agg_func == AggFunc.BIT_XOR:
+                xor_expr = self._bitwise_xor_sql(f"{mv_table}.{col_alias}", f"({val_e})")
+                update_assignments.append(
+                    f"{col_alias} = CASE "
+                    f"WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
+                    f"ELSE {xor_expr} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_AND:
+                cnt_col = col_nonnull_count_map[ekey]
+                tcnt_col = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
+                new_tcnt = f"({mv_table}.{tcnt_col} + {_plus_tcnt_expr(item)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                    f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_OR:
+                cnt_col = col_nonnull_count_map[ekey]
+                tcnt_col = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
+                new_tcnt = f"({mv_table}.{tcnt_col} + {_plus_tcnt_expr(item)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                    f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
+                )
+            else:
+                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomp}")
+
+        if row_count_col not in updated_cols:
+            insert_cols.append(row_count_col)
+            insert_vals.append("1")
+            update_assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} + 1")
+            updated_cols.add(row_count_col)
+
+        ekey_to_item: Dict[str, SelectItem] = {
+            expr_key_fn(it): it for it in work_items if it.is_aggregate
+        }
+        already_in_ins = set(insert_cols)
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            it = ekey_to_item[ekey]
+            val_e = self._effective_agg_value_expr(it, record_prefix=record_prefix)
+            if cnt_col not in already_in_ins:
+                insert_cols.append(cnt_col)
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NOT NULL THEN 1 ELSE 0 END)")
+                already_in_ins.add(cnt_col)
+            if cnt_col not in updated_cols:
+                update_assignments.append(
+                    f"{cnt_col} = {mv_table}.{cnt_col} + {_plus_inc_expr(it)}"
+                )
+                updated_cols.add(cnt_col)
+
+        for ekey, sum_col in col_sum_map.items():
+            it = ekey_to_item[ekey]
+            val_e = self._effective_agg_value_expr(it, record_prefix=record_prefix)
+            if sum_col not in already_in_ins:
+                insert_cols.append(sum_col)
+                insert_vals.append(f"({val_e})")
+                already_in_ins.add(sum_col)
+            if sum_col not in updated_cols:
+                update_assignments.append(f"{sum_col} = {_plus_sum_expr(it, sum_col)}")
+                updated_cols.add(sum_col)
+
+        for ekey, sum2_col in col_sum2_map.items():
+            it = ekey_to_item[ekey]
+            val_e = self._effective_agg_value_expr(it, record_prefix=record_prefix)
+            if sum2_col not in already_in_ins:
+                insert_cols.append(sum2_col)
+                init_s2 = "0.0" if self.dialect == Dialect.SQLITE else self._var_sq_sql(val_e)
+                insert_vals.append(
+                    f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE {init_s2} END)"
+                )
+                already_in_ins.add(sum2_col)
+            if sum2_col not in updated_cols:
+                update_assignments.append(f"{sum2_col} = {_plus_sum2_expr(it, sum2_col)}")
+                updated_cols.add(sum2_col)
+
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            it = ekey_to_item[ekey]
+            if tcnt_col not in already_in_ins:
+                insert_cols.append(tcnt_col)
+                insert_vals.append(_plus_tcnt_expr(it))
+                already_in_ins.add(tcnt_col)
+            if tcnt_col not in updated_cols:
+                update_assignments.append(
+                    f"{tcnt_col} = {mv_table}.{tcnt_col} + {_plus_tcnt_expr(it)}"
+                )
+                updated_cols.add(tcnt_col)
+
+        # In MySQL, ON DUPLICATE KEY UPDATE evaluates left-to-right, so derived columns must come first
+        derived_aliases = {
+            self._q(it.alias)
+            for it in work_items
+            if it.is_aggregate
+            and it.agg_func
+            in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            )
+        }
+        ordered_updates = [
+            a for a in update_assignments if a.split("=")[0].strip() in derived_aliases
+        ] + [
+            a for a in update_assignments if a.split("=")[0].strip() not in derived_aliases
+        ]
+
+        q_insert_cols = [self._q(c) for c in insert_cols]
+        q_pk_cols = [self._q(c) for c in pk_cols]
+        if self.dialect == Dialect.MYSQL:
+            stmts.append(
+                f"INSERT INTO {mv_table} ({', '.join(q_insert_cols)})\n"
+                f"    SELECT {', '.join(insert_vals)}{from_dual}\n"
+                f"    WHERE TRUE\n"
+                f"    ON DUPLICATE KEY UPDATE\n"
+                f"        {', '.join(ordered_updates)};"
+            )
+        else:
+            stmts.append(
+                f"INSERT INTO {mv_table} ({', '.join(q_insert_cols)})\n"
+                f"    SELECT {', '.join(insert_vals)}\n"
+                f"    WHERE TRUE\n"
+                f"    ON CONFLICT ({', '.join(q_pk_cols)}) DO UPDATE SET\n"
+                f"        {', '.join(ordered_updates)};"
+            )
+        return stmts
+
+    def _build_minus_delta_statements(
+        self,
+        mv_table: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+        record_prefix: str = "OLD",
+        include_delete_zero_mv: bool = True,
+    ) -> Tuple[List[str], Optional[str]]:
+        stmts: List[str] = []
+        work_items = self._working_select_items
+        grp_exprs = self._effective_group_by_exprs
+
+        for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
+            val_expr = self._effective_agg_value_expr(rep_item, record_prefix=record_prefix)
+            match_p = self._distinct_match_predicate(aux_tbl, val_expr, record_prefix)
+            stmts.append(
+                f"UPDATE {aux_tbl}\n"
+                f"    SET __ref_cnt = {aux_tbl}.__ref_cnt - 1\n"
+                f"    WHERE ({val_expr}) IS NOT NULL AND {match_p};"
+            )
+
+        def _is_last_distinct_cond(item: SelectItem) -> str:
+            ekey = expr_key_fn(item)
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if not item.is_distinct:
+                return f"({val_e}) IS NOT NULL"
+            aux_tbl = distinct_aux_tables[ekey][0]
+            match_p = self._distinct_match_predicate(aux_tbl, val_e, record_prefix)
+            return f"({val_e}) IS NOT NULL AND (SELECT {aux_tbl}.__ref_cnt FROM {aux_tbl} WHERE {match_p}) <= 0"
+
+        def _minus_dec_expr(item: SelectItem) -> str:
+            return f"(CASE WHEN {_is_last_distinct_cond(item)} THEN 1 ELSE 0 END)"
+
+        def _minus_sum_expr(item: SelectItem, col_alias: str, cnt_col: str) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+            if item.is_distinct:
+                cond = _is_last_distinct_cond(item)
+                return (
+                    f"(CASE WHEN NOT ({cond}) THEN {mv_table}.{col_alias} "
+                    f"WHEN {new_cnt} <= 0 THEN NULL "
+                    f"ELSE {mv_table}.{col_alias} - ({val_e}) END)"
+                )
+            return (
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                f"WHEN {new_cnt} <= 0 THEN NULL "
+                f"ELSE {mv_table}.{col_alias} - ({val_e}) END)"
+            )
+
+        def _minus_sum2_expr(item: SelectItem, col_alias: str, cnt_col: str) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+            if self.dialect == Dialect.SQLITE:
+                ekey = expr_key_fn(item)
+                sum_c = col_sum_map[ekey]
+                delta = f"((1.0 * ({val_e})) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_col}))"
+                return (
+                    f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_cnt} = 1 THEN 0.0 "
+                    f"ELSE MAX(0.0, COALESCE({mv_table}.{col_alias}, 0.0) - ({delta} * {delta} * ((1.0 * {mv_table}.{cnt_col}) / ({mv_table}.{cnt_col} - 1)))) END)"
+                )
+            sq = self._var_sq_sql(val_e)
+            return (
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                f"WHEN {new_cnt} <= 0 THEN NULL "
+                f"ELSE {mv_table}.{col_alias} - {sq} END)"
+            )
+
+        def _minus_tcnt_expr(item: SelectItem) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if self.dialect == Dialect.POSTGRES:
+                return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) THEN 1 ELSE 0 END)"
+            return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) != 0 THEN 1 ELSE 0 END)"
+
+        update_assignments: List[str] = []
+        updated_cols: Set[str] = set()
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            col_alias = self._q(item.alias)
+            updated_cols.add(col_alias)
+            ekey = expr_key_fn(item)
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+
+            if item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
+                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} - 1")
+            elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                update_assignments.append(
+                    f"{col_alias} = {mv_table}.{col_alias} - {_minus_dec_expr(item)}"
+                )
+            elif item.agg_func == AggFunc.SUM:
+                cnt_col = col_nonnull_count_map[ekey]
+                update_assignments.append(
+                    f"{col_alias} = {_minus_sum_expr(item, col_alias, cnt_col)}"
+                )
+            elif item.agg_func == AggFunc.TOTAL:
+                if item.is_distinct:
+                    cond = _is_last_distinct_cond(item)
+                    dec_val = f"(CASE WHEN ({cond}) THEN 1.0 * ({val_e}) ELSE 0.0 END)"
+                else:
+                    dec_val = f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)"
+                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} - {dec_val}")
+            elif item.agg_func == AggFunc.AVG:
+                if self._requires_native_avg_recompute(item):
+                    recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                    update_assignments.append(f"{col_alias} = {recomputed}")
+                else:
+                    cnt_col = col_nonnull_count_map[ekey]
+                    sum_col = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+                    new_sum = _minus_sum_expr(item, sum_col, cnt_col)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    update_assignments.append(
+                        f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                        f"ELSE {dividend} / {new_cnt} END"
+                    )
+            elif item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomputed}")
+            elif item.agg_func == AggFunc.MIN:
+                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN ({val_e}) IS NOT NULL AND {mv_table}.{col_alias} >= ({val_e}) "
+                    f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
+                )
+            elif item.agg_func == AggFunc.MAX:
+                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN ({val_e}) IS NOT NULL AND {mv_table}.{col_alias} <= ({val_e}) "
+                    f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
+                )
+            elif item.agg_func in (AggFunc.BIT_AND, AggFunc.BIT_OR):
+                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN ({val_e}) IS NOT NULL "
+                    f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
+                )
+            elif item.agg_func == AggFunc.BIT_XOR:
+                cnt_col = col_nonnull_count_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+                xor_expr = self._bitwise_xor_sql(f"{mv_table}.{col_alias}", f"({val_e})")
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {new_cnt} <= 0 THEN NULL ELSE {xor_expr} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_AND:
+                cnt_col = col_nonnull_count_map[ekey]
+                tcnt_col = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+                new_tcnt = f"({mv_table}.{tcnt_col} - {_minus_tcnt_expr(item)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_OR:
+                cnt_col = col_nonnull_count_map[ekey]
+                tcnt_col = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+                new_tcnt = f"({mv_table}.{tcnt_col} - {_minus_tcnt_expr(item)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
+                )
+            else:
+                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomp}")
+
+        if row_count_col not in updated_cols:
+            update_assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} - 1")
+            updated_cols.add(row_count_col)
+
+        ekey_to_item: Dict[str, SelectItem] = {
+            expr_key_fn(it): it for it in work_items if it.is_aggregate
+        }
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            if cnt_col not in updated_cols:
+                it = ekey_to_item[ekey]
+                update_assignments.append(
+                    f"{cnt_col} = {mv_table}.{cnt_col} - {_minus_dec_expr(it)}"
+                )
+                updated_cols.add(cnt_col)
+
+        for ekey, sum_col in col_sum_map.items():
+            if sum_col not in updated_cols:
+                it = ekey_to_item[ekey]
+                cnt_col = col_nonnull_count_map[ekey]
+                update_assignments.append(
+                    f"{sum_col} = {_minus_sum_expr(it, sum_col, cnt_col)}"
+                )
+                updated_cols.add(sum_col)
+
+        for ekey, sum2_col in col_sum2_map.items():
+            if sum2_col not in updated_cols:
+                it = ekey_to_item[ekey]
+                cnt_col = col_nonnull_count_map[ekey]
+                update_assignments.append(
+                    f"{sum2_col} = {_minus_sum2_expr(it, sum2_col, cnt_col)}"
+                )
+                updated_cols.add(sum2_col)
+
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            if tcnt_col not in updated_cols:
+                it = ekey_to_item[ekey]
+                update_assignments.append(
+                    f"{tcnt_col} = {mv_table}.{tcnt_col} - {_minus_tcnt_expr(it)}"
+                )
+                updated_cols.add(tcnt_col)
+
+        # In MySQL, UPDATE evaluates SET assignments left-to-right!
+        # Order: (1) derived aggs (AVG, VAR, STDDEV, BIT_XOR, BOOL_AND, BOOL_OR)
+        #        (2) SUM / sum2 / true_cnt (which read col_nonnull_count_map)
+        #        (3) counts & MIN/MAX
+        high_priority_cols = (
+            {
+                self._q(it.alias)
+                for it in work_items
+                if it.is_aggregate
+                and it.agg_func
+                in (
+                    AggFunc.AVG,
+                    AggFunc.VAR_POP,
+                    AggFunc.VAR_SAMP,
+                    AggFunc.STDDEV_POP,
+                    AggFunc.STDDEV_SAMP,
+                    AggFunc.BIT_XOR,
+                    AggFunc.BOOL_AND,
+                    AggFunc.BOOL_OR,
+                )
+            }
+        )
+        mid_priority_cols = (
+            {self._q(it.alias) for it in work_items if it.is_aggregate and it.agg_func == AggFunc.SUM}
+            | set(col_sum_map.values())
+            | set(col_sum2_map.values())
+            | set(col_true_cnt_map.values())
+        )
+        tier_1 = [a for a in update_assignments if a.split("=")[0].strip() in high_priority_cols]
+        tier_2 = [
+            a
+            for a in update_assignments
+            if a.split("=")[0].strip() not in high_priority_cols
+            and a.split("=")[0].strip() in mid_priority_cols
+        ]
+        tier_3 = [
+            a
+            for a in update_assignments
+            if a.split("=")[0].strip() not in high_priority_cols
+            and a.split("=")[0].strip() not in mid_priority_cols
+        ]
+        ordered_updates = tier_1 + tier_2 + tier_3
+
+        grp_pred = self._group_match_predicate_tier1(mv_table, record_prefix)
+        stmts.append(
+            f"UPDATE {mv_table}\n"
+            f"    SET {', '.join(ordered_updates)}\n"
+            f"    WHERE {grp_pred};"
+        )
+
+        for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
+            val_expr = self._effective_agg_value_expr(rep_item, record_prefix=record_prefix)
+            match_p = self._distinct_match_predicate(aux_tbl, val_expr, record_prefix)
+            stmts.append(
+                f"DELETE FROM {aux_tbl}\n"
+                f"    WHERE ({val_expr}) IS NOT NULL AND ({match_p}) AND {aux_tbl}.__ref_cnt <= 0;"
+            )
+
+        delete_zero_mv_stmt: Optional[str] = None
+        if grp_exprs:
+            delete_zero_mv_stmt = (
+                f"DELETE FROM {mv_table}\n"
+                f"    WHERE ({grp_pred}) AND {mv_table}.{row_count_col} <= 0;"
+            )
+            if include_delete_zero_mv:
+                stmts.append(delete_zero_mv_stmt)
+
+        return stmts, delete_zero_mv_stmt
+
+    def _apply_where_guard_to_stmt(self, stmt: str, where_cond: Optional[str]) -> str:
+        if not where_cond:
+            return stmt
+        s = stmt.strip()
+        if re.match(r"^INSERT\s+INTO\b", s, flags=re.IGNORECASE):
+            if re.search(r"\n\s*WHERE\s+TRUE\b", s, flags=re.IGNORECASE):
+                return re.sub(
+                    r"\n\s*WHERE\s+TRUE\b",
+                    f"\n    WHERE ({where_cond})",
+                    s,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+            return re.sub(
+                r"\n\s*WHERE\s+",
+                f"\n    WHERE ({where_cond}) AND ",
+                s,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        if re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", s, flags=re.IGNORECASE):
+            return re.sub(
+                r"\n\s*WHERE\s+",
+                f"\n    WHERE ({where_cond}) AND ",
+                s,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        return stmt
+
+    def _build_tier1_triggers(
+        self,
+        view_name: str,
+        mv_table: str,
+        base_t: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+        initial_populate_sqls: Optional[Sequence[str]] = None,
+    ) -> Tuple[List[str], List[str], List[str]]:
+        plus_new_stmts = self._build_plus_delta_statements(
+            mv_table,
+            row_count_col,
+            col_nonnull_count_map,
+            col_sum_map,
+            col_sum2_map,
+            col_true_cnt_map,
+            distinct_aux_tables,
+            expr_key_fn,
+            record_prefix="NEW",
+        )
+        minus_old_del_stmts, _ = self._build_minus_delta_statements(
+            mv_table,
+            row_count_col,
+            col_nonnull_count_map,
+            col_sum_map,
+            col_sum2_map,
+            col_true_cnt_map,
+            distinct_aux_tables,
+            expr_key_fn,
+            record_prefix="OLD",
+            include_delete_zero_mv=True,
+        )
+        minus_old_upd_stmts, delete_zero_mv_stmt = self._build_minus_delta_statements(
+            mv_table,
+            row_count_col,
+            col_nonnull_count_map,
+            col_sum_map,
+            col_sum2_map,
+            col_true_cnt_map,
+            distinct_aux_tables,
+            expr_key_fn,
+            record_prefix="OLD",
+            include_delete_zero_mv=False,
+        )
+
+        where_new = (
+            self._rewrite_expr_for_record(self.view.where_clause, "NEW")
+            if self.view.where_clause
+            else None
+        )
+        where_old = (
+            self._rewrite_expr_for_record(self.view.where_clause, "OLD")
+            if self.view.where_clause
+            else None
+        )
+        if self.watermark_catalog_table and self._alg_mode in ("single", "distinct"):
+            wm_pk_col: Optional[str] = "rowid" if self.dialect == Dialect.SQLITE else None
+            if self.primary_schema:
+                for c_def in self.primary_schema.columns.values():
+                    if c_def.primary_key and "INT" in c_def.data_type.upper():
+                        wm_pk_col = c_def.name
+                        break
+            if wm_pk_col:
+                q_pk = self._q(wm_pk_col)
+                wm_new = (
+                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                    f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"
+                )
+                wm_old = (
+                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                    f"AND OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"
+                )
+                where_new = f"({where_new}) AND ({wm_new})" if where_new else wm_new
+                where_old = f"({where_old}) AND ({wm_old})" if where_old else wm_old
+
+        trunc_stmts = [
+            f"DELETE FROM {aux_tbl};" for aux_tbl, _, _ in distinct_aux_tables.values()
+        ] + [f"DELETE FROM {mv_table};"]
+        if not self._effective_group_by_exprs and initial_populate_sqls:
+            trunc_stmts.extend(initial_populate_sqls)
+
+        return self._emit_dialect_triggers_for_table(
+            view_name=view_name,
+            base_t=base_t,
+            ins_stmts=plus_new_stmts,
+            del_stmts=minus_old_del_stmts,
+            upd_old_stmts=minus_old_upd_stmts,
+            upd_new_stmts=plus_new_stmts,
+            upd_cleanup_old_stmts=[delete_zero_mv_stmt] if delete_zero_mv_stmt else [],
+            trunc_stmts=trunc_stmts,
+            where_new=where_new,
+            where_old=where_old,
+        )
+
+    def _emit_dialect_triggers_for_table(
+        self,
+        view_name: str,
+        base_t: str,
+        ins_stmts: List[str],
+        del_stmts: List[str],
+        upd_old_stmts: List[str],
+        upd_new_stmts: List[str],
+        upd_cleanup_old_stmts: Optional[List[str]] = None,
+        trunc_stmts: Optional[List[str]] = None,
+        where_new: Optional[str] = None,
+        where_old: Optional[str] = None,
+    ) -> Tuple[List[str], List[str], List[str]]:
+        log_vname = self.logical_view_name
+        p = self.object_prefix if self.object_prefix else "__matview_"
+        stem = f"{log_vname}__{base_t}"
+        t_ai_name = self._bounded_ident(f"{p}trg_", stem, "_ai")
+        t_ad_name = self._bounded_ident(f"{p}trg_", stem, "_ad")
+        t_au_name = self._bounded_ident(f"{p}trg_", stem, "_au")
+        t_trunc_name = self._bounded_ident(f"{p}trg_", stem, "_trunc")
+        t_sync_name = self._bounded_ident(f"{p}trg_", stem, "_sync")
+        q_base_t = self._q(base_t)
+        ref_cols = self._referenced_columns_for_table(base_t)
+        upd_of_clause = (
+            f" OF {', '.join(self._q(c) for c in ref_cols)}"
+            if ref_cols and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES)
+            else ""
+        )
+
+        t_schema = self._schemas_lower.get(base_t.lower())
+        unchanged_conds: List[str] = []
+        if t_schema and ref_cols:
+            for c_name in ref_cols:
+                c_def = t_schema.columns.get(c_name)
+                is_null = not (c_def.not_null if c_def else False)
+                qc = self._q(c_name)
+                unchanged_conds.append(
+                    self._null_safe_eq(f"OLD.{qc}", f"NEW.{qc}", is_nullable=is_null)
+                )
+        changed_guard = f"NOT ({' AND '.join(unchanged_conds)})" if unchanged_conds else None
+
+        cleanup_stmts = upd_cleanup_old_stmts or []
+
+        if self.dialect == Dialect.SQLITE:
+            when_ins = f"\nWHEN {where_new}" if where_new else ""
+            ins_body = "\n    ".join(ins_stmts)
+            trig_ins = (
+                f"CREATE TRIGGER {t_ai_name}\n"
+                f"AFTER INSERT ON {q_base_t}\n"
+                f"FOR EACH ROW{when_ins}\n"
+                f"BEGIN\n"
+                f"    {ins_body}\n"
+                f"END;"
+            )
+
+            when_del = f"\nWHEN {where_old}" if where_old else ""
+            del_body = "\n    ".join(del_stmts)
+            trig_del = (
+                f"CREATE TRIGGER {t_ad_name}\n"
+                f"AFTER DELETE ON {q_base_t}\n"
+                f"FOR EACH ROW{when_del}\n"
+                f"BEGIN\n"
+                f"    {del_body}\n"
+                f"END;"
+            )
+
+            upd_stmts = (
+                [self._apply_where_guard_to_stmt(s, where_old) for s in upd_old_stmts]
+                + [self._apply_where_guard_to_stmt(s, where_new) for s in upd_new_stmts]
+                + [self._apply_where_guard_to_stmt(s, where_old) for s in cleanup_stmts]
+            )
+            upd_body = "\n    ".join(upd_stmts)
+            when_upd = f"\nWHEN {changed_guard}" if changed_guard else ""
+            trig_upd = (
+                f"CREATE TRIGGER {t_au_name}\n"
+                f"AFTER UPDATE{upd_of_clause} ON {q_base_t}\n"
+                f"FOR EACH ROW{when_upd}\n"
+                f"BEGIN\n"
+                f"    {upd_body}\n"
+                f"END;"
+            )
+            t_names = [t_ai_name, t_ad_name, t_au_name]
+            return [trig_ins, trig_del, trig_upd], t_names, []
+
+        elif self.dialect == Dialect.POSTGRES:
+            ins_block = "\n            ".join(ins_stmts)
+            minus_block = "\n            ".join(upd_old_stmts)
+            plus_block = "\n            ".join(upd_new_stmts)
+            cleanup_block = "\n            ".join(cleanup_stmts)
+            trunc_block = "\n        ".join(trunc_stmts or [f"DELETE FROM {self._backing_table_name()};"])
+
+            ins_section = (
+                f"IF ({where_new}) THEN\n            {ins_block}\n        END IF;"
+                if where_new and ins_block
+                else ins_block
+            )
+            old_section = (
+                f"IF ({where_old}) THEN\n            {minus_block}\n        END IF;"
+                if where_old and minus_block
+                else minus_block
+            )
+            new_section = (
+                f"IF ({where_new}) THEN\n            {plus_block}\n        END IF;"
+                if where_new and plus_block
+                else plus_block
+            )
+            clean_section = (
+                f"\n        IF ({where_old}) THEN\n            {cleanup_block}\n        END IF;"
+                if where_old and cleanup_block
+                else (f"\n        {cleanup_block}" if cleanup_block else "")
+            )
+            del_full_block = "\n            ".join(del_stmts)
+            del_section = (
+                f"IF ({where_old}) THEN\n            {del_full_block}\n        END IF;"
+                if where_old
+                else del_full_block
+            )
+
+            fn_trunc = self._bounded_ident(f"{p}fn_sync_", stem, "_trunc")
+            fn_trunc_ddl = (
+                f"CREATE OR REPLACE FUNCTION {fn_trunc}()\n"
+                f"RETURNS TRIGGER AS $$\n"
+                f"BEGIN\n"
+                f"    {trunc_block}\n"
+                f"    RETURN NULL;\n"
+                f"END;\n$$ LANGUAGE plpgsql;"
+            )
+            t_trunc = (
+                f"CREATE TRIGGER {t_trunc_name}\n"
+                f"AFTER TRUNCATE ON {q_base_t}\n"
+                f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_trunc}();"
+            )
+
+            if self.pg_use_transition_tables:
+                fn_ai = self._bounded_ident(f"{p}fn_sync_", stem, "_ai")
+                fn_ad = self._bounded_ident(f"{p}fn_sync_", stem, "_ad")
+                fn_au = self._bounded_ident(f"{p}fn_sync_", stem, "_au")
+                fn_ai_ddl = (
+                    f"CREATE OR REPLACE FUNCTION {fn_ai}()\n"
+                    f"RETURNS TRIGGER AS $$\n"
+                    f"DECLARE\n    NEW RECORD;\n"
+                    f"BEGIN\n"
+                    f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
+                    f"        {ins_section}\n"
+                    f"    END LOOP;\n"
+                    f"    RETURN NULL;\n"
+                    f"END;\n$$ LANGUAGE plpgsql;"
+                )
+                fn_ad_ddl = (
+                    f"CREATE OR REPLACE FUNCTION {fn_ad}()\n"
+                    f"RETURNS TRIGGER AS $$\n"
+                    f"DECLARE\n    OLD RECORD;\n"
+                    f"BEGIN\n"
+                    f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
+                    f"        {del_section}\n"
+                    f"    END LOOP;\n"
+                    f"    RETURN NULL;\n"
+                    f"END;\n$$ LANGUAGE plpgsql;"
+                )
+                au_loops: List[str] = []
+                if old_section.strip():
+                    au_loops.append(
+                        f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
+                        f"        {old_section}\n"
+                        f"    END LOOP;"
+                    )
+                if clean_section.strip():
+                    au_loops.append(
+                        f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
+                        f"        {clean_section.strip()}\n"
+                        f"    END LOOP;"
+                    )
+                if new_section.strip():
+                    au_loops.append(
+                        f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
+                        f"        {new_section}\n"
+                        f"    END LOOP;"
+                    )
+                au_body = "\n".join(au_loops)
+                fn_au_ddl = (
+                    f"CREATE OR REPLACE FUNCTION {fn_au}()\n"
+                    f"RETURNS TRIGGER AS $$\n"
+                    f"DECLARE\n    OLD RECORD;\n    NEW RECORD;\n"
+                    f"BEGIN\n"
+                    f"{au_body}\n"
+                    f"    RETURN NULL;\n"
+                    f"END;\n$$ LANGUAGE plpgsql;"
+                )
+                t_ai = (
+                    f"CREATE TRIGGER {t_ai_name}\n"
+                    f"AFTER INSERT ON {q_base_t}\n"
+                    f"REFERENCING NEW TABLE AS __mv_new_rows\n"
+                    f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_ai}();"
+                )
+                t_ad = (
+                    f"CREATE TRIGGER {t_ad_name}\n"
+                    f"AFTER DELETE ON {q_base_t}\n"
+                    f"REFERENCING OLD TABLE AS __mv_old_rows\n"
+                    f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_ad}();"
+                )
+                t_au = (
+                    f"CREATE TRIGGER {t_au_name}\n"
+                    f"AFTER UPDATE ON {q_base_t}\n"
+                    f"REFERENCING OLD TABLE AS __mv_old_rows NEW TABLE AS __mv_new_rows\n"
+                    f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_au}();"
+                )
+                return (
+                    [fn_ai_ddl, t_ai, fn_ad_ddl, t_ad, fn_au_ddl, t_au, fn_trunc_ddl, t_trunc],
+                    [t_ai_name, t_ad_name, t_au_name, t_trunc_name],
+                    [fn_ai, fn_ad, fn_au, fn_trunc],
+                )
+
+            fn_name = self._bounded_ident(f"{p}fn_sync_", stem)
+            upd_guard_open = f"IF ({changed_guard}) THEN\n        " if changed_guard else ""
+            upd_guard_close = "\n        END IF;" if changed_guard else ""
+            upd_inner = (
+                f"{old_section}\n        {new_section}{clean_section}"
+                if old_section.strip()
+                else f"{new_section}{clean_section}"
+            )
+
+            fn_ddl = (
+                f"CREATE OR REPLACE FUNCTION {fn_name}()\n"
+                f"RETURNS TRIGGER AS $$\n"
+                f"BEGIN\n"
+                f"    IF COALESCE(current_setting('matview.skip_triggers', true), '') = 'on' THEN\n"
+                f"        RETURN NULL;\n"
+                f"    END IF;\n"
+                f"    IF (TG_OP = 'DELETE') THEN\n"
+                f"        {del_section}\n"
+                f"    ELSIF (TG_OP = 'INSERT') THEN\n"
+                f"        {ins_section}\n"
+                f"    ELSIF (TG_OP = 'UPDATE') THEN\n"
+                f"        {upd_guard_open}{upd_inner}{upd_guard_close}\n"
+                f"    END IF;\n"
+                f"    RETURN NULL;\n"
+                f"END;\n"
+                f"$$ LANGUAGE plpgsql;"
+            )
+            t_sync = (
+                f"CREATE TRIGGER {t_sync_name}\n"
+                f"AFTER INSERT OR UPDATE{upd_of_clause} OR DELETE ON {q_base_t}\n"
+                f"FOR EACH ROW EXECUTE FUNCTION {fn_name}();"
+            )
+            return (
+                [fn_ddl, t_sync, fn_trunc_ddl, t_trunc],
+                [t_sync_name, t_trunc_name],
+                [fn_name, fn_trunc],
+            )
+
+        elif self.dialect == Dialect.MYSQL:
+            ins_block = "\n        ".join(ins_stmts)
+            del_block = "\n        ".join(del_stmts)
+            minus_block = "\n        ".join(upd_old_stmts)
+            plus_block = "\n        ".join(upd_new_stmts)
+            cleanup_block = "\n        ".join(cleanup_stmts)
+
+            ins_section = (
+                f"IF ({where_new}) THEN\n        {ins_block}\n    END IF;"
+                if where_new and ins_block
+                else ins_block
+            )
+            del_section = (
+                f"IF ({where_old}) THEN\n        {del_block}\n    END IF;"
+                if where_old and del_block
+                else del_block
+            )
+            old_section = (
+                f"IF ({where_old}) THEN\n        {minus_block}\n    END IF;"
+                if where_old and minus_block
+                else minus_block
+            )
+            new_section = (
+                f"IF ({where_new}) THEN\n        {plus_block}\n    END IF;"
+                if where_new and plus_block
+                else plus_block
+            )
+            clean_section = (
+                f"\n    IF ({where_old}) THEN\n        {cleanup_block}\n    END IF;"
+                if where_old and cleanup_block
+                else (f"\n    {cleanup_block}" if cleanup_block else "")
+            )
+
+            upd_guard_open = f"IF ({changed_guard}) THEN\n    " if changed_guard else ""
+            upd_guard_close = "\n    END IF;" if changed_guard else ""
+            upd_inner = (
+                f"{old_section}\n    {new_section}{clean_section}"
+                if old_section.strip()
+                else f"{new_section}{clean_section}"
+            )
+
+            trig_ins = (
+                f"CREATE TRIGGER {t_ai_name}\n"
+                f"AFTER INSERT ON {q_base_t}\n"
+                f"FOR EACH ROW\n"
+                f"BEGIN\n"
+                f"    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN\n"
+                f"    {ins_section}\n"
+                f"    END IF;\n"
+                f"END;"
+            )
+            trig_del = (
+                f"CREATE TRIGGER {t_ad_name}\n"
+                f"AFTER DELETE ON {q_base_t}\n"
+                f"FOR EACH ROW\n"
+                f"BEGIN\n"
+                f"    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN\n"
+                f"    {del_section}\n"
+                f"    END IF;\n"
+                f"END;"
+            )
+            trig_upd = (
+                f"CREATE TRIGGER {t_au_name}\n"
+                f"AFTER UPDATE ON {q_base_t}\n"
+                f"FOR EACH ROW\n"
+                f"BEGIN\n"
+                f"    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN\n"
+                f"    {upd_guard_open}{upd_inner}{upd_guard_close}\n"
+                f"    END IF;\n"
+                f"END;"
+            )
+            t_names = [t_ai_name, t_ad_name, t_au_name]
+            return [trig_ins, trig_del, trig_upd], t_names, []
+
+        return [], [], []
+
+
+    # =========================================================================
+    # TIER 1B: Multi-Table INNER / CROSS JOIN O(1) Algebraic Delta Maintenance
+    # =========================================================================
+
+    def _qualify_join_expr(self, expr: Optional[str]) -> str:
+        if not expr:
+            return ""
+        col_to_aliases: Dict[str, List[Tuple[str, str]]] = {}
+        for j in self.view.joins:
+            ts = self._schemas_lower.get(j.table_name.lower())
+            if ts:
+                for c_name in ts.columns:
+                    col_to_aliases.setdefault(c_name.lower(), []).append((j.alias, c_name))
+
+        alias_remap: Dict[str, Tuple[str, Optional[TableSchema]]] = {}
+        for j in self.view.joins:
+            ts = self._schemas_lower.get(j.table_name.lower())
+            alias_remap[j.table_name.lower()] = (j.alias, ts)
+            alias_remap[j.alias.lower()] = (j.alias, ts)
+
+        try:
+            toks = sqlglot.tokenize(expr, read="sqlite")
+        except Exception:
+            return expr
+        out: List[str] = []
+        i = 0
+        n = len(toks)
+        cursor = 0
+        while i < n:
+            tk = toks[i]
+            if (
+                _is_word_or_ident_token(tk)
+                and i + 2 < n
+                and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                and _is_word_or_ident_token(toks[i + 2])
+            ):
+                q_low = tk.text.lower()
+                c_unq = toks[i + 2].text
+                if q_low in alias_remap:
+                    new_al, ts = alias_remap[q_low]
+                    actual_c = c_unq
+                    if ts:
+                        for sc in ts.columns:
+                            if sc.lower() == c_unq.lower():
+                                actual_c = sc
+                                break
+                    if tk.start > cursor:
+                        out.append(expr[cursor:tk.start])
+                    out.append(f"{self._q(new_al)}.{self._q(actual_c)}")
+                    cursor = toks[i + 2].end + 1
+                    i += 3
+                    continue
+            if _is_word_or_ident_token(tk):
+                is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
+                is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
+                is_fn_call = (
+                    tk.token_type != SQLGlotTokenType.IDENTIFIER
+                    and i + 1 < n
+                    and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN
+                )
+                if not is_after_dot and not is_before_dot and not is_fn_call:
+                    c_low = tk.text.lower()
+                    als = col_to_aliases.get(c_low)
+                    if als and (
+                        len(als) == 1
+                        or any(
+                            j.on_condition and c_low in {t.text.lower() for t in sqlglot.tokenize(j.on_condition, read="sqlite")}
+                            for j in self.view.joins
+                        )
+                    ):
+                        al, actual_c = als[0]
+                        if tk.start > cursor:
+                            out.append(expr[cursor:tk.start])
+                        out.append(f"{self._q(al)}.{self._q(actual_c)}")
+                        cursor = tk.end + 1
+                        i += 1
+                        continue
+            i += 1
+        if cursor < len(expr):
+            out.append(expr[cursor:])
+        return "".join(out)
+
+    def _compile_tier1_join_algebraic(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        work_items = self._working_select_items
+        grp_exprs = self._effective_group_by_exprs
+
+        count_star_alias: Optional[str] = None
+        for item in work_items:
+            if (
+                item.is_aggregate
+                and item.agg_func == AggFunc.COUNT_STAR
+                and not item.filter_where
+            ):
+                count_star_alias = item.alias
+                break
+        row_count_col = self._q(count_star_alias) if count_star_alias else "__mv_row_count"
+
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = [it.alias for it in self.view.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+
+        has_nullable_grp = self._has_nullable_group_col()
+        pk_cols = self._tier1_pk_cols()
+        if not grp_exprs:
+            col_defs_sql.append("__mv_global_id INTEGER NOT NULL PRIMARY KEY")
+        elif has_nullable_grp:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        non_agg_aliases_lower = {
+            item.alias.lower() for item in work_items if not item.is_aggregate
+        }
+        seen_hidden_grp: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
+                seen_hidden_grp.add(mv_col.lower())
+                collation_match = re.search(
+                    r'\bCOLLATE\s+((?:"[^"]+")|(?:`[^`]+`)|(?:\[[^\]]+\])|(?:[A-Za-z_][A-Za-z0-9_.$]*))\s*                nn = " NOT NULL" if not has_nullable_grp else ""
+                col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
+
+        def _expr_key(item: SelectItem) -> str:
+            eff = self._effective_agg_value_expr(item, record_prefix=None).strip().lower()
+            return f"{'dist:' if item.is_distinct else ''}{eff}"
+
+        col_nonnull_count_map: Dict[str, str] = {}
+        col_sum_map: Dict[str, str] = {}
+        col_sum2_map: Dict[str, str] = {}
+        col_true_cnt_map: Dict[str, str] = {}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            ekey = _expr_key(item)
+            if item.agg_func == AggFunc.COUNT_COL:
+                col_nonnull_count_map[ekey] = self._q(item.alias)
+            elif item.agg_func == AggFunc.SUM:
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = self._q(item.alias)
+
+        group_mv_cols: List[str] = []
+        for g in grp_exprs:
+            mc = self._group_col_alias(g)
+            if mc not in group_mv_cols:
+                group_mv_cols.append(mc)
+        indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
+
+        for item in work_items:
+            if not item.is_aggregate:
+                c_def = self._lookup_col_def(self._qualify_join_expr(item.raw_expr)) or self._lookup_col_def(item.raw_expr)
+                dt = (
+                    self._normalize_dialect_type(c_def.data_type)
+                    if c_def
+                    else self._infer_expr_storage_type(item)
+                )
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
+                col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
+            else:
+                storage_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    storage_type = "VARCHAR(255)"
+                if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
+                elif item.agg_func == AggFunc.TOTAL:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0.0")
+                else:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type}")
+
+        if count_star_alias is None:
+            col_defs_sql.append(f"{row_count_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        aux_idx = 0
+        for item in work_items:
+            if not item.is_aggregate or item.agg_func is None:
+                continue
+            ekey = _expr_key(item)
+            safe_id = _sanitize_ident(item.alias)
+            if item.agg_func in (
+                AggFunc.SUM,
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            ) or (item.agg_func == AggFunc.COUNT_STAR and item.filter_where):
+                if item.agg_func == AggFunc.COUNT_STAR and item.filter_where:
+                    col_nonnull_count_map[ekey] = self._q(item.alias)
+                elif ekey not in col_nonnull_count_map:
+                    aux_idx += 1
+                    cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
+                    col_nonnull_count_map[ekey] = cnt_col
+                    col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+            if item.agg_func in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum_map:
+                    aux_idx += 1
+                    sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
+                    col_sum_map[ekey] = sum_col
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
+
+            if item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum2_map:
+                    aux_idx += 1
+                    s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
+                    sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
+                    col_sum2_map[ekey] = sum2_col
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
+
+            if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if ekey not in col_true_cnt_map:
+                    aux_idx += 1
+                    tcnt_col = f"__mv_tcnt_{safe_id}_{aux_idx}"
+                    col_true_cnt_map[ekey] = tcnt_col
+                    col_defs_sql.append(f"{tcnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        if grp_exprs and not has_nullable_grp:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        backing_col_map = {
+            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            for u_col, expr_s in self._compound_reader_exprs.items()
+            if expr_s != u_col and "__mv_elem_" in expr_s
+        }
+        can_pg15_unique_nnd = (
+            bool(grp_exprs)
+            and has_nullable_grp
+            and len(set(c.lower() for c in group_mv_cols)) == len(grp_exprs)
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=group_mv_cols,
+            has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
+            backing_col_map=backing_col_map,
+            unique_group_nulls_not_distinct=can_pg15_unique_nnd,
+        )
+
+        reader_select_override = [
+            self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
+        ]
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                select_exprs_override=reader_select_override,
+                extra_where_filter=self._rewritten_having_clause,
+            )
+        )
+
+        qual_grp_exprs = [self._qualify_join_expr(g) for g in grp_exprs]
+        target_cols: List[str] = []
+        select_exprs: List[str] = []
+        if not grp_exprs:
+            target_cols.append("__mv_global_id")
+            select_exprs.append("1")
+        elif has_nullable_grp:
+            target_cols.append("__mv_pk")
+            select_exprs.append(self._canonical_group_pk_expr(qual_grp_exprs))
+
+        seen_hidden: Set[str] = set()
+        for g_raw, g_qual in zip(grp_exprs, qual_grp_exprs):
+            mv_col = self._group_col_alias(g_raw)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                target_cols.append(mv_col)
+                select_exprs.append(g_qual)
+
+        for item in work_items:
+            target_cols.append(item.alias)
+            if not item.is_aggregate:
+                select_exprs.append(self._qualify_join_expr(item.raw_expr))
+            else:
+                select_exprs.append(self._qualify_join_expr(self._sql_backfill_agg_expr(item)))
+
+        if count_star_alias is None:
+            target_cols.append(row_count_col)
+            select_exprs.append("COUNT(*)")
+
+        already_in_target = set(target_cols)
+        ekey_to_item: Dict[str, SelectItem] = {
+            _expr_key(it): it for it in work_items if it.is_aggregate
+        }
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            if cnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(cnt_col)
+                select_exprs.append(f"COUNT({eff})")
+                already_in_target.add(cnt_col)
+
+        for ekey, sum_col in col_sum_map.items():
+            if sum_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(sum_col)
+                select_exprs.append(f"SUM({eff})")
+                already_in_target.add(sum_col)
+
+        for ekey, sum2_col in col_sum2_map.items():
+            if sum2_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(sum2_col)
+                if self.dialect == Dialect.SQLITE:
+                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
+                else:
+                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
+                already_in_target.add(sum2_col)
+
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            if tcnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(tcnt_col)
+                select_exprs.append(
+                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
+                )
+                already_in_target.add(tcnt_col)
+
+        def _build_join_from_clause(replace_alias: Optional[str] = None, rec_prefix: Optional[str] = None) -> str:
+            from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+            parts: List[str] = []
+            for idx, j in enumerate(self.view.joins):
+                if replace_alias and j.alias.lower() == replace_alias.lower() and rec_prefix:
+                    ts = self._schemas_lower[j.table_name.lower()]
+                    rec_proj = ", ".join(f"{rec_prefix}.{c} AS {c}" for c in ts.columns)
+                    tbl_sql = f"(SELECT {rec_proj}{from_dual}) AS {j.alias}"
+                else:
+                    tbl_sql = f"{j.table_name} AS {j.alias}"
+                if idx == 0:
+                    parts.append(tbl_sql)
+                else:
+                    on_sql = f" ON {self._qualify_join_expr(j.on_condition)}" if j.on_condition else ""
+                    parts.append(f"{j.join_type} {tbl_sql}{on_sql}")
+            return " ".join(parts)
+
+        full_from_sql = _build_join_from_clause()
+        qual_where = self._qualify_join_expr(self.view.where_clause) if self.view.where_clause else None
+        where_sql = f"\nWHERE {qual_where}" if qual_where else ""
+        qual_grp_for_q = self._group_by_exprs_for_query(qual_grp_exprs, include_canonical_pk=has_nullable_grp)
+        group_sql = f"\nGROUP BY {', '.join(qual_grp_for_q)}" if qual_grp_for_q else ""
+
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+            f"SELECT {', '.join(select_exprs)}\n"
+            f"FROM {full_from_sql}{where_sql}{group_sql};"
+        )
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                f"SELECT {', '.join(target_cols)}\n"
+                f"FROM (\nSELECT {', '.join(f'{ex} AS {col}' for col, ex in zip(target_cols, select_exprs))}\n"
+                f"FROM {full_from_sql}{where_sql}{group_sql}\n) AS __mv_init\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        def _build_join_recompute_subquery(item: SelectItem) -> str:
+            alias_remap = {j.alias.lower(): f"__mv_j_{j.alias}" for j in self.view.joins}
+            for j in self.view.joins:
+                alias_remap[j.table_name.lower()] = f"__mv_j_{j.alias}"
+
+            def _remap_to_j(frag: str) -> str:
+                q_frag = self._qualify_join_expr(frag)
+                tokens = re.split(r"('(?:''|[^'])*')", q_frag)
+                out = []
+                for idx_t, tok in enumerate(tokens):
+                    if idx_t % 2 == 1:
+                        out.append(tok)
+                        continue
+                    mod = tok
+                    for old_a, new_a in sorted(alias_remap.items(), key=lambda x: len(x[0]), reverse=True):
+                        mod = re.sub(rf"\b{re.escape(old_a)}\s*\.", f"{new_a}.", mod, flags=re.IGNORECASE)
+                    out.append(mod)
+                return "".join(out)
+
+            j_parts: List[str] = []
+            for idx, j in enumerate(self.view.joins):
+                tbl_s = f"{j.table_name} AS __mv_j_{j.alias}"
+                if idx == 0:
+                    j_parts.append(tbl_s)
+                else:
+                    on_s = f" ON {_remap_to_j(j.on_condition)}" if j.on_condition else ""
+                    j_parts.append(f"{j.join_type} {tbl_s}{on_s}")
+            conds: List[str] = []
+            if self.view.where_clause:
+                conds.append(f"({_remap_to_j(self.view.where_clause)})")
+            for g_raw in grp_exprs:
+                mv_col = self._group_col_alias(g_raw)
+                lhs_j = _remap_to_j(g_raw)
+                conds.append(
+                    self._null_safe_eq(f"({lhs_j})", f"{mv_table}.{mv_col}", is_nullable=True)
+                )
+            w_sub = f" WHERE {' AND '.join(conds)}" if conds else ""
+            agg_e = _remap_to_j(self._sql_backfill_agg_expr(item))
+            return f"(SELECT {agg_e} FROM {' '.join(j_parts)}{w_sub})"
+
+        plus_merge_assignments = self._build_tier1_chunk_merge_assignments(
+            mv_table=mv_table,
+            row_count_col=row_count_col,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            expr_key_fn=_expr_key,
+            use_mysql_values=(self.dialect == Dialect.MYSQL),
+        )
+        # Native approximate aggregates must preserve the engine's operation
+        # order; algebraically equivalent sum/count updates can differ by ULPs.
+        native_recompute_aliases = {
+            self._q(item.alias)
+            for item in work_items
+            if item.is_aggregate
+            and (
+                item.agg_func in (
+                    AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                    AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                )
+                or self._requires_native_avg_recompute(item)
+            )
+        }
+        if native_recompute_aliases:
+            plus_merge_assignments = [
+                assignment for assignment in plus_merge_assignments
+                if assignment.split("=", 1)[0].strip() not in native_recompute_aliases
+            ]
+            for item in work_items:
+                if item.is_aggregate and (
+                    item.agg_func in (
+                        AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                        AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                    )
+                    or self._requires_native_avg_recompute(item)
+                ):
+                    plus_merge_assignments.append(
+                        f"{self._q(item.alias)} = {_build_join_recompute_subquery(item)}"
+                    )
+
+        # Build minus assignments from `__mv_delta`
+        minus_assignments: List[str] = []
+        minus_updated: Set[str] = set()
+
+        def _delta_sum_minus(col: str, cnt_col: str) -> str:
+            new_c = f"({mv_table}.{cnt_col} - __mv_delta.{cnt_col})"
+            return (
+                f"(CASE WHEN __mv_delta.{col} IS NULL THEN {mv_table}.{col} "
+                f"WHEN {new_c} <= 0 THEN NULL "
+                f"ELSE {mv_table}.{col} - __mv_delta.{col} END)"
+            )
+
+        def _delta_sum2_minus(ekey: str, sum2_col: str, cnt_col: str) -> str:
+            if self.dialect != Dialect.SQLITE:
+                return _delta_sum_minus(sum2_col, cnt_col)
+            sum_c = col_sum_map[ekey]
+            new_c = f"({mv_table}.{cnt_col} - __mv_delta.{cnt_col})"
+            d_mu = f"(((1.0 * __mv_delta.{sum_c}) / __mv_delta.{cnt_col}) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_col}))"
+            return (
+                f"(CASE WHEN __mv_delta.{cnt_col} <= 0 OR __mv_delta.{sum2_col} IS NULL THEN {mv_table}.{sum2_col} "
+                f"WHEN {new_c} <= 0 THEN NULL "
+                f"WHEN {new_c} = 1 THEN 0.0 "
+                f"ELSE MAX(0.0, COALESCE({mv_table}.{sum2_col}, 0.0) - COALESCE(__mv_delta.{sum2_col}, 0.0) - ({d_mu} * {d_mu} * ((1.0 * {mv_table}.{cnt_col} * __mv_delta.{cnt_col}) / {new_c}))) END)"
+            )
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            c = self._q(item.alias)
+            minus_updated.add(c)
+            ekey = _expr_key(item)
+            if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
+                minus_assignments.append(f"{c} = {mv_table}.{c} - __mv_delta.{c}")
+            elif item.agg_func == AggFunc.SUM:
+                cnt_c = col_nonnull_count_map[ekey]
+                minus_assignments.append(f"{c} = {_delta_sum_minus(c, cnt_c)}")
+            elif item.agg_func == AggFunc.AVG:
+                if self._requires_native_avg_recompute(item):
+                    recomputed = _build_join_recompute_subquery(item)
+                    minus_assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                    new_sum = _delta_sum_minus(sum_c, cnt_c)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    minus_assignments.append(
+                        f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL ELSE {dividend} / {new_cnt} END"
+                    )
+            elif item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                recomputed = _build_join_recompute_subquery(item)
+                minus_assignments.append(f"{c} = {recomputed}")
+            elif item.agg_func == AggFunc.MIN:
+                recomp = _build_join_recompute_subquery(item)
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NOT NULL AND {mv_table}.{c} >= __mv_delta.{c} "
+                    f"THEN {recomp} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.MAX:
+                recomp = _build_join_recompute_subquery(item)
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NOT NULL AND {mv_table}.{c} <= __mv_delta.{c} "
+                    f"THEN {recomp} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.BIT_XOR:
+                cnt_c = col_nonnull_count_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                xor_e = self._bitwise_xor_sql(f"{mv_table}.{c}", f"(__mv_delta.{c})")
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {new_cnt} <= 0 THEN NULL ELSE {xor_e} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_AND:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                new_tcnt = f"({mv_table}.{tcnt_c} - __mv_delta.{tcnt_c})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                minus_assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_OR:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                new_tcnt = f"({mv_table}.{tcnt_c} - __mv_delta.{tcnt_c})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                minus_assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
+                )
+
+        if row_count_col not in minus_updated:
+            minus_assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} - __mv_delta.{row_count_col}")
+            minus_updated.add(row_count_col)
+
+        for ekey, cnt_c in col_nonnull_count_map.items():
+            if cnt_c not in minus_updated:
+                minus_assignments.append(f"{cnt_c} = {mv_table}.{cnt_c} - __mv_delta.{cnt_c}")
+                minus_updated.add(cnt_c)
+        for ekey, sum_c in col_sum_map.items():
+            if sum_c not in minus_updated:
+                cnt_c = col_nonnull_count_map[ekey]
+                minus_assignments.append(f"{sum_c} = {_delta_sum_minus(sum_c, cnt_c)}")
+                minus_updated.add(sum_c)
+        for ekey, sum2_c in col_sum2_map.items():
+            if sum2_c not in minus_updated:
+                cnt_c = col_nonnull_count_map[ekey]
+                minus_assignments.append(f"{sum2_c} = {_delta_sum2_minus(ekey, sum2_c, cnt_c)}")
+                minus_updated.add(sum2_c)
+        for ekey, tcnt_c in col_true_cnt_map.items():
+            if tcnt_c not in minus_updated:
+                minus_assignments.append(f"{tcnt_c} = {mv_table}.{tcnt_c} - __mv_delta.{tcnt_c}")
+                minus_updated.add(tcnt_c)
+
+        high_p = {
+            self._q(it.alias)
+            for it in work_items
+            if it.is_aggregate
+            and it.agg_func
+            in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            )
+        }
+        mid_p = (
+            {self._q(it.alias) for it in work_items if it.is_aggregate and it.agg_func == AggFunc.SUM}
+            | set(col_sum_map.values())
+            | set(col_sum2_map.values())
+            | set(col_true_cnt_map.values())
+        )
+        ordered_minus = (
+            [a for a in minus_assignments if a.split("=")[0].strip() in high_p]
+            + [a for a in minus_assignments if a.split("=")[0].strip() not in high_p and a.split("=")[0].strip() in mid_p]
+            + [a for a in minus_assignments if a.split("=")[0].strip() not in high_p and a.split("=")[0].strip() not in mid_p]
+        )
+
+        # For MySQL multi-table UPDATE, LHS column names must be qualified with `mv_table.`
+        mysql_ordered_minus = [
+            f"{mv_table}.{a}" for a in ordered_minus
+        ]
+
+        aliased_delta_select = ", ".join(
+            f"{ex} AS {col}" for col, ex in zip(target_cols, select_exprs)
+        )
+        having_non_empty = "" if grp_exprs else "\nHAVING COUNT(*) > 0"
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for j in self.view.joins:
+            base_t = j.table_name
+            j_alias = j.alias
+            from_new = _build_join_from_clause(replace_alias=j_alias, rec_prefix="NEW")
+            from_old = _build_join_from_clause(replace_alias=j_alias, rec_prefix="OLD")
+
+            delta_pk_match = " AND ".join(
+                f"{mv_table}.{self._q(c)} = __mv_delta.{self._q(c)}" for c in pk_cols
+            )
+            q_pk_cols_csv = ", ".join(self._q(c) for c in pk_cols)
+            if self.dialect == Dialect.MYSQL:
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ON DUPLICATE KEY UPDATE\n"
+                    f"        {', '.join(plus_merge_assignments)};"
+                )
+                minus_stmt = (
+                    f"UPDATE {mv_table}\n"
+                    f"    INNER JOIN (\n"
+                    f"        SELECT {aliased_delta_select}\n"
+                    f"        FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ) AS __mv_delta ON {delta_pk_match}\n"
+                    f"    SET {', '.join(mysql_ordered_minus)};"
+                )
+            else:
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ON CONFLICT ({q_pk_cols_csv}) DO UPDATE SET\n"
+                    f"        {', '.join(plus_merge_assignments)};"
+                )
+                minus_stmt = (
+                    f"UPDATE {mv_table}\n"
+                    f"    SET {', '.join(ordered_minus)}\n"
+                    f"    FROM (\n"
+                    f"        SELECT {aliased_delta_select}\n"
+                    f"        FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ) AS __mv_delta\n"
+                    f"    WHERE {delta_pk_match};"
+                )
+
+            del_zero_stmt = (
+                f"DELETE FROM {mv_table} WHERE {mv_table}.{row_count_col} <= 0;"
+                if grp_exprs
+                else None
+            )
+            del_stmts = [minus_stmt] + ([del_zero_stmt] if del_zero_stmt else [])
+            trunc_stmts = [f"DELETE FROM {mv_table};"] + (
+                [initial_populate_sql] if not grp_exprs else []
+            )
+
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=[plus_stmt],
+                del_stmts=del_stmts,
+                upd_old_stmts=[minus_stmt],
+                upd_new_stmts=[plus_stmt],
+                upd_cleanup_old_stmts=[del_zero_stmt] if del_zero_stmt else [],
+                trunc_stmts=trunc_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+    # =========================================================================
+    # TIER 1C: Z-Set Set Operations (UNION ALL, UNION, INTERSECT, EXCEPT),
+    #          SELECT DISTINCT & PK-Lineage Projections
+    # =========================================================================
+
+    def _parse_setop_branches(self) -> Optional[List[Tuple[str, ViewSpec]]]:
+        raw = self.view.raw_select_sql.strip()
+        try:
+            q_ast = parse_sql_ast(raw)
+        except sqlglot.errors.SqlglotError:
+            return None
+        if not isinstance(q_ast, sqlglot_exp.SetOperation):
+            return None
+
+        ops, branch_sqls = _extract_set_op_branches_from_ast(q_ast, raw)
+        if not ops or len(set(ops)) != 1:
+            return None
+        op_type = ops[0]
+
+        if op_type in ("INTERSECT", "EXCEPT") and len(branch_sqls) != 2:
+            return None
+
+        branches: List[Tuple[str, ViewSpec]] = []
+        col_count: Optional[int] = None
+        for idx, b_sql in enumerate(branch_sqls):
+            try:
+                bs = _parse_single_create_view_stmt(
+                    f"CREATE VIEW __set_b_{idx} AS {b_sql}",
+                    known_tables=set(self._schemas_lower.keys()),
+                )
+            except Exception:
+                return None
+            if (
+                bs.has_cte
+                or bs.has_window_func
+                or bs.has_compound_set_op
+                or bs.has_top_level_distinct
+                or bs.has_limit_or_order
+                or bs.has_subquery_in_from
+                or len(bs.joins) != 1
+                or bs.group_by_cols
+                or any(it.is_aggregate or it.raw_expr.strip() == "*" for it in bs.select_items)
+                or bs.base_table.lower() not in self._schemas_lower
+            ):
+                return None
+            if bs.where_clause and _has_subquery_ast(bs.where_clause):
+                return None
+            if col_count is None:
+                col_count = len(bs.select_items)
+            elif len(bs.select_items) != col_count:
+                return None
+            if op_type == "UNION ALL":
+                ts = self._schemas_lower[bs.base_table.lower()]
+                if not any(c.primary_key for c in ts.columns.values()):
+                    return None
+            branches.append((op_type, bs))
+        return branches
+
+    def _rewrite_branch_expr(self, expr: str, ts: TableSchema, alias: str, record_prefix: Optional[str]) -> str:
+        col_map = {c.lower(): c for c in ts.columns}
+        quals_lower = {q.lower() for q in (ts.name, alias) if q}
+        toks = tokenize_sql(expr)
+        out: List[str] = []
+        i = 0
+        n = len(toks)
+
+        def _next_non_ws(idx: int) -> Optional[SQLToken]:
+            k = idx
+            while k < n:
+                if toks[k].kind != SQLTokenType.WHITESPACE:
+                    return toks[k]
+                k += 1
+            return None
+
+        def _prev_non_ws(idx: int) -> Optional[SQLToken]:
+            k = idx
+            while k >= 0:
+                if toks[k].kind != SQLTokenType.WHITESPACE:
+                    return toks[k]
+                k -= 1
+            return None
+
+        while i < n:
+            t = toks[i]
+            if (
+                t.kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT)
+                and i + 2 < n
+                and toks[i + 1].kind == SQLTokenType.PUNCT
+                and toks[i + 1].text == "."
+                and toks[i + 2].kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT)
+            ):
+                q_low = t.unquoted.lower()
+                c_low = toks[i + 2].unquoted.lower()
+                actual_c = col_map.get(c_low, toks[i + 2].unquoted)
+                if q_low in quals_lower:
+                    if record_prefix:
+                        out.append(f"{record_prefix}.{self._q(actual_c)}")
+                    else:
+                        out.append(f"{self._q(t.unquoted)}.{self._q(actual_c)}")
+                    i += 3
+                    continue
+            if t.kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT):
+                prev_t = _prev_non_ws(i - 1)
+                next_t = _next_non_ws(i + 1)
+                is_after_dot = prev_t is not None and prev_t.kind == SQLTokenType.PUNCT and prev_t.text == "."
+                is_before_dot = next_t is not None and next_t.kind == SQLTokenType.PUNCT and next_t.text == "."
+                is_fn_call = (
+                    t.kind == SQLTokenType.IDENT
+                    and next_t is not None
+                    and next_t.kind == SQLTokenType.PUNCT
+                    and next_t.text == "("
+                )
+                if not is_after_dot and not is_before_dot and not is_fn_call:
+                    w_low = t.unquoted.lower()
+                    if w_low in col_map:
+                        actual_c = col_map[w_low]
+                        if record_prefix:
+                            out.append(f"{record_prefix}.{self._q(actual_c)}")
+                        else:
+                            out.append(self._q(actual_c))
+                        i += 1
+                        continue
+            out.append(t.text)
+            i += 1
+        return "".join(out)
+
+    def _compile_tier1_zset_setop(self) -> MaterializedViewPlan:
+        branches = self._parse_setop_branches()
+        assert branches is not None
+        op_type = branches[0][0]
+        first_bs = branches[0][1]
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        user_columns = [it.alias for it in first_bs.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+
+        # Check if UNION ALL branches share a uniform native composite PK structure
+        branch_pk_defs_list: List[List[ColumnDef]] = []
+        for _, bs in branches:
+            ts_b = self._schemas_lower[bs.base_table.lower()]
+            branch_pk_defs_list.append([c for c in ts_b.columns.values() if c.primary_key])
+
+        use_native_uall_pk = False
+        uall_pk_cols: List[str] = ["__mv_pk"]
+        uall_pk_col_types: List[str] = []
+        if op_type == "UNION ALL" and branch_pk_defs_list and branch_pk_defs_list[0]:
+            k_pks = len(branch_pk_defs_list[0])
+            if all(len(pks) == k_pks for pks in branch_pk_defs_list):
+                use_native_uall_pk = True
+                uall_pk_cols = ["__mv_branch_id", *[f"__mv_pk_{i}" for i in range(k_pks)]]
+                for i in range(k_pks):
+                    dt_i = self._normalize_dialect_type(branch_pk_defs_list[0][i].data_type)
+                    if self.dialect == Dialect.MYSQL and dt_i.upper() == "TEXT":
+                        dt_i = "VARCHAR(255)"
+                    uall_pk_col_types.append(dt_i)
+        self._setop_pk_cols = list(uall_pk_cols)
+
+        col_defs_sql: List[str] = []
+        if use_native_uall_pk:
+            col_defs_sql.append("__mv_branch_id INTEGER NOT NULL")
+            for i, dt_i in enumerate(uall_pk_col_types):
+                col_defs_sql.append(f"__mv_pk_{i} {dt_i} NOT NULL")
+        else:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        indexed_cols_lower = self._indexed_column_names_lower()
+        for it in first_bs.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            col_defs_sql.append(f"{self._q(it.alias)} {dt}")
+
+        if op_type in ("UNION", "UNION ALL"):
+            col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = None
+        elif op_type == "INTERSECT":
+            col_defs_sql.append(f"__mv_cnt_0 {self._int_type()} NOT NULL DEFAULT 0")
+            col_defs_sql.append(f"__mv_cnt_1 {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = "__mv_cnt_0 > 0 AND __mv_cnt_1 > 0"
+        else:  # EXCEPT
+            col_defs_sql.append(f"__mv_cnt_0 {self._int_type()} NOT NULL DEFAULT 0")
+            col_defs_sql.append(f"__mv_cnt_1 {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = "__mv_cnt_0 > 0 AND __mv_cnt_1 = 0"
+
+        if use_native_uall_pk:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(uall_pk_cols)})")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                extra_where_filter=extra_filter,
+            )
+        )
+
+        initial_populate_sqls: List[str] = []
+        by_table_branches: Dict[str, List[Tuple[int, ViewSpec]]] = {}
+        for b_idx, (_, bs) in enumerate(branches):
+            by_table_branches.setdefault(bs.base_table, []).append((b_idx, bs))
+
+        if op_type == "UNION ALL":
+            for b_idx, (_, bs) in enumerate(branches):
+                ts = self._schemas_lower[bs.base_table.lower()]
+                pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                sel_exprs = [it.raw_expr for it in bs.select_items]
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                if use_native_uall_pk:
+                    initial_populate_sqls.append(
+                        f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"SELECT {b_idx}, {', '.join(pk_names)}, {', '.join(sel_exprs)}, 1 FROM {bs.base_table}{w_sql};"
+                    )
+                else:
+                    pk_expr = self._canonical_group_pk_expr([f"'B{b_idx}'", *pk_names])
+                    initial_populate_sqls.append(
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"SELECT {pk_expr}, {', '.join(sel_exprs)}, 1 FROM {bs.base_table}{w_sql};"
+                    )
+        elif op_type == "UNION":
+            u_parts: List[str] = []
+            for _, bs in branches:
+                sel_aliased = ", ".join(
+                    f"{it.raw_expr} AS {col}" for it, col in zip(bs.select_items, user_columns)
+                )
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                u_parts.append(f"    SELECT {sel_aliased} FROM {bs.base_table}{w_sql}")
+            pk_u = self._canonical_group_pk_expr(user_columns)
+            grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
+            initial_populate_sqls.append(
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                f"SELECT {pk_u}, {', '.join(user_columns)}, COUNT(*) FROM (\n"
+                + "\n    UNION ALL\n".join(u_parts)
+                + f"\n) AS __mv_u\nGROUP BY {grp_u};"
+            )
+        else:  # INTERSECT or EXCEPT
+            u_parts = []
+            for b_idx, (_, bs) in enumerate(branches):
+                sel_aliased = ", ".join(
+                    f"{it.raw_expr} AS {col}" for it, col in zip(bs.select_items, user_columns)
+                )
+                b0 = "1" if b_idx == 0 else "0"
+                b1 = "1" if b_idx == 1 else "0"
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                u_parts.append(
+                    f"    SELECT {sel_aliased}, {b0} AS __mv_b0, {b1} AS __mv_b1 FROM {bs.base_table}{w_sql}"
+                )
+            pk_u = self._canonical_group_pk_expr(user_columns)
+            grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
+            initial_populate_sqls.append(
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                f"SELECT {pk_u}, {', '.join(user_columns)}, SUM(__mv_b0), SUM(__mv_b1) FROM (\n"
+                + "\n    UNION ALL\n".join(u_parts)
+                + f"\n) AS __mv_u\nGROUP BY {grp_u};"
+            )
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for base_t, b_list in by_table_branches.items():
+            ts = self._schemas_lower[base_t.lower()]
+            ins_stmts: List[str] = []
+            del_stmts: List[str] = []
+            upd_old_stmts: List[str] = []
+            upd_new_stmts: List[str] = []
+            cleanup_stmts: List[str] = []
+
+            for b_idx, bs in b_list:
+                b_alias = bs.joins[0].alias if bs.joins else base_t
+                w_new = (
+                    self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "NEW")
+                    if bs.where_clause
+                    else "TRUE"
+                )
+                w_old = (
+                    self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "OLD")
+                    if bs.where_clause
+                    else "TRUE"
+                )
+                new_vals = [
+                    self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "NEW")
+                    for it in bs.select_items
+                ]
+                old_vals = [
+                    self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "OLD")
+                    for it in bs.select_items
+                ]
+
+                if op_type == "UNION ALL":
+                    pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                    if use_native_uall_pk:
+                        new_pk_vals = [str(b_idx), *[f"NEW.{self._q(c)}" for c in pk_names]]
+                        old_pk_match = f"{mv_table}.__mv_branch_id = {b_idx} AND " + " AND ".join(
+                            f"{mv_table}.__mv_pk_{i} = OLD.{self._q(c)}" for i, c in enumerate(pk_names)
+                        )
+                        if self.dialect == Dialect.MYSQL:
+                            upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        else:
+                            upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON CONFLICT ({', '.join(uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        minus_s = (
+                            f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                            f"    WHERE ({w_old}) AND ({old_pk_match});"
+                        )
+                        clean_s = (
+                            f"DELETE FROM {mv_table}\n"
+                            f"    WHERE ({w_old}) AND ({old_pk_match}) AND {mv_table}.__mv_row_count <= 0;"
+                        )
+                    else:
+                        pk_new = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"NEW.{c}" for c in pk_names]])
+                        pk_old = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"OLD.{c}" for c in pk_names]])
+                        if self.dialect == Dialect.MYSQL:
+                            upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        else:
+                            upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        minus_s = (
+                            f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                            f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                        )
+                        clean_s = (
+                            f"DELETE FROM {mv_table}\n"
+                            f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+                        )
+                elif op_type == "UNION":
+                    pk_new = self._canonical_group_pk_expr(new_vals)
+                    pk_old = self._canonical_group_pk_expr(old_vals)
+                    if self.dialect == Dialect.MYSQL:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON DUPLICATE KEY UPDATE __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                    else:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                    minus_s = (
+                        f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                        f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                    )
+                    clean_s = (
+                        f"DELETE FROM {mv_table}\n"
+                        f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+                    )
+                else:  # INTERSECT or EXCEPT
+                    pk_new = self._canonical_group_pk_expr(new_vals)
+                    pk_old = self._canonical_group_pk_expr(old_vals)
+                    cnt_col = f"__mv_cnt_{b_idx}"
+                    init_c0 = "1" if b_idx == 0 else "0"
+                    init_c1 = "1" if b_idx == 1 else "0"
+                    if self.dialect == Dialect.MYSQL:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}{from_dual}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON DUPLICATE KEY UPDATE {cnt_col} = {mv_table}.{cnt_col} + 1;"
+                        )
+                    else:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET {cnt_col} = {mv_table}.{cnt_col} + 1;"
+                        )
+                    minus_s = (
+                        f"UPDATE {mv_table} SET {cnt_col} = {mv_table}.{cnt_col} - 1\n"
+                        f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                    )
+                    clean_s = (
+                        f"DELETE FROM {mv_table}\n"
+                        f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_cnt_0 <= 0 AND {mv_table}.__mv_cnt_1 <= 0;"
+                    )
+
+                ins_stmts.append(plus_s)
+                del_stmts.extend([minus_s, clean_s])
+                upd_old_stmts.append(minus_s)
+                upd_new_stmts.append(plus_s)
+                cleanup_stmts.append(clean_s)
+
+            trunc_stmts = [f"DELETE FROM {mv_table};", *initial_populate_sqls]
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=ins_stmts,
+                del_stmts=del_stmts,
+                upd_old_stmts=upd_old_stmts,
+                upd_new_stmts=upd_new_stmts,
+                upd_cleanup_old_stmts=cleanup_stmts,
+                trunc_stmts=trunc_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            chunk_sql_templates=initial_populate_sqls,
+        )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=initial_populate_sqls,
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    def _compile_tier1_zset_distinct(self) -> MaterializedViewPlan:
+        # `SELECT DISTINCT c1, c2 FROM t WHERE ...` is isomorphic to `GROUP BY c1, c2` with hidden `__mv_row_count`
+        self._effective_group_by_exprs = tuple(it.raw_expr for it in self.view.select_items)
+        return self._compile_tier1_algebraic()
+
+    def _projection_pk_mapping(self) -> Tuple[List[str], List[Tuple[str, str, str]], bool]:
+        """
+        Returns `(mv_pk_cols, hidden_pk_defs, uses_native_pk)` for `_compile_tier1_zset_projection`.
+        Preserves the base table's actual primary/composite key columns in the backing table
+        whenever all base PK columns are non-nullable.
+        """
+        assert self.primary_schema is not None
+        pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
+        can_native = bool(pk_defs) and all(
+            c.not_null
+            or "INT" in c.data_type.upper()
+            or self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+            for c in pk_defs
+        )
+        if not can_native:
+            return ["__mv_pk"], [], False
+
+        base_alias = self.view.joins[0].alias.lower() if self.view.joins else self.view.base_table.lower()
+        base_name = self.view.base_table.lower()
+        mv_pk_cols: List[str] = []
+        hidden_pk_defs: List[Tuple[str, str, str]] = []
+        used_user_aliases: Set[str] = set()
+
+        for c_def in pk_defs:
+            c_low = c_def.name.lower()
+            matched_alias: Optional[str] = None
+            for it in self.view.select_items:
+                raw_s = _unquote_ident(it.raw_expr.strip()).lower() if re.match(r'^[A-Za-z0-9_."`\[\]]+$', it.raw_expr.strip()) else ""
+                raw_full = it.raw_expr.strip().lower()
+                if (
+                    raw_full == c_low
+                    or raw_full == f"{base_alias}.{c_low}"
+                    or raw_full == f"{base_name}.{c_low}"
+                    or (raw_s == c_low and "." not in raw_full)
+                ) and it.alias.lower() not in used_user_aliases:
+                    matched_alias = it.alias
+                    used_user_aliases.add(it.alias.lower())
+                    break
+            if matched_alias is not None:
+                mv_pk_cols.append(matched_alias)
+            else:
+                hid_col = f"__mv_pk_{_sanitize_ident(c_def.name)}"
+                dt = self._normalize_dialect_type(c_def.data_type)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                hidden_pk_defs.append((hid_col, c_def.name, dt))
+                mv_pk_cols.append(hid_col)
+
+        return mv_pk_cols, hidden_pk_defs, True
+
+    def _projection_pk_cols(self) -> List[str]:
+        mv_pk_cols, _, _ = self._projection_pk_mapping()
+        return mv_pk_cols
+
+    def _compile_tier1_zset_projection(self) -> MaterializedViewPlan:
+        assert self.primary_schema is not None
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        base_t = self.view.base_table
+        q_base_t = self._q(base_t)
+        user_columns = [it.alias for it in self.view.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+
+        pk_names = [c.name for c in self.primary_schema.columns.values() if c.primary_key]
+        mv_pk_cols, hidden_pk_defs, uses_native_pk = self._projection_pk_mapping()
+        pk_col_set_lower = {c.lower() for c in mv_pk_cols}
+
+        col_defs_sql: List[str] = []
+        if not uses_native_pk:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        indexed_cols_lower = self._indexed_column_names_lower(mv_pk_cols if uses_native_pk else ())
+        for it in self.view.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            nn = " NOT NULL" if (uses_native_pk and it.alias.lower() in pk_col_set_lower) else ""
+            col_defs_sql.append(f"{it.alias} {dt}{nn}")
+
+        for hid_col, _, hid_dt in hidden_pk_defs:
+            col_defs_sql.append(f"{hid_col} {hid_dt} NOT NULL")
+
+        if uses_native_pk:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(mv_pk_cols)})")
+        else:
+            col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        sel_exprs = [it.raw_expr for it in self.view.select_items]
+        w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
+        new_vals = [self._rewrite_expr_for_record(it.raw_expr, "NEW") for it in self.view.select_items]
+
+        if uses_native_pk:
+            all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
+            all_select_exprs = [*sel_exprs, *[h[1] for h in hidden_pk_defs]]
+            all_new_vals = [*new_vals, *[f"NEW.{h[1]}" for h in hidden_pk_defs]]
+            initial_populate_sql = (
+                f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                f"SELECT {', '.join(all_select_exprs)} FROM {q_base_t}{w_sql};"
+            )
+            if self.dialect == Dialect.MYSQL:
+                upd_set = ", ".join(f"{c} = VALUES({c})" for c in all_backing_cols)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                    f"    SELECT {', '.join(all_new_vals)}{from_dual}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON DUPLICATE KEY UPDATE {upd_set};"
+                )
+            else:
+                upd_set = ", ".join(f"{c} = excluded.{c}" for c in all_backing_cols)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                    f"    SELECT {', '.join(all_new_vals)}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON CONFLICT ({', '.join(mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                )
+            pk_old_preds = [
+                f"{mv_table}.{mv_c} = OLD.{src_c}"
+                for mv_c, src_c in zip(mv_pk_cols, pk_names)
+            ]
+            del_where = " AND ".join(pk_old_preds)
+            del_stmt = f"DELETE FROM {mv_table}\n    WHERE {del_where};"
+            del_stmts_list = [del_stmt]
+            upd_old_list = [del_stmt]
+            upd_clean_list: List[str] = []
+        else:
+            pk_expr_base = self._canonical_group_pk_expr(pk_names)
+            initial_populate_sql = (
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_sql};"
+            )
+            pk_new = self._canonical_group_pk_expr([f"NEW.{c}" for c in pk_names])
+            pk_old = self._canonical_group_pk_expr([f"OLD.{c}" for c in pk_names])
+            if self.dialect == Dialect.MYSQL:
+                upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            else:
+                upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            minus_stmt = (
+                f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                f"    WHERE {mv_table}.__mv_pk = ({pk_old});"
+            )
+            clean_stmt = (
+                f"DELETE FROM {mv_table}\n"
+                f"    WHERE ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+            )
+            del_stmts_list = [minus_stmt, clean_stmt]
+            upd_old_list = [minus_stmt]
+            upd_clean_list = [clean_stmt]
+
+        where_new = (
+            self._rewrite_expr_for_record(self.view.where_clause, "NEW")
+            if self.view.where_clause
+            else None
+        )
+        where_old = (
+            self._rewrite_expr_for_record(self.view.where_clause, "OLD")
+            if self.view.where_clause
+            else None
+        )
+
+        trigger_ddls, trig_names, fn_names = self._emit_dialect_triggers_for_table(
+            view_name=view_name,
+            base_t=base_t,
+            ins_stmts=[plus_stmt],
+            del_stmts=del_stmts_list,
+            upd_old_stmts=upd_old_list,
+            upd_new_stmts=[plus_stmt],
+            upd_cleanup_old_stmts=upd_clean_list,
+            trunc_stmts=[f"DELETE FROM {mv_table};"],
+            where_new=where_new,
+            where_old=where_old,
+        )
+
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            chunk_sql_templates=[initial_populate_sql],
+        )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    def _compile_tier1_union_all_agg(self) -> MaterializedViewPlan:
+        """
+        Compiles an aggregation query over a `UNION ALL` CTE or derived subquery into Tier 1 O(1)
+        per-branch algebraic delta triggers.
+        """
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        work_items = list(self._working_select_items)
+        grp_exprs = list(self._effective_group_by_exprs)
+        inner_u_sql = self._union_all_inner_sql
+        u_alias = self._union_all_sub_alias
+        branch_specs = self._union_all_branch_specs
+
+        count_star_alias: Optional[str] = None
+        for item in work_items:
+            if (
+                item.is_aggregate
+                and item.agg_func == AggFunc.COUNT_STAR
+                and not item.filter_where
+            ):
+                count_star_alias = item.alias
+                break
+        row_count_col = self._q(count_star_alias) if count_star_alias else "__mv_row_count"
+
+        # Check if all group_by columns are NOT NULL across every UNION ALL branch
+        uall_has_nullable = False
+        if grp_exprs:
+            first_b_aliases = [it.alias.lower() for it in branch_specs[0].select_items]
+            seen_g_al: Set[str] = set()
+            for g_expr in grp_exprs:
+                g_id = _unquote_ident(g_expr.split(".")[-1]).lower() if _is_simple_column_expr(g_expr.strip()) else ""
+                if not g_id or g_id not in first_b_aliases:
+                    uall_has_nullable = True
+                    break
+                col_pos = first_b_aliases.index(g_id)
+                for bs in branch_specs:
+                    b_it = bs.select_items[col_pos]
+                    ts_b = self._schemas_lower[bs.base_table.lower()]
+                    c_b = ts_b.columns.get(b_it.source_col or "") if b_it.source_col else None
+                    if c_b is None or not c_b.not_null:
+                        uall_has_nullable = True
+                        break
+                if uall_has_nullable:
+                    break
+                al_g = self._group_col_alias(g_expr).lower()
+                if al_g in seen_g_al:
+                    uall_has_nullable = True
+                    break
+                seen_g_al.add(al_g)
+        self._uall_has_nullable_grp = uall_has_nullable
+        has_nullable_grp = self._has_nullable_group_col()
+        pk_cols = self._tier1_pk_cols()
+
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = [it.alias for it in self.view.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+
+        if not grp_exprs:
+            col_defs_sql.append("__mv_global_id INTEGER NOT NULL PRIMARY KEY")
+        elif has_nullable_grp:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        non_agg_aliases_lower = {
+            item.alias.lower() for item in work_items if not item.is_aggregate
+        }
+        seen_hidden_grp: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
+                seen_hidden_grp.add(mv_col.lower())
+                fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
+                dt = self._infer_expr_storage_type(fake_it)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if not has_nullable_grp else ""
+                col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
+
+        def _expr_key(item: SelectItem) -> str:
+            eff = self._effective_agg_value_expr(item, record_prefix=None).strip().lower()
+            return f"{'dist:' if item.is_distinct else ''}{eff}"
+
+        col_nonnull_count_map: Dict[str, str] = {}
+        col_sum_map: Dict[str, str] = {}
+        col_sum2_map: Dict[str, str] = {}
+        col_true_cnt_map: Dict[str, str] = {}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            ekey = _expr_key(item)
+            if item.agg_func == AggFunc.COUNT_COL:
+                col_nonnull_count_map[ekey] = self._q(item.alias)
+            elif item.agg_func == AggFunc.SUM:
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = self._q(item.alias)
+
+        group_mv_cols: List[str] = []
+        for g in grp_exprs:
+            mc = self._group_col_alias(g)
+            if mc not in group_mv_cols:
+                group_mv_cols.append(mc)
+        indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
+
+        # Infer aggregate types from first branch
+        first_b = branch_specs[0]
+        first_b_map = {it.alias.lower(): it.raw_expr for it in first_b.select_items}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                dt = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
+                col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
+            else:
+                # Check if arg_expr maps to an integer column across all branches
+                storage_type = self._infer_expr_storage_type(item)
+                if item.agg_func in (AggFunc.SUM, AggFunc.MIN, AggFunc.MAX) and item.arg_expr:
+                    arg_id = _unquote_ident(item.arg_expr).lower()
+                    if arg_id in first_b_map:
+                        b_types = []
+                        for bs in branch_specs:
+                            b_m = {bi.alias.lower(): bi for bi in bs.select_items}
+                            if arg_id in b_m:
+                                bi_item = b_m[arg_id]
+                                ts_b = self._schemas_lower[bs.base_table.lower()]
+                                c_b = ts_b.columns.get(bi_item.source_col or "") if bi_item.source_col else None
+                                if c_b:
+                                    b_types.append(self._normalize_dialect_type(c_b.data_type))
+                                elif re.match(r"^\d+$", bi_item.raw_expr.strip()):
+                                    b_types.append("INT")
+                                else:
+                                    b_types.append(self._float_type())
+                        if b_types and all("INT" in bt.upper() for bt in b_types):
+                            storage_type = self._int_type() if item.agg_func == AggFunc.SUM else b_types[0]
+                if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    storage_type = "VARCHAR(255)"
+                if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
+                elif item.agg_func == AggFunc.TOTAL:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0.0")
+                else:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type}")
+
+        if count_star_alias is None:
+            col_defs_sql.append(f"{row_count_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        aux_idx = 0
+        for item in work_items:
+            if not item.is_aggregate or item.agg_func is None:
+                continue
+            ekey = _expr_key(item)
+            safe_id = _sanitize_ident(item.alias)
+            if item.agg_func in (
+                AggFunc.SUM,
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            ) or (item.agg_func == AggFunc.COUNT_STAR and item.filter_where):
+                if item.agg_func == AggFunc.COUNT_STAR and item.filter_where:
+                    col_nonnull_count_map[ekey] = self._q(item.alias)
+                elif ekey not in col_nonnull_count_map:
+                    aux_idx += 1
+                    cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
+                    col_nonnull_count_map[ekey] = cnt_col
+                    col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+            if item.agg_func in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum_map:
+                    aux_idx += 1
+                    sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
+                    col_sum_map[ekey] = sum_col
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
+
+            if item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum2_map:
+                    aux_idx += 1
+                    s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
+                    sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
+                    col_sum2_map[ekey] = sum2_col
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
+
+            if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if ekey not in col_true_cnt_map:
+                    aux_idx += 1
+                    tcnt_col = f"__mv_tcnt_{safe_id}_{aux_idx}"
+                    col_true_cnt_map[ekey] = tcnt_col
+                    col_defs_sql.append(f"{tcnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        if grp_exprs and not has_nullable_grp:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        backing_col_map = {
+            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            for u_col, expr_s in self._compound_reader_exprs.items()
+            if expr_s != u_col and "__mv_elem_" in expr_s
+        }
+        can_pg15_unique_nnd = (
+            bool(grp_exprs)
+            and has_nullable_grp
+            and len(set(c.lower() for c in group_mv_cols)) == len(grp_exprs)
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=group_mv_cols,
+            has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
+            backing_col_map=backing_col_map,
+            unique_group_nulls_not_distinct=can_pg15_unique_nnd,
+        )
+        reader_select_override = [
+            self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
+        ]
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                select_exprs_override=reader_select_override,
+                extra_where_filter=self._rewritten_having_clause,
+            )
+        )
+
+        target_cols: List[str] = []
+        select_exprs: List[str] = []
+        if not grp_exprs:
+            target_cols.append("__mv_global_id")
+            select_exprs.append("1")
+        elif has_nullable_grp:
+            target_cols.append("__mv_pk")
+            select_exprs.append(self._canonical_group_pk_expr(grp_exprs))
+
+        seen_hidden: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                target_cols.append(mv_col)
+                select_exprs.append(g_expr)
+
+        for item in work_items:
+            target_cols.append(item.alias)
+            if not item.is_aggregate:
+                select_exprs.append(item.raw_expr)
+            else:
+                select_exprs.append(self._sql_backfill_agg_expr(item))
+
+        if count_star_alias is None:
+            target_cols.append(row_count_col)
+            select_exprs.append("COUNT(*)")
+
+        already_in_target = set(target_cols)
+        ekey_to_item: Dict[str, SelectItem] = {
+            _expr_key(it): it for it in work_items if it.is_aggregate
+        }
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            if cnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(cnt_col)
+                select_exprs.append(f"COUNT({eff})")
+                already_in_target.add(cnt_col)
+        for ekey, sum_col in col_sum_map.items():
+            if sum_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(sum_col)
+                select_exprs.append(f"SUM({eff})")
+                already_in_target.add(sum_col)
+        for ekey, sum2_col in col_sum2_map.items():
+            if sum2_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(sum2_col)
+                if self.dialect == Dialect.SQLITE:
+                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
+                else:
+                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
+                already_in_target.add(sum2_col)
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            if tcnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(tcnt_col)
+                select_exprs.append(
+                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
+                )
+                already_in_target.add(tcnt_col)
+
+        w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
+        grp_for_q = self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=has_nullable_grp)
+        g_sql = f"\nGROUP BY {', '.join(grp_for_q)}" if grp_for_q else ""
+
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+            f"SELECT {', '.join(select_exprs)} FROM (\n{inner_u_sql}\n) AS {u_alias}{w_sql}{g_sql};"
+        )
+
+        # Group branches by base table and generate per-branch delta statements
+        by_table: Dict[str, List[ViewSpec]] = {}
+        for bs in branch_specs:
+            by_table.setdefault(bs.base_table, []).append(bs)
+
+        orig_view = self.view
+        orig_work_items = list(self._working_select_items)
+        orig_grp_exprs = tuple(self._effective_group_by_exprs)
+        orig_grp_aliases = [self._group_col_alias(g) for g in orig_grp_exprs]
+        orig_primary_schema = self.primary_schema
+        self._uall_orig_grp_exprs = orig_grp_exprs
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for base_t, b_list in by_table.items():
+            ts = self._schemas_lower[base_t.lower()]
+            ins_all: List[str] = []
+            del_all: List[str] = []
+            upd_old_all: List[str] = []
+            upd_new_all: List[str] = []
+            cleanup_all: List[str] = []
+
+            for bs in b_list:
+                b_alias = bs.joins[0].alias if bs.joins else base_t
+                col_subst: Dict[str, str] = {}
+                for col_i, b_it in enumerate(bs.select_items):
+                    u_col_name = first_b.select_items[col_i].alias.lower()
+                    cleaned = re.sub(
+                        rf"\b{re.escape(b_alias)}\.",
+                        "",
+                        b_it.raw_expr.strip(),
+                        flags=re.IGNORECASE,
+                    )
+                    col_subst[u_col_name] = f"({cleaned})"
+
+                def _subst_u(frag: Optional[str]) -> Optional[str]:
+                    if frag is None:
+                        return None
+                    toks = sqlglot.tokenize(frag, read="sqlite")
+                    if not toks:
+                        return frag
+                    out = []
+                    cursor = 0
+                    i = 0
+                    n = len(toks)
+                    while i < n:
+                        tk = toks[i]
+                        if (
+                            _is_word_or_ident_token(tk)
+                            and i + 2 < n
+                            and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                            and _is_word_or_ident_token(toks[i + 2])
+                        ):
+                            if tk.text.lower() == u_alias.lower():
+                                c_col = toks[i + 2].text.lower()
+                                if tk.start > cursor:
+                                    out.append(frag[cursor:tk.start])
+                                out.append(col_subst.get(c_col, toks[i + 2].text))
+                                cursor = toks[i + 2].end + 1
+                                i += 3
+                                continue
+                        if _is_word_or_ident_token(tk):
+                            is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
+                            is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
+                            is_fn = (
+                                tk.token_type != SQLGlotTokenType.IDENTIFIER
+                                and i + 1 < n
+                                and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN
+                            )
+                            if not is_after_dot and not is_before_dot and not is_fn:
+                                c_low = tk.text.lower()
+                                if c_low in col_subst:
+                                    if tk.start > cursor:
+                                        out.append(frag[cursor:tk.start])
+                                    out.append(col_subst[c_low])
+                                    cursor = tk.end + 1
+                                    i += 1
+                                    continue
+                        i += 1
+                    if cursor < len(frag):
+                        out.append(frag[cursor:])
+                    return "".join(out)
+
+                mapped_work_items: List[SelectItem] = []
+                orig_item_map: Dict[int, SelectItem] = {}
+                mapped_nonnull: Dict[str, str] = {}
+                mapped_sum: Dict[str, str] = {}
+                mapped_sum2: Dict[str, str] = {}
+                mapped_tcnt: Dict[str, str] = {}
+
+                for orig_it in orig_work_items:
+                    if not orig_it.is_aggregate:
+                        new_it = SelectItem(
+                            raw_expr=_subst_u(orig_it.raw_expr) or orig_it.raw_expr,
+                            alias=orig_it.alias,
+                            is_aggregate=False,
+                        )
+                    else:
+                        new_it = SelectItem(
+                            raw_expr=_subst_u(orig_it.raw_expr) or orig_it.raw_expr,
+                            alias=orig_it.alias,
+                            is_aggregate=True,
+                            agg_func=orig_it.agg_func,
+                            arg_expr=_subst_u(orig_it.arg_expr) if orig_it.arg_expr else orig_it.arg_expr,
+                            extra_args=orig_it.extra_args,
+                            is_distinct=orig_it.is_distinct,
+                            filter_where=_subst_u(orig_it.filter_where),
+                        )
+                        orig_ekey = _expr_key(orig_it)
+                        new_ekey = _expr_key(new_it)
+                        if orig_ekey in col_nonnull_count_map:
+                            mapped_nonnull[new_ekey] = col_nonnull_count_map[orig_ekey]
+                        if orig_ekey in col_sum_map:
+                            mapped_sum[new_ekey] = col_sum_map[orig_ekey]
+                        if orig_ekey in col_sum2_map:
+                            mapped_sum2[new_ekey] = col_sum2_map[orig_ekey]
+                        if orig_ekey in col_true_cnt_map:
+                            mapped_tcnt[new_ekey] = col_true_cnt_map[orig_ekey]
+                    orig_item_map[id(new_it)] = orig_it
+                    mapped_work_items.append(new_it)
+
+                mapped_grps = tuple(_subst_u(g) or g for g in orig_grp_exprs)
+                b_w = (
+                    re.sub(rf"\b{re.escape(b_alias)}\.", "", bs.where_clause, flags=re.IGNORECASE)
+                    if bs.where_clause
+                    else None
+                )
+                o_w = _subst_u(orig_view.where_clause)
+                comb_w = f"({b_w}) AND ({o_w})" if (b_w and o_w) else (b_w or o_w)
+
+                # Temporarily bind branch context
+                self.primary_schema = ts
+                self._working_select_items = mapped_work_items
+                self._effective_group_by_exprs = mapped_grps
+                self._uall_grp_alias_map = {mg: oa for mg, oa in zip(mapped_grps, orig_grp_aliases)}
+                self._uall_orig_item_map = orig_item_map
+                self.view = ViewSpec(
+                    view_name=orig_view.view_name,
+                    raw_select_sql=orig_view.raw_select_sql,
+                    base_table=base_t,
+                    joins=(JoinSpec(join_type="FROM", table_name=base_t, alias=base_t),),
+                    referenced_tables=(base_t,),
+                    select_items=tuple(mapped_work_items),
+                    where_clause=orig_view.where_clause,
+                    group_by_cols=mapped_grps,
+                )
+
+                plus_b = self._build_plus_delta_statements(
+                    mv_table,
+                    row_count_col,
+                    mapped_nonnull,
+                    mapped_sum,
+                    mapped_sum2,
+                    mapped_tcnt,
+                    {},
+                    _expr_key,
+                    record_prefix="NEW",
+                )
+                minus_del_b, _ = self._build_minus_delta_statements(
+                    mv_table,
+                    row_count_col,
+                    mapped_nonnull,
+                    mapped_sum,
+                    mapped_sum2,
+                    mapped_tcnt,
+                    {},
+                    _expr_key,
+                    record_prefix="OLD",
+                    include_delete_zero_mv=True,
+                )
+                minus_upd_b, del_zero_b = self._build_minus_delta_statements(
+                    mv_table,
+                    row_count_col,
+                    mapped_nonnull,
+                    mapped_sum,
+                    mapped_sum2,
+                    mapped_tcnt,
+                    {},
+                    _expr_key,
+                    record_prefix="OLD",
+                    include_delete_zero_mv=False,
+                )
+
+                w_new_b = self._rewrite_expr_for_record(comb_w, "NEW") if comb_w else None
+                w_old_b = self._rewrite_expr_for_record(comb_w, "OLD") if comb_w else None
+
+                ins_all.extend(self._apply_where_guard_to_stmt(s, w_new_b) for s in plus_b)
+                del_all.extend(self._apply_where_guard_to_stmt(s, w_old_b) for s in minus_del_b)
+                upd_old_all.extend(self._apply_where_guard_to_stmt(s, w_old_b) for s in minus_upd_b)
+                upd_new_all.extend(self._apply_where_guard_to_stmt(s, w_new_b) for s in plus_b)
+                if del_zero_b:
+                    cleanup_all.append(self._apply_where_guard_to_stmt(del_zero_b, w_old_b))
+
+            # Restore original view context
+            self.view = orig_view
+            self._working_select_items = orig_work_items
+            self._effective_group_by_exprs = orig_grp_exprs
+            self.primary_schema = orig_primary_schema
+            self._uall_grp_alias_map = None
+
+            trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=ins_all,
+                del_stmts=del_all,
+                upd_old_stmts=upd_old_all,
+                upd_new_stmts=upd_new_all,
+                upd_cleanup_old_stmts=cleanup_all,
+                trunc_stmts=trunc_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            chunk_sql_templates=[initial_populate_sql],
+        )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+    # =========================================================================
+    # TIER 2: Group-Scoped Delta Recomputation (Holistic Aggs, LEFT JOINs, etc.)
+    # =========================================================================
+
+    def _can_push_down_group_filter_into_where(self) -> bool:
+        if not self.view.where_clause:
+            return True
+        return not _has_subquery_ast(self.view.where_clause)
+
+    def _inject_where_into_source_query(self, source_query_sql: str, extra_predicate: str) -> str:
+        s = source_query_sql.strip().rstrip(";")
+        tok_where = _find_top_level_token(s, (SQLGlotTokenType.WHERE,))
+        tok_group = _find_top_level_token(s, (SQLGlotTokenType.GROUP_BY,))
+        if tok_where is not None:
+            insert_pos = tok_where.end + 1
+            before = s[: tok_where.start].rstrip()
+            if tok_group is not None:
+                existing_w = s[insert_pos : tok_group.start].strip()
+                after = s[tok_group.start :]
+                return f"{before}\nWHERE ({existing_w}) AND ({extra_predicate})\n{after}"
+            existing_w = s[insert_pos:].strip()
+            return f"{before}\nWHERE ({existing_w}) AND ({extra_predicate})"
+        if tok_group is not None:
+            before = s[: tok_group.start].rstrip()
+            after = s[tok_group.start :]
+            return f"{before}\nWHERE ({extra_predicate})\n{after}"
+        return f"{s}\nWHERE ({extra_predicate})"
+
+    def _group_scope_predicate_for_table(
+        self,
+        base_t: str,
+        group_mv_cols: List[Tuple[str, str]],
+        lhs_table_alias: Optional[str],
+        record_prefix: str,
+    ) -> Optional[str]:
+        if not group_mv_cols:
+            return None
+
+        if len(self.view.joins) <= 1 and base_t.lower() != self.view.base_table.lower():
+            return None
+        if self.view.where_clause and re.search(r"\b(?:EXISTS|IN)\s*\(", self.view.where_clause, flags=re.IGNORECASE):
+            if base_t.lower() != self.view.base_table.lower():
+                return None
+
+        def _lhs_expr(g_expr: str, mv_col: str) -> str:
+            if lhs_table_alias:
+                return f"{lhs_table_alias}.{mv_col}"
+            return f"({g_expr})"
+
+        if len(self.view.joins) == 1:
+            conds: List[str] = []
+            for g_expr, mv_col in group_mv_cols:
+                rhs_e = self._rewrite_expr_for_record(g_expr, record_prefix)
+                conds.append(self._null_safe_eq(_lhs_expr(g_expr, mv_col), f"({rhs_e})", is_nullable=True))
+            return " AND ".join(conds)
+
+        target_join: Optional[JoinSpec] = None
+        for j in self.view.joins:
+            if j.table_name.lower() == base_t.lower():
+                target_join = j
+                break
+        if target_join is None:
+            return None
+
+        # If base_t is the table that owns all group columns directly, compare directly
+        target_alias = target_join.alias
+        all_owned = True
+        direct_conds: List[str] = []
+        ts_target = self._schemas_lower[base_t.lower()]
+        for g_expr, mv_col in group_mv_cols:
+            gs = g_expr.strip()
+            if "." in gs:
+                p_al, c_part = gs.split(".", 1)
+                if p_al.strip().lower() in (target_alias.lower(), base_t.lower()):
+                    direct_conds.append(
+                        self._null_safe_eq(
+                            _lhs_expr(g_expr, mv_col),
+                            f"({record_prefix}.{_unquote_ident(c_part)})",
+                            is_nullable=True,
+                        )
+                    )
+                else:
+                    all_owned = False
+                    break
+            elif _unquote_ident(gs) in ts_target.columns:
+                direct_conds.append(
+                    self._null_safe_eq(
+                        _lhs_expr(g_expr, mv_col),
+                        f"({record_prefix}.{_unquote_ident(gs)})",
+                        is_nullable=True,
+                    )
+                )
+            else:
+                all_owned = False
+                break
+
+        if all_owned and direct_conds:
+            return " AND ".join(direct_conds)
+
+        # Otherwise build an EXISTS subquery over the join graph with `target_join` replaced by `(SELECT NEW/OLD.*)`
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+        rec_proj = ", ".join(f"{record_prefix}.{c} AS {c}" for c in ts_target.columns)
+        alias_remap: Dict[str, str] = {}
+        for j in self.view.joins:
+            alias_remap[j.alias.lower()] = f"__mv_j_{j.alias}"
+            alias_remap[j.table_name.lower()] = f"__mv_j_{j.alias}"
+
+        def _remap_aliases_in_sql(frag: str) -> str:
+            toks = sqlglot.tokenize(frag, read="sqlite")
+            if not toks:
+                return frag
+            out: List[str] = []
+            cursor = 0
+            i = 0
+            n = len(toks)
+            while i < n:
+                tk = toks[i]
+                if (
+                    _is_word_or_ident_token(tk)
+                    and i + 2 < n
+                    and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                    and _is_word_or_ident_token(toks[i + 2])
+                ):
+                    tbl_low = tk.text.lower()
+                    if tbl_low in alias_remap:
+                        if tk.start > cursor:
+                            out.append(frag[cursor:tk.start])
+                        out.append(f"{alias_remap[tbl_low]}.{toks[i + 2].text}")
+                        cursor = toks[i + 2].end + 1
+                        i += 3
+                        continue
+                i += 1
+            if cursor < len(frag):
+                out.append(frag[cursor:])
+            return "".join(out)
+
+        inline_row_table = f"(SELECT {rec_proj}{from_dual}) AS __mv_j_{target_alias}"
+        join_parts: List[str] = []
+        for idx, j in enumerate(self.view.joins):
+            remapped_alias = f"__mv_j_{j.alias}"
+            tbl_expr = (
+                inline_row_table
+                if j.alias.lower() == target_alias.lower()
+                else f"{j.table_name} AS {remapped_alias}"
+            )
+            if idx == 0:
+                join_parts.append(tbl_expr)
+            else:
+                on_sql = (
+                    f" ON {_remap_aliases_in_sql(j.on_condition)}"
+                    if j.on_condition
+                    else ""
+                )
+                eff_join_type = (
+                    "INNER JOIN"
+                    if j.alias.lower() == target_alias.lower() and j.on_condition
+                    else j.join_type
+                )
+                join_parts.append(f"{eff_join_type} {tbl_expr}{on_sql}")
+
+        from_join_sql = " ".join(join_parts)
+        left_join_remapped = {
+            f"__mv_j_{j.alias}".lower()
+            for j in self.view.joins
+            if j.join_type == "LEFT JOIN"
+        }
+        match_conds: List[str] = []
+        for g_expr, mv_col in group_mv_cols:
+            remapped_g = _remap_aliases_in_sql(g_expr)
+            lhs_e = _lhs_expr(g_expr, mv_col)
+            eq_cond = self._null_safe_eq(lhs_e, f"({remapped_g})", is_nullable=True)
+            if any(
+                re.search(rf"\b{re.escape(la)}\.", remapped_g, flags=re.IGNORECASE)
+                for la in left_join_remapped
+            ):
+                match_conds.append(f"({eq_cond} OR {lhs_e} IS NULL)")
+            else:
+                match_conds.append(eq_cond)
+
+        exists_pred = (
+            f"EXISTS (\n"
+            f"        SELECT 1 FROM {from_join_sql}\n"
+            f"        WHERE {' AND '.join(match_conds)}\n"
+            f"    )"
+        )
+        if any(j.join_type == "LEFT JOIN" for j in self.view.joins) and target_join != self.view.joins[0]:
+            null_preds = " AND ".join(
+                f"{_lhs_expr(g_expr, mv_col)} IS NULL" for g_expr, mv_col in group_mv_cols
+            )
+            return f"({exists_pred} OR ({null_preds}))"
+        return exists_pred
+
+    def _build_tier2_triggers_for_table(
+        self,
+        view_name: str,
+        mv_table: str,
+        base_t: str,
+        target_cols: List[str],
+        group_mv_cols: List[Tuple[str, str]],
+        source_query_sql: str,
+    ) -> Tuple[List[str], List[str], List[str]]:
+        cols_csv = ", ".join(target_cols)
+        src_cols_csv = ", ".join(f"__mv_src.{c}" for c in target_cols)
+
+        pred_mv_old = self._group_scope_predicate_for_table(
+            base_t, group_mv_cols, mv_table, "OLD"
+        )
+        pred_mv_new = self._group_scope_predicate_for_table(
+            base_t, group_mv_cols, mv_table, "NEW"
+        )
+        can_push_down = self._can_push_down_group_filter_into_where()
+
+        full_refresh = [
+            f"DELETE FROM {mv_table};",
+            f"INSERT INTO {mv_table} ({cols_csv})\n"
+            f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src;",
+        ]
+
+        if pred_mv_old and pred_mv_new:
+            if can_push_down:
+                pred_inner_old = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, None, "OLD"
+                )
+                pred_inner_new = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, None, "NEW"
+                )
+                assert pred_inner_old and pred_inner_new
+                q_ins = self._inject_where_into_source_query(source_query_sql, pred_inner_new)
+                q_del = self._inject_where_into_source_query(source_query_sql, pred_inner_old)
+                q_upd = self._inject_where_into_source_query(
+                    source_query_sql, f"({pred_inner_old}) OR ({pred_inner_new})"
+                )
+                ins_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_new};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n    {q_ins};",
+                ]
+                del_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_old};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n    {q_del};",
+                ]
+                upd_coalesced_stmts = [
+                    f"DELETE FROM {mv_table} WHERE ({pred_mv_old}) OR ({pred_mv_new});",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n    {q_upd};",
+                ]
+            else:
+                pred_src_old = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, "__mv_src", "OLD"
+                )
+                pred_src_new = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, "__mv_src", "NEW"
+                )
+                assert pred_src_old and pred_src_new
+                ins_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_new};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    WHERE {pred_src_new};",
+                ]
+                del_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_old};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    WHERE {pred_src_old};",
+                ]
+                upd_coalesced_stmts = [
+                    f"DELETE FROM {mv_table} WHERE ({pred_mv_old}) OR ({pred_mv_new});",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    WHERE ({pred_src_old}) OR ({pred_src_new});",
+                ]
+            if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables:
+                upd_old_stmts = del_stmts
+                upd_new_stmts = ins_stmts
+            else:
+                upd_old_stmts = []
+                upd_new_stmts = upd_coalesced_stmts
+        else:
+            ins_stmts = full_refresh
+            del_stmts = full_refresh
+            upd_old_stmts = []
+            upd_new_stmts = full_refresh
+
+        return self._emit_dialect_triggers_for_table(
+            view_name=view_name,
+            base_t=base_t,
+            ins_stmts=ins_stmts,
+            del_stmts=del_stmts,
+            upd_old_stmts=upd_old_stmts,
+            upd_new_stmts=upd_new_stmts,
+            trunc_stmts=full_refresh,
+        )
+
+    def _rewrite_mysql_not_in_subquery(self, sql: str) -> str:
+        toks = sqlglot.tokenize(sql, read="mysql")
+        n = len(toks)
+        outer_tbl = ""
+        for i, t in enumerate(toks):
+            if t.token_type == SQLGlotTokenType.FROM and i + 1 < n:
+                outer_tbl = toks[i + 1].text
+                if i + 2 < n and toks[i + 2].token_type == SQLGlotTokenType.VAR and toks[i + 2].text.upper() != "WHERE":
+                    outer_tbl = toks[i + 2].text
+                break
+        i = 0
+        while i < n - 4:
+            if (
+                toks[i + 1].token_type == SQLGlotTokenType.NOT
+                and toks[i + 2].token_type == SQLGlotTokenType.IN
+                and toks[i + 3].token_type == SQLGlotTokenType.L_PAREN
+                and toks[i + 4].token_type == SQLGlotTokenType.SELECT
+            ):
+                start_i = i
+                if i >= 2 and toks[i - 1].token_type == SQLGlotTokenType.DOT:
+                    start_i = i - 2
+                    lhs = f"{toks[i - 2].text}.{toks[i].text}"
+                else:
+                    lhs = toks[i].text
+                depth = 0
+                rp_idx = -1
+                for j in range(i + 3, n):
+                    if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                        depth += 1
+                    elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                        depth -= 1
+                        if depth == 0:
+                            rp_idx = j
+                            break
+                if rp_idx != -1:
+                    inner_sql = sql[toks[i + 3].end + 1 : toks[rp_idx].start].strip()
+                    try:
+                        sub_ast = parse_sql_ast(inner_sql, dialect=Dialect.MYSQL)
+                    except sqlglot.errors.SqlglotError:
+                        sub_ast = None
+                    if isinstance(sub_ast, sqlglot_exp.Select) and (sub_ast.args.get("from_") or sub_ast.args.get("from")):
+                        in_from = (sub_ast.args.get("from_") or sub_ast.args.get("from")).this
+                        in_tbl = in_from.name
+                        in_alias = in_from.alias or "__mv_not_in"
+                        rhs_col = sub_ast.expressions[0].name if sub_ast.expressions else "id"
+                        w_node = sub_ast.args.get("where")
+                        in_w = w_node.this.sql("mysql").strip() if w_node and w_node.this else ""
+                        lhs_q = lhs if "." in lhs else f"{outer_tbl}.{lhs}"
+                        rhs_q = f"{in_alias}.{rhs_col}"
+                        w_empty = f" WHERE ({in_w})" if in_w else ""
+                        w_corr = f" WHERE ({in_w}) AND ({rhs_q} IS NULL OR {rhs_q} = {lhs_q})" if in_w else f" WHERE ({rhs_q} IS NULL OR {rhs_q} = {lhs_q})"
+                        replacement = (
+                            f"(NOT EXISTS (SELECT 1 FROM {in_tbl} AS {in_alias}{w_empty}) "
+                            f"OR ({lhs_q} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {in_tbl} AS {in_alias}{w_corr})))"
+                        )
+                        sql = sql[: toks[start_i].start] + replacement + sql[toks[rp_idx].end + 1 :]
+                        toks = sqlglot.tokenize(sql, read="mysql")
+                        n = len(toks)
+                        i = 0
+                        continue
+            i += 1
+        return sql
+
+    @staticmethod
+    def _sqlite_bit_or_tree(terms: Sequence[str]) -> str:
+        chunks = [
+            "(" + " | ".join(terms[i : i + 8]) + ")"
+            for i in range(0, len(terms), 8)
+        ]
+        return "(" + " | ".join(chunks) + ")"
+
+    def _rewrite_sqlite_total_in_sql(self, sql: str) -> str:
+        if self.dialect == Dialect.SQLITE:
+            def _sq_var_expr(arg_s: str, is_samp: bool, is_std: bool) -> str:
+                fake_it = SelectItem(raw_expr=f"VAR_POP({arg_s})", alias="__v", is_aggregate=True, agg_func=AggFunc.VAR_POP, arg_expr=arg_s)
+                m2_s = self._sqlite_m2_agg_sql(fake_it, eff_override=arg_s)
+                return self._variance_formula_sql(
+                    new_cnt=f"COUNT({arg_s})",
+                    new_sum=f"SUM(1.0 * ({arg_s}))",
+                    new_sum2=m2_s,
+                    is_sample=is_samp,
+                    is_stddev=is_std,
+                )
+
+            s_sq = sql
+            toks = sqlglot.tokenize(s_sq, read="sqlite")
+            idx = 0
+            sq_fn_targets = {
+                "VAR_POP", "VARIANCE", "VAR_SAMP", "STDDEV_POP", "STDDEV", "STD", "STDDEV_SAMP",
+                "BIT_AND", "BIT_OR", "BIT_XOR", "BOOL_AND", "EVERY", "BOOL_OR",
+            }
+            while idx < len(toks) - 2:
+                tk = toks[idx]
+                fn_up = tk.text.upper()
+                if fn_up in sq_fn_targets and toks[idx + 1].token_type == SQLGlotTokenType.L_PAREN:
+                    depth = 0
+                    rp_idx = -1
+                    for j in range(idx + 1, len(toks)):
+                        if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                            depth += 1
+                        elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                            depth -= 1
+                            if depth == 0:
+                                rp_idx = j
+                                break
+                    if rp_idx != -1:
+                        arg_s = s_sq[toks[idx + 1].end + 1 : toks[rp_idx].start].strip()
+                        if fn_up in ("VAR_POP", "VARIANCE"):
+                            rep = _sq_var_expr(arg_s, False, False)
+                        elif fn_up == "VAR_SAMP":
+                            rep = _sq_var_expr(arg_s, True, False)
+                        elif fn_up in ("STDDEV_POP", "STDDEV", "STD"):
+                            rep = _sq_var_expr(arg_s, False, True)
+                        elif fn_up == "STDDEV_SAMP":
+                            rep = _sq_var_expr(arg_s, True, True)
+                        elif fn_up == "BIT_AND":
+                            rep = self._sqlite_bit_or_tree([f"MIN(({arg_s}) & {1 << b})" for b in range(63)])
+                        elif fn_up == "BIT_OR":
+                            rep = self._sqlite_bit_or_tree([f"MAX(({arg_s}) & {1 << b})" for b in range(63)])
+                        elif fn_up == "BIT_XOR":
+                            rep = self._sqlite_bit_or_tree([f"((SUM((({arg_s}) >> {b}) & 1) & 1) << {b})" for b in range(63)])
+                        elif fn_up in ("BOOL_AND", "EVERY"):
+                            rep = f"(CASE WHEN COUNT({arg_s}) = 0 THEN NULL WHEN MIN(CASE WHEN ({arg_s}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
+                        else:
+                            rep = f"(CASE WHEN COUNT({arg_s}) = 0 THEN NULL WHEN MAX(CASE WHEN ({arg_s}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
+                        s_sq = s_sq[: tk.start] + rep + s_sq[toks[rp_idx].end + 1 :]
+                        toks = sqlglot.tokenize(s_sq, read="sqlite")
+                        idx = 0
+                        continue
+                idx += 1
+            return s_sq
+
+        # Non-SQLite dialects
+        s = sql
+        toks = sqlglot.tokenize(s, read="sqlite")
+        idx = 0
+        while idx < len(toks) - 2:
+            tk = toks[idx]
+            if tk.text.upper() == "TOTAL" and toks[idx + 1].token_type == SQLGlotTokenType.L_PAREN:
+                depth = 0
+                rp_idx = -1
+                for j in range(idx + 1, len(toks)):
+                    if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                        depth += 1
+                    elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                        depth -= 1
+                        if depth == 0:
+                            rp_idx = j
+                            break
+                if rp_idx != -1:
+                    inner_arg = s[toks[idx + 1].end + 1 : toks[rp_idx].start].strip()
+                    rep = f"COALESCE(1.0 * SUM({inner_arg}), 0.0)"
+                    s = s[: tk.start] + rep + s[toks[rp_idx].end + 1 :]
+                    toks = sqlglot.tokenize(s, read="sqlite")
+                    idx = 0
+                    continue
+            idx += 1
+
+        if self.dialect == Dialect.MYSQL:
+            s = self._rewrite_mysql_not_in_subquery(s)
+            # Full outer join lowering via sqlglot AST
+            try:
+                sel_ast = parse_sql_ast(s.strip(), dialect=Dialect.MYSQL)
+            except sqlglot.errors.SqlglotError:
+                sel_ast = None
+            if isinstance(sel_ast, sqlglot_exp.Select) and sel_ast.args.get("joins"):
+                j0 = sel_ast.args["joins"][0]
+                if j0.side.upper() == "FULL" and (sel_ast.args.get("from_") or sel_ast.args.get("from")) and j0.args.get("on"):
+                    from_t = (sel_ast.args.get("from_") or sel_ast.args.get("from")).this.sql("mysql")
+                    j0_t = j0.this.sql("mysql")
+                    on_s = j0.args["on"].sql("mysql")
+                    sel_s = ", ".join(e.sql("mysql") for e in sel_ast.expressions)
+                    lhs_col = j0.args["on"].expressions[0].sql("mysql") if j0.args["on"].expressions else j0.args["on"].sql("mysql").split("=")[0].strip()
+                    s = (
+                        f"SELECT {sel_s} FROM {from_t} LEFT JOIN {j0_t} ON {on_s} "
+                        f"UNION ALL "
+                        f"SELECT {sel_s} FROM {from_t} RIGHT JOIN {j0_t} ON {on_s} "
+                        f"WHERE {lhs_col} IS NULL"
+                    )
+        return s
+
+    def _compile_tier2_group_scoped(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        user_columns = [it.alias for it in self.view.select_items]
+        grp_exprs = self._effective_group_by_exprs
+
+        target_cols: List[str] = list(user_columns)
+        group_mv_cols: List[Tuple[str, str]] = []
+        hidden_grp_defs: List[Tuple[str, str, str]] = []
+
+        non_agg_map: Dict[str, str] = {}
+        for it in self.view.select_items:
+            if not it.is_aggregate:
+                non_agg_map[it.raw_expr.strip().lower()] = it.alias
+                if it.source_col:
+                    non_agg_map[it.source_col.lower()] = it.alias
+
+        for idx_g, g_expr in enumerate(grp_exprs):
+            g_low = g_expr.strip().lower()
+            g_unq = _unquote_ident(g_expr).lower() if self._is_simple_col_ref(g_expr) else ""
+            if g_low in non_agg_map:
+                mv_c = non_agg_map[g_low]
+            elif g_unq and g_unq in non_agg_map:
+                mv_c = non_agg_map[g_unq]
+            else:
+                mv_c = f"__mv_grp_{idx_g}"
+                target_cols.append(mv_c)
+                # A GROUP BY collation is part of the grouping equivalence
+                # relation. Store hidden group keys with that same collation so
+                # trigger predicates and their indexes match collation-equivalent
+                # source values instead of treating them as distinct byte strings.
+                collation_match = re.search(
+                    r'\bCOLLATE\s+((?:"[^"]+")|(?:`[^`]+`)|(?:\[[^\]]+\])|(?:[A-Za-z_][A-Za-z0-9_.$]*))\s*            group_mv_cols.append((g_expr, mv_c))
+
+        auto_grp_col_names = [mc for _, mc in group_mv_cols]
+        indexed_cols_lower = self._indexed_column_names_lower(auto_grp_col_names)
+
+        col_defs_sql: List[str] = []
+        for it in self.view.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            col_defs_sql.append(f"{it.alias} {dt}")
+        for mv_c, _, dt in hidden_grp_defs:
+            col_defs_sql.append(f"{mv_c} {dt}")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=auto_grp_col_names,
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_q = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        if hidden_grp_defs:
+            tok_from = _find_top_level_token(raw_q, (SQLGlotTokenType.FROM,))
+            assert tok_from is not None
+            extra_sel = ", ".join(f"{g_e} AS {mv_c}" for mv_c, g_e, _ in hidden_grp_defs)
+            source_query_sql = f"{raw_q[:tok_from.start].rstrip()}, {extra_sel} {raw_q[tok_from.start:]}"
+        else:
+            source_query_sql = raw_q
+
+        cols_csv = ", ".join(target_cols)
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({cols_csv})\n"
+            f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init;"
+        )
+        ord_t2 = ", ".join(str(k) for k in range(1, len(target_cols) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t2}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._build_tier2_triggers_for_table(
+                view_name=view_name,
+                mv_table=mv_table,
+                base_t=ref_table,
+                target_cols=target_cols,
+                group_mv_cols=group_mv_cols,
+                source_query_sql=source_query_sql,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    # =========================================================================
+    # TIER 3: Universal Atomic View Sync (Arbitrary Engine View Definitions)
+    # =========================================================================
+
+    def _compile_tier3_atomic_sync(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = []
+
+        indexed_cols_lower = self._indexed_column_names_lower()
+        if len(self.view.select_items) == 1 and self.view.select_items[0].raw_expr.strip() == "*":
+            for j in self.view.joins or []:
+                t_schema = self._schemas_lower.get(j.table_name.lower())
+                if t_schema:
+                    for c_def in t_schema.columns.values():
+                        if c_def.name not in user_columns:
+                            user_columns.append(c_def.name)
+                            dt = self._normalize_dialect_type(c_def.data_type)
+                            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                                dt = "VARCHAR(255)"
+                            col_defs_sql.append(f"{c_def.name} {dt}")
+            if not user_columns and self.primary_schema:
+                for c_def in self.primary_schema.columns.values():
+                    user_columns.append(c_def.name)
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                        dt = "VARCHAR(255)"
+                    col_defs_sql.append(f"{c_def.name} {dt}")
+        else:
+            for item in self.view.select_items:
+                user_columns.append(item.alias)
+                col_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and col_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    col_type = "VARCHAR(255)"
+                col_defs_sql.append(f"{item.alias} {col_type}")
+
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_query = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        cols_csv = ", ".join(user_columns)
+        initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"
+
+        ord_t3 = ", ".join(str(k) for k in range(1, len(user_columns) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{raw_query}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t3}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        refresh_stmts = [
+            f"DELETE FROM {mv_table};",
+            f"INSERT INTO {mv_table} ({cols_csv})\n    {raw_query};",
+        ]
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=ref_table,
+                ins_stmts=refresh_stmts,
+                del_stmts=refresh_stmts,
+                upd_old_stmts=[],
+                upd_new_stmts=refresh_stmts,
+                trunc_stmts=refresh_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+# -----------------------------------------------------------------------------
+# Database Connection, Schema & Safe Migration Manager (`MaterializedViewManager`)
+# -----------------------------------------------------------------------------
+
+
+class MaterializedViewManager:
+    """
+    Setup/migration manager that connects to a database (SQLite connection/path or
+    PEP-249 DB-API 2.0 connection for PostgreSQL / MySQL) to:
+      - Introspect live base table schemas (`fetch_schema`)
+      - Maintain a persistent metadata registry (`__matview_catalog`) of installed MVs
+      - Safely create, diff, update, or drop materialized views (`register_view`, `sync_views`, `drop_view`)
+      - Enforce transparency limitation checks unless `ignore_limitations=True`
+      - Perform incremental (chunked/batched) initial backfills (`backfill_incrementally`)
+      - Execute high-throughput multi-statement bulk changes (`bulk_changes`)
+    Once setup/backfill finishes, all views and triggers operate 100% natively inside
+    the database engine with zero runtime dependency on this manager.
+    """
+
+    CATALOG_TABLE = f"{DEFAULT_OBJECT_PREFIX}catalog"
+
+    @staticmethod
+    def _connect_database_url(
+        conn_or_url: str, dialect: Optional[Dialect] = None
+    ) -> Tuple[Any, Dialect]:
+        u_low = conn_or_url.strip().lower()
+        if u_low.startswith(("postgresql://", "postgres://")):
+            import psycopg2  # type: ignore
+            return psycopg2.connect(conn_or_url), Dialect.POSTGRES
+        if u_low.startswith(("mysql://", "mariadb://")):
+            import pymysql  # type: ignore
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(conn_or_url)
+            db_name = parsed.path.lstrip("/")
+            qs = parse_qs(parsed.query)
+            return (
+                pymysql.connect(
+                    host=parsed.hostname or "127.0.0.1",
+                    port=parsed.port or 3306,
+                    user=parsed.username or "root",
+                    password=parsed.password or "",
+                    database=db_name,
+                    unix_socket=qs.get("unix_socket", [None])[0],
+                    autocommit=False,
+                ),
+                Dialect.MYSQL,
+            )
+        eff_dialect = dialect or Dialect.SQLITE
+        path = conn_or_url.replace("sqlite:///", "").replace("sqlite://", "")
+        return sqlite3.connect(path), eff_dialect
+
+    def __init__(
+        self,
+        conn_or_url: sqlite3.Connection | str | Any,
+        dialect: Optional[Dialect | str | EngineVersion] = None,
+        ignore_limitations: bool = False,
+        object_prefix: str = DEFAULT_OBJECT_PREFIX,
+        pg_use_transition_tables: bool = False,
+        strict: bool = False,
+        engine_version: Optional[EngineVersion | str] = None,
+    ) -> None:
+        hint_d: Optional[Dialect] = None
+        if isinstance(dialect, Dialect):
+            hint_d = dialect
+        elif isinstance(dialect, EngineVersion):
+            hint_d = dialect.dialect
+            if engine_version is None:
+                engine_version = dialect
+        elif isinstance(dialect, str) and dialect.strip():
+            parsed_d = parse_engine_version(dialect)
+            hint_d = parsed_d.dialect
+            if engine_version is None and (":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(ch.isdigit() for ch in dialect.replace("sqlite3", ""))):
+                engine_version = parsed_d
+
+        if isinstance(conn_or_url, str):
+            self.conn, inferred_dialect = self._connect_database_url(conn_or_url, hint_d)
+            if hint_d is None or conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
+                hint_d = inferred_dialect
+        else:
+            self.conn = conn_or_url
+
+        if engine_version is not None:
+            self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
+        else:
+            self.engine_version = detect_engine_version(self.conn, hint_dialect=hint_d)
+
+        self.dialect: Dialect = self.engine_version.dialect
+        self.subdialect: EngineSubdialect = self.engine_version.subdialect
+        self.ignore_limitations = ignore_limitations
+        self.object_prefix = object_prefix
+        self.pg_use_transition_tables = pg_use_transition_tables
+        self.strict = strict
+        self.catalog_table = (
+            f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
+        )
+
+        self._ensure_catalog()
+
+    def _ensure_catalog(self) -> None:
+        cur = self.conn.cursor()
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("PRAGMA recursive_triggers = ON;")
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL:
+            try:
+                cur.execute("SET SESSION collation_connection = @@collation_database;")
+            except Exception:
+                pass
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.catalog_table} (
+                view_name VARCHAR(255) NOT NULL PRIMARY KEY,
+                view_sql TEXT NOT NULL,
+                strategy VARCHAR(64) NOT NULL,
+                signature_hash VARCHAR(64) NOT NULL,
+                backing_table VARCHAR(255) NOT NULL,
+                aux_tables_json TEXT NOT NULL,
+                trigger_names_json TEXT NOT NULL,
+                function_names_json TEXT NOT NULL,
+                trigger_ddls_json TEXT NOT NULL,
+                backfill_cursor_pk BIGINT DEFAULT NULL,
+                backfill_max_pk BIGINT DEFAULT NULL,
+                backfill_active INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        self._commit()
+        for col_ddl in (
+            "backfill_cursor_pk BIGINT DEFAULT NULL",
+            "backfill_max_pk BIGINT DEFAULT NULL",
+            "backfill_active INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                cur.execute(f"ALTER TABLE {self.catalog_table} ADD COLUMN {col_ddl};")
+                self._commit()
+            except Exception:
+                self._rollback()
+
+    def _commit(self) -> None:
+        if hasattr(self.conn, "commit"):
+            self.conn.commit()
+
+    def _rollback(self) -> None:
+        if hasattr(self.conn, "rollback"):
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+    def _param_placeholder(self) -> str:
+        return "?" if self.dialect == Dialect.SQLITE else "%s"
+
+    def _resolve_catalog_name(self, name: str, catalog: Dict[str, Dict[str, Any]]) -> str:
+        if name in catalog:
+            return name
+        if self.object_prefix:
+            prefixed = (
+                name
+                if name.startswith(self.object_prefix)
+                else f"{self.object_prefix}{name}"
+            )
+            if prefixed in catalog:
+                return prefixed
+            if name.startswith(self.object_prefix):
+                unprefixed = name[len(self.object_prefix) :]
+                if unprefixed in catalog:
+                    return unprefixed
+        return name
+
+    def fetch_schema(self, extra_schema_sql: Optional[str] = None) -> Dict[str, TableSchema]:
+        """Fetches the live schema of all user base tables from the connected database."""
+        schemas = introspect_database_schemas(
+            self.conn,
+            dialect=self.dialect,
+            object_prefix=self.object_prefix,
+        )
+        schemas.pop(self.catalog_table, None)
+        if extra_schema_sql:
+            schemas.update(parse_table_schema(extra_schema_sql))
+        return schemas
+
+    def apply_schema_ddl(self, ddl_sql: str, auto_sync_views: bool = True) -> None:
+        """
+        Safely executes schema DDL changes (e.g. `CREATE TABLE`, `ALTER TABLE`) and
+        automatically refreshes any registered materialized views whose underlying
+        base table schema changed.
+        """
+        cur = self.conn.cursor()
+        for stmt in _split_top_level(_strip_sql_comments(ddl_sql), ";"):
+            if stmt.strip():
+                cur.execute(stmt)
+        self._commit()
+        if auto_sync_views:
+            catalog = self.get_catalog()
+            if catalog:
+                self.sync_views([entry["view_sql"] for entry in catalog.values()])
+
+    def get_catalog(self) -> Dict[str, Dict[str, Any]]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
+                f"backfill_cursor_pk, backfill_max_pk, backfill_active "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = True
+        except Exception:
+            self._rollback()
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = False
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in cur.fetchall():
+            out[row[0]] = {
+                "view_name": row[0],
+                "view_sql": row[1],
+                "strategy": row[2],
+                "signature_hash": row[3],
+                "backing_table": row[4],
+                "aux_tables": json.loads(row[5]),
+                "trigger_names": json.loads(row[6]),
+                "function_names": json.loads(row[7]),
+                "trigger_ddls": json.loads(row[8]),
+                "backfill_cursor_pk": row[9] if has_wm_cols and len(row) > 9 else None,
+                "backfill_max_pk": row[10] if has_wm_cols and len(row) > 10 else None,
+                "backfill_active": int(row[11]) if has_wm_cols and len(row) > 11 and row[11] is not None else 0,
+            }
+        return out
+
+    def _compute_signature(self, plan: MaterializedViewPlan, schemas: Dict[str, TableSchema]) -> str:
+        h = hashlib.sha256()
+        h.update(_strip_sql_comments(plan.view_spec.raw_select_sql).encode("utf-8"))
+        h.update(f"prefix:{plan.object_prefix}".encode("utf-8"))
+        for idx_ddl in plan.index_ddls:
+            h.update(f"idx:{idx_ddl}".encode("utf-8"))
+        low_map = {k.lower(): v for k, v in schemas.items()}
+        for ref_t in sorted(plan.view_spec.referenced_tables, key=str.lower):
+            ts = low_map.get(ref_t.lower())
+            if ts:
+                for c_name, c_def in sorted(ts.columns.items()):
+                    h.update(
+                        f"{ts.name}.{c_name}:{c_def.data_type}:{c_def.not_null}:{c_def.primary_key}".encode("utf-8")
+                    )
+        return h.hexdigest()
+
+    @staticmethod
+    def _serialize_view_sql_with_indexes(plan: MaterializedViewPlan, raw_view_sql: Optional[str] = None) -> str:
+        parts = [f"CREATE VIEW {plan.logical_view_name} AS {plan.view_spec.raw_select_sql.strip().rstrip(';')};"]
+        for idx_spec in plan.user_indexes:
+            u_kw = "UNIQUE " if idx_spec.unique else ""
+            n_str = f"{idx_spec.name} " if idx_spec.name else ""
+            using_str = f" USING {idx_spec.using_method}" if idx_spec.using_method else ""
+            w_str = f" WHERE {idx_spec.where_clause}" if idx_spec.where_clause else ""
+            parts.append(
+                f"CREATE {u_kw}INDEX {n_str}ON {plan.logical_view_name}{using_str} "
+                f"({', '.join(idx_spec.columns)}){w_str};"
+            )
+        return "\n".join(parts)
+
+    def drop_view(self, view_name: str) -> bool:
+        """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
+        catalog = self.get_catalog()
+        resolved_name = self._resolve_catalog_name(view_name, catalog)
+        entry = catalog.get(resolved_name)
+        cur = self.conn.cursor()
+        if entry:
+            for t_name in entry["trigger_names"]:
+                if self.dialect != Dialect.POSTGRES:
+                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+            for fn_name in entry["function_names"]:
+                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+            cur.execute(f"DROP VIEW IF EXISTS {resolved_name};")
+            cur.execute(f"DROP TABLE IF EXISTS {entry['backing_table']};")
+            for aux_t in entry["aux_tables"]:
+                cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
+            ph = self._param_placeholder()
+            cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
+            self._commit()
+            return True
+        else:
+            raw_logical = (
+                view_name[len(self.object_prefix) :]
+                if self.object_prefix and view_name.startswith(self.object_prefix)
+                else view_name
+            )
+            db_v = f"{self.object_prefix}{raw_logical}"
+            cur.execute(f"DROP VIEW IF EXISTS {db_v};")
+            cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
+            cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
+            self._commit()
+            return False
+
+    def _update_backfill_watermark(
+        self,
+        cur: Any,
+        view_name: str,
+        cursor_pk: Optional[int],
+        max_pk: Optional[int],
+        active: int,
+    ) -> None:
+        ph = self._param_placeholder()
+        try:
+            cur.execute(
+                f"UPDATE {self.catalog_table} "
+                f"SET backfill_cursor_pk = {ph}, backfill_max_pk = {ph}, backfill_active = {ph} "
+                f"WHERE view_name = {ph}",
+                (cursor_pk, max_pk, active, view_name),
+            )
+        except Exception:
+            pass
+
+    def backfill_incrementally(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        snapshot_isolation: bool = False,
+    ) -> int:
+        """
+        Incrementally backfills the materialized view in bounded chunks of `batch_size`
+        (by PK/rowid range folding for algebraic views, group-key batches for distinct/holistic
+        views, or limit/offset batches for general views), coordinating the active cursor
+        watermark (`backfill_cursor_pk`, `backfill_max_pk`, `backfill_active`) in
+        `__matview_catalog` and optionally running under `snapshot_isolation=True`.
+        Returns the total number of batches executed.
+        """
+        if plan.sub_plans:
+            total_b = 0
+            for sp in plan.sub_plans:
+                total_b += self.backfill_incrementally(
+                    sp,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    snapshot_isolation=snapshot_isolation,
+                )
+            return total_b
+
+        cur = self.conn.cursor()
+        snapshot_started = False
+        try:
+            if snapshot_isolation:
+                try:
+                    if self.dialect == Dialect.POSTGRES:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                    elif self.dialect == Dialect.MYSQL:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                        cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
+                    elif self.dialect == Dialect.SQLITE:
+                        cur.execute("SAVEPOINT __mv_backfill_snap;")
+                    else:
+                        raise RuntimeError(
+                            f"Snapshot isolation is not implemented for {self.dialect.value}"
+                        )
+                except Exception as exc:
+                    self._rollback()
+                    raise RuntimeError(
+                        f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
+                    ) from exc
+                snapshot_started = True
+
+            return self._backfill_incrementally_with_cursor(
+                plan, batch_size, on_progress, snapshot_isolation, cur
+            )
+        except BaseException:
+            if snapshot_isolation and snapshot_started:
+                self._rollback_snapshot_backfill(cur)
+            raise
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _rollback_snapshot_backfill(self, cur: Any) -> None:
+        """Roll back a failed snapshot backfill without leaving its transaction open."""
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT __mv_backfill_snap;")
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                return
+            except Exception:
+                # If the savepoint no longer exists or the connection is already
+                # in an error state, a full rollback is the safest recovery.
+                self._rollback()
+                return
+        self._rollback()
+
+    def _backfill_incrementally_with_cursor(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        snapshot_isolation: bool,
+        cur: Any,
+    ) -> int:
+        spec = plan.incremental_backfill_spec
+        if spec is None or batch_size <= 0:
+            for s in plan.initial_populate_sqls:
+                cur.execute(s)
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            if on_progress:
+                on_progress(1, 1)
+            return 1
+
+        batches_run = 0
+        if spec.mode == "pk_range_fold" and spec.pk_column:
+            base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect)
+            pk_col = quote_sql_identifier(spec.pk_column, self.dialect)
+            cur.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}")
+            row = cur.fetchone()
+            if not row or row[0] is None or row[1] is None:
+                if not plan.view_spec.group_by_cols and not plan.view_spec.has_top_level_distinct:
+                    for s in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(s)
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            min_pk, max_pk = int(row[0]), int(row[1])
+            cursor_pk = min_pk - 1
+            total_span = max(1, max_pk - min_pk + 1)
+            self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, 1)
+            if not snapshot_isolation:
+                self._commit()
+            while cursor_pk < max_pk:
+                upper_pk = min(max_pk, cursor_pk + batch_size)
+                for tmpl in spec.chunk_sql_templates:
+                    cur.execute(tmpl, (cursor_pk, upper_pk))
+                batches_run += 1
+                cursor_pk = upper_pk
+                still_active = 1 if cursor_pk < max_pk else 0
+                self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, still_active)
+                if not snapshot_isolation:
+                    self._commit()
+                if on_progress:
+                    done = min(total_span, cursor_pk - (min_pk - 1))
+                    on_progress(batches_run, done)
+            self._update_backfill_watermark(cur, plan.view_name, max_pk, max_pk, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "group_key_batch" and spec.distinct_group_query:
+            cur.execute(spec.distinct_group_query)
+            all_keys = [r[0] for r in (cur.fetchall() or [])]
+            if not all_keys:
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            ph = self._param_placeholder()
+            for i in range(0, len(all_keys), batch_size):
+                batch_keys = all_keys[i : i + batch_size]
+                placeholders = ", ".join(ph for _ in batch_keys)
+                for tmpl in spec.chunk_sql_templates:
+                    sql = tmpl.format(placeholders=placeholders)
+                    cur.execute(sql, tuple(batch_keys))
+                if not snapshot_isolation:
+                    self._commit()
+                batches_run += 1
+                if on_progress:
+                    on_progress(batches_run, min(len(all_keys), i + batch_size))
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "offset_batch" and spec.offset_insert_template:
+            offset = 0
+            ph = self._param_placeholder()
+            tmpl_sql = spec.offset_insert_template.replace("LIMIT ? OFFSET ?", f"LIMIT {ph} OFFSET {ph}")
+            while True:
+                cur.execute(tmpl_sql, (batch_size, offset))
+                rc = getattr(cur, "rowcount", None)
+                if rc is not None and rc >= 0:
+                    inserted = int(rc)
+                else:
+                    cur.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name}")
+                    cnt_row = cur.fetchone()
+                    total_now = int(cnt_row[0]) if cnt_row and cnt_row[0] is not None else 0
+                    inserted = max(0, total_now - offset)
+                if not snapshot_isolation:
+                    self._commit()
+                if inserted == 0:
+                    break
+                batches_run += 1
+                offset += inserted
+                if on_progress:
+                    on_progress(batches_run, offset)
+                if inserted < batch_size:
+                    break
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        for s in plan.initial_populate_sqls:
+            cur.execute(s)
+        self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+        if snapshot_isolation and self.dialect == Dialect.SQLITE:
+            cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+        self._commit()
+        return 1
+
+    def _register_single_view_spec(
+        self,
+        v_spec: ViewSpec,
+        schemas: Dict[str, TableSchema],
+        populate: bool,
+        incremental_backfill: bool,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        force_rebuild: bool,
+        effective_ignore: bool,
+        effective_strict: bool = False,
+        compiled_plan: Optional[MaterializedViewPlan] = None,
+    ) -> MaterializedViewPlan:
+        plan = compiled_plan or generate_materialized_view(
+            schemas,
+            v_spec,
+            dialect=self.dialect,
+            pg_use_transition_tables=self.pg_use_transition_tables,
+            ignore_limitations=effective_ignore,
+            object_prefix=self.object_prefix,
+            strict=effective_strict,
+            engine_version=self.engine_version,
+            watermark_catalog_table=self.catalog_table if (incremental_backfill or not populate) else None,
+        )
+        sig = self._compute_signature(plan, schemas)
+
+        catalog = self.get_catalog()
+        existing = catalog.get(plan.view_name)
+        if existing and existing["signature_hash"] == sig and not force_rebuild:
+            return plan
+
+        if existing:
+            self.drop_view(plan.view_name)
+
+        # Install structure, maintenance triggers, single-shot backfill, and catalog record
+        # inside a single atomic transaction so concurrent readers/writers never observe an
+        # un-triggered or double-counted window between trigger attachment and population.
+        cur = self.conn.cursor()
+        try:
+            for stmt in plan.create_structure_statements():
+                cur.execute(stmt)
+            for stmt in plan.trigger_ddls:
+                cur.execute(stmt)
+
+            stored_view_sql = self._serialize_view_sql_with_indexes(plan)
+            ph = self._param_placeholder()
+            init_active = 1 if (populate and incremental_backfill) else 0
+            cur.execute(
+                f"""
+                INSERT INTO {self.catalog_table} (
+                    view_name, view_sql, strategy, signature_hash, backing_table,
+                    aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
+                    backfill_cursor_pk, backfill_max_pk, backfill_active
+                ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                """,
+                (
+                    plan.view_name,
+                    stored_view_sql,
+                    plan.strategy.value,
+                    sig,
+                    plan.backing_table_name,
+                    json.dumps(plan.auxiliary_table_names),
+                    json.dumps(plan.trigger_names),
+                    json.dumps(plan.function_names),
+                    json.dumps(plan.trigger_ddls),
+                    None,
+                    None,
+                    init_active,
+                ),
+            )
+
+            if populate:
+                if incremental_backfill:
+                    self._commit()
+                    self.backfill_incrementally(
+                        plan, batch_size=batch_size, on_progress=on_progress
+                    )
+                else:
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+            else:
+                self._commit()
+        except Exception:
+            self._rollback()
+            raise
+        return plan
+
+    def register_view(
+        self,
+        view_sql: ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        populate: bool = True,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        force_rebuild: bool = False,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> MaterializedViewPlan:
+        """
+        Safely installs or updates one or more materialized views on the connected database.
+        Supports both single-view and multi-view SQL scripts seamlessly.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        specs = parse_view_definitions(
+            view_sql,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+        sub_plans: List[MaterializedViewPlan] = []
+        for vs in specs:
+            sub_plans.append(
+                self._register_single_view_spec(
+                    vs,
+                    schemas=schemas,
+                    populate=populate,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    force_rebuild=force_rebuild,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                )
+            )
+        if len(sub_plans) == 1:
+            return sub_plans[0]
+        p0 = sub_plans[0]
+        return MaterializedViewPlan(
+            dialect=p0.dialect,
+            strategy=p0.strategy,
+            view_spec=p0.view_spec,
+            backing_table_name=p0.backing_table_name,
+            backing_table_ddl=p0.backing_table_ddl,
+            auxiliary_table_ddls=[d for sp in sub_plans for d in sp.auxiliary_table_ddls],
+            index_ddls=[d for sp in sub_plans for d in sp.index_ddls],
+            initial_populate_sqls=[d for sp in sub_plans for d in sp.initial_populate_sqls],
+            trigger_ddls=[d for sp in sub_plans for d in sp.trigger_ddls],
+            readonly_trigger_ddls=[d for sp in sub_plans for d in sp.readonly_trigger_ddls],
+            user_columns=p0.user_columns,
+            reader_view_ddl=p0.reader_view_ddl,
+            incremental_backfill_spec=p0.incremental_backfill_spec,
+            auxiliary_table_names=[n for sp in sub_plans for n in sp.auxiliary_table_names],
+            trigger_names=[n for sp in sub_plans for n in sp.trigger_names],
+            function_names=[n for sp in sub_plans for n in sp.function_names],
+            limitations=[lim for sp in sub_plans for lim in sp.limitations],
+            object_prefix=p0.object_prefix,
+            db_view_name=p0.db_view_name,
+            index_names=[n for sp in sub_plans for n in sp.index_names],
+            user_indexes=p0.user_indexes,
+            sub_plans=sub_plans,
+        )
+
+    def sync_views(
+        self,
+        view_sqls: Sequence[ViewSpec | str] | ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        prune_removed: bool = False,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> Dict[str, str]:
+        """
+        Declaratively synchronizes a collection of materialized view definitions against
+        the connected database (supporting multi-view SQL files/strings as well).
+        Returns a status map `{view_name: "created" | "updated" | "unchanged" | "dropped"}`.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        catalog = self.get_catalog()
+        status: Dict[str, str] = {}
+        desired_names: Set[str] = set()
+
+        all_specs = parse_view_definitions(
+            view_sqls,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+
+        for v_spec in all_specs:
+            plan = generate_materialized_view(
+                schemas,
+                v_spec,
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=effective_ignore,
+                object_prefix=self.object_prefix,
+                strict=effective_strict,
+                engine_version=self.engine_version,
+                watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+            )
+            v_name = plan.view_name
+            desired_names.add(v_name)
+            sig = self._compute_signature(plan, schemas)
+            if v_name not in catalog:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=False,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "created"
+            elif catalog[v_name]["signature_hash"] != sig:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=True,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "updated"
+            else:
+                status[v_name] = "unchanged"
+
+        if prune_removed:
+            for existing_name in list(catalog.keys()):
+                if existing_name not in desired_names:
+                    self.drop_view(existing_name)
+                    status[existing_name] = "dropped"
+
+        return status
+
+    def check_schema_drift(self) -> Dict[str, str]:
+        """
+        Inspects all registered views in `__matview_catalog` against the current live base
+        table schemas and returns `{view_name: "ok" | "drifted" | "invalid"}`.
+        """
+        schemas = self.fetch_schema()
+        catalog = self.get_catalog()
+        report: Dict[str, str] = {}
+        for v_name, entry in catalog.items():
+            try:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                sig = self._compute_signature(plan, schemas)
+                report[v_name] = "ok" if sig == entry["signature_hash"] else "drifted"
+            except Exception:
+                report[v_name] = "invalid"
+        return report
+
+    def repair_view(
+        self,
+        view_name: Optional[str] = None,
+        rebuild_on_schema_drift: bool = True,
+    ) -> Dict[str, str]:
+        """
+        Reconciles and repairs one or all registered materialized views in an atomic pass,
+        eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
+        Returns `{view_name: "repaired" | "rebuilt"}`.
+        """
+        catalog = self.get_catalog()
+        if view_name:
+            resolved = self._resolve_catalog_name(view_name, catalog)
+            if resolved not in catalog:
+                raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
+            targets = [catalog[resolved]]
+        else:
+            targets = list(catalog.values())
+
+        schemas = self.fetch_schema()
+        results: Dict[str, str] = {}
+        cur = self.conn.cursor()
+        for entry in targets:
+            v_name = entry["view_name"]
+            plan = generate_materialized_view(
+                schemas,
+                entry["view_sql"],
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=True,
+                object_prefix=self.object_prefix,
+            )
+            sig = self._compute_signature(plan, schemas)
+            if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+                self.register_view(
+                    entry["view_sql"],
+                    populate=True,
+                    force_rebuild=True,
+                    ignore_limitations=True,
+                )
+                results[v_name] = "rebuilt"
+            else:
+                try:
+                    for aux_t in plan.auxiliary_table_names:
+                        cur.execute(f"DELETE FROM {aux_t};")
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+                    results[v_name] = "repaired"
+                except Exception:
+                    self._rollback()
+                    raise
+        return results
+
+    @contextmanager
+    def bulk_changes(
+        self,
+        view_names: Optional[Sequence[str]] = None,
+        use_shadow_swap: bool = False,
+        drop_triggers: bool = False,
+    ) -> Iterator[None]:
+        """
+        Context manager for executing high-throughput multi-statement bulk loads/mutations.
+        Uses session-local trigger bypass flags where supported (`SET LOCAL matview.skip_triggers = 'on'`
+        on PostgreSQL, `SET @__matview_skip_triggers = 1` on MySQL) so triggers are never dropped
+        globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
+        optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
+        """
+        catalog = self.get_catalog()
+        if view_names:
+            resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
+            targets = [catalog[n] for n in resolved if n in catalog]
+        else:
+            targets = list(catalog.values())
+
+        cur = self.conn.cursor()
+        sp_active = False
+        try:
+            cur.execute("SAVEPOINT __mv_bulk_sp;")
+            sp_active = True
+        except Exception:
+            pass
+
+        session_bypass_ok = False
+        if self.dialect == Dialect.POSTGRES and not drop_triggers:
+            try:
+                cur.execute("SET LOCAL matview.skip_triggers = 'on';")
+                session_bypass_ok = True
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL and not drop_triggers:
+            try:
+                cur.execute("SET @__matview_skip_triggers = 1;")
+                session_bypass_ok = True
+            except Exception:
+                pass
+
+        if not session_bypass_ok:
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+        # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
+        # so the trigger suspension and bulk DML remain isolated inside __mv_bulk_sp!
+        try:
+            yield
+        except Exception:
+            if sp_active:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    self._rollback()
+            else:
+                self._rollback()
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for stmt in plan.trigger_ddls:
+                    cur.execute(stmt)
+            self._commit()
+            raise
+        else:
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for aux_t in plan.auxiliary_table_names:
+                    cur.execute(f"DELETE FROM {aux_t};")
+                if use_shadow_swap:
+                    shadow_tbl = f"{plan.backing_table_name}__shadow"
+                    cur.execute(f"DROP TABLE IF EXISTS {shadow_tbl};")
+                    shadow_ddl = plan.backing_table_ddl.replace(
+                        f"CREATE TABLE {plan.backing_table_name}",
+                        f"CREATE TABLE {shadow_tbl}",
+                        1,
+                    )
+                    cur.execute(shadow_ddl)
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        if f"INSERT INTO {plan.backing_table_name}" in stmt:
+                            cur.execute(
+                                stmt.replace(
+                                    f"INSERT INTO {plan.backing_table_name}",
+                                    f"INSERT INTO {shadow_tbl}",
+                                    1,
+                                )
+                            )
+                        else:
+                            cur.execute(stmt)
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    cur.execute(f"DROP VIEW IF EXISTS {plan.view_name};")
+                    cur.execute(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
+                    cur.execute(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+                    if plan.reader_view_ddl:
+                        cur.execute(plan.reader_view_ddl)
+                    for ro_stmt in plan.readonly_trigger_ddls:
+                        cur.execute(ro_stmt)
+                    for idx_ddl in plan.index_ddls:
+                        cur.execute(idx_ddl)
+                else:
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                if not session_bypass_ok or use_shadow_swap:
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    for stmt in plan.trigger_ddls:
+                        cur.execute(stmt)
+            if sp_active:
+                try:
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    pass
+            self._commit()
+
+
+# -----------------------------------------------------------------------------
+# Public High-Level Convenience Functions & CLI
+# -----------------------------------------------------------------------------
+
+
+def _resolve_dialect_and_engine_version(
+    schema_sql_or_dict: Any,
+    dialect: Optional[Dialect | str | EngineVersion],
+    engine_version: Optional[EngineVersion | str],
+) -> EngineVersion:
+    is_conn = hasattr(schema_sql_or_dict, "cursor") or isinstance(
+        schema_sql_or_dict, sqlite3.Connection
+    )
+    if engine_version is not None:
+        def_d = dialect if not isinstance(dialect, EngineVersion) else dialect.dialect
+        return parse_engine_version(engine_version, default_dialect=def_d)
+    if isinstance(dialect, EngineVersion):
+        return dialect
+    if isinstance(dialect, str) and dialect.strip():
+        if ":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(
+            ch.isdigit() for ch in dialect.replace("sqlite3", "")
+        ):
+            return parse_engine_version(dialect)
+        if is_conn:
+            return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+        return parse_engine_version(dialect)
+    if is_conn:
+        return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+    return parse_engine_version(dialect or Dialect.SQLITE)
+
+
+def generate_materialized_view(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sql_or_spec: str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+    watermark_catalog_table: Optional[str] = None,
+) -> MaterializedViewPlan:
+    """
+    Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
+    into a `MaterializedViewPlan`. Autodetects the database dialect and version when passed
+    a live connection, or accepts `engine_version` (e.g. `'postgres:17'`, `'mariadb:11.4'`, `'mysql:8.4'`).
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    known_tables = {k.lower() for k in schemas}
+    if isinstance(view_sql_or_spec, str):
+        view_spec = parse_view_definition(
+            view_sql_or_spec,
+            known_tables=known_tables,
+            indexes=indexes,
+        )
+    elif indexes:
+        parsed_idxs = tuple(
+            parse_view_index_spec(ix, default_view_name=view_sql_or_spec.view_name)
+            for ix in indexes
+        )
+        view_spec = ViewSpec(
+            view_name=view_sql_or_spec.view_name,
+            raw_select_sql=view_sql_or_spec.raw_select_sql,
+            base_table=view_sql_or_spec.base_table,
+            joins=view_sql_or_spec.joins,
+            referenced_tables=view_sql_or_spec.referenced_tables,
+            select_items=view_sql_or_spec.select_items,
+            where_clause=view_sql_or_spec.where_clause,
+            group_by_cols=view_sql_or_spec.group_by_cols,
+            having_clause=view_sql_or_spec.having_clause,
+            has_cte=view_sql_or_spec.has_cte,
+            has_window_func=view_sql_or_spec.has_window_func,
+            has_compound_set_op=view_sql_or_spec.has_compound_set_op,
+            has_top_level_distinct=view_sql_or_spec.has_top_level_distinct,
+            has_limit_or_order=view_sql_or_spec.has_limit_or_order,
+            has_subquery_in_from=view_sql_or_spec.has_subquery_in_from,
+            user_indexes=view_sql_or_spec.user_indexes + parsed_idxs,
+            additional_views=view_sql_or_spec.additional_views,
+        )
+    else:
+        view_spec = view_sql_or_spec
+
+    compiler = IncrementalViewCompiler(
+        schemas=schemas,
+        view_spec=view_spec,
+        dialect=eff_dialect,
+        pg_use_transition_tables=pg_use_transition_tables,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        strict=strict,
+        engine_version=resolved_ev,
+        watermark_catalog_table=watermark_catalog_table,
+    )
+    return compiler.compile()
+
+
+def generate_materialized_views(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sqls: Sequence[str | ViewSpec] | str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+) -> List[MaterializedViewPlan]:
+    """
+    Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
+    into a flat list of `MaterializedViewPlan` objects.
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    specs = parse_view_definitions(
+        view_sqls,
+        known_tables={k.lower() for k in schemas},
+        indexes=indexes,
+    )
+    plans: List[MaterializedViewPlan] = []
+    for vs in specs:
+        comp = IncrementalViewCompiler(
+            schemas=schemas,
+            view_spec=vs,
+            dialect=eff_dialect,
+            pg_use_transition_tables=pg_use_transition_tables,
+            ignore_limitations=ignore_limitations,
+            object_prefix=object_prefix,
+            incremental_backfill=incremental_backfill,
+            batch_size=batch_size,
+            strict=strict,
+            engine_version=resolved_ev,
+        )
+        plans.append(comp._compile_single_plan())
+    return plans
+
+
+def install_materialized_view_sqlite(
+    conn: sqlite3.Connection,
+    view_sql: str | ViewSpec,
+    schema_sql: Optional[str] = None,
+    populate: bool = True,
+    incremental_backfill: bool = False,
+    batch_size: int = 500,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    strict: bool = False,
+) -> MaterializedViewPlan:
+    """Installs one or more materialized views directly into a live SQLite connection."""
+    mgr = MaterializedViewManager(
+        conn,
+        dialect=Dialect.SQLITE,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        strict=strict,
+    )
+    return mgr.register_view(
+        view_sql=view_sql,
+        schema_sql=schema_sql,
+        populate=populate,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        on_progress=on_progress,
+        indexes=indexes,
+        strict=strict,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Compile SQL CREATE VIEW definition(s) into zero-dependency incremental materialized view SQL."
+    )
+    parser.add_argument("--schema", help="Path to SQL file containing base table CREATE TABLE statements.")
+    parser.add_argument("--db", help="Database path or DSN URL (sqlite:///..., postgresql://..., mysql://...).")
+    parser.add_argument("--view", help="Path to SQL file or inline CREATE VIEW statement(s).")
+    parser.add_argument(
+        "--dialect",
+        default=None,
+        help="Target SQL dialect or engine spec (sqlite, postgres, mysql, mariadb, or versioned e.g. postgres:17).",
+    )
+    parser.add_argument(
+        "--engine-version",
+        dest="engine_version",
+        default=None,
+        help="Target engine and version (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45').",
+    )
+    parser.add_argument(
+        "--pg-transition-tables",
+        action="store_true",
+        help="Use PostgreSQL statement-level transition table triggers.",
+    )
+    parser.add_argument(
+        "--object-prefix",
+        default=DEFAULT_OBJECT_PREFIX,
+        help="Prefix for generated database objects (default: __matview_).",
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        dest="indexes",
+        help="Additional user index specification on the materialized view (repeatable).",
+    )
+    parser.add_argument(
+        "--no-populate",
+        action="store_true",
+        help="Omit initial backfill statements from generated SQL.",
+    )
+    parser.add_argument(
+        "--incremental-backfill",
+        action="store_true",
+        help="Generate or execute chunked incremental initial backfill statements.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Batch size for --incremental-backfill (default: 500).",
+    )
+    parser.add_argument(
+        "--ignore-limitations",
+        action="store_true",
+        help="Proceed with warning even if engine transparency limitations exist.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail compilation if a view cannot use Tier 1 ALGEBRAIC_DELTA maintenance.",
+    )
+    parser.add_argument(
+        "--check-drift",
+        action="store_true",
+        help="Check registered views in --db for underlying base table schema drift.",
+    )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Atomically reconcile/repair registered views in --db from base tables.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the generated materialized view directly to --db.",
+    )
+    args = parser.parse_args(argv)
+
+    def _read_sql_arg(val: str) -> str:
+        if "\n" not in val and not re.match(r"^\s*CREATE\b", val, flags=re.IGNORECASE):
+            try:
+                with open(val, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                pass
+        return val
+
+    try:
+        if args.check_drift or args.repair:
+            if not args.db:
+                print("ERROR: --check-drift / --repair requires --db", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if args.check_drift:
+                drift = mgr.check_schema_drift()
+                print(json.dumps(drift, indent=2, sort_keys=True))
+                if any(v != "ok" for v in drift.values()) and not args.repair:
+                    return 1
+            if args.repair:
+                rep = mgr.repair_view()
+                print(json.dumps(rep, indent=2, sort_keys=True))
+            return 0
+
+        if not args.view:
+            print("ERROR: --view is required unless running --check-drift or --repair.", file=sys.stderr)
+            return 2
+
+        view_sql = _read_sql_arg(args.view)
+        schema_sql = _read_sql_arg(args.schema) if args.schema else None
+
+        if args.apply:
+            if not args.db:
+                print("ERROR: --apply requires --db <db_path_or_dsn>", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if schema_sql:
+                mgr.apply_schema_ddl(schema_sql, auto_sync_views=False)
+            plan = mgr.register_view(
+                view_sql,
+                populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+                indexes=args.indexes,
+                strict=args.strict,
+            )
+            print(
+                plan.render_sql_script(
+                    include_populate=not args.no_populate,
+                    incremental_backfill=args.incremental_backfill,
+                    batch_size=args.batch_size,
+                )
+            )
+            return 0
+
+        hint_d: Optional[Dialect] = None
+        if args.dialect:
+            hint_d = parse_engine_version(args.dialect).dialect
+        elif args.engine_version:
+            hint_d = parse_engine_version(args.engine_version).dialect
+
+        detected_ev: Optional[EngineVersion] = None
+        if args.db and not schema_sql:
+            conn, conn_d = MaterializedViewManager._connect_database_url(args.db, hint_d)
+            try:
+                detected_ev = (
+                    parse_engine_version(args.engine_version, default_dialect=conn_d)
+                    if args.engine_version
+                    else detect_engine_version(conn, hint_dialect=args.dialect or conn_d)
+                )
+                schemas = introspect_database_schemas(
+                    conn, dialect=detected_ev.dialect, object_prefix=args.object_prefix
+                )
+            finally:
+                conn.close()
+        elif schema_sql:
+            schemas = parse_table_schema(schema_sql)
+            detected_ev = _resolve_dialect_and_engine_version(
+                schemas, args.dialect, args.engine_version
+            )
+        else:
+            print("ERROR: Either --schema or --db must be provided.", file=sys.stderr)
+            return 2
+
+        plan = generate_materialized_view(
+            schemas,
+            view_sql,
+            dialect=detected_ev.dialect,
+            pg_use_transition_tables=args.pg_transition_tables,
+            ignore_limitations=args.ignore_limitations,
+            object_prefix=args.object_prefix,
+            indexes=args.indexes,
+            incremental_backfill=args.incremental_backfill,
+            batch_size=args.batch_size,
+            strict=args.strict,
+            engine_version=detected_ev,
+        )
+        print(
+            plan.render_sql_script(
+                include_populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+            )
+        )
+        return 0
+    except (EngineLimitationError, StrictCompilationError) as exc:
+        print(f"WARNING: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+,
+                    g_expr,
+                    flags=re.IGNORECASE,
+                )
+                lookup_expr = (
+                    g_expr[:collation_match.start()].strip()
+                    if collation_match else g_expr
+                )
+                c_def = self._lookup_col_def(lookup_expr)
+                dt = (
+                    self._normalize_dialect_type(c_def.data_type)
+                    if c_def
+                    else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
+                )
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                if collation_match:
+                    dt = f"{dt} COLLATE {collation_match.group(1)}"
+                hidden_grp_defs.append((mv_c, g_expr, dt))
+            group_mv_cols.append((g_expr, mv_c))
+
+        auto_grp_col_names = [mc for _, mc in group_mv_cols]
+        indexed_cols_lower = self._indexed_column_names_lower(auto_grp_col_names)
+
+        col_defs_sql: List[str] = []
+        for it in self.view.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            col_defs_sql.append(f"{it.alias} {dt}")
+        for mv_c, _, dt in hidden_grp_defs:
+            col_defs_sql.append(f"{mv_c} {dt}")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=auto_grp_col_names,
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_q = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        if hidden_grp_defs:
+            tok_from = _find_top_level_token(raw_q, (SQLGlotTokenType.FROM,))
+            assert tok_from is not None
+            extra_sel = ", ".join(f"{g_e} AS {mv_c}" for mv_c, g_e, _ in hidden_grp_defs)
+            source_query_sql = f"{raw_q[:tok_from.start].rstrip()}, {extra_sel} {raw_q[tok_from.start:]}"
+        else:
+            source_query_sql = raw_q
+
+        cols_csv = ", ".join(target_cols)
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({cols_csv})\n"
+            f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init;"
+        )
+        ord_t2 = ", ".join(str(k) for k in range(1, len(target_cols) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t2}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._build_tier2_triggers_for_table(
+                view_name=view_name,
+                mv_table=mv_table,
+                base_t=ref_table,
+                target_cols=target_cols,
+                group_mv_cols=group_mv_cols,
+                source_query_sql=source_query_sql,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    # =========================================================================
+    # TIER 3: Universal Atomic View Sync (Arbitrary Engine View Definitions)
+    # =========================================================================
+
+    def _compile_tier3_atomic_sync(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = []
+
+        indexed_cols_lower = self._indexed_column_names_lower()
+        if len(self.view.select_items) == 1 and self.view.select_items[0].raw_expr.strip() == "*":
+            for j in self.view.joins or []:
+                t_schema = self._schemas_lower.get(j.table_name.lower())
+                if t_schema:
+                    for c_def in t_schema.columns.values():
+                        if c_def.name not in user_columns:
+                            user_columns.append(c_def.name)
+                            dt = self._normalize_dialect_type(c_def.data_type)
+                            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                                dt = "VARCHAR(255)"
+                            col_defs_sql.append(f"{c_def.name} {dt}")
+            if not user_columns and self.primary_schema:
+                for c_def in self.primary_schema.columns.values():
+                    user_columns.append(c_def.name)
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                        dt = "VARCHAR(255)"
+                    col_defs_sql.append(f"{c_def.name} {dt}")
+        else:
+            for item in self.view.select_items:
+                user_columns.append(item.alias)
+                col_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and col_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    col_type = "VARCHAR(255)"
+                col_defs_sql.append(f"{item.alias} {col_type}")
+
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_query = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        cols_csv = ", ".join(user_columns)
+        initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"
+
+        ord_t3 = ", ".join(str(k) for k in range(1, len(user_columns) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{raw_query}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t3}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        refresh_stmts = [
+            f"DELETE FROM {mv_table};",
+            f"INSERT INTO {mv_table} ({cols_csv})\n    {raw_query};",
+        ]
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=ref_table,
+                ins_stmts=refresh_stmts,
+                del_stmts=refresh_stmts,
+                upd_old_stmts=[],
+                upd_new_stmts=refresh_stmts,
+                trunc_stmts=refresh_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+# -----------------------------------------------------------------------------
+# Database Connection, Schema & Safe Migration Manager (`MaterializedViewManager`)
+# -----------------------------------------------------------------------------
+
+
+class MaterializedViewManager:
+    """
+    Setup/migration manager that connects to a database (SQLite connection/path or
+    PEP-249 DB-API 2.0 connection for PostgreSQL / MySQL) to:
+      - Introspect live base table schemas (`fetch_schema`)
+      - Maintain a persistent metadata registry (`__matview_catalog`) of installed MVs
+      - Safely create, diff, update, or drop materialized views (`register_view`, `sync_views`, `drop_view`)
+      - Enforce transparency limitation checks unless `ignore_limitations=True`
+      - Perform incremental (chunked/batched) initial backfills (`backfill_incrementally`)
+      - Execute high-throughput multi-statement bulk changes (`bulk_changes`)
+    Once setup/backfill finishes, all views and triggers operate 100% natively inside
+    the database engine with zero runtime dependency on this manager.
+    """
+
+    CATALOG_TABLE = f"{DEFAULT_OBJECT_PREFIX}catalog"
+
+    @staticmethod
+    def _connect_database_url(
+        conn_or_url: str, dialect: Optional[Dialect] = None
+    ) -> Tuple[Any, Dialect]:
+        u_low = conn_or_url.strip().lower()
+        if u_low.startswith(("postgresql://", "postgres://")):
+            import psycopg2  # type: ignore
+            return psycopg2.connect(conn_or_url), Dialect.POSTGRES
+        if u_low.startswith(("mysql://", "mariadb://")):
+            import pymysql  # type: ignore
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(conn_or_url)
+            db_name = parsed.path.lstrip("/")
+            qs = parse_qs(parsed.query)
+            return (
+                pymysql.connect(
+                    host=parsed.hostname or "127.0.0.1",
+                    port=parsed.port or 3306,
+                    user=parsed.username or "root",
+                    password=parsed.password or "",
+                    database=db_name,
+                    unix_socket=qs.get("unix_socket", [None])[0],
+                    autocommit=False,
+                ),
+                Dialect.MYSQL,
+            )
+        eff_dialect = dialect or Dialect.SQLITE
+        path = conn_or_url.replace("sqlite:///", "").replace("sqlite://", "")
+        return sqlite3.connect(path), eff_dialect
+
+    def __init__(
+        self,
+        conn_or_url: sqlite3.Connection | str | Any,
+        dialect: Optional[Dialect | str | EngineVersion] = None,
+        ignore_limitations: bool = False,
+        object_prefix: str = DEFAULT_OBJECT_PREFIX,
+        pg_use_transition_tables: bool = False,
+        strict: bool = False,
+        engine_version: Optional[EngineVersion | str] = None,
+    ) -> None:
+        hint_d: Optional[Dialect] = None
+        if isinstance(dialect, Dialect):
+            hint_d = dialect
+        elif isinstance(dialect, EngineVersion):
+            hint_d = dialect.dialect
+            if engine_version is None:
+                engine_version = dialect
+        elif isinstance(dialect, str) and dialect.strip():
+            parsed_d = parse_engine_version(dialect)
+            hint_d = parsed_d.dialect
+            if engine_version is None and (":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(ch.isdigit() for ch in dialect.replace("sqlite3", ""))):
+                engine_version = parsed_d
+
+        if isinstance(conn_or_url, str):
+            self.conn, inferred_dialect = self._connect_database_url(conn_or_url, hint_d)
+            if hint_d is None or conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
+                hint_d = inferred_dialect
+        else:
+            self.conn = conn_or_url
+
+        if engine_version is not None:
+            self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
+        else:
+            self.engine_version = detect_engine_version(self.conn, hint_dialect=hint_d)
+
+        self.dialect: Dialect = self.engine_version.dialect
+        self.subdialect: EngineSubdialect = self.engine_version.subdialect
+        self.ignore_limitations = ignore_limitations
+        self.object_prefix = object_prefix
+        self.pg_use_transition_tables = pg_use_transition_tables
+        self.strict = strict
+        self.catalog_table = (
+            f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
+        )
+
+        self._ensure_catalog()
+
+    def _ensure_catalog(self) -> None:
+        cur = self.conn.cursor()
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("PRAGMA recursive_triggers = ON;")
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL:
+            try:
+                cur.execute("SET SESSION collation_connection = @@collation_database;")
+            except Exception:
+                pass
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.catalog_table} (
+                view_name VARCHAR(255) NOT NULL PRIMARY KEY,
+                view_sql TEXT NOT NULL,
+                strategy VARCHAR(64) NOT NULL,
+                signature_hash VARCHAR(64) NOT NULL,
+                backing_table VARCHAR(255) NOT NULL,
+                aux_tables_json TEXT NOT NULL,
+                trigger_names_json TEXT NOT NULL,
+                function_names_json TEXT NOT NULL,
+                trigger_ddls_json TEXT NOT NULL,
+                backfill_cursor_pk BIGINT DEFAULT NULL,
+                backfill_max_pk BIGINT DEFAULT NULL,
+                backfill_active INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        self._commit()
+        for col_ddl in (
+            "backfill_cursor_pk BIGINT DEFAULT NULL",
+            "backfill_max_pk BIGINT DEFAULT NULL",
+            "backfill_active INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                cur.execute(f"ALTER TABLE {self.catalog_table} ADD COLUMN {col_ddl};")
+                self._commit()
+            except Exception:
+                self._rollback()
+
+    def _commit(self) -> None:
+        if hasattr(self.conn, "commit"):
+            self.conn.commit()
+
+    def _rollback(self) -> None:
+        if hasattr(self.conn, "rollback"):
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+    def _param_placeholder(self) -> str:
+        return "?" if self.dialect == Dialect.SQLITE else "%s"
+
+    def _resolve_catalog_name(self, name: str, catalog: Dict[str, Dict[str, Any]]) -> str:
+        if name in catalog:
+            return name
+        if self.object_prefix:
+            prefixed = (
+                name
+                if name.startswith(self.object_prefix)
+                else f"{self.object_prefix}{name}"
+            )
+            if prefixed in catalog:
+                return prefixed
+            if name.startswith(self.object_prefix):
+                unprefixed = name[len(self.object_prefix) :]
+                if unprefixed in catalog:
+                    return unprefixed
+        return name
+
+    def fetch_schema(self, extra_schema_sql: Optional[str] = None) -> Dict[str, TableSchema]:
+        """Fetches the live schema of all user base tables from the connected database."""
+        schemas = introspect_database_schemas(
+            self.conn,
+            dialect=self.dialect,
+            object_prefix=self.object_prefix,
+        )
+        schemas.pop(self.catalog_table, None)
+        if extra_schema_sql:
+            schemas.update(parse_table_schema(extra_schema_sql))
+        return schemas
+
+    def apply_schema_ddl(self, ddl_sql: str, auto_sync_views: bool = True) -> None:
+        """
+        Safely executes schema DDL changes (e.g. `CREATE TABLE`, `ALTER TABLE`) and
+        automatically refreshes any registered materialized views whose underlying
+        base table schema changed.
+        """
+        cur = self.conn.cursor()
+        for stmt in _split_top_level(_strip_sql_comments(ddl_sql), ";"):
+            if stmt.strip():
+                cur.execute(stmt)
+        self._commit()
+        if auto_sync_views:
+            catalog = self.get_catalog()
+            if catalog:
+                self.sync_views([entry["view_sql"] for entry in catalog.values()])
+
+    def get_catalog(self) -> Dict[str, Dict[str, Any]]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
+                f"backfill_cursor_pk, backfill_max_pk, backfill_active "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = True
+        except Exception:
+            self._rollback()
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = False
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in cur.fetchall():
+            out[row[0]] = {
+                "view_name": row[0],
+                "view_sql": row[1],
+                "strategy": row[2],
+                "signature_hash": row[3],
+                "backing_table": row[4],
+                "aux_tables": json.loads(row[5]),
+                "trigger_names": json.loads(row[6]),
+                "function_names": json.loads(row[7]),
+                "trigger_ddls": json.loads(row[8]),
+                "backfill_cursor_pk": row[9] if has_wm_cols and len(row) > 9 else None,
+                "backfill_max_pk": row[10] if has_wm_cols and len(row) > 10 else None,
+                "backfill_active": int(row[11]) if has_wm_cols and len(row) > 11 and row[11] is not None else 0,
+            }
+        return out
+
+    def _compute_signature(self, plan: MaterializedViewPlan, schemas: Dict[str, TableSchema]) -> str:
+        h = hashlib.sha256()
+        h.update(_strip_sql_comments(plan.view_spec.raw_select_sql).encode("utf-8"))
+        h.update(f"prefix:{plan.object_prefix}".encode("utf-8"))
+        for idx_ddl in plan.index_ddls:
+            h.update(f"idx:{idx_ddl}".encode("utf-8"))
+        low_map = {k.lower(): v for k, v in schemas.items()}
+        for ref_t in sorted(plan.view_spec.referenced_tables, key=str.lower):
+            ts = low_map.get(ref_t.lower())
+            if ts:
+                for c_name, c_def in sorted(ts.columns.items()):
+                    h.update(
+                        f"{ts.name}.{c_name}:{c_def.data_type}:{c_def.not_null}:{c_def.primary_key}".encode("utf-8")
+                    )
+        return h.hexdigest()
+
+    @staticmethod
+    def _serialize_view_sql_with_indexes(plan: MaterializedViewPlan, raw_view_sql: Optional[str] = None) -> str:
+        parts = [f"CREATE VIEW {plan.logical_view_name} AS {plan.view_spec.raw_select_sql.strip().rstrip(';')};"]
+        for idx_spec in plan.user_indexes:
+            u_kw = "UNIQUE " if idx_spec.unique else ""
+            n_str = f"{idx_spec.name} " if idx_spec.name else ""
+            using_str = f" USING {idx_spec.using_method}" if idx_spec.using_method else ""
+            w_str = f" WHERE {idx_spec.where_clause}" if idx_spec.where_clause else ""
+            parts.append(
+                f"CREATE {u_kw}INDEX {n_str}ON {plan.logical_view_name}{using_str} "
+                f"({', '.join(idx_spec.columns)}){w_str};"
+            )
+        return "\n".join(parts)
+
+    def drop_view(self, view_name: str) -> bool:
+        """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
+        catalog = self.get_catalog()
+        resolved_name = self._resolve_catalog_name(view_name, catalog)
+        entry = catalog.get(resolved_name)
+        cur = self.conn.cursor()
+        if entry:
+            for t_name in entry["trigger_names"]:
+                if self.dialect != Dialect.POSTGRES:
+                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+            for fn_name in entry["function_names"]:
+                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+            cur.execute(f"DROP VIEW IF EXISTS {resolved_name};")
+            cur.execute(f"DROP TABLE IF EXISTS {entry['backing_table']};")
+            for aux_t in entry["aux_tables"]:
+                cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
+            ph = self._param_placeholder()
+            cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
+            self._commit()
+            return True
+        else:
+            raw_logical = (
+                view_name[len(self.object_prefix) :]
+                if self.object_prefix and view_name.startswith(self.object_prefix)
+                else view_name
+            )
+            db_v = f"{self.object_prefix}{raw_logical}"
+            cur.execute(f"DROP VIEW IF EXISTS {db_v};")
+            cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
+            cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
+            self._commit()
+            return False
+
+    def _update_backfill_watermark(
+        self,
+        cur: Any,
+        view_name: str,
+        cursor_pk: Optional[int],
+        max_pk: Optional[int],
+        active: int,
+    ) -> None:
+        ph = self._param_placeholder()
+        try:
+            cur.execute(
+                f"UPDATE {self.catalog_table} "
+                f"SET backfill_cursor_pk = {ph}, backfill_max_pk = {ph}, backfill_active = {ph} "
+                f"WHERE view_name = {ph}",
+                (cursor_pk, max_pk, active, view_name),
+            )
+        except Exception:
+            pass
+
+    def backfill_incrementally(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        snapshot_isolation: bool = False,
+    ) -> int:
+        """
+        Incrementally backfills the materialized view in bounded chunks of `batch_size`
+        (by PK/rowid range folding for algebraic views, group-key batches for distinct/holistic
+        views, or limit/offset batches for general views), coordinating the active cursor
+        watermark (`backfill_cursor_pk`, `backfill_max_pk`, `backfill_active`) in
+        `__matview_catalog` and optionally running under `snapshot_isolation=True`.
+        Returns the total number of batches executed.
+        """
+        if plan.sub_plans:
+            total_b = 0
+            for sp in plan.sub_plans:
+                total_b += self.backfill_incrementally(
+                    sp,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    snapshot_isolation=snapshot_isolation,
+                )
+            return total_b
+
+        cur = self.conn.cursor()
+        snapshot_started = False
+        try:
+            if snapshot_isolation:
+                try:
+                    if self.dialect == Dialect.POSTGRES:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                    elif self.dialect == Dialect.MYSQL:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                        cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
+                    elif self.dialect == Dialect.SQLITE:
+                        cur.execute("SAVEPOINT __mv_backfill_snap;")
+                    else:
+                        raise RuntimeError(
+                            f"Snapshot isolation is not implemented for {self.dialect.value}"
+                        )
+                except Exception as exc:
+                    self._rollback()
+                    raise RuntimeError(
+                        f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
+                    ) from exc
+                snapshot_started = True
+
+            return self._backfill_incrementally_with_cursor(
+                plan, batch_size, on_progress, snapshot_isolation, cur
+            )
+        except BaseException:
+            if snapshot_isolation and snapshot_started:
+                self._rollback_snapshot_backfill(cur)
+            raise
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _rollback_snapshot_backfill(self, cur: Any) -> None:
+        """Roll back a failed snapshot backfill without leaving its transaction open."""
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT __mv_backfill_snap;")
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                return
+            except Exception:
+                # If the savepoint no longer exists or the connection is already
+                # in an error state, a full rollback is the safest recovery.
+                self._rollback()
+                return
+        self._rollback()
+
+    def _backfill_incrementally_with_cursor(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        snapshot_isolation: bool,
+        cur: Any,
+    ) -> int:
+        spec = plan.incremental_backfill_spec
+        if spec is None or batch_size <= 0:
+            for s in plan.initial_populate_sqls:
+                cur.execute(s)
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            if on_progress:
+                on_progress(1, 1)
+            return 1
+
+        batches_run = 0
+        if spec.mode == "pk_range_fold" and spec.pk_column:
+            base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect)
+            pk_col = quote_sql_identifier(spec.pk_column, self.dialect)
+            cur.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}")
+            row = cur.fetchone()
+            if not row or row[0] is None or row[1] is None:
+                if not plan.view_spec.group_by_cols and not plan.view_spec.has_top_level_distinct:
+                    for s in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(s)
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            min_pk, max_pk = int(row[0]), int(row[1])
+            cursor_pk = min_pk - 1
+            total_span = max(1, max_pk - min_pk + 1)
+            self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, 1)
+            if not snapshot_isolation:
+                self._commit()
+            while cursor_pk < max_pk:
+                upper_pk = min(max_pk, cursor_pk + batch_size)
+                for tmpl in spec.chunk_sql_templates:
+                    cur.execute(tmpl, (cursor_pk, upper_pk))
+                batches_run += 1
+                cursor_pk = upper_pk
+                still_active = 1 if cursor_pk < max_pk else 0
+                self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, still_active)
+                if not snapshot_isolation:
+                    self._commit()
+                if on_progress:
+                    done = min(total_span, cursor_pk - (min_pk - 1))
+                    on_progress(batches_run, done)
+            self._update_backfill_watermark(cur, plan.view_name, max_pk, max_pk, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "group_key_batch" and spec.distinct_group_query:
+            cur.execute(spec.distinct_group_query)
+            all_keys = [r[0] for r in (cur.fetchall() or [])]
+            if not all_keys:
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            ph = self._param_placeholder()
+            for i in range(0, len(all_keys), batch_size):
+                batch_keys = all_keys[i : i + batch_size]
+                placeholders = ", ".join(ph for _ in batch_keys)
+                for tmpl in spec.chunk_sql_templates:
+                    sql = tmpl.format(placeholders=placeholders)
+                    cur.execute(sql, tuple(batch_keys))
+                if not snapshot_isolation:
+                    self._commit()
+                batches_run += 1
+                if on_progress:
+                    on_progress(batches_run, min(len(all_keys), i + batch_size))
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "offset_batch" and spec.offset_insert_template:
+            offset = 0
+            ph = self._param_placeholder()
+            tmpl_sql = spec.offset_insert_template.replace("LIMIT ? OFFSET ?", f"LIMIT {ph} OFFSET {ph}")
+            while True:
+                cur.execute(tmpl_sql, (batch_size, offset))
+                rc = getattr(cur, "rowcount", None)
+                if rc is not None and rc >= 0:
+                    inserted = int(rc)
+                else:
+                    cur.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name}")
+                    cnt_row = cur.fetchone()
+                    total_now = int(cnt_row[0]) if cnt_row and cnt_row[0] is not None else 0
+                    inserted = max(0, total_now - offset)
+                if not snapshot_isolation:
+                    self._commit()
+                if inserted == 0:
+                    break
+                batches_run += 1
+                offset += inserted
+                if on_progress:
+                    on_progress(batches_run, offset)
+                if inserted < batch_size:
+                    break
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        for s in plan.initial_populate_sqls:
+            cur.execute(s)
+        self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+        if snapshot_isolation and self.dialect == Dialect.SQLITE:
+            cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+        self._commit()
+        return 1
+
+    def _register_single_view_spec(
+        self,
+        v_spec: ViewSpec,
+        schemas: Dict[str, TableSchema],
+        populate: bool,
+        incremental_backfill: bool,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        force_rebuild: bool,
+        effective_ignore: bool,
+        effective_strict: bool = False,
+        compiled_plan: Optional[MaterializedViewPlan] = None,
+    ) -> MaterializedViewPlan:
+        plan = compiled_plan or generate_materialized_view(
+            schemas,
+            v_spec,
+            dialect=self.dialect,
+            pg_use_transition_tables=self.pg_use_transition_tables,
+            ignore_limitations=effective_ignore,
+            object_prefix=self.object_prefix,
+            strict=effective_strict,
+            engine_version=self.engine_version,
+            watermark_catalog_table=self.catalog_table if (incremental_backfill or not populate) else None,
+        )
+        sig = self._compute_signature(plan, schemas)
+
+        catalog = self.get_catalog()
+        existing = catalog.get(plan.view_name)
+        if existing and existing["signature_hash"] == sig and not force_rebuild:
+            return plan
+
+        if existing:
+            self.drop_view(plan.view_name)
+
+        # Install structure, maintenance triggers, single-shot backfill, and catalog record
+        # inside a single atomic transaction so concurrent readers/writers never observe an
+        # un-triggered or double-counted window between trigger attachment and population.
+        cur = self.conn.cursor()
+        try:
+            for stmt in plan.create_structure_statements():
+                cur.execute(stmt)
+            for stmt in plan.trigger_ddls:
+                cur.execute(stmt)
+
+            stored_view_sql = self._serialize_view_sql_with_indexes(plan)
+            ph = self._param_placeholder()
+            init_active = 1 if (populate and incremental_backfill) else 0
+            cur.execute(
+                f"""
+                INSERT INTO {self.catalog_table} (
+                    view_name, view_sql, strategy, signature_hash, backing_table,
+                    aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
+                    backfill_cursor_pk, backfill_max_pk, backfill_active
+                ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                """,
+                (
+                    plan.view_name,
+                    stored_view_sql,
+                    plan.strategy.value,
+                    sig,
+                    plan.backing_table_name,
+                    json.dumps(plan.auxiliary_table_names),
+                    json.dumps(plan.trigger_names),
+                    json.dumps(plan.function_names),
+                    json.dumps(plan.trigger_ddls),
+                    None,
+                    None,
+                    init_active,
+                ),
+            )
+
+            if populate:
+                if incremental_backfill:
+                    self._commit()
+                    self.backfill_incrementally(
+                        plan, batch_size=batch_size, on_progress=on_progress
+                    )
+                else:
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+            else:
+                self._commit()
+        except Exception:
+            self._rollback()
+            raise
+        return plan
+
+    def register_view(
+        self,
+        view_sql: ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        populate: bool = True,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        force_rebuild: bool = False,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> MaterializedViewPlan:
+        """
+        Safely installs or updates one or more materialized views on the connected database.
+        Supports both single-view and multi-view SQL scripts seamlessly.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        specs = parse_view_definitions(
+            view_sql,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+        sub_plans: List[MaterializedViewPlan] = []
+        for vs in specs:
+            sub_plans.append(
+                self._register_single_view_spec(
+                    vs,
+                    schemas=schemas,
+                    populate=populate,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    force_rebuild=force_rebuild,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                )
+            )
+        if len(sub_plans) == 1:
+            return sub_plans[0]
+        p0 = sub_plans[0]
+        return MaterializedViewPlan(
+            dialect=p0.dialect,
+            strategy=p0.strategy,
+            view_spec=p0.view_spec,
+            backing_table_name=p0.backing_table_name,
+            backing_table_ddl=p0.backing_table_ddl,
+            auxiliary_table_ddls=[d for sp in sub_plans for d in sp.auxiliary_table_ddls],
+            index_ddls=[d for sp in sub_plans for d in sp.index_ddls],
+            initial_populate_sqls=[d for sp in sub_plans for d in sp.initial_populate_sqls],
+            trigger_ddls=[d for sp in sub_plans for d in sp.trigger_ddls],
+            readonly_trigger_ddls=[d for sp in sub_plans for d in sp.readonly_trigger_ddls],
+            user_columns=p0.user_columns,
+            reader_view_ddl=p0.reader_view_ddl,
+            incremental_backfill_spec=p0.incremental_backfill_spec,
+            auxiliary_table_names=[n for sp in sub_plans for n in sp.auxiliary_table_names],
+            trigger_names=[n for sp in sub_plans for n in sp.trigger_names],
+            function_names=[n for sp in sub_plans for n in sp.function_names],
+            limitations=[lim for sp in sub_plans for lim in sp.limitations],
+            object_prefix=p0.object_prefix,
+            db_view_name=p0.db_view_name,
+            index_names=[n for sp in sub_plans for n in sp.index_names],
+            user_indexes=p0.user_indexes,
+            sub_plans=sub_plans,
+        )
+
+    def sync_views(
+        self,
+        view_sqls: Sequence[ViewSpec | str] | ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        prune_removed: bool = False,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> Dict[str, str]:
+        """
+        Declaratively synchronizes a collection of materialized view definitions against
+        the connected database (supporting multi-view SQL files/strings as well).
+        Returns a status map `{view_name: "created" | "updated" | "unchanged" | "dropped"}`.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        catalog = self.get_catalog()
+        status: Dict[str, str] = {}
+        desired_names: Set[str] = set()
+
+        all_specs = parse_view_definitions(
+            view_sqls,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+
+        for v_spec in all_specs:
+            plan = generate_materialized_view(
+                schemas,
+                v_spec,
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=effective_ignore,
+                object_prefix=self.object_prefix,
+                strict=effective_strict,
+                engine_version=self.engine_version,
+                watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+            )
+            v_name = plan.view_name
+            desired_names.add(v_name)
+            sig = self._compute_signature(plan, schemas)
+            if v_name not in catalog:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=False,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "created"
+            elif catalog[v_name]["signature_hash"] != sig:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=True,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "updated"
+            else:
+                status[v_name] = "unchanged"
+
+        if prune_removed:
+            for existing_name in list(catalog.keys()):
+                if existing_name not in desired_names:
+                    self.drop_view(existing_name)
+                    status[existing_name] = "dropped"
+
+        return status
+
+    def check_schema_drift(self) -> Dict[str, str]:
+        """
+        Inspects all registered views in `__matview_catalog` against the current live base
+        table schemas and returns `{view_name: "ok" | "drifted" | "invalid"}`.
+        """
+        schemas = self.fetch_schema()
+        catalog = self.get_catalog()
+        report: Dict[str, str] = {}
+        for v_name, entry in catalog.items():
+            try:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                sig = self._compute_signature(plan, schemas)
+                report[v_name] = "ok" if sig == entry["signature_hash"] else "drifted"
+            except Exception:
+                report[v_name] = "invalid"
+        return report
+
+    def repair_view(
+        self,
+        view_name: Optional[str] = None,
+        rebuild_on_schema_drift: bool = True,
+    ) -> Dict[str, str]:
+        """
+        Reconciles and repairs one or all registered materialized views in an atomic pass,
+        eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
+        Returns `{view_name: "repaired" | "rebuilt"}`.
+        """
+        catalog = self.get_catalog()
+        if view_name:
+            resolved = self._resolve_catalog_name(view_name, catalog)
+            if resolved not in catalog:
+                raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
+            targets = [catalog[resolved]]
+        else:
+            targets = list(catalog.values())
+
+        schemas = self.fetch_schema()
+        results: Dict[str, str] = {}
+        cur = self.conn.cursor()
+        for entry in targets:
+            v_name = entry["view_name"]
+            plan = generate_materialized_view(
+                schemas,
+                entry["view_sql"],
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=True,
+                object_prefix=self.object_prefix,
+            )
+            sig = self._compute_signature(plan, schemas)
+            if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+                self.register_view(
+                    entry["view_sql"],
+                    populate=True,
+                    force_rebuild=True,
+                    ignore_limitations=True,
+                )
+                results[v_name] = "rebuilt"
+            else:
+                try:
+                    for aux_t in plan.auxiliary_table_names:
+                        cur.execute(f"DELETE FROM {aux_t};")
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+                    results[v_name] = "repaired"
+                except Exception:
+                    self._rollback()
+                    raise
+        return results
+
+    @contextmanager
+    def bulk_changes(
+        self,
+        view_names: Optional[Sequence[str]] = None,
+        use_shadow_swap: bool = False,
+        drop_triggers: bool = False,
+    ) -> Iterator[None]:
+        """
+        Context manager for executing high-throughput multi-statement bulk loads/mutations.
+        Uses session-local trigger bypass flags where supported (`SET LOCAL matview.skip_triggers = 'on'`
+        on PostgreSQL, `SET @__matview_skip_triggers = 1` on MySQL) so triggers are never dropped
+        globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
+        optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
+        """
+        catalog = self.get_catalog()
+        if view_names:
+            resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
+            targets = [catalog[n] for n in resolved if n in catalog]
+        else:
+            targets = list(catalog.values())
+
+        cur = self.conn.cursor()
+        sp_active = False
+        try:
+            cur.execute("SAVEPOINT __mv_bulk_sp;")
+            sp_active = True
+        except Exception:
+            pass
+
+        session_bypass_ok = False
+        if self.dialect == Dialect.POSTGRES and not drop_triggers:
+            try:
+                cur.execute("SET LOCAL matview.skip_triggers = 'on';")
+                session_bypass_ok = True
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL and not drop_triggers:
+            try:
+                cur.execute("SET @__matview_skip_triggers = 1;")
+                session_bypass_ok = True
+            except Exception:
+                pass
+
+        if not session_bypass_ok:
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+        # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
+        # so the trigger suspension and bulk DML remain isolated inside __mv_bulk_sp!
+        try:
+            yield
+        except Exception:
+            if sp_active:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    self._rollback()
+            else:
+                self._rollback()
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for stmt in plan.trigger_ddls:
+                    cur.execute(stmt)
+            self._commit()
+            raise
+        else:
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for aux_t in plan.auxiliary_table_names:
+                    cur.execute(f"DELETE FROM {aux_t};")
+                if use_shadow_swap:
+                    shadow_tbl = f"{plan.backing_table_name}__shadow"
+                    cur.execute(f"DROP TABLE IF EXISTS {shadow_tbl};")
+                    shadow_ddl = plan.backing_table_ddl.replace(
+                        f"CREATE TABLE {plan.backing_table_name}",
+                        f"CREATE TABLE {shadow_tbl}",
+                        1,
+                    )
+                    cur.execute(shadow_ddl)
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        if f"INSERT INTO {plan.backing_table_name}" in stmt:
+                            cur.execute(
+                                stmt.replace(
+                                    f"INSERT INTO {plan.backing_table_name}",
+                                    f"INSERT INTO {shadow_tbl}",
+                                    1,
+                                )
+                            )
+                        else:
+                            cur.execute(stmt)
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    cur.execute(f"DROP VIEW IF EXISTS {plan.view_name};")
+                    cur.execute(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
+                    cur.execute(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+                    if plan.reader_view_ddl:
+                        cur.execute(plan.reader_view_ddl)
+                    for ro_stmt in plan.readonly_trigger_ddls:
+                        cur.execute(ro_stmt)
+                    for idx_ddl in plan.index_ddls:
+                        cur.execute(idx_ddl)
+                else:
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                if not session_bypass_ok or use_shadow_swap:
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    for stmt in plan.trigger_ddls:
+                        cur.execute(stmt)
+            if sp_active:
+                try:
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    pass
+            self._commit()
+
+
+# -----------------------------------------------------------------------------
+# Public High-Level Convenience Functions & CLI
+# -----------------------------------------------------------------------------
+
+
+def _resolve_dialect_and_engine_version(
+    schema_sql_or_dict: Any,
+    dialect: Optional[Dialect | str | EngineVersion],
+    engine_version: Optional[EngineVersion | str],
+) -> EngineVersion:
+    is_conn = hasattr(schema_sql_or_dict, "cursor") or isinstance(
+        schema_sql_or_dict, sqlite3.Connection
+    )
+    if engine_version is not None:
+        def_d = dialect if not isinstance(dialect, EngineVersion) else dialect.dialect
+        return parse_engine_version(engine_version, default_dialect=def_d)
+    if isinstance(dialect, EngineVersion):
+        return dialect
+    if isinstance(dialect, str) and dialect.strip():
+        if ":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(
+            ch.isdigit() for ch in dialect.replace("sqlite3", "")
+        ):
+            return parse_engine_version(dialect)
+        if is_conn:
+            return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+        return parse_engine_version(dialect)
+    if is_conn:
+        return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+    return parse_engine_version(dialect or Dialect.SQLITE)
+
+
+def generate_materialized_view(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sql_or_spec: str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+    watermark_catalog_table: Optional[str] = None,
+) -> MaterializedViewPlan:
+    """
+    Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
+    into a `MaterializedViewPlan`. Autodetects the database dialect and version when passed
+    a live connection, or accepts `engine_version` (e.g. `'postgres:17'`, `'mariadb:11.4'`, `'mysql:8.4'`).
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    known_tables = {k.lower() for k in schemas}
+    if isinstance(view_sql_or_spec, str):
+        view_spec = parse_view_definition(
+            view_sql_or_spec,
+            known_tables=known_tables,
+            indexes=indexes,
+        )
+    elif indexes:
+        parsed_idxs = tuple(
+            parse_view_index_spec(ix, default_view_name=view_sql_or_spec.view_name)
+            for ix in indexes
+        )
+        view_spec = ViewSpec(
+            view_name=view_sql_or_spec.view_name,
+            raw_select_sql=view_sql_or_spec.raw_select_sql,
+            base_table=view_sql_or_spec.base_table,
+            joins=view_sql_or_spec.joins,
+            referenced_tables=view_sql_or_spec.referenced_tables,
+            select_items=view_sql_or_spec.select_items,
+            where_clause=view_sql_or_spec.where_clause,
+            group_by_cols=view_sql_or_spec.group_by_cols,
+            having_clause=view_sql_or_spec.having_clause,
+            has_cte=view_sql_or_spec.has_cte,
+            has_window_func=view_sql_or_spec.has_window_func,
+            has_compound_set_op=view_sql_or_spec.has_compound_set_op,
+            has_top_level_distinct=view_sql_or_spec.has_top_level_distinct,
+            has_limit_or_order=view_sql_or_spec.has_limit_or_order,
+            has_subquery_in_from=view_sql_or_spec.has_subquery_in_from,
+            user_indexes=view_sql_or_spec.user_indexes + parsed_idxs,
+            additional_views=view_sql_or_spec.additional_views,
+        )
+    else:
+        view_spec = view_sql_or_spec
+
+    compiler = IncrementalViewCompiler(
+        schemas=schemas,
+        view_spec=view_spec,
+        dialect=eff_dialect,
+        pg_use_transition_tables=pg_use_transition_tables,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        strict=strict,
+        engine_version=resolved_ev,
+        watermark_catalog_table=watermark_catalog_table,
+    )
+    return compiler.compile()
+
+
+def generate_materialized_views(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sqls: Sequence[str | ViewSpec] | str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+) -> List[MaterializedViewPlan]:
+    """
+    Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
+    into a flat list of `MaterializedViewPlan` objects.
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    specs = parse_view_definitions(
+        view_sqls,
+        known_tables={k.lower() for k in schemas},
+        indexes=indexes,
+    )
+    plans: List[MaterializedViewPlan] = []
+    for vs in specs:
+        comp = IncrementalViewCompiler(
+            schemas=schemas,
+            view_spec=vs,
+            dialect=eff_dialect,
+            pg_use_transition_tables=pg_use_transition_tables,
+            ignore_limitations=ignore_limitations,
+            object_prefix=object_prefix,
+            incremental_backfill=incremental_backfill,
+            batch_size=batch_size,
+            strict=strict,
+            engine_version=resolved_ev,
+        )
+        plans.append(comp._compile_single_plan())
+    return plans
+
+
+def install_materialized_view_sqlite(
+    conn: sqlite3.Connection,
+    view_sql: str | ViewSpec,
+    schema_sql: Optional[str] = None,
+    populate: bool = True,
+    incremental_backfill: bool = False,
+    batch_size: int = 500,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    strict: bool = False,
+) -> MaterializedViewPlan:
+    """Installs one or more materialized views directly into a live SQLite connection."""
+    mgr = MaterializedViewManager(
+        conn,
+        dialect=Dialect.SQLITE,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        strict=strict,
+    )
+    return mgr.register_view(
+        view_sql=view_sql,
+        schema_sql=schema_sql,
+        populate=populate,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        on_progress=on_progress,
+        indexes=indexes,
+        strict=strict,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Compile SQL CREATE VIEW definition(s) into zero-dependency incremental materialized view SQL."
+    )
+    parser.add_argument("--schema", help="Path to SQL file containing base table CREATE TABLE statements.")
+    parser.add_argument("--db", help="Database path or DSN URL (sqlite:///..., postgresql://..., mysql://...).")
+    parser.add_argument("--view", help="Path to SQL file or inline CREATE VIEW statement(s).")
+    parser.add_argument(
+        "--dialect",
+        default=None,
+        help="Target SQL dialect or engine spec (sqlite, postgres, mysql, mariadb, or versioned e.g. postgres:17).",
+    )
+    parser.add_argument(
+        "--engine-version",
+        dest="engine_version",
+        default=None,
+        help="Target engine and version (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45').",
+    )
+    parser.add_argument(
+        "--pg-transition-tables",
+        action="store_true",
+        help="Use PostgreSQL statement-level transition table triggers.",
+    )
+    parser.add_argument(
+        "--object-prefix",
+        default=DEFAULT_OBJECT_PREFIX,
+        help="Prefix for generated database objects (default: __matview_).",
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        dest="indexes",
+        help="Additional user index specification on the materialized view (repeatable).",
+    )
+    parser.add_argument(
+        "--no-populate",
+        action="store_true",
+        help="Omit initial backfill statements from generated SQL.",
+    )
+    parser.add_argument(
+        "--incremental-backfill",
+        action="store_true",
+        help="Generate or execute chunked incremental initial backfill statements.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Batch size for --incremental-backfill (default: 500).",
+    )
+    parser.add_argument(
+        "--ignore-limitations",
+        action="store_true",
+        help="Proceed with warning even if engine transparency limitations exist.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail compilation if a view cannot use Tier 1 ALGEBRAIC_DELTA maintenance.",
+    )
+    parser.add_argument(
+        "--check-drift",
+        action="store_true",
+        help="Check registered views in --db for underlying base table schema drift.",
+    )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Atomically reconcile/repair registered views in --db from base tables.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the generated materialized view directly to --db.",
+    )
+    args = parser.parse_args(argv)
+
+    def _read_sql_arg(val: str) -> str:
+        if "\n" not in val and not re.match(r"^\s*CREATE\b", val, flags=re.IGNORECASE):
+            try:
+                with open(val, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                pass
+        return val
+
+    try:
+        if args.check_drift or args.repair:
+            if not args.db:
+                print("ERROR: --check-drift / --repair requires --db", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if args.check_drift:
+                drift = mgr.check_schema_drift()
+                print(json.dumps(drift, indent=2, sort_keys=True))
+                if any(v != "ok" for v in drift.values()) and not args.repair:
+                    return 1
+            if args.repair:
+                rep = mgr.repair_view()
+                print(json.dumps(rep, indent=2, sort_keys=True))
+            return 0
+
+        if not args.view:
+            print("ERROR: --view is required unless running --check-drift or --repair.", file=sys.stderr)
+            return 2
+
+        view_sql = _read_sql_arg(args.view)
+        schema_sql = _read_sql_arg(args.schema) if args.schema else None
+
+        if args.apply:
+            if not args.db:
+                print("ERROR: --apply requires --db <db_path_or_dsn>", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if schema_sql:
+                mgr.apply_schema_ddl(schema_sql, auto_sync_views=False)
+            plan = mgr.register_view(
+                view_sql,
+                populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+                indexes=args.indexes,
+                strict=args.strict,
+            )
+            print(
+                plan.render_sql_script(
+                    include_populate=not args.no_populate,
+                    incremental_backfill=args.incremental_backfill,
+                    batch_size=args.batch_size,
+                )
+            )
+            return 0
+
+        hint_d: Optional[Dialect] = None
+        if args.dialect:
+            hint_d = parse_engine_version(args.dialect).dialect
+        elif args.engine_version:
+            hint_d = parse_engine_version(args.engine_version).dialect
+
+        detected_ev: Optional[EngineVersion] = None
+        if args.db and not schema_sql:
+            conn, conn_d = MaterializedViewManager._connect_database_url(args.db, hint_d)
+            try:
+                detected_ev = (
+                    parse_engine_version(args.engine_version, default_dialect=conn_d)
+                    if args.engine_version
+                    else detect_engine_version(conn, hint_dialect=args.dialect or conn_d)
+                )
+                schemas = introspect_database_schemas(
+                    conn, dialect=detected_ev.dialect, object_prefix=args.object_prefix
+                )
+            finally:
+                conn.close()
+        elif schema_sql:
+            schemas = parse_table_schema(schema_sql)
+            detected_ev = _resolve_dialect_and_engine_version(
+                schemas, args.dialect, args.engine_version
+            )
+        else:
+            print("ERROR: Either --schema or --db must be provided.", file=sys.stderr)
+            return 2
+
+        plan = generate_materialized_view(
+            schemas,
+            view_sql,
+            dialect=detected_ev.dialect,
+            pg_use_transition_tables=args.pg_transition_tables,
+            ignore_limitations=args.ignore_limitations,
+            object_prefix=args.object_prefix,
+            indexes=args.indexes,
+            incremental_backfill=args.incremental_backfill,
+            batch_size=args.batch_size,
+            strict=args.strict,
+            engine_version=detected_ev,
+        )
+        print(
+            plan.render_sql_script(
+                include_populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+            )
+        )
+        return 0
+    except (EngineLimitationError, StrictCompilationError) as exc:
+        print(f"WARNING: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+,
+                    g_expr,
+                    flags=re.IGNORECASE,
+                )
+                lookup_expr = (
+                    g_expr[:collation_match.start()].strip()
+                    if collation_match else g_expr
+                )
+                c_def = self._lookup_col_def(lookup_expr)
+                if c_def:
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                else:
+                    fake_it = SelectItem(raw_expr=lookup_expr, alias=mv_col, is_aggregate=False)
+                    dt = self._infer_expr_storage_type(fake_it)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                if collation_match:
+                    dt = re.sub(r"\s+COLLATE\s+\S+\s*$", "", dt, flags=re.IGNORECASE).strip()
+                    dt = f"{dt} COLLATE {collation_match.group(1)}"
+                nn = " NOT NULL" if not has_nullable_grp else ""
+                col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
+
+        def _expr_key(item: SelectItem) -> str:
+            eff = self._effective_agg_value_expr(item, record_prefix=None).strip().lower()
+            return f"{'dist:' if item.is_distinct else ''}{eff}"
+
+        col_nonnull_count_map: Dict[str, str] = {}
+        col_sum_map: Dict[str, str] = {}
+        col_sum2_map: Dict[str, str] = {}
+        col_true_cnt_map: Dict[str, str] = {}
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]] = {}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            ekey = _expr_key(item)
+            if item.agg_func == AggFunc.COUNT_COL:
+                col_nonnull_count_map[ekey] = self._q(item.alias)
+            elif item.agg_func == AggFunc.SUM:
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = self._q(item.alias)
+            if item.is_distinct and ekey not in distinct_aux_tables:
+                p = self.object_prefix if self.object_prefix else "__matview_"
+                aux_tbl = self._bounded_ident(f"{p}dist_", f"{self.logical_view_name}__{_sanitize_ident(item.alias)}")
+                c_arg = self._lookup_col_def(item.arg_expr)
+                val_dt = (
+                    self._normalize_dialect_type(c_arg.data_type)
+                    if c_arg
+                    else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
+                )
+                if self.dialect == Dialect.MYSQL and val_dt.upper() == "TEXT":
+                    val_dt = "VARCHAR(255)"
+                distinct_aux_tables[ekey] = (aux_tbl, item, val_dt)
+
+        group_mv_cols: List[str] = []
+        for g in grp_exprs:
+            mc = self._group_col_alias(g)
+            if mc not in group_mv_cols:
+                group_mv_cols.append(mc)
+        indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
+
+        for item in work_items:
+            if not item.is_aggregate:
+                c_def = self._lookup_col_def(item.raw_expr)
+                dt = (
+                    self._normalize_dialect_type(c_def.data_type)
+                    if c_def
+                    else self._infer_expr_storage_type(item)
+                )
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
+                col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
+            else:
+                storage_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    storage_type = "VARCHAR(255)"
+                if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
+                elif item.agg_func == AggFunc.TOTAL:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0.0")
+                else:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type}")
+
+        if count_star_alias is None:
+            col_defs_sql.append(f"{row_count_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        aux_idx = 0
+        for item in work_items:
+            if not item.is_aggregate or item.agg_func is None:
+                continue
+            ekey = _expr_key(item)
+            safe_id = _sanitize_ident(item.alias)
+            if item.agg_func in (
+                AggFunc.SUM,
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            ) or (item.agg_func == AggFunc.COUNT_STAR and item.filter_where):
+                if item.agg_func == AggFunc.COUNT_STAR and item.filter_where:
+                    col_nonnull_count_map[ekey] = self._q(item.alias)
+                elif ekey not in col_nonnull_count_map:
+                    aux_idx += 1
+                    cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
+                    col_nonnull_count_map[ekey] = cnt_col
+                    col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+            if item.agg_func in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum_map:
+                    aux_idx += 1
+                    sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
+                    col_sum_map[ekey] = sum_col
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
+
+            if item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum2_map:
+                    aux_idx += 1
+                    s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
+                    sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
+                    col_sum2_map[ekey] = sum2_col
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
+
+            if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if ekey not in col_true_cnt_map:
+                    aux_idx += 1
+                    tcnt_col = f"__mv_tcnt_{safe_id}_{aux_idx}"
+                    col_true_cnt_map[ekey] = tcnt_col
+                    col_defs_sql.append(f"{tcnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        pk_cols = self._tier1_pk_cols()
+        if grp_exprs and not has_nullable_grp:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        aux_ddls: List[str] = []
+        aux_names: List[str] = []
+        for ekey, (aux_tbl, rep_item, val_dt) in distinct_aux_tables.items():
+            aux_names.append(aux_tbl)
+            aux_col_defs: List[str] = []
+            if not grp_exprs:
+                aux_col_defs.append("__mv_global_id INTEGER NOT NULL")
+                aux_pk = ["__mv_global_id", "__val"]
+            elif has_nullable_grp:
+                aux_col_defs.append(f"__mv_pk {pk_type} NOT NULL")
+                aux_pk = ["__mv_pk", "__val"]
+            else:
+                aux_pk = []
+                for g_expr in grp_exprs:
+                    mc = self._group_col_alias(g_expr)
+                    c_def = self._lookup_col_def(g_expr)
+                    dt = (
+                        self._normalize_dialect_type(c_def.data_type)
+                        if c_def
+                        else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
+                    )
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                        dt = "VARCHAR(255)"
+                    aux_col_defs.append(f"{mc} {dt} NOT NULL")
+                    aux_pk.append(mc)
+                aux_pk.append("__val")
+            aux_col_defs.append(f"__val {val_dt} NOT NULL")
+            aux_col_defs.append(f"__ref_cnt {self._int_type()} NOT NULL DEFAULT 0")
+            aux_col_defs.append(f"PRIMARY KEY ({', '.join(aux_pk)})")
+            aux_ddls.append(
+                f"CREATE TABLE {aux_tbl} (\n    " + ",\n    ".join(aux_col_defs) + "\n);"
+            )
+
+        backing_col_map = {
+            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            for u_col, expr_s in self._compound_reader_exprs.items()
+            if expr_s != u_col and "__mv_elem_" in expr_s
+        }
+        can_pg15_unique_nnd = (
+            bool(grp_exprs)
+            and has_nullable_grp
+            and self._alg_mode in ("single", "distinct")
+            and len(set(c.lower() for c in group_mv_cols)) == len(grp_exprs)
+            and all(
+                (cd := self._lookup_col_def(g)) is not None
+                and any(tk in cd.data_type.upper() for tk in ("INT", "CHAR", "TEXT"))
+                for g in grp_exprs
+            )
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=group_mv_cols,
+            has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
+            backing_col_map=backing_col_map,
+            unique_group_nulls_not_distinct=can_pg15_unique_nnd,
+        )
+
+        reader_select_override = [
+            self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
+        ]
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                select_exprs_override=reader_select_override,
+                extra_where_filter=self._rewritten_having_clause,
+            )
+        )
+
+        initial_populate_sqls, inc_spec = self._build_initial_populate_and_inc_spec_tier1(
+            mv_table=mv_table,
+            count_star_alias=count_star_alias,
+            row_count_col=row_count_col,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            distinct_aux_tables=distinct_aux_tables,
+            expr_key_fn=_expr_key,
+        )
+
+        trigger_ddls, trig_names, fn_names = self._build_tier1_triggers(
+            view_name=view_name,
+            mv_table=mv_table,
+            base_t=self.view.base_table,
+            row_count_col=row_count_col,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            distinct_aux_tables=distinct_aux_tables,
+            expr_key_fn=_expr_key,
+            initial_populate_sqls=initial_populate_sqls,
+        )
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=aux_ddls,
+            index_ddls=index_ddls,
+            initial_populate_sqls=initial_populate_sqls,
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            auxiliary_table_names=aux_names,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    def _build_initial_populate_and_inc_spec_tier1(
+        self,
+        mv_table: str,
+        count_star_alias: Optional[str],
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+    ) -> Tuple[List[str], IncrementalBackfillSpec]:
+        stmts: List[str] = []
+        has_nullable_grp = self._has_nullable_group_col()
+        q_base_t = self._q(self.view.base_table)
+        pk_cols = self._tier1_pk_cols()
+        work_items = self._working_select_items
+        grp_exprs = self._effective_group_by_exprs
+
+        for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
+            eff = self._effective_agg_value_expr(rep_item, record_prefix=None)
+            dist_cols: List[str] = []
+            dist_sel: List[str] = []
+            dist_grp: List[str] = []
+            if not grp_exprs:
+                dist_cols.append("__mv_global_id")
+                dist_sel.append("1")
+            elif has_nullable_grp:
+                dist_cols.append("__mv_pk")
+                dist_sel.append(self._canonical_group_pk_expr(grp_exprs))
+                dist_grp.extend(self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=True))
+            else:
+                for g_expr in grp_exprs:
+                    dist_cols.append(self._group_col_alias(g_expr))
+                    dist_sel.append(g_expr)
+                    dist_grp.append(g_expr)
+            dist_cols.extend(["__val", "__ref_cnt"])
+            dist_sel.extend([eff, "COUNT(*)"])
+            dist_grp.append(eff)
+
+            w_parts: List[str] = []
+            if self.view.where_clause:
+                w_parts.append(f"({self.view.where_clause})")
+            w_parts.append(f"({eff}) IS NOT NULL")
+            where_sql = f"\nWHERE {' AND '.join(w_parts)}"
+            group_sql = f"\nGROUP BY {', '.join(dist_grp)}"
+            stmts.append(
+                f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                f"SELECT {', '.join(dist_sel)}\n"
+                f"FROM {q_base_t}{where_sql}{group_sql};"
+            )
+
+        target_cols: List[str] = []
+        select_exprs: List[str] = []
+
+        if not grp_exprs:
+            target_cols.append("__mv_global_id")
+            select_exprs.append("1")
+        elif has_nullable_grp:
+            target_cols.append("__mv_pk")
+            select_exprs.append(self._canonical_group_pk_expr(grp_exprs))
+
+        non_agg_aliases_lower = {
+            item.alias.lower() for item in work_items if not item.is_aggregate
+        }
+        seen_hidden: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                target_cols.append(mv_col)
+                select_exprs.append(g_expr)
+
+        for item in work_items:
+            target_cols.append(item.alias)
+            if not item.is_aggregate:
+                select_exprs.append(self._rewrite_expr_for_record(item.raw_expr, None))
+            else:
+                select_exprs.append(self._sql_backfill_agg_expr(item))
+
+        if count_star_alias is None:
+            target_cols.append(row_count_col)
+            select_exprs.append("COUNT(*)")
+
+        already_in_target = set(target_cols)
+        ekey_to_item: Dict[str, SelectItem] = {
+            expr_key_fn(it): it for it in work_items if it.is_aggregate
+        }
+
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            if cnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                dist = "DISTINCT " if it.is_distinct else ""
+                target_cols.append(cnt_col)
+                select_exprs.append(f"COUNT({dist}{eff})")
+                already_in_target.add(cnt_col)
+
+        for ekey, sum_col in col_sum_map.items():
+            if sum_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                dist = "DISTINCT " if it.is_distinct else ""
+                target_cols.append(sum_col)
+                select_exprs.append(f"SUM({dist}{eff})")
+                already_in_target.add(sum_col)
+
+        for ekey, sum2_col in col_sum2_map.items():
+            if sum2_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(sum2_col)
+                if self.dialect == Dialect.SQLITE:
+                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
+                else:
+                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
+                already_in_target.add(sum2_col)
+
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            if tcnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(tcnt_col)
+                select_exprs.append(
+                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
+                )
+                already_in_target.add(tcnt_col)
+
+        norm_where = self._rewrite_expr_for_record(self.view.where_clause, None) if self.view.where_clause else None
+        where_sql = f"\nWHERE {norm_where}" if norm_where else ""
+        if grp_exprs:
+            norm_grps = [self._rewrite_expr_for_record(g, None) for g in grp_exprs]
+            grp_for_q = self._group_by_exprs_for_query(norm_grps, include_canonical_pk=has_nullable_grp)
+            group_sql = f"\nGROUP BY {', '.join(grp_for_q)}"
+            having_sql = ""
+        else:
+            group_sql = ""
+            having_sql = ""
+
+        q_target_cols = [self._q(c) for c in target_cols]
+        q_base_t = self._q(self.view.base_table)
+        main_backfill_sql = (
+            f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+            f"SELECT {', '.join(select_exprs)}\n"
+            f"FROM {q_base_t}{where_sql}{group_sql}{having_sql};"
+        )
+        stmts.append(main_backfill_sql)
+
+        holistic_funcs = {
+            AggFunc.GROUP_CONCAT,
+            AggFunc.STRING_AGG,
+            AggFunc.JSON_GROUP_ARRAY,
+            AggFunc.JSON_GROUP_OBJECT,
+            AggFunc.ARRAY_AGG,
+        }
+        has_holistic_or_distinct = bool(distinct_aux_tables) or any(
+            it.is_aggregate and it.agg_func in holistic_funcs for it in work_items
+        )
+
+        has_int_pk = bool(
+            self.primary_schema
+            and any(c.primary_key and "INT" in c.data_type.upper() for c in self.primary_schema.columns.values())
+        )
+        if not has_holistic_or_distinct and (self.dialect == Dialect.SQLITE or has_int_pk):
+            pk_col = "rowid"
+            if self.primary_schema:
+                for c_def in self.primary_schema.columns.values():
+                    if c_def.primary_key and "INT" in c_def.data_type.upper():
+                        pk_col = c_def.name
+                        break
+            ph = "?" if self.dialect == Dialect.SQLITE else "%s"
+            chunk_where = (
+                f"({self.view.where_clause}) AND ({pk_col} > {ph} AND {pk_col} <= {ph})"
+                if self.view.where_clause
+                else f"({pk_col} > {ph} AND {pk_col} <= {ph})"
+            )
+            merge_assignments = self._build_tier1_chunk_merge_assignments(
+                mv_table=mv_table,
+                row_count_col=row_count_col,
+                col_nonnull_count_map=col_nonnull_count_map,
+                col_sum_map=col_sum_map,
+                col_sum2_map=col_sum2_map,
+                col_true_cnt_map=col_true_cnt_map,
+                expr_key_fn=expr_key_fn,
+                use_mysql_values=(self.dialect == Dialect.MYSQL),
+            )
+            q_pk_cols = [self._q(c) for c in pk_cols]
+            if self.dialect == Dialect.MYSQL:
+                chunk_upsert_sql = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                    f"SELECT {', '.join(select_exprs)}\n"
+                    f"FROM {q_base_t}\n"
+                    f"WHERE {chunk_where}{group_sql}{having_sql}\n"
+                    f"ON DUPLICATE KEY UPDATE\n"
+                    f"    {', '.join(merge_assignments)};"
+                )
+            else:
+                chunk_upsert_sql = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                    f"SELECT {', '.join(select_exprs)}\n"
+                    f"FROM {q_base_t}\n"
+                    f"WHERE {chunk_where}{group_sql}{having_sql}\n"
+                    f"ON CONFLICT ({', '.join(q_pk_cols)}) DO UPDATE SET\n"
+                    f"    {', '.join(merge_assignments)};"
+                )
+            inc_spec = IncrementalBackfillSpec(
+                mode="pk_range_fold",
+                pk_column=pk_col,
+                chunk_sql_templates=[chunk_upsert_sql],
+            )
+        elif grp_exprs:
+            grp_expr = self._canonical_group_pk_expr(grp_exprs)
+            w_grp = f" WHERE {self.view.where_clause}" if self.view.where_clause else ""
+            dist_grp_query = (
+                f"SELECT DISTINCT {grp_expr} AS __gkey FROM {q_base_t}{w_grp} ORDER BY __gkey"
+            )
+            chunk_templates: List[str] = []
+            for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
+                eff = self._effective_agg_value_expr(rep_item, record_prefix=None)
+                dist_cols = [
+                    pk_cols[0] if len(pk_cols) == 1 else ", ".join(pk_cols),
+                    "__val",
+                    "__ref_cnt",
+                ]
+                dist_sel = []
+                dist_grp_list = []
+                if has_nullable_grp:
+                    dist_sel.append(grp_expr)
+                    dist_grp_list.extend(self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=True))
+                else:
+                    for g_expr in grp_exprs:
+                        dist_sel.append(g_expr)
+                        dist_grp_list.append(g_expr)
+                dist_sel.extend([eff, "COUNT(*)"])
+                dist_grp_list.append(eff)
+                w_p = [f"({eff}) IS NOT NULL", f"({grp_expr}) IN ({{placeholders}})"]
+                if self.view.where_clause:
+                    w_p.insert(0, f"({self.view.where_clause})")
+                aux_conflict = (
+                    "\nON DUPLICATE KEY UPDATE __ref_cnt = VALUES(__ref_cnt)"
+                    if self.dialect == Dialect.MYSQL
+                    else f"\nON CONFLICT ({', '.join(pk_cols)}, __val) DO UPDATE SET __ref_cnt = excluded.__ref_cnt"
+                )
+                chunk_templates.append(
+                    f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                    f"SELECT {', '.join(dist_sel)}\n"
+                    f"FROM {q_base_t}\n"
+                    f"WHERE {' AND '.join(w_p)}\n"
+                    f"GROUP BY {', '.join(dist_grp_list)}{aux_conflict};"
+                )
+            w_main = [f"({grp_expr}) IN ({{placeholders}})"]
+            if self.view.where_clause:
+                w_main.insert(0, f"({self.view.where_clause})")
+            non_pk_target = [c for c in target_cols if c not in pk_cols] or list(pk_cols)
+            main_conflict = (
+                f"\nON DUPLICATE KEY UPDATE {', '.join(f'{c} = VALUES({c})' for c in non_pk_target)}"
+                if self.dialect == Dialect.MYSQL
+                else f"\nON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {', '.join(f'{c} = excluded.{c}' for c in non_pk_target)}"
+            )
+            chunk_templates.append(
+                f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                f"SELECT {', '.join(select_exprs)}\n"
+                f"FROM {q_base_t}\n"
+                f"WHERE {' AND '.join(w_main)}{group_sql}{having_sql}{main_conflict};"
+            )
+            inc_spec = IncrementalBackfillSpec(
+                mode="group_key_batch",
+                distinct_group_query=dist_grp_query,
+                chunk_sql_templates=chunk_templates,
+            )
+        else:
+            inc_spec = IncrementalBackfillSpec(
+                mode="offset_batch",
+                chunk_sql_templates=stmts,
+            )
+
+        return stmts, inc_spec
+
+    def _build_tier1_chunk_merge_assignments(
+        self,
+        mv_table: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        expr_key_fn: Callable[[SelectItem], str],
+        use_mysql_values: bool = False,
+    ) -> List[str]:
+        assignments: List[str] = []
+        updated: Set[str] = set()
+        work_items = self._working_select_items
+
+        def _incoming(col: str) -> str:
+            return f"VALUES({col})" if use_mysql_values else f"excluded.{col}"
+
+        def _merged_sum(col: str) -> str:
+            inc = _incoming(col)
+            return (
+                f"(CASE WHEN {inc} IS NULL THEN {mv_table}.{col} "
+                f"WHEN {mv_table}.{col} IS NULL THEN {inc} "
+                f"ELSE {mv_table}.{col} + {inc} END)"
+            )
+
+        def _merged_sum2(ekey: str, sum2_col: str) -> str:
+            if self.dialect != Dialect.SQLITE:
+                return _merged_sum(sum2_col)
+            cnt_c = col_nonnull_count_map[ekey]
+            sum_c = col_sum_map[ekey]
+            inc_cnt = _incoming(cnt_c)
+            inc_sum = _incoming(sum_c)
+            inc_m2 = _incoming(sum2_col)
+            d_mu = f"(((1.0 * {inc_sum}) / {inc_cnt}) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_c}))"
+            return (
+                f"(CASE WHEN {inc_cnt} <= 0 OR {inc_m2} IS NULL THEN {mv_table}.{sum2_col} "
+                f"WHEN {mv_table}.{cnt_c} <= 0 OR {mv_table}.{sum2_col} IS NULL THEN {inc_m2} "
+                f"ELSE {mv_table}.{sum2_col} + {inc_m2} + ({d_mu} * {d_mu} * ((1.0 * {mv_table}.{cnt_c} * {inc_cnt}) / ({mv_table}.{cnt_c} + {inc_cnt}))) END)"
+            )
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            c = self._q(item.alias)
+            updated.add(c)
+            ekey = expr_key_fn(item)
+            inc_c = _incoming(c)
+            if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
+                assignments.append(f"{c} = {mv_table}.{c} + {inc_c}")
+            elif item.agg_func == AggFunc.SUM:
+                assignments.append(f"{c} = {_merged_sum(c)}")
+            elif item.agg_func == AggFunc.AVG:
+                if self._requires_native_avg_recompute(item):
+                    # The native AVG result family is not reproduced by a
+                    # SUM/COUNT fold for integer inputs (PostgreSQL integer
+                    # division truncates) or for engine-specific DECIMAL scale.
+                    recomputed = self._build_recompute_subquery_raw(item, mv_table)
+                    assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
+                    new_sum = _merged_sum(sum_c)
+                    dividend = f"(1.0 * {new_sum})"
+                    assignments.append(
+                        f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE {dividend} / {new_cnt} END"
+                    )
+            elif item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                native_stat_input = self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+                if native_stat_input:
+                    recomputed = self._build_recompute_subquery_raw(item, mv_table)
+                    assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    sum2_c = col_sum2_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
+                    new_sum = _merged_sum(sum_c)
+                    new_sum2 = _merged_sum2(ekey, sum2_c)
+                    formula = self._variance_formula_sql(
+                        new_cnt=new_cnt,
+                        new_sum=new_sum,
+                        new_sum2=new_sum2,
+                        is_sample=item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
+                        is_stddev=item.agg_func in (AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP),
+                    )
+                    assignments.append(f"{c} = {formula}")
+            elif item.agg_func == AggFunc.MIN:
+                assignments.append(
+                    f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {mv_table}.{c} IS NULL OR {inc_c} < {mv_table}.{c} "
+                    f"THEN {inc_c} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.MAX:
+                assignments.append(
+                    f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {mv_table}.{c} IS NULL OR {inc_c} > {mv_table}.{c} "
+                    f"THEN {inc_c} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.BIT_AND:
+                assignments.append(
+                    f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {mv_table}.{c} IS NULL THEN {inc_c} "
+                    f"ELSE ({mv_table}.{c} & {inc_c}) END"
+                )
+            elif item.agg_func == AggFunc.BIT_OR:
+                assignments.append(
+                    f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {mv_table}.{c} IS NULL THEN {inc_c} "
+                    f"ELSE ({mv_table}.{c} | {inc_c}) END"
+                )
+            elif item.agg_func == AggFunc.BIT_XOR:
+                xor_e = self._bitwise_xor_sql(f"{mv_table}.{c}", f"({inc_c})")
+                assignments.append(
+                    f"{c} = CASE WHEN {inc_c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {mv_table}.{c} IS NULL THEN {inc_c} "
+                    f"ELSE {xor_e} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_AND:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
+                new_tcnt = f"({mv_table}.{tcnt_c} + {_incoming(tcnt_c)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                    f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_OR:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
+                new_tcnt = f"({mv_table}.{tcnt_c} + {_incoming(tcnt_c)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                    f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
+                )
+
+        if row_count_col not in updated:
+            assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} + {_incoming(row_count_col)}")
+            updated.add(row_count_col)
+
+        for cnt_c in col_nonnull_count_map.values():
+            if cnt_c not in updated:
+                assignments.append(f"{cnt_c} = {mv_table}.{cnt_c} + {_incoming(cnt_c)}")
+                updated.add(cnt_c)
+        for sum_c in col_sum_map.values():
+            if sum_c not in updated:
+                assignments.append(f"{sum_c} = {_merged_sum(sum_c)}")
+                updated.add(sum_c)
+        for ekey, sum2_c in col_sum2_map.items():
+            if sum2_c not in updated:
+                assignments.append(f"{sum2_c} = {_merged_sum2(ekey, sum2_c)}")
+                updated.add(sum2_c)
+        for tcnt_c in col_true_cnt_map.values():
+            if tcnt_c not in updated:
+                assignments.append(f"{tcnt_c} = {mv_table}.{tcnt_c} + {_incoming(tcnt_c)}")
+                updated.add(tcnt_c)
+
+        derived_aliases = {
+            self._q(it.alias)
+            for it in work_items
+            if it.is_aggregate
+            and it.agg_func
+            in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            )
+        }
+        return [
+            a for a in assignments if a.split("=")[0].strip() in derived_aliases
+        ] + [
+            a for a in assignments if a.split("=")[0].strip() not in derived_aliases
+        ]
+
+    def _build_recompute_subquery_raw(self, item: SelectItem, record_prefix: str) -> str:
+        def _group_record_expr(group_expr: str) -> str:
+            # Chunk-fold recomputation reads the current aggregate row from the
+            # backing table. A projected group expression may have a different
+            # stored alias (for example COALESCE(sub_cat, 'UNK') AS sc_norm),
+            # so correlate against that stored column rather than the original
+            # base-table column, which does not exist in the backing table.
+            if record_prefix == self._backing_table_name():
+                return f"{record_prefix}.{self._q(self._group_col_alias(group_expr))}"
+            return self._rewrite_expr_for_record(group_expr, record_prefix)
+
+        if getattr(self, "_alg_mode", None) == "union_all_agg":
+            inner_u = getattr(self, "_union_all_inner_sql", "")
+            u_alias = getattr(self, "_union_all_sub_alias", "__mv_u")
+            orig_item = getattr(self, "_uall_orig_item_map", {}).get(id(item), item)
+            orig_grps = getattr(self, "_uall_orig_grp_exprs", self._effective_group_by_exprs)
+            u_conds: List[str] = []
+            if self.view.where_clause:
+                u_conds.append(f"({self.view.where_clause})")
+            for orig_g, branch_g in zip(orig_grps, self._effective_group_by_exprs):
+                rhs_g = _group_record_expr(branch_g)
+                u_conds.append(self._null_safe_eq(f"({orig_g})", f"({rhs_g})", is_nullable=True))
+            w_u = f" WHERE {' AND '.join(u_conds)}" if u_conds else ""
+            u_agg_sql = self._sql_backfill_agg_expr(orig_item)
+            return f"(SELECT {u_agg_sql} FROM ({inner_u}) AS {u_alias}{w_u})"
+        base_t = self.view.base_table
+        q_base_t = self._q(base_t)
+        conds: List[str] = []
+        if self.view.where_clause:
+            conds.append(f"({self.view.where_clause})")
+        for g_expr in self._effective_group_by_exprs:
+            lhs_g = self._rewrite_expr_for_record(g_expr, q_base_t)
+            rhs_g = _group_record_expr(g_expr)
+            is_nn = self._is_simple_col_ref(g_expr) and self._col_def(g_expr).not_null
+            conds.append(
+                self._null_safe_eq(
+                    f"({lhs_g})",
+                    f"({rhs_g})",
+                    is_nullable=not is_nn,
+                )
+            )
+        where_part = f" WHERE {' AND '.join(conds)}" if conds else ""
+        agg_sql = self._sql_backfill_agg_expr(item)
+        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part})"
+
+    def _variance_formula_sql(
+        self,
+        new_cnt: str,
+        new_sum: str,
+        new_sum2: str,
+        is_sample: bool,
+        is_stddev: bool,
+    ) -> str:
+        denom = f"({new_cnt} - 1)" if is_sample else new_cnt
+        min_n = 2 if is_sample else 1
+        if self.dialect == Dialect.SQLITE:
+            raw_var = f"((1.0 * ({new_sum2})) / {denom})"
+        elif self.dialect == Dialect.POSTGRES:
+            raw_var = (
+                f"(((1.0 * ({new_sum2})::NUMERIC) - ((1.0 * ({new_sum})::NUMERIC) * (1.0 * ({new_sum})::NUMERIC)) / {new_cnt}) / {denom})::DOUBLE PRECISION"
+            )
+        else:
+            raw_var = f"((1.0 * {new_sum2}) - ((1.0 * {new_sum}) * (1.0 * {new_sum})) / {new_cnt}) / {denom}"
+        clamped_var = f"(CASE WHEN ({raw_var}) < 0.0 THEN 0.0 ELSE ({raw_var}) END)"
+        val_expr = f"SQRT({clamped_var})" if is_stddev else clamped_var
+        return f"(CASE WHEN {new_cnt} < {min_n} THEN NULL ELSE {val_expr} END)"
+
+    def _group_match_predicate_tier1(self, target_table: str, record_prefix: str) -> str:
+        grp_exprs = self._effective_group_by_exprs
+        if not grp_exprs:
+            return f"{target_table}.__mv_global_id = 1"
+        if self._has_nullable_group_col():
+            rec_exprs = [self._rewrite_expr_for_record(g, record_prefix) for g in grp_exprs]
+            return f"{target_table}.__mv_pk = ({self._canonical_group_pk_expr(rec_exprs)})"
+        preds: List[str] = []
+        for g_expr in grp_exprs:
+            mv_col = self._q(self._group_col_alias(g_expr))
+            rec_e = self._rewrite_expr_for_record(g_expr, record_prefix)
+            preds.append(f"{target_table}.{mv_col} = {rec_e}")
+        return " AND ".join(preds)
+
+    def _distinct_match_predicate(self, aux_tbl: str, val_expr: str, record_prefix: str) -> str:
+        grp_pred = self._group_match_predicate_tier1(aux_tbl, record_prefix)
+        return f"{grp_pred} AND {aux_tbl}.__val = ({val_expr})"
+
+    def _build_plus_delta_statements(
+        self,
+        mv_table: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+        record_prefix: str = "NEW",
+    ) -> List[str]:
+        stmts: List[str] = []
+        has_nullable_grp = self._has_nullable_group_col()
+        pk_cols = self._tier1_pk_cols()
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+        work_items = self._working_select_items
+        grp_exprs = self._effective_group_by_exprs
+
+        for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
+            val_expr = self._effective_agg_value_expr(rep_item, record_prefix=record_prefix)
+            ins_cols: List[str] = []
+            ins_vals: List[str] = []
+            if not grp_exprs:
+                ins_cols.append("__mv_global_id")
+                ins_vals.append("1")
+            elif has_nullable_grp:
+                ins_cols.append("__mv_pk")
+                rec_exprs = [self._rewrite_expr_for_record(g, record_prefix) for g in grp_exprs]
+                ins_vals.append(self._canonical_group_pk_expr(rec_exprs))
+            else:
+                for g_expr in grp_exprs:
+                    ins_cols.append(self._group_col_alias(g_expr))
+                    ins_vals.append(self._rewrite_expr_for_record(g_expr, record_prefix))
+            ins_cols.extend(["__val", "__ref_cnt"])
+            ins_vals.extend([val_expr, "1"])
+            if self.dialect == Dialect.MYSQL:
+                stmts.append(
+                    f"INSERT INTO {aux_tbl} ({', '.join(ins_cols)})\n"
+                    f"    SELECT {', '.join(ins_vals)}{from_dual}\n"
+                    f"    WHERE ({val_expr}) IS NOT NULL\n"
+                    f"    ON DUPLICATE KEY UPDATE __ref_cnt = __ref_cnt + 1;"
+                )
+            else:
+                stmts.append(
+                    f"INSERT INTO {aux_tbl} ({', '.join(ins_cols)})\n"
+                    f"    SELECT {', '.join(ins_vals)}\n"
+                    f"    WHERE ({val_expr}) IS NOT NULL\n"
+                    f"    ON CONFLICT ({', '.join(pk_cols)}, __val) DO UPDATE SET\n"
+                    f"        __ref_cnt = {aux_tbl}.__ref_cnt + 1;"
+                )
+
+        def _is_newly_distinct_cond(item: SelectItem) -> str:
+            ekey = expr_key_fn(item)
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if not item.is_distinct:
+                return f"({val_e}) IS NOT NULL"
+            aux_tbl = distinct_aux_tables[ekey][0]
+            match_p = self._distinct_match_predicate(aux_tbl, val_e, record_prefix)
+            return f"({val_e}) IS NOT NULL AND (SELECT {aux_tbl}.__ref_cnt FROM {aux_tbl} WHERE {match_p}) = 1"
+
+        def _plus_inc_expr(item: SelectItem) -> str:
+            return f"(CASE WHEN {_is_newly_distinct_cond(item)} THEN 1 ELSE 0 END)"
+
+        def _plus_sum_expr(item: SelectItem, col_alias: str) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if item.is_distinct:
+                cond = _is_newly_distinct_cond(item)
+                return (
+                    f"(CASE WHEN NOT ({cond}) THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
+                    f"ELSE {mv_table}.{col_alias} + ({val_e}) END)"
+                )
+            return (
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
+                f"ELSE {mv_table}.{col_alias} + ({val_e}) END)"
+            )
+
+        def _plus_sum2_expr(item: SelectItem, col_alias: str) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if self.dialect == Dialect.SQLITE:
+                ekey = expr_key_fn(item)
+                cnt_c = col_nonnull_count_map[ekey]
+                sum_c = col_sum_map[ekey]
+                delta = f"((1.0 * ({val_e})) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_c}))"
+                return (
+                    f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{cnt_c} <= 0 OR {mv_table}.{sum_c} IS NULL THEN 0.0 "
+                    f"ELSE COALESCE({mv_table}.{col_alias}, 0.0) + ({delta} * {delta} * ((1.0 * {mv_table}.{cnt_c}) / ({mv_table}.{cnt_c} + 1))) END)"
+                )
+            sq = self._var_sq_sql(val_e)
+            return (
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                f"WHEN {mv_table}.{col_alias} IS NULL THEN {sq} "
+                f"ELSE {mv_table}.{col_alias} + {sq} END)"
+            )
+
+        def _plus_tcnt_expr(item: SelectItem) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if self.dialect == Dialect.POSTGRES:
+                return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) THEN 1 ELSE 0 END)"
+            return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) != 0 THEN 1 ELSE 0 END)"
+
+        insert_cols: List[str] = []
+        insert_vals: List[str] = []
+        update_assignments: List[str] = []
+        updated_cols: Set[str] = set()
+
+        if not grp_exprs:
+            insert_cols.append("__mv_global_id")
+            insert_vals.append("1")
+        elif has_nullable_grp:
+            insert_cols.append("__mv_pk")
+            rec_exprs = [self._rewrite_expr_for_record(g, record_prefix) for g in grp_exprs]
+            insert_vals.append(self._canonical_group_pk_expr(rec_exprs))
+
+        non_agg_aliases_lower = {
+            item.alias.lower() for item in work_items if not item.is_aggregate
+        }
+        seen_hidden: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                insert_cols.append(mv_col)
+                insert_vals.append(self._rewrite_expr_for_record(g_expr, record_prefix))
+
+        for item in work_items:
+            col_alias = self._q(item.alias)
+            insert_cols.append(col_alias)
+            if not item.is_aggregate:
+                insert_vals.append(self._rewrite_expr_for_record(item.raw_expr, record_prefix))
+                continue
+
+            updated_cols.add(col_alias)
+            ekey = expr_key_fn(item)
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+
+            if item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
+                insert_vals.append("1")
+            elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NOT NULL THEN 1 ELSE 0 END)")
+            elif item.agg_func == AggFunc.SUM:
+                insert_vals.append(f"({val_e})")
+            elif item.agg_func == AggFunc.TOTAL:
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)")
+            elif item.agg_func == AggFunc.AVG:
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 1.0 * ({val_e}) END)")
+            elif item.agg_func in (AggFunc.VAR_POP, AggFunc.STDDEV_POP):
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 0.0 END)")
+            elif item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP):
+                insert_vals.append("NULL")
+            elif item.agg_func in (AggFunc.MIN, AggFunc.MAX, AggFunc.BIT_AND, AggFunc.BIT_OR, AggFunc.BIT_XOR):
+                insert_vals.append(f"({val_e})")
+            elif item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if self.dialect == Dialect.POSTGRES:
+                    insert_vals.append(
+                        f"(CASE WHEN ({val_e}) IS NULL THEN NULL WHEN ({val_e}) THEN TRUE ELSE FALSE END)"
+                    )
+                else:
+                    insert_vals.append(
+                        f"(CASE WHEN ({val_e}) IS NULL THEN NULL WHEN ({val_e}) != 0 THEN 1 ELSE 0 END)"
+                    )
+            else:
+                insert_vals.append(f"({val_e})")
+
+            if item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
+                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} + 1")
+            elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                update_assignments.append(
+                    f"{col_alias} = {mv_table}.{col_alias} + {_plus_inc_expr(item)}"
+                )
+            elif item.agg_func == AggFunc.SUM:
+                new_sum = _plus_sum_expr(item, col_alias)
+                update_assignments.append(f"{col_alias} = {new_sum}")
+            elif item.agg_func == AggFunc.TOTAL:
+                if item.is_distinct:
+                    cond = _is_newly_distinct_cond(item)
+                    inc_val = f"(CASE WHEN ({cond}) THEN 1.0 * ({val_e}) ELSE 0.0 END)"
+                else:
+                    inc_val = f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)"
+                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} + {inc_val}")
+            elif item.agg_func == AggFunc.AVG:
+                if self._requires_native_avg_recompute(item):
+                    recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                    update_assignments.append(f"{col_alias} = {recomputed}")
+                else:
+                    cnt_col = col_nonnull_count_map[ekey]
+                    sum_col = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
+                    new_sum = _plus_sum_expr(item, sum_col)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    update_assignments.append(
+                        f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                        f"ELSE {dividend} / {new_cnt} END"
+                    )
+            elif item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                # Backfill uses the engine's native statistical aggregate.
+                # A Welford/raw-moment delta update uses a different floating
+                # operation order and is not bit-identical for approximate
+                # inputs. Re-evaluate the affected group with the same native
+                # aggregate so the materialized result matches the live view.
+                recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomputed}")
+            elif item.agg_func == AggFunc.MIN:
+                update_assignments.append(
+                    f"{col_alias} = CASE "
+                    f"WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL OR ({val_e}) < {mv_table}.{col_alias} "
+                    f"THEN ({val_e}) ELSE {mv_table}.{col_alias} END"
+                )
+            elif item.agg_func == AggFunc.MAX:
+                update_assignments.append(
+                    f"{col_alias} = CASE "
+                    f"WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL OR ({val_e}) > {mv_table}.{col_alias} "
+                    f"THEN ({val_e}) ELSE {mv_table}.{col_alias} END"
+                )
+            elif item.agg_func == AggFunc.BIT_AND:
+                update_assignments.append(
+                    f"{col_alias} = CASE "
+                    f"WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
+                    f"ELSE ({mv_table}.{col_alias} & ({val_e})) END"
+                )
+            elif item.agg_func == AggFunc.BIT_OR:
+                update_assignments.append(
+                    f"{col_alias} = CASE "
+                    f"WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
+                    f"ELSE ({mv_table}.{col_alias} | ({val_e})) END"
+                )
+            elif item.agg_func == AggFunc.BIT_XOR:
+                xor_expr = self._bitwise_xor_sql(f"{mv_table}.{col_alias}", f"({val_e})")
+                update_assignments.append(
+                    f"{col_alias} = CASE "
+                    f"WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
+                    f"ELSE {xor_expr} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_AND:
+                cnt_col = col_nonnull_count_map[ekey]
+                tcnt_col = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
+                new_tcnt = f"({mv_table}.{tcnt_col} + {_plus_tcnt_expr(item)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                    f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_OR:
+                cnt_col = col_nonnull_count_map[ekey]
+                tcnt_col = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
+                new_tcnt = f"({mv_table}.{tcnt_col} + {_plus_tcnt_expr(item)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                    f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
+                )
+            else:
+                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomp}")
+
+        if row_count_col not in updated_cols:
+            insert_cols.append(row_count_col)
+            insert_vals.append("1")
+            update_assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} + 1")
+            updated_cols.add(row_count_col)
+
+        ekey_to_item: Dict[str, SelectItem] = {
+            expr_key_fn(it): it for it in work_items if it.is_aggregate
+        }
+        already_in_ins = set(insert_cols)
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            it = ekey_to_item[ekey]
+            val_e = self._effective_agg_value_expr(it, record_prefix=record_prefix)
+            if cnt_col not in already_in_ins:
+                insert_cols.append(cnt_col)
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NOT NULL THEN 1 ELSE 0 END)")
+                already_in_ins.add(cnt_col)
+            if cnt_col not in updated_cols:
+                update_assignments.append(
+                    f"{cnt_col} = {mv_table}.{cnt_col} + {_plus_inc_expr(it)}"
+                )
+                updated_cols.add(cnt_col)
+
+        for ekey, sum_col in col_sum_map.items():
+            it = ekey_to_item[ekey]
+            val_e = self._effective_agg_value_expr(it, record_prefix=record_prefix)
+            if sum_col not in already_in_ins:
+                insert_cols.append(sum_col)
+                insert_vals.append(f"({val_e})")
+                already_in_ins.add(sum_col)
+            if sum_col not in updated_cols:
+                update_assignments.append(f"{sum_col} = {_plus_sum_expr(it, sum_col)}")
+                updated_cols.add(sum_col)
+
+        for ekey, sum2_col in col_sum2_map.items():
+            it = ekey_to_item[ekey]
+            val_e = self._effective_agg_value_expr(it, record_prefix=record_prefix)
+            if sum2_col not in already_in_ins:
+                insert_cols.append(sum2_col)
+                init_s2 = "0.0" if self.dialect == Dialect.SQLITE else self._var_sq_sql(val_e)
+                insert_vals.append(
+                    f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE {init_s2} END)"
+                )
+                already_in_ins.add(sum2_col)
+            if sum2_col not in updated_cols:
+                update_assignments.append(f"{sum2_col} = {_plus_sum2_expr(it, sum2_col)}")
+                updated_cols.add(sum2_col)
+
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            it = ekey_to_item[ekey]
+            if tcnt_col not in already_in_ins:
+                insert_cols.append(tcnt_col)
+                insert_vals.append(_plus_tcnt_expr(it))
+                already_in_ins.add(tcnt_col)
+            if tcnt_col not in updated_cols:
+                update_assignments.append(
+                    f"{tcnt_col} = {mv_table}.{tcnt_col} + {_plus_tcnt_expr(it)}"
+                )
+                updated_cols.add(tcnt_col)
+
+        # In MySQL, ON DUPLICATE KEY UPDATE evaluates left-to-right, so derived columns must come first
+        derived_aliases = {
+            self._q(it.alias)
+            for it in work_items
+            if it.is_aggregate
+            and it.agg_func
+            in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            )
+        }
+        ordered_updates = [
+            a for a in update_assignments if a.split("=")[0].strip() in derived_aliases
+        ] + [
+            a for a in update_assignments if a.split("=")[0].strip() not in derived_aliases
+        ]
+
+        q_insert_cols = [self._q(c) for c in insert_cols]
+        q_pk_cols = [self._q(c) for c in pk_cols]
+        if self.dialect == Dialect.MYSQL:
+            stmts.append(
+                f"INSERT INTO {mv_table} ({', '.join(q_insert_cols)})\n"
+                f"    SELECT {', '.join(insert_vals)}{from_dual}\n"
+                f"    WHERE TRUE\n"
+                f"    ON DUPLICATE KEY UPDATE\n"
+                f"        {', '.join(ordered_updates)};"
+            )
+        else:
+            stmts.append(
+                f"INSERT INTO {mv_table} ({', '.join(q_insert_cols)})\n"
+                f"    SELECT {', '.join(insert_vals)}\n"
+                f"    WHERE TRUE\n"
+                f"    ON CONFLICT ({', '.join(q_pk_cols)}) DO UPDATE SET\n"
+                f"        {', '.join(ordered_updates)};"
+            )
+        return stmts
+
+    def _build_minus_delta_statements(
+        self,
+        mv_table: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+        record_prefix: str = "OLD",
+        include_delete_zero_mv: bool = True,
+    ) -> Tuple[List[str], Optional[str]]:
+        stmts: List[str] = []
+        work_items = self._working_select_items
+        grp_exprs = self._effective_group_by_exprs
+
+        for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
+            val_expr = self._effective_agg_value_expr(rep_item, record_prefix=record_prefix)
+            match_p = self._distinct_match_predicate(aux_tbl, val_expr, record_prefix)
+            stmts.append(
+                f"UPDATE {aux_tbl}\n"
+                f"    SET __ref_cnt = {aux_tbl}.__ref_cnt - 1\n"
+                f"    WHERE ({val_expr}) IS NOT NULL AND {match_p};"
+            )
+
+        def _is_last_distinct_cond(item: SelectItem) -> str:
+            ekey = expr_key_fn(item)
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if not item.is_distinct:
+                return f"({val_e}) IS NOT NULL"
+            aux_tbl = distinct_aux_tables[ekey][0]
+            match_p = self._distinct_match_predicate(aux_tbl, val_e, record_prefix)
+            return f"({val_e}) IS NOT NULL AND (SELECT {aux_tbl}.__ref_cnt FROM {aux_tbl} WHERE {match_p}) <= 0"
+
+        def _minus_dec_expr(item: SelectItem) -> str:
+            return f"(CASE WHEN {_is_last_distinct_cond(item)} THEN 1 ELSE 0 END)"
+
+        def _minus_sum_expr(item: SelectItem, col_alias: str, cnt_col: str) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+            if item.is_distinct:
+                cond = _is_last_distinct_cond(item)
+                return (
+                    f"(CASE WHEN NOT ({cond}) THEN {mv_table}.{col_alias} "
+                    f"WHEN {new_cnt} <= 0 THEN NULL "
+                    f"ELSE {mv_table}.{col_alias} - ({val_e}) END)"
+                )
+            return (
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                f"WHEN {new_cnt} <= 0 THEN NULL "
+                f"ELSE {mv_table}.{col_alias} - ({val_e}) END)"
+            )
+
+        def _minus_sum2_expr(item: SelectItem, col_alias: str, cnt_col: str) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+            if self.dialect == Dialect.SQLITE:
+                ekey = expr_key_fn(item)
+                sum_c = col_sum_map[ekey]
+                delta = f"((1.0 * ({val_e})) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_col}))"
+                return (
+                    f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_cnt} = 1 THEN 0.0 "
+                    f"ELSE MAX(0.0, COALESCE({mv_table}.{col_alias}, 0.0) - ({delta} * {delta} * ((1.0 * {mv_table}.{cnt_col}) / ({mv_table}.{cnt_col} - 1)))) END)"
+                )
+            sq = self._var_sq_sql(val_e)
+            return (
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                f"WHEN {new_cnt} <= 0 THEN NULL "
+                f"ELSE {mv_table}.{col_alias} - {sq} END)"
+            )
+
+        def _minus_tcnt_expr(item: SelectItem) -> str:
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            if self.dialect == Dialect.POSTGRES:
+                return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) THEN 1 ELSE 0 END)"
+            return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) != 0 THEN 1 ELSE 0 END)"
+
+        update_assignments: List[str] = []
+        updated_cols: Set[str] = set()
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            col_alias = self._q(item.alias)
+            updated_cols.add(col_alias)
+            ekey = expr_key_fn(item)
+            val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+
+            if item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
+                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} - 1")
+            elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                update_assignments.append(
+                    f"{col_alias} = {mv_table}.{col_alias} - {_minus_dec_expr(item)}"
+                )
+            elif item.agg_func == AggFunc.SUM:
+                cnt_col = col_nonnull_count_map[ekey]
+                update_assignments.append(
+                    f"{col_alias} = {_minus_sum_expr(item, col_alias, cnt_col)}"
+                )
+            elif item.agg_func == AggFunc.TOTAL:
+                if item.is_distinct:
+                    cond = _is_last_distinct_cond(item)
+                    dec_val = f"(CASE WHEN ({cond}) THEN 1.0 * ({val_e}) ELSE 0.0 END)"
+                else:
+                    dec_val = f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)"
+                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} - {dec_val}")
+            elif item.agg_func == AggFunc.AVG:
+                if self._requires_native_avg_recompute(item):
+                    recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                    update_assignments.append(f"{col_alias} = {recomputed}")
+                else:
+                    cnt_col = col_nonnull_count_map[ekey]
+                    sum_col = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+                    new_sum = _minus_sum_expr(item, sum_col, cnt_col)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    update_assignments.append(
+                        f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                        f"ELSE {dividend} / {new_cnt} END"
+                    )
+            elif item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomputed}")
+            elif item.agg_func == AggFunc.MIN:
+                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN ({val_e}) IS NOT NULL AND {mv_table}.{col_alias} >= ({val_e}) "
+                    f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
+                )
+            elif item.agg_func == AggFunc.MAX:
+                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN ({val_e}) IS NOT NULL AND {mv_table}.{col_alias} <= ({val_e}) "
+                    f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
+                )
+            elif item.agg_func in (AggFunc.BIT_AND, AggFunc.BIT_OR):
+                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN ({val_e}) IS NOT NULL "
+                    f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
+                )
+            elif item.agg_func == AggFunc.BIT_XOR:
+                cnt_col = col_nonnull_count_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+                xor_expr = self._bitwise_xor_sql(f"{mv_table}.{col_alias}", f"({val_e})")
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"WHEN {new_cnt} <= 0 THEN NULL ELSE {xor_expr} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_AND:
+                cnt_col = col_nonnull_count_map[ekey]
+                tcnt_col = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+                new_tcnt = f"({mv_table}.{tcnt_col} - {_minus_tcnt_expr(item)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_OR:
+                cnt_col = col_nonnull_count_map[ekey]
+                tcnt_col = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+                new_tcnt = f"({mv_table}.{tcnt_col} - {_minus_tcnt_expr(item)})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                update_assignments.append(
+                    f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
+                )
+            else:
+                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                update_assignments.append(f"{col_alias} = {recomp}")
+
+        if row_count_col not in updated_cols:
+            update_assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} - 1")
+            updated_cols.add(row_count_col)
+
+        ekey_to_item: Dict[str, SelectItem] = {
+            expr_key_fn(it): it for it in work_items if it.is_aggregate
+        }
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            if cnt_col not in updated_cols:
+                it = ekey_to_item[ekey]
+                update_assignments.append(
+                    f"{cnt_col} = {mv_table}.{cnt_col} - {_minus_dec_expr(it)}"
+                )
+                updated_cols.add(cnt_col)
+
+        for ekey, sum_col in col_sum_map.items():
+            if sum_col not in updated_cols:
+                it = ekey_to_item[ekey]
+                cnt_col = col_nonnull_count_map[ekey]
+                update_assignments.append(
+                    f"{sum_col} = {_minus_sum_expr(it, sum_col, cnt_col)}"
+                )
+                updated_cols.add(sum_col)
+
+        for ekey, sum2_col in col_sum2_map.items():
+            if sum2_col not in updated_cols:
+                it = ekey_to_item[ekey]
+                cnt_col = col_nonnull_count_map[ekey]
+                update_assignments.append(
+                    f"{sum2_col} = {_minus_sum2_expr(it, sum2_col, cnt_col)}"
+                )
+                updated_cols.add(sum2_col)
+
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            if tcnt_col not in updated_cols:
+                it = ekey_to_item[ekey]
+                update_assignments.append(
+                    f"{tcnt_col} = {mv_table}.{tcnt_col} - {_minus_tcnt_expr(it)}"
+                )
+                updated_cols.add(tcnt_col)
+
+        # In MySQL, UPDATE evaluates SET assignments left-to-right!
+        # Order: (1) derived aggs (AVG, VAR, STDDEV, BIT_XOR, BOOL_AND, BOOL_OR)
+        #        (2) SUM / sum2 / true_cnt (which read col_nonnull_count_map)
+        #        (3) counts & MIN/MAX
+        high_priority_cols = (
+            {
+                self._q(it.alias)
+                for it in work_items
+                if it.is_aggregate
+                and it.agg_func
+                in (
+                    AggFunc.AVG,
+                    AggFunc.VAR_POP,
+                    AggFunc.VAR_SAMP,
+                    AggFunc.STDDEV_POP,
+                    AggFunc.STDDEV_SAMP,
+                    AggFunc.BIT_XOR,
+                    AggFunc.BOOL_AND,
+                    AggFunc.BOOL_OR,
+                )
+            }
+        )
+        mid_priority_cols = (
+            {self._q(it.alias) for it in work_items if it.is_aggregate and it.agg_func == AggFunc.SUM}
+            | set(col_sum_map.values())
+            | set(col_sum2_map.values())
+            | set(col_true_cnt_map.values())
+        )
+        tier_1 = [a for a in update_assignments if a.split("=")[0].strip() in high_priority_cols]
+        tier_2 = [
+            a
+            for a in update_assignments
+            if a.split("=")[0].strip() not in high_priority_cols
+            and a.split("=")[0].strip() in mid_priority_cols
+        ]
+        tier_3 = [
+            a
+            for a in update_assignments
+            if a.split("=")[0].strip() not in high_priority_cols
+            and a.split("=")[0].strip() not in mid_priority_cols
+        ]
+        ordered_updates = tier_1 + tier_2 + tier_3
+
+        grp_pred = self._group_match_predicate_tier1(mv_table, record_prefix)
+        stmts.append(
+            f"UPDATE {mv_table}\n"
+            f"    SET {', '.join(ordered_updates)}\n"
+            f"    WHERE {grp_pred};"
+        )
+
+        for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
+            val_expr = self._effective_agg_value_expr(rep_item, record_prefix=record_prefix)
+            match_p = self._distinct_match_predicate(aux_tbl, val_expr, record_prefix)
+            stmts.append(
+                f"DELETE FROM {aux_tbl}\n"
+                f"    WHERE ({val_expr}) IS NOT NULL AND ({match_p}) AND {aux_tbl}.__ref_cnt <= 0;"
+            )
+
+        delete_zero_mv_stmt: Optional[str] = None
+        if grp_exprs:
+            delete_zero_mv_stmt = (
+                f"DELETE FROM {mv_table}\n"
+                f"    WHERE ({grp_pred}) AND {mv_table}.{row_count_col} <= 0;"
+            )
+            if include_delete_zero_mv:
+                stmts.append(delete_zero_mv_stmt)
+
+        return stmts, delete_zero_mv_stmt
+
+    def _apply_where_guard_to_stmt(self, stmt: str, where_cond: Optional[str]) -> str:
+        if not where_cond:
+            return stmt
+        s = stmt.strip()
+        if re.match(r"^INSERT\s+INTO\b", s, flags=re.IGNORECASE):
+            if re.search(r"\n\s*WHERE\s+TRUE\b", s, flags=re.IGNORECASE):
+                return re.sub(
+                    r"\n\s*WHERE\s+TRUE\b",
+                    f"\n    WHERE ({where_cond})",
+                    s,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+            return re.sub(
+                r"\n\s*WHERE\s+",
+                f"\n    WHERE ({where_cond}) AND ",
+                s,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        if re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", s, flags=re.IGNORECASE):
+            return re.sub(
+                r"\n\s*WHERE\s+",
+                f"\n    WHERE ({where_cond}) AND ",
+                s,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        return stmt
+
+    def _build_tier1_triggers(
+        self,
+        view_name: str,
+        mv_table: str,
+        base_t: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+        initial_populate_sqls: Optional[Sequence[str]] = None,
+    ) -> Tuple[List[str], List[str], List[str]]:
+        plus_new_stmts = self._build_plus_delta_statements(
+            mv_table,
+            row_count_col,
+            col_nonnull_count_map,
+            col_sum_map,
+            col_sum2_map,
+            col_true_cnt_map,
+            distinct_aux_tables,
+            expr_key_fn,
+            record_prefix="NEW",
+        )
+        minus_old_del_stmts, _ = self._build_minus_delta_statements(
+            mv_table,
+            row_count_col,
+            col_nonnull_count_map,
+            col_sum_map,
+            col_sum2_map,
+            col_true_cnt_map,
+            distinct_aux_tables,
+            expr_key_fn,
+            record_prefix="OLD",
+            include_delete_zero_mv=True,
+        )
+        minus_old_upd_stmts, delete_zero_mv_stmt = self._build_minus_delta_statements(
+            mv_table,
+            row_count_col,
+            col_nonnull_count_map,
+            col_sum_map,
+            col_sum2_map,
+            col_true_cnt_map,
+            distinct_aux_tables,
+            expr_key_fn,
+            record_prefix="OLD",
+            include_delete_zero_mv=False,
+        )
+
+        where_new = (
+            self._rewrite_expr_for_record(self.view.where_clause, "NEW")
+            if self.view.where_clause
+            else None
+        )
+        where_old = (
+            self._rewrite_expr_for_record(self.view.where_clause, "OLD")
+            if self.view.where_clause
+            else None
+        )
+        if self.watermark_catalog_table and self._alg_mode in ("single", "distinct"):
+            wm_pk_col: Optional[str] = "rowid" if self.dialect == Dialect.SQLITE else None
+            if self.primary_schema:
+                for c_def in self.primary_schema.columns.values():
+                    if c_def.primary_key and "INT" in c_def.data_type.upper():
+                        wm_pk_col = c_def.name
+                        break
+            if wm_pk_col:
+                q_pk = self._q(wm_pk_col)
+                wm_new = (
+                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                    f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"
+                )
+                wm_old = (
+                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                    f"AND OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"
+                )
+                where_new = f"({where_new}) AND ({wm_new})" if where_new else wm_new
+                where_old = f"({where_old}) AND ({wm_old})" if where_old else wm_old
+
+        trunc_stmts = [
+            f"DELETE FROM {aux_tbl};" for aux_tbl, _, _ in distinct_aux_tables.values()
+        ] + [f"DELETE FROM {mv_table};"]
+        if not self._effective_group_by_exprs and initial_populate_sqls:
+            trunc_stmts.extend(initial_populate_sqls)
+
+        return self._emit_dialect_triggers_for_table(
+            view_name=view_name,
+            base_t=base_t,
+            ins_stmts=plus_new_stmts,
+            del_stmts=minus_old_del_stmts,
+            upd_old_stmts=minus_old_upd_stmts,
+            upd_new_stmts=plus_new_stmts,
+            upd_cleanup_old_stmts=[delete_zero_mv_stmt] if delete_zero_mv_stmt else [],
+            trunc_stmts=trunc_stmts,
+            where_new=where_new,
+            where_old=where_old,
+        )
+
+    def _emit_dialect_triggers_for_table(
+        self,
+        view_name: str,
+        base_t: str,
+        ins_stmts: List[str],
+        del_stmts: List[str],
+        upd_old_stmts: List[str],
+        upd_new_stmts: List[str],
+        upd_cleanup_old_stmts: Optional[List[str]] = None,
+        trunc_stmts: Optional[List[str]] = None,
+        where_new: Optional[str] = None,
+        where_old: Optional[str] = None,
+    ) -> Tuple[List[str], List[str], List[str]]:
+        log_vname = self.logical_view_name
+        p = self.object_prefix if self.object_prefix else "__matview_"
+        stem = f"{log_vname}__{base_t}"
+        t_ai_name = self._bounded_ident(f"{p}trg_", stem, "_ai")
+        t_ad_name = self._bounded_ident(f"{p}trg_", stem, "_ad")
+        t_au_name = self._bounded_ident(f"{p}trg_", stem, "_au")
+        t_trunc_name = self._bounded_ident(f"{p}trg_", stem, "_trunc")
+        t_sync_name = self._bounded_ident(f"{p}trg_", stem, "_sync")
+        q_base_t = self._q(base_t)
+        ref_cols = self._referenced_columns_for_table(base_t)
+        upd_of_clause = (
+            f" OF {', '.join(self._q(c) for c in ref_cols)}"
+            if ref_cols and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES)
+            else ""
+        )
+
+        t_schema = self._schemas_lower.get(base_t.lower())
+        unchanged_conds: List[str] = []
+        if t_schema and ref_cols:
+            for c_name in ref_cols:
+                c_def = t_schema.columns.get(c_name)
+                is_null = not (c_def.not_null if c_def else False)
+                qc = self._q(c_name)
+                unchanged_conds.append(
+                    self._null_safe_eq(f"OLD.{qc}", f"NEW.{qc}", is_nullable=is_null)
+                )
+        changed_guard = f"NOT ({' AND '.join(unchanged_conds)})" if unchanged_conds else None
+
+        cleanup_stmts = upd_cleanup_old_stmts or []
+
+        if self.dialect == Dialect.SQLITE:
+            when_ins = f"\nWHEN {where_new}" if where_new else ""
+            ins_body = "\n    ".join(ins_stmts)
+            trig_ins = (
+                f"CREATE TRIGGER {t_ai_name}\n"
+                f"AFTER INSERT ON {q_base_t}\n"
+                f"FOR EACH ROW{when_ins}\n"
+                f"BEGIN\n"
+                f"    {ins_body}\n"
+                f"END;"
+            )
+
+            when_del = f"\nWHEN {where_old}" if where_old else ""
+            del_body = "\n    ".join(del_stmts)
+            trig_del = (
+                f"CREATE TRIGGER {t_ad_name}\n"
+                f"AFTER DELETE ON {q_base_t}\n"
+                f"FOR EACH ROW{when_del}\n"
+                f"BEGIN\n"
+                f"    {del_body}\n"
+                f"END;"
+            )
+
+            upd_stmts = (
+                [self._apply_where_guard_to_stmt(s, where_old) for s in upd_old_stmts]
+                + [self._apply_where_guard_to_stmt(s, where_new) for s in upd_new_stmts]
+                + [self._apply_where_guard_to_stmt(s, where_old) for s in cleanup_stmts]
+            )
+            upd_body = "\n    ".join(upd_stmts)
+            when_upd = f"\nWHEN {changed_guard}" if changed_guard else ""
+            trig_upd = (
+                f"CREATE TRIGGER {t_au_name}\n"
+                f"AFTER UPDATE{upd_of_clause} ON {q_base_t}\n"
+                f"FOR EACH ROW{when_upd}\n"
+                f"BEGIN\n"
+                f"    {upd_body}\n"
+                f"END;"
+            )
+            t_names = [t_ai_name, t_ad_name, t_au_name]
+            return [trig_ins, trig_del, trig_upd], t_names, []
+
+        elif self.dialect == Dialect.POSTGRES:
+            ins_block = "\n            ".join(ins_stmts)
+            minus_block = "\n            ".join(upd_old_stmts)
+            plus_block = "\n            ".join(upd_new_stmts)
+            cleanup_block = "\n            ".join(cleanup_stmts)
+            trunc_block = "\n        ".join(trunc_stmts or [f"DELETE FROM {self._backing_table_name()};"])
+
+            ins_section = (
+                f"IF ({where_new}) THEN\n            {ins_block}\n        END IF;"
+                if where_new and ins_block
+                else ins_block
+            )
+            old_section = (
+                f"IF ({where_old}) THEN\n            {minus_block}\n        END IF;"
+                if where_old and minus_block
+                else minus_block
+            )
+            new_section = (
+                f"IF ({where_new}) THEN\n            {plus_block}\n        END IF;"
+                if where_new and plus_block
+                else plus_block
+            )
+            clean_section = (
+                f"\n        IF ({where_old}) THEN\n            {cleanup_block}\n        END IF;"
+                if where_old and cleanup_block
+                else (f"\n        {cleanup_block}" if cleanup_block else "")
+            )
+            del_full_block = "\n            ".join(del_stmts)
+            del_section = (
+                f"IF ({where_old}) THEN\n            {del_full_block}\n        END IF;"
+                if where_old
+                else del_full_block
+            )
+
+            fn_trunc = self._bounded_ident(f"{p}fn_sync_", stem, "_trunc")
+            fn_trunc_ddl = (
+                f"CREATE OR REPLACE FUNCTION {fn_trunc}()\n"
+                f"RETURNS TRIGGER AS $$\n"
+                f"BEGIN\n"
+                f"    {trunc_block}\n"
+                f"    RETURN NULL;\n"
+                f"END;\n$$ LANGUAGE plpgsql;"
+            )
+            t_trunc = (
+                f"CREATE TRIGGER {t_trunc_name}\n"
+                f"AFTER TRUNCATE ON {q_base_t}\n"
+                f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_trunc}();"
+            )
+
+            if self.pg_use_transition_tables:
+                fn_ai = self._bounded_ident(f"{p}fn_sync_", stem, "_ai")
+                fn_ad = self._bounded_ident(f"{p}fn_sync_", stem, "_ad")
+                fn_au = self._bounded_ident(f"{p}fn_sync_", stem, "_au")
+                fn_ai_ddl = (
+                    f"CREATE OR REPLACE FUNCTION {fn_ai}()\n"
+                    f"RETURNS TRIGGER AS $$\n"
+                    f"DECLARE\n    NEW RECORD;\n"
+                    f"BEGIN\n"
+                    f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
+                    f"        {ins_section}\n"
+                    f"    END LOOP;\n"
+                    f"    RETURN NULL;\n"
+                    f"END;\n$$ LANGUAGE plpgsql;"
+                )
+                fn_ad_ddl = (
+                    f"CREATE OR REPLACE FUNCTION {fn_ad}()\n"
+                    f"RETURNS TRIGGER AS $$\n"
+                    f"DECLARE\n    OLD RECORD;\n"
+                    f"BEGIN\n"
+                    f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
+                    f"        {del_section}\n"
+                    f"    END LOOP;\n"
+                    f"    RETURN NULL;\n"
+                    f"END;\n$$ LANGUAGE plpgsql;"
+                )
+                au_loops: List[str] = []
+                if old_section.strip():
+                    au_loops.append(
+                        f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
+                        f"        {old_section}\n"
+                        f"    END LOOP;"
+                    )
+                if clean_section.strip():
+                    au_loops.append(
+                        f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
+                        f"        {clean_section.strip()}\n"
+                        f"    END LOOP;"
+                    )
+                if new_section.strip():
+                    au_loops.append(
+                        f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
+                        f"        {new_section}\n"
+                        f"    END LOOP;"
+                    )
+                au_body = "\n".join(au_loops)
+                fn_au_ddl = (
+                    f"CREATE OR REPLACE FUNCTION {fn_au}()\n"
+                    f"RETURNS TRIGGER AS $$\n"
+                    f"DECLARE\n    OLD RECORD;\n    NEW RECORD;\n"
+                    f"BEGIN\n"
+                    f"{au_body}\n"
+                    f"    RETURN NULL;\n"
+                    f"END;\n$$ LANGUAGE plpgsql;"
+                )
+                t_ai = (
+                    f"CREATE TRIGGER {t_ai_name}\n"
+                    f"AFTER INSERT ON {q_base_t}\n"
+                    f"REFERENCING NEW TABLE AS __mv_new_rows\n"
+                    f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_ai}();"
+                )
+                t_ad = (
+                    f"CREATE TRIGGER {t_ad_name}\n"
+                    f"AFTER DELETE ON {q_base_t}\n"
+                    f"REFERENCING OLD TABLE AS __mv_old_rows\n"
+                    f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_ad}();"
+                )
+                t_au = (
+                    f"CREATE TRIGGER {t_au_name}\n"
+                    f"AFTER UPDATE ON {q_base_t}\n"
+                    f"REFERENCING OLD TABLE AS __mv_old_rows NEW TABLE AS __mv_new_rows\n"
+                    f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_au}();"
+                )
+                return (
+                    [fn_ai_ddl, t_ai, fn_ad_ddl, t_ad, fn_au_ddl, t_au, fn_trunc_ddl, t_trunc],
+                    [t_ai_name, t_ad_name, t_au_name, t_trunc_name],
+                    [fn_ai, fn_ad, fn_au, fn_trunc],
+                )
+
+            fn_name = self._bounded_ident(f"{p}fn_sync_", stem)
+            upd_guard_open = f"IF ({changed_guard}) THEN\n        " if changed_guard else ""
+            upd_guard_close = "\n        END IF;" if changed_guard else ""
+            upd_inner = (
+                f"{old_section}\n        {new_section}{clean_section}"
+                if old_section.strip()
+                else f"{new_section}{clean_section}"
+            )
+
+            fn_ddl = (
+                f"CREATE OR REPLACE FUNCTION {fn_name}()\n"
+                f"RETURNS TRIGGER AS $$\n"
+                f"BEGIN\n"
+                f"    IF COALESCE(current_setting('matview.skip_triggers', true), '') = 'on' THEN\n"
+                f"        RETURN NULL;\n"
+                f"    END IF;\n"
+                f"    IF (TG_OP = 'DELETE') THEN\n"
+                f"        {del_section}\n"
+                f"    ELSIF (TG_OP = 'INSERT') THEN\n"
+                f"        {ins_section}\n"
+                f"    ELSIF (TG_OP = 'UPDATE') THEN\n"
+                f"        {upd_guard_open}{upd_inner}{upd_guard_close}\n"
+                f"    END IF;\n"
+                f"    RETURN NULL;\n"
+                f"END;\n"
+                f"$$ LANGUAGE plpgsql;"
+            )
+            t_sync = (
+                f"CREATE TRIGGER {t_sync_name}\n"
+                f"AFTER INSERT OR UPDATE{upd_of_clause} OR DELETE ON {q_base_t}\n"
+                f"FOR EACH ROW EXECUTE FUNCTION {fn_name}();"
+            )
+            return (
+                [fn_ddl, t_sync, fn_trunc_ddl, t_trunc],
+                [t_sync_name, t_trunc_name],
+                [fn_name, fn_trunc],
+            )
+
+        elif self.dialect == Dialect.MYSQL:
+            ins_block = "\n        ".join(ins_stmts)
+            del_block = "\n        ".join(del_stmts)
+            minus_block = "\n        ".join(upd_old_stmts)
+            plus_block = "\n        ".join(upd_new_stmts)
+            cleanup_block = "\n        ".join(cleanup_stmts)
+
+            ins_section = (
+                f"IF ({where_new}) THEN\n        {ins_block}\n    END IF;"
+                if where_new and ins_block
+                else ins_block
+            )
+            del_section = (
+                f"IF ({where_old}) THEN\n        {del_block}\n    END IF;"
+                if where_old and del_block
+                else del_block
+            )
+            old_section = (
+                f"IF ({where_old}) THEN\n        {minus_block}\n    END IF;"
+                if where_old and minus_block
+                else minus_block
+            )
+            new_section = (
+                f"IF ({where_new}) THEN\n        {plus_block}\n    END IF;"
+                if where_new and plus_block
+                else plus_block
+            )
+            clean_section = (
+                f"\n    IF ({where_old}) THEN\n        {cleanup_block}\n    END IF;"
+                if where_old and cleanup_block
+                else (f"\n    {cleanup_block}" if cleanup_block else "")
+            )
+
+            upd_guard_open = f"IF ({changed_guard}) THEN\n    " if changed_guard else ""
+            upd_guard_close = "\n    END IF;" if changed_guard else ""
+            upd_inner = (
+                f"{old_section}\n    {new_section}{clean_section}"
+                if old_section.strip()
+                else f"{new_section}{clean_section}"
+            )
+
+            trig_ins = (
+                f"CREATE TRIGGER {t_ai_name}\n"
+                f"AFTER INSERT ON {q_base_t}\n"
+                f"FOR EACH ROW\n"
+                f"BEGIN\n"
+                f"    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN\n"
+                f"    {ins_section}\n"
+                f"    END IF;\n"
+                f"END;"
+            )
+            trig_del = (
+                f"CREATE TRIGGER {t_ad_name}\n"
+                f"AFTER DELETE ON {q_base_t}\n"
+                f"FOR EACH ROW\n"
+                f"BEGIN\n"
+                f"    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN\n"
+                f"    {del_section}\n"
+                f"    END IF;\n"
+                f"END;"
+            )
+            trig_upd = (
+                f"CREATE TRIGGER {t_au_name}\n"
+                f"AFTER UPDATE ON {q_base_t}\n"
+                f"FOR EACH ROW\n"
+                f"BEGIN\n"
+                f"    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN\n"
+                f"    {upd_guard_open}{upd_inner}{upd_guard_close}\n"
+                f"    END IF;\n"
+                f"END;"
+            )
+            t_names = [t_ai_name, t_ad_name, t_au_name]
+            return [trig_ins, trig_del, trig_upd], t_names, []
+
+        return [], [], []
+
+
+    # =========================================================================
+    # TIER 1B: Multi-Table INNER / CROSS JOIN O(1) Algebraic Delta Maintenance
+    # =========================================================================
+
+    def _qualify_join_expr(self, expr: Optional[str]) -> str:
+        if not expr:
+            return ""
+        col_to_aliases: Dict[str, List[Tuple[str, str]]] = {}
+        for j in self.view.joins:
+            ts = self._schemas_lower.get(j.table_name.lower())
+            if ts:
+                for c_name in ts.columns:
+                    col_to_aliases.setdefault(c_name.lower(), []).append((j.alias, c_name))
+
+        alias_remap: Dict[str, Tuple[str, Optional[TableSchema]]] = {}
+        for j in self.view.joins:
+            ts = self._schemas_lower.get(j.table_name.lower())
+            alias_remap[j.table_name.lower()] = (j.alias, ts)
+            alias_remap[j.alias.lower()] = (j.alias, ts)
+
+        try:
+            toks = sqlglot.tokenize(expr, read="sqlite")
+        except Exception:
+            return expr
+        out: List[str] = []
+        i = 0
+        n = len(toks)
+        cursor = 0
+        while i < n:
+            tk = toks[i]
+            if (
+                _is_word_or_ident_token(tk)
+                and i + 2 < n
+                and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                and _is_word_or_ident_token(toks[i + 2])
+            ):
+                q_low = tk.text.lower()
+                c_unq = toks[i + 2].text
+                if q_low in alias_remap:
+                    new_al, ts = alias_remap[q_low]
+                    actual_c = c_unq
+                    if ts:
+                        for sc in ts.columns:
+                            if sc.lower() == c_unq.lower():
+                                actual_c = sc
+                                break
+                    if tk.start > cursor:
+                        out.append(expr[cursor:tk.start])
+                    out.append(f"{self._q(new_al)}.{self._q(actual_c)}")
+                    cursor = toks[i + 2].end + 1
+                    i += 3
+                    continue
+            if _is_word_or_ident_token(tk):
+                is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
+                is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
+                is_fn_call = (
+                    tk.token_type != SQLGlotTokenType.IDENTIFIER
+                    and i + 1 < n
+                    and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN
+                )
+                if not is_after_dot and not is_before_dot and not is_fn_call:
+                    c_low = tk.text.lower()
+                    als = col_to_aliases.get(c_low)
+                    if als and (
+                        len(als) == 1
+                        or any(
+                            j.on_condition and c_low in {t.text.lower() for t in sqlglot.tokenize(j.on_condition, read="sqlite")}
+                            for j in self.view.joins
+                        )
+                    ):
+                        al, actual_c = als[0]
+                        if tk.start > cursor:
+                            out.append(expr[cursor:tk.start])
+                        out.append(f"{self._q(al)}.{self._q(actual_c)}")
+                        cursor = tk.end + 1
+                        i += 1
+                        continue
+            i += 1
+        if cursor < len(expr):
+            out.append(expr[cursor:])
+        return "".join(out)
+
+    def _compile_tier1_join_algebraic(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        work_items = self._working_select_items
+        grp_exprs = self._effective_group_by_exprs
+
+        count_star_alias: Optional[str] = None
+        for item in work_items:
+            if (
+                item.is_aggregate
+                and item.agg_func == AggFunc.COUNT_STAR
+                and not item.filter_where
+            ):
+                count_star_alias = item.alias
+                break
+        row_count_col = self._q(count_star_alias) if count_star_alias else "__mv_row_count"
+
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = [it.alias for it in self.view.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+
+        has_nullable_grp = self._has_nullable_group_col()
+        pk_cols = self._tier1_pk_cols()
+        if not grp_exprs:
+            col_defs_sql.append("__mv_global_id INTEGER NOT NULL PRIMARY KEY")
+        elif has_nullable_grp:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        non_agg_aliases_lower = {
+            item.alias.lower() for item in work_items if not item.is_aggregate
+        }
+        seen_hidden_grp: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
+                seen_hidden_grp.add(mv_col.lower())
+                c_def = self._lookup_col_def(self._qualify_join_expr(g_expr)) or self._lookup_col_def(g_expr)
                 if c_def:
                     dt = self._normalize_dialect_type(c_def.data_type)
                 else:
@@ -5456,6 +15239,11320 @@ class IncrementalViewCompiler:
                     dt = self._infer_expr_storage_type(fake_it)
                 if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
                     dt = "VARCHAR(255)"
+                nn = " NOT NULL" if not has_nullable_grp else ""
+                col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
+
+        def _expr_key(item: SelectItem) -> str:
+            eff = self._effective_agg_value_expr(item, record_prefix=None).strip().lower()
+            return f"{'dist:' if item.is_distinct else ''}{eff}"
+
+        col_nonnull_count_map: Dict[str, str] = {}
+        col_sum_map: Dict[str, str] = {}
+        col_sum2_map: Dict[str, str] = {}
+        col_true_cnt_map: Dict[str, str] = {}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            ekey = _expr_key(item)
+            if item.agg_func == AggFunc.COUNT_COL:
+                col_nonnull_count_map[ekey] = self._q(item.alias)
+            elif item.agg_func == AggFunc.SUM:
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = self._q(item.alias)
+
+        group_mv_cols: List[str] = []
+        for g in grp_exprs:
+            mc = self._group_col_alias(g)
+            if mc not in group_mv_cols:
+                group_mv_cols.append(mc)
+        indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
+
+        for item in work_items:
+            if not item.is_aggregate:
+                c_def = self._lookup_col_def(self._qualify_join_expr(item.raw_expr)) or self._lookup_col_def(item.raw_expr)
+                dt = (
+                    self._normalize_dialect_type(c_def.data_type)
+                    if c_def
+                    else self._infer_expr_storage_type(item)
+                )
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
+                col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
+            else:
+                storage_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    storage_type = "VARCHAR(255)"
+                if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
+                elif item.agg_func == AggFunc.TOTAL:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0.0")
+                else:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type}")
+
+        if count_star_alias is None:
+            col_defs_sql.append(f"{row_count_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        aux_idx = 0
+        for item in work_items:
+            if not item.is_aggregate or item.agg_func is None:
+                continue
+            ekey = _expr_key(item)
+            safe_id = _sanitize_ident(item.alias)
+            if item.agg_func in (
+                AggFunc.SUM,
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            ) or (item.agg_func == AggFunc.COUNT_STAR and item.filter_where):
+                if item.agg_func == AggFunc.COUNT_STAR and item.filter_where:
+                    col_nonnull_count_map[ekey] = self._q(item.alias)
+                elif ekey not in col_nonnull_count_map:
+                    aux_idx += 1
+                    cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
+                    col_nonnull_count_map[ekey] = cnt_col
+                    col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+            if item.agg_func in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum_map:
+                    aux_idx += 1
+                    sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
+                    col_sum_map[ekey] = sum_col
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
+
+            if item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum2_map:
+                    aux_idx += 1
+                    s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
+                    sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
+                    col_sum2_map[ekey] = sum2_col
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
+
+            if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if ekey not in col_true_cnt_map:
+                    aux_idx += 1
+                    tcnt_col = f"__mv_tcnt_{safe_id}_{aux_idx}"
+                    col_true_cnt_map[ekey] = tcnt_col
+                    col_defs_sql.append(f"{tcnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        if grp_exprs and not has_nullable_grp:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        backing_col_map = {
+            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            for u_col, expr_s in self._compound_reader_exprs.items()
+            if expr_s != u_col and "__mv_elem_" in expr_s
+        }
+        can_pg15_unique_nnd = (
+            bool(grp_exprs)
+            and has_nullable_grp
+            and len(set(c.lower() for c in group_mv_cols)) == len(grp_exprs)
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=group_mv_cols,
+            has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
+            backing_col_map=backing_col_map,
+            unique_group_nulls_not_distinct=can_pg15_unique_nnd,
+        )
+
+        reader_select_override = [
+            self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
+        ]
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                select_exprs_override=reader_select_override,
+                extra_where_filter=self._rewritten_having_clause,
+            )
+        )
+
+        qual_grp_exprs = [self._qualify_join_expr(g) for g in grp_exprs]
+        target_cols: List[str] = []
+        select_exprs: List[str] = []
+        if not grp_exprs:
+            target_cols.append("__mv_global_id")
+            select_exprs.append("1")
+        elif has_nullable_grp:
+            target_cols.append("__mv_pk")
+            select_exprs.append(self._canonical_group_pk_expr(qual_grp_exprs))
+
+        seen_hidden: Set[str] = set()
+        for g_raw, g_qual in zip(grp_exprs, qual_grp_exprs):
+            mv_col = self._group_col_alias(g_raw)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                target_cols.append(mv_col)
+                select_exprs.append(g_qual)
+
+        for item in work_items:
+            target_cols.append(item.alias)
+            if not item.is_aggregate:
+                select_exprs.append(self._qualify_join_expr(item.raw_expr))
+            else:
+                select_exprs.append(self._qualify_join_expr(self._sql_backfill_agg_expr(item)))
+
+        if count_star_alias is None:
+            target_cols.append(row_count_col)
+            select_exprs.append("COUNT(*)")
+
+        already_in_target = set(target_cols)
+        ekey_to_item: Dict[str, SelectItem] = {
+            _expr_key(it): it for it in work_items if it.is_aggregate
+        }
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            if cnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(cnt_col)
+                select_exprs.append(f"COUNT({eff})")
+                already_in_target.add(cnt_col)
+
+        for ekey, sum_col in col_sum_map.items():
+            if sum_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(sum_col)
+                select_exprs.append(f"SUM({eff})")
+                already_in_target.add(sum_col)
+
+        for ekey, sum2_col in col_sum2_map.items():
+            if sum2_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(sum2_col)
+                if self.dialect == Dialect.SQLITE:
+                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
+                else:
+                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
+                already_in_target.add(sum2_col)
+
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            if tcnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(tcnt_col)
+                select_exprs.append(
+                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
+                )
+                already_in_target.add(tcnt_col)
+
+        def _build_join_from_clause(replace_alias: Optional[str] = None, rec_prefix: Optional[str] = None) -> str:
+            from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+            parts: List[str] = []
+            for idx, j in enumerate(self.view.joins):
+                if replace_alias and j.alias.lower() == replace_alias.lower() and rec_prefix:
+                    ts = self._schemas_lower[j.table_name.lower()]
+                    rec_proj = ", ".join(f"{rec_prefix}.{c} AS {c}" for c in ts.columns)
+                    tbl_sql = f"(SELECT {rec_proj}{from_dual}) AS {j.alias}"
+                else:
+                    tbl_sql = f"{j.table_name} AS {j.alias}"
+                if idx == 0:
+                    parts.append(tbl_sql)
+                else:
+                    on_sql = f" ON {self._qualify_join_expr(j.on_condition)}" if j.on_condition else ""
+                    parts.append(f"{j.join_type} {tbl_sql}{on_sql}")
+            return " ".join(parts)
+
+        full_from_sql = _build_join_from_clause()
+        qual_where = self._qualify_join_expr(self.view.where_clause) if self.view.where_clause else None
+        where_sql = f"\nWHERE {qual_where}" if qual_where else ""
+        qual_grp_for_q = self._group_by_exprs_for_query(qual_grp_exprs, include_canonical_pk=has_nullable_grp)
+        group_sql = f"\nGROUP BY {', '.join(qual_grp_for_q)}" if qual_grp_for_q else ""
+
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+            f"SELECT {', '.join(select_exprs)}\n"
+            f"FROM {full_from_sql}{where_sql}{group_sql};"
+        )
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                f"SELECT {', '.join(target_cols)}\n"
+                f"FROM (\nSELECT {', '.join(f'{ex} AS {col}' for col, ex in zip(target_cols, select_exprs))}\n"
+                f"FROM {full_from_sql}{where_sql}{group_sql}\n) AS __mv_init\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        def _build_join_recompute_subquery(item: SelectItem) -> str:
+            alias_remap = {j.alias.lower(): f"__mv_j_{j.alias}" for j in self.view.joins}
+            for j in self.view.joins:
+                alias_remap[j.table_name.lower()] = f"__mv_j_{j.alias}"
+
+            def _remap_to_j(frag: str) -> str:
+                q_frag = self._qualify_join_expr(frag)
+                tokens = re.split(r"('(?:''|[^'])*')", q_frag)
+                out = []
+                for idx_t, tok in enumerate(tokens):
+                    if idx_t % 2 == 1:
+                        out.append(tok)
+                        continue
+                    mod = tok
+                    for old_a, new_a in sorted(alias_remap.items(), key=lambda x: len(x[0]), reverse=True):
+                        mod = re.sub(rf"\b{re.escape(old_a)}\s*\.", f"{new_a}.", mod, flags=re.IGNORECASE)
+                    out.append(mod)
+                return "".join(out)
+
+            j_parts: List[str] = []
+            for idx, j in enumerate(self.view.joins):
+                tbl_s = f"{j.table_name} AS __mv_j_{j.alias}"
+                if idx == 0:
+                    j_parts.append(tbl_s)
+                else:
+                    on_s = f" ON {_remap_to_j(j.on_condition)}" if j.on_condition else ""
+                    j_parts.append(f"{j.join_type} {tbl_s}{on_s}")
+            conds: List[str] = []
+            if self.view.where_clause:
+                conds.append(f"({_remap_to_j(self.view.where_clause)})")
+            for g_raw in grp_exprs:
+                mv_col = self._group_col_alias(g_raw)
+                lhs_j = _remap_to_j(g_raw)
+                conds.append(
+                    self._null_safe_eq(f"({lhs_j})", f"{mv_table}.{mv_col}", is_nullable=True)
+                )
+            w_sub = f" WHERE {' AND '.join(conds)}" if conds else ""
+            agg_e = _remap_to_j(self._sql_backfill_agg_expr(item))
+            return f"(SELECT {agg_e} FROM {' '.join(j_parts)}{w_sub})"
+
+        plus_merge_assignments = self._build_tier1_chunk_merge_assignments(
+            mv_table=mv_table,
+            row_count_col=row_count_col,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            expr_key_fn=_expr_key,
+            use_mysql_values=(self.dialect == Dialect.MYSQL),
+        )
+        # Native approximate aggregates must preserve the engine's operation
+        # order; algebraically equivalent sum/count updates can differ by ULPs.
+        native_recompute_aliases = {
+            self._q(item.alias)
+            for item in work_items
+            if item.is_aggregate
+            and (
+                item.agg_func in (
+                    AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                    AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                )
+                or self._requires_native_avg_recompute(item)
+            )
+        }
+        if native_recompute_aliases:
+            plus_merge_assignments = [
+                assignment for assignment in plus_merge_assignments
+                if assignment.split("=", 1)[0].strip() not in native_recompute_aliases
+            ]
+            for item in work_items:
+                if item.is_aggregate and (
+                    item.agg_func in (
+                        AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                        AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                    )
+                    or self._requires_native_avg_recompute(item)
+                ):
+                    plus_merge_assignments.append(
+                        f"{self._q(item.alias)} = {_build_join_recompute_subquery(item)}"
+                    )
+
+        # Build minus assignments from `__mv_delta`
+        minus_assignments: List[str] = []
+        minus_updated: Set[str] = set()
+
+        def _delta_sum_minus(col: str, cnt_col: str) -> str:
+            new_c = f"({mv_table}.{cnt_col} - __mv_delta.{cnt_col})"
+            return (
+                f"(CASE WHEN __mv_delta.{col} IS NULL THEN {mv_table}.{col} "
+                f"WHEN {new_c} <= 0 THEN NULL "
+                f"ELSE {mv_table}.{col} - __mv_delta.{col} END)"
+            )
+
+        def _delta_sum2_minus(ekey: str, sum2_col: str, cnt_col: str) -> str:
+            if self.dialect != Dialect.SQLITE:
+                return _delta_sum_minus(sum2_col, cnt_col)
+            sum_c = col_sum_map[ekey]
+            new_c = f"({mv_table}.{cnt_col} - __mv_delta.{cnt_col})"
+            d_mu = f"(((1.0 * __mv_delta.{sum_c}) / __mv_delta.{cnt_col}) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_col}))"
+            return (
+                f"(CASE WHEN __mv_delta.{cnt_col} <= 0 OR __mv_delta.{sum2_col} IS NULL THEN {mv_table}.{sum2_col} "
+                f"WHEN {new_c} <= 0 THEN NULL "
+                f"WHEN {new_c} = 1 THEN 0.0 "
+                f"ELSE MAX(0.0, COALESCE({mv_table}.{sum2_col}, 0.0) - COALESCE(__mv_delta.{sum2_col}, 0.0) - ({d_mu} * {d_mu} * ((1.0 * {mv_table}.{cnt_col} * __mv_delta.{cnt_col}) / {new_c}))) END)"
+            )
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            c = self._q(item.alias)
+            minus_updated.add(c)
+            ekey = _expr_key(item)
+            if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
+                minus_assignments.append(f"{c} = {mv_table}.{c} - __mv_delta.{c}")
+            elif item.agg_func == AggFunc.SUM:
+                cnt_c = col_nonnull_count_map[ekey]
+                minus_assignments.append(f"{c} = {_delta_sum_minus(c, cnt_c)}")
+            elif item.agg_func == AggFunc.AVG:
+                if self._requires_native_avg_recompute(item):
+                    recomputed = _build_join_recompute_subquery(item)
+                    minus_assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                    new_sum = _delta_sum_minus(sum_c, cnt_c)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    minus_assignments.append(
+                        f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL ELSE {dividend} / {new_cnt} END"
+                    )
+            elif item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                recomputed = _build_join_recompute_subquery(item)
+                minus_assignments.append(f"{c} = {recomputed}")
+            elif item.agg_func == AggFunc.MIN:
+                recomp = _build_join_recompute_subquery(item)
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NOT NULL AND {mv_table}.{c} >= __mv_delta.{c} "
+                    f"THEN {recomp} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.MAX:
+                recomp = _build_join_recompute_subquery(item)
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NOT NULL AND {mv_table}.{c} <= __mv_delta.{c} "
+                    f"THEN {recomp} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.BIT_XOR:
+                cnt_c = col_nonnull_count_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                xor_e = self._bitwise_xor_sql(f"{mv_table}.{c}", f"(__mv_delta.{c})")
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {new_cnt} <= 0 THEN NULL ELSE {xor_e} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_AND:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                new_tcnt = f"({mv_table}.{tcnt_c} - __mv_delta.{tcnt_c})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                minus_assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_OR:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                new_tcnt = f"({mv_table}.{tcnt_c} - __mv_delta.{tcnt_c})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                minus_assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
+                )
+
+        if row_count_col not in minus_updated:
+            minus_assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} - __mv_delta.{row_count_col}")
+            minus_updated.add(row_count_col)
+
+        for ekey, cnt_c in col_nonnull_count_map.items():
+            if cnt_c not in minus_updated:
+                minus_assignments.append(f"{cnt_c} = {mv_table}.{cnt_c} - __mv_delta.{cnt_c}")
+                minus_updated.add(cnt_c)
+        for ekey, sum_c in col_sum_map.items():
+            if sum_c not in minus_updated:
+                cnt_c = col_nonnull_count_map[ekey]
+                minus_assignments.append(f"{sum_c} = {_delta_sum_minus(sum_c, cnt_c)}")
+                minus_updated.add(sum_c)
+        for ekey, sum2_c in col_sum2_map.items():
+            if sum2_c not in minus_updated:
+                cnt_c = col_nonnull_count_map[ekey]
+                minus_assignments.append(f"{sum2_c} = {_delta_sum2_minus(ekey, sum2_c, cnt_c)}")
+                minus_updated.add(sum2_c)
+        for ekey, tcnt_c in col_true_cnt_map.items():
+            if tcnt_c not in minus_updated:
+                minus_assignments.append(f"{tcnt_c} = {mv_table}.{tcnt_c} - __mv_delta.{tcnt_c}")
+                minus_updated.add(tcnt_c)
+
+        high_p = {
+            self._q(it.alias)
+            for it in work_items
+            if it.is_aggregate
+            and it.agg_func
+            in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            )
+        }
+        mid_p = (
+            {self._q(it.alias) for it in work_items if it.is_aggregate and it.agg_func == AggFunc.SUM}
+            | set(col_sum_map.values())
+            | set(col_sum2_map.values())
+            | set(col_true_cnt_map.values())
+        )
+        ordered_minus = (
+            [a for a in minus_assignments if a.split("=")[0].strip() in high_p]
+            + [a for a in minus_assignments if a.split("=")[0].strip() not in high_p and a.split("=")[0].strip() in mid_p]
+            + [a for a in minus_assignments if a.split("=")[0].strip() not in high_p and a.split("=")[0].strip() not in mid_p]
+        )
+
+        # For MySQL multi-table UPDATE, LHS column names must be qualified with `mv_table.`
+        mysql_ordered_minus = [
+            f"{mv_table}.{a}" for a in ordered_minus
+        ]
+
+        aliased_delta_select = ", ".join(
+            f"{ex} AS {col}" for col, ex in zip(target_cols, select_exprs)
+        )
+        having_non_empty = "" if grp_exprs else "\nHAVING COUNT(*) > 0"
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for j in self.view.joins:
+            base_t = j.table_name
+            j_alias = j.alias
+            from_new = _build_join_from_clause(replace_alias=j_alias, rec_prefix="NEW")
+            from_old = _build_join_from_clause(replace_alias=j_alias, rec_prefix="OLD")
+
+            delta_pk_match = " AND ".join(
+                f"{mv_table}.{self._q(c)} = __mv_delta.{self._q(c)}" for c in pk_cols
+            )
+            q_pk_cols_csv = ", ".join(self._q(c) for c in pk_cols)
+            if self.dialect == Dialect.MYSQL:
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ON DUPLICATE KEY UPDATE\n"
+                    f"        {', '.join(plus_merge_assignments)};"
+                )
+                minus_stmt = (
+                    f"UPDATE {mv_table}\n"
+                    f"    INNER JOIN (\n"
+                    f"        SELECT {aliased_delta_select}\n"
+                    f"        FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ) AS __mv_delta ON {delta_pk_match}\n"
+                    f"    SET {', '.join(mysql_ordered_minus)};"
+                )
+            else:
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ON CONFLICT ({q_pk_cols_csv}) DO UPDATE SET\n"
+                    f"        {', '.join(plus_merge_assignments)};"
+                )
+                minus_stmt = (
+                    f"UPDATE {mv_table}\n"
+                    f"    SET {', '.join(ordered_minus)}\n"
+                    f"    FROM (\n"
+                    f"        SELECT {aliased_delta_select}\n"
+                    f"        FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ) AS __mv_delta\n"
+                    f"    WHERE {delta_pk_match};"
+                )
+
+            del_zero_stmt = (
+                f"DELETE FROM {mv_table} WHERE {mv_table}.{row_count_col} <= 0;"
+                if grp_exprs
+                else None
+            )
+            del_stmts = [minus_stmt] + ([del_zero_stmt] if del_zero_stmt else [])
+            trunc_stmts = [f"DELETE FROM {mv_table};"] + (
+                [initial_populate_sql] if not grp_exprs else []
+            )
+
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=[plus_stmt],
+                del_stmts=del_stmts,
+                upd_old_stmts=[minus_stmt],
+                upd_new_stmts=[plus_stmt],
+                upd_cleanup_old_stmts=[del_zero_stmt] if del_zero_stmt else [],
+                trunc_stmts=trunc_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+    # =========================================================================
+    # TIER 1C: Z-Set Set Operations (UNION ALL, UNION, INTERSECT, EXCEPT),
+    #          SELECT DISTINCT & PK-Lineage Projections
+    # =========================================================================
+
+    def _parse_setop_branches(self) -> Optional[List[Tuple[str, ViewSpec]]]:
+        raw = self.view.raw_select_sql.strip()
+        try:
+            q_ast = parse_sql_ast(raw)
+        except sqlglot.errors.SqlglotError:
+            return None
+        if not isinstance(q_ast, sqlglot_exp.SetOperation):
+            return None
+
+        ops, branch_sqls = _extract_set_op_branches_from_ast(q_ast, raw)
+        if not ops or len(set(ops)) != 1:
+            return None
+        op_type = ops[0]
+
+        if op_type in ("INTERSECT", "EXCEPT") and len(branch_sqls) != 2:
+            return None
+
+        branches: List[Tuple[str, ViewSpec]] = []
+        col_count: Optional[int] = None
+        for idx, b_sql in enumerate(branch_sqls):
+            try:
+                bs = _parse_single_create_view_stmt(
+                    f"CREATE VIEW __set_b_{idx} AS {b_sql}",
+                    known_tables=set(self._schemas_lower.keys()),
+                )
+            except Exception:
+                return None
+            if (
+                bs.has_cte
+                or bs.has_window_func
+                or bs.has_compound_set_op
+                or bs.has_top_level_distinct
+                or bs.has_limit_or_order
+                or bs.has_subquery_in_from
+                or len(bs.joins) != 1
+                or bs.group_by_cols
+                or any(it.is_aggregate or it.raw_expr.strip() == "*" for it in bs.select_items)
+                or bs.base_table.lower() not in self._schemas_lower
+            ):
+                return None
+            if bs.where_clause and _has_subquery_ast(bs.where_clause):
+                return None
+            if col_count is None:
+                col_count = len(bs.select_items)
+            elif len(bs.select_items) != col_count:
+                return None
+            if op_type == "UNION ALL":
+                ts = self._schemas_lower[bs.base_table.lower()]
+                if not any(c.primary_key for c in ts.columns.values()):
+                    return None
+            branches.append((op_type, bs))
+        return branches
+
+    def _rewrite_branch_expr(self, expr: str, ts: TableSchema, alias: str, record_prefix: Optional[str]) -> str:
+        col_map = {c.lower(): c for c in ts.columns}
+        quals_lower = {q.lower() for q in (ts.name, alias) if q}
+        toks = tokenize_sql(expr)
+        out: List[str] = []
+        i = 0
+        n = len(toks)
+
+        def _next_non_ws(idx: int) -> Optional[SQLToken]:
+            k = idx
+            while k < n:
+                if toks[k].kind != SQLTokenType.WHITESPACE:
+                    return toks[k]
+                k += 1
+            return None
+
+        def _prev_non_ws(idx: int) -> Optional[SQLToken]:
+            k = idx
+            while k >= 0:
+                if toks[k].kind != SQLTokenType.WHITESPACE:
+                    return toks[k]
+                k -= 1
+            return None
+
+        while i < n:
+            t = toks[i]
+            if (
+                t.kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT)
+                and i + 2 < n
+                and toks[i + 1].kind == SQLTokenType.PUNCT
+                and toks[i + 1].text == "."
+                and toks[i + 2].kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT)
+            ):
+                q_low = t.unquoted.lower()
+                c_low = toks[i + 2].unquoted.lower()
+                actual_c = col_map.get(c_low, toks[i + 2].unquoted)
+                if q_low in quals_lower:
+                    if record_prefix:
+                        out.append(f"{record_prefix}.{self._q(actual_c)}")
+                    else:
+                        out.append(f"{self._q(t.unquoted)}.{self._q(actual_c)}")
+                    i += 3
+                    continue
+            if t.kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT):
+                prev_t = _prev_non_ws(i - 1)
+                next_t = _next_non_ws(i + 1)
+                is_after_dot = prev_t is not None and prev_t.kind == SQLTokenType.PUNCT and prev_t.text == "."
+                is_before_dot = next_t is not None and next_t.kind == SQLTokenType.PUNCT and next_t.text == "."
+                is_fn_call = (
+                    t.kind == SQLTokenType.IDENT
+                    and next_t is not None
+                    and next_t.kind == SQLTokenType.PUNCT
+                    and next_t.text == "("
+                )
+                if not is_after_dot and not is_before_dot and not is_fn_call:
+                    w_low = t.unquoted.lower()
+                    if w_low in col_map:
+                        actual_c = col_map[w_low]
+                        if record_prefix:
+                            out.append(f"{record_prefix}.{self._q(actual_c)}")
+                        else:
+                            out.append(self._q(actual_c))
+                        i += 1
+                        continue
+            out.append(t.text)
+            i += 1
+        return "".join(out)
+
+    def _compile_tier1_zset_setop(self) -> MaterializedViewPlan:
+        branches = self._parse_setop_branches()
+        assert branches is not None
+        op_type = branches[0][0]
+        first_bs = branches[0][1]
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        user_columns = [it.alias for it in first_bs.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+
+        # Check if UNION ALL branches share a uniform native composite PK structure
+        branch_pk_defs_list: List[List[ColumnDef]] = []
+        for _, bs in branches:
+            ts_b = self._schemas_lower[bs.base_table.lower()]
+            branch_pk_defs_list.append([c for c in ts_b.columns.values() if c.primary_key])
+
+        use_native_uall_pk = False
+        uall_pk_cols: List[str] = ["__mv_pk"]
+        uall_pk_col_types: List[str] = []
+        if op_type == "UNION ALL" and branch_pk_defs_list and branch_pk_defs_list[0]:
+            k_pks = len(branch_pk_defs_list[0])
+            if all(len(pks) == k_pks for pks in branch_pk_defs_list):
+                use_native_uall_pk = True
+                uall_pk_cols = ["__mv_branch_id", *[f"__mv_pk_{i}" for i in range(k_pks)]]
+                for i in range(k_pks):
+                    dt_i = self._normalize_dialect_type(branch_pk_defs_list[0][i].data_type)
+                    if self.dialect == Dialect.MYSQL and dt_i.upper() == "TEXT":
+                        dt_i = "VARCHAR(255)"
+                    uall_pk_col_types.append(dt_i)
+        self._setop_pk_cols = list(uall_pk_cols)
+
+        col_defs_sql: List[str] = []
+        if use_native_uall_pk:
+            col_defs_sql.append("__mv_branch_id INTEGER NOT NULL")
+            for i, dt_i in enumerate(uall_pk_col_types):
+                col_defs_sql.append(f"__mv_pk_{i} {dt_i} NOT NULL")
+        else:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        indexed_cols_lower = self._indexed_column_names_lower()
+        for it in first_bs.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            col_defs_sql.append(f"{self._q(it.alias)} {dt}")
+
+        if op_type in ("UNION", "UNION ALL"):
+            col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = None
+        elif op_type == "INTERSECT":
+            col_defs_sql.append(f"__mv_cnt_0 {self._int_type()} NOT NULL DEFAULT 0")
+            col_defs_sql.append(f"__mv_cnt_1 {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = "__mv_cnt_0 > 0 AND __mv_cnt_1 > 0"
+        else:  # EXCEPT
+            col_defs_sql.append(f"__mv_cnt_0 {self._int_type()} NOT NULL DEFAULT 0")
+            col_defs_sql.append(f"__mv_cnt_1 {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = "__mv_cnt_0 > 0 AND __mv_cnt_1 = 0"
+
+        if use_native_uall_pk:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(uall_pk_cols)})")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                extra_where_filter=extra_filter,
+            )
+        )
+
+        initial_populate_sqls: List[str] = []
+        by_table_branches: Dict[str, List[Tuple[int, ViewSpec]]] = {}
+        for b_idx, (_, bs) in enumerate(branches):
+            by_table_branches.setdefault(bs.base_table, []).append((b_idx, bs))
+
+        if op_type == "UNION ALL":
+            for b_idx, (_, bs) in enumerate(branches):
+                ts = self._schemas_lower[bs.base_table.lower()]
+                pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                sel_exprs = [it.raw_expr for it in bs.select_items]
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                if use_native_uall_pk:
+                    initial_populate_sqls.append(
+                        f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"SELECT {b_idx}, {', '.join(pk_names)}, {', '.join(sel_exprs)}, 1 FROM {bs.base_table}{w_sql};"
+                    )
+                else:
+                    pk_expr = self._canonical_group_pk_expr([f"'B{b_idx}'", *pk_names])
+                    initial_populate_sqls.append(
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"SELECT {pk_expr}, {', '.join(sel_exprs)}, 1 FROM {bs.base_table}{w_sql};"
+                    )
+        elif op_type == "UNION":
+            u_parts: List[str] = []
+            for _, bs in branches:
+                sel_aliased = ", ".join(
+                    f"{it.raw_expr} AS {col}" for it, col in zip(bs.select_items, user_columns)
+                )
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                u_parts.append(f"    SELECT {sel_aliased} FROM {bs.base_table}{w_sql}")
+            pk_u = self._canonical_group_pk_expr(user_columns)
+            grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
+            initial_populate_sqls.append(
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                f"SELECT {pk_u}, {', '.join(user_columns)}, COUNT(*) FROM (\n"
+                + "\n    UNION ALL\n".join(u_parts)
+                + f"\n) AS __mv_u\nGROUP BY {grp_u};"
+            )
+        else:  # INTERSECT or EXCEPT
+            u_parts = []
+            for b_idx, (_, bs) in enumerate(branches):
+                sel_aliased = ", ".join(
+                    f"{it.raw_expr} AS {col}" for it, col in zip(bs.select_items, user_columns)
+                )
+                b0 = "1" if b_idx == 0 else "0"
+                b1 = "1" if b_idx == 1 else "0"
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                u_parts.append(
+                    f"    SELECT {sel_aliased}, {b0} AS __mv_b0, {b1} AS __mv_b1 FROM {bs.base_table}{w_sql}"
+                )
+            pk_u = self._canonical_group_pk_expr(user_columns)
+            grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
+            initial_populate_sqls.append(
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                f"SELECT {pk_u}, {', '.join(user_columns)}, SUM(__mv_b0), SUM(__mv_b1) FROM (\n"
+                + "\n    UNION ALL\n".join(u_parts)
+                + f"\n) AS __mv_u\nGROUP BY {grp_u};"
+            )
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for base_t, b_list in by_table_branches.items():
+            ts = self._schemas_lower[base_t.lower()]
+            ins_stmts: List[str] = []
+            del_stmts: List[str] = []
+            upd_old_stmts: List[str] = []
+            upd_new_stmts: List[str] = []
+            cleanup_stmts: List[str] = []
+
+            for b_idx, bs in b_list:
+                b_alias = bs.joins[0].alias if bs.joins else base_t
+                w_new = (
+                    self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "NEW")
+                    if bs.where_clause
+                    else "TRUE"
+                )
+                w_old = (
+                    self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "OLD")
+                    if bs.where_clause
+                    else "TRUE"
+                )
+                new_vals = [
+                    self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "NEW")
+                    for it in bs.select_items
+                ]
+                old_vals = [
+                    self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "OLD")
+                    for it in bs.select_items
+                ]
+
+                if op_type == "UNION ALL":
+                    pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                    if use_native_uall_pk:
+                        new_pk_vals = [str(b_idx), *[f"NEW.{self._q(c)}" for c in pk_names]]
+                        old_pk_match = f"{mv_table}.__mv_branch_id = {b_idx} AND " + " AND ".join(
+                            f"{mv_table}.__mv_pk_{i} = OLD.{self._q(c)}" for i, c in enumerate(pk_names)
+                        )
+                        if self.dialect == Dialect.MYSQL:
+                            upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        else:
+                            upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON CONFLICT ({', '.join(uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        minus_s = (
+                            f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                            f"    WHERE ({w_old}) AND ({old_pk_match});"
+                        )
+                        clean_s = (
+                            f"DELETE FROM {mv_table}\n"
+                            f"    WHERE ({w_old}) AND ({old_pk_match}) AND {mv_table}.__mv_row_count <= 0;"
+                        )
+                    else:
+                        pk_new = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"NEW.{c}" for c in pk_names]])
+                        pk_old = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"OLD.{c}" for c in pk_names]])
+                        if self.dialect == Dialect.MYSQL:
+                            upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        else:
+                            upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        minus_s = (
+                            f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                            f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                        )
+                        clean_s = (
+                            f"DELETE FROM {mv_table}\n"
+                            f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+                        )
+                elif op_type == "UNION":
+                    pk_new = self._canonical_group_pk_expr(new_vals)
+                    pk_old = self._canonical_group_pk_expr(old_vals)
+                    if self.dialect == Dialect.MYSQL:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON DUPLICATE KEY UPDATE __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                    else:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                    minus_s = (
+                        f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                        f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                    )
+                    clean_s = (
+                        f"DELETE FROM {mv_table}\n"
+                        f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+                    )
+                else:  # INTERSECT or EXCEPT
+                    pk_new = self._canonical_group_pk_expr(new_vals)
+                    pk_old = self._canonical_group_pk_expr(old_vals)
+                    cnt_col = f"__mv_cnt_{b_idx}"
+                    init_c0 = "1" if b_idx == 0 else "0"
+                    init_c1 = "1" if b_idx == 1 else "0"
+                    if self.dialect == Dialect.MYSQL:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}{from_dual}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON DUPLICATE KEY UPDATE {cnt_col} = {mv_table}.{cnt_col} + 1;"
+                        )
+                    else:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET {cnt_col} = {mv_table}.{cnt_col} + 1;"
+                        )
+                    minus_s = (
+                        f"UPDATE {mv_table} SET {cnt_col} = {mv_table}.{cnt_col} - 1\n"
+                        f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                    )
+                    clean_s = (
+                        f"DELETE FROM {mv_table}\n"
+                        f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_cnt_0 <= 0 AND {mv_table}.__mv_cnt_1 <= 0;"
+                    )
+
+                ins_stmts.append(plus_s)
+                del_stmts.extend([minus_s, clean_s])
+                upd_old_stmts.append(minus_s)
+                upd_new_stmts.append(plus_s)
+                cleanup_stmts.append(clean_s)
+
+            trunc_stmts = [f"DELETE FROM {mv_table};", *initial_populate_sqls]
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=ins_stmts,
+                del_stmts=del_stmts,
+                upd_old_stmts=upd_old_stmts,
+                upd_new_stmts=upd_new_stmts,
+                upd_cleanup_old_stmts=cleanup_stmts,
+                trunc_stmts=trunc_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            chunk_sql_templates=initial_populate_sqls,
+        )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=initial_populate_sqls,
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    def _compile_tier1_zset_distinct(self) -> MaterializedViewPlan:
+        # `SELECT DISTINCT c1, c2 FROM t WHERE ...` is isomorphic to `GROUP BY c1, c2` with hidden `__mv_row_count`
+        self._effective_group_by_exprs = tuple(it.raw_expr for it in self.view.select_items)
+        return self._compile_tier1_algebraic()
+
+    def _projection_pk_mapping(self) -> Tuple[List[str], List[Tuple[str, str, str]], bool]:
+        """
+        Returns `(mv_pk_cols, hidden_pk_defs, uses_native_pk)` for `_compile_tier1_zset_projection`.
+        Preserves the base table's actual primary/composite key columns in the backing table
+        whenever all base PK columns are non-nullable.
+        """
+        assert self.primary_schema is not None
+        pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
+        can_native = bool(pk_defs) and all(
+            c.not_null
+            or "INT" in c.data_type.upper()
+            or self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+            for c in pk_defs
+        )
+        if not can_native:
+            return ["__mv_pk"], [], False
+
+        base_alias = self.view.joins[0].alias.lower() if self.view.joins else self.view.base_table.lower()
+        base_name = self.view.base_table.lower()
+        mv_pk_cols: List[str] = []
+        hidden_pk_defs: List[Tuple[str, str, str]] = []
+        used_user_aliases: Set[str] = set()
+
+        for c_def in pk_defs:
+            c_low = c_def.name.lower()
+            matched_alias: Optional[str] = None
+            for it in self.view.select_items:
+                raw_s = _unquote_ident(it.raw_expr.strip()).lower() if re.match(r'^[A-Za-z0-9_."`\[\]]+$', it.raw_expr.strip()) else ""
+                raw_full = it.raw_expr.strip().lower()
+                if (
+                    raw_full == c_low
+                    or raw_full == f"{base_alias}.{c_low}"
+                    or raw_full == f"{base_name}.{c_low}"
+                    or (raw_s == c_low and "." not in raw_full)
+                ) and it.alias.lower() not in used_user_aliases:
+                    matched_alias = it.alias
+                    used_user_aliases.add(it.alias.lower())
+                    break
+            if matched_alias is not None:
+                mv_pk_cols.append(matched_alias)
+            else:
+                hid_col = f"__mv_pk_{_sanitize_ident(c_def.name)}"
+                dt = self._normalize_dialect_type(c_def.data_type)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                hidden_pk_defs.append((hid_col, c_def.name, dt))
+                mv_pk_cols.append(hid_col)
+
+        return mv_pk_cols, hidden_pk_defs, True
+
+    def _projection_pk_cols(self) -> List[str]:
+        mv_pk_cols, _, _ = self._projection_pk_mapping()
+        return mv_pk_cols
+
+    def _compile_tier1_zset_projection(self) -> MaterializedViewPlan:
+        assert self.primary_schema is not None
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        base_t = self.view.base_table
+        q_base_t = self._q(base_t)
+        user_columns = [it.alias for it in self.view.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+
+        pk_names = [c.name for c in self.primary_schema.columns.values() if c.primary_key]
+        mv_pk_cols, hidden_pk_defs, uses_native_pk = self._projection_pk_mapping()
+        pk_col_set_lower = {c.lower() for c in mv_pk_cols}
+
+        col_defs_sql: List[str] = []
+        if not uses_native_pk:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        indexed_cols_lower = self._indexed_column_names_lower(mv_pk_cols if uses_native_pk else ())
+        for it in self.view.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            nn = " NOT NULL" if (uses_native_pk and it.alias.lower() in pk_col_set_lower) else ""
+            col_defs_sql.append(f"{it.alias} {dt}{nn}")
+
+        for hid_col, _, hid_dt in hidden_pk_defs:
+            col_defs_sql.append(f"{hid_col} {hid_dt} NOT NULL")
+
+        if uses_native_pk:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(mv_pk_cols)})")
+        else:
+            col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        sel_exprs = [it.raw_expr for it in self.view.select_items]
+        w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
+        new_vals = [self._rewrite_expr_for_record(it.raw_expr, "NEW") for it in self.view.select_items]
+
+        if uses_native_pk:
+            all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
+            all_select_exprs = [*sel_exprs, *[h[1] for h in hidden_pk_defs]]
+            all_new_vals = [*new_vals, *[f"NEW.{h[1]}" for h in hidden_pk_defs]]
+            initial_populate_sql = (
+                f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                f"SELECT {', '.join(all_select_exprs)} FROM {q_base_t}{w_sql};"
+            )
+            if self.dialect == Dialect.MYSQL:
+                upd_set = ", ".join(f"{c} = VALUES({c})" for c in all_backing_cols)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                    f"    SELECT {', '.join(all_new_vals)}{from_dual}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON DUPLICATE KEY UPDATE {upd_set};"
+                )
+            else:
+                upd_set = ", ".join(f"{c} = excluded.{c}" for c in all_backing_cols)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                    f"    SELECT {', '.join(all_new_vals)}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON CONFLICT ({', '.join(mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                )
+            pk_old_preds = [
+                f"{mv_table}.{mv_c} = OLD.{src_c}"
+                for mv_c, src_c in zip(mv_pk_cols, pk_names)
+            ]
+            del_where = " AND ".join(pk_old_preds)
+            del_stmt = f"DELETE FROM {mv_table}\n    WHERE {del_where};"
+            del_stmts_list = [del_stmt]
+            upd_old_list = [del_stmt]
+            upd_clean_list: List[str] = []
+        else:
+            pk_expr_base = self._canonical_group_pk_expr(pk_names)
+            initial_populate_sql = (
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_sql};"
+            )
+            pk_new = self._canonical_group_pk_expr([f"NEW.{c}" for c in pk_names])
+            pk_old = self._canonical_group_pk_expr([f"OLD.{c}" for c in pk_names])
+            if self.dialect == Dialect.MYSQL:
+                upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            else:
+                upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            minus_stmt = (
+                f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                f"    WHERE {mv_table}.__mv_pk = ({pk_old});"
+            )
+            clean_stmt = (
+                f"DELETE FROM {mv_table}\n"
+                f"    WHERE ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+            )
+            del_stmts_list = [minus_stmt, clean_stmt]
+            upd_old_list = [minus_stmt]
+            upd_clean_list = [clean_stmt]
+
+        where_new = (
+            self._rewrite_expr_for_record(self.view.where_clause, "NEW")
+            if self.view.where_clause
+            else None
+        )
+        where_old = (
+            self._rewrite_expr_for_record(self.view.where_clause, "OLD")
+            if self.view.where_clause
+            else None
+        )
+
+        trigger_ddls, trig_names, fn_names = self._emit_dialect_triggers_for_table(
+            view_name=view_name,
+            base_t=base_t,
+            ins_stmts=[plus_stmt],
+            del_stmts=del_stmts_list,
+            upd_old_stmts=upd_old_list,
+            upd_new_stmts=[plus_stmt],
+            upd_cleanup_old_stmts=upd_clean_list,
+            trunc_stmts=[f"DELETE FROM {mv_table};"],
+            where_new=where_new,
+            where_old=where_old,
+        )
+
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            chunk_sql_templates=[initial_populate_sql],
+        )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    def _compile_tier1_union_all_agg(self) -> MaterializedViewPlan:
+        """
+        Compiles an aggregation query over a `UNION ALL` CTE or derived subquery into Tier 1 O(1)
+        per-branch algebraic delta triggers.
+        """
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        work_items = list(self._working_select_items)
+        grp_exprs = list(self._effective_group_by_exprs)
+        inner_u_sql = self._union_all_inner_sql
+        u_alias = self._union_all_sub_alias
+        branch_specs = self._union_all_branch_specs
+
+        count_star_alias: Optional[str] = None
+        for item in work_items:
+            if (
+                item.is_aggregate
+                and item.agg_func == AggFunc.COUNT_STAR
+                and not item.filter_where
+            ):
+                count_star_alias = item.alias
+                break
+        row_count_col = self._q(count_star_alias) if count_star_alias else "__mv_row_count"
+
+        # Check if all group_by columns are NOT NULL across every UNION ALL branch
+        uall_has_nullable = False
+        if grp_exprs:
+            first_b_aliases = [it.alias.lower() for it in branch_specs[0].select_items]
+            seen_g_al: Set[str] = set()
+            for g_expr in grp_exprs:
+                g_id = _unquote_ident(g_expr.split(".")[-1]).lower() if _is_simple_column_expr(g_expr.strip()) else ""
+                if not g_id or g_id not in first_b_aliases:
+                    uall_has_nullable = True
+                    break
+                col_pos = first_b_aliases.index(g_id)
+                for bs in branch_specs:
+                    b_it = bs.select_items[col_pos]
+                    ts_b = self._schemas_lower[bs.base_table.lower()]
+                    c_b = ts_b.columns.get(b_it.source_col or "") if b_it.source_col else None
+                    if c_b is None or not c_b.not_null:
+                        uall_has_nullable = True
+                        break
+                if uall_has_nullable:
+                    break
+                al_g = self._group_col_alias(g_expr).lower()
+                if al_g in seen_g_al:
+                    uall_has_nullable = True
+                    break
+                seen_g_al.add(al_g)
+        self._uall_has_nullable_grp = uall_has_nullable
+        has_nullable_grp = self._has_nullable_group_col()
+        pk_cols = self._tier1_pk_cols()
+
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = [it.alias for it in self.view.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+
+        if not grp_exprs:
+            col_defs_sql.append("__mv_global_id INTEGER NOT NULL PRIMARY KEY")
+        elif has_nullable_grp:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        non_agg_aliases_lower = {
+            item.alias.lower() for item in work_items if not item.is_aggregate
+        }
+        seen_hidden_grp: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
+                seen_hidden_grp.add(mv_col.lower())
+                fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
+                dt = self._infer_expr_storage_type(fake_it)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if not has_nullable_grp else ""
+                col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
+
+        def _expr_key(item: SelectItem) -> str:
+            eff = self._effective_agg_value_expr(item, record_prefix=None).strip().lower()
+            return f"{'dist:' if item.is_distinct else ''}{eff}"
+
+        col_nonnull_count_map: Dict[str, str] = {}
+        col_sum_map: Dict[str, str] = {}
+        col_sum2_map: Dict[str, str] = {}
+        col_true_cnt_map: Dict[str, str] = {}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            ekey = _expr_key(item)
+            if item.agg_func == AggFunc.COUNT_COL:
+                col_nonnull_count_map[ekey] = self._q(item.alias)
+            elif item.agg_func == AggFunc.SUM:
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = self._q(item.alias)
+
+        group_mv_cols: List[str] = []
+        for g in grp_exprs:
+            mc = self._group_col_alias(g)
+            if mc not in group_mv_cols:
+                group_mv_cols.append(mc)
+        indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
+
+        # Infer aggregate types from first branch
+        first_b = branch_specs[0]
+        first_b_map = {it.alias.lower(): it.raw_expr for it in first_b.select_items}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                dt = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
+                col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
+            else:
+                # Check if arg_expr maps to an integer column across all branches
+                storage_type = self._infer_expr_storage_type(item)
+                if item.agg_func in (AggFunc.SUM, AggFunc.MIN, AggFunc.MAX) and item.arg_expr:
+                    arg_id = _unquote_ident(item.arg_expr).lower()
+                    if arg_id in first_b_map:
+                        b_types = []
+                        for bs in branch_specs:
+                            b_m = {bi.alias.lower(): bi for bi in bs.select_items}
+                            if arg_id in b_m:
+                                bi_item = b_m[arg_id]
+                                ts_b = self._schemas_lower[bs.base_table.lower()]
+                                c_b = ts_b.columns.get(bi_item.source_col or "") if bi_item.source_col else None
+                                if c_b:
+                                    b_types.append(self._normalize_dialect_type(c_b.data_type))
+                                elif re.match(r"^\d+$", bi_item.raw_expr.strip()):
+                                    b_types.append("INT")
+                                else:
+                                    b_types.append(self._float_type())
+                        if b_types and all("INT" in bt.upper() for bt in b_types):
+                            storage_type = self._int_type() if item.agg_func == AggFunc.SUM else b_types[0]
+                if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    storage_type = "VARCHAR(255)"
+                if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
+                elif item.agg_func == AggFunc.TOTAL:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0.0")
+                else:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type}")
+
+        if count_star_alias is None:
+            col_defs_sql.append(f"{row_count_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        aux_idx = 0
+        for item in work_items:
+            if not item.is_aggregate or item.agg_func is None:
+                continue
+            ekey = _expr_key(item)
+            safe_id = _sanitize_ident(item.alias)
+            if item.agg_func in (
+                AggFunc.SUM,
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            ) or (item.agg_func == AggFunc.COUNT_STAR and item.filter_where):
+                if item.agg_func == AggFunc.COUNT_STAR and item.filter_where:
+                    col_nonnull_count_map[ekey] = self._q(item.alias)
+                elif ekey not in col_nonnull_count_map:
+                    aux_idx += 1
+                    cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
+                    col_nonnull_count_map[ekey] = cnt_col
+                    col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+            if item.agg_func in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum_map:
+                    aux_idx += 1
+                    sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
+                    col_sum_map[ekey] = sum_col
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
+
+            if item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum2_map:
+                    aux_idx += 1
+                    s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
+                    sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
+                    col_sum2_map[ekey] = sum2_col
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
+
+            if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if ekey not in col_true_cnt_map:
+                    aux_idx += 1
+                    tcnt_col = f"__mv_tcnt_{safe_id}_{aux_idx}"
+                    col_true_cnt_map[ekey] = tcnt_col
+                    col_defs_sql.append(f"{tcnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        if grp_exprs and not has_nullable_grp:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        backing_col_map = {
+            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            for u_col, expr_s in self._compound_reader_exprs.items()
+            if expr_s != u_col and "__mv_elem_" in expr_s
+        }
+        can_pg15_unique_nnd = (
+            bool(grp_exprs)
+            and has_nullable_grp
+            and len(set(c.lower() for c in group_mv_cols)) == len(grp_exprs)
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=group_mv_cols,
+            has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
+            backing_col_map=backing_col_map,
+            unique_group_nulls_not_distinct=can_pg15_unique_nnd,
+        )
+        reader_select_override = [
+            self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
+        ]
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                select_exprs_override=reader_select_override,
+                extra_where_filter=self._rewritten_having_clause,
+            )
+        )
+
+        target_cols: List[str] = []
+        select_exprs: List[str] = []
+        if not grp_exprs:
+            target_cols.append("__mv_global_id")
+            select_exprs.append("1")
+        elif has_nullable_grp:
+            target_cols.append("__mv_pk")
+            select_exprs.append(self._canonical_group_pk_expr(grp_exprs))
+
+        seen_hidden: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                target_cols.append(mv_col)
+                select_exprs.append(g_expr)
+
+        for item in work_items:
+            target_cols.append(item.alias)
+            if not item.is_aggregate:
+                select_exprs.append(item.raw_expr)
+            else:
+                select_exprs.append(self._sql_backfill_agg_expr(item))
+
+        if count_star_alias is None:
+            target_cols.append(row_count_col)
+            select_exprs.append("COUNT(*)")
+
+        already_in_target = set(target_cols)
+        ekey_to_item: Dict[str, SelectItem] = {
+            _expr_key(it): it for it in work_items if it.is_aggregate
+        }
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            if cnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(cnt_col)
+                select_exprs.append(f"COUNT({eff})")
+                already_in_target.add(cnt_col)
+        for ekey, sum_col in col_sum_map.items():
+            if sum_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(sum_col)
+                select_exprs.append(f"SUM({eff})")
+                already_in_target.add(sum_col)
+        for ekey, sum2_col in col_sum2_map.items():
+            if sum2_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(sum2_col)
+                if self.dialect == Dialect.SQLITE:
+                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
+                else:
+                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
+                already_in_target.add(sum2_col)
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            if tcnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(tcnt_col)
+                select_exprs.append(
+                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
+                )
+                already_in_target.add(tcnt_col)
+
+        w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
+        grp_for_q = self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=has_nullable_grp)
+        g_sql = f"\nGROUP BY {', '.join(grp_for_q)}" if grp_for_q else ""
+
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+            f"SELECT {', '.join(select_exprs)} FROM (\n{inner_u_sql}\n) AS {u_alias}{w_sql}{g_sql};"
+        )
+
+        # Group branches by base table and generate per-branch delta statements
+        by_table: Dict[str, List[ViewSpec]] = {}
+        for bs in branch_specs:
+            by_table.setdefault(bs.base_table, []).append(bs)
+
+        orig_view = self.view
+        orig_work_items = list(self._working_select_items)
+        orig_grp_exprs = tuple(self._effective_group_by_exprs)
+        orig_grp_aliases = [self._group_col_alias(g) for g in orig_grp_exprs]
+        orig_primary_schema = self.primary_schema
+        self._uall_orig_grp_exprs = orig_grp_exprs
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for base_t, b_list in by_table.items():
+            ts = self._schemas_lower[base_t.lower()]
+            ins_all: List[str] = []
+            del_all: List[str] = []
+            upd_old_all: List[str] = []
+            upd_new_all: List[str] = []
+            cleanup_all: List[str] = []
+
+            for bs in b_list:
+                b_alias = bs.joins[0].alias if bs.joins else base_t
+                col_subst: Dict[str, str] = {}
+                for col_i, b_it in enumerate(bs.select_items):
+                    u_col_name = first_b.select_items[col_i].alias.lower()
+                    cleaned = re.sub(
+                        rf"\b{re.escape(b_alias)}\.",
+                        "",
+                        b_it.raw_expr.strip(),
+                        flags=re.IGNORECASE,
+                    )
+                    col_subst[u_col_name] = f"({cleaned})"
+
+                def _subst_u(frag: Optional[str]) -> Optional[str]:
+                    if frag is None:
+                        return None
+                    toks = sqlglot.tokenize(frag, read="sqlite")
+                    if not toks:
+                        return frag
+                    out = []
+                    cursor = 0
+                    i = 0
+                    n = len(toks)
+                    while i < n:
+                        tk = toks[i]
+                        if (
+                            _is_word_or_ident_token(tk)
+                            and i + 2 < n
+                            and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                            and _is_word_or_ident_token(toks[i + 2])
+                        ):
+                            if tk.text.lower() == u_alias.lower():
+                                c_col = toks[i + 2].text.lower()
+                                if tk.start > cursor:
+                                    out.append(frag[cursor:tk.start])
+                                out.append(col_subst.get(c_col, toks[i + 2].text))
+                                cursor = toks[i + 2].end + 1
+                                i += 3
+                                continue
+                        if _is_word_or_ident_token(tk):
+                            is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
+                            is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
+                            is_fn = (
+                                tk.token_type != SQLGlotTokenType.IDENTIFIER
+                                and i + 1 < n
+                                and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN
+                            )
+                            if not is_after_dot and not is_before_dot and not is_fn:
+                                c_low = tk.text.lower()
+                                if c_low in col_subst:
+                                    if tk.start > cursor:
+                                        out.append(frag[cursor:tk.start])
+                                    out.append(col_subst[c_low])
+                                    cursor = tk.end + 1
+                                    i += 1
+                                    continue
+                        i += 1
+                    if cursor < len(frag):
+                        out.append(frag[cursor:])
+                    return "".join(out)
+
+                mapped_work_items: List[SelectItem] = []
+                orig_item_map: Dict[int, SelectItem] = {}
+                mapped_nonnull: Dict[str, str] = {}
+                mapped_sum: Dict[str, str] = {}
+                mapped_sum2: Dict[str, str] = {}
+                mapped_tcnt: Dict[str, str] = {}
+
+                for orig_it in orig_work_items:
+                    if not orig_it.is_aggregate:
+                        new_it = SelectItem(
+                            raw_expr=_subst_u(orig_it.raw_expr) or orig_it.raw_expr,
+                            alias=orig_it.alias,
+                            is_aggregate=False,
+                        )
+                    else:
+                        new_it = SelectItem(
+                            raw_expr=_subst_u(orig_it.raw_expr) or orig_it.raw_expr,
+                            alias=orig_it.alias,
+                            is_aggregate=True,
+                            agg_func=orig_it.agg_func,
+                            arg_expr=_subst_u(orig_it.arg_expr) if orig_it.arg_expr else orig_it.arg_expr,
+                            extra_args=orig_it.extra_args,
+                            is_distinct=orig_it.is_distinct,
+                            filter_where=_subst_u(orig_it.filter_where),
+                        )
+                        orig_ekey = _expr_key(orig_it)
+                        new_ekey = _expr_key(new_it)
+                        if orig_ekey in col_nonnull_count_map:
+                            mapped_nonnull[new_ekey] = col_nonnull_count_map[orig_ekey]
+                        if orig_ekey in col_sum_map:
+                            mapped_sum[new_ekey] = col_sum_map[orig_ekey]
+                        if orig_ekey in col_sum2_map:
+                            mapped_sum2[new_ekey] = col_sum2_map[orig_ekey]
+                        if orig_ekey in col_true_cnt_map:
+                            mapped_tcnt[new_ekey] = col_true_cnt_map[orig_ekey]
+                    orig_item_map[id(new_it)] = orig_it
+                    mapped_work_items.append(new_it)
+
+                mapped_grps = tuple(_subst_u(g) or g for g in orig_grp_exprs)
+                b_w = (
+                    re.sub(rf"\b{re.escape(b_alias)}\.", "", bs.where_clause, flags=re.IGNORECASE)
+                    if bs.where_clause
+                    else None
+                )
+                o_w = _subst_u(orig_view.where_clause)
+                comb_w = f"({b_w}) AND ({o_w})" if (b_w and o_w) else (b_w or o_w)
+
+                # Temporarily bind branch context
+                self.primary_schema = ts
+                self._working_select_items = mapped_work_items
+                self._effective_group_by_exprs = mapped_grps
+                self._uall_grp_alias_map = {mg: oa for mg, oa in zip(mapped_grps, orig_grp_aliases)}
+                self._uall_orig_item_map = orig_item_map
+                self.view = ViewSpec(
+                    view_name=orig_view.view_name,
+                    raw_select_sql=orig_view.raw_select_sql,
+                    base_table=base_t,
+                    joins=(JoinSpec(join_type="FROM", table_name=base_t, alias=base_t),),
+                    referenced_tables=(base_t,),
+                    select_items=tuple(mapped_work_items),
+                    where_clause=orig_view.where_clause,
+                    group_by_cols=mapped_grps,
+                )
+
+                plus_b = self._build_plus_delta_statements(
+                    mv_table,
+                    row_count_col,
+                    mapped_nonnull,
+                    mapped_sum,
+                    mapped_sum2,
+                    mapped_tcnt,
+                    {},
+                    _expr_key,
+                    record_prefix="NEW",
+                )
+                minus_del_b, _ = self._build_minus_delta_statements(
+                    mv_table,
+                    row_count_col,
+                    mapped_nonnull,
+                    mapped_sum,
+                    mapped_sum2,
+                    mapped_tcnt,
+                    {},
+                    _expr_key,
+                    record_prefix="OLD",
+                    include_delete_zero_mv=True,
+                )
+                minus_upd_b, del_zero_b = self._build_minus_delta_statements(
+                    mv_table,
+                    row_count_col,
+                    mapped_nonnull,
+                    mapped_sum,
+                    mapped_sum2,
+                    mapped_tcnt,
+                    {},
+                    _expr_key,
+                    record_prefix="OLD",
+                    include_delete_zero_mv=False,
+                )
+
+                w_new_b = self._rewrite_expr_for_record(comb_w, "NEW") if comb_w else None
+                w_old_b = self._rewrite_expr_for_record(comb_w, "OLD") if comb_w else None
+
+                ins_all.extend(self._apply_where_guard_to_stmt(s, w_new_b) for s in plus_b)
+                del_all.extend(self._apply_where_guard_to_stmt(s, w_old_b) for s in minus_del_b)
+                upd_old_all.extend(self._apply_where_guard_to_stmt(s, w_old_b) for s in minus_upd_b)
+                upd_new_all.extend(self._apply_where_guard_to_stmt(s, w_new_b) for s in plus_b)
+                if del_zero_b:
+                    cleanup_all.append(self._apply_where_guard_to_stmt(del_zero_b, w_old_b))
+
+            # Restore original view context
+            self.view = orig_view
+            self._working_select_items = orig_work_items
+            self._effective_group_by_exprs = orig_grp_exprs
+            self.primary_schema = orig_primary_schema
+            self._uall_grp_alias_map = None
+
+            trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=ins_all,
+                del_stmts=del_all,
+                upd_old_stmts=upd_old_all,
+                upd_new_stmts=upd_new_all,
+                upd_cleanup_old_stmts=cleanup_all,
+                trunc_stmts=trunc_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            chunk_sql_templates=[initial_populate_sql],
+        )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+    # =========================================================================
+    # TIER 2: Group-Scoped Delta Recomputation (Holistic Aggs, LEFT JOINs, etc.)
+    # =========================================================================
+
+    def _can_push_down_group_filter_into_where(self) -> bool:
+        if not self.view.where_clause:
+            return True
+        return not _has_subquery_ast(self.view.where_clause)
+
+    def _inject_where_into_source_query(self, source_query_sql: str, extra_predicate: str) -> str:
+        s = source_query_sql.strip().rstrip(";")
+        tok_where = _find_top_level_token(s, (SQLGlotTokenType.WHERE,))
+        tok_group = _find_top_level_token(s, (SQLGlotTokenType.GROUP_BY,))
+        if tok_where is not None:
+            insert_pos = tok_where.end + 1
+            before = s[: tok_where.start].rstrip()
+            if tok_group is not None:
+                existing_w = s[insert_pos : tok_group.start].strip()
+                after = s[tok_group.start :]
+                return f"{before}\nWHERE ({existing_w}) AND ({extra_predicate})\n{after}"
+            existing_w = s[insert_pos:].strip()
+            return f"{before}\nWHERE ({existing_w}) AND ({extra_predicate})"
+        if tok_group is not None:
+            before = s[: tok_group.start].rstrip()
+            after = s[tok_group.start :]
+            return f"{before}\nWHERE ({extra_predicate})\n{after}"
+        return f"{s}\nWHERE ({extra_predicate})"
+
+    def _group_scope_predicate_for_table(
+        self,
+        base_t: str,
+        group_mv_cols: List[Tuple[str, str]],
+        lhs_table_alias: Optional[str],
+        record_prefix: str,
+    ) -> Optional[str]:
+        if not group_mv_cols:
+            return None
+
+        if len(self.view.joins) <= 1 and base_t.lower() != self.view.base_table.lower():
+            return None
+        if self.view.where_clause and re.search(r"\b(?:EXISTS|IN)\s*\(", self.view.where_clause, flags=re.IGNORECASE):
+            if base_t.lower() != self.view.base_table.lower():
+                return None
+
+        def _lhs_expr(g_expr: str, mv_col: str) -> str:
+            if lhs_table_alias:
+                return f"{lhs_table_alias}.{mv_col}"
+            return f"({g_expr})"
+
+        if len(self.view.joins) == 1:
+            conds: List[str] = []
+            for g_expr, mv_col in group_mv_cols:
+                rhs_e = self._rewrite_expr_for_record(g_expr, record_prefix)
+                conds.append(self._null_safe_eq(_lhs_expr(g_expr, mv_col), f"({rhs_e})", is_nullable=True))
+            return " AND ".join(conds)
+
+        target_join: Optional[JoinSpec] = None
+        for j in self.view.joins:
+            if j.table_name.lower() == base_t.lower():
+                target_join = j
+                break
+        if target_join is None:
+            return None
+
+        # If base_t is the table that owns all group columns directly, compare directly
+        target_alias = target_join.alias
+        all_owned = True
+        direct_conds: List[str] = []
+        ts_target = self._schemas_lower[base_t.lower()]
+        for g_expr, mv_col in group_mv_cols:
+            gs = g_expr.strip()
+            if "." in gs:
+                p_al, c_part = gs.split(".", 1)
+                if p_al.strip().lower() in (target_alias.lower(), base_t.lower()):
+                    direct_conds.append(
+                        self._null_safe_eq(
+                            _lhs_expr(g_expr, mv_col),
+                            f"({record_prefix}.{_unquote_ident(c_part)})",
+                            is_nullable=True,
+                        )
+                    )
+                else:
+                    all_owned = False
+                    break
+            elif _unquote_ident(gs) in ts_target.columns:
+                direct_conds.append(
+                    self._null_safe_eq(
+                        _lhs_expr(g_expr, mv_col),
+                        f"({record_prefix}.{_unquote_ident(gs)})",
+                        is_nullable=True,
+                    )
+                )
+            else:
+                all_owned = False
+                break
+
+        if all_owned and direct_conds:
+            return " AND ".join(direct_conds)
+
+        # Otherwise build an EXISTS subquery over the join graph with `target_join` replaced by `(SELECT NEW/OLD.*)`
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+        rec_proj = ", ".join(f"{record_prefix}.{c} AS {c}" for c in ts_target.columns)
+        alias_remap: Dict[str, str] = {}
+        for j in self.view.joins:
+            alias_remap[j.alias.lower()] = f"__mv_j_{j.alias}"
+            alias_remap[j.table_name.lower()] = f"__mv_j_{j.alias}"
+
+        def _remap_aliases_in_sql(frag: str) -> str:
+            toks = sqlglot.tokenize(frag, read="sqlite")
+            if not toks:
+                return frag
+            out: List[str] = []
+            cursor = 0
+            i = 0
+            n = len(toks)
+            while i < n:
+                tk = toks[i]
+                if (
+                    _is_word_or_ident_token(tk)
+                    and i + 2 < n
+                    and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                    and _is_word_or_ident_token(toks[i + 2])
+                ):
+                    tbl_low = tk.text.lower()
+                    if tbl_low in alias_remap:
+                        if tk.start > cursor:
+                            out.append(frag[cursor:tk.start])
+                        out.append(f"{alias_remap[tbl_low]}.{toks[i + 2].text}")
+                        cursor = toks[i + 2].end + 1
+                        i += 3
+                        continue
+                i += 1
+            if cursor < len(frag):
+                out.append(frag[cursor:])
+            return "".join(out)
+
+        inline_row_table = f"(SELECT {rec_proj}{from_dual}) AS __mv_j_{target_alias}"
+        join_parts: List[str] = []
+        for idx, j in enumerate(self.view.joins):
+            remapped_alias = f"__mv_j_{j.alias}"
+            tbl_expr = (
+                inline_row_table
+                if j.alias.lower() == target_alias.lower()
+                else f"{j.table_name} AS {remapped_alias}"
+            )
+            if idx == 0:
+                join_parts.append(tbl_expr)
+            else:
+                on_sql = (
+                    f" ON {_remap_aliases_in_sql(j.on_condition)}"
+                    if j.on_condition
+                    else ""
+                )
+                eff_join_type = (
+                    "INNER JOIN"
+                    if j.alias.lower() == target_alias.lower() and j.on_condition
+                    else j.join_type
+                )
+                join_parts.append(f"{eff_join_type} {tbl_expr}{on_sql}")
+
+        from_join_sql = " ".join(join_parts)
+        left_join_remapped = {
+            f"__mv_j_{j.alias}".lower()
+            for j in self.view.joins
+            if j.join_type == "LEFT JOIN"
+        }
+        match_conds: List[str] = []
+        for g_expr, mv_col in group_mv_cols:
+            remapped_g = _remap_aliases_in_sql(g_expr)
+            lhs_e = _lhs_expr(g_expr, mv_col)
+            eq_cond = self._null_safe_eq(lhs_e, f"({remapped_g})", is_nullable=True)
+            if any(
+                re.search(rf"\b{re.escape(la)}\.", remapped_g, flags=re.IGNORECASE)
+                for la in left_join_remapped
+            ):
+                match_conds.append(f"({eq_cond} OR {lhs_e} IS NULL)")
+            else:
+                match_conds.append(eq_cond)
+
+        exists_pred = (
+            f"EXISTS (\n"
+            f"        SELECT 1 FROM {from_join_sql}\n"
+            f"        WHERE {' AND '.join(match_conds)}\n"
+            f"    )"
+        )
+        if any(j.join_type == "LEFT JOIN" for j in self.view.joins) and target_join != self.view.joins[0]:
+            null_preds = " AND ".join(
+                f"{_lhs_expr(g_expr, mv_col)} IS NULL" for g_expr, mv_col in group_mv_cols
+            )
+            return f"({exists_pred} OR ({null_preds}))"
+        return exists_pred
+
+    def _build_tier2_triggers_for_table(
+        self,
+        view_name: str,
+        mv_table: str,
+        base_t: str,
+        target_cols: List[str],
+        group_mv_cols: List[Tuple[str, str]],
+        source_query_sql: str,
+    ) -> Tuple[List[str], List[str], List[str]]:
+        cols_csv = ", ".join(target_cols)
+        src_cols_csv = ", ".join(f"__mv_src.{c}" for c in target_cols)
+
+        pred_mv_old = self._group_scope_predicate_for_table(
+            base_t, group_mv_cols, mv_table, "OLD"
+        )
+        pred_mv_new = self._group_scope_predicate_for_table(
+            base_t, group_mv_cols, mv_table, "NEW"
+        )
+        can_push_down = self._can_push_down_group_filter_into_where()
+
+        full_refresh = [
+            f"DELETE FROM {mv_table};",
+            f"INSERT INTO {mv_table} ({cols_csv})\n"
+            f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src;",
+        ]
+
+        if pred_mv_old and pred_mv_new:
+            if can_push_down:
+                pred_inner_old = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, None, "OLD"
+                )
+                pred_inner_new = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, None, "NEW"
+                )
+                assert pred_inner_old and pred_inner_new
+                q_ins = self._inject_where_into_source_query(source_query_sql, pred_inner_new)
+                q_del = self._inject_where_into_source_query(source_query_sql, pred_inner_old)
+                q_upd = self._inject_where_into_source_query(
+                    source_query_sql, f"({pred_inner_old}) OR ({pred_inner_new})"
+                )
+                ins_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_new};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n    {q_ins};",
+                ]
+                del_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_old};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n    {q_del};",
+                ]
+                upd_coalesced_stmts = [
+                    f"DELETE FROM {mv_table} WHERE ({pred_mv_old}) OR ({pred_mv_new});",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n    {q_upd};",
+                ]
+            else:
+                pred_src_old = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, "__mv_src", "OLD"
+                )
+                pred_src_new = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, "__mv_src", "NEW"
+                )
+                assert pred_src_old and pred_src_new
+                ins_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_new};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    WHERE {pred_src_new};",
+                ]
+                del_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_old};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    WHERE {pred_src_old};",
+                ]
+                upd_coalesced_stmts = [
+                    f"DELETE FROM {mv_table} WHERE ({pred_mv_old}) OR ({pred_mv_new});",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    WHERE ({pred_src_old}) OR ({pred_src_new});",
+                ]
+            if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables:
+                upd_old_stmts = del_stmts
+                upd_new_stmts = ins_stmts
+            else:
+                upd_old_stmts = []
+                upd_new_stmts = upd_coalesced_stmts
+        else:
+            ins_stmts = full_refresh
+            del_stmts = full_refresh
+            upd_old_stmts = []
+            upd_new_stmts = full_refresh
+
+        return self._emit_dialect_triggers_for_table(
+            view_name=view_name,
+            base_t=base_t,
+            ins_stmts=ins_stmts,
+            del_stmts=del_stmts,
+            upd_old_stmts=upd_old_stmts,
+            upd_new_stmts=upd_new_stmts,
+            trunc_stmts=full_refresh,
+        )
+
+    def _rewrite_mysql_not_in_subquery(self, sql: str) -> str:
+        toks = sqlglot.tokenize(sql, read="mysql")
+        n = len(toks)
+        outer_tbl = ""
+        for i, t in enumerate(toks):
+            if t.token_type == SQLGlotTokenType.FROM and i + 1 < n:
+                outer_tbl = toks[i + 1].text
+                if i + 2 < n and toks[i + 2].token_type == SQLGlotTokenType.VAR and toks[i + 2].text.upper() != "WHERE":
+                    outer_tbl = toks[i + 2].text
+                break
+        i = 0
+        while i < n - 4:
+            if (
+                toks[i + 1].token_type == SQLGlotTokenType.NOT
+                and toks[i + 2].token_type == SQLGlotTokenType.IN
+                and toks[i + 3].token_type == SQLGlotTokenType.L_PAREN
+                and toks[i + 4].token_type == SQLGlotTokenType.SELECT
+            ):
+                start_i = i
+                if i >= 2 and toks[i - 1].token_type == SQLGlotTokenType.DOT:
+                    start_i = i - 2
+                    lhs = f"{toks[i - 2].text}.{toks[i].text}"
+                else:
+                    lhs = toks[i].text
+                depth = 0
+                rp_idx = -1
+                for j in range(i + 3, n):
+                    if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                        depth += 1
+                    elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                        depth -= 1
+                        if depth == 0:
+                            rp_idx = j
+                            break
+                if rp_idx != -1:
+                    inner_sql = sql[toks[i + 3].end + 1 : toks[rp_idx].start].strip()
+                    try:
+                        sub_ast = parse_sql_ast(inner_sql, dialect=Dialect.MYSQL)
+                    except sqlglot.errors.SqlglotError:
+                        sub_ast = None
+                    if isinstance(sub_ast, sqlglot_exp.Select) and (sub_ast.args.get("from_") or sub_ast.args.get("from")):
+                        in_from = (sub_ast.args.get("from_") or sub_ast.args.get("from")).this
+                        in_tbl = in_from.name
+                        in_alias = in_from.alias or "__mv_not_in"
+                        rhs_col = sub_ast.expressions[0].name if sub_ast.expressions else "id"
+                        w_node = sub_ast.args.get("where")
+                        in_w = w_node.this.sql("mysql").strip() if w_node and w_node.this else ""
+                        lhs_q = lhs if "." in lhs else f"{outer_tbl}.{lhs}"
+                        rhs_q = f"{in_alias}.{rhs_col}"
+                        w_empty = f" WHERE ({in_w})" if in_w else ""
+                        w_corr = f" WHERE ({in_w}) AND ({rhs_q} IS NULL OR {rhs_q} = {lhs_q})" if in_w else f" WHERE ({rhs_q} IS NULL OR {rhs_q} = {lhs_q})"
+                        replacement = (
+                            f"(NOT EXISTS (SELECT 1 FROM {in_tbl} AS {in_alias}{w_empty}) "
+                            f"OR ({lhs_q} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {in_tbl} AS {in_alias}{w_corr})))"
+                        )
+                        sql = sql[: toks[start_i].start] + replacement + sql[toks[rp_idx].end + 1 :]
+                        toks = sqlglot.tokenize(sql, read="mysql")
+                        n = len(toks)
+                        i = 0
+                        continue
+            i += 1
+        return sql
+
+    @staticmethod
+    def _sqlite_bit_or_tree(terms: Sequence[str]) -> str:
+        chunks = [
+            "(" + " | ".join(terms[i : i + 8]) + ")"
+            for i in range(0, len(terms), 8)
+        ]
+        return "(" + " | ".join(chunks) + ")"
+
+    def _rewrite_sqlite_total_in_sql(self, sql: str) -> str:
+        if self.dialect == Dialect.SQLITE:
+            def _sq_var_expr(arg_s: str, is_samp: bool, is_std: bool) -> str:
+                fake_it = SelectItem(raw_expr=f"VAR_POP({arg_s})", alias="__v", is_aggregate=True, agg_func=AggFunc.VAR_POP, arg_expr=arg_s)
+                m2_s = self._sqlite_m2_agg_sql(fake_it, eff_override=arg_s)
+                return self._variance_formula_sql(
+                    new_cnt=f"COUNT({arg_s})",
+                    new_sum=f"SUM(1.0 * ({arg_s}))",
+                    new_sum2=m2_s,
+                    is_sample=is_samp,
+                    is_stddev=is_std,
+                )
+
+            s_sq = sql
+            toks = sqlglot.tokenize(s_sq, read="sqlite")
+            idx = 0
+            sq_fn_targets = {
+                "VAR_POP", "VARIANCE", "VAR_SAMP", "STDDEV_POP", "STDDEV", "STD", "STDDEV_SAMP",
+                "BIT_AND", "BIT_OR", "BIT_XOR", "BOOL_AND", "EVERY", "BOOL_OR",
+            }
+            while idx < len(toks) - 2:
+                tk = toks[idx]
+                fn_up = tk.text.upper()
+                if fn_up in sq_fn_targets and toks[idx + 1].token_type == SQLGlotTokenType.L_PAREN:
+                    depth = 0
+                    rp_idx = -1
+                    for j in range(idx + 1, len(toks)):
+                        if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                            depth += 1
+                        elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                            depth -= 1
+                            if depth == 0:
+                                rp_idx = j
+                                break
+                    if rp_idx != -1:
+                        arg_s = s_sq[toks[idx + 1].end + 1 : toks[rp_idx].start].strip()
+                        if fn_up in ("VAR_POP", "VARIANCE"):
+                            rep = _sq_var_expr(arg_s, False, False)
+                        elif fn_up == "VAR_SAMP":
+                            rep = _sq_var_expr(arg_s, True, False)
+                        elif fn_up in ("STDDEV_POP", "STDDEV", "STD"):
+                            rep = _sq_var_expr(arg_s, False, True)
+                        elif fn_up == "STDDEV_SAMP":
+                            rep = _sq_var_expr(arg_s, True, True)
+                        elif fn_up == "BIT_AND":
+                            rep = self._sqlite_bit_or_tree([f"MIN(({arg_s}) & {1 << b})" for b in range(63)])
+                        elif fn_up == "BIT_OR":
+                            rep = self._sqlite_bit_or_tree([f"MAX(({arg_s}) & {1 << b})" for b in range(63)])
+                        elif fn_up == "BIT_XOR":
+                            rep = self._sqlite_bit_or_tree([f"((SUM((({arg_s}) >> {b}) & 1) & 1) << {b})" for b in range(63)])
+                        elif fn_up in ("BOOL_AND", "EVERY"):
+                            rep = f"(CASE WHEN COUNT({arg_s}) = 0 THEN NULL WHEN MIN(CASE WHEN ({arg_s}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
+                        else:
+                            rep = f"(CASE WHEN COUNT({arg_s}) = 0 THEN NULL WHEN MAX(CASE WHEN ({arg_s}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
+                        s_sq = s_sq[: tk.start] + rep + s_sq[toks[rp_idx].end + 1 :]
+                        toks = sqlglot.tokenize(s_sq, read="sqlite")
+                        idx = 0
+                        continue
+                idx += 1
+            return s_sq
+
+        # Non-SQLite dialects
+        s = sql
+        toks = sqlglot.tokenize(s, read="sqlite")
+        idx = 0
+        while idx < len(toks) - 2:
+            tk = toks[idx]
+            if tk.text.upper() == "TOTAL" and toks[idx + 1].token_type == SQLGlotTokenType.L_PAREN:
+                depth = 0
+                rp_idx = -1
+                for j in range(idx + 1, len(toks)):
+                    if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                        depth += 1
+                    elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                        depth -= 1
+                        if depth == 0:
+                            rp_idx = j
+                            break
+                if rp_idx != -1:
+                    inner_arg = s[toks[idx + 1].end + 1 : toks[rp_idx].start].strip()
+                    rep = f"COALESCE(1.0 * SUM({inner_arg}), 0.0)"
+                    s = s[: tk.start] + rep + s[toks[rp_idx].end + 1 :]
+                    toks = sqlglot.tokenize(s, read="sqlite")
+                    idx = 0
+                    continue
+            idx += 1
+
+        if self.dialect == Dialect.MYSQL:
+            s = self._rewrite_mysql_not_in_subquery(s)
+            # Full outer join lowering via sqlglot AST
+            try:
+                sel_ast = parse_sql_ast(s.strip(), dialect=Dialect.MYSQL)
+            except sqlglot.errors.SqlglotError:
+                sel_ast = None
+            if isinstance(sel_ast, sqlglot_exp.Select) and sel_ast.args.get("joins"):
+                j0 = sel_ast.args["joins"][0]
+                if j0.side.upper() == "FULL" and (sel_ast.args.get("from_") or sel_ast.args.get("from")) and j0.args.get("on"):
+                    from_t = (sel_ast.args.get("from_") or sel_ast.args.get("from")).this.sql("mysql")
+                    j0_t = j0.this.sql("mysql")
+                    on_s = j0.args["on"].sql("mysql")
+                    sel_s = ", ".join(e.sql("mysql") for e in sel_ast.expressions)
+                    lhs_col = j0.args["on"].expressions[0].sql("mysql") if j0.args["on"].expressions else j0.args["on"].sql("mysql").split("=")[0].strip()
+                    s = (
+                        f"SELECT {sel_s} FROM {from_t} LEFT JOIN {j0_t} ON {on_s} "
+                        f"UNION ALL "
+                        f"SELECT {sel_s} FROM {from_t} RIGHT JOIN {j0_t} ON {on_s} "
+                        f"WHERE {lhs_col} IS NULL"
+                    )
+        return s
+
+    def _compile_tier2_group_scoped(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        user_columns = [it.alias for it in self.view.select_items]
+        grp_exprs = self._effective_group_by_exprs
+
+        target_cols: List[str] = list(user_columns)
+        group_mv_cols: List[Tuple[str, str]] = []
+        hidden_grp_defs: List[Tuple[str, str, str]] = []
+
+        non_agg_map: Dict[str, str] = {}
+        for it in self.view.select_items:
+            if not it.is_aggregate:
+                non_agg_map[it.raw_expr.strip().lower()] = it.alias
+                if it.source_col:
+                    non_agg_map[it.source_col.lower()] = it.alias
+
+        for idx_g, g_expr in enumerate(grp_exprs):
+            g_low = g_expr.strip().lower()
+            g_unq = _unquote_ident(g_expr).lower() if self._is_simple_col_ref(g_expr) else ""
+            if g_low in non_agg_map:
+                mv_c = non_agg_map[g_low]
+            elif g_unq and g_unq in non_agg_map:
+                mv_c = non_agg_map[g_unq]
+            else:
+                mv_c = f"__mv_grp_{idx_g}"
+                target_cols.append(mv_c)
+                # A GROUP BY collation is part of the grouping equivalence
+                # relation. Store hidden group keys with that same collation so
+                # trigger predicates and their indexes match collation-equivalent
+                # source values instead of treating them as distinct byte strings.
+                collation_match = re.search(
+                    r'\bCOLLATE\s+((?:"[^"]+")|(?:`[^`]+`)|(?:\[[^\]]+\])|(?:[A-Za-z_][A-Za-z0-9_.$]*))\s*            group_mv_cols.append((g_expr, mv_c))
+
+        auto_grp_col_names = [mc for _, mc in group_mv_cols]
+        indexed_cols_lower = self._indexed_column_names_lower(auto_grp_col_names)
+
+        col_defs_sql: List[str] = []
+        for it in self.view.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            col_defs_sql.append(f"{it.alias} {dt}")
+        for mv_c, _, dt in hidden_grp_defs:
+            col_defs_sql.append(f"{mv_c} {dt}")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=auto_grp_col_names,
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_q = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        if hidden_grp_defs:
+            tok_from = _find_top_level_token(raw_q, (SQLGlotTokenType.FROM,))
+            assert tok_from is not None
+            extra_sel = ", ".join(f"{g_e} AS {mv_c}" for mv_c, g_e, _ in hidden_grp_defs)
+            source_query_sql = f"{raw_q[:tok_from.start].rstrip()}, {extra_sel} {raw_q[tok_from.start:]}"
+        else:
+            source_query_sql = raw_q
+
+        cols_csv = ", ".join(target_cols)
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({cols_csv})\n"
+            f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init;"
+        )
+        ord_t2 = ", ".join(str(k) for k in range(1, len(target_cols) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t2}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._build_tier2_triggers_for_table(
+                view_name=view_name,
+                mv_table=mv_table,
+                base_t=ref_table,
+                target_cols=target_cols,
+                group_mv_cols=group_mv_cols,
+                source_query_sql=source_query_sql,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    # =========================================================================
+    # TIER 3: Universal Atomic View Sync (Arbitrary Engine View Definitions)
+    # =========================================================================
+
+    def _compile_tier3_atomic_sync(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = []
+
+        indexed_cols_lower = self._indexed_column_names_lower()
+        if len(self.view.select_items) == 1 and self.view.select_items[0].raw_expr.strip() == "*":
+            for j in self.view.joins or []:
+                t_schema = self._schemas_lower.get(j.table_name.lower())
+                if t_schema:
+                    for c_def in t_schema.columns.values():
+                        if c_def.name not in user_columns:
+                            user_columns.append(c_def.name)
+                            dt = self._normalize_dialect_type(c_def.data_type)
+                            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                                dt = "VARCHAR(255)"
+                            col_defs_sql.append(f"{c_def.name} {dt}")
+            if not user_columns and self.primary_schema:
+                for c_def in self.primary_schema.columns.values():
+                    user_columns.append(c_def.name)
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                        dt = "VARCHAR(255)"
+                    col_defs_sql.append(f"{c_def.name} {dt}")
+        else:
+            for item in self.view.select_items:
+                user_columns.append(item.alias)
+                col_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and col_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    col_type = "VARCHAR(255)"
+                col_defs_sql.append(f"{item.alias} {col_type}")
+
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_query = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        cols_csv = ", ".join(user_columns)
+        initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"
+
+        ord_t3 = ", ".join(str(k) for k in range(1, len(user_columns) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{raw_query}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t3}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        refresh_stmts = [
+            f"DELETE FROM {mv_table};",
+            f"INSERT INTO {mv_table} ({cols_csv})\n    {raw_query};",
+        ]
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=ref_table,
+                ins_stmts=refresh_stmts,
+                del_stmts=refresh_stmts,
+                upd_old_stmts=[],
+                upd_new_stmts=refresh_stmts,
+                trunc_stmts=refresh_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+# -----------------------------------------------------------------------------
+# Database Connection, Schema & Safe Migration Manager (`MaterializedViewManager`)
+# -----------------------------------------------------------------------------
+
+
+class MaterializedViewManager:
+    """
+    Setup/migration manager that connects to a database (SQLite connection/path or
+    PEP-249 DB-API 2.0 connection for PostgreSQL / MySQL) to:
+      - Introspect live base table schemas (`fetch_schema`)
+      - Maintain a persistent metadata registry (`__matview_catalog`) of installed MVs
+      - Safely create, diff, update, or drop materialized views (`register_view`, `sync_views`, `drop_view`)
+      - Enforce transparency limitation checks unless `ignore_limitations=True`
+      - Perform incremental (chunked/batched) initial backfills (`backfill_incrementally`)
+      - Execute high-throughput multi-statement bulk changes (`bulk_changes`)
+    Once setup/backfill finishes, all views and triggers operate 100% natively inside
+    the database engine with zero runtime dependency on this manager.
+    """
+
+    CATALOG_TABLE = f"{DEFAULT_OBJECT_PREFIX}catalog"
+
+    @staticmethod
+    def _connect_database_url(
+        conn_or_url: str, dialect: Optional[Dialect] = None
+    ) -> Tuple[Any, Dialect]:
+        u_low = conn_or_url.strip().lower()
+        if u_low.startswith(("postgresql://", "postgres://")):
+            import psycopg2  # type: ignore
+            return psycopg2.connect(conn_or_url), Dialect.POSTGRES
+        if u_low.startswith(("mysql://", "mariadb://")):
+            import pymysql  # type: ignore
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(conn_or_url)
+            db_name = parsed.path.lstrip("/")
+            qs = parse_qs(parsed.query)
+            return (
+                pymysql.connect(
+                    host=parsed.hostname or "127.0.0.1",
+                    port=parsed.port or 3306,
+                    user=parsed.username or "root",
+                    password=parsed.password or "",
+                    database=db_name,
+                    unix_socket=qs.get("unix_socket", [None])[0],
+                    autocommit=False,
+                ),
+                Dialect.MYSQL,
+            )
+        eff_dialect = dialect or Dialect.SQLITE
+        path = conn_or_url.replace("sqlite:///", "").replace("sqlite://", "")
+        return sqlite3.connect(path), eff_dialect
+
+    def __init__(
+        self,
+        conn_or_url: sqlite3.Connection | str | Any,
+        dialect: Optional[Dialect | str | EngineVersion] = None,
+        ignore_limitations: bool = False,
+        object_prefix: str = DEFAULT_OBJECT_PREFIX,
+        pg_use_transition_tables: bool = False,
+        strict: bool = False,
+        engine_version: Optional[EngineVersion | str] = None,
+    ) -> None:
+        hint_d: Optional[Dialect] = None
+        if isinstance(dialect, Dialect):
+            hint_d = dialect
+        elif isinstance(dialect, EngineVersion):
+            hint_d = dialect.dialect
+            if engine_version is None:
+                engine_version = dialect
+        elif isinstance(dialect, str) and dialect.strip():
+            parsed_d = parse_engine_version(dialect)
+            hint_d = parsed_d.dialect
+            if engine_version is None and (":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(ch.isdigit() for ch in dialect.replace("sqlite3", ""))):
+                engine_version = parsed_d
+
+        if isinstance(conn_or_url, str):
+            self.conn, inferred_dialect = self._connect_database_url(conn_or_url, hint_d)
+            if hint_d is None or conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
+                hint_d = inferred_dialect
+        else:
+            self.conn = conn_or_url
+
+        if engine_version is not None:
+            self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
+        else:
+            self.engine_version = detect_engine_version(self.conn, hint_dialect=hint_d)
+
+        self.dialect: Dialect = self.engine_version.dialect
+        self.subdialect: EngineSubdialect = self.engine_version.subdialect
+        self.ignore_limitations = ignore_limitations
+        self.object_prefix = object_prefix
+        self.pg_use_transition_tables = pg_use_transition_tables
+        self.strict = strict
+        self.catalog_table = (
+            f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
+        )
+
+        self._ensure_catalog()
+
+    def _ensure_catalog(self) -> None:
+        cur = self.conn.cursor()
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("PRAGMA recursive_triggers = ON;")
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL:
+            try:
+                cur.execute("SET SESSION collation_connection = @@collation_database;")
+            except Exception:
+                pass
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.catalog_table} (
+                view_name VARCHAR(255) NOT NULL PRIMARY KEY,
+                view_sql TEXT NOT NULL,
+                strategy VARCHAR(64) NOT NULL,
+                signature_hash VARCHAR(64) NOT NULL,
+                backing_table VARCHAR(255) NOT NULL,
+                aux_tables_json TEXT NOT NULL,
+                trigger_names_json TEXT NOT NULL,
+                function_names_json TEXT NOT NULL,
+                trigger_ddls_json TEXT NOT NULL,
+                backfill_cursor_pk BIGINT DEFAULT NULL,
+                backfill_max_pk BIGINT DEFAULT NULL,
+                backfill_active INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        self._commit()
+        for col_ddl in (
+            "backfill_cursor_pk BIGINT DEFAULT NULL",
+            "backfill_max_pk BIGINT DEFAULT NULL",
+            "backfill_active INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                cur.execute(f"ALTER TABLE {self.catalog_table} ADD COLUMN {col_ddl};")
+                self._commit()
+            except Exception:
+                self._rollback()
+
+    def _commit(self) -> None:
+        if hasattr(self.conn, "commit"):
+            self.conn.commit()
+
+    def _rollback(self) -> None:
+        if hasattr(self.conn, "rollback"):
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+    def _param_placeholder(self) -> str:
+        return "?" if self.dialect == Dialect.SQLITE else "%s"
+
+    def _resolve_catalog_name(self, name: str, catalog: Dict[str, Dict[str, Any]]) -> str:
+        if name in catalog:
+            return name
+        if self.object_prefix:
+            prefixed = (
+                name
+                if name.startswith(self.object_prefix)
+                else f"{self.object_prefix}{name}"
+            )
+            if prefixed in catalog:
+                return prefixed
+            if name.startswith(self.object_prefix):
+                unprefixed = name[len(self.object_prefix) :]
+                if unprefixed in catalog:
+                    return unprefixed
+        return name
+
+    def fetch_schema(self, extra_schema_sql: Optional[str] = None) -> Dict[str, TableSchema]:
+        """Fetches the live schema of all user base tables from the connected database."""
+        schemas = introspect_database_schemas(
+            self.conn,
+            dialect=self.dialect,
+            object_prefix=self.object_prefix,
+        )
+        schemas.pop(self.catalog_table, None)
+        if extra_schema_sql:
+            schemas.update(parse_table_schema(extra_schema_sql))
+        return schemas
+
+    def apply_schema_ddl(self, ddl_sql: str, auto_sync_views: bool = True) -> None:
+        """
+        Safely executes schema DDL changes (e.g. `CREATE TABLE`, `ALTER TABLE`) and
+        automatically refreshes any registered materialized views whose underlying
+        base table schema changed.
+        """
+        cur = self.conn.cursor()
+        for stmt in _split_top_level(_strip_sql_comments(ddl_sql), ";"):
+            if stmt.strip():
+                cur.execute(stmt)
+        self._commit()
+        if auto_sync_views:
+            catalog = self.get_catalog()
+            if catalog:
+                self.sync_views([entry["view_sql"] for entry in catalog.values()])
+
+    def get_catalog(self) -> Dict[str, Dict[str, Any]]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
+                f"backfill_cursor_pk, backfill_max_pk, backfill_active "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = True
+        except Exception:
+            self._rollback()
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = False
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in cur.fetchall():
+            out[row[0]] = {
+                "view_name": row[0],
+                "view_sql": row[1],
+                "strategy": row[2],
+                "signature_hash": row[3],
+                "backing_table": row[4],
+                "aux_tables": json.loads(row[5]),
+                "trigger_names": json.loads(row[6]),
+                "function_names": json.loads(row[7]),
+                "trigger_ddls": json.loads(row[8]),
+                "backfill_cursor_pk": row[9] if has_wm_cols and len(row) > 9 else None,
+                "backfill_max_pk": row[10] if has_wm_cols and len(row) > 10 else None,
+                "backfill_active": int(row[11]) if has_wm_cols and len(row) > 11 and row[11] is not None else 0,
+            }
+        return out
+
+    def _compute_signature(self, plan: MaterializedViewPlan, schemas: Dict[str, TableSchema]) -> str:
+        h = hashlib.sha256()
+        h.update(_strip_sql_comments(plan.view_spec.raw_select_sql).encode("utf-8"))
+        h.update(f"prefix:{plan.object_prefix}".encode("utf-8"))
+        for idx_ddl in plan.index_ddls:
+            h.update(f"idx:{idx_ddl}".encode("utf-8"))
+        low_map = {k.lower(): v for k, v in schemas.items()}
+        for ref_t in sorted(plan.view_spec.referenced_tables, key=str.lower):
+            ts = low_map.get(ref_t.lower())
+            if ts:
+                for c_name, c_def in sorted(ts.columns.items()):
+                    h.update(
+                        f"{ts.name}.{c_name}:{c_def.data_type}:{c_def.not_null}:{c_def.primary_key}".encode("utf-8")
+                    )
+        return h.hexdigest()
+
+    @staticmethod
+    def _serialize_view_sql_with_indexes(plan: MaterializedViewPlan, raw_view_sql: Optional[str] = None) -> str:
+        parts = [f"CREATE VIEW {plan.logical_view_name} AS {plan.view_spec.raw_select_sql.strip().rstrip(';')};"]
+        for idx_spec in plan.user_indexes:
+            u_kw = "UNIQUE " if idx_spec.unique else ""
+            n_str = f"{idx_spec.name} " if idx_spec.name else ""
+            using_str = f" USING {idx_spec.using_method}" if idx_spec.using_method else ""
+            w_str = f" WHERE {idx_spec.where_clause}" if idx_spec.where_clause else ""
+            parts.append(
+                f"CREATE {u_kw}INDEX {n_str}ON {plan.logical_view_name}{using_str} "
+                f"({', '.join(idx_spec.columns)}){w_str};"
+            )
+        return "\n".join(parts)
+
+    def drop_view(self, view_name: str) -> bool:
+        """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
+        catalog = self.get_catalog()
+        resolved_name = self._resolve_catalog_name(view_name, catalog)
+        entry = catalog.get(resolved_name)
+        cur = self.conn.cursor()
+        if entry:
+            for t_name in entry["trigger_names"]:
+                if self.dialect != Dialect.POSTGRES:
+                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+            for fn_name in entry["function_names"]:
+                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+            cur.execute(f"DROP VIEW IF EXISTS {resolved_name};")
+            cur.execute(f"DROP TABLE IF EXISTS {entry['backing_table']};")
+            for aux_t in entry["aux_tables"]:
+                cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
+            ph = self._param_placeholder()
+            cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
+            self._commit()
+            return True
+        else:
+            raw_logical = (
+                view_name[len(self.object_prefix) :]
+                if self.object_prefix and view_name.startswith(self.object_prefix)
+                else view_name
+            )
+            db_v = f"{self.object_prefix}{raw_logical}"
+            cur.execute(f"DROP VIEW IF EXISTS {db_v};")
+            cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
+            cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
+            self._commit()
+            return False
+
+    def _update_backfill_watermark(
+        self,
+        cur: Any,
+        view_name: str,
+        cursor_pk: Optional[int],
+        max_pk: Optional[int],
+        active: int,
+    ) -> None:
+        ph = self._param_placeholder()
+        try:
+            cur.execute(
+                f"UPDATE {self.catalog_table} "
+                f"SET backfill_cursor_pk = {ph}, backfill_max_pk = {ph}, backfill_active = {ph} "
+                f"WHERE view_name = {ph}",
+                (cursor_pk, max_pk, active, view_name),
+            )
+        except Exception:
+            pass
+
+    def backfill_incrementally(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        snapshot_isolation: bool = False,
+    ) -> int:
+        """
+        Incrementally backfills the materialized view in bounded chunks of `batch_size`
+        (by PK/rowid range folding for algebraic views, group-key batches for distinct/holistic
+        views, or limit/offset batches for general views), coordinating the active cursor
+        watermark (`backfill_cursor_pk`, `backfill_max_pk`, `backfill_active`) in
+        `__matview_catalog` and optionally running under `snapshot_isolation=True`.
+        Returns the total number of batches executed.
+        """
+        if plan.sub_plans:
+            total_b = 0
+            for sp in plan.sub_plans:
+                total_b += self.backfill_incrementally(
+                    sp,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    snapshot_isolation=snapshot_isolation,
+                )
+            return total_b
+
+        cur = self.conn.cursor()
+        snapshot_started = False
+        try:
+            if snapshot_isolation:
+                try:
+                    if self.dialect == Dialect.POSTGRES:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                    elif self.dialect == Dialect.MYSQL:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                        cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
+                    elif self.dialect == Dialect.SQLITE:
+                        cur.execute("SAVEPOINT __mv_backfill_snap;")
+                    else:
+                        raise RuntimeError(
+                            f"Snapshot isolation is not implemented for {self.dialect.value}"
+                        )
+                except Exception as exc:
+                    self._rollback()
+                    raise RuntimeError(
+                        f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
+                    ) from exc
+                snapshot_started = True
+
+            return self._backfill_incrementally_with_cursor(
+                plan, batch_size, on_progress, snapshot_isolation, cur
+            )
+        except BaseException:
+            if snapshot_isolation and snapshot_started:
+                self._rollback_snapshot_backfill(cur)
+            raise
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _rollback_snapshot_backfill(self, cur: Any) -> None:
+        """Roll back a failed snapshot backfill without leaving its transaction open."""
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT __mv_backfill_snap;")
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                return
+            except Exception:
+                # If the savepoint no longer exists or the connection is already
+                # in an error state, a full rollback is the safest recovery.
+                self._rollback()
+                return
+        self._rollback()
+
+    def _backfill_incrementally_with_cursor(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        snapshot_isolation: bool,
+        cur: Any,
+    ) -> int:
+        spec = plan.incremental_backfill_spec
+        if spec is None or batch_size <= 0:
+            for s in plan.initial_populate_sqls:
+                cur.execute(s)
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            if on_progress:
+                on_progress(1, 1)
+            return 1
+
+        batches_run = 0
+        if spec.mode == "pk_range_fold" and spec.pk_column:
+            base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect)
+            pk_col = quote_sql_identifier(spec.pk_column, self.dialect)
+            cur.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}")
+            row = cur.fetchone()
+            if not row or row[0] is None or row[1] is None:
+                if not plan.view_spec.group_by_cols and not plan.view_spec.has_top_level_distinct:
+                    for s in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(s)
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            min_pk, max_pk = int(row[0]), int(row[1])
+            cursor_pk = min_pk - 1
+            total_span = max(1, max_pk - min_pk + 1)
+            self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, 1)
+            if not snapshot_isolation:
+                self._commit()
+            while cursor_pk < max_pk:
+                upper_pk = min(max_pk, cursor_pk + batch_size)
+                for tmpl in spec.chunk_sql_templates:
+                    cur.execute(tmpl, (cursor_pk, upper_pk))
+                batches_run += 1
+                cursor_pk = upper_pk
+                still_active = 1 if cursor_pk < max_pk else 0
+                self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, still_active)
+                if not snapshot_isolation:
+                    self._commit()
+                if on_progress:
+                    done = min(total_span, cursor_pk - (min_pk - 1))
+                    on_progress(batches_run, done)
+            self._update_backfill_watermark(cur, plan.view_name, max_pk, max_pk, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "group_key_batch" and spec.distinct_group_query:
+            cur.execute(spec.distinct_group_query)
+            all_keys = [r[0] for r in (cur.fetchall() or [])]
+            if not all_keys:
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            ph = self._param_placeholder()
+            for i in range(0, len(all_keys), batch_size):
+                batch_keys = all_keys[i : i + batch_size]
+                placeholders = ", ".join(ph for _ in batch_keys)
+                for tmpl in spec.chunk_sql_templates:
+                    sql = tmpl.format(placeholders=placeholders)
+                    cur.execute(sql, tuple(batch_keys))
+                if not snapshot_isolation:
+                    self._commit()
+                batches_run += 1
+                if on_progress:
+                    on_progress(batches_run, min(len(all_keys), i + batch_size))
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "offset_batch" and spec.offset_insert_template:
+            offset = 0
+            ph = self._param_placeholder()
+            tmpl_sql = spec.offset_insert_template.replace("LIMIT ? OFFSET ?", f"LIMIT {ph} OFFSET {ph}")
+            while True:
+                cur.execute(tmpl_sql, (batch_size, offset))
+                rc = getattr(cur, "rowcount", None)
+                if rc is not None and rc >= 0:
+                    inserted = int(rc)
+                else:
+                    cur.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name}")
+                    cnt_row = cur.fetchone()
+                    total_now = int(cnt_row[0]) if cnt_row and cnt_row[0] is not None else 0
+                    inserted = max(0, total_now - offset)
+                if not snapshot_isolation:
+                    self._commit()
+                if inserted == 0:
+                    break
+                batches_run += 1
+                offset += inserted
+                if on_progress:
+                    on_progress(batches_run, offset)
+                if inserted < batch_size:
+                    break
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        for s in plan.initial_populate_sqls:
+            cur.execute(s)
+        self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+        if snapshot_isolation and self.dialect == Dialect.SQLITE:
+            cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+        self._commit()
+        return 1
+
+    def _register_single_view_spec(
+        self,
+        v_spec: ViewSpec,
+        schemas: Dict[str, TableSchema],
+        populate: bool,
+        incremental_backfill: bool,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        force_rebuild: bool,
+        effective_ignore: bool,
+        effective_strict: bool = False,
+        compiled_plan: Optional[MaterializedViewPlan] = None,
+    ) -> MaterializedViewPlan:
+        plan = compiled_plan or generate_materialized_view(
+            schemas,
+            v_spec,
+            dialect=self.dialect,
+            pg_use_transition_tables=self.pg_use_transition_tables,
+            ignore_limitations=effective_ignore,
+            object_prefix=self.object_prefix,
+            strict=effective_strict,
+            engine_version=self.engine_version,
+            watermark_catalog_table=self.catalog_table if (incremental_backfill or not populate) else None,
+        )
+        sig = self._compute_signature(plan, schemas)
+
+        catalog = self.get_catalog()
+        existing = catalog.get(plan.view_name)
+        if existing and existing["signature_hash"] == sig and not force_rebuild:
+            return plan
+
+        if existing:
+            self.drop_view(plan.view_name)
+
+        # Install structure, maintenance triggers, single-shot backfill, and catalog record
+        # inside a single atomic transaction so concurrent readers/writers never observe an
+        # un-triggered or double-counted window between trigger attachment and population.
+        cur = self.conn.cursor()
+        try:
+            for stmt in plan.create_structure_statements():
+                cur.execute(stmt)
+            for stmt in plan.trigger_ddls:
+                cur.execute(stmt)
+
+            stored_view_sql = self._serialize_view_sql_with_indexes(plan)
+            ph = self._param_placeholder()
+            init_active = 1 if (populate and incremental_backfill) else 0
+            cur.execute(
+                f"""
+                INSERT INTO {self.catalog_table} (
+                    view_name, view_sql, strategy, signature_hash, backing_table,
+                    aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
+                    backfill_cursor_pk, backfill_max_pk, backfill_active
+                ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                """,
+                (
+                    plan.view_name,
+                    stored_view_sql,
+                    plan.strategy.value,
+                    sig,
+                    plan.backing_table_name,
+                    json.dumps(plan.auxiliary_table_names),
+                    json.dumps(plan.trigger_names),
+                    json.dumps(plan.function_names),
+                    json.dumps(plan.trigger_ddls),
+                    None,
+                    None,
+                    init_active,
+                ),
+            )
+
+            if populate:
+                if incremental_backfill:
+                    self._commit()
+                    self.backfill_incrementally(
+                        plan, batch_size=batch_size, on_progress=on_progress
+                    )
+                else:
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+            else:
+                self._commit()
+        except Exception:
+            self._rollback()
+            raise
+        return plan
+
+    def register_view(
+        self,
+        view_sql: ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        populate: bool = True,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        force_rebuild: bool = False,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> MaterializedViewPlan:
+        """
+        Safely installs or updates one or more materialized views on the connected database.
+        Supports both single-view and multi-view SQL scripts seamlessly.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        specs = parse_view_definitions(
+            view_sql,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+        sub_plans: List[MaterializedViewPlan] = []
+        for vs in specs:
+            sub_plans.append(
+                self._register_single_view_spec(
+                    vs,
+                    schemas=schemas,
+                    populate=populate,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    force_rebuild=force_rebuild,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                )
+            )
+        if len(sub_plans) == 1:
+            return sub_plans[0]
+        p0 = sub_plans[0]
+        return MaterializedViewPlan(
+            dialect=p0.dialect,
+            strategy=p0.strategy,
+            view_spec=p0.view_spec,
+            backing_table_name=p0.backing_table_name,
+            backing_table_ddl=p0.backing_table_ddl,
+            auxiliary_table_ddls=[d for sp in sub_plans for d in sp.auxiliary_table_ddls],
+            index_ddls=[d for sp in sub_plans for d in sp.index_ddls],
+            initial_populate_sqls=[d for sp in sub_plans for d in sp.initial_populate_sqls],
+            trigger_ddls=[d for sp in sub_plans for d in sp.trigger_ddls],
+            readonly_trigger_ddls=[d for sp in sub_plans for d in sp.readonly_trigger_ddls],
+            user_columns=p0.user_columns,
+            reader_view_ddl=p0.reader_view_ddl,
+            incremental_backfill_spec=p0.incremental_backfill_spec,
+            auxiliary_table_names=[n for sp in sub_plans for n in sp.auxiliary_table_names],
+            trigger_names=[n for sp in sub_plans for n in sp.trigger_names],
+            function_names=[n for sp in sub_plans for n in sp.function_names],
+            limitations=[lim for sp in sub_plans for lim in sp.limitations],
+            object_prefix=p0.object_prefix,
+            db_view_name=p0.db_view_name,
+            index_names=[n for sp in sub_plans for n in sp.index_names],
+            user_indexes=p0.user_indexes,
+            sub_plans=sub_plans,
+        )
+
+    def sync_views(
+        self,
+        view_sqls: Sequence[ViewSpec | str] | ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        prune_removed: bool = False,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> Dict[str, str]:
+        """
+        Declaratively synchronizes a collection of materialized view definitions against
+        the connected database (supporting multi-view SQL files/strings as well).
+        Returns a status map `{view_name: "created" | "updated" | "unchanged" | "dropped"}`.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        catalog = self.get_catalog()
+        status: Dict[str, str] = {}
+        desired_names: Set[str] = set()
+
+        all_specs = parse_view_definitions(
+            view_sqls,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+
+        for v_spec in all_specs:
+            plan = generate_materialized_view(
+                schemas,
+                v_spec,
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=effective_ignore,
+                object_prefix=self.object_prefix,
+                strict=effective_strict,
+                engine_version=self.engine_version,
+                watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+            )
+            v_name = plan.view_name
+            desired_names.add(v_name)
+            sig = self._compute_signature(plan, schemas)
+            if v_name not in catalog:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=False,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "created"
+            elif catalog[v_name]["signature_hash"] != sig:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=True,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "updated"
+            else:
+                status[v_name] = "unchanged"
+
+        if prune_removed:
+            for existing_name in list(catalog.keys()):
+                if existing_name not in desired_names:
+                    self.drop_view(existing_name)
+                    status[existing_name] = "dropped"
+
+        return status
+
+    def check_schema_drift(self) -> Dict[str, str]:
+        """
+        Inspects all registered views in `__matview_catalog` against the current live base
+        table schemas and returns `{view_name: "ok" | "drifted" | "invalid"}`.
+        """
+        schemas = self.fetch_schema()
+        catalog = self.get_catalog()
+        report: Dict[str, str] = {}
+        for v_name, entry in catalog.items():
+            try:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                sig = self._compute_signature(plan, schemas)
+                report[v_name] = "ok" if sig == entry["signature_hash"] else "drifted"
+            except Exception:
+                report[v_name] = "invalid"
+        return report
+
+    def repair_view(
+        self,
+        view_name: Optional[str] = None,
+        rebuild_on_schema_drift: bool = True,
+    ) -> Dict[str, str]:
+        """
+        Reconciles and repairs one or all registered materialized views in an atomic pass,
+        eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
+        Returns `{view_name: "repaired" | "rebuilt"}`.
+        """
+        catalog = self.get_catalog()
+        if view_name:
+            resolved = self._resolve_catalog_name(view_name, catalog)
+            if resolved not in catalog:
+                raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
+            targets = [catalog[resolved]]
+        else:
+            targets = list(catalog.values())
+
+        schemas = self.fetch_schema()
+        results: Dict[str, str] = {}
+        cur = self.conn.cursor()
+        for entry in targets:
+            v_name = entry["view_name"]
+            plan = generate_materialized_view(
+                schemas,
+                entry["view_sql"],
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=True,
+                object_prefix=self.object_prefix,
+            )
+            sig = self._compute_signature(plan, schemas)
+            if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+                self.register_view(
+                    entry["view_sql"],
+                    populate=True,
+                    force_rebuild=True,
+                    ignore_limitations=True,
+                )
+                results[v_name] = "rebuilt"
+            else:
+                try:
+                    for aux_t in plan.auxiliary_table_names:
+                        cur.execute(f"DELETE FROM {aux_t};")
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+                    results[v_name] = "repaired"
+                except Exception:
+                    self._rollback()
+                    raise
+        return results
+
+    @contextmanager
+    def bulk_changes(
+        self,
+        view_names: Optional[Sequence[str]] = None,
+        use_shadow_swap: bool = False,
+        drop_triggers: bool = False,
+    ) -> Iterator[None]:
+        """
+        Context manager for executing high-throughput multi-statement bulk loads/mutations.
+        Uses session-local trigger bypass flags where supported (`SET LOCAL matview.skip_triggers = 'on'`
+        on PostgreSQL, `SET @__matview_skip_triggers = 1` on MySQL) so triggers are never dropped
+        globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
+        optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
+        """
+        catalog = self.get_catalog()
+        if view_names:
+            resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
+            targets = [catalog[n] for n in resolved if n in catalog]
+        else:
+            targets = list(catalog.values())
+
+        cur = self.conn.cursor()
+        sp_active = False
+        try:
+            cur.execute("SAVEPOINT __mv_bulk_sp;")
+            sp_active = True
+        except Exception:
+            pass
+
+        session_bypass_ok = False
+        if self.dialect == Dialect.POSTGRES and not drop_triggers:
+            try:
+                cur.execute("SET LOCAL matview.skip_triggers = 'on';")
+                session_bypass_ok = True
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL and not drop_triggers:
+            try:
+                cur.execute("SET @__matview_skip_triggers = 1;")
+                session_bypass_ok = True
+            except Exception:
+                pass
+
+        if not session_bypass_ok:
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+        # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
+        # so the trigger suspension and bulk DML remain isolated inside __mv_bulk_sp!
+        try:
+            yield
+        except Exception:
+            if sp_active:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    self._rollback()
+            else:
+                self._rollback()
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for stmt in plan.trigger_ddls:
+                    cur.execute(stmt)
+            self._commit()
+            raise
+        else:
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for aux_t in plan.auxiliary_table_names:
+                    cur.execute(f"DELETE FROM {aux_t};")
+                if use_shadow_swap:
+                    shadow_tbl = f"{plan.backing_table_name}__shadow"
+                    cur.execute(f"DROP TABLE IF EXISTS {shadow_tbl};")
+                    shadow_ddl = plan.backing_table_ddl.replace(
+                        f"CREATE TABLE {plan.backing_table_name}",
+                        f"CREATE TABLE {shadow_tbl}",
+                        1,
+                    )
+                    cur.execute(shadow_ddl)
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        if f"INSERT INTO {plan.backing_table_name}" in stmt:
+                            cur.execute(
+                                stmt.replace(
+                                    f"INSERT INTO {plan.backing_table_name}",
+                                    f"INSERT INTO {shadow_tbl}",
+                                    1,
+                                )
+                            )
+                        else:
+                            cur.execute(stmt)
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    cur.execute(f"DROP VIEW IF EXISTS {plan.view_name};")
+                    cur.execute(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
+                    cur.execute(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+                    if plan.reader_view_ddl:
+                        cur.execute(plan.reader_view_ddl)
+                    for ro_stmt in plan.readonly_trigger_ddls:
+                        cur.execute(ro_stmt)
+                    for idx_ddl in plan.index_ddls:
+                        cur.execute(idx_ddl)
+                else:
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                if not session_bypass_ok or use_shadow_swap:
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    for stmt in plan.trigger_ddls:
+                        cur.execute(stmt)
+            if sp_active:
+                try:
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    pass
+            self._commit()
+
+
+# -----------------------------------------------------------------------------
+# Public High-Level Convenience Functions & CLI
+# -----------------------------------------------------------------------------
+
+
+def _resolve_dialect_and_engine_version(
+    schema_sql_or_dict: Any,
+    dialect: Optional[Dialect | str | EngineVersion],
+    engine_version: Optional[EngineVersion | str],
+) -> EngineVersion:
+    is_conn = hasattr(schema_sql_or_dict, "cursor") or isinstance(
+        schema_sql_or_dict, sqlite3.Connection
+    )
+    if engine_version is not None:
+        def_d = dialect if not isinstance(dialect, EngineVersion) else dialect.dialect
+        return parse_engine_version(engine_version, default_dialect=def_d)
+    if isinstance(dialect, EngineVersion):
+        return dialect
+    if isinstance(dialect, str) and dialect.strip():
+        if ":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(
+            ch.isdigit() for ch in dialect.replace("sqlite3", "")
+        ):
+            return parse_engine_version(dialect)
+        if is_conn:
+            return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+        return parse_engine_version(dialect)
+    if is_conn:
+        return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+    return parse_engine_version(dialect or Dialect.SQLITE)
+
+
+def generate_materialized_view(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sql_or_spec: str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+    watermark_catalog_table: Optional[str] = None,
+) -> MaterializedViewPlan:
+    """
+    Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
+    into a `MaterializedViewPlan`. Autodetects the database dialect and version when passed
+    a live connection, or accepts `engine_version` (e.g. `'postgres:17'`, `'mariadb:11.4'`, `'mysql:8.4'`).
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    known_tables = {k.lower() for k in schemas}
+    if isinstance(view_sql_or_spec, str):
+        view_spec = parse_view_definition(
+            view_sql_or_spec,
+            known_tables=known_tables,
+            indexes=indexes,
+        )
+    elif indexes:
+        parsed_idxs = tuple(
+            parse_view_index_spec(ix, default_view_name=view_sql_or_spec.view_name)
+            for ix in indexes
+        )
+        view_spec = ViewSpec(
+            view_name=view_sql_or_spec.view_name,
+            raw_select_sql=view_sql_or_spec.raw_select_sql,
+            base_table=view_sql_or_spec.base_table,
+            joins=view_sql_or_spec.joins,
+            referenced_tables=view_sql_or_spec.referenced_tables,
+            select_items=view_sql_or_spec.select_items,
+            where_clause=view_sql_or_spec.where_clause,
+            group_by_cols=view_sql_or_spec.group_by_cols,
+            having_clause=view_sql_or_spec.having_clause,
+            has_cte=view_sql_or_spec.has_cte,
+            has_window_func=view_sql_or_spec.has_window_func,
+            has_compound_set_op=view_sql_or_spec.has_compound_set_op,
+            has_top_level_distinct=view_sql_or_spec.has_top_level_distinct,
+            has_limit_or_order=view_sql_or_spec.has_limit_or_order,
+            has_subquery_in_from=view_sql_or_spec.has_subquery_in_from,
+            user_indexes=view_sql_or_spec.user_indexes + parsed_idxs,
+            additional_views=view_sql_or_spec.additional_views,
+        )
+    else:
+        view_spec = view_sql_or_spec
+
+    compiler = IncrementalViewCompiler(
+        schemas=schemas,
+        view_spec=view_spec,
+        dialect=eff_dialect,
+        pg_use_transition_tables=pg_use_transition_tables,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        strict=strict,
+        engine_version=resolved_ev,
+        watermark_catalog_table=watermark_catalog_table,
+    )
+    return compiler.compile()
+
+
+def generate_materialized_views(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sqls: Sequence[str | ViewSpec] | str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+) -> List[MaterializedViewPlan]:
+    """
+    Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
+    into a flat list of `MaterializedViewPlan` objects.
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    specs = parse_view_definitions(
+        view_sqls,
+        known_tables={k.lower() for k in schemas},
+        indexes=indexes,
+    )
+    plans: List[MaterializedViewPlan] = []
+    for vs in specs:
+        comp = IncrementalViewCompiler(
+            schemas=schemas,
+            view_spec=vs,
+            dialect=eff_dialect,
+            pg_use_transition_tables=pg_use_transition_tables,
+            ignore_limitations=ignore_limitations,
+            object_prefix=object_prefix,
+            incremental_backfill=incremental_backfill,
+            batch_size=batch_size,
+            strict=strict,
+            engine_version=resolved_ev,
+        )
+        plans.append(comp._compile_single_plan())
+    return plans
+
+
+def install_materialized_view_sqlite(
+    conn: sqlite3.Connection,
+    view_sql: str | ViewSpec,
+    schema_sql: Optional[str] = None,
+    populate: bool = True,
+    incremental_backfill: bool = False,
+    batch_size: int = 500,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    strict: bool = False,
+) -> MaterializedViewPlan:
+    """Installs one or more materialized views directly into a live SQLite connection."""
+    mgr = MaterializedViewManager(
+        conn,
+        dialect=Dialect.SQLITE,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        strict=strict,
+    )
+    return mgr.register_view(
+        view_sql=view_sql,
+        schema_sql=schema_sql,
+        populate=populate,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        on_progress=on_progress,
+        indexes=indexes,
+        strict=strict,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Compile SQL CREATE VIEW definition(s) into zero-dependency incremental materialized view SQL."
+    )
+    parser.add_argument("--schema", help="Path to SQL file containing base table CREATE TABLE statements.")
+    parser.add_argument("--db", help="Database path or DSN URL (sqlite:///..., postgresql://..., mysql://...).")
+    parser.add_argument("--view", help="Path to SQL file or inline CREATE VIEW statement(s).")
+    parser.add_argument(
+        "--dialect",
+        default=None,
+        help="Target SQL dialect or engine spec (sqlite, postgres, mysql, mariadb, or versioned e.g. postgres:17).",
+    )
+    parser.add_argument(
+        "--engine-version",
+        dest="engine_version",
+        default=None,
+        help="Target engine and version (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45').",
+    )
+    parser.add_argument(
+        "--pg-transition-tables",
+        action="store_true",
+        help="Use PostgreSQL statement-level transition table triggers.",
+    )
+    parser.add_argument(
+        "--object-prefix",
+        default=DEFAULT_OBJECT_PREFIX,
+        help="Prefix for generated database objects (default: __matview_).",
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        dest="indexes",
+        help="Additional user index specification on the materialized view (repeatable).",
+    )
+    parser.add_argument(
+        "--no-populate",
+        action="store_true",
+        help="Omit initial backfill statements from generated SQL.",
+    )
+    parser.add_argument(
+        "--incremental-backfill",
+        action="store_true",
+        help="Generate or execute chunked incremental initial backfill statements.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Batch size for --incremental-backfill (default: 500).",
+    )
+    parser.add_argument(
+        "--ignore-limitations",
+        action="store_true",
+        help="Proceed with warning even if engine transparency limitations exist.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail compilation if a view cannot use Tier 1 ALGEBRAIC_DELTA maintenance.",
+    )
+    parser.add_argument(
+        "--check-drift",
+        action="store_true",
+        help="Check registered views in --db for underlying base table schema drift.",
+    )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Atomically reconcile/repair registered views in --db from base tables.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the generated materialized view directly to --db.",
+    )
+    args = parser.parse_args(argv)
+
+    def _read_sql_arg(val: str) -> str:
+        if "\n" not in val and not re.match(r"^\s*CREATE\b", val, flags=re.IGNORECASE):
+            try:
+                with open(val, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                pass
+        return val
+
+    try:
+        if args.check_drift or args.repair:
+            if not args.db:
+                print("ERROR: --check-drift / --repair requires --db", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if args.check_drift:
+                drift = mgr.check_schema_drift()
+                print(json.dumps(drift, indent=2, sort_keys=True))
+                if any(v != "ok" for v in drift.values()) and not args.repair:
+                    return 1
+            if args.repair:
+                rep = mgr.repair_view()
+                print(json.dumps(rep, indent=2, sort_keys=True))
+            return 0
+
+        if not args.view:
+            print("ERROR: --view is required unless running --check-drift or --repair.", file=sys.stderr)
+            return 2
+
+        view_sql = _read_sql_arg(args.view)
+        schema_sql = _read_sql_arg(args.schema) if args.schema else None
+
+        if args.apply:
+            if not args.db:
+                print("ERROR: --apply requires --db <db_path_or_dsn>", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if schema_sql:
+                mgr.apply_schema_ddl(schema_sql, auto_sync_views=False)
+            plan = mgr.register_view(
+                view_sql,
+                populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+                indexes=args.indexes,
+                strict=args.strict,
+            )
+            print(
+                plan.render_sql_script(
+                    include_populate=not args.no_populate,
+                    incremental_backfill=args.incremental_backfill,
+                    batch_size=args.batch_size,
+                )
+            )
+            return 0
+
+        hint_d: Optional[Dialect] = None
+        if args.dialect:
+            hint_d = parse_engine_version(args.dialect).dialect
+        elif args.engine_version:
+            hint_d = parse_engine_version(args.engine_version).dialect
+
+        detected_ev: Optional[EngineVersion] = None
+        if args.db and not schema_sql:
+            conn, conn_d = MaterializedViewManager._connect_database_url(args.db, hint_d)
+            try:
+                detected_ev = (
+                    parse_engine_version(args.engine_version, default_dialect=conn_d)
+                    if args.engine_version
+                    else detect_engine_version(conn, hint_dialect=args.dialect or conn_d)
+                )
+                schemas = introspect_database_schemas(
+                    conn, dialect=detected_ev.dialect, object_prefix=args.object_prefix
+                )
+            finally:
+                conn.close()
+        elif schema_sql:
+            schemas = parse_table_schema(schema_sql)
+            detected_ev = _resolve_dialect_and_engine_version(
+                schemas, args.dialect, args.engine_version
+            )
+        else:
+            print("ERROR: Either --schema or --db must be provided.", file=sys.stderr)
+            return 2
+
+        plan = generate_materialized_view(
+            schemas,
+            view_sql,
+            dialect=detected_ev.dialect,
+            pg_use_transition_tables=args.pg_transition_tables,
+            ignore_limitations=args.ignore_limitations,
+            object_prefix=args.object_prefix,
+            indexes=args.indexes,
+            incremental_backfill=args.incremental_backfill,
+            batch_size=args.batch_size,
+            strict=args.strict,
+            engine_version=detected_ev,
+        )
+        print(
+            plan.render_sql_script(
+                include_populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+            )
+        )
+        return 0
+    except (EngineLimitationError, StrictCompilationError) as exc:
+        print(f"WARNING: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+,
+                    g_expr,
+                    flags=re.IGNORECASE,
+                )
+                lookup_expr = (
+                    g_expr[:collation_match.start()].strip()
+                    if collation_match else g_expr
+                )
+                c_def = self._lookup_col_def(lookup_expr)
+                dt = (
+                    self._normalize_dialect_type(c_def.data_type)
+                    if c_def
+                    else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
+                )
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                if collation_match:
+                    dt = f"{dt} COLLATE {collation_match.group(1)}"
+                hidden_grp_defs.append((mv_c, g_expr, dt))
+            group_mv_cols.append((g_expr, mv_c))
+
+        auto_grp_col_names = [mc for _, mc in group_mv_cols]
+        indexed_cols_lower = self._indexed_column_names_lower(auto_grp_col_names)
+
+        col_defs_sql: List[str] = []
+        for it in self.view.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            col_defs_sql.append(f"{it.alias} {dt}")
+        for mv_c, _, dt in hidden_grp_defs:
+            col_defs_sql.append(f"{mv_c} {dt}")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=auto_grp_col_names,
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_q = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        if hidden_grp_defs:
+            tok_from = _find_top_level_token(raw_q, (SQLGlotTokenType.FROM,))
+            assert tok_from is not None
+            extra_sel = ", ".join(f"{g_e} AS {mv_c}" for mv_c, g_e, _ in hidden_grp_defs)
+            source_query_sql = f"{raw_q[:tok_from.start].rstrip()}, {extra_sel} {raw_q[tok_from.start:]}"
+        else:
+            source_query_sql = raw_q
+
+        cols_csv = ", ".join(target_cols)
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({cols_csv})\n"
+            f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init;"
+        )
+        ord_t2 = ", ".join(str(k) for k in range(1, len(target_cols) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t2}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._build_tier2_triggers_for_table(
+                view_name=view_name,
+                mv_table=mv_table,
+                base_t=ref_table,
+                target_cols=target_cols,
+                group_mv_cols=group_mv_cols,
+                source_query_sql=source_query_sql,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    # =========================================================================
+    # TIER 3: Universal Atomic View Sync (Arbitrary Engine View Definitions)
+    # =========================================================================
+
+    def _compile_tier3_atomic_sync(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = []
+
+        indexed_cols_lower = self._indexed_column_names_lower()
+        if len(self.view.select_items) == 1 and self.view.select_items[0].raw_expr.strip() == "*":
+            for j in self.view.joins or []:
+                t_schema = self._schemas_lower.get(j.table_name.lower())
+                if t_schema:
+                    for c_def in t_schema.columns.values():
+                        if c_def.name not in user_columns:
+                            user_columns.append(c_def.name)
+                            dt = self._normalize_dialect_type(c_def.data_type)
+                            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                                dt = "VARCHAR(255)"
+                            col_defs_sql.append(f"{c_def.name} {dt}")
+            if not user_columns and self.primary_schema:
+                for c_def in self.primary_schema.columns.values():
+                    user_columns.append(c_def.name)
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                        dt = "VARCHAR(255)"
+                    col_defs_sql.append(f"{c_def.name} {dt}")
+        else:
+            for item in self.view.select_items:
+                user_columns.append(item.alias)
+                col_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and col_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    col_type = "VARCHAR(255)"
+                col_defs_sql.append(f"{item.alias} {col_type}")
+
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_query = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        cols_csv = ", ".join(user_columns)
+        initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"
+
+        ord_t3 = ", ".join(str(k) for k in range(1, len(user_columns) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{raw_query}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t3}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        refresh_stmts = [
+            f"DELETE FROM {mv_table};",
+            f"INSERT INTO {mv_table} ({cols_csv})\n    {raw_query};",
+        ]
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=ref_table,
+                ins_stmts=refresh_stmts,
+                del_stmts=refresh_stmts,
+                upd_old_stmts=[],
+                upd_new_stmts=refresh_stmts,
+                trunc_stmts=refresh_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+# -----------------------------------------------------------------------------
+# Database Connection, Schema & Safe Migration Manager (`MaterializedViewManager`)
+# -----------------------------------------------------------------------------
+
+
+class MaterializedViewManager:
+    """
+    Setup/migration manager that connects to a database (SQLite connection/path or
+    PEP-249 DB-API 2.0 connection for PostgreSQL / MySQL) to:
+      - Introspect live base table schemas (`fetch_schema`)
+      - Maintain a persistent metadata registry (`__matview_catalog`) of installed MVs
+      - Safely create, diff, update, or drop materialized views (`register_view`, `sync_views`, `drop_view`)
+      - Enforce transparency limitation checks unless `ignore_limitations=True`
+      - Perform incremental (chunked/batched) initial backfills (`backfill_incrementally`)
+      - Execute high-throughput multi-statement bulk changes (`bulk_changes`)
+    Once setup/backfill finishes, all views and triggers operate 100% natively inside
+    the database engine with zero runtime dependency on this manager.
+    """
+
+    CATALOG_TABLE = f"{DEFAULT_OBJECT_PREFIX}catalog"
+
+    @staticmethod
+    def _connect_database_url(
+        conn_or_url: str, dialect: Optional[Dialect] = None
+    ) -> Tuple[Any, Dialect]:
+        u_low = conn_or_url.strip().lower()
+        if u_low.startswith(("postgresql://", "postgres://")):
+            import psycopg2  # type: ignore
+            return psycopg2.connect(conn_or_url), Dialect.POSTGRES
+        if u_low.startswith(("mysql://", "mariadb://")):
+            import pymysql  # type: ignore
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(conn_or_url)
+            db_name = parsed.path.lstrip("/")
+            qs = parse_qs(parsed.query)
+            return (
+                pymysql.connect(
+                    host=parsed.hostname or "127.0.0.1",
+                    port=parsed.port or 3306,
+                    user=parsed.username or "root",
+                    password=parsed.password or "",
+                    database=db_name,
+                    unix_socket=qs.get("unix_socket", [None])[0],
+                    autocommit=False,
+                ),
+                Dialect.MYSQL,
+            )
+        eff_dialect = dialect or Dialect.SQLITE
+        path = conn_or_url.replace("sqlite:///", "").replace("sqlite://", "")
+        return sqlite3.connect(path), eff_dialect
+
+    def __init__(
+        self,
+        conn_or_url: sqlite3.Connection | str | Any,
+        dialect: Optional[Dialect | str | EngineVersion] = None,
+        ignore_limitations: bool = False,
+        object_prefix: str = DEFAULT_OBJECT_PREFIX,
+        pg_use_transition_tables: bool = False,
+        strict: bool = False,
+        engine_version: Optional[EngineVersion | str] = None,
+    ) -> None:
+        hint_d: Optional[Dialect] = None
+        if isinstance(dialect, Dialect):
+            hint_d = dialect
+        elif isinstance(dialect, EngineVersion):
+            hint_d = dialect.dialect
+            if engine_version is None:
+                engine_version = dialect
+        elif isinstance(dialect, str) and dialect.strip():
+            parsed_d = parse_engine_version(dialect)
+            hint_d = parsed_d.dialect
+            if engine_version is None and (":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(ch.isdigit() for ch in dialect.replace("sqlite3", ""))):
+                engine_version = parsed_d
+
+        if isinstance(conn_or_url, str):
+            self.conn, inferred_dialect = self._connect_database_url(conn_or_url, hint_d)
+            if hint_d is None or conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
+                hint_d = inferred_dialect
+        else:
+            self.conn = conn_or_url
+
+        if engine_version is not None:
+            self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
+        else:
+            self.engine_version = detect_engine_version(self.conn, hint_dialect=hint_d)
+
+        self.dialect: Dialect = self.engine_version.dialect
+        self.subdialect: EngineSubdialect = self.engine_version.subdialect
+        self.ignore_limitations = ignore_limitations
+        self.object_prefix = object_prefix
+        self.pg_use_transition_tables = pg_use_transition_tables
+        self.strict = strict
+        self.catalog_table = (
+            f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
+        )
+
+        self._ensure_catalog()
+
+    def _ensure_catalog(self) -> None:
+        cur = self.conn.cursor()
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("PRAGMA recursive_triggers = ON;")
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL:
+            try:
+                cur.execute("SET SESSION collation_connection = @@collation_database;")
+            except Exception:
+                pass
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.catalog_table} (
+                view_name VARCHAR(255) NOT NULL PRIMARY KEY,
+                view_sql TEXT NOT NULL,
+                strategy VARCHAR(64) NOT NULL,
+                signature_hash VARCHAR(64) NOT NULL,
+                backing_table VARCHAR(255) NOT NULL,
+                aux_tables_json TEXT NOT NULL,
+                trigger_names_json TEXT NOT NULL,
+                function_names_json TEXT NOT NULL,
+                trigger_ddls_json TEXT NOT NULL,
+                backfill_cursor_pk BIGINT DEFAULT NULL,
+                backfill_max_pk BIGINT DEFAULT NULL,
+                backfill_active INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        self._commit()
+        for col_ddl in (
+            "backfill_cursor_pk BIGINT DEFAULT NULL",
+            "backfill_max_pk BIGINT DEFAULT NULL",
+            "backfill_active INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                cur.execute(f"ALTER TABLE {self.catalog_table} ADD COLUMN {col_ddl};")
+                self._commit()
+            except Exception:
+                self._rollback()
+
+    def _commit(self) -> None:
+        if hasattr(self.conn, "commit"):
+            self.conn.commit()
+
+    def _rollback(self) -> None:
+        if hasattr(self.conn, "rollback"):
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+    def _param_placeholder(self) -> str:
+        return "?" if self.dialect == Dialect.SQLITE else "%s"
+
+    def _resolve_catalog_name(self, name: str, catalog: Dict[str, Dict[str, Any]]) -> str:
+        if name in catalog:
+            return name
+        if self.object_prefix:
+            prefixed = (
+                name
+                if name.startswith(self.object_prefix)
+                else f"{self.object_prefix}{name}"
+            )
+            if prefixed in catalog:
+                return prefixed
+            if name.startswith(self.object_prefix):
+                unprefixed = name[len(self.object_prefix) :]
+                if unprefixed in catalog:
+                    return unprefixed
+        return name
+
+    def fetch_schema(self, extra_schema_sql: Optional[str] = None) -> Dict[str, TableSchema]:
+        """Fetches the live schema of all user base tables from the connected database."""
+        schemas = introspect_database_schemas(
+            self.conn,
+            dialect=self.dialect,
+            object_prefix=self.object_prefix,
+        )
+        schemas.pop(self.catalog_table, None)
+        if extra_schema_sql:
+            schemas.update(parse_table_schema(extra_schema_sql))
+        return schemas
+
+    def apply_schema_ddl(self, ddl_sql: str, auto_sync_views: bool = True) -> None:
+        """
+        Safely executes schema DDL changes (e.g. `CREATE TABLE`, `ALTER TABLE`) and
+        automatically refreshes any registered materialized views whose underlying
+        base table schema changed.
+        """
+        cur = self.conn.cursor()
+        for stmt in _split_top_level(_strip_sql_comments(ddl_sql), ";"):
+            if stmt.strip():
+                cur.execute(stmt)
+        self._commit()
+        if auto_sync_views:
+            catalog = self.get_catalog()
+            if catalog:
+                self.sync_views([entry["view_sql"] for entry in catalog.values()])
+
+    def get_catalog(self) -> Dict[str, Dict[str, Any]]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
+                f"backfill_cursor_pk, backfill_max_pk, backfill_active "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = True
+        except Exception:
+            self._rollback()
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = False
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in cur.fetchall():
+            out[row[0]] = {
+                "view_name": row[0],
+                "view_sql": row[1],
+                "strategy": row[2],
+                "signature_hash": row[3],
+                "backing_table": row[4],
+                "aux_tables": json.loads(row[5]),
+                "trigger_names": json.loads(row[6]),
+                "function_names": json.loads(row[7]),
+                "trigger_ddls": json.loads(row[8]),
+                "backfill_cursor_pk": row[9] if has_wm_cols and len(row) > 9 else None,
+                "backfill_max_pk": row[10] if has_wm_cols and len(row) > 10 else None,
+                "backfill_active": int(row[11]) if has_wm_cols and len(row) > 11 and row[11] is not None else 0,
+            }
+        return out
+
+    def _compute_signature(self, plan: MaterializedViewPlan, schemas: Dict[str, TableSchema]) -> str:
+        h = hashlib.sha256()
+        h.update(_strip_sql_comments(plan.view_spec.raw_select_sql).encode("utf-8"))
+        h.update(f"prefix:{plan.object_prefix}".encode("utf-8"))
+        for idx_ddl in plan.index_ddls:
+            h.update(f"idx:{idx_ddl}".encode("utf-8"))
+        low_map = {k.lower(): v for k, v in schemas.items()}
+        for ref_t in sorted(plan.view_spec.referenced_tables, key=str.lower):
+            ts = low_map.get(ref_t.lower())
+            if ts:
+                for c_name, c_def in sorted(ts.columns.items()):
+                    h.update(
+                        f"{ts.name}.{c_name}:{c_def.data_type}:{c_def.not_null}:{c_def.primary_key}".encode("utf-8")
+                    )
+        return h.hexdigest()
+
+    @staticmethod
+    def _serialize_view_sql_with_indexes(plan: MaterializedViewPlan, raw_view_sql: Optional[str] = None) -> str:
+        parts = [f"CREATE VIEW {plan.logical_view_name} AS {plan.view_spec.raw_select_sql.strip().rstrip(';')};"]
+        for idx_spec in plan.user_indexes:
+            u_kw = "UNIQUE " if idx_spec.unique else ""
+            n_str = f"{idx_spec.name} " if idx_spec.name else ""
+            using_str = f" USING {idx_spec.using_method}" if idx_spec.using_method else ""
+            w_str = f" WHERE {idx_spec.where_clause}" if idx_spec.where_clause else ""
+            parts.append(
+                f"CREATE {u_kw}INDEX {n_str}ON {plan.logical_view_name}{using_str} "
+                f"({', '.join(idx_spec.columns)}){w_str};"
+            )
+        return "\n".join(parts)
+
+    def drop_view(self, view_name: str) -> bool:
+        """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
+        catalog = self.get_catalog()
+        resolved_name = self._resolve_catalog_name(view_name, catalog)
+        entry = catalog.get(resolved_name)
+        cur = self.conn.cursor()
+        if entry:
+            for t_name in entry["trigger_names"]:
+                if self.dialect != Dialect.POSTGRES:
+                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+            for fn_name in entry["function_names"]:
+                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+            cur.execute(f"DROP VIEW IF EXISTS {resolved_name};")
+            cur.execute(f"DROP TABLE IF EXISTS {entry['backing_table']};")
+            for aux_t in entry["aux_tables"]:
+                cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
+            ph = self._param_placeholder()
+            cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
+            self._commit()
+            return True
+        else:
+            raw_logical = (
+                view_name[len(self.object_prefix) :]
+                if self.object_prefix and view_name.startswith(self.object_prefix)
+                else view_name
+            )
+            db_v = f"{self.object_prefix}{raw_logical}"
+            cur.execute(f"DROP VIEW IF EXISTS {db_v};")
+            cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
+            cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
+            self._commit()
+            return False
+
+    def _update_backfill_watermark(
+        self,
+        cur: Any,
+        view_name: str,
+        cursor_pk: Optional[int],
+        max_pk: Optional[int],
+        active: int,
+    ) -> None:
+        ph = self._param_placeholder()
+        try:
+            cur.execute(
+                f"UPDATE {self.catalog_table} "
+                f"SET backfill_cursor_pk = {ph}, backfill_max_pk = {ph}, backfill_active = {ph} "
+                f"WHERE view_name = {ph}",
+                (cursor_pk, max_pk, active, view_name),
+            )
+        except Exception:
+            pass
+
+    def backfill_incrementally(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        snapshot_isolation: bool = False,
+    ) -> int:
+        """
+        Incrementally backfills the materialized view in bounded chunks of `batch_size`
+        (by PK/rowid range folding for algebraic views, group-key batches for distinct/holistic
+        views, or limit/offset batches for general views), coordinating the active cursor
+        watermark (`backfill_cursor_pk`, `backfill_max_pk`, `backfill_active`) in
+        `__matview_catalog` and optionally running under `snapshot_isolation=True`.
+        Returns the total number of batches executed.
+        """
+        if plan.sub_plans:
+            total_b = 0
+            for sp in plan.sub_plans:
+                total_b += self.backfill_incrementally(
+                    sp,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    snapshot_isolation=snapshot_isolation,
+                )
+            return total_b
+
+        cur = self.conn.cursor()
+        snapshot_started = False
+        try:
+            if snapshot_isolation:
+                try:
+                    if self.dialect == Dialect.POSTGRES:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                    elif self.dialect == Dialect.MYSQL:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                        cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
+                    elif self.dialect == Dialect.SQLITE:
+                        cur.execute("SAVEPOINT __mv_backfill_snap;")
+                    else:
+                        raise RuntimeError(
+                            f"Snapshot isolation is not implemented for {self.dialect.value}"
+                        )
+                except Exception as exc:
+                    self._rollback()
+                    raise RuntimeError(
+                        f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
+                    ) from exc
+                snapshot_started = True
+
+            return self._backfill_incrementally_with_cursor(
+                plan, batch_size, on_progress, snapshot_isolation, cur
+            )
+        except BaseException:
+            if snapshot_isolation and snapshot_started:
+                self._rollback_snapshot_backfill(cur)
+            raise
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _rollback_snapshot_backfill(self, cur: Any) -> None:
+        """Roll back a failed snapshot backfill without leaving its transaction open."""
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT __mv_backfill_snap;")
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                return
+            except Exception:
+                # If the savepoint no longer exists or the connection is already
+                # in an error state, a full rollback is the safest recovery.
+                self._rollback()
+                return
+        self._rollback()
+
+    def _backfill_incrementally_with_cursor(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        snapshot_isolation: bool,
+        cur: Any,
+    ) -> int:
+        spec = plan.incremental_backfill_spec
+        if spec is None or batch_size <= 0:
+            for s in plan.initial_populate_sqls:
+                cur.execute(s)
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            if on_progress:
+                on_progress(1, 1)
+            return 1
+
+        batches_run = 0
+        if spec.mode == "pk_range_fold" and spec.pk_column:
+            base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect)
+            pk_col = quote_sql_identifier(spec.pk_column, self.dialect)
+            cur.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}")
+            row = cur.fetchone()
+            if not row or row[0] is None or row[1] is None:
+                if not plan.view_spec.group_by_cols and not plan.view_spec.has_top_level_distinct:
+                    for s in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(s)
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            min_pk, max_pk = int(row[0]), int(row[1])
+            cursor_pk = min_pk - 1
+            total_span = max(1, max_pk - min_pk + 1)
+            self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, 1)
+            if not snapshot_isolation:
+                self._commit()
+            while cursor_pk < max_pk:
+                upper_pk = min(max_pk, cursor_pk + batch_size)
+                for tmpl in spec.chunk_sql_templates:
+                    cur.execute(tmpl, (cursor_pk, upper_pk))
+                batches_run += 1
+                cursor_pk = upper_pk
+                still_active = 1 if cursor_pk < max_pk else 0
+                self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, still_active)
+                if not snapshot_isolation:
+                    self._commit()
+                if on_progress:
+                    done = min(total_span, cursor_pk - (min_pk - 1))
+                    on_progress(batches_run, done)
+            self._update_backfill_watermark(cur, plan.view_name, max_pk, max_pk, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "group_key_batch" and spec.distinct_group_query:
+            cur.execute(spec.distinct_group_query)
+            all_keys = [r[0] for r in (cur.fetchall() or [])]
+            if not all_keys:
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            ph = self._param_placeholder()
+            for i in range(0, len(all_keys), batch_size):
+                batch_keys = all_keys[i : i + batch_size]
+                placeholders = ", ".join(ph for _ in batch_keys)
+                for tmpl in spec.chunk_sql_templates:
+                    sql = tmpl.format(placeholders=placeholders)
+                    cur.execute(sql, tuple(batch_keys))
+                if not snapshot_isolation:
+                    self._commit()
+                batches_run += 1
+                if on_progress:
+                    on_progress(batches_run, min(len(all_keys), i + batch_size))
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "offset_batch" and spec.offset_insert_template:
+            offset = 0
+            ph = self._param_placeholder()
+            tmpl_sql = spec.offset_insert_template.replace("LIMIT ? OFFSET ?", f"LIMIT {ph} OFFSET {ph}")
+            while True:
+                cur.execute(tmpl_sql, (batch_size, offset))
+                rc = getattr(cur, "rowcount", None)
+                if rc is not None and rc >= 0:
+                    inserted = int(rc)
+                else:
+                    cur.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name}")
+                    cnt_row = cur.fetchone()
+                    total_now = int(cnt_row[0]) if cnt_row and cnt_row[0] is not None else 0
+                    inserted = max(0, total_now - offset)
+                if not snapshot_isolation:
+                    self._commit()
+                if inserted == 0:
+                    break
+                batches_run += 1
+                offset += inserted
+                if on_progress:
+                    on_progress(batches_run, offset)
+                if inserted < batch_size:
+                    break
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        for s in plan.initial_populate_sqls:
+            cur.execute(s)
+        self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+        if snapshot_isolation and self.dialect == Dialect.SQLITE:
+            cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+        self._commit()
+        return 1
+
+    def _register_single_view_spec(
+        self,
+        v_spec: ViewSpec,
+        schemas: Dict[str, TableSchema],
+        populate: bool,
+        incremental_backfill: bool,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        force_rebuild: bool,
+        effective_ignore: bool,
+        effective_strict: bool = False,
+        compiled_plan: Optional[MaterializedViewPlan] = None,
+    ) -> MaterializedViewPlan:
+        plan = compiled_plan or generate_materialized_view(
+            schemas,
+            v_spec,
+            dialect=self.dialect,
+            pg_use_transition_tables=self.pg_use_transition_tables,
+            ignore_limitations=effective_ignore,
+            object_prefix=self.object_prefix,
+            strict=effective_strict,
+            engine_version=self.engine_version,
+            watermark_catalog_table=self.catalog_table if (incremental_backfill or not populate) else None,
+        )
+        sig = self._compute_signature(plan, schemas)
+
+        catalog = self.get_catalog()
+        existing = catalog.get(plan.view_name)
+        if existing and existing["signature_hash"] == sig and not force_rebuild:
+            return plan
+
+        if existing:
+            self.drop_view(plan.view_name)
+
+        # Install structure, maintenance triggers, single-shot backfill, and catalog record
+        # inside a single atomic transaction so concurrent readers/writers never observe an
+        # un-triggered or double-counted window between trigger attachment and population.
+        cur = self.conn.cursor()
+        try:
+            for stmt in plan.create_structure_statements():
+                cur.execute(stmt)
+            for stmt in plan.trigger_ddls:
+                cur.execute(stmt)
+
+            stored_view_sql = self._serialize_view_sql_with_indexes(plan)
+            ph = self._param_placeholder()
+            init_active = 1 if (populate and incremental_backfill) else 0
+            cur.execute(
+                f"""
+                INSERT INTO {self.catalog_table} (
+                    view_name, view_sql, strategy, signature_hash, backing_table,
+                    aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
+                    backfill_cursor_pk, backfill_max_pk, backfill_active
+                ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                """,
+                (
+                    plan.view_name,
+                    stored_view_sql,
+                    plan.strategy.value,
+                    sig,
+                    plan.backing_table_name,
+                    json.dumps(plan.auxiliary_table_names),
+                    json.dumps(plan.trigger_names),
+                    json.dumps(plan.function_names),
+                    json.dumps(plan.trigger_ddls),
+                    None,
+                    None,
+                    init_active,
+                ),
+            )
+
+            if populate:
+                if incremental_backfill:
+                    self._commit()
+                    self.backfill_incrementally(
+                        plan, batch_size=batch_size, on_progress=on_progress
+                    )
+                else:
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+            else:
+                self._commit()
+        except Exception:
+            self._rollback()
+            raise
+        return plan
+
+    def register_view(
+        self,
+        view_sql: ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        populate: bool = True,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        force_rebuild: bool = False,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> MaterializedViewPlan:
+        """
+        Safely installs or updates one or more materialized views on the connected database.
+        Supports both single-view and multi-view SQL scripts seamlessly.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        specs = parse_view_definitions(
+            view_sql,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+        sub_plans: List[MaterializedViewPlan] = []
+        for vs in specs:
+            sub_plans.append(
+                self._register_single_view_spec(
+                    vs,
+                    schemas=schemas,
+                    populate=populate,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    force_rebuild=force_rebuild,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                )
+            )
+        if len(sub_plans) == 1:
+            return sub_plans[0]
+        p0 = sub_plans[0]
+        return MaterializedViewPlan(
+            dialect=p0.dialect,
+            strategy=p0.strategy,
+            view_spec=p0.view_spec,
+            backing_table_name=p0.backing_table_name,
+            backing_table_ddl=p0.backing_table_ddl,
+            auxiliary_table_ddls=[d for sp in sub_plans for d in sp.auxiliary_table_ddls],
+            index_ddls=[d for sp in sub_plans for d in sp.index_ddls],
+            initial_populate_sqls=[d for sp in sub_plans for d in sp.initial_populate_sqls],
+            trigger_ddls=[d for sp in sub_plans for d in sp.trigger_ddls],
+            readonly_trigger_ddls=[d for sp in sub_plans for d in sp.readonly_trigger_ddls],
+            user_columns=p0.user_columns,
+            reader_view_ddl=p0.reader_view_ddl,
+            incremental_backfill_spec=p0.incremental_backfill_spec,
+            auxiliary_table_names=[n for sp in sub_plans for n in sp.auxiliary_table_names],
+            trigger_names=[n for sp in sub_plans for n in sp.trigger_names],
+            function_names=[n for sp in sub_plans for n in sp.function_names],
+            limitations=[lim for sp in sub_plans for lim in sp.limitations],
+            object_prefix=p0.object_prefix,
+            db_view_name=p0.db_view_name,
+            index_names=[n for sp in sub_plans for n in sp.index_names],
+            user_indexes=p0.user_indexes,
+            sub_plans=sub_plans,
+        )
+
+    def sync_views(
+        self,
+        view_sqls: Sequence[ViewSpec | str] | ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        prune_removed: bool = False,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> Dict[str, str]:
+        """
+        Declaratively synchronizes a collection of materialized view definitions against
+        the connected database (supporting multi-view SQL files/strings as well).
+        Returns a status map `{view_name: "created" | "updated" | "unchanged" | "dropped"}`.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        catalog = self.get_catalog()
+        status: Dict[str, str] = {}
+        desired_names: Set[str] = set()
+
+        all_specs = parse_view_definitions(
+            view_sqls,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+
+        for v_spec in all_specs:
+            plan = generate_materialized_view(
+                schemas,
+                v_spec,
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=effective_ignore,
+                object_prefix=self.object_prefix,
+                strict=effective_strict,
+                engine_version=self.engine_version,
+                watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+            )
+            v_name = plan.view_name
+            desired_names.add(v_name)
+            sig = self._compute_signature(plan, schemas)
+            if v_name not in catalog:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=False,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "created"
+            elif catalog[v_name]["signature_hash"] != sig:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=True,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "updated"
+            else:
+                status[v_name] = "unchanged"
+
+        if prune_removed:
+            for existing_name in list(catalog.keys()):
+                if existing_name not in desired_names:
+                    self.drop_view(existing_name)
+                    status[existing_name] = "dropped"
+
+        return status
+
+    def check_schema_drift(self) -> Dict[str, str]:
+        """
+        Inspects all registered views in `__matview_catalog` against the current live base
+        table schemas and returns `{view_name: "ok" | "drifted" | "invalid"}`.
+        """
+        schemas = self.fetch_schema()
+        catalog = self.get_catalog()
+        report: Dict[str, str] = {}
+        for v_name, entry in catalog.items():
+            try:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                sig = self._compute_signature(plan, schemas)
+                report[v_name] = "ok" if sig == entry["signature_hash"] else "drifted"
+            except Exception:
+                report[v_name] = "invalid"
+        return report
+
+    def repair_view(
+        self,
+        view_name: Optional[str] = None,
+        rebuild_on_schema_drift: bool = True,
+    ) -> Dict[str, str]:
+        """
+        Reconciles and repairs one or all registered materialized views in an atomic pass,
+        eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
+        Returns `{view_name: "repaired" | "rebuilt"}`.
+        """
+        catalog = self.get_catalog()
+        if view_name:
+            resolved = self._resolve_catalog_name(view_name, catalog)
+            if resolved not in catalog:
+                raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
+            targets = [catalog[resolved]]
+        else:
+            targets = list(catalog.values())
+
+        schemas = self.fetch_schema()
+        results: Dict[str, str] = {}
+        cur = self.conn.cursor()
+        for entry in targets:
+            v_name = entry["view_name"]
+            plan = generate_materialized_view(
+                schemas,
+                entry["view_sql"],
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=True,
+                object_prefix=self.object_prefix,
+            )
+            sig = self._compute_signature(plan, schemas)
+            if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+                self.register_view(
+                    entry["view_sql"],
+                    populate=True,
+                    force_rebuild=True,
+                    ignore_limitations=True,
+                )
+                results[v_name] = "rebuilt"
+            else:
+                try:
+                    for aux_t in plan.auxiliary_table_names:
+                        cur.execute(f"DELETE FROM {aux_t};")
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+                    results[v_name] = "repaired"
+                except Exception:
+                    self._rollback()
+                    raise
+        return results
+
+    @contextmanager
+    def bulk_changes(
+        self,
+        view_names: Optional[Sequence[str]] = None,
+        use_shadow_swap: bool = False,
+        drop_triggers: bool = False,
+    ) -> Iterator[None]:
+        """
+        Context manager for executing high-throughput multi-statement bulk loads/mutations.
+        Uses session-local trigger bypass flags where supported (`SET LOCAL matview.skip_triggers = 'on'`
+        on PostgreSQL, `SET @__matview_skip_triggers = 1` on MySQL) so triggers are never dropped
+        globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
+        optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
+        """
+        catalog = self.get_catalog()
+        if view_names:
+            resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
+            targets = [catalog[n] for n in resolved if n in catalog]
+        else:
+            targets = list(catalog.values())
+
+        cur = self.conn.cursor()
+        sp_active = False
+        try:
+            cur.execute("SAVEPOINT __mv_bulk_sp;")
+            sp_active = True
+        except Exception:
+            pass
+
+        session_bypass_ok = False
+        if self.dialect == Dialect.POSTGRES and not drop_triggers:
+            try:
+                cur.execute("SET LOCAL matview.skip_triggers = 'on';")
+                session_bypass_ok = True
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL and not drop_triggers:
+            try:
+                cur.execute("SET @__matview_skip_triggers = 1;")
+                session_bypass_ok = True
+            except Exception:
+                pass
+
+        if not session_bypass_ok:
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+        # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
+        # so the trigger suspension and bulk DML remain isolated inside __mv_bulk_sp!
+        try:
+            yield
+        except Exception:
+            if sp_active:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    self._rollback()
+            else:
+                self._rollback()
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for stmt in plan.trigger_ddls:
+                    cur.execute(stmt)
+            self._commit()
+            raise
+        else:
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for aux_t in plan.auxiliary_table_names:
+                    cur.execute(f"DELETE FROM {aux_t};")
+                if use_shadow_swap:
+                    shadow_tbl = f"{plan.backing_table_name}__shadow"
+                    cur.execute(f"DROP TABLE IF EXISTS {shadow_tbl};")
+                    shadow_ddl = plan.backing_table_ddl.replace(
+                        f"CREATE TABLE {plan.backing_table_name}",
+                        f"CREATE TABLE {shadow_tbl}",
+                        1,
+                    )
+                    cur.execute(shadow_ddl)
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        if f"INSERT INTO {plan.backing_table_name}" in stmt:
+                            cur.execute(
+                                stmt.replace(
+                                    f"INSERT INTO {plan.backing_table_name}",
+                                    f"INSERT INTO {shadow_tbl}",
+                                    1,
+                                )
+                            )
+                        else:
+                            cur.execute(stmt)
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    cur.execute(f"DROP VIEW IF EXISTS {plan.view_name};")
+                    cur.execute(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
+                    cur.execute(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+                    if plan.reader_view_ddl:
+                        cur.execute(plan.reader_view_ddl)
+                    for ro_stmt in plan.readonly_trigger_ddls:
+                        cur.execute(ro_stmt)
+                    for idx_ddl in plan.index_ddls:
+                        cur.execute(idx_ddl)
+                else:
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                if not session_bypass_ok or use_shadow_swap:
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    for stmt in plan.trigger_ddls:
+                        cur.execute(stmt)
+            if sp_active:
+                try:
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    pass
+            self._commit()
+
+
+# -----------------------------------------------------------------------------
+# Public High-Level Convenience Functions & CLI
+# -----------------------------------------------------------------------------
+
+
+def _resolve_dialect_and_engine_version(
+    schema_sql_or_dict: Any,
+    dialect: Optional[Dialect | str | EngineVersion],
+    engine_version: Optional[EngineVersion | str],
+) -> EngineVersion:
+    is_conn = hasattr(schema_sql_or_dict, "cursor") or isinstance(
+        schema_sql_or_dict, sqlite3.Connection
+    )
+    if engine_version is not None:
+        def_d = dialect if not isinstance(dialect, EngineVersion) else dialect.dialect
+        return parse_engine_version(engine_version, default_dialect=def_d)
+    if isinstance(dialect, EngineVersion):
+        return dialect
+    if isinstance(dialect, str) and dialect.strip():
+        if ":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(
+            ch.isdigit() for ch in dialect.replace("sqlite3", "")
+        ):
+            return parse_engine_version(dialect)
+        if is_conn:
+            return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+        return parse_engine_version(dialect)
+    if is_conn:
+        return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+    return parse_engine_version(dialect or Dialect.SQLITE)
+
+
+def generate_materialized_view(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sql_or_spec: str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+    watermark_catalog_table: Optional[str] = None,
+) -> MaterializedViewPlan:
+    """
+    Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
+    into a `MaterializedViewPlan`. Autodetects the database dialect and version when passed
+    a live connection, or accepts `engine_version` (e.g. `'postgres:17'`, `'mariadb:11.4'`, `'mysql:8.4'`).
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    known_tables = {k.lower() for k in schemas}
+    if isinstance(view_sql_or_spec, str):
+        view_spec = parse_view_definition(
+            view_sql_or_spec,
+            known_tables=known_tables,
+            indexes=indexes,
+        )
+    elif indexes:
+        parsed_idxs = tuple(
+            parse_view_index_spec(ix, default_view_name=view_sql_or_spec.view_name)
+            for ix in indexes
+        )
+        view_spec = ViewSpec(
+            view_name=view_sql_or_spec.view_name,
+            raw_select_sql=view_sql_or_spec.raw_select_sql,
+            base_table=view_sql_or_spec.base_table,
+            joins=view_sql_or_spec.joins,
+            referenced_tables=view_sql_or_spec.referenced_tables,
+            select_items=view_sql_or_spec.select_items,
+            where_clause=view_sql_or_spec.where_clause,
+            group_by_cols=view_sql_or_spec.group_by_cols,
+            having_clause=view_sql_or_spec.having_clause,
+            has_cte=view_sql_or_spec.has_cte,
+            has_window_func=view_sql_or_spec.has_window_func,
+            has_compound_set_op=view_sql_or_spec.has_compound_set_op,
+            has_top_level_distinct=view_sql_or_spec.has_top_level_distinct,
+            has_limit_or_order=view_sql_or_spec.has_limit_or_order,
+            has_subquery_in_from=view_sql_or_spec.has_subquery_in_from,
+            user_indexes=view_sql_or_spec.user_indexes + parsed_idxs,
+            additional_views=view_sql_or_spec.additional_views,
+        )
+    else:
+        view_spec = view_sql_or_spec
+
+    compiler = IncrementalViewCompiler(
+        schemas=schemas,
+        view_spec=view_spec,
+        dialect=eff_dialect,
+        pg_use_transition_tables=pg_use_transition_tables,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        strict=strict,
+        engine_version=resolved_ev,
+        watermark_catalog_table=watermark_catalog_table,
+    )
+    return compiler.compile()
+
+
+def generate_materialized_views(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sqls: Sequence[str | ViewSpec] | str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+) -> List[MaterializedViewPlan]:
+    """
+    Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
+    into a flat list of `MaterializedViewPlan` objects.
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    specs = parse_view_definitions(
+        view_sqls,
+        known_tables={k.lower() for k in schemas},
+        indexes=indexes,
+    )
+    plans: List[MaterializedViewPlan] = []
+    for vs in specs:
+        comp = IncrementalViewCompiler(
+            schemas=schemas,
+            view_spec=vs,
+            dialect=eff_dialect,
+            pg_use_transition_tables=pg_use_transition_tables,
+            ignore_limitations=ignore_limitations,
+            object_prefix=object_prefix,
+            incremental_backfill=incremental_backfill,
+            batch_size=batch_size,
+            strict=strict,
+            engine_version=resolved_ev,
+        )
+        plans.append(comp._compile_single_plan())
+    return plans
+
+
+def install_materialized_view_sqlite(
+    conn: sqlite3.Connection,
+    view_sql: str | ViewSpec,
+    schema_sql: Optional[str] = None,
+    populate: bool = True,
+    incremental_backfill: bool = False,
+    batch_size: int = 500,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    strict: bool = False,
+) -> MaterializedViewPlan:
+    """Installs one or more materialized views directly into a live SQLite connection."""
+    mgr = MaterializedViewManager(
+        conn,
+        dialect=Dialect.SQLITE,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        strict=strict,
+    )
+    return mgr.register_view(
+        view_sql=view_sql,
+        schema_sql=schema_sql,
+        populate=populate,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        on_progress=on_progress,
+        indexes=indexes,
+        strict=strict,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Compile SQL CREATE VIEW definition(s) into zero-dependency incremental materialized view SQL."
+    )
+    parser.add_argument("--schema", help="Path to SQL file containing base table CREATE TABLE statements.")
+    parser.add_argument("--db", help="Database path or DSN URL (sqlite:///..., postgresql://..., mysql://...).")
+    parser.add_argument("--view", help="Path to SQL file or inline CREATE VIEW statement(s).")
+    parser.add_argument(
+        "--dialect",
+        default=None,
+        help="Target SQL dialect or engine spec (sqlite, postgres, mysql, mariadb, or versioned e.g. postgres:17).",
+    )
+    parser.add_argument(
+        "--engine-version",
+        dest="engine_version",
+        default=None,
+        help="Target engine and version (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45').",
+    )
+    parser.add_argument(
+        "--pg-transition-tables",
+        action="store_true",
+        help="Use PostgreSQL statement-level transition table triggers.",
+    )
+    parser.add_argument(
+        "--object-prefix",
+        default=DEFAULT_OBJECT_PREFIX,
+        help="Prefix for generated database objects (default: __matview_).",
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        dest="indexes",
+        help="Additional user index specification on the materialized view (repeatable).",
+    )
+    parser.add_argument(
+        "--no-populate",
+        action="store_true",
+        help="Omit initial backfill statements from generated SQL.",
+    )
+    parser.add_argument(
+        "--incremental-backfill",
+        action="store_true",
+        help="Generate or execute chunked incremental initial backfill statements.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Batch size for --incremental-backfill (default: 500).",
+    )
+    parser.add_argument(
+        "--ignore-limitations",
+        action="store_true",
+        help="Proceed with warning even if engine transparency limitations exist.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail compilation if a view cannot use Tier 1 ALGEBRAIC_DELTA maintenance.",
+    )
+    parser.add_argument(
+        "--check-drift",
+        action="store_true",
+        help="Check registered views in --db for underlying base table schema drift.",
+    )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Atomically reconcile/repair registered views in --db from base tables.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the generated materialized view directly to --db.",
+    )
+    args = parser.parse_args(argv)
+
+    def _read_sql_arg(val: str) -> str:
+        if "\n" not in val and not re.match(r"^\s*CREATE\b", val, flags=re.IGNORECASE):
+            try:
+                with open(val, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                pass
+        return val
+
+    try:
+        if args.check_drift or args.repair:
+            if not args.db:
+                print("ERROR: --check-drift / --repair requires --db", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if args.check_drift:
+                drift = mgr.check_schema_drift()
+                print(json.dumps(drift, indent=2, sort_keys=True))
+                if any(v != "ok" for v in drift.values()) and not args.repair:
+                    return 1
+            if args.repair:
+                rep = mgr.repair_view()
+                print(json.dumps(rep, indent=2, sort_keys=True))
+            return 0
+
+        if not args.view:
+            print("ERROR: --view is required unless running --check-drift or --repair.", file=sys.stderr)
+            return 2
+
+        view_sql = _read_sql_arg(args.view)
+        schema_sql = _read_sql_arg(args.schema) if args.schema else None
+
+        if args.apply:
+            if not args.db:
+                print("ERROR: --apply requires --db <db_path_or_dsn>", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if schema_sql:
+                mgr.apply_schema_ddl(schema_sql, auto_sync_views=False)
+            plan = mgr.register_view(
+                view_sql,
+                populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+                indexes=args.indexes,
+                strict=args.strict,
+            )
+            print(
+                plan.render_sql_script(
+                    include_populate=not args.no_populate,
+                    incremental_backfill=args.incremental_backfill,
+                    batch_size=args.batch_size,
+                )
+            )
+            return 0
+
+        hint_d: Optional[Dialect] = None
+        if args.dialect:
+            hint_d = parse_engine_version(args.dialect).dialect
+        elif args.engine_version:
+            hint_d = parse_engine_version(args.engine_version).dialect
+
+        detected_ev: Optional[EngineVersion] = None
+        if args.db and not schema_sql:
+            conn, conn_d = MaterializedViewManager._connect_database_url(args.db, hint_d)
+            try:
+                detected_ev = (
+                    parse_engine_version(args.engine_version, default_dialect=conn_d)
+                    if args.engine_version
+                    else detect_engine_version(conn, hint_dialect=args.dialect or conn_d)
+                )
+                schemas = introspect_database_schemas(
+                    conn, dialect=detected_ev.dialect, object_prefix=args.object_prefix
+                )
+            finally:
+                conn.close()
+        elif schema_sql:
+            schemas = parse_table_schema(schema_sql)
+            detected_ev = _resolve_dialect_and_engine_version(
+                schemas, args.dialect, args.engine_version
+            )
+        else:
+            print("ERROR: Either --schema or --db must be provided.", file=sys.stderr)
+            return 2
+
+        plan = generate_materialized_view(
+            schemas,
+            view_sql,
+            dialect=detected_ev.dialect,
+            pg_use_transition_tables=args.pg_transition_tables,
+            ignore_limitations=args.ignore_limitations,
+            object_prefix=args.object_prefix,
+            indexes=args.indexes,
+            incremental_backfill=args.incremental_backfill,
+            batch_size=args.batch_size,
+            strict=args.strict,
+            engine_version=detected_ev,
+        )
+        print(
+            plan.render_sql_script(
+                include_populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+            )
+        )
+        return 0
+    except (EngineLimitationError, StrictCompilationError) as exc:
+        print(f"WARNING: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+,
+                    g_expr,
+                    flags=re.IGNORECASE,
+                )
+                lookup_expr = (
+                    g_expr[:collation_match.start()].strip()
+                    if collation_match else g_expr
+                )
+                c_def = self._lookup_col_def(self._qualify_join_expr(lookup_expr)) or self._lookup_col_def(lookup_expr)
+                if c_def:
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                else:
+                    fake_it = SelectItem(raw_expr=lookup_expr, alias=mv_col, is_aggregate=False)
+                    dt = self._infer_expr_storage_type(fake_it)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                if collation_match:
+                    dt = re.sub(r"\s+COLLATE\s+\S+\s*$", "", dt, flags=re.IGNORECASE).strip()
+                    dt = f"{dt} COLLATE {collation_match.group(1)}"
+                nn = " NOT NULL" if not has_nullable_grp else ""
+                col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
+
+        def _expr_key(item: SelectItem) -> str:
+            eff = self._effective_agg_value_expr(item, record_prefix=None).strip().lower()
+            return f"{'dist:' if item.is_distinct else ''}{eff}"
+
+        col_nonnull_count_map: Dict[str, str] = {}
+        col_sum_map: Dict[str, str] = {}
+        col_sum2_map: Dict[str, str] = {}
+        col_true_cnt_map: Dict[str, str] = {}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            ekey = _expr_key(item)
+            if item.agg_func == AggFunc.COUNT_COL:
+                col_nonnull_count_map[ekey] = self._q(item.alias)
+            elif item.agg_func == AggFunc.SUM:
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = self._q(item.alias)
+
+        group_mv_cols: List[str] = []
+        for g in grp_exprs:
+            mc = self._group_col_alias(g)
+            if mc not in group_mv_cols:
+                group_mv_cols.append(mc)
+        indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
+
+        for item in work_items:
+            if not item.is_aggregate:
+                c_def = self._lookup_col_def(self._qualify_join_expr(item.raw_expr)) or self._lookup_col_def(item.raw_expr)
+                dt = (
+                    self._normalize_dialect_type(c_def.data_type)
+                    if c_def
+                    else self._infer_expr_storage_type(item)
+                )
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
+                col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
+            else:
+                storage_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    storage_type = "VARCHAR(255)"
+                if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
+                elif item.agg_func == AggFunc.TOTAL:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0.0")
+                else:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type}")
+
+        if count_star_alias is None:
+            col_defs_sql.append(f"{row_count_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        aux_idx = 0
+        for item in work_items:
+            if not item.is_aggregate or item.agg_func is None:
+                continue
+            ekey = _expr_key(item)
+            safe_id = _sanitize_ident(item.alias)
+            if item.agg_func in (
+                AggFunc.SUM,
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            ) or (item.agg_func == AggFunc.COUNT_STAR and item.filter_where):
+                if item.agg_func == AggFunc.COUNT_STAR and item.filter_where:
+                    col_nonnull_count_map[ekey] = self._q(item.alias)
+                elif ekey not in col_nonnull_count_map:
+                    aux_idx += 1
+                    cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
+                    col_nonnull_count_map[ekey] = cnt_col
+                    col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+            if item.agg_func in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum_map:
+                    aux_idx += 1
+                    sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
+                    col_sum_map[ekey] = sum_col
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
+
+            if item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum2_map:
+                    aux_idx += 1
+                    s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
+                    sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
+                    col_sum2_map[ekey] = sum2_col
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
+
+            if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if ekey not in col_true_cnt_map:
+                    aux_idx += 1
+                    tcnt_col = f"__mv_tcnt_{safe_id}_{aux_idx}"
+                    col_true_cnt_map[ekey] = tcnt_col
+                    col_defs_sql.append(f"{tcnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        if grp_exprs and not has_nullable_grp:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        backing_col_map = {
+            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            for u_col, expr_s in self._compound_reader_exprs.items()
+            if expr_s != u_col and "__mv_elem_" in expr_s
+        }
+        can_pg15_unique_nnd = (
+            bool(grp_exprs)
+            and has_nullable_grp
+            and len(set(c.lower() for c in group_mv_cols)) == len(grp_exprs)
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=group_mv_cols,
+            has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
+            backing_col_map=backing_col_map,
+            unique_group_nulls_not_distinct=can_pg15_unique_nnd,
+        )
+
+        reader_select_override = [
+            self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
+        ]
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                select_exprs_override=reader_select_override,
+                extra_where_filter=self._rewritten_having_clause,
+            )
+        )
+
+        qual_grp_exprs = [self._qualify_join_expr(g) for g in grp_exprs]
+        target_cols: List[str] = []
+        select_exprs: List[str] = []
+        if not grp_exprs:
+            target_cols.append("__mv_global_id")
+            select_exprs.append("1")
+        elif has_nullable_grp:
+            target_cols.append("__mv_pk")
+            select_exprs.append(self._canonical_group_pk_expr(qual_grp_exprs))
+
+        seen_hidden: Set[str] = set()
+        for g_raw, g_qual in zip(grp_exprs, qual_grp_exprs):
+            mv_col = self._group_col_alias(g_raw)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                target_cols.append(mv_col)
+                select_exprs.append(g_qual)
+
+        for item in work_items:
+            target_cols.append(item.alias)
+            if not item.is_aggregate:
+                select_exprs.append(self._qualify_join_expr(item.raw_expr))
+            else:
+                select_exprs.append(self._qualify_join_expr(self._sql_backfill_agg_expr(item)))
+
+        if count_star_alias is None:
+            target_cols.append(row_count_col)
+            select_exprs.append("COUNT(*)")
+
+        already_in_target = set(target_cols)
+        ekey_to_item: Dict[str, SelectItem] = {
+            _expr_key(it): it for it in work_items if it.is_aggregate
+        }
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            if cnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(cnt_col)
+                select_exprs.append(f"COUNT({eff})")
+                already_in_target.add(cnt_col)
+
+        for ekey, sum_col in col_sum_map.items():
+            if sum_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(sum_col)
+                select_exprs.append(f"SUM({eff})")
+                already_in_target.add(sum_col)
+
+        for ekey, sum2_col in col_sum2_map.items():
+            if sum2_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(sum2_col)
+                if self.dialect == Dialect.SQLITE:
+                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
+                else:
+                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
+                already_in_target.add(sum2_col)
+
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            if tcnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                target_cols.append(tcnt_col)
+                select_exprs.append(
+                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
+                )
+                already_in_target.add(tcnt_col)
+
+        def _build_join_from_clause(replace_alias: Optional[str] = None, rec_prefix: Optional[str] = None) -> str:
+            from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+            parts: List[str] = []
+            for idx, j in enumerate(self.view.joins):
+                if replace_alias and j.alias.lower() == replace_alias.lower() and rec_prefix:
+                    ts = self._schemas_lower[j.table_name.lower()]
+                    rec_proj = ", ".join(f"{rec_prefix}.{c} AS {c}" for c in ts.columns)
+                    tbl_sql = f"(SELECT {rec_proj}{from_dual}) AS {j.alias}"
+                else:
+                    tbl_sql = f"{j.table_name} AS {j.alias}"
+                if idx == 0:
+                    parts.append(tbl_sql)
+                else:
+                    on_sql = f" ON {self._qualify_join_expr(j.on_condition)}" if j.on_condition else ""
+                    parts.append(f"{j.join_type} {tbl_sql}{on_sql}")
+            return " ".join(parts)
+
+        full_from_sql = _build_join_from_clause()
+        qual_where = self._qualify_join_expr(self.view.where_clause) if self.view.where_clause else None
+        where_sql = f"\nWHERE {qual_where}" if qual_where else ""
+        qual_grp_for_q = self._group_by_exprs_for_query(qual_grp_exprs, include_canonical_pk=has_nullable_grp)
+        group_sql = f"\nGROUP BY {', '.join(qual_grp_for_q)}" if qual_grp_for_q else ""
+
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+            f"SELECT {', '.join(select_exprs)}\n"
+            f"FROM {full_from_sql}{where_sql}{group_sql};"
+        )
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                f"SELECT {', '.join(target_cols)}\n"
+                f"FROM (\nSELECT {', '.join(f'{ex} AS {col}' for col, ex in zip(target_cols, select_exprs))}\n"
+                f"FROM {full_from_sql}{where_sql}{group_sql}\n) AS __mv_init\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        def _build_join_recompute_subquery(item: SelectItem) -> str:
+            alias_remap = {j.alias.lower(): f"__mv_j_{j.alias}" for j in self.view.joins}
+            for j in self.view.joins:
+                alias_remap[j.table_name.lower()] = f"__mv_j_{j.alias}"
+
+            def _remap_to_j(frag: str) -> str:
+                q_frag = self._qualify_join_expr(frag)
+                tokens = re.split(r"('(?:''|[^'])*')", q_frag)
+                out = []
+                for idx_t, tok in enumerate(tokens):
+                    if idx_t % 2 == 1:
+                        out.append(tok)
+                        continue
+                    mod = tok
+                    for old_a, new_a in sorted(alias_remap.items(), key=lambda x: len(x[0]), reverse=True):
+                        mod = re.sub(rf"\b{re.escape(old_a)}\s*\.", f"{new_a}.", mod, flags=re.IGNORECASE)
+                    out.append(mod)
+                return "".join(out)
+
+            j_parts: List[str] = []
+            for idx, j in enumerate(self.view.joins):
+                tbl_s = f"{j.table_name} AS __mv_j_{j.alias}"
+                if idx == 0:
+                    j_parts.append(tbl_s)
+                else:
+                    on_s = f" ON {_remap_to_j(j.on_condition)}" if j.on_condition else ""
+                    j_parts.append(f"{j.join_type} {tbl_s}{on_s}")
+            conds: List[str] = []
+            if self.view.where_clause:
+                conds.append(f"({_remap_to_j(self.view.where_clause)})")
+            for g_raw in grp_exprs:
+                mv_col = self._group_col_alias(g_raw)
+                lhs_j = _remap_to_j(g_raw)
+                conds.append(
+                    self._null_safe_eq(f"({lhs_j})", f"{mv_table}.{mv_col}", is_nullable=True)
+                )
+            w_sub = f" WHERE {' AND '.join(conds)}" if conds else ""
+            agg_e = _remap_to_j(self._sql_backfill_agg_expr(item))
+            return f"(SELECT {agg_e} FROM {' '.join(j_parts)}{w_sub})"
+
+        plus_merge_assignments = self._build_tier1_chunk_merge_assignments(
+            mv_table=mv_table,
+            row_count_col=row_count_col,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            expr_key_fn=_expr_key,
+            use_mysql_values=(self.dialect == Dialect.MYSQL),
+        )
+        # Native approximate aggregates must preserve the engine's operation
+        # order; algebraically equivalent sum/count updates can differ by ULPs.
+        native_recompute_aliases = {
+            self._q(item.alias)
+            for item in work_items
+            if item.is_aggregate
+            and (
+                item.agg_func in (
+                    AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                    AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                )
+                or self._requires_native_avg_recompute(item)
+            )
+        }
+        if native_recompute_aliases:
+            plus_merge_assignments = [
+                assignment for assignment in plus_merge_assignments
+                if assignment.split("=", 1)[0].strip() not in native_recompute_aliases
+            ]
+            for item in work_items:
+                if item.is_aggregate and (
+                    item.agg_func in (
+                        AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                        AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                    )
+                    or self._requires_native_avg_recompute(item)
+                ):
+                    plus_merge_assignments.append(
+                        f"{self._q(item.alias)} = {_build_join_recompute_subquery(item)}"
+                    )
+
+        # Build minus assignments from `__mv_delta`
+        minus_assignments: List[str] = []
+        minus_updated: Set[str] = set()
+
+        def _delta_sum_minus(col: str, cnt_col: str) -> str:
+            new_c = f"({mv_table}.{cnt_col} - __mv_delta.{cnt_col})"
+            return (
+                f"(CASE WHEN __mv_delta.{col} IS NULL THEN {mv_table}.{col} "
+                f"WHEN {new_c} <= 0 THEN NULL "
+                f"ELSE {mv_table}.{col} - __mv_delta.{col} END)"
+            )
+
+        def _delta_sum2_minus(ekey: str, sum2_col: str, cnt_col: str) -> str:
+            if self.dialect != Dialect.SQLITE:
+                return _delta_sum_minus(sum2_col, cnt_col)
+            sum_c = col_sum_map[ekey]
+            new_c = f"({mv_table}.{cnt_col} - __mv_delta.{cnt_col})"
+            d_mu = f"(((1.0 * __mv_delta.{sum_c}) / __mv_delta.{cnt_col}) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_col}))"
+            return (
+                f"(CASE WHEN __mv_delta.{cnt_col} <= 0 OR __mv_delta.{sum2_col} IS NULL THEN {mv_table}.{sum2_col} "
+                f"WHEN {new_c} <= 0 THEN NULL "
+                f"WHEN {new_c} = 1 THEN 0.0 "
+                f"ELSE MAX(0.0, COALESCE({mv_table}.{sum2_col}, 0.0) - COALESCE(__mv_delta.{sum2_col}, 0.0) - ({d_mu} * {d_mu} * ((1.0 * {mv_table}.{cnt_col} * __mv_delta.{cnt_col}) / {new_c}))) END)"
+            )
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            c = self._q(item.alias)
+            minus_updated.add(c)
+            ekey = _expr_key(item)
+            if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
+                minus_assignments.append(f"{c} = {mv_table}.{c} - __mv_delta.{c}")
+            elif item.agg_func == AggFunc.SUM:
+                cnt_c = col_nonnull_count_map[ekey]
+                minus_assignments.append(f"{c} = {_delta_sum_minus(c, cnt_c)}")
+            elif item.agg_func == AggFunc.AVG:
+                if self._requires_native_avg_recompute(item):
+                    recomputed = _build_join_recompute_subquery(item)
+                    minus_assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                    new_sum = _delta_sum_minus(sum_c, cnt_c)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    minus_assignments.append(
+                        f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL ELSE {dividend} / {new_cnt} END"
+                    )
+            elif item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                recomputed = _build_join_recompute_subquery(item)
+                minus_assignments.append(f"{c} = {recomputed}")
+            elif item.agg_func == AggFunc.MIN:
+                recomp = _build_join_recompute_subquery(item)
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NOT NULL AND {mv_table}.{c} >= __mv_delta.{c} "
+                    f"THEN {recomp} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.MAX:
+                recomp = _build_join_recompute_subquery(item)
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NOT NULL AND {mv_table}.{c} <= __mv_delta.{c} "
+                    f"THEN {recomp} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.BIT_XOR:
+                cnt_c = col_nonnull_count_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                xor_e = self._bitwise_xor_sql(f"{mv_table}.{c}", f"(__mv_delta.{c})")
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {new_cnt} <= 0 THEN NULL ELSE {xor_e} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_AND:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                new_tcnt = f"({mv_table}.{tcnt_c} - __mv_delta.{tcnt_c})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                minus_assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_OR:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                new_tcnt = f"({mv_table}.{tcnt_c} - __mv_delta.{tcnt_c})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                minus_assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
+                )
+
+        if row_count_col not in minus_updated:
+            minus_assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} - __mv_delta.{row_count_col}")
+            minus_updated.add(row_count_col)
+
+        for ekey, cnt_c in col_nonnull_count_map.items():
+            if cnt_c not in minus_updated:
+                minus_assignments.append(f"{cnt_c} = {mv_table}.{cnt_c} - __mv_delta.{cnt_c}")
+                minus_updated.add(cnt_c)
+        for ekey, sum_c in col_sum_map.items():
+            if sum_c not in minus_updated:
+                cnt_c = col_nonnull_count_map[ekey]
+                minus_assignments.append(f"{sum_c} = {_delta_sum_minus(sum_c, cnt_c)}")
+                minus_updated.add(sum_c)
+        for ekey, sum2_c in col_sum2_map.items():
+            if sum2_c not in minus_updated:
+                cnt_c = col_nonnull_count_map[ekey]
+                minus_assignments.append(f"{sum2_c} = {_delta_sum2_minus(ekey, sum2_c, cnt_c)}")
+                minus_updated.add(sum2_c)
+        for ekey, tcnt_c in col_true_cnt_map.items():
+            if tcnt_c not in minus_updated:
+                minus_assignments.append(f"{tcnt_c} = {mv_table}.{tcnt_c} - __mv_delta.{tcnt_c}")
+                minus_updated.add(tcnt_c)
+
+        high_p = {
+            self._q(it.alias)
+            for it in work_items
+            if it.is_aggregate
+            and it.agg_func
+            in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            )
+        }
+        mid_p = (
+            {self._q(it.alias) for it in work_items if it.is_aggregate and it.agg_func == AggFunc.SUM}
+            | set(col_sum_map.values())
+            | set(col_sum2_map.values())
+            | set(col_true_cnt_map.values())
+        )
+        ordered_minus = (
+            [a for a in minus_assignments if a.split("=")[0].strip() in high_p]
+            + [a for a in minus_assignments if a.split("=")[0].strip() not in high_p and a.split("=")[0].strip() in mid_p]
+            + [a for a in minus_assignments if a.split("=")[0].strip() not in high_p and a.split("=")[0].strip() not in mid_p]
+        )
+
+        # For MySQL multi-table UPDATE, LHS column names must be qualified with `mv_table.`
+        mysql_ordered_minus = [
+            f"{mv_table}.{a}" for a in ordered_minus
+        ]
+
+        aliased_delta_select = ", ".join(
+            f"{ex} AS {col}" for col, ex in zip(target_cols, select_exprs)
+        )
+        having_non_empty = "" if grp_exprs else "\nHAVING COUNT(*) > 0"
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for j in self.view.joins:
+            base_t = j.table_name
+            j_alias = j.alias
+            from_new = _build_join_from_clause(replace_alias=j_alias, rec_prefix="NEW")
+            from_old = _build_join_from_clause(replace_alias=j_alias, rec_prefix="OLD")
+
+            delta_pk_match = " AND ".join(
+                f"{mv_table}.{self._q(c)} = __mv_delta.{self._q(c)}" for c in pk_cols
+            )
+            q_pk_cols_csv = ", ".join(self._q(c) for c in pk_cols)
+            if self.dialect == Dialect.MYSQL:
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ON DUPLICATE KEY UPDATE\n"
+                    f"        {', '.join(plus_merge_assignments)};"
+                )
+                minus_stmt = (
+                    f"UPDATE {mv_table}\n"
+                    f"    INNER JOIN (\n"
+                    f"        SELECT {aliased_delta_select}\n"
+                    f"        FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ) AS __mv_delta ON {delta_pk_match}\n"
+                    f"    SET {', '.join(mysql_ordered_minus)};"
+                )
+            else:
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ON CONFLICT ({q_pk_cols_csv}) DO UPDATE SET\n"
+                    f"        {', '.join(plus_merge_assignments)};"
+                )
+                minus_stmt = (
+                    f"UPDATE {mv_table}\n"
+                    f"    SET {', '.join(ordered_minus)}\n"
+                    f"    FROM (\n"
+                    f"        SELECT {aliased_delta_select}\n"
+                    f"        FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ) AS __mv_delta\n"
+                    f"    WHERE {delta_pk_match};"
+                )
+
+            del_zero_stmt = (
+                f"DELETE FROM {mv_table} WHERE {mv_table}.{row_count_col} <= 0;"
+                if grp_exprs
+                else None
+            )
+            del_stmts = [minus_stmt] + ([del_zero_stmt] if del_zero_stmt else [])
+            trunc_stmts = [f"DELETE FROM {mv_table};"] + (
+                [initial_populate_sql] if not grp_exprs else []
+            )
+
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=[plus_stmt],
+                del_stmts=del_stmts,
+                upd_old_stmts=[minus_stmt],
+                upd_new_stmts=[plus_stmt],
+                upd_cleanup_old_stmts=[del_zero_stmt] if del_zero_stmt else [],
+                trunc_stmts=trunc_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+    # =========================================================================
+    # TIER 1C: Z-Set Set Operations (UNION ALL, UNION, INTERSECT, EXCEPT),
+    #          SELECT DISTINCT & PK-Lineage Projections
+    # =========================================================================
+
+    def _parse_setop_branches(self) -> Optional[List[Tuple[str, ViewSpec]]]:
+        raw = self.view.raw_select_sql.strip()
+        try:
+            q_ast = parse_sql_ast(raw)
+        except sqlglot.errors.SqlglotError:
+            return None
+        if not isinstance(q_ast, sqlglot_exp.SetOperation):
+            return None
+
+        ops, branch_sqls = _extract_set_op_branches_from_ast(q_ast, raw)
+        if not ops or len(set(ops)) != 1:
+            return None
+        op_type = ops[0]
+
+        if op_type in ("INTERSECT", "EXCEPT") and len(branch_sqls) != 2:
+            return None
+
+        branches: List[Tuple[str, ViewSpec]] = []
+        col_count: Optional[int] = None
+        for idx, b_sql in enumerate(branch_sqls):
+            try:
+                bs = _parse_single_create_view_stmt(
+                    f"CREATE VIEW __set_b_{idx} AS {b_sql}",
+                    known_tables=set(self._schemas_lower.keys()),
+                )
+            except Exception:
+                return None
+            if (
+                bs.has_cte
+                or bs.has_window_func
+                or bs.has_compound_set_op
+                or bs.has_top_level_distinct
+                or bs.has_limit_or_order
+                or bs.has_subquery_in_from
+                or len(bs.joins) != 1
+                or bs.group_by_cols
+                or any(it.is_aggregate or it.raw_expr.strip() == "*" for it in bs.select_items)
+                or bs.base_table.lower() not in self._schemas_lower
+            ):
+                return None
+            if bs.where_clause and _has_subquery_ast(bs.where_clause):
+                return None
+            if col_count is None:
+                col_count = len(bs.select_items)
+            elif len(bs.select_items) != col_count:
+                return None
+            if op_type == "UNION ALL":
+                ts = self._schemas_lower[bs.base_table.lower()]
+                if not any(c.primary_key for c in ts.columns.values()):
+                    return None
+            branches.append((op_type, bs))
+        return branches
+
+    def _rewrite_branch_expr(self, expr: str, ts: TableSchema, alias: str, record_prefix: Optional[str]) -> str:
+        col_map = {c.lower(): c for c in ts.columns}
+        quals_lower = {q.lower() for q in (ts.name, alias) if q}
+        toks = tokenize_sql(expr)
+        out: List[str] = []
+        i = 0
+        n = len(toks)
+
+        def _next_non_ws(idx: int) -> Optional[SQLToken]:
+            k = idx
+            while k < n:
+                if toks[k].kind != SQLTokenType.WHITESPACE:
+                    return toks[k]
+                k += 1
+            return None
+
+        def _prev_non_ws(idx: int) -> Optional[SQLToken]:
+            k = idx
+            while k >= 0:
+                if toks[k].kind != SQLTokenType.WHITESPACE:
+                    return toks[k]
+                k -= 1
+            return None
+
+        while i < n:
+            t = toks[i]
+            if (
+                t.kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT)
+                and i + 2 < n
+                and toks[i + 1].kind == SQLTokenType.PUNCT
+                and toks[i + 1].text == "."
+                and toks[i + 2].kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT)
+            ):
+                q_low = t.unquoted.lower()
+                c_low = toks[i + 2].unquoted.lower()
+                actual_c = col_map.get(c_low, toks[i + 2].unquoted)
+                if q_low in quals_lower:
+                    if record_prefix:
+                        out.append(f"{record_prefix}.{self._q(actual_c)}")
+                    else:
+                        out.append(f"{self._q(t.unquoted)}.{self._q(actual_c)}")
+                    i += 3
+                    continue
+            if t.kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT):
+                prev_t = _prev_non_ws(i - 1)
+                next_t = _next_non_ws(i + 1)
+                is_after_dot = prev_t is not None and prev_t.kind == SQLTokenType.PUNCT and prev_t.text == "."
+                is_before_dot = next_t is not None and next_t.kind == SQLTokenType.PUNCT and next_t.text == "."
+                is_fn_call = (
+                    t.kind == SQLTokenType.IDENT
+                    and next_t is not None
+                    and next_t.kind == SQLTokenType.PUNCT
+                    and next_t.text == "("
+                )
+                if not is_after_dot and not is_before_dot and not is_fn_call:
+                    w_low = t.unquoted.lower()
+                    if w_low in col_map:
+                        actual_c = col_map[w_low]
+                        if record_prefix:
+                            out.append(f"{record_prefix}.{self._q(actual_c)}")
+                        else:
+                            out.append(self._q(actual_c))
+                        i += 1
+                        continue
+            out.append(t.text)
+            i += 1
+        return "".join(out)
+
+    def _compile_tier1_zset_setop(self) -> MaterializedViewPlan:
+        branches = self._parse_setop_branches()
+        assert branches is not None
+        op_type = branches[0][0]
+        first_bs = branches[0][1]
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        user_columns = [it.alias for it in first_bs.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+
+        # Check if UNION ALL branches share a uniform native composite PK structure
+        branch_pk_defs_list: List[List[ColumnDef]] = []
+        for _, bs in branches:
+            ts_b = self._schemas_lower[bs.base_table.lower()]
+            branch_pk_defs_list.append([c for c in ts_b.columns.values() if c.primary_key])
+
+        use_native_uall_pk = False
+        uall_pk_cols: List[str] = ["__mv_pk"]
+        uall_pk_col_types: List[str] = []
+        if op_type == "UNION ALL" and branch_pk_defs_list and branch_pk_defs_list[0]:
+            k_pks = len(branch_pk_defs_list[0])
+            if all(len(pks) == k_pks for pks in branch_pk_defs_list):
+                use_native_uall_pk = True
+                uall_pk_cols = ["__mv_branch_id", *[f"__mv_pk_{i}" for i in range(k_pks)]]
+                for i in range(k_pks):
+                    dt_i = self._normalize_dialect_type(branch_pk_defs_list[0][i].data_type)
+                    if self.dialect == Dialect.MYSQL and dt_i.upper() == "TEXT":
+                        dt_i = "VARCHAR(255)"
+                    uall_pk_col_types.append(dt_i)
+        self._setop_pk_cols = list(uall_pk_cols)
+
+        col_defs_sql: List[str] = []
+        if use_native_uall_pk:
+            col_defs_sql.append("__mv_branch_id INTEGER NOT NULL")
+            for i, dt_i in enumerate(uall_pk_col_types):
+                col_defs_sql.append(f"__mv_pk_{i} {dt_i} NOT NULL")
+        else:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        indexed_cols_lower = self._indexed_column_names_lower()
+        for it in first_bs.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            col_defs_sql.append(f"{self._q(it.alias)} {dt}")
+
+        if op_type in ("UNION", "UNION ALL"):
+            col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = None
+        elif op_type == "INTERSECT":
+            col_defs_sql.append(f"__mv_cnt_0 {self._int_type()} NOT NULL DEFAULT 0")
+            col_defs_sql.append(f"__mv_cnt_1 {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = "__mv_cnt_0 > 0 AND __mv_cnt_1 > 0"
+        else:  # EXCEPT
+            col_defs_sql.append(f"__mv_cnt_0 {self._int_type()} NOT NULL DEFAULT 0")
+            col_defs_sql.append(f"__mv_cnt_1 {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = "__mv_cnt_0 > 0 AND __mv_cnt_1 = 0"
+
+        if use_native_uall_pk:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(uall_pk_cols)})")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                extra_where_filter=extra_filter,
+            )
+        )
+
+        initial_populate_sqls: List[str] = []
+        by_table_branches: Dict[str, List[Tuple[int, ViewSpec]]] = {}
+        for b_idx, (_, bs) in enumerate(branches):
+            by_table_branches.setdefault(bs.base_table, []).append((b_idx, bs))
+
+        if op_type == "UNION ALL":
+            for b_idx, (_, bs) in enumerate(branches):
+                ts = self._schemas_lower[bs.base_table.lower()]
+                pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                sel_exprs = [it.raw_expr for it in bs.select_items]
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                if use_native_uall_pk:
+                    initial_populate_sqls.append(
+                        f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"SELECT {b_idx}, {', '.join(pk_names)}, {', '.join(sel_exprs)}, 1 FROM {bs.base_table}{w_sql};"
+                    )
+                else:
+                    pk_expr = self._canonical_group_pk_expr([f"'B{b_idx}'", *pk_names])
+                    initial_populate_sqls.append(
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"SELECT {pk_expr}, {', '.join(sel_exprs)}, 1 FROM {bs.base_table}{w_sql};"
+                    )
+        elif op_type == "UNION":
+            u_parts: List[str] = []
+            for _, bs in branches:
+                sel_aliased = ", ".join(
+                    f"{it.raw_expr} AS {col}" for it, col in zip(bs.select_items, user_columns)
+                )
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                u_parts.append(f"    SELECT {sel_aliased} FROM {bs.base_table}{w_sql}")
+            pk_u = self._canonical_group_pk_expr(user_columns)
+            grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
+            initial_populate_sqls.append(
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                f"SELECT {pk_u}, {', '.join(user_columns)}, COUNT(*) FROM (\n"
+                + "\n    UNION ALL\n".join(u_parts)
+                + f"\n) AS __mv_u\nGROUP BY {grp_u};"
+            )
+        else:  # INTERSECT or EXCEPT
+            u_parts = []
+            for b_idx, (_, bs) in enumerate(branches):
+                sel_aliased = ", ".join(
+                    f"{it.raw_expr} AS {col}" for it, col in zip(bs.select_items, user_columns)
+                )
+                b0 = "1" if b_idx == 0 else "0"
+                b1 = "1" if b_idx == 1 else "0"
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                u_parts.append(
+                    f"    SELECT {sel_aliased}, {b0} AS __mv_b0, {b1} AS __mv_b1 FROM {bs.base_table}{w_sql}"
+                )
+            pk_u = self._canonical_group_pk_expr(user_columns)
+            grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
+            initial_populate_sqls.append(
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                f"SELECT {pk_u}, {', '.join(user_columns)}, SUM(__mv_b0), SUM(__mv_b1) FROM (\n"
+                + "\n    UNION ALL\n".join(u_parts)
+                + f"\n) AS __mv_u\nGROUP BY {grp_u};"
+            )
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for base_t, b_list in by_table_branches.items():
+            ts = self._schemas_lower[base_t.lower()]
+            ins_stmts: List[str] = []
+            del_stmts: List[str] = []
+            upd_old_stmts: List[str] = []
+            upd_new_stmts: List[str] = []
+            cleanup_stmts: List[str] = []
+
+            for b_idx, bs in b_list:
+                b_alias = bs.joins[0].alias if bs.joins else base_t
+                w_new = (
+                    self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "NEW")
+                    if bs.where_clause
+                    else "TRUE"
+                )
+                w_old = (
+                    self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "OLD")
+                    if bs.where_clause
+                    else "TRUE"
+                )
+                new_vals = [
+                    self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "NEW")
+                    for it in bs.select_items
+                ]
+                old_vals = [
+                    self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "OLD")
+                    for it in bs.select_items
+                ]
+
+                if op_type == "UNION ALL":
+                    pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                    if use_native_uall_pk:
+                        new_pk_vals = [str(b_idx), *[f"NEW.{self._q(c)}" for c in pk_names]]
+                        old_pk_match = f"{mv_table}.__mv_branch_id = {b_idx} AND " + " AND ".join(
+                            f"{mv_table}.__mv_pk_{i} = OLD.{self._q(c)}" for i, c in enumerate(pk_names)
+                        )
+                        if self.dialect == Dialect.MYSQL:
+                            upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        else:
+                            upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON CONFLICT ({', '.join(uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        minus_s = (
+                            f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                            f"    WHERE ({w_old}) AND ({old_pk_match});"
+                        )
+                        clean_s = (
+                            f"DELETE FROM {mv_table}\n"
+                            f"    WHERE ({w_old}) AND ({old_pk_match}) AND {mv_table}.__mv_row_count <= 0;"
+                        )
+                    else:
+                        pk_new = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"NEW.{c}" for c in pk_names]])
+                        pk_old = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"OLD.{c}" for c in pk_names]])
+                        if self.dialect == Dialect.MYSQL:
+                            upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        else:
+                            upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        minus_s = (
+                            f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                            f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                        )
+                        clean_s = (
+                            f"DELETE FROM {mv_table}\n"
+                            f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+                        )
+                elif op_type == "UNION":
+                    pk_new = self._canonical_group_pk_expr(new_vals)
+                    pk_old = self._canonical_group_pk_expr(old_vals)
+                    if self.dialect == Dialect.MYSQL:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON DUPLICATE KEY UPDATE __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                    else:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                    minus_s = (
+                        f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                        f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                    )
+                    clean_s = (
+                        f"DELETE FROM {mv_table}\n"
+                        f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+                    )
+                else:  # INTERSECT or EXCEPT
+                    pk_new = self._canonical_group_pk_expr(new_vals)
+                    pk_old = self._canonical_group_pk_expr(old_vals)
+                    cnt_col = f"__mv_cnt_{b_idx}"
+                    init_c0 = "1" if b_idx == 0 else "0"
+                    init_c1 = "1" if b_idx == 1 else "0"
+                    if self.dialect == Dialect.MYSQL:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}{from_dual}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON DUPLICATE KEY UPDATE {cnt_col} = {mv_table}.{cnt_col} + 1;"
+                        )
+                    else:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET {cnt_col} = {mv_table}.{cnt_col} + 1;"
+                        )
+                    minus_s = (
+                        f"UPDATE {mv_table} SET {cnt_col} = {mv_table}.{cnt_col} - 1\n"
+                        f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                    )
+                    clean_s = (
+                        f"DELETE FROM {mv_table}\n"
+                        f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_cnt_0 <= 0 AND {mv_table}.__mv_cnt_1 <= 0;"
+                    )
+
+                ins_stmts.append(plus_s)
+                del_stmts.extend([minus_s, clean_s])
+                upd_old_stmts.append(minus_s)
+                upd_new_stmts.append(plus_s)
+                cleanup_stmts.append(clean_s)
+
+            trunc_stmts = [f"DELETE FROM {mv_table};", *initial_populate_sqls]
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=ins_stmts,
+                del_stmts=del_stmts,
+                upd_old_stmts=upd_old_stmts,
+                upd_new_stmts=upd_new_stmts,
+                upd_cleanup_old_stmts=cleanup_stmts,
+                trunc_stmts=trunc_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            chunk_sql_templates=initial_populate_sqls,
+        )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=initial_populate_sqls,
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    def _compile_tier1_zset_distinct(self) -> MaterializedViewPlan:
+        # `SELECT DISTINCT c1, c2 FROM t WHERE ...` is isomorphic to `GROUP BY c1, c2` with hidden `__mv_row_count`
+        self._effective_group_by_exprs = tuple(it.raw_expr for it in self.view.select_items)
+        return self._compile_tier1_algebraic()
+
+    def _projection_pk_mapping(self) -> Tuple[List[str], List[Tuple[str, str, str]], bool]:
+        """
+        Returns `(mv_pk_cols, hidden_pk_defs, uses_native_pk)` for `_compile_tier1_zset_projection`.
+        Preserves the base table's actual primary/composite key columns in the backing table
+        whenever all base PK columns are non-nullable.
+        """
+        assert self.primary_schema is not None
+        pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
+        can_native = bool(pk_defs) and all(
+            c.not_null
+            or "INT" in c.data_type.upper()
+            or self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
+            for c in pk_defs
+        )
+        if not can_native:
+            return ["__mv_pk"], [], False
+
+        base_alias = self.view.joins[0].alias.lower() if self.view.joins else self.view.base_table.lower()
+        base_name = self.view.base_table.lower()
+        mv_pk_cols: List[str] = []
+        hidden_pk_defs: List[Tuple[str, str, str]] = []
+        used_user_aliases: Set[str] = set()
+
+        for c_def in pk_defs:
+            c_low = c_def.name.lower()
+            matched_alias: Optional[str] = None
+            for it in self.view.select_items:
+                raw_s = _unquote_ident(it.raw_expr.strip()).lower() if re.match(r'^[A-Za-z0-9_."`\[\]]+$', it.raw_expr.strip()) else ""
+                raw_full = it.raw_expr.strip().lower()
+                if (
+                    raw_full == c_low
+                    or raw_full == f"{base_alias}.{c_low}"
+                    or raw_full == f"{base_name}.{c_low}"
+                    or (raw_s == c_low and "." not in raw_full)
+                ) and it.alias.lower() not in used_user_aliases:
+                    matched_alias = it.alias
+                    used_user_aliases.add(it.alias.lower())
+                    break
+            if matched_alias is not None:
+                mv_pk_cols.append(matched_alias)
+            else:
+                hid_col = f"__mv_pk_{_sanitize_ident(c_def.name)}"
+                dt = self._normalize_dialect_type(c_def.data_type)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                hidden_pk_defs.append((hid_col, c_def.name, dt))
+                mv_pk_cols.append(hid_col)
+
+        return mv_pk_cols, hidden_pk_defs, True
+
+    def _projection_pk_cols(self) -> List[str]:
+        mv_pk_cols, _, _ = self._projection_pk_mapping()
+        return mv_pk_cols
+
+    def _compile_tier1_zset_projection(self) -> MaterializedViewPlan:
+        assert self.primary_schema is not None
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        base_t = self.view.base_table
+        q_base_t = self._q(base_t)
+        user_columns = [it.alias for it in self.view.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+
+        pk_names = [c.name for c in self.primary_schema.columns.values() if c.primary_key]
+        mv_pk_cols, hidden_pk_defs, uses_native_pk = self._projection_pk_mapping()
+        pk_col_set_lower = {c.lower() for c in mv_pk_cols}
+
+        col_defs_sql: List[str] = []
+        if not uses_native_pk:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        indexed_cols_lower = self._indexed_column_names_lower(mv_pk_cols if uses_native_pk else ())
+        for it in self.view.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            nn = " NOT NULL" if (uses_native_pk and it.alias.lower() in pk_col_set_lower) else ""
+            col_defs_sql.append(f"{it.alias} {dt}{nn}")
+
+        for hid_col, _, hid_dt in hidden_pk_defs:
+            col_defs_sql.append(f"{hid_col} {hid_dt} NOT NULL")
+
+        if uses_native_pk:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(mv_pk_cols)})")
+        else:
+            col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        sel_exprs = [it.raw_expr for it in self.view.select_items]
+        w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
+        new_vals = [self._rewrite_expr_for_record(it.raw_expr, "NEW") for it in self.view.select_items]
+
+        if uses_native_pk:
+            all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
+            all_select_exprs = [*sel_exprs, *[h[1] for h in hidden_pk_defs]]
+            all_new_vals = [*new_vals, *[f"NEW.{h[1]}" for h in hidden_pk_defs]]
+            initial_populate_sql = (
+                f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                f"SELECT {', '.join(all_select_exprs)} FROM {q_base_t}{w_sql};"
+            )
+            if self.dialect == Dialect.MYSQL:
+                upd_set = ", ".join(f"{c} = VALUES({c})" for c in all_backing_cols)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                    f"    SELECT {', '.join(all_new_vals)}{from_dual}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON DUPLICATE KEY UPDATE {upd_set};"
+                )
+            else:
+                upd_set = ", ".join(f"{c} = excluded.{c}" for c in all_backing_cols)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                    f"    SELECT {', '.join(all_new_vals)}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON CONFLICT ({', '.join(mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                )
+            pk_old_preds = [
+                f"{mv_table}.{mv_c} = OLD.{src_c}"
+                for mv_c, src_c in zip(mv_pk_cols, pk_names)
+            ]
+            del_where = " AND ".join(pk_old_preds)
+            del_stmt = f"DELETE FROM {mv_table}\n    WHERE {del_where};"
+            del_stmts_list = [del_stmt]
+            upd_old_list = [del_stmt]
+            upd_clean_list: List[str] = []
+        else:
+            pk_expr_base = self._canonical_group_pk_expr(pk_names)
+            initial_populate_sql = (
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_sql};"
+            )
+            pk_new = self._canonical_group_pk_expr([f"NEW.{c}" for c in pk_names])
+            pk_old = self._canonical_group_pk_expr([f"OLD.{c}" for c in pk_names])
+            if self.dialect == Dialect.MYSQL:
+                upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            else:
+                upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            minus_stmt = (
+                f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                f"    WHERE {mv_table}.__mv_pk = ({pk_old});"
+            )
+            clean_stmt = (
+                f"DELETE FROM {mv_table}\n"
+                f"    WHERE ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+            )
+            del_stmts_list = [minus_stmt, clean_stmt]
+            upd_old_list = [minus_stmt]
+            upd_clean_list = [clean_stmt]
+
+        where_new = (
+            self._rewrite_expr_for_record(self.view.where_clause, "NEW")
+            if self.view.where_clause
+            else None
+        )
+        where_old = (
+            self._rewrite_expr_for_record(self.view.where_clause, "OLD")
+            if self.view.where_clause
+            else None
+        )
+
+        trigger_ddls, trig_names, fn_names = self._emit_dialect_triggers_for_table(
+            view_name=view_name,
+            base_t=base_t,
+            ins_stmts=[plus_stmt],
+            del_stmts=del_stmts_list,
+            upd_old_stmts=upd_old_list,
+            upd_new_stmts=[plus_stmt],
+            upd_cleanup_old_stmts=upd_clean_list,
+            trunc_stmts=[f"DELETE FROM {mv_table};"],
+            where_new=where_new,
+            where_old=where_old,
+        )
+
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            chunk_sql_templates=[initial_populate_sql],
+        )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    def _compile_tier1_union_all_agg(self) -> MaterializedViewPlan:
+        """
+        Compiles an aggregation query over a `UNION ALL` CTE or derived subquery into Tier 1 O(1)
+        per-branch algebraic delta triggers.
+        """
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        work_items = list(self._working_select_items)
+        grp_exprs = list(self._effective_group_by_exprs)
+        inner_u_sql = self._union_all_inner_sql
+        u_alias = self._union_all_sub_alias
+        branch_specs = self._union_all_branch_specs
+
+        count_star_alias: Optional[str] = None
+        for item in work_items:
+            if (
+                item.is_aggregate
+                and item.agg_func == AggFunc.COUNT_STAR
+                and not item.filter_where
+            ):
+                count_star_alias = item.alias
+                break
+        row_count_col = self._q(count_star_alias) if count_star_alias else "__mv_row_count"
+
+        # Check if all group_by columns are NOT NULL across every UNION ALL branch
+        uall_has_nullable = False
+        if grp_exprs:
+            first_b_aliases = [it.alias.lower() for it in branch_specs[0].select_items]
+            seen_g_al: Set[str] = set()
+            for g_expr in grp_exprs:
+                g_id = _unquote_ident(g_expr.split(".")[-1]).lower() if _is_simple_column_expr(g_expr.strip()) else ""
+                if not g_id or g_id not in first_b_aliases:
+                    uall_has_nullable = True
+                    break
+                col_pos = first_b_aliases.index(g_id)
+                for bs in branch_specs:
+                    b_it = bs.select_items[col_pos]
+                    ts_b = self._schemas_lower[bs.base_table.lower()]
+                    c_b = ts_b.columns.get(b_it.source_col or "") if b_it.source_col else None
+                    if c_b is None or not c_b.not_null:
+                        uall_has_nullable = True
+                        break
+                if uall_has_nullable:
+                    break
+                al_g = self._group_col_alias(g_expr).lower()
+                if al_g in seen_g_al:
+                    uall_has_nullable = True
+                    break
+                seen_g_al.add(al_g)
+        self._uall_has_nullable_grp = uall_has_nullable
+        has_nullable_grp = self._has_nullable_group_col()
+        pk_cols = self._tier1_pk_cols()
+
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = [it.alias for it in self.view.select_items]
+        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+
+        if not grp_exprs:
+            col_defs_sql.append("__mv_global_id INTEGER NOT NULL PRIMARY KEY")
+        elif has_nullable_grp:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        non_agg_aliases_lower = {
+            item.alias.lower() for item in work_items if not item.is_aggregate
+        }
+        seen_hidden_grp: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
+                seen_hidden_grp.add(mv_col.lower())
+                fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
+                dt = self._infer_expr_storage_type(fake_it)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if not has_nullable_grp else ""
+                col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
+
+        def _expr_key(item: SelectItem) -> str:
+            eff = self._effective_agg_value_expr(item, record_prefix=None).strip().lower()
+            return f"{'dist:' if item.is_distinct else ''}{eff}"
+
+        col_nonnull_count_map: Dict[str, str] = {}
+        col_sum_map: Dict[str, str] = {}
+        col_sum2_map: Dict[str, str] = {}
+        col_true_cnt_map: Dict[str, str] = {}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            ekey = _expr_key(item)
+            if item.agg_func == AggFunc.COUNT_COL:
+                col_nonnull_count_map[ekey] = self._q(item.alias)
+            elif item.agg_func == AggFunc.SUM:
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = self._q(item.alias)
+
+        group_mv_cols: List[str] = []
+        for g in grp_exprs:
+            mc = self._group_col_alias(g)
+            if mc not in group_mv_cols:
+                group_mv_cols.append(mc)
+        indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
+
+        # Infer aggregate types from first branch
+        first_b = branch_specs[0]
+        first_b_map = {it.alias.lower(): it.raw_expr for it in first_b.select_items}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                dt = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
+                col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
+            else:
+                # Check if arg_expr maps to an integer column across all branches
+                storage_type = self._infer_expr_storage_type(item)
+                if item.agg_func in (AggFunc.SUM, AggFunc.MIN, AggFunc.MAX) and item.arg_expr:
+                    arg_id = _unquote_ident(item.arg_expr).lower()
+                    if arg_id in first_b_map:
+                        b_types = []
+                        for bs in branch_specs:
+                            b_m = {bi.alias.lower(): bi for bi in bs.select_items}
+                            if arg_id in b_m:
+                                bi_item = b_m[arg_id]
+                                ts_b = self._schemas_lower[bs.base_table.lower()]
+                                c_b = ts_b.columns.get(bi_item.source_col or "") if bi_item.source_col else None
+                                if c_b:
+                                    b_types.append(self._normalize_dialect_type(c_b.data_type))
+                                elif re.match(r"^\d+$", bi_item.raw_expr.strip()):
+                                    b_types.append("INT")
+                                else:
+                                    b_types.append(self._float_type())
+                        if b_types and all("INT" in bt.upper() for bt in b_types):
+                            storage_type = self._int_type() if item.agg_func == AggFunc.SUM else b_types[0]
+                if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    storage_type = "VARCHAR(255)"
+                if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
+                elif item.agg_func == AggFunc.TOTAL:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0.0")
+                else:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type}")
+
+        if count_star_alias is None:
+            col_defs_sql.append(f"{row_count_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        aux_idx = 0
+        for item in work_items:
+            if not item.is_aggregate or item.agg_func is None:
+                continue
+            ekey = _expr_key(item)
+            safe_id = _sanitize_ident(item.alias)
+            if item.agg_func in (
+                AggFunc.SUM,
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            ) or (item.agg_func == AggFunc.COUNT_STAR and item.filter_where):
+                if item.agg_func == AggFunc.COUNT_STAR and item.filter_where:
+                    col_nonnull_count_map[ekey] = self._q(item.alias)
+                elif ekey not in col_nonnull_count_map:
+                    aux_idx += 1
+                    cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
+                    col_nonnull_count_map[ekey] = cnt_col
+                    col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+            if item.agg_func in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum_map:
+                    aux_idx += 1
+                    sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
+                    col_sum_map[ekey] = sum_col
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
+
+            if item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum2_map:
+                    aux_idx += 1
+                    s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
+                    sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
+                    col_sum2_map[ekey] = sum2_col
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
+
+            if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if ekey not in col_true_cnt_map:
+                    aux_idx += 1
+                    tcnt_col = f"__mv_tcnt_{safe_id}_{aux_idx}"
+                    col_true_cnt_map[ekey] = tcnt_col
+                    col_defs_sql.append(f"{tcnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        if grp_exprs and not has_nullable_grp:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        backing_col_map = {
+            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            for u_col, expr_s in self._compound_reader_exprs.items()
+            if expr_s != u_col and "__mv_elem_" in expr_s
+        }
+        can_pg15_unique_nnd = (
+            bool(grp_exprs)
+            and has_nullable_grp
+            and len(set(c.lower() for c in group_mv_cols)) == len(grp_exprs)
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=group_mv_cols,
+            has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
+            backing_col_map=backing_col_map,
+            unique_group_nulls_not_distinct=can_pg15_unique_nnd,
+        )
+        reader_select_override = [
+            self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
+        ]
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                select_exprs_override=reader_select_override,
+                extra_where_filter=self._rewritten_having_clause,
+            )
+        )
+
+        target_cols: List[str] = []
+        select_exprs: List[str] = []
+        if not grp_exprs:
+            target_cols.append("__mv_global_id")
+            select_exprs.append("1")
+        elif has_nullable_grp:
+            target_cols.append("__mv_pk")
+            select_exprs.append(self._canonical_group_pk_expr(grp_exprs))
+
+        seen_hidden: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                target_cols.append(mv_col)
+                select_exprs.append(g_expr)
+
+        for item in work_items:
+            target_cols.append(item.alias)
+            if not item.is_aggregate:
+                select_exprs.append(item.raw_expr)
+            else:
+                select_exprs.append(self._sql_backfill_agg_expr(item))
+
+        if count_star_alias is None:
+            target_cols.append(row_count_col)
+            select_exprs.append("COUNT(*)")
+
+        already_in_target = set(target_cols)
+        ekey_to_item: Dict[str, SelectItem] = {
+            _expr_key(it): it for it in work_items if it.is_aggregate
+        }
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            if cnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(cnt_col)
+                select_exprs.append(f"COUNT({eff})")
+                already_in_target.add(cnt_col)
+        for ekey, sum_col in col_sum_map.items():
+            if sum_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(sum_col)
+                select_exprs.append(f"SUM({eff})")
+                already_in_target.add(sum_col)
+        for ekey, sum2_col in col_sum2_map.items():
+            if sum2_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(sum2_col)
+                if self.dialect == Dialect.SQLITE:
+                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
+                else:
+                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
+                already_in_target.add(sum2_col)
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            if tcnt_col not in already_in_target:
+                it = ekey_to_item[ekey]
+                eff = self._effective_agg_value_expr(it, record_prefix=None)
+                target_cols.append(tcnt_col)
+                select_exprs.append(
+                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
+                )
+                already_in_target.add(tcnt_col)
+
+        w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
+        grp_for_q = self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=has_nullable_grp)
+        g_sql = f"\nGROUP BY {', '.join(grp_for_q)}" if grp_for_q else ""
+
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+            f"SELECT {', '.join(select_exprs)} FROM (\n{inner_u_sql}\n) AS {u_alias}{w_sql}{g_sql};"
+        )
+
+        # Group branches by base table and generate per-branch delta statements
+        by_table: Dict[str, List[ViewSpec]] = {}
+        for bs in branch_specs:
+            by_table.setdefault(bs.base_table, []).append(bs)
+
+        orig_view = self.view
+        orig_work_items = list(self._working_select_items)
+        orig_grp_exprs = tuple(self._effective_group_by_exprs)
+        orig_grp_aliases = [self._group_col_alias(g) for g in orig_grp_exprs]
+        orig_primary_schema = self.primary_schema
+        self._uall_orig_grp_exprs = orig_grp_exprs
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for base_t, b_list in by_table.items():
+            ts = self._schemas_lower[base_t.lower()]
+            ins_all: List[str] = []
+            del_all: List[str] = []
+            upd_old_all: List[str] = []
+            upd_new_all: List[str] = []
+            cleanup_all: List[str] = []
+
+            for bs in b_list:
+                b_alias = bs.joins[0].alias if bs.joins else base_t
+                col_subst: Dict[str, str] = {}
+                for col_i, b_it in enumerate(bs.select_items):
+                    u_col_name = first_b.select_items[col_i].alias.lower()
+                    cleaned = re.sub(
+                        rf"\b{re.escape(b_alias)}\.",
+                        "",
+                        b_it.raw_expr.strip(),
+                        flags=re.IGNORECASE,
+                    )
+                    col_subst[u_col_name] = f"({cleaned})"
+
+                def _subst_u(frag: Optional[str]) -> Optional[str]:
+                    if frag is None:
+                        return None
+                    toks = sqlglot.tokenize(frag, read="sqlite")
+                    if not toks:
+                        return frag
+                    out = []
+                    cursor = 0
+                    i = 0
+                    n = len(toks)
+                    while i < n:
+                        tk = toks[i]
+                        if (
+                            _is_word_or_ident_token(tk)
+                            and i + 2 < n
+                            and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                            and _is_word_or_ident_token(toks[i + 2])
+                        ):
+                            if tk.text.lower() == u_alias.lower():
+                                c_col = toks[i + 2].text.lower()
+                                if tk.start > cursor:
+                                    out.append(frag[cursor:tk.start])
+                                out.append(col_subst.get(c_col, toks[i + 2].text))
+                                cursor = toks[i + 2].end + 1
+                                i += 3
+                                continue
+                        if _is_word_or_ident_token(tk):
+                            is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
+                            is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
+                            is_fn = (
+                                tk.token_type != SQLGlotTokenType.IDENTIFIER
+                                and i + 1 < n
+                                and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN
+                            )
+                            if not is_after_dot and not is_before_dot and not is_fn:
+                                c_low = tk.text.lower()
+                                if c_low in col_subst:
+                                    if tk.start > cursor:
+                                        out.append(frag[cursor:tk.start])
+                                    out.append(col_subst[c_low])
+                                    cursor = tk.end + 1
+                                    i += 1
+                                    continue
+                        i += 1
+                    if cursor < len(frag):
+                        out.append(frag[cursor:])
+                    return "".join(out)
+
+                mapped_work_items: List[SelectItem] = []
+                orig_item_map: Dict[int, SelectItem] = {}
+                mapped_nonnull: Dict[str, str] = {}
+                mapped_sum: Dict[str, str] = {}
+                mapped_sum2: Dict[str, str] = {}
+                mapped_tcnt: Dict[str, str] = {}
+
+                for orig_it in orig_work_items:
+                    if not orig_it.is_aggregate:
+                        new_it = SelectItem(
+                            raw_expr=_subst_u(orig_it.raw_expr) or orig_it.raw_expr,
+                            alias=orig_it.alias,
+                            is_aggregate=False,
+                        )
+                    else:
+                        new_it = SelectItem(
+                            raw_expr=_subst_u(orig_it.raw_expr) or orig_it.raw_expr,
+                            alias=orig_it.alias,
+                            is_aggregate=True,
+                            agg_func=orig_it.agg_func,
+                            arg_expr=_subst_u(orig_it.arg_expr) if orig_it.arg_expr else orig_it.arg_expr,
+                            extra_args=orig_it.extra_args,
+                            is_distinct=orig_it.is_distinct,
+                            filter_where=_subst_u(orig_it.filter_where),
+                        )
+                        orig_ekey = _expr_key(orig_it)
+                        new_ekey = _expr_key(new_it)
+                        if orig_ekey in col_nonnull_count_map:
+                            mapped_nonnull[new_ekey] = col_nonnull_count_map[orig_ekey]
+                        if orig_ekey in col_sum_map:
+                            mapped_sum[new_ekey] = col_sum_map[orig_ekey]
+                        if orig_ekey in col_sum2_map:
+                            mapped_sum2[new_ekey] = col_sum2_map[orig_ekey]
+                        if orig_ekey in col_true_cnt_map:
+                            mapped_tcnt[new_ekey] = col_true_cnt_map[orig_ekey]
+                    orig_item_map[id(new_it)] = orig_it
+                    mapped_work_items.append(new_it)
+
+                mapped_grps = tuple(_subst_u(g) or g for g in orig_grp_exprs)
+                b_w = (
+                    re.sub(rf"\b{re.escape(b_alias)}\.", "", bs.where_clause, flags=re.IGNORECASE)
+                    if bs.where_clause
+                    else None
+                )
+                o_w = _subst_u(orig_view.where_clause)
+                comb_w = f"({b_w}) AND ({o_w})" if (b_w and o_w) else (b_w or o_w)
+
+                # Temporarily bind branch context
+                self.primary_schema = ts
+                self._working_select_items = mapped_work_items
+                self._effective_group_by_exprs = mapped_grps
+                self._uall_grp_alias_map = {mg: oa for mg, oa in zip(mapped_grps, orig_grp_aliases)}
+                self._uall_orig_item_map = orig_item_map
+                self.view = ViewSpec(
+                    view_name=orig_view.view_name,
+                    raw_select_sql=orig_view.raw_select_sql,
+                    base_table=base_t,
+                    joins=(JoinSpec(join_type="FROM", table_name=base_t, alias=base_t),),
+                    referenced_tables=(base_t,),
+                    select_items=tuple(mapped_work_items),
+                    where_clause=orig_view.where_clause,
+                    group_by_cols=mapped_grps,
+                )
+
+                plus_b = self._build_plus_delta_statements(
+                    mv_table,
+                    row_count_col,
+                    mapped_nonnull,
+                    mapped_sum,
+                    mapped_sum2,
+                    mapped_tcnt,
+                    {},
+                    _expr_key,
+                    record_prefix="NEW",
+                )
+                minus_del_b, _ = self._build_minus_delta_statements(
+                    mv_table,
+                    row_count_col,
+                    mapped_nonnull,
+                    mapped_sum,
+                    mapped_sum2,
+                    mapped_tcnt,
+                    {},
+                    _expr_key,
+                    record_prefix="OLD",
+                    include_delete_zero_mv=True,
+                )
+                minus_upd_b, del_zero_b = self._build_minus_delta_statements(
+                    mv_table,
+                    row_count_col,
+                    mapped_nonnull,
+                    mapped_sum,
+                    mapped_sum2,
+                    mapped_tcnt,
+                    {},
+                    _expr_key,
+                    record_prefix="OLD",
+                    include_delete_zero_mv=False,
+                )
+
+                w_new_b = self._rewrite_expr_for_record(comb_w, "NEW") if comb_w else None
+                w_old_b = self._rewrite_expr_for_record(comb_w, "OLD") if comb_w else None
+
+                ins_all.extend(self._apply_where_guard_to_stmt(s, w_new_b) for s in plus_b)
+                del_all.extend(self._apply_where_guard_to_stmt(s, w_old_b) for s in minus_del_b)
+                upd_old_all.extend(self._apply_where_guard_to_stmt(s, w_old_b) for s in minus_upd_b)
+                upd_new_all.extend(self._apply_where_guard_to_stmt(s, w_new_b) for s in plus_b)
+                if del_zero_b:
+                    cleanup_all.append(self._apply_where_guard_to_stmt(del_zero_b, w_old_b))
+
+            # Restore original view context
+            self.view = orig_view
+            self._working_select_items = orig_work_items
+            self._effective_group_by_exprs = orig_grp_exprs
+            self.primary_schema = orig_primary_schema
+            self._uall_grp_alias_map = None
+
+            trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=ins_all,
+                del_stmts=del_all,
+                upd_old_stmts=upd_old_all,
+                upd_new_stmts=upd_new_all,
+                upd_cleanup_old_stmts=cleanup_all,
+                trunc_stmts=trunc_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            chunk_sql_templates=[initial_populate_sql],
+        )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+    # =========================================================================
+    # TIER 2: Group-Scoped Delta Recomputation (Holistic Aggs, LEFT JOINs, etc.)
+    # =========================================================================
+
+    def _can_push_down_group_filter_into_where(self) -> bool:
+        if not self.view.where_clause:
+            return True
+        return not _has_subquery_ast(self.view.where_clause)
+
+    def _inject_where_into_source_query(self, source_query_sql: str, extra_predicate: str) -> str:
+        s = source_query_sql.strip().rstrip(";")
+        tok_where = _find_top_level_token(s, (SQLGlotTokenType.WHERE,))
+        tok_group = _find_top_level_token(s, (SQLGlotTokenType.GROUP_BY,))
+        if tok_where is not None:
+            insert_pos = tok_where.end + 1
+            before = s[: tok_where.start].rstrip()
+            if tok_group is not None:
+                existing_w = s[insert_pos : tok_group.start].strip()
+                after = s[tok_group.start :]
+                return f"{before}\nWHERE ({existing_w}) AND ({extra_predicate})\n{after}"
+            existing_w = s[insert_pos:].strip()
+            return f"{before}\nWHERE ({existing_w}) AND ({extra_predicate})"
+        if tok_group is not None:
+            before = s[: tok_group.start].rstrip()
+            after = s[tok_group.start :]
+            return f"{before}\nWHERE ({extra_predicate})\n{after}"
+        return f"{s}\nWHERE ({extra_predicate})"
+
+    def _group_scope_predicate_for_table(
+        self,
+        base_t: str,
+        group_mv_cols: List[Tuple[str, str]],
+        lhs_table_alias: Optional[str],
+        record_prefix: str,
+    ) -> Optional[str]:
+        if not group_mv_cols:
+            return None
+
+        if len(self.view.joins) <= 1 and base_t.lower() != self.view.base_table.lower():
+            return None
+        if self.view.where_clause and re.search(r"\b(?:EXISTS|IN)\s*\(", self.view.where_clause, flags=re.IGNORECASE):
+            if base_t.lower() != self.view.base_table.lower():
+                return None
+
+        def _lhs_expr(g_expr: str, mv_col: str) -> str:
+            if lhs_table_alias:
+                return f"{lhs_table_alias}.{mv_col}"
+            return f"({g_expr})"
+
+        if len(self.view.joins) == 1:
+            conds: List[str] = []
+            for g_expr, mv_col in group_mv_cols:
+                rhs_e = self._rewrite_expr_for_record(g_expr, record_prefix)
+                conds.append(self._null_safe_eq(_lhs_expr(g_expr, mv_col), f"({rhs_e})", is_nullable=True))
+            return " AND ".join(conds)
+
+        target_join: Optional[JoinSpec] = None
+        for j in self.view.joins:
+            if j.table_name.lower() == base_t.lower():
+                target_join = j
+                break
+        if target_join is None:
+            return None
+
+        # If base_t is the table that owns all group columns directly, compare directly
+        target_alias = target_join.alias
+        all_owned = True
+        direct_conds: List[str] = []
+        ts_target = self._schemas_lower[base_t.lower()]
+        for g_expr, mv_col in group_mv_cols:
+            gs = g_expr.strip()
+            if "." in gs:
+                p_al, c_part = gs.split(".", 1)
+                if p_al.strip().lower() in (target_alias.lower(), base_t.lower()):
+                    direct_conds.append(
+                        self._null_safe_eq(
+                            _lhs_expr(g_expr, mv_col),
+                            f"({record_prefix}.{_unquote_ident(c_part)})",
+                            is_nullable=True,
+                        )
+                    )
+                else:
+                    all_owned = False
+                    break
+            elif _unquote_ident(gs) in ts_target.columns:
+                direct_conds.append(
+                    self._null_safe_eq(
+                        _lhs_expr(g_expr, mv_col),
+                        f"({record_prefix}.{_unquote_ident(gs)})",
+                        is_nullable=True,
+                    )
+                )
+            else:
+                all_owned = False
+                break
+
+        if all_owned and direct_conds:
+            return " AND ".join(direct_conds)
+
+        # Otherwise build an EXISTS subquery over the join graph with `target_join` replaced by `(SELECT NEW/OLD.*)`
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+        rec_proj = ", ".join(f"{record_prefix}.{c} AS {c}" for c in ts_target.columns)
+        alias_remap: Dict[str, str] = {}
+        for j in self.view.joins:
+            alias_remap[j.alias.lower()] = f"__mv_j_{j.alias}"
+            alias_remap[j.table_name.lower()] = f"__mv_j_{j.alias}"
+
+        def _remap_aliases_in_sql(frag: str) -> str:
+            toks = sqlglot.tokenize(frag, read="sqlite")
+            if not toks:
+                return frag
+            out: List[str] = []
+            cursor = 0
+            i = 0
+            n = len(toks)
+            while i < n:
+                tk = toks[i]
+                if (
+                    _is_word_or_ident_token(tk)
+                    and i + 2 < n
+                    and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                    and _is_word_or_ident_token(toks[i + 2])
+                ):
+                    tbl_low = tk.text.lower()
+                    if tbl_low in alias_remap:
+                        if tk.start > cursor:
+                            out.append(frag[cursor:tk.start])
+                        out.append(f"{alias_remap[tbl_low]}.{toks[i + 2].text}")
+                        cursor = toks[i + 2].end + 1
+                        i += 3
+                        continue
+                i += 1
+            if cursor < len(frag):
+                out.append(frag[cursor:])
+            return "".join(out)
+
+        inline_row_table = f"(SELECT {rec_proj}{from_dual}) AS __mv_j_{target_alias}"
+        join_parts: List[str] = []
+        for idx, j in enumerate(self.view.joins):
+            remapped_alias = f"__mv_j_{j.alias}"
+            tbl_expr = (
+                inline_row_table
+                if j.alias.lower() == target_alias.lower()
+                else f"{j.table_name} AS {remapped_alias}"
+            )
+            if idx == 0:
+                join_parts.append(tbl_expr)
+            else:
+                on_sql = (
+                    f" ON {_remap_aliases_in_sql(j.on_condition)}"
+                    if j.on_condition
+                    else ""
+                )
+                eff_join_type = (
+                    "INNER JOIN"
+                    if j.alias.lower() == target_alias.lower() and j.on_condition
+                    else j.join_type
+                )
+                join_parts.append(f"{eff_join_type} {tbl_expr}{on_sql}")
+
+        from_join_sql = " ".join(join_parts)
+        left_join_remapped = {
+            f"__mv_j_{j.alias}".lower()
+            for j in self.view.joins
+            if j.join_type == "LEFT JOIN"
+        }
+        match_conds: List[str] = []
+        for g_expr, mv_col in group_mv_cols:
+            remapped_g = _remap_aliases_in_sql(g_expr)
+            lhs_e = _lhs_expr(g_expr, mv_col)
+            eq_cond = self._null_safe_eq(lhs_e, f"({remapped_g})", is_nullable=True)
+            if any(
+                re.search(rf"\b{re.escape(la)}\.", remapped_g, flags=re.IGNORECASE)
+                for la in left_join_remapped
+            ):
+                match_conds.append(f"({eq_cond} OR {lhs_e} IS NULL)")
+            else:
+                match_conds.append(eq_cond)
+
+        exists_pred = (
+            f"EXISTS (\n"
+            f"        SELECT 1 FROM {from_join_sql}\n"
+            f"        WHERE {' AND '.join(match_conds)}\n"
+            f"    )"
+        )
+        if any(j.join_type == "LEFT JOIN" for j in self.view.joins) and target_join != self.view.joins[0]:
+            null_preds = " AND ".join(
+                f"{_lhs_expr(g_expr, mv_col)} IS NULL" for g_expr, mv_col in group_mv_cols
+            )
+            return f"({exists_pred} OR ({null_preds}))"
+        return exists_pred
+
+    def _build_tier2_triggers_for_table(
+        self,
+        view_name: str,
+        mv_table: str,
+        base_t: str,
+        target_cols: List[str],
+        group_mv_cols: List[Tuple[str, str]],
+        source_query_sql: str,
+    ) -> Tuple[List[str], List[str], List[str]]:
+        cols_csv = ", ".join(target_cols)
+        src_cols_csv = ", ".join(f"__mv_src.{c}" for c in target_cols)
+
+        pred_mv_old = self._group_scope_predicate_for_table(
+            base_t, group_mv_cols, mv_table, "OLD"
+        )
+        pred_mv_new = self._group_scope_predicate_for_table(
+            base_t, group_mv_cols, mv_table, "NEW"
+        )
+        can_push_down = self._can_push_down_group_filter_into_where()
+
+        full_refresh = [
+            f"DELETE FROM {mv_table};",
+            f"INSERT INTO {mv_table} ({cols_csv})\n"
+            f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src;",
+        ]
+
+        if pred_mv_old and pred_mv_new:
+            if can_push_down:
+                pred_inner_old = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, None, "OLD"
+                )
+                pred_inner_new = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, None, "NEW"
+                )
+                assert pred_inner_old and pred_inner_new
+                q_ins = self._inject_where_into_source_query(source_query_sql, pred_inner_new)
+                q_del = self._inject_where_into_source_query(source_query_sql, pred_inner_old)
+                q_upd = self._inject_where_into_source_query(
+                    source_query_sql, f"({pred_inner_old}) OR ({pred_inner_new})"
+                )
+                ins_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_new};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n    {q_ins};",
+                ]
+                del_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_old};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n    {q_del};",
+                ]
+                upd_coalesced_stmts = [
+                    f"DELETE FROM {mv_table} WHERE ({pred_mv_old}) OR ({pred_mv_new});",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n    {q_upd};",
+                ]
+            else:
+                pred_src_old = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, "__mv_src", "OLD"
+                )
+                pred_src_new = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, "__mv_src", "NEW"
+                )
+                assert pred_src_old and pred_src_new
+                ins_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_new};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    WHERE {pred_src_new};",
+                ]
+                del_stmts = [
+                    f"DELETE FROM {mv_table} WHERE {pred_mv_old};",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    WHERE {pred_src_old};",
+                ]
+                upd_coalesced_stmts = [
+                    f"DELETE FROM {mv_table} WHERE ({pred_mv_old}) OR ({pred_mv_new});",
+                    f"INSERT INTO {mv_table} ({cols_csv})\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    WHERE ({pred_src_old}) OR ({pred_src_new});",
+                ]
+            if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables:
+                upd_old_stmts = del_stmts
+                upd_new_stmts = ins_stmts
+            else:
+                upd_old_stmts = []
+                upd_new_stmts = upd_coalesced_stmts
+        else:
+            ins_stmts = full_refresh
+            del_stmts = full_refresh
+            upd_old_stmts = []
+            upd_new_stmts = full_refresh
+
+        return self._emit_dialect_triggers_for_table(
+            view_name=view_name,
+            base_t=base_t,
+            ins_stmts=ins_stmts,
+            del_stmts=del_stmts,
+            upd_old_stmts=upd_old_stmts,
+            upd_new_stmts=upd_new_stmts,
+            trunc_stmts=full_refresh,
+        )
+
+    def _rewrite_mysql_not_in_subquery(self, sql: str) -> str:
+        toks = sqlglot.tokenize(sql, read="mysql")
+        n = len(toks)
+        outer_tbl = ""
+        for i, t in enumerate(toks):
+            if t.token_type == SQLGlotTokenType.FROM and i + 1 < n:
+                outer_tbl = toks[i + 1].text
+                if i + 2 < n and toks[i + 2].token_type == SQLGlotTokenType.VAR and toks[i + 2].text.upper() != "WHERE":
+                    outer_tbl = toks[i + 2].text
+                break
+        i = 0
+        while i < n - 4:
+            if (
+                toks[i + 1].token_type == SQLGlotTokenType.NOT
+                and toks[i + 2].token_type == SQLGlotTokenType.IN
+                and toks[i + 3].token_type == SQLGlotTokenType.L_PAREN
+                and toks[i + 4].token_type == SQLGlotTokenType.SELECT
+            ):
+                start_i = i
+                if i >= 2 and toks[i - 1].token_type == SQLGlotTokenType.DOT:
+                    start_i = i - 2
+                    lhs = f"{toks[i - 2].text}.{toks[i].text}"
+                else:
+                    lhs = toks[i].text
+                depth = 0
+                rp_idx = -1
+                for j in range(i + 3, n):
+                    if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                        depth += 1
+                    elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                        depth -= 1
+                        if depth == 0:
+                            rp_idx = j
+                            break
+                if rp_idx != -1:
+                    inner_sql = sql[toks[i + 3].end + 1 : toks[rp_idx].start].strip()
+                    try:
+                        sub_ast = parse_sql_ast(inner_sql, dialect=Dialect.MYSQL)
+                    except sqlglot.errors.SqlglotError:
+                        sub_ast = None
+                    if isinstance(sub_ast, sqlglot_exp.Select) and (sub_ast.args.get("from_") or sub_ast.args.get("from")):
+                        in_from = (sub_ast.args.get("from_") or sub_ast.args.get("from")).this
+                        in_tbl = in_from.name
+                        in_alias = in_from.alias or "__mv_not_in"
+                        rhs_col = sub_ast.expressions[0].name if sub_ast.expressions else "id"
+                        w_node = sub_ast.args.get("where")
+                        in_w = w_node.this.sql("mysql").strip() if w_node and w_node.this else ""
+                        lhs_q = lhs if "." in lhs else f"{outer_tbl}.{lhs}"
+                        rhs_q = f"{in_alias}.{rhs_col}"
+                        w_empty = f" WHERE ({in_w})" if in_w else ""
+                        w_corr = f" WHERE ({in_w}) AND ({rhs_q} IS NULL OR {rhs_q} = {lhs_q})" if in_w else f" WHERE ({rhs_q} IS NULL OR {rhs_q} = {lhs_q})"
+                        replacement = (
+                            f"(NOT EXISTS (SELECT 1 FROM {in_tbl} AS {in_alias}{w_empty}) "
+                            f"OR ({lhs_q} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {in_tbl} AS {in_alias}{w_corr})))"
+                        )
+                        sql = sql[: toks[start_i].start] + replacement + sql[toks[rp_idx].end + 1 :]
+                        toks = sqlglot.tokenize(sql, read="mysql")
+                        n = len(toks)
+                        i = 0
+                        continue
+            i += 1
+        return sql
+
+    @staticmethod
+    def _sqlite_bit_or_tree(terms: Sequence[str]) -> str:
+        chunks = [
+            "(" + " | ".join(terms[i : i + 8]) + ")"
+            for i in range(0, len(terms), 8)
+        ]
+        return "(" + " | ".join(chunks) + ")"
+
+    def _rewrite_sqlite_total_in_sql(self, sql: str) -> str:
+        if self.dialect == Dialect.SQLITE:
+            def _sq_var_expr(arg_s: str, is_samp: bool, is_std: bool) -> str:
+                fake_it = SelectItem(raw_expr=f"VAR_POP({arg_s})", alias="__v", is_aggregate=True, agg_func=AggFunc.VAR_POP, arg_expr=arg_s)
+                m2_s = self._sqlite_m2_agg_sql(fake_it, eff_override=arg_s)
+                return self._variance_formula_sql(
+                    new_cnt=f"COUNT({arg_s})",
+                    new_sum=f"SUM(1.0 * ({arg_s}))",
+                    new_sum2=m2_s,
+                    is_sample=is_samp,
+                    is_stddev=is_std,
+                )
+
+            s_sq = sql
+            toks = sqlglot.tokenize(s_sq, read="sqlite")
+            idx = 0
+            sq_fn_targets = {
+                "VAR_POP", "VARIANCE", "VAR_SAMP", "STDDEV_POP", "STDDEV", "STD", "STDDEV_SAMP",
+                "BIT_AND", "BIT_OR", "BIT_XOR", "BOOL_AND", "EVERY", "BOOL_OR",
+            }
+            while idx < len(toks) - 2:
+                tk = toks[idx]
+                fn_up = tk.text.upper()
+                if fn_up in sq_fn_targets and toks[idx + 1].token_type == SQLGlotTokenType.L_PAREN:
+                    depth = 0
+                    rp_idx = -1
+                    for j in range(idx + 1, len(toks)):
+                        if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                            depth += 1
+                        elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                            depth -= 1
+                            if depth == 0:
+                                rp_idx = j
+                                break
+                    if rp_idx != -1:
+                        arg_s = s_sq[toks[idx + 1].end + 1 : toks[rp_idx].start].strip()
+                        if fn_up in ("VAR_POP", "VARIANCE"):
+                            rep = _sq_var_expr(arg_s, False, False)
+                        elif fn_up == "VAR_SAMP":
+                            rep = _sq_var_expr(arg_s, True, False)
+                        elif fn_up in ("STDDEV_POP", "STDDEV", "STD"):
+                            rep = _sq_var_expr(arg_s, False, True)
+                        elif fn_up == "STDDEV_SAMP":
+                            rep = _sq_var_expr(arg_s, True, True)
+                        elif fn_up == "BIT_AND":
+                            rep = self._sqlite_bit_or_tree([f"MIN(({arg_s}) & {1 << b})" for b in range(63)])
+                        elif fn_up == "BIT_OR":
+                            rep = self._sqlite_bit_or_tree([f"MAX(({arg_s}) & {1 << b})" for b in range(63)])
+                        elif fn_up == "BIT_XOR":
+                            rep = self._sqlite_bit_or_tree([f"((SUM((({arg_s}) >> {b}) & 1) & 1) << {b})" for b in range(63)])
+                        elif fn_up in ("BOOL_AND", "EVERY"):
+                            rep = f"(CASE WHEN COUNT({arg_s}) = 0 THEN NULL WHEN MIN(CASE WHEN ({arg_s}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
+                        else:
+                            rep = f"(CASE WHEN COUNT({arg_s}) = 0 THEN NULL WHEN MAX(CASE WHEN ({arg_s}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
+                        s_sq = s_sq[: tk.start] + rep + s_sq[toks[rp_idx].end + 1 :]
+                        toks = sqlglot.tokenize(s_sq, read="sqlite")
+                        idx = 0
+                        continue
+                idx += 1
+            return s_sq
+
+        # Non-SQLite dialects
+        s = sql
+        toks = sqlglot.tokenize(s, read="sqlite")
+        idx = 0
+        while idx < len(toks) - 2:
+            tk = toks[idx]
+            if tk.text.upper() == "TOTAL" and toks[idx + 1].token_type == SQLGlotTokenType.L_PAREN:
+                depth = 0
+                rp_idx = -1
+                for j in range(idx + 1, len(toks)):
+                    if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                        depth += 1
+                    elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                        depth -= 1
+                        if depth == 0:
+                            rp_idx = j
+                            break
+                if rp_idx != -1:
+                    inner_arg = s[toks[idx + 1].end + 1 : toks[rp_idx].start].strip()
+                    rep = f"COALESCE(1.0 * SUM({inner_arg}), 0.0)"
+                    s = s[: tk.start] + rep + s[toks[rp_idx].end + 1 :]
+                    toks = sqlglot.tokenize(s, read="sqlite")
+                    idx = 0
+                    continue
+            idx += 1
+
+        if self.dialect == Dialect.MYSQL:
+            s = self._rewrite_mysql_not_in_subquery(s)
+            # Full outer join lowering via sqlglot AST
+            try:
+                sel_ast = parse_sql_ast(s.strip(), dialect=Dialect.MYSQL)
+            except sqlglot.errors.SqlglotError:
+                sel_ast = None
+            if isinstance(sel_ast, sqlglot_exp.Select) and sel_ast.args.get("joins"):
+                j0 = sel_ast.args["joins"][0]
+                if j0.side.upper() == "FULL" and (sel_ast.args.get("from_") or sel_ast.args.get("from")) and j0.args.get("on"):
+                    from_t = (sel_ast.args.get("from_") or sel_ast.args.get("from")).this.sql("mysql")
+                    j0_t = j0.this.sql("mysql")
+                    on_s = j0.args["on"].sql("mysql")
+                    sel_s = ", ".join(e.sql("mysql") for e in sel_ast.expressions)
+                    lhs_col = j0.args["on"].expressions[0].sql("mysql") if j0.args["on"].expressions else j0.args["on"].sql("mysql").split("=")[0].strip()
+                    s = (
+                        f"SELECT {sel_s} FROM {from_t} LEFT JOIN {j0_t} ON {on_s} "
+                        f"UNION ALL "
+                        f"SELECT {sel_s} FROM {from_t} RIGHT JOIN {j0_t} ON {on_s} "
+                        f"WHERE {lhs_col} IS NULL"
+                    )
+        return s
+
+    def _compile_tier2_group_scoped(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        user_columns = [it.alias for it in self.view.select_items]
+        grp_exprs = self._effective_group_by_exprs
+
+        target_cols: List[str] = list(user_columns)
+        group_mv_cols: List[Tuple[str, str]] = []
+        hidden_grp_defs: List[Tuple[str, str, str]] = []
+
+        non_agg_map: Dict[str, str] = {}
+        for it in self.view.select_items:
+            if not it.is_aggregate:
+                non_agg_map[it.raw_expr.strip().lower()] = it.alias
+                if it.source_col:
+                    non_agg_map[it.source_col.lower()] = it.alias
+
+        for idx_g, g_expr in enumerate(grp_exprs):
+            g_low = g_expr.strip().lower()
+            g_unq = _unquote_ident(g_expr).lower() if self._is_simple_col_ref(g_expr) else ""
+            if g_low in non_agg_map:
+                mv_c = non_agg_map[g_low]
+            elif g_unq and g_unq in non_agg_map:
+                mv_c = non_agg_map[g_unq]
+            else:
+                mv_c = f"__mv_grp_{idx_g}"
+                target_cols.append(mv_c)
+                # A GROUP BY collation is part of the grouping equivalence
+                # relation. Store hidden group keys with that same collation so
+                # trigger predicates and their indexes match collation-equivalent
+                # source values instead of treating them as distinct byte strings.
+                collation_match = re.search(
+                    r'\bCOLLATE\s+((?:"[^"]+")|(?:`[^`]+`)|(?:\[[^\]]+\])|(?:[A-Za-z_][A-Za-z0-9_.$]*))\s*            group_mv_cols.append((g_expr, mv_c))
+
+        auto_grp_col_names = [mc for _, mc in group_mv_cols]
+        indexed_cols_lower = self._indexed_column_names_lower(auto_grp_col_names)
+
+        col_defs_sql: List[str] = []
+        for it in self.view.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            col_defs_sql.append(f"{it.alias} {dt}")
+        for mv_c, _, dt in hidden_grp_defs:
+            col_defs_sql.append(f"{mv_c} {dt}")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=auto_grp_col_names,
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_q = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        if hidden_grp_defs:
+            tok_from = _find_top_level_token(raw_q, (SQLGlotTokenType.FROM,))
+            assert tok_from is not None
+            extra_sel = ", ".join(f"{g_e} AS {mv_c}" for mv_c, g_e, _ in hidden_grp_defs)
+            source_query_sql = f"{raw_q[:tok_from.start].rstrip()}, {extra_sel} {raw_q[tok_from.start:]}"
+        else:
+            source_query_sql = raw_q
+
+        cols_csv = ", ".join(target_cols)
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({cols_csv})\n"
+            f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init;"
+        )
+        ord_t2 = ", ".join(str(k) for k in range(1, len(target_cols) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t2}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._build_tier2_triggers_for_table(
+                view_name=view_name,
+                mv_table=mv_table,
+                base_t=ref_table,
+                target_cols=target_cols,
+                group_mv_cols=group_mv_cols,
+                source_query_sql=source_query_sql,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    # =========================================================================
+    # TIER 3: Universal Atomic View Sync (Arbitrary Engine View Definitions)
+    # =========================================================================
+
+    def _compile_tier3_atomic_sync(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = []
+
+        indexed_cols_lower = self._indexed_column_names_lower()
+        if len(self.view.select_items) == 1 and self.view.select_items[0].raw_expr.strip() == "*":
+            for j in self.view.joins or []:
+                t_schema = self._schemas_lower.get(j.table_name.lower())
+                if t_schema:
+                    for c_def in t_schema.columns.values():
+                        if c_def.name not in user_columns:
+                            user_columns.append(c_def.name)
+                            dt = self._normalize_dialect_type(c_def.data_type)
+                            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                                dt = "VARCHAR(255)"
+                            col_defs_sql.append(f"{c_def.name} {dt}")
+            if not user_columns and self.primary_schema:
+                for c_def in self.primary_schema.columns.values():
+                    user_columns.append(c_def.name)
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                        dt = "VARCHAR(255)"
+                    col_defs_sql.append(f"{c_def.name} {dt}")
+        else:
+            for item in self.view.select_items:
+                user_columns.append(item.alias)
+                col_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and col_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    col_type = "VARCHAR(255)"
+                col_defs_sql.append(f"{item.alias} {col_type}")
+
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_query = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        cols_csv = ", ".join(user_columns)
+        initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"
+
+        ord_t3 = ", ".join(str(k) for k in range(1, len(user_columns) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{raw_query}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t3}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        refresh_stmts = [
+            f"DELETE FROM {mv_table};",
+            f"INSERT INTO {mv_table} ({cols_csv})\n    {raw_query};",
+        ]
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=ref_table,
+                ins_stmts=refresh_stmts,
+                del_stmts=refresh_stmts,
+                upd_old_stmts=[],
+                upd_new_stmts=refresh_stmts,
+                trunc_stmts=refresh_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+# -----------------------------------------------------------------------------
+# Database Connection, Schema & Safe Migration Manager (`MaterializedViewManager`)
+# -----------------------------------------------------------------------------
+
+
+class MaterializedViewManager:
+    """
+    Setup/migration manager that connects to a database (SQLite connection/path or
+    PEP-249 DB-API 2.0 connection for PostgreSQL / MySQL) to:
+      - Introspect live base table schemas (`fetch_schema`)
+      - Maintain a persistent metadata registry (`__matview_catalog`) of installed MVs
+      - Safely create, diff, update, or drop materialized views (`register_view`, `sync_views`, `drop_view`)
+      - Enforce transparency limitation checks unless `ignore_limitations=True`
+      - Perform incremental (chunked/batched) initial backfills (`backfill_incrementally`)
+      - Execute high-throughput multi-statement bulk changes (`bulk_changes`)
+    Once setup/backfill finishes, all views and triggers operate 100% natively inside
+    the database engine with zero runtime dependency on this manager.
+    """
+
+    CATALOG_TABLE = f"{DEFAULT_OBJECT_PREFIX}catalog"
+
+    @staticmethod
+    def _connect_database_url(
+        conn_or_url: str, dialect: Optional[Dialect] = None
+    ) -> Tuple[Any, Dialect]:
+        u_low = conn_or_url.strip().lower()
+        if u_low.startswith(("postgresql://", "postgres://")):
+            import psycopg2  # type: ignore
+            return psycopg2.connect(conn_or_url), Dialect.POSTGRES
+        if u_low.startswith(("mysql://", "mariadb://")):
+            import pymysql  # type: ignore
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(conn_or_url)
+            db_name = parsed.path.lstrip("/")
+            qs = parse_qs(parsed.query)
+            return (
+                pymysql.connect(
+                    host=parsed.hostname or "127.0.0.1",
+                    port=parsed.port or 3306,
+                    user=parsed.username or "root",
+                    password=parsed.password or "",
+                    database=db_name,
+                    unix_socket=qs.get("unix_socket", [None])[0],
+                    autocommit=False,
+                ),
+                Dialect.MYSQL,
+            )
+        eff_dialect = dialect or Dialect.SQLITE
+        path = conn_or_url.replace("sqlite:///", "").replace("sqlite://", "")
+        return sqlite3.connect(path), eff_dialect
+
+    def __init__(
+        self,
+        conn_or_url: sqlite3.Connection | str | Any,
+        dialect: Optional[Dialect | str | EngineVersion] = None,
+        ignore_limitations: bool = False,
+        object_prefix: str = DEFAULT_OBJECT_PREFIX,
+        pg_use_transition_tables: bool = False,
+        strict: bool = False,
+        engine_version: Optional[EngineVersion | str] = None,
+    ) -> None:
+        hint_d: Optional[Dialect] = None
+        if isinstance(dialect, Dialect):
+            hint_d = dialect
+        elif isinstance(dialect, EngineVersion):
+            hint_d = dialect.dialect
+            if engine_version is None:
+                engine_version = dialect
+        elif isinstance(dialect, str) and dialect.strip():
+            parsed_d = parse_engine_version(dialect)
+            hint_d = parsed_d.dialect
+            if engine_version is None and (":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(ch.isdigit() for ch in dialect.replace("sqlite3", ""))):
+                engine_version = parsed_d
+
+        if isinstance(conn_or_url, str):
+            self.conn, inferred_dialect = self._connect_database_url(conn_or_url, hint_d)
+            if hint_d is None or conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
+                hint_d = inferred_dialect
+        else:
+            self.conn = conn_or_url
+
+        if engine_version is not None:
+            self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
+        else:
+            self.engine_version = detect_engine_version(self.conn, hint_dialect=hint_d)
+
+        self.dialect: Dialect = self.engine_version.dialect
+        self.subdialect: EngineSubdialect = self.engine_version.subdialect
+        self.ignore_limitations = ignore_limitations
+        self.object_prefix = object_prefix
+        self.pg_use_transition_tables = pg_use_transition_tables
+        self.strict = strict
+        self.catalog_table = (
+            f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
+        )
+
+        self._ensure_catalog()
+
+    def _ensure_catalog(self) -> None:
+        cur = self.conn.cursor()
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("PRAGMA recursive_triggers = ON;")
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL:
+            try:
+                cur.execute("SET SESSION collation_connection = @@collation_database;")
+            except Exception:
+                pass
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.catalog_table} (
+                view_name VARCHAR(255) NOT NULL PRIMARY KEY,
+                view_sql TEXT NOT NULL,
+                strategy VARCHAR(64) NOT NULL,
+                signature_hash VARCHAR(64) NOT NULL,
+                backing_table VARCHAR(255) NOT NULL,
+                aux_tables_json TEXT NOT NULL,
+                trigger_names_json TEXT NOT NULL,
+                function_names_json TEXT NOT NULL,
+                trigger_ddls_json TEXT NOT NULL,
+                backfill_cursor_pk BIGINT DEFAULT NULL,
+                backfill_max_pk BIGINT DEFAULT NULL,
+                backfill_active INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        self._commit()
+        for col_ddl in (
+            "backfill_cursor_pk BIGINT DEFAULT NULL",
+            "backfill_max_pk BIGINT DEFAULT NULL",
+            "backfill_active INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                cur.execute(f"ALTER TABLE {self.catalog_table} ADD COLUMN {col_ddl};")
+                self._commit()
+            except Exception:
+                self._rollback()
+
+    def _commit(self) -> None:
+        if hasattr(self.conn, "commit"):
+            self.conn.commit()
+
+    def _rollback(self) -> None:
+        if hasattr(self.conn, "rollback"):
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+    def _param_placeholder(self) -> str:
+        return "?" if self.dialect == Dialect.SQLITE else "%s"
+
+    def _resolve_catalog_name(self, name: str, catalog: Dict[str, Dict[str, Any]]) -> str:
+        if name in catalog:
+            return name
+        if self.object_prefix:
+            prefixed = (
+                name
+                if name.startswith(self.object_prefix)
+                else f"{self.object_prefix}{name}"
+            )
+            if prefixed in catalog:
+                return prefixed
+            if name.startswith(self.object_prefix):
+                unprefixed = name[len(self.object_prefix) :]
+                if unprefixed in catalog:
+                    return unprefixed
+        return name
+
+    def fetch_schema(self, extra_schema_sql: Optional[str] = None) -> Dict[str, TableSchema]:
+        """Fetches the live schema of all user base tables from the connected database."""
+        schemas = introspect_database_schemas(
+            self.conn,
+            dialect=self.dialect,
+            object_prefix=self.object_prefix,
+        )
+        schemas.pop(self.catalog_table, None)
+        if extra_schema_sql:
+            schemas.update(parse_table_schema(extra_schema_sql))
+        return schemas
+
+    def apply_schema_ddl(self, ddl_sql: str, auto_sync_views: bool = True) -> None:
+        """
+        Safely executes schema DDL changes (e.g. `CREATE TABLE`, `ALTER TABLE`) and
+        automatically refreshes any registered materialized views whose underlying
+        base table schema changed.
+        """
+        cur = self.conn.cursor()
+        for stmt in _split_top_level(_strip_sql_comments(ddl_sql), ";"):
+            if stmt.strip():
+                cur.execute(stmt)
+        self._commit()
+        if auto_sync_views:
+            catalog = self.get_catalog()
+            if catalog:
+                self.sync_views([entry["view_sql"] for entry in catalog.values()])
+
+    def get_catalog(self) -> Dict[str, Dict[str, Any]]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
+                f"backfill_cursor_pk, backfill_max_pk, backfill_active "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = True
+        except Exception:
+            self._rollback()
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = False
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in cur.fetchall():
+            out[row[0]] = {
+                "view_name": row[0],
+                "view_sql": row[1],
+                "strategy": row[2],
+                "signature_hash": row[3],
+                "backing_table": row[4],
+                "aux_tables": json.loads(row[5]),
+                "trigger_names": json.loads(row[6]),
+                "function_names": json.loads(row[7]),
+                "trigger_ddls": json.loads(row[8]),
+                "backfill_cursor_pk": row[9] if has_wm_cols and len(row) > 9 else None,
+                "backfill_max_pk": row[10] if has_wm_cols and len(row) > 10 else None,
+                "backfill_active": int(row[11]) if has_wm_cols and len(row) > 11 and row[11] is not None else 0,
+            }
+        return out
+
+    def _compute_signature(self, plan: MaterializedViewPlan, schemas: Dict[str, TableSchema]) -> str:
+        h = hashlib.sha256()
+        h.update(_strip_sql_comments(plan.view_spec.raw_select_sql).encode("utf-8"))
+        h.update(f"prefix:{plan.object_prefix}".encode("utf-8"))
+        for idx_ddl in plan.index_ddls:
+            h.update(f"idx:{idx_ddl}".encode("utf-8"))
+        low_map = {k.lower(): v for k, v in schemas.items()}
+        for ref_t in sorted(plan.view_spec.referenced_tables, key=str.lower):
+            ts = low_map.get(ref_t.lower())
+            if ts:
+                for c_name, c_def in sorted(ts.columns.items()):
+                    h.update(
+                        f"{ts.name}.{c_name}:{c_def.data_type}:{c_def.not_null}:{c_def.primary_key}".encode("utf-8")
+                    )
+        return h.hexdigest()
+
+    @staticmethod
+    def _serialize_view_sql_with_indexes(plan: MaterializedViewPlan, raw_view_sql: Optional[str] = None) -> str:
+        parts = [f"CREATE VIEW {plan.logical_view_name} AS {plan.view_spec.raw_select_sql.strip().rstrip(';')};"]
+        for idx_spec in plan.user_indexes:
+            u_kw = "UNIQUE " if idx_spec.unique else ""
+            n_str = f"{idx_spec.name} " if idx_spec.name else ""
+            using_str = f" USING {idx_spec.using_method}" if idx_spec.using_method else ""
+            w_str = f" WHERE {idx_spec.where_clause}" if idx_spec.where_clause else ""
+            parts.append(
+                f"CREATE {u_kw}INDEX {n_str}ON {plan.logical_view_name}{using_str} "
+                f"({', '.join(idx_spec.columns)}){w_str};"
+            )
+        return "\n".join(parts)
+
+    def drop_view(self, view_name: str) -> bool:
+        """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
+        catalog = self.get_catalog()
+        resolved_name = self._resolve_catalog_name(view_name, catalog)
+        entry = catalog.get(resolved_name)
+        cur = self.conn.cursor()
+        if entry:
+            for t_name in entry["trigger_names"]:
+                if self.dialect != Dialect.POSTGRES:
+                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+            for fn_name in entry["function_names"]:
+                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+            cur.execute(f"DROP VIEW IF EXISTS {resolved_name};")
+            cur.execute(f"DROP TABLE IF EXISTS {entry['backing_table']};")
+            for aux_t in entry["aux_tables"]:
+                cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
+            ph = self._param_placeholder()
+            cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
+            self._commit()
+            return True
+        else:
+            raw_logical = (
+                view_name[len(self.object_prefix) :]
+                if self.object_prefix and view_name.startswith(self.object_prefix)
+                else view_name
+            )
+            db_v = f"{self.object_prefix}{raw_logical}"
+            cur.execute(f"DROP VIEW IF EXISTS {db_v};")
+            cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
+            cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
+            self._commit()
+            return False
+
+    def _update_backfill_watermark(
+        self,
+        cur: Any,
+        view_name: str,
+        cursor_pk: Optional[int],
+        max_pk: Optional[int],
+        active: int,
+    ) -> None:
+        ph = self._param_placeholder()
+        try:
+            cur.execute(
+                f"UPDATE {self.catalog_table} "
+                f"SET backfill_cursor_pk = {ph}, backfill_max_pk = {ph}, backfill_active = {ph} "
+                f"WHERE view_name = {ph}",
+                (cursor_pk, max_pk, active, view_name),
+            )
+        except Exception:
+            pass
+
+    def backfill_incrementally(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        snapshot_isolation: bool = False,
+    ) -> int:
+        """
+        Incrementally backfills the materialized view in bounded chunks of `batch_size`
+        (by PK/rowid range folding for algebraic views, group-key batches for distinct/holistic
+        views, or limit/offset batches for general views), coordinating the active cursor
+        watermark (`backfill_cursor_pk`, `backfill_max_pk`, `backfill_active`) in
+        `__matview_catalog` and optionally running under `snapshot_isolation=True`.
+        Returns the total number of batches executed.
+        """
+        if plan.sub_plans:
+            total_b = 0
+            for sp in plan.sub_plans:
+                total_b += self.backfill_incrementally(
+                    sp,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    snapshot_isolation=snapshot_isolation,
+                )
+            return total_b
+
+        cur = self.conn.cursor()
+        snapshot_started = False
+        try:
+            if snapshot_isolation:
+                try:
+                    if self.dialect == Dialect.POSTGRES:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                    elif self.dialect == Dialect.MYSQL:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                        cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
+                    elif self.dialect == Dialect.SQLITE:
+                        cur.execute("SAVEPOINT __mv_backfill_snap;")
+                    else:
+                        raise RuntimeError(
+                            f"Snapshot isolation is not implemented for {self.dialect.value}"
+                        )
+                except Exception as exc:
+                    self._rollback()
+                    raise RuntimeError(
+                        f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
+                    ) from exc
+                snapshot_started = True
+
+            return self._backfill_incrementally_with_cursor(
+                plan, batch_size, on_progress, snapshot_isolation, cur
+            )
+        except BaseException:
+            if snapshot_isolation and snapshot_started:
+                self._rollback_snapshot_backfill(cur)
+            raise
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _rollback_snapshot_backfill(self, cur: Any) -> None:
+        """Roll back a failed snapshot backfill without leaving its transaction open."""
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT __mv_backfill_snap;")
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                return
+            except Exception:
+                # If the savepoint no longer exists or the connection is already
+                # in an error state, a full rollback is the safest recovery.
+                self._rollback()
+                return
+        self._rollback()
+
+    def _backfill_incrementally_with_cursor(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        snapshot_isolation: bool,
+        cur: Any,
+    ) -> int:
+        spec = plan.incremental_backfill_spec
+        if spec is None or batch_size <= 0:
+            for s in plan.initial_populate_sqls:
+                cur.execute(s)
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            if on_progress:
+                on_progress(1, 1)
+            return 1
+
+        batches_run = 0
+        if spec.mode == "pk_range_fold" and spec.pk_column:
+            base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect)
+            pk_col = quote_sql_identifier(spec.pk_column, self.dialect)
+            cur.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}")
+            row = cur.fetchone()
+            if not row or row[0] is None or row[1] is None:
+                if not plan.view_spec.group_by_cols and not plan.view_spec.has_top_level_distinct:
+                    for s in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(s)
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            min_pk, max_pk = int(row[0]), int(row[1])
+            cursor_pk = min_pk - 1
+            total_span = max(1, max_pk - min_pk + 1)
+            self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, 1)
+            if not snapshot_isolation:
+                self._commit()
+            while cursor_pk < max_pk:
+                upper_pk = min(max_pk, cursor_pk + batch_size)
+                for tmpl in spec.chunk_sql_templates:
+                    cur.execute(tmpl, (cursor_pk, upper_pk))
+                batches_run += 1
+                cursor_pk = upper_pk
+                still_active = 1 if cursor_pk < max_pk else 0
+                self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, still_active)
+                if not snapshot_isolation:
+                    self._commit()
+                if on_progress:
+                    done = min(total_span, cursor_pk - (min_pk - 1))
+                    on_progress(batches_run, done)
+            self._update_backfill_watermark(cur, plan.view_name, max_pk, max_pk, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "group_key_batch" and spec.distinct_group_query:
+            cur.execute(spec.distinct_group_query)
+            all_keys = [r[0] for r in (cur.fetchall() or [])]
+            if not all_keys:
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            ph = self._param_placeholder()
+            for i in range(0, len(all_keys), batch_size):
+                batch_keys = all_keys[i : i + batch_size]
+                placeholders = ", ".join(ph for _ in batch_keys)
+                for tmpl in spec.chunk_sql_templates:
+                    sql = tmpl.format(placeholders=placeholders)
+                    cur.execute(sql, tuple(batch_keys))
+                if not snapshot_isolation:
+                    self._commit()
+                batches_run += 1
+                if on_progress:
+                    on_progress(batches_run, min(len(all_keys), i + batch_size))
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "offset_batch" and spec.offset_insert_template:
+            offset = 0
+            ph = self._param_placeholder()
+            tmpl_sql = spec.offset_insert_template.replace("LIMIT ? OFFSET ?", f"LIMIT {ph} OFFSET {ph}")
+            while True:
+                cur.execute(tmpl_sql, (batch_size, offset))
+                rc = getattr(cur, "rowcount", None)
+                if rc is not None and rc >= 0:
+                    inserted = int(rc)
+                else:
+                    cur.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name}")
+                    cnt_row = cur.fetchone()
+                    total_now = int(cnt_row[0]) if cnt_row and cnt_row[0] is not None else 0
+                    inserted = max(0, total_now - offset)
+                if not snapshot_isolation:
+                    self._commit()
+                if inserted == 0:
+                    break
+                batches_run += 1
+                offset += inserted
+                if on_progress:
+                    on_progress(batches_run, offset)
+                if inserted < batch_size:
+                    break
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        for s in plan.initial_populate_sqls:
+            cur.execute(s)
+        self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+        if snapshot_isolation and self.dialect == Dialect.SQLITE:
+            cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+        self._commit()
+        return 1
+
+    def _register_single_view_spec(
+        self,
+        v_spec: ViewSpec,
+        schemas: Dict[str, TableSchema],
+        populate: bool,
+        incremental_backfill: bool,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        force_rebuild: bool,
+        effective_ignore: bool,
+        effective_strict: bool = False,
+        compiled_plan: Optional[MaterializedViewPlan] = None,
+    ) -> MaterializedViewPlan:
+        plan = compiled_plan or generate_materialized_view(
+            schemas,
+            v_spec,
+            dialect=self.dialect,
+            pg_use_transition_tables=self.pg_use_transition_tables,
+            ignore_limitations=effective_ignore,
+            object_prefix=self.object_prefix,
+            strict=effective_strict,
+            engine_version=self.engine_version,
+            watermark_catalog_table=self.catalog_table if (incremental_backfill or not populate) else None,
+        )
+        sig = self._compute_signature(plan, schemas)
+
+        catalog = self.get_catalog()
+        existing = catalog.get(plan.view_name)
+        if existing and existing["signature_hash"] == sig and not force_rebuild:
+            return plan
+
+        if existing:
+            self.drop_view(plan.view_name)
+
+        # Install structure, maintenance triggers, single-shot backfill, and catalog record
+        # inside a single atomic transaction so concurrent readers/writers never observe an
+        # un-triggered or double-counted window between trigger attachment and population.
+        cur = self.conn.cursor()
+        try:
+            for stmt in plan.create_structure_statements():
+                cur.execute(stmt)
+            for stmt in plan.trigger_ddls:
+                cur.execute(stmt)
+
+            stored_view_sql = self._serialize_view_sql_with_indexes(plan)
+            ph = self._param_placeholder()
+            init_active = 1 if (populate and incremental_backfill) else 0
+            cur.execute(
+                f"""
+                INSERT INTO {self.catalog_table} (
+                    view_name, view_sql, strategy, signature_hash, backing_table,
+                    aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
+                    backfill_cursor_pk, backfill_max_pk, backfill_active
+                ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                """,
+                (
+                    plan.view_name,
+                    stored_view_sql,
+                    plan.strategy.value,
+                    sig,
+                    plan.backing_table_name,
+                    json.dumps(plan.auxiliary_table_names),
+                    json.dumps(plan.trigger_names),
+                    json.dumps(plan.function_names),
+                    json.dumps(plan.trigger_ddls),
+                    None,
+                    None,
+                    init_active,
+                ),
+            )
+
+            if populate:
+                if incremental_backfill:
+                    self._commit()
+                    self.backfill_incrementally(
+                        plan, batch_size=batch_size, on_progress=on_progress
+                    )
+                else:
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+            else:
+                self._commit()
+        except Exception:
+            self._rollback()
+            raise
+        return plan
+
+    def register_view(
+        self,
+        view_sql: ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        populate: bool = True,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        force_rebuild: bool = False,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> MaterializedViewPlan:
+        """
+        Safely installs or updates one or more materialized views on the connected database.
+        Supports both single-view and multi-view SQL scripts seamlessly.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        specs = parse_view_definitions(
+            view_sql,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+        sub_plans: List[MaterializedViewPlan] = []
+        for vs in specs:
+            sub_plans.append(
+                self._register_single_view_spec(
+                    vs,
+                    schemas=schemas,
+                    populate=populate,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    force_rebuild=force_rebuild,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                )
+            )
+        if len(sub_plans) == 1:
+            return sub_plans[0]
+        p0 = sub_plans[0]
+        return MaterializedViewPlan(
+            dialect=p0.dialect,
+            strategy=p0.strategy,
+            view_spec=p0.view_spec,
+            backing_table_name=p0.backing_table_name,
+            backing_table_ddl=p0.backing_table_ddl,
+            auxiliary_table_ddls=[d for sp in sub_plans for d in sp.auxiliary_table_ddls],
+            index_ddls=[d for sp in sub_plans for d in sp.index_ddls],
+            initial_populate_sqls=[d for sp in sub_plans for d in sp.initial_populate_sqls],
+            trigger_ddls=[d for sp in sub_plans for d in sp.trigger_ddls],
+            readonly_trigger_ddls=[d for sp in sub_plans for d in sp.readonly_trigger_ddls],
+            user_columns=p0.user_columns,
+            reader_view_ddl=p0.reader_view_ddl,
+            incremental_backfill_spec=p0.incremental_backfill_spec,
+            auxiliary_table_names=[n for sp in sub_plans for n in sp.auxiliary_table_names],
+            trigger_names=[n for sp in sub_plans for n in sp.trigger_names],
+            function_names=[n for sp in sub_plans for n in sp.function_names],
+            limitations=[lim for sp in sub_plans for lim in sp.limitations],
+            object_prefix=p0.object_prefix,
+            db_view_name=p0.db_view_name,
+            index_names=[n for sp in sub_plans for n in sp.index_names],
+            user_indexes=p0.user_indexes,
+            sub_plans=sub_plans,
+        )
+
+    def sync_views(
+        self,
+        view_sqls: Sequence[ViewSpec | str] | ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        prune_removed: bool = False,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> Dict[str, str]:
+        """
+        Declaratively synchronizes a collection of materialized view definitions against
+        the connected database (supporting multi-view SQL files/strings as well).
+        Returns a status map `{view_name: "created" | "updated" | "unchanged" | "dropped"}`.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        catalog = self.get_catalog()
+        status: Dict[str, str] = {}
+        desired_names: Set[str] = set()
+
+        all_specs = parse_view_definitions(
+            view_sqls,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+
+        for v_spec in all_specs:
+            plan = generate_materialized_view(
+                schemas,
+                v_spec,
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=effective_ignore,
+                object_prefix=self.object_prefix,
+                strict=effective_strict,
+                engine_version=self.engine_version,
+                watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+            )
+            v_name = plan.view_name
+            desired_names.add(v_name)
+            sig = self._compute_signature(plan, schemas)
+            if v_name not in catalog:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=False,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "created"
+            elif catalog[v_name]["signature_hash"] != sig:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=True,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "updated"
+            else:
+                status[v_name] = "unchanged"
+
+        if prune_removed:
+            for existing_name in list(catalog.keys()):
+                if existing_name not in desired_names:
+                    self.drop_view(existing_name)
+                    status[existing_name] = "dropped"
+
+        return status
+
+    def check_schema_drift(self) -> Dict[str, str]:
+        """
+        Inspects all registered views in `__matview_catalog` against the current live base
+        table schemas and returns `{view_name: "ok" | "drifted" | "invalid"}`.
+        """
+        schemas = self.fetch_schema()
+        catalog = self.get_catalog()
+        report: Dict[str, str] = {}
+        for v_name, entry in catalog.items():
+            try:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                sig = self._compute_signature(plan, schemas)
+                report[v_name] = "ok" if sig == entry["signature_hash"] else "drifted"
+            except Exception:
+                report[v_name] = "invalid"
+        return report
+
+    def repair_view(
+        self,
+        view_name: Optional[str] = None,
+        rebuild_on_schema_drift: bool = True,
+    ) -> Dict[str, str]:
+        """
+        Reconciles and repairs one or all registered materialized views in an atomic pass,
+        eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
+        Returns `{view_name: "repaired" | "rebuilt"}`.
+        """
+        catalog = self.get_catalog()
+        if view_name:
+            resolved = self._resolve_catalog_name(view_name, catalog)
+            if resolved not in catalog:
+                raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
+            targets = [catalog[resolved]]
+        else:
+            targets = list(catalog.values())
+
+        schemas = self.fetch_schema()
+        results: Dict[str, str] = {}
+        cur = self.conn.cursor()
+        for entry in targets:
+            v_name = entry["view_name"]
+            plan = generate_materialized_view(
+                schemas,
+                entry["view_sql"],
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=True,
+                object_prefix=self.object_prefix,
+            )
+            sig = self._compute_signature(plan, schemas)
+            if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+                self.register_view(
+                    entry["view_sql"],
+                    populate=True,
+                    force_rebuild=True,
+                    ignore_limitations=True,
+                )
+                results[v_name] = "rebuilt"
+            else:
+                try:
+                    for aux_t in plan.auxiliary_table_names:
+                        cur.execute(f"DELETE FROM {aux_t};")
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+                    results[v_name] = "repaired"
+                except Exception:
+                    self._rollback()
+                    raise
+        return results
+
+    @contextmanager
+    def bulk_changes(
+        self,
+        view_names: Optional[Sequence[str]] = None,
+        use_shadow_swap: bool = False,
+        drop_triggers: bool = False,
+    ) -> Iterator[None]:
+        """
+        Context manager for executing high-throughput multi-statement bulk loads/mutations.
+        Uses session-local trigger bypass flags where supported (`SET LOCAL matview.skip_triggers = 'on'`
+        on PostgreSQL, `SET @__matview_skip_triggers = 1` on MySQL) so triggers are never dropped
+        globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
+        optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
+        """
+        catalog = self.get_catalog()
+        if view_names:
+            resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
+            targets = [catalog[n] for n in resolved if n in catalog]
+        else:
+            targets = list(catalog.values())
+
+        cur = self.conn.cursor()
+        sp_active = False
+        try:
+            cur.execute("SAVEPOINT __mv_bulk_sp;")
+            sp_active = True
+        except Exception:
+            pass
+
+        session_bypass_ok = False
+        if self.dialect == Dialect.POSTGRES and not drop_triggers:
+            try:
+                cur.execute("SET LOCAL matview.skip_triggers = 'on';")
+                session_bypass_ok = True
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL and not drop_triggers:
+            try:
+                cur.execute("SET @__matview_skip_triggers = 1;")
+                session_bypass_ok = True
+            except Exception:
+                pass
+
+        if not session_bypass_ok:
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+        # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
+        # so the trigger suspension and bulk DML remain isolated inside __mv_bulk_sp!
+        try:
+            yield
+        except Exception:
+            if sp_active:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    self._rollback()
+            else:
+                self._rollback()
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for stmt in plan.trigger_ddls:
+                    cur.execute(stmt)
+            self._commit()
+            raise
+        else:
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for aux_t in plan.auxiliary_table_names:
+                    cur.execute(f"DELETE FROM {aux_t};")
+                if use_shadow_swap:
+                    shadow_tbl = f"{plan.backing_table_name}__shadow"
+                    cur.execute(f"DROP TABLE IF EXISTS {shadow_tbl};")
+                    shadow_ddl = plan.backing_table_ddl.replace(
+                        f"CREATE TABLE {plan.backing_table_name}",
+                        f"CREATE TABLE {shadow_tbl}",
+                        1,
+                    )
+                    cur.execute(shadow_ddl)
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        if f"INSERT INTO {plan.backing_table_name}" in stmt:
+                            cur.execute(
+                                stmt.replace(
+                                    f"INSERT INTO {plan.backing_table_name}",
+                                    f"INSERT INTO {shadow_tbl}",
+                                    1,
+                                )
+                            )
+                        else:
+                            cur.execute(stmt)
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    cur.execute(f"DROP VIEW IF EXISTS {plan.view_name};")
+                    cur.execute(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
+                    cur.execute(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+                    if plan.reader_view_ddl:
+                        cur.execute(plan.reader_view_ddl)
+                    for ro_stmt in plan.readonly_trigger_ddls:
+                        cur.execute(ro_stmt)
+                    for idx_ddl in plan.index_ddls:
+                        cur.execute(idx_ddl)
+                else:
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                if not session_bypass_ok or use_shadow_swap:
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    for stmt in plan.trigger_ddls:
+                        cur.execute(stmt)
+            if sp_active:
+                try:
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    pass
+            self._commit()
+
+
+# -----------------------------------------------------------------------------
+# Public High-Level Convenience Functions & CLI
+# -----------------------------------------------------------------------------
+
+
+def _resolve_dialect_and_engine_version(
+    schema_sql_or_dict: Any,
+    dialect: Optional[Dialect | str | EngineVersion],
+    engine_version: Optional[EngineVersion | str],
+) -> EngineVersion:
+    is_conn = hasattr(schema_sql_or_dict, "cursor") or isinstance(
+        schema_sql_or_dict, sqlite3.Connection
+    )
+    if engine_version is not None:
+        def_d = dialect if not isinstance(dialect, EngineVersion) else dialect.dialect
+        return parse_engine_version(engine_version, default_dialect=def_d)
+    if isinstance(dialect, EngineVersion):
+        return dialect
+    if isinstance(dialect, str) and dialect.strip():
+        if ":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(
+            ch.isdigit() for ch in dialect.replace("sqlite3", "")
+        ):
+            return parse_engine_version(dialect)
+        if is_conn:
+            return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+        return parse_engine_version(dialect)
+    if is_conn:
+        return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+    return parse_engine_version(dialect or Dialect.SQLITE)
+
+
+def generate_materialized_view(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sql_or_spec: str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+    watermark_catalog_table: Optional[str] = None,
+) -> MaterializedViewPlan:
+    """
+    Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
+    into a `MaterializedViewPlan`. Autodetects the database dialect and version when passed
+    a live connection, or accepts `engine_version` (e.g. `'postgres:17'`, `'mariadb:11.4'`, `'mysql:8.4'`).
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    known_tables = {k.lower() for k in schemas}
+    if isinstance(view_sql_or_spec, str):
+        view_spec = parse_view_definition(
+            view_sql_or_spec,
+            known_tables=known_tables,
+            indexes=indexes,
+        )
+    elif indexes:
+        parsed_idxs = tuple(
+            parse_view_index_spec(ix, default_view_name=view_sql_or_spec.view_name)
+            for ix in indexes
+        )
+        view_spec = ViewSpec(
+            view_name=view_sql_or_spec.view_name,
+            raw_select_sql=view_sql_or_spec.raw_select_sql,
+            base_table=view_sql_or_spec.base_table,
+            joins=view_sql_or_spec.joins,
+            referenced_tables=view_sql_or_spec.referenced_tables,
+            select_items=view_sql_or_spec.select_items,
+            where_clause=view_sql_or_spec.where_clause,
+            group_by_cols=view_sql_or_spec.group_by_cols,
+            having_clause=view_sql_or_spec.having_clause,
+            has_cte=view_sql_or_spec.has_cte,
+            has_window_func=view_sql_or_spec.has_window_func,
+            has_compound_set_op=view_sql_or_spec.has_compound_set_op,
+            has_top_level_distinct=view_sql_or_spec.has_top_level_distinct,
+            has_limit_or_order=view_sql_or_spec.has_limit_or_order,
+            has_subquery_in_from=view_sql_or_spec.has_subquery_in_from,
+            user_indexes=view_sql_or_spec.user_indexes + parsed_idxs,
+            additional_views=view_sql_or_spec.additional_views,
+        )
+    else:
+        view_spec = view_sql_or_spec
+
+    compiler = IncrementalViewCompiler(
+        schemas=schemas,
+        view_spec=view_spec,
+        dialect=eff_dialect,
+        pg_use_transition_tables=pg_use_transition_tables,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        strict=strict,
+        engine_version=resolved_ev,
+        watermark_catalog_table=watermark_catalog_table,
+    )
+    return compiler.compile()
+
+
+def generate_materialized_views(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sqls: Sequence[str | ViewSpec] | str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+) -> List[MaterializedViewPlan]:
+    """
+    Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
+    into a flat list of `MaterializedViewPlan` objects.
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    specs = parse_view_definitions(
+        view_sqls,
+        known_tables={k.lower() for k in schemas},
+        indexes=indexes,
+    )
+    plans: List[MaterializedViewPlan] = []
+    for vs in specs:
+        comp = IncrementalViewCompiler(
+            schemas=schemas,
+            view_spec=vs,
+            dialect=eff_dialect,
+            pg_use_transition_tables=pg_use_transition_tables,
+            ignore_limitations=ignore_limitations,
+            object_prefix=object_prefix,
+            incremental_backfill=incremental_backfill,
+            batch_size=batch_size,
+            strict=strict,
+            engine_version=resolved_ev,
+        )
+        plans.append(comp._compile_single_plan())
+    return plans
+
+
+def install_materialized_view_sqlite(
+    conn: sqlite3.Connection,
+    view_sql: str | ViewSpec,
+    schema_sql: Optional[str] = None,
+    populate: bool = True,
+    incremental_backfill: bool = False,
+    batch_size: int = 500,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    strict: bool = False,
+) -> MaterializedViewPlan:
+    """Installs one or more materialized views directly into a live SQLite connection."""
+    mgr = MaterializedViewManager(
+        conn,
+        dialect=Dialect.SQLITE,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        strict=strict,
+    )
+    return mgr.register_view(
+        view_sql=view_sql,
+        schema_sql=schema_sql,
+        populate=populate,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        on_progress=on_progress,
+        indexes=indexes,
+        strict=strict,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Compile SQL CREATE VIEW definition(s) into zero-dependency incremental materialized view SQL."
+    )
+    parser.add_argument("--schema", help="Path to SQL file containing base table CREATE TABLE statements.")
+    parser.add_argument("--db", help="Database path or DSN URL (sqlite:///..., postgresql://..., mysql://...).")
+    parser.add_argument("--view", help="Path to SQL file or inline CREATE VIEW statement(s).")
+    parser.add_argument(
+        "--dialect",
+        default=None,
+        help="Target SQL dialect or engine spec (sqlite, postgres, mysql, mariadb, or versioned e.g. postgres:17).",
+    )
+    parser.add_argument(
+        "--engine-version",
+        dest="engine_version",
+        default=None,
+        help="Target engine and version (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45').",
+    )
+    parser.add_argument(
+        "--pg-transition-tables",
+        action="store_true",
+        help="Use PostgreSQL statement-level transition table triggers.",
+    )
+    parser.add_argument(
+        "--object-prefix",
+        default=DEFAULT_OBJECT_PREFIX,
+        help="Prefix for generated database objects (default: __matview_).",
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        dest="indexes",
+        help="Additional user index specification on the materialized view (repeatable).",
+    )
+    parser.add_argument(
+        "--no-populate",
+        action="store_true",
+        help="Omit initial backfill statements from generated SQL.",
+    )
+    parser.add_argument(
+        "--incremental-backfill",
+        action="store_true",
+        help="Generate or execute chunked incremental initial backfill statements.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Batch size for --incremental-backfill (default: 500).",
+    )
+    parser.add_argument(
+        "--ignore-limitations",
+        action="store_true",
+        help="Proceed with warning even if engine transparency limitations exist.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail compilation if a view cannot use Tier 1 ALGEBRAIC_DELTA maintenance.",
+    )
+    parser.add_argument(
+        "--check-drift",
+        action="store_true",
+        help="Check registered views in --db for underlying base table schema drift.",
+    )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Atomically reconcile/repair registered views in --db from base tables.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the generated materialized view directly to --db.",
+    )
+    args = parser.parse_args(argv)
+
+    def _read_sql_arg(val: str) -> str:
+        if "\n" not in val and not re.match(r"^\s*CREATE\b", val, flags=re.IGNORECASE):
+            try:
+                with open(val, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                pass
+        return val
+
+    try:
+        if args.check_drift or args.repair:
+            if not args.db:
+                print("ERROR: --check-drift / --repair requires --db", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if args.check_drift:
+                drift = mgr.check_schema_drift()
+                print(json.dumps(drift, indent=2, sort_keys=True))
+                if any(v != "ok" for v in drift.values()) and not args.repair:
+                    return 1
+            if args.repair:
+                rep = mgr.repair_view()
+                print(json.dumps(rep, indent=2, sort_keys=True))
+            return 0
+
+        if not args.view:
+            print("ERROR: --view is required unless running --check-drift or --repair.", file=sys.stderr)
+            return 2
+
+        view_sql = _read_sql_arg(args.view)
+        schema_sql = _read_sql_arg(args.schema) if args.schema else None
+
+        if args.apply:
+            if not args.db:
+                print("ERROR: --apply requires --db <db_path_or_dsn>", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if schema_sql:
+                mgr.apply_schema_ddl(schema_sql, auto_sync_views=False)
+            plan = mgr.register_view(
+                view_sql,
+                populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+                indexes=args.indexes,
+                strict=args.strict,
+            )
+            print(
+                plan.render_sql_script(
+                    include_populate=not args.no_populate,
+                    incremental_backfill=args.incremental_backfill,
+                    batch_size=args.batch_size,
+                )
+            )
+            return 0
+
+        hint_d: Optional[Dialect] = None
+        if args.dialect:
+            hint_d = parse_engine_version(args.dialect).dialect
+        elif args.engine_version:
+            hint_d = parse_engine_version(args.engine_version).dialect
+
+        detected_ev: Optional[EngineVersion] = None
+        if args.db and not schema_sql:
+            conn, conn_d = MaterializedViewManager._connect_database_url(args.db, hint_d)
+            try:
+                detected_ev = (
+                    parse_engine_version(args.engine_version, default_dialect=conn_d)
+                    if args.engine_version
+                    else detect_engine_version(conn, hint_dialect=args.dialect or conn_d)
+                )
+                schemas = introspect_database_schemas(
+                    conn, dialect=detected_ev.dialect, object_prefix=args.object_prefix
+                )
+            finally:
+                conn.close()
+        elif schema_sql:
+            schemas = parse_table_schema(schema_sql)
+            detected_ev = _resolve_dialect_and_engine_version(
+                schemas, args.dialect, args.engine_version
+            )
+        else:
+            print("ERROR: Either --schema or --db must be provided.", file=sys.stderr)
+            return 2
+
+        plan = generate_materialized_view(
+            schemas,
+            view_sql,
+            dialect=detected_ev.dialect,
+            pg_use_transition_tables=args.pg_transition_tables,
+            ignore_limitations=args.ignore_limitations,
+            object_prefix=args.object_prefix,
+            indexes=args.indexes,
+            incremental_backfill=args.incremental_backfill,
+            batch_size=args.batch_size,
+            strict=args.strict,
+            engine_version=detected_ev,
+        )
+        print(
+            plan.render_sql_script(
+                include_populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+            )
+        )
+        return 0
+    except (EngineLimitationError, StrictCompilationError) as exc:
+        print(f"WARNING: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+,
+                    g_expr,
+                    flags=re.IGNORECASE,
+                )
+                lookup_expr = (
+                    g_expr[:collation_match.start()].strip()
+                    if collation_match else g_expr
+                )
+                c_def = self._lookup_col_def(lookup_expr)
+                dt = (
+                    self._normalize_dialect_type(c_def.data_type)
+                    if c_def
+                    else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
+                )
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                if collation_match:
+                    dt = f"{dt} COLLATE {collation_match.group(1)}"
+                hidden_grp_defs.append((mv_c, g_expr, dt))
+            group_mv_cols.append((g_expr, mv_c))
+
+        auto_grp_col_names = [mc for _, mc in group_mv_cols]
+        indexed_cols_lower = self._indexed_column_names_lower(auto_grp_col_names)
+
+        col_defs_sql: List[str] = []
+        for it in self.view.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            col_defs_sql.append(f"{it.alias} {dt}")
+        for mv_c, _, dt in hidden_grp_defs:
+            col_defs_sql.append(f"{mv_c} {dt}")
+
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=auto_grp_col_names,
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_q = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        if hidden_grp_defs:
+            tok_from = _find_top_level_token(raw_q, (SQLGlotTokenType.FROM,))
+            assert tok_from is not None
+            extra_sel = ", ".join(f"{g_e} AS {mv_c}" for mv_c, g_e, _ in hidden_grp_defs)
+            source_query_sql = f"{raw_q[:tok_from.start].rstrip()}, {extra_sel} {raw_q[tok_from.start:]}"
+        else:
+            source_query_sql = raw_q
+
+        cols_csv = ", ".join(target_cols)
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({cols_csv})\n"
+            f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init;"
+        )
+        ord_t2 = ", ".join(str(k) for k in range(1, len(target_cols) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t2}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._build_tier2_triggers_for_table(
+                view_name=view_name,
+                mv_table=mv_table,
+                base_t=ref_table,
+                target_cols=target_cols,
+                group_mv_cols=group_mv_cols,
+                source_query_sql=source_query_sql,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    # =========================================================================
+    # TIER 3: Universal Atomic View Sync (Arbitrary Engine View Definitions)
+    # =========================================================================
+
+    def _compile_tier3_atomic_sync(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = []
+
+        indexed_cols_lower = self._indexed_column_names_lower()
+        if len(self.view.select_items) == 1 and self.view.select_items[0].raw_expr.strip() == "*":
+            for j in self.view.joins or []:
+                t_schema = self._schemas_lower.get(j.table_name.lower())
+                if t_schema:
+                    for c_def in t_schema.columns.values():
+                        if c_def.name not in user_columns:
+                            user_columns.append(c_def.name)
+                            dt = self._normalize_dialect_type(c_def.data_type)
+                            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                                dt = "VARCHAR(255)"
+                            col_defs_sql.append(f"{c_def.name} {dt}")
+            if not user_columns and self.primary_schema:
+                for c_def in self.primary_schema.columns.values():
+                    user_columns.append(c_def.name)
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                        dt = "VARCHAR(255)"
+                    col_defs_sql.append(f"{c_def.name} {dt}")
+        else:
+            for item in self.view.select_items:
+                user_columns.append(item.alias)
+                col_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and col_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    col_type = "VARCHAR(255)"
+                col_defs_sql.append(f"{item.alias} {col_type}")
+
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        raw_query = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        cols_csv = ", ".join(user_columns)
+        initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"
+
+        ord_t3 = ", ".join(str(k) for k in range(1, len(user_columns) + 1))
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"SELECT {cols_csv} FROM (\n{raw_query}\n) AS __mv_init\n"
+                f"ORDER BY {ord_t3}\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        refresh_stmts = [
+            f"DELETE FROM {mv_table};",
+            f"INSERT INTO {mv_table} ({cols_csv})\n    {raw_query};",
+        ]
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+        for ref_table in self.view.referenced_tables:
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=ref_table,
+                ins_stmts=refresh_stmts,
+                del_stmts=refresh_stmts,
+                upd_old_stmts=[],
+                upd_new_stmts=refresh_stmts,
+                trunc_stmts=refresh_stmts,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+
+# -----------------------------------------------------------------------------
+# Database Connection, Schema & Safe Migration Manager (`MaterializedViewManager`)
+# -----------------------------------------------------------------------------
+
+
+class MaterializedViewManager:
+    """
+    Setup/migration manager that connects to a database (SQLite connection/path or
+    PEP-249 DB-API 2.0 connection for PostgreSQL / MySQL) to:
+      - Introspect live base table schemas (`fetch_schema`)
+      - Maintain a persistent metadata registry (`__matview_catalog`) of installed MVs
+      - Safely create, diff, update, or drop materialized views (`register_view`, `sync_views`, `drop_view`)
+      - Enforce transparency limitation checks unless `ignore_limitations=True`
+      - Perform incremental (chunked/batched) initial backfills (`backfill_incrementally`)
+      - Execute high-throughput multi-statement bulk changes (`bulk_changes`)
+    Once setup/backfill finishes, all views and triggers operate 100% natively inside
+    the database engine with zero runtime dependency on this manager.
+    """
+
+    CATALOG_TABLE = f"{DEFAULT_OBJECT_PREFIX}catalog"
+
+    @staticmethod
+    def _connect_database_url(
+        conn_or_url: str, dialect: Optional[Dialect] = None
+    ) -> Tuple[Any, Dialect]:
+        u_low = conn_or_url.strip().lower()
+        if u_low.startswith(("postgresql://", "postgres://")):
+            import psycopg2  # type: ignore
+            return psycopg2.connect(conn_or_url), Dialect.POSTGRES
+        if u_low.startswith(("mysql://", "mariadb://")):
+            import pymysql  # type: ignore
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(conn_or_url)
+            db_name = parsed.path.lstrip("/")
+            qs = parse_qs(parsed.query)
+            return (
+                pymysql.connect(
+                    host=parsed.hostname or "127.0.0.1",
+                    port=parsed.port or 3306,
+                    user=parsed.username or "root",
+                    password=parsed.password or "",
+                    database=db_name,
+                    unix_socket=qs.get("unix_socket", [None])[0],
+                    autocommit=False,
+                ),
+                Dialect.MYSQL,
+            )
+        eff_dialect = dialect or Dialect.SQLITE
+        path = conn_or_url.replace("sqlite:///", "").replace("sqlite://", "")
+        return sqlite3.connect(path), eff_dialect
+
+    def __init__(
+        self,
+        conn_or_url: sqlite3.Connection | str | Any,
+        dialect: Optional[Dialect | str | EngineVersion] = None,
+        ignore_limitations: bool = False,
+        object_prefix: str = DEFAULT_OBJECT_PREFIX,
+        pg_use_transition_tables: bool = False,
+        strict: bool = False,
+        engine_version: Optional[EngineVersion | str] = None,
+    ) -> None:
+        hint_d: Optional[Dialect] = None
+        if isinstance(dialect, Dialect):
+            hint_d = dialect
+        elif isinstance(dialect, EngineVersion):
+            hint_d = dialect.dialect
+            if engine_version is None:
+                engine_version = dialect
+        elif isinstance(dialect, str) and dialect.strip():
+            parsed_d = parse_engine_version(dialect)
+            hint_d = parsed_d.dialect
+            if engine_version is None and (":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(ch.isdigit() for ch in dialect.replace("sqlite3", ""))):
+                engine_version = parsed_d
+
+        if isinstance(conn_or_url, str):
+            self.conn, inferred_dialect = self._connect_database_url(conn_or_url, hint_d)
+            if hint_d is None or conn_or_url.strip().lower().startswith(("postgresql://", "postgres://", "mysql://", "mariadb://")):
+                hint_d = inferred_dialect
+        else:
+            self.conn = conn_or_url
+
+        if engine_version is not None:
+            self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
+        else:
+            self.engine_version = detect_engine_version(self.conn, hint_dialect=hint_d)
+
+        self.dialect: Dialect = self.engine_version.dialect
+        self.subdialect: EngineSubdialect = self.engine_version.subdialect
+        self.ignore_limitations = ignore_limitations
+        self.object_prefix = object_prefix
+        self.pg_use_transition_tables = pg_use_transition_tables
+        self.strict = strict
+        self.catalog_table = (
+            f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
+        )
+
+        self._ensure_catalog()
+
+    def _ensure_catalog(self) -> None:
+        cur = self.conn.cursor()
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("PRAGMA recursive_triggers = ON;")
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL:
+            try:
+                cur.execute("SET SESSION collation_connection = @@collation_database;")
+            except Exception:
+                pass
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.catalog_table} (
+                view_name VARCHAR(255) NOT NULL PRIMARY KEY,
+                view_sql TEXT NOT NULL,
+                strategy VARCHAR(64) NOT NULL,
+                signature_hash VARCHAR(64) NOT NULL,
+                backing_table VARCHAR(255) NOT NULL,
+                aux_tables_json TEXT NOT NULL,
+                trigger_names_json TEXT NOT NULL,
+                function_names_json TEXT NOT NULL,
+                trigger_ddls_json TEXT NOT NULL,
+                backfill_cursor_pk BIGINT DEFAULT NULL,
+                backfill_max_pk BIGINT DEFAULT NULL,
+                backfill_active INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        self._commit()
+        for col_ddl in (
+            "backfill_cursor_pk BIGINT DEFAULT NULL",
+            "backfill_max_pk BIGINT DEFAULT NULL",
+            "backfill_active INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                cur.execute(f"ALTER TABLE {self.catalog_table} ADD COLUMN {col_ddl};")
+                self._commit()
+            except Exception:
+                self._rollback()
+
+    def _commit(self) -> None:
+        if hasattr(self.conn, "commit"):
+            self.conn.commit()
+
+    def _rollback(self) -> None:
+        if hasattr(self.conn, "rollback"):
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+    def _param_placeholder(self) -> str:
+        return "?" if self.dialect == Dialect.SQLITE else "%s"
+
+    def _resolve_catalog_name(self, name: str, catalog: Dict[str, Dict[str, Any]]) -> str:
+        if name in catalog:
+            return name
+        if self.object_prefix:
+            prefixed = (
+                name
+                if name.startswith(self.object_prefix)
+                else f"{self.object_prefix}{name}"
+            )
+            if prefixed in catalog:
+                return prefixed
+            if name.startswith(self.object_prefix):
+                unprefixed = name[len(self.object_prefix) :]
+                if unprefixed in catalog:
+                    return unprefixed
+        return name
+
+    def fetch_schema(self, extra_schema_sql: Optional[str] = None) -> Dict[str, TableSchema]:
+        """Fetches the live schema of all user base tables from the connected database."""
+        schemas = introspect_database_schemas(
+            self.conn,
+            dialect=self.dialect,
+            object_prefix=self.object_prefix,
+        )
+        schemas.pop(self.catalog_table, None)
+        if extra_schema_sql:
+            schemas.update(parse_table_schema(extra_schema_sql))
+        return schemas
+
+    def apply_schema_ddl(self, ddl_sql: str, auto_sync_views: bool = True) -> None:
+        """
+        Safely executes schema DDL changes (e.g. `CREATE TABLE`, `ALTER TABLE`) and
+        automatically refreshes any registered materialized views whose underlying
+        base table schema changed.
+        """
+        cur = self.conn.cursor()
+        for stmt in _split_top_level(_strip_sql_comments(ddl_sql), ";"):
+            if stmt.strip():
+                cur.execute(stmt)
+        self._commit()
+        if auto_sync_views:
+            catalog = self.get_catalog()
+            if catalog:
+                self.sync_views([entry["view_sql"] for entry in catalog.values()])
+
+    def get_catalog(self) -> Dict[str, Dict[str, Any]]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
+                f"backfill_cursor_pk, backfill_max_pk, backfill_active "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = True
+        except Exception:
+            self._rollback()
+            cur.execute(
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
+                f"FROM {self.catalog_table}"
+            )
+            has_wm_cols = False
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in cur.fetchall():
+            out[row[0]] = {
+                "view_name": row[0],
+                "view_sql": row[1],
+                "strategy": row[2],
+                "signature_hash": row[3],
+                "backing_table": row[4],
+                "aux_tables": json.loads(row[5]),
+                "trigger_names": json.loads(row[6]),
+                "function_names": json.loads(row[7]),
+                "trigger_ddls": json.loads(row[8]),
+                "backfill_cursor_pk": row[9] if has_wm_cols and len(row) > 9 else None,
+                "backfill_max_pk": row[10] if has_wm_cols and len(row) > 10 else None,
+                "backfill_active": int(row[11]) if has_wm_cols and len(row) > 11 and row[11] is not None else 0,
+            }
+        return out
+
+    def _compute_signature(self, plan: MaterializedViewPlan, schemas: Dict[str, TableSchema]) -> str:
+        h = hashlib.sha256()
+        h.update(_strip_sql_comments(plan.view_spec.raw_select_sql).encode("utf-8"))
+        h.update(f"prefix:{plan.object_prefix}".encode("utf-8"))
+        for idx_ddl in plan.index_ddls:
+            h.update(f"idx:{idx_ddl}".encode("utf-8"))
+        low_map = {k.lower(): v for k, v in schemas.items()}
+        for ref_t in sorted(plan.view_spec.referenced_tables, key=str.lower):
+            ts = low_map.get(ref_t.lower())
+            if ts:
+                for c_name, c_def in sorted(ts.columns.items()):
+                    h.update(
+                        f"{ts.name}.{c_name}:{c_def.data_type}:{c_def.not_null}:{c_def.primary_key}".encode("utf-8")
+                    )
+        return h.hexdigest()
+
+    @staticmethod
+    def _serialize_view_sql_with_indexes(plan: MaterializedViewPlan, raw_view_sql: Optional[str] = None) -> str:
+        parts = [f"CREATE VIEW {plan.logical_view_name} AS {plan.view_spec.raw_select_sql.strip().rstrip(';')};"]
+        for idx_spec in plan.user_indexes:
+            u_kw = "UNIQUE " if idx_spec.unique else ""
+            n_str = f"{idx_spec.name} " if idx_spec.name else ""
+            using_str = f" USING {idx_spec.using_method}" if idx_spec.using_method else ""
+            w_str = f" WHERE {idx_spec.where_clause}" if idx_spec.where_clause else ""
+            parts.append(
+                f"CREATE {u_kw}INDEX {n_str}ON {plan.logical_view_name}{using_str} "
+                f"({', '.join(idx_spec.columns)}){w_str};"
+            )
+        return "\n".join(parts)
+
+    def drop_view(self, view_name: str) -> bool:
+        """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
+        catalog = self.get_catalog()
+        resolved_name = self._resolve_catalog_name(view_name, catalog)
+        entry = catalog.get(resolved_name)
+        cur = self.conn.cursor()
+        if entry:
+            for t_name in entry["trigger_names"]:
+                if self.dialect != Dialect.POSTGRES:
+                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+            for fn_name in entry["function_names"]:
+                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+            cur.execute(f"DROP VIEW IF EXISTS {resolved_name};")
+            cur.execute(f"DROP TABLE IF EXISTS {entry['backing_table']};")
+            for aux_t in entry["aux_tables"]:
+                cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
+            ph = self._param_placeholder()
+            cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
+            self._commit()
+            return True
+        else:
+            raw_logical = (
+                view_name[len(self.object_prefix) :]
+                if self.object_prefix and view_name.startswith(self.object_prefix)
+                else view_name
+            )
+            db_v = f"{self.object_prefix}{raw_logical}"
+            cur.execute(f"DROP VIEW IF EXISTS {db_v};")
+            cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
+            cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
+            self._commit()
+            return False
+
+    def _update_backfill_watermark(
+        self,
+        cur: Any,
+        view_name: str,
+        cursor_pk: Optional[int],
+        max_pk: Optional[int],
+        active: int,
+    ) -> None:
+        ph = self._param_placeholder()
+        try:
+            cur.execute(
+                f"UPDATE {self.catalog_table} "
+                f"SET backfill_cursor_pk = {ph}, backfill_max_pk = {ph}, backfill_active = {ph} "
+                f"WHERE view_name = {ph}",
+                (cursor_pk, max_pk, active, view_name),
+            )
+        except Exception:
+            pass
+
+    def backfill_incrementally(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        snapshot_isolation: bool = False,
+    ) -> int:
+        """
+        Incrementally backfills the materialized view in bounded chunks of `batch_size`
+        (by PK/rowid range folding for algebraic views, group-key batches for distinct/holistic
+        views, or limit/offset batches for general views), coordinating the active cursor
+        watermark (`backfill_cursor_pk`, `backfill_max_pk`, `backfill_active`) in
+        `__matview_catalog` and optionally running under `snapshot_isolation=True`.
+        Returns the total number of batches executed.
+        """
+        if plan.sub_plans:
+            total_b = 0
+            for sp in plan.sub_plans:
+                total_b += self.backfill_incrementally(
+                    sp,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    snapshot_isolation=snapshot_isolation,
+                )
+            return total_b
+
+        cur = self.conn.cursor()
+        snapshot_started = False
+        try:
+            if snapshot_isolation:
+                try:
+                    if self.dialect == Dialect.POSTGRES:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                    elif self.dialect == Dialect.MYSQL:
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+                        cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
+                    elif self.dialect == Dialect.SQLITE:
+                        cur.execute("SAVEPOINT __mv_backfill_snap;")
+                    else:
+                        raise RuntimeError(
+                            f"Snapshot isolation is not implemented for {self.dialect.value}"
+                        )
+                except Exception as exc:
+                    self._rollback()
+                    raise RuntimeError(
+                        f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
+                    ) from exc
+                snapshot_started = True
+
+            return self._backfill_incrementally_with_cursor(
+                plan, batch_size, on_progress, snapshot_isolation, cur
+            )
+        except BaseException:
+            if snapshot_isolation and snapshot_started:
+                self._rollback_snapshot_backfill(cur)
+            raise
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _rollback_snapshot_backfill(self, cur: Any) -> None:
+        """Roll back a failed snapshot backfill without leaving its transaction open."""
+        if self.dialect == Dialect.SQLITE:
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT __mv_backfill_snap;")
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                return
+            except Exception:
+                # If the savepoint no longer exists or the connection is already
+                # in an error state, a full rollback is the safest recovery.
+                self._rollback()
+                return
+        self._rollback()
+
+    def _backfill_incrementally_with_cursor(
+        self,
+        plan: MaterializedViewPlan,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        snapshot_isolation: bool,
+        cur: Any,
+    ) -> int:
+        spec = plan.incremental_backfill_spec
+        if spec is None or batch_size <= 0:
+            for s in plan.initial_populate_sqls:
+                cur.execute(s)
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            if on_progress:
+                on_progress(1, 1)
+            return 1
+
+        batches_run = 0
+        if spec.mode == "pk_range_fold" and spec.pk_column:
+            base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect)
+            pk_col = quote_sql_identifier(spec.pk_column, self.dialect)
+            cur.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}")
+            row = cur.fetchone()
+            if not row or row[0] is None or row[1] is None:
+                if not plan.view_spec.group_by_cols and not plan.view_spec.has_top_level_distinct:
+                    for s in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(s)
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            min_pk, max_pk = int(row[0]), int(row[1])
+            cursor_pk = min_pk - 1
+            total_span = max(1, max_pk - min_pk + 1)
+            self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, 1)
+            if not snapshot_isolation:
+                self._commit()
+            while cursor_pk < max_pk:
+                upper_pk = min(max_pk, cursor_pk + batch_size)
+                for tmpl in spec.chunk_sql_templates:
+                    cur.execute(tmpl, (cursor_pk, upper_pk))
+                batches_run += 1
+                cursor_pk = upper_pk
+                still_active = 1 if cursor_pk < max_pk else 0
+                self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, still_active)
+                if not snapshot_isolation:
+                    self._commit()
+                if on_progress:
+                    done = min(total_span, cursor_pk - (min_pk - 1))
+                    on_progress(batches_run, done)
+            self._update_backfill_watermark(cur, plan.view_name, max_pk, max_pk, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "group_key_batch" and spec.distinct_group_query:
+            cur.execute(spec.distinct_group_query)
+            all_keys = [r[0] for r in (cur.fetchall() or [])]
+            if not all_keys:
+                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+                if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                self._commit()
+                return 0
+            ph = self._param_placeholder()
+            for i in range(0, len(all_keys), batch_size):
+                batch_keys = all_keys[i : i + batch_size]
+                placeholders = ", ".join(ph for _ in batch_keys)
+                for tmpl in spec.chunk_sql_templates:
+                    sql = tmpl.format(placeholders=placeholders)
+                    cur.execute(sql, tuple(batch_keys))
+                if not snapshot_isolation:
+                    self._commit()
+                batches_run += 1
+                if on_progress:
+                    on_progress(batches_run, min(len(all_keys), i + batch_size))
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        elif spec.mode == "offset_batch" and spec.offset_insert_template:
+            offset = 0
+            ph = self._param_placeholder()
+            tmpl_sql = spec.offset_insert_template.replace("LIMIT ? OFFSET ?", f"LIMIT {ph} OFFSET {ph}")
+            while True:
+                cur.execute(tmpl_sql, (batch_size, offset))
+                rc = getattr(cur, "rowcount", None)
+                if rc is not None and rc >= 0:
+                    inserted = int(rc)
+                else:
+                    cur.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name}")
+                    cnt_row = cur.fetchone()
+                    total_now = int(cnt_row[0]) if cnt_row and cnt_row[0] is not None else 0
+                    inserted = max(0, total_now - offset)
+                if not snapshot_isolation:
+                    self._commit()
+                if inserted == 0:
+                    break
+                batches_run += 1
+                offset += inserted
+                if on_progress:
+                    on_progress(batches_run, offset)
+                if inserted < batch_size:
+                    break
+            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+            self._commit()
+            return batches_run
+
+        for s in plan.initial_populate_sqls:
+            cur.execute(s)
+        self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
+        if snapshot_isolation and self.dialect == Dialect.SQLITE:
+            cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+        self._commit()
+        return 1
+
+    def _register_single_view_spec(
+        self,
+        v_spec: ViewSpec,
+        schemas: Dict[str, TableSchema],
+        populate: bool,
+        incremental_backfill: bool,
+        batch_size: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        force_rebuild: bool,
+        effective_ignore: bool,
+        effective_strict: bool = False,
+        compiled_plan: Optional[MaterializedViewPlan] = None,
+    ) -> MaterializedViewPlan:
+        plan = compiled_plan or generate_materialized_view(
+            schemas,
+            v_spec,
+            dialect=self.dialect,
+            pg_use_transition_tables=self.pg_use_transition_tables,
+            ignore_limitations=effective_ignore,
+            object_prefix=self.object_prefix,
+            strict=effective_strict,
+            engine_version=self.engine_version,
+            watermark_catalog_table=self.catalog_table if (incremental_backfill or not populate) else None,
+        )
+        sig = self._compute_signature(plan, schemas)
+
+        catalog = self.get_catalog()
+        existing = catalog.get(plan.view_name)
+        if existing and existing["signature_hash"] == sig and not force_rebuild:
+            return plan
+
+        if existing:
+            self.drop_view(plan.view_name)
+
+        # Install structure, maintenance triggers, single-shot backfill, and catalog record
+        # inside a single atomic transaction so concurrent readers/writers never observe an
+        # un-triggered or double-counted window between trigger attachment and population.
+        cur = self.conn.cursor()
+        try:
+            for stmt in plan.create_structure_statements():
+                cur.execute(stmt)
+            for stmt in plan.trigger_ddls:
+                cur.execute(stmt)
+
+            stored_view_sql = self._serialize_view_sql_with_indexes(plan)
+            ph = self._param_placeholder()
+            init_active = 1 if (populate and incremental_backfill) else 0
+            cur.execute(
+                f"""
+                INSERT INTO {self.catalog_table} (
+                    view_name, view_sql, strategy, signature_hash, backing_table,
+                    aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
+                    backfill_cursor_pk, backfill_max_pk, backfill_active
+                ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                """,
+                (
+                    plan.view_name,
+                    stored_view_sql,
+                    plan.strategy.value,
+                    sig,
+                    plan.backing_table_name,
+                    json.dumps(plan.auxiliary_table_names),
+                    json.dumps(plan.trigger_names),
+                    json.dumps(plan.function_names),
+                    json.dumps(plan.trigger_ddls),
+                    None,
+                    None,
+                    init_active,
+                ),
+            )
+
+            if populate:
+                if incremental_backfill:
+                    self._commit()
+                    self.backfill_incrementally(
+                        plan, batch_size=batch_size, on_progress=on_progress
+                    )
+                else:
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+            else:
+                self._commit()
+        except Exception:
+            self._rollback()
+            raise
+        return plan
+
+    def register_view(
+        self,
+        view_sql: ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        populate: bool = True,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        force_rebuild: bool = False,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> MaterializedViewPlan:
+        """
+        Safely installs or updates one or more materialized views on the connected database.
+        Supports both single-view and multi-view SQL scripts seamlessly.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        specs = parse_view_definitions(
+            view_sql,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+        sub_plans: List[MaterializedViewPlan] = []
+        for vs in specs:
+            sub_plans.append(
+                self._register_single_view_spec(
+                    vs,
+                    schemas=schemas,
+                    populate=populate,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=on_progress,
+                    force_rebuild=force_rebuild,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                )
+            )
+        if len(sub_plans) == 1:
+            return sub_plans[0]
+        p0 = sub_plans[0]
+        return MaterializedViewPlan(
+            dialect=p0.dialect,
+            strategy=p0.strategy,
+            view_spec=p0.view_spec,
+            backing_table_name=p0.backing_table_name,
+            backing_table_ddl=p0.backing_table_ddl,
+            auxiliary_table_ddls=[d for sp in sub_plans for d in sp.auxiliary_table_ddls],
+            index_ddls=[d for sp in sub_plans for d in sp.index_ddls],
+            initial_populate_sqls=[d for sp in sub_plans for d in sp.initial_populate_sqls],
+            trigger_ddls=[d for sp in sub_plans for d in sp.trigger_ddls],
+            readonly_trigger_ddls=[d for sp in sub_plans for d in sp.readonly_trigger_ddls],
+            user_columns=p0.user_columns,
+            reader_view_ddl=p0.reader_view_ddl,
+            incremental_backfill_spec=p0.incremental_backfill_spec,
+            auxiliary_table_names=[n for sp in sub_plans for n in sp.auxiliary_table_names],
+            trigger_names=[n for sp in sub_plans for n in sp.trigger_names],
+            function_names=[n for sp in sub_plans for n in sp.function_names],
+            limitations=[lim for sp in sub_plans for lim in sp.limitations],
+            object_prefix=p0.object_prefix,
+            db_view_name=p0.db_view_name,
+            index_names=[n for sp in sub_plans for n in sp.index_names],
+            user_indexes=p0.user_indexes,
+            sub_plans=sub_plans,
+        )
+
+    def sync_views(
+        self,
+        view_sqls: Sequence[ViewSpec | str] | ViewSpec | str,
+        schema_sql: Optional[str] = None,
+        prune_removed: bool = False,
+        incremental_backfill: bool = False,
+        batch_size: int = 500,
+        ignore_limitations: Optional[bool] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+    ) -> Dict[str, str]:
+        """
+        Declaratively synchronizes a collection of materialized view definitions against
+        the connected database (supporting multi-view SQL files/strings as well).
+        Returns a status map `{view_name: "created" | "updated" | "unchanged" | "dropped"}`.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        catalog = self.get_catalog()
+        status: Dict[str, str] = {}
+        desired_names: Set[str] = set()
+
+        all_specs = parse_view_definitions(
+            view_sqls,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+
+        for v_spec in all_specs:
+            plan = generate_materialized_view(
+                schemas,
+                v_spec,
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=effective_ignore,
+                object_prefix=self.object_prefix,
+                strict=effective_strict,
+                engine_version=self.engine_version,
+                watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+            )
+            v_name = plan.view_name
+            desired_names.add(v_name)
+            sig = self._compute_signature(plan, schemas)
+            if v_name not in catalog:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=False,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "created"
+            elif catalog[v_name]["signature_hash"] != sig:
+                self._register_single_view_spec(
+                    v_spec,
+                    schemas=schemas,
+                    populate=True,
+                    incremental_backfill=incremental_backfill,
+                    batch_size=batch_size,
+                    on_progress=None,
+                    force_rebuild=True,
+                    effective_ignore=effective_ignore,
+                    effective_strict=effective_strict,
+                    compiled_plan=plan,
+                )
+                status[v_name] = "updated"
+            else:
+                status[v_name] = "unchanged"
+
+        if prune_removed:
+            for existing_name in list(catalog.keys()):
+                if existing_name not in desired_names:
+                    self.drop_view(existing_name)
+                    status[existing_name] = "dropped"
+
+        return status
+
+    def check_schema_drift(self) -> Dict[str, str]:
+        """
+        Inspects all registered views in `__matview_catalog` against the current live base
+        table schemas and returns `{view_name: "ok" | "drifted" | "invalid"}`.
+        """
+        schemas = self.fetch_schema()
+        catalog = self.get_catalog()
+        report: Dict[str, str] = {}
+        for v_name, entry in catalog.items():
+            try:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                sig = self._compute_signature(plan, schemas)
+                report[v_name] = "ok" if sig == entry["signature_hash"] else "drifted"
+            except Exception:
+                report[v_name] = "invalid"
+        return report
+
+    def repair_view(
+        self,
+        view_name: Optional[str] = None,
+        rebuild_on_schema_drift: bool = True,
+    ) -> Dict[str, str]:
+        """
+        Reconciles and repairs one or all registered materialized views in an atomic pass,
+        eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
+        Returns `{view_name: "repaired" | "rebuilt"}`.
+        """
+        catalog = self.get_catalog()
+        if view_name:
+            resolved = self._resolve_catalog_name(view_name, catalog)
+            if resolved not in catalog:
+                raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
+            targets = [catalog[resolved]]
+        else:
+            targets = list(catalog.values())
+
+        schemas = self.fetch_schema()
+        results: Dict[str, str] = {}
+        cur = self.conn.cursor()
+        for entry in targets:
+            v_name = entry["view_name"]
+            plan = generate_materialized_view(
+                schemas,
+                entry["view_sql"],
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=True,
+                object_prefix=self.object_prefix,
+            )
+            sig = self._compute_signature(plan, schemas)
+            if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+                self.register_view(
+                    entry["view_sql"],
+                    populate=True,
+                    force_rebuild=True,
+                    ignore_limitations=True,
+                )
+                results[v_name] = "rebuilt"
+            else:
+                try:
+                    for aux_t in plan.auxiliary_table_names:
+                        cur.execute(f"DELETE FROM {aux_t};")
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                    self._commit()
+                    results[v_name] = "repaired"
+                except Exception:
+                    self._rollback()
+                    raise
+        return results
+
+    @contextmanager
+    def bulk_changes(
+        self,
+        view_names: Optional[Sequence[str]] = None,
+        use_shadow_swap: bool = False,
+        drop_triggers: bool = False,
+    ) -> Iterator[None]:
+        """
+        Context manager for executing high-throughput multi-statement bulk loads/mutations.
+        Uses session-local trigger bypass flags where supported (`SET LOCAL matview.skip_triggers = 'on'`
+        on PostgreSQL, `SET @__matview_skip_triggers = 1` on MySQL) so triggers are never dropped
+        globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
+        optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
+        """
+        catalog = self.get_catalog()
+        if view_names:
+            resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
+            targets = [catalog[n] for n in resolved if n in catalog]
+        else:
+            targets = list(catalog.values())
+
+        cur = self.conn.cursor()
+        sp_active = False
+        try:
+            cur.execute("SAVEPOINT __mv_bulk_sp;")
+            sp_active = True
+        except Exception:
+            pass
+
+        session_bypass_ok = False
+        if self.dialect == Dialect.POSTGRES and not drop_triggers:
+            try:
+                cur.execute("SET LOCAL matview.skip_triggers = 'on';")
+                session_bypass_ok = True
+            except Exception:
+                pass
+        elif self.dialect == Dialect.MYSQL and not drop_triggers:
+            try:
+                cur.execute("SET @__matview_skip_triggers = 1;")
+                session_bypass_ok = True
+            except Exception:
+                pass
+
+        if not session_bypass_ok:
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+        # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
+        # so the trigger suspension and bulk DML remain isolated inside __mv_bulk_sp!
+        try:
+            yield
+        except Exception:
+            if sp_active:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    self._rollback()
+            else:
+                self._rollback()
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                if self.dialect == Dialect.POSTGRES:
+                    for fn_name in entry["function_names"]:
+                        if "fn_readonly_" not in fn_name:
+                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                else:
+                    for t_name in entry["trigger_names"]:
+                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for stmt in plan.trigger_ddls:
+                    cur.execute(stmt)
+            self._commit()
+            raise
+        else:
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception:
+                    pass
+            schemas = self.fetch_schema()
+            for entry in targets:
+                plan = generate_materialized_view(
+                    schemas,
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    ignore_limitations=True,
+                    object_prefix=self.object_prefix,
+                    engine_version=self.engine_version,
+                )
+                for aux_t in plan.auxiliary_table_names:
+                    cur.execute(f"DELETE FROM {aux_t};")
+                if use_shadow_swap:
+                    shadow_tbl = f"{plan.backing_table_name}__shadow"
+                    cur.execute(f"DROP TABLE IF EXISTS {shadow_tbl};")
+                    shadow_ddl = plan.backing_table_ddl.replace(
+                        f"CREATE TABLE {plan.backing_table_name}",
+                        f"CREATE TABLE {shadow_tbl}",
+                        1,
+                    )
+                    cur.execute(shadow_ddl)
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        if f"INSERT INTO {plan.backing_table_name}" in stmt:
+                            cur.execute(
+                                stmt.replace(
+                                    f"INSERT INTO {plan.backing_table_name}",
+                                    f"INSERT INTO {shadow_tbl}",
+                                    1,
+                                )
+                            )
+                        else:
+                            cur.execute(stmt)
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    cur.execute(f"DROP VIEW IF EXISTS {plan.view_name};")
+                    cur.execute(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
+                    cur.execute(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+                    if plan.reader_view_ddl:
+                        cur.execute(plan.reader_view_ddl)
+                    for ro_stmt in plan.readonly_trigger_ddls:
+                        cur.execute(ro_stmt)
+                    for idx_ddl in plan.index_ddls:
+                        cur.execute(idx_ddl)
+                else:
+                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                    for stmt in plan.get_populate_statements(incremental_backfill=False):
+                        cur.execute(stmt)
+                if not session_bypass_ok or use_shadow_swap:
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                    for stmt in plan.trigger_ddls:
+                        cur.execute(stmt)
+            if sp_active:
+                try:
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    pass
+            self._commit()
+
+
+# -----------------------------------------------------------------------------
+# Public High-Level Convenience Functions & CLI
+# -----------------------------------------------------------------------------
+
+
+def _resolve_dialect_and_engine_version(
+    schema_sql_or_dict: Any,
+    dialect: Optional[Dialect | str | EngineVersion],
+    engine_version: Optional[EngineVersion | str],
+) -> EngineVersion:
+    is_conn = hasattr(schema_sql_or_dict, "cursor") or isinstance(
+        schema_sql_or_dict, sqlite3.Connection
+    )
+    if engine_version is not None:
+        def_d = dialect if not isinstance(dialect, EngineVersion) else dialect.dialect
+        return parse_engine_version(engine_version, default_dialect=def_d)
+    if isinstance(dialect, EngineVersion):
+        return dialect
+    if isinstance(dialect, str) and dialect.strip():
+        if ":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(
+            ch.isdigit() for ch in dialect.replace("sqlite3", "")
+        ):
+            return parse_engine_version(dialect)
+        if is_conn:
+            return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+        return parse_engine_version(dialect)
+    if is_conn:
+        return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
+    return parse_engine_version(dialect or Dialect.SQLITE)
+
+
+def generate_materialized_view(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sql_or_spec: str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+    watermark_catalog_table: Optional[str] = None,
+) -> MaterializedViewPlan:
+    """
+    Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
+    into a `MaterializedViewPlan`. Autodetects the database dialect and version when passed
+    a live connection, or accepts `engine_version` (e.g. `'postgres:17'`, `'mariadb:11.4'`, `'mysql:8.4'`).
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    known_tables = {k.lower() for k in schemas}
+    if isinstance(view_sql_or_spec, str):
+        view_spec = parse_view_definition(
+            view_sql_or_spec,
+            known_tables=known_tables,
+            indexes=indexes,
+        )
+    elif indexes:
+        parsed_idxs = tuple(
+            parse_view_index_spec(ix, default_view_name=view_sql_or_spec.view_name)
+            for ix in indexes
+        )
+        view_spec = ViewSpec(
+            view_name=view_sql_or_spec.view_name,
+            raw_select_sql=view_sql_or_spec.raw_select_sql,
+            base_table=view_sql_or_spec.base_table,
+            joins=view_sql_or_spec.joins,
+            referenced_tables=view_sql_or_spec.referenced_tables,
+            select_items=view_sql_or_spec.select_items,
+            where_clause=view_sql_or_spec.where_clause,
+            group_by_cols=view_sql_or_spec.group_by_cols,
+            having_clause=view_sql_or_spec.having_clause,
+            has_cte=view_sql_or_spec.has_cte,
+            has_window_func=view_sql_or_spec.has_window_func,
+            has_compound_set_op=view_sql_or_spec.has_compound_set_op,
+            has_top_level_distinct=view_sql_or_spec.has_top_level_distinct,
+            has_limit_or_order=view_sql_or_spec.has_limit_or_order,
+            has_subquery_in_from=view_sql_or_spec.has_subquery_in_from,
+            user_indexes=view_sql_or_spec.user_indexes + parsed_idxs,
+            additional_views=view_sql_or_spec.additional_views,
+        )
+    else:
+        view_spec = view_sql_or_spec
+
+    compiler = IncrementalViewCompiler(
+        schemas=schemas,
+        view_spec=view_spec,
+        dialect=eff_dialect,
+        pg_use_transition_tables=pg_use_transition_tables,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        strict=strict,
+        engine_version=resolved_ev,
+        watermark_catalog_table=watermark_catalog_table,
+    )
+    return compiler.compile()
+
+
+def generate_materialized_views(
+    schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
+    view_sqls: Sequence[str | ViewSpec] | str | ViewSpec,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    pg_use_transition_tables: bool = False,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    incremental_backfill: bool = False,
+    batch_size: int = 1000,
+    strict: bool = False,
+    engine_version: Optional[EngineVersion | str] = None,
+) -> List[MaterializedViewPlan]:
+    """
+    Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
+    into a flat list of `MaterializedViewPlan` objects.
+    """
+    resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
+    eff_dialect = resolved_ev.dialect
+
+    if isinstance(schema_sql_or_dict, str):
+        schemas = parse_table_schema(schema_sql_or_dict)
+    elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        schemas = introspect_database_schemas(
+            schema_sql_or_dict,
+            dialect=eff_dialect,
+            object_prefix=object_prefix,
+        )
+    else:
+        schemas = dict(schema_sql_or_dict)
+
+    specs = parse_view_definitions(
+        view_sqls,
+        known_tables={k.lower() for k in schemas},
+        indexes=indexes,
+    )
+    plans: List[MaterializedViewPlan] = []
+    for vs in specs:
+        comp = IncrementalViewCompiler(
+            schemas=schemas,
+            view_spec=vs,
+            dialect=eff_dialect,
+            pg_use_transition_tables=pg_use_transition_tables,
+            ignore_limitations=ignore_limitations,
+            object_prefix=object_prefix,
+            incremental_backfill=incremental_backfill,
+            batch_size=batch_size,
+            strict=strict,
+            engine_version=resolved_ev,
+        )
+        plans.append(comp._compile_single_plan())
+    return plans
+
+
+def install_materialized_view_sqlite(
+    conn: sqlite3.Connection,
+    view_sql: str | ViewSpec,
+    schema_sql: Optional[str] = None,
+    populate: bool = True,
+    incremental_backfill: bool = False,
+    batch_size: int = 500,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    ignore_limitations: bool = False,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+    strict: bool = False,
+) -> MaterializedViewPlan:
+    """Installs one or more materialized views directly into a live SQLite connection."""
+    mgr = MaterializedViewManager(
+        conn,
+        dialect=Dialect.SQLITE,
+        ignore_limitations=ignore_limitations,
+        object_prefix=object_prefix,
+        strict=strict,
+    )
+    return mgr.register_view(
+        view_sql=view_sql,
+        schema_sql=schema_sql,
+        populate=populate,
+        incremental_backfill=incremental_backfill,
+        batch_size=batch_size,
+        on_progress=on_progress,
+        indexes=indexes,
+        strict=strict,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Compile SQL CREATE VIEW definition(s) into zero-dependency incremental materialized view SQL."
+    )
+    parser.add_argument("--schema", help="Path to SQL file containing base table CREATE TABLE statements.")
+    parser.add_argument("--db", help="Database path or DSN URL (sqlite:///..., postgresql://..., mysql://...).")
+    parser.add_argument("--view", help="Path to SQL file or inline CREATE VIEW statement(s).")
+    parser.add_argument(
+        "--dialect",
+        default=None,
+        help="Target SQL dialect or engine spec (sqlite, postgres, mysql, mariadb, or versioned e.g. postgres:17).",
+    )
+    parser.add_argument(
+        "--engine-version",
+        dest="engine_version",
+        default=None,
+        help="Target engine and version (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45').",
+    )
+    parser.add_argument(
+        "--pg-transition-tables",
+        action="store_true",
+        help="Use PostgreSQL statement-level transition table triggers.",
+    )
+    parser.add_argument(
+        "--object-prefix",
+        default=DEFAULT_OBJECT_PREFIX,
+        help="Prefix for generated database objects (default: __matview_).",
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        dest="indexes",
+        help="Additional user index specification on the materialized view (repeatable).",
+    )
+    parser.add_argument(
+        "--no-populate",
+        action="store_true",
+        help="Omit initial backfill statements from generated SQL.",
+    )
+    parser.add_argument(
+        "--incremental-backfill",
+        action="store_true",
+        help="Generate or execute chunked incremental initial backfill statements.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Batch size for --incremental-backfill (default: 500).",
+    )
+    parser.add_argument(
+        "--ignore-limitations",
+        action="store_true",
+        help="Proceed with warning even if engine transparency limitations exist.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail compilation if a view cannot use Tier 1 ALGEBRAIC_DELTA maintenance.",
+    )
+    parser.add_argument(
+        "--check-drift",
+        action="store_true",
+        help="Check registered views in --db for underlying base table schema drift.",
+    )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Atomically reconcile/repair registered views in --db from base tables.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the generated materialized view directly to --db.",
+    )
+    args = parser.parse_args(argv)
+
+    def _read_sql_arg(val: str) -> str:
+        if "\n" not in val and not re.match(r"^\s*CREATE\b", val, flags=re.IGNORECASE):
+            try:
+                with open(val, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                pass
+        return val
+
+    try:
+        if args.check_drift or args.repair:
+            if not args.db:
+                print("ERROR: --check-drift / --repair requires --db", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if args.check_drift:
+                drift = mgr.check_schema_drift()
+                print(json.dumps(drift, indent=2, sort_keys=True))
+                if any(v != "ok" for v in drift.values()) and not args.repair:
+                    return 1
+            if args.repair:
+                rep = mgr.repair_view()
+                print(json.dumps(rep, indent=2, sort_keys=True))
+            return 0
+
+        if not args.view:
+            print("ERROR: --view is required unless running --check-drift or --repair.", file=sys.stderr)
+            return 2
+
+        view_sql = _read_sql_arg(args.view)
+        schema_sql = _read_sql_arg(args.schema) if args.schema else None
+
+        if args.apply:
+            if not args.db:
+                print("ERROR: --apply requires --db <db_path_or_dsn>", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                object_prefix=args.object_prefix,
+                pg_use_transition_tables=args.pg_transition_tables,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            if schema_sql:
+                mgr.apply_schema_ddl(schema_sql, auto_sync_views=False)
+            plan = mgr.register_view(
+                view_sql,
+                populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+                indexes=args.indexes,
+                strict=args.strict,
+            )
+            print(
+                plan.render_sql_script(
+                    include_populate=not args.no_populate,
+                    incremental_backfill=args.incremental_backfill,
+                    batch_size=args.batch_size,
+                )
+            )
+            return 0
+
+        hint_d: Optional[Dialect] = None
+        if args.dialect:
+            hint_d = parse_engine_version(args.dialect).dialect
+        elif args.engine_version:
+            hint_d = parse_engine_version(args.engine_version).dialect
+
+        detected_ev: Optional[EngineVersion] = None
+        if args.db and not schema_sql:
+            conn, conn_d = MaterializedViewManager._connect_database_url(args.db, hint_d)
+            try:
+                detected_ev = (
+                    parse_engine_version(args.engine_version, default_dialect=conn_d)
+                    if args.engine_version
+                    else detect_engine_version(conn, hint_dialect=args.dialect or conn_d)
+                )
+                schemas = introspect_database_schemas(
+                    conn, dialect=detected_ev.dialect, object_prefix=args.object_prefix
+                )
+            finally:
+                conn.close()
+        elif schema_sql:
+            schemas = parse_table_schema(schema_sql)
+            detected_ev = _resolve_dialect_and_engine_version(
+                schemas, args.dialect, args.engine_version
+            )
+        else:
+            print("ERROR: Either --schema or --db must be provided.", file=sys.stderr)
+            return 2
+
+        plan = generate_materialized_view(
+            schemas,
+            view_sql,
+            dialect=detected_ev.dialect,
+            pg_use_transition_tables=args.pg_transition_tables,
+            ignore_limitations=args.ignore_limitations,
+            object_prefix=args.object_prefix,
+            indexes=args.indexes,
+            incremental_backfill=args.incremental_backfill,
+            batch_size=args.batch_size,
+            strict=args.strict,
+            engine_version=detected_ev,
+        )
+        print(
+            plan.render_sql_script(
+                include_populate=not args.no_populate,
+                incremental_backfill=args.incremental_backfill,
+                batch_size=args.batch_size,
+            )
+        )
+        return 0
+    except (EngineLimitationError, StrictCompilationError) as exc:
+        print(f"WARNING: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+,
+                    g_expr,
+                    flags=re.IGNORECASE,
+                )
+                lookup_expr = (
+                    g_expr[:collation_match.start()].strip()
+                    if collation_match else g_expr
+                )
+                c_def = self._lookup_col_def(lookup_expr)
+                if c_def:
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                else:
+                    fake_it = SelectItem(raw_expr=lookup_expr, alias=mv_col, is_aggregate=False)
+                    dt = self._infer_expr_storage_type(fake_it)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                if collation_match:
+                    dt = re.sub(r"\s+COLLATE\s+\S+\s*$", "", dt, flags=re.IGNORECASE).strip()
+                    dt = f"{dt} COLLATE {collation_match.group(1)}"
                 nn = " NOT NULL" if not has_nullable_grp else ""
                 col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
 
