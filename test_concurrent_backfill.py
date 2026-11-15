@@ -465,8 +465,8 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             )
             self.assertEqual(
                 conn.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name};").fetchone()[0],
-                expected_rows,
-                "rolled-back or deleted rows leaked into the materialized backing table",
+                len(expected),
+                "backing table must contain exactly one row per surviving group",
             )
         finally:
             conn.close()
