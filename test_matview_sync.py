@@ -6610,9 +6610,10 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 self.closed = False
                 self.last_sql = ""
 
-            def execute(self, sql: str) -> "CursorProxy":
+            def execute(self, sql: str) -> None:
                 self.last_sql = sql
-                return self
+                # DB-API adapters are not required to return the cursor object.
+                return None
 
             def fetchone(self):
                 if self.fail_readback:
