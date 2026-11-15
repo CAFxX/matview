@@ -12275,64 +12275,63 @@ class MaterializedViewManager:
                 except Exception:
                     pass
 
-    def _get_live_table_names(self) -> Set[str]:
+    def _query_lower_name_set(self, sql: str) -> Optional[Set[str]]:
+        """Execute a metadata query returning lowercase object names, or None if unavailable."""
         cur = self.conn.cursor()
         try:
-            if self.dialect == Dialect.SQLITE:
-                cur.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view');")
-                return {row[0].lower() for row in cur.fetchall() if row[0]}
-            elif self.dialect == Dialect.POSTGRES:
-                cur.execute(
-                    "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() "
-                    "UNION SELECT table_name FROM information_schema.views WHERE table_schema = current_schema();"
-                )
-                return {row[0].lower() for row in cur.fetchall() if row[0]}
-            elif self.dialect == Dialect.MYSQL:
-                cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE();")
-                return {row[0].lower() for row in cur.fetchall() if row[0]}
+            cur.execute(sql)
+            return {row[0].lower() for row in cur.fetchall() if row[0]}
         except Exception:
             self._rollback()
-        return set()
+            return None
+        finally:
+            cur.close()
 
-    def _get_live_trigger_names(self) -> Set[str]:
-        cur = self.conn.cursor()
-        try:
-            if self.dialect == Dialect.SQLITE:
-                cur.execute("SELECT name FROM sqlite_master WHERE type = 'trigger';")
-                return {row[0].lower() for row in cur.fetchall() if row[0]}
-            elif self.dialect == Dialect.POSTGRES:
-                cur.execute(
-                    "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = current_schema();"
-                )
-                return {row[0].lower() for row in cur.fetchall() if row[0]}
-            elif self.dialect == Dialect.MYSQL:
-                cur.execute(
-                    "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE();"
-                )
-                return {row[0].lower() for row in cur.fetchall() if row[0]}
-        except Exception:
-            self._rollback()
-        return set()
+    def _get_live_table_names(self) -> Optional[Set[str]]:
+        if self.dialect == Dialect.SQLITE:
+            return self._query_lower_name_set(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view');"
+            )
+        if self.dialect == Dialect.POSTGRES:
+            return self._query_lower_name_set(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() "
+                "UNION SELECT table_name FROM information_schema.views WHERE table_schema = current_schema();"
+            )
+        if self.dialect == Dialect.MYSQL:
+            return self._query_lower_name_set(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE();"
+            )
+        return None
 
-    def _get_live_index_names(self) -> Set[str]:
-        cur = self.conn.cursor()
-        try:
-            if self.dialect == Dialect.SQLITE:
-                cur.execute("SELECT name FROM sqlite_master WHERE type = 'index';")
-                return {row[0].lower() for row in cur.fetchall() if row[0]}
-            elif self.dialect == Dialect.POSTGRES:
-                cur.execute(
-                    "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema();"
-                )
-                return {row[0].lower() for row in cur.fetchall() if row[0]}
-            elif self.dialect == Dialect.MYSQL:
-                cur.execute(
-                    "SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_schema = DATABASE();"
-                )
-                return {row[0].lower() for row in cur.fetchall() if row[0]}
-        except Exception:
-            self._rollback()
-        return set()
+    def _get_live_trigger_names(self) -> Optional[Set[str]]:
+        if self.dialect == Dialect.SQLITE:
+            return self._query_lower_name_set(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger';"
+            )
+        if self.dialect == Dialect.POSTGRES:
+            return self._query_lower_name_set(
+                "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = current_schema();"
+            )
+        if self.dialect == Dialect.MYSQL:
+            return self._query_lower_name_set(
+                "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE();"
+            )
+        return None
+
+    def _get_live_index_names(self) -> Optional[Set[str]]:
+        if self.dialect == Dialect.SQLITE:
+            return self._query_lower_name_set(
+                "SELECT name FROM sqlite_master WHERE type = 'index';"
+            )
+        if self.dialect == Dialect.POSTGRES:
+            return self._query_lower_name_set(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema();"
+            )
+        if self.dialect == Dialect.MYSQL:
+            return self._query_lower_name_set(
+                "SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_schema = DATABASE();"
+            )
+        return None
 
     def diff_views(
         self,
@@ -12430,13 +12429,23 @@ class MaterializedViewManager:
                 cat_strat = existing.get("strategy")
                 cat_backing = existing.get("backing_table", "")
                 cat_trigs = set(existing.get("trigger_names", []))
+                cat_trigs_lower = {t.lower() for t in cat_trigs}
+                plan_trigs_lower = {t.lower() for t in plan.trigger_names}
 
-                backing_exists = cat_backing.lower() in live_tables if live_tables else True
+                backing_exists = (
+                    True if live_tables is None else (cat_backing.lower() in live_tables)
+                )
                 view_exists = (
-                    v_name.lower() in live_tables
-                    or f"{self.object_prefix}{v_name}".lower() in live_tables
-                ) if live_tables else True
-                trigs_match = cat_trigs.issubset(live_triggers) if live_triggers else True
+                    True
+                    if live_tables is None
+                    else (
+                        v_name.lower() in live_tables
+                        or f"{self.object_prefix}{v_name}".lower() in live_tables
+                    )
+                )
+                trigs_match = (
+                    True if live_triggers is None else cat_trigs_lower.issubset(live_triggers)
+                )
 
                 is_clean_noop = (
                     cat_sig == sig
@@ -12492,10 +12501,25 @@ class MaterializedViewManager:
                     )
 
                     status = "REPLACE" if needs_replace else "ALTER"
-                    to_create_trigs = [t for t in plan.trigger_names if t not in cat_trigs or needs_replace]
-                    to_drop_trigs = list(cat_trigs) if needs_replace else [t for t in cat_trigs if t not in plan.trigger_names]
-                    unchanged_trigs = [] if needs_replace else [t for t in plan.trigger_names if t in cat_trigs]
+                    to_create_trigs = [
+                        t
+                        for t in plan.trigger_names
+                        if needs_replace
+                        or t.lower() not in cat_trigs_lower
+                        or (live_triggers is not None and t.lower() not in live_triggers)
+                    ]
+                    to_drop_trigs = (
+                        list(cat_trigs)
+                        if needs_replace
+                        else [t for t in cat_trigs if t.lower() not in plan_trigs_lower]
+                    )
+                    unchanged_trigs = (
+                        []
+                        if needs_replace
+                        else [t for t in plan.trigger_names if t not in to_create_trigs]
+                    )
 
+                    reader_action = "REPLACE" if needs_replace else ("CREATE" if not view_exists else "KEEP")
                     pending_changes = {
                         "backing_table": {
                             "name": plan.backing_table_name,
@@ -12508,7 +12532,7 @@ class MaterializedViewManager:
                         ],
                         "reader_view": {
                             "name": plan.view_name,
-                            "action": "REPLACE" if needs_replace else "KEEP",
+                            "action": reader_action,
                         },
                         "triggers": {
                             "to_create": to_create_trigs,
@@ -12525,9 +12549,26 @@ class MaterializedViewManager:
                         pending_ddls = plan.drop_statements() + plan.create_structure_statements() + plan.trigger_ddls
                         summary = f"View '{v_name}' query, schema, or strategy changed; pending REPLACE."
                     else:
-                        pending_ddls = [
-                            s for s in plan.trigger_ddls if any(t in s for t in to_create_trigs)
-                        ] + list(plan.index_ddls)
+                        trig_patterns = [
+                            re.compile(rf"(?:^|[^A-Za-z0-9_]){re.escape(t)}(?:$|[^A-Za-z0-9_])", re.IGNORECASE)
+                            for t in to_create_trigs
+                        ]
+                        alter_trig_ddls = [
+                            s
+                            for s in plan.trigger_ddls
+                            if any(p.search(s) for p in trig_patterns)
+                            or (
+                                to_create_trigs
+                                and self.dialect == Dialect.POSTGRES
+                                and s.lstrip().upper().startswith("CREATE OR REPLACE FUNCTION")
+                            )
+                        ]
+                        view_repair_ddls = (
+                            [plan.reader_view_ddl, *plan.readonly_trigger_ddls]
+                            if not view_exists
+                            else []
+                        )
+                        pending_ddls = view_repair_ddls + alter_trig_ddls + list(plan.index_ddls)
                         summary = f"View '{v_name}' auxiliary objects changed; pending ALTER."
 
                     diffs[v_name] = ViewDiff(
