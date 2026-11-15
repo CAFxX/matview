@@ -1526,7 +1526,10 @@ class TranspiledConnectionAdapter:
             self._sim_engine_version = parse_engine_version(dialect)
         assert dialect in (Dialect.POSTGRES, Dialect.MYSQL)
         self.dialect = dialect
-        self.autocommit = True
+        # Model the transactional DB-API contract used by the MySQL manager
+        # path. SQLite remains in explicit autocommit mode internally; SAVEPOINT
+        # starts a transaction and RELEASE commits only an outermost savepoint.
+        self.autocommit = False
         self._sq_conn: Optional[sqlite3.Connection] = None
         self._pg_functions: Dict[str, str] = {}
         self._pg_fn_triggers: Dict[str, List[str]] = {}
@@ -1559,8 +1562,13 @@ class TranspiledConnectionAdapter:
         c.execute(sql, params)
         return c
 
+    @property
+    def in_transaction(self) -> bool:
+        return bool(self._sq_conn is not None and self._sq_conn.in_transaction)
+
     def commit(self) -> None:
-        pass
+        if self._sq_conn is not None:
+            self._sq_conn.commit()
 
     def rollback(self) -> None:
         if self._sq_conn is not None:
