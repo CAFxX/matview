@@ -45,8 +45,15 @@ def _mutant_coerce_integers_to_float(original: Callable[..., bool]) -> Callable[
 
 
 def _mutant_drop_duplicate_rows(original: Callable[..., bool]) -> Callable[..., bool]:
+    def dedupe(rows: Any) -> list[Any]:
+        unique: list[Any] = []
+        for row in rows:
+            if row not in unique:
+                unique.append(row)
+        return unique
+
     def mutant(rows_a: Any, rows_b: Any, *args: Any, **kwargs: Any) -> bool:
-        return original(list(dict.fromkeys(rows_a)), list(dict.fromkeys(rows_b)), *args, **kwargs)
+        return original(dedupe(rows_a), dedupe(rows_b), *args, **kwargs)
     return mutant
 
 
