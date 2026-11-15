@@ -6517,6 +6517,48 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             with self.subTest(conflict_target=target, initialized=True):
                 assert_replace_behavior(target, replacement, initialized=True)
 
+    def test_sqlite_connection_initializer_closes_dbapi_cursor(self) -> None:
+        class CursorProxy:
+            def __init__(self, fail_readback: bool = False) -> None:
+                self.fail_readback = fail_readback
+                self.closed = False
+                self.last_sql = ""
+
+            def execute(self, sql: str) -> "CursorProxy":
+                self.last_sql = sql
+                return self
+
+            def fetchone(self):
+                if self.fail_readback:
+                    raise sqlite3.OperationalError("injected PRAGMA readback failure")
+                return (1,)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class ConnectionProxy:
+            def __init__(self, cursor: CursorProxy) -> None:
+                self._cursor = cursor
+
+            def cursor(self) -> CursorProxy:
+                return self._cursor
+
+        successful_cursor = CursorProxy()
+        successful_connection = ConnectionProxy(successful_cursor)
+        self.assertIs(
+            MaterializedViewManager.configure_sqlite_connection(successful_connection),
+            successful_connection,
+        )
+        self.assertTrue(successful_cursor.closed)
+
+        failing_cursor = CursorProxy(fail_readback=True)
+        failing_connection = ConnectionProxy(failing_cursor)
+        with self.assertRaisesRegex(
+            sqlite3.OperationalError, "injected PRAGMA readback failure"
+        ):
+            MaterializedViewManager.configure_sqlite_connection(failing_connection)
+        self.assertTrue(failing_cursor.closed)
+
     def test_parser_scanners_preserve_postgres_dollar_quoted_literals(self) -> None:
         fragment = "SELECT $$comma, semi; -- /* stays literal */$$, 7"
         self.assertEqual(
