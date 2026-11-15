@@ -4178,6 +4178,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         cursor = Cursor()
         conn = Connection(cursor)
         conn.in_transaction = True
+        conn.autocommit = True  # START TRANSACTION is valid with autocommit mode enabled.
         mgr = make_manager(conn, catalog={})
         mgr.fetch_schema = lambda: {}
         with mgr.bulk_changes():
