@@ -670,6 +670,155 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 conn.rollback()
             conn.close()
 
+
+    def _run_native_multiwriter_aggregate_stress(self, engine: Dialect, dsn: str) -> None:
+        """Exercise trigger-maintained grouped aggregates from independent native sessions."""
+        suffix = uuid.uuid4().hex[:10]
+        schema_name = f"mv_writers_{suffix}"
+        table_name = f"concurrent_ledger_{suffix}"
+        view_name = f"concurrent_totals_{suffix}"
+        conn = self._connect_native(engine, dsn)
+        manager = None
+        plan = None
+        worker_errors: list[BaseException] = []
+        completed: list[int] = []
+        error_lock = threading.Lock()
+        worker_count = 4
+        transactions_per_worker = 40
+        start = threading.Barrier(worker_count)
+
+        try:
+            cur = conn.cursor()
+            if engine == Dialect.POSTGRES:
+                cur.execute(f'CREATE SCHEMA "{schema_name}";')
+                cur.execute(f'SET search_path TO "{schema_name}";')
+            engine_suffix = " ENGINE=InnoDB" if engine == Dialect.MYSQL else ""
+            cur.execute(
+                f"CREATE TABLE {table_name} ("
+                "id BIGINT PRIMARY KEY, bucket VARCHAR(32) NOT NULL, amount BIGINT NULL"
+                f"){engine_suffix};"
+            )
+            conn.commit()
+            manager = MaterializedViewManager(conn, dialect=engine)
+            plan = manager.register_view(
+                f"CREATE VIEW {view_name} AS "
+                "SELECT bucket, COUNT(*) AS row_count, COUNT(amount) AS valued_count, "
+                f"SUM(amount) AS total_amount FROM {table_name} GROUP BY bucket;"
+            )
+
+            def writer(worker_id: int) -> None:
+                second = None
+                try:
+                    second = self._connect_native(engine, dsn)
+                    second_cur = second.cursor()
+                    if engine == Dialect.POSTGRES:
+                        second_cur.execute(f'SET search_path TO "{schema_name}";')
+                        second.commit()
+                    start.wait(timeout=30)
+                    for sequence in range(transactions_per_worker):
+                        row_id = worker_id * 10000 + sequence + 1
+                        bucket = f"source_{worker_id % 2}"
+                        amount = None if sequence % 9 == 0 else worker_id * 100 + sequence
+                        second_cur.execute("BEGIN;")
+                        second_cur.execute(
+                            f"INSERT INTO {table_name} (id, bucket, amount) VALUES (%s, %s, %s)",
+                            (row_id, bucket, amount),
+                        )
+                        second_cur.execute(
+                            f"UPDATE {table_name} SET bucket = %s, "
+                            "amount = CASE WHEN amount IS NULL THEN NULL ELSE amount + 7 END "
+                            "WHERE id = %s",
+                            (f"target_{worker_id % 3}", row_id),
+                        )
+                        if sequence % 4 == 0:
+                            second_cur.execute(
+                                f"DELETE FROM {table_name} WHERE id = %s", (row_id,)
+                            )
+                        if sequence % 13 == 0:
+                            second.rollback()
+                        else:
+                            second.commit()
+                    with error_lock:
+                        completed.append(worker_id)
+                except BaseException as exc:
+                    with error_lock:
+                        worker_errors.append(exc)
+                finally:
+                    if second is not None:
+                        second.close()
+
+            threads = [
+                threading.Thread(target=writer, args=(worker_id,), daemon=True)
+                for worker_id in range(worker_count)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=90)
+            self.assertFalse(
+                [thread.name for thread in threads if thread.is_alive()],
+                f"{engine.value} concurrent writers deadlocked or exceeded timeout",
+            )
+            self.assertEqual(worker_errors, [], f"{engine.value} writer errors: {worker_errors!r}")
+            self.assertEqual(sorted(completed), list(range(worker_count)))
+
+            cur.execute(
+                f"SELECT bucket, row_count, valued_count, total_amount "
+                f"FROM {plan.view_name} ORDER BY bucket;"
+            )
+            actual = [tuple(row) for row in cur.fetchall()]
+            cur.execute(
+                f"SELECT bucket, COUNT(*) AS row_count, COUNT(amount) AS valued_count, "
+                f"SUM(amount) AS total_amount FROM {table_name} GROUP BY bucket ORDER BY bucket;"
+            )
+            expected = [tuple(row) for row in cur.fetchall()]
+            self.assertEqual(actual, expected)
+            expected_rows = sum(
+                1
+                for sequence in range(transactions_per_worker)
+                for _worker_id in range(worker_count)
+                if sequence % 13 != 0 and sequence % 4 != 0
+            )
+            cur.execute(f"SELECT COUNT(*) FROM {table_name};")
+            self.assertEqual(cur.fetchone()[0], expected_rows)
+            cur.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name};")
+            self.assertEqual(
+                cur.fetchone()[0],
+                len(expected),
+                f"{engine.value} backing table must contain one row per surviving group",
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.rollback()
+                cur = conn.cursor()
+                if engine == Dialect.POSTGRES:
+                    cur.execute("SET search_path TO public;")
+                    cur.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE;')
+                else:
+                    if manager is not None and plan is not None:
+                        try:
+                            manager.drop_view(plan.view_name)
+                        except Exception:
+                            pass
+                    cur.execute(f"DROP TABLE IF EXISTS {table_name};")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+            conn.close()
+
+    def test_native_postgres_concurrent_writers_keep_aggregates_consistent(self) -> None:
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN is not set; native PostgreSQL test only")
+        self._run_native_multiwriter_aggregate_stress(Dialect.POSTGRES, dsn)
+
+    def test_native_mysql_family_concurrent_writers_keep_aggregates_consistent(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
+        self._run_native_multiwriter_aggregate_stress(Dialect.MYSQL, dsn)
+
     def test_native_postgres_watermark_gates_independent_session_dml(self) -> None:
         dsn = os.environ.get("POSTGRES_DSN")
         if not dsn:
