@@ -4382,6 +4382,100 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(conn.commit_calls, 0)
         self.assertEqual(conn.close_calls, 1)
 
+    def test_00c_sqlite_bulk_changes_requires_writer_reservation(self) -> None:
+        statements: List[str] = []
+
+        class Cursor:
+            def execute(self, statement: str, params: Any = None) -> None:
+                sql = str(statement).strip()
+                statements.append(sql)
+                if sql == "BEGIN IMMEDIATE;":
+                    raise sqlite3.OperationalError("injected writer reservation failure")
+
+        class Connection:
+            in_transaction = False
+
+            def cursor(self) -> Cursor:
+                return Cursor()
+
+            def rollback(self) -> None:
+                statements.append("ROLLBACK;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = Connection()
+        manager.dialect = Dialect.SQLITE
+        manager.get_catalog = lambda: self.fail(
+            "catalog access must not happen before the SQLite writer reservation"
+        )
+
+        with self.assertRaisesRegex(
+            sqlite3.OperationalError, "writer reservation failure"
+        ):
+            with manager.bulk_changes():
+                self.fail("bulk_changes must fail before entering the user block")
+
+        self.assertEqual(statements, ["BEGIN IMMEDIATE;"])
+
+        # A known caller-owned transaction is rejected without issuing SQL.
+        caller_conn = Connection()
+        caller_conn.in_transaction = True
+        caller_manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        caller_manager.conn = caller_conn
+        caller_manager.dialect = Dialect.SQLITE
+        caller_manager.get_catalog = lambda: self.fail(
+            "caller transaction must be rejected before catalog access"
+        )
+        with self.assertRaisesRegex(RuntimeError, "idle connection"):
+            with caller_manager.bulk_changes():
+                self.fail("caller-owned SQLite transaction must not be joined")
+
+    def test_00d_postgres_set_local_noop_without_savepoint_fails_closed(self) -> None:
+        statements: List[str] = []
+
+        class Cursor:
+            def execute(self, statement: str, params: Any = None) -> None:
+                sql = str(statement).strip()
+                statements.append(sql)
+                if sql.startswith("SAVEPOINT "):
+                    raise RuntimeError("injected savepoint failure")
+                # A real PostgreSQL autocommit connection emits a WARNING and
+                # treats SET LOCAL outside a transaction as a no-op.
+                if sql == "SET LOCAL matview.skip_triggers = 'on';":
+                    return
+
+        class Connection:
+            autocommit = True
+
+            def cursor(self) -> Cursor:
+                return Cursor()
+
+            def rollback(self) -> None:
+                statements.append("ROLLBACK;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = Connection()
+        manager.dialect = Dialect.POSTGRES
+        manager.get_catalog = lambda: {
+            "v_guard": {
+                "view_name": "v_guard",
+                "trigger_names": [],
+                "function_names": ["mv_guard_insert_fn"],
+                "view_sql": "CREATE VIEW v_guard AS SELECT id FROM guarded_rows;",
+            }
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "requires a transactional savepoint"):
+            with manager.bulk_changes():
+                self.fail("bulk_changes must not accept a no-op SET LOCAL")
+
+        self.assertTrue(any(sql.startswith("SAVEPOINT ") for sql in statements))
+        self.assertIn("SET LOCAL matview.skip_triggers = 'on';", statements)
+        self.assertFalse(
+            any(sql.upper().startswith("DROP FUNCTION") for sql in statements),
+            statements,
+        )
+        self.assertEqual(statements[-1], "ROLLBACK;")
+
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
