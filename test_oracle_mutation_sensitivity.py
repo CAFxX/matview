@@ -67,10 +67,10 @@ def _mutant_casefold_text(original: Callable[..., bool]) -> Callable[..., bool]:
 
 
 MUTANTS = (
-    ("accept_every_result", _mutant_always_equal),
-    ("coerce_exact_integers_to_binary64", _mutant_coerce_integers_to_float),
-    ("discard_duplicate_rows", _mutant_drop_duplicate_rows),
-    ("casefold_exact_text", _mutant_casefold_text),
+    ("accept_every_result", _mutant_always_equal, "test_14_differential_oracle_preserves_exact_numeric_values"),
+    ("coerce_exact_integers_to_binary64", _mutant_coerce_integers_to_float, "test_14_differential_oracle_preserves_exact_numeric_values"),
+    ("discard_duplicate_rows", _mutant_drop_duplicate_rows, "test_16_differential_oracle_preserves_types_and_row_multiplicity"),
+    ("casefold_exact_text", _mutant_casefold_text, "test_16_differential_oracle_preserves_types_and_row_multiplicity"),
 )
 
 
@@ -91,7 +91,11 @@ def _run_focused_oracle_tests() -> unittest.TestResult:
     return result
 
 
-def run_mutant(name: str, factory: Callable[[Callable[..., bool]], Callable[..., bool]]) -> int:
+def run_mutant(
+    name: str,
+    factory: Callable[[Callable[..., bool]], Callable[..., bool]],
+    expected_killer: str,
+) -> int:
     original = oracle._rows_equal
     baseline = _run_focused_oracle_tests()
     if not baseline.wasSuccessful():
@@ -105,10 +109,13 @@ def run_mutant(name: str, factory: Callable[[Callable[..., bool]], Callable[...,
         result = _run_focused_oracle_tests()
         # Count only assertion failures as kills. Import/setup/runtime errors
         # are invalid mutation runs, not evidence that a test detected a bug.
-        if result.errors or not result.failures:
+        failed_test_ids = {test.id() for test, _ in result.failures}
+        expected_id = f"TestGeneratorAndManagerCodePaths.{expected_killer}"
+        if result.errors or expected_id not in failed_test_ids:
             raise AssertionError(
-                f"mutant {name!r} was not killed by a clean assertion failure "
-                f"({len(result.failures)} failures, {len(result.errors)} errors)"
+                f"mutant {name!r} was not killed by its designated regression "
+                f"{expected_id!r}; failures={sorted(failed_test_ids)}, "
+                f"errors={len(result.errors)}"
             )
         print(
             f"KILLED {name}: {len(result.failures)}/{result.testsRun} tests failed "
@@ -121,8 +128,8 @@ def run_mutant(name: str, factory: Callable[[Callable[..., bool]], Callable[...,
 
 def main() -> None:
     total = 0
-    for name, factory in MUTANTS:
-        total += run_mutant(name, factory)
+    for name, factory, expected_killer in MUTANTS:
+        total += run_mutant(name, factory, expected_killer)
     print(f"Oracle mutation sensitivity passed: {len(MUTANTS)} mutants killed ({total} failing test executions).")
 
 
