@@ -10656,31 +10656,7 @@ class MaterializedViewManager:
                         "publication is implemented; the existing view was left untouched"
                     )
 
-                # SQLite and PostgreSQL support transactional DDL. For a single-shot
-                # replacement, keep removal of the old reader/backing objects in the
-                # same transaction as creation and population of the replacement, so
-                # a failed rebuild restores the previously working materialized view.
-                transactional_replacement = True
-                if transactional_replacement:
-                    sqlite_writer_reserved = reserve_sqlite_writer()
-                    self.drop_view(plan.view_name, _commit_transaction=False)
- For a single-shot
-                # replacement, keep removal of the old reader/backing objects in the
-                # same transaction as creation and population of the replacement, so
-                # a failed rebuild restores the previously working materialized view.
-                # MySQL/MariaDB implicitly commit DDL, and incremental backfills
-                # intentionally commit chunks; those paths still require a future
-                # shadow-generation publication protocol.
-                transactional_replacement = (
-                    not incremental_backfill
-                    and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES)
-                )
-                if transactional_replacement:
-                    sqlite_writer_reserved = reserve_sqlite_writer()
-                    self.drop_view(plan.view_name, _commit_transaction=False)
-                else:
-                    self.drop_view(plan.view_name)
-
+                # SQLite and PostgreSQL support transactional DDL.
             # Reserve before the first structure/trigger DDL on new registrations.
             # For SQLite this also closes the trigger-installation/backfill writer
             # race. For transactional replacement the reservation was taken before
