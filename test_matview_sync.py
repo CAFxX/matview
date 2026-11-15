@@ -8875,6 +8875,86 @@ class WrappedConnectionTransactionStateTests(unittest.TestCase):
             self.cursor_calls += 1
             raise AssertionError("caller transaction must be rejected before SQL")
 
+    class MySQLUnknownFacade:
+        in_transaction = False
+        autocommit = False
+
+        def __init__(self, driver):
+            self.connection = driver
+            self.cursor_calls = 0
+
+        def cursor(self):
+            self.cursor_calls += 1
+            raise AssertionError("unknown driver state must be rejected before SQL")
+
+    class PostgresUnknownFacade:
+        in_transaction = False
+        autocommit = False
+
+        def __init__(self, driver):
+            self.connection = driver
+            self.cursor_calls = 0
+
+        def cursor(self):
+            self.cursor_calls += 1
+            raise AssertionError("unknown driver state must be rejected before SQL")
+
+    class MySQLDriverWithoutState:
+        pass
+
+    class MySQLDriverWithoutAutocommit:
+        in_transaction = False
+
+    class PostgresDriverWithoutState:
+        autocommit = False
+
+    class PostgresDriverWithoutAutocommit:
+        in_transaction = False
+
+    def test_mysql_bulk_changes_rejects_unknown_deepest_driver_transaction_state(self):
+        connection = self.MySQLUnknownFacade(self.MySQLDriverWithoutState())
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = connection
+        manager.dialect = Dialect.MYSQL
+
+        with self.assertRaisesRegex(RuntimeError, "requires.*exposes in_transaction"):
+            with manager.bulk_changes():
+                self.fail("unknown physical transaction state must fail closed")
+        self.assertEqual(connection.cursor_calls, 0)
+
+    def test_mysql_bulk_changes_rejects_unknown_deepest_driver_autocommit(self):
+        connection = self.MySQLUnknownFacade(self.MySQLDriverWithoutAutocommit())
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = connection
+        manager.dialect = Dialect.MYSQL
+
+        with self.assertRaisesRegex(RuntimeError, "exposes its autocommit mode"):
+            with manager.bulk_changes():
+                self.fail("unknown physical autocommit state must fail closed")
+        self.assertEqual(connection.cursor_calls, 0)
+
+    def test_postgres_bulk_changes_rejects_unknown_deepest_driver_transaction_state(self):
+        connection = self.PostgresUnknownFacade(self.PostgresDriverWithoutState())
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = connection
+        manager.dialect = Dialect.POSTGRES
+
+        with self.assertRaisesRegex(RuntimeError, "every wrapped driver layer.*transaction state"):
+            with manager.bulk_changes():
+                self.fail("unknown physical transaction state must fail closed")
+        self.assertEqual(connection.cursor_calls, 0)
+
+    def test_postgres_bulk_changes_rejects_unknown_deepest_driver_autocommit(self):
+        connection = self.PostgresUnknownFacade(self.PostgresDriverWithoutAutocommit())
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = connection
+        manager.dialect = Dialect.POSTGRES
+
+        with self.assertRaisesRegex(RuntimeError, "every wrapped driver layer.*autocommit state"):
+            with manager.bulk_changes():
+                self.fail("unknown physical autocommit state must fail closed")
+        self.assertEqual(connection.cursor_calls, 0)
+
     def test_mysql_bulk_changes_preserves_transaction_hidden_by_facade(self):
         connection = self.MySQLFacade()
         manager = MaterializedViewManager.__new__(MaterializedViewManager)
