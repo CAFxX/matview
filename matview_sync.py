@@ -11099,13 +11099,16 @@ class MaterializedViewManager:
             # and a MySQL bypass flag set before a savepoint failure must be reset.
             if session_bypass_ok:
                 try:
-                    cur.execute("SET @__matview_skip_triggers = 0;")
-                except Exception:
+                    if self.dialect == Dialect.POSTGRES:
+                        cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                    elif self.dialect == Dialect.MYSQL:
+                        cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception as reset_error:
                     self._rollback()
                     raise RuntimeError(
                         "bulk_changes setup failed and the session-local trigger bypass "
                         "could not be cleared; discard the connection before reuse"
-                    )
+                    ) from reset_error
             if sp_active:
                 try:
                     cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
