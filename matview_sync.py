@@ -11041,6 +11041,7 @@ class MaterializedViewManager:
             # Falling back to DROP/CREATE TRIGGER would implicitly commit the
             # transaction. Refuse before any such DDL rather than silently
             # weakening the context manager's rollback guarantee.
+            self._rollback()
             raise RuntimeError(
                 "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
                 "the trigger-DDL fallback is unsafe because MySQL implicitly commits DDL"
