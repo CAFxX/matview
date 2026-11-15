@@ -133,6 +133,7 @@ def main() -> None:
         ]
 
         # Unsupported replacement modes fail before drop_view is called.
+        schemas_for_test = manager.fetch_schema()
         original_dialect = manager.dialect
         original_drop = manager.drop_view
         def unexpected_drop(*args, **kwargs):
@@ -147,7 +148,7 @@ def main() -> None:
                 try:
                     manager._register_single_view_spec(
                         plan.view_spec,
-                        schemas=manager.fetch_schema(),
+                        schemas=schemas_for_test,
                         populate=True,
                         incremental_backfill=incremental,
                         batch_size=500,
