@@ -10987,10 +10987,10 @@ class MaterializedViewManager:
                 )
             mysql_caller_transaction = tx_state
             autocommit = self._mysql_autocommit_state()
-            if autocommit is None:
+            if autocommit is None and not mysql_caller_transaction:
                 raise RuntimeError(
                     "bulk_changes() on MySQL/MariaDB requires a connection adapter "
-                    "that exposes its autocommit mode; cannot guarantee context rollback"
+                    "that exposes its autocommit mode when no caller transaction is active"
                 )
             if autocommit and not mysql_caller_transaction:
                 raise RuntimeError(
@@ -11207,7 +11207,8 @@ class MaterializedViewManager:
                     try:
                         cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
                     except Exception:
-                        pass
+                        if self.dialect == Dialect.MYSQL:
+                            raise
                 if self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
                     self._commit()
 
