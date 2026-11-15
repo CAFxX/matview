@@ -237,7 +237,7 @@ class QueryASTMaterializedViewTests(unittest.TestCase):
         """Exercise generated variable schemas and recursive SELECT ASTs on a live database."""
         conn = self._connect_native(dialect, dsn)
         version_info = detect_engine_version(conn, hint_dialect=dialect)
-        engine_label = f"native {version_info.engine_name} ({version_info.raw_version})"
+        engine_label = f"native {version_info.label} ({version_info.raw_version})"
 
         suffix = uuid.uuid4().hex[:8]
         pg_root_schema = f"ast_pg_{suffix}"
