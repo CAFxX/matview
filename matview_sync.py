@@ -11017,6 +11017,24 @@ class MaterializedViewManager:
 
         cur = self.conn.cursor()
         sp_active = False
+        bypass_reset_done = False
+
+        def _reset_mysql_trigger_bypass() -> None:
+            nonlocal bypass_reset_done
+            try:
+                cur.execute("SET @__matview_skip_triggers = 0;")
+                bypass_reset_done = True
+            except Exception as reset_exc:
+                # MySQL user variables are session-scoped, not transactional.
+                # A rollback cannot repair an unknown bypass state.
+                self._mysql_bulk_connection_unsafe = True
+                error = RuntimeError(
+                    "failed to clear the MySQL materialized-view trigger-bypass "
+                    "session variable; the connection state is unsafe and the "
+                    "connection must be discarded"
+                )
+                error.connection_unsafe = True
+                raise error from reset_exc
         try:
             cur.execute("SAVEPOINT __mv_bulk_sp;")
             sp_active = True
@@ -11044,9 +11062,10 @@ class MaterializedViewManager:
             # session variable defensively in case the failed SET reached the
             # server but its response was lost.
             try:
-                cur.execute("SET @__matview_skip_triggers = 0;")
-            except Exception:
-                pass
+                _reset_mysql_trigger_bypass()
+            except RuntimeError:
+                self._rollback()
+                raise
             self._rollback()
             raise RuntimeError(
                 "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
@@ -11067,7 +11086,7 @@ class MaterializedViewManager:
         # so the trigger suspension and bulk DML remain isolated inside __mv_bulk_sp!
         try:
             yield
-        except Exception:
+        except Exception as operation_error:
             if sp_active:
                 try:
                     cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
@@ -11081,16 +11100,16 @@ class MaterializedViewManager:
                     cur.execute("SET LOCAL matview.skip_triggers = 'off';")
                 except Exception:
                     pass
-            elif self.dialect == Dialect.MYSQL:
+            elif self.dialect == Dialect.MYSQL and session_bypass_ok:
                 try:
-                    cur.execute("SET @__matview_skip_triggers = 0;")
-                except Exception:
-                    pass
+                    _reset_mysql_trigger_bypass()
+                except RuntimeError as reset_error:
+                    reset_error.add_note(f"Original bulk operation failure: {operation_error!r}")
+                    self._rollback()
+                    raise reset_error from operation_error
             if self.dialect == Dialect.MYSQL:
-                # The MySQL path is guaranteed to use the session-local bypass
-                # (and no DDL). Roll back the complete context-owned transaction;
-                # recreating triggers here would implicitly commit and is neither
-                # necessary nor safe.
+                # MySQL user variables survive rollback. If reset failed, the
+                # manager is marked unsafe and the caller must discard its connection.
                 self._rollback()
                 raise
 
@@ -11128,7 +11147,7 @@ class MaterializedViewManager:
                     # Do not commit if the session flag cannot be cleared:
                     # it would suppress maintenance on later statements using
                     # this pooled connection.
-                    cur.execute("SET @__matview_skip_triggers = 0;")
+                    _reset_mysql_trigger_bypass()
                 schemas = self.fetch_schema()
                 for entry in targets:
                     plan = generate_materialized_view(
@@ -11201,14 +11220,21 @@ class MaterializedViewManager:
                         pass
                 self._commit()
 
-            except Exception:
+            except Exception as operation_error:
                 if self.dialect == Dialect.MYSQL:
-                    # Failures during post-yield refresh work are still part of
-                    # this context. Do not leak a partially applied transaction.
-                    try:
-                        cur.execute("SET @__matview_skip_triggers = 0;")
-                    except Exception:
-                        pass
+                    # Do not hide a failed session-variable reset: rollback
+                    # cannot clear MySQL user variables.
+                    if session_bypass_ok and not bypass_reset_done and not getattr(
+                        self, "_mysql_bulk_connection_unsafe", False
+                    ):
+                        try:
+                            _reset_mysql_trigger_bypass()
+                        except RuntimeError as reset_error:
+                            reset_error.add_note(
+                                f"Original bulk operation failure: {operation_error!r}"
+                            )
+                            self._rollback()
+                            raise reset_error from operation_error
                     self._rollback()
                 raise
 
