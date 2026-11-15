@@ -1772,7 +1772,7 @@ def _resolve_statistical_aggregate_alias_item(
     # those parentheses before resolving dialect-specific aliases so
     # (VARIANCE(...)) and ((STDDEV(...))) retain PostgreSQL sample semantics.
     alias_expr = _unwrap_outer_parens(item.raw_expr)
-    match = re.match(r"^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(", alias_expr)
+    match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", alias_expr)
     alias_func = match.group(1).upper() if match else ""
     if dialect == Dialect.POSTGRES:
         aliases = {

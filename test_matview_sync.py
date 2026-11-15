@@ -5704,7 +5704,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         }
         self.assertEqual(aggregates["variance_alias"], AggFunc.VAR_SAMP)
         self.assertEqual(aggregates["stddev_alias"], AggFunc.STDDEV_SAMP)
-        postgres_sql = "\\n".join(postgres.initial_populate_sqls).upper()
+        postgres_sql = "\n".join(postgres.initial_populate_sqls).upper()
         self.assertIn("VAR_SAMP(", postgres_sql)
         self.assertIn("STDDEV_SAMP(", postgres_sql)
         self.assertNotIn("VAR_POP(", postgres_sql)
