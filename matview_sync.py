@@ -10253,67 +10253,9 @@ class MaterializedViewManager:
 
     @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
-        """Fail closed unless a PostgreSQL connection is idle and non-autocommit."""
-        autocommit = getattr(conn, "autocommit", None)
-        if autocommit is None:
-            adapter_connection = getattr(conn, "connection", None)
-            driver_connection = getattr(
-                adapter_connection, "driver_connection", adapter_connection
-            )
-            autocommit = getattr(driver_connection, "autocommit", None)
-        if autocommit is not False:
-            raise RuntimeError(
-                "PostgreSQL manager initialization requires autocommit=False "
-                "to preserve transactional DDL atomicity"
-            )
-
-        state = getattr(conn, "in_transaction", None)
-        if callable(state):
-            try:
-                state = state()
-            except Exception:
-                state = None
-        if not isinstance(state, bool):
-            status = None
-            getter = getattr(conn, "get_transaction_status", None)
-            if callable(getter):
-                try:
-                    status = getter()
-                except Exception:
-                    status = None
-            if status is None:
-                info = getattr(conn, "info", None)
-                status = getattr(info, "transaction_status", None)
-            if status is None:
-                raise RuntimeError(
-                    "PostgreSQL manager initialization requires an adapter that exposes "
-                    "transaction state; cannot safely determine whether a caller transaction "
-                    "would be committed"
-                )
-            try:
-                state = int(status) != 0
-            except (TypeError, ValueError):
-                state_text = str(status).lower()
-                if state_text.endswith("idle"):
-                    state = False
-                else:
-                    raise RuntimeError(
-                        "PostgreSQL manager initialization could not interpret "
-                        "the connection transaction state"
-                    )
-        if state:
-            raise RuntimeError(
-                "PostgreSQL manager initialization cannot run inside an active caller "
-                "transaction; commit or roll back that transaction first"
-            )
-
-    @staticmethod
-    def _require_idle_mysql_connection(conn: Any) -> None:
-        """Fail closed unless a MySQL/MariaDB connection and its driver are idle."""
-        # SQLAlchemy's Connection wraps a PoolProxiedConnection, which in turn
-        # exposes the actual DB-API connection as driver_connection. Inspect
-        # both layers: callers can start a transaction through that driver
-        # connection without SQLAlchemy's own transaction facade noticing it.
+        """Fail closed unless the PostgreSQL connection and wrapped driver are idle."""
+        # SQLAlchemy and pool adapters can expose an idle facade while application
+        # code has started a transaction directly on the underlying DB-API driver.
         candidates = []
         pending = [conn]
         seen = set()
@@ -10331,7 +10273,23 @@ class MaterializedViewManager:
                 if nested is not None and nested is not candidate:
                     pending.append(nested)
 
-        observed_idle_state = False
+        observed_autocommit = False
+        for candidate in candidates:
+            autocommit = getattr(candidate, "autocommit", None)
+            if autocommit is not None:
+                observed_autocommit = True
+                if autocommit is not False:
+                    raise RuntimeError(
+                        "PostgreSQL manager initialization requires autocommit=False "
+                        "to preserve transactional DDL atomicity"
+                    )
+        if not observed_autocommit:
+            raise RuntimeError(
+                "PostgreSQL manager initialization requires an adapter that exposes "
+                "autocommit state; cannot safely guarantee transactional DDL"
+            )
+
+        observed_transaction_state = False
         for candidate in candidates:
             state = getattr(candidate, "in_transaction", None)
             if callable(state):
@@ -10340,32 +10298,49 @@ class MaterializedViewManager:
                 except Exception:
                     state = None
             if isinstance(state, bool):
+                observed_transaction_state = True
                 if state:
                     raise RuntimeError(
-                        "MySQL/MariaDB manager initialization cannot run inside an active "
-                        "caller transaction; commit or roll back that transaction first"
+                        "PostgreSQL manager initialization cannot run inside an active caller "
+                        "transaction; commit or roll back that transaction first"
                     )
-                observed_idle_state = True
                 continue
 
-            # PyMySQL and mysqlclient expose the protocol SERVER_STATUS_IN_TRANS
-            # bit in server_status. Its value is 1 across MySQL and MariaDB.
-            status = getattr(candidate, "server_status", None)
+            status = None
+            getter = getattr(candidate, "get_transaction_status", None)
+            if callable(getter):
+                try:
+                    status = getter()
+                except Exception:
+                    status = None
             if status is None:
-                status = getattr(candidate, "_server_status", None)
-            if isinstance(status, int):
-                if status & 0x0001:
+                info = getattr(candidate, "info", None)
+                status = getattr(info, "transaction_status", None)
+            if status is None:
+                continue
+            try:
+                state = int(status) != 0
+            except (TypeError, ValueError):
+                state_text = str(status).lower()
+                if state_text.endswith("idle"):
+                    state = False
+                else:
                     raise RuntimeError(
-                        "MySQL/MariaDB manager initialization cannot run inside an active "
-                        "caller transaction; commit or roll back that transaction first"
+                        "PostgreSQL manager initialization could not interpret "
+                        "the connection transaction state"
                     )
-                observed_idle_state = True
+            observed_transaction_state = True
+            if state:
+                raise RuntimeError(
+                    "PostgreSQL manager initialization cannot run inside an active caller "
+                    "transaction; commit or roll back that transaction first"
+                )
 
-        if not observed_idle_state:
+        if not observed_transaction_state:
             raise RuntimeError(
-                "MySQL/MariaDB manager initialization requires an adapter that "
-                "exposes transaction state; cannot safely determine whether "
-                "catalog initialization would commit caller work"
+                "PostgreSQL manager initialization requires an adapter that exposes "
+                "transaction state; cannot safely determine whether a caller transaction "
+                "would be committed"
             )
 
     def _assert_registration_transaction_ownership(self) -> None:
