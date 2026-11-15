@@ -11025,6 +11025,14 @@ class MaterializedViewManager:
         globally across concurrent connections, transactional `BEGIN IMMEDIATE` + `SAVEPOINT` write-lock
         isolation on SQLite, and atomic shadow-table rebuild + atomic table swap (`use_shadow_swap=True`).
         """
+        if self.dialect == Dialect.MYSQL and (drop_triggers or use_shadow_swap):
+            # Both options execute trigger/table DDL. MySQL/MariaDB implicitly
+            # commits DDL, so this context cannot preserve its rollback contract.
+            raise RuntimeError(
+                "bulk_changes() on MySQL/MariaDB cannot use drop_triggers or "
+                "use_shadow_swap because those options execute implicitly committing DDL"
+            )
+
         catalog = self.get_catalog()
         if view_names:
             resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
