@@ -11080,8 +11080,16 @@ class MaterializedViewManager:
                         # in_transaction. An explicit nested-BEGIN response is
                         # the only safe evidence that the caller owns a tx.
                         sqlite_caller_transaction = True
-                cur.execute("SAVEPOINT __mv_bulk_sp;")
-                sp_active = True
+                try:
+                    cur.execute("SAVEPOINT __mv_bulk_sp;")
+                    sp_active = True
+                except Exception:
+                    # Release only a writer reservation acquired by this context.
+                    # A caller-owned transaction must remain open for its owner.
+                    if sqlite_started_writer_transaction:
+                        self._rollback()
+                        sqlite_started_writer_transaction = False
+                    raise
             else:
                 try:
                     cur.execute("SAVEPOINT __mv_bulk_sp;")
