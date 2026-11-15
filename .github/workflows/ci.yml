@@ -394,6 +394,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_concurrent_backfill.py
+
+      - name: Test MySQL session-bypass reset failure invalidates physical connection
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_mysql_bulk_changes_reset_failure.py
   # Representative LTS boundaries for MariaDB: oldest, previous, newest LTS.
   mysql-compat:
     needs: classify
@@ -484,6 +489,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_concurrent_backfill.py
+
+      - name: Test MariaDB session-bypass reset failure invalidates physical connection
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_mysql_bulk_changes_reset_failure.py
   # Stable branch-protection check. Only the required PR gate is aggregated;
   # scheduled/deferred compatibility jobs live in the separate workflow.
   ci-success:
