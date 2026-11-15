@@ -10419,7 +10419,6 @@ class MaterializedViewManager:
 
     def _assert_connection_usable(self) -> None:
         """Reject all public DB operations after an unrecoverable connection-state failure."""
-        self._assert_connection_usable()
 
     @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
@@ -10532,6 +10531,7 @@ class MaterializedViewManager:
 
     def fetch_schema(self, extra_schema_sql: Optional[str] = None) -> Dict[str, TableSchema]:
         """Fetches the live schema of all user base tables from the connected database."""
+        self._assert_connection_usable()
         schemas = introspect_database_schemas(
             self.conn,
             dialect=self.dialect,
@@ -10539,7 +10539,6 @@ class MaterializedViewManager:
         )
         schemas.pop(self.catalog_table, None)
         if extra_schema_sql:
-        self._assert_connection_usable()
             schemas.update(parse_table_schema(extra_schema_sql))
         return schemas
 
@@ -10549,9 +10548,9 @@ class MaterializedViewManager:
         automatically refreshes any registered materialized views whose underlying
         base table schema changed.
         """
+        self._assert_connection_usable()
         cur = self.conn.cursor()
         for stmt in _split_top_level(_strip_sql_comments(ddl_sql), ";"):
-        self._assert_connection_usable()
             if stmt.strip():
                 cur.execute(stmt)
         self._commit()
@@ -10561,9 +10560,9 @@ class MaterializedViewManager:
                 self.sync_views([entry["view_sql"] for entry in catalog.values()])
 
     def get_catalog(self) -> Dict[str, Dict[str, Any]]:
+        self._assert_connection_usable()
         cur = self.conn.cursor()
         try:
-        self._assert_connection_usable()
             cur.execute(
                 f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
                 f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
@@ -10637,12 +10636,12 @@ class MaterializedViewManager:
 
     def drop_view(self, view_name: str) -> bool:
         """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
+        self._assert_connection_usable()
         catalog = self.get_catalog()
         resolved_name = self._resolve_catalog_name(view_name, catalog)
         entry = catalog.get(resolved_name)
         cur = self.conn.cursor()
         if entry:
-        self._assert_connection_usable()
             for t_name in entry["trigger_names"]:
                 if self.dialect != Dialect.POSTGRES:
                     cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
@@ -10703,8 +10702,8 @@ class MaterializedViewManager:
         `__matview_catalog` and optionally running under `snapshot_isolation=True`.
         Returns the total number of batches executed.
         """
-        if plan.sub_plans:
         self._assert_connection_usable()
+        if plan.sub_plans:
             total_b = 0
             for sp in plan.sub_plans:
                 total_b += self.backfill_incrementally(
@@ -10995,6 +10994,7 @@ class MaterializedViewManager:
         Safely installs or updates one or more materialized views on the connected database.
         Supports both single-view and multi-view SQL scripts seamlessly.
         """
+        self._assert_connection_usable()
         effective_ignore = (
             self.ignore_limitations if ignore_limitations is None else ignore_limitations
         )
@@ -11007,7 +11007,6 @@ class MaterializedViewManager:
         )
         sub_plans: List[MaterializedViewPlan] = []
         for vs in specs:
-        self._assert_connection_usable()
             sub_plans.append(
                 self._register_single_view_spec(
                     vs,
@@ -11065,6 +11064,7 @@ class MaterializedViewManager:
         the connected database (supporting multi-view SQL files/strings as well).
         Returns a status map `{view_name: "created" | "updated" | "unchanged" | "dropped"}`.
         """
+        self._assert_connection_usable()
         effective_ignore = (
             self.ignore_limitations if ignore_limitations is None else ignore_limitations
         )
@@ -11081,7 +11081,6 @@ class MaterializedViewManager:
         )
 
         for v_spec in all_specs:
-        self._assert_connection_usable()
             plan = generate_materialized_view(
                 schemas,
                 v_spec,
@@ -11140,11 +11139,11 @@ class MaterializedViewManager:
         Inspects all registered views in `__matview_catalog` against the current live base
         table schemas and returns `{view_name: "ok" | "drifted" | "invalid"}`.
         """
+        self._assert_connection_usable()
         schemas = self.fetch_schema()
         catalog = self.get_catalog()
         report: Dict[str, str] = {}
         for v_name, entry in catalog.items():
-        self._assert_connection_usable()
             try:
                 plan = generate_materialized_view(
                     schemas,
@@ -11171,9 +11170,9 @@ class MaterializedViewManager:
         eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
         Returns `{view_name: "repaired" | "rebuilt"}`.
         """
+        self._assert_connection_usable()
         catalog = self.get_catalog()
         if view_name:
-        self._assert_connection_usable()
             resolved = self._resolve_catalog_name(view_name, catalog)
             if resolved not in catalog:
                 raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
@@ -11236,11 +11235,11 @@ class MaterializedViewManager:
         it starts itself, but leaves a caller-owned transaction open and rollback-able by the caller.
         MySQL DDL paths are rejected because DDL can implicitly commit even when the context fails.
         """
+        self._assert_connection_usable()
         if self.dialect == Dialect.MYSQL and (
             getattr(self, "_mysql_connection_discarded", False)
             or getattr(self.conn, "_matview_connection_discarded", False)
         ):
-        self._assert_connection_usable()
             raise RuntimeError(
                 "this MySQL/MariaDB manager connection was discarded after an "
                 "unrecoverable trigger-bypass reset failure"
