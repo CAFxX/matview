@@ -9018,7 +9018,7 @@ class SQLiteBulkSavepointRollbackFailureTests(unittest.TestCase):
         self.assertTrue(conn._cursor.closed)
         self.assertTrue(manager._sqlite_connection_discarded)
         with self.assertRaisesRegex(RuntimeError, "SQLite manager connection was discarded"):
-            manager.get_catalog()
+            MaterializedViewManager.get_catalog(manager)
         self.assertIsInstance(raised.exception.__cause__, RuntimeError)
         self.assertIn("injected writer rollback failure", str(raised.exception.__cause__))
 
