@@ -1749,40 +1749,46 @@ _FN_TO_AGG_ENUM: Dict[str, AggFunc] = {
 }
 
 
+def _resolve_statistical_aggregate_alias_item(
+    item: SelectItem, dialect: Dialect
+) -> SelectItem:
+    """Resolve statistical aliases using the target engine's SQL contract."""
+    if not item.is_aggregate:
+        return item
+    match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", item.raw_expr)
+    alias_func = match.group(1).upper() if match else ""
+    if dialect == Dialect.POSTGRES:
+        if alias_func == "STD":
+            raise ValueError(
+                "STD() is not a PostgreSQL aggregate alias; use STDDEV_SAMP() or STDDEV()"
+            )
+        aliases = {
+            "VARIANCE": AggFunc.VAR_SAMP,
+            "STDDEV": AggFunc.STDDEV_SAMP,
+        }
+        resolved_func = aliases.get(alias_func)
+        if resolved_func is not None:
+            return replace(item, agg_func=resolved_func)
+    return item
+
+
 def _resolve_statistical_aggregate_aliases(
     view_spec: ViewSpec, dialect: Dialect
 ) -> ViewSpec:
-    """Resolve VARIANCE/STDDEV aliases according to the target engine."""
-    if dialect != Dialect.POSTGRES:
-        return view_spec
-
-    aliases = {
-        "VARIANCE": AggFunc.VAR_SAMP,
-        "STDDEV": AggFunc.STDDEV_SAMP,
-        "STD": AggFunc.STDDEV_SAMP,
-    }
-    resolved_items = []
-    for item in view_spec.select_items:
-        if not item.is_aggregate:
-            resolved_items.append(item)
-            continue
-        match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", item.raw_expr)
-        alias_func = match.group(1).upper() if match else ""
-        resolved_func = aliases.get(alias_func)
-        if resolved_func is not None:
-            resolved_items.append(replace(item, agg_func=resolved_func))
-        else:
-            resolved_items.append(item)
-
+    """Resolve statistical aliases recursively before planning."""
+    resolved_items = tuple(
+        _resolve_statistical_aggregate_alias_item(item, dialect)
+        for item in view_spec.select_items
+    )
     resolved_additional = tuple(
         _resolve_statistical_aggregate_aliases(extra, dialect)
         for extra in view_spec.additional_views
     )
-    if tuple(resolved_items) == view_spec.select_items and resolved_additional == view_spec.additional_views:
+    if resolved_items == view_spec.select_items and resolved_additional == view_spec.additional_views:
         return view_spec
     return replace(
         view_spec,
-        select_items=tuple(resolved_items),
+        select_items=resolved_items,
         additional_views=resolved_additional,
     )
 
@@ -2383,13 +2389,17 @@ def parse_view_ast(
     else:
         vs = _parse_single_create_view_stmt(f"CREATE VIEW __mv_ast_tmp AS {clean}", known_tables=known_tables)
     cte_names, main_sel, has_cte = _extract_cte_names_and_strip_with(vs.raw_select_sql)
+    dialect_select_items = tuple(
+        _resolve_statistical_aggregate_alias_item(item, dialect)
+        for item in vs.select_items
+    )
     return SQLSelectAST(
         raw_sql=vs.raw_select_sql,
         cte_names=tuple(sorted(cte_names)),
         main_select_sql=main_sel,
         has_cte=has_cte,
         has_distinct=vs.has_top_level_distinct,
-        select_items=vs.select_items,
+        select_items=dialect_select_items,
         from_clause=vs.base_table,
         joins=vs.joins,
         where_clause=vs.where_clause,

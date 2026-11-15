@@ -63,6 +63,7 @@ from matview_sync import (
     main as cli_main,
     parse_table_schema,
     parse_view_definition,
+    parse_view_ast,
     parse_view_definitions,
     parse_view_index_spec,
 )
@@ -5584,7 +5585,6 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         SELECT grp,
                VARIANCE(value) AS variance_alias,
                STDDEV(value) AS stddev_alias,
-               STD(value) AS std_alias,
                VAR_POP(value) AS variance_population,
                VAR_SAMP(value) AS variance_sample,
                STDDEV_POP(value) AS stddev_population,
@@ -5592,10 +5592,16 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         FROM measurements
         GROUP BY grp;
         """
+        view_with_std = """
+        CREATE VIEW measurement_aliases AS
+        SELECT grp, VARIANCE(value) AS variance_alias,
+               STDDEV(value) AS stddev_alias, STD(value) AS std_alias
+        FROM measurements GROUP BY grp;
+        """
 
-        def aggregates(dialect: str) -> Dict[str, AggFunc]:
+        def aggregates(dialect: str, sql: str = view) -> Dict[str, AggFunc]:
             plan = generate_materialized_view(
-                schema, view, dialect=dialect, ignore_limitations=True
+                schema, sql, dialect=dialect, ignore_limitations=True
             )
             return {
                 item.alias: item.agg_func
@@ -5606,18 +5612,207 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         postgres = aggregates("postgres")
         self.assertEqual(postgres["variance_alias"], AggFunc.VAR_SAMP)
         self.assertEqual(postgres["stddev_alias"], AggFunc.STDDEV_SAMP)
-        self.assertEqual(postgres["std_alias"], AggFunc.STDDEV_SAMP)
         self.assertEqual(postgres["variance_population"], AggFunc.VAR_POP)
         self.assertEqual(postgres["variance_sample"], AggFunc.VAR_SAMP)
         self.assertEqual(postgres["stddev_population"], AggFunc.STDDEV_POP)
         self.assertEqual(postgres["stddev_sample"], AggFunc.STDDEV_SAMP)
 
+        postgres_ast = parse_view_ast(view, dialect=Dialect.POSTGRES)
+        self.assertEqual(postgres_ast.select_items[1].agg_func, AggFunc.VAR_SAMP)
+        self.assertEqual(postgres_ast.select_items[2].agg_func, AggFunc.STDDEV_SAMP)
+
         for dialect in ("mysql", "sqlite"):
             with self.subTest(dialect=dialect):
-                resolved = aggregates(dialect)
+                resolved = aggregates(dialect, view_with_std)
                 self.assertEqual(resolved["variance_alias"], AggFunc.VAR_POP)
                 self.assertEqual(resolved["stddev_alias"], AggFunc.STDDEV_POP)
                 self.assertEqual(resolved["std_alias"], AggFunc.STDDEV_POP)
+                ast = parse_view_ast(view_with_std, dialect=Dialect(dialect))
+                self.assertEqual(ast.select_items[3].agg_func, AggFunc.STDDEV_POP)
+
+        unsupported_postgres_alias = """
+        CREATE VIEW measurement_std AS
+        SELECT grp, STD(value) AS deviation
+        FROM measurements GROUP BY grp;
+        """
+        with self.assertRaisesRegex(ValueError, r"STD\(\) is not a PostgreSQL"):
+            generate_materialized_view(
+                schema, unsupported_postgres_alias, dialect="postgres"
+            )
+        with self.assertRaisesRegex(ValueError, r"STD\(\) is not a PostgreSQL"):
+            parse_view_ast(unsupported_postgres_alias, dialect=Dialect.POSTGRES)
+
+    def _assert_native_statistical_alias_maintenance(
+        self, dialect: Dialect, dsn: str
+    ) -> None:
+        if dialect == Dialect.POSTGRES:
+            import psycopg2
+            conn = psycopg2.connect(dsn)
+        else:
+            from urllib.parse import urlparse
+            import pymysql
+
+            parsed = urlparse(dsn)
+            conn = pymysql.connect(
+                host=parsed.hostname or "127.0.0.1",
+                port=parsed.port or 3306,
+                user=parsed.username or "root",
+                password=parsed.password or "",
+                database=parsed.path.lstrip("/") or None,
+                autocommit=False,
+            )
+
+        suffix = str(os.getpid())
+        schema_name = f"mv_alias_{suffix}"
+        table_name = f"mv_alias_values_{suffix}"
+        view_name = f"mv_alias_stats_{suffix}"
+        manager = None
+        cursor = conn.cursor()
+        schema_created = False
+        try:
+            if dialect == Dialect.POSTGRES:
+                cursor.execute(f'CREATE SCHEMA "{schema_name}";')
+                cursor.execute(f'SET search_path TO "{schema_name}";')
+                conn.commit()
+                schema_created = True
+
+            engine_suffix = " ENGINE=InnoDB" if dialect == Dialect.MYSQL else ""
+            cursor.execute(
+                f"CREATE TABLE {table_name} ("
+                "id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, "
+                f"value NUMERIC(18, 4) NOT NULL){engine_suffix};"
+            )
+            cursor.executemany(
+                f"INSERT INTO {table_name} (id, grp, value) VALUES (%s, %s, %s)",
+                [
+                    (1, "A", 1),
+                    (2, "A", 3),
+                    (3, "A", 5),
+                    (4, "B", 2),
+                    (5, "B", 10),
+                    (6, "C", 13),
+                ],
+            )
+            conn.commit()
+
+            manager = MaterializedViewManager(conn, dialect=dialect)
+            view_sql = (
+                f"CREATE VIEW {view_name} AS "
+                f"SELECT grp, VARIANCE(value) AS variance, "
+                f"STDDEV(value) AS deviation FROM {table_name} GROUP BY grp;"
+            )
+            if dialect == Dialect.MYSQL:
+                with warnings.catch_warnings(record=True) as emitted:
+                    warnings.simplefilter("always", EngineLimitationWarning)
+                    plan = manager.register_view(
+                        view_sql, ignore_limitations=True
+                    )
+                limitation_warnings = [
+                    warning for warning in emitted
+                    if issubclass(warning.category, EngineLimitationWarning)
+                ]
+                self.assertEqual(len(limitation_warnings), 1)
+                self.assertIn(
+                    "MYSQL_NO_TRUNCATE_TRIGGER",
+                    str(limitation_warnings[0].message),
+                )
+                self.assertEqual(
+                    {lim.code for lim in plan.limitations},
+                    {"MYSQL_NO_TRUNCATE_TRIGGER"},
+                )
+            else:
+                plan = manager.register_view(view_sql)
+            self.assertEqual(plan.view_name, view_name)
+            conn.commit()
+
+            def assert_live_equivalence(label: str) -> None:
+                cursor.execute(
+                    f"SELECT grp, variance, deviation FROM {view_name} ORDER BY grp"
+                )
+                actual = [tuple(row) for row in cursor.fetchall()]
+                cursor.execute(
+                    f"SELECT grp, VARIANCE(value), STDDEV(value) "
+                    f"FROM {table_name} GROUP BY grp ORDER BY grp"
+                )
+                expected = [tuple(row) for row in cursor.fetchall()]
+                self.assertEqual(actual, expected, label)
+                singleton_rows = [row for row in expected if row[0] == "C"]
+                self.assertEqual(len(singleton_rows), 1, f"{label}: singleton group disappeared")
+                if dialect == Dialect.POSTGRES:
+                    self.assertIsNone(singleton_rows[0][1], f"{label}: PostgreSQL VARIANCE must be sample variance")
+                    self.assertIsNone(singleton_rows[0][2], f"{label}: PostgreSQL STDDEV must be sample stddev")
+                else:
+                    self.assertEqual(singleton_rows[0][1:], (0, 0), f"{label}: MySQL/MariaDB aliases must be population statistics")
+                for actual_row, expected_row in zip(actual, expected):
+                    self.assertEqual(
+                        tuple(type(value) for value in actual_row),
+                        tuple(type(value) for value in expected_row),
+                        f"{label}: native result types changed",
+                    )
+
+            assert_live_equivalence("initial population")
+            cursor.execute(
+                f"INSERT INTO {table_name} (id, grp, value) VALUES (%s, %s, %s)",
+                (7, "A", 9),
+            )
+            conn.commit()
+            assert_live_equivalence("insert maintenance")
+
+            cursor.execute(
+                f"UPDATE {table_name} SET value = %s WHERE id = %s", (17, 2)
+            )
+            conn.commit()
+            assert_live_equivalence("update maintenance")
+
+            cursor.execute(f"DELETE FROM {table_name} WHERE id = %s", (1,))
+            conn.commit()
+            assert_live_equivalence("delete maintenance")
+
+            cursor.execute("BEGIN;")
+            cursor.execute(
+                f"INSERT INTO {table_name} (id, grp, value) VALUES (%s, %s, %s)",
+                (8, "D", 101),
+            )
+            cursor.execute(
+                f"UPDATE {table_name} SET value = %s WHERE id = %s", (999, 4)
+            )
+            conn.rollback()
+            assert_live_equivalence("rollback maintenance")
+        finally:
+            try:
+                conn.rollback()
+                if manager is not None:
+                    try:
+                        manager.drop_view(view_name)
+                    except Exception:
+                        pass
+                cleanup = conn.cursor()
+                if dialect == Dialect.POSTGRES:
+                    cleanup.execute("SET search_path TO public;")
+                    if schema_created:
+                        cleanup.execute(
+                            f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE;'
+                        )
+                else:
+                    cleanup.execute(f"DROP TABLE IF EXISTS {table_name};")
+                conn.commit()
+                cleanup.close()
+            except Exception:
+                conn.rollback()
+            cursor.close()
+            conn.close()
+
+    def test_native_statistical_aliases_match_live_engine_after_dml(self) -> None:
+        dsn_by_dialect = (
+            (Dialect.POSTGRES, os.environ.get("POSTGRES_DSN")),
+            (Dialect.MYSQL, os.environ.get("MYSQL_DSN")),
+        )
+        configured = [(dialect, dsn) for dialect, dsn in dsn_by_dialect if dsn]
+        if not configured:
+            self.skipTest("POSTGRES_DSN and MYSQL_DSN are not set; native alias tests only")
+        for dialect, dsn in configured:
+            with self.subTest(dialect=dialect.value):
+                self._assert_native_statistical_alias_maintenance(dialect, dsn)
 
     def test_23_statistical_delta_triggers_recompute_native_aggregates(self) -> None:
         single_schema = """
