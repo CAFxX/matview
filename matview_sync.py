@@ -4265,7 +4265,13 @@ class IncrementalViewCompiler:
                 scale = min(self._max_decimal_scale(), scale)
                 return min(65, max(scale, precision)), scale
             if kind == "Distinct":
-                expressions = list(node.iter_expressions())
+                # SQLGlot versions represent DISTINCT arguments either in
+                # the this field or in expressions. SUM(DISTINCT column) must
+                # retain the argument exact scale in either AST shape.
+                distinct_value = node.args.get("this")
+                if distinct_value is not None:
+                    return infer(distinct_value)
+                expressions = list(node.args.get("expressions") or ())
                 if len(expressions) == 1:
                     return infer(expressions[0])
                 values = [infer(child) for child in expressions]
@@ -4540,11 +4546,6 @@ class IncrementalViewCompiler:
                         except (sqlglot.errors.SqlglotError, AttributeError, TypeError):
                             pass
                     return self._normalize_dialect_type(c_inner.data_type)
-            if self.dialect == Dialect.MYSQL:
-                exact_expression_type = self._exact_numeric_precision_scale(item.raw_expr)
-                if exact_expression_type is not None:
-                    precision, scale = exact_expression_type
-                    return f"DECIMAL({precision}, {scale})"
             m_win_col = re.match(
                 r'^(?:LAG|LEAD|FIRST_VALUE|LAST_VALUE|NTH_VALUE)\s*\(\s*([A-Za-z0-9_."`\[\]]+)',
                 item.raw_expr.strip(),
@@ -4574,6 +4575,11 @@ class IncrementalViewCompiler:
                             return "BIGINT"
                         return "DECIMAL(65, 0)" if self.dialect == Dialect.MYSQL else "NUMERIC"
                     return self._float_type() if any("." in nb for nb in num_branches) else self._int_type()
+            if self.dialect == Dialect.MYSQL:
+                exact_expression_type = self._exact_numeric_precision_scale(item.raw_expr)
+                if exact_expression_type is not None:
+                    precision, scale = exact_expression_type
+                    return f"DECIMAL({precision}, {scale})"
             if re.match(r"^(?:ROW_NUMBER|RANK|DENSE_RANK|NTILE|COUNT|LENGTH|CHAR_LENGTH|INSTR)\s*\(", raw_u):
                 return self._int_type()
             if re.match(r"^(?:PERCENT_RANK|CUME_DIST|AVG|SUM|TOTAL|ROUND|ABS)\s*\(", raw_u):
