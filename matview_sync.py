@@ -10159,8 +10159,20 @@ class MaterializedViewManager:
             or (isinstance(connection_dialect_name, str) and "postgres" in connection_dialect_name.lower())
             or any(name in connection_module for name in ("psycopg", "pg8000", "asyncpg", "postgres", "pgsql"))
         )
+        mysql_candidate = (
+            hint_d == Dialect.MYSQL
+            or (isinstance(connection_dialect_name, str) and any(
+                token in connection_dialect_name.lower() for token in ("mysql", "maria")
+            ))
+            or any(name in connection_module for name in ("pymysql", "mysql", "mariadb", "mysqldb"))
+        )
         if postgres_candidate:
             self._require_idle_postgres_connection(self.conn)
+        elif mysql_candidate:
+            # Version detection and catalog setup issue SQL and the latter
+            # executes DDL/COMMIT. MySQL DDL can implicitly commit caller work,
+            # so reject an active transaction before touching the connection.
+            self._require_idle_mysql_connection(self.conn)
 
         if engine_version is not None:
             self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
@@ -10286,6 +10298,35 @@ class MaterializedViewManager:
             raise RuntimeError(
                 "PostgreSQL manager initialization cannot run inside an active caller "
                 "transaction; commit or roll back that transaction first"
+            )
+
+    @staticmethod
+    def _require_idle_mysql_connection(conn: Any) -> None:
+        """Fail closed unless a MySQL/MariaDB connection is outside a transaction."""
+        state = getattr(conn, "in_transaction", None)
+        if callable(state):
+            try:
+                state = state()
+            except Exception:
+                state = None
+        if not isinstance(state, bool):
+            # PyMySQL and mysqlclient expose the protocol SERVER_STATUS_IN_TRANS
+            # bit in server_status. Its value is 1 across MySQL and MariaDB.
+            status = getattr(conn, "server_status", None)
+            if status is None:
+                status = getattr(conn, "_server_status", None)
+            if isinstance(status, int):
+                state = bool(status & 0x0001)
+        if not isinstance(state, bool):
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization requires an adapter that "
+                "exposes transaction state; cannot safely determine whether "
+                "catalog initialization would commit caller work"
+            )
+        if state:
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization cannot run inside an active "
+                "caller transaction; commit or roll back that transaction first"
             )
 
     def _assert_registration_transaction_ownership(self) -> None:
