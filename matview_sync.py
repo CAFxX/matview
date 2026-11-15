@@ -10973,6 +10973,12 @@ class MaterializedViewManager:
         must have autocommit disabled, and must not already be inside a transaction. The context
         commits its own work, while MySQL DDL can implicitly commit even when the context fails.
         """
+        if self.dialect == Dialect.MYSQL and getattr(self, "_mysql_bulk_connection_unsafe", False):
+            raise RuntimeError(
+                "this manager's MySQL connection was previously left with an unknown "
+                "trigger-bypass session state; discard the connection before reuse"
+            )
+
         # MySQL DDL implicitly commits. More generally, this context manager
         # owns the transaction it commits/rolls back, so it must never enter
         # while the application already has an open transaction. Check before
