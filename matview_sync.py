@@ -10969,15 +10969,14 @@ class MaterializedViewManager:
         on PostgreSQL, `SET @__matview_skip_triggers = 1` on MySQL) so triggers are never dropped
         globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
         optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
-        On MySQL/MariaDB, the connection must expose reliable transaction and autocommit state,
-        must have autocommit disabled, and must not already be inside a transaction. The context
-        commits its own work, while MySQL DDL can implicitly commit even when the context fails.
+        On MySQL/MariaDB, the connection must expose reliable transaction and autocommit state
+        and have autocommit disabled. The DML-only path uses a savepoint: it commits a transaction
+        it starts itself, but leaves a caller-owned transaction open and rollback-able by the caller.
+        MySQL DDL paths are rejected because DDL can implicitly commit even when the context fails.
         """
-        # MySQL DDL implicitly commits. More generally, this context manager
-        # owns the transaction it commits/rolls back, so it must never enter
-        # while the application already has an open transaction. Check before
-        # get_catalog(): its SELECT can itself start a transaction on DB-API
-        # connections configured with autocommit disabled.
+        # MySQL DDL implicitly commits. Check transaction state before
+        # get_catalog(): its SELECT can itself start a DB-API transaction.
+        mysql_caller_transaction = False
         if self.dialect == Dialect.MYSQL:
             tx_state = self._mysql_transaction_state()
             if tx_state is None:
@@ -10986,11 +10985,7 @@ class MaterializedViewManager:
                     "that exposes in_transaction or the MySQL server_status bitmask; "
                     "cannot safely determine whether caller work would be committed"
                 )
-            if tx_state:
-                raise RuntimeError(
-                    "bulk_changes() on MySQL/MariaDB cannot run inside an active "
-                    "caller transaction; commit or roll back that transaction first"
-                )
+            mysql_caller_transaction = tx_state
             autocommit = self._mysql_autocommit_state()
             if autocommit is None:
                 raise RuntimeError(
@@ -11020,8 +11015,14 @@ class MaterializedViewManager:
         try:
             cur.execute("SAVEPOINT __mv_bulk_sp;")
             sp_active = True
-        except Exception:
-            pass
+        except Exception as exc:
+            if self.dialect == Dialect.MYSQL:
+                if not mysql_caller_transaction:
+                    self._rollback()
+                raise RuntimeError(
+                    "bulk_changes() on MySQL/MariaDB requires SAVEPOINT support "
+                    "to preserve transaction rollback semantics"
+                ) from exc
 
         session_bypass_ok = False
         if self.dialect == Dialect.POSTGRES and not drop_triggers:
@@ -11047,7 +11048,15 @@ class MaterializedViewManager:
                 cur.execute("SET @__matview_skip_triggers = 0;")
             except Exception:
                 pass
-            self._rollback()
+            if sp_active:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                except Exception:
+                    if not mysql_caller_transaction:
+                        self._rollback()
+            if not mysql_caller_transaction:
+                self._rollback()
             raise RuntimeError(
                 "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
                 "the trigger-DDL fallback is unsafe because MySQL implicitly commits DDL"
@@ -11073,25 +11082,25 @@ class MaterializedViewManager:
                     cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
                     cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
                 except Exception:
-                    self._rollback()
-            else:
+                    if self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
+                        self._rollback()
+            elif self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
                 self._rollback()
             if self.dialect == Dialect.POSTGRES:
                 try:
                     cur.execute("SET LOCAL matview.skip_triggers = 'off';")
                 except Exception:
                     pass
-            elif self.dialect == Dialect.MYSQL:
+            elif self.dialect == Dialect.MYSQL and session_bypass_ok:
                 try:
                     cur.execute("SET @__matview_skip_triggers = 0;")
                 except Exception:
                     pass
             if self.dialect == Dialect.MYSQL:
-                # The MySQL path is guaranteed to use the session-local bypass
-                # (and no DDL). Roll back the complete context-owned transaction;
-                # recreating triggers here would implicitly commit and is neither
-                # necessary nor safe.
-                self._rollback()
+                # A caller-owned transaction is rolled back only to our
+                # savepoint; a context-owned transaction is fully rolled back.
+                if not mysql_caller_transaction:
+                    self._rollback()
                 raise
 
             schemas = self.fetch_schema()
@@ -11199,17 +11208,28 @@ class MaterializedViewManager:
                         cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
                     except Exception:
                         pass
-                self._commit()
+                if self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
+                    self._commit()
 
             except Exception:
                 if self.dialect == Dialect.MYSQL:
                     # Failures during post-yield refresh work are still part of
-                    # this context. Do not leak a partially applied transaction.
-                    try:
-                        cur.execute("SET @__matview_skip_triggers = 0;")
-                    except Exception:
-                        pass
-                    self._rollback()
+                    # this context. Roll back only our savepoint when the caller
+                    # owns the surrounding transaction.
+                    if session_bypass_ok:
+                        try:
+                            cur.execute("SET @__matview_skip_triggers = 0;")
+                        except Exception:
+                            pass
+                    if sp_active:
+                        try:
+                            cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                            cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                        except Exception:
+                            if not mysql_caller_transaction:
+                                self._rollback()
+                    if not mysql_caller_transaction:
+                        self._rollback()
                 raise
 
 
