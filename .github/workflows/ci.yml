@@ -169,8 +169,10 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
 
-      - name: Verify SQLite library version
-        run: python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
+      - name: Verify actual SQLite runtime and minimum feature boundaries
+        env:
+          EXPECTED_SQLITE_MIN_VERSION: "3.25.0"
+        run: python3 verify_engine_matrix.py
 
       - name: Run full test suite (SQLite + cross-dialect transpiled suites)
         env:

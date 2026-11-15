@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 from urllib.parse import urlparse
 
 
@@ -48,6 +49,55 @@ def verify_postgres() -> None:
                     )
 
     print(f"[NATIVE ENGINE VERIFIED] PostgreSQL major={major}; server={version_text}")
+
+
+def _version_tuple(version: str) -> tuple[int, int, int]:
+    match = re.match(r"^(\\d+)\\.(\\d+)\\.(\\d+)", version)
+    if not match:
+        raise RuntimeError(f"cannot parse SQLite runtime version: {version!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+def verify_sqlite() -> None:
+    """Verify the actual linked SQLite library, not Python's version or a simulated target."""
+    runtime = sqlite3.sqlite_version
+    runtime_tuple = _version_tuple(runtime)
+    expected_min = os.environ.get("EXPECTED_SQLITE_MIN_VERSION", "3.25.0")
+    expected_tuple = _version_tuple(expected_min)
+    if runtime_tuple < expected_tuple:
+        raise RuntimeError(
+            f"SQLite runtime {runtime} is below the supported minimum {expected_min}"
+        )
+
+    # Probe the actual runtime for the syntax/features whose version gates the
+    # compiler relies on. These execute against the linked SQLite library.
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE feature_probe (id INTEGER PRIMARY KEY, value INTEGER)")
+        conn.execute("INSERT INTO feature_probe VALUES (1, 10)")
+        conn.execute(
+            "INSERT INTO feature_probe VALUES (1, 20) "
+            "ON CONFLICT(id) DO UPDATE SET value = excluded.value"
+        )
+        upsert_value = conn.execute("SELECT value FROM feature_probe WHERE id = 1").fetchone()[0]
+        if upsert_value != 20:
+            raise RuntimeError(f"SQLite UPSERT runtime probe returned {upsert_value!r}, expected 20")
+        window_values = conn.execute(
+            "SELECT value, ROW_NUMBER() OVER (ORDER BY id) FROM feature_probe"
+        ).fetchall()
+        if window_values != [(20, 1)]:
+            raise RuntimeError(f"SQLite window-function runtime probe returned {window_values!r}")
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError(
+            f"SQLite {runtime} failed a required UPSERT/window-function runtime probe"
+        ) from exc
+    finally:
+        conn.close()
+
+    print(
+        f"[NATIVE ENGINE VERIFIED] SQLite runtime={runtime}; minimum={expected_min}; "
+        "UPSERT=pass; window-functions=pass"
+    )
 
 
 def _mysql_version_pair(version: str, product: str) -> tuple[int, int]:
@@ -128,4 +178,4 @@ if __name__ == "__main__":
     elif os.environ.get("MYSQL_DSN"):
         verify_mysql()
     else:
-        raise SystemExit("Set POSTGRES_DSN or MYSQL_DSN to verify a native database service.")
+        verify_sqlite()
