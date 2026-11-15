@@ -1101,6 +1101,9 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
         if dialect == Dialect.MYSQL and callable(getattr(conn, "begin", None)):
             conn.commit()
             conn.begin()
+            # This name deliberately matches the manager's old fixed
+            # savepoint name. bulk_changes() must not shadow caller savepoints.
+            cur.execute("SAVEPOINT __mv_bulk_sp;")
             cur.execute("INSERT INTO mgr_items VALUES (9, 'Z', 'caller_tx', 90);")
             with mgr.bulk_changes():
                 pass
@@ -1109,9 +1112,11 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
             )
             _verify_external_db_mv(cur, "v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:caller_tx_inside")
             _verify_external_db_mv(cur, "v_mgr_dist", q_dist, f"{dialect.value}:mgr:caller_tx_inside_dist")
-            conn.rollback()
+            # Rolling back to the caller's pre-existing savepoint must still
+            # work and undo both the base-table mutation and materialized data.
+            cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
             cur.execute("SELECT COUNT(*) FROM mgr_items WHERE id = 9;")
-            assert int(cur.fetchone()[0]) == 0, "caller rollback did not undo base-table DML"
+            assert int(cur.fetchone()[0]) == 0, "caller savepoint rollback did not undo base-table DML"
             _verify_external_db_mv(cur, "v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:caller_tx_rollback")
             _verify_external_db_mv(cur, "v_mgr_dist", q_dist, f"{dialect.value}:mgr:caller_tx_rollback_dist")
             checks += 4
