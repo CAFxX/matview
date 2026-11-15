@@ -10660,6 +10660,9 @@ class MaterializedViewManager:
                     )
 
                 # SQLite and PostgreSQL support transactional DDL.
+                sqlite_writer_reserved = reserve_sqlite_writer()
+                self.drop_view(plan.view_name, _commit_transaction=False)
+
             # Reserve before the first structure/trigger DDL on new registrations.
             # For SQLite this also closes the trigger-installation/backfill writer
             # race. For transactional replacement the reservation was taken before
