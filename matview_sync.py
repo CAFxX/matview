@@ -10158,7 +10158,7 @@ class MaterializedViewManager:
             if engine_version is not None
             else None
         )
-        effective_hint_dialect = hint_d or explicit_engine_dialect
+        effective_hint_dialect = explicit_engine_dialect or hint_d
 
         connection_module = (
             f"{type(self.conn).__module__}.{type(self.conn).__qualname__}".lower()
