@@ -330,6 +330,7 @@ class MatviewStatefulMachine(hs.RuleBasedStateMachine):
     @hs.rule()
     def rebuild_views(self) -> None:
         self.mgr.repair_view()
+        self.catalog = self.mgr.get_catalog()
 
     # --- Transaction ROLLBACK vs COMMIT Rules ---
 
