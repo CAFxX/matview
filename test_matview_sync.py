@@ -4087,6 +4087,89 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         getter_mgr = make_manager(GetterConnection())
         self.assertIs(getter_mgr._mysql_autocommit_state(), False)
 
+    def test_00a_mysql_bulk_changes_never_uses_implicit_commit_ddl(self) -> None:
+        class Cursor:
+            def __init__(self, fail_bypass: bool = False) -> None:
+                self.statements: List[str] = []
+                self.fail_bypass = fail_bypass
+
+            def execute(self, statement: str) -> None:
+                self.statements.append(statement)
+                if self.fail_bypass and statement == "SET @__matview_skip_triggers = 1;":
+                    raise RuntimeError("session variables unavailable")
+
+        class Connection:
+            in_transaction = False
+            autocommit = False
+
+            def __init__(self, cursor: Cursor) -> None:
+                self._cursor = cursor
+                self.rollback_calls = 0
+                self.commit_calls = 0
+
+            def cursor(self) -> Cursor:
+                return self._cursor
+
+            def rollback(self) -> None:
+                self.rollback_calls += 1
+
+            def commit(self) -> None:
+                self.commit_calls += 1
+
+        entry = {
+            "function_names": [],
+            "trigger_names": ["__matview_trigger_v"],
+            "view_sql": "CREATE VIEW v AS SELECT id FROM t",
+        }
+
+        def make_manager(conn: Connection) -> MaterializedViewManager:
+            mgr = MaterializedViewManager.__new__(MaterializedViewManager)
+            mgr.conn = conn
+            mgr.dialect = Dialect.MYSQL
+            mgr.get_catalog = lambda: {"v": entry}
+            return mgr
+
+        # Explicit DDL options must fail before even reading the catalog.
+        for options in ({"drop_triggers": True}, {"use_shadow_swap": True}):
+            cursor = Cursor()
+            conn = Connection(cursor)
+            mgr = make_manager(conn)
+            mgr.get_catalog = lambda: self.fail("unsafe option must fail before catalog access")
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(RuntimeError, "implicitly commits"):
+                    with mgr.bulk_changes(**options):
+                        self.fail("unsafe MySQL DDL option must be rejected")
+            self.assertEqual(cursor.statements, [])
+            self.assertEqual(conn.rollback_calls, 0)
+
+        # If the session-local bypass is unavailable, reject before the
+        # DROP TRIGGER fallback and roll back the context-owned transaction.
+        cursor = Cursor(fail_bypass=True)
+        conn = Connection(cursor)
+        mgr = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "requires session trigger bypass"):
+            with mgr.bulk_changes():
+                self.fail("unsafe trigger-DDL fallback must be rejected")
+        self.assertFalse(any("DROP TRIGGER" in sql for sql in cursor.statements))
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
+
+        # On failure after entry, the session flag is reset and the complete
+        # transaction is rolled back. No trigger DDL or schema regeneration
+        # may occur in the exception path.
+        cursor = Cursor()
+        conn = Connection(cursor)
+        mgr = make_manager(conn)
+        mgr.fetch_schema = lambda: self.fail("MySQL exception cleanup must not regenerate DDL")
+        with self.assertRaisesRegex(ValueError, "intentional failure"):
+            with mgr.bulk_changes():
+                raise ValueError("intentional failure")
+        self.assertIn("ROLLBACK TO SAVEPOINT __mv_bulk_sp;", cursor.statements)
+        self.assertIn("SET @__matview_skip_triggers = 0;", cursor.statements)
+        self.assertFalse(any("DROP TRIGGER" in sql or sql.startswith("CREATE TRIGGER") for sql in cursor.statements))
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
+
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
