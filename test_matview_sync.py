@@ -4767,23 +4767,25 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
 
     def test_scalar_expression_storage_types_match_native_engines(self) -> None:
         pg_schema = parse_table_schema(
-            "CREATE TABLE sales (qty INTEGER PRIMARY KEY, amount NUMERIC(12, 2));"
+            "CREATE TABLE sales (qty INTEGER PRIMARY KEY, wide_qty BIGINT NOT NULL, "
+            "exact_qty NUMERIC(12, 2) NOT NULL, amount NUMERIC(12, 2));"
         )
         pg_view = parse_view_definition(
             "CREATE VIEW parity_stats AS SELECT qty % 2 AS parity, "
-            "SUM(amount) AS total FROM sales GROUP BY qty % 2;",
+            "wide_qty % 2 AS wide_parity, exact_qty % 2.0 AS decimal_parity, "
+            "SUM(amount) AS total FROM sales "
+            "GROUP BY qty % 2, wide_qty % 2, exact_qty % 2.0;",
             known_tables={name.lower() for name in pg_schema},
         )
         pg_compiler = IncrementalViewCompiler(
             pg_schema, pg_view, dialect=Dialect.POSTGRES
         )
-        parity_item = next(
-            item for item in pg_compiler.view.select_items if item.alias == "parity"
-        )
-        # PostgreSQL's INTEGER % INTEGER operator returns INTEGER, not BIGINT.
-        self.assertEqual(
-            pg_compiler._infer_expr_storage_type(parity_item), "INTEGER"
-        )
+        pg_items = {item.alias: item for item in pg_compiler.view.select_items}
+        # PostgreSQL resolves the modulo result from the native operand types:
+        # INTEGER stays INTEGER, BIGINT stays BIGINT, and NUMERIC stays NUMERIC.
+        self.assertEqual(pg_compiler._infer_expr_storage_type(pg_items["parity"]), "INTEGER")
+        self.assertEqual(pg_compiler._infer_expr_storage_type(pg_items["wide_parity"]), "BIGINT")
+        self.assertEqual(pg_compiler._infer_expr_storage_type(pg_items["decimal_parity"]), "NUMERIC")
 
         mysql_schema = parse_table_schema(
             "CREATE TABLE events (id INTEGER PRIMARY KEY, tenant INTEGER NOT NULL, "
