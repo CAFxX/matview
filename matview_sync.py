@@ -10974,7 +10974,10 @@ class MaterializedViewManager:
         it starts itself, but leaves a caller-owned transaction open and rollback-able by the caller.
         MySQL DDL paths are rejected because DDL can implicitly commit even when the context fails.
         """
-        if self.dialect == Dialect.MYSQL and getattr(self, "_mysql_bulk_connection_unsafe", False):
+        if self.dialect == Dialect.MYSQL and (
+            getattr(self, "_mysql_bulk_connection_unsafe", False)
+            or getattr(self.conn, "_matview_bulk_connection_unsafe", False)
+        ):
             raise RuntimeError(
                 "this manager's MySQL connection was previously left with an unknown "
                 "trigger-bypass session state; discard the connection before reuse"
@@ -11029,6 +11032,12 @@ class MaterializedViewManager:
                 # MySQL user variables are session-scoped, not transactional.
                 # A rollback cannot repair an unknown bypass state.
                 self._mysql_bulk_connection_unsafe = True
+                try:
+                    setattr(self.conn, "_matview_bulk_connection_unsafe", True)
+                except Exception:
+                    # Some C-extension DB-API connections reject custom attributes;
+                    # the manager flag and raised discard signal still apply.
+                    pass
                 error = RuntimeError(
                     "failed to clear the MySQL materialized-view trigger-bypass "
                     "session variable; the connection state is unsafe and the "
