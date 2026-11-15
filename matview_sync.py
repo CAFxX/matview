@@ -11058,10 +11058,11 @@ class MaterializedViewManager:
             # weakening the context manager's rollback guarantee. Clear the
             # session variable defensively in case the failed SET reached the
             # server but its response was lost.
+            bypass_reset_error = None
             try:
                 cur.execute("SET @__matview_skip_triggers = 0;")
-            except Exception:
-                pass
+            except Exception as reset_exc:
+                bypass_reset_error = reset_exc
             if sp_active:
                 try:
                     cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
@@ -11071,6 +11072,11 @@ class MaterializedViewManager:
                         self._rollback()
             if not mysql_caller_transaction:
                 self._rollback()
+            if bypass_reset_error is not None:
+                raise RuntimeError(
+                    "bulk_changes() could not establish or clear the MySQL/MariaDB "
+                    "session trigger-bypass flag; discard this connection before reuse"
+                ) from bypass_reset_error
             raise RuntimeError(
                 "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
                 "the trigger-DDL fallback is unsafe because MySQL implicitly commits DDL"
@@ -11090,7 +11096,7 @@ class MaterializedViewManager:
         # so the trigger suspension and bulk DML remain isolated inside the savepoint!
         try:
             yield
-        except Exception:
+        except Exception as original_exc:
             if sp_active:
                 try:
                     cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
@@ -11108,8 +11114,14 @@ class MaterializedViewManager:
             elif self.dialect == Dialect.MYSQL and session_bypass_ok:
                 try:
                     cur.execute("SET @__matview_skip_triggers = 0;")
-                except Exception:
-                    pass
+                except Exception as reset_exc:
+                    if not mysql_caller_transaction:
+                        self._rollback()
+                    raise RuntimeError(
+                        "bulk_changes() rolled back its DML but could not clear the "
+                        "MySQL/MariaDB session trigger-bypass flag; discard this connection "
+                        f"before reuse (original error: {original_exc!r})"
+                    ) from reset_exc
             if self.dialect == Dialect.MYSQL:
                 # A caller-owned transaction is rolled back only to our
                 # savepoint; a context-owned transaction is fully rolled back.
@@ -11226,16 +11238,17 @@ class MaterializedViewManager:
                 if self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
                     self._commit()
 
-            except Exception:
+            except Exception as original_exc:
                 if self.dialect == Dialect.MYSQL:
                     # Failures during post-yield refresh work are still part of
                     # this context. Roll back only our savepoint when the caller
                     # owns the surrounding transaction.
+                    reset_error = None
                     if session_bypass_ok:
                         try:
                             cur.execute("SET @__matview_skip_triggers = 0;")
-                        except Exception:
-                            pass
+                        except Exception as reset_exc:
+                            reset_error = reset_exc
                     if sp_active:
                         try:
                             cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
@@ -11245,6 +11258,12 @@ class MaterializedViewManager:
                                 self._rollback()
                     if not mysql_caller_transaction:
                         self._rollback()
+                    if reset_error is not None:
+                        raise RuntimeError(
+                            "bulk_changes() rolled back its DML but could not clear the "
+                            "MySQL/MariaDB session trigger-bypass flag; discard this connection "
+                            f"before reuse (original error: {original_exc!r})"
+                        ) from reset_error
                 raise
 
 
