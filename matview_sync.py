@@ -12598,15 +12598,13 @@ class MaterializedViewManager:
 
     def _query_lower_name_set(self, sql: str) -> Optional[Set[str]]:
         """Execute a metadata query returning lowercase object names, or None if unavailable."""
-        cur = self.conn.cursor()
         try:
-            cur.execute(sql)
-            return {row[0].lower() for row in cur.fetchall() if row[0]}
+            with self._cursor() as cur:
+                cur.execute(sql)
+                return {row[0].lower() for row in cur.fetchall() if row[0]}
         except Exception:
             self._rollback()
             return None
-        finally:
-            cur.close()
 
     def _get_live_table_names(self) -> Optional[Set[str]]:
         if self.dialect == Dialect.SQLITE:
@@ -12822,22 +12820,26 @@ class MaterializedViewManager:
                     )
 
                     status = "REPLACE" if needs_replace else "ALTER"
+                    live_trigs_for_cmp = live_triggers if live_triggers is not None else cat_trigs_lower
                     to_create_trigs = [
                         t
                         for t in plan.trigger_names
-                        if needs_replace
-                        or t.lower() not in cat_trigs_lower
-                        or (live_triggers is not None and t.lower() not in live_triggers)
+                        if needs_replace or t.lower() not in cat_trigs_lower or t.lower() not in live_trigs_for_cmp
                     ]
                     to_drop_trigs = (
                         list(cat_trigs)
                         if needs_replace
                         else [t for t in cat_trigs if t.lower() not in plan_trigs_lower]
                     )
+                    to_create_lower = {t.lower() for t in to_create_trigs}
                     unchanged_trigs = (
                         []
                         if needs_replace
-                        else [t for t in plan.trigger_names if t not in to_create_trigs]
+                        else [
+                            t
+                            for t in plan.trigger_names
+                            if t.lower() in cat_trigs_lower and t.lower() not in to_create_lower
+                        ]
                     )
 
                     reader_action = "REPLACE" if needs_replace else ("CREATE" if not view_exists else "KEEP")
@@ -12871,25 +12873,40 @@ class MaterializedViewManager:
                         summary = f"View '{v_name}' query, schema, or strategy changed; pending REPLACE."
                     else:
                         trig_patterns = [
-                            re.compile(rf"(?:^|[^A-Za-z0-9_]){re.escape(t)}(?:$|[^A-Za-z0-9_])", re.IGNORECASE)
+                            re.compile(rf"(?<![A-Za-z0-9_]){re.escape(t)}(?![A-Za-z0-9_])", re.IGNORECASE)
                             for t in to_create_trigs
                         ]
-                        alter_trig_ddls = [
-                            s
-                            for s in plan.trigger_ddls
-                            if any(p.search(s) for p in trig_patterns)
-                            or (
-                                to_create_trigs
-                                and self.dialect == Dialect.POSTGRES
-                                and s.lstrip().upper().startswith("CREATE OR REPLACE FUNCTION")
+                        needed_fn_names: Set[str] = set()
+                        matched_trig_ddls: List[str] = []
+                        for stmt in plan.trigger_ddls:
+                            if any(p.search(stmt) for p in trig_patterns):
+                                matched_trig_ddls.append(stmt)
+                                fn_m = re.search(
+                                    r"\bEXECUTE\s+(?:FUNCTION|PROCEDURE)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                                    stmt,
+                                    re.IGNORECASE,
+                                )
+                                if fn_m:
+                                    needed_fn_names.add(fn_m.group(1).lower())
+                        fn_ddls = [
+                            stmt
+                            for stmt in plan.trigger_ddls
+                            if any(
+                                re.search(
+                                    rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:\"?{re.escape(fn)}\"?)\b",
+                                    stmt,
+                                    re.IGNORECASE,
+                                )
+                                for fn in needed_fn_names
                             )
+                            and stmt not in matched_trig_ddls
                         ]
                         view_repair_ddls = (
                             [plan.reader_view_ddl, *plan.readonly_trigger_ddls]
                             if not view_exists
                             else []
                         )
-                        pending_ddls = view_repair_ddls + alter_trig_ddls + list(plan.index_ddls)
+                        pending_ddls = view_repair_ddls + fn_ddls + matched_trig_ddls + list(plan.index_ddls)
                         summary = f"View '{v_name}' auxiliary objects changed; pending ALTER."
 
                     diffs[v_name] = ViewDiff(
