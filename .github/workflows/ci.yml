@@ -169,6 +169,9 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
 
+      - name: Test MySQL/MariaDB transaction-state guard adapters
+        run: python3 test_mysql_transaction_state_guard.py
+
       - name: Verify SQLite library version
         run: python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
 
@@ -391,6 +394,11 @@ jobs:
           MATVIEW_CI_ACTUAL_IMAGE: mysql:${{ matrix.mysql-version }}
         run: python3 verify_engine_matrix.py
 
+      - name: Test native MySQL constructor transaction ownership
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_mysql_constructor_transaction_ownership.py
+
       - name: Run full test suite + live MySQL ${{ matrix.mysql-version }} integration tests
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
@@ -480,6 +488,11 @@ jobs:
           MATVIEW_CI_REQUESTED_IMAGE: ${{ matrix.image }}
           MATVIEW_CI_ACTUAL_IMAGE: ${{ matrix.image }}
         run: python3 verify_engine_matrix.py
+
+      - name: Test native MariaDB constructor transaction ownership
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_mysql_constructor_transaction_ownership.py
 
       - name: Run full test suite + live ${{ matrix.label }} integration tests
         env:
