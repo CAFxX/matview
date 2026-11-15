@@ -116,7 +116,7 @@ def run_mutant(
         ):
             raise AssertionError(
                 f"mutant {name!r} was not killed by its designated regression "
-                f"{expected_id!r}; failures={sorted(failed_test_ids)}, "
+                f"{expected_suffix!r}; failures={sorted(failed_test_ids)}, "
                 f"errors={len(result.errors)}"
             )
         print(
