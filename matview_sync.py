@@ -11229,15 +11229,34 @@ class MaterializedViewManager:
             )
 
         if not session_bypass_ok:
-            for entry in targets:
-                if self.dialect == Dialect.POSTGRES:
-                    for fn_name in entry["function_names"]:
-                        if "fn_readonly_" not in fn_name:
-                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-                else:
-                    for t_name in entry["trigger_names"]:
-                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
-                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+            try:
+                for entry in targets:
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+            except Exception:
+                # Trigger DDL is transactional on SQLite/PostgreSQL and is
+                # protected by the savepoint established above. Restore the
+                # pre-suspension set if a later DROP in this loop fails.
+                if sp_active:
+                    try:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                        cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+                    except Exception:
+                        self._rollback()
+                if self.dialect == Dialect.SQLITE and sqlite_writer_reserved:
+                    self._rollback()
+                elif self.dialect == Dialect.POSTGRES:
+                    self._rollback()
+                elif self.dialect == Dialect.MYSQL and not mysql_caller_transaction:
+                    self._rollback()
+                close_cursor()
+                raise
         # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
         # so the trigger suspension and bulk DML remain isolated inside the savepoint!
         try:
