@@ -3446,6 +3446,7 @@ class IncrementalViewCompiler:
         view_spec: ViewSpec,
         dialect: Dialect | str | EngineVersion = Dialect.SQLITE,
         pg_use_transition_tables: bool = False,
+        pg_vectorize_transition_tables: bool = True,
         ignore_limitations: bool = False,
         object_prefix: str = DEFAULT_OBJECT_PREFIX,
         incremental_backfill: bool = False,
@@ -3473,6 +3474,7 @@ class IncrementalViewCompiler:
         self.pg_use_transition_tables = bool(
             pg_use_transition_tables and self.engine_version.supports_pg_transition_tables
         )
+        self.pg_vectorize_transition_tables = bool(pg_vectorize_transition_tables)
         self.ignore_limitations = ignore_limitations
         self.object_prefix = object_prefix
         self.incremental_backfill = incremental_backfill
@@ -6377,6 +6379,7 @@ class IncrementalViewCompiler:
                 view_spec=extra_v,
                 dialect=self.dialect,
                 pg_use_transition_tables=self.pg_use_transition_tables,
+                pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
                 ignore_limitations=self.ignore_limitations,
                 object_prefix=self.object_prefix,
                 incremental_backfill=self.incremental_backfill,
@@ -8311,6 +8314,585 @@ class IncrementalViewCompiler:
             )
         return stmt
 
+    def _build_tier1_vectorized_pg_bodies(
+        self,
+        mv_table: str,
+        base_t: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        try:
+            grp_exprs = self._effective_group_by_exprs
+            has_nullable_grp = self._has_nullable_group_col()
+            pk_cols = self._tier1_pk_cols()
+            q_pk_cols = [self._q(c) for c in pk_cols]
+            work_items = self._working_select_items
+
+            where_new_clause = self.view.where_clause
+            where_old_clause = self.view.where_clause
+            if self.watermark_catalog_table and self._alg_mode in ("single", "distinct"):
+                wm_pk_col = None
+                if self.primary_schema:
+                    for c_def in self.primary_schema.columns.values():
+                        if c_def.primary_key and "INT" in c_def.data_type.upper():
+                            wm_pk_col = c_def.name
+                            break
+                if wm_pk_col:
+                    q_pk = self._q(wm_pk_col)
+                    wm_new = (
+                        f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                        f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                        f"AND __mv_new_rows.{q_pk} > backfill_cursor_pk AND __mv_new_rows.{q_pk} <= backfill_max_pk)"
+                    )
+                    wm_old = (
+                        f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                        f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                        f"AND __mv_old_rows.{q_pk} > backfill_cursor_pk AND __mv_old_rows.{q_pk} <= backfill_max_pk)"
+                    )
+                    where_new_clause = f"({where_new_clause}) AND ({wm_new})" if where_new_clause else wm_new
+                    where_old_clause = f"({where_old_clause}) AND ({wm_old})" if where_old_clause else wm_old
+
+            w_new_cond = self._rewrite_expr_for_record(where_new_clause, "__mv_new_rows") if where_new_clause else None
+            w_old_cond = self._rewrite_expr_for_record(where_old_clause, "__mv_old_rows") if where_old_clause else None
+            w_new_sql = f"\n    WHERE {w_new_cond}" if w_new_cond else ""
+            w_old_sql = f"\n    WHERE {w_old_cond}" if w_old_cond else ""
+            w_new_and = f" AND ({w_new_cond})" if w_new_cond else ""
+            w_old_and = f" AND ({w_old_cond})" if w_old_cond else ""
+
+            if not grp_exprs:
+                rec_grp_new: List[str] = []
+                rec_grp_old: List[str] = []
+                grp_by_new_sql = ""
+                grp_by_old_sql = ""
+                grp_match_del = f"{mv_table}.__mv_global_id = __del.__mv_global_id"
+            else:
+                rec_grp_new = [self._rewrite_expr_for_record(g, "__mv_new_rows") for g in grp_exprs]
+                rec_grp_old = [self._rewrite_expr_for_record(g, "__mv_old_rows") for g in grp_exprs]
+                grp_by_new_sql = f"\n    GROUP BY {', '.join(rec_grp_new)}"
+                grp_by_old_sql = f"\n    GROUP BY {', '.join(rec_grp_old)}"
+                if has_nullable_grp:
+                    pk_new_val = self._canonical_group_pk_expr(rec_grp_new)
+                    pk_old_val = self._canonical_group_pk_expr(rec_grp_old)
+                    grp_match_del = f"{mv_table}.__mv_pk = __del.__mv_pk"
+                else:
+                    grp_match_del = " AND ".join(
+                        f"{mv_table}.{self._q(self._group_col_alias(g))} = __del.{self._q(self._group_col_alias(g))}"
+                        for g in grp_exprs
+                    )
+
+            # Build plus (upsert) statements
+            ins_cols: List[str] = []
+            ins_vals: List[str] = []
+            upd_assignments: List[str] = []
+            updated_cols: Set[str] = set()
+
+            if not grp_exprs:
+                ins_cols.append("__mv_global_id")
+                ins_vals.append("1 AS __mv_global_id")
+            elif has_nullable_grp:
+                ins_cols.append("__mv_pk")
+                ins_vals.append(f"{pk_new_val} AS __mv_pk")
+
+            for i, g_expr in enumerate(grp_exprs):
+                mv_col = self._group_col_alias(g_expr)
+                ins_cols.append(self._q(mv_col))
+                ins_vals.append(f"{rec_grp_new[i]} AS {self._q(mv_col)}")
+
+            ekey_to_item: Dict[str, SelectItem] = {
+                expr_key_fn(it): it for it in work_items if it.is_aggregate
+            }
+
+            for item in work_items:
+                if not item.is_aggregate:
+                    continue
+                col_alias = self._q(item.alias)
+                updated_cols.add(col_alias)
+                ekey = expr_key_fn(item)
+                val_e_new = self._effective_agg_value_expr(item, record_prefix="__mv_new_rows")
+                ins_cols.append(col_alias)
+
+                if item.agg_func == AggFunc.COUNT_STAR:
+                    if item.filter_where:
+                        fw = self._rewrite_expr_for_record(item.filter_where, "__mv_new_rows")
+                        ins_vals.append(f"COUNT(*) FILTER (WHERE {fw}) AS {col_alias}")
+                    else:
+                        ins_vals.append(f"COUNT(*) AS {col_alias}")
+                    upd_assignments.append(f"{col_alias} = {mv_table}.{col_alias} + EXCLUDED.{col_alias}")
+
+                elif item.agg_func == AggFunc.COUNT_COL:
+                    if item.is_distinct:
+                        ins_vals.append(f"0 AS {col_alias}")
+                        upd_assignments.append(f"{col_alias} = {mv_table}.{col_alias}")
+                    else:
+                        ins_vals.append(f"COUNT({val_e_new}) AS {col_alias}")
+                        upd_assignments.append(f"{col_alias} = {mv_table}.{col_alias} + EXCLUDED.{col_alias}")
+
+                elif item.agg_func == AggFunc.SUM:
+                    if item.is_distinct:
+                        ins_vals.append(f"0 AS {col_alias}")
+                        upd_assignments.append(f"{col_alias} = {mv_table}.{col_alias}")
+                    else:
+                        ins_vals.append(f"SUM({val_e_new}) AS {col_alias}")
+                        upd_assignments.append(
+                            f"{col_alias} = CASE WHEN {mv_table}.{col_alias} IS NULL THEN EXCLUDED.{col_alias} "
+                            f"WHEN EXCLUDED.{col_alias} IS NULL THEN {mv_table}.{col_alias} "
+                            f"ELSE {mv_table}.{col_alias} + EXCLUDED.{col_alias} END"
+                        )
+
+                elif item.agg_func == AggFunc.TOTAL:
+                    if item.is_distinct:
+                        ins_vals.append(f"0.0 AS {col_alias}")
+                        upd_assignments.append(f"{col_alias} = {mv_table}.{col_alias}")
+                    else:
+                        ins_vals.append(f"COALESCE(SUM(1.0 * ({val_e_new})), 0.0) AS {col_alias}")
+                        upd_assignments.append(
+                            f"{col_alias} = COALESCE({mv_table}.{col_alias}, 0.0) + COALESCE(EXCLUDED.{col_alias}, 0.0)"
+                        )
+
+                elif item.agg_func == AggFunc.MIN:
+                    ins_vals.append(f"MIN({val_e_new}) AS {col_alias}")
+                    upd_assignments.append(
+                        f"{col_alias} = CASE WHEN {mv_table}.{col_alias} IS NULL THEN EXCLUDED.{col_alias} "
+                        f"WHEN EXCLUDED.{col_alias} IS NULL THEN {mv_table}.{col_alias} "
+                        f"WHEN EXCLUDED.{col_alias} < {mv_table}.{col_alias} THEN EXCLUDED.{col_alias} "
+                        f"ELSE {mv_table}.{col_alias} END"
+                    )
+
+                elif item.agg_func == AggFunc.MAX:
+                    ins_vals.append(f"MAX({val_e_new}) AS {col_alias}")
+                    upd_assignments.append(
+                        f"{col_alias} = CASE WHEN {mv_table}.{col_alias} IS NULL THEN EXCLUDED.{col_alias} "
+                        f"WHEN EXCLUDED.{col_alias} IS NULL THEN {mv_table}.{col_alias} "
+                        f"WHEN EXCLUDED.{col_alias} > {mv_table}.{col_alias} THEN EXCLUDED.{col_alias} "
+                        f"ELSE {mv_table}.{col_alias} END"
+                    )
+
+                elif item.agg_func == AggFunc.AVG:
+                    if item.is_distinct:
+                        ins_vals.append(f"0 AS {col_alias}")
+                        upd_assignments.append(f"{col_alias} = {mv_table}.{col_alias}")
+                    elif self._requires_native_avg_recompute(item):
+                        ins_recomp = self._build_recompute_subquery_raw(item, "__mv_new_rows")
+                        ins_vals.append(f"{ins_recomp} AS {col_alias}")
+                        recomp = self._build_recompute_subquery_raw(item, mv_table)
+                        upd_assignments.append(f"{col_alias} = {recomp}")
+                    else:
+                        cnt_col = col_nonnull_count_map[ekey]
+                        sum_col = col_sum_map[ekey]
+                        ins_vals.append(
+                            f"(CASE WHEN COUNT({val_e_new}) = 0 THEN NULL "
+                            f"ELSE (1.0 * SUM({val_e_new})) / COUNT({val_e_new}) END) AS {col_alias}"
+                        )
+                        new_cnt = f"({mv_table}.{cnt_col} + EXCLUDED.{cnt_col})"
+                        new_sum = (
+                            f"(CASE WHEN {mv_table}.{sum_col} IS NULL THEN EXCLUDED.{sum_col} "
+                            f"WHEN EXCLUDED.{sum_col} IS NULL THEN {mv_table}.{sum_col} "
+                            f"ELSE {mv_table}.{sum_col} + EXCLUDED.{sum_col} END)"
+                        )
+                        upd_assignments.append(
+                            f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE (1.0 * {new_sum}) / {new_cnt} END"
+                        )
+
+                elif item.agg_func == AggFunc.BOOL_AND:
+                    cnt_col = col_nonnull_count_map[ekey]
+                    tcnt_col = col_true_cnt_map[ekey]
+                    ins_vals.append(
+                        f"(CASE WHEN COUNT({val_e_new}) = 0 THEN NULL "
+                        f"WHEN COUNT({val_e_new}) = COUNT(*) FILTER (WHERE ({val_e_new}) IS NOT NULL AND ({val_e_new})) THEN TRUE "
+                        f"ELSE FALSE END) AS {col_alias}"
+                    )
+                    new_cnt = f"({mv_table}.{cnt_col} + EXCLUDED.{cnt_col})"
+                    new_tcnt = f"({mv_table}.{tcnt_col} + EXCLUDED.{tcnt_col})"
+                    upd_assignments.append(
+                        f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL WHEN {new_cnt} = {new_tcnt} THEN TRUE ELSE FALSE END"
+                    )
+
+                elif item.agg_func == AggFunc.BOOL_OR:
+                    cnt_col = col_nonnull_count_map[ekey]
+                    ins_vals.append(
+                        f"(CASE WHEN COUNT({val_e_new}) = 0 THEN NULL "
+                        f"WHEN COUNT(*) FILTER (WHERE ({val_e_new}) IS NOT NULL AND ({val_e_new})) > 0 THEN TRUE "
+                        f"ELSE FALSE END) AS {col_alias}"
+                    )
+                    new_cnt = f"({mv_table}.{cnt_col} + EXCLUDED.{cnt_col})"
+                    upd_assignments.append(
+                        f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                        f"WHEN ({mv_table}.{col_true_cnt_map[ekey]} + EXCLUDED.{col_true_cnt_map[ekey]}) > 0 THEN TRUE ELSE FALSE END"
+                    )
+
+                elif item.agg_func in (AggFunc.BIT_AND, AggFunc.BIT_OR):
+                    fn = "BIT_AND" if item.agg_func == AggFunc.BIT_AND else "BIT_OR"
+                    op = "&" if item.agg_func == AggFunc.BIT_AND else "|"
+                    ins_vals.append(f"{fn}({val_e_new}) AS {col_alias}")
+                    upd_assignments.append(
+                        f"{col_alias} = CASE WHEN {mv_table}.{col_alias} IS NULL THEN EXCLUDED.{col_alias} "
+                        f"WHEN EXCLUDED.{col_alias} IS NULL THEN {mv_table}.{col_alias} "
+                        f"ELSE {mv_table}.{col_alias} {op} EXCLUDED.{col_alias} END"
+                    )
+
+                else:
+                    ins_recomp = self._build_recompute_subquery_raw(item, "__mv_new_rows")
+                    recomp = self._build_recompute_subquery_raw(item, mv_table)
+                    ins_vals.append(f"{ins_recomp} AS {col_alias}")
+                    upd_assignments.append(f"{col_alias} = {recomp}")
+
+            for ekey, cnt_col in col_nonnull_count_map.items():
+                if cnt_col not in updated_cols:
+                    it = ekey_to_item[ekey]
+                    ve = self._effective_agg_value_expr(it, record_prefix="__mv_new_rows")
+                    ins_cols.append(cnt_col)
+                    ins_vals.append(f"COUNT({ve}) AS {cnt_col}")
+                    upd_assignments.append(f"{cnt_col} = {mv_table}.{cnt_col} + EXCLUDED.{cnt_col}")
+                    updated_cols.add(cnt_col)
+
+            for ekey, sum_col in col_sum_map.items():
+                if sum_col not in updated_cols:
+                    it = ekey_to_item[ekey]
+                    ve = self._effective_agg_value_expr(it, record_prefix="__mv_new_rows")
+                    ins_cols.append(sum_col)
+                    ins_vals.append(f"SUM({ve}) AS {sum_col}")
+                    upd_assignments.append(
+                        f"{sum_col} = CASE WHEN {mv_table}.{sum_col} IS NULL THEN EXCLUDED.{sum_col} "
+                        f"WHEN EXCLUDED.{sum_col} IS NULL THEN {mv_table}.{sum_col} "
+                        f"ELSE {mv_table}.{sum_col} + EXCLUDED.{sum_col} END"
+                    )
+                    updated_cols.add(sum_col)
+
+            for ekey, sum2_col in col_sum2_map.items():
+                if sum2_col not in updated_cols:
+                    it = ekey_to_item[ekey]
+                    ve = self._effective_agg_value_expr(it, record_prefix="__mv_new_rows")
+                    ins_cols.append(sum2_col)
+                    ins_vals.append(f"SUM(({ve}) * ({ve})) AS {sum2_col}")
+                    upd_assignments.append(
+                        f"{sum2_col} = CASE WHEN {mv_table}.{sum2_col} IS NULL THEN EXCLUDED.{sum2_col} "
+                        f"WHEN EXCLUDED.{sum2_col} IS NULL THEN {mv_table}.{sum2_col} "
+                        f"ELSE {mv_table}.{sum2_col} + EXCLUDED.{sum2_col} END"
+                    )
+                    updated_cols.add(sum2_col)
+
+            for ekey, tcnt_col in col_true_cnt_map.items():
+                if tcnt_col not in updated_cols:
+                    it = ekey_to_item[ekey]
+                    ve = self._effective_agg_value_expr(it, record_prefix="__mv_new_rows")
+                    ins_cols.append(tcnt_col)
+                    ins_vals.append(f"COUNT(*) FILTER (WHERE ({ve}) IS NOT NULL AND ({ve})) AS {tcnt_col}")
+                    upd_assignments.append(f"{tcnt_col} = {mv_table}.{tcnt_col} + EXCLUDED.{tcnt_col}")
+                    updated_cols.add(tcnt_col)
+
+            q_row_count = self._q(row_count_col)
+            if q_row_count not in updated_cols:
+                ins_cols.append(q_row_count)
+                ins_vals.append(f"COUNT(*) AS {q_row_count}")
+                upd_assignments.append(f"{q_row_count} = {mv_table}.{q_row_count} + EXCLUDED.{q_row_count}")
+                updated_cols.add(q_row_count)
+
+            having_clause = "\n    HAVING COUNT(*) > 0" if not grp_exprs else ""
+            sep_upd = ",\n        "
+            upsert_plus_sql = (
+                f"INSERT INTO {mv_table} ({', '.join(ins_cols)})\n"
+                f"    SELECT {', '.join(ins_vals)}\n"
+                f"    FROM __mv_new_rows{w_new_sql}{grp_by_new_sql}{having_clause}\n"
+                f"    ON CONFLICT ({', '.join(q_pk_cols)}) DO UPDATE SET\n"
+                f"        {sep_upd.join(upd_assignments)};"
+            )
+
+            # Build minus (delta update) statements for __mv_old_rows
+            del_select_exprs: List[str] = []
+            del_updates: List[str] = []
+            del_updated_cols: Set[str] = set()
+
+            if not grp_exprs:
+                del_select_exprs.append("1 AS __mv_global_id")
+            elif has_nullable_grp:
+                del_select_exprs.append(f"{pk_old_val} AS __mv_pk")
+            else:
+                for i, g_expr in enumerate(grp_exprs):
+                    mv_col = self._group_col_alias(g_expr)
+                    del_select_exprs.append(f"{rec_grp_old[i]} AS {self._q(mv_col)}")
+
+            for item in work_items:
+                if not item.is_aggregate:
+                    continue
+                col_alias = self._q(item.alias)
+                del_updated_cols.add(col_alias)
+                ekey = expr_key_fn(item)
+                val_e_old = self._effective_agg_value_expr(item, record_prefix="__mv_old_rows")
+
+                if item.agg_func == AggFunc.COUNT_STAR:
+                    if item.filter_where:
+                        fw = self._rewrite_expr_for_record(item.filter_where, "__mv_old_rows")
+                        del_select_exprs.append(f"COUNT(*) FILTER (WHERE {fw}) AS {col_alias}")
+                    else:
+                        del_select_exprs.append(f"COUNT(*) AS {col_alias}")
+                    del_updates.append(f"{col_alias} = {mv_table}.{col_alias} - __del.{col_alias}")
+
+                elif item.agg_func == AggFunc.COUNT_COL:
+                    if not item.is_distinct:
+                        del_select_exprs.append(f"COUNT({val_e_old}) AS {col_alias}")
+                        del_updates.append(f"{col_alias} = {mv_table}.{col_alias} - __del.{col_alias}")
+
+                elif item.agg_func == AggFunc.SUM:
+                    if not item.is_distinct:
+                        cnt_col = col_nonnull_count_map[ekey]
+                        del_select_exprs.append(f"SUM({val_e_old}) AS {col_alias}")
+                        del_updates.append(
+                            f"{col_alias} = CASE WHEN ({mv_table}.{cnt_col} - __del.{cnt_col}) <= 0 THEN NULL "
+                            f"ELSE {mv_table}.{col_alias} - COALESCE(__del.{col_alias}, 0) END"
+                        )
+
+                elif item.agg_func == AggFunc.TOTAL:
+                    if not item.is_distinct:
+                        del_select_exprs.append(f"COALESCE(SUM(1.0 * ({val_e_old})), 0.0) AS {col_alias}")
+                        del_updates.append(f"{col_alias} = {mv_table}.{col_alias} - __del.{col_alias}")
+
+                elif item.agg_func == AggFunc.MIN:
+                    del_select_exprs.append(f"MIN({val_e_old}) AS {col_alias}")
+                    recomp = self._build_recompute_subquery_raw(item, mv_table)
+                    del_updates.append(
+                        f"{col_alias} = CASE WHEN __del.{col_alias} IS NOT NULL AND {mv_table}.{col_alias} >= __del.{col_alias} "
+                        f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
+                    )
+
+                elif item.agg_func == AggFunc.MAX:
+                    del_select_exprs.append(f"MAX({val_e_old}) AS {col_alias}")
+                    recomp = self._build_recompute_subquery_raw(item, mv_table)
+                    del_updates.append(
+                        f"{col_alias} = CASE WHEN __del.{col_alias} IS NOT NULL AND {mv_table}.{col_alias} <= __del.{col_alias} "
+                        f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
+                    )
+
+                elif item.agg_func == AggFunc.AVG:
+                    if not item.is_distinct:
+                        if self._requires_native_avg_recompute(item):
+                            recomp = self._build_recompute_subquery_raw(item, mv_table)
+                            del_updates.append(f"{col_alias} = {recomp}")
+                        else:
+                            cnt_col = col_nonnull_count_map[ekey]
+                            sum_col = col_sum_map[ekey]
+                            new_cnt = f"({mv_table}.{cnt_col} - __del.{cnt_col})"
+                            new_sum = f"({mv_table}.{sum_col} - COALESCE(__del.{sum_col}, 0))"
+                            del_updates.append(
+                                f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL ELSE (1.0 * {new_sum}) / {new_cnt} END"
+                            )
+
+                elif item.agg_func == AggFunc.BOOL_AND:
+                    cnt_col = col_nonnull_count_map[ekey]
+                    tcnt_col = col_true_cnt_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_col} - __del.{cnt_col})"
+                    new_tcnt = f"({mv_table}.{tcnt_col} - __del.{tcnt_col})"
+                    del_updates.append(
+                        f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL WHEN {new_cnt} = {new_tcnt} THEN TRUE ELSE FALSE END"
+                    )
+
+                elif item.agg_func == AggFunc.BOOL_OR:
+                    cnt_col = col_nonnull_count_map[ekey]
+                    tcnt_col = col_true_cnt_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_col} - __del.{cnt_col})"
+                    del_updates.append(
+                        f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                        f"WHEN ({mv_table}.{tcnt_col} - __del.{tcnt_col}) > 0 THEN TRUE ELSE FALSE END"
+                    )
+
+                else:
+                    recomp = self._build_recompute_subquery_raw(item, mv_table)
+                    del_updates.append(f"{col_alias} = {recomp}")
+
+            for ekey, cnt_col in col_nonnull_count_map.items():
+                if cnt_col not in del_updated_cols:
+                    it = ekey_to_item[ekey]
+                    ve = self._effective_agg_value_expr(it, record_prefix="__mv_old_rows")
+                    del_select_exprs.append(f"COUNT({ve}) AS {cnt_col}")
+                    del_updates.append(f"{cnt_col} = {mv_table}.{cnt_col} - __del.{cnt_col}")
+                    del_updated_cols.add(cnt_col)
+
+            for ekey, sum_col in col_sum_map.items():
+                if sum_col not in del_updated_cols:
+                    it = ekey_to_item[ekey]
+                    ve = self._effective_agg_value_expr(it, record_prefix="__mv_old_rows")
+                    del_select_exprs.append(f"SUM({ve}) AS {sum_col}")
+                    cnt_c = col_nonnull_count_map[ekey]
+                    del_updates.append(
+                        f"{sum_col} = CASE WHEN ({mv_table}.{cnt_c} - __del.{cnt_c}) <= 0 THEN NULL "
+                        f"ELSE {mv_table}.{sum_col} - COALESCE(__del.{sum_col}, 0) END"
+                    )
+                    del_updated_cols.add(sum_col)
+
+            for ekey, sum2_col in col_sum2_map.items():
+                if sum2_col not in del_updated_cols:
+                    it = ekey_to_item[ekey]
+                    ve = self._effective_agg_value_expr(it, record_prefix="__mv_old_rows")
+                    del_select_exprs.append(f"SUM(({ve}) * ({ve})) AS {sum2_col}")
+                    cnt_c = col_nonnull_count_map[ekey]
+                    del_updates.append(
+                        f"{sum2_col} = CASE WHEN ({mv_table}.{cnt_c} - __del.{cnt_c}) <= 0 THEN NULL "
+                        f"ELSE {mv_table}.{sum2_col} - COALESCE(__del.{sum2_col}, 0) END"
+                    )
+                    del_updated_cols.add(sum2_col)
+
+            for ekey, tcnt_col in col_true_cnt_map.items():
+                if tcnt_col not in del_updated_cols:
+                    it = ekey_to_item[ekey]
+                    ve = self._effective_agg_value_expr(it, record_prefix="__mv_old_rows")
+                    del_select_exprs.append(f"COUNT(*) FILTER (WHERE ({ve}) IS NOT NULL AND ({ve})) AS {tcnt_col}")
+                    del_updates.append(f"{tcnt_col} = {mv_table}.{tcnt_col} - __del.{tcnt_col}")
+                    del_updated_cols.add(tcnt_col)
+
+            if q_row_count not in del_updated_cols:
+                del_select_exprs.append(f"COUNT(*) AS {q_row_count}")
+                del_updates.append(f"{q_row_count} = {mv_table}.{q_row_count} - __del.{q_row_count}")
+                del_updated_cols.add(q_row_count)
+
+            sep_del = ",\n        "
+            minus_sql = (
+                f"UPDATE {mv_table}\n"
+                f"    SET {sep_del.join(del_updates)}\n"
+                f"    FROM (\n"
+                f"        SELECT {', '.join(del_select_exprs)}\n"
+                f"        FROM __mv_old_rows{w_old_sql}{grp_by_old_sql}{having_clause}\n"
+                f"    ) AS __del\n"
+                f"    WHERE {grp_match_del};"
+            )
+
+            cleanup_sql = f"DELETE FROM {mv_table} WHERE {row_count_col} <= 0;" if grp_exprs else ""
+
+            # Auxiliary tables (COUNT DISTINCT, etc.)
+            distinct_aux_sqls_plus: List[str] = []
+            distinct_aux_sqls_minus: List[str] = []
+            distinct_recomp_mv_sqls: List[str] = []
+
+            for ekey, (aux_tbl, rep_item, val_dt) in distinct_aux_tables.items():
+                ve_new = self._effective_agg_value_expr(rep_item, record_prefix="__mv_new_rows")
+                ve_old = self._effective_agg_value_expr(rep_item, record_prefix="__mv_old_rows")
+
+                if not grp_exprs:
+                    aux_cols = ["__mv_global_id", "__val", "__ref_cnt"]
+                    aux_sel_new = ["1 AS __mv_global_id", f"({ve_new}) AS __val", "COUNT(*) AS __ref_cnt"]
+                    aux_grp_new = ["1", f"({ve_new})"]
+                    aux_sel_old = ["1 AS __mv_global_id", f"({ve_old}) AS __val", "COUNT(*) AS __ref_cnt"]
+                    aux_grp_old = ["1", f"({ve_old})"]
+                    aux_match = f"{aux_tbl}.__mv_global_id = __d.__mv_global_id AND {aux_tbl}.__val = __d.__val"
+                    grp_match_aux = f"{aux_tbl}.__mv_global_id = {mv_table}.__mv_global_id"
+                elif has_nullable_grp:
+                    aux_cols = ["__mv_pk", "__val", "__ref_cnt"]
+                    aux_sel_new = [f"{pk_new_val} AS __mv_pk", f"({ve_new}) AS __val", "COUNT(*) AS __ref_cnt"]
+                    aux_grp_new = [pk_new_val, f"({ve_new})"]
+                    aux_sel_old = [f"{pk_old_val} AS __mv_pk", f"({ve_old}) AS __val", "COUNT(*) AS __ref_cnt"]
+                    aux_grp_old = [pk_old_val, f"({ve_old})"]
+                    aux_match = f"{aux_tbl}.__mv_pk = __d.__mv_pk AND {aux_tbl}.__val = __d.__val"
+                    grp_match_aux = f"{aux_tbl}.__mv_pk = {mv_table}.__mv_pk"
+                else:
+                    g_cols = [self._group_col_alias(g) for g in grp_exprs]
+                    aux_cols = [*g_cols, "__val", "__ref_cnt"]
+                    aux_sel_new = [*rec_grp_new, f"({ve_new}) AS __val", "COUNT(*) AS __ref_cnt"]
+                    aux_grp_new = [*rec_grp_new, f"({ve_new})"]
+                    aux_sel_old = [*rec_grp_old, f"({ve_old}) AS __val", "COUNT(*) AS __ref_cnt"]
+                    aux_grp_old = [*rec_grp_old, f"({ve_old})"]
+                    aux_match = " AND ".join(f"{aux_tbl}.{mc} = __d.{mc}" for mc in g_cols) + f" AND {aux_tbl}.__val = __d.__val"
+                    grp_match_aux = " AND ".join(f"{aux_tbl}.{mc} = {mv_table}.{mc}" for mc in g_cols)
+
+                aux_pk_cols = [self._q(c) for c in aux_cols if c != "__ref_cnt"]
+
+                ins_aux_sql = (
+                    f"INSERT INTO {aux_tbl} ({', '.join(aux_cols)})\n"
+                    f"    SELECT {', '.join(aux_sel_new)}\n"
+                    f"    FROM __mv_new_rows\n"
+                    f"    WHERE ({ve_new}) IS NOT NULL{w_new_and}\n"
+                    f"    GROUP BY {', '.join(aux_grp_new)}\n"
+                    f"    ON CONFLICT ({', '.join(aux_pk_cols)}) DO UPDATE SET\n"
+                    f"        __ref_cnt = {aux_tbl}.__ref_cnt + EXCLUDED.__ref_cnt;"
+                )
+                distinct_aux_sqls_plus.append(ins_aux_sql)
+
+                upd_aux_sql = (
+                    f"UPDATE {aux_tbl}\n"
+                    f"    SET __ref_cnt = {aux_tbl}.__ref_cnt - __d.__ref_cnt\n"
+                    f"    FROM (\n"
+                    f"        SELECT {', '.join(aux_sel_old)}\n"
+                    f"        FROM __mv_old_rows\n"
+                    f"        WHERE ({ve_old}) IS NOT NULL{w_old_and}\n"
+                    f"        GROUP BY {', '.join(aux_grp_old)}\n"
+                    f"    ) AS __d\n"
+                    f"    WHERE {aux_match};"
+                )
+                del_zero_aux_sql = f"DELETE FROM {aux_tbl} WHERE __ref_cnt <= 0;"
+                distinct_aux_sqls_minus.extend([upd_aux_sql, del_zero_aux_sql])
+
+                matching_items = [
+                    it for it in work_items
+                    if it.is_aggregate and it.is_distinct and expr_key_fn(it) == ekey
+                ]
+                if not matching_items:
+                    matching_items = [rep_item]
+
+                for d_item in matching_items:
+                    alias_q = self._q(d_item.alias)
+                    if d_item.agg_func == AggFunc.SUM:
+                        recomp_distinct_sql = (
+                            f"UPDATE {mv_table}\n"
+                            f"    SET {alias_q} = (SELECT SUM(__val) FROM {aux_tbl} WHERE {grp_match_aux});"
+                        )
+                    elif d_item.agg_func == AggFunc.AVG:
+                        recomp_distinct_sql = (
+                            f"UPDATE {mv_table}\n"
+                            f"    SET {alias_q} = (SELECT AVG(__val) FROM {aux_tbl} WHERE {grp_match_aux});"
+                        )
+                    elif d_item.agg_func == AggFunc.TOTAL:
+                        recomp_distinct_sql = (
+                            f"UPDATE {mv_table}\n"
+                            f"    SET {alias_q} = COALESCE((SELECT 1.0 * SUM(__val) FROM {aux_tbl} WHERE {grp_match_aux}), 0.0);"
+                        )
+                    else:
+                        recomp_distinct_sql = (
+                            f"UPDATE {mv_table}\n"
+                            f"    SET {alias_q} = COALESCE((SELECT COUNT(*) FROM {aux_tbl} WHERE {grp_match_aux}), 0);"
+                        )
+                    distinct_recomp_mv_sqls.append(recomp_distinct_sql)
+
+            # Assemble AI body
+            ai_parts: List[str] = []
+            if distinct_aux_sqls_plus:
+                ai_parts.extend(distinct_aux_sqls_plus)
+            ai_parts.append(upsert_plus_sql)
+            if distinct_recomp_mv_sqls:
+                ai_parts.extend(distinct_recomp_mv_sqls)
+            pg_ai_body = "\n".join(ai_parts)
+
+            # Assemble AD body
+            ad_parts: List[str] = []
+            if distinct_aux_sqls_minus:
+                ad_parts.extend(distinct_aux_sqls_minus)
+            ad_parts.append(minus_sql)
+            if distinct_recomp_mv_sqls:
+                ad_parts.extend(distinct_recomp_mv_sqls)
+            if cleanup_sql:
+                ad_parts.append(cleanup_sql)
+            pg_ad_body = "\n".join(ad_parts)
+
+            # Assemble AU body: OLD deltas -> NEW upsert -> cleanup
+            au_parts: List[str] = []
+            if distinct_aux_sqls_minus:
+                au_parts.extend(distinct_aux_sqls_minus)
+            au_parts.append(minus_sql)
+            if distinct_aux_sqls_plus:
+                ai_parts_for_au = list(distinct_aux_sqls_plus)
+                au_parts.extend(ai_parts_for_au)
+            au_parts.append(upsert_plus_sql)
+            if distinct_recomp_mv_sqls:
+                au_parts.extend(distinct_recomp_mv_sqls)
+            if cleanup_sql:
+                au_parts.append(cleanup_sql)
+            pg_au_body = "\n".join(au_parts)
+
+            return pg_ai_body, pg_ad_body, pg_au_body
+        except Exception:
+            return None, None, None
+
     def _build_tier1_triggers(
         self,
         view_name: str,
@@ -8399,6 +8981,22 @@ class IncrementalViewCompiler:
         if not self._effective_group_by_exprs and initial_populate_sqls:
             trunc_stmts.extend(initial_populate_sqls)
 
+        pg_ai_body: Optional[str] = None
+        pg_ad_body: Optional[str] = None
+        pg_au_body: Optional[str] = None
+        if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables:
+            pg_ai_body, pg_ad_body, pg_au_body = self._build_tier1_vectorized_pg_bodies(
+                mv_table=mv_table,
+                base_t=base_t,
+                row_count_col=row_count_col,
+                col_nonnull_count_map=col_nonnull_count_map,
+                col_sum_map=col_sum_map,
+                col_sum2_map=col_sum2_map,
+                col_true_cnt_map=col_true_cnt_map,
+                distinct_aux_tables=distinct_aux_tables,
+                expr_key_fn=expr_key_fn,
+            )
+
         return self._emit_dialect_triggers_for_table(
             view_name=view_name,
             base_t=base_t,
@@ -8410,6 +9008,9 @@ class IncrementalViewCompiler:
             trunc_stmts=trunc_stmts,
             where_new=where_new,
             where_old=where_old,
+            pg_ai_body=pg_ai_body,
+            pg_ad_body=pg_ad_body,
+            pg_au_body=pg_au_body,
         )
 
     def _emit_dialect_triggers_for_table(
@@ -8424,6 +9025,9 @@ class IncrementalViewCompiler:
         trunc_stmts: Optional[List[str]] = None,
         where_new: Optional[str] = None,
         where_old: Optional[str] = None,
+        pg_ai_body: Optional[str] = None,
+        pg_ad_body: Optional[str] = None,
+        pg_au_body: Optional[str] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         log_vname = self.logical_view_name
         p = self.object_prefix if self.object_prefix else "__matview_"
@@ -8549,57 +9153,140 @@ class IncrementalViewCompiler:
                 fn_ai = self._bounded_ident(f"{p}fn_sync_", stem, "_ai")
                 fn_ad = self._bounded_ident(f"{p}fn_sync_", stem, "_ad")
                 fn_au = self._bounded_ident(f"{p}fn_sync_", stem, "_au")
-                fn_ai_ddl = (
-                    f"CREATE OR REPLACE FUNCTION {fn_ai}()\n"
-                    f"RETURNS TRIGGER AS $$\n"
-                    f"DECLARE\n    NEW RECORD;\n"
-                    f"BEGIN\n"
-                    f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
-                    f"        {ins_section}\n"
-                    f"    END LOOP;\n"
-                    f"    RETURN NULL;\n"
-                    f"END;\n$$ LANGUAGE plpgsql;"
-                )
-                fn_ad_ddl = (
-                    f"CREATE OR REPLACE FUNCTION {fn_ad}()\n"
-                    f"RETURNS TRIGGER AS $$\n"
-                    f"DECLARE\n    OLD RECORD;\n"
-                    f"BEGIN\n"
-                    f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
-                    f"        {del_section}\n"
-                    f"    END LOOP;\n"
-                    f"    RETURN NULL;\n"
-                    f"END;\n$$ LANGUAGE plpgsql;"
-                )
-                au_loops: List[str] = []
-                if old_section.strip():
-                    au_loops.append(
-                        f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
-                        f"        {old_section}\n"
-                        f"    END LOOP;"
+
+                use_vec = bool(self.pg_vectorize_transition_tables)
+
+                # Determine whether we can vectorize AI, AD, AU triggers directly
+                if use_vec and pg_ai_body is not None:
+                    ai_sql = pg_ai_body.strip()
+                    fn_ai_ddl = (
+                        f"CREATE OR REPLACE FUNCTION {fn_ai}()\n"
+                        f"RETURNS TRIGGER AS $$\n"
+                        f"BEGIN\n"
+                        f"    {ai_sql}\n"
+                        f"    RETURN NULL;\n"
+                        f"END;\n$$ LANGUAGE plpgsql;"
                     )
-                if new_section.strip():
-                    au_loops.append(
+                elif use_vec and ("NEW." not in ins_section and ":NEW" not in ins_section):
+                    ai_sql = ins_section.strip()
+                    fn_ai_ddl = (
+                        f"CREATE OR REPLACE FUNCTION {fn_ai}()\n"
+                        f"RETURNS TRIGGER AS $$\n"
+                        f"BEGIN\n"
+                        f"    {ai_sql}\n"
+                        f"    RETURN NULL;\n"
+                        f"END;\n$$ LANGUAGE plpgsql;"
+                    )
+                else:
+                    fn_ai_ddl = (
+                        f"CREATE OR REPLACE FUNCTION {fn_ai}()\n"
+                        f"RETURNS TRIGGER AS $$\n"
+                        f"DECLARE\n    NEW RECORD;\n"
+                        f"BEGIN\n"
                         f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
-                        f"        {new_section}\n"
-                        f"    END LOOP;"
+                        f"        {ins_section}\n"
+                        f"    END LOOP;\n"
+                        f"    RETURN NULL;\n"
+                        f"END;\n$$ LANGUAGE plpgsql;"
                     )
-                if clean_section.strip():
-                    au_loops.append(
+
+                if use_vec and pg_ad_body is not None:
+                    ad_sql = pg_ad_body.strip()
+                    fn_ad_ddl = (
+                        f"CREATE OR REPLACE FUNCTION {fn_ad}()\n"
+                        f"RETURNS TRIGGER AS $$\n"
+                        f"BEGIN\n"
+                        f"    {ad_sql}\n"
+                        f"    RETURN NULL;\n"
+                        f"END;\n$$ LANGUAGE plpgsql;"
+                    )
+                elif use_vec and ("OLD." not in del_section and ":OLD" not in del_section):
+                    ad_sql = del_section.strip()
+                    fn_ad_ddl = (
+                        f"CREATE OR REPLACE FUNCTION {fn_ad}()\n"
+                        f"RETURNS TRIGGER AS $$\n"
+                        f"BEGIN\n"
+                        f"    {ad_sql}\n"
+                        f"    RETURN NULL;\n"
+                        f"END;\n$$ LANGUAGE plpgsql;"
+                    )
+                else:
+                    fn_ad_ddl = (
+                        f"CREATE OR REPLACE FUNCTION {fn_ad}()\n"
+                        f"RETURNS TRIGGER AS $$\n"
+                        f"DECLARE\n    OLD RECORD;\n"
+                        f"BEGIN\n"
                         f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
-                        f"        {clean_section.strip()}\n"
-                        f"    END LOOP;"
+                        f"        {del_section}\n"
+                        f"    END LOOP;\n"
+                        f"    RETURN NULL;\n"
+                        f"END;\n$$ LANGUAGE plpgsql;"
                     )
-                au_body = "\n".join(au_loops)
-                fn_au_ddl = (
-                    f"CREATE OR REPLACE FUNCTION {fn_au}()\n"
-                    f"RETURNS TRIGGER AS $$\n"
-                    f"DECLARE\n    OLD RECORD;\n    NEW RECORD;\n"
-                    f"BEGIN\n"
-                    f"{au_body}\n"
-                    f"    RETURN NULL;\n"
-                    f"END;\n$$ LANGUAGE plpgsql;"
-                )
+
+                if use_vec and pg_au_body is not None:
+                    au_sql = pg_au_body.strip()
+                    fn_au_ddl = (
+                        f"CREATE OR REPLACE FUNCTION {fn_au}()\n"
+                        f"RETURNS TRIGGER AS $$\n"
+                        f"BEGIN\n"
+                        f"    {au_sql}\n"
+                        f"    RETURN NULL;\n"
+                        f"END;\n$$ LANGUAGE plpgsql;"
+                    )
+                elif use_vec and (
+                    "OLD." not in old_section
+                    and ":OLD" not in old_section
+                    and "NEW." not in new_section
+                    and ":NEW" not in new_section
+                    and "OLD." not in clean_section
+                    and ":OLD" not in clean_section
+                ):
+                    au_parts: List[str] = []
+                    if old_section.strip():
+                        au_parts.append(old_section.strip())
+                    if new_section.strip():
+                        au_parts.append(new_section.strip())
+                    if clean_section.strip():
+                        au_parts.append(clean_section.strip())
+                    au_sql = "\n    ".join(au_parts)
+                    fn_au_ddl = (
+                        f"CREATE OR REPLACE FUNCTION {fn_au}()\n"
+                        f"RETURNS TRIGGER AS $$\n"
+                        f"BEGIN\n"
+                        f"    {au_sql}\n"
+                        f"    RETURN NULL;\n"
+                        f"END;\n$$ LANGUAGE plpgsql;"
+                    )
+                else:
+                    au_loops: List[str] = []
+                    if old_section.strip():
+                        au_loops.append(
+                            f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
+                            f"        {old_section}\n"
+                            f"    END LOOP;"
+                        )
+                    if new_section.strip():
+                        au_loops.append(
+                            f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
+                            f"        {new_section}\n"
+                            f"    END LOOP;"
+                        )
+                    if clean_section.strip():
+                        au_loops.append(
+                            f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
+                            f"        {clean_section.strip()}\n"
+                            f"    END LOOP;"
+                        )
+                    au_body = "\n".join(au_loops)
+                    fn_au_ddl = (
+                        f"CREATE OR REPLACE FUNCTION {fn_au}()\n"
+                        f"RETURNS TRIGGER AS $$\n"
+                        f"DECLARE\n    OLD RECORD;\n    NEW RECORD;\n"
+                        f"BEGIN\n"
+                        f"{au_body}\n"
+                        f"    RETURN NULL;\n"
+                        f"END;\n$$ LANGUAGE plpgsql;"
+                    )
                 t_ai = (
                     f"CREATE TRIGGER {t_ai_name}\n"
                     f"AFTER INSERT ON {q_base_t}\n"
@@ -9073,9 +9760,12 @@ class IncrementalViewCompiler:
             parts: List[str] = []
             for idx, j in enumerate(self.view.joins):
                 if replace_alias and j.alias.lower() == replace_alias.lower() and rec_prefix:
-                    ts = self._schemas_lower[j.table_name.lower()]
-                    rec_proj = ", ".join(f"{rec_prefix}.{self._q(c)} AS {self._q(c)}" for c in ts.columns)
-                    tbl_sql = f"(SELECT {rec_proj}{from_dual}) AS {self._q(j.alias)}"
+                    if rec_prefix in ("__mv_new_rows", "__mv_old_rows"):
+                        tbl_sql = f"{rec_prefix} AS {self._q(j.alias)}"
+                    else:
+                        ts = self._schemas_lower[j.table_name.lower()]
+                        rec_proj = ", ".join(f"{rec_prefix}.{self._q(c)} AS {self._q(c)}" for c in ts.columns)
+                        tbl_sql = f"(SELECT {rec_proj}{from_dual}) AS {self._q(j.alias)}"
                 else:
                     tbl_sql = f"{self._q(j.table_name)} AS {self._q(j.alias)}"
                 if idx == 0:
@@ -9421,6 +10111,33 @@ class IncrementalViewCompiler:
                 [initial_populate_sql] if not grp_exprs else []
             )
 
+            pg_ai_body: Optional[str] = None
+            pg_ad_body: Optional[str] = None
+            pg_au_body: Optional[str] = None
+
+            if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables:
+                from_vec_new = _build_join_from_clause(replace_alias=j_alias, rec_prefix="__mv_new_rows")
+                from_vec_old = _build_join_from_clause(replace_alias=j_alias, rec_prefix="__mv_old_rows")
+                vec_plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {from_vec_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ON CONFLICT ({q_pk_cols_csv}) DO UPDATE SET\n"
+                    f"        {', '.join(plus_merge_assignments)};"
+                )
+                vec_minus_stmt = (
+                    f"UPDATE {mv_table}\n"
+                    f"    SET {', '.join(ordered_minus)}\n"
+                    f"    FROM (\n"
+                    f"        SELECT {aliased_delta_select}\n"
+                    f"        FROM {from_vec_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ) AS __mv_delta\n"
+                    f"    WHERE {delta_pk_match};"
+                )
+                pg_ai_body = vec_plus_stmt
+                pg_ad_body = f"{vec_minus_stmt}\n{del_zero_stmt}" if del_zero_stmt else vec_minus_stmt
+                pg_au_body = f"{vec_minus_stmt}\n{vec_plus_stmt}\n{del_zero_stmt}" if del_zero_stmt else f"{vec_minus_stmt}\n{vec_plus_stmt}"
+
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
                 view_name=view_name,
                 base_t=base_t,
@@ -9430,6 +10147,9 @@ class IncrementalViewCompiler:
                 upd_new_stmts=[plus_stmt],
                 upd_cleanup_old_stmts=[del_zero_stmt] if del_zero_stmt else [],
                 trunc_stmts=trunc_stmts,
+                pg_ai_body=pg_ai_body,
+                pg_ad_body=pg_ad_body,
+                pg_au_body=pg_au_body,
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)
@@ -9915,6 +10635,65 @@ class IncrementalViewCompiler:
                 cleanup_stmts.append(clean_s)
 
             trunc_stmts = [f"DELETE FROM {mv_table};", *initial_populate_sqls]
+
+            pg_ai_body: Optional[str] = None
+            pg_ad_body: Optional[str] = None
+            pg_au_body: Optional[str] = None
+
+            if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables and len(b_list) == 1:
+                b_idx, bs = b_list[0]
+                ts = self._schemas_lower[bs.base_table.lower()]
+                b_alias = bs.joins[0].alias if bs.joins else base_t
+                w_vec_new = self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "__mv_new_rows") if bs.where_clause else None
+                w_vec_old = self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "__mv_old_rows") if bs.where_clause else None
+                vec_new_vals = [self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "__mv_new_rows") for it in bs.select_items]
+                w_n_sql = f"\n    WHERE {w_vec_new}" if w_vec_new else ""
+                w_o_sql = f"\n    WHERE {w_vec_old}" if w_vec_old else ""
+
+                if op_type == "UNION ALL" and use_native_uall_pk:
+                    pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                    new_pk_vec = [str(b_idx), *[f"__mv_new_rows.{self._q(c)}" for c in pk_names]]
+                    del_pk_vec = [str(b_idx), *[f"__mv_old_rows.{self._q(c)}" for c in pk_names]]
+                    upd_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in user_columns)
+                    grp_new = [f"__mv_new_rows.{self._q(c)}" for c in pk_names] + vec_new_vals
+                    grp_del = [f"__mv_old_rows.{self._q(c)}" for c in pk_names]
+                    old_pk_match_vec = f"{mv_table}.__mv_branch_id = {b_idx} AND " + " AND ".join(
+                        f"{mv_table}.__mv_pk_{i} = __del.{self._q(c)}" for i, c in enumerate(pk_names)
+                    )
+                    del_sel = [*del_pk_vec, "COUNT(*) AS cnt"]
+                    pg_ai_body = (
+                        f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"    SELECT {', '.join(new_pk_vec)}, {', '.join(vec_new_vals)}, COUNT(*)\n"
+                        f"    FROM __mv_new_rows{w_n_sql}\n"
+                        f"    GROUP BY {', '.join(grp_new)}\n"
+                        f"    ON CONFLICT ({', '.join(uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;"
+                    )
+                    pg_ad_body = (
+                        f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
+                        f"FROM (\n"
+                        f"    SELECT {', '.join(del_sel)}\n"
+                        f"    FROM __mv_old_rows{w_o_sql}\n"
+                        f"    GROUP BY {', '.join(grp_del)}\n"
+                        f") AS __del\n"
+                        f"WHERE {old_pk_match_vec};\n"
+                        f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
+                    )
+                    pg_au_body = (
+                        f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
+                        f"FROM (\n"
+                        f"    SELECT {', '.join(del_sel)}\n"
+                        f"    FROM __mv_old_rows{w_o_sql}\n"
+                        f"    GROUP BY {', '.join(grp_del)}\n"
+                        f") AS __del\n"
+                        f"WHERE {old_pk_match_vec};\n"
+                        f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"    SELECT {', '.join(new_pk_vec)}, {', '.join(vec_new_vals)}, COUNT(*)\n"
+                        f"    FROM __mv_new_rows{w_n_sql}\n"
+                        f"    GROUP BY {', '.join(grp_new)}\n"
+                        f"    ON CONFLICT ({', '.join(uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;\n"
+                        f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
+                    )
+
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
                 view_name=view_name,
                 base_t=base_t,
@@ -9924,6 +10703,9 @@ class IncrementalViewCompiler:
                 upd_new_stmts=upd_new_stmts,
                 upd_cleanup_old_stmts=cleanup_stmts,
                 trunc_stmts=trunc_stmts,
+                pg_ai_body=pg_ai_body,
+                pg_ad_body=pg_ad_body,
+                pg_au_body=pg_au_body,
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)
@@ -10312,6 +11094,118 @@ class IncrementalViewCompiler:
             where_new = f"({where_new}) AND ({wm_new})" if where_new else wm_new
             where_old = f"({where_old}) AND ({wm_old})" if where_old else wm_old
 
+        pg_ai_body: Optional[str] = None
+        pg_ad_body: Optional[str] = None
+        pg_au_body: Optional[str] = None
+
+        if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables:
+            vec_new_pred = self._rewrite_expr_for_record(self.view.where_clause, "__mv_new_rows") if self.view.where_clause else None
+            vec_old_pred = self._rewrite_expr_for_record(self.view.where_clause, "__mv_old_rows") if self.view.where_clause else None
+            if self.watermark_catalog_table and wm_pk_col:
+                q_pk = self._q(wm_pk_col)
+                wm_vec_new = (
+                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                    f"AND __mv_new_rows.{q_pk} > backfill_cursor_pk AND __mv_new_rows.{q_pk} <= backfill_max_pk)"
+                )
+                wm_vec_old = (
+                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                    f"AND __mv_old_rows.{q_pk} > backfill_cursor_pk AND __mv_old_rows.{q_pk} <= backfill_max_pk)"
+                )
+                vec_new_pred = f"({vec_new_pred}) AND ({wm_vec_new})" if vec_new_pred else wm_vec_new
+                vec_old_pred = f"({vec_old_pred}) AND ({wm_vec_old})" if vec_old_pred else wm_vec_old
+            w_vec_new = f"\nWHERE {vec_new_pred}" if vec_new_pred else ""
+            w_vec_old = f"\nWHERE {vec_old_pred}" if vec_old_pred else ""
+            w_vec_old_and = f" AND ({vec_old_pred})" if vec_old_pred else ""
+
+            if uses_native_pk:
+                all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
+                q_all_backing_cols = [self._q(c) for c in all_backing_cols]
+                all_vec_new_vals = [
+                    *[self._rewrite_expr_for_record(it.raw_expr, "__mv_new_rows") for it in self.view.select_items],
+                    *[f"__mv_new_rows.{self._q(h[1])}" for h in hidden_pk_defs],
+                ]
+                upd_set = ", ".join(f"{self._q(c)} = EXCLUDED.{self._q(c)}" for c in all_backing_cols)
+                del_where_vec = " AND ".join(
+                    f"{mv_table}.{self._q(mv_c)} = __mv_old_rows.{self._q(src_c)}"
+                    for mv_c, src_c in zip(mv_pk_cols, pk_names)
+                )
+                base_pk_eq_vec_old = " AND ".join(
+                    f"{q_base_t}.{self._q(src_c)} = __mv_old_rows.{self._q(src_c)}"
+                    for src_c in pk_names
+                )
+                and_base_where = (
+                    f" AND ({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})"
+                    if self.view.where_clause
+                    else ""
+                )
+
+                pg_ai_body = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                    f"SELECT {', '.join(all_vec_new_vals)}\n"
+                    f"FROM __mv_new_rows{w_vec_new}\n"
+                    f"ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                )
+                pg_ad_body = (
+                    f"DELETE FROM {mv_table}\n"
+                    f"USING __mv_old_rows\n"
+                    f"WHERE {del_where_vec}{w_vec_old_and};"
+                )
+                pg_au_body = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                    f"SELECT {', '.join(all_vec_new_vals)}\n"
+                    f"FROM __mv_new_rows{w_vec_new}\n"
+                    f"ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};\n"
+                    f"DELETE FROM {mv_table}\n"
+                    f"USING __mv_old_rows\n"
+                    f"WHERE {del_where_vec}{w_vec_old_and}\n"
+                    f"  AND NOT EXISTS (\n"
+                    f"      SELECT 1 FROM {q_base_t}\n"
+                    f"      WHERE {base_pk_eq_vec_old}{and_base_where}\n"
+                    f"  );"
+                )
+            else:
+                q_user_columns = [self._q(c) for c in user_columns]
+                pk_vec_new = self._canonical_group_pk_expr([f"__mv_new_rows.{self._q(c)}" for c in pk_hash_cols])
+                pk_vec_old = self._canonical_group_pk_expr([f"__mv_old_rows.{self._q(c)}" for c in pk_hash_cols])
+                vec_new_vals = [self._rewrite_expr_for_record(it.raw_expr, "__mv_new_rows") for it in self.view.select_items]
+                upd_set = ", ".join(f"{self._q(c)} = EXCLUDED.{self._q(c)}" for c in user_columns)
+                group_by_cols_new = f"{pk_vec_new}" + (f", {', '.join(vec_new_vals)}" if vec_new_vals else "")
+
+                pg_ai_body = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                    f"SELECT {pk_vec_new}, {', '.join(vec_new_vals)}, COUNT(*)\n"
+                    f"FROM __mv_new_rows{w_vec_new}\n"
+                    f"GROUP BY {group_by_cols_new}\n"
+                    f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;"
+                )
+                pg_ad_body = (
+                    f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
+                    f"FROM (\n"
+                    f"    SELECT {pk_vec_old} AS __mv_pk, COUNT(*) AS cnt\n"
+                    f"    FROM __mv_old_rows{w_vec_old}\n"
+                    f"    GROUP BY {pk_vec_old}\n"
+                    f") AS __del\n"
+                    f"WHERE {mv_table}.__mv_pk = __del.__mv_pk;\n"
+                    f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
+                )
+                pg_au_body = (
+                    f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
+                    f"FROM (\n"
+                    f"    SELECT {pk_vec_old} AS __mv_pk, COUNT(*) AS cnt\n"
+                    f"    FROM __mv_old_rows{w_vec_old}\n"
+                    f"    GROUP BY {pk_vec_old}\n"
+                    f") AS __del\n"
+                    f"WHERE {mv_table}.__mv_pk = __del.__mv_pk;\n"
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                    f"SELECT {pk_vec_new}, {', '.join(vec_new_vals)}, COUNT(*)\n"
+                    f"FROM __mv_new_rows{w_vec_new}\n"
+                    f"GROUP BY {group_by_cols_new}\n"
+                    f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;\n"
+                    f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
+                )
+
         trigger_ddls, trig_names, fn_names = self._emit_dialect_triggers_for_table(
             view_name=view_name,
             base_t=base_t,
@@ -10323,6 +11217,9 @@ class IncrementalViewCompiler:
             trunc_stmts=[f"DELETE FROM {mv_table};"],
             where_new=where_new,
             where_old=where_old,
+            pg_ai_body=pg_ai_body,
+            pg_ad_body=pg_ad_body,
+            pg_au_body=pg_au_body,
         )
 
         if wm_pk_col and chunk_upsert_sql:
@@ -10960,7 +11857,10 @@ class IncrementalViewCompiler:
             for g_expr, mv_col in group_mv_cols:
                 rhs_e = self._rewrite_expr_for_record(g_expr, record_prefix)
                 conds.append(self._null_safe_eq(_lhs_expr(g_expr, mv_col), f"({rhs_e})", is_nullable=True))
-            return " AND ".join(conds)
+            cond_str = " AND ".join(conds)
+            if record_prefix in ("__mv_new_rows", "__mv_old_rows"):
+                return f"EXISTS (SELECT 1 FROM {record_prefix} WHERE {cond_str})"
+            return cond_str
 
         target_join: Optional[JoinSpec] = None
         for j in self.view.joins:
@@ -11003,7 +11903,10 @@ class IncrementalViewCompiler:
                 break
 
         if all_owned and direct_conds:
-            return " AND ".join(direct_conds)
+            cond_str = " AND ".join(direct_conds)
+            if record_prefix in ("__mv_new_rows", "__mv_old_rows"):
+                return f"EXISTS (SELECT 1 FROM {record_prefix} WHERE {cond_str})"
+            return cond_str
 
         # Otherwise build an EXISTS subquery over the join graph with `target_join` replaced by `(SELECT NEW/OLD.*)`
         from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
@@ -11042,7 +11945,10 @@ class IncrementalViewCompiler:
                 out.append(frag[cursor:])
             return "".join(out)
 
-        inline_row_table = f"(SELECT {rec_proj}{from_dual}) AS __mv_j_{target_alias}"
+        if record_prefix in ("__mv_new_rows", "__mv_old_rows"):
+            inline_row_table = f"{record_prefix} AS __mv_j_{target_alias}"
+        else:
+            inline_row_table = f"(SELECT {rec_proj}{from_dual}) AS __mv_j_{target_alias}"
         join_parts: List[str] = []
         for idx, j in enumerate(self.view.joins):
             remapped_alias = f"__mv_j_{j.alias}"
@@ -11189,6 +12095,75 @@ class IncrementalViewCompiler:
             upd_old_stmts = []
             upd_new_stmts = full_refresh
 
+        pg_ai_body: Optional[str] = None
+        pg_ad_body: Optional[str] = None
+        pg_au_body: Optional[str] = None
+
+        if (
+            self.dialect == Dialect.POSTGRES
+            and self.pg_use_transition_tables
+            and self.pg_vectorize_transition_tables
+            and pred_mv_old
+            and pred_mv_new
+        ):
+            pred_vec_old = self._group_scope_predicate_for_table(
+                base_t, group_mv_cols, mv_table, "__mv_old_rows"
+            )
+            pred_vec_new = self._group_scope_predicate_for_table(
+                base_t, group_mv_cols, mv_table, "__mv_new_rows"
+            )
+            if can_push_down:
+                pred_inner_vec_old = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, None, "__mv_old_rows"
+                )
+                pred_inner_vec_new = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, None, "__mv_new_rows"
+                )
+                if pred_inner_vec_old and pred_inner_vec_new and pred_vec_old and pred_vec_new:
+                    q_vec_ins = self._inject_where_into_source_query(source_query_sql, pred_inner_vec_new)
+                    q_vec_del = self._inject_where_into_source_query(source_query_sql, pred_inner_vec_old)
+                    q_vec_upd = self._inject_where_into_source_query(
+                        source_query_sql, f"({pred_inner_vec_old}) OR ({pred_inner_vec_new})"
+                    )
+                    pg_ai_body = (
+                        f"DELETE FROM {mv_table} WHERE {pred_vec_new};\n"
+                        f"INSERT INTO {mv_table} ({cols_csv})\n    {q_vec_ins};"
+                    )
+                    pg_ad_body = (
+                        f"DELETE FROM {mv_table} WHERE {pred_vec_old};\n"
+                        f"INSERT INTO {mv_table} ({cols_csv})\n    {q_vec_del};"
+                    )
+                    pg_au_body = (
+                        f"DELETE FROM {mv_table} WHERE ({pred_vec_old}) OR ({pred_vec_new});\n"
+                        f"INSERT INTO {mv_table} ({cols_csv})\n    {q_vec_upd};"
+                    )
+            else:
+                pred_src_vec_old = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, "__mv_src", "__mv_old_rows"
+                )
+                pred_src_vec_new = self._group_scope_predicate_for_table(
+                    base_t, group_mv_cols, "__mv_src", "__mv_new_rows"
+                )
+                if pred_src_vec_old and pred_src_vec_new and pred_vec_old and pred_vec_new:
+                    pg_ai_body = (
+                        f"DELETE FROM {mv_table} WHERE {pred_vec_new};\n"
+                        f"INSERT INTO {mv_table} ({cols_csv})\n"
+                        f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                        f"    WHERE {pred_src_vec_new};"
+                    )
+                    pg_ad_body = (
+                        f"DELETE FROM {mv_table} WHERE {pred_vec_old};\n"
+                        f"INSERT INTO {mv_table} ({cols_csv})\n"
+                        f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                        f"    WHERE {pred_src_vec_old};"
+                    )
+                    pg_au_body = (
+                        f"DELETE FROM {mv_table} WHERE ({pred_vec_old}) OR ({pred_vec_new});\n"
+                        f"INSERT INTO {mv_table} ({cols_csv})\n"
+                        f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                        f"    WHERE ({pred_src_vec_old}) OR ({pred_src_vec_new});"
+                    )
+
         return self._emit_dialect_triggers_for_table(
             view_name=view_name,
             base_t=base_t,
@@ -11197,6 +12172,9 @@ class IncrementalViewCompiler:
             upd_old_stmts=upd_old_stmts,
             upd_new_stmts=upd_new_stmts,
             trunc_stmts=full_refresh,
+            pg_ai_body=pg_ai_body,
+            pg_ad_body=pg_ad_body,
+            pg_au_body=pg_au_body,
         )
 
     def _rewrite_mysql_not_in_subquery(self, sql: str) -> str:
@@ -11725,6 +12703,7 @@ class MaterializedViewManager:
         ignore_limitations: bool = False,
         object_prefix: str = DEFAULT_OBJECT_PREFIX,
         pg_use_transition_tables: bool = False,
+        pg_vectorize_transition_tables: bool = True,
         strict: bool = False,
         engine_version: Optional[EngineVersion | str] = None,
         skip_ensure_catalog: bool = False,
@@ -11760,6 +12739,7 @@ class MaterializedViewManager:
         self.ignore_limitations = ignore_limitations
         self.object_prefix = object_prefix
         self.pg_use_transition_tables = pg_use_transition_tables
+        self.pg_vectorize_transition_tables = pg_vectorize_transition_tables
         self.strict = strict
         self.pg_fillfactor = pg_fillfactor
         self.catalog_table = (
@@ -12294,6 +13274,7 @@ class MaterializedViewManager:
             v_spec,
             dialect=self.dialect,
             pg_use_transition_tables=self.pg_use_transition_tables,
+            pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
             ignore_limitations=effective_ignore,
             object_prefix=self.object_prefix,
             strict=effective_strict,
@@ -12513,6 +13494,7 @@ class MaterializedViewManager:
                 v_spec,
                 dialect=self.dialect,
                 pg_use_transition_tables=self.pg_use_transition_tables,
+                pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
                 ignore_limitations=effective_ignore,
                 object_prefix=self.object_prefix,
                 strict=effective_strict,
@@ -12577,6 +13559,7 @@ class MaterializedViewManager:
                     entry["view_sql"],
                     dialect=self.dialect,
                     pg_use_transition_tables=self.pg_use_transition_tables,
+                    pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
                     ignore_limitations=True,
                     object_prefix=self.object_prefix,
                     engine_version=self.engine_version,
@@ -12855,6 +13838,7 @@ class MaterializedViewManager:
                             entry["view_sql"],
                             dialect=self.dialect,
                             pg_use_transition_tables=self.pg_use_transition_tables,
+                            pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
                             ignore_limitations=True,
                             object_prefix=self.object_prefix,
                             engine_version=self.engine_version,
@@ -12891,6 +13875,7 @@ class MaterializedViewManager:
                         entry["view_sql"],
                         dialect=self.dialect,
                         pg_use_transition_tables=self.pg_use_transition_tables,
+                        pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
                         ignore_limitations=True,
                         object_prefix=self.object_prefix,
                         engine_version=self.engine_version,
@@ -13484,6 +14469,7 @@ def generate_materialized_view(
     view_sql_or_spec: str | ViewSpec,
     dialect: Optional[Dialect | str | EngineVersion] = None,
     pg_use_transition_tables: bool = False,
+    pg_vectorize_transition_tables: bool = True,
     ignore_limitations: bool = False,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
@@ -13553,6 +14539,7 @@ def generate_materialized_view(
         view_spec=view_spec,
         dialect=eff_dialect,
         pg_use_transition_tables=pg_use_transition_tables,
+        pg_vectorize_transition_tables=pg_vectorize_transition_tables,
         ignore_limitations=ignore_limitations,
         object_prefix=object_prefix,
         incremental_backfill=incremental_backfill,
@@ -13570,6 +14557,7 @@ def generate_materialized_views(
     view_sqls: Sequence[str | ViewSpec] | str | ViewSpec,
     dialect: Optional[Dialect | str | EngineVersion] = None,
     pg_use_transition_tables: bool = False,
+    pg_vectorize_transition_tables: bool = True,
     ignore_limitations: bool = False,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
@@ -13610,6 +14598,7 @@ def generate_materialized_views(
             view_spec=vs,
             dialect=eff_dialect,
             pg_use_transition_tables=pg_use_transition_tables,
+            pg_vectorize_transition_tables=pg_vectorize_transition_tables,
             ignore_limitations=ignore_limitations,
             object_prefix=object_prefix,
             incremental_backfill=incremental_backfill,
@@ -13677,6 +14666,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--pg-transition-tables",
         action="store_true",
         help="Use PostgreSQL statement-level transition table triggers.",
+    )
+    parser.add_argument(
+        "--no-pg-vectorize-transition-tables",
+        action="store_false",
+        dest="pg_vectorize_transition_tables",
+        default=True,
+        help="Disable set-based vectorization of PostgreSQL transition tables and fall back to row-by-row loops.",
     )
     parser.add_argument(
         "--object-prefix",
@@ -13878,6 +14874,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ignore_limitations=args.ignore_limitations,
                 object_prefix=args.object_prefix,
                 pg_use_transition_tables=args.pg_transition_tables,
+                pg_vectorize_transition_tables=args.pg_vectorize_transition_tables,
                 strict=args.strict,
                 engine_version=args.engine_version,
             )
@@ -13914,6 +14911,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ignore_limitations=args.ignore_limitations,
                 object_prefix=args.object_prefix,
                 pg_use_transition_tables=args.pg_transition_tables,
+                pg_vectorize_transition_tables=args.pg_vectorize_transition_tables,
                 strict=args.strict,
                 engine_version=args.engine_version,
             )
@@ -13976,6 +14974,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             view_sql,
             dialect=detected_ev.dialect,
             pg_use_transition_tables=args.pg_transition_tables,
+            pg_vectorize_transition_tables=args.pg_vectorize_transition_tables,
             ignore_limitations=args.ignore_limitations,
             object_prefix=args.object_prefix,
             indexes=args.indexes,

@@ -96,7 +96,7 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
         )
 
     def test_postgres_transition_table_loop_ordering(self) -> None:
-        """Verify statement-level transition table triggers execute NEW loop before cleanup."""
+        """Verify fallback loop-based transition table triggers execute NEW loop before cleanup."""
         schema_sql = """
         CREATE TABLE items (
             id INT PRIMARY KEY,
@@ -110,6 +110,7 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
             view_sql,
             dialect=Dialect.POSTGRES,
             pg_use_transition_tables=True,
+            pg_vectorize_transition_tables=False,
         )
 
         au_ddl = [ddl for ddl in plan.trigger_ddls if "_au()" in ddl][0]
@@ -122,6 +123,36 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
         self.assertNotEqual(pos_clean, -1)
         self.assertLess(pos_old, pos_new, "OLD loop must precede NEW loop")
         self.assertLess(pos_new, pos_clean, "NEW loop must precede zero-count cleanup")
+
+    def test_postgres_transition_table_vectorized_ordering(self) -> None:
+        """Verify vectorized statement-level transition table triggers have no loops and run NEW before cleanup."""
+        schema_sql = """
+        CREATE TABLE items (
+            id INT PRIMARY KEY,
+            category VARCHAR(32) NOT NULL,
+            qty INT NOT NULL
+        );
+        """
+        view_sql = "CREATE VIEW cat_summary_mv AS SELECT category, SUM(qty) AS total_qty FROM items GROUP BY category;"
+        plan = generate_materialized_view(
+            schema_sql,
+            view_sql,
+            dialect=Dialect.POSTGRES,
+            pg_use_transition_tables=True,
+            pg_vectorize_transition_tables=True,
+        )
+
+        au_ddl = [ddl for ddl in plan.trigger_ddls if "_au()" in ddl][0]
+        self.assertNotIn("LOOP", au_ddl, "Vectorized trigger function must not contain row loops")
+        pos_old = au_ddl.find("__mv_old_rows")
+        pos_new = au_ddl.find("__mv_new_rows")
+        pos_clean = au_ddl.find("DELETE FROM __matview_store_cat_summary_mv")
+
+        self.assertNotEqual(pos_old, -1, "__mv_old_rows must be referenced in AU")
+        self.assertNotEqual(pos_new, -1, "__mv_new_rows must be referenced in AU")
+        self.assertNotEqual(pos_clean, -1, "zero-count cleanup must be present in AU")
+        self.assertLess(pos_old, pos_new, "OLD delta update must precede NEW delta upsert")
+        self.assertLess(pos_new, pos_clean, "NEW delta upsert must precede zero-count cleanup")
 
     def test_sqlite_trigger_sql_inspection(self) -> None:
         """Verify SQLite trigger contains NOT EXISTS gate for PK swap protection."""
