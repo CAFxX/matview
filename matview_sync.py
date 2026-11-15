@@ -4769,6 +4769,11 @@ class IncrementalViewCompiler:
             return f"({a} ^ {b})"
         return f"(({a} | {b}) - ({a} & {b}))"
 
+    def _canonical_group_pk_type(self) -> str:
+        if self.dialect == Dialect.MYSQL:
+            return "VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
+        return "TEXT"
+
     def _canonical_group_pk_expr(self, group_exprs: Sequence[str]) -> str:
         if self.dialect == Dialect.SQLITE:
             return " || '|' || ".join(f"quote({e})" for e in group_exprs)
@@ -4780,10 +4785,10 @@ class IncrementalViewCompiler:
             return f"ROW({', '.join(pg_parts)})::TEXT"
         elif self.dialect == Dialect.MYSQL:
             parts = [
-                f"IF({e} IS NULL, 'N', CONCAT('V', LENGTH(CAST({e} AS CHAR)), ':', CAST({e} AS CHAR)))"
+                f"IF({e} IS NULL, 'N', CONCAT('V', OCTET_LENGTH(CAST({e} AS CHAR CHARACTER SET utf8mb4)), ':', CAST({e} AS CHAR CHARACTER SET utf8mb4)))"
                 for e in group_exprs
             ]
-            return f"CONCAT_WS('|', {', '.join(parts)})"
+            return f"CONCAT_WS('|', {', '.join(parts)}) COLLATE utf8mb4_bin"
         return " || '|' || ".join(f"quote({e})" for e in group_exprs)
 
     def _group_by_exprs_for_query(
@@ -5593,7 +5598,7 @@ class IncrementalViewCompiler:
 
         col_defs_sql: List[str] = []
         user_columns: List[str] = [it.alias for it in self.view.select_items]
-        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        pk_type = self._canonical_group_pk_type()
 
         if not grp_exprs:
             col_defs_sql.append("__mv_global_id INTEGER NOT NULL PRIMARY KEY")
@@ -7399,16 +7404,16 @@ class IncrementalViewCompiler:
                         f"        {old_section}\n"
                         f"    END LOOP;"
                     )
-                if clean_section.strip():
-                    au_loops.append(
-                        f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
-                        f"        {clean_section.strip()}\n"
-                        f"    END LOOP;"
-                    )
                 if new_section.strip():
                     au_loops.append(
                         f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
                         f"        {new_section}\n"
+                        f"    END LOOP;"
+                    )
+                if clean_section.strip():
+                    au_loops.append(
+                        f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
+                        f"        {clean_section.strip()}\n"
                         f"    END LOOP;"
                     )
                 au_body = "\n".join(au_loops)
@@ -7661,7 +7666,7 @@ class IncrementalViewCompiler:
 
         col_defs_sql: List[str] = []
         user_columns: List[str] = [it.alias for it in self.view.select_items]
-        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        pk_type = self._canonical_group_pk_type()
 
         has_nullable_grp = self._has_nullable_group_col()
         pk_cols = self._tier1_pk_cols()
@@ -8427,7 +8432,7 @@ class IncrementalViewCompiler:
         view_name = self.view.view_name
         mv_table = self._backing_table_name()
         user_columns = [it.alias for it in first_bs.select_items]
-        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        pk_type = self._canonical_group_pk_type()
         from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
 
         # Check if UNION ALL branches share a uniform native composite PK structure
@@ -8814,7 +8819,7 @@ class IncrementalViewCompiler:
         base_t = self.view.base_table
         q_base_t = self._q(base_t)
         user_columns = [it.alias for it in self.view.select_items]
-        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        pk_type = self._canonical_group_pk_type()
         from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
 
         pk_names = [c.name for c in self.primary_schema.columns.values() if c.primary_key]
@@ -8886,7 +8891,22 @@ class IncrementalViewCompiler:
             del_where = " AND ".join(pk_old_preds)
             del_stmt = f"DELETE FROM {mv_table}\n    WHERE {del_where};"
             del_stmts_list = [del_stmt]
-            upd_old_list = [del_stmt]
+
+            base_pk_eq_old = " AND ".join(
+                f"{q_base_t}.{self._q(src_c)} = OLD.{self._q(src_c)}"
+                for src_c in pk_names
+            )
+            and_base_where = (
+                f" AND ({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})"
+                if self.view.where_clause
+                else ""
+            )
+            upd_del_stmt = (
+                f"DELETE FROM {mv_table}\n"
+                f"    WHERE {del_where}\n"
+                f"    AND NOT EXISTS (SELECT 1 FROM {q_base_t} WHERE {base_pk_eq_old}{and_base_where});"
+            )
+            upd_old_list = [upd_del_stmt]
             upd_clean_list: List[str] = []
         else:
             pk_expr_base = self._canonical_group_pk_expr(pk_names)
@@ -9030,7 +9050,7 @@ class IncrementalViewCompiler:
 
         col_defs_sql: List[str] = []
         user_columns: List[str] = [it.alias for it in self.view.select_items]
-        pk_type = "VARCHAR(512)" if self.dialect == Dialect.MYSQL else "TEXT"
+        pk_type = self._canonical_group_pk_type()
 
         if not grp_exprs:
             col_defs_sql.append("__mv_global_id INTEGER NOT NULL PRIMARY KEY")
