@@ -29,7 +29,7 @@ GROUP BY customer_id;
 4. Triggers that apply changes when source tables are inserted, updated, or deleted.
 5. SQL to populate the initial result, either in one operation or in batches.
 
-**The generated view name is prefixed by default.** The definition above is exposed as `__matview_customer_sales`, not `customer_sales`. The default prefix is `__matview_`; change it with `--object-prefix` or the Python API's `object_prefix` option. The generated view is read-only: write to the source tables, not to the materialized view.
+**User-accessible materialized views retain their declared logical SQL name.** The definition above is exposed directly as `customer_sales`. Internal supporting objects—the backing storage table (`__matview_customer_sales_data`), delta tables, maintenance triggers, auxiliary tables, and catalog metadata (`__matview_catalog`)—use the internal object prefix (default `__matview_`; configurable with `--object-prefix` or `object_prefix`). The materialized view is read-only: query it directly like any standard view, and write only to the source tables.
 
 The triggers run as part of the database's normal transaction processing, so maintenance is performed by the database rather than by polling or a separate synchronization job. Python is needed to compile, install, and manage the objects—not for ongoing query or trigger execution.
 
@@ -107,11 +107,11 @@ Without `--apply`, the command prints the generated SQL script to standard outpu
 
 ### 4. Query the result
 
-With the default object prefix, query the generated view:
+Query the materialized view directly using its declared name:
 
 ```sql
 SELECT customer_id, order_count, total_amount
-FROM __matview_customer_sales;
+FROM customer_sales;
 ```
 
 Subsequent changes to `orders` are reflected by the installed triggers.
@@ -165,7 +165,7 @@ This is a summary, not a promise that every syntactic variation is supported. SQ
 | `--batch-size N` | Set the batch size for incremental backfill (default: `500`). |
 | `--no-populate` | Install the objects without running the initial population. Use only when you intend to populate the view separately. |
 | `--index SPEC` | Add a user-defined index; the option can be repeated. `CREATE INDEX` statements can also be included in the view SQL input. |
-| `--object-prefix PREFIX` | Change the prefix used for generated database objects (default: `__matview_`). |
+| `--object-prefix PREFIX` | Change the prefix used for internal supporting database objects (backing tables, triggers, auxiliary tables, catalog; default: `__matview_`). |
 | `--strict` | Fail unless the view can use `ALGEBRAIC_DELTA`. |
 | `--ignore-limitations` | Continue despite a detected engine limitation that prevents a full transparency guarantee. See [Safety and limitations](#safety-and-limitations). |
 | `--check-drift` | Compare registered views with the current live base-table schema. Requires `--db`. |
@@ -223,7 +223,7 @@ plan = manager.register_view(
     batch_size=500,
 )
 
-print(plan.view_name)          # __matview_customer_sales (default prefix)
+print(plan.view_name)          # customer_sales (uses declared view name; internal objects use __matview_*)
 print(plan.strategy.value)     # selected maintenance strategy
 
 conn.close()
@@ -261,12 +261,32 @@ For large initial populations, `--incremental-backfill` generates dialect-specif
 
 Materialized views are read-only. Make application writes against the source tables. Also review generated SQL and test the target engine/version before deploying schema or view changes to production.
 
-## Tests and differential fuzzing
+## Tests, differential fuzzing, and test strength
 
-Run the full test suite:
+### Running tests
+
+Run the deterministic unit and integration test suite:
 
 ```bash
 python3 test_matview_sync.py
+```
+
+Measure test strength, generate honest structural coverage statistics, and verify CI/documentation consistency:
+
+```bash
+python3 test_strength_reporting.py
+```
+
+Run the schema-aware recursive SELECT AST query fuzzer:
+
+```bash
+python3 test_query_ast_fuzzer.py
+```
+
+Run independent-session concurrent backfill and snapshot isolation tests:
+
+```bash
+python3 test_concurrent_backfill.py
 ```
 
 Run the differential fuzzer and regression corpus:
@@ -275,7 +295,7 @@ Run the differential fuzzer and regression corpus:
 python3 test_matview_sync.py --fuzz
 ```
 
-Increase the fuzzing workload:
+Increase the differential fuzzing workload:
 
 ```bash
 python3 test_matview_sync.py --fuzz --fuzz-scale 3
@@ -296,7 +316,30 @@ SQLITE_COMPAT_ENGINE="apsw" \
 python3 test_matview_sync.py
 ```
 
-The CI workflow runs a broader engine/version matrix and a dedicated high-intensity fuzzing job. See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the exact current coverage.
+### Honest test coverage and test strength reporting
+
+The project separates **Structural & Semantic Coverage Metrics** from **Workload Statistics**:
+
+- **Workload statistics** (such as raw assertion counts exceeding 100,000, hundreds of views registered, and thousands of mutation steps) measure test execution volume and stress scale. They are **not** proxies for structural grammar coverage, AST diversity, or semantic boundary verification.
+- **Structural coverage metrics** are tracked deterministically by `test_strength_reporting.py` across:
+  - **Schema topologies & constraint diversity**: `SchemaCoverageTracker` validates 7 distinct graph topologies (`chain`, `star`, `disconnected`, `self`, `bridge`, `cycle`, `mixed`), composite PKs, FK delete/update actions (`CASCADE`, `SET NULL`, `RESTRICT`), column type families (integer, exact decimal/numeric, floating-point, varchar/text), unique constraints, check constraints, and generated columns.
+  - **Recursive DML AST grammar**: schema-aware AST mutations reaching multi-row `INSERT`, `INSERT ... SELECT`, recursive `UPDATE` with bounded arithmetic (`+`, saturating `-`, `*`, `/`, `%`, `ABS`, `ROUND`, `CASE`, `COALESCE`), dialect-specific `UPSERT`, and `DELETE` predicates with recursive boolean trees (`AND`, `OR`, `NOT`, `BETWEEN`, `IN`, `LIKE`, `IS NULL`).
+  - **Recursive SELECT AST grammar**: `SchemaAwareSelectFuzzer` generating diverse query AST structures and clause combinations (`JOIN + GROUP BY + HAVING`, `CTE + WINDOW`, `EXISTS + SUBQUERY`, set operations `UNION`/`INTERSECT`/`EXCEPT`, distinct projections).
+  - **Concurrency & isolation scenarios**: independent-session watermark interleaving during incremental backfill, snapshot-isolation writer blocking, rollback recovery, and multi-writer stress.
+
+### Execution fidelity: native engines vs transpiled simulation
+
+Tests explicitly differentiate between native database engine execution and transpiled auxiliary execution:
+
+- **Native Database Engines** (CPython `sqlite3`, `apsw`, `sqlcipher`, `libsql`, live `PostgreSQL` 15–18, live `MySQL` 8.4/9.7 LTS, and live `MariaDB` 10.11/11.8/12.3 LTS): Full-fidelity execution directly on real database binaries and services. Only native engine runs establish engine-specific trigger semantics, procedural functions, transactional isolation levels, type coercions, and dialect-specific semantics.
+- **Transpiled / Simulated Dialect Execution (`TranspiledConnectionAdapter`)**: Fast local transpilation via `sqlglot` to SQLite for preliminary syntax/logic checks. Labeled strictly as auxiliary developer checks, not as substitutes for native engine semantics (they do not exercise real database triggers, native procedural languages, or native concurrency).
+
+### Continuous Integration architecture: PR gate vs deferred compatibility sweep
+
+CI is structured into two complementary workflows:
+
+- **PR Gate ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))**: A fast, high-signal, non-redundant gate for every PR. Exercises supported Python versions (3.11 & 3.15), alternative SQLite engines (APSW, SQLCipher, libSQL), PostgreSQL major/LTS boundaries (15 & 18), MySQL LTS (8.4 & 9.7), and MariaDB LTS (10.11, 11.8, 12.3), alongside deterministic suites and standard-scale fuzzing. Required for PR merge via `ci-success`.
+- **Deferred Compatibility Sweep ([`.github/workflows/ci-deferred.yml`](.github/workflows/ci-deferred.yml))**: Scheduled weekly sweep covering intermediate Python versions (3.13 & 3.14), intermediate engine releases (PostgreSQL 16 & 17, Percona PostgreSQL 18, MySQL 26.10 Innovation, MariaDB 11.4 LTS & 13.1 Rolling, Percona Server for MySQL 8.4 & 9.7, SQLite3MC, sqlean), declared dependency floors, and scale-3 stress fuzzing campaigns. Aggregate result reported via `deferred-success`.
 
 ## Roadmap
 
