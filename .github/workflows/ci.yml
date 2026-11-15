@@ -215,6 +215,9 @@ jobs:
       - name: Test compiler alias, aux type, and PK NULL safety
         run: python3 test_p0_compiler_alias_aux_pk_safety.py
 
+      - name: Test dialect-aware SQLGlot AST parsing
+        run: python3 test_p1_dialect_parsing.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
