@@ -4021,6 +4021,40 @@ def run_suite_11_live_engine_50_view_battery_across_all_dialects(runner: MVTestR
 
 
 class TestGeneratorAndManagerCodePaths(unittest.TestCase):
+    def test_postgres_registration_requires_owned_transaction_before_introspection(self) -> None:
+        class Connection:
+            def __init__(self, autocommit: Any, status: Any) -> None:
+                self.autocommit = autocommit
+                self._status = status
+
+            def get_transaction_status(self) -> Any:
+                return self._status
+
+        def make_manager(conn: Connection) -> MaterializedViewManager:
+            manager = MaterializedViewManager.__new__(MaterializedViewManager)
+            manager.conn = conn
+            manager.dialect = Dialect.POSTGRES
+            manager.fetch_schema = lambda **kwargs: self.fail(
+                "unsafe transaction state must be rejected before schema introspection"
+            )
+            return manager
+
+        cases = (
+            (Connection(True, 0), "autocommit=False"),
+            (Connection(False, 2), "active caller transaction"),
+            (Connection(False, None), "cannot safely determine"),
+        )
+        for conn, message in cases:
+            manager = make_manager(conn)
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    manager.register_view("CREATE VIEW v AS SELECT 1 AS value;")
+
+        conn = Connection(False, 2)
+        manager = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
+            manager.sync_views("CREATE VIEW v AS SELECT 1 AS value;")
+
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
