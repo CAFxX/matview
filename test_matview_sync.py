@@ -3200,15 +3200,26 @@ def run_suite_5_joins(runner: MVTestRunner) -> None:
         "SELECT u.tier, o.status, COUNT(*) AS cnt, SUM(o.total) AS sum_t FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.tier, o.status",
         "SELECT u.tier, COUNT(*) AS joined_rows, COUNT(o.total) AS valued_rows, SUM(o.total) AS total_amount FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.tier",
     ]
-    for base_q in join_agg_queries:
-        for w in ["", " WHERE u.active = 1", " WHERE u.id >= 1"]:
-            for h in ["", " HAVING COUNT(*) >= 1", " HAVING TOTAL(o.total) >= 0.0"]:
-                if "o.total" in h and "o.total" not in base_q:
-                    continue
-                idx += 1
-                v_name = f"s5_join_{idx:03d}"
-                q = base_q.replace(" GROUP BY", f"{w} GROUP BY") + h
-                views.append((v_name, f"CREATE VIEW {v_name} AS {q};"))
+    for base_idx, base_q in enumerate(join_agg_queries):
+        # The final query is the dedicated native regression fixture. One
+        # unfiltered variant is sufficient: the deterministic mutation sequence
+        # below exercises its full group lifecycle, without multiplying the
+        # expensive multi-engine view matrix by nine.
+        variants = (
+            [("", "")]
+            if base_idx == len(join_agg_queries) - 1
+            else [
+                (w, h)
+                for w in ["", " WHERE u.active = 1", " WHERE u.id >= 1"]
+                for h in ["", " HAVING COUNT(*) >= 1", " HAVING TOTAL(o.total) >= 0.0"]
+                if "o.total" not in h or "o.total" in base_q
+            ]
+        )
+        for w, h in variants:
+            idx += 1
+            v_name = f"s5_join_{idx:03d}"
+            q = base_q.replace(" GROUP BY", f"{w} GROUP BY") + h
+            views.append((v_name, f"CREATE VIEW {v_name} AS {q};"))
 
     # 4. Self-Join (Employee -> Manager) across INNER and LEFT JOIN
     self_join_projs = [
