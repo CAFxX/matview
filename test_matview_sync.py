@@ -1249,11 +1249,21 @@ class _CompatCursorAdapter:
 
 
 class _CompatConnectionAdapter:
-    def __init__(self, cursor_factory, close_fn, commit_fn=None, rollback_fn=None):
+    def __init__(self, cursor_factory, close_fn, commit_fn=None, rollback_fn=None, in_tx_fn=None):
         self._cursor_factory = cursor_factory
         self._close_fn = close_fn
         self._commit_fn = commit_fn
         self._rollback_fn = rollback_fn
+        self._in_tx_fn = in_tx_fn
+
+    @property
+    def in_transaction(self) -> bool:
+        if self._in_tx_fn:
+            try:
+                return bool(self._in_tx_fn())
+            except Exception:
+                return False
+        return False
 
     def cursor(self) -> _CompatCursorAdapter:
         return self._cursor_factory()
@@ -1313,7 +1323,13 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in raw_cur.execute(q)]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_apsw_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(
+            _make_apsw_cursor,
+            raw_conn.close,
+            commit_fn=lambda: raw_conn.cursor().execute("COMMIT;") if getattr(raw_conn, "in_transaction", False) else None,
+            rollback_fn=lambda: raw_conn.cursor().execute("ROLLBACK;") if getattr(raw_conn, "in_transaction", False) else None,
+            in_tx_fn=lambda: getattr(raw_conn, "in_transaction", False),
+        )
 
     elif eng == "sqlcipher":
         try:
@@ -1344,7 +1360,13 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in (c.fetchall() or [])]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_cipher_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(
+            _make_cipher_cursor,
+            raw_conn.close,
+            commit_fn=lambda: raw_conn.execute("COMMIT;") if getattr(raw_conn, "in_transaction", False) else (raw_conn.commit() if hasattr(raw_conn, "commit") else None),
+            rollback_fn=lambda: raw_conn.execute("ROLLBACK;") if getattr(raw_conn, "in_transaction", False) else (raw_conn.rollback() if hasattr(raw_conn, "rollback") else None),
+            in_tx_fn=lambda: getattr(raw_conn, "in_transaction", False),
+        )
 
     elif eng == "sqlean":
         import sqlean  # type: ignore
@@ -1371,7 +1393,13 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in (c.fetchall() or [])]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_sqlean_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(
+            _make_sqlean_cursor,
+            raw_conn.close,
+            commit_fn=lambda: raw_conn.execute("COMMIT;") if getattr(raw_conn, "in_transaction", False) else (raw_conn.commit() if hasattr(raw_conn, "commit") else None),
+            rollback_fn=lambda: raw_conn.execute("ROLLBACK;") if getattr(raw_conn, "in_transaction", False) else (raw_conn.rollback() if hasattr(raw_conn, "rollback") else None),
+            in_tx_fn=lambda: getattr(raw_conn, "in_transaction", False),
+        )
 
     elif eng == "libsql":
         try:
@@ -1474,6 +1502,9 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
         return _CompatConnectionAdapter(
             lambda: _CompatCursorAdapter(_libsql_exec, _libsql_query),
             lambda: raw_conn.close() if hasattr(raw_conn, "close") else None,
+            commit_fn=lambda: _libsql_exec("COMMIT;") if tx_state["in_tx"] else (raw_conn.commit() if hasattr(raw_conn, "commit") else None),
+            rollback_fn=lambda: _libsql_exec("ROLLBACK;") if tx_state["in_tx"] else (raw_conn.rollback() if hasattr(raw_conn, "rollback") else None),
+            in_tx_fn=lambda: tx_state["in_tx"],
         )
 
     elif eng == "sqlite3":
@@ -1507,7 +1538,13 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in (c.fetchall() or [])]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_sq3_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(
+            _make_sq3_cursor,
+            raw_conn.close,
+            commit_fn=lambda: raw_conn.execute("COMMIT;") if raw_conn.in_transaction else raw_conn.commit(),
+            rollback_fn=lambda: raw_conn.execute("ROLLBACK;") if raw_conn.in_transaction else raw_conn.rollback(),
+            in_tx_fn=lambda: raw_conn.in_transaction,
+        )
 
     else:
         raise ValueError(f"Unknown SQLITE_COMPAT_ENGINE: {engine_spec}")
