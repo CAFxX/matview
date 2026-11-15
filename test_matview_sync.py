@@ -4253,6 +4253,53 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             self.assertGreaterEqual(len(w_rec), 1)
             self.assertIn("CREATE ALGORITHM = TEMPTABLE VIEW", plan.reader_view_ddl)
 
+    def test_04b_cli_limitation_default_rejection_and_explicit_override(self) -> None:
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        schema = "CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, val INT);"
+        view = "CREATE VIEW v AS SELECT grp, COUNT(*) AS c FROM t GROUP BY grp;"
+
+        with self.assertRaises(EngineLimitationError) as raised:
+            generate_materialized_view(
+                schema, view, dialect="mysql", ignore_limitations=False
+            )
+        expected_codes = {lim.code for lim in raised.exception.limitations}
+        self.assertTrue(expected_codes)
+        self.assertNotIn("", expected_codes)
+
+        default_stdout = io.StringIO()
+        default_stderr = io.StringIO()
+        with redirect_stdout(default_stdout), redirect_stderr(default_stderr):
+            default_rc = cli_main(
+                ["--schema", schema, "--view", view, "--dialect", "mysql"]
+            )
+        self.assertEqual(default_rc, 2)
+        self.assertEqual(default_stdout.getvalue(), "")
+        for code in expected_codes:
+            self.assertIn(f"[{code}]", default_stderr.getvalue())
+
+        override_stdout = io.StringIO()
+        override_stderr = io.StringIO()
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter("always", EngineLimitationWarning)
+            with redirect_stdout(override_stdout), redirect_stderr(override_stderr):
+                override_rc = cli_main(
+                    [
+                        "--schema", schema, "--view", view, "--dialect", "mysql",
+                        "--ignore-limitations",
+                    ]
+                )
+        self.assertEqual(override_rc, 0)
+        self.assertTrue(override_stdout.getvalue().strip())
+        limitation_warnings = [
+            warning for warning in emitted
+            if issubclass(warning.category, EngineLimitationWarning)
+        ]
+        self.assertEqual(len(limitation_warnings), 1)
+        for code in expected_codes:
+            self.assertIn(code, str(limitation_warnings[0].message))
+
     def test_05_non_deterministic_functions_and_right_full_join_lowering(self) -> None:
         schema = """
         CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, aval TEXT);
