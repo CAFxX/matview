@@ -248,6 +248,9 @@ jobs:
       - name: Test sqlglot.exp AST SQL builder helpers
         run: python3 test_p1_sqlglot_builders.py
 
+      - name: Test Jinja2 procedural trigger and backfill templates
+        run: python3 test_p1_jinja2_templates.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
