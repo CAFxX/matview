@@ -8901,6 +8901,68 @@ class WrappedConnectionTransactionStateTests(unittest.TestCase):
         self.assertEqual(connection.commit_calls, 0)
         self.assertEqual(connection.rollback_calls, 0)
 
+
+    class MySQLUnknownDriver:
+        pass
+
+    class MySQLUnknownFacade:
+        in_transaction = False
+        autocommit = False
+
+        def __init__(self):
+            self.connection = WrappedConnectionTransactionStateTests.MySQLUnknownDriver()
+            self.cursor_calls = 0
+
+        def cursor(self):
+            self.cursor_calls += 1
+            raise AssertionError("unknown physical transaction state must be rejected before SQL")
+
+        def commit(self):
+            raise AssertionError("must not commit when driver transaction state is unknown")
+
+        def rollback(self):
+            raise AssertionError("must not roll back when driver transaction state is unknown")
+
+    class PostgresUnknownDriver:
+        autocommit = False
+
+    class PostgresUnknownFacade:
+        in_transaction = False
+        autocommit = False
+
+        def __init__(self):
+            self.connection = WrappedConnectionTransactionStateTests.PostgresUnknownDriver()
+            self.cursor_calls = 0
+
+        def cursor(self):
+            self.cursor_calls += 1
+            raise AssertionError("unknown physical transaction state must be rejected before SQL")
+
+    def test_mysql_bulk_changes_rejects_unknown_deepest_driver_state(self):
+        connection = self.MySQLUnknownFacade()
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = connection
+        manager.dialect = Dialect.MYSQL
+        manager.get_catalog = lambda: self.fail("catalog access must not occur")
+        manager.fetch_schema = lambda: self.fail("schema access must not occur")
+
+        with self.assertRaisesRegex(RuntimeError, "cannot safely determine|transaction state"):
+            with manager.bulk_changes():
+                self.fail("unknown physical transaction state must be rejected")
+        self.assertEqual(connection.cursor_calls, 0)
+
+    def test_postgres_bulk_changes_rejects_unknown_deepest_driver_state(self):
+        connection = self.PostgresUnknownFacade()
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = connection
+        manager.dialect = Dialect.POSTGRES
+        manager.get_catalog = lambda: self.fail("catalog access must not occur")
+
+        with self.assertRaisesRegex(RuntimeError, "deepest wrapped driver"):
+            with manager.bulk_changes():
+                self.fail("unknown physical transaction state must be rejected")
+        self.assertEqual(connection.cursor_calls, 0)
+
     def test_postgres_bulk_changes_rejects_transaction_hidden_by_facade(self):
         connection = self.PostgresFacade()
         manager = MaterializedViewManager.__new__(MaterializedViewManager)
