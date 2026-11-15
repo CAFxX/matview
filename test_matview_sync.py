@@ -2056,25 +2056,34 @@ class TranspiledConnectionAdapter:
                     body,
                     flags=re.I | re.S,
                 )
-                b_clean = _transpile_pg_expr_to_sqlite("\n".join(loop_bodies))
+                if loop_bodies:
+                    b_clean = _transpile_pg_expr_to_sqlite("\n".join(loop_bodies))
 
-                def _unwrap_if_tr(m_inner: re.Match[str]) -> str:
-                    c_in, st_in = m_inner.group(1).strip(), m_inner.group(2).strip()
-                    out_sts = []
-                    for st_p in _split_top_level(st_in, ";"):
-                        sp = st_p.strip()
-                        if not sp:
-                            continue
-                        if re.match(r"^INSERT\s+INTO\b", sp, flags=re.I):
-                            if re.search(r"\bWHERE\s+(?:TRUE|1)\b", sp, flags=re.I):
-                                sp = re.sub(
-                                    r"\bWHERE\s+(?:TRUE|1)\b",
-                                    f"WHERE ({c_in})",
-                                    sp,
-                                    count=1,
-                                    flags=re.I,
-                                )
-                            else:
+                    def _unwrap_if_tr(m_inner: re.Match[str]) -> str:
+                        c_in, st_in = m_inner.group(1).strip(), m_inner.group(2).strip()
+                        out_sts = []
+                        for st_p in _split_top_level(st_in, ";"):
+                            sp = st_p.strip()
+                            if not sp:
+                                continue
+                            if re.match(r"^INSERT\s+INTO\b", sp, flags=re.I):
+                                if re.search(r"\bWHERE\s+(?:TRUE|1)\b", sp, flags=re.I):
+                                    sp = re.sub(
+                                        r"\bWHERE\s+(?:TRUE|1)\b",
+                                        f"WHERE ({c_in})",
+                                        sp,
+                                        count=1,
+                                        flags=re.I,
+                                    )
+                                else:
+                                    sp = re.sub(
+                                        r"\n\s*WHERE\s+",
+                                        f"\n    WHERE ({c_in}) AND ",
+                                        sp,
+                                        count=1,
+                                        flags=re.I,
+                                    )
+                            elif re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", sp, flags=re.I):
                                 sp = re.sub(
                                     r"\n\s*WHERE\s+",
                                     f"\n    WHERE ({c_in}) AND ",
@@ -2082,23 +2091,82 @@ class TranspiledConnectionAdapter:
                                     count=1,
                                     flags=re.I,
                                 )
-                        elif re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", sp, flags=re.I):
-                            sp = re.sub(
-                                r"\n\s*WHERE\s+",
-                                f"\n    WHERE ({c_in}) AND ",
-                                sp,
-                                count=1,
-                                flags=re.I,
-                            )
-                        out_sts.append(sp + ";")
-                    return "\n".join(out_sts)
+                            out_sts.append(sp + ";")
+                        return "\n".join(out_sts)
 
-                b_clean = re.sub(
-                    r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
-                    _unwrap_if_tr,
-                    b_clean,
-                    flags=re.I | re.S,
-                )
+                    b_clean = re.sub(
+                        r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
+                        _unwrap_if_tr,
+                        b_clean,
+                        flags=re.I | re.S,
+                    )
+                else:
+                    m_code = re.search(r"\bBEGIN\s*(.*?)\s*RETURN\s+NULL;", body, flags=re.I | re.S)
+                    raw_code = m_code.group(1).strip() if m_code else ""
+                    cols_info = self._sq_conn.execute(f"PRAGMA table_info({base_t})").fetchall()
+                    col_names = [r[1] for r in cols_info]
+
+                    def _conv_delete_using(m_del: re.Match[str]) -> str:
+                        del_tbl = m_del.group(1)
+                        using_src = m_del.group(2).strip()
+                        where_clause = m_del.group(3).strip().rstrip(";")
+                        return f"DELETE FROM {del_tbl} WHERE EXISTS (SELECT 1 FROM {using_src} WHERE {where_clause});"
+
+                    raw_code = re.sub(
+                        r"\bDELETE\s+FROM\s+([A-Za-z0-9_]+)\s+USING\s+([^\n;]+?)\s+WHERE\s+(.+?);",
+                        _conv_delete_using,
+                        raw_code,
+                        flags=re.I | re.S,
+                    )
+
+                    cols_s_new = ', '.join(f'NEW.{c} AS {c}' for c in col_names)
+                    cols_s_old = ', '.join(f'OLD.{c} AS {c}' for c in col_names)
+                    raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_new_rows\s+AS\s+([A-Za-z0-9_]+)\b", rf"\1 (SELECT {cols_s_new}) AS \2", raw_code)
+                    raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_old_rows\s+AS\s+([A-Za-z0-9_]+)\b", rf"\1 (SELECT {cols_s_old}) AS \2", raw_code)
+                    raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_new_rows\b", rf"\1 (SELECT {cols_s_new}) AS __mv_new_rows", raw_code)
+                    raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_old_rows\b", rf"\1 (SELECT {cols_s_old}) AS __mv_old_rows", raw_code)
+
+                    def _strip_target_tbl_in_do_update(m_upsert: re.Match[str]) -> str:
+                        pre = m_upsert.group(1)
+                        tbl = m_upsert.group(2)
+                        assignments = m_upsert.group(3)
+                        out = []
+                        i = 0
+                        n = len(assignments)
+                        while i < n:
+                            if assignments[i:i+7].upper() == "(SELECT":
+                                depth = 1
+                                j = i + 1
+                                while j < n and depth > 0:
+                                    if assignments[j] == "(":
+                                        depth += 1
+                                    elif assignments[j] == ")":
+                                        depth -= 1
+                                    j += 1
+                                subq = assignments[i:j]
+                                subq = re.sub(rf"\b{re.escape(tbl)}\.([A-Za-z0-9_]+)\b", r"EXCLUDED.\1", subq)
+                                out.append(subq)
+                                i = j
+                            else:
+                                out.append(assignments[i])
+                                i += 1
+                        assignments = "".join(out)
+                        assignments = re.sub(rf"\b{re.escape(tbl)}\.", "", assignments)
+                        return f"{pre}{assignments}"
+
+                    raw_code = re.sub(
+                        r"(INSERT\s+INTO\s+([A-Za-z0-9_]+)\b.*?ON\s+CONFLICT\s*\(.*?\)\s*DO\s+UPDATE\s+SET\s+)([^;]+;)",
+                        _strip_target_tbl_in_do_update,
+                        raw_code,
+                        flags=re.I | re.S,
+                    )
+                    raw_code = re.sub(
+                        r"(FROM\s+[^\n;]+?)\s*\n\s*(ON\s+CONFLICT\b)",
+                        r"\1\nWHERE 1=1\n\2",
+                        raw_code,
+                        flags=re.I,
+                    )
+                    b_clean = _transpile_pg_expr_to_sqlite(raw_code)
                 self._sq_conn.execute(
                     f"CREATE TRIGGER {t_name} AFTER {op} ON {base_t} FOR EACH ROW\nBEGIN\n{b_clean}\nEND;"
                 )

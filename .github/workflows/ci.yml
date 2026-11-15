@@ -239,6 +239,9 @@ jobs:
       - name: Test quoting SQL reserved keyword identifiers across DDL and triggers
         run: python3 test_p1_quote_identifiers.py
 
+      - name: Test PostgreSQL statement transition-table vectorization
+        run: python3 test_p1_pg_transition_vectorization.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
@@ -375,6 +378,11 @@ jobs:
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_p1_manager_safety.py
+
+      - name: Test PostgreSQL statement transition-table vectorization
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+        run: python3 test_p1_pg_transition_vectorization.py
   # Both supported Oracle MySQL LTS series are required on every PR.
   mysql:
     needs: classify
