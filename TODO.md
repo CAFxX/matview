@@ -132,6 +132,10 @@ The existing differential-testing harness is useful, but its current headline co
   - Reconcile README, module docstrings, runner output, and CI matrix descriptions from one generated source of truth.
   - Remove brittle workflow-text-count assertions; validate workflow structure semantically where needed and rely on actual CI execution for runtime behavior.
 
+- [ ] **Make SQLite REPLACE Conflict Handling Safe Across Independent Writer Connections**:
+  - Progress: Added `MaterializedViewManager.configure_sqlite_connection(connection)`, a public DB-API helper that enables and verifies connection-local `PRAGMA recursive_triggers = ON`; the manager uses the same fail-closed helper for its own connection. README guidance requires calling it for every application/pooled writer connection. A file-backed independent-connection regression deliberately disables recursive triggers on one writer and proves `INSERT OR REPLACE` leaves the MV stale, then verifies the initialized writer maintains the live result. The helper cannot prevent application code from later disabling the PRAGMA, and applications must initialize every writer connection.
+  - Remaining: exercise REPLACE conflicts on every relevant UNIQUE constraint and supported SQLite-compatible driver/runtime; consider pool/ORM integration hooks. Do not claim the manager connection's PRAGMA protects arbitrary writers.
+
 ## P1 — Modular Architecture, Engine/Version Optimizations & Developer Experience
 
 - [x] **Keep User-Accessible Materialized Views Free of the Internal Object Prefix**:
