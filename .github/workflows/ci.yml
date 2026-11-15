@@ -172,6 +172,9 @@ jobs:
       - name: Verify SQLite library version
         run: python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
 
+      - name: Verify SQLite runtime feature boundaries
+        run: python3 test_sqlite_runtime_boundaries.py
+
       - name: Run full test suite (SQLite + cross-dialect transpiled suites)
         env:
           MATVIEW_FUZZ_TARGET: "SQLite / Python ${{ matrix.python-version }}"
