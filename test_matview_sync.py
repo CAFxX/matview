@@ -4198,9 +4198,15 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 self._cursor = cursor
                 self.rollback_calls = 0
                 self.commit_calls = 0
+                self.close_calls = 0
 
             def cursor(self) -> Cursor:
+                if self.close_calls:
+                    raise RuntimeError("connection is closed")
                 return self._cursor
+
+            def close(self) -> None:
+                self.close_calls += 1
 
             def rollback(self) -> None:
                 self.rollback_calls += 1
@@ -4340,6 +4346,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 pass
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
+        self.assertEqual(conn.close_calls, 1)
+        with self.assertRaisesRegex(RuntimeError, "connection is closed"):
+            conn.cursor()
 
         # If the body itself fails and cleanup cannot clear the session flag,
         # surface the connection-contamination hazard instead of silently
@@ -4352,6 +4361,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 raise ValueError("body failed")
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
+        self.assertEqual(conn.close_calls, 1)
 
         # The same rule applies when refresh fails after the with-body returns.
         cursor = Cursor(fail_reset=True)
@@ -4363,6 +4373,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 pass
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
+        self.assertEqual(conn.close_calls, 1)
 
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
