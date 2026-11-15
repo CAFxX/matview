@@ -10235,7 +10235,10 @@ class MaterializedViewManager:
 
     def _mysql_autocommit_state(self) -> Optional[bool]:
         """Return the configured MySQL autocommit mode without changing it."""
-        getter = getattr(self.conn, "get_autocommit", None)
+        try:
+            getter = getattr(self.conn, "get_autocommit", None)
+        except Exception:
+            getter = None
         if callable(getter):
             try:
                 value = getter()
@@ -10966,6 +10969,9 @@ class MaterializedViewManager:
         on PostgreSQL, `SET @__matview_skip_triggers = 1` on MySQL) so triggers are never dropped
         globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
         optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
+        On MySQL/MariaDB, the connection must expose reliable transaction and autocommit state,
+        must have autocommit disabled, and must not already be inside a transaction. The context
+        commits its own work, while MySQL DDL can implicitly commit even when the context fails.
         """
         # MySQL DDL implicitly commits. More generally, this context manager
         # owns the transaction it commits/rolls back, so it must never enter
