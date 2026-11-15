@@ -10328,8 +10328,12 @@ class MaterializedViewManager:
             )
         return "\n".join(parts)
 
-    def drop_view(self, view_name: str) -> bool:
-        """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
+    def drop_view(self, view_name: str, _commit_transaction: bool = True) -> bool:
+        """Drops a registered materialized view, its triggers, read-only view, and backing tables.
+
+        Internal callers may defer the commit when composing this operation into a
+        larger transaction on engines with transactional DDL.
+        """
         catalog = self.get_catalog()
         resolved_name = self._resolve_catalog_name(view_name, catalog)
         entry = catalog.get(resolved_name)
@@ -10346,7 +10350,8 @@ class MaterializedViewManager:
                 cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
             ph = self._param_placeholder()
             cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
-            self._commit()
+            if _commit_transaction:
+                self._commit()
             return True
         else:
             raw_logical = (
@@ -10358,7 +10363,8 @@ class MaterializedViewManager:
             cur.execute(f"DROP VIEW IF EXISTS {db_v};")
             cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
             cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
-            self._commit()
+            if _commit_transaction:
+                self._commit()
             return False
 
     def _update_backfill_watermark(
@@ -10612,43 +10618,56 @@ class MaterializedViewManager:
         if existing and existing["signature_hash"] == sig and not force_rebuild:
             return plan
 
-        if existing:
-            self.drop_view(plan.view_name)
-
-        # Install structure, maintenance triggers, single-shot backfill, and catalog record
-        # inside a single atomic transaction so concurrent readers/writers never observe an
-        # un-triggered or double-counted window between trigger attachment and population.
         cur = self.conn.cursor()
+        sqlite_writer_reserved = False
+
+        def reserve_sqlite_writer() -> bool:
+            if self.dialect != Dialect.SQLITE:
+                return False
+            transaction_active = getattr(self.conn, "in_transaction", None)
+            if transaction_active:
+                return True
+            try:
+                cur.execute("BEGIN IMMEDIATE;")
+            except Exception as exc:
+                message = str(exc).lower()
+                already_active = (
+                    transaction_active is None
+                    and (
+                        "within a transaction" in message
+                        or "already in a transaction" in message
+                    )
+                )
+                if not already_active:
+                    raise
+            return True
+
         try:
-            # sqlite3 does not implicitly wrap DDL in a transaction. Without an
-            # explicit write transaction, another connection can commit DML after
-            # maintenance triggers are installed but before initial population;
-            # that row is then both trigger-applied and backfilled. Reserve the
-            # SQLite writer before any structure/trigger DDL so installation and
-            # population are one writer-visible operation. An existing caller
-            # transaction already owns the transaction boundary; its first DDL
-            # obtains the write lock before trigger installation.
-            if self.dialect == Dialect.SQLITE:
-                # Standard sqlite3 exposes in_transaction, but SQLite-compatible
-                # DB-API adapters (APSW/SQLCipher/libSQL test adapters) may not.
-                # Try to reserve the writer in that case; if the adapter reports
-                # that a transaction is already active, retain the caller's
-                # transaction rather than treating the wrapper as autocommit.
-                transaction_active = getattr(self.conn, "in_transaction", None)
-                if not transaction_active:
-                    try:
-                        cur.execute("BEGIN IMMEDIATE;")
-                    except Exception as exc:
-                        message = str(exc).lower()
-                        already_active = (
-                            transaction_active is None
-                            and (
-                                "within a transaction" in message
-                                or "already in a transaction" in message
-                            )
-                        )
-                        if not already_active:
-                            raise
+            if existing:
+                # SQLite and PostgreSQL support transactional DDL. For a single-shot
+                # replacement, keep removal of the old reader/backing objects in the
+                # same transaction as creation and population of the replacement, so
+                # a failed rebuild restores the previously working materialized view.
+                # MySQL/MariaDB implicitly commit DDL, and incremental backfills
+                # intentionally commit chunks; those paths still require a future
+                # shadow-generation publication protocol.
+                transactional_replacement = (
+                    not incremental_backfill
+                    and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES)
+                )
+                if transactional_replacement:
+                    sqlite_writer_reserved = reserve_sqlite_writer()
+                    self.drop_view(plan.view_name, _commit_transaction=False)
+                else:
+                    self.drop_view(plan.view_name)
+
+            # Reserve before the first structure/trigger DDL on new registrations.
+            # For SQLite this also closes the trigger-installation/backfill writer
+            # race. For transactional replacement the reservation was taken before
+            # dropping the old generation above.
+            if not sqlite_writer_reserved:
+                sqlite_writer_reserved = reserve_sqlite_writer()
+
             for stmt in plan.create_structure_statements():
                 cur.execute(stmt)
             for stmt in plan.trigger_ddls:
