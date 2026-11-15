@@ -4264,6 +4264,14 @@ class IncrementalViewCompiler:
                     precision = (p1 - s1) + s2 + scale
                 scale = min(self._max_decimal_scale(), scale)
                 return min(65, max(scale, precision)), scale
+            if kind == "Distinct":
+                expressions = list(node.iter_expressions())
+                if len(expressions) == 1:
+                    return infer(expressions[0])
+                values = [infer(child) for child in expressions]
+                if not values or any(value is None for value in values):
+                    return None
+                return merge_types([value for value in values if value is not None])
             if kind == "Sum":
                 value = infer(node.this)
                 if value is None:
