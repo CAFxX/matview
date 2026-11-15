@@ -496,6 +496,10 @@ class StrictCompilationError(ValueError):
     """Raised when strict=True is enabled and a view cannot be compiled with Tier 1 ALGEBRAIC_DELTA."""
 
 
+class UnsupportedMaterializedViewError(ValueError):
+    """Raised when an unsupported materialized view operation or configuration is attempted."""
+
+
 @dataclass(frozen=True)
 class ColumnDef:
     name: str
@@ -626,6 +630,12 @@ class MaterializedViewPlan:
     @property
     def initial_populate_sql(self) -> str:
         return "\n\n".join(self.initial_populate_sqls)
+
+    @property
+    def has_watermark_triggers(self) -> bool:
+        if self.sub_plans:
+            return all(sp.has_watermark_triggers for sp in self.sub_plans)
+        return any("backfill_active" in trig for trig in self.trigger_ddls)
 
     def get_populate_statements(
         self,
@@ -4956,6 +4966,11 @@ class IncrementalViewCompiler:
             pk_col = spec.pk_column
             tmpl = spec.chunk_sql_templates[0].strip().rstrip(";")
             ph = "?" if self.dialect == Dialect.SQLITE else "%s"
+            is_global_agg = (
+                any(it.is_aggregate for it in raw_plan.view_spec.select_items)
+                and not raw_plan.view_spec.group_by_cols
+                and not raw_plan.view_spec.has_top_level_distinct
+            )
 
             if self.dialect == Dialect.SQLITE:
                 # Replace `(pk_col > ? AND pk_col <= ?)` with recursive CTE batch join
@@ -4996,7 +5011,7 @@ class IncrementalViewCompiler:
                     f"({pk_col} > %s AND {pk_col} <= %s)",
                     f"({pk_col} > __mv_cur_pk AND {pk_col} <= __mv_top_pk)",
                 )
-                if not raw_plan.view_spec.group_by_cols and not raw_plan.view_spec.has_top_level_distinct:
+                if is_global_agg:
                     pg_chunk = re.sub(
                         r"\nON CONFLICT\b",
                         "\nHAVING COUNT(*) > 0\nON CONFLICT",
@@ -5004,7 +5019,7 @@ class IncrementalViewCompiler:
                         count=1,
                     )
                 fallback_global = ""
-                if not raw_plan.view_spec.group_by_cols and not raw_plan.view_spec.has_top_level_distinct:
+                if is_global_agg:
                     for pop_s in raw_plan.initial_populate_sqls:
                         p_clean = pop_s.strip().rstrip(";")
                         fallback_global += (
@@ -5038,7 +5053,7 @@ class IncrementalViewCompiler:
                     f"({pk_col} > %s AND {pk_col} <= %s)",
                     f"({pk_col} > __mv_cur_pk AND {pk_col} <= __mv_top_pk)",
                 )
-                if not raw_plan.view_spec.group_by_cols and not raw_plan.view_spec.has_top_level_distinct:
+                if is_global_agg:
                     my_chunk = re.sub(
                         r"\nON DUPLICATE KEY UPDATE\b",
                         "\nHAVING COUNT(*) > 0\nON DUPLICATE KEY UPDATE",
@@ -5046,7 +5061,7 @@ class IncrementalViewCompiler:
                         count=1,
                     )
                 fallback_global = ""
-                if not raw_plan.view_spec.group_by_cols and not raw_plan.view_spec.has_top_level_distinct:
+                if is_global_agg:
                     for pop_s in raw_plan.initial_populate_sqls:
                         p_clean = pop_s.strip().rstrip(";")
                         fallback_global += (
@@ -8786,6 +8801,16 @@ class IncrementalViewCompiler:
         w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
         new_vals = [self._rewrite_expr_for_record(it.raw_expr, "NEW") for it in self.view.select_items]
 
+        wm_pk_col: Optional[str] = None
+        int_pk_cols = [
+            c for c in self.primary_schema.columns.values()
+            if c.primary_key and "INT" in c.data_type.upper()
+        ]
+        if len(int_pk_cols) == 1:
+            wm_pk_col = int_pk_cols[0].name
+        elif self.dialect == Dialect.SQLITE and len(pk_names) <= 1:
+            wm_pk_col = pk_names[0] if pk_names else "rowid"
+
         if uses_native_pk:
             all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
             all_select_exprs = [*sel_exprs, *[h[1] for h in hidden_pk_defs]]
@@ -8810,6 +8835,29 @@ class IncrementalViewCompiler:
                     f"    WHERE TRUE\n"
                     f"    ON CONFLICT ({', '.join(mv_pk_cols)}) DO UPDATE SET {upd_set};"
                 )
+            if wm_pk_col:
+                ph = "?" if self.dialect == Dialect.SQLITE else "%s"
+                chunk_w = (
+                    f"({self.view.where_clause}) AND ({wm_pk_col} > {ph} AND {wm_pk_col} <= {ph})"
+                    if self.view.where_clause
+                    else f"({wm_pk_col} > {ph} AND {wm_pk_col} <= {ph})"
+                )
+                if self.dialect == Dialect.MYSQL:
+                    chunk_upsert_sql: Optional[str] = (
+                        f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                        f"SELECT {', '.join(all_select_exprs)}\nFROM {q_base_t}\n"
+                        f"WHERE {chunk_w}\n"
+                        f"ON DUPLICATE KEY UPDATE {upd_set};"
+                    )
+                else:
+                    chunk_upsert_sql = (
+                        f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                        f"SELECT {', '.join(all_select_exprs)}\nFROM {q_base_t}\n"
+                        f"WHERE {chunk_w}\n"
+                        f"ON CONFLICT ({', '.join(mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                    )
+            else:
+                chunk_upsert_sql = None
             pk_old_preds = [
                 f"{mv_table}.{mv_c} = OLD.{src_c}"
                 for mv_c, src_c in zip(mv_pk_cols, pk_names)
@@ -8858,6 +8906,29 @@ class IncrementalViewCompiler:
                     f"    WHERE TRUE\n"
                     f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                 )
+            if wm_pk_col:
+                ph = "?" if self.dialect == Dialect.SQLITE else "%s"
+                chunk_w = (
+                    f"({self.view.where_clause}) AND ({wm_pk_col} > {ph} AND {wm_pk_col} <= {ph})"
+                    if self.view.where_clause
+                    else f"({wm_pk_col} > {ph} AND {wm_pk_col} <= {ph})"
+                )
+                if self.dialect == Dialect.MYSQL:
+                    chunk_upsert_sql = (
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1\nFROM {q_base_t}\n"
+                        f"WHERE {chunk_w}\n"
+                        f"ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                    )
+                else:
+                    chunk_upsert_sql = (
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1\nFROM {q_base_t}\n"
+                        f"WHERE {chunk_w}\n"
+                        f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                    )
+            else:
+                chunk_upsert_sql = None
             minus_stmt = (
                 f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
                 f"    WHERE {mv_table}.__mv_pk = ({pk_old});"
@@ -8881,6 +8952,21 @@ class IncrementalViewCompiler:
             else None
         )
 
+        if self.watermark_catalog_table and wm_pk_col:
+            q_pk = self._q(wm_pk_col)
+            wm_new = (
+                f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"
+            )
+            wm_old = (
+                f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"AND OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"
+            )
+            where_new = f"({where_new}) AND ({wm_new})" if where_new else wm_new
+            where_old = f"({where_old}) AND ({wm_old})" if where_old else wm_old
+
         trigger_ddls, trig_names, fn_names = self._emit_dialect_triggers_for_table(
             view_name=view_name,
             base_t=base_t,
@@ -8894,10 +8980,17 @@ class IncrementalViewCompiler:
             where_old=where_old,
         )
 
-        inc_spec = IncrementalBackfillSpec(
-            mode="offset_batch",
-            chunk_sql_templates=[initial_populate_sql],
-        )
+        if wm_pk_col and chunk_upsert_sql:
+            inc_spec = IncrementalBackfillSpec(
+                mode="pk_range_fold",
+                pk_column=wm_pk_col,
+                chunk_sql_templates=[chunk_upsert_sql],
+            )
+        else:
+            inc_spec = IncrementalBackfillSpec(
+                mode="offset_batch",
+                chunk_sql_templates=[initial_populate_sql],
+            )
         return MaterializedViewPlan(
             dialect=self.dialect,
             strategy=self.strategy,
@@ -10508,15 +10601,12 @@ class MaterializedViewManager:
         active: int,
     ) -> None:
         ph = self._param_placeholder()
-        try:
-            cur.execute(
-                f"UPDATE {self.catalog_table} "
-                f"SET backfill_cursor_pk = {ph}, backfill_max_pk = {ph}, backfill_active = {ph} "
-                f"WHERE view_name = {ph}",
-                (cursor_pk, max_pk, active, view_name),
-            )
-        except Exception:
-            pass
+        cur.execute(
+            f"UPDATE {self.catalog_table} "
+            f"SET backfill_cursor_pk = {ph}, backfill_max_pk = {ph}, backfill_active = {ph} "
+            f"WHERE view_name = {ph}",
+            (cursor_pk, max_pk, active, view_name),
+        )
 
     def backfill_incrementally(
         self,
@@ -10533,6 +10623,18 @@ class MaterializedViewManager:
         `__matview_catalog` and optionally running under `snapshot_isolation=True`.
         Returns the total number of batches executed.
         """
+        if not snapshot_isolation and batch_size > 0:
+            sub_list = plan.sub_plans if plan.sub_plans else [plan]
+            for p in sub_list:
+                if p.incremental_backfill_spec is not None:
+                    if (
+                        p.incremental_backfill_spec.mode != "pk_range_fold"
+                        or not p.has_watermark_triggers
+                    ):
+                        raise UnsupportedMaterializedViewError(
+                            f"Incremental backfill without snapshot isolation requires watermark-gated triggers and pk_range_fold mode; view '{p.view_name}' does not meet these requirements."
+                        )
+
         if plan.sub_plans:
             total_b = 0
             for sp in plan.sub_plans:
@@ -10571,8 +10673,21 @@ class MaterializedViewManager:
                 plan, batch_size, on_progress, snapshot_isolation, cur
             )
         except BaseException:
-            if snapshot_isolation and snapshot_started:
-                self._rollback_snapshot_backfill(cur)
+            if snapshot_isolation:
+                if snapshot_started:
+                    self._rollback_snapshot_backfill(cur, plan.view_name)
+            else:
+                self._rollback()
+                if (
+                    self.dialect == Dialect.SQLITE
+                    and not hasattr(self.conn, "rollback")
+                    and getattr(self.conn, "in_transaction", False)
+                ):
+                    try:
+                        cur.execute("ROLLBACK;")
+                    except Exception:
+                        pass
+                self._best_effort_reset_backfill_watermark(plan.view_name)
             raise
         finally:
             try:
@@ -10580,7 +10695,7 @@ class MaterializedViewManager:
             except Exception:
                 pass
 
-    def _rollback_snapshot_backfill(self, cur: Any) -> None:
+    def _rollback_snapshot_backfill(self, cur: Any, view_name: Optional[str] = None) -> None:
         """Roll back a failed snapshot backfill without leaving its transaction open."""
         if self.dialect == Dialect.SQLITE:
             try:
@@ -10591,8 +10706,32 @@ class MaterializedViewManager:
                 # If the savepoint no longer exists or the connection is already
                 # in an error state, a full rollback is the safest recovery.
                 self._rollback()
+                if view_name:
+                    self._best_effort_reset_backfill_watermark(view_name)
                 return
         self._rollback()
+        if view_name:
+            self._best_effort_reset_backfill_watermark(view_name)
+
+    def _best_effort_reset_backfill_watermark(self, view_name: str) -> None:
+        try:
+            reset_cur = self.conn.cursor()
+            try:
+                ph = self._param_placeholder()
+                reset_cur.execute(
+                    f"UPDATE {self.catalog_table} "
+                    f"SET backfill_cursor_pk = NULL, backfill_max_pk = NULL, backfill_active = 0 "
+                    f"WHERE view_name = {ph}",
+                    (view_name,),
+                )
+                self._commit()
+            finally:
+                reset_cur.close()
+        except Exception:
+            try:
+                self._rollback()
+            except Exception:
+                pass
 
     def _backfill_incrementally_with_cursor(
         self,
@@ -10635,8 +10774,26 @@ class MaterializedViewManager:
             self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, 1)
             if not snapshot_isolation:
                 self._commit()
+            ph = self._param_placeholder()
             while cursor_pk < max_pk:
                 upper_pk = min(max_pk, cursor_pk + batch_size)
+                sqlite_chunk_tx_began = False
+                if not snapshot_isolation:
+                    if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+                        try:
+                            cur.execute(
+                                f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > {ph} AND {pk_col} <= {ph} FOR UPDATE",
+                                (cursor_pk, upper_pk),
+                            )
+                        except Exception:
+                            pass
+                    elif self.dialect == Dialect.SQLITE:
+                        if not getattr(self.conn, "in_transaction", False):
+                            try:
+                                cur.execute("BEGIN IMMEDIATE;")
+                                sqlite_chunk_tx_began = True
+                            except Exception:
+                                pass
                 for tmpl in spec.chunk_sql_templates:
                     cur.execute(tmpl, (cursor_pk, upper_pk))
                 batches_run += 1
@@ -10645,6 +10802,14 @@ class MaterializedViewManager:
                 self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, still_active)
                 if not snapshot_isolation:
                     self._commit()
+                    if sqlite_chunk_tx_began and (
+                        not hasattr(self.conn, "commit")
+                        or getattr(self.conn, "in_transaction", False)
+                    ):
+                        try:
+                            cur.execute("COMMIT;")
+                        except Exception:
+                            pass
                 if on_progress:
                     done = min(total_span, cursor_pk - (min_pk - 1))
                     on_progress(batches_run, done)
@@ -10793,8 +10958,16 @@ class MaterializedViewManager:
             if populate:
                 if incremental_backfill:
                     self._commit()
+                    use_snap = not (
+                        plan.incremental_backfill_spec
+                        and plan.incremental_backfill_spec.mode == "pk_range_fold"
+                        and plan.has_watermark_triggers
+                    )
                     self.backfill_incrementally(
-                        plan, batch_size=batch_size, on_progress=on_progress
+                        plan,
+                        batch_size=batch_size,
+                        on_progress=on_progress,
+                        snapshot_isolation=use_snap,
                     )
                 else:
                     for stmt in plan.get_populate_statements(incremental_backfill=False):
