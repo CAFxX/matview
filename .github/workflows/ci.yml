@@ -221,6 +221,9 @@ jobs:
       - name: Verify Docker test environment and configuration
         run: python3 test_docker_test_env.py
 
+      - name: Test matview diff CLI command & compilation plan diagnostics
+        run: python3 test_cli_diff.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
