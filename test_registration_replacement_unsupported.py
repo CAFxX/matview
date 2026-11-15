@@ -49,6 +49,9 @@ class NonTransactionalReplacementTests(unittest.TestCase):
     def test_mysql_replacement_is_refused_before_any_sql(self):
         self._assert_refused(Dialect.MYSQL, incremental_backfill=False)
 
+    def test_mysql_incremental_replacement_is_refused_before_any_sql(self):
+        self._assert_refused(Dialect.MYSQL, incremental_backfill=True)
+
     def test_sqlite_incremental_replacement_is_refused_before_any_sql(self):
         self._assert_refused(Dialect.SQLITE, incremental_backfill=True)
 
