@@ -1120,6 +1120,7 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
             assert int(cur.fetchone()[0]) == 0, "caller savepoint rollback did not undo base-table DML"
             _verify_external_db_mv(cur, "v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:caller_tx_rollback")
             _verify_external_db_mv(cur, "v_mgr_dist", q_dist, f"{dialect.value}:mgr:caller_tx_rollback_dist")
+            conn.rollback()  # Close the caller transaction before the DDL lifecycle checks below.
             checks += 4
 
         # 7. ALTER TABLE schema migration via apply_schema_ddl + trigger rebuild
