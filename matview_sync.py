@@ -10299,20 +10299,7 @@ class MaterializedViewManager:
                 )
 
         if self.dialect == Dialect.POSTGRES:
-            if bool(getattr(self.conn, "autocommit", False)):
-                raise RuntimeError(
-                    "register_view/sync_views require PostgreSQL autocommit=False "
-                    "for transactional DDL"
-                )
-            status_getter = getattr(self.conn, "get_transaction_status", None)
-            if callable(status_getter):
-                # psycopg2.extensions.TRANSACTION_STATUS_IDLE is 0.
-                status = status_getter()
-                if status != 0:
-                    raise RuntimeError(
-                        "register_view/sync_views require an idle PostgreSQL connection; "
-                        "commit or roll back the caller transaction first"
-                    )
+            self._require_idle_postgres_connection(self.conn)
 
     def _param_placeholder(self) -> str:
         return "?" if self.dialect == Dialect.SQLITE else "%s"
