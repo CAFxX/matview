@@ -1749,6 +1749,21 @@ _FN_TO_AGG_ENUM: Dict[str, AggFunc] = {
 }
 
 
+def _aggregate_function_for_dialect(fn_raw: str, dialect: Optional[Dialect]) -> AggFunc:
+    """Resolve dialect-defined statistical aliases without losing native semantics."""
+    fn_up = fn_raw.upper()
+    if dialect == Dialect.POSTGRES:
+        if fn_up == "VARIANCE":
+            return AggFunc.VAR_SAMP
+        if fn_up == "STDDEV":
+            return AggFunc.STDDEV_SAMP
+        if fn_up == "STD":
+            raise ValueError(
+                "STD() is not a PostgreSQL aggregate alias; use STDDEV_SAMP() or STDDEV()"
+            )
+    return _FN_TO_AGG_ENUM[fn_up]
+
+
 def _unwrap_outer_parens(sql: str) -> str:
     s = sql.strip()
     while s.startswith("(") and s.endswith(")"):
@@ -1772,7 +1787,9 @@ def _unwrap_outer_parens(sql: str) -> str:
     return s
 
 
-def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
+def _parse_single_agg_expr(
+    expr: str, alias: str, dialect: Optional[Dialect] = None
+) -> Optional[SelectItem]:
     """Parses a single top-level aggregate function call using `sqlglot.parse_one` and `sqlglot.tokenize`."""
     s = _unwrap_outer_parens(expr)
     if not s:
@@ -1896,7 +1913,7 @@ def _parse_single_agg_expr(expr: str, alias: str) -> Optional[SelectItem]:
         raw_expr=expr.strip(),
         alias=alias,
         is_aggregate=True,
-        agg_func=_FN_TO_AGG_ENUM[fn_raw],
+        agg_func=_aggregate_function_for_dialect(fn_raw, dialect),
         arg_expr=first_arg,
         extra_args=extra_args,
         is_distinct=is_dist,
@@ -1921,7 +1938,9 @@ def _contains_aggregate_call(expr: str) -> bool:
     return False
 
 
-def _parse_select_item(raw_item: str, idx: int) -> SelectItem:
+def _parse_select_item(
+    raw_item: str, idx: int, dialect: Optional[Dialect] = None
+) -> SelectItem:
     """Parses a single `SELECT` projection item via `sqlglot.parse_one`."""
     s = raw_item.strip()
     try:
@@ -1948,7 +1967,7 @@ def _parse_select_item(raw_item: str, idx: int) -> SelectItem:
         else:
             alias = f"col_{idx}"
 
-    parsed_agg = _parse_single_agg_expr(expr, alias)
+    parsed_agg = _parse_single_agg_expr(expr, alias, dialect=dialect)
     if parsed_agg is not None:
         return parsed_agg
 
@@ -2344,6 +2363,16 @@ def parse_view_ast(
         vs = _parse_single_create_view_stmt(clean, known_tables=known_tables)
     else:
         vs = _parse_single_create_view_stmt(f"CREATE VIEW __mv_ast_tmp AS {clean}", known_tables=known_tables)
+    # _parse_single_create_view_stmt is intentionally dialect-neutral; re-resolve
+    # aggregate aliases here so the public AST API preserves target-engine semantics.
+    dialect_select_items = tuple(
+        _parse_select_item(
+            f"{item.raw_expr} AS {item.alias}", idx, dialect=dialect
+        )
+        if item.is_aggregate and item.agg_func is not None
+        else item
+        for idx, item in enumerate(vs.select_items)
+    )
     cte_names, main_sel, has_cte = _extract_cte_names_and_strip_with(vs.raw_select_sql)
     return SQLSelectAST(
         raw_sql=vs.raw_select_sql,
@@ -2351,7 +2380,7 @@ def parse_view_ast(
         main_select_sql=main_sel,
         has_cte=has_cte,
         has_distinct=vs.has_top_level_distinct,
-        select_items=vs.select_items,
+        select_items=dialect_select_items,
         from_clause=vs.base_table,
         joins=vs.joins,
         where_clause=vs.where_clause,
@@ -2758,9 +2787,19 @@ class IncrementalViewCompiler:
                 f"User-facing materialized view name '{self.logical_view_name}' "
                 "conflicts with an existing base table. Choose a distinct view name."
             )
+        expanded_view = self._try_expand_select_star(unwrapped_view)
+        dialect_select_items = tuple(
+            _parse_select_item(
+                f"{item.raw_expr} AS {item.alias}", idx, dialect=self.dialect
+            )
+            if item.is_aggregate and item.agg_func is not None
+            else item
+            for idx, item in enumerate(expanded_view.select_items)
+        )
         self.view = replace(
-            self._try_expand_select_star(unwrapped_view),
+            expanded_view,
             view_name=self.logical_view_name,
+            select_items=dialect_select_items,
         )
 
         (
@@ -3133,7 +3172,9 @@ class IncrementalViewCompiler:
         new_items: List[SelectItem] = []
         for it in v.select_items:
             sub_raw = _subst(it.raw_expr) or it.raw_expr
-            parsed = _parse_select_item(f"{sub_raw} AS {it.alias}", 0)
+            parsed = _parse_select_item(
+                f"{sub_raw} AS {it.alias}", 0, dialect=self.dialect
+            )
             new_items.append(parsed)
 
         inner_w = None
@@ -3257,7 +3298,9 @@ class IncrementalViewCompiler:
                         else:
                             elem_counter += 1
                             col_al = f"__mv_elem_{elem_counter}"
-                            parsed_el = _parse_single_agg_expr(full_call, col_al)
+                            parsed_el = _parse_single_agg_expr(
+                                full_call, col_al, dialect=self.dialect
+                            )
                             if parsed_el is None:
                                 return expr_str, False
                             agg_call_to_alias[norm_key] = col_al
@@ -4508,11 +4551,8 @@ class IncrementalViewCompiler:
                         len(num_branches) == branch_count
                         and all("." not in value for value in num_branches)
                     ):
-                        # Native CASE expressions over small integer literals
-                        # produce INT/INTEGER, not BIGINT. Preserve the
-                        # server's result-column width instead of widening the
-                        # materialized reader column and changing DB-API
-                        # metadata (e.g. MySQL LONG vs LONGLONG).
+                        # Preserve the native result width for literal CASE
+                        # branches instead of widening INT/INTEGER to BIGINT.
                         values = [int(value) for value in num_branches]
                         if all(-(2 ** 31) <= value < (2 ** 31) for value in values):
                             return "INT" if self.dialect == Dialect.MYSQL else "INTEGER"
