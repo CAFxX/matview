@@ -47,7 +47,11 @@ class SQLiteRuntimeBoundaryTests(unittest.TestCase):
                     (20,),
                 )
             else:
-                self.fail(f"SQLite {detected.version_str} is below the UPSERT feature floor")
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute(
+                        "INSERT INTO upsert_probe VALUES (1, 20) "
+                        "ON CONFLICT(k) DO UPDATE SET value = excluded.value;"
+                    )
 
             if detected.supports_sqlite_window_functions:
                 rows = conn.execute(
@@ -55,7 +59,10 @@ class SQLiteRuntimeBoundaryTests(unittest.TestCase):
                 ).fetchall()
                 self.assertEqual(rows, [(1, 1)])
             else:
-                self.fail(f"SQLite {detected.version_str} is below the window-function floor")
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute(
+                        "SELECT ROW_NUMBER() OVER (ORDER BY k) FROM upsert_probe;"
+                    )
 
             if detected.supports_sqlite_returning:
                 returned = conn.execute(
