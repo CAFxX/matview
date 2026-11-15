@@ -10162,7 +10162,7 @@ class MaterializedViewManager:
         self._ensure_catalog()
 
     @staticmethod
-    def configure_sqlite_connection(connection: sqlite3.Connection) -> sqlite3.Connection:
+    def configure_sqlite_connection(connection: Any) -> Any:
         """Enable and verify SQLite settings required by matview maintenance triggers.
 
         Call this on every SQLite connection that can write source tables. SQLite
@@ -10171,8 +10171,8 @@ class MaterializedViewManager:
         In particular, REPLACE's implicit DELETE operations fire DELETE triggers only
         when recursive_triggers is enabled on the connection executing the statement.
         """
-        if not isinstance(connection, sqlite3.Connection):
-            raise TypeError("connection must be a sqlite3.Connection")
+        if not callable(getattr(connection, "cursor", None)):
+            raise TypeError("connection must provide a DB-API cursor() method")
         cursor = connection.cursor()
         cursor.execute("PRAGMA recursive_triggers = ON;")
         row = cursor.execute("PRAGMA recursive_triggers;").fetchone()
