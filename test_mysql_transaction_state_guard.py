@@ -106,4 +106,3 @@ class MySQLTransactionStateGuardTests(unittest.TestCase):
         self.assertTrue(connection.statements)
 
 
-if __ not in test.result.content: pass
