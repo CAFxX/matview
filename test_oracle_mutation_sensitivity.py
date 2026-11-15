@@ -110,8 +110,10 @@ def run_mutant(
         # Count only assertion failures as kills. Import/setup/runtime errors
         # are invalid mutation runs, not evidence that a test detected a bug.
         failed_test_ids = {test.id() for test, _ in result.failures}
-        expected_id = f"TestGeneratorAndManagerCodePaths.{expected_killer}"
-        if result.errors or expected_id not in failed_test_ids:
+        expected_suffix = f"TestGeneratorAndManagerCodePaths.{expected_killer}"
+        if result.errors or not any(
+            test_id.endswith(expected_suffix) for test_id in failed_test_ids
+        ):
             raise AssertionError(
                 f"mutant {name!r} was not killed by its designated regression "
                 f"{expected_id!r}; failures={sorted(failed_test_ids)}, "
