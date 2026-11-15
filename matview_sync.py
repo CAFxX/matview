@@ -1324,20 +1324,26 @@ class ViewDiffReport(dict):
 _DOLLAR_QUOTE_RE = re.compile(r"^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 
 _SQL_RESERVED_KEYWORDS: Set[str] = {
-    "ADD", "ALL", "ALTER", "AND", "ANY", "AS", "ASC", "BETWEEN", "BY", "CASE",
-    "CAST", "CHECK", "COLLATE", "COLUMN", "CONSTRAINT", "CREATE", "CROSS",
-    "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER",
-    "DATABASE", "DEFAULT", "DELETE", "DESC", "DISTINCT", "DROP", "ELSE", "END",
-    "EXCEPT", "EXISTS", "FALSE", "FETCH", "FILTER", "FOR", "FOREIGN", "FROM",
-    "FULL", "FUNCTION", "GRANT", "GROUP", "HAVING", "IF", "IN", "INDEX",
-    "INNER", "INSERT", "INTERSECT", "INTO", "IS", "JOIN", "KEY", "LEADING",
-    "LEFT", "LIKE", "LIMIT", "LOCALTIME", "LOCALTIMESTAMP", "NATURAL", "NOT",
-    "NULL", "OFFSET", "ON", "ONLY", "OR", "ORDER", "OUTER", "OVER", "PARTITION",
-    "PRIMARY", "PROCEDURE", "RANGE", "RECURSIVE", "REFERENCES", "RETURNING",
-    "REVOKE", "RIGHT", "ROWS", "SCHEMA", "SELECT", "SESSION_USER", "SET",
-    "SOME", "SYMMETRIC", "TABLE", "THEN", "TO", "TRAILING", "TRIGGER", "TRUE",
-    "UNION", "UNIQUE", "UPDATE", "USER", "USING", "VALUES", "VARIADIC", "VIEW",
-    "WHEN", "WHERE", "WINDOW", "WITH",
+    "ABORT", "ADD", "ALL", "ALTER", "ANALYSE", "ANALYZE", "AND", "ANY", "AS", "ASC",
+    "ATTACH", "BEGIN", "BETWEEN", "BIGINT", "BINARY", "BIT", "BLOB", "BOOL", "BOOLEAN",
+    "BY", "CASE", "CAST", "CHAR", "CHARACTER", "CHECK", "CLOB", "COLLATE", "COLUMN",
+    "COMMIT", "CONDITION", "CONSTRAINT", "CREATE", "CROSS", "CURRENT_DATE", "CURRENT_TIME",
+    "CURRENT_TIMESTAMP", "CURRENT_USER", "DATABASE", "DATE", "DATETIME", "DECIMAL",
+    "DEFAULT", "DELETE", "DESC", "DESCRIBE", "DETACH", "DISTINCT", "DIV", "DO", "DOUBLE",
+    "DROP", "ELSE", "ELSEIF", "END", "EXCEPT", "EXISTS", "EXPLAIN", "FALSE", "FETCH",
+    "FILTER", "FLOAT", "FOR", "FOREIGN", "FROM", "FULL", "FUNCTION", "GRANT", "GROUP",
+    "HAVING", "IF", "IN", "INDEX", "INNER", "INOUT", "INSERT", "INT", "INTEGER",
+    "INTERSECT", "INTERVAL", "INTO", "IS", "JOIN", "KEY", "KILL", "LEADING", "LEFT",
+    "LIKE", "LIMIT", "LOAD", "LOCALTIME", "LOCALTIMESTAMP", "LOCK", "MATCH", "MEDIUMINT",
+    "MOD", "NATURAL", "NOT", "NULL", "NUMERIC", "OFFSET", "ON", "ONLY", "OR", "ORDER",
+    "OUT", "OUTER", "OVER", "PARTITION", "PRAGMA", "PRECISION", "PRIMARY", "PROCEDURE",
+    "RANGE", "REAL", "RECURSIVE", "REFERENCES", "REGEXP", "RELEASE", "RENAME", "REPLACE",
+    "RETURNING", "REVOKE", "RIGHT", "RLIKE", "ROLLBACK", "ROW", "ROWS", "SAVEPOINT",
+    "SCHEMA", "SELECT", "SEPARATOR", "SESSION_USER", "SET", "SHOW", "SMALLINT", "SOME",
+    "STATUS", "SYMMETRIC", "TABLE", "TEXT", "THEN", "TIME", "TIMESTAMP", "TINYINT", "TO",
+    "TRAILING", "TRIGGER", "TRUE", "UNION", "UNIQUE", "UNLOCK", "UPDATE", "USAGE", "USE",
+    "USER", "USING", "VACUUM", "VALUES", "VARCHAR", "VARIADIC", "VIEW", "WHEN", "WHERE",
+    "WINDOW", "WITH", "XOR", "YEAR",
 }
 
 _IDENT_TOKEN_PATTERN = r'(?:"[^"]*(?:""[^"]*)*"|`[^`]*(?:``[^`]*)*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_]*)'
@@ -4625,17 +4631,17 @@ class IncrementalViewCompiler:
             idx_name = self._bounded_ident(f"{p}idx_", log_vname, "__grp")
             if unique_group_nulls_not_distinct and self.engine_version.supports_pg_nulls_not_distinct:
                 ddls.append(
-                    f"CREATE UNIQUE INDEX {idx_name} ON {mv_table} ({', '.join(q_auto_group_cols)}) NULLS NOT DISTINCT;"
+                    f"CREATE UNIQUE INDEX {self._q(idx_name)} ON {self._q(mv_table)} ({', '.join(q_auto_group_cols)}) NULLS NOT DISTINCT;"
                 )
             else:
-                ddls.append(f"CREATE INDEX {idx_name} ON {mv_table} ({', '.join(q_auto_group_cols)});")
+                ddls.append(f"CREATE INDEX {self._q(idx_name)} ON {self._q(mv_table)} ({', '.join(q_auto_group_cols)});")
             names.append(idx_name)
 
         if len(auto_group_cols) > 1:
             for g_idx, g_col in enumerate(auto_group_cols[1:], start=2):
                 sub_idx_name = self._bounded_ident(f"{p}idx_", f"{log_vname}__{_sanitize_ident(g_col)}", f"__g{g_idx}")
                 if sub_idx_name not in names:
-                    ddls.append(f"CREATE INDEX {sub_idx_name} ON {mv_table} ({self._q(g_col)});")
+                    ddls.append(f"CREATE INDEX {self._q(sub_idx_name)} ON {self._q(mv_table)} ({self._q(g_col)});")
                     names.append(sub_idx_name)
 
         for i, idx_spec in enumerate(self.user_indexes, 1):
@@ -4655,29 +4661,40 @@ class IncrementalViewCompiler:
                 if backing_col_map:
                     for u_col, b_expr in backing_col_map.items():
                         c_mod = re.sub(rf"\b{re.escape(u_col)}\b", b_expr, c_mod, flags=re.IGNORECASE)
-                if self.dialect == Dialect.MYSQL:
+                m_ident = re.match(
+                    r"^((?:\"[^\"]+\"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*))"
+                    r"(\s+COLLATE\s+\S+)?"
+                    r"(\s+(?:ASC|DESC))?"
+                    r"(\s+NULLS\s+(?:FIRST|LAST))?$",
+                    c_mod,
+                    flags=re.IGNORECASE,
+                )
+                if m_ident:
+                    q_col = self._q(m_ident.group(1))
+                    collate_s = m_ident.group(2) or ""
+                    dir_s = m_ident.group(3) or ""
+                    nulls_s = m_ident.group(4) or ""
+                    if self.dialect == Dialect.MYSQL:
+                        c_mod = f"{q_col}{collate_s}{dir_s}"
+                    else:
+                        c_mod = f"{q_col}{collate_s}{dir_s}{nulls_s}"
+                elif self.dialect == Dialect.MYSQL:
                     c_mod = re.sub(r"\bNULLS\s+(?:FIRST|LAST)\b", "", c_mod, flags=re.IGNORECASE).strip()
-                    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\s+(?:ASC|DESC))?$", c_mod, flags=re.IGNORECASE):
-                        m_dir = re.search(r"\s+(ASC|DESC)\s*$", c_mod, flags=re.IGNORECASE)
-                        dir_s = f" {m_dir.group(1).upper()}" if m_dir else ""
-                        expr_part = c_mod[: m_dir.start()].strip() if m_dir else c_mod
-                        if not (expr_part.startswith("((") and expr_part.endswith("))")):
-                            c_mod = f"(({expr_part})){dir_s}"
+                    m_dir = re.search(r"\s+(ASC|DESC)\s*$", c_mod, flags=re.IGNORECASE)
+                    dir_s = f" {m_dir.group(1).upper()}" if m_dir else ""
+                    expr_part = c_mod[: m_dir.start()].strip() if m_dir else c_mod
+                    if not (expr_part.startswith("((") and expr_part.endswith("))")):
+                        c_mod = f"(({expr_part})){dir_s}"
                 elif self.dialect in (Dialect.SQLITE, Dialect.POSTGRES):
-                    if not re.match(
-                        r"^[A-Za-z_][A-Za-z0-9_]*(\s+COLLATE\s+\S+)?(\s+(?:ASC|DESC))?(\s+NULLS\s+(?:FIRST|LAST))?$",
+                    m_tail = re.search(
+                        r"(\s+(?:ASC|DESC))?(\s+NULLS\s+(?:FIRST|LAST))?\s*$",
                         c_mod,
                         flags=re.IGNORECASE,
-                    ):
-                        m_tail = re.search(
-                            r"(\s+(?:ASC|DESC))?(\s+NULLS\s+(?:FIRST|LAST))?\s*$",
-                            c_mod,
-                            flags=re.IGNORECASE,
-                        )
-                        tail_s = m_tail.group(0) if m_tail else ""
-                        expr_part = c_mod[: len(c_mod) - len(tail_s)].strip()
-                        if not (expr_part.startswith("(") and expr_part.endswith(")")):
-                            c_mod = f"({expr_part}){tail_s}"
+                    )
+                    tail_s = m_tail.group(0) if m_tail else ""
+                    expr_part = c_mod[: len(c_mod) - len(tail_s)].strip()
+                    if not (expr_part.startswith("(") and expr_part.endswith(")")):
+                        c_mod = f"({expr_part}){tail_s}"
                 mapped_cols.append(c_mod)
 
             u_kw = "UNIQUE " if idx_spec.unique else ""
@@ -4695,7 +4712,7 @@ class IncrementalViewCompiler:
                 where_str = f" WHERE {w_mod}"
 
             ddls.append(
-                f"CREATE {u_kw}INDEX {idx_name} ON {mv_table}{using_str} ({', '.join(mapped_cols)}){where_str};"
+                f"CREATE {u_kw}INDEX {self._q(idx_name)} ON {self._q(mv_table)}{using_str} ({', '.join(mapped_cols)}){where_str};"
             )
             names.append(idx_name)
 
@@ -5559,36 +5576,58 @@ class IncrementalViewCompiler:
         return "TEXT"
 
     def _canonical_group_pk_expr(self, group_exprs: Sequence[str]) -> str:
+        def _clean_pk_arg(e: str) -> str:
+            s = e.strip()
+            if not s:
+                return s
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", s):
+                return self._q(s)
+            m_dot = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$", s)
+            if m_dot:
+                return f"{m_dot.group(1)}.{self._q(m_dot.group(2))}"
+            return s
+
+        cleaned_exprs = [_clean_pk_arg(e) for e in group_exprs]
         if self.dialect == Dialect.SQLITE:
-            return " || '|' || ".join(f"quote({e})" for e in group_exprs)
+            return " || '|' || ".join(f"quote({e})" for e in cleaned_exprs)
         elif self.dialect == Dialect.POSTGRES:
             pg_parts = [
                 f"CAST({e} AS TEXT)" if e.strip().startswith("'") and e.strip().endswith("'") else e
-                for e in group_exprs
+                for e in cleaned_exprs
             ]
             return f"ROW({', '.join(pg_parts)})::TEXT"
         elif self.dialect == Dialect.MYSQL:
             parts = [
                 f"IF({e} IS NULL, 'N', CONCAT('V', OCTET_LENGTH(CAST({e} AS CHAR CHARACTER SET utf8mb4)), ':', CAST({e} AS CHAR CHARACTER SET utf8mb4)))"
-                for e in group_exprs
+                for e in cleaned_exprs
             ]
             return f"CONCAT_WS('|', {', '.join(parts)}) COLLATE utf8mb4_bin"
-        return " || '|' || ".join(f"quote({e})" for e in group_exprs)
+        return " || '|' || ".join(f"quote({e})" for e in cleaned_exprs)
 
     def _group_by_exprs_for_query(
         self, group_exprs: Sequence[str], include_canonical_pk: bool = True
     ) -> List[str]:
+        def _clean_grp(g: str) -> str:
+            s = g.strip()
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", s):
+                return self._q(s)
+            m_dot = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$", s)
+            if m_dot:
+                return f"{self._q(m_dot.group(1))}.{self._q(m_dot.group(2))}"
+            return s
+
+        cleaned = [_clean_grp(g) for g in group_exprs]
         if (
             include_canonical_pk
             and self.dialect == Dialect.MYSQL
-            and group_exprs
+            and cleaned
             and any(
-                not re.match(r"^(?:[A-Za-z_][A-Za-z0-9_.]*|'[^']*')$", g.strip())
-                for g in group_exprs
+                not re.match(r"^(?:[A-Za-z_`\"][A-Za-z0-9_`\".]*|'[^']*')$", g.strip())
+                for g in cleaned
             )
         ):
-            return [self._canonical_group_pk_expr(group_exprs), *group_exprs]
-        return list(group_exprs)
+            return [self._canonical_group_pk_expr(cleaned), *cleaned]
+        return list(cleaned)
 
     def _group_col_alias(self, g_expr: str) -> str:
         uall_map = getattr(self, "_uall_grp_alias_map", None)
@@ -5755,18 +5794,18 @@ class IncrementalViewCompiler:
                 else "EXISTS (SELECT 1)"
             )
             reader_view_ddl = (
-                f"CREATE ALGORITHM = TEMPTABLE VIEW {db_view} AS\n"
+                f"CREATE ALGORITHM = TEMPTABLE VIEW {self._q(db_view)} AS\n"
                 f"SELECT {proj_csv}\n"
-                f"FROM {mv_table}\n"
+                f"FROM {self._q(mv_table)}\n"
                 f"WHERE {where_cond};"
             )
             return reader_view_ddl, [], [], []
 
         where_sql = f"\nWHERE {extra_where_filter}" if extra_where_filter else ""
         reader_view_ddl = (
-            f"CREATE VIEW {db_view} AS\n"
+            f"CREATE VIEW {self._q(db_view)} AS\n"
             f"SELECT {proj_csv}\n"
-            f"FROM {mv_table}{where_sql};"
+            f"FROM {self._q(mv_table)}{where_sql};"
         )
 
         if self.dialect == Dialect.SQLITE:
@@ -5776,8 +5815,8 @@ class IncrementalViewCompiler:
                 t_name = self._bounded_ident(f"{p}trg_", log_vname, f"__ro_{suf}")
                 ro_names.append(t_name)
                 ro_trigs.append(
-                    f"CREATE TRIGGER {t_name}\n"
-                    f"INSTEAD OF {op} ON {db_view}\n"
+                    f"CREATE TRIGGER {self._q(t_name)}\n"
+                    f"INSTEAD OF {op} ON {self._q(db_view)}\n"
                     f"BEGIN\n"
                     f"    SELECT RAISE(ABORT, 'Materialized view {db_view} is read-only and maintained automatically');\n"
                     f"END;"
@@ -5788,7 +5827,7 @@ class IncrementalViewCompiler:
         fn_ro = self._bounded_ident(f"{p}fn_readonly_", log_vname)
         t_ro = self._bounded_ident(f"{p}trg_", log_vname, "__readonly")
         fn_ddl = (
-            f"CREATE OR REPLACE FUNCTION {fn_ro}()\n"
+            f"CREATE OR REPLACE FUNCTION {self._q(fn_ro)}()\n"
             f"RETURNS TRIGGER AS $$\n"
             f"BEGIN\n"
             f"    RAISE EXCEPTION 'Materialized view % is read-only and maintained automatically', TG_TABLE_NAME;\n"
@@ -5796,9 +5835,9 @@ class IncrementalViewCompiler:
             f"$$ LANGUAGE plpgsql;"
         )
         t_ddl = (
-            f"CREATE TRIGGER {t_ro}\n"
-            f"INSTEAD OF INSERT OR UPDATE OR DELETE ON {db_view}\n"
-            f"FOR EACH ROW EXECUTE FUNCTION {fn_ro}();"
+            f"CREATE TRIGGER {self._q(t_ro)}\n"
+            f"INSTEAD OF INSERT OR UPDATE OR DELETE ON {self._q(db_view)}\n"
+            f"FOR EACH ROW EXECUTE FUNCTION {self._q(fn_ro)}();"
         )
         return reader_view_ddl, [fn_ddl, t_ddl], [t_ro], [fn_ro]
 
@@ -5819,16 +5858,16 @@ class IncrementalViewCompiler:
                 and not raw_plan.view_spec.group_by_cols
                 and not raw_plan.view_spec.has_top_level_distinct
             )
+            q_base_t = self._q(base_t)
+            q_pk_col = self._q(pk_col)
 
             if self.dialect == Dialect.SQLITE:
                 # Replace `(pk_col > ? AND pk_col <= ?)` with recursive CTE batch join
-                cond_pat = f"({pk_col} > {ph} AND {pk_col} <= {ph})"
+                cond_pat = f"({q_pk_col} > {ph} AND {q_pk_col} <= {ph})"
                 joined_tmpl = tmpl.replace(
                     cond_pat,
-                    f"({base_t}.{pk_col} > __mv_b.lo AND {base_t}.{pk_col} <= __mv_b.hi)",
+                    f"({q_base_t}.{q_pk_col} > __mv_b.lo AND {q_base_t}.{q_pk_col} <= __mv_b.hi)",
                 )
-                q_base_t = self._q(base_t)
-                q_pk_col = self._q(pk_col)
                 joined_tmpl = re.sub(
                     rf"\nFROM\s+{re.escape(q_base_t)}\b",
                     f"\nFROM __mv_batches AS __mv_b JOIN {q_base_t} ON ({q_base_t}.{q_pk_col} > __mv_b.lo AND {q_base_t}.{q_pk_col} <= __mv_b.hi)",
@@ -5838,7 +5877,7 @@ class IncrementalViewCompiler:
                 )
                 out_stmts = [
                     f"WITH RECURSIVE __mv_bounds AS (\n"
-                    f"    SELECT MIN({pk_col}) AS min_id, MAX({pk_col}) AS max_id FROM {base_t}\n"
+                    f"    SELECT MIN({q_pk_col}) AS min_id, MAX({q_pk_col}) AS max_id FROM {q_base_t}\n"
                     f"),\n"
                     f"__mv_batches(lo, hi, max_id) AS (\n"
                     f"    SELECT min_id - 1, MIN(max_id, min_id - 1 + {b_size}), max_id\n"
@@ -5856,8 +5895,8 @@ class IncrementalViewCompiler:
 
             elif self.dialect == Dialect.POSTGRES:
                 pg_chunk = tmpl.replace(
-                    f"({pk_col} > %s AND {pk_col} <= %s)",
-                    f"({pk_col} > __mv_cur_pk AND {pk_col} <= __mv_top_pk)",
+                    f"({q_pk_col} > %s AND {q_pk_col} <= %s)",
+                    f"({q_pk_col} > __mv_cur_pk AND {q_pk_col} <= __mv_top_pk)",
                 )
                 if is_global_agg:
                     pg_chunk = re.sub(
@@ -5871,7 +5910,7 @@ class IncrementalViewCompiler:
                     for pop_s in raw_plan.initial_populate_sqls:
                         p_clean = pop_s.strip().rstrip(";")
                         fallback_global += (
-                            f"\n    IF NOT EXISTS (SELECT 1 FROM {raw_plan.backing_table_name}) THEN\n"
+                            f"\n    IF NOT EXISTS (SELECT 1 FROM {self._q(raw_plan.backing_table_name)}) THEN\n"
                             f"        {p_clean};\n"
                             f"    END IF;"
                         )
@@ -5884,7 +5923,7 @@ class IncrementalViewCompiler:
                     f"    __mv_top_pk BIGINT;\n"
                     f"    __mv_batch_size BIGINT := {b_size};\n"
                     f"BEGIN\n"
-                    f"    SELECT MIN({pk_col}), MAX({pk_col}) INTO __mv_min_pk, __mv_max_pk FROM {base_t};\n"
+                    f"    SELECT MIN({q_pk_col}), MAX({q_pk_col}) INTO __mv_min_pk, __mv_max_pk FROM {q_base_t};\n"
                     f"    IF __mv_min_pk IS NOT NULL AND __mv_max_pk IS NOT NULL THEN\n"
                     f"        __mv_cur_pk := __mv_min_pk - 1;\n"
                     f"        WHILE __mv_cur_pk < __mv_max_pk LOOP\n"
@@ -5898,8 +5937,8 @@ class IncrementalViewCompiler:
 
             elif self.dialect == Dialect.MYSQL:
                 my_chunk = tmpl.replace(
-                    f"({pk_col} > %s AND {pk_col} <= %s)",
-                    f"({pk_col} > __mv_cur_pk AND {pk_col} <= __mv_top_pk)",
+                    f"({q_pk_col} > %s AND {q_pk_col} <= %s)",
+                    f"({q_pk_col} > __mv_cur_pk AND {q_pk_col} <= __mv_top_pk)",
                 )
                 if is_global_agg:
                     if "\n) AS __mv_src\nON DUPLICATE KEY UPDATE" in my_chunk:
@@ -5920,7 +5959,7 @@ class IncrementalViewCompiler:
                     for pop_s in raw_plan.initial_populate_sqls:
                         p_clean = pop_s.strip().rstrip(";")
                         fallback_global += (
-                            f"\n    IF NOT EXISTS (SELECT 1 FROM {raw_plan.backing_table_name}) THEN\n"
+                            f"\n    IF NOT EXISTS (SELECT 1 FROM {self._q(raw_plan.backing_table_name)}) THEN\n"
                             f"        {p_clean};\n"
                             f"    END IF;"
                         )
@@ -5935,7 +5974,7 @@ class IncrementalViewCompiler:
                         f"    DECLARE __mv_cur_pk BIGINT;\n"
                         f"    DECLARE __mv_top_pk BIGINT;\n"
                         f"    DECLARE __mv_batch_size BIGINT DEFAULT {b_size};\n"
-                        f"    SELECT MIN({pk_col}), MAX({pk_col}) INTO __mv_min_pk, __mv_max_pk FROM {base_t};\n"
+                        f"    SELECT MIN({q_pk_col}), MAX({q_pk_col}) INTO __mv_min_pk, __mv_max_pk FROM {q_base_t};\n"
                         f"    IF __mv_min_pk IS NOT NULL AND __mv_max_pk IS NOT NULL THEN\n"
                         f"        SET __mv_cur_pk = __mv_min_pk - 1;\n"
                         f"        WHILE __mv_cur_pk < __mv_max_pk DO\n"
@@ -6022,7 +6061,7 @@ class IncrementalViewCompiler:
                             ):
                                 aliased_list.append(r_proj)
                             else:
-                                aliased_list.append(f"{r_proj} AS {c_name}")
+                                aliased_list.append(f"{r_proj} AS {self._q(c_name)}")
                         aliased_inner = f"SELECT {', '.join(aliased_list)}\n{from_and_rest}"
 
             is_aux_dist = "__val" in cols and "__ref_cnt" in cols
@@ -6032,14 +6071,16 @@ class IncrementalViewCompiler:
                 else []
             )
             tbl_pks = [c for c in tbl_pks if c in cols]
+            q_cols = [self._q(c) for c in cols]
+            q_tbl_pks = [self._q(c) for c in tbl_pks]
 
             if self.dialect == Dialect.SQLITE:
                 upsert_tail = ""
                 if tbl_pks:
-                    upd_cols = [f"{c} = excluded.{c}" for c in cols if c not in tbl_pks] or [
-                        f"{tbl_pks[0]} = excluded.{tbl_pks[0]}"
+                    upd_cols = [f"{self._q(c)} = excluded.{self._q(c)}" for c in cols if c not in tbl_pks] or [
+                        f"{self._q(tbl_pks[0])} = excluded.{self._q(tbl_pks[0])}"
                     ]
-                    upsert_tail = f"\nON CONFLICT ({', '.join(tbl_pks)}) DO UPDATE SET {', '.join(upd_cols)}"
+                    upsert_tail = f"\nON CONFLICT ({', '.join(q_tbl_pks)}) DO UPDATE SET {', '.join(upd_cols)}"
                 inc_stmts.append(
                     f"WITH __mv_batched_src AS (\n"
                     f"    SELECT\n"
@@ -6050,8 +6091,8 @@ class IncrementalViewCompiler:
                     f"    ) AS __mv_raw_src\n"
                     f"    ORDER BY 1\n"
                     f")\n"
-                    f"INSERT INTO {target_tbl} ({', '.join(cols)})\n"
-                    f"SELECT {', '.join(cols)}\n"
+                    f"INSERT INTO {self._q(target_tbl)} ({', '.join(q_cols)})\n"
+                    f"SELECT {', '.join(q_cols)}\n"
                     f"FROM __mv_batched_src\n"
                     f"WHERE TRUE{upsert_tail};"
                 )
@@ -6061,23 +6102,23 @@ class IncrementalViewCompiler:
                 if tbl_pks and self.engine_version.supports_pg_merge:
                     non_pk_cols = [c for c in cols if c not in tbl_pks]
                     if non_pk_cols:
-                        matched_clause = f"WHEN MATCHED THEN\n            UPDATE SET {', '.join(f'{c} = __mv_src.{c}' for c in non_pk_cols)}"
+                        matched_clause = f"WHEN MATCHED THEN\n            UPDATE SET {', '.join(f'{self._q(c)} = __mv_src.{self._q(c)}' for c in non_pk_cols)}"
                     else:
                         matched_clause = "WHEN MATCHED THEN DO NOTHING"
                     merge_body = (
-                        f"        MERGE INTO {target_tbl} AS __mv_dst\n"
+                        f"        MERGE INTO {self._q(target_tbl)} AS __mv_dst\n"
                         f"        USING (\n"
-                        f"            SELECT {', '.join(cols)}\n"
+                        f"            SELECT {', '.join(q_cols)}\n"
                         f"            FROM (\n"
                         f"                {aliased_inner}\n"
                         f"            ) AS __mv_init{ord_tail}\n"
                         f"            LIMIT __mv_batch_size OFFSET __mv_offset\n"
                         f"        ) AS __mv_src\n"
-                        f"        ON ({' AND '.join(f'__mv_dst.{c} = __mv_src.{c}' for c in tbl_pks)})\n"
+                        f"        ON ({' AND '.join(f'__mv_dst.{self._q(c)} = __mv_src.{self._q(c)}' for c in tbl_pks)})\n"
                         f"        {matched_clause}\n"
                         f"        WHEN NOT MATCHED THEN\n"
-                        f"            INSERT ({', '.join(cols)})\n"
-                        f"            VALUES ({', '.join(f'__mv_src.{c}' for c in cols)});\n"
+                        f"            INSERT ({', '.join(q_cols)})\n"
+                        f"            VALUES ({', '.join(f'__mv_src.{self._q(c)}' for c in cols)});\n"
                     )
                     inc_stmts.append(
                         f"DO $$\n"
@@ -6097,10 +6138,10 @@ class IncrementalViewCompiler:
                 else:
                     upsert_tail = ""
                     if tbl_pks:
-                        upd_cols = [f"{c} = excluded.{c}" for c in cols if c not in tbl_pks] or [
-                            f"{tbl_pks[0]} = excluded.{tbl_pks[0]}"
+                        upd_cols = [f"{self._q(c)} = excluded.{self._q(c)}" for c in cols if c not in tbl_pks] or [
+                            f"{self._q(tbl_pks[0])} = excluded.{self._q(tbl_pks[0])}"
                         ]
-                        upsert_tail = f"\n        ON CONFLICT ({', '.join(tbl_pks)}) DO UPDATE SET {', '.join(upd_cols)}"
+                        upsert_tail = f"\n        ON CONFLICT ({', '.join(q_tbl_pks)}) DO UPDATE SET {', '.join(upd_cols)}"
                     inc_stmts.append(
                         f"DO $$\n"
                         f"DECLARE\n"
@@ -6109,8 +6150,8 @@ class IncrementalViewCompiler:
                         f"    __mv_rows BIGINT := 0;\n"
                         f"BEGIN\n"
                         f"    LOOP\n"
-                        f"        INSERT INTO {target_tbl} ({', '.join(cols)})\n"
-                        f"        SELECT {', '.join(cols)}\n"
+                        f"        INSERT INTO {self._q(target_tbl)} ({', '.join(q_cols)})\n"
+                        f"        SELECT {', '.join(q_cols)}\n"
                         f"        FROM (\n"
                         f"            {aliased_inner}\n"
                         f"        ) AS __mv_init{ord_tail}\n"
@@ -6125,12 +6166,12 @@ class IncrementalViewCompiler:
                 upsert_tail = ""
                 if tbl_pks:
                     if self.engine_version.supports_mysql_row_alias_upsert:
-                        upd_cols = [f"{c} = __mv_init.{c}" for c in cols if c not in tbl_pks] or [
-                            f"{tbl_pks[0]} = __mv_init.{tbl_pks[0]}"
+                        upd_cols = [f"{self._q(c)} = __mv_init.{self._q(c)}" for c in cols if c not in tbl_pks] or [
+                            f"{self._q(tbl_pks[0])} = __mv_init.{self._q(tbl_pks[0])}"
                         ]
                     else:
-                        upd_cols = [f"{c} = VALUES({c})" for c in cols if c not in tbl_pks] or [
-                            f"{tbl_pks[0]} = VALUES({tbl_pks[0]})"
+                        upd_cols = [f"{self._q(c)} = VALUES({self._q(c)})" for c in cols if c not in tbl_pks] or [
+                            f"{self._q(tbl_pks[0])} = VALUES({self._q(tbl_pks[0])})"
                         ]
                     upsert_tail = f"\n        ON DUPLICATE KEY UPDATE {', '.join(upd_cols)}"
                 ord_cols = ", ".join(str(k) for k in range(1, len(cols) + 1))
@@ -6145,8 +6186,8 @@ class IncrementalViewCompiler:
                         f"    DECLARE __mv_batch_size BIGINT DEFAULT {b_size};\n"
                         f"    DECLARE __mv_rows BIGINT DEFAULT 0;\n"
                         f"    REPEAT\n"
-                        f"        INSERT INTO {target_tbl} ({', '.join(cols)})\n"
-                        f"        SELECT {', '.join(cols)}\n"
+                        f"        INSERT INTO {self._q(target_tbl)} ({', '.join(q_cols)})\n"
+                        f"        SELECT {', '.join(q_cols)}\n"
                         f"        FROM (\n"
                         f"            {aliased_inner}\n"
                         f"        ) AS __mv_init{ord_tail}\n"
@@ -6739,11 +6780,11 @@ class IncrementalViewCompiler:
                         dt = self._infer_expr_storage_type(fake_grp)
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
                         dt = "VARCHAR(255)"
-                    aux_col_defs.append(f"{mc} {dt} NOT NULL")
-                    aux_pk.append(mc)
-                aux_pk.append("__val")
-            aux_col_defs.append(f"__val {val_dt} NOT NULL")
-            aux_col_defs.append(f"__ref_cnt {self._int_type()} NOT NULL DEFAULT 0")
+                    aux_col_defs.append(f"{self._q(mc)} {dt} NOT NULL")
+                    aux_pk.append(self._q(mc))
+                aux_pk.append(self._q("__val"))
+            aux_col_defs.append(f"{self._q('__val')} {val_dt} NOT NULL")
+            aux_col_defs.append(f"{self._q('__ref_cnt')} {self._int_type()} NOT NULL DEFAULT 0")
             aux_col_defs.append(f"PRIMARY KEY ({', '.join(aux_pk)})")
             aux_ddls.append(
                 self._create_table_ddl(aux_tbl, aux_col_defs, is_backing_store=False, pk_cols=aux_pk)
@@ -6948,7 +6989,7 @@ class IncrementalViewCompiler:
             where_sql = f"\nWHERE {' AND '.join(w_parts)}"
             group_sql = f"\nGROUP BY {', '.join(dist_grp)}"
             stmts.append(
-                f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                f"INSERT INTO {aux_tbl} ({', '.join(self._q(c) for c in dist_cols)})\n"
                 f"SELECT {', '.join(dist_sel)}\n"
                 f"FROM {q_base_t}{where_sql}{group_sql};"
             )
@@ -7042,10 +7083,11 @@ class IncrementalViewCompiler:
                         pk_col = c_def.name
                         break
             ph = "?" if self.dialect == Dialect.SQLITE else "%s"
+            q_pk_col = "rowid" if pk_col == "rowid" else self._q(pk_col)
             chunk_where = (
-                f"({self.view.where_clause}) AND ({pk_col} > {ph} AND {pk_col} <= {ph})"
+                f"({self.view.where_clause}) AND ({q_pk_col} > {ph} AND {q_pk_col} <= {ph})"
                 if self.view.where_clause
-                else f"({pk_col} > {ph} AND {pk_col} <= {ph})"
+                else f"({q_pk_col} > {ph} AND {q_pk_col} <= {ph})"
             )
             is_pg_merge = (self.dialect == Dialect.POSTGRES and self.engine_version.supports_pg_merge)
             is_mysql_alias = (self.dialect == Dialect.MYSQL and self.engine_version.supports_mysql_row_alias_upsert)
@@ -7126,7 +7168,7 @@ class IncrementalViewCompiler:
             for ekey, (aux_tbl, rep_item, _) in distinct_aux_tables.items():
                 eff = self._effective_agg_value_expr(rep_item, record_prefix=None)
                 dist_cols = [
-                    pk_cols[0] if len(pk_cols) == 1 else ", ".join(pk_cols),
+                    *pk_cols,
                     "__val",
                     "__ref_cnt",
                 ]
@@ -7142,8 +7184,11 @@ class IncrementalViewCompiler:
                 dist_sel.extend([eff, "COUNT(*)"])
                 dist_grp_list.append(eff)
                 dist_cols_flat = [*pk_cols, "__val", "__ref_cnt"]
+                q_dist_cols = [self._q(c) for c in dist_cols]
+                q_pk_cols = [self._q(c) for c in pk_cols]
+                q_dist_cols_flat = [self._q(c) for c in dist_cols_flat]
                 dist_aliased_sel = [
-                    f"{expr} AS {col}" for expr, col in zip(dist_sel, dist_cols_flat)
+                    f"{expr} AS {col}" for expr, col in zip(dist_sel, q_dist_cols_flat)
                 ]
                 w_p = [f"({eff}) IS NOT NULL", f"({grp_expr}) IN ({{placeholders}})"]
                 if self.view.where_clause:
@@ -7151,23 +7196,23 @@ class IncrementalViewCompiler:
                 if self.dialect == Dialect.MYSQL:
                     if self.engine_version.supports_mysql_row_alias_upsert:
                         chunk_templates.append(
-                            f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                            f"INSERT INTO {aux_tbl} ({', '.join(q_dist_cols)})\n"
                             f"SELECT * FROM (\n"
                             f"    SELECT {', '.join(dist_aliased_sel)}\n"
                             f"    FROM {q_base_t}\n"
                             f"    WHERE {' AND '.join(w_p)}\n"
                             f"    GROUP BY {', '.join(dist_grp_list)}\n"
                             f") AS __mv_src\n"
-                            f"ON DUPLICATE KEY UPDATE __ref_cnt = __mv_src.__ref_cnt;"
+                            f"ON DUPLICATE KEY UPDATE {self._q('__ref_cnt')} = __mv_src.{self._q('__ref_cnt')};"
                         )
                     else:
                         chunk_templates.append(
-                            f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                            f"INSERT INTO {aux_tbl} ({', '.join(q_dist_cols)})\n"
                             f"SELECT {', '.join(dist_sel)}\n"
                             f"FROM {q_base_t}\n"
                             f"WHERE {' AND '.join(w_p)}\n"
                             f"GROUP BY {', '.join(dist_grp_list)}\n"
-                            f"ON DUPLICATE KEY UPDATE __ref_cnt = VALUES(__ref_cnt);"
+                            f"ON DUPLICATE KEY UPDATE {self._q('__ref_cnt')} = VALUES({self._q('__ref_cnt')});"
                         )
                 elif self.dialect == Dialect.POSTGRES and self.engine_version.supports_pg_merge:
                     chunk_templates.append(
@@ -7178,17 +7223,18 @@ class IncrementalViewCompiler:
                         f"    WHERE {' AND '.join(w_p)}\n"
                         f"    GROUP BY {', '.join(dist_grp_list)}\n"
                         f") AS __mv_src\n"
-                        f"ON ({' AND '.join(f'{aux_tbl}.{c} = __mv_src.{c}' for c in pk_cols)} AND {aux_tbl}.__val = __mv_src.__val)\n"
+                        f"ON ({' AND '.join(f'{aux_tbl}.{c} = __mv_src.{c}' for c in q_pk_cols)} AND {aux_tbl}.__val = __mv_src.__val)\n"
                         f"WHEN MATCHED THEN\n"
                         f"    UPDATE SET __ref_cnt = __mv_src.__ref_cnt\n"
                         f"WHEN NOT MATCHED THEN\n"
-                        f"    INSERT ({', '.join(dist_cols)})\n"
-                        f"    VALUES ({', '.join(f'__mv_src.{c}' for c in dist_cols_flat)});"
+                        f"    INSERT ({', '.join(q_dist_cols)})\n"
+                        f"    VALUES ({', '.join(f'__mv_src.{c}' for c in q_dist_cols_flat)});"
                     )
                 else:
-                    aux_conflict = f"\nON CONFLICT ({', '.join(pk_cols)}, __val) DO UPDATE SET __ref_cnt = excluded.__ref_cnt"
+                    q_aux_conflict_cols = [self._q(c) for c in [*pk_cols, "__val"]]
+                    aux_conflict = f"\nON CONFLICT ({', '.join(q_aux_conflict_cols)}) DO UPDATE SET {self._q('__ref_cnt')} = excluded.{self._q('__ref_cnt')}"
                     chunk_templates.append(
-                        f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                        f"INSERT INTO {aux_tbl} ({', '.join(q_dist_cols)})\n"
                         f"SELECT {', '.join(dist_sel)}\n"
                         f"FROM {q_base_t}\n"
                         f"WHERE {' AND '.join(w_p)}\n"
@@ -7273,31 +7319,34 @@ class IncrementalViewCompiler:
         work_items = self._working_select_items
 
         def _incoming(col: str) -> str:
+            qc = self._q(col)
             if incoming_alias:
-                return f"{incoming_alias}.{col}"
-            return f"VALUES({col})" if use_mysql_values else f"excluded.{col}"
+                return f"{incoming_alias}.{qc}"
+            return f"VALUES({qc})" if use_mysql_values else f"excluded.{qc}"
 
         def _merged_sum(col: str) -> str:
-            inc = _incoming(col)
+            qc = self._q(col)
+            inc = _incoming(qc)
             return (
-                f"(CASE WHEN {inc} IS NULL THEN {mv_table}.{col} "
-                f"WHEN {mv_table}.{col} IS NULL THEN {inc} "
-                f"ELSE {mv_table}.{col} + {inc} END)"
+                f"(CASE WHEN {inc} IS NULL THEN {mv_table}.{qc} "
+                f"WHEN {mv_table}.{qc} IS NULL THEN {inc} "
+                f"ELSE {mv_table}.{qc} + {inc} END)"
             )
 
         def _merged_sum2(ekey: str, sum2_col: str) -> str:
+            q_sum2 = self._q(sum2_col)
             if self.dialect != Dialect.SQLITE:
-                return _merged_sum(sum2_col)
-            cnt_c = col_nonnull_count_map[ekey]
-            sum_c = col_sum_map[ekey]
+                return _merged_sum(q_sum2)
+            cnt_c = self._q(col_nonnull_count_map[ekey])
+            sum_c = self._q(col_sum_map[ekey])
             inc_cnt = _incoming(cnt_c)
             inc_sum = _incoming(sum_c)
-            inc_m2 = _incoming(sum2_col)
+            inc_m2 = _incoming(q_sum2)
             d_mu = f"(((1.0 * {inc_sum}) / {inc_cnt}) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_c}))"
             return (
-                f"(CASE WHEN {inc_cnt} <= 0 OR {inc_m2} IS NULL THEN {mv_table}.{sum2_col} "
-                f"WHEN {mv_table}.{cnt_c} <= 0 OR {mv_table}.{sum2_col} IS NULL THEN {inc_m2} "
-                f"ELSE {mv_table}.{sum2_col} + {inc_m2} + ({d_mu} * {d_mu} * ((1.0 * {mv_table}.{cnt_c} * {inc_cnt}) / ({mv_table}.{cnt_c} + {inc_cnt}))) END)"
+                f"(CASE WHEN {inc_cnt} <= 0 OR {inc_m2} IS NULL THEN {mv_table}.{q_sum2} "
+                f"WHEN {mv_table}.{cnt_c} <= 0 OR {mv_table}.{q_sum2} IS NULL THEN {inc_m2} "
+                f"ELSE {mv_table}.{q_sum2} + {inc_m2} + ({d_mu} * {d_mu} * ((1.0 * {mv_table}.{cnt_c} * {inc_cnt}) / ({mv_table}.{cnt_c} + {inc_cnt}))) END)"
             )
 
         for item in work_items:
@@ -7319,8 +7368,8 @@ class IncrementalViewCompiler:
                     recomputed = self._build_recompute_subquery_raw(item, mv_table)
                     assignments.append(f"{c} = {recomputed}")
                 else:
-                    cnt_c = col_nonnull_count_map[ekey]
-                    sum_c = col_sum_map[ekey]
+                    cnt_c = self._q(col_nonnull_count_map[ekey])
+                    sum_c = self._q(col_sum_map[ekey])
                     new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
                     new_sum = _merged_sum(sum_c)
                     dividend = f"(1.0 * {new_sum})"
@@ -7338,9 +7387,9 @@ class IncrementalViewCompiler:
                     recomputed = self._build_recompute_subquery_raw(item, mv_table)
                     assignments.append(f"{c} = {recomputed}")
                 else:
-                    cnt_c = col_nonnull_count_map[ekey]
-                    sum_c = col_sum_map[ekey]
-                    sum2_c = col_sum2_map[ekey]
+                    cnt_c = self._q(col_nonnull_count_map[ekey])
+                    sum_c = self._q(col_sum_map[ekey])
+                    sum2_c = self._q(col_sum2_map[ekey])
                     new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
                     new_sum = _merged_sum(sum_c)
                     new_sum2 = _merged_sum2(ekey, sum2_c)
@@ -7384,8 +7433,8 @@ class IncrementalViewCompiler:
                     f"ELSE {xor_e} END"
                 )
             elif item.agg_func == AggFunc.BOOL_AND:
-                cnt_c = col_nonnull_count_map[ekey]
-                tcnt_c = col_true_cnt_map[ekey]
+                cnt_c = self._q(col_nonnull_count_map[ekey])
+                tcnt_c = self._q(col_true_cnt_map[ekey])
                 new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
                 new_tcnt = f"({mv_table}.{tcnt_c} + {_incoming(tcnt_c)})"
                 t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
@@ -7395,8 +7444,8 @@ class IncrementalViewCompiler:
                     f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
                 )
             elif item.agg_func == AggFunc.BOOL_OR:
-                cnt_c = col_nonnull_count_map[ekey]
-                tcnt_c = col_true_cnt_map[ekey]
+                cnt_c = self._q(col_nonnull_count_map[ekey])
+                tcnt_c = self._q(col_true_cnt_map[ekey])
                 new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
                 new_tcnt = f"({mv_table}.{tcnt_c} + {_incoming(tcnt_c)})"
                 t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
@@ -7406,26 +7455,31 @@ class IncrementalViewCompiler:
                     f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
                 )
 
-        if row_count_col not in updated:
-            assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} + {_incoming(row_count_col)}")
-            updated.add(row_count_col)
+        q_row_count_col = self._q(row_count_col)
+        if q_row_count_col not in updated:
+            assignments.append(f"{q_row_count_col} = {mv_table}.{q_row_count_col} + {_incoming(q_row_count_col)}")
+            updated.add(q_row_count_col)
 
         for cnt_c in col_nonnull_count_map.values():
-            if cnt_c not in updated:
-                assignments.append(f"{cnt_c} = {mv_table}.{cnt_c} + {_incoming(cnt_c)}")
-                updated.add(cnt_c)
+            q_cnt_c = self._q(cnt_c)
+            if q_cnt_c not in updated:
+                assignments.append(f"{q_cnt_c} = {mv_table}.{q_cnt_c} + {_incoming(q_cnt_c)}")
+                updated.add(q_cnt_c)
         for sum_c in col_sum_map.values():
-            if sum_c not in updated:
-                assignments.append(f"{sum_c} = {_merged_sum(sum_c)}")
-                updated.add(sum_c)
+            q_sum_c = self._q(sum_c)
+            if q_sum_c not in updated:
+                assignments.append(f"{q_sum_c} = {_merged_sum(q_sum_c)}")
+                updated.add(q_sum_c)
         for ekey, sum2_c in col_sum2_map.items():
-            if sum2_c not in updated:
-                assignments.append(f"{sum2_c} = {_merged_sum2(ekey, sum2_c)}")
-                updated.add(sum2_c)
+            q_sum2_c = self._q(sum2_c)
+            if q_sum2_c not in updated:
+                assignments.append(f"{q_sum2_c} = {_merged_sum2(ekey, q_sum2_c)}")
+                updated.add(q_sum2_c)
         for tcnt_c in col_true_cnt_map.values():
-            if tcnt_c not in updated:
-                assignments.append(f"{tcnt_c} = {mv_table}.{tcnt_c} + {_incoming(tcnt_c)}")
-                updated.add(tcnt_c)
+            q_tcnt_c = self._q(tcnt_c)
+            if q_tcnt_c not in updated:
+                assignments.append(f"{q_tcnt_c} = {mv_table}.{q_tcnt_c} + {_incoming(q_tcnt_c)}")
+                updated.add(q_tcnt_c)
 
         derived_aliases = {
             self._q(it.alias)
@@ -7533,7 +7587,7 @@ class IncrementalViewCompiler:
 
     def _distinct_match_predicate(self, aux_tbl: str, val_expr: str, record_prefix: str) -> str:
         grp_pred = self._group_match_predicate_tier1(aux_tbl, record_prefix)
-        return f"{grp_pred} AND {aux_tbl}.__val = ({val_expr})"
+        return f"{grp_pred} AND {aux_tbl}.{self._q('__val')} = ({val_expr})"
 
     def _build_plus_delta_statements(
         self,
@@ -7573,18 +7627,19 @@ class IncrementalViewCompiler:
             ins_vals.extend([val_expr, "1"])
             if self.dialect == Dialect.MYSQL:
                 stmts.append(
-                    f"INSERT INTO {aux_tbl} ({', '.join(ins_cols)})\n"
+                    f"INSERT INTO {aux_tbl} ({', '.join(self._q(c) for c in ins_cols)})\n"
                     f"    SELECT {', '.join(ins_vals)}{from_dual}\n"
                     f"    WHERE ({val_expr}) IS NOT NULL\n"
-                    f"    ON DUPLICATE KEY UPDATE __ref_cnt = __ref_cnt + 1;"
+                    f"    ON DUPLICATE KEY UPDATE {self._q('__ref_cnt')} = {self._q('__ref_cnt')} + 1;"
                 )
             else:
+                q_aux_conflict = [self._q(c) for c in [*pk_cols, "__val"]]
                 stmts.append(
-                    f"INSERT INTO {aux_tbl} ({', '.join(ins_cols)})\n"
+                    f"INSERT INTO {aux_tbl} ({', '.join(self._q(c) for c in ins_cols)})\n"
                     f"    SELECT {', '.join(ins_vals)}\n"
                     f"    WHERE ({val_expr}) IS NOT NULL\n"
-                    f"    ON CONFLICT ({', '.join(pk_cols)}, __val) DO UPDATE SET\n"
-                    f"        __ref_cnt = {aux_tbl}.__ref_cnt + 1;"
+                    f"    ON CONFLICT ({', '.join(q_aux_conflict)}) DO UPDATE SET\n"
+                    f"        {self._q('__ref_cnt')} = {aux_tbl}.{self._q('__ref_cnt')} + 1;"
                 )
 
         def _is_newly_distinct_cond(item: SelectItem) -> str:
@@ -7594,43 +7649,45 @@ class IncrementalViewCompiler:
                 return f"({val_e}) IS NOT NULL"
             aux_tbl = distinct_aux_tables[ekey][0]
             match_p = self._distinct_match_predicate(aux_tbl, val_e, record_prefix)
-            return f"({val_e}) IS NOT NULL AND (SELECT {aux_tbl}.__ref_cnt FROM {aux_tbl} WHERE {match_p}) = 1"
+            return f"({val_e}) IS NOT NULL AND (SELECT {aux_tbl}.{self._q('__ref_cnt')} FROM {aux_tbl} WHERE {match_p}) = 1"
 
         def _plus_inc_expr(item: SelectItem) -> str:
             return f"(CASE WHEN {_is_newly_distinct_cond(item)} THEN 1 ELSE 0 END)"
 
         def _plus_sum_expr(item: SelectItem, col_alias: str) -> str:
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            q_col = self._q(col_alias)
             if item.is_distinct:
                 cond = _is_newly_distinct_cond(item)
                 return (
-                    f"(CASE WHEN NOT ({cond}) THEN {mv_table}.{col_alias} "
-                    f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
-                    f"ELSE {mv_table}.{col_alias} + ({val_e}) END)"
+                    f"(CASE WHEN NOT ({cond}) THEN {mv_table}.{q_col} "
+                    f"WHEN {mv_table}.{q_col} IS NULL THEN ({val_e}) "
+                    f"ELSE {mv_table}.{q_col} + ({val_e}) END)"
                 )
             return (
-                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
-                f"WHEN {mv_table}.{col_alias} IS NULL THEN ({val_e}) "
-                f"ELSE {mv_table}.{col_alias} + ({val_e}) END)"
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{q_col} "
+                f"WHEN {mv_table}.{q_col} IS NULL THEN ({val_e}) "
+                f"ELSE {mv_table}.{q_col} + ({val_e}) END)"
             )
 
         def _plus_sum2_expr(item: SelectItem, col_alias: str) -> str:
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
+            q_col = self._q(col_alias)
             if self.dialect == Dialect.SQLITE:
                 ekey = expr_key_fn(item)
-                cnt_c = col_nonnull_count_map[ekey]
-                sum_c = col_sum_map[ekey]
+                cnt_c = self._q(col_nonnull_count_map[ekey])
+                sum_c = self._q(col_sum_map[ekey])
                 delta = f"((1.0 * ({val_e})) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_c}))"
                 return (
-                    f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{q_col} "
                     f"WHEN {mv_table}.{cnt_c} <= 0 OR {mv_table}.{sum_c} IS NULL THEN 0.0 "
-                    f"ELSE COALESCE({mv_table}.{col_alias}, 0.0) + ({delta} * {delta} * ((1.0 * {mv_table}.{cnt_c}) / ({mv_table}.{cnt_c} + 1))) END)"
+                    f"ELSE COALESCE({mv_table}.{q_col}, 0.0) + ({delta} * {delta} * ((1.0 * {mv_table}.{cnt_c}) / ({mv_table}.{cnt_c} + 1))) END)"
                 )
             sq = self._var_sq_sql(val_e)
             return (
-                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
-                f"WHEN {mv_table}.{col_alias} IS NULL THEN {sq} "
-                f"ELSE {mv_table}.{col_alias} + {sq} END)"
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{q_col} "
+                f"WHEN {mv_table}.{q_col} IS NULL THEN {sq} "
+                f"ELSE {mv_table}.{q_col} + {sq} END)"
             )
 
         def _plus_tcnt_expr(item: SelectItem) -> str:
@@ -7723,8 +7780,8 @@ class IncrementalViewCompiler:
                     recomputed = self._build_recompute_subquery_raw(item, record_prefix)
                     update_assignments.append(f"{col_alias} = {recomputed}")
                 else:
-                    cnt_col = col_nonnull_count_map[ekey]
-                    sum_col = col_sum_map[ekey]
+                    cnt_col = self._q(col_nonnull_count_map[ekey])
+                    sum_col = self._q(col_sum_map[ekey])
                     new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
                     new_sum = _plus_sum_expr(item, sum_col)
                     exact_avg = (
@@ -7786,8 +7843,8 @@ class IncrementalViewCompiler:
                     f"ELSE {xor_expr} END"
                 )
             elif item.agg_func == AggFunc.BOOL_AND:
-                cnt_col = col_nonnull_count_map[ekey]
-                tcnt_col = col_true_cnt_map[ekey]
+                cnt_col = self._q(col_nonnull_count_map[ekey])
+                tcnt_col = self._q(col_true_cnt_map[ekey])
                 new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
                 new_tcnt = f"({mv_table}.{tcnt_col} + {_plus_tcnt_expr(item)})"
                 t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
@@ -7797,8 +7854,8 @@ class IncrementalViewCompiler:
                     f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
                 )
             elif item.agg_func == AggFunc.BOOL_OR:
-                cnt_col = col_nonnull_count_map[ekey]
-                tcnt_col = col_true_cnt_map[ekey]
+                cnt_col = self._q(col_nonnull_count_map[ekey])
+                tcnt_col = self._q(col_true_cnt_map[ekey])
                 new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
                 new_tcnt = f"({mv_table}.{tcnt_col} + {_plus_tcnt_expr(item)})"
                 t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
@@ -7811,11 +7868,12 @@ class IncrementalViewCompiler:
                 recomp = self._build_recompute_subquery_raw(item, record_prefix)
                 update_assignments.append(f"{col_alias} = {recomp}")
 
-        if row_count_col not in updated_cols:
-            insert_cols.append(row_count_col)
+        q_row_count_col = self._q(row_count_col)
+        if q_row_count_col not in updated_cols:
+            insert_cols.append(q_row_count_col)
             insert_vals.append("1")
-            update_assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} + 1")
-            updated_cols.add(row_count_col)
+            update_assignments.append(f"{q_row_count_col} = {mv_table}.{q_row_count_col} + 1")
+            updated_cols.add(q_row_count_col)
 
         ekey_to_item: Dict[str, SelectItem] = {
             expr_key_fn(it): it for it in work_items if it.is_aggregate
@@ -7823,53 +7881,57 @@ class IncrementalViewCompiler:
         already_in_ins = set(insert_cols)
         for ekey, cnt_col in col_nonnull_count_map.items():
             it = ekey_to_item[ekey]
+            q_cnt_col = self._q(cnt_col)
             val_e = self._effective_agg_value_expr(it, record_prefix=record_prefix)
-            if cnt_col not in already_in_ins:
-                insert_cols.append(cnt_col)
+            if q_cnt_col not in already_in_ins:
+                insert_cols.append(q_cnt_col)
                 insert_vals.append(f"(CASE WHEN ({val_e}) IS NOT NULL THEN 1 ELSE 0 END)")
-                already_in_ins.add(cnt_col)
-            if cnt_col not in updated_cols:
+                already_in_ins.add(q_cnt_col)
+            if q_cnt_col not in updated_cols:
                 update_assignments.append(
-                    f"{cnt_col} = {mv_table}.{cnt_col} + {_plus_inc_expr(it)}"
+                    f"{q_cnt_col} = {mv_table}.{q_cnt_col} + {_plus_inc_expr(it)}"
                 )
-                updated_cols.add(cnt_col)
+                updated_cols.add(q_cnt_col)
 
         for ekey, sum_col in col_sum_map.items():
             it = ekey_to_item[ekey]
+            q_sum_col = self._q(sum_col)
             val_e = self._effective_agg_value_expr(it, record_prefix=record_prefix)
-            if sum_col not in already_in_ins:
-                insert_cols.append(sum_col)
+            if q_sum_col not in already_in_ins:
+                insert_cols.append(q_sum_col)
                 insert_vals.append(f"({val_e})")
-                already_in_ins.add(sum_col)
-            if sum_col not in updated_cols:
-                update_assignments.append(f"{sum_col} = {_plus_sum_expr(it, sum_col)}")
-                updated_cols.add(sum_col)
+                already_in_ins.add(q_sum_col)
+            if q_sum_col not in updated_cols:
+                update_assignments.append(f"{q_sum_col} = {_plus_sum_expr(it, q_sum_col)}")
+                updated_cols.add(q_sum_col)
 
         for ekey, sum2_col in col_sum2_map.items():
             it = ekey_to_item[ekey]
+            q_sum2_col = self._q(sum2_col)
             val_e = self._effective_agg_value_expr(it, record_prefix=record_prefix)
-            if sum2_col not in already_in_ins:
-                insert_cols.append(sum2_col)
+            if q_sum2_col not in already_in_ins:
+                insert_cols.append(q_sum2_col)
                 init_s2 = "0.0" if self.dialect == Dialect.SQLITE else self._var_sq_sql(val_e)
                 insert_vals.append(
                     f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE {init_s2} END)"
                 )
-                already_in_ins.add(sum2_col)
-            if sum2_col not in updated_cols:
-                update_assignments.append(f"{sum2_col} = {_plus_sum2_expr(it, sum2_col)}")
-                updated_cols.add(sum2_col)
+                already_in_ins.add(q_sum2_col)
+            if q_sum2_col not in updated_cols:
+                update_assignments.append(f"{q_sum2_col} = {_plus_sum2_expr(it, q_sum2_col)}")
+                updated_cols.add(q_sum2_col)
 
         for ekey, tcnt_col in col_true_cnt_map.items():
             it = ekey_to_item[ekey]
-            if tcnt_col not in already_in_ins:
-                insert_cols.append(tcnt_col)
+            q_tcnt_col = self._q(tcnt_col)
+            if q_tcnt_col not in already_in_ins:
+                insert_cols.append(q_tcnt_col)
                 insert_vals.append(_plus_tcnt_expr(it))
-                already_in_ins.add(tcnt_col)
-            if tcnt_col not in updated_cols:
+                already_in_ins.add(q_tcnt_col)
+            if q_tcnt_col not in updated_cols:
                 update_assignments.append(
-                    f"{tcnt_col} = {mv_table}.{tcnt_col} + {_plus_tcnt_expr(it)}"
+                    f"{q_tcnt_col} = {mv_table}.{q_tcnt_col} + {_plus_tcnt_expr(it)}"
                 )
-                updated_cols.add(tcnt_col)
+                updated_cols.add(q_tcnt_col)
 
         # In MySQL, ON DUPLICATE KEY UPDATE evaluates left-to-right, so derived columns must come first
         derived_aliases = {
@@ -7935,7 +7997,7 @@ class IncrementalViewCompiler:
             match_p = self._distinct_match_predicate(aux_tbl, val_expr, record_prefix)
             stmts.append(
                 f"UPDATE {aux_tbl}\n"
-                f"    SET __ref_cnt = {aux_tbl}.__ref_cnt - 1\n"
+                f"    SET {self._q('__ref_cnt')} = {aux_tbl}.{self._q('__ref_cnt')} - 1\n"
                 f"    WHERE ({val_expr}) IS NOT NULL AND {match_p};"
             )
 
@@ -7946,45 +8008,49 @@ class IncrementalViewCompiler:
                 return f"({val_e}) IS NOT NULL"
             aux_tbl = distinct_aux_tables[ekey][0]
             match_p = self._distinct_match_predicate(aux_tbl, val_e, record_prefix)
-            return f"({val_e}) IS NOT NULL AND (SELECT {aux_tbl}.__ref_cnt FROM {aux_tbl} WHERE {match_p}) <= 0"
+            return f"({val_e}) IS NOT NULL AND (SELECT {aux_tbl}.{self._q('__ref_cnt')} FROM {aux_tbl} WHERE {match_p}) <= 0"
 
         def _minus_dec_expr(item: SelectItem) -> str:
             return f"(CASE WHEN {_is_last_distinct_cond(item)} THEN 1 ELSE 0 END)"
 
         def _minus_sum_expr(item: SelectItem, col_alias: str, cnt_col: str) -> str:
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
-            new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+            q_col = self._q(col_alias)
+            q_cnt = self._q(cnt_col)
+            new_cnt = f"({mv_table}.{q_cnt} - {_minus_dec_expr(item)})"
             if item.is_distinct:
                 cond = _is_last_distinct_cond(item)
                 return (
-                    f"(CASE WHEN NOT ({cond}) THEN {mv_table}.{col_alias} "
+                    f"(CASE WHEN NOT ({cond}) THEN {mv_table}.{q_col} "
                     f"WHEN {new_cnt} <= 0 THEN NULL "
-                    f"ELSE {mv_table}.{col_alias} - ({val_e}) END)"
+                    f"ELSE {mv_table}.{q_col} - ({val_e}) END)"
                 )
             return (
-                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{q_col} "
                 f"WHEN {new_cnt} <= 0 THEN NULL "
-                f"ELSE {mv_table}.{col_alias} - ({val_e}) END)"
+                f"ELSE {mv_table}.{q_col} - ({val_e}) END)"
             )
 
         def _minus_sum2_expr(item: SelectItem, col_alias: str, cnt_col: str) -> str:
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
-            new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
+            q_col = self._q(col_alias)
+            q_cnt = self._q(cnt_col)
+            new_cnt = f"({mv_table}.{q_cnt} - {_minus_dec_expr(item)})"
             if self.dialect == Dialect.SQLITE:
                 ekey = expr_key_fn(item)
-                sum_c = col_sum_map[ekey]
-                delta = f"((1.0 * ({val_e})) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_col}))"
+                sum_c = self._q(col_sum_map[ekey])
+                delta = f"((1.0 * ({val_e})) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{q_cnt}))"
                 return (
-                    f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                    f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{q_col} "
                     f"WHEN {new_cnt} <= 0 THEN NULL "
                     f"WHEN {new_cnt} = 1 THEN 0.0 "
-                    f"ELSE MAX(0.0, COALESCE({mv_table}.{col_alias}, 0.0) - ({delta} * {delta} * ((1.0 * {mv_table}.{cnt_col}) / ({mv_table}.{cnt_col} - 1)))) END)"
+                    f"ELSE MAX(0.0, COALESCE({mv_table}.{q_col}, 0.0) - ({delta} * {delta} * ((1.0 * {mv_table}.{q_cnt}) / ({mv_table}.{q_cnt} - 1)))) END)"
                 )
             sq = self._var_sq_sql(val_e)
             return (
-                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{col_alias} "
+                f"(CASE WHEN ({val_e}) IS NULL THEN {mv_table}.{q_col} "
                 f"WHEN {new_cnt} <= 0 THEN NULL "
-                f"ELSE {mv_table}.{col_alias} - {sq} END)"
+                f"ELSE {mv_table}.{q_col} - {sq} END)"
             )
 
         def _minus_tcnt_expr(item: SelectItem) -> str:
@@ -8011,7 +8077,7 @@ class IncrementalViewCompiler:
                     f"{col_alias} = {mv_table}.{col_alias} - {_minus_dec_expr(item)}"
                 )
             elif item.agg_func == AggFunc.SUM:
-                cnt_col = col_nonnull_count_map[ekey]
+                cnt_col = self._q(col_nonnull_count_map[ekey])
                 update_assignments.append(
                     f"{col_alias} = {_minus_sum_expr(item, col_alias, cnt_col)}"
                 )
@@ -8027,8 +8093,8 @@ class IncrementalViewCompiler:
                     recomputed = self._build_recompute_subquery_raw(item, record_prefix)
                     update_assignments.append(f"{col_alias} = {recomputed}")
                 else:
-                    cnt_col = col_nonnull_count_map[ekey]
-                    sum_col = col_sum_map[ekey]
+                    cnt_col = self._q(col_nonnull_count_map[ekey])
+                    sum_col = self._q(col_sum_map[ekey])
                     new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
                     new_sum = _minus_sum_expr(item, sum_col, cnt_col)
                     exact_avg = (
@@ -8067,7 +8133,7 @@ class IncrementalViewCompiler:
                     f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
                 )
             elif item.agg_func == AggFunc.BIT_XOR:
-                cnt_col = col_nonnull_count_map[ekey]
+                cnt_col = self._q(col_nonnull_count_map[ekey])
                 new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
                 xor_expr = self._bitwise_xor_sql(f"{mv_table}.{col_alias}", f"({val_e})")
                 update_assignments.append(
@@ -8075,8 +8141,8 @@ class IncrementalViewCompiler:
                     f"WHEN {new_cnt} <= 0 THEN NULL ELSE {xor_expr} END"
                 )
             elif item.agg_func == AggFunc.BOOL_AND:
-                cnt_col = col_nonnull_count_map[ekey]
-                tcnt_col = col_true_cnt_map[ekey]
+                cnt_col = self._q(col_nonnull_count_map[ekey])
+                tcnt_col = self._q(col_true_cnt_map[ekey])
                 new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
                 new_tcnt = f"({mv_table}.{tcnt_col} - {_minus_tcnt_expr(item)})"
                 t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
@@ -8086,8 +8152,8 @@ class IncrementalViewCompiler:
                     f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
                 )
             elif item.agg_func == AggFunc.BOOL_OR:
-                cnt_col = col_nonnull_count_map[ekey]
-                tcnt_col = col_true_cnt_map[ekey]
+                cnt_col = self._q(col_nonnull_count_map[ekey])
+                tcnt_col = self._q(col_true_cnt_map[ekey])
                 new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
                 new_tcnt = f"({mv_table}.{tcnt_col} - {_minus_tcnt_expr(item)})"
                 t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
@@ -8100,46 +8166,51 @@ class IncrementalViewCompiler:
                 recomp = self._build_recompute_subquery_raw(item, record_prefix)
                 update_assignments.append(f"{col_alias} = {recomp}")
 
-        if row_count_col not in updated_cols:
-            update_assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} - 1")
-            updated_cols.add(row_count_col)
+        q_row_count_col = self._q(row_count_col)
+        if q_row_count_col not in updated_cols:
+            update_assignments.append(f"{q_row_count_col} = {mv_table}.{q_row_count_col} - 1")
+            updated_cols.add(q_row_count_col)
 
         ekey_to_item: Dict[str, SelectItem] = {
             expr_key_fn(it): it for it in work_items if it.is_aggregate
         }
         for ekey, cnt_col in col_nonnull_count_map.items():
-            if cnt_col not in updated_cols:
+            q_cnt_col = self._q(cnt_col)
+            if q_cnt_col not in updated_cols:
                 it = ekey_to_item[ekey]
                 update_assignments.append(
-                    f"{cnt_col} = {mv_table}.{cnt_col} - {_minus_dec_expr(it)}"
+                    f"{q_cnt_col} = {mv_table}.{q_cnt_col} - {_minus_dec_expr(it)}"
                 )
-                updated_cols.add(cnt_col)
+                updated_cols.add(q_cnt_col)
 
         for ekey, sum_col in col_sum_map.items():
-            if sum_col not in updated_cols:
+            q_sum_col = self._q(sum_col)
+            if q_sum_col not in updated_cols:
                 it = ekey_to_item[ekey]
-                cnt_col = col_nonnull_count_map[ekey]
+                cnt_col = self._q(col_nonnull_count_map[ekey])
                 update_assignments.append(
-                    f"{sum_col} = {_minus_sum_expr(it, sum_col, cnt_col)}"
+                    f"{q_sum_col} = {_minus_sum_expr(it, q_sum_col, cnt_col)}"
                 )
-                updated_cols.add(sum_col)
+                updated_cols.add(q_sum_col)
 
         for ekey, sum2_col in col_sum2_map.items():
-            if sum2_col not in updated_cols:
+            q_sum2_col = self._q(sum2_col)
+            if q_sum2_col not in updated_cols:
                 it = ekey_to_item[ekey]
-                cnt_col = col_nonnull_count_map[ekey]
+                cnt_col = self._q(col_nonnull_count_map[ekey])
                 update_assignments.append(
-                    f"{sum2_col} = {_minus_sum2_expr(it, sum2_col, cnt_col)}"
+                    f"{q_sum2_col} = {_minus_sum2_expr(it, q_sum2_col, cnt_col)}"
                 )
-                updated_cols.add(sum2_col)
+                updated_cols.add(q_sum2_col)
 
         for ekey, tcnt_col in col_true_cnt_map.items():
-            if tcnt_col not in updated_cols:
+            q_tcnt_col = self._q(tcnt_col)
+            if q_tcnt_col not in updated_cols:
                 it = ekey_to_item[ekey]
                 update_assignments.append(
-                    f"{tcnt_col} = {mv_table}.{tcnt_col} - {_minus_tcnt_expr(it)}"
+                    f"{q_tcnt_col} = {mv_table}.{q_tcnt_col} - {_minus_tcnt_expr(it)}"
                 )
-                updated_cols.add(tcnt_col)
+                updated_cols.add(q_tcnt_col)
 
         # In MySQL, UPDATE evaluates SET assignments left-to-right!
         # Order: (1) derived aggs (AVG, VAR, STDDEV, BIT_XOR, BOOL_AND, BOOL_OR)
@@ -8165,9 +8236,9 @@ class IncrementalViewCompiler:
         )
         mid_priority_cols = (
             {self._q(it.alias) for it in work_items if it.is_aggregate and it.agg_func == AggFunc.SUM}
-            | set(col_sum_map.values())
-            | set(col_sum2_map.values())
-            | set(col_true_cnt_map.values())
+            | {self._q(c) for c in col_sum_map.values()}
+            | {self._q(c) for c in col_sum2_map.values()}
+            | {self._q(c) for c in col_true_cnt_map.values()}
         )
         tier_1 = [a for a in update_assignments if a.split("=")[0].strip() in high_priority_cols]
         tier_2 = [
@@ -8196,14 +8267,14 @@ class IncrementalViewCompiler:
             match_p = self._distinct_match_predicate(aux_tbl, val_expr, record_prefix)
             stmts.append(
                 f"DELETE FROM {aux_tbl}\n"
-                f"    WHERE ({val_expr}) IS NOT NULL AND ({match_p}) AND {aux_tbl}.__ref_cnt <= 0;"
+                f"    WHERE ({val_expr}) IS NOT NULL AND ({match_p}) AND {aux_tbl}.{self._q('__ref_cnt')} <= 0;"
             )
 
         delete_zero_mv_stmt: Optional[str] = None
         if grp_exprs:
             delete_zero_mv_stmt = (
                 f"DELETE FROM {mv_table}\n"
-                f"    WHERE ({grp_pred}) AND {mv_table}.{row_count_col} <= 0;"
+                f"    WHERE ({grp_pred}) AND {mv_table}.{self._q(row_count_col)} <= 0;"
             )
             if include_delete_zero_mv:
                 stmts.append(delete_zero_mv_stmt)
@@ -9003,10 +9074,10 @@ class IncrementalViewCompiler:
             for idx, j in enumerate(self.view.joins):
                 if replace_alias and j.alias.lower() == replace_alias.lower() and rec_prefix:
                     ts = self._schemas_lower[j.table_name.lower()]
-                    rec_proj = ", ".join(f"{rec_prefix}.{c} AS {c}" for c in ts.columns)
-                    tbl_sql = f"(SELECT {rec_proj}{from_dual}) AS {j.alias}"
+                    rec_proj = ", ".join(f"{rec_prefix}.{self._q(c)} AS {self._q(c)}" for c in ts.columns)
+                    tbl_sql = f"(SELECT {rec_proj}{from_dual}) AS {self._q(j.alias)}"
                 else:
-                    tbl_sql = f"{j.table_name} AS {j.alias}"
+                    tbl_sql = f"{self._q(j.table_name)} AS {self._q(j.alias)}"
                 if idx == 0:
                     parts.append(tbl_sql)
                 else:
@@ -9020,6 +9091,7 @@ class IncrementalViewCompiler:
         qual_grp_for_q = self._group_by_exprs_for_query(qual_grp_exprs, include_canonical_pk=has_nullable_grp)
         group_sql = f"\nGROUP BY {', '.join(qual_grp_for_q)}" if qual_grp_for_q else ""
 
+        q_target_cols = [self._q(c) for c in target_cols]
         initial_populate_sql = (
             f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
             f"SELECT {', '.join(select_exprs)}\n"
@@ -9067,7 +9139,7 @@ class IncrementalViewCompiler:
             if self.view.where_clause:
                 conds.append(f"({_remap_to_j(self.view.where_clause)})")
             for g_raw in grp_exprs:
-                mv_col = self._group_col_alias(g_raw)
+                mv_col = self._q(self._group_col_alias(g_raw))
                 lhs_j = _remap_to_j(g_raw)
                 conds.append(
                     self._null_safe_eq(f"({lhs_j})", f"{mv_table}.{mv_col}", is_nullable=True)
@@ -9122,24 +9194,28 @@ class IncrementalViewCompiler:
         minus_updated: Set[str] = set()
 
         def _delta_sum_minus(col: str, cnt_col: str) -> str:
-            new_c = f"({mv_table}.{cnt_col} - __mv_delta.{cnt_col})"
+            qc = self._q(col)
+            qcnt = self._q(cnt_col)
+            new_c = f"({mv_table}.{qcnt} - __mv_delta.{qcnt})"
             return (
-                f"(CASE WHEN __mv_delta.{col} IS NULL THEN {mv_table}.{col} "
+                f"(CASE WHEN __mv_delta.{qc} IS NULL THEN {mv_table}.{qc} "
                 f"WHEN {new_c} <= 0 THEN NULL "
-                f"ELSE {mv_table}.{col} - __mv_delta.{col} END)"
+                f"ELSE {mv_table}.{qc} - __mv_delta.{qc} END)"
             )
 
         def _delta_sum2_minus(ekey: str, sum2_col: str, cnt_col: str) -> str:
+            q_sum2 = self._q(sum2_col)
+            q_cnt = self._q(cnt_col)
             if self.dialect != Dialect.SQLITE:
-                return _delta_sum_minus(sum2_col, cnt_col)
-            sum_c = col_sum_map[ekey]
-            new_c = f"({mv_table}.{cnt_col} - __mv_delta.{cnt_col})"
-            d_mu = f"(((1.0 * __mv_delta.{sum_c}) / __mv_delta.{cnt_col}) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_col}))"
+                return _delta_sum_minus(q_sum2, q_cnt)
+            sum_c = self._q(col_sum_map[ekey])
+            new_c = f"({mv_table}.{q_cnt} - __mv_delta.{q_cnt})"
+            d_mu = f"(((1.0 * __mv_delta.{sum_c}) / __mv_delta.{q_cnt}) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_c}))"
             return (
-                f"(CASE WHEN __mv_delta.{cnt_col} <= 0 OR __mv_delta.{sum2_col} IS NULL THEN {mv_table}.{sum2_col} "
+                f"(CASE WHEN __mv_delta.{q_cnt} <= 0 OR __mv_delta.{q_sum2} IS NULL THEN {mv_table}.{q_sum2} "
                 f"WHEN {new_c} <= 0 THEN NULL "
                 f"WHEN {new_c} = 1 THEN 0.0 "
-                f"ELSE MAX(0.0, COALESCE({mv_table}.{sum2_col}, 0.0) - COALESCE(__mv_delta.{sum2_col}, 0.0) - ({d_mu} * {d_mu} * ((1.0 * {mv_table}.{cnt_col} * __mv_delta.{cnt_col}) / {new_c}))) END)"
+                f"ELSE MAX(0.0, COALESCE({mv_table}.{q_sum2}, 0.0) - COALESCE(__mv_delta.{q_sum2}, 0.0) - ({d_mu} * {d_mu} * ((1.0 * {mv_table}.{cnt_c} * __mv_delta.{q_cnt}) / {new_c}))) END)"
             )
 
         for item in work_items:
@@ -9221,28 +9297,33 @@ class IncrementalViewCompiler:
                     f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
                 )
 
-        if row_count_col not in minus_updated:
-            minus_assignments.append(f"{row_count_col} = {mv_table}.{row_count_col} - __mv_delta.{row_count_col}")
-            minus_updated.add(row_count_col)
+        q_row_count_col = self._q(row_count_col)
+        if q_row_count_col not in minus_updated:
+            minus_assignments.append(f"{q_row_count_col} = {mv_table}.{q_row_count_col} - __mv_delta.{q_row_count_col}")
+            minus_updated.add(q_row_count_col)
 
         for ekey, cnt_c in col_nonnull_count_map.items():
-            if cnt_c not in minus_updated:
-                minus_assignments.append(f"{cnt_c} = {mv_table}.{cnt_c} - __mv_delta.{cnt_c}")
-                minus_updated.add(cnt_c)
+            q_cnt_c = self._q(cnt_c)
+            if q_cnt_c not in minus_updated:
+                minus_assignments.append(f"{q_cnt_c} = {mv_table}.{q_cnt_c} - __mv_delta.{q_cnt_c}")
+                minus_updated.add(q_cnt_c)
         for ekey, sum_c in col_sum_map.items():
-            if sum_c not in minus_updated:
-                cnt_c = col_nonnull_count_map[ekey]
-                minus_assignments.append(f"{sum_c} = {_delta_sum_minus(sum_c, cnt_c)}")
-                minus_updated.add(sum_c)
+            q_sum_c = self._q(sum_c)
+            if q_sum_c not in minus_updated:
+                cnt_c = self._q(col_nonnull_count_map[ekey])
+                minus_assignments.append(f"{q_sum_c} = {_delta_sum_minus(q_sum_c, cnt_c)}")
+                minus_updated.add(q_sum_c)
         for ekey, sum2_c in col_sum2_map.items():
-            if sum2_c not in minus_updated:
-                cnt_c = col_nonnull_count_map[ekey]
-                minus_assignments.append(f"{sum2_c} = {_delta_sum2_minus(ekey, sum2_c, cnt_c)}")
-                minus_updated.add(sum2_c)
+            q_sum2_c = self._q(sum2_c)
+            if q_sum2_c not in minus_updated:
+                cnt_c = self._q(col_nonnull_count_map[ekey])
+                minus_assignments.append(f"{q_sum2_c} = {_delta_sum2_minus(ekey, q_sum2_c, cnt_c)}")
+                minus_updated.add(q_sum2_c)
         for ekey, tcnt_c in col_true_cnt_map.items():
-            if tcnt_c not in minus_updated:
-                minus_assignments.append(f"{tcnt_c} = {mv_table}.{tcnt_c} - __mv_delta.{tcnt_c}")
-                minus_updated.add(tcnt_c)
+            q_tcnt_c = self._q(tcnt_c)
+            if q_tcnt_c not in minus_updated:
+                minus_assignments.append(f"{q_tcnt_c} = {mv_table}.{q_tcnt_c} - __mv_delta.{q_tcnt_c}")
+                minus_updated.add(q_tcnt_c)
 
         high_p = {
             self._q(it.alias)
@@ -9262,9 +9343,9 @@ class IncrementalViewCompiler:
         }
         mid_p = (
             {self._q(it.alias) for it in work_items if it.is_aggregate and it.agg_func == AggFunc.SUM}
-            | set(col_sum_map.values())
-            | set(col_sum2_map.values())
-            | set(col_true_cnt_map.values())
+            | {self._q(c) for c in col_sum_map.values()}
+            | {self._q(c) for c in col_sum2_map.values()}
+            | {self._q(c) for c in col_true_cnt_map.values()}
         )
         ordered_minus = (
             [a for a in minus_assignments if a.split("=")[0].strip() in high_p]
@@ -9331,7 +9412,7 @@ class IncrementalViewCompiler:
                 )
 
             del_zero_stmt = (
-                f"DELETE FROM {mv_table} WHERE {mv_table}.{row_count_col} <= 0;"
+                f"DELETE FROM {mv_table} WHERE {mv_table}.{self._q(row_count_col)} <= 0;"
                 if grp_exprs
                 else None
             )
@@ -9565,7 +9646,7 @@ class IncrementalViewCompiler:
             extra_filter = "__mv_cnt_0 > 0 AND __mv_cnt_1 = 0"
 
         if use_native_uall_pk:
-            col_defs_sql.append(f"PRIMARY KEY ({', '.join(uall_pk_cols)})")
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in uall_pk_cols)})")
 
         backing_table_ddl = self._create_table_ddl(
             mv_table,
@@ -9592,36 +9673,40 @@ class IncrementalViewCompiler:
         for b_idx, (_, bs) in enumerate(branches):
             by_table_branches.setdefault(bs.base_table, []).append((b_idx, bs))
 
+        q_uall_pk_cols = [self._q(c) for c in uall_pk_cols]
+        q_user_columns = [self._q(c) for c in user_columns]
+
         if op_type == "UNION ALL":
             for b_idx, (_, bs) in enumerate(branches):
                 ts = self._schemas_lower[bs.base_table.lower()]
                 pk_names = [c.name for c in ts.columns.values() if c.primary_key]
                 sel_exprs = [it.raw_expr for it in bs.select_items]
                 w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                q_pk_names = [self._q(c) for c in pk_names]
                 if use_native_uall_pk:
                     initial_populate_sqls.append(
-                        f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
-                        f"SELECT {b_idx}, {', '.join(pk_names)}, {', '.join(sel_exprs)}, 1 FROM {bs.base_table}{w_sql};"
+                        f"INSERT INTO {mv_table} ({', '.join(q_uall_pk_cols)}, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                        f"SELECT {b_idx}, {', '.join(q_pk_names)}, {', '.join(sel_exprs)}, 1 FROM {self._q(bs.base_table)}{w_sql};"
                     )
                 else:
                     pk_expr = self._canonical_group_pk_expr([f"'B{b_idx}'", *pk_names])
                     initial_populate_sqls.append(
-                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
-                        f"SELECT {pk_expr}, {', '.join(sel_exprs)}, 1 FROM {bs.base_table}{w_sql};"
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                        f"SELECT {pk_expr}, {', '.join(sel_exprs)}, 1 FROM {self._q(bs.base_table)}{w_sql};"
                     )
         elif op_type == "UNION":
             u_parts: List[str] = []
             for _, bs in branches:
                 sel_aliased = ", ".join(
-                    f"{it.raw_expr} AS {col}" for it, col in zip(bs.select_items, user_columns)
+                    f"{it.raw_expr} AS {self._q(col)}" for it, col in zip(bs.select_items, user_columns)
                 )
                 w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
-                u_parts.append(f"    SELECT {sel_aliased} FROM {bs.base_table}{w_sql}")
+                u_parts.append(f"    SELECT {sel_aliased} FROM {self._q(bs.base_table)}{w_sql}")
             pk_u = self._canonical_group_pk_expr(user_columns)
             grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
             initial_populate_sqls.append(
-                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
-                f"SELECT {pk_u}, {', '.join(user_columns)}, COUNT(*) FROM (\n"
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                f"SELECT {pk_u}, {', '.join(q_user_columns)}, COUNT(*) FROM (\n"
                 + "\n    UNION ALL\n".join(u_parts)
                 + f"\n) AS __mv_u\nGROUP BY {grp_u};"
             )
@@ -9629,19 +9714,19 @@ class IncrementalViewCompiler:
             u_parts = []
             for b_idx, (_, bs) in enumerate(branches):
                 sel_aliased = ", ".join(
-                    f"{it.raw_expr} AS {col}" for it, col in zip(bs.select_items, user_columns)
+                    f"{it.raw_expr} AS {self._q(col)}" for it, col in zip(bs.select_items, user_columns)
                 )
                 b0 = "1" if b_idx == 0 else "0"
                 b1 = "1" if b_idx == 1 else "0"
                 w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
                 u_parts.append(
-                    f"    SELECT {sel_aliased}, {b0} AS __mv_b0, {b1} AS __mv_b1 FROM {bs.base_table}{w_sql}"
+                    f"    SELECT {sel_aliased}, {b0} AS __mv_b0, {b1} AS __mv_b1 FROM {self._q(bs.base_table)}{w_sql}"
                 )
             pk_u = self._canonical_group_pk_expr(user_columns)
             grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
             initial_populate_sqls.append(
-                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
-                f"SELECT {pk_u}, {', '.join(user_columns)}, SUM(__mv_b0), SUM(__mv_b1) FROM (\n"
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                f"SELECT {pk_u}, {', '.join(q_user_columns)}, SUM(__mv_b0), SUM(__mv_b1) FROM (\n"
                 + "\n    UNION ALL\n".join(u_parts)
                 + f"\n) AS __mv_u\nGROUP BY {grp_u};"
             )
@@ -9688,14 +9773,14 @@ class IncrementalViewCompiler:
                         )
                         if self.dialect == Dialect.MYSQL:
                             if self.engine_version.supports_mysql_row_alias_upsert:
-                                upd_set = ", ".join(f"{c} = __mv_new.{c}" for c in user_columns)
+                                upd_set = ", ".join(f"{self._q(c)} = __mv_new.{self._q(c)}" for c in user_columns)
                                 aliased_uall_sel = [
-                                    *[f"{expr} AS {col}" for expr, col in zip(new_pk_vals, uall_pk_cols)],
-                                    *[f"{expr} AS {col}" for expr, col in zip(new_vals, user_columns)],
+                                    *[f"{expr} AS {col}" for expr, col in zip(new_pk_vals, q_uall_pk_cols)],
+                                    *[f"{expr} AS {col}" for expr, col in zip(new_vals, q_user_columns)],
                                     "1 AS __mv_row_count",
                                 ]
                                 plus_s = (
-                                    f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                    f"INSERT INTO {mv_table} ({', '.join(q_uall_pk_cols)}, {', '.join(q_user_columns)}, __mv_row_count)\n"
                                     f"    SELECT * FROM (\n"
                                     f"        SELECT {', '.join(aliased_uall_sel)}{from_dual}\n"
                                     f"        WHERE {w_new}\n"
@@ -9703,20 +9788,20 @@ class IncrementalViewCompiler:
                                     f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                                 )
                             else:
-                                upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                                upd_set = ", ".join(f"{self._q(c)} = VALUES({self._q(c)})" for c in user_columns)
                                 plus_s = (
-                                    f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                    f"INSERT INTO {mv_table} ({', '.join(q_uall_pk_cols)}, {', '.join(q_user_columns)}, __mv_row_count)\n"
                                     f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1{from_dual}\n"
                                     f"    WHERE {w_new}\n"
                                     f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                                 )
                         else:
-                            upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                            upd_set = ", ".join(f"{self._q(c)} = excluded.{self._q(c)}" for c in user_columns)
                             plus_s = (
-                                f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"INSERT INTO {mv_table} ({', '.join(q_uall_pk_cols)}, {', '.join(q_user_columns)}, __mv_row_count)\n"
                                 f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1\n"
                                 f"    WHERE {w_new}\n"
-                                f"    ON CONFLICT ({', '.join(uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                                f"    ON CONFLICT ({', '.join(q_uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                             )
                         minus_s = (
                             f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
@@ -9727,18 +9812,18 @@ class IncrementalViewCompiler:
                             f"    WHERE ({w_old}) AND ({old_pk_match}) AND {mv_table}.__mv_row_count <= 0;"
                         )
                     else:
-                        pk_new = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"NEW.{c}" for c in pk_names]])
-                        pk_old = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"OLD.{c}" for c in pk_names]])
+                        pk_new = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"NEW.{self._q(c)}" for c in pk_names]])
+                        pk_old = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"OLD.{self._q(c)}" for c in pk_names]])
                         if self.dialect == Dialect.MYSQL:
                             if self.engine_version.supports_mysql_row_alias_upsert:
-                                upd_set = ", ".join(f"{c} = __mv_new.{c}" for c in user_columns)
+                                upd_set = ", ".join(f"{self._q(c)} = __mv_new.{self._q(c)}" for c in user_columns)
                                 aliased_uall_sel = [
                                     f"{pk_new} AS __mv_pk",
-                                    *[f"{expr} AS {col}" for expr, col in zip(new_vals, user_columns)],
+                                    *[f"{expr} AS {col}" for expr, col in zip(new_vals, q_user_columns)],
                                     "1 AS __mv_row_count",
                                 ]
                                 plus_s = (
-                                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                                     f"    SELECT * FROM (\n"
                                     f"        SELECT {', '.join(aliased_uall_sel)}{from_dual}\n"
                                     f"        WHERE {w_new}\n"
@@ -9746,17 +9831,17 @@ class IncrementalViewCompiler:
                                     f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                                 )
                             else:
-                                upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                                upd_set = ", ".join(f"{self._q(c)} = VALUES({self._q(c)})" for c in user_columns)
                                 plus_s = (
-                                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                                     f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
                                     f"    WHERE {w_new}\n"
                                     f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                                 )
                         else:
-                            upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                            upd_set = ", ".join(f"{self._q(c)} = excluded.{self._q(c)}" for c in user_columns)
                             plus_s = (
-                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                                 f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
                                 f"    WHERE {w_new}\n"
                                 f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
@@ -9774,14 +9859,14 @@ class IncrementalViewCompiler:
                     pk_old = self._canonical_group_pk_expr(old_vals)
                     if self.dialect == Dialect.MYSQL:
                         plus_s = (
-                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                             f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
                             f"    WHERE {w_new}\n"
                             f"    ON DUPLICATE KEY UPDATE __mv_row_count = {mv_table}.__mv_row_count + 1;"
                         )
                     else:
                         plus_s = (
-                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                             f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
                             f"    WHERE {w_new}\n"
                             f"    ON CONFLICT (__mv_pk) DO UPDATE SET __mv_row_count = {mv_table}.__mv_row_count + 1;"
@@ -9802,14 +9887,14 @@ class IncrementalViewCompiler:
                     init_c1 = "1" if b_idx == 1 else "0"
                     if self.dialect == Dialect.MYSQL:
                         plus_s = (
-                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
                             f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}{from_dual}\n"
                             f"    WHERE {w_new}\n"
                             f"    ON DUPLICATE KEY UPDATE {cnt_col} = {mv_table}.{cnt_col} + 1;"
                         )
                     else:
                         plus_s = (
-                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
                             f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}\n"
                             f"    WHERE {w_new}\n"
                             f"    ON CONFLICT (__mv_pk) DO UPDATE SET {cnt_col} = {mv_table}.{cnt_col} + 1;"
@@ -9912,12 +9997,16 @@ class IncrementalViewCompiler:
             for it in self.view.select_items:
                 raw_s = _unquote_ident(it.raw_expr.strip(), dialect=self.dialect).lower() if re.match(r'^[A-Za-z0-9_."`\[\]]+$', it.raw_expr.strip()) else ""
                 raw_full = it.raw_expr.strip().lower()
-                if (
+                raw_parts = [p.strip().strip('"').strip('`').strip('[').strip(']').lower() for p in raw_full.split('.')]
+                col_match = (
                     raw_full == c_low
                     or raw_full == f"{base_alias}.{c_low}"
                     or raw_full == f"{base_name}.{c_low}"
                     or (raw_s == c_low and "." not in raw_full)
-                ) and it.alias.lower() not in used_user_aliases:
+                    or (len(raw_parts) == 2 and raw_parts[0] in (base_alias, base_name) and raw_parts[1] == c_low)
+                    or (len(raw_parts) == 1 and raw_parts[0] == c_low)
+                )
+                if col_match and it.alias.lower() not in used_user_aliases:
                     matched_alias = it.alias
                     used_user_aliases.add(it.alias.lower())
                     break
@@ -9961,13 +10050,14 @@ class IncrementalViewCompiler:
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
             nn = " NOT NULL" if (uses_native_pk and it.alias.lower() in pk_col_set_lower) else ""
-            col_defs_sql.append(f"{it.alias} {dt}{nn}")
+            col_defs_sql.append(f"{self._q(it.alias)} {dt}{nn}")
 
         for hid_col, _, hid_dt in hidden_pk_defs:
-            col_defs_sql.append(f"{hid_col} {hid_dt} NOT NULL")
+            col_defs_sql.append(f"{self._q(hid_col)} {hid_dt} NOT NULL")
 
+        q_mv_pk_cols = [self._q(c) for c in mv_pk_cols]
         if uses_native_pk:
-            col_defs_sql.append(f"PRIMARY KEY ({', '.join(mv_pk_cols)})")
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(q_mv_pk_cols)})")
         else:
             col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
 
@@ -10002,51 +10092,53 @@ class IncrementalViewCompiler:
 
         if uses_native_pk:
             all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
-            all_select_exprs = [*sel_exprs, *[h[1] for h in hidden_pk_defs]]
-            all_new_vals = [*new_vals, *[f"NEW.{h[1]}" for h in hidden_pk_defs]]
+            q_all_backing_cols = [self._q(c) for c in all_backing_cols]
+            all_select_exprs = [*sel_exprs, *[self._q(h[1]) for h in hidden_pk_defs]]
+            all_new_vals = [*new_vals, *[f"NEW.{self._q(h[1])}" for h in hidden_pk_defs]]
             initial_populate_sql = (
-                f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
                 f"SELECT {', '.join(all_select_exprs)} FROM {q_base_t}{w_sql};"
             )
             if self.dialect == Dialect.MYSQL:
                 if self.engine_version.supports_mysql_row_alias_upsert:
-                    upd_set = ", ".join(f"{c} = __mv_new.{c}" for c in all_backing_cols)
+                    upd_set = ", ".join(f"{self._q(c)} = __mv_new.{self._q(c)}" for c in all_backing_cols)
                     plus_stmt = (
-                        f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                        f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
                         f"    VALUES ({', '.join(all_new_vals)}) AS __mv_new\n"
                         f"    ON DUPLICATE KEY UPDATE {upd_set};"
                     )
                 else:
-                    upd_set = ", ".join(f"{c} = VALUES({c})" for c in all_backing_cols)
+                    upd_set = ", ".join(f"{self._q(c)} = VALUES({self._q(c)})" for c in all_backing_cols)
                     plus_stmt = (
-                        f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                        f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
                         f"    SELECT {', '.join(all_new_vals)}{from_dual}\n"
                         f"    WHERE TRUE\n"
                         f"    ON DUPLICATE KEY UPDATE {upd_set};"
                     )
             else:
-                upd_set = ", ".join(f"{c} = excluded.{c}" for c in all_backing_cols)
+                upd_set = ", ".join(f"{self._q(c)} = excluded.{self._q(c)}" for c in all_backing_cols)
                 plus_stmt = (
-                    f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                    f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
                     f"    SELECT {', '.join(all_new_vals)}\n"
                     f"    WHERE TRUE\n"
-                    f"    ON CONFLICT ({', '.join(mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                    f"    ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};"
                 )
             if wm_pk_col:
                 ph = "?" if self.dialect == Dialect.SQLITE else "%s"
+                q_wm_pk = self._q(wm_pk_col)
                 chunk_w = (
-                    f"({self.view.where_clause}) AND ({wm_pk_col} > {ph} AND {wm_pk_col} <= {ph})"
+                    f"({self.view.where_clause}) AND ({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
                     if self.view.where_clause
-                    else f"({wm_pk_col} > {ph} AND {wm_pk_col} <= {ph})"
+                    else f"({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
                 )
                 if self.dialect == Dialect.MYSQL:
                     if self.engine_version.supports_mysql_row_alias_upsert:
                         aliased_chunk_sel = [
-                            f"{expr} AS {col}" for expr, col in zip(all_select_exprs, all_backing_cols)
+                            f"{expr} AS {col}" for expr, col in zip(all_select_exprs, q_all_backing_cols)
                         ]
-                        chunk_upd = ", ".join(f"{c} = __mv_src.{c}" for c in all_backing_cols)
+                        chunk_upd = ", ".join(f"{c} = __mv_src.{c}" for c in q_all_backing_cols)
                         chunk_upsert_sql: Optional[str] = (
-                            f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                            f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
                             f"SELECT * FROM (\n"
                             f"    SELECT {', '.join(aliased_chunk_sel)}\n"
                             f"    FROM {q_base_t}\n"
@@ -10056,22 +10148,22 @@ class IncrementalViewCompiler:
                         )
                     else:
                         chunk_upsert_sql = (
-                            f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                            f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
                             f"SELECT {', '.join(all_select_exprs)}\nFROM {q_base_t}\n"
                             f"WHERE {chunk_w}\n"
                             f"ON DUPLICATE KEY UPDATE {upd_set};"
                         )
                 else:
                     chunk_upsert_sql = (
-                        f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                        f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
                         f"SELECT {', '.join(all_select_exprs)}\nFROM {q_base_t}\n"
                         f"WHERE {chunk_w}\n"
-                        f"ON CONFLICT ({', '.join(mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                        f"ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};"
                     )
             else:
                 chunk_upsert_sql = None
             pk_old_preds = [
-                f"{mv_table}.{mv_c} = OLD.{src_c}"
+                f"{mv_table}.{self._q(mv_c)} = OLD.{self._q(src_c)}"
                 for mv_c, src_c in zip(mv_pk_cols, pk_names)
             ]
             del_where = " AND ".join(pk_old_preds)
@@ -10099,17 +10191,19 @@ class IncrementalViewCompiler:
             pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
             has_nullable_pk = (not pk_defs) or any(not c.not_null for c in pk_defs)
             pk_hash_cols = all_base_cols if (has_nullable_pk and all_base_cols) else (pk_names or sel_exprs)
-            pk_expr_base = self._canonical_group_pk_expr(pk_hash_cols)
+            q_pk_hash_cols = [self._q(c) for c in pk_hash_cols] if (has_nullable_pk and all_base_cols) or pk_names else sel_exprs
+            pk_expr_base = self._canonical_group_pk_expr(q_pk_hash_cols)
+            q_user_columns = [self._q(c) for c in user_columns]
             w_pop = w_sql or "\nWHERE TRUE"
             if self.dialect == Dialect.MYSQL:
                 initial_populate_sql = (
-                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                     f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_pop}\n"
                     f"ON DUPLICATE KEY UPDATE __mv_row_count = {mv_table}.__mv_row_count + 1;"
                 )
             else:
                 initial_populate_sql = (
-                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                     f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_pop}\n"
                     f"ON CONFLICT (__mv_pk) DO UPDATE SET __mv_row_count = {mv_table}.__mv_row_count + 1;"
                 )
@@ -10117,45 +10211,46 @@ class IncrementalViewCompiler:
             pk_old = self._canonical_group_pk_expr([f"OLD.{self._q(c)}" for c in pk_hash_cols])
             if self.dialect == Dialect.MYSQL:
                 if self.engine_version.supports_mysql_row_alias_upsert:
-                    upd_set = ", ".join(f"{c} = __mv_new.{c}" for c in user_columns)
+                    upd_set = ", ".join(f"{self._q(c)} = __mv_new.{self._q(c)}" for c in user_columns)
                     plus_stmt = (
-                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                         f"    VALUES ({pk_new}, {', '.join(new_vals)}, 1) AS __mv_new\n"
                         f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                     )
                 else:
-                    upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                    upd_set = ", ".join(f"{self._q(c)} = VALUES({self._q(c)})" for c in user_columns)
                     plus_stmt = (
-                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                         f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
                         f"    WHERE TRUE\n"
                         f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                     )
             else:
-                upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
+                upd_set = ", ".join(f"{self._q(c)} = excluded.{self._q(c)}" for c in user_columns)
                 plus_stmt = (
-                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                     f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
                     f"    WHERE TRUE\n"
                     f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                 )
             if wm_pk_col:
                 ph = "?" if self.dialect == Dialect.SQLITE else "%s"
+                q_wm_pk = self._q(wm_pk_col)
                 chunk_w = (
-                    f"({self.view.where_clause}) AND ({wm_pk_col} > {ph} AND {wm_pk_col} <= {ph})"
+                    f"({self.view.where_clause}) AND ({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
                     if self.view.where_clause
-                    else f"({wm_pk_col} > {ph} AND {wm_pk_col} <= {ph})"
+                    else f"({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
                 )
                 if self.dialect == Dialect.MYSQL:
                     if self.engine_version.supports_mysql_row_alias_upsert:
                         aliased_chunk_sel = [
                             f"{pk_expr_base} AS __mv_pk",
-                            *[f"{expr} AS {col}" for expr, col in zip(sel_exprs, user_columns)],
+                            *[f"{expr} AS {col}" for expr, col in zip(sel_exprs, q_user_columns)],
                             "1 AS __mv_row_count",
                         ]
-                        chunk_upd = ", ".join(f"{c} = __mv_src.{c}" for c in user_columns)
+                        chunk_upd = ", ".join(f"{c} = __mv_src.{c}" for c in q_user_columns)
                         chunk_upsert_sql = (
-                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                             f"SELECT * FROM (\n"
                             f"    SELECT {', '.join(aliased_chunk_sel)}\n"
                             f"    FROM {q_base_t}\n"
@@ -10165,14 +10260,14 @@ class IncrementalViewCompiler:
                         )
                     else:
                         chunk_upsert_sql = (
-                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                             f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1\nFROM {q_base_t}\n"
                             f"WHERE {chunk_w}\n"
                             f"ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                         )
                 else:
                     chunk_upsert_sql = (
-                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                         f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1\nFROM {q_base_t}\n"
                         f"WHERE {chunk_w}\n"
                         f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
@@ -10857,7 +10952,7 @@ class IncrementalViewCompiler:
 
         def _lhs_expr(g_expr: str, mv_col: str) -> str:
             if lhs_table_alias:
-                return f"{lhs_table_alias}.{mv_col}"
+                return f"{lhs_table_alias}.{self._q(mv_col)}"
             return f"({g_expr})"
 
         if len(self.view.joins) == 1:
@@ -10888,7 +10983,7 @@ class IncrementalViewCompiler:
                     direct_conds.append(
                         self._null_safe_eq(
                             _lhs_expr(g_expr, mv_col),
-                            f"({record_prefix}.{_unquote_ident(c_part, dialect=self.dialect)})",
+                            f"({record_prefix}.{self._q(_unquote_ident(c_part, dialect=self.dialect))})",
                             is_nullable=True,
                         )
                     )
@@ -10899,7 +10994,7 @@ class IncrementalViewCompiler:
                 direct_conds.append(
                     self._null_safe_eq(
                         _lhs_expr(g_expr, mv_col),
-                        f"({record_prefix}.{_unquote_ident(gs, dialect=self.dialect)})",
+                        f"({record_prefix}.{self._q(_unquote_ident(gs, dialect=self.dialect))})",
                         is_nullable=True,
                     )
                 )
@@ -10912,7 +11007,7 @@ class IncrementalViewCompiler:
 
         # Otherwise build an EXISTS subquery over the join graph with `target_join` replaced by `(SELECT NEW/OLD.*)`
         from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
-        rec_proj = ", ".join(f"{record_prefix}.{c} AS {c}" for c in ts_target.columns)
+        rec_proj = ", ".join(f"{record_prefix}.{self._q(c)} AS {self._q(c)}" for c in ts_target.columns)
         alias_remap: Dict[str, str] = {}
         for j in self.view.joins:
             alias_remap[j.alias.lower()] = f"__mv_j_{j.alias}"
@@ -10954,7 +11049,7 @@ class IncrementalViewCompiler:
             tbl_expr = (
                 inline_row_table
                 if j.alias.lower() == target_alias.lower()
-                else f"{j.table_name} AS {remapped_alias}"
+                else f"{self._q(j.table_name)} AS {remapped_alias}"
             )
             if idx == 0:
                 join_parts.append(tbl_expr)
@@ -11012,8 +11107,9 @@ class IncrementalViewCompiler:
         group_mv_cols: List[Tuple[str, str]],
         source_query_sql: str,
     ) -> Tuple[List[str], List[str], List[str]]:
-        cols_csv = ", ".join(target_cols)
-        src_cols_csv = ", ".join(f"__mv_src.{c}" for c in target_cols)
+        q_target_cols = [self._q(c) for c in target_cols]
+        cols_csv = ", ".join(q_target_cols)
+        src_cols_csv = ", ".join(f"__mv_src.{self._q(c)}" for c in target_cols)
 
         pred_mv_old = self._group_scope_predicate_for_table(
             base_t, group_mv_cols, mv_table, "OLD"
@@ -11330,9 +11426,9 @@ class IncrementalViewCompiler:
             dt = self._infer_expr_storage_type(it)
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
-            col_defs_sql.append(f"{it.alias} {dt}")
+            col_defs_sql.append(f"{self._q(it.alias)} {dt}")
         for mv_c, _, dt in hidden_grp_defs:
-            col_defs_sql.append(f"{mv_c} {dt}")
+            col_defs_sql.append(f"{self._q(mv_c)} {dt}")
 
         backing_table_ddl = self._create_table_ddl(
             mv_table,
@@ -11352,12 +11448,13 @@ class IncrementalViewCompiler:
         if hidden_grp_defs:
             tok_from = _find_top_level_token(raw_q, (SQLGlotTokenType.FROM,), dialect=self.dialect)
             assert tok_from is not None
-            extra_sel = ", ".join(f"{g_e} AS {mv_c}" for mv_c, g_e, _ in hidden_grp_defs)
+            extra_sel = ", ".join(f"{g_e} AS {self._q(mv_c)}" for mv_c, g_e, _ in hidden_grp_defs)
             source_query_sql = f"{raw_q[:tok_from.start].rstrip()}, {extra_sel} {raw_q[tok_from.start:]}"
         else:
             source_query_sql = raw_q
 
-        cols_csv = ", ".join(target_cols)
+        q_target_cols = [self._q(c) for c in target_cols]
+        cols_csv = ", ".join(q_target_cols)
         initial_populate_sql = (
             f"INSERT INTO {mv_table} ({cols_csv})\n"
             f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init;"
@@ -11433,21 +11530,21 @@ class IncrementalViewCompiler:
                             dt = self._normalize_dialect_type(c_def.data_type)
                             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
                                 dt = "VARCHAR(255)"
-                            col_defs_sql.append(f"{c_def.name} {dt}")
+                            col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
             if not user_columns and self.primary_schema:
                 for c_def in self.primary_schema.columns.values():
                     user_columns.append(c_def.name)
                     dt = self._normalize_dialect_type(c_def.data_type)
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
                         dt = "VARCHAR(255)"
-                    col_defs_sql.append(f"{c_def.name} {dt}")
+                    col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
         else:
             for item in self.view.select_items:
                 user_columns.append(item.alias)
                 col_type = self._infer_expr_storage_type(item)
                 if self.dialect == Dialect.MYSQL and col_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
                     col_type = "VARCHAR(255)"
-                col_defs_sql.append(f"{item.alias} {col_type}")
+                col_defs_sql.append(f"{self._q(item.alias)} {col_type}")
 
         index_ddls, index_names = self._build_all_index_ddls(
             mv_table=mv_table,
@@ -11466,7 +11563,8 @@ class IncrementalViewCompiler:
         )
 
         raw_query = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
-        cols_csv = ", ".join(user_columns)
+        q_user_columns = [self._q(c) for c in user_columns]
+        cols_csv = ", ".join(q_user_columns)
         initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"
 
         ord_t3 = ", ".join(str(k) for k in range(1, len(user_columns) + 1))

@@ -236,6 +236,9 @@ jobs:
       - name: Test stateful property-based fuzzing and shrinking (Hypothesis + pytest)
         run: pytest -v test_p1_hypothesis_stateful.py
 
+      - name: Test quoting SQL reserved keyword identifiers across DDL and triggers
+        run: python3 test_p1_quote_identifiers.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
