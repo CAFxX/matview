@@ -10402,6 +10402,25 @@ class MaterializedViewManager:
             except Exception:
                 pass
 
+    def _invalidate_sqlite_connection_after_rollback_failure(self) -> Optional[BaseException]:
+        """Mark and close a SQLite connection whose writer transaction cannot be recovered."""
+        self._sqlite_connection_discarded = True
+        try:
+            setattr(self.conn, "_matview_connection_discarded", True)
+        except Exception:
+            pass
+        try:
+            close = getattr(self.conn, "close", None)
+            if callable(close):
+                close()
+        except Exception as close_error:
+            return close_error
+        return None
+
+    def _assert_connection_usable(self) -> None:
+        """Reject all public DB operations after an unrecoverable connection-state failure."""
+        self._assert_connection_usable()
+
     @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
         """Fail closed unless every physical PostgreSQL driver leaf is idle and non-autocommit."""
@@ -10520,6 +10539,7 @@ class MaterializedViewManager:
         )
         schemas.pop(self.catalog_table, None)
         if extra_schema_sql:
+        self._assert_connection_usable()
             schemas.update(parse_table_schema(extra_schema_sql))
         return schemas
 
@@ -10531,6 +10551,7 @@ class MaterializedViewManager:
         """
         cur = self.conn.cursor()
         for stmt in _split_top_level(_strip_sql_comments(ddl_sql), ";"):
+        self._assert_connection_usable()
             if stmt.strip():
                 cur.execute(stmt)
         self._commit()
@@ -10542,6 +10563,7 @@ class MaterializedViewManager:
     def get_catalog(self) -> Dict[str, Dict[str, Any]]:
         cur = self.conn.cursor()
         try:
+        self._assert_connection_usable()
             cur.execute(
                 f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
                 f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
@@ -10620,6 +10642,7 @@ class MaterializedViewManager:
         entry = catalog.get(resolved_name)
         cur = self.conn.cursor()
         if entry:
+        self._assert_connection_usable()
             for t_name in entry["trigger_names"]:
                 if self.dialect != Dialect.POSTGRES:
                     cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
@@ -10681,6 +10704,7 @@ class MaterializedViewManager:
         Returns the total number of batches executed.
         """
         if plan.sub_plans:
+        self._assert_connection_usable()
             total_b = 0
             for sp in plan.sub_plans:
                 total_b += self.backfill_incrementally(
@@ -10983,6 +11007,7 @@ class MaterializedViewManager:
         )
         sub_plans: List[MaterializedViewPlan] = []
         for vs in specs:
+        self._assert_connection_usable()
             sub_plans.append(
                 self._register_single_view_spec(
                     vs,
@@ -11056,6 +11081,7 @@ class MaterializedViewManager:
         )
 
         for v_spec in all_specs:
+        self._assert_connection_usable()
             plan = generate_materialized_view(
                 schemas,
                 v_spec,
@@ -11118,6 +11144,7 @@ class MaterializedViewManager:
         catalog = self.get_catalog()
         report: Dict[str, str] = {}
         for v_name, entry in catalog.items():
+        self._assert_connection_usable()
             try:
                 plan = generate_materialized_view(
                     schemas,
@@ -11146,6 +11173,7 @@ class MaterializedViewManager:
         """
         catalog = self.get_catalog()
         if view_name:
+        self._assert_connection_usable()
             resolved = self._resolve_catalog_name(view_name, catalog)
             if resolved not in catalog:
                 raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
@@ -11212,6 +11240,7 @@ class MaterializedViewManager:
             getattr(self, "_mysql_connection_discarded", False)
             or getattr(self.conn, "_matview_connection_discarded", False)
         ):
+        self._assert_connection_usable()
             raise RuntimeError(
                 "this MySQL/MariaDB manager connection was discarded after an "
                 "unrecoverable trigger-bypass reset failure"
@@ -11315,7 +11344,19 @@ class MaterializedViewManager:
                 ) from exc
             if self.dialect == Dialect.SQLITE:
                 if sqlite_writer_reserved:
-                    self._rollback()
+                    try:
+                        self.conn.rollback()
+                    except Exception as rollback_error:
+                        close_error = self._invalidate_sqlite_connection_after_rollback_failure()
+                        detail = (
+                            "bulk_changes() could not release its SQLite writer reservation "
+                            "after SAVEPOINT setup failed; the manager connection was "
+                            "invalidated and must not be reused"
+                        )
+                        if close_error is not None:
+                            detail += f"; closing the physical connection also failed: {close_error!r}"
+                        close_cursor()
+                        raise RuntimeError(detail) from rollback_error
                 close_cursor()
                 raise RuntimeError(
                     "bulk_changes() on SQLite requires SAVEPOINT support "
