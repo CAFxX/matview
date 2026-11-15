@@ -31,6 +31,7 @@ import sqlglot
 from sqlglot import exp as sqlglot_exp
 import struct
 import tempfile
+import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import warnings
 
@@ -5975,6 +5976,145 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             assert_matches_live("delete from a collation-equivalent group")
         finally:
             conn.close()
+
+    def test_reader_snapshot_visibility_is_atomic_across_writer_commit(self) -> None:
+        """A reader snapshot must see one coherent MV version across a concurrent commit."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "reader_visibility.db")
+            setup = sqlite3.connect(db_path, isolation_level=None)
+            try:
+                setup.execute("PRAGMA journal_mode = WAL;")
+                setup.executescript(
+                    """
+                    CREATE TABLE reader_items (
+                        id INTEGER PRIMARY KEY,
+                        grp TEXT NOT NULL,
+                        value INTEGER NOT NULL
+                    );
+                    INSERT INTO reader_items VALUES
+                        (1, 'A', 10), (2, 'A', 20), (3, 'B', 5);
+                    """
+                )
+                manager = MaterializedViewManager(setup, dialect="sqlite")
+                plan = manager.register_view(
+                    "CREATE VIEW reader_totals AS "
+                    "SELECT grp, COUNT(*) AS row_count, SUM(value) AS total "
+                    "FROM reader_items GROUP BY grp;"
+                )
+                view_name = plan.view_name
+            finally:
+                setup.close()
+
+            reader = sqlite3.connect(db_path, isolation_level=None, timeout=10)
+            writer_ready = threading.Event()
+            allow_writer_commit = threading.Event()
+            writer_committed = threading.Event()
+            writer_errors: List[BaseException] = []
+
+            def rows(conn: sqlite3.Connection, sql: str) -> List[Tuple[Any, ...]]:
+                return [
+                    tuple(row)
+                    for row in conn.execute(sql).fetchall()
+                ]
+
+            def assert_snapshot(conn: sqlite3.Connection, label: str) -> List[Tuple[Any, ...]]:
+                visible = rows(
+                    conn,
+                    f"SELECT grp, row_count, total FROM {view_name} ORDER BY grp",
+                )
+                live = rows(
+                    conn,
+                    "SELECT grp, COUNT(*) AS row_count, SUM(value) AS total "
+                    "FROM reader_items GROUP BY grp ORDER BY grp",
+                )
+                self.assertTrue(
+                    _rows_equal(visible, live),
+                    f"{label}: reader saw a mixed or stale materialized version; "
+                    f"visible={visible!r}, live={live!r}",
+                )
+                return visible
+
+            def writer() -> None:
+                conn = sqlite3.connect(db_path, isolation_level=None, timeout=10)
+                try:
+                    conn.execute("PRAGMA busy_timeout = 10000;")
+                    conn.execute("BEGIN IMMEDIATE;")
+                    conn.execute(
+                        "UPDATE reader_items SET grp = 'B', value = 12 WHERE id = 1;"
+                    )
+                    # The writer must see its own trigger-maintained state before commit.
+                    visible = rows(
+                        conn,
+                        f"SELECT grp, row_count, total FROM {view_name} ORDER BY grp",
+                    )
+                    live = rows(
+                        conn,
+                        "SELECT grp, COUNT(*) AS row_count, SUM(value) AS total "
+                        "FROM reader_items GROUP BY grp ORDER BY grp",
+                    )
+                    if not _rows_equal(visible, live):
+                        raise AssertionError(
+                            f"writer transaction diverged before commit: "
+                            f"visible={visible!r}, live={live!r}"
+                        )
+                    if not _rows_equal(visible, [("A", 1, 20), ("B", 2, 17)]):
+                        raise AssertionError(
+                            f"writer did not observe the complete updated aggregate: {visible!r}"
+                        )
+                    writer_ready.set()
+                    if not allow_writer_commit.wait(timeout=10):
+                        raise TimeoutError("reader did not release the writer to commit")
+                    conn.commit()
+                    writer_committed.set()
+                except BaseException as exc:
+                    writer_errors.append(exc)
+                    writer_ready.set()
+                    writer_committed.set()
+                finally:
+                    conn.close()
+
+            thread = threading.Thread(target=writer, name="matview-reader-visibility-writer")
+            try:
+                reader.execute("BEGIN;")
+                # This first read establishes the WAL snapshot before the writer starts.
+                initial_rows = assert_snapshot(reader, "initial reader snapshot")
+                self.assertTrue(_rows_equal(initial_rows, [("A", 2, 30), ("B", 1, 5)]))
+                thread.start()
+                self.assertTrue(writer_ready.wait(timeout=10), "writer did not reach pre-commit barrier")
+                if writer_errors:
+                    raise writer_errors[0]
+
+                # The writer has changed both base and materialized state, but has not
+                # committed. The independent reader must continue to see the old version.
+                pending_rows = assert_snapshot(
+                    reader, "reader while writer transaction is uncommitted"
+                )
+                self.assertTrue(_rows_equal(pending_rows, initial_rows))
+                allow_writer_commit.set()
+                self.assertTrue(
+                    writer_committed.wait(timeout=10),
+                    "writer could not commit while the reader snapshot remained open",
+                )
+                if writer_errors:
+                    raise writer_errors[0]
+
+                # A committed writer must not leak half-way into an already-open reader
+                # snapshot. A fresh snapshot, however, must see the complete new version.
+                committed_snapshot = assert_snapshot(
+                    reader, "reader after concurrent writer commit"
+                )
+                self.assertTrue(_rows_equal(committed_snapshot, initial_rows))
+                reader.commit()
+                reader.execute("BEGIN;")
+                new_rows = assert_snapshot(reader, "new reader snapshot after writer commit")
+                self.assertTrue(_rows_equal(new_rows, [("A", 1, 20), ("B", 2, 17)]))
+                reader.commit()
+            finally:
+                allow_writer_commit.set()
+                if thread.is_alive():
+                    thread.join(timeout=10)
+                reader.close()
+                self.assertFalse(thread.is_alive(), "writer thread did not terminate")
 
     def test_24_metamorphic_mv_invariants_and_rebuild_consistency(self) -> None:
         schema = """
