@@ -1092,5 +1092,89 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
             raw.close()
 
 
+    def test_sqlite_bulk_changes_fails_before_user_block_when_independent_writer_holds_lock(self) -> None:
+        """A real competing SQLite writer must prevent bulk trigger suspension."""
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            manager = MaterializedViewManager(f"sqlite:///{tmp.name}")
+            manager.apply_schema_ddl(
+                "CREATE TABLE contention_rows (id INTEGER PRIMARY KEY, value INTEGER);",
+                auto_sync_views=False,
+            )
+            manager.conn.execute("INSERT INTO contention_rows VALUES (1, 10);")
+            manager.conn.commit()
+            manager.register_view(
+                "CREATE VIEW contention_view AS "
+                "SELECT id, value FROM contention_rows;"
+            )
+            manager.conn.commit()
+
+            catalog = manager.get_catalog()
+            trigger_names = list(catalog["contention_view"]["trigger_names"])
+            triggers_before = manager.conn.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = 'contention_rows' "
+                "ORDER BY name"
+            ).fetchall()
+            rows_before = manager.conn.execute(
+                "SELECT * FROM contention_view ORDER BY id"
+            ).fetchall()
+
+            # The independent connection reserves SQLite's single-writer slot.
+            competing = sqlite3.connect(tmp.name, timeout=0)
+            try:
+                competing.execute("BEGIN IMMEDIATE;")
+                competing.execute(
+                    "INSERT INTO contention_rows VALUES (2, 20);"
+                )
+                manager.conn.execute("PRAGMA busy_timeout = 0;")
+
+                with self.assertRaises(sqlite3.OperationalError):
+                    with manager.bulk_changes():
+                        self.fail(
+                            "bulk_changes must not enter the user block while "
+                            "another connection owns the SQLite writer reservation"
+                        )
+
+                self.assertTrue(competing.in_transaction)
+                self.assertEqual(
+                    competing.execute(
+                        "SELECT id, value FROM contention_rows ORDER BY id"
+                    ).fetchall(),
+                    [(1, 10), (2, 20)],
+                )
+                self.assertEqual(
+                    manager.conn.execute(
+                        "SELECT * FROM contention_view ORDER BY id"
+                    ).fetchall(),
+                    rows_before,
+                )
+                triggers_after = manager.conn.execute(
+                    "SELECT name, sql FROM sqlite_master "
+                    "WHERE type = 'trigger' AND tbl_name = 'contention_rows' "
+                    "ORDER BY name"
+                ).fetchall()
+                self.assertEqual(triggers_after, triggers_before)
+                self.assertTrue(
+                    set(trigger_names).issubset({row[0] for row in triggers_after})
+                )
+            finally:
+                competing.rollback()
+                competing.close()
+
+            # Once the competing writer releases its reservation, normal DML
+            # must still maintain the materialized view.
+            manager.conn.execute(
+                "INSERT INTO contention_rows VALUES (2, 20);"
+            )
+            manager.conn.commit()
+            self.assertEqual(
+                manager.conn.execute(
+                    "SELECT * FROM contention_view ORDER BY id"
+                ).fetchall(),
+                [(1, 10), (2, 20)],
+            )
+            manager.conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
