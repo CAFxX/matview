@@ -10618,7 +10618,7 @@ class MaterializedViewManager:
         if existing and existing["signature_hash"] == sig and not force_rebuild:
             return plan
 
-        cur = self.conn.cursor()
+        cur = None
         sqlite_writer_reserved = False
 
         def reserve_sqlite_writer() -> bool:
@@ -10659,9 +10659,16 @@ class MaterializedViewManager:
                         "publication is implemented; the existing view was left untouched"
                     )
 
+                # Open the cursor only after unsupported replacement modes have
+                # been rejected; cursor acquisition itself may start or alter a
+                # transaction for some adapters.
+                cur = self.conn.cursor()
                 # SQLite and PostgreSQL support transactional DDL.
                 sqlite_writer_reserved = reserve_sqlite_writer()
                 self.drop_view(plan.view_name, _commit_transaction=False)
+
+            if cur is None:
+                cur = self.conn.cursor()
 
             # Reserve before the first structure/trigger DDL on new registrations.
             # For SQLite this also closes the trigger-installation/backfill writer
