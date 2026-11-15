@@ -110,6 +110,7 @@ The existing differential-testing harness is useful, but its current headline co
   - Test minimum supported versions and feature boundaries, including real SQLite runtime versions rather than only simulated version metadata.
 
 - [ ] **Add Mutation Testing for Test-Suite Sensitivity**:
+  - Progress: A permanent SQLite mutation-sensitivity regression now flips the generated join SUM retraction from subtraction to addition and verifies that the independently executed live SELECT detects the resulting wrong aggregate (41 to 30 expected, 52 produced by the mutant). This establishes one curated mutant; the broader trigger predicate/action, NULL/key, watermark, transaction/rollback, and dialect/version mutant set remains open.
   - Introduce targeted mutations to trigger predicates/actions, delta signs, aggregate maintenance, NULL handling, group/key handling, watermark comparisons, transaction boundaries, rollback/recovery, and dialect/version branches.
   - Require the relevant tests to kill each curated non-equivalent mutant; record surviving mutants and justify exclusions.
   - Use mutation testing to find blind spots, not as a substitute for semantic test design or as an unqualified global percentage target.

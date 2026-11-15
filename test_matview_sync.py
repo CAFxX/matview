@@ -31,6 +31,7 @@ import sqlglot
 from sqlglot import exp as sqlglot_exp
 import struct
 import tempfile
+from unittest.mock import patch
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import warnings
 
@@ -6078,6 +6079,99 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             conn.execute("INSERT INTO join_orders VALUES (20, 1, 23)")
             conn.execute("INSERT INTO join_orders VALUES (21, 1, NULL)")
             assert_matches_live("reinsert into emptied group")
+        finally:
+            conn.close()
+
+    def test_26_join_sum_retraction_sign_mutant_is_killed_by_live_oracle(self) -> None:
+        """Prove the join regression detects a wrong-sign SUM retraction mutant."""
+        schema = """
+        CREATE TABLE mutation_customers (
+            id INTEGER PRIMARY KEY,
+            segment TEXT NOT NULL
+        );
+        CREATE TABLE mutation_orders (
+            id INTEGER PRIMARY KEY,
+            customer_id INTEGER NOT NULL REFERENCES mutation_customers(id),
+            amount INTEGER
+        );
+        INSERT INTO mutation_customers VALUES (1, 'A'), (2, 'A'), (3, 'B');
+        INSERT INTO mutation_orders VALUES
+            (10, 1, 11), (11, 1, 13), (12, 2, 17), (13, 3, 19),
+            (14, 3, NULL);
+        """
+        view_sql = (
+            "CREATE VIEW mutation_join_summary AS "
+            "SELECT c.segment, COUNT(*) AS joined_rows, SUM(o.amount) AS total_amount "
+            "FROM mutation_customers c "
+            "INNER JOIN mutation_orders o ON o.customer_id = c.id "
+            "GROUP BY c.segment;"
+        )
+        live_sql = (
+            "SELECT c.segment, COUNT(*) AS joined_rows, SUM(o.amount) AS total_amount "
+            "FROM mutation_customers c "
+            "INNER JOIN mutation_orders o ON o.customer_id = c.id "
+            "GROUP BY c.segment"
+        )
+
+        original_compile = IncrementalViewCompiler._compile_tier1_join_algebraic
+        mutated_statement_count = 0
+
+        def compile_with_wrong_sum_retraction_sign(compiler):
+            nonlocal mutated_statement_count
+            plan = original_compile(compiler)
+            # Mutate only the join SUM retraction, leaving row counts and all
+            # other aggregate maintenance untouched. This is a curated,
+            # non-equivalent mutant of the production trigger SQL.
+            wrong_sign = re.compile(
+                rf'({re.escape(plan.backing_table_name)}\."total_amount")'
+                rf'\s+-\s+(__mv_delta\."total_amount")'
+            )
+            for index, ddl in enumerate(plan.trigger_ddls):
+                mutated, count = wrong_sign.subn(r"\1 + \2", ddl)
+                if count:
+                    plan.trigger_ddls[index] = mutated
+                    mutated_statement_count += count
+            return plan
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute("PRAGMA foreign_keys = ON;")
+        try:
+            manager = MaterializedViewManager(conn, dialect="sqlite")
+            manager.apply_schema_ddl(schema)
+            with patch.object(
+                IncrementalViewCompiler,
+                "_compile_tier1_join_algebraic",
+                compile_with_wrong_sum_retraction_sign,
+            ):
+                plan = manager.register_view(view_sql)
+
+            self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+            self.assertGreater(
+                mutated_statement_count,
+                0,
+                "the curated wrong-sign SUM mutant did not match generated join trigger SQL",
+            )
+
+            # A's live SUM falls from 41 to 30. The mutant adds the deleted
+            # amount instead, so the materialized value becomes 52.
+            conn.execute("DELETE FROM mutation_orders WHERE id = 10")
+            actual = [
+                tuple(row)
+                for row in conn.execute(
+                    f"SELECT segment, joined_rows, total_amount "
+                    f"FROM {plan.view_name} ORDER BY segment"
+                ).fetchall()
+            ]
+            expected = [
+                tuple(row)
+                for row in conn.execute(live_sql + " ORDER BY segment").fetchall()
+            ]
+            self.assertEqual(expected[0], ("A", 2, 30))
+            self.assertEqual(actual[0], ("A", 2, 52))
+            self.assertFalse(
+                _rows_equal(actual, expected),
+                "the independent live-SELECT oracle failed to detect the wrong-sign join SUM mutant",
+            )
         finally:
             conn.close()
 
