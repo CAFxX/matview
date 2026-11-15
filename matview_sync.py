@@ -4286,8 +4286,14 @@ class IncrementalViewCompiler:
                 scale = len(fraction) if dot else 0
                 precision = max(1, len((whole + fraction).lstrip("0")), scale)
                 return precision, min(self._max_decimal_scale(), scale)
-            if kind in ("Paren", "Neg", "Abs", "Floor", "Ceil", "Ceiling", "Sign", "Trunc"):
+            if kind in ("Paren", "Neg", "Abs", "Floor", "Ceil", "Ceiling", "Sign", "Trunc", "Distinct"):
                 return infer(node.this)
+            if kind == "Sum":
+                # MySQL SUM over exact numeric inputs returns DECIMAL, including
+                # integer arguments. Preserve that exact family when SUM is
+                # nested inside scalar arithmetic (e.g. 1.0 * SUM(...)).
+                argument = infer(node.this)
+                return (65, argument[1]) if argument is not None else None
             if kind == "Cast":
                 target = node.args.get("to")
                 return self._numeric_precision_scale_from_type(target.sql()) if target is not None else None
@@ -4489,6 +4495,55 @@ class IncrementalViewCompiler:
 
         return None
 
+    def _postgres_integer_expression_storage_type(self, expr: str) -> Optional[str]:
+        """Infer PostgreSQL's native integer width for simple integer expressions."""
+        try:
+            root = parse_sql_ast(expr)
+        except sqlglot.errors.SqlglotError:
+            return None
+
+        # PostgreSQL promotes SMALLINT operands to INTEGER when combined with
+        # an INTEGER literal; BIGINT and NUMERIC retain their wider families.
+        def infer(node: Any) -> Optional[int]:
+            kind = node.__class__.__name__
+            if kind == "Paren":
+                return infer(node.this)
+            if kind == "Column":
+                column = self._lookup_col_def(node.sql())
+                if column is None:
+                    column = self._lookup_col_def(node.name)
+                if column is None:
+                    return None
+                data_type = column.data_type.upper()
+                if any(token in data_type for token in ("DOUBLE", "FLOAT", "REAL")):
+                    return None
+                for name, rank in (
+                    ("SMALLINT", 1), ("INT2", 1),
+                    ("INTEGER", 2), ("INT4", 2), ("INT", 2),
+                    ("BIGINT", 3), ("INT8", 3),
+                    ("NUMERIC", 4), ("DECIMAL", 4),
+                ):
+                    if name in data_type:
+                        return rank
+                return None
+            if kind == "Literal" and not node.args.get("is_string"):
+                value = str(node.this)
+                if not re.fullmatch(r"[+-]?\\d+", value):
+                    return None
+                number = int(value)
+                if -(2 ** 31) <= number < 2 ** 31:
+                    return 2
+                if -(2 ** 63) <= number < 2 ** 63:
+                    return 3
+                return 4
+            if kind in ("Mod", "Add", "Sub", "Mul", "Div"):
+                left, right = infer(node.this), infer(node.expression)
+                return max(left, right) if left is not None and right is not None else None
+            return None
+
+        rank = infer(root)
+        return {1: "SMALLINT", 2: "INTEGER", 3: "BIGINT", 4: "NUMERIC"}.get(rank)
+
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
         if not item.is_aggregate:
             c_def = self._lookup_col_def(item.raw_expr)
@@ -4570,8 +4625,20 @@ class IncrementalViewCompiler:
                 if any(fn in raw_u for fn in ("SUM(", "AVG(", "TOTAL(", "MIN(", "MAX(")):
                     return self._float_type()
             if "%" in raw_u:
+                if self.dialect == Dialect.POSTGRES:
+                    native_integer_type = self._postgres_integer_expression_storage_type(raw_expr)
+                    if native_integer_type is not None:
+                        return native_integer_type
+                if self.dialect == Dialect.MYSQL:
+                    exact_type = self._exact_numeric_precision_scale(raw_expr)
+                    if exact_type is not None:
+                        return f"DECIMAL({max(exact_type[0], exact_type[1])}, {exact_type[1]})"
                 return self._int_type()
             if any(op in raw_u for op in ("*", "/", "+", "-")):
+                if self.dialect == Dialect.MYSQL:
+                    exact_type = self._exact_numeric_precision_scale(raw_expr)
+                    if exact_type is not None:
+                        return f"DECIMAL({max(exact_type[0], exact_type[1])}, {exact_type[1]})"
                 if "/" not in raw_u and not re.search(r"\d+\.\d+", raw_u):
                     cols_found = [
                         self._lookup_col_def(m_id.group(1))
