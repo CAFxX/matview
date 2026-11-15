@@ -57,7 +57,13 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                     second.execute("DELETE FROM ledger WHERE id = 2;")
                     second.execute("DELETE FROM ledger WHERE id = 8;")
                     second.execute("UPDATE ledger SET amt = 999 WHERE id = 1;")
+                    # The first batch ends at PK 3 and the captured upper
+                    # watermark is PK 10. Exercise both inclusive boundaries:
+                    # the cursor row must still receive trigger deltas, while
+                    # the maximum row must remain owned by the pending backfill.
+                    second.execute("UPDATE ledger SET amt = 777 WHERE id = 3;")
                     second.execute("UPDATE ledger SET amt = 888 WHERE id = 9;")
+                    second.execute("UPDATE ledger SET amt = 666 WHERE id = 10;")
                     second.commit()
 
                     # A rolled-back write must roll back its trigger effects too.
@@ -438,9 +444,20 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                         f"UPDATE {table_name} SET amt = %s, approx_amt = %s WHERE id = %s",
                         (999, 12.3456789, 1),
                     )
+                    # batch_size=3 makes PK 3 the first committed cursor;
+                    # PK 10 is the captured max watermark. Mutate both exact
+                    # endpoints to catch off-by-one trigger-gating regressions.
+                    second_cur.execute(
+                        f"UPDATE {table_name} SET amt = %s, approx_amt = %s WHERE id = %s",
+                        (777, 7.777, 3),
+                    )
                     second_cur.execute(
                         f"UPDATE {table_name} SET amt = %s, approx_amt = %s WHERE id = %s",
                         (888, 9.87654321, 9),
+                    )
+                    second_cur.execute(
+                        f"UPDATE {table_name} SET amt = %s, approx_amt = %s WHERE id = %s",
+                        (666, 6.666, 10),
                     )
                     second.commit()
 
