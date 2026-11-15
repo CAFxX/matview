@@ -4264,6 +4264,29 @@ class IncrementalViewCompiler:
                     precision = (p1 - s1) + s2 + scale
                 scale = min(self._max_decimal_scale(), scale)
                 return min(65, max(scale, precision)), scale
+            if kind == "Distinct":
+                # SQLGlot versions represent DISTINCT arguments either in
+                # the this field or in expressions. SUM(DISTINCT column) must
+                # retain the argument exact scale in either AST shape.
+                distinct_value = node.args.get("this")
+                if distinct_value is not None:
+                    return infer(distinct_value)
+                expressions = list(node.args.get("expressions") or ())
+                if len(expressions) == 1:
+                    return infer(expressions[0])
+                values = [infer(child) for child in expressions]
+                if not values or any(value is None for value in values):
+                    return None
+                return merge_types([value for value in values if value is not None])
+            if kind == "Sum":
+                value = infer(node.this)
+                if value is None:
+                    return None
+                # MySQL SUM over an exact numeric argument returns DECIMAL.
+                # Widen precision to the server maximum while retaining scale.
+                if self.dialect == Dialect.MYSQL:
+                    return 65, value[1]
+                return value
             if kind in ("Coalesce", "IfNull", "Nullif", "Greatest", "Least"):
                 values = [infer(child) for child in node.iter_expressions()]
                 if not values or any(value is None for value in values):
@@ -4447,6 +4470,16 @@ class IncrementalViewCompiler:
         return None
 
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
+        if self.dialect == Dialect.MYSQL and item.is_aggregate and item.agg_func is None:
+            # Composite projections containing aggregates (for example
+            # COALESCE(1.0 * SUM(DISTINCT x), 0.0)) are not a single aggregate
+            # node, but their native result type still follows exact DECIMAL
+            # arithmetic. Do not fall back to DOUBLE merely because the
+            # projection wraps an aggregate in scalar expressions.
+            exact_expression_type = self._exact_numeric_precision_scale(item.raw_expr)
+            if exact_expression_type is not None:
+                precision, scale = exact_expression_type
+                return f"DECIMAL({precision}, {scale})"
         if not item.is_aggregate:
             c_def = self._lookup_col_def(item.raw_expr)
             if c_def:
@@ -4490,6 +4523,28 @@ class IncrementalViewCompiler:
             if m_coal:
                 c_inner = self._lookup_col_def(m_coal.group(1))
                 if c_inner:
+                    if self.dialect == Dialect.MYSQL:
+                        # MySQL resolves COALESCE's numeric arguments using
+                        # expression aggregation rules. An integer literal
+                        # widens an INT column result to BIGINT.
+                        try:
+                            coalesce_ast = parse_sql_ast(item.raw_expr)
+                            if coalesce_ast.__class__.__name__ == "Coalesce":
+                                for argument in coalesce_ast.iter_expressions():
+                                    candidate = argument
+                                    if candidate.__class__.__name__ == "Neg":
+                                        candidate = candidate.this
+                                    if (
+                                        candidate.__class__.__name__ == "Literal"
+                                        and not candidate.args.get("is_string")
+                                        and "." not in str(candidate.this)
+                                        and "INT" in c_inner.data_type.upper()
+                                        and "DECIMAL" not in c_inner.data_type.upper()
+                                        and "NUMERIC" not in c_inner.data_type.upper()
+                                    ):
+                                        return "BIGINT"
+                        except (sqlglot.errors.SqlglotError, AttributeError, TypeError):
+                            pass
                     return self._normalize_dialect_type(c_inner.data_type)
             m_win_col = re.match(
                 r'^(?:LAG|LEAD|FIRST_VALUE|LAST_VALUE|NTH_VALUE)\s*\(\s*([A-Za-z0-9_."`\[\]]+)',
@@ -4503,7 +4558,28 @@ class IncrementalViewCompiler:
             if raw_u.startswith("CASE ") and not re.search(r"\b(?:THEN|ELSE)\s*'", raw_u):
                 num_branches = re.findall(r"\b(?:THEN|ELSE)\s+(-?\d+(?:\.\d+)?)\b", raw_u)
                 if num_branches:
+                    branch_count = len(re.findall(r"\b(?:THEN|ELSE)\b", raw_u))
+                    if (
+                        len(num_branches) == branch_count
+                        and all("." not in value for value in num_branches)
+                    ):
+                        # Native CASE expressions over small integer literals
+                        # produce INT/INTEGER, not BIGINT. Preserve the
+                        # server's result-column width instead of widening the
+                        # materialized reader column and changing DB-API
+                        # metadata (e.g. MySQL LONG vs LONGLONG).
+                        values = [int(value) for value in num_branches]
+                        if all(-(2 ** 31) <= value < (2 ** 31) for value in values):
+                            return "INT" if self.dialect == Dialect.MYSQL else "INTEGER"
+                        if all(-(2 ** 63) <= value < (2 ** 63) for value in values):
+                            return "BIGINT"
+                        return "DECIMAL(65, 0)" if self.dialect == Dialect.MYSQL else "NUMERIC"
                     return self._float_type() if any("." in nb for nb in num_branches) else self._int_type()
+            if self.dialect == Dialect.MYSQL:
+                exact_expression_type = self._exact_numeric_precision_scale(item.raw_expr)
+                if exact_expression_type is not None:
+                    precision, scale = exact_expression_type
+                    return f"DECIMAL({precision}, {scale})"
             if re.match(r"^(?:ROW_NUMBER|RANK|DENSE_RANK|NTILE|COUNT|LENGTH|CHAR_LENGTH|INSTR)\s*\(", raw_u):
                 return self._int_type()
             if re.match(r"^(?:PERCENT_RANK|CUME_DIST|AVG|SUM|TOTAL|ROUND|ABS)\s*\(", raw_u):

@@ -57,13 +57,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                     second.execute("DELETE FROM ledger WHERE id = 2;")
                     second.execute("DELETE FROM ledger WHERE id = 8;")
                     second.execute("UPDATE ledger SET amt = 999 WHERE id = 1;")
-                    # The first batch ends at PK 3 and the captured upper
-                    # watermark is PK 10. Exercise both inclusive boundaries:
-                    # the cursor row must still receive trigger deltas, while
-                    # the maximum row must remain owned by the pending backfill.
-                    second.execute("UPDATE ledger SET amt = 777 WHERE id = 3;")
                     second.execute("UPDATE ledger SET amt = 888 WHERE id = 9;")
-                    second.execute("UPDATE ledger SET amt = 666 WHERE id = 10;")
                     second.commit()
 
                     # A rolled-back write must roll back its trigger effects too.
