@@ -4073,6 +4073,123 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 self.assertEqual(items["variance_alias"].agg_func, variance_func)
                 self.assertEqual(items["stddev_alias"].agg_func, stddev_func)
 
+    def test_native_statistical_aliases_match_engine_live_query(self) -> None:
+        runner = MVTestRunner()
+        targets = []
+        if runner.pg_dsn:
+            targets.append(Dialect.POSTGRES)
+        if runner.mysql_dsn:
+            targets.append(Dialect.MYSQL)
+        if not targets:
+            self.skipTest("requires POSTGRES_DSN and/or MYSQL_DSN for native alias semantics")
+
+        for dialect in targets:
+            with self.subTest(dialect=dialect.value):
+                conn, cur, _, _, engine_label, close_fn = runner._open_backend_session(
+                    dialect, suite_tag=f"stat_alias_{dialect.value}"
+                )
+                self.assertTrue(
+                    engine_label.startswith("LIVE "),
+                    f"{dialect.value} DSN was configured but the test did not obtain a native session: {engine_label}",
+                )
+                suffix = f"{dialect.value}_{id(self):x}".replace("-", "_")
+                table = f"alias_src_{suffix}"
+                view = f"alias_mv_{suffix}"
+                manager = None
+                try:
+                    cur.execute(
+                        f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, grp VARCHAR(32) NOT NULL, value DECIMAL(12, 2) NOT NULL)"
+                    )
+                    for row in [(1, "A", 1), (2, "A", 3), (3, "A", 5), (4, "B", 7)]:
+                        cur.execute(
+                            f"INSERT INTO {table} (id, grp, value) VALUES (%s, %s, %s)",
+                            row,
+                        )
+                    conn.commit()
+                    manager = MaterializedViewManager(
+                        conn,
+                        dialect=dialect,
+                        engine_version=detect_engine_version(conn, dialect),
+                    )
+                    manager.register_view(
+                        f"CREATE VIEW {view} AS SELECT grp, "
+                        f"VARIANCE(value) AS variance_alias, "
+                        f"STDDEV(value) AS stddev_alias FROM {table} GROUP BY grp;"
+                    )
+
+                    def assert_equivalent() -> None:
+                        raw_sql = (
+                            f"SELECT grp, VARIANCE(value) AS variance_alias, "
+                            f"STDDEV(value) AS stddev_alias FROM {table} GROUP BY grp ORDER BY grp"
+                        )
+                        mv_sql = (
+                            f"SELECT grp, variance_alias, stddev_alias FROM {view} ORDER BY grp"
+                        )
+                        cur.execute(raw_sql)
+                        raw_rows = cur.fetchall()
+                        raw_desc = cur.description
+                        cur.execute(mv_sql)
+                        mv_rows = cur.fetchall()
+                        mv_desc = cur.description
+                        self.assertEqual(
+                            [d[1] for d in mv_desc],
+                            [d[1] for d in raw_desc],
+                            "materialized reader result types must match the native view",
+                        )
+                        self.assertEqual(len(mv_rows), len(raw_rows))
+                        for raw_row, mv_row in zip(raw_rows, mv_rows):
+                            self.assertEqual(mv_row[0], raw_row[0])
+                            for expected_value, actual_value in zip(raw_row[1:], mv_row[1:]):
+                                if expected_value is None:
+                                    self.assertIsNone(actual_value)
+                                else:
+                                    self.assertTrue(
+                                        math.isclose(
+                                            float(actual_value),
+                                            float(expected_value),
+                                            rel_tol=1e-12,
+                                            abs_tol=1e-12,
+                                        ),
+                                        (dialect.value, raw_row, mv_row),
+                                    )
+
+                    assert_equivalent()
+                    if dialect == Dialect.POSTGRES:
+                        # PostgreSQL's aliases are sample statistics: singleton groups are NULL.
+                        cur.execute(f"SELECT variance_alias, stddev_alias FROM {view} WHERE grp = 'B'")
+                        self.assertEqual(cur.fetchone(), (None, None))
+                    else:
+                        # MySQL/MariaDB's aliases are population statistics: singleton groups are zero.
+                        cur.execute(f"SELECT variance_alias, stddev_alias FROM {view} WHERE grp = 'B'")
+                        singleton = cur.fetchone()
+                        self.assertEqual(float(singleton[0]), 0.0)
+                        self.assertEqual(float(singleton[1]), 0.0)
+
+                    cur.execute(
+                        f"INSERT INTO {table} (id, grp, value) VALUES (%s, %s, %s)",
+                        (5, "B", 9),
+                    )
+                    conn.commit()
+                    assert_equivalent()
+                    cur.execute(f"UPDATE {table} SET value = 9 WHERE id = 2")
+                    conn.commit()
+                    assert_equivalent()
+                    cur.execute(f"DELETE FROM {table} WHERE id = 1")
+                    conn.commit()
+                    assert_equivalent()
+                finally:
+                    if manager is not None:
+                        try:
+                            manager.drop_view(view)
+                        except Exception:
+                            pass
+                    try:
+                        cur.execute(f"DROP TABLE IF EXISTS {table}")
+                        conn.commit()
+                    except Exception:
+                        pass
+                    close_fn()
+
     def test_02_incremental_backfill_strategies_and_progress_callback(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
