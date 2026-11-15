@@ -512,6 +512,29 @@ class TableSchema:
     has_on_conflict_replace: bool = False
 
 
+def _resolve_statistical_aggregate_alias(item: SelectItem, dialect: Dialect) -> SelectItem:
+    """Resolve VARIANCE/STDDEV aliases using the target engine's native SQL semantics."""
+    match = re.match(r"^\\s*(VARIANCE|STDDEV|STD)\\s*\\(", item.raw_expr, flags=re.IGNORECASE)
+    if match is None:
+        return item
+    alias = match.group(1).upper()
+    if dialect == Dialect.POSTGRES:
+        target = {
+            "VARIANCE": AggFunc.VAR_SAMP,
+            "STDDEV": AggFunc.STDDEV_SAMP,
+            "STD": AggFunc.STDDEV_SAMP,
+        }[alias]
+    else:
+        # MySQL/MariaDB define these aliases as population statistics. SQLite's
+        # compatibility UDFs intentionally follow that same population mapping.
+        target = {
+            "VARIANCE": AggFunc.VAR_POP,
+            "STDDEV": AggFunc.STDDEV_POP,
+            "STD": AggFunc.STDDEV_POP,
+        }[alias]
+    return replace(item, agg_func=target)
+
+
 @dataclass(frozen=True)
 class SelectItem:
     raw_expr: str
@@ -2750,6 +2773,13 @@ class IncrementalViewCompiler:
 
         self.user_indexes: List[ViewIndexSpec] = list(view_spec.user_indexes)
         unwrapped_view = self._try_unwrap_simple_cte_or_derived_view(view_spec)
+        unwrapped_view = replace(
+            unwrapped_view,
+            select_items=tuple(
+                _resolve_statistical_aggregate_alias(item, self.dialect)
+                for item in unwrapped_view.select_items
+            ),
+        )
         self.primary_schema: Optional[TableSchema] = self._schemas_lower.get(
             unwrapped_view.base_table.lower()
         )
@@ -3260,6 +3290,7 @@ class IncrementalViewCompiler:
                             parsed_el = _parse_single_agg_expr(full_call, col_al)
                             if parsed_el is None:
                                 return expr_str, False
+                            parsed_el = _resolve_statistical_aggregate_alias(parsed_el, self.dialect)
                             agg_call_to_alias[norm_key] = col_al
                             work_items.append(parsed_el)
                             extra_having_items.append(parsed_el)

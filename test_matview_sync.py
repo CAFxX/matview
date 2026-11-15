@@ -4052,6 +4052,27 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 conn.execute(bad_dml)
         conn.close()
 
+    def test_statistical_aliases_follow_target_dialect(self) -> None:
+        schema = "CREATE TABLE alias_values (id INTEGER PRIMARY KEY, grp TEXT, value REAL);"
+        ddl = (
+            "CREATE VIEW alias_stats AS SELECT grp, "
+            "VARIANCE(value) AS variance_alias, STDDEV(value) AS stddev_alias "
+            "FROM alias_values GROUP BY grp;"
+        )
+        expected = {
+            Dialect.POSTGRES: (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
+            Dialect.MYSQL: (AggFunc.VAR_POP, AggFunc.STDDEV_POP),
+            Dialect.SQLITE: (AggFunc.VAR_POP, AggFunc.STDDEV_POP),
+        }
+        for dialect, (variance_func, stddev_func) in expected.items():
+            with self.subTest(dialect=dialect.value):
+                plan = generate_materialized_view(
+                    schema, ddl, dialect=dialect, ignore_limitations=True
+                )
+                items = {item.alias: item for item in plan.view_spec.select_items}
+                self.assertEqual(items["variance_alias"].agg_func, variance_func)
+                self.assertEqual(items["stddev_alias"].agg_func, stddev_func)
+
     def test_02_incremental_backfill_strategies_and_progress_callback(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
