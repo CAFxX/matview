@@ -5913,6 +5913,64 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn(f"{backing_name}.sc_norm", normalized_chunk)
         self.assertNotIn(f"{backing_name}.sub_cat", normalized_chunk)
 
+    def test_25_collation_grouping_matches_live_select_after_dml(self) -> None:
+        """Explicit grouping collations must survive incremental maintenance."""
+        schema = """
+        CREATE TABLE collation_items (
+            id INTEGER PRIMARY KEY,
+            grp TEXT NOT NULL,
+            value INTEGER NOT NULL
+        );
+        INSERT INTO collation_items VALUES
+            (1, 'alpha', 10),
+            (2, 'ALPHA', 20),
+            (3, 'Beta', 5);
+        """
+        view_sql = """
+        CREATE VIEW collation_summary AS
+        SELECT MIN(grp) AS grp, COUNT(*) AS row_count, SUM(value) AS total_value
+        FROM collation_items
+        GROUP BY grp COLLATE NOCASE;
+        """
+        live_sql = (
+            "SELECT MIN(grp) AS grp, COUNT(*) AS row_count, SUM(value) AS total_value "
+            "FROM collation_items GROUP BY grp COLLATE NOCASE"
+        )
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            manager = MaterializedViewManager(conn, dialect="sqlite")
+            manager.apply_schema_ddl(schema)
+            plan = manager.register_view(view_sql)
+
+            def assert_matches_live(label: str) -> None:
+                actual = [
+                    tuple(row)
+                    for row in conn.execute(
+                        f"SELECT grp, row_count, total_value FROM {plan.view_name} "
+                        "ORDER BY grp"
+                    ).fetchall()
+                ]
+                expected = [
+                    tuple(row)
+                    for row in conn.execute(live_sql + " ORDER BY grp").fetchall()
+                ]
+                self.assertTrue(
+                    _rows_equal(actual, expected),
+                    f"{label}: COLLATE NOCASE materialized result diverged; "
+                    f"actual={actual!r}, expected={expected!r}",
+                )
+
+            assert_matches_live("initial collation-aware backfill")
+            conn.execute("INSERT INTO collation_items VALUES (4, 'Alpha', 7)")
+            assert_matches_live("insert into an existing collation-equivalent group")
+            conn.execute("UPDATE collation_items SET grp = 'alpha', value = 8 WHERE id = 3")
+            assert_matches_live("move a row between collation-equivalent groups")
+            conn.execute("DELETE FROM collation_items WHERE id = 2")
+            assert_matches_live("delete from a collation-equivalent group")
+        finally:
+            conn.close()
+
     def test_24_metamorphic_mv_invariants_and_rebuild_consistency(self) -> None:
         schema = """
         CREATE TABLE invariant_items (
