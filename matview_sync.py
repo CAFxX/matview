@@ -11030,7 +11030,7 @@ class MaterializedViewManager:
                 session_bypass_ok = True
             except Exception:
                 pass
-        elif self.dialect == Dialect.MYSQL and not drop_triggers:
+        elif self.dialect == Dialect.MYSQL and not drop_triggers and targets:
             try:
                 cur.execute("SET @__matview_skip_triggers = 1;")
                 session_bypass_ok = True
@@ -11124,7 +11124,7 @@ class MaterializedViewManager:
                         cur.execute("SET LOCAL matview.skip_triggers = 'off';")
                     except Exception:
                         pass
-                elif self.dialect == Dialect.MYSQL:
+                elif self.dialect == Dialect.MYSQL and session_bypass_ok:
                     # Do not commit if the session flag cannot be cleared:
                     # it would suppress maintenance on later statements using
                     # this pooled connection.
