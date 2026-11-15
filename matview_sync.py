@@ -10252,15 +10252,12 @@ class MaterializedViewManager:
                 pass
 
     @staticmethod
-    def _require_idle_mysql_connection(conn: Any) -> None:
-        """Fail closed unless a MySQL/MariaDB connection and its driver are idle."""
-        # SQLAlchemy's Connection wraps a PoolProxiedConnection, which in turn
-        # exposes the actual DB-API connection as driver_connection. Inspect
-        # both layers: callers can start a transaction through that driver
-        # connection without SQLAlchemy's own transaction facade noticing it.
+    def _connection_chain(conn: Any) -> Tuple[List[Any], List[Any]]:
+        """Return all discoverable wrappers and their physical driver leaves."""
         candidates = []
         pending = [conn]
         seen = set()
+        child_ids = set()
         while pending:
             candidate = pending.pop()
             if candidate is None or id(candidate) in seen:
@@ -10273,100 +10270,125 @@ class MaterializedViewManager:
                 except Exception:
                     nested = None
                 if nested is not None and nested is not candidate:
+                    child_ids.add(id(nested))
                     pending.append(nested)
+        leaves = [candidate for candidate in candidates if id(candidate) not in child_ids]
+        return candidates, leaves
 
-        observed_idle_state = False
+    @staticmethod
+    def _require_idle_mysql_connection(conn: Any) -> None:
+        """Fail closed unless every physical MySQL/MariaDB driver leaf is idle."""
+        candidates, leaves = MaterializedViewManager._connection_chain(conn)
+        if not leaves:
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization requires a discoverable physical "
+                "DB-API connection"
+            )
+        active = False
+        observed_leaf_ids = set()
         for candidate in candidates:
+            known = False
             state = getattr(candidate, "in_transaction", None)
             if callable(state):
                 try:
                     state = state()
                 except Exception:
                     state = None
-            if isinstance(state, bool):
-                if state:
-                    raise RuntimeError(
-                        "MySQL/MariaDB manager initialization cannot run inside an active "
-                        "caller transaction; commit or roll back that transaction first"
-                    )
-                observed_idle_state = True
-                continue
-
-            # PyMySQL and mysqlclient expose the protocol SERVER_STATUS_IN_TRANS
-            # bit in server_status. Its value is 1 across MySQL and MariaDB.
-            status = getattr(candidate, "server_status", None)
-            if status is None:
-                status = getattr(candidate, "_server_status", None)
-            if isinstance(status, int):
-                if status & 0x0001:
-                    raise RuntimeError(
-                        "MySQL/MariaDB manager initialization cannot run inside an active "
-                        "caller transaction; commit or roll back that transaction first"
-                    )
-                observed_idle_state = True
-
-        if not observed_idle_state:
+            if isinstance(state, bool) or (
+                isinstance(state, int) and not isinstance(state, bool) and state in (0, 1)
+            ):
+                known = True
+                active = active or bool(state)
+            for attr in ("server_status", "_server_status"):
+                status = getattr(candidate, attr, None)
+                if isinstance(status, int) and not isinstance(status, bool):
+                    known = True
+                    active = active or bool(status & 0x0001)
+            if known and any(candidate is leaf for leaf in leaves):
+                observed_leaf_ids.add(id(candidate))
+        if active:
             raise RuntimeError(
-                "MySQL/MariaDB manager initialization requires an adapter that "
-                "exposes transaction state; cannot safely determine whether "
-                "catalog initialization would commit caller work"
+                "MySQL/MariaDB manager initialization cannot run inside an active "
+                "caller transaction; commit or roll back that transaction first"
+            )
+        if len(observed_leaf_ids) != len(leaves):
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization requires transaction state on every "
+                "physical DB-API connection; refusing to trust an idle facade"
             )
 
     @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
-        """Fail closed unless a PostgreSQL connection is idle and non-autocommit."""
-        autocommit = getattr(conn, "autocommit", None)
-        if autocommit is None:
-            adapter_connection = getattr(conn, "connection", None)
-            driver_connection = getattr(
-                adapter_connection, "driver_connection", adapter_connection
-            )
-            autocommit = getattr(driver_connection, "autocommit", None)
-        if autocommit is not False:
+        """Fail closed unless every physical PostgreSQL driver leaf is idle and non-autocommit."""
+        candidates, leaves = MaterializedViewManager._connection_chain(conn)
+        if not leaves:
             raise RuntimeError(
-                "PostgreSQL manager initialization requires autocommit=False "
-                "to preserve transactional DDL atomicity"
+                "PostgreSQL manager initialization requires a discoverable physical DB-API connection"
             )
 
-        state = getattr(conn, "in_transaction", None)
-        if callable(state):
-            try:
-                state = state()
-            except Exception:
-                state = None
-        if not isinstance(state, bool):
-            status = None
-            getter = getattr(conn, "get_transaction_status", None)
-            if callable(getter):
-                try:
-                    status = getter()
-                except Exception:
-                    status = None
-            if status is None:
-                info = getattr(conn, "info", None)
-                status = getattr(info, "transaction_status", None)
-            if status is None:
+        active = False
+        observed_leaf_ids = set()
+        for candidate in candidates:
+            autocommit = getattr(candidate, "autocommit", None)
+            if autocommit is not None and autocommit is not False:
                 raise RuntimeError(
-                    "PostgreSQL manager initialization requires an adapter that exposes "
-                    "transaction state; cannot safely determine whether a caller transaction "
-                    "would be committed"
+                    "PostgreSQL manager initialization requires autocommit=False "
+                    "to preserve transactional DDL atomicity"
                 )
-            try:
-                state = int(status) != 0
-            except (TypeError, ValueError):
-                state_text = str(status).lower()
-                if state_text.endswith("idle"):
-                    state = False
-                else:
-                    raise RuntimeError(
-                        "PostgreSQL manager initialization could not interpret "
-                        "the connection transaction state"
-                    )
-        if state:
+
+            state = getattr(candidate, "in_transaction", None)
+            if callable(state):
+                try:
+                    state = state()
+                except Exception:
+                    state = None
+            known = isinstance(state, bool)
+            if known:
+                active = active or state
+            else:
+                status = None
+                getter = getattr(candidate, "get_transaction_status", None)
+                if callable(getter):
+                    try:
+                        status = getter()
+                    except Exception:
+                        status = None
+                if status is None:
+                    info = getattr(candidate, "info", None)
+                    status = getattr(info, "transaction_status", None)
+                if status is not None:
+                    try:
+                        state = int(status) != 0
+                    except (TypeError, ValueError):
+                        state_text = str(status).lower()
+                        if state_text.endswith("idle"):
+                            state = False
+                        else:
+                            raise RuntimeError(
+                                "PostgreSQL manager initialization could not interpret "
+                                "the connection transaction state"
+                            )
+                    known = True
+                    active = active or bool(state)
+            if known and any(candidate is leaf for leaf in leaves):
+                observed_leaf_ids.add(id(candidate))
+
+        if active:
             raise RuntimeError(
                 "PostgreSQL manager initialization cannot run inside an active caller "
                 "transaction; commit or roll back that transaction first"
             )
+        if len(observed_leaf_ids) != len(leaves):
+            raise RuntimeError(
+                "PostgreSQL manager initialization requires transaction state on every "
+                "physical DB-API connection; refusing to trust an idle facade"
+            )
+        for leaf in leaves:
+            if getattr(leaf, "autocommit", None) is not False:
+                raise RuntimeError(
+                    "PostgreSQL manager initialization requires autocommit=False "
+                    "on the physical DB-API connection"
+                )
 
     def _assert_registration_transaction_ownership(self) -> None:
         """Reject transaction modes that registration cannot safely own.
