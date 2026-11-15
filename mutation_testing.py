@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Run curated, test-specific source mutants to verify regression sensitivity.
 
-Opt-in diagnostic:
+Manual invocation:
     python mutation_testing.py
+
+CI also runs this diagnostic once in the SQLite / Python 3.11 matrix leg.
 
 Each mutant is applied to an isolated temporary source copy. The target
 regression must pass unchanged and fail by assertion for the mutant. Syntax,
