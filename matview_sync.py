@@ -512,9 +512,22 @@ class TableSchema:
     has_on_conflict_replace: bool = False
 
 
+@dataclass(frozen=True)
+class SelectItem:
+    raw_expr: str
+    alias: str
+    is_aggregate: bool
+    agg_func: Optional[AggFunc] = None
+    arg_expr: Optional[str] = None
+    extra_args: Optional[str] = None
+    is_distinct: bool = False
+    filter_where: Optional[str] = None
+    source_col: Optional[str] = None
+
+
 def _resolve_statistical_aggregate_alias(item: SelectItem, dialect: Dialect) -> SelectItem:
     """Resolve VARIANCE/STDDEV aliases using the target engine's native SQL semantics."""
-    match = re.match(r"^\\s*(VARIANCE|STDDEV|STD)\\s*\\(", item.raw_expr, flags=re.IGNORECASE)
+    match = re.match(r"^\s*(VARIANCE|STDDEV|STD)\s*\(", item.raw_expr, flags=re.IGNORECASE)
     if match is None:
         return item
     alias = match.group(1).upper()
@@ -533,20 +546,6 @@ def _resolve_statistical_aggregate_alias(item: SelectItem, dialect: Dialect) -> 
             "STD": AggFunc.STDDEV_POP,
         }[alias]
     return replace(item, agg_func=target)
-
-
-@dataclass(frozen=True)
-class SelectItem:
-    raw_expr: str
-    alias: str
-    is_aggregate: bool
-    agg_func: Optional[AggFunc] = None
-    arg_expr: Optional[str] = None
-    extra_args: Optional[str] = None
-    is_distinct: bool = False
-    filter_where: Optional[str] = None
-    source_col: Optional[str] = None
-
 
 @dataclass(frozen=True)
 class JoinSpec:
