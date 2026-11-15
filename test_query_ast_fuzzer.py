@@ -12,7 +12,10 @@ from typing import Any
 from test_matview_sync import VariableSchemaDifferentialFuzzer
 
 
-def _ident(name: str) -> str:
+def _ident(name: str, dialect: Any = None) -> str:
+    from matview_sync import Dialect
+    if dialect == Dialect.MYSQL:
+        return '`' + name.replace('`', '``') + '`'
     return '"' + name.replace('"', '""') + '"'
 
 
@@ -48,104 +51,104 @@ class GeneratedQuery:
     max_expression_depth: int
 
 
-def _render_expr(node: tuple[Any, ...]) -> str:
+def _render_expr(node: tuple[Any, ...], dialect: Any = None) -> str:
     kind = node[0]
     if kind == "column":
-        return f"{_ident(node[1])}.{_ident(node[2])}"
+        return f"{_ident(node[1], dialect)}.{_ident(node[2], dialect)}"
     if kind == "bare_column":
-        return _ident(node[1])
+        return _ident(node[1], dialect)
     if kind == "literal":
         return _literal(node[1])
     if kind == "star":
         return "*"
     if kind == "coalesce":
-        return f"COALESCE({_render_expr(node[1])}, {_render_expr(node[2])})"
+        return f"COALESCE({_render_expr(node[1], dialect)}, {_render_expr(node[2], dialect)})"
     if kind in ("add", "multiply"):
         op = "+" if kind == "add" else "*"
-        return f"({_render_expr(node[1])} {op} {_render_expr(node[2])})"
+        return f"({_render_expr(node[1], dialect)} {op} {_render_expr(node[2], dialect)})"
     if kind == "case":
         return (
-            f"(CASE WHEN {_render_predicate(node[1])} "
-            f"THEN {_render_expr(node[2])} ELSE {_render_expr(node[3])} END)"
+            f"(CASE WHEN {_render_predicate(node[1], dialect)} "
+            f"THEN {_render_expr(node[2], dialect)} ELSE {_render_expr(node[3], dialect)} END)"
         )
     if kind == "aggregate":
-        return f"{node[1]}({_render_expr(node[2])})"
+        return f"{node[1]}({_render_expr(node[2], dialect)})"
     if kind == "window":
         return (
-            f"{node[1]}() OVER (PARTITION BY {_render_expr(node[2])} "
-            f"ORDER BY {_render_expr(node[3])})"
+            f"{node[1]}() OVER (PARTITION BY {_render_expr(node[2], dialect)} "
+            f"ORDER BY {_render_expr(node[3], dialect)})"
         )
     if kind == "scalar_count":
         return (
-            f"(SELECT COUNT(*) FROM {_ident(node[1])} {_ident(node[2])} "
-            f"WHERE {_ident(node[2])}.id = {_render_expr(node[3])})"
+            f"(SELECT COUNT(*) FROM {_ident(node[1], dialect)} {_ident(node[2], dialect)} "
+            f"WHERE {_ident(node[2], dialect)}.id = {_render_expr(node[3], dialect)})"
         )
     raise ValueError(f"unknown expression node: {kind}")
 
 
-def _render_predicate(node: tuple[Any, ...]) -> str:
+def _render_predicate(node: tuple[Any, ...], dialect: Any = None) -> str:
     kind = node[0]
     if kind == "is_null":
-        return f"{_render_expr(node[1])} IS NULL"
+        return f"{_render_expr(node[1], dialect)} IS NULL"
     if kind == "compare":
-        return f"{_render_expr(node[1])} {node[2]} {_render_expr(node[3])}"
+        return f"{_render_expr(node[1], dialect)} {node[2]} {_render_expr(node[3], dialect)}"
     if kind == "between":
-        return f"{_render_expr(node[1])} BETWEEN {_literal(node[2])} AND {_literal(node[3])}"
+        return f"{_render_expr(node[1], dialect)} BETWEEN {_literal(node[2])} AND {_literal(node[3])}"
     if kind == "not":
-        return f"(NOT {_render_predicate(node[1])})"
+        return f"(NOT {_render_predicate(node[1], dialect)})"
     if kind in ("and", "or"):
         op = "AND" if kind == "and" else "OR"
-        return f"({_render_predicate(node[1])} {op} {_render_predicate(node[2])})"
+        return f"({_render_predicate(node[1], dialect)} {op} {_render_predicate(node[2], dialect)})"
     if kind == "exists":
         return (
-            f"EXISTS (SELECT 1 FROM {_ident(node[1])} {_ident(node[2])} "
-            f"WHERE {_ident(node[2])}.id = {_render_expr(node[3])})"
+            f"EXISTS (SELECT 1 FROM {_ident(node[1], dialect)} {_ident(node[2], dialect)} "
+            f"WHERE {_ident(node[2], dialect)}.id = {_render_expr(node[3], dialect)})"
         )
     if kind == "in_subquery":
         return (
-            f"{_render_expr(node[1])} IN (SELECT {_ident(node[3])}.id "
-            f"FROM {_ident(node[2])} {_ident(node[3])} "
-            f"WHERE {_ident(node[3])}.qty IS NULL OR {_ident(node[3])}.qty >= 0)"
+            f"{_render_expr(node[1], dialect)} IN (SELECT {_ident(node[3], dialect)}.id "
+            f"FROM {_ident(node[2], dialect)} {_ident(node[3], dialect)} "
+            f"WHERE {_ident(node[3], dialect)}.qty IS NULL OR {_ident(node[3], dialect)}.qty >= 0)"
         )
     raise ValueError(f"unknown predicate node: {kind}")
 
 
-def _render_select(query: SelectAST, *, include_order: bool = True) -> str:
+def _render_select(query: SelectAST, *, include_order: bool = True, dialect: Any = None) -> str:
     parts: list[str] = []
     if query.cte is not None:
         cte_name, cte_query = query.cte
-        parts.append(f"WITH {_ident(cte_name)} AS ({_render_select(cte_query)}) ")
+        parts.append(f"WITH {_ident(cte_name, dialect)} AS ({_render_select(cte_query, dialect=dialect)}) ")
 
-    projections = ", ".join(_render_expr(expr) for expr in query.projections)
+    projections = ", ".join(_render_expr(expr, dialect) for expr in query.projections)
     parts.append("SELECT " + ("DISTINCT " if query.distinct else "") + projections)
 
     source = query.source
     if source[0] == "table":
-        parts.append(f"FROM {_ident(source[1])} {_ident(source[2])}")
+        parts.append(f"FROM {_ident(source[1], dialect)} {_ident(source[2], dialect)}")
     elif source[0] == "derived":
-        parts.append(f"FROM ({_render_select(source[1])}) {_ident(source[2])}")
+        parts.append(f"FROM ({_render_select(source[1], dialect=dialect)}) {_ident(source[2], dialect)}")
     elif source[0] == "cte":
-        parts.append(f"FROM {_ident(source[1])} {_ident(source[2])}")
+        parts.append(f"FROM {_ident(source[1], dialect)} {_ident(source[2], dialect)}")
     else:
         raise ValueError(f"unknown source node: {source[0]}")
 
     for table, alias, predicate in query.joins:
         parts.append(
-            f"JOIN {_ident(table)} {_ident(alias)} ON {_render_predicate(predicate)}"
+            f"JOIN {_ident(table, dialect)} {_ident(alias, dialect)} ON {_render_predicate(predicate, dialect)}"
         )
     if query.where is not None:
-        parts.append("WHERE " + _render_predicate(query.where))
+        parts.append("WHERE " + _render_predicate(query.where, dialect))
     if query.group_by:
-        parts.append("GROUP BY " + ", ".join(_render_expr(expr) for expr in query.group_by))
+        parts.append("GROUP BY " + ", ".join(_render_expr(expr, dialect) for expr in query.group_by))
     if query.having is not None:
-        parts.append("HAVING " + _render_predicate(query.having))
+        parts.append("HAVING " + _render_predicate(query.having, dialect))
 
     sql = " ".join(parts)
     if query.set_operation is not None:
         operator, right = query.set_operation
-        sql += f" {operator} {_render_select(right, include_order=False)}"
+        sql += f" {operator} {_render_select(right, include_order=False, dialect=dialect)}"
     if include_order and query.order_by:
-        sql += " ORDER BY " + ", ".join(_render_expr(expr) for expr in query.order_by)
+        sql += " ORDER BY " + ", ".join(_render_expr(expr, dialect) for expr in query.order_by)
     if include_order and query.limit is not None:
         sql += f" LIMIT {query.limit}"
     return sql
@@ -194,18 +197,78 @@ class SchemaAwareSelectFuzzer:
         self.max_expression_depth = 0
 
     @staticmethod
-    def _schema(conn: sqlite3.Connection) -> tuple[list[str], list[tuple[str, str, str]]]:
-        tables = [
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'vs*_t*' ORDER BY name"
+    def _schema(conn: Any) -> tuple[list[str], list[tuple[str, str, str]]]:
+        if isinstance(conn, sqlite3.Connection) or type(conn).__module__.startswith("sqlite3"):
+            tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'vs*_t*' ORDER BY name"
+                )
+            ]
+            foreign_keys: list[tuple[str, str, str]] = []
+            for table in tables:
+                for row in conn.execute(f"PRAGMA foreign_key_list({_literal(table)})"):
+                    foreign_keys.append((table, row[3], row[2]))
+            return tables, foreign_keys
+
+        cur = conn.cursor() if hasattr(conn, "cursor") else conn
+        try:
+            from matview_sync import detect_engine_version, Dialect
+            dialect = detect_engine_version(conn).dialect
+        except Exception:
+            dialect = None
+
+        from matview_sync import Dialect
+        if dialect == Dialect.POSTGRES:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = current_schema() AND table_name LIKE 'vs%_t%' "
+                "ORDER BY table_name"
             )
-        ]
-        foreign_keys: list[tuple[str, str, str]] = []
-        for table in tables:
-            for row in conn.execute(f"PRAGMA foreign_key_list({_literal(table)})"):
-                foreign_keys.append((table, row[3], row[2]))
-        return tables, foreign_keys
+            tables = [row[0] for row in (cur.fetchall() or [])]
+            cur.execute(
+                """
+                SELECT
+                    tc.table_name,
+                    kcu.column_name,
+                    ccu.table_name AS foreign_table_name
+                FROM information_schema.table_constraints AS tc
+                JOIN information_schema.key_column_usage AS kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                  AND tc.table_schema = kcu.table_schema
+                JOIN information_schema.constraint_column_usage AS ccu
+                  ON ccu.constraint_name = tc.constraint_name
+                  AND ccu.table_schema = tc.table_schema
+                WHERE tc.constraint_type = 'FOREIGN KEY'
+                  AND tc.table_schema = current_schema()
+                """
+            )
+            foreign_keys = [(row[0], row[1], row[2]) for row in (cur.fetchall() or [])]
+            return tables, foreign_keys
+
+        if dialect == Dialect.MYSQL:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() AND table_name LIKE 'vs%_t%' "
+                "ORDER BY table_name"
+            )
+            tables = [row[0] for row in (cur.fetchall() or [])]
+            cur.execute(
+                """
+                SELECT
+                    table_name,
+                    column_name,
+                    referenced_table_name
+                FROM information_schema.key_column_usage
+                WHERE table_schema = DATABASE()
+                  AND referenced_table_name IS NOT NULL
+                  AND table_name LIKE 'vs%_t%'
+                """
+            )
+            foreign_keys = [(row[0], row[1], row[2]) for row in (cur.fetchall() or [])]
+            return tables, foreign_keys
+
+        return [], []
 
     def _predicate(
         self, alias: str, depth: int, tables: list[str]
@@ -448,13 +511,36 @@ class SchemaAwareSelectFuzzer:
             query.limit is not None,
         )
 
-    def generate(self, conn: sqlite3.Connection) -> GeneratedQuery:
-        tables, foreign_keys = self._schema(conn)
-        if len(tables) < 2:
+    def generate(
+        self,
+        conn: Any = None,
+        *,
+        tables: list[str] | None = None,
+        foreign_keys: list[tuple[str, str, str]] | None = None,
+        dialect: Any = None,
+    ) -> GeneratedQuery:
+        if tables is not None:
+            t = list(tables)
+            fk = list(foreign_keys or [])
+        elif conn is not None:
+            t, fk = self._schema(conn)
+        else:
+            raise ValueError("query generation requires either conn or tables")
+
+        if len(t) < 2:
             raise ValueError("query generation requires at least two generated tables")
-        query = self._build_select(tables, foreign_keys, depth=2)
+
+        eff_dialect = dialect
+        if eff_dialect is None and conn is not None:
+            try:
+                from matview_sync import detect_engine_version
+                eff_dialect = detect_engine_version(conn).dialect
+            except Exception:
+                eff_dialect = None
+
+        query = self._build_select(t, fk, depth=2)
         return GeneratedQuery(
-            sql=_render_select(query),
+            sql=_render_select(query, dialect=eff_dialect),
             features=frozenset(self.features),
             shape=self._shape(query),
             max_predicate_depth=self.max_predicate_depth,
