@@ -6515,6 +6515,16 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertEqual([view.view_name for view in views], ["item_a", "item_b"])
 
+    def test_sqlite_manager_initialization_uses_connection_initializer(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            MaterializedViewManager(conn)
+            self.assertEqual(
+                conn.execute("PRAGMA recursive_triggers;").fetchone()[0], 1
+            )
+        finally:
+            conn.close()
+
     def test_sqlite_writer_connection_initializer_protects_replace_maintenance(self) -> None:
         import os
         import tempfile
