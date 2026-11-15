@@ -10147,20 +10147,27 @@ class MaterializedViewManager:
             self.conn = conn_or_url
 
         # Version detection and catalog initialization both execute SQL and
-        # catalog initialization commits. Refuse a pre-existing PostgreSQL
-        # transaction before either can touch or commit caller-owned work.
+        # catalog initialization commits. Refuse caller-owned transactions before
+        # either can touch or commit caller work. An explicit engine_version is
+        # authoritative even when a generic connection wrapper hides its dialect.
+        explicit_engine_dialect = (
+            parse_engine_version(engine_version, default_dialect=hint_d).dialect
+            if engine_version is not None
+            else None
+        )
+        effective_hint_dialect = explicit_engine_dialect or hint_d
         connection_module = (
             f"{type(self.conn).__module__}.{type(self.conn).__qualname__}".lower()
         )
         connection_dialect = getattr(self.conn, "dialect", None)
         connection_dialect_name = getattr(connection_dialect, "name", connection_dialect)
         postgres_candidate = (
-            hint_d == Dialect.POSTGRES
+            effective_hint_dialect == Dialect.POSTGRES
             or (isinstance(connection_dialect_name, str) and "postgres" in connection_dialect_name.lower())
             or any(name in connection_module for name in ("psycopg", "pg8000", "asyncpg", "postgres", "pgsql"))
         )
         mysql_candidate = (
-            hint_d == Dialect.MYSQL
+            effective_hint_dialect == Dialect.MYSQL
             or (isinstance(connection_dialect_name, str) and any(
                 token in connection_dialect_name.lower() for token in ("mysql", "maria")
             ))
