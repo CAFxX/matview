@@ -10749,8 +10749,6 @@ class MaterializedViewManager:
         try:
             if existing:
                 cur = self.conn.cursor()
-                if cur is None:
-                    cur = self.conn.cursor()
                 if (
                     self.dialect == Dialect.POSTGRES
                     and bool(getattr(self.conn, "autocommit", False))
