@@ -511,10 +511,6 @@ class RecursiveQueryASTTests(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 def _predicate_shrinks(node: tuple[Any, ...]) -> list[tuple[Any, ...]]:
     """Return strictly simpler, local predicate alternatives in deterministic order."""
     kind = node[0]
@@ -643,3 +639,7 @@ class QueryASTShrinkingTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "does not reproduce"):
             minimize_select_ast(query, lambda sql: False)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
