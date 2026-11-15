@@ -209,6 +209,9 @@ jobs:
       - name: Test PK swap data loss prevention and MySQL collation safety
         run: python3 test_p0_pk_swap_and_collation.py
 
+      - name: Test PK-swap trigger mutation sensitivity
+        run: python3 test_pk_swap_mutation_sensitivity.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
