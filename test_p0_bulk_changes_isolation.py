@@ -980,6 +980,58 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         )
 
 
+
+    def test_mysql_bypass_reset_failure_is_not_silently_committed(self) -> None:
+        """A failed session-variable reset must enter rollback/recovery, not commit silently."""
+        executed = []
+        reset_attempts = 0
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                nonlocal reset_attempts
+                sql = str(statement).strip()
+                executed.append(sql)
+                if sql == "SET @__matview_skip_triggers = 0;":
+                    reset_attempts += 1
+                    if reset_attempts == 1:
+                        raise RuntimeError("injected session bypass reset failure")
+                return self
+
+            def close(self):
+                pass
+
+        class RecordingConnection:
+            def cursor(self):
+                return RecordingCursor()
+
+            def commit(self):
+                executed.append("COMMIT;")
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.MYSQL
+        manager.engine_version = parse_engine_version("mysql:8.4")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {}
+        manager.fetch_schema = lambda: {}
+
+        entered = False
+        with self.assertRaisesRegex(RuntimeError, "injected session bypass reset failure"):
+            with manager.bulk_changes():
+                entered = True
+
+        self.assertTrue(entered)
+        self.assertEqual(reset_attempts, 2, executed)
+        self.assertIn("ROLLBACK TO SAVEPOINT __mv_bulk_sp;", executed)
+        self.assertEqual(executed[-1], "COMMIT;")
+        self.assertEqual(executed.count("COMMIT;"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 
