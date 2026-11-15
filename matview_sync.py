@@ -10628,8 +10628,27 @@ class MaterializedViewManager:
             # population are one writer-visible operation. An existing caller
             # transaction already owns the transaction boundary; its first DDL
             # obtains the write lock before trigger installation.
-            if self.dialect == Dialect.SQLITE and not self.conn.in_transaction:
-                cur.execute("BEGIN IMMEDIATE;")
+            if self.dialect == Dialect.SQLITE:
+                # Standard sqlite3 exposes in_transaction, but SQLite-compatible
+                # DB-API adapters (APSW/SQLCipher/libSQL test adapters) may not.
+                # Try to reserve the writer in that case; if the adapter reports
+                # that a transaction is already active, retain the caller's
+                # transaction rather than treating the wrapper as autocommit.
+                transaction_active = getattr(self.conn, "in_transaction", None)
+                if transaction_active is not True:
+                    try:
+                        cur.execute("BEGIN IMMEDIATE;")
+                    except Exception as exc:
+                        message = str(exc).lower()
+                        already_active = (
+                            transaction_active is None
+                            and (
+                                "within a transaction" in message
+                                or "already in a transaction" in message
+                            )
+                        )
+                        if not already_active:
+                            raise
             for stmt in plan.create_structure_statements():
                 cur.execute(stmt)
             for stmt in plan.trigger_ddls:
