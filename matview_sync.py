@@ -10649,7 +10649,10 @@ class MaterializedViewManager:
                 # implicitly commit DDL, and incremental backfills commit chunks;
                 # both require shadow-generation publication, which is not yet
                 # implemented. Reject before opening a cursor or issuing any DDL.
-                if incremental_backfill or self.dialect not in (Dialect.SQLITE, Dialect.POSTGRES):
+                if (
+                    incremental_backfill
+                    or self.dialect not in (Dialect.SQLITE, Dialect.POSTGRES)
+                ):
                     raise RuntimeError(
                         "Replacing an existing materialized view is unsupported for "
                         "MySQL/MariaDB and incremental backfills until atomic shadow-generation "
