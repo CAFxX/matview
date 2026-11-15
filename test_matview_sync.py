@@ -6468,7 +6468,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             )
             unsafe_writer.commit()
             stale = setup.execute(
-                "SELECT bucket, n FROM __matview_source_counts ORDER BY bucket;"
+                "SELECT bucket, n FROM source_counts ORDER BY bucket;"
             ).fetchall()
             self.assertEqual(stale, [("new", 1), ("old", 1)])
             unsafe_writer.close()
@@ -6493,7 +6493,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             )
             safe_writer.commit()
             actual = safe_setup.execute(
-                "SELECT bucket, n FROM __matview_source_counts ORDER BY bucket;"
+                "SELECT bucket, n FROM source_counts ORDER BY bucket;"
             ).fetchall()
             self.assertEqual(actual, [("new", 1)])
             safe_writer.close()
