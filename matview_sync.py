@@ -10204,6 +10204,37 @@ class MaterializedViewManager:
             except Exception:
                 self._rollback()
 
+    def _discard_mysql_connection(self) -> None:
+        """Invalidate/close a MySQL session whose trigger-bypass state is unknown.
+
+        MySQL user variables are session-scoped and survive transaction rollback.
+        If clearing the bypass flag fails, the physical session must not be
+        returned to a pool as healthy.
+        """
+        self._mysql_connection_discarded = True
+        invalidated = False
+        invalidator = getattr(self.conn, "invalidate", None)
+        if callable(invalidator):
+            try:
+                invalidator()
+                invalidated = True
+            except Exception:
+                pass
+        closer = getattr(self.conn, "close", None)
+        if callable(closer):
+            try:
+                closer()
+                return
+            except Exception:
+                if invalidated:
+                    return
+        if not invalidated:
+            raise RuntimeError(
+                "MySQL/MariaDB session trigger-bypass reset failed and the adapter "
+                "does not provide a working invalidate()/close(); the caller must "
+                "discard this connection object and its physical session"
+            )
+
     def _mysql_transaction_state(self) -> Optional[bool]:
         """
         Return the connection's authoritative MySQL transaction state.
@@ -10980,6 +11011,14 @@ class MaterializedViewManager:
         it starts itself, but leaves a caller-owned transaction open and rollback-able by the caller.
         MySQL DDL paths are rejected because DDL can implicitly commit even when the context fails.
         """
+        if self.dialect == Dialect.MYSQL and getattr(
+            self, "_mysql_connection_discarded", False
+        ):
+            raise RuntimeError(
+                "this MySQL/MariaDB manager connection was discarded after an "
+                "unrecoverable trigger-bypass reset failure"
+            )
+
         # MySQL DDL implicitly commits. Check transaction state before
         # get_catalog(): its SELECT can itself start a DB-API transaction.
         mysql_caller_transaction = False
@@ -11073,6 +11112,7 @@ class MaterializedViewManager:
             if not mysql_caller_transaction:
                 self._rollback()
             if bypass_reset_error is not None:
+                self._discard_mysql_connection()
                 raise RuntimeError(
                     "bulk_changes() could not establish or clear the MySQL/MariaDB "
                     "session trigger-bypass flag; discard this connection before reuse"
@@ -11117,6 +11157,7 @@ class MaterializedViewManager:
                 except Exception as reset_exc:
                     if not mysql_caller_transaction:
                         self._rollback()
+                    self._discard_mysql_connection()
                     raise RuntimeError(
                         "bulk_changes() rolled back its DML but could not clear the "
                         "MySQL/MariaDB session trigger-bypass flag; discard this connection "
@@ -11259,6 +11300,7 @@ class MaterializedViewManager:
                     if not mysql_caller_transaction:
                         self._rollback()
                     if reset_error is not None:
+                        self._discard_mysql_connection()
                         raise RuntimeError(
                             "bulk_changes() rolled back its DML but could not clear the "
                             "MySQL/MariaDB session trigger-bypass flag; discard this connection "
