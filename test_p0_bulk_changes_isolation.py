@@ -708,7 +708,6 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
                 "SELECT grp, total FROM restore_totals ORDER BY grp"
             ).fetchall()
             self.assertEqual(reader, live)
-            mgr.close()
 
     def test_postgres_bulk_changes_execution_avoids_pre_delete_and_view_drop(self) -> None:
         """Executing bulk_changes(use_shadow_swap=True) on PostgreSQL recording mock verifies
