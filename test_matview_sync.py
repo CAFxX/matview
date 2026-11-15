@@ -4446,6 +4446,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         class Connection:
             autocommit = True
 
+            def get_transaction_status(self) -> int:
+                return 0
+
             def cursor(self) -> Cursor:
                 return Cursor()
 
