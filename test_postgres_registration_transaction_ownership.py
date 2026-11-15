@@ -97,7 +97,8 @@ def main() -> None:
         )
     finally:
         try:
-            conn.rollback()
+            if not conn.autocommit:
+                conn.rollback()
             conn.autocommit = False
             with conn.cursor() as cur:
                 cur.execute(f'DROP TABLE IF EXISTS "{table}"')
