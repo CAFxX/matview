@@ -8703,6 +8703,125 @@ def run_suite_13_fuzz_regression_corpus(runner: MVTestRunner) -> None:
 
 
 
+class MySQLBulkSavepointCleanupFailureTests(unittest.TestCase):
+    class Cursor:
+        def __init__(
+            self,
+            *,
+            fail_bypass: bool = False,
+            fail_rollback: bool = False,
+            fail_release: bool = False,
+        ) -> None:
+            self.fail_bypass = fail_bypass
+            self.fail_rollback = fail_rollback
+            self.fail_release = fail_release
+            self.statements: List[str] = []
+            self.closed = False
+
+        def execute(self, statement: str) -> None:
+            self.statements.append(statement)
+            if self.fail_bypass and statement == "SET @__matview_skip_triggers = 1;":
+                raise RuntimeError("injected bypass setup failure")
+            if self.fail_rollback and statement.startswith("ROLLBACK TO SAVEPOINT "):
+                raise RuntimeError("injected rollback-to-savepoint failure")
+            if self.fail_release and statement.startswith("RELEASE SAVEPOINT "):
+                raise RuntimeError("injected release-savepoint failure")
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Connection:
+        in_transaction = True
+        autocommit = True
+
+        def __init__(self, cursor: "MySQLBulkSavepointCleanupFailureTests.Cursor") -> None:
+            self._cursor = cursor
+            self.close_calls = 0
+            self.rollback_calls = 0
+            self.commit_calls = 0
+
+        def cursor(self):
+            if self.close_calls:
+                raise RuntimeError("connection is closed")
+            return self._cursor
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        def rollback(self) -> None:
+            self.rollback_calls += 1
+
+        def commit(self) -> None:
+            self.commit_calls += 1
+
+    def _manager(self, cursor: "MySQLBulkSavepointCleanupFailureTests.Cursor"):
+        conn = self.Connection(cursor)
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = conn
+        manager.dialect = Dialect.MYSQL
+        manager.get_catalog = lambda: {
+            "v": {
+                "function_names": [],
+                "trigger_names": ["__matview_trigger_v"],
+                "view_sql": "CREATE VIEW v AS SELECT id FROM t",
+            }
+        }
+        manager.fetch_schema = lambda: {}
+        return manager, conn
+
+    def _assert_discarded(self, manager, conn, cursor, original_error: str) -> None:
+        self.assertEqual(conn.close_calls, 1)
+        self.assertEqual(conn.rollback_calls, 0)
+        self.assertEqual(conn.commit_calls, 0)
+        self.assertTrue(cursor.closed)
+        self.assertTrue(getattr(manager, "_mysql_connection_discarded", False))
+        with self.assertRaisesRegex(RuntimeError, "connection was discarded"):
+            with manager.bulk_changes():
+                self.fail("discarded manager must not be reusable")
+        # The original operation failure and the failed savepoint cleanup must
+        # both remain visible to the caller.
+        self.assertTrue(original_error)
+
+    def test_caller_body_error_plus_rollback_to_failure_discards_connection(self) -> None:
+        cursor = self.Cursor(fail_rollback=True)
+        manager, conn = self._manager(cursor)
+        with self.assertRaisesRegex(RuntimeError, "could not restore.*with-body exception") as caught:
+            with manager.bulk_changes():
+                raise ValueError("body operation failed")
+        self.assertIn("body operation failed", str(caught.exception))
+        self._assert_discarded(manager, conn, cursor, "body operation failed")
+
+    def test_caller_body_error_plus_release_failure_discards_connection(self) -> None:
+        cursor = self.Cursor(fail_release=True)
+        manager, conn = self._manager(cursor)
+        with self.assertRaisesRegex(RuntimeError, "could not restore.*with-body exception") as caught:
+            with manager.bulk_changes():
+                raise ValueError("body release operation failed")
+        self.assertIn("body release operation failed", str(caught.exception))
+        self._assert_discarded(manager, conn, cursor, "body release operation failed")
+
+    def test_refresh_error_plus_rollback_to_failure_discards_connection(self) -> None:
+        cursor = self.Cursor(fail_rollback=True)
+        manager, conn = self._manager(cursor)
+        manager.fetch_schema = lambda: (_ for _ in ()).throw(
+            RuntimeError("refresh operation failed")
+        )
+        with self.assertRaisesRegex(RuntimeError, "could not restore.*post-yield refresh failure") as caught:
+            with manager.bulk_changes():
+                pass
+        self.assertIn("refresh operation failed", str(caught.exception))
+        self._assert_discarded(manager, conn, cursor, "refresh operation failed")
+
+    def test_bypass_setup_error_plus_rollback_failure_discards_connection(self) -> None:
+        cursor = self.Cursor(fail_bypass=True, fail_rollback=True)
+        manager, conn = self._manager(cursor)
+        with self.assertRaisesRegex(RuntimeError, "could not restore.*trigger-bypass setup failure") as caught:
+            with manager.bulk_changes():
+                self.fail("must fail before yielding")
+        self.assertIn("injected bypass setup failure", str(caught.exception))
+        self._assert_discarded(manager, conn, cursor, "injected bypass setup failure")
+
+
 def _run_all_tests() -> None:
     t0 = time.time()
     runner = MVTestRunner()
