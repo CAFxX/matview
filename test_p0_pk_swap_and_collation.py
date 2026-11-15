@@ -127,7 +127,7 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
         """Verify SQLite trigger contains NOT EXISTS gate for PK swap protection."""
         schema_sql = """
         CREATE TABLE accounts (
-            acc_id INT PRIMARY KEY,
+            acc_id INTEGER PRIMARY KEY,
             balance REAL NOT NULL
         );
         """
@@ -172,9 +172,9 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
         """Live execution: demonstrate that NOT EXISTS gate prevents 50% data loss on 2-row PK swap."""
         con = sqlite3.connect(":memory:")
         con.execute("CREATE TABLE nodes (id INT, label TEXT);")
-        con.execute("CREATE TABLE __matview_store_nodes_mv (id INT PRIMARY KEY, label TEXT);")
+        con.execute("CREATE TABLE __matview_store_nodes_mv (id INTEGER PRIMARY KEY, label TEXT);")
 
-        schema_sql = "CREATE TABLE nodes (id INT PRIMARY KEY, label TEXT);"
+        schema_sql = "CREATE TABLE nodes (id INTEGER PRIMARY KEY, label TEXT);"
         view_sql = "CREATE VIEW nodes_mv AS SELECT id, label FROM nodes;"
         plan = generate_materialized_view(schema_sql, view_sql, dialect=Dialect.SQLITE)
 
@@ -211,9 +211,9 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
         """Live execution: 3-row cyclic permutation (1->2, 2->3, 3->1) with zero data loss."""
         con = sqlite3.connect(":memory:")
         con.execute("CREATE TABLE nodes (id INT, val TEXT);")
-        con.execute("CREATE TABLE __matview_store_nodes_mv (id INT PRIMARY KEY, val TEXT);")
+        con.execute("CREATE TABLE __matview_store_nodes_mv (id INTEGER PRIMARY KEY, val TEXT);")
 
-        schema_sql = "CREATE TABLE nodes (id INT PRIMARY KEY, val TEXT);"
+        schema_sql = "CREATE TABLE nodes (id INTEGER PRIMARY KEY, val TEXT);"
         view_sql = "CREATE VIEW nodes_mv AS SELECT id, val FROM nodes;"
         plan = generate_materialized_view(schema_sql, view_sql, dialect=Dialect.SQLITE)
 
@@ -238,9 +238,9 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
         """Live execution: PK swap where one row drops out of WHERE filter."""
         con = sqlite3.connect(":memory:")
         con.execute("CREATE TABLE tasks (id INT, val TEXT);")
-        con.execute("CREATE TABLE __matview_store_keep_tasks_mv (id INT PRIMARY KEY, val TEXT);")
+        con.execute("CREATE TABLE __matview_store_keep_tasks_mv (id INTEGER PRIMARY KEY, val TEXT);")
 
-        schema_sql = "CREATE TABLE tasks (id INT PRIMARY KEY, val TEXT);"
+        schema_sql = "CREATE TABLE tasks (id INTEGER PRIMARY KEY, val TEXT);"
         view_sql = "CREATE VIEW keep_tasks_mv AS SELECT id, val FROM tasks WHERE val = 'keep';"
         plan = generate_materialized_view(schema_sql, view_sql, dialect=Dialect.SQLITE)
 
