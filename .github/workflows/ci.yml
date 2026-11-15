@@ -302,6 +302,11 @@ jobs:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
           MATVIEW_FUZZ_TARGET: "PostgreSQL ${{ matrix.pg-version }}"
         run: python3 test_matview_sync.py
+      - name: Verify native PostgreSQL collation maintenance
+        env:
+          MATVIEW_NATIVE_ENGINE: postgres
+          MATVIEW_NATIVE_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+        run: python3 test_native_collation.py
       - name: Archive fuzz campaign manifest
         if: always()
         uses: actions/upload-artifact@v4
@@ -378,6 +383,11 @@ jobs:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
           MATVIEW_FUZZ_TARGET: "MySQL ${{ matrix.mysql-version }}"
         run: python3 test_matview_sync.py
+      - name: Verify native MySQL collation maintenance
+        env:
+          MATVIEW_NATIVE_ENGINE: mysql
+          MATVIEW_NATIVE_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_native_collation.py
       - name: Archive fuzz campaign manifest
         if: always()
         uses: actions/upload-artifact@v4
@@ -468,6 +478,11 @@ jobs:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
           MATVIEW_FUZZ_TARGET: "${{ matrix.label }}"
         run: python3 test_matview_sync.py
+      - name: Verify native MariaDB collation maintenance
+        env:
+          MATVIEW_NATIVE_ENGINE: mariadb
+          MATVIEW_NATIVE_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_native_collation.py
       - name: Archive fuzz campaign manifest
         if: always()
         uses: actions/upload-artifact@v4
