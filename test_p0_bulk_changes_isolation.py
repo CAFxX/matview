@@ -923,6 +923,7 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
 
         self.assertIn("SAVEPOINT __mv_bulk_sp;", executed)
         self.assertIn("SET @__matview_skip_triggers = 1;", executed)
+        self.assertIn("SET @__matview_skip_triggers = 0;", executed)
         self.assertFalse(
             any(sql.upper().startswith("DROP TRIGGER") for sql in executed),
             executed,
