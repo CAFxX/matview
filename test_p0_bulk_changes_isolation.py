@@ -1032,5 +1032,61 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         self.assertEqual(executed.count("COMMIT;"), 1)
 
 
+
+    def test_mysql_session_bypass_exception_does_not_drop_and_recreate_triggers(self) -> None:
+        """Session bypass leaves triggers installed; exception cleanup must not use implicit-commit DDL."""
+        executed = []
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                return self
+
+            def close(self):
+                pass
+
+        class RecordingConnection:
+            def cursor(self):
+                return RecordingCursor()
+
+            def commit(self):
+                executed.append("COMMIT;")
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.MYSQL
+        manager.engine_version = parse_engine_version("mysql:8.4")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {
+            "v_guard": {
+                "view_name": "v_guard",
+                "trigger_names": ["mv_guard_insert", "mv_guard_update"],
+                "function_names": [],
+                "view_sql": "CREATE VIEW v_guard AS SELECT id FROM guarded_rows;",
+            }
+        }
+        manager.fetch_schema = lambda: self.fail(
+            "session-bypass cleanup must not introspect or regenerate triggers"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "injected user-block failure"):
+            with manager.bulk_changes():
+                executed.append("USER BLOCK DML")
+                raise RuntimeError("injected user-block failure")
+
+        self.assertIn("SET @__matview_skip_triggers = 1;", executed)
+        self.assertIn("ROLLBACK TO SAVEPOINT __mv_bulk_sp;", executed)
+        self.assertIn("SET @__matview_skip_triggers = 0;", executed)
+        self.assertFalse(any(sql.upper().startswith("DROP TRIGGER") for sql in executed), executed)
+        self.assertFalse(any(sql.upper().startswith("CREATE TRIGGER") for sql in executed), executed)
+        self.assertEqual(executed[-1], "COMMIT;")
+
+
 if __name__ == "__main__":
     unittest.main()
