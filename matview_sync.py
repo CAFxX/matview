@@ -7856,7 +7856,7 @@ class IncrementalViewCompiler:
             return (
                 f"(CASE WHEN __mv_delta.{col} IS NULL THEN {mv_table}.{col} "
                 f"WHEN {new_c} <= 0 THEN NULL "
-                f"ELSE {mv_table}.{col} - __mv_delta.{col} END)"
+                f"ELSE {mv_table}.{col} + __mv_delta.{col} END)"
             )
 
         def _delta_sum2_minus(ekey: str, sum2_col: str, cnt_col: str) -> str:
