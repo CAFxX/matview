@@ -11035,6 +11035,7 @@ class MaterializedViewManager:
         cur = self.conn.cursor()
         sp_active = False
         trigger_suspension_started = False
+        triggers_dropped = False
         created_shadow_tables: List[str] = []
 
         try:
@@ -11100,6 +11101,7 @@ class MaterializedViewManager:
                 # From this point a partial trigger-removal failure needs the
                 # restoration path, so mark it before issuing the first DDL.
                 trigger_suspension_started = True
+                triggers_dropped = True
                 for entry in targets:
                     if self.dialect == Dialect.POSTGRES:
                         for fn_name in entry["function_names"]:
@@ -11120,14 +11122,6 @@ class MaterializedViewManager:
                 else:
                     self._rollback()
 
-                # Reinstallation is correctness-critical. On engines with
-                # transactional DDL, isolate restoration so a failed CREATE
-                # TRIGGER/FUNCTION rolls back to the original installed set.
-                restore_savepoint = False
-                if self.dialect in (Dialect.SQLITE, Dialect.POSTGRES):
-                    cur.execute("SAVEPOINT __mv_bulk_restore_sp;")
-                    restore_savepoint = True
-
                 try:
                     if self.dialect == Dialect.POSTGRES:
                         cur.execute("SET LOCAL matview.skip_triggers = 'off';")
@@ -11137,6 +11131,22 @@ class MaterializedViewManager:
                     for st in created_shadow_tables:
                         cur.execute(f"DROP TABLE IF EXISTS {st};")
 
+                    # Session-local bypass never removed the installed triggers.
+                    # In particular, do not DROP/CREATE MySQL triggers here:
+                    # those DDL statements implicitly commit and expose a window
+                    # in which concurrent writers would miss maintenance.
+                    if not triggers_dropped:
+                        self._commit()
+                        return
+
+                    # Reinstallation is correctness-critical. On engines with
+                    # transactional DDL, isolate restoration so a failed CREATE
+                    # TRIGGER/FUNCTION rolls back to the original installed set.
+                    restore_savepoint = False
+                    if self.dialect in (Dialect.SQLITE, Dialect.POSTGRES):
+                        cur.execute("SAVEPOINT __mv_bulk_restore_sp;")
+                        restore_savepoint = True
+
                     schemas = self.fetch_schema()
                     for entry in targets:
                         if self.dialect == Dialect.POSTGRES:
@@ -11145,7 +11155,7 @@ class MaterializedViewManager:
                                     cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
                         else:
                             for t_name in entry["trigger_names"]:
-                                if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                if "__ro__" not in t_name and not t_name.endswith("__readonly"):
                                     cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
                         plan = generate_materialized_view(
                             schemas,
