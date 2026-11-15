@@ -1038,5 +1038,253 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         self.assertEqual(executed, ["BEGIN IMMEDIATE;", "SAVEPOINT __mv_bulk_sp;", "ROLLBACK;"])
 
 
+    def test_sqlite_savepoint_setup_failure_preserves_caller_transaction(self) -> None:
+        """A failed savepoint must not roll back a transaction owned by the caller."""
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            raw = sqlite3.connect(tmp.name)
+            raw.execute("CREATE TABLE caller_rows (id INTEGER PRIMARY KEY);")
+            raw.commit()
+            raw.execute("BEGIN;")
+            raw.execute("INSERT INTO caller_rows VALUES (7);")
+
+            original_cursor = raw.cursor
+
+            class CursorProxy:
+                def __init__(self, cursor):
+                    self._cursor = cursor
+
+                def execute(self, statement, params=None):
+                    if str(statement).strip() == "SAVEPOINT __mv_bulk_sp;":
+                        raise sqlite3.OperationalError("injected caller savepoint failure")
+                    if params is None:
+                        return self._cursor.execute(statement)
+                    return self._cursor.execute(statement, params)
+
+                def __getattr__(self, name):
+                    return getattr(self._cursor, name)
+
+            class ConnectionProxy:
+                def cursor(self, *args, **kwargs):
+                    return CursorProxy(original_cursor(*args, **kwargs))
+
+                def __getattr__(self, name):
+                    return getattr(raw, name)
+
+            manager = MaterializedViewManager.__new__(MaterializedViewManager)
+            manager.conn = ConnectionProxy()
+            manager.dialect = Dialect.SQLITE
+            manager.engine_version = parse_engine_version("sqlite:3.45")
+            manager.object_prefix = "__matview_"
+            manager.catalog_table = "__matview_catalog"
+            manager.pg_use_transition_tables = False
+            manager.get_catalog = lambda: {}
+
+            with self.assertRaisesRegex(sqlite3.OperationalError, "caller savepoint failure"):
+                with manager.bulk_changes():
+                    self.fail("bulk_changes must not enter the user block after savepoint setup fails")
+
+            # The caller's active transaction and uncommitted write must survive.
+            self.assertTrue(raw.in_transaction)
+            self.assertEqual(raw.execute("SELECT id FROM caller_rows").fetchall(), [(7,)])
+            raw.rollback()
+            self.assertFalse(raw.in_transaction)
+            self.assertEqual(raw.execute("SELECT id FROM caller_rows").fetchall(), [])
+            raw.close()
+
+
+    def test_sqlite_bulk_changes_fails_before_user_block_when_independent_writer_holds_lock(self) -> None:
+        """A real competing SQLite writer must prevent bulk trigger suspension."""
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            manager = MaterializedViewManager(f"sqlite:///{tmp.name}")
+            manager.apply_schema_ddl(
+                "CREATE TABLE contention_rows (id INTEGER PRIMARY KEY, value INTEGER);",
+                auto_sync_views=False,
+            )
+            manager.conn.execute("INSERT INTO contention_rows VALUES (1, 10);")
+            manager.conn.commit()
+            manager.register_view(
+                "CREATE VIEW contention_view AS "
+                "SELECT id, value FROM contention_rows;"
+            )
+            manager.conn.commit()
+
+            catalog = manager.get_catalog()
+            trigger_names = list(catalog["contention_view"]["trigger_names"])
+            triggers_before = manager.conn.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = 'contention_rows' "
+                "ORDER BY name"
+            ).fetchall()
+            rows_before = manager.conn.execute(
+                "SELECT * FROM contention_view ORDER BY id"
+            ).fetchall()
+
+            # The independent connection reserves SQLite's single-writer slot.
+            competing = sqlite3.connect(tmp.name, timeout=0)
+            try:
+                competing.execute("BEGIN IMMEDIATE;")
+                competing.execute(
+                    "INSERT INTO contention_rows VALUES (2, 20);"
+                )
+                manager.conn.execute("PRAGMA busy_timeout = 0;")
+
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    with manager.bulk_changes():
+                        self.fail(
+                            "bulk_changes must not enter the user block while "
+                            "another connection owns the SQLite writer reservation"
+                        )
+
+                self.assertFalse(manager.conn.in_transaction)
+                self.assertTrue(competing.in_transaction)
+                self.assertEqual(
+                    competing.execute(
+                        "SELECT id, value FROM contention_rows ORDER BY id"
+                    ).fetchall(),
+                    [(1, 10), (2, 20)],
+                )
+                self.assertEqual(
+                    manager.conn.execute(
+                        "SELECT * FROM contention_view ORDER BY id"
+                    ).fetchall(),
+                    rows_before,
+                )
+                triggers_after = manager.conn.execute(
+                    "SELECT name, sql FROM sqlite_master "
+                    "WHERE type = 'trigger' AND tbl_name = 'contention_rows' "
+                    "ORDER BY name"
+                ).fetchall()
+                self.assertEqual(triggers_after, triggers_before)
+                self.assertTrue(
+                    set(trigger_names).issubset({row[0] for row in triggers_after})
+                )
+            finally:
+                competing.rollback()
+                competing.close()
+
+            # Once the competing writer releases its reservation, normal DML
+            # must still maintain the materialized view.
+            manager.conn.execute(
+                "INSERT INTO contention_rows VALUES (2, 20);"
+            )
+            manager.conn.commit()
+            self.assertEqual(
+                manager.conn.execute(
+                    "SELECT * FROM contention_view ORDER BY id"
+                ).fetchall(),
+                [(1, 10), (2, 20)],
+            )
+            manager.conn.close()
+
+
+    def test_sqlite_bulk_changes_success_preserves_caller_transaction(self) -> None:
+        """Successful bulk refresh must not commit work predating the context."""
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            manager = MaterializedViewManager(f"sqlite:///{tmp.name}")
+            manager.apply_schema_ddl(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER);",
+                auto_sync_views=False,
+            )
+            manager.conn.execute("INSERT INTO items VALUES (1, 10);")
+            manager.conn.commit()
+            manager.register_view(
+                "CREATE VIEW caller_tx_view AS SELECT id, value FROM items;"
+            )
+            manager.conn.execute(
+                "CREATE TABLE caller_owned_rows (id INTEGER PRIMARY KEY);"
+            )
+            manager.conn.commit()
+            observer = sqlite3.connect(tmp.name, timeout=0)
+            try:
+                manager.conn.execute("BEGIN;")
+                manager.conn.execute("INSERT INTO caller_owned_rows VALUES (7);")
+                with manager.bulk_changes():
+                    manager.conn.execute("INSERT INTO items VALUES (2, 20);")
+
+                self.assertTrue(manager.conn.in_transaction)
+                self.assertEqual(
+                    manager.conn.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [(7,)],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id FROM items ORDER BY id").fetchall(),
+                    [(1,)],
+                )
+
+                manager.conn.commit()
+                self.assertEqual(
+                    observer.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [(7,)],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id, value FROM caller_tx_view ORDER BY id").fetchall(),
+                    [(1, 10), (2, 20)],
+                )
+            finally:
+                observer.close()
+                manager.conn.close()
+
+    def test_sqlite_bulk_changes_failure_preserves_caller_transaction(self) -> None:
+        """Failed bulk work rolls back to its savepoint without committing caller work."""
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            manager = MaterializedViewManager(f"sqlite:///{tmp.name}")
+            manager.apply_schema_ddl(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER);",
+                auto_sync_views=False,
+            )
+            manager.conn.execute("INSERT INTO items VALUES (1, 10);")
+            manager.conn.commit()
+            manager.register_view(
+                "CREATE VIEW caller_tx_view AS SELECT id, value FROM items;"
+            )
+            manager.conn.execute(
+                "CREATE TABLE caller_owned_rows (id INTEGER PRIMARY KEY);"
+            )
+            manager.conn.commit()
+            observer = sqlite3.connect(tmp.name, timeout=0)
+            try:
+                manager.conn.execute("BEGIN;")
+                manager.conn.execute("INSERT INTO caller_owned_rows VALUES (7);")
+                with self.assertRaisesRegex(RuntimeError, "injected bulk failure"):
+                    with manager.bulk_changes():
+                        manager.conn.execute("INSERT INTO items VALUES (2, 20);")
+                        raise RuntimeError("injected bulk failure")
+
+                self.assertTrue(manager.conn.in_transaction)
+                self.assertEqual(
+                    manager.conn.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [(7,)],
+                )
+                self.assertEqual(
+                    manager.conn.execute("SELECT id FROM items ORDER BY id").fetchall(),
+                    [(1,)],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id FROM items ORDER BY id").fetchall(),
+                    [(1,)],
+                )
+
+                manager.conn.rollback()
+                self.assertEqual(
+                    observer.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id FROM items ORDER BY id").fetchall(),
+                    [(1,)],
+                )
+            finally:
+                observer.close()
+                manager.conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
