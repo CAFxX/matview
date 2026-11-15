@@ -4286,8 +4286,14 @@ class IncrementalViewCompiler:
                 scale = len(fraction) if dot else 0
                 precision = max(1, len((whole + fraction).lstrip("0")), scale)
                 return precision, min(self._max_decimal_scale(), scale)
-            if kind in ("Paren", "Neg", "Abs", "Floor", "Ceil", "Ceiling", "Sign", "Trunc", "Distinct"):
+            if kind in ("Paren", "Neg", "Abs", "Floor", "Ceil", "Ceiling", "Sign", "Trunc"):
                 return infer(node.this)
+            if kind == "Distinct":
+                inner = node.this
+                if inner is None:
+                    expressions = list(node.expressions)
+                    inner = expressions[0] if len(expressions) == 1 else None
+                return infer(inner) if inner is not None else None
             if kind == "Sum":
                 # MySQL SUM over exact numeric inputs returns DECIMAL, including
                 # integer arguments. Preserve that exact family when SUM is
@@ -4545,7 +4551,10 @@ class IncrementalViewCompiler:
         return {1: "SMALLINT", 2: "INTEGER", 3: "BIGINT", 4: "NUMERIC"}.get(rank)
 
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
-        if not item.is_aggregate:
+        # Aggregate expressions embedded in scalar functions (e.g. COALESCE(
+        # SUM(...), 0)) have no single AggFunc enum, but their native result
+        # type is still inferred from the full scalar expression.
+        if not item.is_aggregate or item.agg_func is None:
             c_def = self._lookup_col_def(item.raw_expr)
             if c_def:
                 return self._normalize_dialect_type(c_def.data_type)
