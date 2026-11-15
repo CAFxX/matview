@@ -11062,10 +11062,27 @@ class MaterializedViewManager:
                     "use_shadow_swap: those options execute DDL that implicitly commits"
                 )
 
+        # SQLite DDL is not automatically transactional. Reserve the writer
+        # before catalog reads or trigger suspension; if an adapter hides
+        # transaction state, BEGIN IMMEDIATE itself is the fail-closed probe.
+        sqlite_writer_reserved = False
+        cur = None
+        if self.dialect == Dialect.SQLITE:
+            if getattr(self.conn, "in_transaction", None) is True:
+                raise RuntimeError(
+                    "bulk_changes() on SQLite requires an idle connection; "
+                    "commit or roll back the caller transaction first"
+                )
+            cur = self.conn.cursor()
+            cur.execute("BEGIN IMMEDIATE;")
+            sqlite_writer_reserved = True
+
         try:
             catalog = self.get_catalog()
         except Exception:
             if self.dialect == Dialect.MYSQL and not mysql_caller_transaction:
+                self._rollback()
+            elif self.dialect == Dialect.SQLITE and sqlite_writer_reserved:
                 self._rollback()
             raise
         if view_names:
@@ -11074,7 +11091,8 @@ class MaterializedViewManager:
         else:
             targets = list(catalog.values())
 
-        cur = self.conn.cursor()
+        if cur is None:
+            cur = self.conn.cursor()
         sp_active = False
         # Never shadow a savepoint created by the caller. MySQL replaces an
         # existing savepoint when SAVEPOINT is issued with the same name.
@@ -11089,6 +11107,13 @@ class MaterializedViewManager:
                 raise RuntimeError(
                     "bulk_changes() on MySQL/MariaDB requires SAVEPOINT support "
                     "to preserve transaction rollback semantics"
+                ) from exc
+            if self.dialect == Dialect.SQLITE:
+                if sqlite_writer_reserved:
+                    self._rollback()
+                raise RuntimeError(
+                    "bulk_changes() on SQLite requires SAVEPOINT support "
+                    "after acquiring its writer reservation"
                 ) from exc
 
         session_bypass_ok = False
@@ -11134,6 +11159,16 @@ class MaterializedViewManager:
             raise RuntimeError(
                 "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
                 "the trigger-DDL fallback is unsafe because MySQL implicitly commits DDL"
+            )
+
+        # PostgreSQL SET LOCAL outside a transaction block is only a
+        # warning/no-op. Never mistake that for a successful trigger bypass:
+        # a real savepoint is the proof that this operation owns a transaction.
+        if self.dialect == Dialect.POSTGRES and not sp_active:
+            self._rollback()
+            raise RuntimeError(
+                "bulk_changes() on PostgreSQL requires a transactional savepoint "
+                "before trigger suspension"
             )
 
         if not session_bypass_ok:
