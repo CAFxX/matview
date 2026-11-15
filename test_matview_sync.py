@@ -8819,6 +8819,101 @@ class MySQLBulkSavepointCleanupFailureTests(unittest.TestCase):
         self._assert_discarded(manager, conn, cursor)
 
 
+class WrappedConnectionTransactionStateTests(unittest.TestCase):
+    class Cursor:
+        def __init__(self):
+            self.statements: List[str] = []
+            self.closed = False
+
+        def execute(self, statement: str) -> None:
+            self.statements.append(statement)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class MySQLDriver:
+        in_transaction = True
+        autocommit = True
+
+    class MySQLPoolConnection:
+        def __init__(self):
+            self.driver_connection = WrappedConnectionTransactionStateTests.MySQLDriver()
+
+    class MySQLFacade:
+        # The SQLAlchemy-like facade lies idle; the underlying driver is active.
+        in_transaction = False
+        autocommit = False
+
+        def __init__(self):
+            self.connection = WrappedConnectionTransactionStateTests.MySQLPoolConnection()
+            self._cursor = WrappedConnectionTransactionStateTests.Cursor()
+            self.commit_calls = 0
+            self.rollback_calls = 0
+
+        def cursor(self):
+            return self._cursor
+
+        def commit(self):
+            self.commit_calls += 1
+
+        def rollback(self):
+            self.rollback_calls += 1
+
+    class PostgresDriver:
+        in_transaction = True
+        autocommit = False
+
+    class PostgresFacade:
+        in_transaction = False
+        autocommit = False
+
+        def __init__(self):
+            self.connection = WrappedConnectionTransactionStateTests.PostgresDriver()
+            self.cursor_calls = 0
+
+        def cursor(self):
+            self.cursor_calls += 1
+            raise AssertionError("caller transaction must be rejected before SQL")
+
+    def test_mysql_bulk_changes_preserves_transaction_hidden_by_facade(self):
+        connection = self.MySQLFacade()
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = connection
+        manager.dialect = Dialect.MYSQL
+        manager.get_catalog = lambda: {}
+        manager.fetch_schema = lambda: {}
+
+        with manager.bulk_changes():
+            pass
+
+        self.assertTrue(
+            any(
+                statement.startswith("SAVEPOINT __mv_bulk_sp_")
+                for statement in connection._cursor.statements
+            )
+        )
+        self.assertTrue(
+            any(
+                statement.startswith("RELEASE SAVEPOINT __mv_bulk_sp_")
+                for statement in connection._cursor.statements
+            )
+        )
+        self.assertEqual(connection.commit_calls, 0)
+        self.assertEqual(connection.rollback_calls, 0)
+
+    def test_postgres_bulk_changes_rejects_transaction_hidden_by_facade(self):
+        connection = self.PostgresFacade()
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = connection
+        manager.dialect = Dialect.POSTGRES
+        manager.get_catalog = lambda: self.fail("catalog access must not occur")
+
+        with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
+            with manager.bulk_changes():
+                self.fail("caller transaction must be rejected before yielding")
+        self.assertEqual(connection.cursor_calls, 0)
+
+
 def _run_all_tests() -> None:
     t0 = time.time()
     runner = MVTestRunner()
@@ -8887,6 +8982,7 @@ def _run_all_tests() -> None:
         [
             loader.loadTestsFromTestCase(TestGeneratorAndManagerCodePaths),
             loader.loadTestsFromTestCase(MySQLBulkSavepointCleanupFailureTests),
+            loader.loadTestsFromTestCase(WrappedConnectionTransactionStateTests),
         ]
     )
     res = unittest.TextTestRunner(verbosity=2).run(suite)
