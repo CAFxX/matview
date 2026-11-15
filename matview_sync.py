@@ -11236,15 +11236,6 @@ class MaterializedViewManager:
         MySQL DDL paths are rejected because DDL can implicitly commit even when the context fails.
         """
         self._assert_connection_usable()
-        if self.dialect == Dialect.MYSQL and (
-            getattr(self, "_mysql_connection_discarded", False)
-            or getattr(self.conn, "_matview_connection_discarded", False)
-        ):
-            raise RuntimeError(
-                "this MySQL/MariaDB manager connection was discarded after an "
-                "unrecoverable trigger-bypass reset failure"
-            )
-
         # MySQL DDL implicitly commits. Check transaction state before
         # get_catalog(): its SELECT can itself start a DB-API transaction.
         mysql_caller_transaction = False
@@ -11291,148 +11282,220 @@ class MaterializedViewManager:
                     "commit or roll back the caller transaction first"
                 )
             cur = self.conn.cursor()
-            try:
-                cur.execute("BEGIN IMMEDIATE;")
-            except Exception:
-                if hasattr(cur, "close"):
-                    cur.close()
-                raise
-            sqlite_writer_reserved = True
-
         try:
-            catalog = self.get_catalog()
-        except Exception:
-            if self.dialect == Dialect.MYSQL and not mysql_caller_transaction:
-                self._rollback()
-            elif self.dialect == Dialect.SQLITE and sqlite_writer_reserved:
-                self._rollback()
-                if cur is not None and hasattr(cur, "close"):
-                    cur.close()
-            raise
-        if view_names:
-            resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
-            targets = [catalog[n] for n in resolved if n in catalog]
-        else:
-            targets = list(catalog.values())
-
-        if cur is None:
-            cur = self.conn.cursor()
-        sp_active = False
-        # Never shadow a savepoint created by the caller. MySQL replaces an
-        # existing savepoint when SAVEPOINT is issued with the same name.
-        sp_name = f"__mv_bulk_sp_{uuid.uuid4().hex}"
-
-        def close_cursor() -> None:
-            if hasattr(cur, "close"):
+            if self.dialect == Dialect.SQLITE:
                 try:
-                    cur.close()
+                    cur.execute("BEGIN IMMEDIATE;")
+                except Exception:
+                    if hasattr(cur, "close"):
+                        cur.close()
+                    raise
+                sqlite_writer_reserved = True
+
+            try:
+                catalog = self.get_catalog()
+            except Exception:
+                if self.dialect == Dialect.MYSQL and not mysql_caller_transaction:
+                    self._rollback()
+                elif self.dialect == Dialect.SQLITE and sqlite_writer_reserved:
+                    self._rollback()
+                    if cur is not None and hasattr(cur, "close"):
+                        cur.close()
+                raise
+            if view_names:
+                resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
+                targets = [catalog[n] for n in resolved if n in catalog]
+            else:
+                targets = list(catalog.values())
+
+            if cur is None:
+                cur = self.conn.cursor()
+            sp_active = False
+            # Never shadow a savepoint created by the caller. MySQL replaces an
+            # existing savepoint when SAVEPOINT is issued with the same name.
+            sp_name = f"__mv_bulk_sp_{uuid.uuid4().hex}"
+
+            def close_cursor() -> None:
+                if hasattr(cur, "close"):
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+
+            try:
+                cur.execute(f"SAVEPOINT {sp_name};")
+                sp_active = True
+            except Exception as exc:
+                if self.dialect == Dialect.MYSQL:
+                    if not mysql_caller_transaction:
+                        self._rollback()
+                    close_cursor()
+                    raise RuntimeError(
+                        "bulk_changes() on MySQL/MariaDB requires SAVEPOINT support "
+                        "to preserve transaction rollback semantics"
+                    ) from exc
+                if self.dialect == Dialect.SQLITE:
+                    if sqlite_writer_reserved:
+                        try:
+                            self.conn.rollback()
+                        except Exception as rollback_error:
+                            close_error = self._invalidate_sqlite_connection_after_rollback_failure()
+                            detail = (
+                                "bulk_changes() could not release its SQLite writer reservation "
+                                "after SAVEPOINT setup failed; the manager connection was "
+                                "invalidated and must not be reused"
+                            )
+                            if close_error is not None:
+                                detail += f"; closing the physical connection also failed: {close_error!r}"
+                            close_cursor()
+                            raise RuntimeError(detail) from rollback_error
+                    close_cursor()
+                    raise RuntimeError(
+                        "bulk_changes() on SQLite requires SAVEPOINT support "
+                        "after acquiring its writer reservation"
+                    ) from exc
+
+            session_bypass_ok = False
+            bypass_setup_error = None
+            if self.dialect == Dialect.POSTGRES and not drop_triggers:
+                try:
+                    cur.execute("SET LOCAL matview.skip_triggers = 'on';")
+                    session_bypass_ok = True
                 except Exception:
                     pass
+            elif self.dialect == Dialect.MYSQL and not drop_triggers and targets:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 1;")
+                    session_bypass_ok = True
+                except Exception as exc:
+                    bypass_setup_error = exc
 
-        try:
-            cur.execute(f"SAVEPOINT {sp_name};")
-            sp_active = True
-        except Exception as exc:
-            if self.dialect == Dialect.MYSQL:
+            if self.dialect == Dialect.MYSQL and not session_bypass_ok and targets:
+                # Falling back to DROP/CREATE TRIGGER would implicitly commit the
+                # transaction. Refuse before any such DDL rather than silently
+                # weakening the context manager's rollback guarantee. Clear the
+                # session variable defensively in case the failed SET reached the
+                # server but its response was lost.
+                bypass_reset_error = None
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 0;")
+                except Exception as reset_exc:
+                    bypass_reset_error = reset_exc
+                if sp_active:
+                    if self.dialect == Dialect.MYSQL:
+                        self._rollback_mysql_bulk_savepoint(
+                            cur,
+                            sp_name,
+                            "trigger-bypass setup failure",
+                            bypass_setup_error or bypass_reset_error or RuntimeError(
+                                "session trigger bypass could not be established"
+                            ),
+                        )
+                    else:
+                        try:
+                            cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                            cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+                        except Exception:
+                            if not mysql_caller_transaction:
+                                self._rollback()
                 if not mysql_caller_transaction:
                     self._rollback()
+                if bypass_reset_error is not None:
+                    self._discard_mysql_connection()
+                    close_cursor()
+                    raise RuntimeError(
+                        "bulk_changes() could not establish or clear the MySQL/MariaDB "
+                        "session trigger-bypass flag; discard this connection before reuse"
+                    ) from bypass_reset_error
                 close_cursor()
                 raise RuntimeError(
-                    "bulk_changes() on MySQL/MariaDB requires SAVEPOINT support "
-                    "to preserve transaction rollback semantics"
-                ) from exc
-            if self.dialect == Dialect.SQLITE:
-                if sqlite_writer_reserved:
-                    try:
-                        self.conn.rollback()
-                    except Exception as rollback_error:
-                        close_error = self._invalidate_sqlite_connection_after_rollback_failure()
-                        detail = (
-                            "bulk_changes() could not release its SQLite writer reservation "
-                            "after SAVEPOINT setup failed; the manager connection was "
-                            "invalidated and must not be reused"
-                        )
-                        if close_error is not None:
-                            detail += f"; closing the physical connection also failed: {close_error!r}"
-                        close_cursor()
-                        raise RuntimeError(detail) from rollback_error
+                    "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
+                    "the trigger-DDL fallback is unsafe because MySQL implicitly commits DDL"
+                )
+
+            # PostgreSQL SET LOCAL outside a transaction block is only a
+            # warning/no-op. Never mistake that for a successful trigger bypass:
+            # a real savepoint is the proof that this operation owns a transaction.
+            if self.dialect == Dialect.POSTGRES and not sp_active:
+                self._rollback()
                 close_cursor()
                 raise RuntimeError(
-                    "bulk_changes() on SQLite requires SAVEPOINT support "
-                    "after acquiring its writer reservation"
-                ) from exc
+                    "bulk_changes() on PostgreSQL requires a transactional savepoint "
+                    "before trigger suspension"
+                )
 
-        session_bypass_ok = False
-        bypass_setup_error = None
-        if self.dialect == Dialect.POSTGRES and not drop_triggers:
+            if not session_bypass_ok:
+                try:
+                    for entry in targets:
+                        if self.dialect == Dialect.POSTGRES:
+                            for fn_name in entry["function_names"]:
+                                if "fn_readonly_" not in fn_name:
+                                    cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                        else:
+                            for t_name in entry["trigger_names"]:
+                                if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                except Exception:
+                    # Trigger DDL is transactional on SQLite/PostgreSQL and is
+                    # protected by the savepoint established above. Restore the
+                    # pre-suspension set if a later DROP in this loop fails.
+                    if sp_active:
+                        try:
+                            cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                            cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+                        except Exception:
+                            self._rollback()
+                    if self.dialect == Dialect.SQLITE and sqlite_writer_reserved:
+                        self._rollback()
+                    elif self.dialect == Dialect.POSTGRES:
+                        self._rollback()
+                    elif self.dialect == Dialect.MYSQL and not mysql_caller_transaction:
+                        self._rollback()
+                    close_cursor()
+                    raise
+            # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
+            # so the trigger suspension and bulk DML remain isolated inside the savepoint!
             try:
-                cur.execute("SET LOCAL matview.skip_triggers = 'on';")
-                session_bypass_ok = True
-            except Exception:
-                pass
-        elif self.dialect == Dialect.MYSQL and not drop_triggers and targets:
-            try:
-                cur.execute("SET @__matview_skip_triggers = 1;")
-                session_bypass_ok = True
-            except Exception as exc:
-                bypass_setup_error = exc
-
-        if self.dialect == Dialect.MYSQL and not session_bypass_ok and targets:
-            # Falling back to DROP/CREATE TRIGGER would implicitly commit the
-            # transaction. Refuse before any such DDL rather than silently
-            # weakening the context manager's rollback guarantee. Clear the
-            # session variable defensively in case the failed SET reached the
-            # server but its response was lost.
-            bypass_reset_error = None
-            try:
-                cur.execute("SET @__matview_skip_triggers = 0;")
-            except Exception as reset_exc:
-                bypass_reset_error = reset_exc
-            if sp_active:
-                if self.dialect == Dialect.MYSQL:
+                yield
+            except Exception as original_exc:
+                if sp_active and self.dialect == Dialect.MYSQL:
                     self._rollback_mysql_bulk_savepoint(
-                        cur,
-                        sp_name,
-                        "trigger-bypass setup failure",
-                        bypass_setup_error or bypass_reset_error or RuntimeError(
-                            "session trigger bypass could not be established"
-                        ),
+                        cur, sp_name, "with-body exception", original_exc
                     )
-                else:
+                elif sp_active:
                     try:
                         cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
                         cur.execute(f"RELEASE SAVEPOINT {sp_name};")
                     except Exception:
+                        if self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
+                            self._rollback()
+                elif self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
+                    self._rollback()
+                if self.dialect == Dialect.POSTGRES:
+                    try:
+                        cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                    except Exception:
+                        pass
+                elif self.dialect == Dialect.MYSQL and session_bypass_ok:
+                    try:
+                        cur.execute("SET @__matview_skip_triggers = 0;")
+                    except Exception as reset_exc:
                         if not mysql_caller_transaction:
                             self._rollback()
-            if not mysql_caller_transaction:
-                self._rollback()
-            if bypass_reset_error is not None:
-                self._discard_mysql_connection()
-                close_cursor()
-                raise RuntimeError(
-                    "bulk_changes() could not establish or clear the MySQL/MariaDB "
-                    "session trigger-bypass flag; discard this connection before reuse"
-                ) from bypass_reset_error
-            close_cursor()
-            raise RuntimeError(
-                "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
-                "the trigger-DDL fallback is unsafe because MySQL implicitly commits DDL"
-            )
+                        self._discard_mysql_connection()
+                        raise RuntimeError(
+                            "bulk_changes() rolled back its DML but could not clear the "
+                            "MySQL/MariaDB session trigger-bypass flag; discard this connection "
+                            f"before reuse (original error: {original_exc!r})"
+                        ) from reset_exc
+                if self.dialect == Dialect.MYSQL:
+                    # A caller-owned transaction is rolled back only to our
+                    # savepoint; a context-owned transaction is fully rolled back.
+                    if not mysql_caller_transaction:
+                        self._rollback()
+                    raise
 
-        # PostgreSQL SET LOCAL outside a transaction block is only a
-        # warning/no-op. Never mistake that for a successful trigger bypass:
-        # a real savepoint is the proof that this operation owns a transaction.
-        if self.dialect == Dialect.POSTGRES and not sp_active:
-            self._rollback()
-            close_cursor()
-            raise RuntimeError(
-                "bulk_changes() on PostgreSQL requires a transactional savepoint "
-                "before trigger suspension"
-            )
-
-        if not session_bypass_ok:
-            try:
+                schemas = self.fetch_schema()
                 for entry in targets:
                     if self.dialect == Dialect.POSTGRES:
                         for fn_name in entry["function_names"]:
@@ -11442,103 +11505,6 @@ class MaterializedViewManager:
                         for t_name in entry["trigger_names"]:
                             if "__ro_" not in t_name and not t_name.endswith("__readonly"):
                                 cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
-            except Exception:
-                # Trigger DDL is transactional on SQLite/PostgreSQL and is
-                # protected by the savepoint established above. Restore the
-                # pre-suspension set if a later DROP in this loop fails.
-                if sp_active:
-                    try:
-                        cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
-                        cur.execute(f"RELEASE SAVEPOINT {sp_name};")
-                    except Exception:
-                        self._rollback()
-                if self.dialect == Dialect.SQLITE and sqlite_writer_reserved:
-                    self._rollback()
-                elif self.dialect == Dialect.POSTGRES:
-                    self._rollback()
-                elif self.dialect == Dialect.MYSQL and not mysql_caller_transaction:
-                    self._rollback()
-                close_cursor()
-                raise
-        # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
-        # so the trigger suspension and bulk DML remain isolated inside the savepoint!
-        try:
-            yield
-        except Exception as original_exc:
-            if sp_active and self.dialect == Dialect.MYSQL:
-                self._rollback_mysql_bulk_savepoint(
-                    cur, sp_name, "with-body exception", original_exc
-                )
-            elif sp_active:
-                try:
-                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
-                    cur.execute(f"RELEASE SAVEPOINT {sp_name};")
-                except Exception:
-                    if self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
-                        self._rollback()
-            elif self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
-                self._rollback()
-            if self.dialect == Dialect.POSTGRES:
-                try:
-                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
-                except Exception:
-                    pass
-            elif self.dialect == Dialect.MYSQL and session_bypass_ok:
-                try:
-                    cur.execute("SET @__matview_skip_triggers = 0;")
-                except Exception as reset_exc:
-                    if not mysql_caller_transaction:
-                        self._rollback()
-                    self._discard_mysql_connection()
-                    raise RuntimeError(
-                        "bulk_changes() rolled back its DML but could not clear the "
-                        "MySQL/MariaDB session trigger-bypass flag; discard this connection "
-                        f"before reuse (original error: {original_exc!r})"
-                    ) from reset_exc
-            if self.dialect == Dialect.MYSQL:
-                # A caller-owned transaction is rolled back only to our
-                # savepoint; a context-owned transaction is fully rolled back.
-                if not mysql_caller_transaction:
-                    self._rollback()
-                raise
-
-            schemas = self.fetch_schema()
-            for entry in targets:
-                if self.dialect == Dialect.POSTGRES:
-                    for fn_name in entry["function_names"]:
-                        if "fn_readonly_" not in fn_name:
-                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-                else:
-                    for t_name in entry["trigger_names"]:
-                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
-                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
-                plan = generate_materialized_view(
-                    schemas,
-                    entry["view_sql"],
-                    dialect=self.dialect,
-                    pg_use_transition_tables=self.pg_use_transition_tables,
-                    ignore_limitations=True,
-                    object_prefix=self.object_prefix,
-                    engine_version=self.engine_version,
-                )
-                for stmt in plan.trigger_ddls:
-                    cur.execute(stmt)
-            self._commit()
-            raise
-        else:
-            try:
-                if self.dialect == Dialect.POSTGRES:
-                    try:
-                        cur.execute("SET LOCAL matview.skip_triggers = 'off';")
-                    except Exception:
-                        pass
-                elif self.dialect == Dialect.MYSQL and session_bypass_ok:
-                    # Do not commit if the session flag cannot be cleared:
-                    # it would suppress maintenance on later statements using
-                    # this pooled connection.
-                    cur.execute("SET @__matview_skip_triggers = 0;")
-                schemas = self.fetch_schema()
-                for entry in targets:
                     plan = generate_materialized_view(
                         schemas,
                         entry["view_sql"],
@@ -11548,95 +11514,129 @@ class MaterializedViewManager:
                         object_prefix=self.object_prefix,
                         engine_version=self.engine_version,
                     )
-                    for aux_t in plan.auxiliary_table_names:
-                        cur.execute(f"DELETE FROM {aux_t};")
-                    if use_shadow_swap:
-                        shadow_tbl = f"{plan.backing_table_name}__shadow"
-                        cur.execute(f"DROP TABLE IF EXISTS {shadow_tbl};")
-                        shadow_ddl = plan.backing_table_ddl.replace(
-                            f"CREATE TABLE {plan.backing_table_name}",
-                            f"CREATE TABLE {shadow_tbl}",
-                            1,
-                        )
-                        cur.execute(shadow_ddl)
-                        for stmt in plan.get_populate_statements(incremental_backfill=False):
-                            if f"INSERT INTO {plan.backing_table_name}" in stmt:
-                                cur.execute(
-                                    stmt.replace(
-                                        f"INSERT INTO {plan.backing_table_name}",
-                                        f"INSERT INTO {shadow_tbl}",
-                                        1,
-                                    )
-                                )
-                            else:
-                                cur.execute(stmt)
-                        if self.dialect == Dialect.POSTGRES:
-                            for fn_name in entry["function_names"]:
-                                if "fn_readonly_" not in fn_name:
-                                    cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-                        else:
-                            for t_name in entry["trigger_names"]:
-                                if "__ro_" not in t_name and not t_name.endswith("__readonly"):
-                                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
-                        cur.execute(f"DROP VIEW IF EXISTS {plan.view_name};")
-                        cur.execute(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
-                        cur.execute(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
-                        if plan.reader_view_ddl:
-                            cur.execute(plan.reader_view_ddl)
-                        for ro_stmt in plan.readonly_trigger_ddls:
-                            cur.execute(ro_stmt)
-                        for idx_ddl in plan.index_ddls:
-                            cur.execute(idx_ddl)
-                    else:
-                        cur.execute(f"DELETE FROM {plan.backing_table_name};")
-                        for stmt in plan.get_populate_statements(incremental_backfill=False):
-                            cur.execute(stmt)
-                    if not session_bypass_ok or use_shadow_swap:
-                        if self.dialect == Dialect.POSTGRES:
-                            for fn_name in entry["function_names"]:
-                                if "fn_readonly_" not in fn_name:
-                                    cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-                        else:
-                            for t_name in entry["trigger_names"]:
-                                if "__ro_" not in t_name and not t_name.endswith("__readonly"):
-                                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
-                        for stmt in plan.trigger_ddls:
-                            cur.execute(stmt)
-                if sp_active:
-                    try:
-                        cur.execute(f"RELEASE SAVEPOINT {sp_name};")
-                    except Exception:
-                        if self.dialect == Dialect.MYSQL:
-                            raise
-                if self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
-                    self._commit()
-
-            except Exception as original_exc:
-                if self.dialect == Dialect.MYSQL:
-                    # Failures during post-yield refresh work are still part of
-                    # this context. Roll back only our savepoint when the caller
-                    # owns the surrounding transaction.
-                    reset_error = None
-                    if session_bypass_ok:
-                        try:
-                            cur.execute("SET @__matview_skip_triggers = 0;")
-                        except Exception as reset_exc:
-                            reset_error = reset_exc
-                    if sp_active:
-                        self._rollback_mysql_bulk_savepoint(
-                            cur, sp_name, "post-yield refresh failure", original_exc
-                        )
-                    if not mysql_caller_transaction:
-                        self._rollback()
-                    if reset_error is not None:
-                        self._discard_mysql_connection()
-                        raise RuntimeError(
-                            "bulk_changes() rolled back its DML but could not clear the "
-                            "MySQL/MariaDB session trigger-bypass flag; discard this connection "
-                            f"before reuse (original error: {original_exc!r})"
-                        ) from reset_error
+                    for stmt in plan.trigger_ddls:
+                        cur.execute(stmt)
+                self._commit()
                 raise
+            else:
+                try:
+                    if self.dialect == Dialect.POSTGRES:
+                        try:
+                            cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                        except Exception:
+                            pass
+                    elif self.dialect == Dialect.MYSQL and session_bypass_ok:
+                        # Do not commit if the session flag cannot be cleared:
+                        # it would suppress maintenance on later statements using
+                        # this pooled connection.
+                        cur.execute("SET @__matview_skip_triggers = 0;")
+                    schemas = self.fetch_schema()
+                    for entry in targets:
+                        plan = generate_materialized_view(
+                            schemas,
+                            entry["view_sql"],
+                            dialect=self.dialect,
+                            pg_use_transition_tables=self.pg_use_transition_tables,
+                            ignore_limitations=True,
+                            object_prefix=self.object_prefix,
+                            engine_version=self.engine_version,
+                        )
+                        for aux_t in plan.auxiliary_table_names:
+                            cur.execute(f"DELETE FROM {aux_t};")
+                        if use_shadow_swap:
+                            shadow_tbl = f"{plan.backing_table_name}__shadow"
+                            cur.execute(f"DROP TABLE IF EXISTS {shadow_tbl};")
+                            shadow_ddl = plan.backing_table_ddl.replace(
+                                f"CREATE TABLE {plan.backing_table_name}",
+                                f"CREATE TABLE {shadow_tbl}",
+                                1,
+                            )
+                            cur.execute(shadow_ddl)
+                            for stmt in plan.get_populate_statements(incremental_backfill=False):
+                                if f"INSERT INTO {plan.backing_table_name}" in stmt:
+                                    cur.execute(
+                                        stmt.replace(
+                                            f"INSERT INTO {plan.backing_table_name}",
+                                            f"INSERT INTO {shadow_tbl}",
+                                            1,
+                                        )
+                                    )
+                                else:
+                                    cur.execute(stmt)
+                            if self.dialect == Dialect.POSTGRES:
+                                for fn_name in entry["function_names"]:
+                                    if "fn_readonly_" not in fn_name:
+                                        cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                            else:
+                                for t_name in entry["trigger_names"]:
+                                    if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                        cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                            cur.execute(f"DROP VIEW IF EXISTS {plan.view_name};")
+                            cur.execute(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
+                            cur.execute(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+                            if plan.reader_view_ddl:
+                                cur.execute(plan.reader_view_ddl)
+                            for ro_stmt in plan.readonly_trigger_ddls:
+                                cur.execute(ro_stmt)
+                            for idx_ddl in plan.index_ddls:
+                                cur.execute(idx_ddl)
+                        else:
+                            cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                            for stmt in plan.get_populate_statements(incremental_backfill=False):
+                                cur.execute(stmt)
+                        if not session_bypass_ok or use_shadow_swap:
+                            if self.dialect == Dialect.POSTGRES:
+                                for fn_name in entry["function_names"]:
+                                    if "fn_readonly_" not in fn_name:
+                                        cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                            else:
+                                for t_name in entry["trigger_names"]:
+                                    if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                        cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                            for stmt in plan.trigger_ddls:
+                                cur.execute(stmt)
+                    if sp_active:
+                        try:
+                            cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+                        except Exception:
+                            if self.dialect == Dialect.MYSQL:
+                                raise
+                    if self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
+                        self._commit()
 
+                except Exception as original_exc:
+                    if self.dialect == Dialect.MYSQL:
+                        # Failures during post-yield refresh work are still part of
+                        # this context. Roll back only our savepoint when the caller
+                        # owns the surrounding transaction.
+                        reset_error = None
+                        if session_bypass_ok:
+                            try:
+                                cur.execute("SET @__matview_skip_triggers = 0;")
+                            except Exception as reset_exc:
+                                reset_error = reset_exc
+                        if sp_active:
+                            self._rollback_mysql_bulk_savepoint(
+                                cur, sp_name, "post-yield refresh failure", original_exc
+                            )
+                        if not mysql_caller_transaction:
+                            self._rollback()
+                        if reset_error is not None:
+                            self._discard_mysql_connection()
+                            raise RuntimeError(
+                                "bulk_changes() rolled back its DML but could not clear the "
+                                "MySQL/MariaDB session trigger-bypass flag; discard this connection "
+                                f"before reuse (original error: {original_exc!r})"
+                            ) from reset_error
+                    raise
+
+        finally:
+            close_cursor = getattr(cur, "close", None)
+            if callable(close_cursor):
+                try:
+                    close_cursor()
+                except Exception:
+                    pass
 
 # -----------------------------------------------------------------------------
 # Public High-Level Convenience Functions & CLI
