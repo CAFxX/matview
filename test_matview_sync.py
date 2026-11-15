@@ -4335,11 +4335,23 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         cursor = Cursor(fail_reset=True)
         conn = Connection(cursor)
         mgr = make_manager(conn)
-        with self.assertRaisesRegex(RuntimeError, "discard this connection"):
+        with self.assertRaisesRegex(RuntimeError, "connection must be discarded") as caught:
             with mgr.bulk_changes():
                 pass
+        self.assertTrue(caught.exception.connection_unsafe)
+        self.assertTrue(mgr._mysql_bulk_connection_unsafe)
+        self.assertTrue(conn._matview_bulk_connection_unsafe)
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
+        statements_before_reuse = list(cursor.statements)
+        with self.assertRaisesRegex(RuntimeError, "must be discarded"):
+            with mgr.bulk_changes():
+                self.fail("unsafe manager must not be reused")
+        other_manager = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "must be discarded"):
+            with other_manager.bulk_changes():
+                self.fail("unsafe connection must not be reused through another manager")
+        self.assertEqual(cursor.statements, statements_before_reuse)
 
         # If the body itself fails and cleanup cannot clear the session flag,
         # surface the connection-contamination hazard instead of silently
@@ -4347,9 +4359,12 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         cursor = Cursor(fail_reset=True)
         conn = Connection(cursor)
         mgr = make_manager(conn)
-        with self.assertRaisesRegex(RuntimeError, "discard this connection"):
+        with self.assertRaisesRegex(RuntimeError, "connection must be discarded") as caught:
             with mgr.bulk_changes():
                 raise ValueError("body failed")
+        self.assertTrue(caught.exception.connection_unsafe)
+        self.assertTrue(any("body failed" in note for note in caught.exception.__notes__))
+        self.assertTrue(conn._matview_bulk_connection_unsafe)
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
 
@@ -4358,9 +4373,11 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         conn = Connection(cursor)
         mgr = make_manager(conn)
         mgr.fetch_schema = lambda: (_ for _ in ()).throw(RuntimeError("refresh failed"))
-        with self.assertRaisesRegex(RuntimeError, "discard this connection"):
+        with self.assertRaisesRegex(RuntimeError, "connection must be discarded") as caught:
             with mgr.bulk_changes():
                 pass
+        self.assertTrue(caught.exception.connection_unsafe)
+        self.assertTrue(conn._matview_bulk_connection_unsafe)
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
 
