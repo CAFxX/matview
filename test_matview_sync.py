@@ -4170,6 +4170,19 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
 
+        # Errors in the manager's post-yield refresh phase must also roll back;
+        # they occur after the caller's with-body has returned successfully.
+        cursor = Cursor()
+        conn = Connection(cursor)
+        mgr = make_manager(conn)
+        mgr.fetch_schema = lambda: (_ for _ in ()).throw(RuntimeError("refresh failed"))
+        with self.assertRaisesRegex(RuntimeError, "refresh failed"):
+            with mgr.bulk_changes():
+                pass
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
+        self.assertGreaterEqual(cursor.statements.count("SET @__matview_skip_triggers = 0;"), 2)
+
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
