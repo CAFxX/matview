@@ -11093,8 +11093,8 @@ class MaterializedViewManager:
         except Exception:
             if sp_active:
                 try:
-                    cur.execute("ROLLBACK TO SAVEPOINT {sp_name};")
-                    cur.execute("RELEASE SAVEPOINT {sp_name};")
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                    cur.execute(f"RELEASE SAVEPOINT {sp_name};")
                 except Exception:
                     if self.dialect != Dialect.MYSQL or not mysql_caller_transaction:
                         self._rollback()
@@ -11219,7 +11219,7 @@ class MaterializedViewManager:
                             cur.execute(stmt)
                 if sp_active:
                     try:
-                        cur.execute("RELEASE SAVEPOINT {sp_name};")
+                        cur.execute(f"RELEASE SAVEPOINT {sp_name};")
                     except Exception:
                         if self.dialect == Dialect.MYSQL:
                             raise
@@ -11238,8 +11238,8 @@ class MaterializedViewManager:
                             pass
                     if sp_active:
                         try:
-                            cur.execute("ROLLBACK TO SAVEPOINT {sp_name};")
-                            cur.execute("RELEASE SAVEPOINT {sp_name};")
+                            cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                            cur.execute(f"RELEASE SAVEPOINT {sp_name};")
                         except Exception:
                             if not mysql_caller_transaction:
                                 self._rollback()
