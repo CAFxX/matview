@@ -4456,6 +4456,16 @@ class IncrementalViewCompiler:
         return None
 
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
+        if self.dialect == Dialect.MYSQL and item.is_aggregate and item.agg_func is None:
+            # Composite projections containing aggregates (for example
+            # COALESCE(1.0 * SUM(DISTINCT x), 0.0)) are not a single aggregate
+            # node, but their native result type still follows exact DECIMAL
+            # arithmetic. Do not fall back to DOUBLE merely because the
+            # projection wraps an aggregate in scalar expressions.
+            exact_expression_type = self._exact_numeric_precision_scale(item.raw_expr)
+            if exact_expression_type is not None:
+                precision, scale = exact_expression_type
+                return f"DECIMAL({precision}, {scale})"
         if not item.is_aggregate:
             c_def = self._lookup_col_def(item.raw_expr)
             if c_def:
