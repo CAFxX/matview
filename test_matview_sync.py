@@ -4128,6 +4128,39 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         getter_mgr = make_manager(GetterConnection())
         self.assertIs(getter_mgr._mysql_autocommit_state(), False)
 
+    def test_00b_mysql_legacy_catalog_fallback_does_not_rollback_caller(self) -> None:
+        class Cursor:
+            def __init__(self) -> None:
+                self.statements: List[str] = []
+
+            def execute(self, statement: str) -> None:
+                self.statements.append(statement)
+                if "backfill_cursor_pk" in statement:
+                    raise RuntimeError("legacy catalog has no watermark columns")
+
+            def fetchall(self) -> List[Any]:
+                return []
+
+        class Connection:
+            def __init__(self) -> None:
+                self._cursor = Cursor()
+                self.rollback_calls = 0
+
+            def cursor(self) -> Cursor:
+                return self._cursor
+
+            def rollback(self) -> None:
+                self.rollback_calls += 1
+
+        conn = Connection()
+        mgr = MaterializedViewManager.__new__(MaterializedViewManager)
+        mgr.conn = conn
+        mgr.dialect = Dialect.MYSQL
+        mgr.catalog_table = "__matview_catalog"
+        self.assertEqual(mgr.get_catalog(), {})
+        self.assertEqual(conn.rollback_calls, 0)
+        self.assertEqual(len(conn._cursor.statements), 2)
+
     def test_00a_mysql_bulk_changes_never_uses_implicit_commit_ddl(self) -> None:
         class Cursor:
             def __init__(self, fail_bypass: bool = False, fail_reset: bool = False) -> None:
