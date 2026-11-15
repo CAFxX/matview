@@ -4534,7 +4534,7 @@ class IncrementalViewCompiler:
                 return None
             if kind == "Literal" and not node.args.get("is_string"):
                 value = str(node.this)
-                if re.fullmatch(r"[+-]?\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?", value):
+                if re.fullmatch(r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", value):
                     if any(marker in value for marker in (".", "e", "E")):
                         return 4
                 else:
