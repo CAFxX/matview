@@ -49,6 +49,48 @@ class MySQLTransactionStateGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
             MaterializedViewManager._require_idle_mysql_connection(Connection())
 
+    def test_wrapped_driver_transaction_is_not_hidden_by_idle_sqlalchemy_state(self):
+        class DriverConnection:
+            server_status = 0x0001
+
+        class PoolProxy:
+            driver_connection = DriverConnection()
+
+        class SQLAlchemyConnection:
+            in_transaction = False
+            connection = PoolProxy()
+
+        with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
+            MaterializedViewManager._require_idle_mysql_connection(SQLAlchemyConnection())
+
+    def test_wrapped_idle_driver_state_is_accepted(self):
+        class DriverConnection:
+            server_status = 0x0002
+
+        class PoolProxy:
+            driver_connection = DriverConnection()
+
+        class SQLAlchemyConnection:
+            in_transaction = False
+            connection = PoolProxy()
+
+        MaterializedViewManager._require_idle_mysql_connection(SQLAlchemyConnection())
+
+    def test_wrapped_callable_driver_transaction_is_rejected(self):
+        class DriverConnection:
+            def in_transaction(self):
+                return True
+
+        class PoolProxy:
+            driver_connection = DriverConnection()
+
+        class SQLAlchemyConnection:
+            in_transaction = False
+            connection = PoolProxy()
+
+        with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
+            MaterializedViewManager._require_idle_mysql_connection(SQLAlchemyConnection())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
