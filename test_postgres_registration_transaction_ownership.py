@@ -102,6 +102,7 @@ def main() -> None:
         with observer.cursor() as cur:
             cur.execute(f'SELECT COUNT(*) FROM "{table}"')
             assert cur.fetchone()[0] == 0, "caller rollback did not undo its own DML"
+        manager.drop_view(view)
         print(
             "PASS: native PostgreSQL registration rejects unsafe transaction ownership "
             "without committing or rolling back caller work"
