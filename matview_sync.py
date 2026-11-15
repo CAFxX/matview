@@ -45,6 +45,7 @@ from typing import (
     Union,
 )
 
+from jinja2 import BaseLoader, DictLoader, Environment, StrictUndefined
 from packaging.version import InvalidVersion, Version
 
 import sqlglot
@@ -52,6 +53,261 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot.tokens import TokenType as SQLGlotTokenType
 
 DEFAULT_OBJECT_PREFIX = "__matview_"
+
+
+PROCEDURAL_SQL_TEMPLATES: Dict[str, str] = {
+    "ro_trigger_sqlite": """CREATE TRIGGER {{ trg_name }}
+INSTEAD OF {{ op }} ON {{ db_view }}
+BEGIN
+    SELECT RAISE(ABORT, 'Materialized view {{ raw_db_view }} is read-only and maintained automatically');
+END;""",
+    "ro_function_pg": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'Materialized view % is read-only and maintained automatically', TG_TABLE_NAME;
+END;
+$$ LANGUAGE plpgsql;""",
+    "ro_trigger_pg": """CREATE TRIGGER {{ trg_name }}
+INSTEAD OF INSERT OR UPDATE OR DELETE ON {{ db_view }}
+FOR EACH ROW EXECUTE FUNCTION {{ fn_name }}();""",
+    "backfill_pk_sqlite": """WITH RECURSIVE __mv_bounds AS (
+    SELECT MIN({{ q_pk_col }}) AS min_id, MAX({{ q_pk_col }}) AS max_id FROM {{ q_base_t }}
+),
+__mv_batches(lo, hi, max_id) AS (
+    SELECT min_id - 1, MIN(max_id, min_id - 1 + {{ batch_size }}), max_id
+    FROM __mv_bounds
+    WHERE min_id IS NOT NULL AND max_id IS NOT NULL
+    UNION ALL
+    SELECT hi, MIN(max_id, hi + {{ batch_size }}), max_id
+    FROM __mv_batches
+    WHERE hi < max_id
+)
+{{ joined_tmpl }};""",
+    "backfill_pk_pg": """DO $$
+DECLARE
+    __mv_min_pk BIGINT;
+    __mv_max_pk BIGINT;
+    __mv_cur_pk BIGINT;
+    __mv_top_pk BIGINT;
+    __mv_batch_size BIGINT := {{ batch_size }};
+BEGIN
+    SELECT MIN({{ q_pk_col }}), MAX({{ q_pk_col }}) INTO __mv_min_pk, __mv_max_pk FROM {{ q_base_t }};
+    IF __mv_min_pk IS NOT NULL AND __mv_max_pk IS NOT NULL THEN
+        __mv_cur_pk := __mv_min_pk - 1;
+        WHILE __mv_cur_pk < __mv_max_pk LOOP
+            __mv_top_pk := LEAST(__mv_max_pk, __mv_cur_pk + __mv_batch_size);
+            {{ pg_chunk }};
+            __mv_cur_pk := __mv_top_pk;
+        END LOOP;
+    END IF;
+{% for pop_sql in fallback_populate_sqls %}
+    IF NOT EXISTS (SELECT 1 FROM {{ q_backing_table }}) THEN
+        {{ pop_sql }};
+    END IF;
+{% endfor %}
+END $$;""",
+    "drop_procedure_mysql": "DROP PROCEDURE IF EXISTS {{ proc_name }};",
+    "call_procedure_mysql": "CALL {{ proc_name }}();",
+    "backfill_pk_mysql_proc": """CREATE PROCEDURE {{ proc_name }}()
+BEGIN
+    DECLARE __mv_min_pk BIGINT;
+    DECLARE __mv_max_pk BIGINT;
+    DECLARE __mv_cur_pk BIGINT;
+    DECLARE __mv_top_pk BIGINT;
+    DECLARE __mv_batch_size BIGINT DEFAULT {{ batch_size }};
+    SELECT MIN({{ q_pk_col }}), MAX({{ q_pk_col }}) INTO __mv_min_pk, __mv_max_pk FROM {{ q_base_t }};
+    IF __mv_min_pk IS NOT NULL AND __mv_max_pk IS NOT NULL THEN
+        SET __mv_cur_pk = __mv_min_pk - 1;
+        WHILE __mv_cur_pk < __mv_max_pk DO
+            SET __mv_top_pk = LEAST(__mv_max_pk, __mv_cur_pk + __mv_batch_size);
+            {{ my_chunk }};
+            SET __mv_cur_pk = __mv_top_pk;
+        END WHILE;
+    END IF;
+{% for pop_sql in fallback_populate_sqls %}
+    IF NOT EXISTS (SELECT 1 FROM {{ q_backing_table }}) THEN
+        {{ pop_sql }};
+    END IF;
+{% endfor %}
+END;""",
+    "backfill_offset_sqlite": """WITH __mv_batched_src AS (
+    SELECT
+        ((ROW_NUMBER() OVER () - 1) / {{ batch_size }}) AS __mv_batch_id,
+        __mv_raw_src.*
+    FROM (
+        {{ aliased_inner }}
+    ) AS __mv_raw_src
+    ORDER BY 1
+)
+INSERT INTO {{ q_target_tbl }} ({{ q_cols_csv }})
+SELECT {{ q_cols_csv }}
+FROM __mv_batched_src
+WHERE TRUE{{ upsert_tail }};""",
+    "backfill_offset_pg": """DO $$
+DECLARE
+    __mv_offset BIGINT := 0;
+    __mv_batch_size BIGINT := {{ batch_size }};
+    __mv_rows BIGINT := 0;
+BEGIN
+    LOOP
+{% if use_merge %}
+        MERGE INTO {{ q_target_tbl }} AS __mv_dst
+        USING (
+            SELECT {{ q_cols_csv }}
+            FROM (
+                {{ aliased_inner }}
+            ) AS __mv_init{{ ord_tail }}
+            LIMIT __mv_batch_size OFFSET __mv_offset
+        ) AS __mv_src
+        ON ({{ merge_on_csv }})
+        {{ matched_clause }}
+        WHEN NOT MATCHED THEN
+            INSERT ({{ q_cols_csv }})
+            VALUES ({{ merge_vals_csv }});
+{% else %}
+        INSERT INTO {{ q_target_tbl }} ({{ q_cols_csv }})
+        SELECT {{ q_cols_csv }}
+        FROM (
+            {{ aliased_inner }}
+        ) AS __mv_init{{ ord_tail }}
+        LIMIT __mv_batch_size OFFSET __mv_offset{{ upsert_tail }};
+{% endif %}
+        GET DIAGNOSTICS __mv_rows = ROW_COUNT;
+        EXIT WHEN __mv_rows < __mv_batch_size;
+        __mv_offset := __mv_offset + __mv_rows;
+    END LOOP;
+END $$;""",
+    "backfill_offset_mysql_proc": """CREATE PROCEDURE {{ proc_name }}()
+BEGIN
+    DECLARE __mv_offset BIGINT DEFAULT 0;
+    DECLARE __mv_batch_size BIGINT DEFAULT {{ batch_size }};
+    DECLARE __mv_rows BIGINT DEFAULT 0;
+    REPEAT
+        INSERT INTO {{ q_target_tbl }} ({{ q_cols_csv }})
+        SELECT {{ q_cols_csv }}
+        FROM (
+            {{ aliased_inner }}
+        ) AS __mv_init{{ ord_tail }}
+        LIMIT __mv_batch_size OFFSET __mv_offset{{ upsert_tail }};
+        SET __mv_rows = ROW_COUNT();
+        SET __mv_offset = __mv_offset + __mv_batch_size;
+    UNTIL __mv_rows <= 0 END REPEAT;
+END;""",
+    "trigger_sqlite_after_insert": """CREATE TRIGGER {{ trg_name }}
+AFTER INSERT ON {{ q_base_t }}
+FOR EACH ROW{% if when_clause %}
+
+WHEN {{ when_clause }}{% endif %}
+
+BEGIN
+    {{ body }}
+END;""",
+    "trigger_sqlite_after_delete": """CREATE TRIGGER {{ trg_name }}
+AFTER DELETE ON {{ q_base_t }}
+FOR EACH ROW{% if when_clause %}
+
+WHEN {{ when_clause }}{% endif %}
+
+BEGIN
+    {{ body }}
+END;""",
+    "trigger_sqlite_after_update": """CREATE TRIGGER {{ trg_name }}
+AFTER UPDATE{{ upd_of_clause }} ON {{ q_base_t }}
+FOR EACH ROW{% if when_clause %}
+
+WHEN {{ when_clause }}{% endif %}
+
+BEGIN
+    {{ body }}
+END;""",
+    "pg_truncate_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+RETURNS TRIGGER AS $$
+BEGIN
+    {{ trunc_block }}
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;""",
+    "pg_truncate_trigger": """CREATE TRIGGER {{ trg_name }}
+AFTER TRUNCATE ON {{ q_base_t }}
+FOR EACH STATEMENT EXECUTE FUNCTION {{ fn_name }}();""",
+    "pg_transition_simple_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+RETURNS TRIGGER AS $$
+BEGIN
+    {{ body_sql }}
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;""",
+    "pg_transition_loop_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+RETURNS TRIGGER AS $$
+DECLARE
+    {{ row_var }} RECORD;
+BEGIN
+    FOR {{ row_var }} IN SELECT * FROM {{ transition_table }} LOOP
+        {{ section_sql }}
+    END LOOP;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;""",
+    "pg_transition_au_loop_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+RETURNS TRIGGER AS $$
+DECLARE
+    OLD RECORD;
+    NEW RECORD;
+BEGIN
+{% for loop_spec in loops %}
+    FOR {{ loop_spec.row_var }} IN SELECT * FROM {{ loop_spec.transition_table }} LOOP
+        {{ loop_spec.section_sql }}
+    END LOOP;
+{% endfor %}
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;""",
+    "pg_transition_trigger": """CREATE TRIGGER {{ trg_name }}
+AFTER {{ event }} ON {{ q_base_t }}
+REFERENCING {{ referencing }}
+FOR EACH STATEMENT EXECUTE FUNCTION {{ fn_name }}();""",
+    "pg_row_sync_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF COALESCE(current_setting('matview.skip_triggers', true), '') = 'on' THEN
+        RETURN NULL;
+    END IF;
+    IF (TG_OP = 'DELETE') THEN
+        {{ del_section }}
+    ELSIF (TG_OP = 'INSERT') THEN
+        {{ ins_section }}
+    ELSIF (TG_OP = 'UPDATE') THEN
+        {{ upd_body }}
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;""",
+    "pg_row_sync_trigger": """CREATE TRIGGER {{ trg_name }}
+AFTER INSERT OR UPDATE{{ upd_of_clause }} OR DELETE ON {{ q_base_t }}
+FOR EACH ROW EXECUTE FUNCTION {{ fn_name }}();""",
+    "mysql_row_trigger": """CREATE TRIGGER {{ trg_name }}
+AFTER {{ event }} ON {{ q_base_t }}
+FOR EACH ROW
+BEGIN
+    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN
+    {{ body }}
+    END IF;
+END;""",
+}
+
+_PROCEDURAL_TEMPLATE_ENV = Environment(
+    loader=DictLoader(PROCEDURAL_SQL_TEMPLATES),
+    autoescape=False,
+    trim_blocks=True,
+    lstrip_blocks=True,
+    keep_trailing_newline=False,
+    undefined=StrictUndefined,
+)
+
+
+def render_procedural_sql(template_name: str, **context: Any) -> str:
+    """Render a dialect procedural trigger or backfill SQL statement via Jinja2."""
+    return _PROCEDURAL_TEMPLATE_ENV.get_template(template_name).render(**context)
 
 
 class Dialect(str, Enum):
@@ -6108,29 +6364,25 @@ class IncrementalViewCompiler:
                 t_name = self._bounded_ident(f"{p}trg_", log_vname, f"__ro_{suf}")
                 ro_names.append(t_name)
                 ro_trigs.append(
-                    f"CREATE TRIGGER {self._q(t_name)}\n"
-                    f"INSTEAD OF {op} ON {self._q(db_view)}\n"
-                    f"BEGIN\n"
-                    f"    SELECT RAISE(ABORT, 'Materialized view {db_view} is read-only and maintained automatically');\n"
-                    f"END;"
+                    render_procedural_sql(
+                        "ro_trigger_sqlite",
+                        trg_name=self._q(t_name),
+                        op=op,
+                        db_view=self._q(db_view),
+                        raw_db_view=db_view,
+                    )
                 )
             return reader_view_ddl, ro_trigs, ro_names, []
 
         # PostgreSQL: INSTEAD OF trigger on view
         fn_ro = self._bounded_ident(f"{p}fn_readonly_", log_vname)
         t_ro = self._bounded_ident(f"{p}trg_", log_vname, "__readonly")
-        fn_ddl = (
-            f"CREATE OR REPLACE FUNCTION {self._q(fn_ro)}()\n"
-            f"RETURNS TRIGGER AS $$\n"
-            f"BEGIN\n"
-            f"    RAISE EXCEPTION 'Materialized view % is read-only and maintained automatically', TG_TABLE_NAME;\n"
-            f"END;\n"
-            f"$$ LANGUAGE plpgsql;"
-        )
-        t_ddl = (
-            f"CREATE TRIGGER {self._q(t_ro)}\n"
-            f"INSTEAD OF INSERT OR UPDATE OR DELETE ON {self._q(db_view)}\n"
-            f"FOR EACH ROW EXECUTE FUNCTION {self._q(fn_ro)}();"
+        fn_ddl = render_procedural_sql("ro_function_pg", fn_name=self._q(fn_ro))
+        t_ddl = render_procedural_sql(
+            "ro_trigger_pg",
+            trg_name=self._q(t_ro),
+            db_view=self._q(db_view),
+            fn_name=self._q(fn_ro),
         )
         return reader_view_ddl, [fn_ddl, t_ddl], [t_ro], [fn_ro]
 
@@ -6168,23 +6420,15 @@ class IncrementalViewCompiler:
                     count=1,
                     flags=re.IGNORECASE,
                 )
-                out_stmts = [
-                    f"WITH RECURSIVE __mv_bounds AS (\n"
-                    f"    SELECT MIN({q_pk_col}) AS min_id, MAX({q_pk_col}) AS max_id FROM {q_base_t}\n"
-                    f"),\n"
-                    f"__mv_batches(lo, hi, max_id) AS (\n"
-                    f"    SELECT min_id - 1, MIN(max_id, min_id - 1 + {b_size}), max_id\n"
-                    f"    FROM __mv_bounds\n"
-                    f"    WHERE min_id IS NOT NULL AND max_id IS NOT NULL\n"
-                    f"    UNION ALL\n"
-                    f"    SELECT hi, MIN(max_id, hi + {b_size}), max_id\n"
-                    f"    FROM __mv_batches\n"
-                    f"    WHERE hi < max_id\n"
-                    f")\n"
-                    f"{joined_tmpl};"
+                return [
+                    render_procedural_sql(
+                        "backfill_pk_sqlite",
+                        q_pk_col=q_pk_col,
+                        q_base_t=q_base_t,
+                        batch_size=b_size,
+                        joined_tmpl=joined_tmpl,
+                    )
                 ]
-
-                return out_stmts
 
             elif self.dialect == Dialect.POSTGRES:
                 pg_chunk = tmpl.replace(
@@ -6198,34 +6442,21 @@ class IncrementalViewCompiler:
                         pg_chunk,
                         count=1,
                     )
-                fallback_global = ""
-                if is_global_agg:
-                    for pop_s in raw_plan.initial_populate_sqls:
-                        p_clean = pop_s.strip().rstrip(";")
-                        fallback_global += (
-                            f"\n    IF NOT EXISTS (SELECT 1 FROM {self._q(raw_plan.backing_table_name)}) THEN\n"
-                            f"        {p_clean};\n"
-                            f"    END IF;"
-                        )
+                fallback_populate_sqls = (
+                    [pop_s.strip().rstrip(";") for pop_s in raw_plan.initial_populate_sqls]
+                    if is_global_agg
+                    else []
+                )
                 return [
-                    f"DO $$\n"
-                    f"DECLARE\n"
-                    f"    __mv_min_pk BIGINT;\n"
-                    f"    __mv_max_pk BIGINT;\n"
-                    f"    __mv_cur_pk BIGINT;\n"
-                    f"    __mv_top_pk BIGINT;\n"
-                    f"    __mv_batch_size BIGINT := {b_size};\n"
-                    f"BEGIN\n"
-                    f"    SELECT MIN({q_pk_col}), MAX({q_pk_col}) INTO __mv_min_pk, __mv_max_pk FROM {q_base_t};\n"
-                    f"    IF __mv_min_pk IS NOT NULL AND __mv_max_pk IS NOT NULL THEN\n"
-                    f"        __mv_cur_pk := __mv_min_pk - 1;\n"
-                    f"        WHILE __mv_cur_pk < __mv_max_pk LOOP\n"
-                    f"            __mv_top_pk := LEAST(__mv_max_pk, __mv_cur_pk + __mv_batch_size);\n"
-                    f"            {pg_chunk};\n"
-                    f"            __mv_cur_pk := __mv_top_pk;\n"
-                    f"        END LOOP;\n"
-                    f"    END IF;{fallback_global}\n"
-                    f"END $$;"
+                    render_procedural_sql(
+                        "backfill_pk_pg",
+                        batch_size=b_size,
+                        q_pk_col=q_pk_col,
+                        q_base_t=q_base_t,
+                        pg_chunk=pg_chunk,
+                        fallback_populate_sqls=fallback_populate_sqls,
+                        q_backing_table=self._q(raw_plan.backing_table_name),
+                    )
                 ]
 
             elif self.dialect == Dialect.MYSQL:
@@ -6247,39 +6478,26 @@ class IncrementalViewCompiler:
                             my_chunk,
                             count=1,
                         )
-                fallback_global = ""
-                if is_global_agg:
-                    for pop_s in raw_plan.initial_populate_sqls:
-                        p_clean = pop_s.strip().rstrip(";")
-                        fallback_global += (
-                            f"\n    IF NOT EXISTS (SELECT 1 FROM {self._q(raw_plan.backing_table_name)}) THEN\n"
-                            f"        {p_clean};\n"
-                            f"    END IF;"
-                        )
+                fallback_populate_sqls = (
+                    [pop_s.strip().rstrip(";") for pop_s in raw_plan.initial_populate_sqls]
+                    if is_global_agg
+                    else []
+                )
                 proc_name = self._bounded_ident(f"{self.object_prefix}proc_backfill_", self.logical_view_name)
                 return [
-                    f"DROP PROCEDURE IF EXISTS {proc_name};",
-                    (
-                        f"CREATE PROCEDURE {proc_name}()\n"
-                        f"BEGIN\n"
-                        f"    DECLARE __mv_min_pk BIGINT;\n"
-                        f"    DECLARE __mv_max_pk BIGINT;\n"
-                        f"    DECLARE __mv_cur_pk BIGINT;\n"
-                        f"    DECLARE __mv_top_pk BIGINT;\n"
-                        f"    DECLARE __mv_batch_size BIGINT DEFAULT {b_size};\n"
-                        f"    SELECT MIN({q_pk_col}), MAX({q_pk_col}) INTO __mv_min_pk, __mv_max_pk FROM {q_base_t};\n"
-                        f"    IF __mv_min_pk IS NOT NULL AND __mv_max_pk IS NOT NULL THEN\n"
-                        f"        SET __mv_cur_pk = __mv_min_pk - 1;\n"
-                        f"        WHILE __mv_cur_pk < __mv_max_pk DO\n"
-                        f"            SET __mv_top_pk = LEAST(__mv_max_pk, __mv_cur_pk + __mv_batch_size);\n"
-                        f"            {my_chunk};\n"
-                        f"            SET __mv_cur_pk = __mv_top_pk;\n"
-                        f"        END WHILE;\n"
-                        f"    END IF;{fallback_global}\n"
-                        f"END;"
+                    render_procedural_sql("drop_procedure_mysql", proc_name=proc_name),
+                    render_procedural_sql(
+                        "backfill_pk_mysql_proc",
+                        proc_name=proc_name,
+                        batch_size=b_size,
+                        q_pk_col=q_pk_col,
+                        q_base_t=q_base_t,
+                        my_chunk=my_chunk,
+                        fallback_populate_sqls=fallback_populate_sqls,
+                        q_backing_table=self._q(raw_plan.backing_table_name),
                     ),
-                    f"CALL {proc_name}();",
-                    f"DROP PROCEDURE IF EXISTS {proc_name};",
+                    render_procedural_sql("call_procedure_mysql", proc_name=proc_name),
+                    render_procedural_sql("drop_procedure_mysql", proc_name=proc_name),
                 ]
 
         # Case 2: Group-batch or Offset-batch over `raw_plan.initial_populate_sqls`
@@ -6375,19 +6593,14 @@ class IncrementalViewCompiler:
                     ]
                     upsert_tail = f"\nON CONFLICT ({', '.join(q_tbl_pks)}) DO UPDATE SET {', '.join(upd_cols)}"
                 inc_stmts.append(
-                    f"WITH __mv_batched_src AS (\n"
-                    f"    SELECT\n"
-                    f"        ((ROW_NUMBER() OVER () - 1) / {b_size}) AS __mv_batch_id,\n"
-                    f"        __mv_raw_src.*\n"
-                    f"    FROM (\n"
-                    f"        {aliased_inner}\n"
-                    f"    ) AS __mv_raw_src\n"
-                    f"    ORDER BY 1\n"
-                    f")\n"
-                    f"INSERT INTO {self._q(target_tbl)} ({', '.join(q_cols)})\n"
-                    f"SELECT {', '.join(q_cols)}\n"
-                    f"FROM __mv_batched_src\n"
-                    f"WHERE TRUE{upsert_tail};"
+                    render_procedural_sql(
+                        "backfill_offset_sqlite",
+                        batch_size=b_size,
+                        aliased_inner=aliased_inner,
+                        q_target_tbl=self._q(target_tbl),
+                        q_cols_csv=", ".join(q_cols),
+                        upsert_tail=upsert_tail,
+                    )
                 )
             elif self.dialect == Dialect.POSTGRES:
                 ord_cols = ", ".join(str(k) for k in range(1, len(cols) + 1))
@@ -6398,35 +6611,19 @@ class IncrementalViewCompiler:
                         matched_clause = f"WHEN MATCHED THEN\n            UPDATE SET {', '.join(f'{self._q(c)} = __mv_src.{self._q(c)}' for c in non_pk_cols)}"
                     else:
                         matched_clause = "WHEN MATCHED THEN DO NOTHING"
-                    merge_body = (
-                        f"        MERGE INTO {self._q(target_tbl)} AS __mv_dst\n"
-                        f"        USING (\n"
-                        f"            SELECT {', '.join(q_cols)}\n"
-                        f"            FROM (\n"
-                        f"                {aliased_inner}\n"
-                        f"            ) AS __mv_init{ord_tail}\n"
-                        f"            LIMIT __mv_batch_size OFFSET __mv_offset\n"
-                        f"        ) AS __mv_src\n"
-                        f"        ON ({' AND '.join(f'__mv_dst.{self._q(c)} = __mv_src.{self._q(c)}' for c in tbl_pks)})\n"
-                        f"        {matched_clause}\n"
-                        f"        WHEN NOT MATCHED THEN\n"
-                        f"            INSERT ({', '.join(q_cols)})\n"
-                        f"            VALUES ({', '.join(f'__mv_src.{self._q(c)}' for c in cols)});\n"
-                    )
                     inc_stmts.append(
-                        f"DO $$\n"
-                        f"DECLARE\n"
-                        f"    __mv_offset BIGINT := 0;\n"
-                        f"    __mv_batch_size BIGINT := {b_size};\n"
-                        f"    __mv_rows BIGINT := 0;\n"
-                        f"BEGIN\n"
-                        f"    LOOP\n"
-                        f"{merge_body}"
-                        f"        GET DIAGNOSTICS __mv_rows = ROW_COUNT;\n"
-                        f"        EXIT WHEN __mv_rows < __mv_batch_size;\n"
-                        f"        __mv_offset := __mv_offset + __mv_rows;\n"
-                        f"    END LOOP;\n"
-                        f"END $$;"
+                        render_procedural_sql(
+                            "backfill_offset_pg",
+                            use_merge=True,
+                            batch_size=b_size,
+                            q_target_tbl=self._q(target_tbl),
+                            q_cols_csv=", ".join(q_cols),
+                            aliased_inner=aliased_inner,
+                            ord_tail=ord_tail,
+                            merge_on_csv=" AND ".join(f"__mv_dst.{self._q(c)} = __mv_src.{self._q(c)}" for c in tbl_pks),
+                            matched_clause=matched_clause,
+                            merge_vals_csv=", ".join(f"__mv_src.{self._q(c)}" for c in cols),
+                        )
                     )
                 else:
                     upsert_tail = ""
@@ -6436,24 +6633,16 @@ class IncrementalViewCompiler:
                         ]
                         upsert_tail = f"\n        ON CONFLICT ({', '.join(q_tbl_pks)}) DO UPDATE SET {', '.join(upd_cols)}"
                     inc_stmts.append(
-                        f"DO $$\n"
-                        f"DECLARE\n"
-                        f"    __mv_offset BIGINT := 0;\n"
-                        f"    __mv_batch_size BIGINT := {b_size};\n"
-                        f"    __mv_rows BIGINT := 0;\n"
-                        f"BEGIN\n"
-                        f"    LOOP\n"
-                        f"        INSERT INTO {self._q(target_tbl)} ({', '.join(q_cols)})\n"
-                        f"        SELECT {', '.join(q_cols)}\n"
-                        f"        FROM (\n"
-                        f"            {aliased_inner}\n"
-                        f"        ) AS __mv_init{ord_tail}\n"
-                        f"        LIMIT __mv_batch_size OFFSET __mv_offset{upsert_tail};\n"
-                        f"        GET DIAGNOSTICS __mv_rows = ROW_COUNT;\n"
-                        f"        EXIT WHEN __mv_rows < __mv_batch_size;\n"
-                        f"        __mv_offset := __mv_offset + __mv_rows;\n"
-                        f"    END LOOP;\n"
-                        f"END $$;"
+                        render_procedural_sql(
+                            "backfill_offset_pg",
+                            use_merge=False,
+                            batch_size=b_size,
+                            q_target_tbl=self._q(target_tbl),
+                            q_cols_csv=", ".join(q_cols),
+                            aliased_inner=aliased_inner,
+                            ord_tail=ord_tail,
+                            upsert_tail=upsert_tail,
+                        )
                     )
             elif self.dialect == Dialect.MYSQL:
                 upsert_tail = ""
@@ -6471,27 +6660,19 @@ class IncrementalViewCompiler:
                 ord_tail = f"\n        ORDER BY {ord_cols}"
                 proc_name = self._bounded_ident(f"{self.object_prefix}proc_backfill_", self.logical_view_name, f"_{idx_s}")
                 inc_stmts.extend([
-                    f"DROP PROCEDURE IF EXISTS {proc_name};",
-                    (
-                        f"CREATE PROCEDURE {proc_name}()\n"
-                        f"BEGIN\n"
-                        f"    DECLARE __mv_offset BIGINT DEFAULT 0;\n"
-                        f"    DECLARE __mv_batch_size BIGINT DEFAULT {b_size};\n"
-                        f"    DECLARE __mv_rows BIGINT DEFAULT 0;\n"
-                        f"    REPEAT\n"
-                        f"        INSERT INTO {self._q(target_tbl)} ({', '.join(q_cols)})\n"
-                        f"        SELECT {', '.join(q_cols)}\n"
-                        f"        FROM (\n"
-                        f"            {aliased_inner}\n"
-                        f"        ) AS __mv_init{ord_tail}\n"
-                        f"        LIMIT __mv_batch_size OFFSET __mv_offset{upsert_tail};\n"
-                        f"        SET __mv_rows = ROW_COUNT();\n"
-                        f"        SET __mv_offset = __mv_offset + __mv_batch_size;\n"
-                        f"    UNTIL __mv_rows <= 0 END REPEAT;\n"
-                        f"END;"
+                    render_procedural_sql("drop_procedure_mysql", proc_name=proc_name),
+                    render_procedural_sql(
+                        "backfill_offset_mysql_proc",
+                        proc_name=proc_name,
+                        batch_size=b_size,
+                        q_target_tbl=self._q(target_tbl),
+                        q_cols_csv=", ".join(q_cols),
+                        aliased_inner=aliased_inner,
+                        ord_tail=ord_tail,
+                        upsert_tail=upsert_tail,
                     ),
-                    f"CALL {proc_name}();",
-                    f"DROP PROCEDURE IF EXISTS {proc_name};",
+                    render_procedural_sql("call_procedure_mysql", proc_name=proc_name),
+                    render_procedural_sql("drop_procedure_mysql", proc_name=proc_name),
                 ])
         return inc_stmts
 
@@ -9381,42 +9562,32 @@ class IncrementalViewCompiler:
         cleanup_stmts = upd_cleanup_old_stmts or []
 
         if self.dialect == Dialect.SQLITE:
-            when_ins = f"\nWHEN {where_new}" if where_new else ""
-            ins_body = "\n    ".join(ins_stmts)
-            trig_ins = (
-                f"CREATE TRIGGER {t_ai_name}\n"
-                f"AFTER INSERT ON {q_base_t}\n"
-                f"FOR EACH ROW{when_ins}\n"
-                f"BEGIN\n"
-                f"    {ins_body}\n"
-                f"END;"
+            trig_ins = render_procedural_sql(
+                "trigger_sqlite_after_insert",
+                trg_name=t_ai_name,
+                q_base_t=q_base_t,
+                when_clause=where_new,
+                body="\n    ".join(ins_stmts),
             )
-
-            when_del = f"\nWHEN {where_old}" if where_old else ""
-            del_body = "\n    ".join(del_stmts)
-            trig_del = (
-                f"CREATE TRIGGER {t_ad_name}\n"
-                f"AFTER DELETE ON {q_base_t}\n"
-                f"FOR EACH ROW{when_del}\n"
-                f"BEGIN\n"
-                f"    {del_body}\n"
-                f"END;"
+            trig_del = render_procedural_sql(
+                "trigger_sqlite_after_delete",
+                trg_name=t_ad_name,
+                q_base_t=q_base_t,
+                when_clause=where_old,
+                body="\n    ".join(del_stmts),
             )
-
             upd_stmts = (
                 [self._apply_where_guard_to_stmt(s, where_old) for s in upd_old_stmts]
                 + [self._apply_where_guard_to_stmt(s, where_new) for s in upd_new_stmts]
                 + [self._apply_where_guard_to_stmt(s, where_old) for s in cleanup_stmts]
             )
-            upd_body = "\n    ".join(upd_stmts)
-            when_upd = f"\nWHEN {changed_guard}" if changed_guard else ""
-            trig_upd = (
-                f"CREATE TRIGGER {t_au_name}\n"
-                f"AFTER UPDATE{upd_of_clause} ON {q_base_t}\n"
-                f"FOR EACH ROW{when_upd}\n"
-                f"BEGIN\n"
-                f"    {upd_body}\n"
-                f"END;"
+            trig_upd = render_procedural_sql(
+                "trigger_sqlite_after_update",
+                trg_name=t_au_name,
+                upd_of_clause=upd_of_clause,
+                q_base_t=q_base_t,
+                when_clause=changed_guard,
+                body="\n    ".join(upd_stmts),
             )
             t_names = [t_ai_name, t_ad_name, t_au_name]
             return [trig_ins, trig_del, trig_upd], t_names, []
@@ -9456,18 +9627,16 @@ class IncrementalViewCompiler:
             )
 
             fn_trunc = self._bounded_ident(f"{p}fn_sync_", stem, "_trunc")
-            fn_trunc_ddl = (
-                f"CREATE OR REPLACE FUNCTION {fn_trunc}()\n"
-                f"RETURNS TRIGGER AS $$\n"
-                f"BEGIN\n"
-                f"    {trunc_block}\n"
-                f"    RETURN NULL;\n"
-                f"END;\n$$ LANGUAGE plpgsql;"
+            fn_trunc_ddl = render_procedural_sql(
+                "pg_truncate_function",
+                fn_name=fn_trunc,
+                trunc_block=trunc_block,
             )
-            t_trunc = (
-                f"CREATE TRIGGER {t_trunc_name}\n"
-                f"AFTER TRUNCATE ON {q_base_t}\n"
-                f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_trunc}();"
+            t_trunc = render_procedural_sql(
+                "pg_truncate_trigger",
+                trg_name=t_trunc_name,
+                q_base_t=q_base_t,
+                fn_name=fn_trunc,
             )
 
             if self.pg_use_transition_tables:
@@ -9477,82 +9646,53 @@ class IncrementalViewCompiler:
 
                 use_vec = bool(self.pg_vectorize_transition_tables)
 
-                # Determine whether we can vectorize AI, AD, AU triggers directly
                 if use_vec and pg_ai_body is not None:
-                    ai_sql = pg_ai_body.strip()
-                    fn_ai_ddl = (
-                        f"CREATE OR REPLACE FUNCTION {fn_ai}()\n"
-                        f"RETURNS TRIGGER AS $$\n"
-                        f"BEGIN\n"
-                        f"    {ai_sql}\n"
-                        f"    RETURN NULL;\n"
-                        f"END;\n$$ LANGUAGE plpgsql;"
+                    fn_ai_ddl = render_procedural_sql(
+                        "pg_transition_simple_function",
+                        fn_name=fn_ai,
+                        body_sql=pg_ai_body.strip(),
                     )
                 elif use_vec and ("NEW." not in ins_section and ":NEW" not in ins_section):
-                    ai_sql = ins_section.strip()
-                    fn_ai_ddl = (
-                        f"CREATE OR REPLACE FUNCTION {fn_ai}()\n"
-                        f"RETURNS TRIGGER AS $$\n"
-                        f"BEGIN\n"
-                        f"    {ai_sql}\n"
-                        f"    RETURN NULL;\n"
-                        f"END;\n$$ LANGUAGE plpgsql;"
+                    fn_ai_ddl = render_procedural_sql(
+                        "pg_transition_simple_function",
+                        fn_name=fn_ai,
+                        body_sql=ins_section.strip(),
                     )
                 else:
-                    fn_ai_ddl = (
-                        f"CREATE OR REPLACE FUNCTION {fn_ai}()\n"
-                        f"RETURNS TRIGGER AS $$\n"
-                        f"DECLARE\n    NEW RECORD;\n"
-                        f"BEGIN\n"
-                        f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
-                        f"        {ins_section}\n"
-                        f"    END LOOP;\n"
-                        f"    RETURN NULL;\n"
-                        f"END;\n$$ LANGUAGE plpgsql;"
+                    fn_ai_ddl = render_procedural_sql(
+                        "pg_transition_loop_function",
+                        fn_name=fn_ai,
+                        row_var="NEW",
+                        transition_table="__mv_new_rows",
+                        section_sql=ins_section,
                     )
 
                 if use_vec and pg_ad_body is not None:
-                    ad_sql = pg_ad_body.strip()
-                    fn_ad_ddl = (
-                        f"CREATE OR REPLACE FUNCTION {fn_ad}()\n"
-                        f"RETURNS TRIGGER AS $$\n"
-                        f"BEGIN\n"
-                        f"    {ad_sql}\n"
-                        f"    RETURN NULL;\n"
-                        f"END;\n$$ LANGUAGE plpgsql;"
+                    fn_ad_ddl = render_procedural_sql(
+                        "pg_transition_simple_function",
+                        fn_name=fn_ad,
+                        body_sql=pg_ad_body.strip(),
                     )
                 elif use_vec and ("OLD." not in del_section and ":OLD" not in del_section):
-                    ad_sql = del_section.strip()
-                    fn_ad_ddl = (
-                        f"CREATE OR REPLACE FUNCTION {fn_ad}()\n"
-                        f"RETURNS TRIGGER AS $$\n"
-                        f"BEGIN\n"
-                        f"    {ad_sql}\n"
-                        f"    RETURN NULL;\n"
-                        f"END;\n$$ LANGUAGE plpgsql;"
+                    fn_ad_ddl = render_procedural_sql(
+                        "pg_transition_simple_function",
+                        fn_name=fn_ad,
+                        body_sql=del_section.strip(),
                     )
                 else:
-                    fn_ad_ddl = (
-                        f"CREATE OR REPLACE FUNCTION {fn_ad}()\n"
-                        f"RETURNS TRIGGER AS $$\n"
-                        f"DECLARE\n    OLD RECORD;\n"
-                        f"BEGIN\n"
-                        f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
-                        f"        {del_section}\n"
-                        f"    END LOOP;\n"
-                        f"    RETURN NULL;\n"
-                        f"END;\n$$ LANGUAGE plpgsql;"
+                    fn_ad_ddl = render_procedural_sql(
+                        "pg_transition_loop_function",
+                        fn_name=fn_ad,
+                        row_var="OLD",
+                        transition_table="__mv_old_rows",
+                        section_sql=del_section,
                     )
 
                 if use_vec and pg_au_body is not None:
-                    au_sql = pg_au_body.strip()
-                    fn_au_ddl = (
-                        f"CREATE OR REPLACE FUNCTION {fn_au}()\n"
-                        f"RETURNS TRIGGER AS $$\n"
-                        f"BEGIN\n"
-                        f"    {au_sql}\n"
-                        f"    RETURN NULL;\n"
-                        f"END;\n$$ LANGUAGE plpgsql;"
+                    fn_au_ddl = render_procedural_sql(
+                        "pg_transition_simple_function",
+                        fn_name=fn_au,
+                        body_sql=pg_au_body.strip(),
                     )
                 elif use_vec and (
                     "OLD." not in old_section
@@ -9562,69 +9702,61 @@ class IncrementalViewCompiler:
                     and "OLD." not in clean_section
                     and ":OLD" not in clean_section
                 ):
-                    au_parts: List[str] = []
-                    if old_section.strip():
-                        au_parts.append(old_section.strip())
-                    if new_section.strip():
-                        au_parts.append(new_section.strip())
-                    if clean_section.strip():
-                        au_parts.append(clean_section.strip())
-                    au_sql = "\n    ".join(au_parts)
-                    fn_au_ddl = (
-                        f"CREATE OR REPLACE FUNCTION {fn_au}()\n"
-                        f"RETURNS TRIGGER AS $$\n"
-                        f"BEGIN\n"
-                        f"    {au_sql}\n"
-                        f"    RETURN NULL;\n"
-                        f"END;\n$$ LANGUAGE plpgsql;"
+                    au_parts = [s.strip() for s in (old_section, new_section, clean_section) if s.strip()]
+                    fn_au_ddl = render_procedural_sql(
+                        "pg_transition_simple_function",
+                        fn_name=fn_au,
+                        body_sql="\n    ".join(au_parts),
                     )
                 else:
-                    au_loops: List[str] = []
+                    au_loops: List[Dict[str, str]] = []
                     if old_section.strip():
-                        au_loops.append(
-                            f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
-                            f"        {old_section}\n"
-                            f"    END LOOP;"
-                        )
+                        au_loops.append({
+                            "row_var": "OLD",
+                            "transition_table": "__mv_old_rows",
+                            "section_sql": old_section,
+                        })
                     if new_section.strip():
-                        au_loops.append(
-                            f"    FOR NEW IN SELECT * FROM __mv_new_rows LOOP\n"
-                            f"        {new_section}\n"
-                            f"    END LOOP;"
-                        )
+                        au_loops.append({
+                            "row_var": "NEW",
+                            "transition_table": "__mv_new_rows",
+                            "section_sql": new_section,
+                        })
                     if clean_section.strip():
-                        au_loops.append(
-                            f"    FOR OLD IN SELECT * FROM __mv_old_rows LOOP\n"
-                            f"        {clean_section.strip()}\n"
-                            f"    END LOOP;"
-                        )
-                    au_body = "\n".join(au_loops)
-                    fn_au_ddl = (
-                        f"CREATE OR REPLACE FUNCTION {fn_au}()\n"
-                        f"RETURNS TRIGGER AS $$\n"
-                        f"DECLARE\n    OLD RECORD;\n    NEW RECORD;\n"
-                        f"BEGIN\n"
-                        f"{au_body}\n"
-                        f"    RETURN NULL;\n"
-                        f"END;\n$$ LANGUAGE plpgsql;"
+                        au_loops.append({
+                            "row_var": "OLD",
+                            "transition_table": "__mv_old_rows",
+                            "section_sql": clean_section.strip(),
+                        })
+                    fn_au_ddl = render_procedural_sql(
+                        "pg_transition_au_loop_function",
+                        fn_name=fn_au,
+                        loops=au_loops,
                     )
-                t_ai = (
-                    f"CREATE TRIGGER {t_ai_name}\n"
-                    f"AFTER INSERT ON {q_base_t}\n"
-                    f"REFERENCING NEW TABLE AS __mv_new_rows\n"
-                    f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_ai}();"
+
+                t_ai = render_procedural_sql(
+                    "pg_transition_trigger",
+                    trg_name=t_ai_name,
+                    event="INSERT",
+                    q_base_t=q_base_t,
+                    referencing="NEW TABLE AS __mv_new_rows",
+                    fn_name=fn_ai,
                 )
-                t_ad = (
-                    f"CREATE TRIGGER {t_ad_name}\n"
-                    f"AFTER DELETE ON {q_base_t}\n"
-                    f"REFERENCING OLD TABLE AS __mv_old_rows\n"
-                    f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_ad}();"
+                t_ad = render_procedural_sql(
+                    "pg_transition_trigger",
+                    trg_name=t_ad_name,
+                    event="DELETE",
+                    q_base_t=q_base_t,
+                    referencing="OLD TABLE AS __mv_old_rows",
+                    fn_name=fn_ad,
                 )
-                t_au = (
-                    f"CREATE TRIGGER {t_au_name}\n"
-                    f"AFTER UPDATE ON {q_base_t}\n"
-                    f"REFERENCING OLD TABLE AS __mv_old_rows NEW TABLE AS __mv_new_rows\n"
-                    f"FOR EACH STATEMENT EXECUTE FUNCTION {fn_au}();"
+                t_au = render_procedural_sql(
+                    "pg_transition_trigger",
+                    trg_name=t_au_name,
+                    event="UPDATE",
+                    q_base_t=q_base_t,
+                    referencing="OLD TABLE AS __mv_old_rows NEW TABLE AS __mv_new_rows",
+                    fn_name=fn_au,
                 )
                 return (
                     [fn_ai_ddl, t_ai, fn_ad_ddl, t_ad, fn_au_ddl, t_au, fn_trunc_ddl, t_trunc],
@@ -9640,29 +9772,19 @@ class IncrementalViewCompiler:
                 if old_section.strip()
                 else f"{new_section}{clean_section}"
             )
-
-            fn_ddl = (
-                f"CREATE OR REPLACE FUNCTION {fn_name}()\n"
-                f"RETURNS TRIGGER AS $$\n"
-                f"BEGIN\n"
-                f"    IF COALESCE(current_setting('matview.skip_triggers', true), '') = 'on' THEN\n"
-                f"        RETURN NULL;\n"
-                f"    END IF;\n"
-                f"    IF (TG_OP = 'DELETE') THEN\n"
-                f"        {del_section}\n"
-                f"    ELSIF (TG_OP = 'INSERT') THEN\n"
-                f"        {ins_section}\n"
-                f"    ELSIF (TG_OP = 'UPDATE') THEN\n"
-                f"        {upd_guard_open}{upd_inner}{upd_guard_close}\n"
-                f"    END IF;\n"
-                f"    RETURN NULL;\n"
-                f"END;\n"
-                f"$$ LANGUAGE plpgsql;"
+            fn_ddl = render_procedural_sql(
+                "pg_row_sync_function",
+                fn_name=fn_name,
+                del_section=del_section,
+                ins_section=ins_section,
+                upd_body=f"{upd_guard_open}{upd_inner}{upd_guard_close}",
             )
-            t_sync = (
-                f"CREATE TRIGGER {t_sync_name}\n"
-                f"AFTER INSERT OR UPDATE{upd_of_clause} OR DELETE ON {q_base_t}\n"
-                f"FOR EACH ROW EXECUTE FUNCTION {fn_name}();"
+            t_sync = render_procedural_sql(
+                "pg_row_sync_trigger",
+                trg_name=t_sync_name,
+                upd_of_clause=upd_of_clause,
+                q_base_t=q_base_t,
+                fn_name=fn_name,
             )
             return (
                 [fn_ddl, t_sync, fn_trunc_ddl, t_trunc],
@@ -9711,35 +9833,26 @@ class IncrementalViewCompiler:
                 else f"{new_section}{clean_section}"
             )
 
-            trig_ins = (
-                f"CREATE TRIGGER {t_ai_name}\n"
-                f"AFTER INSERT ON {q_base_t}\n"
-                f"FOR EACH ROW\n"
-                f"BEGIN\n"
-                f"    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN\n"
-                f"    {ins_section}\n"
-                f"    END IF;\n"
-                f"END;"
+            trig_ins = render_procedural_sql(
+                "mysql_row_trigger",
+                trg_name=t_ai_name,
+                event="INSERT",
+                q_base_t=q_base_t,
+                body=ins_section,
             )
-            trig_del = (
-                f"CREATE TRIGGER {t_ad_name}\n"
-                f"AFTER DELETE ON {q_base_t}\n"
-                f"FOR EACH ROW\n"
-                f"BEGIN\n"
-                f"    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN\n"
-                f"    {del_section}\n"
-                f"    END IF;\n"
-                f"END;"
+            trig_del = render_procedural_sql(
+                "mysql_row_trigger",
+                trg_name=t_ad_name,
+                event="DELETE",
+                q_base_t=q_base_t,
+                body=del_section,
             )
-            trig_upd = (
-                f"CREATE TRIGGER {t_au_name}\n"
-                f"AFTER UPDATE ON {q_base_t}\n"
-                f"FOR EACH ROW\n"
-                f"BEGIN\n"
-                f"    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN\n"
-                f"    {upd_guard_open}{upd_inner}{upd_guard_close}\n"
-                f"    END IF;\n"
-                f"END;"
+            trig_upd = render_procedural_sql(
+                "mysql_row_trigger",
+                trg_name=t_au_name,
+                event="UPDATE",
+                q_base_t=q_base_t,
+                body=f"{upd_guard_open}{upd_inner}{upd_guard_close}",
             )
             t_names = [t_ai_name, t_ad_name, t_au_name]
             return [trig_ins, trig_del, trig_upd], t_names, []
