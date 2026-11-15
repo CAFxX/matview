@@ -11122,6 +11122,7 @@ class MaterializedViewManager:
                 else:
                     self._rollback()
 
+                restore_savepoint = False
                 try:
                     if self.dialect == Dialect.POSTGRES:
                         cur.execute("SET LOCAL matview.skip_triggers = 'off';")
@@ -11142,7 +11143,6 @@ class MaterializedViewManager:
                     # Reinstallation is correctness-critical. On engines with
                     # transactional DDL, isolate restoration so a failed CREATE
                     # TRIGGER/FUNCTION rolls back to the original installed set.
-                    restore_savepoint = False
                     if self.dialect in (Dialect.SQLITE, Dialect.POSTGRES):
                         cur.execute("SAVEPOINT __mv_bulk_restore_sp;")
                         restore_savepoint = True
