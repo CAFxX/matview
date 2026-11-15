@@ -10252,6 +10252,63 @@ class MaterializedViewManager:
                 pass
 
     @staticmethod
+    def _require_idle_mysql_connection(conn: Any) -> None:
+        """Fail closed unless every wrapped MySQL/MariaDB connection layer is idle."""
+        # SQLAlchemy and pool facades can report no transaction while callers
+        # have started one directly on the underlying DB-API connection.
+        candidates = []
+        pending = [conn]
+        seen = set()
+        while pending:
+            candidate = pending.pop()
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            candidates.append(candidate)
+            for attr in ("connection", "driver_connection", "dbapi_connection", "_connection"):
+                try:
+                    nested = getattr(candidate, attr, None)
+                except Exception:
+                    nested = None
+                if nested is not None and nested is not candidate:
+                    pending.append(nested)
+
+        observed_transaction_state = False
+        for candidate in candidates:
+            state = getattr(candidate, "in_transaction", None)
+            if callable(state):
+                try:
+                    state = state()
+                except Exception:
+                    state = None
+            if isinstance(state, bool):
+                observed_transaction_state = True
+                if state:
+                    raise RuntimeError(
+                        "MySQL/MariaDB manager initialization cannot run inside an active "
+                        "caller transaction; commit or roll back that transaction first"
+                    )
+                continue
+
+            status = getattr(candidate, "server_status", None)
+            if status is None:
+                status = getattr(candidate, "_server_status", None)
+            if isinstance(status, int):
+                observed_transaction_state = True
+                if status & 0x0001:
+                    raise RuntimeError(
+                        "MySQL/MariaDB manager initialization cannot run inside an active "
+                        "caller transaction; commit or roll back that transaction first"
+                    )
+
+        if not observed_transaction_state:
+            raise RuntimeError(
+                "MySQL/MariaDB manager initialization requires an adapter that exposes "
+                "transaction state; cannot safely determine whether catalog initialization "
+                "would commit caller work"
+            )
+
+    @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
         """Fail closed unless the PostgreSQL connection and wrapped driver are idle."""
         # SQLAlchemy and pool adapters can expose an idle facade while application
