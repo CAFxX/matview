@@ -4046,11 +4046,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         for conn in active_connections:
             mgr = make_manager(conn)
-            for options in ({}, {"drop_triggers": True}, {"use_shadow_swap": True}):
-                with self.subTest(options=options, attrs=conn.__dict__):
-                    with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
-                        with mgr.bulk_changes(**options):
-                            self.fail("active transaction must be rejected")
+            self.assertIs(mgr._mysql_transaction_state(), True)
             self.assertEqual(conn.cursor_calls, 0)
 
         # An adapter with no reliable state API is rejected closed: guessing
@@ -4125,12 +4121,42 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "view_sql": "CREATE VIEW v AS SELECT id FROM t",
         }
 
-        def make_manager(conn: Connection) -> MaterializedViewManager:
+        def make_manager(conn: Connection, catalog: Optional[Dict[str, Any]] = None) -> MaterializedViewManager:
             mgr = MaterializedViewManager.__new__(MaterializedViewManager)
             mgr.conn = conn
             mgr.dialect = Dialect.MYSQL
-            mgr.get_catalog = lambda: {"v": entry}
+            mgr.get_catalog = lambda: {"v": entry} if catalog is None else catalog
             return mgr
+
+        # A caller-owned transaction is protected by a savepoint: successful
+        # exit releases only the savepoint and leaves commit/rollback to caller.
+        cursor = Cursor()
+        conn = Connection(cursor)
+        conn.in_transaction = True
+        mgr = make_manager(conn, catalog={})
+        mgr.fetch_schema = lambda: {}
+        with mgr.bulk_changes():
+            pass
+        self.assertIn("SAVEPOINT __mv_bulk_sp;", cursor.statements)
+        self.assertIn("RELEASE SAVEPOINT __mv_bulk_sp;", cursor.statements)
+        self.assertEqual(conn.commit_calls, 0)
+        self.assertEqual(conn.rollback_calls, 0)
+        conn.rollback()
+        self.assertEqual(conn.rollback_calls, 1)
+
+        # A failure inside the context rolls back only to its savepoint; it
+        # must not roll back the caller's surrounding transaction.
+        cursor = Cursor()
+        conn = Connection(cursor)
+        conn.in_transaction = True
+        mgr = make_manager(conn, catalog={})
+        with self.assertRaisesRegex(ValueError, "caller rollback"):
+            with mgr.bulk_changes():
+                raise ValueError("caller rollback")
+        self.assertIn("ROLLBACK TO SAVEPOINT __mv_bulk_sp;", cursor.statements)
+        self.assertEqual(conn.rollback_calls, 0)
+        self.assertEqual(conn.commit_calls, 0)
+        self.assertIs(conn.in_transaction, True)
 
         # Explicit DDL options must fail before even reading the catalog.
         for options in ({"drop_triggers": True}, {"use_shadow_swap": True}):
