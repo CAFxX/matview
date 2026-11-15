@@ -4203,6 +4203,19 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 self.fail("a connection with unknown trigger-bypass state must never be reused")
         self.assertEqual(cursor.statements, statements_before_reuse)
 
+        # A body failure must not hide a reset failure either; the reset
+        # failure takes precedence while retaining the original error as a note.
+        cursor = Cursor(fail_reset=True)
+        conn = Connection(cursor)
+        mgr = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "connection must be discarded") as caught:
+            with mgr.bulk_changes():
+                raise ValueError("original body failure")
+        self.assertTrue(caught.exception.connection_unsafe)
+        self.assertTrue(any("original body failure" in note for note in caught.exception.__notes__))
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
+
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
