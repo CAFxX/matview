@@ -10982,8 +10982,25 @@ class MaterializedViewManager:
         """
         # MySQL DDL implicitly commits. Check transaction state before
         # get_catalog(): its SELECT can itself start a DB-API transaction.
+        def _mark_mysql_bulk_connection_unsafe() -> None:
+            self._mysql_bulk_connection_unsafe = True
+            try:
+                setattr(self.conn, "_matview_bulk_connection_unsafe", True)
+            except Exception:
+                # Some C-extension DB-API connections reject custom attributes.
+                # The manager-level guard and discard signal still apply.
+                pass
+
         mysql_caller_transaction = False
         if self.dialect == Dialect.MYSQL:
+            if (
+                getattr(self, "_mysql_bulk_connection_unsafe", False)
+                or getattr(self.conn, "_matview_bulk_connection_unsafe", False)
+            ):
+                raise RuntimeError(
+                    "this MySQL/MariaDB connection has an unknown trigger-bypass "
+                    "session state and must be discarded before reuse"
+                )
             tx_state = self._mysql_transaction_state()
             if tx_state is None:
                 raise RuntimeError(
@@ -11073,10 +11090,14 @@ class MaterializedViewManager:
             if not mysql_caller_transaction:
                 self._rollback()
             if bypass_reset_error is not None:
-                raise RuntimeError(
+                _mark_mysql_bulk_connection_unsafe()
+                error = RuntimeError(
                     "bulk_changes() could not establish or clear the MySQL/MariaDB "
-                    "session trigger-bypass flag; discard this connection before reuse"
-                ) from bypass_reset_error
+                    "session trigger-bypass flag; the connection state is unsafe and "
+                    "the connection must be discarded before reuse"
+                )
+                error.connection_unsafe = True
+                raise error from bypass_reset_error
             raise RuntimeError(
                 "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
                 "the trigger-DDL fallback is unsafe because MySQL implicitly commits DDL"
@@ -11115,13 +11136,17 @@ class MaterializedViewManager:
                 try:
                     cur.execute("SET @__matview_skip_triggers = 0;")
                 except Exception as reset_exc:
+                    _mark_mysql_bulk_connection_unsafe()
                     if not mysql_caller_transaction:
                         self._rollback()
-                    raise RuntimeError(
+                    error = RuntimeError(
                         "bulk_changes() rolled back its DML but could not clear the "
-                        "MySQL/MariaDB session trigger-bypass flag; discard this connection "
-                        f"before reuse (original error: {original_exc!r})"
-                    ) from reset_exc
+                        "MySQL/MariaDB session trigger-bypass flag; the connection state "
+                        "is unsafe and the connection must be discarded before reuse"
+                    )
+                    error.connection_unsafe = True
+                    error.add_note(f"Original bulk operation failure: {original_exc!r}")
+                    raise error from reset_exc
             if self.dialect == Dialect.MYSQL:
                 # A caller-owned transaction is rolled back only to our
                 # savepoint; a context-owned transaction is fully rolled back.
@@ -11259,11 +11284,15 @@ class MaterializedViewManager:
                     if not mysql_caller_transaction:
                         self._rollback()
                     if reset_error is not None:
-                        raise RuntimeError(
+                        _mark_mysql_bulk_connection_unsafe()
+                        error = RuntimeError(
                             "bulk_changes() rolled back its DML but could not clear the "
-                            "MySQL/MariaDB session trigger-bypass flag; discard this connection "
-                            f"before reuse (original error: {original_exc!r})"
-                        ) from reset_error
+                            "MySQL/MariaDB session trigger-bypass flag; the connection state "
+                            "is unsafe and the connection must be discarded before reuse"
+                        )
+                        error.connection_unsafe = True
+                        error.add_note(f"Original bulk refresh failure: {original_exc!r}")
+                        raise error from reset_error
                 raise
 
 
