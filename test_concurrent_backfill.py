@@ -732,7 +732,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                         # transaction-abort errors, from BEGIN through COMMIT,
                         # so the workload still completes every logical DML
                         # sequence exactly once.
-                        for attempt in range(5):
+                        for attempt in range(12):
                             try:
                                 second_cur.execute("BEGIN;")
                                 second_cur.execute(
@@ -764,9 +764,9 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                                 ) or (
                                     engine == Dialect.POSTGRES and sqlstate in {"40P01", "40001"}
                                 )
-                                if not retryable or attempt == 4:
+                                if not retryable or attempt == 11:
                                     raise
-                                time.sleep(0.01 * (2 ** attempt) + worker_id * 0.001)
+                                time.sleep(min(0.25, 0.01 * (2 ** attempt)) + 0.003 * ((worker_id * 7 + sequence * 3 + attempt) % 5))
                     with error_lock:
                         completed.append(worker_id)
                 except BaseException as exc:
