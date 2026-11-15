@@ -11111,7 +11111,12 @@ class MaterializedViewManager:
                     "commit or roll back the caller transaction first"
                 )
             cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                cur.execute("BEGIN IMMEDIATE;")
+            except Exception:
+                if hasattr(cur, "close"):
+                    cur.close()
+                raise
             sqlite_writer_reserved = True
 
         try:
@@ -11121,6 +11126,8 @@ class MaterializedViewManager:
                 self._rollback()
             elif self.dialect == Dialect.SQLITE and sqlite_writer_reserved:
                 self._rollback()
+                if cur is not None and hasattr(cur, "close"):
+                    cur.close()
             raise
         if view_names:
             resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
