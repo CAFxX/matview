@@ -10233,6 +10233,25 @@ class MaterializedViewManager:
                 return bool(status & 0x0001)
         return None
 
+    def _mysql_autocommit_state(self) -> Optional[bool]:
+        """Return the configured MySQL autocommit mode without changing it."""
+        getter = getattr(self.conn, "get_autocommit", None)
+        if callable(getter):
+            try:
+                value = getter()
+                if isinstance(value, bool):
+                    return value
+            except Exception:
+                pass
+        for attr in ("autocommit", "autocommit_mode"):
+            try:
+                value = getattr(self.conn, attr)
+            except Exception:
+                continue
+            if isinstance(value, bool):
+                return value
+        return None
+
     def _commit(self) -> None:
         if hasattr(self.conn, "commit"):
             self.conn.commit()
@@ -10965,6 +10984,17 @@ class MaterializedViewManager:
                 raise RuntimeError(
                     "bulk_changes() on MySQL/MariaDB cannot run inside an active "
                     "caller transaction; commit or roll back that transaction first"
+                )
+            autocommit = self._mysql_autocommit_state()
+            if autocommit is None:
+                raise RuntimeError(
+                    "bulk_changes() on MySQL/MariaDB requires a connection adapter "
+                    "that exposes its autocommit mode; cannot guarantee context rollback"
+                )
+            if autocommit:
+                raise RuntimeError(
+                    "bulk_changes() on MySQL/MariaDB requires autocommit to be disabled "
+                    "so the context can roll back its own DML on failure"
                 )
 
         catalog = self.get_catalog()
