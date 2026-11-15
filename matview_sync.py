@@ -10235,13 +10235,25 @@ class MaterializedViewManager:
     @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
         """Fail closed unless a PostgreSQL connection is idle and non-autocommit."""
-        if getattr(conn, "autocommit", None) is not False:
+        autocommit = getattr(conn, "autocommit", None)
+        if autocommit is None:
+            adapter_connection = getattr(conn, "connection", None)
+            driver_connection = getattr(
+                adapter_connection, "driver_connection", adapter_connection
+            )
+            autocommit = getattr(driver_connection, "autocommit", None)
+        if autocommit is not False:
             raise RuntimeError(
                 "PostgreSQL manager initialization requires autocommit=False "
                 "to preserve transactional DDL atomicity"
             )
 
         state = getattr(conn, "in_transaction", None)
+        if callable(state):
+            try:
+                state = state()
+            except Exception:
+                state = None
         if not isinstance(state, bool):
             status = None
             getter = getattr(conn, "get_transaction_status", None)
