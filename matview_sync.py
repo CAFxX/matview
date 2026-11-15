@@ -10229,21 +10229,47 @@ class MaterializedViewManager:
                 )
             return
 
-        if self.dialect == Dialect.POSTGRES:
-            if bool(getattr(self.conn, "autocommit", False)):
-                raise RuntimeError(
-                    "register_view/sync_views require PostgreSQL autocommit=False "
-                    "for transactional DDL"
-                )
+        if self.dialect != Dialect.POSTGRES:
+            return
+
+        autocommit = getattr(self.conn, "autocommit", None)
+        if autocommit is not False:
+            raise RuntimeError(
+                "register_view/sync_views require PostgreSQL autocommit=False "
+                "for transactional DDL"
+            )
+
+        transaction_state = getattr(self.conn, "in_transaction", None)
+        if not isinstance(transaction_state, bool):
+            status = None
             status_getter = getattr(self.conn, "get_transaction_status", None)
             if callable(status_getter):
-                # psycopg2.extensions.TRANSACTION_STATUS_IDLE is 0.
-                status = status_getter()
-                if status != 0:
-                    raise RuntimeError(
-                        "register_view/sync_views require an idle PostgreSQL connection; "
-                        "commit or roll back the caller transaction first"
-                    )
+                try:
+                    status = status_getter()
+                except Exception:
+                    status = None
+            if status is None:
+                info = getattr(self.conn, "info", None)
+                status = getattr(info, "transaction_status", None)
+            if status is None:
+                raise RuntimeError(
+                    "register_view/sync_views require a connection adapter that exposes "
+                    "transaction state; cannot safely determine whether a caller "
+                    "transaction would be committed"
+                )
+            try:
+                # psycopg2 and psycopg3 both expose IDLE as numeric zero.
+                transaction_state = int(status) != 0
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    "register_view/sync_views could not interpret PostgreSQL "
+                    "connection transaction state"
+                )
+        if transaction_state:
+            raise RuntimeError(
+                "register_view/sync_views cannot run inside an active caller "
+                "transaction; commit or roll back that transaction first"
+            )
 
     def _param_placeholder(self) -> str:
         return "?" if self.dialect == Dialect.SQLITE else "%s"
