@@ -78,6 +78,86 @@ def main() -> None:
             "SELECT id, value FROM replacement_reader ORDER BY id;"
         ).fetchall()
         assert after_write == [(1, 10), (2, 20), (3, 30), (4, 40)], after_write
+
+        # Exercise the earlier failure boundary too: fail only after drop_view
+        # has removed the reader/backing objects but before it deletes the
+        # catalog row. The whole DDL sequence must roll back on the same
+        # connection, and that connection must remain usable afterwards.
+        raw_conn = conn
+        executed = []
+        injected = {"fail": True}
+
+        class CursorProxy:
+            def __init__(self, cursor):
+                self._cursor = cursor
+
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                normalized = " ".join(sql.upper().split())
+                if (
+                    injected["fail"]
+                    and normalized.startswith(
+                        f"DELETE FROM {manager.catalog_table.upper()}"
+                    )
+                ):
+                    assert any(
+                        item.upper().startswith("DROP VIEW IF EXISTS REPLACEMENT_READER")
+                        for item in executed
+                    ), executed
+                    injected["fail"] = False
+                    raise sqlite3.OperationalError(
+                        "injected failure after reader/backing drop"
+                    )
+                if params is None:
+                    return self._cursor.execute(statement)
+                return self._cursor.execute(statement, params)
+
+            def __getattr__(self, name):
+                return getattr(self._cursor, name)
+
+        class ConnectionProxy:
+            def cursor(self, *args, **kwargs):
+                return CursorProxy(raw_conn.cursor(*args, **kwargs))
+
+            def __getattr__(self, name):
+                return getattr(raw_conn, name)
+
+        manager.conn = ConnectionProxy()
+        try:
+            manager.register_view(view_sql, force_rebuild=True)
+        except sqlite3.OperationalError as exc:
+            assert "injected failure after reader/backing drop" in str(exc), exc
+        else:
+            raise AssertionError("drop-stage replacement unexpectedly succeeded")
+        finally:
+            manager.conn = raw_conn
+
+        assert not injected["fail"], "fault injection did not reach catalog cleanup"
+        restored_rows = raw_conn.execute(
+            "SELECT id, value FROM replacement_reader ORDER BY id;"
+        ).fetchall()
+        assert restored_rows == [(1, 10), (2, 20), (3, 30), (4, 40)], restored_rows
+        restored_catalog = manager.get_catalog()[plan.view_name]
+        assert restored_catalog["signature_hash"] == original_catalog["signature_hash"]
+        for trigger_name in original_catalog["trigger_names"]:
+            found = raw_conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?;",
+                (trigger_name,),
+            ).fetchone()[0]
+            assert found == 1, f"old maintenance trigger {trigger_name} was not restored"
+
+        # Prove the failed DDL transaction did not poison the connection.
+        raw_conn.execute("BEGIN;")
+        raw_conn.execute("INSERT INTO replacement_rows VALUES (5, 50);")
+        raw_conn.commit()
+        after_recovery = raw_conn.execute(
+            "SELECT id, value FROM replacement_reader ORDER BY id;"
+        ).fetchall()
+        assert after_recovery == [
+            (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+        ], after_recovery
+
         print("PASS: failed replacement rolled back to the prior live materialized view")
     finally:
         conn.close()
