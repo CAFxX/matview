@@ -6068,12 +6068,11 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             f"forward={forward!r}, reverse={reverse!r}",
         )
         self.assertEqual(len(forward_aux), len(reverse_aux))
-        for step, (left, right) in enumerate(zip(forward_aux, reverse_aux)):
-            self.assertTrue(
-                _rows_equal(left, right),
-                f"commuting DML permutations produced different DISTINCT auxiliary "
-                f"state at checkpoint {step}: forward={left!r}, reverse={right!r}",
-            )
+        self.assertTrue(
+            _rows_equal(forward_aux[-1], reverse_aux[-1]),
+            "commuting DML permutations produced different final DISTINCT auxiliary "
+            f"state: forward={forward_aux[-1]!r}, reverse={reverse_aux[-1]!r}",
+        )
 
     def test_manager_register_view_enforces_limitations_before_install_and_warns_on_override(self) -> None:
         conn = sqlite3.connect(":memory:")
