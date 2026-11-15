@@ -359,6 +359,120 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             conn.close()
             os.unlink(db_path)
 
+    def test_concurrent_independent_writers_keep_materialized_aggregates_consistent(self) -> None:
+        """Stress trigger maintenance with concurrent committed and rolled-back DML."""
+        fd, db_path = tempfile.mkstemp(prefix="matview-multiwriter-", suffix=".sqlite")
+        os.close(fd)
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        _register_sqlite_compat_udfs(conn)
+        conn.execute(
+            "CREATE TABLE concurrent_ledger ("
+            "id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, amount INTEGER);"
+        )
+        conn.commit()
+
+        manager = MaterializedViewManager(conn)
+        plan = manager.register_view(
+            "CREATE VIEW concurrent_totals AS "
+            "SELECT bucket, COUNT(*) AS row_count, COUNT(amount) AS valued_count, "
+            "SUM(amount) AS total_amount "
+            "FROM concurrent_ledger GROUP BY bucket;"
+        )
+        worker_count = 4
+        transactions_per_worker = 40
+        start = threading.Barrier(worker_count)
+        errors: list[BaseException] = []
+        completed: list[int] = []
+        error_lock = threading.Lock()
+
+        def writer(worker_id: int) -> None:
+            second = None
+            try:
+                second = sqlite3.connect(db_path, timeout=30)
+                second.execute("PRAGMA busy_timeout=30000;")
+                _register_sqlite_compat_udfs(second)
+                start.wait(timeout=15)
+                for sequence in range(transactions_per_worker):
+                    row_id = worker_id * 10000 + sequence + 1
+                    bucket = f"source_{worker_id % 2}"
+                    amount = None if sequence % 9 == 0 else worker_id * 100 + sequence
+                    second.execute("BEGIN IMMEDIATE;")
+                    second.execute(
+                        "INSERT INTO concurrent_ledger (id, bucket, amount) VALUES (?, ?, ?);",
+                        (row_id, bucket, amount),
+                    )
+                    second.execute(
+                        "UPDATE concurrent_ledger SET bucket = ?, "
+                        "amount = CASE WHEN amount IS NULL THEN NULL ELSE amount + 7 END "
+                        "WHERE id = ?;",
+                        (f"target_{worker_id % 3}", row_id),
+                    )
+                    if sequence % 4 == 0:
+                        second.execute(
+                            "DELETE FROM concurrent_ledger WHERE id = ?;", (row_id,)
+                        )
+                    if sequence % 13 == 0:
+                        second.rollback()
+                    else:
+                        second.commit()
+                with error_lock:
+                    completed.append(worker_id)
+            except BaseException as exc:
+                with error_lock:
+                    errors.append(exc)
+            finally:
+                if second is not None:
+                    second.close()
+
+        threads = [
+            threading.Thread(target=writer, args=(worker_id,), daemon=True)
+            for worker_id in range(worker_count)
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=45)
+            self.assertFalse(
+                [thread.name for thread in threads if thread.is_alive()],
+                "concurrent DML workers deadlocked or exceeded the timeout",
+            )
+            self.assertEqual(errors, [], f"concurrent writer errors: {errors!r}")
+            self.assertEqual(completed, list(range(worker_count)))
+
+            actual = conn.execute(
+                f"SELECT bucket, row_count, valued_count, total_amount "
+                f"FROM {plan.view_name} ORDER BY bucket;"
+            ).fetchall()
+            expected = conn.execute(
+                "SELECT bucket, COUNT(*) AS row_count, COUNT(amount) AS valued_count, "
+                "SUM(amount) AS total_amount FROM concurrent_ledger "
+                "GROUP BY bucket ORDER BY bucket;"
+            ).fetchall()
+            self.assertEqual(actual, expected)
+
+            expected_rows = sum(
+                1
+                for sequence in range(transactions_per_worker)
+                for _worker_id in range(worker_count)
+                if sequence % 13 != 0 and sequence % 4 != 0
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM concurrent_ledger;").fetchone()[0],
+                expected_rows,
+            )
+            self.assertEqual(
+                conn.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name};").fetchone()[0],
+                expected_rows,
+                "rolled-back or deleted rows leaked into the materialized backing table",
+            )
+        finally:
+            conn.close()
+            os.unlink(db_path)
+
+
     @staticmethod
     def _connect_native(engine: Dialect, dsn: str):
         if engine == Dialect.POSTGRES:
