@@ -10161,13 +10161,32 @@ class MaterializedViewManager:
 
         self._ensure_catalog()
 
+    @staticmethod
+    def configure_sqlite_connection(connection: sqlite3.Connection) -> sqlite3.Connection:
+        """Enable and verify SQLite settings required by matview maintenance triggers.
+
+        Call this on every SQLite connection that can write source tables. SQLite
+        connection PRAGMAs are not database-wide: configuring the manager's own
+        connection does not configure independent application writer connections.
+        In particular, REPLACE's implicit DELETE operations fire DELETE triggers only
+        when recursive_triggers is enabled on the connection executing the statement.
+        """
+        if not isinstance(connection, sqlite3.Connection):
+            raise TypeError("connection must be a sqlite3.Connection")
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA recursive_triggers = ON;")
+        row = cursor.execute("PRAGMA recursive_triggers;").fetchone()
+        if row is None or int(row[0]) != 1:
+            raise RuntimeError(
+                "SQLite recursive_triggers could not be enabled on this connection; "
+                "REPLACE may bypass materialized-view DELETE maintenance"
+            )
+        return connection
+
     def _ensure_catalog(self) -> None:
         cur = self.conn.cursor()
         if self.dialect == Dialect.SQLITE:
-            try:
-                cur.execute("PRAGMA recursive_triggers = ON;")
-            except Exception:
-                pass
+            self.configure_sqlite_connection(self.conn)
         elif self.dialect == Dialect.MYSQL:
             try:
                 cur.execute("SET SESSION collation_connection = @@collation_database;")
