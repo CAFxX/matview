@@ -697,6 +697,35 @@ def verify_ci_and_docs_consistency(repo_root: Optional[Path | str] = None) -> Li
             if not (expected_needs <= ci_success_needs):
                 errors.append(f"ci.yml ci-success job must aggregate PR-gate jobs, missing: {expected_needs - ci_success_needs}")
 
+            # Check MATVIEW_FUZZ_TARGET matrix references in ci.yml are defined in each job's matrix
+            for job_id, job in jobs.items():
+                if not isinstance(job, dict):
+                    continue
+                matrix_def = job.get("strategy", {}).get("matrix", {})
+                matrix_keys = set(matrix_def.keys()) - {"include", "exclude"}
+                includes = matrix_def.get("include", [])
+                if includes and isinstance(includes, list):
+                    # Keys must be present in every include row if not in root matrix
+                    include_key_sets = [set(inc.keys()) for inc in includes if isinstance(inc, dict)]
+                    if include_key_sets:
+                        common_include_keys = set.intersection(*include_key_sets)
+                        matrix_keys.update(common_include_keys)
+                for step in job.get("steps", []):
+                    if not isinstance(step, dict):
+                        continue
+                    env_map = step.get("env", {})
+                    if not isinstance(env_map, dict):
+                        continue
+                    fuzz_target = env_map.get("MATVIEW_FUZZ_TARGET", "")
+                    if fuzz_target:
+                        refs = re.findall(r"\$\{\{\s*matrix\.([a-zA-Z0-9_-]+)\s*\}\}", str(fuzz_target))
+                        for ref in refs:
+                            if ref not in matrix_keys:
+                                errors.append(
+                                    f"ci.yml job {job_id!r} step {step.get('name')!r} references matrix.{ref} in "
+                                    f"MATVIEW_FUZZ_TARGET, but {ref!r} is not defined in matrix: {sorted(matrix_keys)}"
+                                )
+
         except Exception as exc:
             errors.append(f"Failed to parse ci.yml: {exc}")
 
@@ -726,6 +755,37 @@ def verify_ci_and_docs_consistency(repo_root: Optional[Path | str] = None) -> Li
             missing_images = expected_images - images
             if missing_images:
                 errors.append(f"ci-deferred.yml compatibility-sweep missing expected images: {sorted(missing_images)}")
+
+            # Check that compatibility-sweep and dependency-minimum execute verify_engine_matrix.py
+            for target_job in ("compatibility-sweep", "dependency-minimum"):
+                job_def = jobs.get(target_job, {})
+                steps = job_def.get("steps", [])
+                verify_step = None
+                test_step_idx = -1
+                verify_step_idx = -1
+                for idx, step in enumerate(steps):
+                    if not isinstance(step, dict):
+                        continue
+                    run_cmd = step.get("run", "")
+                    if "verify_engine_matrix.py" in run_cmd:
+                        verify_step = step
+                        verify_step_idx = idx
+                    if "test_matview_sync.py" in run_cmd:
+                        test_step_idx = idx
+
+                if verify_step is None:
+                    errors.append(f"ci-deferred.yml job {target_job!r} missing verify_engine_matrix.py step")
+                elif test_step_idx >= 0 and verify_step_idx > test_step_idx:
+                    errors.append(f"ci-deferred.yml job {target_job!r} must run verify_engine_matrix.py before tests")
+                else:
+                    step_env = verify_step.get("env", {})
+                    if not isinstance(step_env, dict) or (
+                        "EXPECTED_PG_MAJOR" not in step_env and "EXPECTED_MYSQL_VERSION" not in step_env
+                    ):
+                        errors.append(
+                            f"ci-deferred.yml job {target_job!r} verify step must specify explicit version expectations "
+                            f"(EXPECTED_PG_MAJOR or EXPECTED_MYSQL_VERSION), got env keys: {sorted(step_env.keys()) if isinstance(step_env, dict) else step_env}"
+                        )
 
         except Exception as exc:
             errors.append(f"Failed to parse ci-deferred.yml: {exc}")
