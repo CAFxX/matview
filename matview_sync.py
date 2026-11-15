@@ -11092,25 +11092,6 @@ class MaterializedViewManager:
                 )
 
             if setup_failure:
-                reset_error = None
-                if session_bypass_ok:
-                    try:
-                        cur.execute("SET @__matview_skip_triggers = 0;")
-                    except Exception as exc:
-                        reset_error = exc
-                if sp_active:
-                    try:
-                        cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
-                        cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
-                    except Exception:
-                        self._rollback()
-                else:
-                    self._rollback()
-                if reset_error is not None:
-                    raise RuntimeError(
-                        "bulk_changes could not establish safe isolation and could not clear "
-                        "the session-local trigger bypass; discard the connection before reuse"
-                    ) from reset_error
                 raise RuntimeError(setup_failure)
         except Exception:
             # Setup must be all-or-nothing. In particular, a SQLite reservation
