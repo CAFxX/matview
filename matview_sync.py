@@ -4264,6 +4264,15 @@ class IncrementalViewCompiler:
                     precision = (p1 - s1) + s2 + scale
                 scale = min(self._max_decimal_scale(), scale)
                 return min(65, max(scale, precision)), scale
+            if kind == "Sum":
+                value = infer(node.this)
+                if value is None:
+                    return None
+                # MySQL SUM over an exact numeric argument returns DECIMAL.
+                # Widen precision to the server maximum while retaining scale.
+                if self.dialect == Dialect.MYSQL:
+                    return 65, value[1]
+                return value
             if kind in ("Coalesce", "IfNull", "Nullif", "Greatest", "Least"):
                 values = [infer(child) for child in node.iter_expressions()]
                 if not values or any(value is None for value in values):
@@ -4490,7 +4499,31 @@ class IncrementalViewCompiler:
             if m_coal:
                 c_inner = self._lookup_col_def(m_coal.group(1))
                 if c_inner:
+                    if self.dialect == Dialect.MYSQL:
+                        # MySQL resolves COALESCE's numeric arguments using
+                        # expression aggregation rules. An integer literal
+                        # widens an INT column result to BIGINT.
+                        try:
+                            coalesce_ast = parse_sql_ast(item.raw_expr)
+                            if coalesce_ast.__class__.__name__ == "Coalesce":
+                                for argument in coalesce_ast.iter_expressions():
+                                    candidate = argument
+                                    if candidate.__class__.__name__ == "Neg":
+                                        candidate = candidate.this
+                                    if (
+                                        candidate.__class__.__name__ == "Literal"
+                                        and not candidate.args.get("is_string")
+                                        and "." not in str(candidate.this)
+                                    ):
+                                        return "BIGINT"
+                        except (sqlglot.errors.SqlglotError, AttributeError, TypeError):
+                            pass
                     return self._normalize_dialect_type(c_inner.data_type)
+            if self.dialect == Dialect.MYSQL:
+                exact_expression_type = self._exact_numeric_precision_scale(item.raw_expr)
+                if exact_expression_type is not None:
+                    precision, scale = exact_expression_type
+                    return f"DECIMAL({precision}, {scale})"
             m_win_col = re.match(
                 r'^(?:LAG|LEAD|FIRST_VALUE|LAST_VALUE|NTH_VALUE)\s*\(\s*([A-Za-z0-9_."`\[\]]+)',
                 item.raw_expr.strip(),
