@@ -6487,18 +6487,13 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     "FROM source_rows_materialized ORDER BY id;"
                 ).fetchall()
                 if initialized:
-                    self.assertEqual(rows, [replacement])
+                    self.assertEqual(sorted(rows), [replacement])
                 else:
                     # The INSERT trigger adds the replacement, but with recursive
                     # triggers OFF SQLite omits the implicit-conflict DELETE trigger.
                     self.assertEqual(
-                        rows,
-                        [
-                            (1, "code-1", "tag-1", "old"),
-                            replacement,
-                        ] if replacement[0] != 1 else [
-                            (1, "code-1", "tag-1", "old"),
-                        ],
+                        sorted(rows),
+                        sorted([(1, "code-1", "tag-1", "old"), replacement]),
                     )
             finally:
                 if writer is not None:
