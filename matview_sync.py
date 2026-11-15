@@ -11044,15 +11044,22 @@ class MaterializedViewManager:
         sp_active = False
         trigger_suspension_started = False
         created_shadow_tables: List[str] = []
+        # A caller-owned SQLite transaction must remain caller-owned on both
+        # success and failure. Only commit when this context acquired the
+        # writer reservation itself.
+        sqlite_caller_transaction = (
+            self.dialect == Dialect.SQLITE
+            and bool(getattr(self.conn, "in_transaction", False))
+        )
+        sqlite_started_writer_transaction = False
 
         try:
             if self.dialect == Dialect.SQLITE:
-                started_writer_transaction = False
-                if not getattr(self.conn, "in_transaction", False):
+                if not sqlite_caller_transaction:
                     # A deferred transaction would allow another writer to race
                     # trigger suspension. Never continue without the reservation.
                     cur.execute("BEGIN IMMEDIATE;")
-                    started_writer_transaction = True
+                    sqlite_started_writer_transaction = True
                 try:
                     cur.execute("SAVEPOINT __mv_bulk_sp;")
                     sp_active = True
@@ -11060,7 +11067,7 @@ class MaterializedViewManager:
                     # If this context acquired the writer reservation, release
                     # it before propagating a failed savepoint setup. Do not
                     # roll back a transaction already owned by the caller.
-                    if started_writer_transaction:
+                    if sqlite_started_writer_transaction:
                         self._rollback()
                     raise
             else:
@@ -11177,7 +11184,8 @@ class MaterializedViewManager:
 
                     if restore_savepoint:
                         cur.execute("RELEASE SAVEPOINT __mv_bulk_restore_sp;")
-                    self._commit()
+                    if self.dialect != Dialect.SQLITE or sqlite_started_writer_transaction:
+                        self._commit()
                 except Exception as restore_error:
                     if restore_savepoint:
                         try:
@@ -11352,7 +11360,8 @@ class MaterializedViewManager:
                         cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
                     except Exception:
                         pass
-                self._commit()
+                if self.dialect != Dialect.SQLITE or sqlite_started_writer_transaction:
+                    self._commit()
             except Exception:
                 if trigger_suspension_started:
                     _cleanup_and_restore()
