@@ -4334,23 +4334,14 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         cursor = Cursor(fail_reset=True)
         conn = Connection(cursor)
         mgr = make_manager(conn)
-        with self.assertRaisesRegex(RuntimeError, "cannot reset session variable"):
-            with mgr.bulk_changes():
-                pass
-        self.assertEqual(conn.rollback_calls, 1)
-        self.assertEqual(conn.commit_calls, 0)
-
-        # A reset failure leaves a session-scoped user variable in an unknown
-        # state. Mark the connection unsafe and reject future reuse.
-        cursor = Cursor(fail_reset=True)
-        conn = Connection(cursor)
-        mgr = make_manager(conn)
         with self.assertRaisesRegex(RuntimeError, "connection must be discarded") as caught:
             with mgr.bulk_changes():
                 pass
         self.assertTrue(caught.exception.connection_unsafe)
         self.assertTrue(mgr._mysql_bulk_connection_unsafe)
         self.assertTrue(conn._matview_bulk_connection_unsafe)
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
         statements_before_reuse = list(cursor.statements)
         with self.assertRaisesRegex(RuntimeError, "must be discarded"):
             with mgr.bulk_changes():
