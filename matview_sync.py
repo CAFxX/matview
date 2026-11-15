@@ -10203,6 +10203,36 @@ class MaterializedViewManager:
             except Exception:
                 self._rollback()
 
+    def _mysql_transaction_state(self) -> Optional[bool]:
+        """
+        Return the connection's authoritative MySQL transaction state.
+
+        MySQL-family DB-API drivers expose this either as in_transaction
+        (for example mysql-connector) or as the server status bitmask
+        server_status (for example PyMySQL/mysqlclient). Do not probe with
+        SQL here: a SELECT can itself start a transaction when autocommit is
+        disabled, which would make the probe change the state being measured.
+        """
+        try:
+            state = getattr(self.conn, "in_transaction")
+        except Exception:
+            state = None
+        if isinstance(state, bool):
+            return state
+        if isinstance(state, int) and state in (0, 1):
+            return bool(state)
+
+        # SERVER_STATUS_IN_TRANS is bit 0 (value 0x0001) in the MySQL
+        # protocol. Some adapters expose it as _server_status instead.
+        for attr in ("server_status", "_server_status"):
+            try:
+                status = getattr(self.conn, attr)
+            except Exception:
+                continue
+            if isinstance(status, int) and not isinstance(status, bool):
+                return bool(status & 0x0001)
+        return None
+
     def _commit(self) -> None:
         if hasattr(self.conn, "commit"):
             self.conn.commit()
@@ -10918,6 +10948,25 @@ class MaterializedViewManager:
         globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
         optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
         """
+        # MySQL DDL implicitly commits. More generally, this context manager
+        # owns the transaction it commits/rolls back, so it must never enter
+        # while the application already has an open transaction. Check before
+        # get_catalog(): its SELECT can itself start a transaction on DB-API
+        # connections configured with autocommit disabled.
+        if self.dialect == Dialect.MYSQL:
+            tx_state = self._mysql_transaction_state()
+            if tx_state is None:
+                raise RuntimeError(
+                    "bulk_changes() on MySQL/MariaDB requires a connection adapter "
+                    "that exposes in_transaction or the MySQL server_status bitmask; "
+                    "cannot safely determine whether caller work would be committed"
+                )
+            if tx_state:
+                raise RuntimeError(
+                    "bulk_changes() on MySQL/MariaDB cannot run inside an active "
+                    "caller transaction; commit or roll back that transaction first"
+                )
+
         catalog = self.get_catalog()
         if view_names:
             resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
