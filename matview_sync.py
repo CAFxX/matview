@@ -10799,6 +10799,9 @@ class MaterializedViewManager:
                     effective_strict=effective_strict,
                 )
             )
+        # Close any read transaction opened by schema/catalog introspection,
+        # including the all-unchanged case where no registration helper committed.
+        self._commit()
         if len(sub_plans) == 1:
             return sub_plans[0]
         p0 = sub_plans[0]
@@ -10911,6 +10914,9 @@ class MaterializedViewManager:
                     self.drop_view(existing_name)
                     status[existing_name] = "dropped"
 
+        # The entry guard guarantees this method started with an idle connection;
+        # close its own read-only transaction when every requested view is unchanged.
+        self._commit()
         return status
 
     def check_schema_drift(self) -> Dict[str, str]:
