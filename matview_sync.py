@@ -4272,6 +4272,11 @@ class IncrementalViewCompiler:
             kind = node.__class__.__name__
             if kind == "Column":
                 column = self._lookup_col_def(node.sql())
+                if column is None:
+                    # Qualified references (e.g. t.amount) are common in
+                    # generated native queries. Resolve the underlying column
+                    # name as a fallback so its DECIMAL scale is not lost.
+                    column = self._lookup_col_def(node.name)
                 if column:
                     return self._numeric_precision_scale_from_type(column.data_type)
                 cte_expression = self._resolve_cte_column_expression(node)

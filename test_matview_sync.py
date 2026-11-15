@@ -4833,6 +4833,36 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "DECIMAL(65, 1)",
         )
 
+        # Qualified DECIMAL references must retain their source scale when
+        # inferring MySQL AVG's native result type (input scale + 4).
+        mysql_decimal_schema = parse_table_schema(
+            "CREATE TABLE decimal_events (id INTEGER PRIMARY KEY, "
+            "tenant INTEGER NOT NULL, amount DECIMAL(20, 12) NOT NULL);"
+        )
+        mysql_decimal_view = parse_view_definition(
+            "CREATE VIEW decimal_avg AS SELECT e.tenant, AVG(e.amount) AS avg_amount "
+            "FROM decimal_events e GROUP BY e.tenant;",
+            known_tables={name.lower() for name in mysql_decimal_schema},
+        )
+        mysql_decimal_compiler = IncrementalViewCompiler(
+            mysql_decimal_schema,
+            mysql_decimal_view,
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+        )
+        avg_item = next(
+            item for item in mysql_decimal_compiler.view.select_items
+            if item.alias == "avg_amount"
+        )
+        self.assertEqual(
+            mysql_decimal_compiler._exact_numeric_precision_scale("e.amount"),
+            (20, 12),
+        )
+        self.assertEqual(
+            mysql_decimal_compiler._infer_expr_storage_type(avg_item),
+            "DECIMAL(24, 16)",
+        )
+
     def test_statistical_aliases_compile_with_target_engine_semantics(self) -> None:
         schema = (
             "CREATE TABLE alias_values ("
