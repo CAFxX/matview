@@ -10204,6 +10204,33 @@ class MaterializedViewManager:
             except Exception:
                 self._rollback()
 
+    def _rollback_mysql_bulk_savepoint(
+        self,
+        cur: Any,
+        savepoint_name: str,
+        stage: str,
+        original_error: BaseException,
+    ) -> None:
+        """Restore a MySQL caller savepoint or discard the session if state is uncertain."""
+        try:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name};")
+            cur.execute(f"RELEASE SAVEPOINT {savepoint_name};")
+        except Exception as cleanup_error:
+            discard_error = None
+            try:
+                self._discard_mysql_connection()
+            except Exception as exc:
+                discard_error = exc
+            detail = (
+                f"bulk_changes() could not restore its MySQL/MariaDB savepoint during {stage}; "
+                "the connection has been marked unusable and discarded because the caller "
+                f"transaction may contain partial bulk DML (original operation error: {original_error!r}; "
+                f"savepoint cleanup error: {cleanup_error!r})"
+            )
+            if discard_error is not None:
+                detail += f"; physical connection invalidation also failed: {discard_error!r}"
+            raise RuntimeError(detail) from cleanup_error
+
     def _discard_mysql_connection(self) -> None:
         """Invalidate/close a MySQL session whose trigger-bypass state is unknown.
 
@@ -11171,6 +11198,7 @@ class MaterializedViewManager:
                 ) from exc
 
         session_bypass_ok = False
+        bypass_setup_error = None
         if self.dialect == Dialect.POSTGRES and not drop_triggers:
             try:
                 cur.execute("SET LOCAL matview.skip_triggers = 'on';")
@@ -11181,8 +11209,8 @@ class MaterializedViewManager:
             try:
                 cur.execute("SET @__matview_skip_triggers = 1;")
                 session_bypass_ok = True
-            except Exception:
-                pass
+            except Exception as exc:
+                bypass_setup_error = exc
 
         if self.dialect == Dialect.MYSQL and not session_bypass_ok and targets:
             # Falling back to DROP/CREATE TRIGGER would implicitly commit the
@@ -11196,12 +11224,22 @@ class MaterializedViewManager:
             except Exception as reset_exc:
                 bypass_reset_error = reset_exc
             if sp_active:
-                try:
-                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
-                    cur.execute(f"RELEASE SAVEPOINT {sp_name};")
-                except Exception:
-                    if not mysql_caller_transaction:
-                        self._rollback()
+                if self.dialect == Dialect.MYSQL:
+                    self._rollback_mysql_bulk_savepoint(
+                        cur,
+                        sp_name,
+                        "trigger-bypass setup failure",
+                        bypass_setup_error or bypass_reset_error or RuntimeError(
+                            "session trigger bypass could not be established"
+                        ),
+                    )
+                else:
+                    try:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                        cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+                    except Exception:
+                        if not mysql_caller_transaction:
+                            self._rollback()
             if not mysql_caller_transaction:
                 self._rollback()
             if bypass_reset_error is not None:
@@ -11262,7 +11300,11 @@ class MaterializedViewManager:
         try:
             yield
         except Exception as original_exc:
-            if sp_active:
+            if sp_active and self.dialect == Dialect.MYSQL:
+                self._rollback_mysql_bulk_savepoint(
+                    cur, sp_name, "with-body exception", original_exc
+                )
+            elif sp_active:
                 try:
                     cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
                     cur.execute(f"RELEASE SAVEPOINT {sp_name};")
@@ -11416,12 +11458,9 @@ class MaterializedViewManager:
                         except Exception as reset_exc:
                             reset_error = reset_exc
                     if sp_active:
-                        try:
-                            cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
-                            cur.execute(f"RELEASE SAVEPOINT {sp_name};")
-                        except Exception:
-                            if not mysql_caller_transaction:
-                                self._rollback()
+                        self._rollback_mysql_bulk_savepoint(
+                            cur, sp_name, "post-yield refresh failure", original_exc
+                        )
                     if not mysql_caller_transaction:
                         self._rollback()
                     if reset_error is not None:
