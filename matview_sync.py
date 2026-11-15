@@ -563,7 +563,68 @@ def detect_engine_version(
             default_dialect=cand_dialect or Dialect.SQLITE,
         )
 
-    if cand_dialect == Dialect.SQLITE:
+    try:
+        if cand_dialect == Dialect.SQLITE:
+            try:
+                cur.execute("SELECT sqlite_version();")
+                row = cur.fetchone()
+                if row and row[0]:
+                    v_str = str(row[0])
+                    return parse_engine_version(f"sqlite:{v_str}", default_dialect=Dialect.SQLITE)
+            except Exception:
+                pass
+            return parse_engine_version("sqlite", default_dialect=Dialect.SQLITE)
+
+        if cand_dialect == Dialect.POSTGRES:
+            raw_v = ""
+            ver_tuple: Optional[Tuple[int, int, int]] = None
+            try:
+                cur.execute("SHOW server_version_num;")
+                r_num = cur.fetchone()
+                if r_num and r_num[0]:
+                    num_s = str(r_num[0]).strip()
+                    ver_tuple = _extract_version_tuple(num_s, (14, 0, 0))
+                    raw_v = num_s
+            except Exception:
+                pass
+            try:
+                cur.execute("SELECT version();")
+                r_v = cur.fetchone()
+                if r_v and r_v[0]:
+                    raw_v = str(r_v[0]).strip()
+                    if ver_tuple is None:
+                        ver_tuple = _extract_version_tuple(raw_v, (14, 0, 0))
+            except Exception:
+                pass
+            if ver_tuple is not None:
+                return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, ver_tuple, raw_v)
+            return parse_engine_version(
+                hint_dialect if isinstance(hint_dialect, str) else None,
+                default_dialect=Dialect.POSTGRES,
+            )
+
+        if cand_dialect == Dialect.MYSQL:
+            try:
+                cur.execute("SELECT VERSION();")
+                row = cur.fetchone()
+                if row and row[0]:
+                    v_str = str(row[0]).strip()
+                    if "mariadb" in v_str.lower() or cand_sub == EngineSubdialect.MARIADB:
+                        ver = _extract_version_tuple(v_str, (11, 4, 0))
+                        div_increment = _read_mariadb_div_precision_increment(cur)
+                        return EngineVersion(
+                            Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str, div_increment
+                        )
+                    ver = _extract_version_tuple(v_str, (8, 0, 0))
+                    return EngineVersion(Dialect.MYSQL, EngineSubdialect.MYSQL, ver, v_str)
+            except Exception:
+                pass
+            return parse_engine_version(
+                hint_dialect if isinstance(hint_dialect, str) else None,
+                default_dialect=cand_sub.value if cand_sub else Dialect.MYSQL,
+            )
+
+        # 4. Unknown connection class with no dialect hint: probe SQLite -> Postgres -> MySQL/MariaDB
         try:
             cur.execute("SELECT sqlite_version();")
             row = cur.fetchone()
@@ -572,50 +633,21 @@ def detect_engine_version(
                 return parse_engine_version(f"sqlite:{v_str}", default_dialect=Dialect.SQLITE)
         except Exception:
             pass
-        return parse_engine_version("sqlite", default_dialect=Dialect.SQLITE)
-
-    if cand_dialect == Dialect.POSTGRES:
-        raw_v = ""
-        ver_tuple: Optional[Tuple[int, int, int]] = None
-        pkg_v: Optional[Version] = None
-        try:
-            cur.execute("SHOW server_version_num;")
-            r_num = cur.fetchone()
-            if r_num and r_num[0]:
-                num_s = str(r_num[0]).strip()
-                pkg_v, ver_tuple = _extract_packaging_and_tuple(num_s, (14, 0, 0))
-                raw_v = num_s
-        except Exception:
-            pass
         try:
             cur.execute("SELECT version();")
-            r_v = cur.fetchone()
-            if r_v and r_v[0]:
-                raw_v = str(r_v[0]).strip()
-                if ver_tuple is None:
-                    pkg_v, ver_tuple = _extract_packaging_and_tuple(raw_v, (14, 0, 0))
-        except Exception:
-            pass
-        if ver_tuple is not None:
-            return EngineVersion(
-                Dialect.POSTGRES,
-                EngineSubdialect.POSTGRES,
-                ver_tuple,
-                raw_v,
-                packaging_version=pkg_v,
-            )
-        return parse_engine_version(
-            hint_dialect if isinstance(hint_dialect, str) else None,
-            default_dialect=Dialect.POSTGRES,
-        )
-
-    if cand_dialect == Dialect.MYSQL:
-        try:
-            cur.execute("SELECT VERSION();")
             row = cur.fetchone()
             if row and row[0]:
                 v_str = str(row[0]).strip()
-                if "mariadb" in v_str.lower() or cand_sub == EngineSubdialect.MARIADB:
+                if "postgres" in v_str.lower() or "cockroach" in v_str.lower() or "yugabyte" in v_str.lower():
+                    pkg_v, ver = _extract_packaging_and_tuple(v_str, (14, 0, 0))
+                    return EngineVersion(
+                        Dialect.POSTGRES,
+                        EngineSubdialect.POSTGRES,
+                        ver,
+                        v_str,
+                        packaging_version=pkg_v,
+                    )
+                if "mariadb" in v_str.lower():
                     pkg_v, ver = _extract_packaging_and_tuple(v_str, (11, 4, 0))
                     div_increment = _read_mariadb_div_precision_increment(cur)
                     return EngineVersion(
@@ -636,55 +668,11 @@ def detect_engine_version(
                 )
         except Exception:
             pass
-        return parse_engine_version(
-            hint_dialect if isinstance(hint_dialect, str) else None,
-            default_dialect=cand_sub.value if cand_sub else Dialect.MYSQL,
-        )
-
-    # 4. Unknown connection class with no dialect hint: probe SQLite -> Postgres -> MySQL/MariaDB
-    try:
-        cur.execute("SELECT sqlite_version();")
-        row = cur.fetchone()
-        if row and row[0]:
-            return parse_engine_version(f"sqlite:{row[0]}", default_dialect=Dialect.SQLITE)
-    except Exception:
-        pass
-    try:
-        cur.execute("SELECT version();")
-        row = cur.fetchone()
-        if row and row[0]:
-            v_str = str(row[0]).strip()
-            if "postgres" in v_str.lower() or "cockroach" in v_str.lower() or "yugabyte" in v_str.lower():
-                pkg_v, ver = _extract_packaging_and_tuple(v_str, (14, 0, 0))
-                return EngineVersion(
-                    Dialect.POSTGRES,
-                    EngineSubdialect.POSTGRES,
-                    ver,
-                    v_str,
-                    packaging_version=pkg_v,
-                )
-            if "mariadb" in v_str.lower():
-                pkg_v, ver = _extract_packaging_and_tuple(v_str, (11, 4, 0))
-                div_increment = _read_mariadb_div_precision_increment(cur)
-                return EngineVersion(
-                    Dialect.MYSQL,
-                    EngineSubdialect.MARIADB,
-                    ver,
-                    v_str,
-                    div_increment,
-                    packaging_version=pkg_v,
-                )
-            pkg_v, ver = _extract_packaging_and_tuple(v_str, (8, 0, 0))
-            return EngineVersion(
-                Dialect.MYSQL,
-                EngineSubdialect.MYSQL,
-                ver,
-                v_str,
-                packaging_version=pkg_v,
-            )
-    except Exception:
-        pass
-    return parse_engine_version("sqlite", default_dialect=Dialect.SQLITE)
+        return parse_engine_version("sqlite", default_dialect=Dialect.SQLITE)
+    finally:
+        close_fn = getattr(cur, "close", None)
+        if callable(close_fn):
+            close_fn()
 
 
 class MaintenanceStrategy(str, Enum):
@@ -2134,79 +2122,84 @@ def introspect_sqlite_schemas(
 ) -> Dict[str, TableSchema]:
     """Introspects all non-internal base tables from a live SQLite connection."""
     cur = conn.cursor()
-    cur.execute(
-        "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-    )
-    rows = cur.fetchall() or []
-    ddl_parts: List[str] = []
-    table_names: List[str] = []
-    for name, sql in rows:
-        if not name:
-            continue
-        t_str = str(name)
-        if t_str.startswith(("__matview_", "__mv_")) or (
-            object_prefix and t_str.startswith(object_prefix)
-        ):
-            continue
-        table_names.append(t_str)
-        if sql:
-            ddl_parts.append(str(sql).rstrip(";") + ";")
-    schemas = (
-        parse_table_schema("\n".join(ddl_parts), dialect=Dialect.SQLITE)
-        if ddl_parts
-        else {}
-    )
-    low_known = {k.lower(): k for k in schemas}
-
-    # Fallback / enrichment via PRAGMA table_info & foreign_key_list for tables without standard DDL (e.g. CREATE TABLE AS)
-    for t_str in table_names:
-        existing = schemas.get(low_known.get(t_str.lower(), t_str))
-        if existing and existing.columns:
-            continue
-        try:
-            cur.execute(f'PRAGMA table_info("{t_str}")')
-            t_info = cur.fetchall() or []
-            if not t_info:
+    try:
+        cur.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+        rows = cur.fetchall() or []
+        ddl_parts: List[str] = []
+        table_names: List[str] = []
+        for name, sql in rows:
+            if not name:
                 continue
-            pk_count = sum(1 for r in t_info if bool(r[5]))
-            cols: Dict[str, ColumnDef] = {}
-            for r in t_info:
-                c_name = str(r[1])
-                c_type = str(r[2]).upper() if r[2] else "TEXT"
-                c_pk = bool(r[5])
-                c_notnull = bool(r[3]) or (
-                    c_pk and pk_count == 1 and re.sub(r"\s+", " ", c_type.strip()) == "INTEGER"
-                )
-                cols[c_name] = ColumnDef(
-                    name=c_name,
-                    data_type=c_type,
-                    not_null=c_notnull,
-                    primary_key=c_pk,
-                )
-            fk_actions: List[str] = []
+            t_str = str(name)
+            if t_str.startswith(("__matview_", "__mv_")) or (
+                object_prefix and t_str.startswith(object_prefix)
+            ):
+                continue
+            table_names.append(t_str)
+            if sql:
+                ddl_parts.append(str(sql).rstrip(";") + ";")
+        schemas = (
+            parse_table_schema("\n".join(ddl_parts), dialect=Dialect.SQLITE)
+            if ddl_parts
+            else {}
+        )
+        low_known = {k.lower(): k for k in schemas}
+
+        # Fallback / enrichment via PRAGMA table_info & foreign_key_list for tables without standard DDL (e.g. CREATE TABLE AS)
+        for t_str in table_names:
+            existing = schemas.get(low_known.get(t_str.lower(), t_str))
+            if existing and existing.columns:
+                continue
             try:
-                cur.execute(f'PRAGMA foreign_key_list("{t_str}")')
-                for fk_r in (cur.fetchall() or []):
-                    on_upd = str(fk_r[5]).upper() if len(fk_r) > 5 and fk_r[5] else ""
-                    on_del = str(fk_r[6]).upper() if len(fk_r) > 6 and fk_r[6] else ""
-                    if on_del in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                        act = f"ON DELETE {on_del}"
-                        if act not in fk_actions:
-                            fk_actions.append(act)
-                    if on_upd in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                        act = f"ON UPDATE {on_upd}"
-                        if act not in fk_actions:
-                            fk_actions.append(act)
+                cur.execute(f'PRAGMA table_info("{t_str}")')
+                t_info = cur.fetchall() or []
+                if not t_info:
+                    continue
+                pk_count = sum(1 for r in t_info if bool(r[5]))
+                cols: Dict[str, ColumnDef] = {}
+                for r in t_info:
+                    c_name = str(r[1])
+                    c_type = str(r[2]).upper() if r[2] else "TEXT"
+                    c_pk = bool(r[5])
+                    c_notnull = bool(r[3]) or (
+                        c_pk and pk_count == 1 and re.sub(r"\s+", " ", c_type.strip()) == "INTEGER"
+                    )
+                    cols[c_name] = ColumnDef(
+                        name=c_name,
+                        data_type=c_type,
+                        not_null=c_notnull,
+                        primary_key=c_pk,
+                    )
+                fk_actions: List[str] = []
+                try:
+                    cur.execute(f'PRAGMA foreign_key_list("{t_str}")')
+                    for fk_r in (cur.fetchall() or []):
+                        on_upd = str(fk_r[5]).upper() if len(fk_r) > 5 and fk_r[5] else ""
+                        on_del = str(fk_r[6]).upper() if len(fk_r) > 6 and fk_r[6] else ""
+                        if on_del in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                            act = f"ON DELETE {on_del}"
+                            if act not in fk_actions:
+                                fk_actions.append(act)
+                        if on_upd in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                            act = f"ON UPDATE {on_upd}"
+                            if act not in fk_actions:
+                                fk_actions.append(act)
+                except Exception:
+                    pass
+                schemas[t_str] = TableSchema(
+                    name=t_str,
+                    columns=cols,
+                    fk_cascade_actions=tuple(fk_actions),
+                )
             except Exception:
                 pass
-            schemas[t_str] = TableSchema(
-                name=t_str,
-                columns=cols,
-                fk_cascade_actions=tuple(fk_actions),
-            )
-        except Exception:
-            pass
-    return schemas
+        return schemas
+    finally:
+        close_fn = getattr(cur, "close", None)
+        if callable(close_fn):
+            close_fn()
 
 
 def introspect_database_schemas(
@@ -2234,38 +2227,115 @@ def introspect_database_schemas(
 
     schemas = {}
     cur = conn.cursor()
-    if dialect == Dialect.POSTGRES:
-        cur.execute(
-            """
-            SELECT kcu.table_name, kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-             AND tc.table_schema = kcu.table_schema
-             AND tc.table_name = kcu.table_name
-            WHERE tc.constraint_type = 'PRIMARY KEY'
-              AND tc.table_schema = current_schema()
-            """
-        )
-        pk_pairs = {(str(r[0]).lower(), str(r[1]).lower()) for r in (cur.fetchall() or [])}
-        fk_by_table: Dict[str, List[str]] = {}
-        try:
+    try:
+        if dialect == Dialect.POSTGRES:
             cur.execute(
                 """
-                SELECT tc.table_name, rc.delete_rule, rc.update_rule
+                SELECT kcu.table_name, kcu.column_name
                 FROM information_schema.table_constraints tc
-                JOIN information_schema.referential_constraints rc
-                  ON tc.constraint_name = rc.constraint_name
-                 AND tc.table_schema = rc.constraint_schema
-                WHERE tc.constraint_type = 'FOREIGN KEY'
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
+                 AND tc.table_name = kcu.table_name
+                WHERE tc.constraint_type = 'PRIMARY KEY'
                   AND tc.table_schema = current_schema()
                 """
             )
+            pk_pairs = {(str(r[0]).lower(), str(r[1]).lower()) for r in (cur.fetchall() or [])}
+            fk_by_table: Dict[str, List[str]] = {}
+            try:
+                cur.execute(
+                    """
+                    SELECT tc.table_name, rc.delete_rule, rc.update_rule
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.referential_constraints rc
+                      ON tc.constraint_name = rc.constraint_name
+                     AND tc.table_schema = rc.constraint_schema
+                    WHERE tc.constraint_type = 'FOREIGN KEY'
+                      AND tc.table_schema = current_schema()
+                    """
+                )
+                for fk_r in (cur.fetchall() or []):
+                    t_low = str(fk_r[0]).lower()
+                    del_r = str(fk_r[1]).upper() if fk_r[1] else ""
+                    upd_r = str(fk_r[2]).upper() if fk_r[2] else ""
+                    acts = fk_by_table.setdefault(t_low, [])
+                    if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                        a_str = f"ON DELETE {del_r}"
+                        if a_str not in acts:
+                            acts.append(a_str)
+                    if upd_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                        a_str = f"ON UPDATE {upd_r}"
+                        if a_str not in acts:
+                            acts.append(a_str)
+            except Exception:
+                pass
+
+            cur.execute(
+                """
+                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.character_maximum_length
+                FROM information_schema.columns c
+                JOIN information_schema.tables t
+                  ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+                WHERE c.table_schema = current_schema()
+                  AND t.table_type = 'BASE TABLE'
+                  AND c.table_name NOT LIKE '__matview_%'
+                  AND c.table_name NOT LIKE '__mv_%'
+                ORDER BY c.table_name, c.ordinal_position
+                """
+            )
+            grouped: Dict[str, Dict[str, ColumnDef]] = {}
+            for row in (cur.fetchall() or []):
+                t_name, c_name, d_type, is_null, char_len = (
+                    str(row[0]),
+                    str(row[1]),
+                    row[2],
+                    row[3],
+                    row[4],
+                )
+                if t_name == catalog_table or (
+                    object_prefix and t_name.startswith(object_prefix)
+                ):
+                    continue
+                dt_up = str(d_type).upper()
+                if dt_up in ("CHARACTER VARYING", "VARCHAR") and char_len:
+                    dt_up = f"VARCHAR({int(char_len)})"
+                elif dt_up == "CHARACTER VARYING":
+                    dt_up = "TEXT"
+                is_pk = (t_name.lower(), c_name.lower()) in pk_pairs
+                grouped.setdefault(t_name, {})[c_name] = ColumnDef(
+                    name=c_name,
+                    data_type=dt_up,
+                    not_null=(str(is_null).upper() == "NO") or is_pk,
+                    primary_key=is_pk,
+                )
+            for t_name, cols in grouped.items():
+                schemas[t_name] = TableSchema(
+                    name=t_name,
+                    columns=cols,
+                    fk_cascade_actions=tuple(fk_by_table.get(t_name.lower(), ())),
+                )
+            return schemas
+        # MySQL / MariaDB
+        def _dec(val: Any) -> str:
+            if isinstance(val, (bytes, bytearray)):
+                return val.decode("utf-8")
+            return "" if val is None else str(val)
+
+        fk_by_table_my: Dict[str, List[str]] = {}
+        try:
+            cur.execute(
+                """
+                SELECT rc.table_name, rc.delete_rule, rc.update_rule
+                FROM information_schema.referential_constraints rc
+                WHERE rc.constraint_schema = DATABASE()
+                """
+            )
             for fk_r in (cur.fetchall() or []):
-                t_low = str(fk_r[0]).lower()
-                del_r = str(fk_r[1]).upper() if fk_r[1] else ""
-                upd_r = str(fk_r[2]).upper() if fk_r[2] else ""
-                acts = fk_by_table.setdefault(t_low, [])
+                t_low = _dec(fk_r[0]).lower()
+                del_r = _dec(fk_r[1]).upper()
+                upd_r = _dec(fk_r[2]).upper()
+                acts = fk_by_table_my.setdefault(t_low, [])
                 if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
                     a_str = f"ON DELETE {del_r}"
                     if a_str not in acts:
@@ -2279,132 +2349,59 @@ def introspect_database_schemas(
 
         cur.execute(
             """
-            SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.character_maximum_length
+            SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_key, c.column_type
             FROM information_schema.columns c
             JOIN information_schema.tables t
               ON c.table_schema = t.table_schema AND c.table_name = t.table_name
-            WHERE c.table_schema = current_schema()
+            WHERE c.table_schema = DATABASE()
               AND t.table_type = 'BASE TABLE'
               AND c.table_name NOT LIKE '__matview_%'
               AND c.table_name NOT LIKE '__mv_%'
             ORDER BY c.table_name, c.ordinal_position
             """
         )
-        grouped: Dict[str, Dict[str, ColumnDef]] = {}
+        grouped_my: Dict[str, Dict[str, ColumnDef]] = {}
         for row in (cur.fetchall() or []):
-            t_name, c_name, d_type, is_null, char_len = (
-                str(row[0]),
-                str(row[1]),
-                row[2],
-                row[3],
-                row[4],
+            t_name, c_name, d_type, is_null, col_key = (
+                _dec(row[0]),
+                _dec(row[1]),
+                _dec(row[2]),
+                _dec(row[3]),
+                _dec(row[4]),
             )
+            col_type = _dec(row[5]) if len(row) > 5 and row[5] is not None else None
             if t_name == catalog_table or (
                 object_prefix and t_name.startswith(object_prefix)
             ):
                 continue
-            dt_up = str(d_type).upper()
-            if dt_up in ("CHARACTER VARYING", "VARCHAR") and char_len:
-                dt_up = f"VARCHAR({int(char_len)})"
-            elif dt_up == "CHARACTER VARYING":
-                dt_up = "TEXT"
-            is_pk = (t_name.lower(), c_name.lower()) in pk_pairs
-            grouped.setdefault(t_name, {})[c_name] = ColumnDef(
+            dt_up = d_type.upper()
+            # information_schema.DATA_TYPE drops numeric precision/scale and
+            # integer signedness. COLUMN_TYPE is the native declaration (for
+            # example DECIMAL(20,12)); retain it for every numeric family so AVG
+            # and expression result types match the live server metadata.
+            if dt_up in (
+                "VARCHAR", "CHAR", "TINYINT", "DECIMAL", "NUMERIC", "DEC", "FIXED",
+                "INT", "INTEGER", "SMALLINT", "MEDIUMINT", "BIGINT", "FLOAT", "DOUBLE", "REAL",
+            ) and col_type:
+                dt_up = col_type.upper()
+            is_pk = col_key.upper() == "PRI"
+            grouped_my.setdefault(t_name, {})[c_name] = ColumnDef(
                 name=c_name,
                 data_type=dt_up,
                 not_null=(str(is_null).upper() == "NO") or is_pk,
                 primary_key=is_pk,
             )
-        for t_name, cols in grouped.items():
+        for t_name, cols in grouped_my.items():
             schemas[t_name] = TableSchema(
                 name=t_name,
                 columns=cols,
-                fk_cascade_actions=tuple(fk_by_table.get(t_name.lower(), ())),
+                fk_cascade_actions=tuple(fk_by_table_my.get(t_name.lower(), ())),
             )
         return schemas
-
-    # MySQL / MariaDB
-    def _dec(val: Any) -> str:
-        if isinstance(val, (bytes, bytearray)):
-            return val.decode("utf-8")
-        return "" if val is None else str(val)
-
-    fk_by_table_my: Dict[str, List[str]] = {}
-    try:
-        cur.execute(
-            """
-            SELECT rc.table_name, rc.delete_rule, rc.update_rule
-            FROM information_schema.referential_constraints rc
-            WHERE rc.constraint_schema = DATABASE()
-            """
-        )
-        for fk_r in (cur.fetchall() or []):
-            t_low = _dec(fk_r[0]).lower()
-            del_r = _dec(fk_r[1]).upper()
-            upd_r = _dec(fk_r[2]).upper()
-            acts = fk_by_table_my.setdefault(t_low, [])
-            if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                a_str = f"ON DELETE {del_r}"
-                if a_str not in acts:
-                    acts.append(a_str)
-            if upd_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                a_str = f"ON UPDATE {upd_r}"
-                if a_str not in acts:
-                    acts.append(a_str)
-    except Exception:
-        pass
-
-    cur.execute(
-        """
-        SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_key, c.column_type
-        FROM information_schema.columns c
-        JOIN information_schema.tables t
-          ON c.table_schema = t.table_schema AND c.table_name = t.table_name
-        WHERE c.table_schema = DATABASE()
-          AND t.table_type = 'BASE TABLE'
-          AND c.table_name NOT LIKE '__matview_%'
-          AND c.table_name NOT LIKE '__mv_%'
-        ORDER BY c.table_name, c.ordinal_position
-        """
-    )
-    grouped_my: Dict[str, Dict[str, ColumnDef]] = {}
-    for row in (cur.fetchall() or []):
-        t_name, c_name, d_type, is_null, col_key = (
-            _dec(row[0]),
-            _dec(row[1]),
-            _dec(row[2]),
-            _dec(row[3]),
-            _dec(row[4]),
-        )
-        col_type = _dec(row[5]) if len(row) > 5 and row[5] is not None else None
-        if t_name == catalog_table or (
-            object_prefix and t_name.startswith(object_prefix)
-        ):
-            continue
-        dt_up = d_type.upper()
-        # information_schema.DATA_TYPE drops numeric precision/scale and
-        # integer signedness. COLUMN_TYPE is the native declaration (for
-        # example DECIMAL(20,12)); retain it for every numeric family so AVG
-        # and expression result types match the live server metadata.
-        if dt_up in (
-            "VARCHAR", "CHAR", "TINYINT", "DECIMAL", "NUMERIC", "DEC", "FIXED",
-            "INT", "INTEGER", "SMALLINT", "MEDIUMINT", "BIGINT", "FLOAT", "DOUBLE", "REAL",
-        ) and col_type:
-            dt_up = col_type.upper()
-        is_pk = col_key.upper() == "PRI"
-        grouped_my.setdefault(t_name, {})[c_name] = ColumnDef(
-            name=c_name,
-            data_type=dt_up,
-            not_null=(str(is_null).upper() == "NO") or is_pk,
-            primary_key=is_pk,
-        )
-    for t_name, cols in grouped_my.items():
-        schemas[t_name] = TableSchema(
-            name=t_name,
-            columns=cols,
-            fk_cascade_actions=tuple(fk_by_table_my.get(t_name.lower(), ())),
-        )
-    return schemas
+    finally:
+        close_fn = getattr(cur, "close", None)
+        if callable(close_fn):
+            close_fn()
 
 
 _SQL_EXPR_FUNCTIONS = {
@@ -11217,6 +11214,39 @@ class IncrementalViewCompiler:
 # -----------------------------------------------------------------------------
 
 
+def _extract_created_object(stmt: str) -> Optional[Tuple[str, str]]:
+    """Extracts object type ('trigger', 'view', 'table') and name created by a DDL statement."""
+    cleaned = _strip_sql_comments(stmt).strip()
+    m_trig = re.match(
+        r"^CREATE(?:\s+OR\s+REPLACE)?(?:\s+DEFINER\s*=\s*\S+)?\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.\"`]+)",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m_trig:
+        name = m_trig.group(1).strip('"`').split(".")[-1].strip('"`')
+        return ("trigger", name)
+
+    m_view = re.match(
+        r"^CREATE(?:\s+OR\s+REPLACE)?(?:\s+ALGORITHM\s*=\s*\w+)?(?:\s+DEFINER\s*=\s*\S+)?\s+VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.\"`]+)",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m_view:
+        name = m_view.group(1).strip('"`').split(".")[-1].strip('"`')
+        return ("view", name)
+
+    m_tbl = re.match(
+        r"^CREATE(?:\s+TEMPORARY)?\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.\"`]+)",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m_tbl:
+        name = m_tbl.group(1).strip('"`').split(".")[-1].strip('"`')
+        return ("table", name)
+
+    return None
+
+
 class MaterializedViewManager:
     """
     Setup/migration manager that connects to a database (SQLite connection/path or
@@ -11262,6 +11292,16 @@ class MaterializedViewManager:
         eff_dialect = dialect or Dialect.SQLITE
         path = conn_or_url.replace("sqlite:///", "").replace("sqlite://", "")
         return sqlite3.connect(path), eff_dialect
+
+    @contextmanager
+    def _cursor(self) -> Iterator[Any]:
+        cur = self.conn.cursor()
+        try:
+            yield cur
+        finally:
+            close_fn = getattr(cur, "close", None)
+            if callable(close_fn):
+                close_fn()
 
     def __init__(
         self,
@@ -11313,8 +11353,7 @@ class MaterializedViewManager:
             self._ensure_catalog()
 
     def _ensure_catalog(self) -> None:
-        cur = self.conn.cursor()
-        try:
+        with self._cursor() as cur:
             if self.dialect == Dialect.SQLITE:
                 try:
                     cur.execute("PRAGMA recursive_triggers = ON;")
@@ -11354,12 +11393,6 @@ class MaterializedViewManager:
                     self._commit()
                 except Exception:
                     self._rollback()
-        finally:
-            if hasattr(cur, "close"):
-                try:
-                    cur.close()
-                except Exception:
-                    pass
 
     def _commit(self) -> None:
         if hasattr(self.conn, "commit"):
@@ -11410,40 +11443,41 @@ class MaterializedViewManager:
         automatically refreshes any registered materialized views whose underlying
         base table schema changed.
         """
-        cur = self.conn.cursor()
-        for stmt in _split_top_level(_strip_sql_comments(ddl_sql, dialect=self.dialect), ";", dialect=self.dialect):
-            if stmt.strip():
-                cur.execute(stmt)
-        self._commit()
+        with self._cursor() as cur:
+            for stmt in _split_top_level(_strip_sql_comments(ddl_sql, dialect=self.dialect), ";", dialect=self.dialect):
+                if stmt.strip():
+                    cur.execute(stmt)
+            self._commit()
         if auto_sync_views:
             catalog = self.get_catalog()
             if catalog:
                 self.sync_views([entry["view_sql"] for entry in catalog.values()])
 
     def get_catalog(self) -> Dict[str, Dict[str, Any]]:
-        cur = self.conn.cursor()
-        try:
-            cur.execute(
-                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
-                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
-                f"backfill_cursor_pk, backfill_max_pk, backfill_active "
-                f"FROM {self.catalog_table}"
-            )
-            has_wm_cols = True
-        except Exception:
-            self._rollback()
+        with self._cursor() as cur:
             try:
                 cur.execute(
                     f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
-                    f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
+                    f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
+                    f"backfill_cursor_pk, backfill_max_pk, backfill_active "
                     f"FROM {self.catalog_table}"
                 )
-                has_wm_cols = False
+                has_wm_cols = True
             except Exception:
                 self._rollback()
-                return {}
+                try:
+                    cur.execute(
+                        f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                        f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
+                        f"FROM {self.catalog_table}"
+                    )
+                    has_wm_cols = False
+                except Exception:
+                    self._rollback()
+                    return {}
+            rows = cur.fetchall()
         out: Dict[str, Dict[str, Any]] = {}
-        for row in cur.fetchall():
+        for row in rows:
             out[row[0]] = {
                 "view_name": row[0],
                 "view_sql": row[1],
@@ -11495,33 +11529,33 @@ class MaterializedViewManager:
         catalog = self.get_catalog()
         resolved_name = self._resolve_catalog_name(view_name, catalog)
         entry = catalog.get(resolved_name)
-        cur = self.conn.cursor()
-        if entry:
-            for t_name in entry["trigger_names"]:
-                if self.dialect != Dialect.POSTGRES:
-                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
-            for fn_name in entry["function_names"]:
-                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-            cur.execute(f"DROP VIEW IF EXISTS {resolved_name};")
-            cur.execute(f"DROP TABLE IF EXISTS {entry['backing_table']};")
-            for aux_t in entry["aux_tables"]:
-                cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
-            ph = self._param_placeholder()
-            cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
-            self._commit()
-            return True
-        else:
-            raw_logical = (
-                view_name[len(self.object_prefix) :]
-                if self.object_prefix and view_name.startswith(self.object_prefix)
-                else view_name
-            )
-            db_v = f"{self.object_prefix}{raw_logical}"
-            cur.execute(f"DROP VIEW IF EXISTS {db_v};")
-            cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
-            cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
-            self._commit()
-            return False
+        with self._cursor() as cur:
+            if entry:
+                for t_name in entry["trigger_names"]:
+                    if self.dialect != Dialect.POSTGRES:
+                        cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                for fn_name in entry["function_names"]:
+                    cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                cur.execute(f"DROP VIEW IF EXISTS {resolved_name};")
+                cur.execute(f"DROP TABLE IF EXISTS {entry['backing_table']};")
+                for aux_t in entry["aux_tables"]:
+                    cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
+                ph = self._param_placeholder()
+                cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
+                self._commit()
+                return True
+            else:
+                raw_logical = (
+                    view_name[len(self.object_prefix) :]
+                    if self.object_prefix and view_name.startswith(self.object_prefix)
+                    else view_name
+                )
+                db_v = f"{self.object_prefix}{raw_logical}"
+                cur.execute(f"DROP VIEW IF EXISTS {db_v};")
+                cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
+                cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
+                self._commit()
+                return False
 
     def _update_backfill_watermark(
         self,
@@ -11852,63 +11886,94 @@ class MaterializedViewManager:
         # Install structure, maintenance triggers, single-shot backfill, and catalog record
         # inside a single atomic transaction so concurrent readers/writers never observe an
         # un-triggered or double-counted window between trigger attachment and population.
-        cur = self.conn.cursor()
-        try:
-            for stmt in plan.create_structure_statements():
-                cur.execute(stmt)
-            for stmt in plan.trigger_ddls:
-                cur.execute(stmt)
+        with self._cursor() as cur:
+            created_objects: List[Tuple[str, str]] = []
+            catalog_inserted = False
+            try:
+                for stmt in plan.create_structure_statements():
+                    obj = _extract_created_object(stmt)
+                    cur.execute(stmt)
+                    if obj:
+                        created_objects.append(obj)
+                for stmt in plan.trigger_ddls:
+                    obj = _extract_created_object(stmt)
+                    cur.execute(stmt)
+                    if obj:
+                        created_objects.append(obj)
 
-            stored_view_sql = self._serialize_view_sql_with_indexes(plan)
-            ph = self._param_placeholder()
-            init_active = 1 if (populate and incremental_backfill) else 0
-            cur.execute(
-                f"""
-                INSERT INTO {self.catalog_table} (
-                    view_name, view_sql, strategy, signature_hash, backing_table,
-                    aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
-                    backfill_cursor_pk, backfill_max_pk, backfill_active
-                ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
-                """,
-                (
-                    plan.view_name,
-                    stored_view_sql,
-                    plan.strategy.value,
-                    sig,
-                    plan.backing_table_name,
-                    json.dumps(plan.auxiliary_table_names),
-                    json.dumps(plan.trigger_names),
-                    json.dumps(plan.function_names),
-                    json.dumps(plan.trigger_ddls),
-                    None,
-                    None,
-                    init_active,
-                ),
-            )
+                stored_view_sql = self._serialize_view_sql_with_indexes(plan)
+                ph = self._param_placeholder()
+                init_active = 1 if (populate and incremental_backfill) else 0
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.catalog_table} (
+                        view_name, view_sql, strategy, signature_hash, backing_table,
+                        aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
+                        backfill_cursor_pk, backfill_max_pk, backfill_active
+                    ) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                    """,
+                    (
+                        plan.view_name,
+                        stored_view_sql,
+                        plan.strategy.value,
+                        sig,
+                        plan.backing_table_name,
+                        json.dumps(plan.auxiliary_table_names),
+                        json.dumps(plan.trigger_names),
+                        json.dumps(plan.function_names),
+                        json.dumps(plan.trigger_ddls),
+                        None,
+                        None,
+                        init_active,
+                    ),
+                )
+                catalog_inserted = True
 
-            if populate:
-                if incremental_backfill:
-                    self._commit()
-                    use_snap = not (
-                        plan.incremental_backfill_spec
-                        and plan.incremental_backfill_spec.mode == "pk_range_fold"
-                        and plan.has_watermark_triggers
-                    )
-                    self.backfill_incrementally(
-                        plan,
-                        batch_size=batch_size,
-                        on_progress=on_progress,
-                        snapshot_isolation=use_snap,
-                    )
+                if populate:
+                    if incremental_backfill:
+                        self._commit()
+                        use_snap = not (
+                            plan.incremental_backfill_spec
+                            and plan.incremental_backfill_spec.mode == "pk_range_fold"
+                            and plan.has_watermark_triggers
+                        )
+                        self.backfill_incrementally(
+                            plan,
+                            batch_size=batch_size,
+                            on_progress=on_progress,
+                            snapshot_isolation=use_snap,
+                        )
+                    else:
+                        for stmt in plan.get_populate_statements(incremental_backfill=False):
+                            cur.execute(stmt)
+                        self._commit()
                 else:
-                    for stmt in plan.get_populate_statements(incremental_backfill=False):
-                        cur.execute(stmt)
                     self._commit()
-            else:
-                self._commit()
-        except Exception:
-            self._rollback()
-            raise
+            except Exception:
+                self._rollback()
+                if self.dialect == Dialect.MYSQL:
+                    if catalog_inserted:
+                        try:
+                            ph = self._param_placeholder()
+                            cur.execute(
+                                f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}",
+                                (plan.view_name,),
+                            )
+                            self._commit()
+                        except Exception:
+                            pass
+                    for kind, name in reversed(created_objects):
+                        try:
+                            if kind == "trigger":
+                                cur.execute(f"DROP TRIGGER IF EXISTS {name};")
+                            elif kind == "view":
+                                cur.execute(f"DROP VIEW IF EXISTS {name};")
+                            elif kind == "table":
+                                cur.execute(f"DROP TABLE IF EXISTS {name};")
+                        except Exception:
+                            pass
+                    self._commit()
+                raise
         return plan
 
     def register_view(
@@ -12114,28 +12179,27 @@ class MaterializedViewManager:
 
         schemas = self.fetch_schema()
         results: Dict[str, str] = {}
-        cur = self.conn.cursor()
-        try:
-            for entry in targets:
-                v_name = entry["view_name"]
-                plan = generate_materialized_view(
-                    schemas,
+        for entry in targets:
+            v_name = entry["view_name"]
+            plan = generate_materialized_view(
+                schemas,
+                entry["view_sql"],
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=True,
+                object_prefix=self.object_prefix,
+            )
+            sig = self._compute_signature(plan, schemas)
+            if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+                self.register_view(
                     entry["view_sql"],
-                    dialect=self.dialect,
-                    pg_use_transition_tables=self.pg_use_transition_tables,
+                    populate=True,
+                    force_rebuild=True,
                     ignore_limitations=True,
-                    object_prefix=self.object_prefix,
                 )
-                sig = self._compute_signature(plan, schemas)
-                if rebuild_on_schema_drift and sig != entry["signature_hash"]:
-                    self.register_view(
-                        entry["view_sql"],
-                        populate=True,
-                        force_rebuild=True,
-                        ignore_limitations=True,
-                    )
-                    results[v_name] = "rebuilt"
-                else:
+                results[v_name] = "rebuilt"
+            else:
+                with self._cursor() as cur:
                     try:
                         for aux_t in plan.auxiliary_table_names:
                             cur.execute(f"DELETE FROM {aux_t};")
@@ -12147,12 +12211,6 @@ class MaterializedViewManager:
                     except Exception:
                         self._rollback()
                         raise
-        finally:
-            if hasattr(cur, "close"):
-                try:
-                    cur.close()
-                except Exception:
-                    pass
         return results
 
     def _shadow_name(self, tbl: str) -> str:
