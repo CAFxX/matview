@@ -230,6 +230,9 @@ jobs:
       - name: Test manager cursor leak and rollback safety
         run: python3 test_p1_manager_safety.py
 
+      - name: Test engine and version-specific optimal codegen
+        run: python3 test_p1_engine_codegen.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
