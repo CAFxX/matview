@@ -4349,6 +4349,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(conn.close_calls, 1)
         with self.assertRaisesRegex(RuntimeError, "connection is closed"):
             conn.cursor()
+        with self.assertRaisesRegex(RuntimeError, "connection was discarded"):
+            with mgr.bulk_changes():
+                self.fail("discarded manager must not be reused")
 
         # If the body itself fails and cleanup cannot clear the session flag,
         # surface the connection-contamination hazard instead of silently
