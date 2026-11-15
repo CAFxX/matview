@@ -7,6 +7,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import warnings
 import uuid
@@ -725,25 +726,47 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                         row_id = worker_id * 10000 + sequence + 1
                         bucket = f"source_{worker_id % 2}"
                         amount = None if sequence % 9 == 0 else worker_id * 100 + sequence
-                        second_cur.execute("BEGIN;")
-                        second_cur.execute(
-                            f"INSERT INTO {table_name} (id, bucket, amount) VALUES (%s, %s, %s)",
-                            (row_id, bucket, amount),
-                        )
-                        second_cur.execute(
-                            f"UPDATE {table_name} SET bucket = %s, "
-                            "amount = CASE WHEN amount IS NULL THEN NULL ELSE amount + 7 END "
-                            "WHERE id = %s",
-                            (f"target_{worker_id % 3}", row_id),
-                        )
-                        if sequence % 4 == 0:
-                            second_cur.execute(
-                                f"DELETE FROM {table_name} WHERE id = %s", (row_id,)
-                            )
-                        if sequence % 13 == 0:
-                            second.rollback()
-                        else:
-                            second.commit()
+                        # InnoDB and PostgreSQL may legitimately abort one
+                        # transaction when concurrent trigger work contends on
+                        # shared aggregate groups. Retry only recognized
+                        # transaction-abort errors, from BEGIN through COMMIT,
+                        # so the workload still completes every logical DML
+                        # sequence exactly once.
+                        for attempt in range(5):
+                            try:
+                                second_cur.execute("BEGIN;")
+                                second_cur.execute(
+                                    f"INSERT INTO {table_name} (id, bucket, amount) VALUES (%s, %s, %s)",
+                                    (row_id, bucket, amount),
+                                )
+                                second_cur.execute(
+                                    f"UPDATE {table_name} SET bucket = %s, "
+                                    "amount = CASE WHEN amount IS NULL THEN NULL ELSE amount + 7 END "
+                                    "WHERE id = %s",
+                                    (f"target_{worker_id % 3}", row_id),
+                                )
+                                if sequence % 4 == 0:
+                                    second_cur.execute(
+                                        f"DELETE FROM {table_name} WHERE id = %s", (row_id,)
+                                    )
+                                if sequence % 13 == 0:
+                                    second.rollback()
+                                else:
+                                    second.commit()
+                                break
+                            except Exception as exc:
+                                second.rollback()
+                                args = getattr(exc, "args", ())
+                                mysql_code = args[0] if args and isinstance(args[0], int) else None
+                                sqlstate = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+                                retryable = (
+                                    engine == Dialect.MYSQL and mysql_code in {1205, 1213}
+                                ) or (
+                                    engine == Dialect.POSTGRES and sqlstate in {"40P01", "40001"}
+                                )
+                                if not retryable or attempt == 4:
+                                    raise
+                                time.sleep(0.01 * (2 ** attempt) + worker_id * 0.001)
                     with error_lock:
                         completed.append(worker_id)
                 except BaseException as exc:
