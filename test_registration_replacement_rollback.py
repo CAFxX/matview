@@ -104,7 +104,8 @@ def main() -> None:
         ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT id, value FROM replacement_reader ORDER BY id;"
-        ).fetchall() == original_rows
+        ).fetchall() == after_write
+        assert manager.get_catalog()[plan.view_name]["signature_hash"] == original_catalog["signature_hash"]
         conn.execute("INSERT INTO replacement_rows VALUES (5, 50);")
         conn.commit()
         assert conn.execute(
