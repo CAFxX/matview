@@ -4787,6 +4787,27 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(pg_compiler._infer_expr_storage_type(pg_items["wide_parity"]), "BIGINT")
         self.assertEqual(pg_compiler._infer_expr_storage_type(pg_items["decimal_parity"]), "NUMERIC")
 
+        # Nested CASE branches must use PostgreSQL's common result type. The
+        # integer literals and INTEGER column below all resolve to INTEGER;
+        # a generic fallback to BIGINT changes the reader's exposed type.
+        case_view = parse_view_definition(
+            "CREATE VIEW case_result AS SELECT "
+            "(CASE WHEN qty IS NULL THEN 1 ELSE "
+            "(CASE WHEN qty IS NULL THEN 4 ELSE qty END) END) AS case_value "
+            "FROM sales;",
+            known_tables={name.lower() for name in pg_schema},
+        )
+        case_compiler = IncrementalViewCompiler(
+            pg_schema, case_view, dialect=Dialect.POSTGRES
+        )
+        case_item = next(
+            item for item in case_compiler.view.select_items
+            if item.alias == "case_value"
+        )
+        self.assertEqual(
+            case_compiler._infer_expr_storage_type(case_item), "INTEGER"
+        )
+
         mysql_schema = parse_table_schema(
             "CREATE TABLE events (id INTEGER PRIMARY KEY, tenant INTEGER NOT NULL, "
             "latency INTEGER NOT NULL);"

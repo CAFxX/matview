@@ -4545,6 +4545,21 @@ class IncrementalViewCompiler:
                 if -(2 ** 63) <= number < 2 ** 63:
                     return 3
                 return 4
+            if kind == "Case":
+                # CASE result type is the common type of every THEN branch
+                # and the ELSE branch. Recurse so nested CASE expressions do
+                # not fall through to the generic BIGINT heuristic.
+                branches: list[Any] = []
+                for arm in node.args.get("ifs") or []:
+                    result_expr = arm.args.get("true")
+                    if result_expr is not None:
+                        branches.append(result_expr)
+                default_expr = node.args.get("default")
+                if default_expr is not None:
+                    branches.append(default_expr)
+                ranks = [infer(branch) for branch in branches]
+                known = [rank for rank in ranks if rank is not None]
+                return max(known) if known and len(known) == len(ranks) else None
             if kind in ("Mod", "Add", "Sub", "Mul", "Div"):
                 left, right = infer(node.this), infer(node.expression)
                 return max(left, right) if left is not None and right is not None else None
@@ -4592,6 +4607,10 @@ class IncrementalViewCompiler:
                     break
                 raw_expr = raw_expr[tokens[0].end + 1:tokens[-1].start].strip()
             raw_u = raw_expr.upper()
+            if self.dialect == Dialect.POSTGRES and raw_u.startswith("CASE "):
+                native_case_type = self._postgres_integer_expression_storage_type(raw_expr)
+                if native_case_type is not None:
+                    return native_case_type
             m_coal = re.match(
                 r'^(?:COALESCE|IFNULL)\s*\(\s*([A-Za-z0-9_."`\[\]]+)\s*,',
                 item.raw_expr.strip(),
