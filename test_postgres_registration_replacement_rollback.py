@@ -127,6 +127,22 @@ def main() -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT id, value FROM replacement_reader ORDER BY id")
             assert cur.fetchall() == original_rows
+        assert manager.get_catalog()[plan.view_name]["signature_hash"] == original_catalog["signature_hash"]
+        with conn.cursor() as cur:
+            for trigger_name in original_catalog["trigger_names"]:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM pg_trigger t
+                    JOIN pg_class c ON c.oid = t.tgrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = %s AND t.tgname = %s AND NOT t.tgisinternal
+                    """,
+                    (schema, trigger_name),
+                )
+                assert cur.fetchone()[0] == 1, (
+                    f"old maintenance trigger {trigger_name} was not restored after mid-drop"
+                )
 
         # An unrelated caller transaction must not be committed by registration.
         with conn.cursor() as cur:
