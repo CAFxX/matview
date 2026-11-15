@@ -1038,5 +1038,59 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         self.assertEqual(executed, ["BEGIN IMMEDIATE;", "SAVEPOINT __mv_bulk_sp;", "ROLLBACK;"])
 
 
+    def test_sqlite_savepoint_setup_failure_preserves_caller_transaction(self) -> None:
+        """A failed savepoint must not roll back a transaction owned by the caller."""
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            raw = sqlite3.connect(tmp.name)
+            raw.execute("CREATE TABLE caller_rows (id INTEGER PRIMARY KEY);")
+            raw.commit()
+            raw.execute("BEGIN;")
+            raw.execute("INSERT INTO caller_rows VALUES (7);")
+
+            original_cursor = raw.cursor
+
+            class CursorProxy:
+                def __init__(self, cursor):
+                    self._cursor = cursor
+
+                def execute(self, statement, params=None):
+                    if str(statement).strip() == "SAVEPOINT __mv_bulk_sp;":
+                        raise sqlite3.OperationalError("injected caller savepoint failure")
+                    if params is None:
+                        return self._cursor.execute(statement)
+                    return self._cursor.execute(statement, params)
+
+                def __getattr__(self, name):
+                    return getattr(self._cursor, name)
+
+            class ConnectionProxy:
+                def cursor(self, *args, **kwargs):
+                    return CursorProxy(original_cursor(*args, **kwargs))
+
+                def __getattr__(self, name):
+                    return getattr(raw, name)
+
+            manager = MaterializedViewManager.__new__(MaterializedViewManager)
+            manager.conn = ConnectionProxy()
+            manager.dialect = Dialect.SQLITE
+            manager.engine_version = parse_engine_version("sqlite:3.45")
+            manager.object_prefix = "__matview_"
+            manager.catalog_table = "__matview_catalog"
+            manager.pg_use_transition_tables = False
+            manager.get_catalog = lambda: {}
+
+            with self.assertRaisesRegex(sqlite3.OperationalError, "caller savepoint failure"):
+                with manager.bulk_changes():
+                    self.fail("bulk_changes must not enter the user block after savepoint setup fails")
+
+            # The caller's active transaction and uncommitted write must survive.
+            self.assertTrue(raw.in_transaction)
+            self.assertEqual(raw.execute("SELECT id FROM caller_rows").fetchall(), [(7,)])
+            raw.rollback()
+            self.assertFalse(raw.in_transaction)
+            self.assertEqual(raw.execute("SELECT id FROM caller_rows").fetchall(), [])
+            raw.close()
+
+
 if __name__ == "__main__":
     unittest.main()
