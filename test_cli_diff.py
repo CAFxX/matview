@@ -543,6 +543,41 @@ class TestCLIDiffCommand(unittest.TestCase):
             if os.path.exists(view_path):
                 os.unlink(view_path)
 
+    def test_diff_detects_missing_live_triggers_and_dropped_reader_view(self) -> None:
+        mgr = MaterializedViewManager(self.tmp.name)
+        try:
+            v_sql = "CREATE VIEW v_drift AS SELECT customer_id, COUNT(*) AS c FROM orders GROUP BY customer_id;"
+            plan = mgr.register_view(v_sql)
+
+            # Drop ALL triggers in database out-of-band so live_triggers == set()
+            for trig_name in plan.trigger_names:
+                mgr.conn.execute(f"DROP TRIGGER IF EXISTS {trig_name};")
+            mgr.conn.commit()
+
+            rep_trigs = mgr.diff_views(v_sql)
+            diff_trigs = rep_trigs["v_drift"]
+            self.assertEqual(diff_trigs.status, "ALTER")
+            self.assertTrue(diff_trigs.has_changes)
+            self.assertEqual(
+                set(diff_trigs.pending_changes["triggers"]["to_create"]),
+                set(plan.trigger_names),
+            )
+            self.assertTrue(any("CREATE TRIGGER" in s for s in diff_trigs.pending_ddls))
+
+            # Re-create triggers via repair, then drop only the reader view out-of-band
+            mgr.repair_view("v_drift")
+            mgr.conn.execute("DROP VIEW IF EXISTS v_drift;")
+            mgr.conn.commit()
+
+            rep_view = mgr.diff_views(v_sql)
+            diff_view = rep_view["v_drift"]
+            self.assertEqual(diff_view.status, "ALTER")
+            self.assertTrue(diff_view.has_changes)
+            self.assertEqual(diff_view.pending_changes["reader_view"]["action"], "CREATE")
+            self.assertTrue(any("CREATE VIEW" in s for s in diff_view.pending_ddls))
+        finally:
+            mgr.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
