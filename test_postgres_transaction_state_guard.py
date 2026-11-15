@@ -27,6 +27,40 @@ class PostgresTransactionStateGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "active caller transaction"):
             MaterializedViewManager._require_idle_postgres_connection(SQLAlchemyConnection())
 
+    def test_idle_facade_with_unknown_driver_state_fails_closed(self):
+        class UnknownDriver:
+            autocommit = False
+
+        class PoolProxy:
+            driver_connection = UnknownDriver()
+
+        class SQLAlchemyConnection:
+            autocommit = False
+            connection = PoolProxy()
+
+            def in_transaction(self):
+                return False
+
+        with self.assertRaisesRegex(RuntimeError, "every physical DB-API connection"):
+            MaterializedViewManager._require_idle_postgres_connection(SQLAlchemyConnection())
+
+    def test_idle_facade_with_unknown_driver_autocommit_fails_closed(self):
+        class Driver:
+            in_transaction = False
+
+        class PoolProxy:
+            driver_connection = Driver()
+
+        class SQLAlchemyConnection:
+            autocommit = False
+            connection = PoolProxy()
+
+            def in_transaction(self):
+                return False
+
+        with self.assertRaisesRegex(RuntimeError, "autocommit=False"):
+            MaterializedViewManager._require_idle_postgres_connection(SQLAlchemyConnection())
+
     def test_wrapped_idle_driver_is_accepted(self):
         class Driver:
             autocommit = False
@@ -47,7 +81,7 @@ class PostgresTransactionStateGuardTests(unittest.TestCase):
         class Connection:
             autocommit = False
 
-        with self.assertRaisesRegex(RuntimeError, "cannot safely determine"):
+        with self.assertRaisesRegex(RuntimeError, "transaction state on every physical DB-API connection"):
             MaterializedViewManager._require_idle_postgres_connection(Connection())
 
     def test_driver_autocommit_is_checked_even_when_facade_is_idle(self):
