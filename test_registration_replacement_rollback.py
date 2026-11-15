@@ -102,7 +102,9 @@ def main() -> None:
                     )
                 ):
                     assert any(
-                        item.upper().startswith("DROP VIEW IF EXISTS REPLACEMENT_READER")
+                        item.upper().startswith(
+                            f"DROP VIEW IF EXISTS {plan.view_name.upper()}"
+                        )
                         for item in executed
                     ), executed
                     injected["fail"] = False
@@ -140,6 +142,23 @@ def main() -> None:
         assert restored_rows == [(1, 10), (2, 20), (3, 30), (4, 40)], restored_rows
         restored_catalog = manager.get_catalog()[plan.view_name]
         assert restored_catalog["signature_hash"] == original_catalog["signature_hash"]
+
+        # A restored reader/catalog entry is insufficient if its physical
+        # generation is missing. Check the backing and every auxiliary table.
+        physical_tables = {
+            row[0]
+            for row in raw_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        }
+        assert plan.backing_table_name in physical_tables, (
+            f"backing table {plan.backing_table_name} was not restored"
+        )
+        for auxiliary_name in plan.auxiliary_table_names:
+            assert auxiliary_name in physical_tables, (
+                f"auxiliary table {auxiliary_name} was not restored"
+            )
+
         for trigger_name in original_catalog["trigger_names"]:
             found = raw_conn.execute(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?;",
