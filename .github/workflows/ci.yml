@@ -203,6 +203,9 @@ jobs:
       - name: Test differential oracle adversarial boundaries
         run: python3 test_oracle_adversarial_boundaries.py
 
+      - name: Test bulk_changes atomic shadow swap and trigger isolation
+        run: python3 test_p0_bulk_changes_isolation.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify

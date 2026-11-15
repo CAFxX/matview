@@ -1835,6 +1835,26 @@ class TranspiledConnectionAdapter:
                 self._exec_loop_backfill_in_sqlite(proc_body)
             return [], 0
 
+        if self.dialect == Dialect.MYSQL and s_up.startswith("RENAME TABLE "):
+            pairs_str = s[len("RENAME TABLE "):].rstrip(";").strip()
+            for pair in pairs_str.split(","):
+                m_p = re.match(r"^\s*([A-Za-z0-9_]+)\s+TO\s+([A-Za-z0-9_]+)\s*$", pair.strip(), flags=re.I)
+                if m_p:
+                    self._sq_conn.execute(f"ALTER TABLE {m_p.group(1)} RENAME TO {m_p.group(2)};")
+            return [], 0
+
+        m_rep_v = re.match(
+            r"^CREATE\s+OR\s+REPLACE\s+(?:ALGORITHM\s*=\s*[A-Za-z0-9_]+\s+)?VIEW\s+([A-Za-z0-9_]+)\s+AS\s*(.*)",
+            s,
+            flags=re.I | re.S,
+        )
+        if m_rep_v:
+            v_name = m_rep_v.group(1)
+            v_body = m_rep_v.group(2)
+            self._sq_conn.execute(f"DROP VIEW IF EXISTS {v_name};")
+            s = f"CREATE VIEW {v_name} AS {v_body}"
+            s_up = s.upper().rstrip(";").strip()
+
         m_pg_fn = re.match(
             r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\)\s+RETURNS\s+TRIGGER\s+AS\s+\$\$(.*)\$\$\s+LANGUAGE\s+plpgsql;?",
             s,
