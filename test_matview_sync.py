@@ -8914,6 +8914,30 @@ class WrappedConnectionTransactionStateTests(unittest.TestCase):
         self.assertEqual(connection.cursor_calls, 0)
 
 
+    def test_bulk_changes_closes_cursor_after_success_and_body_failure(self):
+        for fail_body in (False, True):
+            with self.subTest(fail_body=fail_body):
+                connection = self.MySQLFacade()
+                manager = MaterializedViewManager.__new__(MaterializedViewManager)
+                manager.conn = connection
+                manager.dialect = Dialect.MYSQL
+                manager.get_catalog = lambda: {}
+                manager.fetch_schema = lambda: {}
+
+                if fail_body:
+                    with self.assertRaisesRegex(ValueError, "injected body failure"):
+                        with manager.bulk_changes():
+                            raise ValueError("injected body failure")
+                else:
+                    with manager.bulk_changes():
+                        pass
+
+                self.assertTrue(
+                    connection._cursor.closed,
+                    "bulk_changes must close its DB-API cursor on every exit path",
+                )
+
+
 def _run_all_tests() -> None:
     t0 = time.time()
     runner = MVTestRunner()
