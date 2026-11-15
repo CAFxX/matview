@@ -1081,13 +1081,13 @@ class MaterializedViewPlan:
         stmts = []
         if self.dialect != Dialect.POSTGRES:
             for t_name in self.trigger_names:
-                stmts.append(f"DROP TRIGGER IF EXISTS {t_name};")
+                stmts.append(build_drop_sql("TRIGGER", t_name, dialect=self.dialect))
         for fn_name in self.function_names:
             stmts.append(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-        stmts.append(f"DROP VIEW IF EXISTS {self.view_name};")
-        stmts.append(f"DROP TABLE IF EXISTS {self.backing_table_name};")
+        stmts.append(build_drop_sql("VIEW", self.view_name, dialect=self.dialect))
+        stmts.append(build_drop_sql("TABLE", self.backing_table_name, dialect=self.dialect))
         for aux_t in self.auxiliary_table_names:
-            stmts.append(f"DROP TABLE IF EXISTS {aux_t};")
+            stmts.append(build_drop_sql("TABLE", aux_t, dialect=self.dialect))
         return stmts
 
     def render_sql_script(
@@ -1724,6 +1724,224 @@ def format_sql(
         pass
     lines = [re.sub(r"[ \t]+", " ", ln).rstrip() for ln in sql.strip().splitlines()]
     return "\n".join(ln for ln in lines if ln or lines)
+
+
+def _ast_needs_quotes(raw_ident: str, original_ident: str) -> bool:
+    """Returns True if an identifier was already quoted or requires dialect quoting."""
+    orig = original_ident.strip()
+    if (orig.startswith('"') and orig.endswith('"')) or (orig.startswith("`") and orig.endswith("`")):
+        return True
+    return raw_ident.upper() in _SQL_RESERVED_KEYWORDS or not re.match(
+        r"^[A-Za-z_][A-Za-z0-9_]*$", raw_ident
+    )
+
+
+def _ast_ident_expr(ident: str, dialect: Dialect = Dialect.SQLITE) -> sqlglot_exp.Identifier:
+    """Builds a `sqlglot.exp.Identifier` preserving dialect quoting requirements."""
+    raw = _unquote_ident(ident.strip(), dialect=dialect)
+    return sqlglot_exp.to_identifier(raw, quoted=_ast_needs_quotes(raw, ident))
+
+
+def _ast_table_expr(name: str, dialect: Dialect = Dialect.SQLITE) -> sqlglot_exp.Table:
+    """Builds a `sqlglot.exp.Table`, handling optional `schema.table` qualification."""
+    parts = _split_top_level(name.strip(), ".")
+    if len(parts) == 2:
+        db_ident = _ast_ident_expr(parts[0], dialect)
+        tbl_ident = _ast_ident_expr(parts[1], dialect)
+        return sqlglot_exp.Table(this=tbl_ident, db=db_ident)
+    return sqlglot_exp.Table(this=_ast_ident_expr(name, dialect))
+
+
+def build_drop_sql(
+    kind: str,
+    names: Union[str, Sequence[str]],
+    dialect: Dialect = Dialect.SQLITE,
+    if_exists: bool = True,
+    cascade: bool = False,
+    on_table: Optional[str] = None,
+) -> str:
+    """Constructs a dialect-appropriate DROP statement via `sqlglot.exp.Drop`."""
+    name_seq = [names] if isinstance(names, str) else list(names)
+    tables = [_ast_table_expr(n, dialect) for n in name_seq]
+    cluster = (
+        sqlglot_exp.OnProperty(this=_ast_table_expr(on_table, dialect))
+        if on_table
+        else None
+    )
+    node = sqlglot_exp.Drop(
+        tables=tables,
+        kind=kind.strip().upper(),
+        exists=if_exists,
+        cascade=cascade,
+        cluster=cluster,
+    )
+    return node.sql(dialect=_sqlglot_dialect(dialect)) + ";"
+
+
+def build_alter_rename_table_sql(
+    old_table: str,
+    new_table: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> str:
+    """Constructs an `ALTER TABLE ... RENAME ...` statement via `sqlglot.exp.Alter`."""
+    node = sqlglot_exp.Alter(
+        this=_ast_table_expr(old_table, dialect),
+        kind="TABLE",
+        actions=[sqlglot_exp.AlterRename(this=_ast_table_expr(new_table, dialect))],
+    )
+    return node.sql(dialect=_sqlglot_dialect(dialect)) + ";"
+
+
+def build_select_sql(
+    select_exprs: Sequence[str],
+    from_table: str,
+    where_sql: Optional[str] = None,
+    group_by_exprs: Sequence[str] = (),
+    having_sql: Optional[str] = None,
+    order_by_exprs: Sequence[str] = (),
+    limit: Optional[int] = None,
+    dialect: Dialect = Dialect.SQLITE,
+) -> str:
+    """Builds a SELECT statement via `sqlglot.exp.Select` and serializes for `dialect`."""
+    sg_dialect = _sqlglot_dialect(dialect)
+    proj_nodes = [parse_sql_ast(expr, dialect=dialect) for expr in select_exprs]
+    query = sqlglot_exp.select(*proj_nodes).from_(_ast_table_expr(from_table, dialect))
+    if where_sql:
+        query = query.where(parse_sql_ast(where_sql, dialect=dialect))
+    if group_by_exprs:
+        query = query.group_by(*(parse_sql_ast(g, dialect=dialect) for g in group_by_exprs))
+    if having_sql:
+        query = query.having(parse_sql_ast(having_sql, dialect=dialect))
+    if order_by_exprs:
+        order_nodes = [
+            sqlglot.parse_one(f"SELECT 1 ORDER BY {o}", read=sg_dialect).args["order"].expressions[0]
+            for o in order_by_exprs
+        ]
+        query = query.order_by(*order_nodes)
+    if limit is not None:
+        query = query.limit(int(limit))
+    return query.sql(dialect=sg_dialect) + ";"
+
+
+def build_insert_select_sql(
+    target_table: str,
+    columns: Sequence[str],
+    select_sql_or_ast: Union[str, sqlglot_exp.Query],
+    dialect: Dialect = Dialect.SQLITE,
+) -> str:
+    """Builds an `INSERT INTO tbl (cols) SELECT ...` statement via `sqlglot.exp.Insert`."""
+    select_ast = (
+        parse_sql_ast(select_sql_or_ast, dialect=dialect)
+        if isinstance(select_sql_or_ast, str)
+        else select_sql_or_ast
+    )
+    target = (
+        sqlglot_exp.Schema(
+            this=_ast_table_expr(target_table, dialect),
+            expressions=[_ast_ident_expr(c, dialect) for c in columns],
+        )
+        if columns
+        else _ast_table_expr(target_table, dialect)
+    )
+    node = sqlglot_exp.Insert(this=target, expression=select_ast)
+    return node.sql(dialect=_sqlglot_dialect(dialect)) + ";"
+
+
+def build_create_view_sql(
+    view_name: str,
+    from_table: str,
+    select_exprs: Sequence[str],
+    where_sql: Optional[str] = None,
+    dialect: Dialect = Dialect.SQLITE,
+    replace: bool = False,
+    algorithm: Optional[str] = None,
+) -> str:
+    """Builds a `CREATE [OR REPLACE] [ALGORITHM=...] VIEW` statement via `sqlglot.exp.Create`."""
+    sg_dialect = _sqlglot_dialect(dialect)
+    proj_nodes = [parse_sql_ast(expr, dialect=dialect) for expr in select_exprs]
+    query = sqlglot_exp.select(*proj_nodes).from_(_ast_table_expr(from_table, dialect))
+    if where_sql:
+        query = query.where(parse_sql_ast(where_sql, dialect=dialect))
+    props = None
+    if algorithm:
+        props = sqlglot_exp.Properties(
+            expressions=[sqlglot_exp.AlgorithmProperty(this=sqlglot_exp.Var(this=algorithm.strip().upper()))]
+        )
+    node = sqlglot_exp.Create(
+        this=_ast_table_expr(view_name, dialect),
+        kind="VIEW",
+        replace=replace,
+        expression=query,
+        properties=props,
+    )
+    sql = node.sql(dialect=sg_dialect)
+    if algorithm:
+        sql = re.sub(r"\bALGORITHM\s*=\s*", "ALGORITHM = ", sql, count=1, flags=re.IGNORECASE)
+    return sql + ";"
+
+
+def _parse_index_col_ast(col_spec: str, dialect: Dialect) -> sqlglot_exp.Expr:
+    """Parses an index key specification into a sqlglot AST expression."""
+    cleaned = col_spec.strip()
+    if re.match(r"^(?:\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)$", cleaned):
+        return sqlglot_exp.Column(this=_ast_ident_expr(cleaned, dialect))
+    # MySQL functional index keys wrap expressions in outer `((expr))`; strip one layer
+    # before feeding sqlglot so serialization does not emit redundant triple parens.
+    probe_spec = cleaned
+    if dialect == Dialect.MYSQL and cleaned.startswith("(("):
+        m_tail = re.search(r"\)\s*(?:ASC|DESC)?\s*$", cleaned, flags=re.IGNORECASE)
+        if m_tail and ")" in cleaned:
+            close_paren = cleaned.rfind(")")
+            tail = cleaned[close_paren + 1 :]
+            inner = cleaned[1:close_paren]
+            if inner.startswith("(") and inner.endswith(")"):
+                probe_spec = f"{inner}{tail}"
+    sg_dialect = _sqlglot_dialect(dialect)
+    probe_ast = sqlglot.parse_one(f"CREATE INDEX __mv_probe_idx ON __mv_probe_tbl ({probe_spec})", read=sg_dialect)
+    if isinstance(probe_ast, sqlglot_exp.Create) and isinstance(probe_ast.this, sqlglot_exp.Index):
+        params = probe_ast.this.args.get("params")
+        if params and params.args.get("columns"):
+            return params.args["columns"][0]
+    return parse_sql_ast(cleaned, dialect=dialect)
+
+
+def build_create_index_sql(
+    index_name: str,
+    table_name: str,
+    col_specs: Sequence[str],
+    dialect: Dialect = Dialect.SQLITE,
+    unique: bool = False,
+    using_method: Optional[str] = None,
+    where_clause: Optional[str] = None,
+    nulls_not_distinct: bool = False,
+) -> str:
+    """Builds a `CREATE [UNIQUE] INDEX` statement via `sqlglot.exp.Create` and `sqlglot.exp.Index`."""
+    sg_dialect = _sqlglot_dialect(dialect)
+    cols = [_parse_index_col_ast(c, dialect) for c in col_specs]
+    where_node = None
+    if where_clause:
+        where_node = sqlglot_exp.Where(this=parse_sql_ast(where_clause, dialect=dialect))
+    params = sqlglot_exp.IndexParameters(
+        using=sqlglot_exp.Var(this=using_method.strip()) if using_method else None,
+        columns=cols,
+        where=where_node,
+    )
+    tbl_sql = _ast_table_expr(table_name, dialect).sql(dialect=sg_dialect)
+    node = sqlglot_exp.Create(
+        this=sqlglot_exp.Index(
+            this=_ast_ident_expr(index_name, dialect),
+            table=_ast_table_expr(table_name, dialect),
+            params=params,
+        ),
+        kind="INDEX",
+        unique=unique,
+    )
+    sql = node.sql(dialect=sg_dialect)
+    # Standardize `ON <table>(` emitted by sqlglot to `ON <table> (` for readability and planner regexes.
+    sql = sql.replace(f"ON {tbl_sql}(", f"ON {tbl_sql} (", 1)
+    if nulls_not_distinct:
+        sql = f"{sql} NULLS NOT DISTINCT"
+    return sql + ";"
 
 
 def _strip_sql_comments(
@@ -4631,19 +4849,26 @@ class IncrementalViewCompiler:
         q_auto_group_cols = [self._q(c) for c in auto_group_cols]
         if q_auto_group_cols and not has_pk_on_group_cols:
             idx_name = self._bounded_ident(f"{p}idx_", log_vname, "__grp")
-            if unique_group_nulls_not_distinct and self.engine_version.supports_pg_nulls_not_distinct:
-                ddls.append(
-                    f"CREATE UNIQUE INDEX {self._q(idx_name)} ON {self._q(mv_table)} ({', '.join(q_auto_group_cols)}) NULLS NOT DISTINCT;"
+            use_nnd = bool(unique_group_nulls_not_distinct and self.engine_version.supports_pg_nulls_not_distinct)
+            ddls.append(
+                build_create_index_sql(
+                    idx_name,
+                    mv_table,
+                    q_auto_group_cols,
+                    dialect=self.dialect,
+                    unique=use_nnd,
+                    nulls_not_distinct=use_nnd,
                 )
-            else:
-                ddls.append(f"CREATE INDEX {self._q(idx_name)} ON {self._q(mv_table)} ({', '.join(q_auto_group_cols)});")
+            )
             names.append(idx_name)
 
         if len(auto_group_cols) > 1:
             for g_idx, g_col in enumerate(auto_group_cols[1:], start=2):
                 sub_idx_name = self._bounded_ident(f"{p}idx_", f"{log_vname}__{_sanitize_ident(g_col)}", f"__g{g_idx}")
                 if sub_idx_name not in names:
-                    ddls.append(f"CREATE INDEX {self._q(sub_idx_name)} ON {self._q(mv_table)} ({self._q(g_col)});")
+                    ddls.append(
+                        build_create_index_sql(sub_idx_name, mv_table, [self._q(g_col)], dialect=self.dialect)
+                    )
                     names.append(sub_idx_name)
 
         for i, idx_spec in enumerate(self.user_indexes, 1):
@@ -4699,22 +4924,29 @@ class IncrementalViewCompiler:
                         c_mod = f"({expr_part}){tail_s}"
                 mapped_cols.append(c_mod)
 
-            u_kw = "UNIQUE " if idx_spec.unique else ""
-            using_str = (
-                f" USING {idx_spec.using_method}"
+            using_method = (
+                idx_spec.using_method
                 if idx_spec.using_method and self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
-                else ""
+                else None
             )
-            where_str = ""
+            where_clause = None
             if idx_spec.where_clause and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES):
                 w_mod = idx_spec.where_clause
                 if backing_col_map:
                     for u_col, b_expr in backing_col_map.items():
                         w_mod = re.sub(rf"\b{re.escape(u_col)}\b", b_expr, w_mod, flags=re.IGNORECASE)
-                where_str = f" WHERE {w_mod}"
+                where_clause = w_mod
 
             ddls.append(
-                f"CREATE {u_kw}INDEX {self._q(idx_name)} ON {self._q(mv_table)}{using_str} ({', '.join(mapped_cols)}){where_str};"
+                build_create_index_sql(
+                    idx_name,
+                    mv_table,
+                    mapped_cols,
+                    dialect=self.dialect,
+                    unique=idx_spec.unique,
+                    using_method=using_method,
+                    where_clause=where_clause,
+                )
             )
             names.append(idx_name)
 
@@ -5839,13 +6071,10 @@ class IncrementalViewCompiler:
         db_view = self.db_view_name
         log_vname = self.logical_view_name
         p = self.object_prefix if self.object_prefix else "__matview_"
-        proj_csv = (
-            ", ".join(
-                (self._q(ex) if ex in user_columns else ex)
-                for ex in select_exprs_override
-            )
+        proj_exprs = (
+            [self._q(ex) if ex in user_columns else ex for ex in select_exprs_override]
             if select_exprs_override
-            else ", ".join(self._q(c) for c in user_columns)
+            else [self._q(c) for c in user_columns]
         )
 
         if self.dialect == Dialect.MYSQL:
@@ -5854,19 +6083,22 @@ class IncrementalViewCompiler:
                 if extra_where_filter
                 else "EXISTS (SELECT 1)"
             )
-            reader_view_ddl = (
-                f"CREATE ALGORITHM = TEMPTABLE VIEW {self._q(db_view)} AS\n"
-                f"SELECT {proj_csv}\n"
-                f"FROM {self._q(mv_table)}\n"
-                f"WHERE {where_cond};"
+            reader_view_ddl = build_create_view_sql(
+                db_view,
+                mv_table,
+                proj_exprs,
+                where_sql=where_cond,
+                dialect=self.dialect,
+                algorithm="TEMPTABLE",
             )
             return reader_view_ddl, [], [], []
 
-        where_sql = f"\nWHERE {extra_where_filter}" if extra_where_filter else ""
-        reader_view_ddl = (
-            f"CREATE VIEW {self._q(db_view)} AS\n"
-            f"SELECT {proj_csv}\n"
-            f"FROM {self._q(mv_table)}{where_sql};"
+        reader_view_ddl = build_create_view_sql(
+            db_view,
+            mv_table,
+            proj_exprs,
+            where_sql=extra_where_filter,
+            dialect=self.dialect,
         )
 
         if self.dialect == Dialect.SQLITE:
@@ -13019,13 +13251,13 @@ class MaterializedViewManager:
             if entry:
                 for t_name in entry["trigger_names"]:
                     if self.dialect != Dialect.POSTGRES:
-                        cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                        cur.execute(build_drop_sql("TRIGGER", t_name, dialect=self.dialect))
                 for fn_name in entry["function_names"]:
                     cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-                cur.execute(f"DROP VIEW IF EXISTS {resolved_name};")
-                cur.execute(f"DROP TABLE IF EXISTS {entry['backing_table']};")
+                cur.execute(build_drop_sql("VIEW", resolved_name, dialect=self.dialect))
+                cur.execute(build_drop_sql("TABLE", entry["backing_table"], dialect=self.dialect))
                 for aux_t in entry["aux_tables"]:
-                    cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
+                    cur.execute(build_drop_sql("TABLE", aux_t, dialect=self.dialect))
                 ph = self._param_placeholder()
                 if self.dialect == Dialect.SQLITE and self.engine_version.supports_sqlite_returning:
                     cur.execute(
@@ -13047,9 +13279,9 @@ class MaterializedViewManager:
                     else view_name
                 )
                 db_v = f"{self.object_prefix}{raw_logical}"
-                cur.execute(f"DROP VIEW IF EXISTS {db_v};")
-                cur.execute(f"DROP VIEW IF EXISTS {raw_logical};")
-                cur.execute(f"DROP TABLE IF EXISTS {self.object_prefix}store_{raw_logical};")
+                cur.execute(build_drop_sql("VIEW", db_v, dialect=self.dialect))
+                cur.execute(build_drop_sql("VIEW", raw_logical, dialect=self.dialect))
+                cur.execute(build_drop_sql("TABLE", f"{self.object_prefix}store_{raw_logical}", dialect=self.dialect))
                 self._commit()
                 return False
 
@@ -13757,31 +13989,31 @@ class MaterializedViewManager:
         sqls: List[str] = []
         if self.dialect == Dialect.POSTGRES:
             old_tbl = self._old_name(plan.backing_table_name)
-            sqls.append(f"DROP TABLE IF EXISTS {old_tbl};")
+            sqls.append(build_drop_sql("TABLE", old_tbl, dialect=self.dialect))
             for aux_t in plan.auxiliary_table_names:
-                sqls.append(f"DROP TABLE IF EXISTS {self._old_name(aux_t)};")
+                sqls.append(build_drop_sql("TABLE", self._old_name(aux_t), dialect=self.dialect))
 
-            sqls.append(f"ALTER TABLE {plan.backing_table_name} RENAME TO {old_tbl};")
+            sqls.append(build_alter_rename_table_sql(plan.backing_table_name, old_tbl, dialect=self.dialect))
             for aux_t in plan.auxiliary_table_names:
-                sqls.append(f"ALTER TABLE {aux_t} RENAME TO {self._old_name(aux_t)};")
+                sqls.append(build_alter_rename_table_sql(aux_t, self._old_name(aux_t), dialect=self.dialect))
 
-            sqls.append(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+            sqls.append(build_alter_rename_table_sql(shadow_tbl, plan.backing_table_name, dialect=self.dialect))
             for aux_t, s_aux in shadow_aux_map.items():
-                sqls.append(f"ALTER TABLE {s_aux} RENAME TO {aux_t};")
+                sqls.append(build_alter_rename_table_sql(s_aux, aux_t, dialect=self.dialect))
 
             if plan.reader_view_ddl:
                 sqls.append(self._make_replace_view_ddl(plan.reader_view_ddl))
 
-            sqls.append(f"DROP TABLE IF EXISTS {old_tbl};")
+            sqls.append(build_drop_sql("TABLE", old_tbl, dialect=self.dialect))
             for aux_t in plan.auxiliary_table_names:
-                sqls.append(f"DROP TABLE IF EXISTS {self._old_name(aux_t)};")
+                sqls.append(build_drop_sql("TABLE", self._old_name(aux_t), dialect=self.dialect))
 
         elif self.dialect == Dialect.MYSQL:
             old_tbl = self._old_name(plan.backing_table_name)
             old_tables = [old_tbl]
             for aux_t in plan.auxiliary_table_names:
                 old_tables.append(self._old_name(aux_t))
-            sqls.append(f"DROP TABLE IF EXISTS {', '.join(old_tables)};")
+            sqls.append(build_drop_sql("TABLE", old_tables, dialect=self.dialect))
 
             rename_pairs = [
                 f"{plan.backing_table_name} TO {old_tbl}",
@@ -13796,15 +14028,15 @@ class MaterializedViewManager:
             if plan.reader_view_ddl:
                 sqls.append(self._make_replace_view_ddl(plan.reader_view_ddl))
 
-            sqls.append(f"DROP TABLE IF EXISTS {', '.join(old_tables)};")
+            sqls.append(build_drop_sql("TABLE", old_tables, dialect=self.dialect))
 
         else:  # SQLite and generic fallback
-            sqls.append(f"DROP VIEW IF EXISTS {plan.view_name};")
-            sqls.append(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
-            sqls.append(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+            sqls.append(build_drop_sql("VIEW", plan.view_name, dialect=self.dialect))
+            sqls.append(build_drop_sql("TABLE", plan.backing_table_name, dialect=self.dialect))
+            sqls.append(build_alter_rename_table_sql(shadow_tbl, plan.backing_table_name, dialect=self.dialect))
             for aux_t, s_aux in shadow_aux_map.items():
-                sqls.append(f"DROP TABLE IF EXISTS {aux_t};")
-                sqls.append(f"ALTER TABLE {s_aux} RENAME TO {aux_t};")
+                sqls.append(build_drop_sql("TABLE", aux_t, dialect=self.dialect))
+                sqls.append(build_alter_rename_table_sql(s_aux, aux_t, dialect=self.dialect))
             if plan.reader_view_ddl:
                 sqls.append(plan.reader_view_ddl)
 

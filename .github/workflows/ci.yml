@@ -245,6 +245,9 @@ jobs:
       - name: Test dialect-aware AST expression storage type inference
         run: python3 test_p1_expr_storage_types.py
 
+      - name: Test sqlglot.exp AST SQL builder helpers
+        run: python3 test_p1_sqlglot_builders.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
