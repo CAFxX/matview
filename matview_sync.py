@@ -11201,15 +11201,15 @@ class MaterializedViewManager:
 
             try:
                 if self.dialect == Dialect.POSTGRES:
-                    try:
-                        cur.execute("SET LOCAL matview.skip_triggers = 'off';")
-                    except Exception:
-                        pass
+                    # A failed reset aborts the transaction; let the outer
+                    # failure path roll back rather than committing with an
+                    # unexpected trigger-bypass state.
+                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
                 elif self.dialect == Dialect.MYSQL:
-                    try:
-                        cur.execute("SET @__matview_skip_triggers = 0;")
-                    except Exception:
-                        pass
+                    # This is a session variable, not transaction-local. Never
+                    # commit while it may still suppress maintenance triggers
+                    # on subsequent operations using this connection.
+                    cur.execute("SET @__matview_skip_triggers = 0;")
 
                 schemas = self.fetch_schema()
                 for entry in targets:
