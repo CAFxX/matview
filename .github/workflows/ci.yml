@@ -326,6 +326,10 @@ jobs:
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_postgres_registration_replacement_rollback.py
+      - name: Test PostgreSQL registration transaction ownership
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+        run: python3 test_postgres_registration_transaction_ownership.py
   # Both supported Oracle MySQL LTS series are required on every PR.
   mysql:
     needs: classify
