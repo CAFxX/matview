@@ -222,7 +222,9 @@ class SchemaAwareSelectFuzzer:
         if dialect == Dialect.POSTGRES:
             cur.execute(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = current_schema() AND table_name LIKE 'vs%_t%' "
+                "WHERE table_schema = current_schema() "
+                "AND table_type = 'BASE TABLE' "
+                "AND table_name LIKE 'vs%#_t%' ESCAPE '#' "
                 "ORDER BY table_name"
             )
             tables = [row[0] for row in (cur.fetchall() or [])]
@@ -249,7 +251,9 @@ class SchemaAwareSelectFuzzer:
         if dialect == Dialect.MYSQL:
             cur.execute(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = DATABASE() AND table_name LIKE 'vs%_t%' "
+                "WHERE table_schema = DATABASE() "
+                "AND table_type = 'BASE TABLE' "
+                "AND table_name LIKE 'vs%#_t%' ESCAPE '#' "
                 "ORDER BY table_name"
             )
             tables = [row[0] for row in (cur.fetchall() or [])]
@@ -262,7 +266,7 @@ class SchemaAwareSelectFuzzer:
                 FROM information_schema.key_column_usage
                 WHERE table_schema = DATABASE()
                   AND referenced_table_name IS NOT NULL
-                  AND table_name LIKE 'vs%_t%'
+                  AND table_name LIKE 'vs%#_t%' ESCAPE '#'
                 """
             )
             foreign_keys = [(row[0], row[1], row[2]) for row in (cur.fetchall() or [])]
@@ -458,6 +462,9 @@ class SchemaAwareSelectFuzzer:
             # Compound SELECT ordering is expressed against the result column,
             # not a table-qualified name from either branch.
             order_by = (("bare_column", "id"),)
+        elif group:
+            # Keep ORDER BY compliant with ONLY_FULL_GROUP_BY / PostgreSQL grouping rules.
+            order_by = () if simple or rng.random() < 0.22 else (("column", available_alias, "label"),)
         else:
             order_by = () if simple or rng.random() < 0.22 else (("column", available_alias, "id"),)
         if order_by:
