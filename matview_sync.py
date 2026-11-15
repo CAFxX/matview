@@ -10984,6 +10984,14 @@ class MaterializedViewManager:
         # get_catalog(): its SELECT can itself start a DB-API transaction.
         mysql_caller_transaction = False
         if self.dialect == Dialect.MYSQL:
+            if (
+                getattr(self, "_mysql_bulk_connection_unsafe", False)
+                or getattr(self.conn, "_matview_bulk_connection_unsafe", False)
+            ):
+                raise RuntimeError(
+                    "this MySQL/MariaDB connection has an unknown trigger-bypass "
+                    "session state and must be discarded before reuse"
+                )
             tx_state = self._mysql_transaction_state()
             if tx_state is None:
                 raise RuntimeError(
@@ -11023,6 +11031,25 @@ class MaterializedViewManager:
 
         cur = self.conn.cursor()
         sp_active = False
+
+        def _reset_mysql_trigger_bypass() -> None:
+            """Clear the session flag or mark the connection unsafe for reuse."""
+            try:
+                cur.execute("SET @__matview_skip_triggers = 0;")
+            except Exception as reset_exc:
+                self._mysql_bulk_connection_unsafe = True
+                try:
+                    setattr(self.conn, "_matview_bulk_connection_unsafe", True)
+                except Exception:
+                    # Some DB-API extension objects disallow custom attributes.
+                    # The manager flag and raised discard signal still apply.
+                    pass
+                error = RuntimeError(
+                    "failed to clear the MySQL/MariaDB trigger-bypass session variable; "
+                    "the connection state is unsafe and the connection must be discarded"
+                )
+                error.connection_unsafe = True
+                raise error from reset_exc
         # Never shadow a savepoint created by the caller. MySQL replaces an
         # existing savepoint when SAVEPOINT is issued with the same name.
         sp_name = f"__mv_bulk_sp_{uuid.uuid4().hex}"
@@ -11059,9 +11086,18 @@ class MaterializedViewManager:
             # session variable defensively in case the failed SET reached the
             # server but its response was lost.
             try:
-                cur.execute("SET @__matview_skip_triggers = 0;")
-            except Exception:
-                pass
+                _reset_mysql_trigger_bypass()
+            except RuntimeError as reset_error:
+                if sp_active:
+                    try:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                        cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+                    except Exception:
+                        if not mysql_caller_transaction:
+                            self._rollback()
+                if not mysql_caller_transaction:
+                    self._rollback()
+                raise reset_error
             if sp_active:
                 try:
                     cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
@@ -11107,9 +11143,12 @@ class MaterializedViewManager:
                     pass
             elif self.dialect == Dialect.MYSQL and session_bypass_ok:
                 try:
-                    cur.execute("SET @__matview_skip_triggers = 0;")
-                except Exception:
-                    pass
+                    _reset_mysql_trigger_bypass()
+                except RuntimeError as reset_error:
+                    reset_error.add_note(f"Original bulk operation failure: {operation_error!r}")
+                    if not mysql_caller_transaction:
+                        self._rollback()
+                    raise reset_error from operation_error
             if self.dialect == Dialect.MYSQL:
                 # A caller-owned transaction is rolled back only to our
                 # savepoint; a context-owned transaction is fully rolled back.
@@ -11148,10 +11187,9 @@ class MaterializedViewManager:
                     except Exception:
                         pass
                 elif self.dialect == Dialect.MYSQL and session_bypass_ok:
-                    # Do not commit if the session flag cannot be cleared:
-                    # it would suppress maintenance on later statements using
-                    # this pooled connection.
-                    cur.execute("SET @__matview_skip_triggers = 0;")
+                    # A failed reset is a session-safety failure; rollback cannot
+                    # undo a MySQL user-variable assignment.
+                    _reset_mysql_trigger_bypass()
                 schemas = self.fetch_schema()
                 for entry in targets:
                     plan = generate_materialized_view(
@@ -11233,9 +11271,21 @@ class MaterializedViewManager:
                     # owns the surrounding transaction.
                     if session_bypass_ok:
                         try:
-                            cur.execute("SET @__matview_skip_triggers = 0;")
-                        except Exception:
-                            pass
+                            _reset_mysql_trigger_bypass()
+                        except RuntimeError as reset_error:
+                            reset_error.add_note(
+                                f"Original bulk refresh failure: {operation_error!r}"
+                            )
+                            if sp_active:
+                                try:
+                                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                                    cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+                                except Exception:
+                                    if not mysql_caller_transaction:
+                                        self._rollback()
+                            if not mysql_caller_transaction:
+                                self._rollback()
+                            raise reset_error from operation_error
                     if sp_active:
                         try:
                             cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
