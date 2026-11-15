@@ -146,6 +146,38 @@ def main() -> None:
             "SELECT COUNT(*) FROM replacement_rows WHERE id=7;"
         ).fetchone()[0] == 0
 
+        # Compatibility adapters may not expose in_transaction. If their
+        # BEGIN IMMEDIATE probe finds a caller transaction, registration must
+        # fail without rolling that transaction back.
+        class ConnectionWithoutTransactionFlag:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __getattr__(self, name):
+                if name == "in_transaction":
+                    raise AttributeError(name)
+                return getattr(self._wrapped, name)
+
+        conn.execute("BEGIN;")
+        conn.execute("INSERT INTO replacement_rows VALUES (8, 80);")
+        wrapped_manager = MaterializedViewManager(
+            ConnectionWithoutTransactionFlag(conn), dialect=Dialect.SQLITE
+        )
+        try:
+            wrapped_manager.register_view(view_sql, force_rebuild=True)
+        except Exception as exc:
+            assert "transaction" in str(exc).lower()
+        else:
+            raise AssertionError("adapter with hidden transaction state joined caller transaction")
+        assert conn.in_transaction
+        assert conn.execute(
+            "SELECT COUNT(*) FROM replacement_rows WHERE id=8;"
+        ).fetchone()[0] == 1
+        conn.rollback()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM replacement_rows WHERE id=8;"
+        ).fetchone()[0] == 0
+
         # Unsupported replacement modes fail before drop_view is called.
         schemas_for_test = manager.fetch_schema()
         original_dialect = manager.dialect
