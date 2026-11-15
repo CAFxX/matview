@@ -4089,14 +4089,17 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
 
     def test_00a_mysql_bulk_changes_never_uses_implicit_commit_ddl(self) -> None:
         class Cursor:
-            def __init__(self, fail_bypass: bool = False) -> None:
+            def __init__(self, fail_bypass: bool = False, fail_reset: bool = False) -> None:
                 self.statements: List[str] = []
                 self.fail_bypass = fail_bypass
+                self.fail_reset = fail_reset
 
             def execute(self, statement: str) -> None:
                 self.statements.append(statement)
                 if self.fail_bypass and statement == "SET @__matview_skip_triggers = 1;":
                     raise RuntimeError("session variables unavailable")
+                if self.fail_reset and statement == "SET @__matview_skip_triggers = 0;":
+                    raise RuntimeError("cannot reset session variable")
 
         class Connection:
             in_transaction = False
@@ -4182,6 +4185,16 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
         self.assertGreaterEqual(cursor.statements.count("SET @__matview_skip_triggers = 0;"), 2)
+
+        # A failed reset must prevent commit and roll back the data changes.
+        cursor = Cursor(fail_reset=True)
+        conn = Connection(cursor)
+        mgr = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "cannot reset session variable"):
+            with mgr.bulk_changes():
+                pass
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
 
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
