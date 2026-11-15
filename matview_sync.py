@@ -4524,6 +4524,9 @@ class IncrementalViewCompiler:
                                         candidate.__class__.__name__ == "Literal"
                                         and not candidate.args.get("is_string")
                                         and "." not in str(candidate.this)
+                                        and "INT" in c_inner.data_type.upper()
+                                        and "DECIMAL" not in c_inner.data_type.upper()
+                                        and "NUMERIC" not in c_inner.data_type.upper()
                                     ):
                                         return "BIGINT"
                         except (sqlglot.errors.SqlglotError, AttributeError, TypeError):
