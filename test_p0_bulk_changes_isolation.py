@@ -869,7 +869,7 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
             }
         }
 
-        with self.assertRaisesRegex(RuntimeError, "could not establish either session-local trigger bypass"):
+        with self.assertRaisesRegex(RuntimeError, "could not establish the required transactional savepoint"):
             with manager.bulk_changes():
                 self.fail("bulk_changes must fail before entering the user block")
 
@@ -882,7 +882,159 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         self.assertEqual(executed[-1], "ROLLBACK;")
 
 
+    def test_mysql_session_bypass_without_savepoint_fails_closed(self) -> None:
+        """A session bypass alone is insufficient when MySQL cannot roll back bulk DML."""
+        executed = []
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                if sql == "SAVEPOINT __mv_bulk_sp;":
+                    raise RuntimeError("injected savepoint failure")
+                return self
+
+        class RecordingConnection:
+            def cursor(self):
+                return RecordingCursor()
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.MYSQL
+        manager.engine_version = parse_engine_version("mysql:8.4")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {
+            "v_guard": {
+                "view_name": "v_guard",
+                "trigger_names": ["mv_guard_insert"],
+                "function_names": [],
+                "view_sql": "CREATE VIEW v_guard AS SELECT id FROM guarded_rows;",
+            }
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "required transactional savepoint"):
+            with manager.bulk_changes():
+                self.fail("bulk_changes must fail before entering the user block")
+
+        self.assertIn("SAVEPOINT __mv_bulk_sp;", executed)
+        self.assertIn("SET @__matview_skip_triggers = 1;", executed)
+        self.assertFalse(
+            any(sql.upper().startswith("DROP TRIGGER") for sql in executed),
+            executed,
+        )
+        self.assertEqual(executed[-1], "ROLLBACK;")
+
+
     def test_mysql_session_bypass_failure_fails_closed_before_trigger_ddl(self) -> None:
+        """A failed MySQL session bypass must not fall back to implicitly committed trigger DDL."""
+        executed = []
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                if sql == "SET @__matview_skip_triggers = 1;":
+                    raise RuntimeError("session variables unavailable")
+                return self
+
+        class RecordingConnection:
+            def cursor(self):
+                return RecordingCursor()
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+            def commit(self):
+                executed.append("COMMIT;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.MYSQL
+        manager.engine_version = parse_engine_version("mysql:8.4")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {
+            "v_guard": {
+                "view_name": "v_guard",
+                "trigger_names": ["mv_guard_insert", "mv_guard_update"],
+                "function_names": [],
+                "view_sql": "CREATE VIEW v_guard AS SELECT id FROM guarded_rows;",
+            }
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "refusing to drop maintenance triggers"):
+            with manager.bulk_changes():
+                self.fail("bulk_changes must fail before entering the user block")
+
+        self.assertIn("SAVEPOINT __mv_bulk_sp;", executed)
+        self.assertIn("SET @__matview_skip_triggers = 1;", executed)
+        self.assertFalse(
+            any(sql.upper().startswith("DROP TRIGGER") for sql in executed),
+            executed,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+        """A failed MySQL session bypass must not fall back to implicitly committed trigger DDL."""
+        executed = []
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                if sql == "SET @__matview_skip_triggers = 1;":
+                    raise RuntimeError("session variables unavailable")
+                return self
+
+        class RecordingConnection:
+            def cursor(self):
+                return RecordingCursor()
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+            def commit(self):
+                executed.append("COMMIT;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.MYSQL
+        manager.engine_version = parse_engine_version("mysql:8.4")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {
+            "v_guard": {
+                "view_name": "v_guard",
+                "trigger_names": ["mv_guard_insert", "mv_guard_update"],
+                "function_names": [],
+                "view_sql": "CREATE VIEW v_guard AS SELECT id FROM guarded_rows;",
+            }
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "refusing to drop maintenance triggers"):
+            with manager.bulk_changes():
+                self.fail("bulk_changes must fail before entering the user block")
+
+        self.assertIn("SAVEPOINT __mv_bulk_sp;", executed)
+        self.assertIn("SET @__matview_skip_triggers = 1;", executed)
+        self.assertFalse(
+            any(sql.upper().startswith("DROP TRIGGER") for sql in executed),
+            executed,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
         """A failed MySQL session bypass must not fall back to implicitly committed trigger DDL."""
         executed = []
 
