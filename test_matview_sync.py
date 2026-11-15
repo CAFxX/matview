@@ -4176,7 +4176,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
 
             def execute(self, statement: str) -> None:
                 self.statements.append(statement)
-                if self.fail_savepoint and statement == "SAVEPOINT __mv_bulk_sp;":
+                if self.fail_savepoint and statement.startswith("SAVEPOINT __mv_bulk_sp_"):
                     raise RuntimeError("savepoints unavailable")
                 if self.fail_bypass and statement == "SET @__matview_skip_triggers = 1;":
                     raise RuntimeError("session variables unavailable")
@@ -4224,8 +4224,10 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         mgr.fetch_schema = lambda: {}
         with mgr.bulk_changes():
             pass
-        self.assertIn("SAVEPOINT __mv_bulk_sp;", cursor.statements)
-        self.assertIn("RELEASE SAVEPOINT __mv_bulk_sp;", cursor.statements)
+        savepoint_stmt = next(sql for sql in cursor.statements if sql.startswith("SAVEPOINT __mv_bulk_sp_"))
+        savepoint_name = savepoint_stmt.removeprefix("SAVEPOINT ").removesuffix(";")
+        self.assertNotEqual(savepoint_name, "__mv_bulk_sp")
+        self.assertIn(f"RELEASE SAVEPOINT {savepoint_name};", cursor.statements)
         self.assertEqual(conn.commit_calls, 0)
         self.assertEqual(conn.rollback_calls, 0)
         conn.rollback()
@@ -4240,7 +4242,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "caller rollback"):
             with mgr.bulk_changes():
                 raise ValueError("caller rollback")
-        self.assertIn("ROLLBACK TO SAVEPOINT __mv_bulk_sp;", cursor.statements)
+        self.assertTrue(any(sql.startswith("ROLLBACK TO SAVEPOINT __mv_bulk_sp_") for sql in cursor.statements))
         self.assertEqual(conn.rollback_calls, 0)
         self.assertEqual(conn.commit_calls, 0)
         self.assertIs(conn.in_transaction, True)
