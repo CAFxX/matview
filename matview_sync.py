@@ -11141,6 +11141,14 @@ class MaterializedViewManager:
         # Never shadow a savepoint created by the caller. MySQL replaces an
         # existing savepoint when SAVEPOINT is issued with the same name.
         sp_name = f"__mv_bulk_sp_{uuid.uuid4().hex}"
+
+        def close_cursor() -> None:
+            if hasattr(cur, "close"):
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
         try:
             cur.execute(f"SAVEPOINT {sp_name};")
             sp_active = True
@@ -11148,6 +11156,7 @@ class MaterializedViewManager:
             if self.dialect == Dialect.MYSQL:
                 if not mysql_caller_transaction:
                     self._rollback()
+                close_cursor()
                 raise RuntimeError(
                     "bulk_changes() on MySQL/MariaDB requires SAVEPOINT support "
                     "to preserve transaction rollback semantics"
@@ -11155,6 +11164,7 @@ class MaterializedViewManager:
             if self.dialect == Dialect.SQLITE:
                 if sqlite_writer_reserved:
                     self._rollback()
+                close_cursor()
                 raise RuntimeError(
                     "bulk_changes() on SQLite requires SAVEPOINT support "
                     "after acquiring its writer reservation"
@@ -11196,6 +11206,7 @@ class MaterializedViewManager:
                 self._rollback()
             if bypass_reset_error is not None:
                 self._discard_mysql_connection()
+                close_cursor()
                 raise RuntimeError(
                     "bulk_changes() could not establish or clear the MySQL/MariaDB "
                     "session trigger-bypass flag; discard this connection before reuse"
@@ -11210,6 +11221,7 @@ class MaterializedViewManager:
         # a real savepoint is the proof that this operation owns a transaction.
         if self.dialect == Dialect.POSTGRES and not sp_active:
             self._rollback()
+            close_cursor()
             raise RuntimeError(
                 "bulk_changes() on PostgreSQL requires a transactional savepoint "
                 "before trigger suspension"
