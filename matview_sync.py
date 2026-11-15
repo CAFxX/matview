@@ -25,6 +25,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
+import functools
 import hashlib
 import json
 import re
@@ -43,6 +44,8 @@ from typing import (
     Tuple,
     Union,
 )
+
+from packaging.version import InvalidVersion, Version
 
 import sqlglot
 from sqlglot import exp as sqlglot_exp
@@ -64,11 +67,13 @@ class EngineSubdialect(str, Enum):
     MARIADB = "mariadb"
 
 
-@dataclass(frozen=True, order=True)
+@functools.total_ordering
+@dataclass(frozen=True)
 class EngineVersion:
     """
     Represents a specific database engine, subdialect (`sqlite`, `postgres`, `mysql`, `mariadb`),
-    and semantic version tuple `(major, minor, patch)` for version-optimal SQL generation.
+    and semantic version for version-optimal SQL generation.
+    Delegates semantic version parsing, normalization, and rich comparison to `packaging.version.Version`.
     """
     dialect: Dialect
     subdialect: EngineSubdialect
@@ -78,6 +83,21 @@ class EngineVersion:
     # parse/prepare time. Capture it as a literal: MariaDB forbids system-variable
     # references in CREATE VIEW definitions.
     mariadb_div_precision_increment: int = field(default=4, compare=False)
+    packaging_version: Optional[Version] = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.packaging_version is None:
+            pkg_v: Optional[Version] = None
+            if self.raw_version:
+                try:
+                    pkg_v, _ = _extract_packaging_and_tuple(
+                        self.raw_version, self.version, require_valid=False
+                    )
+                except Exception:
+                    pkg_v = None
+            if pkg_v is None:
+                pkg_v = Version(f"{self.version[0]}.{self.version[1]}.{self.version[2]}")
+            object.__setattr__(self, "packaging_version", pkg_v)
 
     @property
     def major(self) -> int:
@@ -93,6 +113,8 @@ class EngineVersion:
 
     @property
     def version_str(self) -> str:
+        if self.packaging_version is not None:
+            return str(self.packaging_version)
         return f"{self.version[0]}.{self.version[1]}.{self.version[2]}"
 
     @property
@@ -120,67 +142,237 @@ class EngineVersion:
         return self.subdialect == EngineSubdialect.MARIADB
 
     @property
+    def is_prerelease(self) -> bool:
+        return bool(self.packaging_version and self.packaging_version.is_prerelease)
+
+    @property
+    def is_postrelease(self) -> bool:
+        return bool(self.packaging_version and self.packaging_version.is_postrelease)
+
+    @property
+    def is_devrelease(self) -> bool:
+        return bool(self.packaging_version and self.packaging_version.is_devrelease)
+
+    @property
+    def base_version(self) -> str:
+        return self.packaging_version.base_version if self.packaging_version else self.version_str
+
+    def at_least(self, target: Version | str | Tuple[int, ...] | EngineVersion) -> bool:
+        """
+        Returns True if this EngineVersion satisfies the specified target version floor.
+        Accepts packaging.version.Version, version string (e.g. '15.0', '8.4.0rc1'),
+        version tuple (e.g. (15, 0, 0)), or another EngineVersion.
+        """
+        if isinstance(target, EngineVersion):
+            target_v = target.packaging_version
+        elif isinstance(target, Version):
+            target_v = target
+        elif isinstance(target, tuple):
+            target_v = Version(".".join(str(x) for x in target))
+        elif isinstance(target, str):
+            target_v = _to_packaging_version(target)
+        else:
+            raise TypeError(f"Unsupported target type for at_least: {type(target)!r}")
+        assert self.packaging_version is not None
+        return self.packaging_version >= target_v
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, EngineVersion):
+            return NotImplemented
+        return (
+            self.dialect == other.dialect
+            and self.subdialect == other.subdialect
+            and self.packaging_version == other.packaging_version
+        )
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, EngineVersion):
+            return NotImplemented
+        if (self.dialect, self.subdialect) != (other.dialect, other.subdialect):
+            return (self.dialect.value, self.subdialect.value) < (
+                other.dialect.value,
+                other.subdialect.value,
+            )
+        assert self.packaging_version is not None
+        assert other.packaging_version is not None
+        return self.packaging_version < other.packaging_version
+
+    def __hash__(self) -> int:
+        return hash((self.dialect, self.subdialect, self.packaging_version))
+
+    @property
     def supports_pg_transition_tables(self) -> bool:
-        return self.is_postgres and self.version >= (10, 0, 0)
+        return self.is_postgres and self.at_least((10, 0, 0))
 
     @property
     def supports_pg_nulls_not_distinct(self) -> bool:
-        return self.is_postgres and self.version >= (15, 0, 0)
+        return self.is_postgres and self.at_least((15, 0, 0))
 
     @property
     def supports_pg_merge(self) -> bool:
-        return self.is_postgres and self.version >= (15, 0, 0)
+        return self.is_postgres and self.at_least((15, 0, 0))
 
     @property
     def supports_sqlite_upsert(self) -> bool:
-        return self.is_sqlite and self.version >= (3, 24, 0)
+        return self.is_sqlite and self.at_least((3, 24, 0))
 
     @property
     def supports_sqlite_window_functions(self) -> bool:
-        return self.is_sqlite and self.version >= (3, 25, 0)
+        return self.is_sqlite and self.at_least((3, 25, 0))
 
     @property
     def supports_sqlite_returning(self) -> bool:
-        return self.is_sqlite and self.version >= (3, 35, 0)
+        return self.is_sqlite and self.at_least((3, 35, 0))
 
     @property
     def supports_mysql_window_functions(self) -> bool:
-        return (self.is_mysql and self.version >= (8, 0, 0)) or (
-            self.is_mariadb and self.version >= (10, 2, 0)
+        return (self.is_mysql and self.at_least((8, 0, 0))) or (
+            self.is_mariadb and self.at_least((10, 2, 0))
         )
 
     @property
     def supports_mysql_row_alias_upsert(self) -> bool:
-        return self.is_mysql and self.version >= (8, 0, 19)
+        return self.is_mysql and self.at_least((8, 0, 19))
+
+
+BARE_DIALECT_NAMES = {
+    "postgres",
+    "postgresql",
+    "pg",
+    "cockroach",
+    "yugabyte",
+    "mysql",
+    "percona",
+    "tidb",
+    "mariadb",
+    "sqlite",
+    "sqlite3",
+    "apsw",
+    "sqlcipher",
+    "sqlean",
+    "libsql",
+}
+
+
+def _extract_packaging_and_tuple(
+    text_s: str,
+    default_ver: Tuple[int, int, int],
+    require_valid: bool = False,
+) -> Tuple[Version, Tuple[int, int, int]]:
+    """
+    Extracts a standardized packaging.version.Version and backward-compatible
+    (major, minor, patch) tuple from arbitrary database engine banners or version strings.
+    """
+    s = (text_s or "").strip()
+    if not s:
+        if require_valid:
+            raise ValueError(f"Empty version string in specification {text_s!r}")
+        v_str = f"{default_ver[0]}.{default_ver[1]}.{default_ver[2]}"
+        return Version(v_str), default_ver
+
+    # 1. PostgreSQL 5- or 6-digit server_version_num like 170002 or 90624
+    m_pgnum = re.search(r"\b(\d{5,6})\b", s)
+    if m_pgnum and "." not in s:
+        num = int(m_pgnum.group(1))
+        maj = num // 10000
+        min_v = (num % 10000) // 100
+        pat = num % 100
+        ver_tuple = (maj, min_v, pat)
+        return Version(f"{maj}.{min_v}.{pat}"), ver_tuple
+
+    # 2. MariaDB banner (e.g. '5.5.5-10.11.8-MariaDB-1:10.11.8+maria~ubu2204' or '10.11.8-MariaDB')
+    cleaned = re.sub(r"^5\.5\.5-", "", s, flags=re.IGNORECASE)
+    m_maria = re.search(r"(\d+\.\d+(?:\.\d+)?(?:[-._]?[a-zA-Z0-9]+)?)(?=-MariaDB)", cleaned, flags=re.IGNORECASE)
+    if m_maria:
+        cand = m_maria.group(1)
+        cand_norm = re.sub(r"-(rc|beta|alpha|b|a)", r"\1", cand, flags=re.IGNORECASE)
+        try:
+            pv = Version(cand_norm)
+            rel = pv.release
+            maj = rel[0] if len(rel) > 0 else default_ver[0]
+            min_v = rel[1] if len(rel) > 1 else 0
+            pat = rel[2] if len(rel) > 2 else 0
+            if not (pv.is_prerelease or pv.is_postrelease or pv.is_devrelease) and len(rel) < 3:
+                pv = Version(f"{maj}.{min_v}.{pat}")
+            return pv, (maj, min_v, pat)
+        except InvalidVersion:
+            pass
+
+    # 3. Strip engine prefixes
+    cleaned = re.sub(r"\bsqlite3\b", "sqlite", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(?:postgres(?:ql)?|pg|mysql|mariadb|sqlite)[-:_/\s]*", "", cleaned, flags=re.IGNORECASE)
+
+    # 4. Strip distribution build suffixes
+    cleaned = re.sub(r"-(?:0ubuntu|\d+:|\d+ubuntu|\d+build|\d+deb).*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[+~].*$", "", cleaned)
+
+    # 5. Check if anything is left
+    cand_first = cleaned.split()[0] if cleaned.split() else cleaned
+    cand_first = cand_first.rstrip(";,.)]")
+
+    # Normalize pre-releases
+    cand_norm = re.sub(r"-(rc|beta|alpha|b|a|dev|post)", r"\1", cand_first, flags=re.IGNORECASE)
+    cand_norm = re.sub(r"\bbeta\b", "b", cand_norm, flags=re.IGNORECASE)
+    cand_norm = re.sub(r"\balpha\b", "a", cand_norm, flags=re.IGNORECASE)
+
+    if cand_norm:
+        try:
+            pv = Version(cand_norm)
+            rel = pv.release
+            maj = rel[0] if len(rel) > 0 else default_ver[0]
+            min_v = rel[1] if len(rel) > 1 else 0
+            pat = rel[2] if len(rel) > 2 else 0
+            if not (pv.is_prerelease or pv.is_postrelease or pv.is_devrelease) and len(rel) < 3:
+                pv = Version(f"{maj}.{min_v}.{pat}")
+            return pv, (maj, min_v, pat)
+        except InvalidVersion:
+            pass
+
+    # 6. Fallback regex search for digits
+    m_ver = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?((?:a|b|rc|dev|post|\.post)\d+)?", cleaned, flags=re.IGNORECASE)
+    if m_ver:
+        maj = int(m_ver.group(1))
+        min_v = int(m_ver.group(2)) if m_ver.group(2) is not None else 0
+        pat = int(m_ver.group(3)) if m_ver.group(3) is not None else 0
+        suffix = m_ver.group(4) or ""
+        v_str = f"{maj}.{min_v}.{pat}{suffix}"
+        try:
+            pv = Version(v_str)
+            return pv, (maj, min_v, pat)
+        except InvalidVersion:
+            return Version(f"{maj}.{min_v}.{pat}"), (maj, min_v, pat)
+
+    if require_valid:
+        raise ValueError(f"Invalid engine version specification {text_s!r}: cannot extract valid semantic version.")
+
+    v_str = f"{default_ver[0]}.{default_ver[1]}.{default_ver[2]}"
+    return Version(v_str), default_ver
 
 
 def _extract_version_tuple(
     text_s: str, default_ver: Tuple[int, int, int]
 ) -> Tuple[int, int, int]:
-    # Handle 5- or 6-digit PostgreSQL server_version_num like 170002 or 90624
-    m_pgnum = re.search(r"\b(\d{5,6})\b", text_s)
-    if m_pgnum and "." not in text_s:
-        num = int(m_pgnum.group(1))
-        if num >= 100000:
-            return (num // 10000, (num % 10000) // 100, num % 100)
-        return (num // 10000, (num % 10000) // 100, num % 100)
-    # If MariaDB banner like '5.5.5-10.11.8-MariaDB' or '10.11.8-MariaDB-1:10.11.8'
-    m_maria = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?(?=-MariaDB)", text_s, flags=re.IGNORECASE)
-    if m_maria:
-        return (
-            int(m_maria.group(1)),
-            int(m_maria.group(2)),
-            int(m_maria.group(3)) if m_maria.group(3) is not None else 0,
-        )
-    # Strip 'sqlite3' prefix so '3' in 'sqlite3' is not mistaken for version 3.0.0
-    cleaned = re.sub(r"\bsqlite3\b", "sqlite", text_s, flags=re.IGNORECASE)
-    m_ver = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", cleaned)
-    if not m_ver:
-        return default_ver
-    maj = int(m_ver.group(1))
-    min_v = int(m_ver.group(2)) if m_ver.group(2) is not None else 0
-    pat = int(m_ver.group(3)) if m_ver.group(3) is not None else 0
-    return (maj, min_v, pat)
+    return _extract_packaging_and_tuple(text_s, default_ver, require_valid=False)[1]
+
+
+def _to_packaging_version(
+    spec: Version | str | Tuple[int, ...] | EngineVersion,
+    default_ver: Tuple[int, int, int] = (0, 0, 0),
+) -> Version:
+    if isinstance(spec, EngineVersion):
+        assert spec.packaging_version is not None
+        return spec.packaging_version
+    if isinstance(spec, Version):
+        return spec
+    if isinstance(spec, tuple):
+        return Version(".".join(str(x) for x in spec))
+    if isinstance(spec, str):
+        try:
+            return Version(spec)
+        except InvalidVersion:
+            pv, _ = _extract_packaging_and_tuple(spec, default_ver, require_valid=True)
+            return pv
+    raise TypeError(f"Cannot convert {spec!r} of type {type(spec)!r} to packaging.version.Version")
 
 
 def parse_engine_version(
@@ -217,13 +409,34 @@ def parse_engine_version(
 
     if isinstance(spec, Dialect):
         if spec == Dialect.POSTGRES:
-            return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, (14, 0, 0), "14.0.0")
+            return EngineVersion(
+                Dialect.POSTGRES,
+                EngineSubdialect.POSTGRES,
+                (14, 0, 0),
+                "14.0.0",
+                packaging_version=Version("14.0.0"),
+            )
         if spec == Dialect.MYSQL:
             sub = def_sub if def_sub in (EngineSubdialect.MYSQL, EngineSubdialect.MARIADB) else EngineSubdialect.MYSQL
             ver = (11, 4, 0) if sub == EngineSubdialect.MARIADB else (8, 0, 0)
-            return EngineVersion(Dialect.MYSQL, sub, ver, f"{ver[0]}.{ver[1]}.{ver[2]}")
+            v_str = f"{ver[0]}.{ver[1]}.{ver[2]}"
+            return EngineVersion(
+                Dialect.MYSQL,
+                sub,
+                ver,
+                v_str,
+                packaging_version=Version(v_str),
+            )
         sq_v = sqlite3.sqlite_version_info[:3]
-        return EngineVersion(Dialect.SQLITE, EngineSubdialect.SQLITE, (sq_v[0], sq_v[1], sq_v[2]), sqlite3.sqlite_version)
+        ver = (sq_v[0], sq_v[1], sq_v[2])
+        v_str = f"{ver[0]}.{ver[1]}.{ver[2]}"
+        return EngineVersion(
+            Dialect.SQLITE,
+            EngineSubdialect.SQLITE,
+            ver,
+            sqlite3.sqlite_version,
+            packaging_version=Version(v_str),
+        )
 
     s = (spec or "").strip()
     if not s:
@@ -231,38 +444,53 @@ def parse_engine_version(
         return parse_engine_version(target_d, default_dialect=default_dialect)
 
     s_low = s.lower()
+    target_d: Optional[Dialect] = None
+    target_sub: Optional[EngineSubdialect] = None
+    def_ver: Tuple[int, int, int] = (0, 0, 0)
+
     if "mariadb" in s_low:
-        ver = _extract_version_tuple(s, (11, 4, 0))
-        return EngineVersion(Dialect.MYSQL, EngineSubdialect.MARIADB, ver, s)
-    if any(k in s_low for k in ("postgres", "postgresql", "pg", "cockroach", "yugabyte")):
-        ver = _extract_version_tuple(s, (14, 0, 0))
-        return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, ver, s)
-    if any(k in s_low for k in ("mysql", "percona", "tidb")):
-        ver = _extract_version_tuple(s, (8, 0, 0))
-        return EngineVersion(Dialect.MYSQL, EngineSubdialect.MYSQL, ver, s)
-    if any(k in s_low for k in ("sqlite", "apsw", "sqlcipher", "sqlean", "libsql")):
+        target_d = Dialect.MYSQL
+        target_sub = EngineSubdialect.MARIADB
+        def_ver = (11, 4, 0)
+    elif any(k in s_low for k in ("postgres", "postgresql", "pg", "cockroach", "yugabyte")):
+        target_d = Dialect.POSTGRES
+        target_sub = EngineSubdialect.POSTGRES
+        def_ver = (14, 0, 0)
+    elif any(k in s_low for k in ("mysql", "percona", "tidb")):
+        target_d = Dialect.MYSQL
+        target_sub = EngineSubdialect.MYSQL
+        def_ver = (8, 0, 0)
+    elif any(k in s_low for k in ("sqlite", "apsw", "sqlcipher", "sqlean", "libsql")):
+        target_d = Dialect.SQLITE
+        target_sub = EngineSubdialect.SQLITE
         sq_def = sqlite3.sqlite_version_info[:3]
-        ver = _extract_version_tuple(s, (sq_def[0], sq_def[1], sq_def[2]))
-        return EngineVersion(Dialect.SQLITE, EngineSubdialect.SQLITE, ver, s)
-
-    # Bare version string (e.g. '17.2', '8.4.0', '3.45.1')
-    if def_d is not None:
+        def_ver = (sq_def[0], sq_def[1], sq_def[2])
+    elif def_d is not None:
+        target_d = def_d
         if def_d == Dialect.POSTGRES:
-            ver = _extract_version_tuple(s, (14, 0, 0))
-            return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, ver, s)
-        if def_d == Dialect.MYSQL:
-            sub = def_sub if def_sub in (EngineSubdialect.MYSQL, EngineSubdialect.MARIADB) else EngineSubdialect.MYSQL
-            def_v = (11, 4, 0) if sub == EngineSubdialect.MARIADB else (8, 0, 0)
-            ver = _extract_version_tuple(s, def_v)
-            return EngineVersion(Dialect.MYSQL, sub, ver, s)
-        sq_def = sqlite3.sqlite_version_info[:3]
-        ver = _extract_version_tuple(s, (sq_def[0], sq_def[1], sq_def[2]))
-        return EngineVersion(Dialect.SQLITE, EngineSubdialect.SQLITE, ver, s)
+            target_sub = EngineSubdialect.POSTGRES
+            def_ver = (14, 0, 0)
+        elif def_d == Dialect.MYSQL:
+            target_sub = def_sub if def_sub in (EngineSubdialect.MYSQL, EngineSubdialect.MARIADB) else EngineSubdialect.MYSQL
+            def_ver = (11, 4, 0) if target_sub == EngineSubdialect.MARIADB else (8, 0, 0)
+        else:
+            target_sub = EngineSubdialect.SQLITE
+            sq_def = sqlite3.sqlite_version_info[:3]
+            def_ver = (sq_def[0], sq_def[1], sq_def[2])
+    else:
+        raise ValueError(
+            f"Cannot determine database dialect from engine/version specification {spec!r}; "
+            f"use '<engine>:<version>' (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45')."
+        )
 
-    raise ValueError(
-        f"Cannot determine database dialect from engine/version specification {spec!r}; "
-        f"use '<engine>:<version>' (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45')."
-    )
+    if s_low in BARE_DIALECT_NAMES:
+        v_str = f"{def_ver[0]}.{def_ver[1]}.{def_ver[2]}"
+        pv = Version(v_str)
+        ver = def_ver
+    else:
+        pv, ver = _extract_packaging_and_tuple(s, def_ver, require_valid=True)
+
+    return EngineVersion(target_d, target_sub, ver, s, packaging_version=pv)
 
 
 def _read_mariadb_div_precision_increment(cur: Any) -> int:
@@ -349,12 +577,13 @@ def detect_engine_version(
     if cand_dialect == Dialect.POSTGRES:
         raw_v = ""
         ver_tuple: Optional[Tuple[int, int, int]] = None
+        pkg_v: Optional[Version] = None
         try:
             cur.execute("SHOW server_version_num;")
             r_num = cur.fetchone()
             if r_num and r_num[0]:
                 num_s = str(r_num[0]).strip()
-                ver_tuple = _extract_version_tuple(num_s, (14, 0, 0))
+                pkg_v, ver_tuple = _extract_packaging_and_tuple(num_s, (14, 0, 0))
                 raw_v = num_s
         except Exception:
             pass
@@ -364,11 +593,17 @@ def detect_engine_version(
             if r_v and r_v[0]:
                 raw_v = str(r_v[0]).strip()
                 if ver_tuple is None:
-                    ver_tuple = _extract_version_tuple(raw_v, (14, 0, 0))
+                    pkg_v, ver_tuple = _extract_packaging_and_tuple(raw_v, (14, 0, 0))
         except Exception:
             pass
         if ver_tuple is not None:
-            return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, ver_tuple, raw_v)
+            return EngineVersion(
+                Dialect.POSTGRES,
+                EngineSubdialect.POSTGRES,
+                ver_tuple,
+                raw_v,
+                packaging_version=pkg_v,
+            )
         return parse_engine_version(
             hint_dialect if isinstance(hint_dialect, str) else None,
             default_dialect=Dialect.POSTGRES,
@@ -381,13 +616,24 @@ def detect_engine_version(
             if row and row[0]:
                 v_str = str(row[0]).strip()
                 if "mariadb" in v_str.lower() or cand_sub == EngineSubdialect.MARIADB:
-                    ver = _extract_version_tuple(v_str, (11, 4, 0))
+                    pkg_v, ver = _extract_packaging_and_tuple(v_str, (11, 4, 0))
                     div_increment = _read_mariadb_div_precision_increment(cur)
                     return EngineVersion(
-                        Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str, div_increment
+                        Dialect.MYSQL,
+                        EngineSubdialect.MARIADB,
+                        ver,
+                        v_str,
+                        div_increment,
+                        packaging_version=pkg_v,
                     )
-                ver = _extract_version_tuple(v_str, (8, 0, 0))
-                return EngineVersion(Dialect.MYSQL, EngineSubdialect.MYSQL, ver, v_str)
+                pkg_v, ver = _extract_packaging_and_tuple(v_str, (8, 0, 0))
+                return EngineVersion(
+                    Dialect.MYSQL,
+                    EngineSubdialect.MYSQL,
+                    ver,
+                    v_str,
+                    packaging_version=pkg_v,
+                )
         except Exception:
             pass
         return parse_engine_version(
@@ -409,16 +655,33 @@ def detect_engine_version(
         if row and row[0]:
             v_str = str(row[0]).strip()
             if "postgres" in v_str.lower() or "cockroach" in v_str.lower() or "yugabyte" in v_str.lower():
-                ver = _extract_version_tuple(v_str, (14, 0, 0))
-                return EngineVersion(Dialect.POSTGRES, EngineSubdialect.POSTGRES, ver, v_str)
+                pkg_v, ver = _extract_packaging_and_tuple(v_str, (14, 0, 0))
+                return EngineVersion(
+                    Dialect.POSTGRES,
+                    EngineSubdialect.POSTGRES,
+                    ver,
+                    v_str,
+                    packaging_version=pkg_v,
+                )
             if "mariadb" in v_str.lower():
-                ver = _extract_version_tuple(v_str, (11, 4, 0))
+                pkg_v, ver = _extract_packaging_and_tuple(v_str, (11, 4, 0))
                 div_increment = _read_mariadb_div_precision_increment(cur)
                 return EngineVersion(
-                    Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str, div_increment
+                    Dialect.MYSQL,
+                    EngineSubdialect.MARIADB,
+                    ver,
+                    v_str,
+                    div_increment,
+                    packaging_version=pkg_v,
                 )
-            ver = _extract_version_tuple(v_str, (8, 0, 0))
-            return EngineVersion(Dialect.MYSQL, EngineSubdialect.MYSQL, ver, v_str)
+            pkg_v, ver = _extract_packaging_and_tuple(v_str, (8, 0, 0))
+            return EngineVersion(
+                Dialect.MYSQL,
+                EngineSubdialect.MYSQL,
+                ver,
+                v_str,
+                packaging_version=pkg_v,
+            )
     except Exception:
         pass
     return parse_engine_version("sqlite", default_dialect=Dialect.SQLITE)
@@ -13205,6 +13468,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     except (EngineLimitationError, StrictCompilationError) as exc:
         print(f"WARNING: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
 

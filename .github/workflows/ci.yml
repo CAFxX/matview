@@ -35,7 +35,7 @@ name: CI — Multi-Engine Materialized View Tests
 #   Scale-3 stress campaigns are deferred weekly, not repeated on each PR.
 #
 # Dependency and environment dimensions:
-# - requirements.txt declares sqlglot>=25.0.0, psycopg2-binary>=2.9.9 and
+# - requirements.txt declares packaging>=23.0, sqlglot>=25.0.0, psycopg2-binary>=2.9.9 and
 #   cryptography>=41.0.0 for Python <3.15, and pymysql>=1.1.0. PR jobs resolve
 #   the newest compatible releases; ci-deferred.yml tests these declared lower
 #   bounds on Python 3.11 against live PostgreSQL and MySQL.
@@ -223,6 +223,9 @@ jobs:
 
       - name: Test matview diff CLI command & compilation plan diagnostics
         run: python3 test_cli_diff.py
+
+      - name: Test standardized engine version parsing with packaging
+        run: python3 test_p1_packaging_version.py
 
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:

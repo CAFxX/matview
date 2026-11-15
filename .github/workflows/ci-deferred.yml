@@ -244,6 +244,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
           python3 -m pip install --force-reinstall \
+            "packaging==23.0" \
             "sqlglot==25.0.0" \
             "psycopg2-binary==2.9.9" \
             "pymysql==1.1.0" \
