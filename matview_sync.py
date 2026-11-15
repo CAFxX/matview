@@ -11044,25 +11044,44 @@ class MaterializedViewManager:
         sp_active = False
         trigger_suspension_started = False
         created_shadow_tables: List[str] = []
+        # A caller-owned SQLite transaction must remain caller-owned on both
+        # success and failure. Only commit when this context acquired the
+        # writer reservation itself.
+        sqlite_transaction_state = (
+            getattr(self.conn, "in_transaction", None)
+            if self.dialect == Dialect.SQLITE
+            else None
+        )
+        sqlite_caller_transaction = (
+            self.dialect == Dialect.SQLITE and sqlite_transaction_state is True
+        )
+        sqlite_started_writer_transaction = False
 
         try:
             if self.dialect == Dialect.SQLITE:
-                started_writer_transaction = False
-                if not getattr(self.conn, "in_transaction", False):
+                if not sqlite_caller_transaction:
                     # A deferred transaction would allow another writer to race
                     # trigger suspension. Never continue without the reservation.
-                    cur.execute("BEGIN IMMEDIATE;")
-                    started_writer_transaction = True
-                try:
-                    cur.execute("SAVEPOINT __mv_bulk_sp;")
-                    sp_active = True
-                except Exception:
-                    # If this context acquired the writer reservation, release
-                    # it before propagating a failed savepoint setup. Do not
-                    # roll back a transaction already owned by the caller.
-                    if started_writer_transaction:
-                        self._rollback()
-                    raise
+                    try:
+                        cur.execute("BEGIN IMMEDIATE;")
+                        sqlite_started_writer_transaction = True
+                    except Exception as begin_error:
+                        message = str(begin_error).lower()
+                        already_active = (
+                            sqlite_transaction_state is None
+                            and (
+                                "within a transaction" in message
+                                or "already in a transaction" in message
+                            )
+                        )
+                        if not already_active:
+                            raise
+                        # Some SQLite DB-API adapters do not expose
+                        # in_transaction. An explicit nested-BEGIN response is
+                        # the only safe evidence that the caller owns a tx.
+                        sqlite_caller_transaction = True
+                cur.execute("SAVEPOINT __mv_bulk_sp;")
+                sp_active = True
             else:
                 try:
                     cur.execute("SAVEPOINT __mv_bulk_sp;")
@@ -11177,7 +11196,8 @@ class MaterializedViewManager:
 
                     if restore_savepoint:
                         cur.execute("RELEASE SAVEPOINT __mv_bulk_restore_sp;")
-                    self._commit()
+                    if self.dialect != Dialect.SQLITE or sqlite_started_writer_transaction:
+                        self._commit()
                 except Exception as restore_error:
                     if restore_savepoint:
                         try:
@@ -11352,10 +11372,30 @@ class MaterializedViewManager:
                         cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
                     except Exception:
                         pass
-                self._commit()
+                if self.dialect != Dialect.SQLITE or sqlite_started_writer_transaction:
+                    self._commit()
             except Exception:
                 if trigger_suspension_started:
                     _cleanup_and_restore()
+                elif self.dialect == Dialect.SQLITE:
+                    # Setup can fail before trigger suspension starts. Roll back
+                    # only this context's savepoint/reservation; never roll back
+                    # a transaction that was already owned by the caller.
+                    if sp_active:
+                        try:
+                            cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                            cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                        except Exception as savepoint_error:
+                            if sqlite_started_writer_transaction:
+                                self._rollback()
+                            else:
+                                raise RuntimeError(
+                                    "bulk_changes could not unwind its SQLite savepoint; "
+                                    "the caller-owned transaction remains open and must be "
+                                    "rolled back by its owner"
+                                ) from savepoint_error
+                    if sqlite_started_writer_transaction:
+                        self._rollback()
                 else:
                     self._rollback()
                 raise
