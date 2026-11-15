@@ -10620,6 +10620,16 @@ class MaterializedViewManager:
         # un-triggered or double-counted window between trigger attachment and population.
         cur = self.conn.cursor()
         try:
+            # sqlite3 does not implicitly wrap DDL in a transaction. Without an
+            # explicit write transaction, another connection can commit DML after
+            # maintenance triggers are installed but before initial population;
+            # that row is then both trigger-applied and backfilled. Reserve the
+            # SQLite writer before any structure/trigger DDL so installation and
+            # population are one writer-visible operation. An existing caller
+            # transaction already owns the transaction boundary; its first DDL
+            # obtains the write lock before trigger installation.
+            if self.dialect == Dialect.SQLITE and not self.conn.in_transaction:
+                cur.execute("BEGIN IMMEDIATE;")
             for stmt in plan.create_structure_statements():
                 cur.execute(stmt)
             for stmt in plan.trigger_ddls:

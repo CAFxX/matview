@@ -19,6 +19,120 @@ from test_matview_sync import _register_sqlite_compat_udfs
 
 
 class IndependentSessionBackfillTests(unittest.TestCase):
+    def test_registration_blocks_independent_writer_until_initial_population_commits(self) -> None:
+        fd, db_path = tempfile.mkstemp(prefix="matview-registration-race-", suffix=".sqlite")
+        os.close(fd)
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=10000;")
+        _register_sqlite_compat_udfs(conn)
+        conn.execute(
+            "CREATE TABLE registration_rows (id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, value INTEGER NOT NULL);"
+        )
+        conn.executemany(
+            "INSERT INTO registration_rows VALUES (?, ?, ?);",
+            [(1, "a", 10), (2, "a", 20), (3, "b", 30)],
+        )
+        conn.commit()
+
+        writer_started = threading.Event()
+        statement_started = threading.Event()
+        writer_finished = threading.Event()
+        writer_errors: list[BaseException] = []
+        writer_thread: threading.Thread | None = None
+        committed_during_install: list[bool] = []
+
+        def write_from_independent_session() -> None:
+            second = sqlite3.connect(db_path, timeout=10)
+            try:
+                second.execute("PRAGMA busy_timeout=10000;")
+                _register_sqlite_compat_udfs(second)
+
+                def trace_writer(statement: str) -> None:
+                    if statement.lstrip().upper().startswith(
+                        "INSERT INTO REGISTRATION_ROWS"
+                    ):
+                        statement_started.set()
+
+                second.set_trace_callback(trace_writer)
+                writer_started.set()
+                second.execute("INSERT INTO registration_rows VALUES (4, 'b', 40);")
+                second.commit()
+            except BaseException as exc:
+                writer_errors.append(exc)
+            finally:
+                second.close()
+                writer_finished.set()
+
+        def trace_registration(statement: str) -> None:
+            nonlocal writer_thread
+            if not statement.lstrip().upper().startswith(
+                "INSERT INTO __MATVIEW_CATALOG"
+            ):
+                return
+            if writer_thread is not None:
+                return
+
+            # All maintenance triggers now exist, but initial population has not
+            # started. The independent INSERT must reach SQLite yet remain blocked
+            # until registration commits, otherwise trigger and backfill effects
+            # can overlap.
+            writer_thread = threading.Thread(
+                target=write_from_independent_session, daemon=True
+            )
+            writer_thread.start()
+            if not writer_started.wait(timeout=10):
+                committed_during_install.append(True)
+                return
+            if not statement_started.wait(timeout=10):
+                committed_during_install.append(True)
+                return
+            if writer_finished.wait(timeout=0.5):
+                committed_during_install.append(True)
+
+        manager = MaterializedViewManager(conn)
+        try:
+            conn.set_trace_callback(trace_registration)
+            plan = manager.register_view(
+                "CREATE VIEW registration_totals AS "
+                "SELECT bucket, COUNT(*) AS n, SUM(value) AS total "
+                "FROM registration_rows GROUP BY bucket;"
+            )
+            conn.set_trace_callback(None)
+            self.assertIsNotNone(writer_thread)
+            writer_thread.join(timeout=10)
+            self.assertFalse(
+                writer_thread.is_alive(),
+                "independent writer did not resume after registration committed",
+            )
+            if writer_errors:
+                raise writer_errors[0]
+            self.assertTrue(statement_started.is_set())
+            self.assertFalse(
+                committed_during_install,
+                "independent writer committed between trigger installation and initial population",
+            )
+
+            actual = conn.execute(
+                "SELECT bucket, n, total FROM registration_totals ORDER BY bucket;"
+            ).fetchall()
+            expected = conn.execute(
+                "SELECT bucket, COUNT(*) AS n, SUM(value) AS total "
+                "FROM registration_rows GROUP BY bucket ORDER BY bucket;"
+            ).fetchall()
+            self.assertEqual(actual, expected)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM registration_rows;").fetchone()[0],
+                4,
+            )
+            self.assertEqual(manager.get_catalog()[plan.view_name]["backfill_active"], 0)
+        finally:
+            conn.set_trace_callback(None)
+            if writer_thread is not None and writer_thread.is_alive():
+                writer_thread.join(timeout=10)
+            conn.close()
+            os.unlink(db_path)
+
     def test_committed_chunk_allows_concurrent_second_session_dml(self) -> None:
         fd, db_path = tempfile.mkstemp(prefix="matview-backfill-", suffix=".sqlite")
         os.close(fd)
