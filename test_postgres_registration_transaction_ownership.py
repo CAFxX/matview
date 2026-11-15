@@ -25,7 +25,9 @@ def main() -> None:
 
     conn = psycopg2.connect(dsn)
     observer = psycopg2.connect(dsn)
-    table = "mv_tx_owner_" + uuid.uuid4().hex[:16]
+    suffix = uuid.uuid4().hex[:16]
+    table = "mv_tx_owner_" + suffix
+    view = "mv_tx_owner_view_" + suffix
     try:
         manager = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
 
@@ -34,10 +36,10 @@ def main() -> None:
         conn.autocommit = True
         for operation in (
             lambda: manager.register_view(
-                "CREATE VIEW should_not_exist AS SELECT 1 AS value;"
+                f"CREATE VIEW {view} AS SELECT 1 AS value;"
             ),
             lambda: manager.sync_views(
-                "CREATE VIEW should_not_exist AS SELECT 1 AS value;"
+                f"CREATE VIEW {view} AS SELECT 1 AS value;"
             ),
         ):
             try:
@@ -47,9 +49,7 @@ def main() -> None:
             else:
                 raise AssertionError("registration accepted an autocommit connection")
         with observer.cursor() as cur:
-            cur.execute(
-                "SELECT to_regclass('public.should_not_exist')"
-            )
+            cur.execute("SELECT to_regclass(%s)", (f"public.{view}",))
             assert cur.fetchone()[0] is None
         conn.autocommit = False
 
@@ -67,10 +67,10 @@ def main() -> None:
 
         for operation in (
             lambda: manager.register_view(
-                "CREATE VIEW should_not_exist AS SELECT 1 AS value;"
+                f"CREATE VIEW {view} AS SELECT 1 AS value;"
             ),
             lambda: manager.sync_views(
-                "CREATE VIEW should_not_exist AS SELECT 1 AS value;"
+                f"CREATE VIEW {view} AS SELECT 1 AS value;"
             ),
         ):
             try:
@@ -102,7 +102,7 @@ def main() -> None:
             conn.autocommit = False
             with conn.cursor() as cur:
                 cur.execute(f'DROP TABLE IF EXISTS "{table}"')
-                cur.execute("DROP VIEW IF EXISTS should_not_exist")
+                cur.execute(f'DROP VIEW IF EXISTS "{view}"')
             conn.commit()
         finally:
             observer.close()
