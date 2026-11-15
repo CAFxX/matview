@@ -3447,6 +3447,7 @@ class IncrementalViewCompiler:
         strict: bool = False,
         engine_version: Optional[EngineVersion | str] = None,
         watermark_catalog_table: Optional[str] = None,
+        pg_fillfactor: Optional[int] = 80,
     ) -> None:
         self.schemas = dict(schemas)
         self._schemas_lower: Dict[str, TableSchema] = {
@@ -3472,6 +3473,7 @@ class IncrementalViewCompiler:
         self.batch_size = max(1, int(batch_size)) if batch_size else 1000
         self.strict = strict
         self.watermark_catalog_table = watermark_catalog_table
+        self.pg_fillfactor = pg_fillfactor
 
         raw_vname = view_spec.view_name
         self.logical_view_name = (
@@ -3531,6 +3533,53 @@ class IncrementalViewCompiler:
     def _backing_table_name(self) -> str:
         p = self.object_prefix if self.object_prefix else "__matview_"
         return self._bounded_ident(f"{p}store_", self.logical_view_name)
+
+    def _create_table_ddl(
+        self,
+        table_name: str,
+        col_defs_sql: List[str],
+        is_backing_store: bool = False,
+        pk_cols: Optional[Sequence[str]] = None,
+    ) -> str:
+        fillfactor_tail = ""
+        if is_backing_store and self.dialect == Dialect.POSTGRES and self.pg_fillfactor is not None:
+            fillfactor_tail = f" WITH (fillfactor = {self.pg_fillfactor})"
+
+        without_rowid_tail = ""
+        if self.dialect == Dialect.SQLITE:
+            effective_pks: List[str] = list(pk_cols) if pk_cols else []
+            if not effective_pks:
+                for line in col_defs_sql:
+                    m = re.search(r"PRIMARY\s+KEY\s*\(([^)]+)\)", line, flags=re.IGNORECASE)
+                    if m:
+                        effective_pks = [
+                            c.strip().strip('"').strip("`")
+                            for c in m.group(1).split(",")
+                            if c.strip()
+                        ]
+                        break
+            if len(effective_pks) >= 2:
+                pk_set = {p.lower() for p in effective_pks}
+                found_nn: Set[str] = set()
+                has_autoincrement = False
+                for line in col_defs_sql:
+                    line_s = line.strip()
+                    if re.match(r"^PRIMARY\s+KEY\b", line_s, flags=re.IGNORECASE):
+                        continue
+                    if "AUTOINCREMENT" in line_s.upper():
+                        has_autoincrement = True
+                    col_match = re.match(r'^("([^"]+)"|`([^`]+)`|([A-Za-z0-9_]+))\s+(.*)$', line_s)
+                    if col_match:
+                        col_ident = (col_match.group(2) or col_match.group(3) or col_match.group(4)).lower()
+                        if col_ident in pk_set:
+                            rest = col_match.group(5).upper()
+                            if "NOT NULL" in rest:
+                                found_nn.add(col_ident)
+                if len(found_nn) == len(pk_set) and not has_autoincrement:
+                    without_rowid_tail = " WITHOUT ROWID"
+
+        cols_joined = ",\n    ".join(col_defs_sql)
+        return f"CREATE TABLE {table_name} (\n    {cols_joined}\n){fillfactor_tail}{without_rowid_tail};"
 
     def _enforce_or_warn(self) -> None:
         self._enforce_limitations()
@@ -6000,40 +6049,82 @@ class IncrementalViewCompiler:
                     f"WHERE TRUE{upsert_tail};"
                 )
             elif self.dialect == Dialect.POSTGRES:
-                upsert_tail = ""
-                if tbl_pks:
-                    upd_cols = [f"{c} = excluded.{c}" for c in cols if c not in tbl_pks] or [
-                        f"{tbl_pks[0]} = excluded.{tbl_pks[0]}"
-                    ]
-                    upsert_tail = f"\n        ON CONFLICT ({', '.join(tbl_pks)}) DO UPDATE SET {', '.join(upd_cols)}"
                 ord_cols = ", ".join(str(k) for k in range(1, len(cols) + 1))
                 ord_tail = f"\n        ORDER BY {ord_cols}" if not self.view.has_limit_or_order else f"\n        ORDER BY {ord_cols}"
-                inc_stmts.append(
-                    f"DO $$\n"
-                    f"DECLARE\n"
-                    f"    __mv_offset BIGINT := 0;\n"
-                    f"    __mv_batch_size BIGINT := {b_size};\n"
-                    f"    __mv_rows BIGINT := 0;\n"
-                    f"BEGIN\n"
-                    f"    LOOP\n"
-                    f"        INSERT INTO {target_tbl} ({', '.join(cols)})\n"
-                    f"        SELECT {', '.join(cols)}\n"
-                    f"        FROM (\n"
-                    f"            {aliased_inner}\n"
-                    f"        ) AS __mv_init{ord_tail}\n"
-                    f"        LIMIT __mv_batch_size OFFSET __mv_offset{upsert_tail};\n"
-                    f"        GET DIAGNOSTICS __mv_rows = ROW_COUNT;\n"
-                    f"        EXIT WHEN __mv_rows < __mv_batch_size;\n"
-                    f"        __mv_offset := __mv_offset + __mv_rows;\n"
-                    f"    END LOOP;\n"
-                    f"END $$;"
-                )
+                if tbl_pks and self.engine_version.supports_pg_merge:
+                    non_pk_cols = [c for c in cols if c not in tbl_pks]
+                    if non_pk_cols:
+                        matched_clause = f"WHEN MATCHED THEN\n            UPDATE SET {', '.join(f'{c} = __mv_src.{c}' for c in non_pk_cols)}"
+                    else:
+                        matched_clause = "WHEN MATCHED THEN DO NOTHING"
+                    merge_body = (
+                        f"        MERGE INTO {target_tbl} AS __mv_dst\n"
+                        f"        USING (\n"
+                        f"            SELECT {', '.join(cols)}\n"
+                        f"            FROM (\n"
+                        f"                {aliased_inner}\n"
+                        f"            ) AS __mv_init{ord_tail}\n"
+                        f"            LIMIT __mv_batch_size OFFSET __mv_offset\n"
+                        f"        ) AS __mv_src\n"
+                        f"        ON ({' AND '.join(f'__mv_dst.{c} = __mv_src.{c}' for c in tbl_pks)})\n"
+                        f"        {matched_clause}\n"
+                        f"        WHEN NOT MATCHED THEN\n"
+                        f"            INSERT ({', '.join(cols)})\n"
+                        f"            VALUES ({', '.join(f'__mv_src.{c}' for c in cols)});\n"
+                    )
+                    inc_stmts.append(
+                        f"DO $$\n"
+                        f"DECLARE\n"
+                        f"    __mv_offset BIGINT := 0;\n"
+                        f"    __mv_batch_size BIGINT := {b_size};\n"
+                        f"    __mv_rows BIGINT := 0;\n"
+                        f"BEGIN\n"
+                        f"    LOOP\n"
+                        f"{merge_body}"
+                        f"        GET DIAGNOSTICS __mv_rows = ROW_COUNT;\n"
+                        f"        EXIT WHEN __mv_rows < __mv_batch_size;\n"
+                        f"        __mv_offset := __mv_offset + __mv_rows;\n"
+                        f"    END LOOP;\n"
+                        f"END $$;"
+                    )
+                else:
+                    upsert_tail = ""
+                    if tbl_pks:
+                        upd_cols = [f"{c} = excluded.{c}" for c in cols if c not in tbl_pks] or [
+                            f"{tbl_pks[0]} = excluded.{tbl_pks[0]}"
+                        ]
+                        upsert_tail = f"\n        ON CONFLICT ({', '.join(tbl_pks)}) DO UPDATE SET {', '.join(upd_cols)}"
+                    inc_stmts.append(
+                        f"DO $$\n"
+                        f"DECLARE\n"
+                        f"    __mv_offset BIGINT := 0;\n"
+                        f"    __mv_batch_size BIGINT := {b_size};\n"
+                        f"    __mv_rows BIGINT := 0;\n"
+                        f"BEGIN\n"
+                        f"    LOOP\n"
+                        f"        INSERT INTO {target_tbl} ({', '.join(cols)})\n"
+                        f"        SELECT {', '.join(cols)}\n"
+                        f"        FROM (\n"
+                        f"            {aliased_inner}\n"
+                        f"        ) AS __mv_init{ord_tail}\n"
+                        f"        LIMIT __mv_batch_size OFFSET __mv_offset{upsert_tail};\n"
+                        f"        GET DIAGNOSTICS __mv_rows = ROW_COUNT;\n"
+                        f"        EXIT WHEN __mv_rows < __mv_batch_size;\n"
+                        f"        __mv_offset := __mv_offset + __mv_rows;\n"
+                        f"    END LOOP;\n"
+                        f"END $$;"
+                    )
             elif self.dialect == Dialect.MYSQL:
                 upsert_tail = ""
                 if tbl_pks:
-                    upd_cols = [f"{c} = VALUES({c})" for c in cols if c not in tbl_pks] or [
-                        f"{tbl_pks[0]} = VALUES({tbl_pks[0]})"
-                    ]
+                    if self.engine_version.supports_mysql_row_alias_upsert:
+                        upd_cols = [f"{c} = __mv_init.{c}" for c in cols if c not in tbl_pks] or [
+                            f"{tbl_pks[0]} = __mv_init.{tbl_pks[0]}"
+                        ]
+                    else:
+                        upd_cols = [f"{c} = VALUES({c})" for c in cols if c not in tbl_pks] or [
+                            f"{tbl_pks[0]} = VALUES({tbl_pks[0]})"
+                        ]
                     upsert_tail = f"\n        ON DUPLICATE KEY UPDATE {', '.join(upd_cols)}"
                 ord_cols = ", ".join(str(k) for k in range(1, len(cols) + 1))
                 ord_tail = f"\n        ORDER BY {ord_cols}"
@@ -6244,6 +6335,7 @@ class IncrementalViewCompiler:
                 batch_size=self.batch_size,
                 strict=self.strict,
                 engine_version=self.engine_version,
+                pg_fillfactor=getattr(self, "pg_fillfactor", 80),
             )
             sub_plans.append(sub_comp._compile_single_plan())
 
@@ -6611,8 +6703,11 @@ class IncrementalViewCompiler:
         if grp_exprs and not has_nullable_grp:
             col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
 
-        cols_joined = ",\n    ".join(col_defs_sql)
-        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+        backing_table_ddl = self._create_table_ddl(
+            mv_table,
+            col_defs_sql,
+            is_backing_store=True,
+        )
 
         aux_ddls: List[str] = []
         aux_names: List[str] = []
@@ -6644,7 +6739,7 @@ class IncrementalViewCompiler:
             aux_col_defs.append(f"__ref_cnt {self._int_type()} NOT NULL DEFAULT 0")
             aux_col_defs.append(f"PRIMARY KEY ({', '.join(aux_pk)})")
             aux_ddls.append(
-                f"CREATE TABLE {aux_tbl} (\n    " + ",\n    ".join(aux_col_defs) + "\n);"
+                self._create_table_ddl(aux_tbl, aux_col_defs, is_backing_store=False, pk_cols=aux_pk)
             )
 
         backing_col_map = {
@@ -6945,6 +7040,9 @@ class IncrementalViewCompiler:
                 if self.view.where_clause
                 else f"({pk_col} > {ph} AND {pk_col} <= {ph})"
             )
+            is_pg_merge = (self.dialect == Dialect.POSTGRES and self.engine_version.supports_pg_merge)
+            is_mysql_alias = (self.dialect == Dialect.MYSQL and self.engine_version.supports_mysql_row_alias_upsert)
+            incoming_alias = "__mv_src" if (is_pg_merge or is_mysql_alias) else None
             merge_assignments = self._build_tier1_chunk_merge_assignments(
                 mv_table=mv_table,
                 row_count_col=row_count_col,
@@ -6953,17 +7051,46 @@ class IncrementalViewCompiler:
                 col_sum2_map=col_sum2_map,
                 col_true_cnt_map=col_true_cnt_map,
                 expr_key_fn=expr_key_fn,
-                use_mysql_values=(self.dialect == Dialect.MYSQL),
+                use_mysql_values=(self.dialect == Dialect.MYSQL and not is_mysql_alias),
+                incoming_alias=incoming_alias,
             )
             q_pk_cols = [self._q(c) for c in pk_cols]
             if self.dialect == Dialect.MYSQL:
+                if is_mysql_alias:
+                    chunk_upsert_sql = (
+                        f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                        f"SELECT * FROM (\n"
+                        f"    SELECT {', '.join(select_exprs)}\n"
+                        f"    FROM {q_base_t}\n"
+                        f"    WHERE {chunk_where}{group_sql}{having_sql}\n"
+                        f") AS __mv_src\n"
+                        f"ON DUPLICATE KEY UPDATE\n"
+                        f"    {', '.join(merge_assignments)};"
+                    )
+                else:
+                    chunk_upsert_sql = (
+                        f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                        f"SELECT {', '.join(select_exprs)}\n"
+                        f"FROM {q_base_t}\n"
+                        f"WHERE {chunk_where}{group_sql}{having_sql}\n"
+                        f"ON DUPLICATE KEY UPDATE\n"
+                        f"    {', '.join(merge_assignments)};"
+                    )
+            elif is_pg_merge:
                 chunk_upsert_sql = (
-                    f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
-                    f"SELECT {', '.join(select_exprs)}\n"
-                    f"FROM {q_base_t}\n"
-                    f"WHERE {chunk_where}{group_sql}{having_sql}\n"
-                    f"ON DUPLICATE KEY UPDATE\n"
-                    f"    {', '.join(merge_assignments)};"
+                    f"MERGE INTO {mv_table}\n"
+                    f"USING (\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {q_base_t}\n"
+                    f"    WHERE {chunk_where}{group_sql}{having_sql}\n"
+                    f") AS __mv_src\n"
+                    f"ON ({' AND '.join(f'{mv_table}.{c} = __mv_src.{c}' for c in q_pk_cols)})\n"
+                    f"WHEN MATCHED THEN\n"
+                    f"    UPDATE SET\n"
+                    f"        {', '.join(merge_assignments)}\n"
+                    f"WHEN NOT MATCHED THEN\n"
+                    f"    INSERT ({', '.join(q_target_cols)})\n"
+                    f"    VALUES ({', '.join(f'__mv_src.{c}' for c in q_target_cols)});"
                 )
             else:
                 chunk_upsert_sql = (
@@ -7007,35 +7134,100 @@ class IncrementalViewCompiler:
                 w_p = [f"({eff}) IS NOT NULL", f"({grp_expr}) IN ({{placeholders}})"]
                 if self.view.where_clause:
                     w_p.insert(0, f"({self.view.where_clause})")
-                aux_conflict = (
-                    "\nON DUPLICATE KEY UPDATE __ref_cnt = VALUES(__ref_cnt)"
-                    if self.dialect == Dialect.MYSQL
-                    else f"\nON CONFLICT ({', '.join(pk_cols)}, __val) DO UPDATE SET __ref_cnt = excluded.__ref_cnt"
-                )
-                chunk_templates.append(
-                    f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
-                    f"SELECT {', '.join(dist_sel)}\n"
-                    f"FROM {q_base_t}\n"
-                    f"WHERE {' AND '.join(w_p)}\n"
-                    f"GROUP BY {', '.join(dist_grp_list)}{aux_conflict};"
-                )
+                if self.dialect == Dialect.MYSQL:
+                    if self.engine_version.supports_mysql_row_alias_upsert:
+                        chunk_templates.append(
+                            f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                            f"SELECT * FROM (\n"
+                            f"    SELECT {', '.join(dist_sel)}\n"
+                            f"    FROM {q_base_t}\n"
+                            f"    WHERE {' AND '.join(w_p)}\n"
+                            f"    GROUP BY {', '.join(dist_grp_list)}\n"
+                            f") AS __mv_src\n"
+                            f"ON DUPLICATE KEY UPDATE __ref_cnt = __mv_src.__ref_cnt;"
+                        )
+                    else:
+                        chunk_templates.append(
+                            f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                            f"SELECT {', '.join(dist_sel)}\n"
+                            f"FROM {q_base_t}\n"
+                            f"WHERE {' AND '.join(w_p)}\n"
+                            f"GROUP BY {', '.join(dist_grp_list)}\n"
+                            f"ON DUPLICATE KEY UPDATE __ref_cnt = VALUES(__ref_cnt);"
+                        )
+                elif self.dialect == Dialect.POSTGRES and self.engine_version.supports_pg_merge:
+                    chunk_templates.append(
+                        f"MERGE INTO {aux_tbl}\n"
+                        f"USING (\n"
+                        f"    SELECT {', '.join(dist_sel)}\n"
+                        f"    FROM {q_base_t}\n"
+                        f"    WHERE {' AND '.join(w_p)}\n"
+                        f"    GROUP BY {', '.join(dist_grp_list)}\n"
+                        f") AS __mv_src\n"
+                        f"ON ({' AND '.join(f'{aux_tbl}.{c} = __mv_src.{c}' for c in pk_cols)} AND {aux_tbl}.__val = __mv_src.__val)\n"
+                        f"WHEN MATCHED THEN\n"
+                        f"    UPDATE SET __ref_cnt = __mv_src.__ref_cnt\n"
+                        f"WHEN NOT MATCHED THEN\n"
+                        f"    INSERT ({', '.join(dist_cols)})\n"
+                        f"    VALUES ({', '.join(f'__mv_src.{c}' for c in dist_cols)});"
+                    )
+                else:
+                    aux_conflict = f"\nON CONFLICT ({', '.join(pk_cols)}, __val) DO UPDATE SET __ref_cnt = excluded.__ref_cnt"
+                    chunk_templates.append(
+                        f"INSERT INTO {aux_tbl} ({', '.join(dist_cols)})\n"
+                        f"SELECT {', '.join(dist_sel)}\n"
+                        f"FROM {q_base_t}\n"
+                        f"WHERE {' AND '.join(w_p)}\n"
+                        f"GROUP BY {', '.join(dist_grp_list)}{aux_conflict};"
+                    )
             w_main = [f"({grp_expr}) IN ({{placeholders}})"]
             if self.view.where_clause:
                 w_main.insert(0, f"({self.view.where_clause})")
             q_pk_cols = [self._q(c) for c in pk_cols]
             q_pk_set = set(q_pk_cols)
             non_pk_target = [c for c in q_target_cols if c not in q_pk_set] or list(q_pk_cols)
-            main_conflict = (
-                f"\nON DUPLICATE KEY UPDATE {', '.join(f'{c} = VALUES({c})' for c in non_pk_target)}"
-                if self.dialect == Dialect.MYSQL
-                else f"\nON CONFLICT ({', '.join(q_pk_cols)}) DO UPDATE SET {', '.join(f'{c} = excluded.{c}' for c in non_pk_target)}"
-            )
-            chunk_templates.append(
-                f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
-                f"SELECT {', '.join(select_exprs)}\n"
-                f"FROM {q_base_t}\n"
-                f"WHERE {' AND '.join(w_main)}{group_sql}{having_sql}{main_conflict};"
-            )
+            if self.dialect == Dialect.MYSQL:
+                if self.engine_version.supports_mysql_row_alias_upsert:
+                    main_conflict = f"\nON DUPLICATE KEY UPDATE {', '.join(f'{c} = __mv_src.{c}' for c in non_pk_target)}"
+                    chunk_templates.append(
+                        f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                        f"SELECT * FROM (\n"
+                        f"    SELECT {', '.join(select_exprs)}\n"
+                        f"    FROM {q_base_t}\n"
+                        f"    WHERE {' AND '.join(w_main)}{group_sql}{having_sql}\n"
+                        f") AS __mv_src{main_conflict};"
+                    )
+                else:
+                    main_conflict = f"\nON DUPLICATE KEY UPDATE {', '.join(f'{c} = VALUES({c})' for c in non_pk_target)}"
+                    chunk_templates.append(
+                        f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                        f"SELECT {', '.join(select_exprs)}\n"
+                        f"FROM {q_base_t}\n"
+                        f"WHERE {' AND '.join(w_main)}{group_sql}{having_sql}{main_conflict};"
+                    )
+            elif self.dialect == Dialect.POSTGRES and self.engine_version.supports_pg_merge:
+                chunk_templates.append(
+                    f"MERGE INTO {mv_table}\n"
+                    f"USING (\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {q_base_t}\n"
+                    f"    WHERE {' AND '.join(w_main)}{group_sql}{having_sql}\n"
+                    f") AS __mv_src\n"
+                    f"ON ({' AND '.join(f'{mv_table}.{c} = __mv_src.{c}' for c in q_pk_cols)})\n"
+                    f"WHEN MATCHED THEN\n"
+                    f"    UPDATE SET {', '.join(f'{c} = __mv_src.{c}' for c in non_pk_target)}\n"
+                    f"WHEN NOT MATCHED THEN\n"
+                    f"    INSERT ({', '.join(q_target_cols)})\n"
+                    f"    VALUES ({', '.join(f'__mv_src.{c}' for c in q_target_cols)});"
+                )
+            else:
+                main_conflict = f"\nON CONFLICT ({', '.join(q_pk_cols)}) DO UPDATE SET {', '.join(f'{c} = excluded.{c}' for c in non_pk_target)}"
+                chunk_templates.append(
+                    f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                    f"SELECT {', '.join(select_exprs)}\n"
+                    f"FROM {q_base_t}\n"
+                    f"WHERE {' AND '.join(w_main)}{group_sql}{having_sql}{main_conflict};"
+                )
             inc_spec = IncrementalBackfillSpec(
                 mode="group_key_batch",
                 distinct_group_query=dist_grp_query,
@@ -7059,12 +7251,15 @@ class IncrementalViewCompiler:
         col_true_cnt_map: Dict[str, str],
         expr_key_fn: Callable[[SelectItem], str],
         use_mysql_values: bool = False,
+        incoming_alias: Optional[str] = None,
     ) -> List[str]:
         assignments: List[str] = []
         updated: Set[str] = set()
         work_items = self._working_select_items
 
         def _incoming(col: str) -> str:
+            if incoming_alias:
+                return f"{incoming_alias}.{col}"
             return f"VALUES({col})" if use_mysql_values else f"excluded.{col}"
 
         def _merged_sum(col: str) -> str:
@@ -7293,14 +7488,16 @@ class IncrementalViewCompiler:
     ) -> str:
         denom = f"({new_cnt} - 1)" if is_sample else new_cnt
         min_n = 2 if is_sample else 1
+        safe_cnt = f"NULLIF({new_cnt}, 0)"
+        safe_denom = f"NULLIF({denom}, 0)"
         if self.dialect == Dialect.SQLITE:
-            raw_var = f"((1.0 * ({new_sum2})) / {denom})"
+            raw_var = f"((1.0 * ({new_sum2})) / {safe_denom})"
         elif self.dialect == Dialect.POSTGRES:
             raw_var = (
-                f"(((1.0 * ({new_sum2})::NUMERIC) - ((1.0 * ({new_sum})::NUMERIC) * (1.0 * ({new_sum})::NUMERIC)) / {new_cnt}) / {denom})::DOUBLE PRECISION"
+                f"(((1.0 * ({new_sum2})::NUMERIC) - ((1.0 * ({new_sum})::NUMERIC) * (1.0 * ({new_sum})::NUMERIC)) / {safe_cnt}) / {safe_denom})::DOUBLE PRECISION"
             )
         else:
-            raw_var = f"((1.0 * {new_sum2}) - ((1.0 * {new_sum}) * (1.0 * {new_sum})) / {new_cnt}) / {denom}"
+            raw_var = f"((1.0 * {new_sum2}) - ((1.0 * {new_sum}) * (1.0 * {new_sum})) / {safe_cnt}) / {safe_denom}"
         clamped_var = f"(CASE WHEN ({raw_var}) < 0.0 THEN 0.0 ELSE ({raw_var}) END)"
         val_expr = f"SQRT({clamped_var})" if is_stddev else clamped_var
         return f"(CASE WHEN {new_cnt} < {min_n} THEN NULL ELSE {val_expr} END)"
@@ -8704,8 +8901,11 @@ class IncrementalViewCompiler:
         if grp_exprs and not has_nullable_grp:
             col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
 
-        cols_joined = ",\n    ".join(col_defs_sql)
-        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+        backing_table_ddl = self._create_table_ddl(
+            mv_table,
+            col_defs_sql,
+            is_backing_store=True,
+        )
 
         backing_col_map = {
             u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
@@ -9352,7 +9552,12 @@ class IncrementalViewCompiler:
         if use_native_uall_pk:
             col_defs_sql.append(f"PRIMARY KEY ({', '.join(uall_pk_cols)})")
 
-        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        backing_table_ddl = self._create_table_ddl(
+            mv_table,
+            col_defs_sql,
+            is_backing_store=True,
+            pk_cols=uall_pk_cols if use_native_uall_pk else None,
+        )
         index_ddls, index_names = self._build_all_index_ddls(
             mv_table=mv_table,
             auto_group_cols=(),
@@ -9467,13 +9672,24 @@ class IncrementalViewCompiler:
                             f"{mv_table}.__mv_pk_{i} = OLD.{self._q(c)}" for i, c in enumerate(pk_names)
                         )
                         if self.dialect == Dialect.MYSQL:
-                            upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
-                            plus_s = (
-                                f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
-                                f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1{from_dual}\n"
-                                f"    WHERE {w_new}\n"
-                                f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
-                            )
+                            if self.engine_version.supports_mysql_row_alias_upsert:
+                                upd_set = ", ".join(f"{c} = __mv_new.{c}" for c in user_columns)
+                                plus_s = (
+                                    f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                    f"    SELECT * FROM (\n"
+                                    f"        SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                    f"        WHERE {w_new}\n"
+                                    f"    ) AS __mv_new\n"
+                                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                                )
+                            else:
+                                upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                                plus_s = (
+                                    f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                                    f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                    f"    WHERE {w_new}\n"
+                                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                                )
                         else:
                             upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
                             plus_s = (
@@ -9494,13 +9710,24 @@ class IncrementalViewCompiler:
                         pk_new = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"NEW.{c}" for c in pk_names]])
                         pk_old = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"OLD.{c}" for c in pk_names]])
                         if self.dialect == Dialect.MYSQL:
-                            upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
-                            plus_s = (
-                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
-                                f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
-                                f"    WHERE {w_new}\n"
-                                f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
-                            )
+                            if self.engine_version.supports_mysql_row_alias_upsert:
+                                upd_set = ", ".join(f"{c} = __mv_new.{c}" for c in user_columns)
+                                plus_s = (
+                                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                    f"    SELECT * FROM (\n"
+                                    f"        SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                    f"        WHERE {w_new}\n"
+                                    f"    ) AS __mv_new\n"
+                                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                                )
+                            else:
+                                upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                                plus_s = (
+                                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                    f"    WHERE {w_new}\n"
+                                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                                )
                         else:
                             upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
                             plus_s = (
@@ -9719,7 +9946,12 @@ class IncrementalViewCompiler:
         else:
             col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
 
-        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        backing_table_ddl = self._create_table_ddl(
+            mv_table,
+            col_defs_sql,
+            is_backing_store=True,
+            pk_cols=mv_pk_cols if uses_native_pk else None,
+        )
         index_ddls, index_names = self._build_all_index_ddls(
             mv_table=mv_table,
             auto_group_cols=(),
@@ -9752,13 +9984,21 @@ class IncrementalViewCompiler:
                 f"SELECT {', '.join(all_select_exprs)} FROM {q_base_t}{w_sql};"
             )
             if self.dialect == Dialect.MYSQL:
-                upd_set = ", ".join(f"{c} = VALUES({c})" for c in all_backing_cols)
-                plus_stmt = (
-                    f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
-                    f"    SELECT {', '.join(all_new_vals)}{from_dual}\n"
-                    f"    WHERE TRUE\n"
-                    f"    ON DUPLICATE KEY UPDATE {upd_set};"
-                )
+                if self.engine_version.supports_mysql_row_alias_upsert:
+                    upd_set = ", ".join(f"{c} = __mv_new.{c}" for c in all_backing_cols)
+                    plus_stmt = (
+                        f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                        f"    VALUES ({', '.join(all_new_vals)}) AS __mv_new\n"
+                        f"    ON DUPLICATE KEY UPDATE {upd_set};"
+                    )
+                else:
+                    upd_set = ", ".join(f"{c} = VALUES({c})" for c in all_backing_cols)
+                    plus_stmt = (
+                        f"INSERT INTO {mv_table} ({', '.join(all_backing_cols)})\n"
+                        f"    SELECT {', '.join(all_new_vals)}{from_dual}\n"
+                        f"    WHERE TRUE\n"
+                        f"    ON DUPLICATE KEY UPDATE {upd_set};"
+                    )
             else:
                 upd_set = ", ".join(f"{c} = excluded.{c}" for c in all_backing_cols)
                 plus_stmt = (
@@ -9836,13 +10076,21 @@ class IncrementalViewCompiler:
             pk_new = self._canonical_group_pk_expr([f"NEW.{self._q(c)}" for c in pk_hash_cols])
             pk_old = self._canonical_group_pk_expr([f"OLD.{self._q(c)}" for c in pk_hash_cols])
             if self.dialect == Dialect.MYSQL:
-                upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
-                plus_stmt = (
-                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
-                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
-                    f"    WHERE TRUE\n"
-                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
-                )
+                if self.engine_version.supports_mysql_row_alias_upsert:
+                    upd_set = ", ".join(f"{c} = __mv_new.{c}" for c in user_columns)
+                    plus_stmt = (
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"    VALUES ({pk_new}, {', '.join(new_vals)}, 1) AS __mv_new\n"
+                        f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                    )
+                else:
+                    upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
+                    plus_stmt = (
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                        f"    WHERE TRUE\n"
+                        f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                    )
             else:
                 upd_set = ", ".join(f"{c} = excluded.{c}" for c in user_columns)
                 plus_stmt = (
@@ -10173,7 +10421,12 @@ class IncrementalViewCompiler:
         if grp_exprs and not has_nullable_grp:
             col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
 
-        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        backing_table_ddl = self._create_table_ddl(
+            mv_table,
+            col_defs_sql,
+            is_backing_store=True,
+            pk_cols=pk_cols if (grp_exprs and not has_nullable_grp) else None,
+        )
         backing_col_map = {
             u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
             for u_col, expr_s in self._compound_reader_exprs.items()
@@ -11024,7 +11277,11 @@ class IncrementalViewCompiler:
         for mv_c, _, dt in hidden_grp_defs:
             col_defs_sql.append(f"{mv_c} {dt}")
 
-        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    " + ",\n    ".join(col_defs_sql) + "\n);"
+        backing_table_ddl = self._create_table_ddl(
+            mv_table,
+            col_defs_sql,
+            is_backing_store=True,
+        )
         index_ddls, index_names = self._build_all_index_ddls(
             mv_table=mv_table,
             auto_group_cols=auto_grp_col_names,
@@ -11141,8 +11398,11 @@ class IncrementalViewCompiler:
             has_pk_on_group_cols=False,
         )
 
-        cols_joined = ",\n    ".join(col_defs_sql)
-        backing_table_ddl = f"CREATE TABLE {mv_table} (\n    {cols_joined}\n);"
+        backing_table_ddl = self._create_table_ddl(
+            mv_table,
+            col_defs_sql,
+            is_backing_store=True,
+        )
 
         reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
             self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
@@ -11313,6 +11573,7 @@ class MaterializedViewManager:
         strict: bool = False,
         engine_version: Optional[EngineVersion | str] = None,
         skip_ensure_catalog: bool = False,
+        pg_fillfactor: Optional[int] = 80,
     ) -> None:
         hint_d: Optional[Dialect] = None
         if isinstance(dialect, Dialect):
@@ -11345,6 +11606,7 @@ class MaterializedViewManager:
         self.object_prefix = object_prefix
         self.pg_use_transition_tables = pg_use_transition_tables
         self.strict = strict
+        self.pg_fillfactor = pg_fillfactor
         self.catalog_table = (
             f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
         )
@@ -11541,7 +11803,17 @@ class MaterializedViewManager:
                 for aux_t in entry["aux_tables"]:
                     cur.execute(f"DROP TABLE IF EXISTS {aux_t};")
                 ph = self._param_placeholder()
-                cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph}", (resolved_name,))
+                if self.dialect == Dialect.SQLITE and self.engine_version.supports_sqlite_returning:
+                    cur.execute(
+                        f"DELETE FROM {self.catalog_table} WHERE view_name = {ph} RETURNING view_name;",
+                        (resolved_name,),
+                    )
+                    try:
+                        cur.fetchall()
+                    except Exception:
+                        pass
+                else:
+                    cur.execute(f"DELETE FROM {self.catalog_table} WHERE view_name = {ph};", (resolved_name,))
                 self._commit()
                 return True
             else:
@@ -11872,6 +12144,7 @@ class MaterializedViewManager:
             strict=effective_strict,
             engine_version=self.engine_version,
             watermark_catalog_table=self.catalog_table if (incremental_backfill or not populate) else None,
+            pg_fillfactor=getattr(self, "pg_fillfactor", 80),
         )
         sig = self._compute_signature(plan, schemas)
 
@@ -12090,6 +12363,7 @@ class MaterializedViewManager:
                 strict=effective_strict,
                 engine_version=self.engine_version,
                 watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+                pg_fillfactor=getattr(self, "pg_fillfactor", 80),
             )
             v_name = plan.view_name
             desired_names.add(v_name)
@@ -12151,6 +12425,7 @@ class MaterializedViewManager:
                     ignore_limitations=True,
                     object_prefix=self.object_prefix,
                     engine_version=self.engine_version,
+                    pg_fillfactor=getattr(self, "pg_fillfactor", 80),
                 )
                 sig = self._compute_signature(plan, schemas)
                 report[v_name] = "ok" if sig == entry["signature_hash"] else "drifted"
@@ -12188,6 +12463,8 @@ class MaterializedViewManager:
                 pg_use_transition_tables=self.pg_use_transition_tables,
                 ignore_limitations=True,
                 object_prefix=self.object_prefix,
+                engine_version=self.engine_version,
+                pg_fillfactor=getattr(self, "pg_fillfactor", 80),
             )
             sig = self._compute_signature(plan, schemas)
             if rebuild_on_schema_drift and sig != entry["signature_hash"]:
@@ -12426,6 +12703,7 @@ class MaterializedViewManager:
                             ignore_limitations=True,
                             object_prefix=self.object_prefix,
                             engine_version=self.engine_version,
+                            pg_fillfactor=getattr(self, "pg_fillfactor", 80),
                         )
                         for stmt in plan.trigger_ddls:
                             cur.execute(stmt)
@@ -12461,6 +12739,7 @@ class MaterializedViewManager:
                         ignore_limitations=True,
                         object_prefix=self.object_prefix,
                         engine_version=self.engine_version,
+                        pg_fillfactor=getattr(self, "pg_fillfactor", 80),
                     )
 
                     if use_shadow_swap:
@@ -12511,10 +12790,22 @@ class MaterializedViewManager:
                                 s_stmt,
                                 flags=re.IGNORECASE,
                             )
+                            s_stmt = re.sub(
+                                rf"\bMERGE\s+INTO\s+(?:\"{re.escape(plan.backing_table_name)}\"|`{re.escape(plan.backing_table_name)}`|{re.escape(plan.backing_table_name)})\b",
+                                f"MERGE INTO {shadow_tbl}",
+                                s_stmt,
+                                flags=re.IGNORECASE,
+                            )
                             for aux_t, s_aux in shadow_aux_map.items():
                                 s_stmt = re.sub(
                                     rf"\bINSERT\s+INTO\s+(?:\"{re.escape(aux_t)}\"|`{re.escape(aux_t)}`|{re.escape(aux_t)})\b",
                                     f"INSERT INTO {s_aux}",
+                                    s_stmt,
+                                    flags=re.IGNORECASE,
+                                )
+                                s_stmt = re.sub(
+                                    rf"\bMERGE\s+INTO\s+(?:\"{re.escape(aux_t)}\"|`{re.escape(aux_t)}`|{re.escape(aux_t)})\b",
+                                    f"MERGE INTO {s_aux}",
                                     s_stmt,
                                     flags=re.IGNORECASE,
                                 )
@@ -13045,6 +13336,7 @@ def generate_materialized_view(
     strict: bool = False,
     engine_version: Optional[EngineVersion | str] = None,
     watermark_catalog_table: Optional[str] = None,
+    pg_fillfactor: Optional[int] = 80,
 ) -> MaterializedViewPlan:
     """
     Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
@@ -13112,6 +13404,7 @@ def generate_materialized_view(
         strict=strict,
         engine_version=resolved_ev,
         watermark_catalog_table=watermark_catalog_table,
+        pg_fillfactor=pg_fillfactor,
     )
     return compiler.compile()
 
@@ -13128,6 +13421,7 @@ def generate_materialized_views(
     batch_size: int = 1000,
     strict: bool = False,
     engine_version: Optional[EngineVersion | str] = None,
+    pg_fillfactor: Optional[int] = 80,
 ) -> List[MaterializedViewPlan]:
     """
     Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
@@ -13166,6 +13460,7 @@ def generate_materialized_views(
             batch_size=batch_size,
             strict=strict,
             engine_version=resolved_ev,
+            pg_fillfactor=pg_fillfactor,
         )
         plans.append(comp._compile_single_plan())
     return plans
