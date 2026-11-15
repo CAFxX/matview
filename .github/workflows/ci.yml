@@ -172,6 +172,9 @@ jobs:
       - name: Test MySQL/MariaDB transaction-state guard adapters
         run: python3 test_mysql_transaction_state_guard.py
 
+      - name: Test PostgreSQL transaction-state guard adapters
+        run: python3 test_postgres_transaction_state_guard.py
+
       - name: Verify SQLite library version
         run: python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
 
