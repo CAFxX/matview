@@ -10618,7 +10618,7 @@ class MaterializedViewManager:
         if existing and existing["signature_hash"] == sig and not force_rebuild:
             return plan
 
-        cur = self.conn.cursor()
+        cur = None
         sqlite_writer_reserved = False
 
         def reserve_sqlite_writer() -> bool:
@@ -10642,24 +10642,29 @@ class MaterializedViewManager:
                     raise
             return True
 
+        # Reject unsupported replacement before entering the transactional
+        # cleanup path: its exception handler must not roll back a caller-owned
+        # transaction on a dialect where this operation is unsupported.
+        if existing and (
+            incremental_backfill
+            or self.dialect not in (Dialect.SQLITE, Dialect.POSTGRES)
+        ):
+            raise RuntimeError(
+                "Replacing an existing materialized view is unsupported for "
+                "MySQL/MariaDB and incremental backfills until atomic shadow-generation "
+                "publication is implemented; the existing view was left untouched"
+            )
+
         try:
             if existing:
-                # SQLite and PostgreSQL support transactional DDL. For a single-shot
-                # replacement, keep removal of the old reader/backing objects in the
-                # same transaction as creation and population of the replacement, so
-                # a failed rebuild restores the previously working materialized view.
-                # MySQL/MariaDB implicitly commit DDL, and incremental backfills
-                # intentionally commit chunks; those paths still require a future
-                # shadow-generation publication protocol.
-                transactional_replacement = (
-                    not incremental_backfill
-                    and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES)
-                )
-                if transactional_replacement:
-                    sqlite_writer_reserved = reserve_sqlite_writer()
-                    self.drop_view(plan.view_name, _commit_transaction=False)
-                else:
-                    self.drop_view(plan.view_name)
+                # Cursor acquisition follows the side-effect-free preflight above.
+                cur = self.conn.cursor()
+                # SQLite and PostgreSQL support transactional DDL.
+                sqlite_writer_reserved = reserve_sqlite_writer()
+                self.drop_view(plan.view_name, _commit_transaction=False)
+
+            if cur is None:
+                cur = self.conn.cursor()
 
             # Reserve before the first structure/trigger DDL on new registrations.
             # For SQLite this also closes the trigger-installation/backfill writer
