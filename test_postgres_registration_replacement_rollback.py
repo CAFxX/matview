@@ -103,6 +103,70 @@ def main() -> None:
                 assert cur.fetchone()[0] == 1, (
                     f"old maintenance trigger {trigger_name} was not restored"
                 )
+        # Inject a failure after the old reader has been dropped but before
+        # catalog cleanup. Transactional PostgreSQL DDL must restore it.
+        original_drop = manager.drop_view
+
+        def fail_mid_drop(view_name, _commit_transaction=True):
+            with conn.cursor() as cur:
+                cur.execute(f'DROP VIEW IF EXISTS "{view_name}"')
+            raise RuntimeError("injected mid-drop failure")
+
+        manager.drop_view = fail_mid_drop
+        try:
+            try:
+                manager.register_view(view_sql, force_rebuild=True)
+            except RuntimeError as exc:
+                assert "injected mid-drop failure" in str(exc)
+                conn.rollback()
+            else:
+                raise AssertionError("mid-drop failure was not injected")
+        finally:
+            manager.drop_view = original_drop
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, value FROM replacement_reader ORDER BY id")
+            assert cur.fetchall() == original_rows
+
+        # An unrelated caller transaction must not be committed by registration.
+        with conn.cursor() as cur:
+            cur.execute("UPDATE replacement_control SET should_fail = TRUE")
+        try:
+            manager.register_view(view_sql, force_rebuild=True)
+        except RuntimeError as exc:
+            assert "idle PostgreSQL connection" in str(exc)
+        else:
+            raise AssertionError("caller-owned PostgreSQL transaction was accepted")
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("SELECT should_fail FROM replacement_control")
+            assert cur.fetchone()[0] is False
+
+        # sync_views shares the same pre-read transaction ownership guard.
+        with conn.cursor() as cur:
+            cur.execute("UPDATE replacement_control SET should_fail = TRUE")
+        try:
+            manager.sync_views([view_sql])
+        except RuntimeError as exc:
+            assert "idle PostgreSQL connection" in str(exc)
+        else:
+            raise AssertionError("sync_views accepted a caller-owned PostgreSQL transaction")
+        conn.rollback()
+
+        # PostgreSQL autocommit makes DDL non-transactional; reject before any
+        # schema/catalog reads or destructive replacement statements.
+        conn.autocommit = True
+        try:
+            try:
+                manager.register_view(view_sql, force_rebuild=True)
+            except RuntimeError as exc:
+                assert "autocommit=False" in str(exc)
+            else:
+                raise AssertionError("PostgreSQL autocommit replacement was accepted")
+        finally:
+            conn.autocommit = False
+
+        with conn.cursor() as cur:
             cur.execute("UPDATE replacement_control SET should_fail = FALSE")
             cur.execute("INSERT INTO replacement_rows VALUES (4, 40)")
         conn.commit()
@@ -115,7 +179,7 @@ def main() -> None:
         assert after_write == [
             (1, 10), (2, 20), (3, 30), (4, 40)
         ], after_write
-        print("PASS: PostgreSQL failed replacement restored the prior live materialized view")
+        print("PASS: PostgreSQL replacement rollback, mid-drop rollback, and transaction guards")
     finally:
         try:
             conn.rollback()
