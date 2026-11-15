@@ -11025,9 +11025,9 @@ class MaterializedViewManager:
         sp_active = False
         # Never shadow a savepoint created by the caller. MySQL replaces an
         # existing savepoint when SAVEPOINT is issued with the same name.
-        sp_name = f"{sp_name}_{uuid.uuid4().hex}"
+        sp_name = f"__mv_bulk_sp_{uuid.uuid4().hex}"
         try:
-            cur.execute("SAVEPOINT {sp_name};")
+            cur.execute(f"SAVEPOINT {sp_name};")
             sp_active = True
         except Exception as exc:
             if self.dialect == Dialect.MYSQL:
@@ -11064,8 +11064,8 @@ class MaterializedViewManager:
                 pass
             if sp_active:
                 try:
-                    cur.execute("ROLLBACK TO SAVEPOINT {sp_name};")
-                    cur.execute("RELEASE SAVEPOINT {sp_name};")
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                    cur.execute(f"RELEASE SAVEPOINT {sp_name};")
                 except Exception:
                     if not mysql_caller_transaction:
                         self._rollback()
@@ -11087,7 +11087,7 @@ class MaterializedViewManager:
                         if "__ro_" not in t_name and not t_name.endswith("__readonly"):
                             cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
         # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
-        # so the trigger suspension and bulk DML remain isolated inside {sp_name}!
+        # so the trigger suspension and bulk DML remain isolated inside the savepoint!
         try:
             yield
         except Exception:
