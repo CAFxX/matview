@@ -700,10 +700,16 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             )
             conn.commit()
             manager = MaterializedViewManager(conn, dialect=engine)
+            # MySQL cannot intercept TRUNCATE, so the manager correctly
+            # classifies general transparency as limited. This stress case
+            # deliberately exercises only INSERT/UPDATE/DELETE and therefore
+            # opts into that documented limitation without weakening the
+            # production default-rejection contract.
             plan = manager.register_view(
                 f"CREATE VIEW {view_name} AS "
                 "SELECT bucket, COUNT(*) AS row_count, COUNT(amount) AS valued_count, "
-                f"SUM(amount) AS total_amount FROM {table_name} GROUP BY bucket;"
+                f"SUM(amount) AS total_amount FROM {table_name} GROUP BY bucket;",
+                ignore_limitations=(engine == Dialect.MYSQL),
             )
 
             def writer(worker_id: int) -> None:
