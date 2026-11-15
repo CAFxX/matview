@@ -10229,6 +10229,13 @@ class MaterializedViewManager:
                 )
             return
 
+        if self.dialect not in (Dialect.SQLITE, Dialect.POSTGRES):
+            if getattr(self.conn, "in_transaction", None) is True:
+                raise RuntimeError(
+                    "register_view/sync_views require an idle connection; "
+                    "commit or roll back the caller transaction first"
+                )
+
         if self.dialect == Dialect.POSTGRES:
             if bool(getattr(self.conn, "autocommit", False)):
                 raise RuntimeError(
@@ -10741,7 +10748,11 @@ class MaterializedViewManager:
             else:
                 self._commit()
         except Exception:
-            self._rollback()
+            # If a SQLite-compatible adapter does not expose in_transaction and
+            # BEGIN IMMEDIATE failed, this operation never acquired the writer.
+            # Do not roll back a possibly caller-owned transaction in that case.
+            if self.dialect != Dialect.SQLITE or sqlite_writer_reserved:
+                self._rollback()
             raise
         return plan
 
