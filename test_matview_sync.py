@@ -4267,6 +4267,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 pass
         self.assertTrue(caught.exception.connection_unsafe)
         self.assertTrue(mgr._mysql_bulk_connection_unsafe)
+        self.assertTrue(conn._matview_bulk_connection_unsafe)
         self.assertEqual(conn.rollback_calls, 1)
         self.assertEqual(conn.commit_calls, 0)
         statements_before_reuse = list(cursor.statements)
