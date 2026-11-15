@@ -923,6 +923,7 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
 
         self.assertIn("SAVEPOINT __mv_bulk_sp;", executed)
         self.assertIn("SET @__matview_skip_triggers = 1;", executed)
+        self.assertIn("SET @__matview_skip_triggers = 0;", executed)
         self.assertFalse(
             any(sql.upper().startswith("DROP TRIGGER") for sql in executed),
             executed,
@@ -995,6 +996,154 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "implicitly committing DDL"):
                     with manager.bulk_changes(**options):
                         self.fail("unsafe MySQL DDL option must be rejected")
+
+
+
+    def test_mysql_bypass_reset_failure_is_not_silently_committed(self) -> None:
+        """A failed session-variable reset must enter rollback/recovery, not commit silently."""
+        executed = []
+        reset_attempts = 0
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                nonlocal reset_attempts
+                sql = str(statement).strip()
+                executed.append(sql)
+                if sql == "SET @__matview_skip_triggers = 0;":
+                    reset_attempts += 1
+                    if reset_attempts == 1:
+                        raise RuntimeError("injected session bypass reset failure")
+                return self
+
+            def close(self):
+                pass
+
+        class RecordingConnection:
+            def cursor(self):
+                return RecordingCursor()
+
+            def commit(self):
+                executed.append("COMMIT;")
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.MYSQL
+        manager.engine_version = parse_engine_version("mysql:8.4")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {}
+        manager.fetch_schema = lambda: {}
+
+        with self.assertRaisesRegex(RuntimeError, "injected session bypass reset failure"):
+            with manager.bulk_changes():
+                pass
+
+        self.assertEqual(reset_attempts, 2, executed)
+        self.assertIn("ROLLBACK TO SAVEPOINT __mv_bulk_sp;", executed)
+        self.assertEqual(executed[-1], "COMMIT;")
+        self.assertEqual(executed.count("COMMIT;"), 1)
+
+
+    def test_mysql_session_bypass_exception_does_not_drop_and_recreate_triggers(self) -> None:
+        """Session bypass leaves triggers installed; cleanup must not use implicit-commit DDL."""
+        executed = []
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                return self
+
+            def close(self):
+                pass
+
+        class RecordingConnection:
+            def cursor(self):
+                return RecordingCursor()
+
+            def commit(self):
+                executed.append("COMMIT;")
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.MYSQL
+        manager.engine_version = parse_engine_version("mysql:8.4")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {
+            "v_guard": {
+                "view_name": "v_guard",
+                "trigger_names": ["mv_guard_insert", "mv_guard_update"],
+                "function_names": [],
+                "view_sql": "CREATE VIEW v_guard AS SELECT id FROM guarded_rows;",
+            }
+        }
+        manager.fetch_schema = lambda: self.fail(
+            "session-bypass cleanup must not introspect or regenerate triggers"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "injected user-block failure"):
+            with manager.bulk_changes():
+                executed.append("USER BLOCK DML")
+                raise RuntimeError("injected user-block failure")
+
+        self.assertIn("SET @__matview_skip_triggers = 1;", executed)
+        self.assertIn("ROLLBACK TO SAVEPOINT __mv_bulk_sp;", executed)
+        self.assertIn("SET @__matview_skip_triggers = 0;", executed)
+        self.assertFalse(any(sql.upper().startswith("DROP TRIGGER") for sql in executed), executed)
+        self.assertFalse(any(sql.upper().startswith("CREATE TRIGGER") for sql in executed), executed)
+        self.assertEqual(executed[-1], "COMMIT;")
+
+
+    def test_sqlite_savepoint_setup_failure_releases_new_writer_reservation(self) -> None:
+        """If SAVEPOINT setup fails after BEGIN IMMEDIATE, release the writer lock."""
+        executed = []
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                if sql == "SAVEPOINT __mv_bulk_sp;":
+                    raise sqlite3.OperationalError("injected savepoint failure")
+                return self
+
+            def close(self):
+                pass
+
+        class RecordingConnection:
+            in_transaction = False
+
+            def cursor(self):
+                return RecordingCursor()
+
+            def commit(self):
+                executed.append("COMMIT;")
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.SQLITE
+        manager.engine_version = parse_engine_version("sqlite:3.45")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {}
+
+        with self.assertRaisesRegex(sqlite3.OperationalError, "savepoint failure"):
+            with manager.bulk_changes():
+                self.fail("bulk_changes must not enter the user block after savepoint setup fails")
+
+        self.assertEqual(executed, ["BEGIN IMMEDIATE;", "SAVEPOINT __mv_bulk_sp;", "ROLLBACK;"])
 
 
 if __name__ == "__main__":
