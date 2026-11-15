@@ -4352,6 +4352,10 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "connection was discarded"):
             with mgr.bulk_changes():
                 self.fail("discarded manager must not be reused")
+        second_manager = make_manager(conn, catalog={})
+        with self.assertRaisesRegex(RuntimeError, "connection was discarded"):
+            with second_manager.bulk_changes():
+                self.fail("a second manager must not reuse the discarded connection")
 
         # If the body itself fails and cleanup cannot clear the session flag,
         # surface the connection-contamination hazard instead of silently
