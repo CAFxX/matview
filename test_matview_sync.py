@@ -4066,7 +4066,7 @@ def run_suite_11_live_engine_50_view_battery_across_all_dialects(runner: MVTestR
 
 
 class TestGeneratorAndManagerCodePaths(unittest.TestCase):
-    def test_00_mysql_bulk_changes_rejects_active_or_unknown_transaction_state(self) -> None:
+    def test_00_mysql_transaction_state_detection_and_unknown_state_rejection(self) -> None:
         class Connection:
             def __init__(self, **attrs: Any) -> None:
                 self.__dict__.update(attrs)
