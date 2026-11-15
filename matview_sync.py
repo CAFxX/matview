@@ -10219,10 +10219,12 @@ class MaterializedViewManager:
         return connection
 
     def _ensure_catalog(self) -> None:
-        cur = self.conn.cursor()
+        # The SQLite initializer owns and closes its short-lived cursor. Run it
+        # before opening the catalog cursor to avoid retaining an unused cursor.
         if self.dialect == Dialect.SQLITE:
             self.configure_sqlite_connection(self.conn)
-        elif self.dialect == Dialect.MYSQL:
+        cur = self.conn.cursor()
+        if self.dialect == Dialect.MYSQL:
             try:
                 cur.execute("SET SESSION collation_connection = @@collation_database;")
             except Exception:
