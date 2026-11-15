@@ -253,9 +253,14 @@ class QueryASTMaterializedViewTests(unittest.TestCase):
 
         try:
             cur = conn.cursor()
+            orig_mysql_db: Optional[str] = None
             if dialect == Dialect.POSTGRES:
                 cur.execute(f'CREATE SCHEMA "{pg_root_schema}";')
                 cur.execute(f'SET search_path TO "{pg_root_schema}";')
+            elif dialect == Dialect.MYSQL:
+                cur.execute("SELECT DATABASE();")
+                row = cur.fetchone()
+                orig_mysql_db = str(row[0]) if row and row[0] else None
 
             for schema_seed in range(num_schemas):
                 schema, _, seed_sql, mutations, _ = (
@@ -269,6 +274,7 @@ class QueryASTMaterializedViewTests(unittest.TestCase):
 
                 for query_index in range(num_queries):
                     query_pg_schema = f"{pg_root_schema}_{schema_seed}_{query_index}"
+                    query_mysql_db = f"ast_mysql_{suffix}_{schema_seed}_{query_index}"
                     manager: Optional[MaterializedViewManager] = None
                     plan: Any = None
 
@@ -276,6 +282,12 @@ class QueryASTMaterializedViewTests(unittest.TestCase):
                         if dialect == Dialect.POSTGRES:
                             cur.execute(f'CREATE SCHEMA "{query_pg_schema}";')
                             cur.execute(f'SET search_path TO "{query_pg_schema}";')
+                        elif dialect == Dialect.MYSQL:
+                            cur.execute(
+                                f"CREATE DATABASE `{query_mysql_db}` "
+                                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+                            )
+                            cur.execute(f"USE `{query_mysql_db}`;")
 
                         # Execute base table DDL and seed statements
                         for stmt in [s.strip() for s in schema.split(";") if s.strip()]:
@@ -365,20 +377,12 @@ class QueryASTMaterializedViewTests(unittest.TestCase):
                                     manager.drop_view(plan.view_name)
                                 except Exception:
                                     pass
-                            cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
-                            cur.execute(
-                                f"SELECT table_name FROM information_schema.tables "
-                                f"WHERE table_schema = DATABASE() AND (table_name LIKE 'vs{schema_seed + 1}%' OR table_name LIKE '__matview%');"
-                            )
-                            for (t_name,) in (cur.fetchall() or []):
-                                cur.execute(f"DROP TABLE IF EXISTS `{t_name}`;")
-                            cur.execute(
-                                f"SELECT table_name FROM information_schema.views "
-                                f"WHERE table_schema = DATABASE() AND (table_name LIKE 'ast_%' OR table_name LIKE '__matview%');"
-                            )
-                            for (v_name,) in (cur.fetchall() or []):
-                                cur.execute(f"DROP VIEW IF EXISTS `{v_name}`;")
-                            cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
+                            try:
+                                if orig_mysql_db:
+                                    cur.execute(f"USE `{orig_mysql_db}`;")
+                                cur.execute(f"DROP DATABASE IF EXISTS `{query_mysql_db}`;")
+                            except Exception:
+                                pass
 
         finally:
             try:
@@ -386,21 +390,8 @@ class QueryASTMaterializedViewTests(unittest.TestCase):
                 if dialect == Dialect.POSTGRES:
                     cur.execute("SET search_path TO public;")
                     cur.execute(f'DROP SCHEMA IF EXISTS "{pg_root_schema}" CASCADE;')
-                elif dialect == Dialect.MYSQL:
-                    cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
-                    cur.execute(
-                        "SELECT table_name FROM information_schema.tables "
-                        "WHERE table_schema = DATABASE() AND (table_name LIKE 'vs%' OR table_name LIKE '__matview%');"
-                    )
-                    for (t_name,) in (cur.fetchall() or []):
-                        cur.execute(f"DROP TABLE IF EXISTS `{t_name}`;")
-                    cur.execute(
-                        "SELECT table_name FROM information_schema.views "
-                        "WHERE table_schema = DATABASE() AND (table_name LIKE 'ast_%' OR table_name LIKE '__matview%');"
-                    )
-                    for (v_name,) in (cur.fetchall() or []):
-                        cur.execute(f"DROP VIEW IF EXISTS `{v_name}`;")
-                    cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
+                elif dialect == Dialect.MYSQL and orig_mysql_db:
+                    cur.execute(f"USE `{orig_mysql_db}`;")
             except Exception:
                 pass
             conn.close()
@@ -558,6 +549,59 @@ class QueryASTMaterializedViewTests(unittest.TestCase):
             self.assertTrue(query.features)
         finally:
             conn.close()
+
+    def test_schema_introspection_filters_views_and_grouped_order_by(self) -> None:
+        """Ensure _schema excludes views/LIKE wildcards and grouped ORDER BY avoids ungrouped id."""
+        for dialect, version_str in (
+            (Dialect.POSTGRES, "PostgreSQL 18.1"),
+            (Dialect.MYSQL, "8.4.4-MySQL"),
+        ):
+            executed: list[str] = []
+
+            class _FakeCursor:
+                def execute(self, sql: str) -> None:
+                    executed.append(sql)
+                    self._last = sql
+
+                def fetchall(self):
+                    sql_up = self._last.upper()
+                    if "VERSION()" in sql_up:
+                        return [(version_str,)]
+                    if "INFORMATION_SCHEMA.TABLES" in sql_up:
+                        return [("vs1_t0",), ("vs1_t1",)]
+                    return []
+
+                def fetchone(self):
+                    rows = self.fetchall()
+                    return rows[0] if rows else None
+
+                def close(self) -> None:
+                    pass
+
+            class _FakeConn:
+                def cursor(self):
+                    return _FakeCursor()
+
+            tables, _ = SchemaAwareSelectFuzzer._schema(_FakeConn())
+            self.assertEqual(tables, ["vs1_t0", "vs1_t1"])
+            table_queries = [q for q in executed if "information_schema.tables" in q.lower()]
+            self.assertEqual(len(table_queries), 1, f"expected table lookup query for {dialect}")
+            self.assertIn("BASE TABLE", table_queries[0])
+            self.assertIn("vs%#_t%", table_queries[0])
+            self.assertIn("ESCAPE '#'", table_queries[0])
+
+        for seed in range(64):
+            for dialect in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+                q = SchemaAwareSelectFuzzer(seed).generate(
+                    tables=["vs1_t0", "vs1_t1"],
+                    foreign_keys=[("vs1_t1", "parent_0_id", "vs1_t0")],
+                    dialect=dialect,
+                )
+                if "group_by" in q.features:
+                    # Top-level grouped query must not reference ungrouped `id` in ORDER BY.
+                    order_idx = q.sql.rfind("ORDER BY ")
+                    if order_idx != -1:
+                        self.assertNotIn("id", q.sql[order_idx:].lower(), q.sql)
 
 
 if __name__ == "__main__":
