@@ -1584,7 +1584,8 @@ def introspect_database_schemas(
 
         cur.execute(
             """
-            SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.character_maximum_length
+            SELECT c.table_name, c.column_name, c.data_type, c.is_nullable,
+                   c.character_maximum_length, c.collation_name
             FROM information_schema.columns c
             JOIN information_schema.tables t
               ON c.table_schema = t.table_schema AND c.table_name = t.table_name
@@ -1597,12 +1598,13 @@ def introspect_database_schemas(
         )
         grouped: Dict[str, Dict[str, ColumnDef]] = {}
         for row in (cur.fetchall() or []):
-            t_name, c_name, d_type, is_null, char_len = (
+            t_name, c_name, d_type, is_null, char_len, collation_name = (
                 str(row[0]),
                 str(row[1]),
                 row[2],
                 row[3],
                 row[4],
+                row[5] if len(row) > 5 else None,
             )
             if t_name == catalog_table or (
                 object_prefix and t_name.startswith(object_prefix)
@@ -1613,6 +1615,9 @@ def introspect_database_schemas(
                 dt_up = f"VARCHAR({int(char_len)})"
             elif dt_up == "CHARACTER VARYING":
                 dt_up = "TEXT"
+            if collation_name and str(collation_name).lower() != "default":
+                quoted_collation = '"' + str(collation_name).replace('"', '""') + '"'
+                dt_up = f"{dt_up} COLLATE {quoted_collation}"
             is_pk = (t_name.lower(), c_name.lower()) in pk_pairs
             grouped.setdefault(t_name, {})[c_name] = ColumnDef(
                 name=c_name,
@@ -1661,7 +1666,8 @@ def introspect_database_schemas(
 
     cur.execute(
         """
-        SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_key, c.column_type
+        SELECT c.table_name, c.column_name, c.data_type, c.is_nullable,
+               c.column_key, c.column_type, c.collation_name
         FROM information_schema.columns c
         JOIN information_schema.tables t
           ON c.table_schema = t.table_schema AND c.table_name = t.table_name
@@ -1682,6 +1688,7 @@ def introspect_database_schemas(
             _dec(row[4]),
         )
         col_type = _dec(row[5]) if len(row) > 5 and row[5] is not None else None
+        collation_name = _dec(row[6]) if len(row) > 6 and row[6] is not None else None
         if t_name == catalog_table or (
             object_prefix and t_name.startswith(object_prefix)
         ):
@@ -1689,6 +1696,8 @@ def introspect_database_schemas(
         dt_up = d_type.upper()
         if dt_up in ("VARCHAR", "CHAR", "TINYINT") and col_type:
             dt_up = col_type.upper()
+        if collation_name and re.fullmatch(r"[A-Za-z0-9_]+", collation_name):
+            dt_up = f"{dt_up} COLLATE {collation_name}"
         is_pk = col_key.upper() == "PRI"
         grouped_my.setdefault(t_name, {})[c_name] = ColumnDef(
             name=c_name,
