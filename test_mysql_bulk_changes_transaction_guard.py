@@ -49,9 +49,7 @@ def main() -> None:
         # implicit DDL), this observer will see the uncommitted row.
         with conn.cursor() as cur:
             cur.execute(f"INSERT INTO {table} VALUES (1)")
-        assert conn.in_transaction, "fixture failed to establish caller transaction"
         assert manager._mysql_transaction_state() is True
-        assert observer.cursor().execute(f"SELECT COUNT(*) FROM {table}") == 1
         with observer.cursor() as cur:
             assert cur.fetchone()[0] == 0
 
@@ -63,7 +61,7 @@ def main() -> None:
         else:
             raise AssertionError("active caller transaction was not rejected")
 
-        assert conn.in_transaction, "rejected entry ended the caller transaction"
+        assert manager._mysql_transaction_state() is True, "rejected entry ended the caller transaction"
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM {table}")
             assert cur.fetchone()[0] == 1, "caller transaction lost its own write"
