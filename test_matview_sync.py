@@ -5677,7 +5677,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"STD\(\) is not a PostgreSQL"):
             parse_view_ast(unsupported_postgres_alias, dialect=Dialect.POSTGRES)
 
-    def test_preparsed_view_spec_resolves_statistical_aliases_for_target_dialect(self) -> None:
+    def test_preparsed_view_spec_resolves_statistical_aliases_for_target_dialect(
+        self,
+    ) -> None:
         schema = """
         CREATE TABLE measurements (
             id INTEGER PRIMARY KEY,
@@ -5706,7 +5708,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         postgres = generate_materialized_view(
             schema, parsed, dialect="postgres", ignore_limitations=True
         )
-        postgres_sql = "\\n".join(postgres.initial_populate_sqls).upper()
+        postgres_sql = "\n".join(postgres.initial_populate_sqls).upper()
         self.assertIn("VAR_SAMP(", postgres_sql)
         self.assertIn("STDDEV_SAMP(", postgres_sql)
         self.assertNotIn("VAR_POP(", postgres_sql)
@@ -5715,7 +5717,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         mysql = generate_materialized_view(
             schema, parsed, dialect="mysql", ignore_limitations=True
         )
-        mysql_sql = "\\n".join(mysql.initial_populate_sqls).upper()
+        mysql_sql = "\n".join(mysql.initial_populate_sqls).upper()
         self.assertIn("VAR_POP(", mysql_sql)
         self.assertIn("STDDEV_POP(", mysql_sql)
         self.assertNotIn("VAR_SAMP(", mysql_sql)
@@ -5729,7 +5731,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             """,
             known_tables={"measurements"},
         )
-        with self.assertRaisesRegex(ValueError, r"STD\\(\\) is not a PostgreSQL"):
+        with self.assertRaisesRegex(ValueError, r"STD\(\) is not a PostgreSQL"):
             generate_materialized_view(
                 schema, unsupported_std, dialect="postgres", ignore_limitations=True
             )
