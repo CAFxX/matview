@@ -2,6 +2,18 @@
 
 The implementation must prioritize correctness, reliability, maintainability, and explicit behavior. Features must be generic where their contract requires it; do not mistake a collection of examples or templates for general support.
 
+## Non-negotiable semantic-equivalence invariant
+
+For every supported materialized view, target engine/version, and valid sequence of base-table mutations, querying the materialized view MUST return the same result as executing the original view definition against the current base tables. Any discrepancy is a correctness bug in `matview`, regardless of whether it originates in compilation, initial population, incremental maintenance, fallback refresh, transaction/concurrency handling, or result decoding.
+
+This is the primary correctness contract and takes precedence over implementation convenience, performance, and existing test expectations. Tests must treat the original view executed on the same native database state as the independent oracle. Never derive expected results from generated materialization SQL, backing-table state, trigger logic, or another path that shares the implementation under test.
+
+The comparison must preserve row multiplicity and compare values, NULL behavior, grouping keys, and result types deliberately. Integers and exact numeric types must be compared exactly. Approximate floating-point values may use only narrow, documented, operation- and type-specific tolerances that account for legitimate engine evaluation-order differences; tolerances must not mask wrong aggregate semantics, stale/missing/extra rows, incorrect grouping, or maintenance errors. Ordering is compared only where the SQL contract defines it.
+
+Every supported view shape must be checked against this oracle after initial population and after relevant INSERT, UPDATE, DELETE, UPSERT, bulk, rollback, and concurrent-transaction transitions. Exercise meaningful combinations of query structure, DML, types, NULLs, constraints, and engine/version behavior. Run native-engine tests for engine-specific semantics; transpilation or emulation is not a substitute.
+
+Every discovered mismatch becomes a minimized, deterministic, permanent regression test. A test suite is not considered adequate merely because it passes: periodically inject representative faults (or use targeted mutation testing) and demonstrate that the differential tests fail. Never weaken, skip, normalize away, or broaden tolerances to make a discrepancy pass without first proving that the difference is permitted by the documented SQL/engine contract. Unsupported behavior must be rejected explicitly rather than silently returning a divergent result.
+
 ## Testing standards
 
 - Design tests from the documented behavior and supported SQL/engine contract, not from the implementation's current code paths. Avoid tautological tests that reproduce the implementation's assumptions.
