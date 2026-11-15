@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import random
 import sqlite3
 import unittest
-from typing import Any
+from typing import Any, Callable
 
 from test_matview_sync import VariableSchemaDifferentialFuzzer
 
@@ -513,3 +513,133 @@ class RecursiveQueryASTTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def _predicate_shrinks(node: tuple[Any, ...]) -> list[tuple[Any, ...]]:
+    """Return strictly simpler, local predicate alternatives in deterministic order."""
+    kind = node[0]
+    candidates: list[tuple[Any, ...]] = []
+    if kind == "not":
+        candidates.append(node[1])
+    elif kind in ("and", "or"):
+        candidates.extend((node[1], node[2]))
+        for index in (1, 2):
+            child = node[index]
+            if child[0] in ("and", "or", "not"):
+                for simpler in _predicate_shrinks(child):
+                    parts = list(node)
+                    parts[index] = simpler
+                    candidates.append(tuple(parts))
+    # Stable de-duplication also prevents a malformed/custom AST from looping.
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate != node))
+
+
+def _query_shrink_candidates(query: SelectAST) -> list[SelectAST]:
+    """Generate conservative AST reductions; validity is decided by the caller."""
+    candidates: list[SelectAST] = []
+    if query.order_by:
+        candidates.append(replace(query, order_by=()))
+    if query.limit is not None:
+        candidates.append(replace(query, limit=None))
+    if query.distinct:
+        candidates.append(replace(query, distinct=False))
+    if len(query.projections) > 1:
+        candidates.append(replace(query, projections=query.projections[:-1]))
+    if query.where is not None:
+        candidates.append(replace(query, where=None))
+        candidates.extend(
+            replace(query, where=simpler)
+            for simpler in _predicate_shrinks(query.where)
+        )
+    if query.having is not None:
+        candidates.append(replace(query, having=None))
+        candidates.extend(
+            replace(query, having=simpler)
+            for simpler in _predicate_shrinks(query.having)
+        )
+    if query.joins:
+        candidates.append(replace(query, joins=query.joins[:-1]))
+    if query.set_operation is not None:
+        candidates.append(replace(query, set_operation=None))
+    if query.group_by:
+        # Removing grouping is only accepted if the caller confirms the resulting
+        # query is valid and still exhibits the same failure.
+        candidates.append(replace(query, group_by=(), having=None))
+    return list(dict.fromkeys(candidates))
+
+
+def minimize_select_ast(
+    query: SelectAST,
+    still_fails: Callable[[str], bool],
+) -> SelectAST:
+    """Greedily minimize a failing SELECT while preserving the caller's failure predicate.
+
+    The callback should execute the query against the same schema/data and return
+    true only for the failure being minimized (ideally matching its failure class,
+    not merely any exception). Invalid candidate SQL should return false.
+    """
+    if not still_fails(_render_select(query)):
+        raise ValueError("initial SELECT does not reproduce the requested failure")
+
+    current = query
+    changed = True
+    while changed:
+        changed = False
+        for candidate in _query_shrink_candidates(current):
+            if candidate == current:
+                continue
+            try:
+                reproduces = still_fails(_render_select(candidate))
+            except Exception:
+                # A shrinker must not replace the original failure with an
+                # unrelated parser/renderer/connection exception.
+                reproduces = False
+            if reproduces:
+                current = candidate
+                changed = True
+                break
+    return current
+
+
+class QueryASTShrinkingTests(unittest.TestCase):
+    def test_minimizer_removes_irrelevant_select_structure_but_keeps_failure(self) -> None:
+        query = SelectAST(
+            source=("table", "vs0_t0", "t"),
+            projections=(
+                ("column", "t", "id"),
+                ("column", "t", "label"),
+                ("add", ("column", "t", "qty"), ("literal", 1)),
+            ),
+            distinct=True,
+            where=(
+                "and",
+                ("compare", ("column", "t", "id"), "=", ("literal", 1)),
+                ("is_null", ("column", "t", "qty")),
+            ),
+            order_by=(("column", "t", "id"),),
+            limit=7,
+        )
+
+        def reproduces(sql: str) -> bool:
+            # Model a stable, query-specific failure: it requires the NULL
+            # predicate, but is independent of projection, sort, limit and
+            # the unrelated conjunct.
+            return "WHERE" in sql and '"qty" IS NULL' in sql
+
+        minimized = minimize_select_ast(query, reproduces)
+        sql = _render_select(minimized)
+        self.assertTrue(reproduces(sql), sql)
+        self.assertEqual(len(minimized.projections), 1)
+        self.assertIsNone(minimized.limit)
+        self.assertFalse(minimized.order_by)
+        self.assertFalse(minimized.distinct)
+        self.assertEqual(minimized.where, ("is_null", ("column", "t", "qty")))
+        self.assertLess(len(sql), len(_render_select(query)))
+
+    def test_minimizer_rejects_non_reproducing_input(self) -> None:
+        query = SelectAST(
+            source=("table", "vs0_t0", "t"),
+            projections=(("column", "t", "id"),),
+        )
+        with self.assertRaisesRegex(ValueError, "does not reproduce"):
+            minimize_select_ast(query, lambda sql: False)
