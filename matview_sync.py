@@ -11223,16 +11223,21 @@ class MaterializedViewManager:
 
         try:
             if self.dialect == Dialect.SQLITE:
+                # SQLite must acquire the writer reservation before any trigger is
+                # suspended.  Failing open here can expose concurrent writers to a
+                # partially disabled materialized-view maintenance path.
                 if not getattr(self.conn, "in_transaction", False):
-                    try:
-                        cur.execute("BEGIN IMMEDIATE;")
-                    except Exception:
-                        pass
-            try:
+                    cur.execute("BEGIN IMMEDIATE;")
+                # A failed savepoint is equally unsafe: do not fall back to trigger
+                # removal without transactional protection.
                 cur.execute("SAVEPOINT __mv_bulk_sp;")
                 sp_active = True
-            except Exception:
-                pass
+            else:
+                try:
+                    cur.execute("SAVEPOINT __mv_bulk_sp;")
+                    sp_active = True
+                except Exception:
+                    pass
 
             session_bypass_ok = False
             if self.dialect == Dialect.POSTGRES and not drop_triggers:
