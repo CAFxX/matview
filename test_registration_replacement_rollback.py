@@ -78,6 +78,51 @@ def main() -> None:
             "SELECT id, value FROM replacement_reader ORDER BY id;"
         ).fetchall()
         assert after_write == [(1, 10), (2, 20), (3, 30), (4, 40)], after_write
+
+        # Reject replacement paths that cannot publish atomically, before the
+        # old generation is dropped (MySQL DDL and chunked incremental backfill).
+        schemas = manager.fetch_schema()
+        original_dialect = manager.dialect
+        original_get_catalog = manager.get_catalog
+        original_signature = manager._compute_signature
+        original_drop_view = manager.drop_view
+        try:
+            manager.get_catalog = lambda: {
+                plan.view_name: {"signature_hash": "old-signature"}
+            }
+            manager._compute_signature = lambda *args, **kwargs: "new-signature"
+            for dialect, incremental in (
+                (Dialect.MYSQL, False),
+                (Dialect.SQLITE, True),
+            ):
+                manager.dialect = dialect
+                dropped = []
+                manager.drop_view = lambda *args, **kwargs: dropped.append(args)
+                try:
+                    manager._register_single_view_spec(
+                        plan.view_spec,
+                        schemas,
+                        populate=True,
+                        incremental_backfill=incremental,
+                        batch_size=10,
+                        on_progress=None,
+                        force_rebuild=True,
+                        effective_ignore=False,
+                        compiled_plan=plan,
+                    )
+                except RuntimeError as exc:
+                    assert "atomically publish a replacement" in str(exc), str(exc)
+                else:
+                    raise AssertionError(
+                        f"unsafe replacement unexpectedly proceeded: {dialect.value}, incremental={incremental}"
+                    )
+                assert not dropped, "old generation must not be dropped on a rejected replacement"
+        finally:
+            manager.dialect = original_dialect
+            manager.get_catalog = original_get_catalog
+            manager._compute_signature = original_signature
+            manager.drop_view = original_drop_view
+
         print("PASS: failed replacement rolled back to the prior live materialized view")
     finally:
         conn.close()

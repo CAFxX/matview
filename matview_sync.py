@@ -10619,28 +10619,30 @@ class MaterializedViewManager:
             return plan
 
         if existing:
-            # SQLite and PostgreSQL support transactional DDL. For a single-shot
-            # replacement, keep removal of the old reader/backing objects in the
-            # same transaction as creation and population of the replacement, so
-            # a failed rebuild restores the previously working materialized view.
-            # SQLite needs an explicit writer reservation because sqlite3 does not
-            # automatically wrap DDL in a transaction. MySQL/MariaDB implicitly
-            # commit DDL, and incremental backfills intentionally commit chunks;
-            # those paths still require a future shadow-generation publication
-            # protocol before replacement can be made failure-atomic.
+            # Only SQLite and PostgreSQL single-shot replacements currently have
+            # a failure-atomic publication path. MySQL/MariaDB implicitly commit
+            # DDL, while incremental backfills commit chunks; dropping the old
+            # generation on those paths can irreversibly destroy a working view
+            # before the replacement has populated. Reject rather than silently
+            # degrade the existing installation until shadow-generation publish
+            # and recovery are implemented.
             transactional_replacement = (
                 not incremental_backfill
                 and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES)
             )
-            if transactional_replacement:
-                if (
-                    self.dialect == Dialect.SQLITE
-                    and not self.conn.in_transaction
-                ):
-                    self.conn.cursor().execute("BEGIN IMMEDIATE;")
-                self.drop_view(plan.view_name, _commit_transaction=False)
-            else:
-                self.drop_view(plan.view_name)
+            if not transactional_replacement:
+                raise RuntimeError(
+                    "Replacing an existing materialized view is currently disabled "
+                    f"for {self.dialect.value} with incremental_backfill={incremental_backfill}; "
+                    "the engine/path cannot atomically publish a replacement, so the "
+                    "existing materialized view was left unchanged"
+                )
+            if (
+                self.dialect == Dialect.SQLITE
+                and not self.conn.in_transaction
+            ):
+                self.conn.cursor().execute("BEGIN IMMEDIATE;")
+            self.drop_view(plan.view_name, _commit_transaction=False)
 
         # On SQLite/PostgreSQL, keep structure, triggers, single-shot population,
         # and catalog publication in the surrounding transaction. SQLite's explicit
