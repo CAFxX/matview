@@ -4311,7 +4311,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "intentional failure"):
             with mgr.bulk_changes():
                 raise ValueError("intentional failure")
-        self.assertIn("ROLLBACK TO SAVEPOINT __mv_bulk_sp;", cursor.statements)
+        self.assertTrue(any(sql.startswith("ROLLBACK TO SAVEPOINT __mv_bulk_sp_") for sql in cursor.statements))
         self.assertIn("SET @__matview_skip_triggers = 0;", cursor.statements)
         self.assertFalse(any("DROP TRIGGER" in sql or sql.startswith("CREATE TRIGGER") for sql in cursor.statements))
         self.assertEqual(conn.rollback_calls, 1)
@@ -4330,11 +4330,35 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(conn.commit_calls, 0)
         self.assertGreaterEqual(cursor.statements.count("SET @__matview_skip_triggers = 0;"), 2)
 
-        # A failed reset must prevent commit and roll back the data changes.
+        # A failed reset must prevent commit, roll back the data changes,
+        # and make the potentially contaminated pooled connection unusable.
         cursor = Cursor(fail_reset=True)
         conn = Connection(cursor)
         mgr = make_manager(conn)
-        with self.assertRaisesRegex(RuntimeError, "cannot reset session variable"):
+        with self.assertRaisesRegex(RuntimeError, "discard this connection"):
+            with mgr.bulk_changes():
+                pass
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
+
+        # If the body itself fails and cleanup cannot clear the session flag,
+        # surface the connection-contamination hazard instead of silently
+        # preserving the original exception while leaving a poisoned session.
+        cursor = Cursor(fail_reset=True)
+        conn = Connection(cursor)
+        mgr = make_manager(conn)
+        with self.assertRaisesRegex(RuntimeError, "discard this connection"):
+            with mgr.bulk_changes():
+                raise ValueError("body failed")
+        self.assertEqual(conn.rollback_calls, 1)
+        self.assertEqual(conn.commit_calls, 0)
+
+        # The same rule applies when refresh fails after the with-body returns.
+        cursor = Cursor(fail_reset=True)
+        conn = Connection(cursor)
+        mgr = make_manager(conn)
+        mgr.fetch_schema = lambda: (_ for _ in ()).throw(RuntimeError("refresh failed"))
+        with self.assertRaisesRegex(RuntimeError, "discard this connection"):
             with mgr.bulk_changes():
                 pass
         self.assertEqual(conn.rollback_calls, 1)
