@@ -74,29 +74,47 @@ MUTANTS = (
 )
 
 
+def _run_focused_oracle_tests() -> unittest.TestResult:
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite(
+        loader.loadTestsFromName(
+            f"TestGeneratorAndManagerCodePaths.{test_name}", oracle
+        )
+        for test_name in ORACLE_TESTS
+    )
+    result = unittest.TestResult()
+    suite.run(result)
+    if result.testsRun != len(ORACLE_TESTS):
+        raise AssertionError(
+            f"expected {len(ORACLE_TESTS)} focused tests, ran {result.testsRun}"
+        )
+    return result
+
+
 def run_mutant(name: str, factory: Callable[[Callable[..., bool]], Callable[..., bool]]) -> int:
     original = oracle._rows_equal
+    baseline = _run_focused_oracle_tests()
+    if not baseline.wasSuccessful():
+        raise AssertionError(
+            f"baseline failed before applying mutant {name!r}: "
+            f"{len(baseline.failures)} failures, {len(baseline.errors)} errors"
+        )
+
     oracle._rows_equal = factory(original)
     try:
-        loader = unittest.defaultTestLoader
-        suite = unittest.TestSuite(
-            loader.loadTestsFromName(
-                f"TestGeneratorAndManagerCodePaths.{test_name}", oracle
-            )
-            for test_name in ORACLE_TESTS
-        )
-        result = unittest.TestResult()
-        suite.run(result)
-        killed = len(result.failures) + len(result.errors)
-        if result.testsRun == 0 or killed == 0:
+        result = _run_focused_oracle_tests()
+        # Count only assertion failures as kills. Import/setup/runtime errors
+        # are invalid mutation runs, not evidence that a test detected a bug.
+        if result.errors or not result.failures:
             raise AssertionError(
-                f"mutant {name!r} survived {result.testsRun} focused oracle tests"
+                f"mutant {name!r} was not killed by a clean assertion failure "
+                f"({len(result.failures)} failures, {len(result.errors)} errors)"
             )
         print(
-            f"KILLED {name}: {killed}/{result.testsRun} tests failed "
-            f"({len(result.failures)} failures, {len(result.errors)} errors)"
+            f"KILLED {name}: {len(result.failures)}/{result.testsRun} tests failed "
+            f"with assertions (no test errors)"
         )
-        return killed
+        return len(result.failures)
     finally:
         oracle._rows_equal = original
 
