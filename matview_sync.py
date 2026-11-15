@@ -10642,9 +10642,11 @@ class MaterializedViewManager:
             else:
                 self.drop_view(plan.view_name)
 
-        # Install structure, maintenance triggers, single-shot backfill, and catalog record
-        # inside a single atomic transaction so concurrent readers/writers never observe an
-        # un-triggered or double-counted window between trigger attachment and population.
+        # On SQLite/PostgreSQL, keep structure, triggers, single-shot population,
+        # and catalog publication in the surrounding transaction. SQLite's explicit
+        # BEGIN IMMEDIATE is established above when needed. MySQL/MariaDB implicitly
+        # commit DDL, so this block is not an atomic registration protocol on those
+        # engines; see the engine-specific registration TODO.
         cur = self.conn.cursor()
         try:
             for stmt in plan.create_structure_statements():
