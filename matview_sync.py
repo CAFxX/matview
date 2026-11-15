@@ -11155,7 +11155,7 @@ class MaterializedViewManager:
                                     cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
                         else:
                             for t_name in entry["trigger_names"]:
-                                if "__ro__" not in t_name and not t_name.endswith("__readonly"):
+                                if "__ro_" not in t_name and not t_name.endswith("__readonly"):
                                     cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
                         plan = generate_materialized_view(
                             schemas,
