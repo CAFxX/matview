@@ -923,6 +923,7 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
 
         self.assertIn("SAVEPOINT __mv_bulk_sp;", executed)
         self.assertIn("SET @__matview_skip_triggers = 1;", executed)
+        self.assertIn("SET @__matview_skip_triggers = 0;", executed)
         self.assertFalse(
             any(sql.upper().startswith("DROP TRIGGER") for sql in executed),
             executed,
@@ -1086,6 +1087,50 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         self.assertFalse(any(sql.upper().startswith("DROP TRIGGER") for sql in executed), executed)
         self.assertFalse(any(sql.upper().startswith("CREATE TRIGGER") for sql in executed), executed)
         self.assertEqual(executed[-1], "COMMIT;")
+
+
+
+    def test_sqlite_savepoint_setup_failure_releases_new_writer_reservation(self) -> None:
+        """If SAVEPOINT setup fails after BEGIN IMMEDIATE, release the writer lock."""
+        executed = []
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                if sql == "SAVEPOINT __mv_bulk_sp;":
+                    raise sqlite3.OperationalError("injected savepoint failure")
+                return self
+
+            def close(self):
+                pass
+
+        class RecordingConnection:
+            in_transaction = False
+
+            def cursor(self):
+                return RecordingCursor()
+
+            def commit(self):
+                executed.append("COMMIT;")
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.SQLITE
+        manager.engine_version = parse_engine_version("sqlite:3.45")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {}
+
+        with self.assertRaisesRegex(sqlite3.OperationalError, "savepoint failure"):
+            with manager.bulk_changes():
+                self.fail("bulk_changes must not enter the user block after savepoint setup fails")
+
+        self.assertEqual(executed, ["BEGIN IMMEDIATE;", "SAVEPOINT __mv_bulk_sp;", "ROLLBACK;"])
 
 
 if __name__ == "__main__":
