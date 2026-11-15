@@ -1,0 +1,400 @@
+name: CI — Deferred Compatibility Sweep
+
+# This workflow owns the compatibility dimensions intentionally removed from
+# the per-PR gate. Run weekly and on demand; it is not a required branch check.
+#
+# Deferred dimensions:
+# - CPython 3.13 and 3.14 on standard SQLite. Python 3.11/3.15 are gate endpoints;
+#   Python 3.12 is the runtime for all live-engine gate jobs.
+# - PostgreSQL 16 and 17; one Percona Distribution for PostgreSQL 18 representative.
+#   PostgreSQL 14 is retired because upstream support ends 2026-11-12.
+# - MySQL 26.10 Innovation; MariaDB 11.4 LTS and 13.1 rolling; Percona Server for
+#   MySQL 8.4 and 9.7. Gate coverage remains MySQL 8.4/9.7 LTS and MariaDB
+#   10.11/11.8/12.3 LTS.
+# - SQLite3MC and sqlean are periodic SQLite-build smoke checks. The current
+#   suite does not verify cipher correctness or sqlean-specific extension APIs.
+# - Minimum declared Python dependency versions are tested on Python 3.11 against
+#   live PostgreSQL and MySQL. The PR gate installs latest compatible versions.
+# - Optional SQLite drivers have no declared minimum versions; this workflow
+#   tests the latest installable releases, not a lower-bound compatibility claim.
+# - Scale-3 fuzz campaigns run weekly. Every PR-gate full-suite job still runs
+#   the ordinary deterministic suite and normal-scale fuzzer.
+#
+# Excluded, not deferred: TimescaleDB, PostGIS, and pgvector images. Restore them
+# only alongside tests that CREATE EXTENSION and exercise their respective APIs.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  python-deferred:
+    name: CPython ${{ matrix.python-version }} / SQLite
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      - name: Run full test suite
+        run: python3 test_matview_sync.py
+
+  compatibility-sweep:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "SQLite3 Multiple Ciphers"
+            kind: sqlite
+            sqlite-engine: sqlite3mc
+            driver-package: apsw-sqlite3mc
+          - name: "sqlean SQLite"
+            kind: sqlite
+            sqlite-engine: sqlean
+            driver-package: sqlean.py
+          - name: "PostgreSQL 16"
+            kind: postgres
+            image: postgres:16
+          - name: "PostgreSQL 17"
+            kind: postgres
+            image: postgres:17
+          - name: "Percona PostgreSQL 18"
+            kind: postgres
+            image: percona/percona-distribution-postgresql:18
+          - name: "MySQL 26.10 Innovation"
+            kind: mysql
+            image: mysql:26.10
+          - name: "MariaDB 11.4 LTS"
+            kind: mysql
+            image: mariadb:11.4
+          - name: "MariaDB 13.1 Rolling"
+            kind: mysql
+            image: mariadb:13.1
+          - name: "Percona Server for MySQL 8.4"
+            kind: mysql
+            image: percona/percona-server:8.4
+          - name: "Percona Server for MySQL 9.7"
+            kind: mysql
+            image: percona/percona-server:9.7
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies and optional SQLite driver
+        env:
+          KIND: ${{ matrix.kind }}
+          DRIVER_PACKAGE: ${{ matrix.driver-package }}
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+          if [ "$KIND" = "sqlite" ]; then
+            python3 -m pip install "$DRIVER_PACKAGE"
+          fi
+
+      - name: Start live database
+        if: ${{ matrix.kind != 'sqlite' }}
+        env:
+          KIND: ${{ matrix.kind }}
+          IMAGE: ${{ matrix.image }}
+          LABEL: ${{ matrix.name }}
+        run: |
+          docker pull "$IMAGE"
+          if [ "$KIND" = "postgres" ]; then
+            docker run -d --name pg-srv \
+              -e POSTGRES_USER=postgres \
+              -e POSTGRES_PASSWORD=password \
+              -e POSTGRES_DB=matview_test \
+              -p 5432:5432 \
+              "$IMAGE"
+            for i in $(seq 1 60); do
+              if docker exec pg-srv pg_isready -U postgres -d matview_test; then
+                echo "$LABEL is ready!"
+                exit 0
+              fi
+              sleep 2
+            done
+            docker logs pg-srv
+            exit 1
+          else
+            docker run -d --name mysql-srv \
+              -e MYSQL_ROOT_PASSWORD=password \
+              -e MARIADB_ROOT_PASSWORD=password \
+              -e MYSQL_DATABASE=matview_test \
+              -e MARIADB_DATABASE=matview_test \
+              -p 3306:3306 \
+              "$IMAGE" \
+              --character-set-server=utf8mb4 \
+              --collation-server=utf8mb4_unicode_ci \
+              --innodb-flush-log-at-trx-commit=0 \
+              --sync-binlog=0 \
+              --skip-log-bin
+            for i in $(seq 1 60); do
+              if docker exec mysql-srv sh -c "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent || mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent" 2>/dev/null; then
+                echo "$LABEL is ready!"
+                exit 0
+              fi
+              sleep 2
+            done
+            docker logs mysql-srv
+            exit 1
+          fi
+
+      - name: Run full test suite
+        env:
+          POSTGRES_DSN: ${{ matrix.kind == 'postgres' && 'postgresql://postgres:password@127.0.0.1:5432/matview_test' || '' }}
+          MYSQL_DSN: ${{ matrix.kind == 'mysql' && 'mysql://root:password@127.0.0.1:3306/matview_test' || '' }}
+          SQLITE_COMPAT_ENGINE: ${{ matrix.sqlite-engine || '' }}
+        run: python3 test_matview_sync.py
+
+  dependency-minimum:
+    name: Minimum declared dependencies / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "PostgreSQL 18"
+            kind: postgres
+            image: postgres:18
+          - name: "MySQL 9.7"
+            kind: mysql
+            image: mysql:9.7
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Start live database
+        env:
+          KIND: ${{ matrix.kind }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker pull "$IMAGE"
+          if [ "$KIND" = "postgres" ]; then
+            docker run -d --name db-srv \
+              -e POSTGRES_USER=postgres \
+              -e POSTGRES_PASSWORD=password \
+              -e POSTGRES_DB=matview_test \
+              -p 5432:5432 \
+              "$IMAGE"
+            for i in $(seq 1 60); do
+              if docker exec db-srv pg_isready -U postgres -d matview_test; then
+                exit 0
+              fi
+              sleep 2
+            done
+          else
+            docker run -d --name db-srv \
+              -e MYSQL_ROOT_PASSWORD=password \
+              -e MYSQL_DATABASE=matview_test \
+              -p 3306:3306 \
+              "$IMAGE" \
+              --character-set-server=utf8mb4 \
+              --collation-server=utf8mb4_unicode_ci \
+              --innodb-flush-log-at-trx-commit=0 \
+              --sync-binlog=0 \
+              --skip-log-bin
+            for i in $(seq 1 60); do
+              if docker exec db-srv mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent; then
+                exit 0
+              fi
+              sleep 2
+            done
+          fi
+          docker logs db-srv
+          exit 1
+
+      - name: Set up minimum supported Python dependency versions
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+          python3 -m pip install --force-reinstall \
+            "sqlglot==25.0.0" \
+            "psycopg2-binary==2.9.9" \
+            "pymysql==1.1.0" \
+            "cryptography==41.0.0"
+          python3 -m pip check
+
+      - name: Run full test suite with minimum dependencies
+        env:
+          POSTGRES_DSN: ${{ matrix.kind == 'postgres' && 'postgresql://postgres:password@127.0.0.1:5432/matview_test' || '' }}
+          MYSQL_DSN: ${{ matrix.kind == 'mysql' && 'mysql://root:password@127.0.0.1:3306/matview_test' || '' }}
+        run: python3 test_matview_sync.py
+
+  fuzz-stress:
+    name: Scale-3 differential fuzz / ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "SQLite 3 + transpiled PostgreSQL/MySQL"
+            backend: sqlite
+            scale: "3"
+          - label: "APSW SQLite"
+            backend: apsw
+            scale: "3"
+          - label: "PostgreSQL 17"
+            backend: postgres
+            pg-image: postgres:17
+            scale: "3"
+          - label: "PostgreSQL 18"
+            backend: postgres
+            pg-image: postgres:18
+            scale: "3"
+          - label: "MySQL 8.4"
+            backend: mysql
+            mysql-image: mysql:8.4
+            scale: "3"
+          - label: "MariaDB 11.4"
+            backend: mysql
+            mysql-image: mariadb:11.4
+            scale: "3"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies and APSW when selected
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+          if [ "$BACKEND" = "apsw" ]; then
+            python3 -m pip install apsw
+          fi
+
+      - name: Start fuzz database
+        if: ${{ matrix.backend == 'postgres' || matrix.backend == 'mysql' }}
+        env:
+          BACKEND: ${{ matrix.backend }}
+          PG_IMAGE: ${{ matrix.pg-image }}
+          MYSQL_IMAGE: ${{ matrix.mysql-image }}
+        run: |
+          if [ "$BACKEND" = "postgres" ]; then
+            docker pull "$PG_IMAGE"
+            docker run -d --name fuzz-srv \
+              -e POSTGRES_USER=postgres \
+              -e POSTGRES_PASSWORD=password \
+              -e POSTGRES_DB=matview_test \
+              -p 5432:5432 \
+              "$PG_IMAGE"
+            for i in $(seq 1 60); do
+              if docker exec fuzz-srv pg_isready -U postgres -d matview_test; then
+                exit 0
+              fi
+              sleep 2
+            done
+          else
+            docker pull "$MYSQL_IMAGE"
+            docker run -d --name fuzz-srv \
+              -e MYSQL_ROOT_PASSWORD=password \
+              -e MARIADB_ROOT_PASSWORD=password \
+              -e MYSQL_DATABASE=matview_test \
+              -e MARIADB_DATABASE=matview_test \
+              -p 3306:3306 \
+              "$MYSQL_IMAGE" \
+              --character-set-server=utf8mb4 \
+              --collation-server=utf8mb4_unicode_ci \
+              --innodb-flush-log-at-trx-commit=0 \
+              --sync-binlog=0 \
+              --skip-log-bin
+            for i in $(seq 1 60); do
+              if docker exec fuzz-srv sh -c "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent || mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent" 2>/dev/null; then
+                exit 0
+              fi
+              sleep 2
+            done
+          fi
+          docker logs fuzz-srv
+          exit 1
+
+      - name: Run scale-3 differential fuzzer
+        env:
+          BACKEND: ${{ matrix.backend }}
+          FUZZ_SCALE: ${{ matrix.scale }}
+          POSTGRES_DSN: ${{ matrix.backend == 'postgres' && 'postgresql://postgres:password@127.0.0.1:5432/matview_test' || '' }}
+          MYSQL_DSN: ${{ matrix.backend == 'mysql' && 'mysql://root:password@127.0.0.1:3306/matview_test' || '' }}
+        run: |
+          if [ "$BACKEND" = "apsw" ]; then
+            SQLITE_COMPAT_ENGINE=apsw python3 test_matview_sync.py --fuzz --fuzz-scale "$FUZZ_SCALE"
+          elif [ "$BACKEND" = "postgres" ]; then
+            python3 test_matview_sync.py --fuzz --fuzz-scale "$FUZZ_SCALE"
+          elif [ "$BACKEND" = "mysql" ]; then
+            python3 test_matview_sync.py --fuzz --fuzz-scale "$FUZZ_SCALE"
+          else
+            python3 test_matview_sync.py --fuzz --fuzz-scale "$FUZZ_SCALE"
+          fi
+
+  deferred-success:
+    name: Deferred CI success
+    if: ${{ always() }}
+    needs:
+      - python-deferred
+      - compatibility-sweep
+      - dependency-minimum
+      - fuzz-stress
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every deferred job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          results = json.loads(os.environ["NEEDS_JSON"])
+          unsuccessful = {
+              name: result["result"]
+              for name, result in results.items()
+              if result["result"] != "success"
+          }
+          if unsuccessful:
+              for name, result in sorted(unsuccessful.items()):
+                  print(f"::error::{name} did not succeed (result: {result})")
+              sys.exit(1)
+
+          print(f"All {len(results)} deferred CI jobs succeeded.")
+          PY
