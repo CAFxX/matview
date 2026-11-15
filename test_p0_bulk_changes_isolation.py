@@ -300,6 +300,68 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
                 except OSError:
                     pass
 
+    def test_sqlite_writer_reservation_failure_fails_closed_before_yield(self) -> None:
+        """A busy writer lock must abort before bulk_changes can yield or alter triggers."""
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            dbpath = tmp.name
+
+        raw_conn = sqlite3.connect(dbpath, timeout=0.05)
+        mgr = MaterializedViewManager(raw_conn)
+        try:
+            mgr.conn.execute("PRAGMA journal_mode = WAL;")
+            mgr.apply_schema_ddl(
+                "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT);",
+                auto_sync_views=False,
+            )
+            mgr.conn.execute("INSERT INTO accounts VALUES (1, 100);")
+            mgr.conn.commit()
+            mgr.register_view(
+                "CREATE VIEW v_total_bal AS SELECT SUM(balance) AS total FROM accounts;"
+            )
+            trigger_names = list(mgr.get_catalog()["v_total_bal"]["trigger_names"])
+            self.assertTrue(trigger_names)
+            before = {
+                row[0]
+                for row in mgr.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger';"
+                ).fetchall()
+            }
+            self.assertTrue(set(trigger_names).issubset(before))
+
+            blocker = sqlite3.connect(dbpath, timeout=0.05, isolation_level=None)
+            try:
+                blocker.execute("BEGIN IMMEDIATE;")
+                yielded = False
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked|busy"):
+                    with mgr.bulk_changes():
+                        yielded = True
+                self.assertFalse(yielded, "bulk_changes must not yield without its writer reservation")
+
+                after = {
+                    row[0]
+                    for row in mgr.conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='trigger';"
+                    ).fetchall()
+                }
+                self.assertTrue(
+                    set(trigger_names).issubset(after),
+                    "trigger maintenance must remain installed after lock acquisition fails",
+                )
+            finally:
+                blocker.rollback()
+                blocker.close()
+
+            mgr.conn.execute("INSERT INTO accounts VALUES (2, 200);")
+            expected = mgr.conn.execute(
+                "SELECT SUM(balance) FROM accounts;"
+            ).fetchone()[0]
+            actual = mgr.conn.execute(
+                "SELECT total FROM v_total_bal;"
+            ).fetchone()[0]
+            self.assertEqual(actual, expected)
+        finally:
+            mgr.conn.close()
+
     def test_sqlite_concurrent_writer_blocked_during_bulk_changes(self) -> None:
         """While Connection A is inside with manager.bulk_changes(), Connection B is
 
