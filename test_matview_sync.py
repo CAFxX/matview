@@ -4073,6 +4073,21 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 self.assertEqual(items["variance_alias"].agg_func, variance_func)
                 self.assertEqual(items["stddev_alias"].agg_func, stddev_func)
 
+        mysql_std = generate_materialized_view(
+            schema,
+            "CREATE VIEW alias_std AS SELECT grp, STD(value) AS std_alias FROM alias_values GROUP BY grp;",
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+        )
+        self.assertEqual(mysql_std.view_spec.select_items[1].agg_func, AggFunc.STDDEV_POP)
+        with self.assertRaisesRegex(ValueError, "STD\\(\\) is not a PostgreSQL aggregate alias"):
+            generate_materialized_view(
+                schema,
+                "CREATE VIEW alias_std_pg AS SELECT grp, STD(value) AS std_alias FROM alias_values GROUP BY grp;",
+                dialect=Dialect.POSTGRES,
+                ignore_limitations=True,
+            )
+
     def test_native_statistical_aliases_match_engine_live_query(self) -> None:
         runner = MVTestRunner()
         targets = []
@@ -4088,17 +4103,17 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 conn, cur, _, _, engine_label, close_fn = runner._open_backend_session(
                     dialect, suite_tag=f"stat_alias_{dialect.value}"
                 )
-                self.assertTrue(
-                    engine_label.startswith("LIVE "),
-                    f"{dialect.value} DSN was configured but the test did not obtain a native session: {engine_label}",
-                )
                 suffix = f"{dialect.value}_{id(self):x}".replace("-", "_")
                 table = f"alias_src_{suffix}"
                 view = f"alias_mv_{suffix}"
                 manager = None
                 try:
+                    self.assertTrue(
+                        engine_label.startswith("LIVE "),
+                        f"{dialect.value} DSN was configured but the test did not obtain a native session: {engine_label}",
+                    )
                     cur.execute(
-                        f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, grp VARCHAR(32) NOT NULL, value DECIMAL(12, 2) NOT NULL)"
+                        f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, grp VARCHAR(32) NOT NULL, value DOUBLE PRECISION NOT NULL)"
                     )
                     for row in [(1, "A", 1), (2, "A", 3), (3, "A", 5), (4, "B", 7)]:
                         cur.execute(

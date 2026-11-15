@@ -532,10 +532,13 @@ def _resolve_statistical_aggregate_alias(item: SelectItem, dialect: Dialect) -> 
         return item
     alias = match.group(1).upper()
     if dialect == Dialect.POSTGRES:
+        if alias == "STD":
+            raise ValueError(
+                "STD() is not a PostgreSQL aggregate alias; use STDDEV_SAMP() explicitly"
+            )
         target = {
             "VARIANCE": AggFunc.VAR_SAMP,
             "STDDEV": AggFunc.STDDEV_SAMP,
-            "STD": AggFunc.STDDEV_SAMP,
         }[alias]
     else:
         # MySQL/MariaDB define these aliases as population statistics. SQLite's
@@ -546,6 +549,7 @@ def _resolve_statistical_aggregate_alias(item: SelectItem, dialect: Dialect) -> 
             "STD": AggFunc.STDDEV_POP,
         }[alias]
     return replace(item, agg_func=target)
+
 
 @dataclass(frozen=True)
 class JoinSpec:
