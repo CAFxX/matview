@@ -248,7 +248,9 @@ jobs:
             "sqlglot==25.0.0" \
             "psycopg2-binary==2.9.9" \
             "pymysql==1.1.0" \
-            "cryptography==41.0.0"
+            "cryptography==41.0.0" \
+            "hypothesis==6.100.0" \
+            "pytest==8.0.0"
           python3 -m pip check
 
       - name: Run full test suite with minimum dependencies
