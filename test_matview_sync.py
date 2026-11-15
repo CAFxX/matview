@@ -4479,6 +4479,79 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertEqual(statements[-1], "ROLLBACK;")
 
+    def test_00e_partial_trigger_suspension_failure_rolls_back(self) -> None:
+        for dialect in (Dialect.SQLITE, Dialect.POSTGRES):
+            with self.subTest(dialect=dialect.value):
+                statements: List[str] = []
+
+                class Cursor:
+                    def execute(self, statement: str, params: Any = None) -> None:
+                        sql = str(statement).strip()
+                        statements.append(sql)
+                        if dialect == Dialect.SQLITE and sql == "DROP TRIGGER IF EXISTS second_trigger;":
+                            raise RuntimeError("injected second trigger drop failure")
+                        if dialect == Dialect.POSTGRES and sql == "SET LOCAL matview.skip_triggers = 'on';":
+                            raise RuntimeError("injected SET LOCAL failure")
+                        if dialect == Dialect.POSTGRES and sql == "DROP FUNCTION IF EXISTS second_fn() CASCADE;":
+                            raise RuntimeError("injected second function drop failure")
+
+                    def close(self) -> None:
+                        statements.append("CLOSE CURSOR;")
+
+                class Connection:
+                    autocommit = False
+                    in_transaction = False
+
+                    def cursor(self) -> Cursor:
+                        return Cursor()
+
+                    def get_transaction_status(self) -> int:
+                        return 0
+
+                    def rollback(self) -> None:
+                        statements.append("ROLLBACK;")
+
+                manager = MaterializedViewManager.__new__(MaterializedViewManager)
+                manager.conn = Connection()
+                manager.dialect = dialect
+                if dialect == Dialect.SQLITE:
+                    manager.get_catalog = lambda: {
+                        "v_guard": {
+                            "view_name": "v_guard",
+                            "trigger_names": ["first_trigger", "second_trigger"],
+                            "function_names": [],
+                            "view_sql": "CREATE VIEW v_guard AS SELECT id FROM guarded_rows;",
+                        }
+                    }
+                else:
+                    manager.get_catalog = lambda: {
+                        "v_guard": {
+                            "view_name": "v_guard",
+                            "trigger_names": [],
+                            "function_names": ["first_fn", "second_fn"],
+                            "view_sql": "CREATE VIEW v_guard AS SELECT id FROM guarded_rows;",
+                        }
+                    }
+
+                with self.assertRaisesRegex(RuntimeError, "second .* drop failure"):
+                    with manager.bulk_changes():
+                        self.fail("user block must not run after partial trigger suspension")
+
+                self.assertTrue(
+                    any(sql.startswith("ROLLBACK TO SAVEPOINT ") for sql in statements),
+                    statements,
+                )
+                self.assertTrue(
+                    any(sql.startswith("RELEASE SAVEPOINT ") for sql in statements),
+                    statements,
+                )
+                self.assertEqual(statements[-2:], ["ROLLBACK;", "CLOSE CURSOR;"])
+                if dialect == Dialect.SQLITE:
+                    self.assertIn("BEGIN IMMEDIATE;", statements)
+                    self.assertIn("DROP TRIGGER IF EXISTS first_trigger;", statements)
+                else:
+                    self.assertIn("DROP FUNCTION IF EXISTS first_fn() CASCADE;", statements)
+
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
