@@ -11211,6 +11211,7 @@ class MaterializedViewManager:
                     "bulk_changes() could not establish or clear the MySQL/MariaDB "
                     "session trigger-bypass flag; discard this connection before reuse"
                 ) from bypass_reset_error
+            close_cursor()
             raise RuntimeError(
                 "bulk_changes() on MySQL/MariaDB requires session trigger bypass; "
                 "the trigger-DDL fallback is unsafe because MySQL implicitly commits DDL"
