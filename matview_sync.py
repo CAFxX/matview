@@ -10281,57 +10281,77 @@ class MaterializedViewManager:
                 "discard this connection object and its physical session"
             )
 
-    def _mysql_transaction_state(self) -> Optional[bool]:
-        """
-        Return the connection's authoritative MySQL transaction state.
-
-        MySQL-family DB-API drivers expose this either as in_transaction
-        (for example mysql-connector) or as the server status bitmask
-        server_status (for example PyMySQL/mysqlclient). Do not probe with
-        SQL here: a SELECT can itself start a transaction when autocommit is
-        disabled, which would make the probe change the state being measured.
-        """
-        try:
-            state = getattr(self.conn, "in_transaction")
-        except Exception:
-            state = None
-        if isinstance(state, bool):
-            return state
-        if isinstance(state, int) and state in (0, 1):
-            return bool(state)
-
-        # SERVER_STATUS_IN_TRANS is bit 0 (value 0x0001) in the MySQL
-        # protocol. Some adapters expose it as _server_status instead.
-        for attr in ("server_status", "_server_status"):
-            try:
-                status = getattr(self.conn, attr)
-            except Exception:
+    def _connection_wrapper_chain(self) -> List[Any]:
+        """Return the DB-API connection and any discoverable wrapped driver layers."""
+        candidates = []
+        pending = [self.conn]
+        seen = set()
+        while pending:
+            candidate = pending.pop()
+            if candidate is None or id(candidate) in seen:
                 continue
-            if isinstance(status, int) and not isinstance(status, bool):
-                return bool(status & 0x0001)
-        return None
+            seen.add(id(candidate))
+            candidates.append(candidate)
+            for attr in ("connection", "driver_connection", "dbapi_connection", "_connection"):
+                try:
+                    nested = getattr(candidate, attr, None)
+                except Exception:
+                    nested = None
+                if nested is not None and nested is not candidate:
+                    pending.append(nested)
+        return candidates
+
+    def _mysql_transaction_state(self) -> Optional[bool]:
+        """Return MySQL transaction state across facade and wrapped DB-API layers."""
+        observed = False
+        active = False
+        for candidate in self._connection_wrapper_chain():
+            try:
+                state = getattr(candidate, "in_transaction", None)
+            except Exception:
+                state = None
+            if callable(state):
+                try:
+                    state = state()
+                except Exception:
+                    state = None
+            if isinstance(state, bool) or (
+                isinstance(state, int) and not isinstance(state, bool) and state in (0, 1)
+            ):
+                observed = True
+                active = active or bool(state)
+            for attr in ("server_status", "_server_status"):
+                try:
+                    status = getattr(candidate, attr, None)
+                except Exception:
+                    status = None
+                if isinstance(status, int) and not isinstance(status, bool):
+                    observed = True
+                    active = active or bool(status & 0x0001)
+        return active if observed else None
 
     def _mysql_autocommit_state(self) -> Optional[bool]:
-        """Return the configured MySQL autocommit mode without changing it."""
-        try:
-            getter = getattr(self.conn, "get_autocommit", None)
-        except Exception:
-            getter = None
-        if callable(getter):
-            try:
-                value = getter()
+        """Return MySQL autocommit mode across facade and wrapped driver layers."""
+        observed = []
+        for candidate in self._connection_wrapper_chain():
+            getter = getattr(candidate, "get_autocommit", None)
+            if callable(getter):
+                try:
+                    value = getter()
+                    if isinstance(value, bool):
+                        observed.append(value)
+                except Exception:
+                    pass
+            for attr in ("autocommit", "autocommit_mode"):
+                try:
+                    value = getattr(candidate, attr, None)
+                except Exception:
+                    continue
                 if isinstance(value, bool):
-                    return value
-            except Exception:
-                pass
-        for attr in ("autocommit", "autocommit_mode"):
-            try:
-                value = getattr(self.conn, attr)
-            except Exception:
-                continue
-            if isinstance(value, bool):
-                return value
-        return None
+                    observed.append(value)
+        if not observed:
+            return None
+        return any(observed)
 
     def _commit(self) -> None:
         if hasattr(self.conn, "commit"):
@@ -10343,6 +10363,98 @@ class MaterializedViewManager:
                 self.conn.rollback()
             except Exception:
                 pass
+
+    @staticmethod
+    def _require_idle_postgres_connection(conn: Any) -> None:
+        """Fail closed unless the PostgreSQL connection and wrapped driver are idle."""
+        # SQLAlchemy and pool adapters can expose an idle facade while application
+        # code has started a transaction directly on the underlying DB-API driver.
+        candidates = []
+        pending = [conn]
+        seen = set()
+        while pending:
+            candidate = pending.pop()
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            candidates.append(candidate)
+            for attr in ("connection", "driver_connection", "dbapi_connection", "_connection"):
+                try:
+                    nested = getattr(candidate, attr, None)
+                except Exception:
+                    nested = None
+                if nested is not None and nested is not candidate:
+                    pending.append(nested)
+
+        observed_autocommit = False
+        for candidate in candidates:
+            autocommit = getattr(candidate, "autocommit", None)
+            if autocommit is not None:
+                observed_autocommit = True
+                if autocommit is not False:
+                    raise RuntimeError(
+                        "PostgreSQL manager initialization requires autocommit=False "
+                        "to preserve transactional DDL atomicity"
+                    )
+        if not observed_autocommit:
+            raise RuntimeError(
+                "PostgreSQL manager initialization requires an adapter that exposes "
+                "autocommit state; cannot safely guarantee transactional DDL"
+            )
+
+        observed_transaction_state = False
+        for candidate in candidates:
+            state = getattr(candidate, "in_transaction", None)
+            if callable(state):
+                try:
+                    state = state()
+                except Exception:
+                    state = None
+            if isinstance(state, bool):
+                observed_transaction_state = True
+                if state:
+                    raise RuntimeError(
+                        "PostgreSQL manager initialization cannot run inside an active caller "
+                        "transaction; commit or roll back that transaction first"
+                    )
+                continue
+
+            status = None
+            getter = getattr(candidate, "get_transaction_status", None)
+            if callable(getter):
+                try:
+                    status = getter()
+                except Exception:
+                    status = None
+            if status is None:
+                info = getattr(candidate, "info", None)
+                status = getattr(info, "transaction_status", None)
+            if status is None:
+                continue
+            try:
+                state = int(status) != 0
+            except (TypeError, ValueError):
+                state_text = str(status).lower()
+                if state_text.endswith("idle"):
+                    state = False
+                else:
+                    raise RuntimeError(
+                        "PostgreSQL manager initialization could not interpret "
+                        "the connection transaction state"
+                    )
+            observed_transaction_state = True
+            if state:
+                raise RuntimeError(
+                    "PostgreSQL manager initialization cannot run inside an active caller "
+                    "transaction; commit or roll back that transaction first"
+                )
+
+        if not observed_transaction_state:
+            raise RuntimeError(
+                "PostgreSQL manager initialization requires an adapter that exposes "
+                "transaction state; cannot safely determine whether a caller transaction "
+                "would be committed"
+            )
 
     def _param_placeholder(self) -> str:
         return "?" if self.dialect == Dialect.SQLITE else "%s"
@@ -11099,38 +11211,10 @@ class MaterializedViewManager:
                     "use_shadow_swap: those options execute DDL that implicitly commits"
                 )
 
-        # PostgreSQL savepoints compose safely with a caller transaction,
-        # but this context currently owns its final commit. Reject such a
-        # transaction before get_catalog()/introspection can start or alter it.
+        # PostgreSQL's context owns its final commit. Inspect facade and
+        # wrapped DB-API layers before get_catalog() can start a transaction.
         if self.dialect == Dialect.POSTGRES:
-            pg_transaction_state = getattr(self.conn, "in_transaction", None)
-            if not isinstance(pg_transaction_state, bool):
-                pg_status = None
-                status_getter = getattr(self.conn, "get_transaction_status", None)
-                if callable(status_getter):
-                    try:
-                        pg_status = status_getter()
-                    except Exception:
-                        pg_status = None
-                if pg_status is None:
-                    pg_info = getattr(self.conn, "info", None)
-                    pg_status = getattr(pg_info, "transaction_status", None)
-                if pg_status is None:
-                    raise RuntimeError(
-                        "bulk_changes() on PostgreSQL requires an adapter exposing "
-                        "transaction state; refusing to risk committing caller work"
-                    )
-                try:
-                    pg_transaction_state = int(pg_status) != 0
-                except (TypeError, ValueError):
-                    raise RuntimeError(
-                        "bulk_changes() could not interpret PostgreSQL transaction state"
-                    )
-            if pg_transaction_state:
-                raise RuntimeError(
-                    "bulk_changes() on PostgreSQL cannot run inside an active caller "
-                    "transaction; commit or roll back it first"
-                )
+            self._require_idle_postgres_connection(self.conn)
 
         # SQLite DDL is not automatically transactional. Reserve the writer
         # before catalog reads or trigger suspension; if an adapter hides
