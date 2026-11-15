@@ -11232,6 +11232,7 @@ class MaterializedViewManager:
                 )
             cur = self.conn.cursor()
         try:
+            if self.dialect == Dialect.SQLITE:
                 try:
                     cur.execute("BEGIN IMMEDIATE;")
                 except Exception:
