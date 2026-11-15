@@ -10214,6 +10214,37 @@ class MaterializedViewManager:
             except Exception:
                 pass
 
+    def _assert_registration_transaction_ownership(self) -> None:
+        """Reject transaction modes that registration cannot safely own.
+
+        Registration performs DDL and commits its work. It must not silently
+        commit a transaction opened by the caller, nor claim rollback atomicity
+        when PostgreSQL autocommit is enabled.
+        """
+        if self.dialect == Dialect.SQLITE:
+            if getattr(self.conn, "in_transaction", None) is True:
+                raise RuntimeError(
+                    "register_view/sync_views require an idle SQLite connection; "
+                    "commit or roll back the caller transaction first"
+                )
+            return
+
+        if self.dialect == Dialect.POSTGRES:
+            if bool(getattr(self.conn, "autocommit", False)):
+                raise RuntimeError(
+                    "register_view/sync_views require PostgreSQL autocommit=False "
+                    "for transactional DDL"
+                )
+            status_getter = getattr(self.conn, "get_transaction_status", None)
+            if callable(status_getter):
+                # psycopg2.extensions.TRANSACTION_STATUS_IDLE is 0.
+                status = status_getter()
+                if status != 0:
+                    raise RuntimeError(
+                        "register_view/sync_views require an idle PostgreSQL connection; "
+                        "commit or roll back the caller transaction first"
+                    )
+
     def _param_placeholder(self) -> str:
         return "?" if self.dialect == Dialect.SQLITE else "%s"
 
@@ -10625,41 +10656,38 @@ class MaterializedViewManager:
             if self.dialect != Dialect.SQLITE:
                 return False
             transaction_active = getattr(self.conn, "in_transaction", None)
-            if transaction_active:
-                return True
-            try:
-                cur.execute("BEGIN IMMEDIATE;")
-            except Exception as exc:
-                message = str(exc).lower()
-                already_active = (
-                    transaction_active is None
-                    and (
-                        "within a transaction" in message
-                        or "already in a transaction" in message
-                    )
+            if transaction_active is True:
+                raise RuntimeError(
+                    "SQLite registration cannot join a caller-owned transaction"
                 )
-                if not already_active:
-                    raise
+            # If the adapter does not expose in_transaction, BEGIN IMMEDIATE is
+            # the fail-closed probe: it succeeds only when this operation can
+            # establish and own the writer transaction.
+            cur.execute("BEGIN IMMEDIATE;")
             return True
 
         try:
             if existing:
-                # SQLite and PostgreSQL support transactional DDL. For a single-shot
-                # replacement, keep removal of the old reader/backing objects in the
-                # same transaction as creation and population of the replacement, so
-                # a failed rebuild restores the previously working materialized view.
-                # MySQL/MariaDB implicitly commit DDL, and incremental backfills
-                # intentionally commit chunks; those paths still require a future
-                # shadow-generation publication protocol.
-                transactional_replacement = (
-                    not incremental_backfill
-                    and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES)
-                )
-                if transactional_replacement:
-                    sqlite_writer_reserved = reserve_sqlite_writer()
-                    self.drop_view(plan.view_name, _commit_transaction=False)
-                else:
-                    self.drop_view(plan.view_name)
+                # Never destroy the currently published generation unless all
+                # replacement DDL/population can be rolled back as one transaction.
+                if incremental_backfill or self.dialect not in (
+                    Dialect.SQLITE,
+                    Dialect.POSTGRES,
+                ):
+                    raise RuntimeError(
+                        "Replacing an existing materialized view is unsupported for "
+                        f"{self.dialect.value} with incremental_backfill={incremental_backfill}; "
+                        "a shadow-generation publication protocol is required"
+                    )
+                if (
+                    self.dialect == Dialect.POSTGRES
+                    and bool(getattr(self.conn, "autocommit", False))
+                ):
+                    raise RuntimeError(
+                        "PostgreSQL replacement requires autocommit=False"
+                    )
+                sqlite_writer_reserved = reserve_sqlite_writer()
+                self.drop_view(plan.view_name, _commit_transaction=False)
 
             # Reserve before the first structure/trigger DDL on new registrations.
             # For SQLite this also closes the trigger-installation/backfill writer
@@ -10734,6 +10762,7 @@ class MaterializedViewManager:
         Safely installs or updates one or more materialized views on the connected database.
         Supports both single-view and multi-view SQL scripts seamlessly.
         """
+        self._assert_registration_transaction_ownership()
         effective_ignore = (
             self.ignore_limitations if ignore_limitations is None else ignore_limitations
         )
@@ -10803,6 +10832,7 @@ class MaterializedViewManager:
         the connected database (supporting multi-view SQL files/strings as well).
         Returns a status map `{view_name: "created" | "updated" | "unchanged" | "dropped"}`.
         """
+        self._assert_registration_transaction_ownership()
         effective_ignore = (
             self.ignore_limitations if ignore_limitations is None else ignore_limitations
         )
