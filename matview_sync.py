@@ -527,7 +527,7 @@ class SelectItem:
 
 def _resolve_statistical_aggregate_alias(item: SelectItem, dialect: Dialect) -> SelectItem:
     """Resolve VARIANCE/STDDEV aliases using the target engine's native SQL semantics."""
-    match = re.match(r"^\s*(VARIANCE|STDDEV|STD)\s*\(", item.raw_expr, flags=re.IGNORECASE)
+    match = re.match(r"^\s*\(*\s*(VARIANCE|STDDEV|STD)\s*\(", item.raw_expr, flags=re.IGNORECASE)
     if match is None:
         return item
     alias = match.group(1).upper()
