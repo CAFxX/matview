@@ -29,6 +29,28 @@ def main() -> None:
     table = "mv_tx_owner_" + suffix
     view = "mv_tx_owner_view_" + suffix
     try:
+        # Construction itself must not commit an already-active caller
+        # transaction: it performs version detection and catalog initialization.
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE TABLE "mv_constructor_owner_{suffix}" (id INTEGER PRIMARY KEY)')
+        conn.commit()
+        constructor_table = "mv_constructor_owner_" + suffix
+        with conn.cursor() as cur:
+            cur.execute("BEGIN")
+            cur.execute(f'INSERT INTO "{constructor_table}" VALUES (1)')
+        assert conn.get_transaction_status() == extensions.TRANSACTION_STATUS_INTRANS
+        try:
+            MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
+        except RuntimeError as exc:
+            assert "active caller transaction" in str(exc), str(exc)
+        else:
+            raise AssertionError("manager construction accepted a caller-owned transaction")
+        assert conn.get_transaction_status() == extensions.TRANSACTION_STATUS_INTRANS
+        with observer.cursor() as cur:
+            cur.execute(f'SELECT COUNT(*) FROM "{constructor_table}"')
+            assert cur.fetchone()[0] == 0, "manager construction committed caller-owned DML"
+        conn.rollback()
+
         manager = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
 
         # With autocommit enabled, each DDL statement would commit separately.
