@@ -1764,6 +1764,61 @@ def _aggregate_function_for_dialect(fn_raw: str, dialect: Optional[Dialect]) -> 
     return _FN_TO_AGG_ENUM[fn_up]
 
 
+def _resolve_statistical_aggregate_alias_item(
+    item: SelectItem, dialect: Dialect
+) -> SelectItem:
+    """Resolve statistical aliases using the target engine's SQL contract."""
+    if dialect == Dialect.POSTGRES:
+        # Also validate aliases nested inside scalar expressions, where the
+        # projection itself is not represented as a top-level aggregate item.
+        tokens = sqlglot.tokenize(item.raw_expr, read="sqlite")
+        for index, token in enumerate(tokens[:-1]):
+            if (
+                token.text.upper() == "STD"
+                and tokens[index + 1].token_type == SQLGlotTokenType.L_PAREN
+            ):
+                raise ValueError(
+                    "STD() is not a PostgreSQL aggregate alias; use STDDEV_SAMP() or STDDEV()"
+                )
+    if not item.is_aggregate:
+        return item
+    match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", item.raw_expr)
+    alias_func = match.group(1).upper() if match else ""
+    if dialect == Dialect.POSTGRES:
+        aliases = {
+            "VARIANCE": AggFunc.VAR_SAMP,
+            "STDDEV": AggFunc.STDDEV_SAMP,
+        }
+        resolved_func = aliases.get(alias_func)
+        if resolved_func is not None:
+            return replace(item, agg_func=resolved_func)
+    return item
+
+
+def _resolve_statistical_aggregate_aliases(
+    view_spec: ViewSpec, dialect: Dialect
+) -> ViewSpec:
+    """Resolve statistical aliases recursively before planning."""
+    resolved_items = tuple(
+        _resolve_statistical_aggregate_alias_item(item, dialect)
+        for item in view_spec.select_items
+    )
+    resolved_additional = tuple(
+        _resolve_statistical_aggregate_aliases(extra, dialect)
+        for extra in view_spec.additional_views
+    )
+    if (
+        resolved_items == view_spec.select_items
+        and resolved_additional == view_spec.additional_views
+    ):
+        return view_spec
+    return replace(
+        view_spec,
+        select_items=resolved_items,
+        additional_views=resolved_additional,
+    )
+
+
 def _unwrap_outer_parens(sql: str) -> str:
     s = sql.strip()
     while s.startswith("(") and s.endswith(")"):
@@ -2373,6 +2428,10 @@ def parse_view_ast(
         else item
         for idx, item in enumerate(vs.select_items)
     )
+    dialect_select_items = tuple(
+        _resolve_statistical_aggregate_alias_item(item, dialect)
+        for item in dialect_select_items
+    )
     cte_names, main_sel, has_cte = _extract_cte_names_and_strip_with(vs.raw_select_sql)
     return SQLSelectAST(
         raw_sql=vs.raw_select_sql,
@@ -2744,7 +2803,6 @@ class IncrementalViewCompiler:
         self._schemas_lower: Dict[str, TableSchema] = {
             k.lower(): v for k, v in self.schemas.items()
         }
-        self.raw_view = view_spec
         if engine_version is not None:
             self.engine_version = parse_engine_version(
                 engine_version,
@@ -2754,6 +2812,8 @@ class IncrementalViewCompiler:
             self.engine_version = parse_engine_version(dialect)
         self.dialect: Dialect = self.engine_version.dialect
         self.subdialect: EngineSubdialect = self.engine_version.subdialect
+        view_spec = _resolve_statistical_aggregate_aliases(view_spec, self.dialect)
+        self.raw_view = view_spec
         # Automatically disable transition tables if targeting PostgreSQL < 10.0
         self.pg_use_transition_tables = bool(
             pg_use_transition_tables and self.engine_version.supports_pg_transition_tables
@@ -3303,6 +3363,9 @@ class IncrementalViewCompiler:
                             )
                             if parsed_el is None:
                                 return expr_str, False
+                            parsed_el = _resolve_statistical_aggregate_alias_item(
+                                parsed_el, self.dialect
+                            )
                             agg_call_to_alias[norm_key] = col_al
                             work_items.append(parsed_el)
                             extra_having_items.append(parsed_el)
