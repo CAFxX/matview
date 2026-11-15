@@ -53,6 +53,17 @@ def main() -> None:
             assert cur.fetchone()[0] is None
         conn.autocommit = False
 
+        # Successful and no-op registration/sync must close transactions they
+        # opened for introspection, otherwise the next operation would mistake
+        # manager-owned reads for caller-owned work.
+        view_sql = f"CREATE VIEW {view} AS SELECT 1 AS value;"
+        manager.register_view(view_sql)
+        assert conn.get_transaction_status() == extensions.TRANSACTION_STATUS_IDLE
+        manager.register_view(view_sql)
+        assert conn.get_transaction_status() == extensions.TRANSACTION_STATUS_IDLE
+        manager.sync_views(view_sql)
+        assert conn.get_transaction_status() == extensions.TRANSACTION_STATUS_IDLE
+
         # A caller-owned transaction must not be committed or rolled back by
         # registration/sync. Its uncommitted row stays invisible to another
         # connection, and the transaction remains active after both rejections.
