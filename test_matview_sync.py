@@ -949,6 +949,16 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
     execution, `bulk_changes`, and `drop_view`) against a live database connection.
     """
     checks = 0
+    if dialect == Dialect.MYSQL:
+        # bulk_changes() requires transactional DB-API mode. The live MySQL
+        # connector helper normally uses autocommit for the broader test
+        # battery; switch only this manager-lifecycle connection to explicit
+        # transactions. The transpiled adapter already models this contract.
+        autocommit = getattr(conn, "autocommit", None)
+        if callable(autocommit):
+            autocommit(False)
+        elif isinstance(autocommit, bool):
+            conn.autocommit = False
     drop_suffix = " CASCADE" if dialect == Dialect.POSTGRES else ""
     for v_n in ("v_mgr_alg", "v_mgr_dist", "v_mgr_win", "v_mgr_off", "v_mgr_right", "v_mgr_full"):
         cur.execute(f"DROP VIEW IF EXISTS __matview_{v_n}{drop_suffix};")
@@ -1070,6 +1080,12 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
         _verify_external_db_mv(cur, "v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:alg_updated")
         checks += 1
 
+        # SELECT-based verification above starts a transaction on a
+        # non-autocommit MySQL connection. End it explicitly so the following
+        # call exercises the context-owned transaction path.
+        if dialect == Dialect.MYSQL:
+            conn.commit()
+
         # 6. bulk_changes context manager
         with mgr.bulk_changes():
             cur.execute("INSERT INTO mgr_items VALUES (6, 'A', 'z', 100), (7, 'D', 'w', 25);")
@@ -1078,6 +1094,27 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
         _verify_external_db_mv(cur, "v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:bulk_alg")
         _verify_external_db_mv(cur, "v_mgr_dist", q_dist, f"{dialect.value}:mgr:bulk_dist")
         checks += 2
+
+        # Native MySQL/MariaDB: a caller-owned transaction must survive the
+        # context uncommitted, and rolling it back must undo both base-table
+        # changes and the DML refresh of every materialized reader.
+        if dialect == Dialect.MYSQL and callable(getattr(conn, "begin", None)):
+            conn.commit()
+            conn.begin()
+            cur.execute("INSERT INTO mgr_items VALUES (9, 'Z', 'caller_tx', 90);")
+            with mgr.bulk_changes():
+                pass
+            assert mgr._mysql_transaction_state() is True, (
+                "bulk_changes committed a caller-owned MySQL/MariaDB transaction"
+            )
+            _verify_external_db_mv(cur, "v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:caller_tx_inside")
+            _verify_external_db_mv(cur, "v_mgr_dist", q_dist, f"{dialect.value}:mgr:caller_tx_inside_dist")
+            conn.rollback()
+            cur.execute("SELECT COUNT(*) FROM mgr_items WHERE id = 9;")
+            assert int(cur.fetchone()[0]) == 0, "caller rollback did not undo base-table DML"
+            _verify_external_db_mv(cur, "v_mgr_alg", q_alg_v2, f"{dialect.value}:mgr:caller_tx_rollback")
+            _verify_external_db_mv(cur, "v_mgr_dist", q_dist, f"{dialect.value}:mgr:caller_tx_rollback_dist")
+            checks += 4
 
         # 7. ALTER TABLE schema migration via apply_schema_ddl + trigger rebuild
         mgr.apply_schema_ddl("ALTER TABLE mgr_items ADD COLUMN note VARCHAR(32) DEFAULT 'ok';")
