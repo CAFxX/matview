@@ -10635,7 +10635,7 @@ class MaterializedViewManager:
                 # that a transaction is already active, retain the caller's
                 # transaction rather than treating the wrapper as autocommit.
                 transaction_active = getattr(self.conn, "in_transaction", None)
-                if transaction_active is not True:
+                if not transaction_active:
                     try:
                         cur.execute("BEGIN IMMEDIATE;")
                     except Exception as exc:
