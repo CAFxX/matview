@@ -980,5 +980,22 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         )
 
 
+    def test_mysql_bulk_changes_rejects_implicit_commit_options_before_catalog_access(self) -> None:
+        class Connection:
+            def cursor(self):
+                raise AssertionError("unsafe options must be rejected before SQL")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = Connection()
+        manager.dialect = Dialect.MYSQL
+        manager.get_catalog = lambda: self.fail("unsafe options must be rejected before catalog access")
+
+        for options in ({"drop_triggers": True}, {"use_shadow_swap": True}):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(RuntimeError, "implicitly committing DDL"):
+                    with manager.bulk_changes(**options):
+                        self.fail("unsafe MySQL DDL option must be rejected")
+
+
 if __name__ == "__main__":
     unittest.main()
