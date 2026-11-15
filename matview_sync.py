@@ -10240,43 +10240,76 @@ class MaterializedViewManager:
 
     @staticmethod
     def _require_idle_postgres_connection(conn: Any) -> None:
-        """Fail closed unless a PostgreSQL connection is idle and non-autocommit."""
-        autocommit = getattr(conn, "autocommit", None)
-        if autocommit is None:
-            adapter_connection = getattr(conn, "connection", None)
-            driver_connection = getattr(
-                adapter_connection, "driver_connection", adapter_connection
-            )
-            autocommit = getattr(driver_connection, "autocommit", None)
-        if autocommit is not False:
-            raise RuntimeError(
-                "PostgreSQL manager initialization requires autocommit=False "
-                "to preserve transactional DDL atomicity"
-            )
+        """Fail closed unless every wrapped PostgreSQL driver is idle and non-autocommit."""
+        candidates = []
+        leaves = []
+        pending = [conn]
+        seen = set()
+        while pending:
+            candidate = pending.pop()
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            candidates.append(candidate)
+            has_nested = False
+            for attr in ("connection", "driver_connection", "dbapi_connection", "_connection"):
+                try:
+                    nested = getattr(candidate, attr, None)
+                except Exception:
+                    nested = None
+                if nested is not None and nested is not candidate:
+                    pending.append(nested)
+                    has_nested = True
+            if not has_nested:
+                leaves.append(candidate)
 
-        state = getattr(conn, "in_transaction", None)
-        if callable(state):
-            try:
-                state = state()
-            except Exception:
-                state = None
-        if not isinstance(state, bool):
+        # The outer facade can be idle while a caller has opened a transaction
+        # directly on the raw driver. Require authoritative state on every leaf.
+        for candidate in candidates:
+            autocommit = getattr(candidate, "autocommit", None)
+            if autocommit is True:
+                raise RuntimeError(
+                    "PostgreSQL manager initialization requires autocommit=False "
+                    "to preserve transactional DDL atomicity"
+                )
+        for leaf in leaves:
+            if getattr(leaf, "autocommit", None) is not False:
+                raise RuntimeError(
+                    "PostgreSQL manager initialization requires the underlying driver "
+                    "to expose autocommit=False; cannot safely guarantee transactional DDL"
+                )
+
+        checked_leaves = set()
+        leaf_ids = {id(leaf) for leaf in leaves}
+        for candidate in candidates:
+            state = getattr(candidate, "in_transaction", None)
+            if callable(state):
+                try:
+                    state = state()
+                except Exception:
+                    state = None
+            if isinstance(state, bool):
+                if id(candidate) in leaf_ids:
+                    checked_leaves.add(id(candidate))
+                if state:
+                    raise RuntimeError(
+                        "PostgreSQL manager initialization cannot run inside an active caller "
+                        "transaction; commit or roll back that transaction first"
+                    )
+                continue
+
             status = None
-            getter = getattr(conn, "get_transaction_status", None)
+            getter = getattr(candidate, "get_transaction_status", None)
             if callable(getter):
                 try:
                     status = getter()
                 except Exception:
                     status = None
             if status is None:
-                info = getattr(conn, "info", None)
+                info = getattr(candidate, "info", None)
                 status = getattr(info, "transaction_status", None)
             if status is None:
-                raise RuntimeError(
-                    "PostgreSQL manager initialization requires an adapter that exposes "
-                    "transaction state; cannot safely determine whether a caller transaction "
-                    "would be committed"
-                )
+                continue
             try:
                 state = int(status) != 0
             except (TypeError, ValueError):
@@ -10288,10 +10321,18 @@ class MaterializedViewManager:
                         "PostgreSQL manager initialization could not interpret "
                         "the connection transaction state"
                     )
-        if state:
+            if id(candidate) in leaf_ids:
+                checked_leaves.add(id(candidate))
+            if state:
+                raise RuntimeError(
+                    "PostgreSQL manager initialization cannot run inside an active caller "
+                    "transaction; commit or roll back that transaction first"
+                )
+
+        if checked_leaves != leaf_ids:
             raise RuntimeError(
-                "PostgreSQL manager initialization cannot run inside an active caller "
-                "transaction; commit or roll back that transaction first"
+                "PostgreSQL manager initialization requires transaction state from every "
+                "underlying driver; cannot safely determine whether caller work would be committed"
             )
 
     def _assert_registration_transaction_ownership(self) -> None:
