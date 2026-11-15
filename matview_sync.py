@@ -11084,40 +11084,33 @@ class MaterializedViewManager:
                 else:
                     self._rollback()
 
-                if self.dialect == Dialect.POSTGRES:
-                    try:
-                        cur.execute("SET LOCAL matview.skip_triggers = 'off';")
-                    except Exception:
-                        pass
-                elif self.dialect == Dialect.MYSQL:
-                    try:
-                        cur.execute("SET @__matview_skip_triggers = 0;")
-                    except Exception:
-                        pass
-
-                for st in created_shadow_tables:
-                    try:
-                        cur.execute(f"DROP TABLE IF EXISTS {st};")
-                    except Exception:
-                        pass
+                # Reinstallation is correctness-critical. On engines with
+                # transactional DDL, isolate restoration so a failed CREATE
+                # TRIGGER/FUNCTION rolls back to the original installed set.
+                restore_savepoint = False
+                if self.dialect in (Dialect.SQLITE, Dialect.POSTGRES):
+                    cur.execute("SAVEPOINT __mv_bulk_restore_sp;")
+                    restore_savepoint = True
 
                 try:
+                    if self.dialect == Dialect.POSTGRES:
+                        cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                    elif self.dialect == Dialect.MYSQL:
+                        cur.execute("SET @__matview_skip_triggers = 0;")
+
+                    for st in created_shadow_tables:
+                        cur.execute(f"DROP TABLE IF EXISTS {st};")
+
                     schemas = self.fetch_schema()
                     for entry in targets:
                         if self.dialect == Dialect.POSTGRES:
                             for fn_name in entry["function_names"]:
                                 if "fn_readonly_" not in fn_name:
-                                    try:
-                                        cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-                                    except Exception:
-                                        pass
+                                    cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
                         else:
                             for t_name in entry["trigger_names"]:
                                 if "__ro_" not in t_name and not t_name.endswith("__readonly"):
-                                    try:
-                                        cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
-                                    except Exception:
-                                        pass
+                                    cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
                         plan = generate_materialized_view(
                             schemas,
                             entry["view_sql"],
@@ -11129,14 +11122,36 @@ class MaterializedViewManager:
                         )
                         for stmt in plan.trigger_ddls:
                             cur.execute(stmt)
-                except Exception:
-                    pass
-                self._commit()
+
+                    if restore_savepoint:
+                        cur.execute("RELEASE SAVEPOINT __mv_bulk_restore_sp;")
+                    self._commit()
+                except Exception as restore_error:
+                    if restore_savepoint:
+                        try:
+                            cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_restore_sp;")
+                            cur.execute("RELEASE SAVEPOINT __mv_bulk_restore_sp;")
+                        except Exception:
+                            self._rollback()
+                    else:
+                        # MySQL/MariaDB DDL implicitly commits. We cannot promise
+                        # rollback of partially restored triggers, so surface the
+                        # failure prominently instead of hiding it.
+                        self._rollback()
+                    raise RuntimeError(
+                        "bulk_changes failed and maintenance-trigger restoration also failed; "
+                        "the materialized-view installation requires repair before further writes"
+                    ) from restore_error
 
             try:
                 yield
-            except Exception:
-                _cleanup_and_restore()
+            except Exception as operation_error:
+                try:
+                    _cleanup_and_restore()
+                except Exception as restore_error:
+                    raise RuntimeError(
+                        "bulk_changes operation failed and maintenance-trigger restoration failed"
+                    ) from restore_error
                 raise
 
             try:
