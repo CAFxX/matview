@@ -69,8 +69,8 @@ MUTANTS = (
     Mutant(
         name="join-retraction-reads-new-row-instead-of-old-row",
         source_path="matview_sync.py",
-        original='from_old = _build_join_from_clause(replace_alias=j_alias, rec_prefix="OLD")',
-        replacement='from_old = _build_join_from_clause(replace_alias=j_alias, rec_prefix="NEW")',
+        original='upd_old_stmts=[minus_stmt]',
+        replacement='upd_old_stmts=[minus_stmt.replace("OLD.", "NEW.")]',
     ),
 )
 
