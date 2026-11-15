@@ -52,6 +52,7 @@ def main() -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT id, value FROM savepoint_guard_reader ORDER BY id")
             assert cur.fetchall() == [(1, 10), (2, 20)]
+        conn.commit()
 
         # In autocommit mode, SAVEPOINT fails and SET LOCAL outside a
         # transaction emits a warning/no-op rather than raising. The manager
