@@ -5571,6 +5571,54 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("AVG(exact_value)", mysql_population)
         self.assertNotIn("AVG(1.0 *", mysql_population)
 
+    def test_22_statistical_aliases_follow_target_dialect(self) -> None:
+        schema = """
+        CREATE TABLE measurements (
+            id INTEGER PRIMARY KEY,
+            grp TEXT,
+            value DOUBLE PRECISION
+        );
+        """
+        view = """
+        CREATE VIEW measurement_aliases AS
+        SELECT grp,
+               VARIANCE(value) AS variance_alias,
+               STDDEV(value) AS stddev_alias,
+               STD(value) AS std_alias,
+               VAR_POP(value) AS variance_population,
+               VAR_SAMP(value) AS variance_sample,
+               STDDEV_POP(value) AS stddev_population,
+               STDDEV_SAMP(value) AS stddev_sample
+        FROM measurements
+        GROUP BY grp;
+        """
+
+        def aggregates(dialect: str) -> Dict[str, AggFunc]:
+            plan = generate_materialized_view(
+                schema, view, dialect=dialect, ignore_limitations=True
+            )
+            return {
+                item.alias: item.agg_func
+                for item in plan.view_spec.select_items
+                if item.is_aggregate
+            }
+
+        postgres = aggregates("postgres")
+        self.assertEqual(postgres["variance_alias"], AggFunc.VAR_SAMP)
+        self.assertEqual(postgres["stddev_alias"], AggFunc.STDDEV_SAMP)
+        self.assertEqual(postgres["std_alias"], AggFunc.STDDEV_SAMP)
+        self.assertEqual(postgres["variance_population"], AggFunc.VAR_POP)
+        self.assertEqual(postgres["variance_sample"], AggFunc.VAR_SAMP)
+        self.assertEqual(postgres["stddev_population"], AggFunc.STDDEV_POP)
+        self.assertEqual(postgres["stddev_sample"], AggFunc.STDDEV_SAMP)
+
+        for dialect in ("mysql", "sqlite"):
+            with self.subTest(dialect=dialect):
+                resolved = aggregates(dialect)
+                self.assertEqual(resolved["variance_alias"], AggFunc.VAR_POP)
+                self.assertEqual(resolved["stddev_alias"], AggFunc.STDDEV_POP)
+                self.assertEqual(resolved["std_alias"], AggFunc.STDDEV_POP)
+
     def test_23_statistical_delta_triggers_recompute_native_aggregates(self) -> None:
         single_schema = """
         CREATE TABLE measurements (
