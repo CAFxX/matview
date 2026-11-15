@@ -4765,6 +4765,51 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             self.assertEqual(mgr.check_schema_drift(), {"v_star": "ok"})
             mgr.conn.close()
 
+    def test_scalar_expression_storage_types_match_native_engines(self) -> None:
+        pg_schema = parse_table_schema(
+            "CREATE TABLE sales (qty INTEGER PRIMARY KEY, amount NUMERIC(12, 2));"
+        )
+        pg_view = parse_view_definition(
+            "CREATE VIEW parity_stats AS SELECT qty % 2 AS parity, "
+            "SUM(amount) AS total FROM sales GROUP BY qty % 2;",
+            known_tables={name.lower() for name in pg_schema},
+        )
+        pg_compiler = IncrementalViewCompiler(
+            pg_schema, pg_view, dialect=Dialect.POSTGRES
+        )
+        parity_item = next(
+            item for item in pg_compiler.view.select_items if item.alias == "parity"
+        )
+        # PostgreSQL's INTEGER % INTEGER operator returns INTEGER, not BIGINT.
+        self.assertEqual(
+            pg_compiler._infer_expr_storage_type(parity_item), "INTEGER"
+        )
+
+        mysql_schema = parse_table_schema(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, tenant INTEGER NOT NULL, "
+            "latency INTEGER NOT NULL);"
+        )
+        mysql_view = parse_view_definition(
+            "CREATE VIEW tenant_latency AS SELECT tenant, "
+            "COALESCE(1.0 * SUM(DISTINCT latency), 0.0) AS tdl "
+            "FROM events GROUP BY tenant;",
+            known_tables={name.lower() for name in mysql_schema},
+        )
+        mysql_compiler = IncrementalViewCompiler(
+            mysql_schema,
+            mysql_view,
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+        )
+        total_item = next(
+            item for item in mysql_compiler.view.select_items if item.alias == "tdl"
+        )
+        # MySQL's exact SUM multiplied by a DECIMAL literal remains DECIMAL.
+        self.assertEqual(
+            mysql_compiler._infer_expr_storage_type(total_item),
+            "DECIMAL(65, 1)",
+        )
+
     def test_statistical_aliases_compile_with_target_engine_semantics(self) -> None:
         schema = (
             "CREATE TABLE alias_values ("
