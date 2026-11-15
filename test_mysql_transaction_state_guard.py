@@ -92,6 +92,22 @@ class MySQLTransactionStateGuardTests(unittest.TestCase):
             MaterializedViewManager._require_idle_mysql_connection(SQLAlchemyConnection())
 
 
+    def test_idle_facade_cannot_hide_unknown_driver_transaction_state(self):
+        class DriverConnection:
+            pass
+
+        class PoolProxy:
+            driver_connection = DriverConnection()
+
+        class SQLAlchemyConnection:
+            in_transaction = False
+            connection = PoolProxy()
+
+        with self.assertRaisesRegex(RuntimeError, "every underlying driver"):
+            MaterializedViewManager._require_idle_mysql_connection(
+                SQLAlchemyConnection()
+            )
+
     def test_explicit_mysql_engine_version_guards_generic_connection_wrapper(self):
         class GenericConnectionWrapper:
             in_transaction = True
