@@ -132,6 +132,9 @@ The existing differential-testing harness is useful, but its current headline co
   - Reconcile README, module docstrings, runner output, and CI matrix descriptions from one generated source of truth.
   - Remove brittle workflow-text-count assertions; validate workflow structure semantically where needed and rely on actual CI execution for runtime behavior.
 
+- [ ] **Make SQLite REPLACE Conflict Handling Safe Across Independent Writer Connections**:
+  SQLite's delete triggers for rows removed by the `REPLACE` conflict algorithm fire only when `PRAGMA recursive_triggers = ON` is enabled on the connection executing the statement. The manager can configure its own connection, but that setting is connection-local and cannot protect arbitrary application connections. An independent writer using `INSERT OR REPLACE` can therefore delete a source row without running materialized-view DELETE maintenance, leaving the reader stale. Define and enforce an explicit contract: either provide a supported per-connection initialization/integration mechanism and require it on every writer connection, or reject/otherwise make REPLACE safe. Add file-backed, independent-connection tests proving the default-off failure mode and the supported safe mode, including conflicts on every relevant UNIQUE constraint. Document that ordinary `INSERT ... ON CONFLICT DO UPDATE` is not equivalent to REPLACE and should be preferred when update semantics are intended. Do not claim global protection based on the manager connection's PRAGMA.
+
 ## P1 — Modular Architecture, Engine/Version Optimizations & Developer Experience
 
 - [x] **Keep User-Accessible Materialized Views Free of the Internal Object Prefix**:
