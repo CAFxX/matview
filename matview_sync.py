@@ -11066,6 +11066,39 @@ class MaterializedViewManager:
                     "use_shadow_swap: those options execute DDL that implicitly commits"
                 )
 
+        # PostgreSQL savepoints compose safely with a caller transaction,
+        # but this context currently owns its final commit. Reject such a
+        # transaction before get_catalog()/introspection can start or alter it.
+        if self.dialect == Dialect.POSTGRES:
+            pg_transaction_state = getattr(self.conn, "in_transaction", None)
+            if not isinstance(pg_transaction_state, bool):
+                pg_status = None
+                status_getter = getattr(self.conn, "get_transaction_status", None)
+                if callable(status_getter):
+                    try:
+                        pg_status = status_getter()
+                    except Exception:
+                        pg_status = None
+                if pg_status is None:
+                    pg_info = getattr(self.conn, "info", None)
+                    pg_status = getattr(pg_info, "transaction_status", None)
+                if pg_status is None:
+                    raise RuntimeError(
+                        "bulk_changes() on PostgreSQL requires an adapter exposing "
+                        "transaction state; refusing to risk committing caller work"
+                    )
+                try:
+                    pg_transaction_state = int(pg_status) != 0
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        "bulk_changes() could not interpret PostgreSQL transaction state"
+                    )
+            if pg_transaction_state:
+                raise RuntimeError(
+                    "bulk_changes() on PostgreSQL cannot run inside an active caller "
+                    "transaction; commit or roll back it first"
+                )
+
         # SQLite DDL is not automatically transactional. Reserve the writer
         # before catalog reads or trigger suspension; if an adapter hides
         # transaction state, BEGIN IMMEDIATE itself is the fail-closed probe.
