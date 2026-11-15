@@ -212,6 +212,9 @@ jobs:
       - name: Test backfill watermark safety and trigger coverage
         run: python3 test_p0_backfill_watermark_safety.py
 
+      - name: Test compiler alias, aux type, and PK NULL safety
+        run: python3 test_p0_compiler_alias_aux_pk_safety.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
