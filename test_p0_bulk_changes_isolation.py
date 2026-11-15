@@ -1177,5 +1177,114 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
             manager.conn.close()
 
 
+    def test_sqlite_bulk_changes_success_preserves_caller_transaction(self) -> None:
+        """Successful bulk refresh must not commit work predating the context."""
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            manager = MaterializedViewManager(f"sqlite:///{tmp.name}")
+            manager.apply_schema_ddl(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER);",
+                auto_sync_views=False,
+            )
+            manager.conn.execute("INSERT INTO items VALUES (1, 10);")
+            manager.conn.commit()
+            manager.register_view(
+                "CREATE VIEW caller_tx_view AS SELECT id, value FROM items;"
+            )
+            manager.conn.execute(
+                "CREATE TABLE caller_owned_rows (id INTEGER PRIMARY KEY);"
+            )
+            manager.conn.commit()
+            observer = sqlite3.connect(tmp.name, timeout=0)
+            try:
+                manager.conn.execute("BEGIN;")
+                manager.conn.execute("INSERT INTO caller_owned_rows VALUES (7);")
+                with manager.bulk_changes():
+                    manager.conn.execute("INSERT INTO items VALUES (2, 20);")
+
+                self.assertTrue(manager.conn.in_transaction)
+                self.assertEqual(
+                    manager.conn.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [(7,)],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id FROM items ORDER BY id").fetchall(),
+                    [(1,)],
+                )
+
+                manager.conn.commit()
+                self.assertEqual(
+                    observer.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [(7,)],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id, value FROM caller_tx_view ORDER BY id").fetchall(),
+                    [(1, 10), (2, 20)],
+                )
+            finally:
+                observer.close()
+                manager.conn.close()
+
+    def test_sqlite_bulk_changes_failure_preserves_caller_transaction(self) -> None:
+        """Failed bulk work rolls back to its savepoint without committing caller work."""
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            manager = MaterializedViewManager(f"sqlite:///{tmp.name}")
+            manager.apply_schema_ddl(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER);",
+                auto_sync_views=False,
+            )
+            manager.conn.execute("INSERT INTO items VALUES (1, 10);")
+            manager.conn.commit()
+            manager.register_view(
+                "CREATE VIEW caller_tx_view AS SELECT id, value FROM items;"
+            )
+            manager.conn.execute(
+                "CREATE TABLE caller_owned_rows (id INTEGER PRIMARY KEY);"
+            )
+            manager.conn.commit()
+            observer = sqlite3.connect(tmp.name, timeout=0)
+            try:
+                manager.conn.execute("BEGIN;")
+                manager.conn.execute("INSERT INTO caller_owned_rows VALUES (7);")
+                with self.assertRaisesRegex(RuntimeError, "injected bulk failure"):
+                    with manager.bulk_changes():
+                        manager.conn.execute("INSERT INTO items VALUES (2, 20);")
+                        raise RuntimeError("injected bulk failure")
+
+                self.assertTrue(manager.conn.in_transaction)
+                self.assertEqual(
+                    manager.conn.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [(7,)],
+                )
+                self.assertEqual(
+                    manager.conn.execute("SELECT id FROM items ORDER BY id").fetchall(),
+                    [(1,)],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id FROM items ORDER BY id").fetchall(),
+                    [(1,)],
+                )
+
+                manager.conn.rollback()
+                self.assertEqual(
+                    observer.execute("SELECT id FROM caller_owned_rows").fetchall(),
+                    [],
+                )
+                self.assertEqual(
+                    observer.execute("SELECT id FROM items ORDER BY id").fetchall(),
+                    [(1,)],
+                )
+            finally:
+                observer.close()
+                manager.conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
