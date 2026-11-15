@@ -194,6 +194,9 @@ jobs:
       - name: Test failed MV replacement preserves prior reader
         run: python3 test_registration_replacement_rollback.py
 
+      - name: Test non-transactional MV replacement fails closed
+        run: python3 test_registration_replacement_unsupported.py
+
       - name: Test recursive SELECT AST generator
         run: python3 test_query_ast_fuzzer.py
 
