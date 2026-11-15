@@ -6515,6 +6515,136 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertEqual([view.view_name for view in views], ["item_a", "item_b"])
 
+    def test_sqlite_writer_connection_initializer_protects_replace_maintenance(self) -> None:
+        import os
+        import tempfile
+
+        schema = """
+            CREATE TABLE source_rows (
+                id INTEGER PRIMARY KEY,
+                unique_code TEXT NOT NULL UNIQUE,
+                unique_tag TEXT NOT NULL UNIQUE,
+                bucket TEXT NOT NULL
+            );
+            INSERT INTO source_rows VALUES (1, 'code-1', 'tag-1', 'old');
+        """
+        view_sql = (
+            "CREATE VIEW source_rows_materialized AS "
+            "SELECT id, unique_code, unique_tag, bucket FROM source_rows;"
+        )
+
+        def assert_replace_behavior(
+            conflict_target: str, replacement: tuple, initialized: bool
+        ) -> None:
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as db_file:
+                db_path = db_file.name
+            setup = None
+            writer = None
+            try:
+                setup = sqlite3.connect(db_path)
+                manager = MaterializedViewManager(setup)
+                manager.apply_schema_ddl(schema)
+                manager.register_view(view_sql)
+
+                writer = sqlite3.connect(db_path)
+                if initialized:
+                    returned = MaterializedViewManager.configure_sqlite_connection(
+                        writer
+                    )
+                    self.assertIs(returned, writer)
+                    # Idempotence matters for connection-pool initialization hooks.
+                    MaterializedViewManager.configure_sqlite_connection(writer)
+                else:
+                    # Force the documented unsafe setting independent of SQLite's
+                    # compile-time default.
+                    writer.execute("PRAGMA recursive_triggers = OFF;")
+                    self.assertEqual(
+                        writer.execute("PRAGMA recursive_triggers;").fetchone()[0], 0
+                    )
+
+                writer.execute(
+                    "INSERT OR REPLACE INTO source_rows VALUES (?, ?, ?, ?);",
+                    replacement,
+                )
+                writer.commit()
+
+                rows = setup.execute(
+                    "SELECT id, unique_code, unique_tag, bucket "
+                    "FROM source_rows_materialized ORDER BY id;"
+                ).fetchall()
+                if initialized:
+                    self.assertEqual(sorted(rows), [replacement])
+                else:
+                    # The INSERT trigger adds the replacement, but with recursive
+                    # triggers OFF SQLite omits the implicit-conflict DELETE trigger.
+                    self.assertEqual(
+                        sorted(rows),
+                        sorted([(1, "code-1", "tag-1", "old"), replacement]),
+                    )
+            finally:
+                if writer is not None:
+                    writer.close()
+                if setup is not None:
+                    setup.close()
+                try:
+                    os.unlink(db_path)
+                except FileNotFoundError:
+                    pass
+
+        # Exercise every independent uniqueness path: rowid primary key and both
+        # declared UNIQUE constraints. Each case gets an isolated file-backed DB.
+        for target, replacement in (
+            ("primary key", (1, "code-2", "tag-2", "new")),
+            ("unique_code", (2, "code-1", "tag-2", "new")),
+            ("unique_tag", (2, "code-2", "tag-1", "new")),
+        ):
+            with self.subTest(conflict_target=target, initialized=False):
+                assert_replace_behavior(target, replacement, initialized=False)
+            with self.subTest(conflict_target=target, initialized=True):
+                assert_replace_behavior(target, replacement, initialized=True)
+
+    def test_sqlite_connection_initializer_closes_dbapi_cursor(self) -> None:
+        class CursorProxy:
+            def __init__(self, fail_readback: bool = False) -> None:
+                self.fail_readback = fail_readback
+                self.closed = False
+                self.last_sql = ""
+
+            def execute(self, sql: str) -> "CursorProxy":
+                self.last_sql = sql
+                return self
+
+            def fetchone(self):
+                if self.fail_readback:
+                    raise sqlite3.OperationalError("injected PRAGMA readback failure")
+                return (1,)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class ConnectionProxy:
+            def __init__(self, cursor: CursorProxy) -> None:
+                self._cursor = cursor
+
+            def cursor(self) -> CursorProxy:
+                return self._cursor
+
+        successful_cursor = CursorProxy()
+        successful_connection = ConnectionProxy(successful_cursor)
+        self.assertIs(
+            MaterializedViewManager.configure_sqlite_connection(successful_connection),
+            successful_connection,
+        )
+        self.assertTrue(successful_cursor.closed)
+
+        failing_cursor = CursorProxy(fail_readback=True)
+        failing_connection = ConnectionProxy(failing_cursor)
+        with self.assertRaisesRegex(
+            sqlite3.OperationalError, "injected PRAGMA readback failure"
+        ):
+            MaterializedViewManager.configure_sqlite_connection(failing_connection)
+        self.assertTrue(failing_cursor.closed)
+
     def test_parser_scanners_preserve_postgres_dollar_quoted_literals(self) -> None:
         fragment = "SELECT $$comma, semi; -- /* stays literal */$$, 7"
         self.assertEqual(
