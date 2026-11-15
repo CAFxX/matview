@@ -1766,7 +1766,7 @@ def _resolve_statistical_aggregate_aliases(
         if not item.is_aggregate:
             resolved_items.append(item)
             continue
-        match = re.match(r"^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(", item.raw_expr)
+        match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", item.raw_expr)
         alias_func = match.group(1).upper() if match else ""
         resolved_func = aliases.get(alias_func)
         if resolved_func is not None:
