@@ -832,7 +832,109 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         self.assertFalse(any(sql.upper().startswith("DROP TRIGGER") for sql in executed))
 
 
+    def test_postgres_bypass_and_savepoint_failure_fails_closed(self) -> None:
+        """Do not drop PostgreSQL maintenance functions if neither isolation mechanism works."""
+        executed = []
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                if sql == "SAVEPOINT __mv_bulk_sp;":
+                    raise RuntimeError("injected savepoint failure")
+                if sql == "SET LOCAL matview.skip_triggers = 'on';":
+                    raise RuntimeError("injected session bypass failure")
+                return self
+
+        class RecordingConnection:
+            def cursor(self):
+                return RecordingCursor()
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.POSTGRES
+        manager.engine_version = parse_engine_version("postgres:16")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {
+            "v_guard": {
+                "view_name": "v_guard",
+                "trigger_names": [],
+                "function_names": ["mv_guard_insert_fn", "mv_guard_update_fn"],
+                "view_sql": "CREATE VIEW v_guard AS SELECT id FROM guarded_rows;",
+            }
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "neither session-local trigger bypass nor transactional savepoint"):
+            with manager.bulk_changes():
+                self.fail("bulk_changes must fail before entering the user block")
+
+        self.assertIn("SAVEPOINT __mv_bulk_sp;", executed)
+        self.assertIn("SET LOCAL matview.skip_triggers = 'on';", executed)
+        self.assertFalse(
+            any(sql.upper().startswith("DROP FUNCTION") for sql in executed),
+            executed,
+        )
+        self.assertEqual(executed[-1], "ROLLBACK;")
+
+
     def test_mysql_session_bypass_failure_fails_closed_before_trigger_ddl(self) -> None:
+        """A failed MySQL session bypass must not fall back to implicitly committed trigger DDL."""
+        executed = []
+
+        class RecordingCursor:
+            def execute(self, statement, params=None):
+                sql = str(statement).strip()
+                executed.append(sql)
+                if sql == "SET @__matview_skip_triggers = 1;":
+                    raise RuntimeError("session variables unavailable")
+                return self
+
+        class RecordingConnection:
+            def cursor(self):
+                return RecordingCursor()
+
+            def rollback(self):
+                executed.append("ROLLBACK;")
+
+            def commit(self):
+                executed.append("COMMIT;")
+
+        manager = MaterializedViewManager.__new__(MaterializedViewManager)
+        manager.conn = RecordingConnection()
+        manager.dialect = Dialect.MYSQL
+        manager.engine_version = parse_engine_version("mysql:8.4")
+        manager.object_prefix = "__matview_"
+        manager.catalog_table = "__matview_catalog"
+        manager.pg_use_transition_tables = False
+        manager.get_catalog = lambda: {
+            "v_guard": {
+                "view_name": "v_guard",
+                "trigger_names": ["mv_guard_insert", "mv_guard_update"],
+                "function_names": [],
+                "view_sql": "CREATE VIEW v_guard AS SELECT id FROM guarded_rows;",
+            }
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "refusing to drop maintenance triggers"):
+            with manager.bulk_changes():
+                self.fail("bulk_changes must fail before entering the user block")
+
+        self.assertIn("SAVEPOINT __mv_bulk_sp;", executed)
+        self.assertIn("SET @__matview_skip_triggers = 1;", executed)
+        self.assertFalse(
+            any(sql.upper().startswith("DROP TRIGGER") for sql in executed),
+            executed,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
         """A failed MySQL session bypass must not fall back to implicitly committed trigger DDL."""
         executed = []
 
