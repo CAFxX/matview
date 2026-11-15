@@ -14,7 +14,7 @@ import warnings
 import uuid
 from urllib.parse import urlparse
 
-from matview_sync import Dialect, EngineLimitationWarning, MaterializedViewManager
+from matview_sync import Dialect, EngineLimitationError, EngineLimitationWarning, MaterializedViewManager
 from test_matview_sync import _register_sqlite_compat_udfs
 
 
@@ -580,6 +580,187 @@ class IndependentSessionBackfillTests(unittest.TestCase):
         if not dsn:
             self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
         self._run_native_watermark_interleaving(Dialect.MYSQL, dsn)
+
+
+    def _run_native_transaction_visibility_invariant(self, engine: Dialect, dsn: str) -> None:
+        """Verify MV trigger effects share the base transaction's visibility boundary."""
+        suffix = uuid.uuid4().hex[:10]
+        schema_name = f"mv_visibility_{suffix}"
+        table_name = f"visibility_rows_{suffix}"
+        view_name = f"visibility_totals_{suffix}"
+        writer = self._connect_native(engine, dsn)
+        reader = None
+        manager = None
+        schema_created = False
+
+        def rows(connection, sql: str):
+            cursor = connection.cursor()
+            cursor.execute(sql)
+            result = [tuple(row) for row in cursor.fetchall()]
+            cursor.close()
+            return result
+
+        def assert_reader_matches_committed_state(expected):
+            visible = rows(
+                reader,
+                f"SELECT grp, row_count, total FROM {view_name} ORDER BY grp",
+            )
+            live = rows(
+                reader,
+                f"SELECT grp, COUNT(*) AS row_count, SUM(amount) AS total "
+                f"FROM {table_name} GROUP BY grp ORDER BY grp",
+            )
+            self.assertEqual(visible, expected, "reader saw uncommitted or stale MV state")
+            self.assertEqual(live, expected, "reader's committed base-table state was unexpected")
+            # End the read transaction so the next assertion obtains a fresh
+            # READ COMMITTED statement snapshot (and a new InnoDB snapshot).
+            reader.commit()
+
+        try:
+            writer_cursor = writer.cursor()
+            if engine == Dialect.POSTGRES:
+                writer_cursor.execute(f'CREATE SCHEMA "{schema_name}";')
+                writer_cursor.execute(f'SET search_path TO "{schema_name}";')
+                writer.commit()
+                schema_created = True
+            engine_suffix = " ENGINE=InnoDB" if engine == Dialect.MYSQL else ""
+            writer_cursor.execute(
+                f"CREATE TABLE {table_name} ("
+                "id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amount BIGINT NOT NULL"
+                f"){engine_suffix};"
+            )
+            writer_cursor.executemany(
+                f"INSERT INTO {table_name} (id, grp, amount) VALUES (%s, %s, %s)",
+                [(1, "A", 10), (2, "A", 20), (3, "B", 5)],
+            )
+            writer.commit()
+
+            reader = self._connect_native(engine, dsn)
+            reader_cursor = reader.cursor()
+            if engine == Dialect.POSTGRES:
+                reader_cursor.execute(f'SET search_path TO "{schema_name}";')
+                reader.commit()
+
+            manager = MaterializedViewManager(writer, dialect=engine)
+            view_sql = (
+                f"CREATE VIEW {view_name} AS "
+                f"SELECT grp, COUNT(*) AS row_count, SUM(amount) AS total "
+                f"FROM {table_name} GROUP BY grp;"
+            )
+            if engine == Dialect.MYSQL:
+                with self.assertRaises(EngineLimitationError) as cm:
+                    manager.register_view(view_sql)
+                self.assertIn("MYSQL_NO_TRUNCATE_TRIGGER", str(cm.exception))
+
+            with warnings.catch_warnings(record=True) as emitted:
+                warnings.simplefilter("always", EngineLimitationWarning)
+                plan = manager.register_view(
+                    view_sql,
+                    ignore_limitations=True,
+                )
+            limitation_warnings = [
+                warning for warning in emitted
+                if issubclass(warning.category, EngineLimitationWarning)
+            ]
+            expected_limitation_codes = (
+                {"MYSQL_NO_TRUNCATE_TRIGGER"} if engine == Dialect.MYSQL else set()
+            )
+            self.assertEqual(
+                {lim.code for lim in plan.limitations},
+                expected_limitation_codes,
+            )
+            self.assertEqual(len(limitation_warnings), len(expected_limitation_codes))
+            if expected_limitation_codes:
+                self.assertIn(
+                    "MYSQL_NO_TRUNCATE_TRIGGER",
+                    str(limitation_warnings[0].message),
+                )
+            writer.commit()
+            self.assertEqual(plan.view_name, view_name)
+            initial = [("A", 2, 30), ("B", 1, 5)]
+            assert_reader_matches_committed_state(initial)
+
+            # The writer must see its own trigger-maintained changes, while an
+            # independent reader must continue to see the last committed state.
+            writer_cursor.execute("BEGIN;")
+            writer_cursor.execute(
+                f"INSERT INTO {table_name} (id, grp, amount) VALUES (%s, %s, %s)",
+                (4, "A", 40),
+            )
+            writer_cursor.execute(
+                f"UPDATE {table_name} SET amount = %s WHERE id = %s",
+                (7, 3),
+            )
+            writer_cursor.execute(
+                f"DELETE FROM {table_name} WHERE id = %s", (2,)
+            )
+            uncommitted = [("A", 2, 50), ("B", 1, 7)]
+            self.assertEqual(
+                rows(writer, f"SELECT grp, row_count, total FROM {view_name} ORDER BY grp"),
+                uncommitted,
+                "writer did not see its own materialized trigger effects",
+            )
+            assert_reader_matches_committed_state(initial)
+
+            writer.commit()
+            committed = [("A", 2, 50), ("B", 1, 7)]
+            assert_reader_matches_committed_state(committed)
+
+            # A second transaction exercises both insertion and retraction,
+            # then rolls back. Neither the base rows nor MV trigger effects may
+            # leak to another connection.
+            writer_cursor.execute("BEGIN;")
+            writer_cursor.execute(
+                f"INSERT INTO {table_name} (id, grp, amount) VALUES (%s, %s, %s)",
+                (5, "C", 99),
+            )
+            writer_cursor.execute(
+                f"UPDATE {table_name} SET amount = %s WHERE id = %s",
+                (1000, 1),
+            )
+            self.assertEqual(
+                rows(writer, f"SELECT grp, row_count, total FROM {view_name} ORDER BY grp"),
+                [("A", 2, 1040), ("B", 1, 7), ("C", 1, 99)],
+            )
+            assert_reader_matches_committed_state(committed)
+            writer.rollback()
+            assert_reader_matches_committed_state(committed)
+        finally:
+            if reader is not None:
+                try:
+                    reader.rollback()
+                finally:
+                    reader.close()
+            try:
+                writer.rollback()
+                cleanup = writer.cursor()
+                if engine == Dialect.POSTGRES:
+                    cleanup.execute("SET search_path TO public;")
+                    if schema_created:
+                        cleanup.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE;')
+                else:
+                    if manager is not None:
+                        try:
+                            manager.drop_view(view_name)
+                        except Exception:
+                            pass
+                    cleanup.execute(f"DROP TABLE IF EXISTS {table_name};")
+                writer.commit()
+            except Exception:
+                writer.rollback()
+            writer.close()
+
+    def test_native_postgres_materialized_trigger_transaction_visibility(self) -> None:
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN is not set; native PostgreSQL test only")
+        self._run_native_transaction_visibility_invariant(Dialect.POSTGRES, dsn)
+
+    def test_native_mysql_family_materialized_trigger_transaction_visibility(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
+        self._run_native_transaction_visibility_invariant(Dialect.MYSQL, dsn)
 
 
 if __name__ == "__main__":
