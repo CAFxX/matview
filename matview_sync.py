@@ -5449,8 +5449,15 @@ class IncrementalViewCompiler:
             if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
                 seen_hidden_grp.add(mv_col.lower())
                 collation_match = re.search(
-                    r'\bCOLLATE\s+((?:"[^"]+")|(?:`[^`]+`)|(?:\[[^\]]+\])|(?:[A-Za-z_][A-Za-z0-9_.$]*))\s*                nn = " NOT NULL" if not has_nullable_grp else ""
-                col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
+                    r'\bCOLLATE\s+((?:"[^"]+")|(?:`[^`]+`)|(?:\[[^\]]+\])|(?:[A-Za-z_][A-Za-z0-9_.$]*))',
+                    g_expr,
+                    re.IGNORECASE,
+                )
+                collation_sql = (
+                    f" COLLATE {collation_match.group(1)}" if collation_match else ""
+                )
+                nn = " NOT NULL" if not has_nullable_grp else ""
+                col_defs_sql.append(f"{self._q(mv_col)} {dt}{collation_sql}{nn}")
 
         def _expr_key(item: SelectItem) -> str:
             eff = self._effective_agg_value_expr(item, record_prefix=None).strip().lower()
