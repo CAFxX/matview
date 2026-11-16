@@ -10348,45 +10348,52 @@ class MaterializedViewManager:
 
     def _ensure_catalog(self) -> None:
         cur = self.conn.cursor()
-        if self.dialect == Dialect.SQLITE:
-            try:
-                cur.execute("PRAGMA recursive_triggers = ON;")
-            except Exception:
-                pass
-        elif self.dialect == Dialect.MYSQL:
-            try:
-                cur.execute("SET SESSION collation_connection = @@collation_database;")
-            except Exception:
-                pass
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.catalog_table} (
-                view_name VARCHAR(255) NOT NULL PRIMARY KEY,
-                view_sql TEXT NOT NULL,
-                strategy VARCHAR(64) NOT NULL,
-                signature_hash VARCHAR(64) NOT NULL,
-                backing_table VARCHAR(255) NOT NULL,
-                aux_tables_json TEXT NOT NULL,
-                trigger_names_json TEXT NOT NULL,
-                function_names_json TEXT NOT NULL,
-                trigger_ddls_json TEXT NOT NULL,
-                backfill_cursor_pk BIGINT DEFAULT NULL,
-                backfill_max_pk BIGINT DEFAULT NULL,
-                backfill_active INTEGER NOT NULL DEFAULT 0
-            );
-            """
-        )
-        self._commit()
-        for col_ddl in (
-            "backfill_cursor_pk BIGINT DEFAULT NULL",
-            "backfill_max_pk BIGINT DEFAULT NULL",
-            "backfill_active INTEGER NOT NULL DEFAULT 0",
-        ):
-            try:
-                cur.execute(f"ALTER TABLE {self.catalog_table} ADD COLUMN {col_ddl};")
-                self._commit()
-            except Exception:
-                self._rollback()
+        try:
+            if self.dialect == Dialect.SQLITE:
+                try:
+                    cur.execute("PRAGMA recursive_triggers = ON;")
+                except Exception:
+                    pass
+            elif self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute("SET SESSION collation_connection = @@collation_database;")
+                except Exception:
+                    pass
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.catalog_table} (
+                    view_name VARCHAR(255) NOT NULL PRIMARY KEY,
+                    view_sql TEXT NOT NULL,
+                    strategy VARCHAR(64) NOT NULL,
+                    signature_hash VARCHAR(64) NOT NULL,
+                    backing_table VARCHAR(255) NOT NULL,
+                    aux_tables_json TEXT NOT NULL,
+                    trigger_names_json TEXT NOT NULL,
+                    function_names_json TEXT NOT NULL,
+                    trigger_ddls_json TEXT NOT NULL,
+                    backfill_cursor_pk BIGINT DEFAULT NULL,
+                    backfill_max_pk BIGINT DEFAULT NULL,
+                    backfill_active INTEGER NOT NULL DEFAULT 0
+                );
+                """
+            )
+            self._commit()
+            for col_ddl in (
+                "backfill_cursor_pk BIGINT DEFAULT NULL",
+                "backfill_max_pk BIGINT DEFAULT NULL",
+                "backfill_active INTEGER NOT NULL DEFAULT 0",
+            ):
+                try:
+                    cur.execute(f"ALTER TABLE {self.catalog_table} ADD COLUMN {col_ddl};")
+                    self._commit()
+                except Exception:
+                    self._rollback()
+        finally:
+            if hasattr(cur, "close"):
+                try:
+                    cur.close()
+                except Exception:
+                    pass
 
     def _commit(self) -> None:
         if hasattr(self.conn, "commit"):
@@ -11056,38 +11063,138 @@ class MaterializedViewManager:
         schemas = self.fetch_schema()
         results: Dict[str, str] = {}
         cur = self.conn.cursor()
-        for entry in targets:
-            v_name = entry["view_name"]
-            plan = generate_materialized_view(
-                schemas,
-                entry["view_sql"],
-                dialect=self.dialect,
-                pg_use_transition_tables=self.pg_use_transition_tables,
-                ignore_limitations=True,
-                object_prefix=self.object_prefix,
-            )
-            sig = self._compute_signature(plan, schemas)
-            if rebuild_on_schema_drift and sig != entry["signature_hash"]:
-                self.register_view(
+        try:
+            for entry in targets:
+                v_name = entry["view_name"]
+                plan = generate_materialized_view(
+                    schemas,
                     entry["view_sql"],
-                    populate=True,
-                    force_rebuild=True,
+                    dialect=self.dialect,
+                    pg_use_transition_tables=self.pg_use_transition_tables,
                     ignore_limitations=True,
+                    object_prefix=self.object_prefix,
                 )
-                results[v_name] = "rebuilt"
-            else:
+                sig = self._compute_signature(plan, schemas)
+                if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+                    self.register_view(
+                        entry["view_sql"],
+                        populate=True,
+                        force_rebuild=True,
+                        ignore_limitations=True,
+                    )
+                    results[v_name] = "rebuilt"
+                else:
+                    try:
+                        for aux_t in plan.auxiliary_table_names:
+                            cur.execute(f"DELETE FROM {aux_t};")
+                        cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                        for stmt in plan.get_populate_statements(incremental_backfill=False):
+                            cur.execute(stmt)
+                        self._commit()
+                        results[v_name] = "repaired"
+                    except Exception:
+                        self._rollback()
+                        raise
+        finally:
+            if hasattr(cur, "close"):
                 try:
-                    for aux_t in plan.auxiliary_table_names:
-                        cur.execute(f"DELETE FROM {aux_t};")
-                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
-                    for stmt in plan.get_populate_statements(incremental_backfill=False):
-                        cur.execute(stmt)
-                    self._commit()
-                    results[v_name] = "repaired"
+                    cur.close()
                 except Exception:
-                    self._rollback()
-                    raise
+                    pass
         return results
+
+    def _shadow_name(self, tbl: str) -> str:
+        suf = "__shadow"
+        if len(tbl) + len(suf) <= 62:
+            return f"{tbl}{suf}"
+        h = hashlib.sha1(tbl.encode("utf-8")).hexdigest()[:8]
+        avail = 62 - len(suf) - 9
+        return f"{tbl[:avail]}_{h}{suf}"
+
+    def _old_name(self, tbl: str) -> str:
+        suf = "__old"
+        if len(tbl) + len(suf) <= 62:
+            return f"{tbl}{suf}"
+        h = hashlib.sha1(tbl.encode("utf-8")).hexdigest()[:8]
+        avail = 62 - len(suf) - 9
+        return f"{tbl[:avail]}_{h}{suf}"
+
+    def _make_replace_view_ddl(self, reader_ddl: str) -> str:
+        if re.search(r"^\s*CREATE\s+OR\s+REPLACE\b", reader_ddl, flags=re.IGNORECASE):
+            return reader_ddl
+        pattern = re.compile(
+            r"^\s*CREATE\s+(?:ALGORITHM\s*=\s*[A-Za-z0-9_]+\s+)?VIEW\b",
+            flags=re.IGNORECASE,
+        )
+        if pattern.search(reader_ddl):
+            return pattern.sub(
+                lambda m: re.sub(r"(?i)\bCREATE\b", "CREATE OR REPLACE", m.group(0), count=1),
+                reader_ddl,
+                count=1,
+            )
+        return reader_ddl
+
+    def _build_shadow_swap_sqls(
+        self,
+        plan: MaterializedViewPlan,
+        shadow_tbl: str,
+        shadow_aux_map: Dict[str, str],
+    ) -> List[str]:
+        sqls: List[str] = []
+        if self.dialect == Dialect.POSTGRES:
+            old_tbl = self._old_name(plan.backing_table_name)
+            sqls.append(f"DROP TABLE IF EXISTS {old_tbl};")
+            for aux_t in plan.auxiliary_table_names:
+                sqls.append(f"DROP TABLE IF EXISTS {self._old_name(aux_t)};")
+
+            sqls.append(f"ALTER TABLE {plan.backing_table_name} RENAME TO {old_tbl};")
+            for aux_t in plan.auxiliary_table_names:
+                sqls.append(f"ALTER TABLE {aux_t} RENAME TO {self._old_name(aux_t)};")
+
+            sqls.append(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+            for aux_t, s_aux in shadow_aux_map.items():
+                sqls.append(f"ALTER TABLE {s_aux} RENAME TO {aux_t};")
+
+            if plan.reader_view_ddl:
+                sqls.append(self._make_replace_view_ddl(plan.reader_view_ddl))
+
+            sqls.append(f"DROP TABLE IF EXISTS {old_tbl};")
+            for aux_t in plan.auxiliary_table_names:
+                sqls.append(f"DROP TABLE IF EXISTS {self._old_name(aux_t)};")
+
+        elif self.dialect == Dialect.MYSQL:
+            old_tbl = self._old_name(plan.backing_table_name)
+            old_tables = [old_tbl]
+            for aux_t in plan.auxiliary_table_names:
+                old_tables.append(self._old_name(aux_t))
+            sqls.append(f"DROP TABLE IF EXISTS {', '.join(old_tables)};")
+
+            rename_pairs = [
+                f"{plan.backing_table_name} TO {old_tbl}",
+                f"{shadow_tbl} TO {plan.backing_table_name}",
+            ]
+            for aux_t, s_aux in shadow_aux_map.items():
+                rename_pairs.append(f"{aux_t} TO {self._old_name(aux_t)}")
+                rename_pairs.append(f"{s_aux} TO {aux_t}")
+
+            sqls.append(f"RENAME TABLE {', '.join(rename_pairs)};")
+
+            if plan.reader_view_ddl:
+                sqls.append(self._make_replace_view_ddl(plan.reader_view_ddl))
+
+            sqls.append(f"DROP TABLE IF EXISTS {', '.join(old_tables)};")
+
+        else:  # SQLite and generic fallback
+            sqls.append(f"DROP VIEW IF EXISTS {plan.view_name};")
+            sqls.append(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
+            sqls.append(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
+            for aux_t, s_aux in shadow_aux_map.items():
+                sqls.append(f"DROP TABLE IF EXISTS {aux_t};")
+                sqls.append(f"ALTER TABLE {s_aux} RENAME TO {aux_t};")
+            if plan.reader_view_ddl:
+                sqls.append(plan.reader_view_ddl)
+
+        return sqls
 
     @contextmanager
     def bulk_changes(
@@ -11100,8 +11207,8 @@ class MaterializedViewManager:
         Context manager for executing high-throughput multi-statement bulk loads/mutations.
         Uses session-local trigger bypass flags where supported (`SET LOCAL matview.skip_triggers = 'on'`
         on PostgreSQL, `SET @__matview_skip_triggers = 1` on MySQL) so triggers are never dropped
-        globally across concurrent connections, transactional `SAVEPOINT` isolation on SQLite, and
-        optional shadow-table rebuild + atomic `ALTER TABLE ... RENAME` swap (`use_shadow_swap=True`).
+        globally across concurrent connections, transactional `BEGIN IMMEDIATE` + `SAVEPOINT` write-lock
+        isolation on SQLite, and atomic shadow-table rebuild + atomic table swap (`use_shadow_swap=True`).
         """
         catalog = self.get_catalog()
         if view_names:
@@ -11112,164 +11219,272 @@ class MaterializedViewManager:
 
         cur = self.conn.cursor()
         sp_active = False
-        try:
-            cur.execute("SAVEPOINT __mv_bulk_sp;")
-            sp_active = True
-        except Exception:
-            pass
+        created_shadow_tables: List[str] = []
 
-        session_bypass_ok = False
-        if self.dialect == Dialect.POSTGRES and not drop_triggers:
-            try:
-                cur.execute("SET LOCAL matview.skip_triggers = 'on';")
-                session_bypass_ok = True
-            except Exception:
-                pass
-        elif self.dialect == Dialect.MYSQL and not drop_triggers:
-            try:
-                cur.execute("SET @__matview_skip_triggers = 1;")
-                session_bypass_ok = True
-            except Exception:
-                pass
-
-        if not session_bypass_ok:
-            for entry in targets:
-                if self.dialect == Dialect.POSTGRES:
-                    for fn_name in entry["function_names"]:
-                        if "fn_readonly_" not in fn_name:
-                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-                else:
-                    for t_name in entry["trigger_names"]:
-                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
-                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
-        # Note: Do NOT call self._commit() here on transactional-DDL engines (SQLite/PostgreSQL)
-        # so the trigger suspension and bulk DML remain isolated inside __mv_bulk_sp!
         try:
-            yield
-        except Exception:
-            if sp_active:
-                try:
-                    cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
-                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
-                except Exception:
-                    self._rollback()
+            if self.dialect == Dialect.SQLITE:
+                # SQLite must acquire the writer reservation before any trigger is
+                # suspended.  Failing open here can expose concurrent writers to a
+                # partially disabled materialized-view maintenance path.
+                if not getattr(self.conn, "in_transaction", False):
+                    cur.execute("BEGIN IMMEDIATE;")
+                # A failed savepoint is equally unsafe: do not fall back to trigger
+                # removal without transactional protection.
+                cur.execute("SAVEPOINT __mv_bulk_sp;")
+                sp_active = True
             else:
-                self._rollback()
-            if self.dialect == Dialect.POSTGRES:
                 try:
-                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                    cur.execute("SAVEPOINT __mv_bulk_sp;")
+                    sp_active = True
                 except Exception:
                     pass
-            elif self.dialect == Dialect.MYSQL:
+
+            session_bypass_ok = False
+            if self.dialect == Dialect.POSTGRES and not drop_triggers:
                 try:
-                    cur.execute("SET @__matview_skip_triggers = 0;")
+                    cur.execute("SET LOCAL matview.skip_triggers = 'on';")
+                    session_bypass_ok = True
                 except Exception:
                     pass
-            schemas = self.fetch_schema()
-            for entry in targets:
-                if self.dialect == Dialect.POSTGRES:
-                    for fn_name in entry["function_names"]:
-                        if "fn_readonly_" not in fn_name:
-                            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+            elif self.dialect == Dialect.MYSQL and not drop_triggers:
+                try:
+                    cur.execute("SET @__matview_skip_triggers = 1;")
+                    session_bypass_ok = True
+                except Exception:
+                    pass
+
+            if not session_bypass_ok:
+                for entry in targets:
+                    if self.dialect == Dialect.POSTGRES:
+                        for fn_name in entry["function_names"]:
+                            if "fn_readonly_" not in fn_name:
+                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    else:
+                        for t_name in entry["trigger_names"]:
+                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+
+            def _cleanup_and_restore() -> None:
+                if sp_active:
+                    try:
+                        cur.execute("ROLLBACK TO SAVEPOINT __mv_bulk_sp;")
+                        cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                    except Exception:
+                        self._rollback()
                 else:
-                    for t_name in entry["trigger_names"]:
-                        if "__ro_" not in t_name and not t_name.endswith("__readonly"):
-                            cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
-                plan = generate_materialized_view(
-                    schemas,
-                    entry["view_sql"],
-                    dialect=self.dialect,
-                    pg_use_transition_tables=self.pg_use_transition_tables,
-                    ignore_limitations=True,
-                    object_prefix=self.object_prefix,
-                    engine_version=self.engine_version,
-                )
-                for stmt in plan.trigger_ddls:
-                    cur.execute(stmt)
-            self._commit()
-            raise
-        else:
-            if self.dialect == Dialect.POSTGRES:
+                    self._rollback()
+
+                if self.dialect == Dialect.POSTGRES:
+                    try:
+                        cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                    except Exception:
+                        pass
+                elif self.dialect == Dialect.MYSQL:
+                    try:
+                        cur.execute("SET @__matview_skip_triggers = 0;")
+                    except Exception:
+                        pass
+
+                for st in created_shadow_tables:
+                    try:
+                        cur.execute(f"DROP TABLE IF EXISTS {st};")
+                    except Exception:
+                        pass
+
                 try:
-                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                    schemas = self.fetch_schema()
+                    for entry in targets:
+                        if self.dialect == Dialect.POSTGRES:
+                            for fn_name in entry["function_names"]:
+                                if "fn_readonly_" not in fn_name:
+                                    try:
+                                        cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                                    except Exception:
+                                        pass
+                        else:
+                            for t_name in entry["trigger_names"]:
+                                if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                    try:
+                                        cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                                    except Exception:
+                                        pass
+                        plan = generate_materialized_view(
+                            schemas,
+                            entry["view_sql"],
+                            dialect=self.dialect,
+                            pg_use_transition_tables=self.pg_use_transition_tables,
+                            ignore_limitations=True,
+                            object_prefix=self.object_prefix,
+                            engine_version=self.engine_version,
+                        )
+                        for stmt in plan.trigger_ddls:
+                            cur.execute(stmt)
                 except Exception:
                     pass
-            elif self.dialect == Dialect.MYSQL:
-                try:
-                    cur.execute("SET @__matview_skip_triggers = 0;")
-                except Exception:
-                    pass
-            schemas = self.fetch_schema()
-            for entry in targets:
-                plan = generate_materialized_view(
-                    schemas,
-                    entry["view_sql"],
-                    dialect=self.dialect,
-                    pg_use_transition_tables=self.pg_use_transition_tables,
-                    ignore_limitations=True,
-                    object_prefix=self.object_prefix,
-                    engine_version=self.engine_version,
-                )
-                for aux_t in plan.auxiliary_table_names:
-                    cur.execute(f"DELETE FROM {aux_t};")
-                if use_shadow_swap:
-                    shadow_tbl = f"{plan.backing_table_name}__shadow"
-                    cur.execute(f"DROP TABLE IF EXISTS {shadow_tbl};")
-                    shadow_ddl = plan.backing_table_ddl.replace(
-                        f"CREATE TABLE {plan.backing_table_name}",
-                        f"CREATE TABLE {shadow_tbl}",
-                        1,
+                self._commit()
+
+            try:
+                yield
+            except Exception:
+                _cleanup_and_restore()
+                raise
+
+            try:
+                if self.dialect == Dialect.POSTGRES:
+                    try:
+                        cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                    except Exception:
+                        pass
+                elif self.dialect == Dialect.MYSQL:
+                    try:
+                        cur.execute("SET @__matview_skip_triggers = 0;")
+                    except Exception:
+                        pass
+
+                schemas = self.fetch_schema()
+                for entry in targets:
+                    plan = generate_materialized_view(
+                        schemas,
+                        entry["view_sql"],
+                        dialect=self.dialect,
+                        pg_use_transition_tables=self.pg_use_transition_tables,
+                        ignore_limitations=True,
+                        object_prefix=self.object_prefix,
+                        engine_version=self.engine_version,
                     )
-                    cur.execute(shadow_ddl)
-                    for stmt in plan.get_populate_statements(incremental_backfill=False):
-                        if f"INSERT INTO {plan.backing_table_name}" in stmt:
-                            cur.execute(
-                                stmt.replace(
-                                    f"INSERT INTO {plan.backing_table_name}",
-                                    f"INSERT INTO {shadow_tbl}",
+
+                    if use_shadow_swap:
+                        shadow_tbl = self._shadow_name(plan.backing_table_name)
+                        cur.execute(f"DROP TABLE IF EXISTS {shadow_tbl};")
+                        shadow_ddl = re.sub(
+                            rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:\"{re.escape(plan.backing_table_name)}\"|`{re.escape(plan.backing_table_name)}`|{re.escape(plan.backing_table_name)})\b",
+                            f"CREATE TABLE {shadow_tbl}",
+                            plan.backing_table_ddl,
+                            count=1,
+                            flags=re.IGNORECASE,
+                        )
+                        if shadow_ddl == plan.backing_table_ddl:
+                            shadow_ddl = plan.backing_table_ddl.replace(
+                                f"CREATE TABLE {plan.backing_table_name}",
+                                f"CREATE TABLE {shadow_tbl}",
+                                1,
+                            )
+                        cur.execute(shadow_ddl)
+                        created_shadow_tables.append(shadow_tbl)
+
+                        shadow_aux_map: Dict[str, str] = {}
+                        for aux_t, aux_ddl in zip(plan.auxiliary_table_names, plan.auxiliary_table_ddls):
+                            s_aux = self._shadow_name(aux_t)
+                            shadow_aux_map[aux_t] = s_aux
+                            cur.execute(f"DROP TABLE IF EXISTS {s_aux};")
+                            s_aux_ddl = re.sub(
+                                rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:\"{re.escape(aux_t)}\"|`{re.escape(aux_t)}`|{re.escape(aux_t)})\b",
+                                f"CREATE TABLE {s_aux}",
+                                aux_ddl,
+                                count=1,
+                                flags=re.IGNORECASE,
+                            )
+                            if s_aux_ddl == aux_ddl:
+                                s_aux_ddl = aux_ddl.replace(
+                                    f"CREATE TABLE {aux_t}",
+                                    f"CREATE TABLE {s_aux}",
                                     1,
                                 )
+                            cur.execute(s_aux_ddl)
+                            created_shadow_tables.append(s_aux)
+
+                        for stmt in plan.get_populate_statements(incremental_backfill=False):
+                            s_stmt = stmt
+                            s_stmt = re.sub(
+                                rf"\bINSERT\s+INTO\s+(?:\"{re.escape(plan.backing_table_name)}\"|`{re.escape(plan.backing_table_name)}`|{re.escape(plan.backing_table_name)})\b",
+                                f"INSERT INTO {shadow_tbl}",
+                                s_stmt,
+                                flags=re.IGNORECASE,
                             )
-                        else:
+                            for aux_t, s_aux in shadow_aux_map.items():
+                                s_stmt = re.sub(
+                                    rf"\bINSERT\s+INTO\s+(?:\"{re.escape(aux_t)}\"|`{re.escape(aux_t)}`|{re.escape(aux_t)})\b",
+                                    f"INSERT INTO {s_aux}",
+                                    s_stmt,
+                                    flags=re.IGNORECASE,
+                                )
+                                s_stmt = re.sub(
+                                    rf"\bFROM\s+(?:\"{re.escape(aux_t)}\"|`{re.escape(aux_t)}`|{re.escape(aux_t)})\b",
+                                    f"FROM {s_aux}",
+                                    s_stmt,
+                                    flags=re.IGNORECASE,
+                                )
+                                s_stmt = re.sub(
+                                    rf"\bJOIN\s+(?:\"{re.escape(aux_t)}\"|`{re.escape(aux_t)}`|{re.escape(aux_t)})\b",
+                                    f"JOIN {s_aux}",
+                                    s_stmt,
+                                    flags=re.IGNORECASE,
+                                )
+                            cur.execute(s_stmt)
+
+                        if not session_bypass_ok or drop_triggers:
+                            if self.dialect == Dialect.POSTGRES:
+                                for fn_name in entry["function_names"]:
+                                    if "fn_readonly_" not in fn_name:
+                                        cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                            else:
+                                for t_name in entry["trigger_names"]:
+                                    if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                        cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+
+                        swap_sqls = self._build_shadow_swap_sqls(plan, shadow_tbl, shadow_aux_map)
+                        for s in swap_sqls:
+                            cur.execute(s)
+
+                        for ro_stmt in plan.readonly_trigger_ddls:
+                            try:
+                                cur.execute(ro_stmt)
+                            except Exception:
+                                pass
+                        for idx_ddl in plan.index_ddls:
+                            cur.execute(idx_ddl)
+
+                        created_shadow_tables.clear()
+                    else:
+                        for aux_t in plan.auxiliary_table_names:
+                            cur.execute(f"DELETE FROM {aux_t};")
+                        cur.execute(f"DELETE FROM {plan.backing_table_name};")
+                        for stmt in plan.get_populate_statements(incremental_backfill=False):
                             cur.execute(stmt)
-                    if self.dialect == Dialect.POSTGRES:
-                        for fn_name in entry["function_names"]:
-                            if "fn_readonly_" not in fn_name:
-                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-                    else:
-                        for t_name in entry["trigger_names"]:
-                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
-                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
-                    cur.execute(f"DROP VIEW IF EXISTS {plan.view_name};")
-                    cur.execute(f"DROP TABLE IF EXISTS {plan.backing_table_name};")
-                    cur.execute(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
-                    if plan.reader_view_ddl:
-                        cur.execute(plan.reader_view_ddl)
-                    for ro_stmt in plan.readonly_trigger_ddls:
-                        cur.execute(ro_stmt)
-                    for idx_ddl in plan.index_ddls:
-                        cur.execute(idx_ddl)
-                else:
-                    cur.execute(f"DELETE FROM {plan.backing_table_name};")
-                    for stmt in plan.get_populate_statements(incremental_backfill=False):
-                        cur.execute(stmt)
-                if not session_bypass_ok or use_shadow_swap:
-                    if self.dialect == Dialect.POSTGRES:
-                        for fn_name in entry["function_names"]:
-                            if "fn_readonly_" not in fn_name:
-                                cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-                    else:
-                        for t_name in entry["trigger_names"]:
-                            if "__ro_" not in t_name and not t_name.endswith("__readonly"):
-                                cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
-                    for stmt in plan.trigger_ddls:
-                        cur.execute(stmt)
-            if sp_active:
+
+                    if not session_bypass_ok or use_shadow_swap or drop_triggers:
+                        if self.dialect == Dialect.POSTGRES:
+                            for fn_name in entry["function_names"]:
+                                if "fn_readonly_" not in fn_name:
+                                    try:
+                                        cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                                    except Exception:
+                                        pass
+                        else:
+                            for t_name in entry["trigger_names"]:
+                                if "__ro_" not in t_name and not t_name.endswith("__readonly"):
+                                    try:
+                                        cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
+                                    except Exception:
+                                        pass
+                        for stmt in plan.trigger_ddls:
+                            cur.execute(stmt)
+
+                if sp_active:
+                    try:
+                        cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                    except Exception:
+                        pass
+                self._commit()
+            except Exception:
+                _cleanup_and_restore()
+                raise
+        finally:
+            if hasattr(cur, "close"):
                 try:
-                    cur.execute("RELEASE SAVEPOINT __mv_bulk_sp;")
+                    cur.close()
                 except Exception:
                     pass
-            self._commit()
 
 
 # -----------------------------------------------------------------------------
