@@ -95,6 +95,9 @@ class Tier2Mixin:
         def _lhs_expr(g_expr: str, mv_col: str) -> str:
             if lhs_table_alias:
                 return f"{lhs_table_alias}.{self._q(mv_col)}"
+            if record_prefix in ("__mv_new_rows", "__mv_old_rows") and self.view.joins:
+                outer_alias = self._q(self.view.joins[0].alias or base_t)
+                return f"({self._rewrite_expr_for_record(g_expr, outer_alias)})"
             return f"({g_expr})"
 
         if len(self.view.joins) == 1:
@@ -427,7 +430,7 @@ class Tier2Mixin:
         view_name = self.view.view_name
         mv_table = self._backing_table_name()
         user_columns = [it.alias for it in self.view.select_items]
-        grp_exprs = self._effective_group_by_exprs
+        grp_exprs = self._tier2_scope_exprs()
 
         target_cols: List[str] = list(user_columns)
         group_mv_cols: List[Tuple[str, str]] = []
