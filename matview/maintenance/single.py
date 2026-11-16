@@ -324,6 +324,7 @@ class Tier1SingleMixin:
 
         aux_ddls: List[str] = []
         aux_names: List[str] = []
+        aux_index_specs: List[Tuple[str, str, List[str], bool]] = []
         for ekey, (aux_tbl, rep_item, val_dt) in distinct_aux_tables.items():
             aux_names.append(aux_tbl)
             aux_col_defs: List[str] = []
@@ -354,6 +355,7 @@ class Tier1SingleMixin:
             aux_ddls.append(
                 self._create_table_ddl(aux_tbl, aux_col_defs, is_backing_store=False, pk_cols=aux_pk)
             )
+            aux_index_specs.append((aux_tbl, rep_item.alias, list(aux_pk), bool(grp_exprs and not has_nullable_grp)))
 
         backing_col_map = {
             u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
@@ -378,6 +380,15 @@ class Tier1SingleMixin:
             backing_col_map=backing_col_map,
             unique_group_nulls_not_distinct=can_pg15_unique_nnd,
         )
+        for aux_tbl, rep_alias, aux_pk_cols, has_nonnull_grp in aux_index_specs:
+            a_ddls, a_names = self._build_aux_dist_index_ddls(
+                aux_tbl=aux_tbl,
+                item_alias=rep_alias,
+                aux_pk_cols=aux_pk_cols,
+                has_group_cols=has_nonnull_grp,
+            )
+            index_ddls.extend(a_ddls)
+            index_names.extend(a_names)
 
         reader_select_override = [
             self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns

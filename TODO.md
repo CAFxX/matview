@@ -324,12 +324,12 @@ The existing differential-testing harness is useful, but its current headline co
 
 ## P2 — Index Intelligence & Incremental SQL Feature Coverage
 
-- [ ] **Introspect & Leverage Existing Base-Table Indexes**:
-  I would like the generator to consider existing indexes on the base tables when deciding how to most efficiently perform the materialization (introspecting `sqlite_master` `type='index'`, `pg_indexes`, and `information_schema.statistics` in `introspect_database_schemas`).
-- [ ] **Propose Additional Base-Table Indexes (`recommended_base_indexes`)**:
-  I would like the generator to propose additional indexes on the base tables, when adding them would yield most efficient materialization (e.g. covering join `ON` columns in Tier 1 Join triggers, `GROUP BY` columns in `MIN`/`MAX` delete recomputations, and Tier 2 group-scoped refresh predicates).
-- [ ] **Automatically Create Optimal Indexes on Auxiliary & Materialized Tables**:
-  I would like the generator to automatically create indexes on the aux or materialized tables when creating them helps materialization efficiency (including indexing group columns on `__matview_dist_*` auxiliary tables and foreign/join keys on backing tables).
+- [x] **Introspect & Leverage Existing Base-Table Indexes**:
+  Introspects existing base-table indexes (`sqlite_master` + `PRAGMA index_list`/`index_info`, `pg_indexes`, `information_schema.statistics`, SQLAlchemy `inspect().get_indexes()`/`get_unique_constraints()`, and `parse_table_schema` `CREATE INDEX` / `UNIQUE` constraints) into `TableIndexDef` and ordered `TableSchema.pk_columns`, and leverages prefix coverage (`TableSchema.has_index_covering`) to avoid duplicate recommendations and record leveraged indexes in `PlanDiagnostics.details["existing_base_indexes_used"]`.
+- [x] **Propose Additional Base-Table Indexes (`recommended_base_indexes`)**:
+  Emits dialect-accurate, deduplicated `recommended_base_indexes` DDLs (and structured `base_index_recommendations` metadata) on `MaterializedViewPlan` and `PlanDiagnostics.details` for unindexed join `ON` lookup keys, `GROUP BY` columns used by `MIN`/`MAX`/`BIT_AND`/`BIT_OR` delete recomputations, Tier 2 group-scoped refresh predicates, window `PARTITION BY` keys, and incremental backfill PK cursors.
+- [x] **Automatically Create Optimal Indexes on Auxiliary & Materialized Tables**:
+  Automatically generates optimal secondary indexes on `__matview_dist_*` auxiliary tables (`__val` and trailing composite `GROUP BY` columns) and projected join/group/partition keys across materialized backing tables (with MySQL `TEXT -> VARCHAR(255)` type coercion, duplicate-prefix skipping, and full shadow-swap / drift / drop support), verified in `test_p2_index_intelligence.py`.
 - [ ] **Tier 1 Algebraic Maintenance for `LEFT OUTER JOIN`**:
   Support $O(1)$ incremental delta maintenance for `LEFT JOIN` projections and aggregates by maintaining a right-side match counter (`__mv_right_cnt`) per left tuple/key to emit or retract the `NULL`-extended row when right-hand matches transition between `0` and `>0`.
 - [ ] **Optional Reference-Counted Auxiliary Tables for `MIN`/`MAX` and `BIT_AND`/`BIT_OR`**:

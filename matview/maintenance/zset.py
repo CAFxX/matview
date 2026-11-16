@@ -708,7 +708,12 @@ class Tier1ZSetMixin:
         if not uses_native_pk:
             col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
 
-        indexed_cols_lower = self._indexed_column_names_lower(mv_pk_cols if uses_native_pk else ())
+        extra_auto_cols = self._auto_backing_extra_index_cols(
+            excluded_leading_cols=(mv_pk_cols[0],) if (uses_native_pk and mv_pk_cols) else ("__mv_pk",)
+        )
+        indexed_cols_lower = self._indexed_column_names_lower(
+            list(mv_pk_cols if uses_native_pk else ()) + list(extra_auto_cols)
+        )
         for it in self.view.select_items:
             dt = self._infer_expr_storage_type(it)
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
@@ -735,6 +740,7 @@ class Tier1ZSetMixin:
             mv_table=mv_table,
             auto_group_cols=(),
             has_pk_on_group_cols=False,
+            extra_auto_index_cols=extra_auto_cols,
         )
         reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
             self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
