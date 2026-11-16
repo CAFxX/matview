@@ -8333,6 +8333,36 @@ class IncrementalViewCompiler:
             q_pk_cols = [self._q(c) for c in pk_cols]
             work_items = self._working_select_items
 
+            # Native recomputation subqueries correlate against transition-row
+            # columns. PostgreSQL rejects those outer references when GROUP BY
+            # contains an expression (for example COALESCE(region, 'UNK')).
+            # Keep this shape correct by using the existing row-loop fallback
+            # until recomputation is joined to projected group-key values.
+            def _requires_transition_group_recompute(item: SelectItem) -> bool:
+                if not item.is_aggregate:
+                    return False
+                if item.agg_func == AggFunc.AVG:
+                    return not item.is_distinct and self._requires_native_avg_recompute(item)
+                return item.agg_func not in (
+                    AggFunc.COUNT_STAR,
+                    AggFunc.COUNT_COL,
+                    AggFunc.SUM,
+                    AggFunc.TOTAL,
+                    AggFunc.MIN,
+                    AggFunc.MAX,
+                    AggFunc.BOOL_AND,
+                    AggFunc.BOOL_OR,
+                    AggFunc.BIT_AND,
+                    AggFunc.BIT_OR,
+                )
+
+            if (
+                grp_exprs
+                and any(not self._is_simple_col_ref(g) for g in grp_exprs)
+                and any(_requires_transition_group_recompute(it) for it in work_items)
+            ):
+                return None, None, None
+
             where_new_clause = self.view.where_clause
             where_old_clause = self.view.where_clause
             if self.watermark_catalog_table and self._alg_mode in ("single", "distinct"):

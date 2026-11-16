@@ -516,6 +516,62 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
         self.cur.execute("SELECT page, reach FROM page_reach ORDER BY page;")
         self.assertEqual(self.cur.fetchall(), [("faq", 1), ("home", 1)])
 
+    def test_native_avg_recompute_with_expression_group_key_uses_safe_row_loop(self) -> None:
+        """Expression GROUP BY plus native AVG recomputation must not correlate an ungrouped raw column."""
+        schema_sql = """
+        CREATE TABLE orders (
+            id INT PRIMARY KEY,
+            region TEXT,
+            amount INT
+        );
+        """
+        view_sql = """
+        CREATE VIEW pgtr_expr_avg AS
+        SELECT COALESCE(region, 'UNK') AS reg_norm,
+               COUNT(*) AS cnt,
+               SUM(amount) AS s_amt,
+               AVG(amount) AS a_amt
+        FROM orders
+        GROUP BY COALESCE(region, 'UNK');
+        """
+        self._execute_script(schema_sql)
+        plan = generate_materialized_view(
+            schema_sql,
+            view_sql,
+            dialect=Dialect.POSTGRES,
+            pg_use_transition_tables=True,
+            pg_vectorize_transition_tables=True,
+        )
+        fn_sql = "\n".join(
+            statement for statement in plan.trigger_ddls
+            if "CREATE OR REPLACE FUNCTION" in statement
+        )
+        self.assertIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", fn_sql)
+
+        for ddl in plan.create_structure_statements() + plan.trigger_ddls:
+            self.cur.execute(ddl)
+
+        def assert_matches_live_view() -> None:
+            self.cur.execute(
+                "SELECT reg_norm, cnt, s_amt, a_amt FROM pgtr_expr_avg ORDER BY reg_norm;"
+            )
+            actual = self.cur.fetchall()
+            self.cur.execute(
+                "SELECT COALESCE(region, 'UNK') AS reg_norm, COUNT(*) AS cnt, "
+                "SUM(amount) AS s_amt, AVG(amount) AS a_amt "
+                "FROM orders GROUP BY COALESCE(region, 'UNK') ORDER BY reg_norm;"
+            )
+            self.assertEqual(actual, self.cur.fetchall())
+
+        self.cur.execute(
+            "INSERT INTO orders VALUES (1, 'NA', 10), (2, 'NA', 20), (3, NULL, 30);"
+        )
+        assert_matches_live_view()
+        self.cur.execute("UPDATE orders SET amount = amount + 5 WHERE region = 'NA';")
+        assert_matches_live_view()
+        self.cur.execute("DELETE FROM orders WHERE id = 3;")
+        assert_matches_live_view()
+
     def test_count_star_alias_not_duplicated_in_vectorized_dml(self) -> None:
         """COUNT(*) with explicit alias (e.g. cnt) must appear only once in INSERT/UPDATE columns."""
         schema_sql = """
