@@ -580,6 +580,61 @@ class IncrementalBackfillSpec:
 
 
 @dataclass(frozen=True)
+class PlanDiagnostics:
+    strategy: str
+    tier: int
+    is_incremental: bool
+    selection_reason: str
+    fallback_reason: Optional[str] = None
+    algebraic_mode: Optional[str] = None
+    engine_limitations: List[Dict[str, Any]] = field(default_factory=list)
+    backing_table: str = ""
+    auxiliary_tables: List[str] = field(default_factory=list)
+    triggers: List[str] = field(default_factory=list)
+    indexes: List[str] = field(default_factory=list)
+    reader_view: Optional[str] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "strategy": self.strategy,
+            "tier": self.tier,
+            "is_incremental": self.is_incremental,
+            "selection_reason": self.selection_reason,
+            "fallback_reason": self.fallback_reason,
+            "algebraic_mode": self.algebraic_mode,
+            "engine_limitations": list(self.engine_limitations),
+            "backing_table": self.backing_table,
+            "auxiliary_tables": list(self.auxiliary_tables),
+            "triggers": list(self.triggers),
+            "indexes": list(self.indexes),
+            "reader_view": self.reader_view,
+            "details": dict(self.details),
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.to_dict().get(key, default)
+
+    def keys(self):
+        return self.to_dict().keys()
+
+    def values(self):
+        return self.to_dict().values()
+
+    def items(self):
+        return self.to_dict().items()
+
+    def __contains__(self, key: object) -> bool:
+        return key in self.to_dict()
+
+    def __iter__(self):
+        return iter(self.to_dict())
+
+
+@dataclass(frozen=True)
 class MaterializedViewPlan:
     dialect: Dialect
     strategy: MaintenanceStrategy
@@ -608,6 +663,50 @@ class MaterializedViewPlan:
     full_populate_sqls: List[str] = field(default_factory=list)
     incremental_populate_sqls: List[str] = field(default_factory=list)
     engine_version: Optional[EngineVersion] = None
+    diagnostics: Optional[PlanDiagnostics] = None
+
+    def __post_init__(self) -> None:
+        if self.diagnostics is None:
+            object.__setattr__(self, "diagnostics", self._build_default_diagnostics())
+
+    def _build_default_diagnostics(self) -> PlanDiagnostics:
+        tier = (
+            1 if self.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA
+            else 2 if self.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA
+            else 3
+        )
+        is_inc = tier in (1, 2)
+        sel_reason = f"Tier {tier} {self.strategy.value} maintenance."
+        fb_reason = None
+        if tier == 2:
+            fb_reason = "Holistic aggregate, group structure, or dialect constraints require Tier 2 group-scoped recomputation."
+        elif tier == 3:
+            fb_reason = "Query complexity (e.g. window function, CTE, or subqueries) requires Tier 3 atomic refresh."
+        return PlanDiagnostics(
+            strategy=self.strategy.value,
+            tier=tier,
+            is_incremental=is_inc,
+            selection_reason=sel_reason,
+            fallback_reason=fb_reason,
+            algebraic_mode=None,
+            engine_limitations=[
+                {
+                    "code": lim.code,
+                    "description": lim.description,
+                    "severity": lim.severity.value,
+                }
+                for lim in self.limitations
+            ],
+            backing_table=self.backing_table_name,
+            auxiliary_tables=list(self.auxiliary_table_names),
+            triggers=list(self.trigger_names),
+            indexes=list(self.index_names),
+            reader_view=self.logical_view_name,
+            details={
+                "dialect": self.dialect.value,
+                "engine_version": self.engine_version.label if self.engine_version else None,
+            },
+        )
 
     @property
     def subdialect(self) -> EngineSubdialect:
@@ -803,6 +902,167 @@ class MaterializedViewPlan:
             for pop in pop_stmts:
                 lines.append(pop)
             lines.append("")
+        return "\n".join(lines)
+
+
+@dataclass
+class ViewDiff:
+    view_name: str
+    status: str  # "CREATE", "REPLACE", "ALTER", "DROP", "NOOP"
+    has_changes: bool
+    strategy: Optional[str]
+    current_strategy: Optional[str]
+    signature_hash: Optional[str]
+    current_signature_hash: Optional[str]
+    diagnostics: Optional[PlanDiagnostics]
+    pending_ddls: List[str]
+    pending_changes: Dict[str, Any]
+    summary: str
+    plan: Optional[MaterializedViewPlan] = None
+    action: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.action:
+            self.action = self.status
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "view_name": self.view_name,
+            "status": self.status,
+            "action": self.action,
+            "has_changes": self.has_changes,
+            "strategy": self.strategy,
+            "current_strategy": self.current_strategy,
+            "signature_hash": self.signature_hash,
+            "current_signature_hash": self.current_signature_hash,
+            "diagnostics": self.diagnostics.to_dict() if self.diagnostics else None,
+            "pending_changes": self.pending_changes,
+            "pending_ddls": list(self.pending_ddls),
+            "summary": self.summary,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.to_dict().get(key, default)
+
+    def keys(self):
+        return self.to_dict().keys()
+
+    def values(self):
+        return self.to_dict().values()
+
+    def items(self):
+        return self.to_dict().items()
+
+    def __contains__(self, key: object) -> bool:
+        return key in self.to_dict()
+
+    def __iter__(self):
+        return iter(self.to_dict())
+
+    def render_text(self) -> str:
+        lines: List[str] = [f"[{self.status}] {self.view_name}"]
+        if self.diagnostics:
+            tier_str = f"Tier {self.diagnostics.tier}"
+            mode_str = f" ({self.diagnostics.algebraic_mode})" if self.diagnostics.algebraic_mode else ""
+            lines.append(f"  Strategy: {self.diagnostics.strategy} ({tier_str}{mode_str})")
+            if self.diagnostics.selection_reason:
+                lines.append(f"  Selection Reason: {self.diagnostics.selection_reason}")
+            if self.diagnostics.fallback_reason:
+                lines.append(f"  Fallback Reason:  {self.diagnostics.fallback_reason}")
+            if self.diagnostics.engine_limitations:
+                lines.append(f"  Limitations ({len(self.diagnostics.engine_limitations)}):")
+                for lim in self.diagnostics.engine_limitations:
+                    lines.append(f"    * [{lim['code']}] {lim['description']}")
+
+        if self.status == "NOOP":
+            lines.append("  Status: Up to date; no pending changes.")
+            return "\n".join(lines)
+
+        lines.append(f"  Summary: {self.summary}")
+        lines.append("  Pending Changes:")
+        bt = self.pending_changes.get("backing_table", {})
+        if bt:
+            act = bt.get("action", "")
+            lines.append(f"    Backing Table: {bt.get('name')} [{act}]")
+        rv = self.pending_changes.get("reader_view", {})
+        if rv:
+            act = rv.get("action", "")
+            lines.append(f"    Reader View:   {rv.get('name')} [{act}]")
+        trigs = self.pending_changes.get("triggers", {})
+        if trigs.get("to_create"):
+            lines.append(f"    Triggers to Create ({len(trigs['to_create'])}):")
+            for t in trigs["to_create"]:
+                lines.append(f"      + {t}")
+        if trigs.get("to_drop"):
+            lines.append(f"    Triggers to Drop ({len(trigs['to_drop'])}):")
+            for t in trigs["to_drop"]:
+                lines.append(f"      - {t}")
+        idxs = self.pending_changes.get("indexes", {})
+        if idxs.get("to_create"):
+            lines.append(f"    Indexes to Create ({len(idxs['to_create'])}):")
+            for idx in idxs["to_create"]:
+                lines.append(f"      + {idx}")
+        if idxs.get("to_drop"):
+            lines.append(f"    Indexes to Drop ({len(idxs['to_drop'])}):")
+            for idx in idxs["to_drop"]:
+                lines.append(f"      - {idx}")
+        if self.pending_ddls:
+            lines.append(f"  Pending DDL Statements: {len(self.pending_ddls)} statement(s)")
+        return "\n".join(lines)
+
+
+class ViewDiffReport(dict):
+    """
+    Mapping of view_name -> ViewDiff, with helper methods for inspection,
+    JSON serialization, and text rendering.
+    """
+
+    def __init__(self, diffs: Dict[str, ViewDiff]) -> None:
+        super().__init__(diffs)
+
+    @property
+    def has_changes(self) -> bool:
+        return any(d.has_changes for d in self.values())
+
+    @property
+    def counts(self) -> Dict[str, int]:
+        c = {"CREATE": 0, "REPLACE": 0, "ALTER": 0, "DROP": 0, "NOOP": 0}
+        for d in self.values():
+            st = d.status.upper()
+            c[st] = c.get(st, 0) + 1
+        return c
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "views": {name: diff.to_dict() for name, diff in self.items()},
+            "summary": {
+                "total_views": len(self),
+                "has_changes": self.has_changes,
+                "counts": self.counts,
+            },
+        }
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
+
+    def render_text(self) -> str:
+        lines: List[str] = [
+            f"=== Matview Diff: {len(self)} view(s) inspected ===",
+            "",
+        ]
+        for name, diff in self.items():
+            lines.append(diff.render_text())
+            lines.append("")
+        lines.append("-" * 78)
+        c = self.counts
+        changed = sum(1 for d in self.values() if d.has_changes)
+        lines.append(
+            f"Summary: {changed} view(s) with pending changes "
+            f"({c['CREATE']} CREATE, {c['REPLACE']} REPLACE, {c['ALTER']} ALTER, {c['DROP']} DROP, {c['NOOP']} NOOP)"
+        )
         return "\n".join(lines)
 
 
@@ -5543,10 +5803,118 @@ class IncrementalViewCompiler:
                 ])
         return inc_stmts
 
+    def _diagnose_tier1_selection(self) -> Tuple[str, Optional[str]]:
+        mode_descriptions = {
+            "single": "single-table O(1) incremental aggregates",
+            "join": "multi-table INNER/CROSS JOIN O(1) delta maintenance",
+            "setop": "Z-set compound set operation (UNION/INTERSECT/EXCEPT)",
+            "distinct": "Z-set SELECT DISTINCT with reference counting",
+            "projection": "PK-lineage projection maintenance",
+            "union_all_agg": "algebraic aggregation over UNION ALL",
+        }
+        desc = mode_descriptions.get(self._alg_mode, "algebraic delta maintenance")
+        return (f"Tier 1 algebraic delta maintenance: {desc}.", None)
+
+    def _diagnose_tier2_fallback(self) -> Tuple[str, str]:
+        sel = "Tier 2 group-scoped delta maintenance: recomputes only the affected GROUP BY groups."
+        if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_upsert:
+            return (sel, "SQLite version lacks UPSERT (INSERT ... ON CONFLICT) required for Tier 1 algebraic delta maintenance.")
+
+        allowed_aggs = {
+            AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG,
+            AggFunc.MIN, AggFunc.MAX, AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP,
+            AggFunc.STDDEV_SAMP, AggFunc.BIT_AND, AggFunc.BIT_OR, AggFunc.BIT_XOR,
+            AggFunc.BOOL_AND, AggFunc.BOOL_OR,
+        }
+        for it in self._working_select_items:
+            if it.is_aggregate and it.agg_func not in allowed_aggs:
+                fn_name = it.agg_func.value if hasattr(it.agg_func, "value") else str(it.agg_func or it.raw_expr)
+                return (sel, f"Holistic aggregate function '{fn_name}' cannot be maintained algebraically with O(1) deltas.")
+            if it.is_aggregate and it.is_distinct:
+                fn_name = it.agg_func.value if hasattr(it.agg_func, "value") else str(it.agg_func or it.raw_expr)
+                return (sel, f"DISTINCT aggregate expression '{fn_name}' requires group-scoped recomputation.")
+
+        for j in self.view.joins:
+            if j.join_type not in ("FROM", "INNER JOIN", "CROSS JOIN"):
+                return (sel, f"Non-inner join '{j.join_type}' cannot be maintained algebraically in Tier 1.")
+
+        if not self._decomposed_ok:
+            return (sel, "Compound aggregate expression could not be decomposed into algebraic components.")
+
+        return (sel, "Query structure requires group-scoped delta recomputation rather than O(1) algebraic maintenance.")
+
+    def _diagnose_tier3_fallback(self) -> Tuple[str, str]:
+        sel = "Tier 3 atomic query sync: full atomic refresh executed on base-table mutations."
+        if self.view.has_window_func:
+            return (sel, "Window function (e.g. ROW_NUMBER, RANK, LAG, LEAD) requires universal atomic refresh.")
+        if self.view.has_cte:
+            return (sel, "Common Table Expression (WITH / CTE) requires universal atomic query refresh.")
+        if self.view.has_limit_or_order:
+            return (sel, "LIMIT or ORDER BY clause requires full query evaluation.")
+        if self.view.has_compound_set_op:
+            return (sel, "Compound set operation does not satisfy Tier 1 algebraic delta requirements.")
+        if self.view.has_subquery_in_from:
+            return (sel, "Subquery in FROM clause cannot be maintained incrementally.")
+        if self.view.where_clause and _has_subquery_ast(self.view.where_clause):
+            return (sel, "Correlated or scalar subquery in WHERE clause requires atomic refresh.")
+        if any(_has_subquery_ast(it.raw_expr) for it in self.view.select_items):
+            return (sel, "Subquery in SELECT list requires atomic refresh.")
+        if not any(it.is_aggregate for it in self.view.select_items):
+            return (sel, "Non-aggregate projection lacks a primary key on base table for incremental delta tracking.")
+        if not self.view.group_by_cols:
+            return (sel, "Global aggregation without GROUP BY could not be maintained algebraically.")
+        if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_upsert:
+            return (sel, "SQLite version lacks UPSERT support and query does not qualify for Tier 2 group-scoped maintenance.")
+        return (sel, "Query structure prevents incremental maintenance; falls back to universal atomic query sync.")
+
+    def _build_compilation_diagnostics(self, raw_plan: MaterializedViewPlan) -> PlanDiagnostics:
+        tier = (
+            1 if raw_plan.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA
+            else 2 if raw_plan.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA
+            else 3
+        )
+        if tier == 1:
+            sel_reason, fb_reason = self._diagnose_tier1_selection()
+            alg_mode = self._alg_mode
+        elif tier == 2:
+            sel_reason, fb_reason = self._diagnose_tier2_fallback()
+            alg_mode = None
+        else:
+            sel_reason, fb_reason = self._diagnose_tier3_fallback()
+            alg_mode = None
+
+        return PlanDiagnostics(
+            strategy=raw_plan.strategy.value,
+            tier=tier,
+            is_incremental=(tier in (1, 2)),
+            selection_reason=sel_reason,
+            fallback_reason=fb_reason,
+            algebraic_mode=alg_mode,
+            engine_limitations=[
+                {
+                    "code": lim.code,
+                    "description": lim.description,
+                    "severity": lim.severity.value,
+                }
+                for lim in raw_plan.limitations
+            ],
+            backing_table=raw_plan.backing_table_name,
+            auxiliary_tables=list(raw_plan.auxiliary_table_names),
+            triggers=list(raw_plan.trigger_names),
+            indexes=list(raw_plan.index_names),
+            reader_view=raw_plan.view_name,
+            details={
+                "dialect": self.dialect.value,
+                "engine_version": self.engine_version.label if self.engine_version else None,
+                "base_tables": list(self.view.referenced_tables),
+            },
+        )
+
     def _finalize_plan_backfill(self, raw_plan: MaterializedViewPlan) -> MaterializedViewPlan:
         full_sqls = list(raw_plan.initial_populate_sqls)
         inc_sqls = self._build_dialect_incremental_populate_sqls(raw_plan)
         active_sqls = inc_sqls if self.incremental_backfill else full_sqls
+        diagnostics = self._build_compilation_diagnostics(raw_plan)
         return MaterializedViewPlan(
             dialect=raw_plan.dialect,
             strategy=raw_plan.strategy,
@@ -5575,6 +5943,7 @@ class IncrementalViewCompiler:
             full_populate_sqls=full_sqls,
             incremental_populate_sqls=inc_sqls,
             engine_version=self.engine_version,
+            diagnostics=diagnostics,
         )
 
     def _compile_single_plan(self) -> MaterializedViewPlan:
@@ -5646,6 +6015,7 @@ class IncrementalViewCompiler:
             full_populate_sqls=[d for sp in sub_plans for d in sp.full_populate_sqls],
             incremental_populate_sqls=[d for sp in sub_plans for d in sp.incremental_populate_sqls],
             engine_version=self.engine_version,
+            diagnostics=first_plan.diagnostics,
         )
 
 
@@ -10639,6 +11009,7 @@ class MaterializedViewManager:
         pg_use_transition_tables: bool = False,
         strict: bool = False,
         engine_version: Optional[EngineVersion | str] = None,
+        skip_ensure_catalog: bool = False,
     ) -> None:
         hint_d: Optional[Dialect] = None
         if isinstance(dialect, Dialect):
@@ -10675,7 +11046,8 @@ class MaterializedViewManager:
             f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
         )
 
-        self._ensure_catalog()
+        if not skip_ensure_catalog:
+            self._ensure_catalog()
 
     def _ensure_catalog(self) -> None:
         cur = self.conn.cursor()
@@ -10797,12 +11169,16 @@ class MaterializedViewManager:
             has_wm_cols = True
         except Exception:
             self._rollback()
-            cur.execute(
-                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
-                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
-                f"FROM {self.catalog_table}"
-            )
-            has_wm_cols = False
+            try:
+                cur.execute(
+                    f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                    f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
+                    f"FROM {self.catalog_table}"
+                )
+                has_wm_cols = False
+            except Exception:
+                self._rollback()
+                return {}
         out: Dict[str, Dict[str, Any]] = {}
         for row in cur.fetchall():
             out[row[0]] = {
@@ -11899,6 +12275,393 @@ class MaterializedViewManager:
                 except Exception:
                     pass
 
+    def _query_lower_name_set(self, sql: str) -> Optional[Set[str]]:
+        """Execute a metadata query returning lowercase object names, or None if unavailable."""
+        cur = self.conn.cursor()
+        try:
+            cur.execute(sql)
+            return {row[0].lower() for row in cur.fetchall() if row[0]}
+        except Exception:
+            self._rollback()
+            return None
+        finally:
+            cur.close()
+
+    def _get_live_table_names(self) -> Optional[Set[str]]:
+        if self.dialect == Dialect.SQLITE:
+            return self._query_lower_name_set(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view');"
+            )
+        if self.dialect == Dialect.POSTGRES:
+            return self._query_lower_name_set(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() "
+                "UNION SELECT table_name FROM information_schema.views WHERE table_schema = current_schema();"
+            )
+        if self.dialect == Dialect.MYSQL:
+            return self._query_lower_name_set(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE();"
+            )
+        return None
+
+    def _get_live_trigger_names(self) -> Optional[Set[str]]:
+        if self.dialect == Dialect.SQLITE:
+            return self._query_lower_name_set(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger';"
+            )
+        if self.dialect == Dialect.POSTGRES:
+            return self._query_lower_name_set(
+                "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = current_schema();"
+            )
+        if self.dialect == Dialect.MYSQL:
+            return self._query_lower_name_set(
+                "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE();"
+            )
+        return None
+
+    def _get_live_index_names(self) -> Optional[Set[str]]:
+        if self.dialect == Dialect.SQLITE:
+            return self._query_lower_name_set(
+                "SELECT name FROM sqlite_master WHERE type = 'index';"
+            )
+        if self.dialect == Dialect.POSTGRES:
+            return self._query_lower_name_set(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema();"
+            )
+        if self.dialect == Dialect.MYSQL:
+            return self._query_lower_name_set(
+                "SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_schema = DATABASE();"
+            )
+        return None
+
+    def diff_views(
+        self,
+        view_sqls: Optional[Sequence[str | ViewSpec] | str | ViewSpec] = None,
+        schema_sql: Optional[str] = None,
+        prune_removed: bool = False,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+        ignore_limitations: Optional[bool] = None,
+        incremental_backfill: Optional[bool] = None,
+        batch_size: Optional[int] = None,
+    ) -> ViewDiffReport:
+        """
+        Compares desired compiled view plan(s) against `__matview_catalog` and live database
+        metadata without mutating database schema state. Reports CREATE / REPLACE / ALTER / DROP / NOOP
+        status, structured compilation diagnostics, and pending DDL statements.
+        """
+        effective_ignore = (
+            self.ignore_limitations if ignore_limitations is None else ignore_limitations
+        )
+        effective_strict = self.strict if strict is None else strict
+        schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        catalog = self.get_catalog()
+        live_tables = self._get_live_table_names()
+        live_triggers = self._get_live_trigger_names()
+        diffs: Dict[str, ViewDiff] = {}
+        desired_names: Set[str] = set()
+
+        if view_sqls is None:
+            if not catalog:
+                return ViewDiffReport({})
+            specs_input: Sequence[str | ViewSpec] = [entry["view_sql"] for entry in catalog.values()]
+        elif isinstance(view_sqls, (str, ViewSpec)):
+            specs_input = [view_sqls]
+        else:
+            specs_input = view_sqls
+
+        all_specs = parse_view_definitions(
+            specs_input,
+            known_tables={k.lower() for k in schemas},
+            indexes=indexes,
+        )
+
+        for v_spec in all_specs:
+            plan = generate_materialized_view(
+                schemas,
+                v_spec,
+                dialect=self.dialect,
+                pg_use_transition_tables=self.pg_use_transition_tables,
+                ignore_limitations=effective_ignore,
+                object_prefix=self.object_prefix,
+                strict=effective_strict,
+                engine_version=self.engine_version,
+                watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+            )
+            v_name = plan.view_name
+            desired_names.add(v_name)
+            sig = self._compute_signature(plan, schemas)
+
+            resolved_cat_name = self._resolve_catalog_name(v_name, catalog)
+            existing = catalog.get(resolved_cat_name)
+
+            if existing is None:
+                pending_changes = {
+                    "backing_table": {"name": plan.backing_table_name, "action": "CREATE"},
+                    "auxiliary_tables": [{"name": a, "action": "CREATE"} for a in plan.auxiliary_table_names],
+                    "reader_view": {"name": plan.view_name, "action": "CREATE"},
+                    "triggers": {
+                        "to_create": list(plan.trigger_names),
+                        "to_drop": [],
+                        "unchanged": [],
+                    },
+                    "indexes": {
+                        "to_create": list(plan.index_names),
+                        "to_drop": [],
+                        "unchanged": [],
+                    },
+                }
+                diffs[v_name] = ViewDiff(
+                    view_name=v_name,
+                    status="CREATE",
+                    has_changes=True,
+                    strategy=plan.strategy.value,
+                    current_strategy=None,
+                    signature_hash=sig,
+                    current_signature_hash=None,
+                    diagnostics=plan.diagnostics,
+                    pending_ddls=plan.create_structure_statements() + plan.trigger_ddls,
+                    pending_changes=pending_changes,
+                    summary=f"View '{v_name}' is not registered; pending creation.",
+                    plan=plan,
+                )
+            else:
+                cat_sig = existing.get("signature_hash")
+                cat_strat = existing.get("strategy")
+                cat_backing = existing.get("backing_table", "")
+                cat_trigs = set(existing.get("trigger_names", []))
+                cat_trigs_lower = {t.lower() for t in cat_trigs}
+                plan_trigs_lower = {t.lower() for t in plan.trigger_names}
+
+                backing_exists = (
+                    True if live_tables is None else (cat_backing.lower() in live_tables)
+                )
+                view_exists = (
+                    True
+                    if live_tables is None
+                    else (
+                        v_name.lower() in live_tables
+                        or f"{self.object_prefix}{v_name}".lower() in live_tables
+                    )
+                )
+                trigs_match = (
+                    True if live_triggers is None else cat_trigs_lower.issubset(live_triggers)
+                )
+
+                is_clean_noop = (
+                    cat_sig == sig
+                    and backing_exists
+                    and view_exists
+                    and trigs_match
+                    and cat_strat == plan.strategy.value
+                )
+
+                if is_clean_noop:
+                    pending_changes = {
+                        "backing_table": {"name": plan.backing_table_name, "action": "KEEP"},
+                        "auxiliary_tables": [{"name": a, "action": "KEEP"} for a in plan.auxiliary_table_names],
+                        "reader_view": {"name": plan.view_name, "action": "KEEP"},
+                        "triggers": {
+                            "to_create": [],
+                            "to_drop": [],
+                            "unchanged": list(plan.trigger_names),
+                        },
+                        "indexes": {
+                            "to_create": [],
+                            "to_drop": [],
+                            "unchanged": list(plan.index_names),
+                        },
+                    }
+                    diffs[v_name] = ViewDiff(
+                        view_name=v_name,
+                        status="NOOP",
+                        has_changes=False,
+                        strategy=plan.strategy.value,
+                        current_strategy=cat_strat,
+                        signature_hash=sig,
+                        current_signature_hash=cat_sig,
+                        diagnostics=plan.diagnostics,
+                        pending_ddls=[],
+                        pending_changes=pending_changes,
+                        summary=f"View '{v_name}' is up to date; no pending changes.",
+                        plan=plan,
+                    )
+                else:
+                    query_sql_changed = (
+                        _strip_sql_comments(existing.get("view_sql", "")).strip()
+                        != _strip_sql_comments(self._serialize_view_sql_with_indexes(plan)).strip()
+                    )
+                    strategy_changed = cat_strat != plan.strategy.value
+                    backing_changed = cat_backing != plan.backing_table_name
+                    needs_replace = (
+                        query_sql_changed
+                        or strategy_changed
+                        or backing_changed
+                        or not backing_exists
+                        or cat_sig != sig
+                    )
+
+                    status = "REPLACE" if needs_replace else "ALTER"
+                    to_create_trigs = [
+                        t
+                        for t in plan.trigger_names
+                        if needs_replace
+                        or t.lower() not in cat_trigs_lower
+                        or (live_triggers is not None and t.lower() not in live_triggers)
+                    ]
+                    to_drop_trigs = (
+                        list(cat_trigs)
+                        if needs_replace
+                        else [t for t in cat_trigs if t.lower() not in plan_trigs_lower]
+                    )
+                    unchanged_trigs = (
+                        []
+                        if needs_replace
+                        else [t for t in plan.trigger_names if t not in to_create_trigs]
+                    )
+
+                    reader_action = "REPLACE" if needs_replace else ("CREATE" if not view_exists else "KEEP")
+                    pending_changes = {
+                        "backing_table": {
+                            "name": plan.backing_table_name,
+                            "action": "REPLACE" if needs_replace else "KEEP",
+                            "previous": cat_backing,
+                        },
+                        "auxiliary_tables": [
+                            {"name": a, "action": "REPLACE" if needs_replace else "KEEP"}
+                            for a in plan.auxiliary_table_names
+                        ],
+                        "reader_view": {
+                            "name": plan.view_name,
+                            "action": reader_action,
+                        },
+                        "triggers": {
+                            "to_create": to_create_trigs,
+                            "to_drop": to_drop_trigs,
+                            "unchanged": unchanged_trigs,
+                        },
+                        "indexes": {
+                            "to_create": list(plan.index_names),
+                            "to_drop": [],
+                            "unchanged": [],
+                        },
+                    }
+                    if needs_replace:
+                        pending_ddls = plan.drop_statements() + plan.create_structure_statements() + plan.trigger_ddls
+                        summary = f"View '{v_name}' query, schema, or strategy changed; pending REPLACE."
+                    else:
+                        trig_patterns = [
+                            re.compile(rf"(?:^|[^A-Za-z0-9_]){re.escape(t)}(?:$|[^A-Za-z0-9_])", re.IGNORECASE)
+                            for t in to_create_trigs
+                        ]
+                        alter_trig_ddls = [
+                            s
+                            for s in plan.trigger_ddls
+                            if any(p.search(s) for p in trig_patterns)
+                            or (
+                                to_create_trigs
+                                and self.dialect == Dialect.POSTGRES
+                                and s.lstrip().upper().startswith("CREATE OR REPLACE FUNCTION")
+                            )
+                        ]
+                        view_repair_ddls = (
+                            [plan.reader_view_ddl, *plan.readonly_trigger_ddls]
+                            if not view_exists
+                            else []
+                        )
+                        pending_ddls = view_repair_ddls + alter_trig_ddls + list(plan.index_ddls)
+                        summary = f"View '{v_name}' auxiliary objects changed; pending ALTER."
+
+                    diffs[v_name] = ViewDiff(
+                        view_name=v_name,
+                        status=status,
+                        has_changes=True,
+                        strategy=plan.strategy.value,
+                        current_strategy=cat_strat,
+                        signature_hash=sig,
+                        current_signature_hash=cat_sig,
+                        diagnostics=plan.diagnostics,
+                        pending_ddls=pending_ddls,
+                        pending_changes=pending_changes,
+                        summary=summary,
+                        plan=plan,
+                    )
+
+        if prune_removed:
+            for cat_name, cat_entry in catalog.items():
+                if cat_name not in desired_names:
+                    drop_ddls: List[str] = []
+                    if self.dialect != Dialect.POSTGRES:
+                        for t_name in cat_entry.get("trigger_names", []):
+                            drop_ddls.append(f"DROP TRIGGER IF EXISTS {t_name};")
+                    for fn_name in cat_entry.get("function_names", []):
+                        drop_ddls.append(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                    drop_ddls.append(f"DROP VIEW IF EXISTS {cat_name};")
+                    if cat_entry.get("backing_table"):
+                        drop_ddls.append(f"DROP TABLE IF EXISTS {cat_entry['backing_table']};")
+                    for aux_t in cat_entry.get("aux_tables", []):
+                        drop_ddls.append(f"DROP TABLE IF EXISTS {aux_t};")
+
+                    pending_changes = {
+                        "backing_table": {
+                            "name": cat_entry.get("backing_table", ""),
+                            "action": "DROP",
+                        },
+                        "auxiliary_tables": [
+                            {"name": a, "action": "DROP"} for a in cat_entry.get("aux_tables", [])
+                        ],
+                        "reader_view": {"name": cat_name, "action": "DROP"},
+                        "triggers": {
+                            "to_create": [],
+                            "to_drop": list(cat_entry.get("trigger_names", [])),
+                            "unchanged": [],
+                        },
+                        "indexes": {"to_create": [], "to_drop": [], "unchanged": []},
+                    }
+                    diffs[cat_name] = ViewDiff(
+                        view_name=cat_name,
+                        status="DROP",
+                        has_changes=True,
+                        strategy=None,
+                        current_strategy=cat_entry.get("strategy"),
+                        signature_hash=None,
+                        current_signature_hash=cat_entry.get("signature_hash"),
+                        diagnostics=None,
+                        pending_ddls=drop_ddls,
+                        pending_changes=pending_changes,
+                        summary=f"View '{cat_name}' is no longer declared; pending DROP.",
+                        plan=None,
+                    )
+
+        return ViewDiffReport(diffs)
+
+    def diff_view(
+        self,
+        view_sql: str | ViewSpec,
+        schema_sql: Optional[str] = None,
+        indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
+        strict: Optional[bool] = None,
+        ignore_limitations: Optional[bool] = None,
+        incremental_backfill: Optional[bool] = None,
+        batch_size: Optional[int] = None,
+    ) -> ViewDiff:
+        """
+        Compares a single desired view definition against `__matview_catalog` and live database
+        metadata without mutating database schema state. Returns a `ViewDiff`.
+        """
+        report = self.diff_views(
+            view_sqls=[view_sql],
+            schema_sql=schema_sql,
+            prune_removed=False,
+            indexes=indexes,
+            strict=strict,
+            ignore_limitations=ignore_limitations,
+            incremental_backfill=incremental_backfill,
+            batch_size=batch_size,
+        )
+        if report:
+            return next(iter(report.values()))
+        raise ValueError("No view definition found to diff.")
+
 
 # -----------------------------------------------------------------------------
 # Public High-Level Convenience Functions & CLI
@@ -12178,7 +12941,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Apply the generated materialized view directly to --db.",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="Inspect pending trigger/table DDL changes against __matview_catalog before execution.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON diagnostics and diff output.",
+    )
+    parser.add_argument(
+        "--exit-code",
+        action="store_true",
+        help="Make diff exit with code 1 if differences exist, 0 if no differences.",
+    )
+    parser.add_argument(
+        "--prune-removed",
+        action="store_true",
+        help="Report DROP for registered views absent from declared view definitions.",
+    )
+
+    raw_argv: List[str] = list(sys.argv[1:]) if argv is None else list(argv)
+    is_diff_subcmd = False
+    filtered_argv: List[str] = []
+    for a in raw_argv:
+        if a == "diff" and not is_diff_subcmd and not filtered_argv:
+            is_diff_subcmd = True
+        else:
+            filtered_argv.append(a)
+
+    args = parser.parse_args(filtered_argv)
+    if is_diff_subcmd:
+        args.diff = True
 
     def _read_sql_arg(val: str) -> str:
         if "\n" not in val and not re.match(r"^\s*CREATE\b", val, flags=re.IGNORECASE):
@@ -12190,6 +12985,100 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return val
 
     try:
+        if args.diff:
+            if not args.db and not args.schema:
+                print("ERROR: matview diff requires --db (or --schema).", file=sys.stderr)
+                return 2
+
+            view_sql = _read_sql_arg(args.view) if args.view else None
+            schema_sql = _read_sql_arg(args.schema) if args.schema else None
+
+            if args.db:
+                mgr = MaterializedViewManager(
+                    args.db,
+                    dialect=args.dialect,
+                    ignore_limitations=args.ignore_limitations,
+                    object_prefix=args.object_prefix,
+                    pg_use_transition_tables=args.pg_transition_tables,
+                    strict=args.strict,
+                    engine_version=args.engine_version,
+                )
+                try:
+                    if not view_sql:
+                        cat = mgr.get_catalog()
+                        if not cat:
+                            print("ERROR: --view is required when no views are registered in --db.", file=sys.stderr)
+                            return 2
+                    report = mgr.diff_views(
+                        view_sqls=view_sql,
+                        schema_sql=schema_sql,
+                        prune_removed=args.prune_removed,
+                        indexes=args.indexes,
+                        strict=args.strict,
+                        ignore_limitations=args.ignore_limitations,
+                        incremental_backfill=args.incremental_backfill,
+                        batch_size=args.batch_size,
+                    )
+                finally:
+                    try:
+                        mgr.conn.close()
+                    except Exception:
+                        pass
+            else:
+                if not view_sql:
+                    print("ERROR: --view is required when --db is not provided.", file=sys.stderr)
+                    return 2
+                schemas = parse_table_schema(schema_sql)
+                detected_ev = _resolve_dialect_and_engine_version(
+                    schemas, args.dialect, args.engine_version
+                )
+                plans = generate_materialized_views(
+                    schemas,
+                    view_sql,
+                    dialect=detected_ev.dialect,
+                    pg_use_transition_tables=args.pg_transition_tables,
+                    ignore_limitations=args.ignore_limitations,
+                    object_prefix=args.object_prefix,
+                    indexes=args.indexes,
+                    incremental_backfill=args.incremental_backfill,
+                    batch_size=args.batch_size,
+                    strict=args.strict,
+                    engine_version=detected_ev,
+                )
+                diffs: Dict[str, ViewDiff] = {}
+                for p in plans:
+                    sig = hashlib.sha256(p.view_spec.raw_select_sql.encode("utf-8")).hexdigest()
+                    diffs[p.view_name] = ViewDiff(
+                        view_name=p.view_name,
+                        status="CREATE",
+                        has_changes=True,
+                        strategy=p.strategy.value,
+                        current_strategy=None,
+                        signature_hash=sig,
+                        current_signature_hash=None,
+                        diagnostics=p.diagnostics,
+                        pending_ddls=p.create_structure_statements() + p.trigger_ddls,
+                        pending_changes={
+                            "backing_table": {"name": p.backing_table_name, "action": "CREATE"},
+                            "auxiliary_tables": [{"name": a, "action": "CREATE"} for a in p.auxiliary_table_names],
+                            "reader_view": {"name": p.view_name, "action": "CREATE"},
+                            "triggers": {"to_create": list(p.trigger_names), "to_drop": [], "unchanged": []},
+                            "indexes": {"to_create": list(p.index_names), "to_drop": [], "unchanged": []},
+                        },
+                        summary=f"View '{p.view_name}' is not registered; pending creation.",
+                        plan=p,
+                    )
+                report = ViewDiffReport(diffs)
+
+            if args.json:
+                print(report.to_json())
+            else:
+                print(report.render_text())
+
+            if args.exit_code:
+                return 1 if report.has_changes else 0
+            return 0
+
         if args.check_drift or args.repair:
             if not args.db:
                 print("ERROR: --check-drift / --repair requires --db", file=sys.stderr)
@@ -12203,15 +13092,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 strict=args.strict,
                 engine_version=args.engine_version,
             )
-            if args.check_drift:
-                drift = mgr.check_schema_drift()
-                print(json.dumps(drift, indent=2, sort_keys=True))
-                if any(v != "ok" for v in drift.values()) and not args.repair:
-                    return 1
-            if args.repair:
-                rep = mgr.repair_view()
-                print(json.dumps(rep, indent=2, sort_keys=True))
-            return 0
+            try:
+                if args.check_drift:
+                    drift = mgr.check_schema_drift()
+                    print(json.dumps(drift, indent=2, sort_keys=True))
+                    if any(v != "ok" for v in drift.values()) and not args.repair:
+                        return 1
+                if args.repair:
+                    rep = mgr.repair_view()
+                    print(json.dumps(rep, indent=2, sort_keys=True))
+                return 0
+            finally:
+                try:
+                    mgr.conn.close()
+                except Exception:
+                    pass
 
         if not args.view:
             print("ERROR: --view is required unless running --check-drift or --repair.", file=sys.stderr)
@@ -12233,24 +13128,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 strict=args.strict,
                 engine_version=args.engine_version,
             )
-            if schema_sql:
-                mgr.apply_schema_ddl(schema_sql, auto_sync_views=False)
-            plan = mgr.register_view(
-                view_sql,
-                populate=not args.no_populate,
-                incremental_backfill=args.incremental_backfill,
-                batch_size=args.batch_size,
-                indexes=args.indexes,
-                strict=args.strict,
-            )
-            print(
-                plan.render_sql_script(
-                    include_populate=not args.no_populate,
+            try:
+                if schema_sql:
+                    mgr.apply_schema_ddl(schema_sql, auto_sync_views=False)
+                plan = mgr.register_view(
+                    view_sql,
+                    populate=not args.no_populate,
                     incremental_backfill=args.incremental_backfill,
                     batch_size=args.batch_size,
+                    indexes=args.indexes,
+                    strict=args.strict,
                 )
-            )
-            return 0
+                print(
+                    plan.render_sql_script(
+                        include_populate=not args.no_populate,
+                        incremental_backfill=args.incremental_backfill,
+                        batch_size=args.batch_size,
+                    )
+                )
+                return 0
+            finally:
+                try:
+                    mgr.conn.close()
+                except Exception:
+                    pass
 
         hint_d: Optional[Dialect] = None
         if args.dialect:
