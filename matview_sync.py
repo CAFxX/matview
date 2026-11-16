@@ -3976,9 +3976,24 @@ class IncrementalViewCompiler:
             return "DOUBLE"
         return "REAL"
 
+    def _lookup_source_col_def(self, expr: Optional[str]) -> Optional[ColumnDef]:
+        """Resolve a column expression directly or through CTE/subquery projections."""
+        col = self._lookup_col_def(expr)
+        if col is not None or not expr:
+            return col
+        try:
+            node = parse_sql_ast(expr)
+        except (sqlglot.errors.SqlglotError, AttributeError, TypeError, ValueError):
+            return None
+        if isinstance(node, sqlglot_exp.Column):
+            resolved = self._resolve_cte_column_expression(node)
+            if isinstance(resolved, sqlglot_exp.Column):
+                return self._lookup_col_def(resolved.sql())
+        return None
+
     def _sum_result_storage_type(self, item: SelectItem) -> str:
         """Preserve the engine's native SUM result type for direct numeric columns."""
-        source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
+        source = self._lookup_source_col_def(item.arg_expr) if item.arg_expr else None
         source_type = source.data_type.strip().upper() if source else ""
         if not source_type:
             exact_type = self._exact_numeric_precision_scale(item.arg_expr or "")
@@ -4031,7 +4046,7 @@ class IncrementalViewCompiler:
 
     def _statistical_result_storage_type(self, item: SelectItem) -> str:
         """Match native VAR/STDDEV result types for exact versus approximate inputs."""
-        source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
+        source = self._lookup_source_col_def(item.arg_expr) if item.arg_expr else None
         source_type = source.data_type.strip().upper() if source else ""
         is_exact_numeric = bool(
             (
@@ -4062,7 +4077,7 @@ class IncrementalViewCompiler:
         detection: CREATE VIEW rejects system-variable references. Approximate
         inputs retain their native DOUBLE display precision.
         """
-        source = self._lookup_col_def(item.arg_expr) if item.arg_expr else None
+        source = self._lookup_source_col_def(item.arg_expr) if item.arg_expr else None
         source_type = source.data_type.strip().upper() if source else ""
 
         if re.search(r"\b(?:DECIMAL|NUMERIC|DEC|FIXED)\b", source_type):
@@ -4138,12 +4153,45 @@ class IncrementalViewCompiler:
                 query = query.this
             return query
 
+        def select_table_aliases(select: Any) -> Dict[str, str]:
+            aliases: Dict[str, str] = {}
+            from_clause = select.args.get("from_") if hasattr(select, "args") else None
+            source = getattr(from_clause, "this", None)
+            if isinstance(source, sqlglot_exp.Table) and source.name:
+                sname = source.name.lower()
+                aliases[sname] = sname
+                if source.alias:
+                    aliases[source.alias.lower()] = sname
+            for j in (select.args.get("joins") or ()):
+                j_tbl = getattr(j, "this", None)
+                if isinstance(j_tbl, sqlglot_exp.Table) and j_tbl.name:
+                    jname = j_tbl.name.lower()
+                    aliases[jname] = jname
+                    if j_tbl.alias:
+                        aliases[j_tbl.alias.lower()] = jname
+            return aliases
+
         def source_cte_name(select: Any) -> Optional[str]:
             from_clause = select.args.get("from_") if hasattr(select, "args") else None
             source = getattr(from_clause, "this", None)
             if isinstance(source, sqlglot_exp.Table):
                 return source.name.lower()
             return None
+
+        def bind_select_sources(node: Any, inner_aliases: Dict[str, str], default_src: Optional[str]) -> Any:
+            if isinstance(node, sqlglot_exp.Column):
+                raw_up = node.table.lower() if node.table else default_src
+                actual_up = inner_aliases.get(raw_up, raw_up) if raw_up else None
+                if actual_up:
+                    return sqlglot_exp.column(node.name, table=actual_up)
+                return node
+            copied = node.copy()
+            for col_n in list(copied.find_all(sqlglot_exp.Column)):
+                raw_up = col_n.table.lower() if col_n.table else default_src
+                actual_up = inner_aliases.get(raw_up, raw_up) if raw_up else None
+                if actual_up:
+                    col_n.replace(sqlglot_exp.column(col_n.name, table=actual_up))
+            return copied
 
         root_select = unwrap_select(query_ast)
         if not isinstance(root_select, sqlglot_exp.Select):
@@ -4162,6 +4210,8 @@ class IncrementalViewCompiler:
             select = unwrap_select(cte_query)
             if not isinstance(select, sqlglot_exp.Select):
                 return None
+            inner_aliases = select_table_aliases(select)
+            default_src = source_cte_name(select)
             next_seen = set(seen)
             next_seen.add(key)
             for projection in select.expressions:
@@ -4172,14 +4222,17 @@ class IncrementalViewCompiler:
                     continue
                 expression = projection.this if isinstance(projection, sqlglot_exp.Alias) else projection
                 if isinstance(expression, sqlglot_exp.Column):
-                    upstream = expression.table.lower() if expression.table else source_cte_name(select)
-                    resolved = resolve(upstream, expression.name, next_seen)
+                    raw_up = expression.table.lower() if expression.table else default_src
+                    actual_up = inner_aliases.get(raw_up, raw_up) if raw_up else None
+                    resolved = resolve(actual_up, expression.name, next_seen)
                     if resolved is not None:
                         return resolved
-                return expression
+                return bind_select_sources(expression, inner_aliases, default_src)
             return None
 
-        root_relation = column.table.lower() if column.table else source_cte_name(root_select)
+        root_aliases = select_table_aliases(root_select)
+        raw_root_rel = column.table.lower() if column.table else source_cte_name(root_select)
+        root_relation = root_aliases.get(raw_root_rel, raw_root_rel) if raw_root_rel else None
         resolved_cte = resolve(root_relation, column.name, set())
         if resolved_cte is not None:
             return resolved_cte
@@ -4205,14 +4258,15 @@ class IncrementalViewCompiler:
                 for arm in arms:
                     if not isinstance(arm, sqlglot_exp.Select):
                         continue
+                    arm_aliases = select_table_aliases(arm)
+                    arm_default_src = source_cte_name(arm)
                     for projection in arm.expressions:
                         output_name = projection.alias
                         if not output_name and isinstance(projection, sqlglot_exp.Column):
                             output_name = projection.name
                         if output_name.lower() == column.name.lower():
-                            expressions.append(
-                                projection.this if isinstance(projection, sqlglot_exp.Alias) else projection
-                            )
+                            expr_node = projection.this if isinstance(projection, sqlglot_exp.Alias) else projection
+                            expressions.append(bind_select_sources(expr_node, arm_aliases, arm_default_src))
                             break
                 if expressions:
                     if len(expressions) == 1:
@@ -4454,8 +4508,9 @@ class IncrementalViewCompiler:
         return None
 
     def _postgres_case_result_storage_type(self, expr: str) -> Optional[str]:
-        """Infer PostgreSQL CASE common types, including nested column branches."""
-        if self.dialect != Dialect.POSTGRES:
+        """Infer CASE common types (Postgres & MariaDB), including nested column branches."""
+        is_mariadb = self.dialect == Dialect.MYSQL and self.subdialect == EngineSubdialect.MARIADB
+        if self.dialect != Dialect.POSTGRES and not is_mariadb:
             return None
         try:
             root = parse_sql_ast(expr)
@@ -4507,7 +4562,10 @@ class IncrementalViewCompiler:
                 column = self._lookup_col_def(node.sql())
                 if column is None:
                     column = self._lookup_col_def(node.name)
-                return canonical_type(column.data_type) if column else None
+                if column is not None:
+                    return canonical_type(column.data_type)
+                cte_t = self._infer_cte_or_subquery_col_type(node.sql()) or self._infer_cte_or_subquery_col_type(node.name)
+                return canonical_type(cte_t) if cte_t else None
             if kind == "Literal":
                 if node.args.get("is_string"):
                     return None
@@ -4527,6 +4585,8 @@ class IncrementalViewCompiler:
             if kind == "Cast":
                 target = node.args.get("to")
                 return canonical_type(target.sql()) if target is not None else None
+            if kind in ("Coalesce", "IfNull"):
+                return merge([infer(ch) for ch in node.iter_expressions()])
             if kind == "Case":
                 branches: List[Optional[str]] = []
                 for branch in node.args.get("ifs") or ():
@@ -4547,11 +4607,22 @@ class IncrementalViewCompiler:
                 left, right = infer(node.this), infer(node.expression)
                 if left is None or right is None:
                     return None
-                return merge((left, right))
+                merged = merge((left, right))
+                if is_mariadb and kind in ("Add", "Sub", "Mul") and merged in ("SMALLINT", "INTEGER"):
+                    return "BIGINT"
+                return merged
             return None
 
         inferred = infer(root)
-        return None if inferred == "UNKNOWN" else inferred
+        if inferred is None or inferred == "UNKNOWN":
+            return None
+        if is_mariadb:
+            if inferred == "INTEGER":
+                return "INT"
+            if inferred == "BIGINT":
+                return "BIGINT"
+            return None
+        return inferred
 
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
         if not item.is_aggregate:
@@ -4607,7 +4678,10 @@ class IncrementalViewCompiler:
                 c_win = self._lookup_col_def(m_win_col.group(1))
                 if c_win:
                     return self._normalize_dialect_type(c_win.data_type)
-            if raw_u.startswith("CASE ") and self.dialect == Dialect.POSTGRES:
+            if raw_u.startswith("CASE ") and (
+                self.dialect == Dialect.POSTGRES
+                or (self.dialect == Dialect.MYSQL and self.subdialect == EngineSubdialect.MARIADB)
+            ):
                 native_case_type = self._postgres_case_result_storage_type(raw_expr)
                 if native_case_type is not None:
                     return native_case_type
