@@ -1351,13 +1351,86 @@ def _is_simple_column_expr(expr_sql: str) -> bool:
     return isinstance(node, sqlglot_exp.Column) and not isinstance(node.this, sqlglot_exp.Star)
 
 
-def parse_table_schema(schema_sql: str) -> Dict[str, TableSchema]:
+def _extract_sqlite_raw_declared_types(stmt_sql: str) -> Dict[str, str]:
+    """Extract uppercased raw type keywords per column from a CREATE TABLE statement."""
+    toks = _tokenize_sql(stmt_sql, read="sqlite")
+    depth = 0
+    lp_idx: Optional[int] = None
+    rp_idx: Optional[int] = None
+    for idx, tk in enumerate(toks):
+        if tk.token_type == SQLGlotTokenType.L_PAREN:
+            if depth == 0:
+                lp_idx = idx
+            depth += 1
+        elif tk.token_type == SQLGlotTokenType.R_PAREN and depth > 0:
+            depth -= 1
+            if depth == 0:
+                rp_idx = idx
+                break
+    if lp_idx is None or rp_idx is None or rp_idx <= lp_idx + 1:
+        return {}
+    constraint_starts = {
+        "PRIMARY", "NOT", "NULL", "UNIQUE", "CHECK", "DEFAULT",
+        "COLLATE", "REFERENCES", "GENERATED", "AS", "CONSTRAINT",
+    }
+    raw_types: Dict[str, str] = {}
+    items: List[List[Any]] = []
+    cur: List[Any] = []
+    inner_depth = 0
+    for tk in toks[lp_idx + 1 : rp_idx]:
+        if tk.token_type == SQLGlotTokenType.L_PAREN:
+            inner_depth += 1
+        elif tk.token_type == SQLGlotTokenType.R_PAREN and inner_depth > 0:
+            inner_depth -= 1
+        elif inner_depth == 0 and tk.token_type == SQLGlotTokenType.COMMA:
+            if cur:
+                items.append(cur)
+                cur = []
+            continue
+        cur.append(tk)
+    if cur:
+        items.append(cur)
+    for item_toks in items:
+        if not item_toks:
+            continue
+        first_up = item_toks[0].text.upper()
+        if first_up in ("CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"):
+            continue
+        col_low = _unquote_ident(item_toks[0].text).lower()
+        t_parts: List[str] = []
+        d = 0
+        for tk in item_toks[1:]:
+            if tk.token_type == SQLGlotTokenType.L_PAREN:
+                break
+            if d == 0 and tk.text.upper().split()[0] in constraint_starts:
+                break
+            t_parts.append(tk.text.upper())
+        raw_types[col_low] = " ".join(t_parts)
+    return raw_types
+
+
+def parse_table_schema(
+    schema_sql: str,
+    dialect: Optional[Dialect] = None,
+) -> Dict[str, TableSchema]:
     """Parses one or more CREATE TABLE statements into TableSchema objects via `sqlglot.parse`."""
     clean = _strip_sql_comments(schema_sql)
     schemas: Dict[str, TableSchema] = {}
-    for stmt_ast in sqlglot.parse(clean, read="sqlite"):
+    for raw_stmt in _split_top_level(clean, ";"):
+        raw_stmt_s = raw_stmt.strip()
+        if not raw_stmt_s:
+            continue
+        try:
+            stmt_ast = parse_sql_ast(raw_stmt_s)
+        except sqlglot.errors.SqlglotError:
+            continue
         if not isinstance(stmt_ast, sqlglot_exp.Create) or stmt_ast.kind.upper() != "TABLE":
             continue
+        raw_col_types = (
+            _extract_sqlite_raw_declared_types(raw_stmt_s)
+            if dialect == Dialect.SQLITE
+            else {}
+        )
         schema_node = stmt_ast.this
         if not isinstance(schema_node, sqlglot_exp.Schema) or not isinstance(schema_node.this, sqlglot_exp.Table):
             continue
@@ -1409,6 +1482,11 @@ def parse_table_schema(schema_sql: str) -> Dict[str, TableSchema]:
                 if pk_name:
                     table_pk_cols.add(pk_name.lower())
 
+        without_rowid = dialect == Dialect.SQLITE and bool(
+            re.search(r"\bWITHOUT\s+ROWID\b", raw_stmt_s, re.IGNORECASE)
+        )
+        col_items: List[Tuple[str, str, bool, bool]] = []
+        all_pk_cols_lower: Set[str] = set(table_pk_cols)
         for expr_item in schema_node.expressions:
             if isinstance(expr_item, sqlglot_exp.ColumnDef):
                 col_name = expr_item.name
@@ -1419,27 +1497,37 @@ def parse_table_schema(schema_sql: str) -> Dict[str, TableSchema]:
                     isinstance(c.kind, sqlglot_exp.PrimaryKeyColumnConstraint)
                     for c in expr_item.constraints
                 )
-                not_null = is_pk or any(
+                explicit_not_null = any(
                     isinstance(c.kind, sqlglot_exp.NotNullColumnConstraint)
                     and not c.kind.args.get("allow_null")
                     for c in expr_item.constraints
                 )
-                cols[col_name] = ColumnDef(
-                    name=col_name,
-                    data_type=data_type,
-                    not_null=not_null,
-                    primary_key=is_pk,
-                )
+                if is_pk:
+                    all_pk_cols_lower.add(col_name.lower())
+                col_items.append((col_name, data_type, is_pk, explicit_not_null))
 
-        if table_pk_cols:
-            for c_name, c_def in list(cols.items()):
-                if c_name.lower() in table_pk_cols:
-                    cols[c_name] = ColumnDef(
-                        name=c_def.name,
-                        data_type=c_def.data_type,
-                        not_null=True,
-                        primary_key=True,
-                    )
+        single_pk = len(all_pk_cols_lower) == 1
+        for col_name, data_type, is_pk, explicit_not_null in col_items:
+            eff_pk = is_pk or (col_name.lower() in all_pk_cols_lower)
+            if dialect == Dialect.SQLITE:
+                # On SQLite, only explicit NOT NULL, WITHOUT ROWID PKs, or a
+                # single-column INTEGER PRIMARY KEY (rowid alias) disallow NULL.
+                raw_declared = raw_col_types.get(col_name.lower(), data_type.strip().upper())
+                is_rowid_alias = (
+                    eff_pk
+                    and single_pk
+                    and not without_rowid
+                    and raw_declared == "INTEGER"
+                )
+                not_null = explicit_not_null or (eff_pk and (without_rowid or is_rowid_alias))
+            else:
+                not_null = explicit_not_null or eff_pk
+            cols[col_name] = ColumnDef(
+                name=col_name,
+                data_type=data_type,
+                not_null=not_null,
+                primary_key=eff_pk,
+            )
 
         schemas[table_name] = TableSchema(
             name=table_name,
@@ -1473,7 +1561,11 @@ def introspect_sqlite_schemas(
         table_names.append(t_str)
         if sql:
             ddl_parts.append(str(sql).rstrip(";") + ";")
-    schemas = parse_table_schema("\n".join(ddl_parts)) if ddl_parts else {}
+    schemas = (
+        parse_table_schema("\n".join(ddl_parts), dialect=Dialect.SQLITE)
+        if ddl_parts
+        else {}
+    )
     low_known = {k.lower(): k for k in schemas}
 
     # Fallback / enrichment via PRAGMA table_info & foreign_key_list for tables without standard DDL (e.g. CREATE TABLE AS)
@@ -1486,12 +1578,15 @@ def introspect_sqlite_schemas(
             t_info = cur.fetchall() or []
             if not t_info:
                 continue
+            pk_count = sum(1 for r in t_info if bool(r[5]))
             cols: Dict[str, ColumnDef] = {}
             for r in t_info:
                 c_name = str(r[1])
                 c_type = str(r[2]).upper() if r[2] else "TEXT"
-                c_notnull = bool(r[3]) or bool(r[5])
                 c_pk = bool(r[5])
+                c_notnull = bool(r[3]) or (
+                    c_pk and pk_count == 1 and re.sub(r"\s+", " ", c_type.strip()) == "INTEGER"
+                )
                 cols[c_name] = ColumnDef(
                     name=c_name,
                     data_type=c_type,
@@ -5668,11 +5763,15 @@ class IncrementalViewCompiler:
                 p = self.object_prefix if self.object_prefix else "__matview_"
                 aux_tbl = self._bounded_ident(f"{p}dist_", f"{self.logical_view_name}__{_sanitize_ident(item.alias)}")
                 c_arg = self._lookup_col_def(item.arg_expr)
-                val_dt = (
-                    self._normalize_dialect_type(c_arg.data_type)
-                    if c_arg
-                    else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
-                )
+                if c_arg:
+                    val_dt = self._normalize_dialect_type(c_arg.data_type)
+                else:
+                    fake_val = SelectItem(
+                        raw_expr=item.arg_expr or "",
+                        alias="__val",
+                        is_aggregate=False,
+                    )
+                    val_dt = self._infer_expr_storage_type(fake_val)
                 if self.dialect == Dialect.MYSQL and val_dt.upper() == "TEXT":
                     val_dt = "VARCHAR(255)"
                 distinct_aux_tables[ekey] = (aux_tbl, item, val_dt)
@@ -5791,11 +5890,11 @@ class IncrementalViewCompiler:
                 for g_expr in grp_exprs:
                     mc = self._group_col_alias(g_expr)
                     c_def = self._lookup_col_def(g_expr)
-                    dt = (
-                        self._normalize_dialect_type(c_def.data_type)
-                        if c_def
-                        else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
-                    )
+                    if c_def:
+                        dt = self._normalize_dialect_type(c_def.data_type)
+                    else:
+                        fake_grp = SelectItem(raw_expr=g_expr, alias=mc, is_aggregate=False)
+                        dt = self._infer_expr_storage_type(fake_grp)
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
                         dt = "VARCHAR(255)"
                     aux_col_defs.append(f"{mc} {dt} NOT NULL")
@@ -5895,6 +5994,71 @@ class IncrementalViewCompiler:
             user_indexes=list(self.user_indexes),
         )
 
+    def _append_aux_stat_target_cols(
+        self,
+        target_cols: List[str],
+        select_exprs: List[str],
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        ekey_to_item: Dict[str, SelectItem],
+        *,
+        qualify_join: bool = False,
+        include_distinct_keyword: bool = False,
+    ) -> List[str]:
+        """Append missing auxiliary stat columns and return quoted target column names."""
+        # Compare quoted forms so visible columns stored pre-quoted in stat maps
+        # (e.g. reserved keywords like "order") match unquoted entries in target_cols.
+        already_in_target_q = {self._q(c) for c in target_cols}
+
+        def _eff(it: SelectItem) -> str:
+            base = self._effective_agg_value_expr(it, record_prefix=None)
+            return self._qualify_join_expr(base) if qualify_join else base
+
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            q_cnt = self._q(cnt_col)
+            if q_cnt not in already_in_target_q:
+                it = ekey_to_item[ekey]
+                dist = "DISTINCT " if (include_distinct_keyword and it.is_distinct) else ""
+                target_cols.append(cnt_col)
+                select_exprs.append(f"COUNT({dist}{_eff(it)})")
+                already_in_target_q.add(q_cnt)
+
+        for ekey, sum_col in col_sum_map.items():
+            q_sum = self._q(sum_col)
+            if q_sum not in already_in_target_q:
+                it = ekey_to_item[ekey]
+                dist = "DISTINCT " if (include_distinct_keyword and it.is_distinct) else ""
+                target_cols.append(sum_col)
+                select_exprs.append(f"SUM({dist}{_eff(it)})")
+                already_in_target_q.add(q_sum)
+
+        for ekey, sum2_col in col_sum2_map.items():
+            q_sum2 = self._q(sum2_col)
+            if q_sum2 not in already_in_target_q:
+                it = ekey_to_item[ekey]
+                eff = _eff(it)
+                target_cols.append(sum2_col)
+                if self.dialect == Dialect.SQLITE:
+                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
+                else:
+                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
+                already_in_target_q.add(q_sum2)
+
+        for ekey, tcnt_col in col_true_cnt_map.items():
+            q_tcnt = self._q(tcnt_col)
+            if q_tcnt not in already_in_target_q:
+                it = ekey_to_item[ekey]
+                eff = _eff(it)
+                target_cols.append(tcnt_col)
+                select_exprs.append(
+                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
+                )
+                already_in_target_q.add(q_tcnt)
+
+        return [self._q(c) for c in target_cols]
+
     def _build_initial_populate_and_inc_spec_tier1(
         self,
         mv_table: str,
@@ -5979,49 +6143,20 @@ class IncrementalViewCompiler:
             target_cols.append(row_count_col)
             select_exprs.append("COUNT(*)")
 
-        already_in_target = set(target_cols)
         ekey_to_item: Dict[str, SelectItem] = {
             expr_key_fn(it): it for it in work_items if it.is_aggregate
         }
-
-        for ekey, cnt_col in col_nonnull_count_map.items():
-            if cnt_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._effective_agg_value_expr(it, record_prefix=None)
-                dist = "DISTINCT " if it.is_distinct else ""
-                target_cols.append(cnt_col)
-                select_exprs.append(f"COUNT({dist}{eff})")
-                already_in_target.add(cnt_col)
-
-        for ekey, sum_col in col_sum_map.items():
-            if sum_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._effective_agg_value_expr(it, record_prefix=None)
-                dist = "DISTINCT " if it.is_distinct else ""
-                target_cols.append(sum_col)
-                select_exprs.append(f"SUM({dist}{eff})")
-                already_in_target.add(sum_col)
-
-        for ekey, sum2_col in col_sum2_map.items():
-            if sum2_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._effective_agg_value_expr(it, record_prefix=None)
-                target_cols.append(sum2_col)
-                if self.dialect == Dialect.SQLITE:
-                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
-                else:
-                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
-                already_in_target.add(sum2_col)
-
-        for ekey, tcnt_col in col_true_cnt_map.items():
-            if tcnt_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._effective_agg_value_expr(it, record_prefix=None)
-                target_cols.append(tcnt_col)
-                select_exprs.append(
-                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
-                )
-                already_in_target.add(tcnt_col)
+        q_target_cols = self._append_aux_stat_target_cols(
+            target_cols=target_cols,
+            select_exprs=select_exprs,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            ekey_to_item=ekey_to_item,
+            qualify_join=False,
+            include_distinct_keyword=True,
+        )
 
         norm_where = self._rewrite_expr_for_record(self.view.where_clause, None) if self.view.where_clause else None
         where_sql = f"\nWHERE {norm_where}" if norm_where else ""
@@ -6034,7 +6169,6 @@ class IncrementalViewCompiler:
             group_sql = ""
             having_sql = ""
 
-        q_target_cols = [self._q(c) for c in target_cols]
         q_base_t = self._q(self.view.base_table)
         main_backfill_sql = (
             f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
@@ -6148,14 +6282,16 @@ class IncrementalViewCompiler:
             w_main = [f"({grp_expr}) IN ({{placeholders}})"]
             if self.view.where_clause:
                 w_main.insert(0, f"({self.view.where_clause})")
-            non_pk_target = [c for c in target_cols if c not in pk_cols] or list(pk_cols)
+            q_pk_cols = [self._q(c) for c in pk_cols]
+            q_pk_set = set(q_pk_cols)
+            non_pk_target = [c for c in q_target_cols if c not in q_pk_set] or list(q_pk_cols)
             main_conflict = (
                 f"\nON DUPLICATE KEY UPDATE {', '.join(f'{c} = VALUES({c})' for c in non_pk_target)}"
                 if self.dialect == Dialect.MYSQL
-                else f"\nON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {', '.join(f'{c} = excluded.{c}' for c in non_pk_target)}"
+                else f"\nON CONFLICT ({', '.join(q_pk_cols)}) DO UPDATE SET {', '.join(f'{c} = excluded.{c}' for c in non_pk_target)}"
             )
             chunk_templates.append(
-                f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
                 f"SELECT {', '.join(select_exprs)}\n"
                 f"FROM {q_base_t}\n"
                 f"WHERE {' AND '.join(w_main)}{group_sql}{having_sql}{main_conflict};"
@@ -7891,46 +8027,20 @@ class IncrementalViewCompiler:
             target_cols.append(row_count_col)
             select_exprs.append("COUNT(*)")
 
-        already_in_target = set(target_cols)
         ekey_to_item: Dict[str, SelectItem] = {
             _expr_key(it): it for it in work_items if it.is_aggregate
         }
-        for ekey, cnt_col in col_nonnull_count_map.items():
-            if cnt_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
-                target_cols.append(cnt_col)
-                select_exprs.append(f"COUNT({eff})")
-                already_in_target.add(cnt_col)
-
-        for ekey, sum_col in col_sum_map.items():
-            if sum_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
-                target_cols.append(sum_col)
-                select_exprs.append(f"SUM({eff})")
-                already_in_target.add(sum_col)
-
-        for ekey, sum2_col in col_sum2_map.items():
-            if sum2_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
-                target_cols.append(sum2_col)
-                if self.dialect == Dialect.SQLITE:
-                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
-                else:
-                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
-                already_in_target.add(sum2_col)
-
-        for ekey, tcnt_col in col_true_cnt_map.items():
-            if tcnt_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
-                target_cols.append(tcnt_col)
-                select_exprs.append(
-                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
-                )
-                already_in_target.add(tcnt_col)
+        q_target_cols = self._append_aux_stat_target_cols(
+            target_cols=target_cols,
+            select_exprs=select_exprs,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            ekey_to_item=ekey_to_item,
+            qualify_join=True,
+            include_distinct_keyword=False,
+        )
 
         def _build_join_from_clause(replace_alias: Optional[str] = None, rec_prefix: Optional[str] = None) -> str:
             from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
@@ -7956,16 +8066,16 @@ class IncrementalViewCompiler:
         group_sql = f"\nGROUP BY {', '.join(qual_grp_for_q)}" if qual_grp_for_q else ""
 
         initial_populate_sql = (
-            f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+            f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
             f"SELECT {', '.join(select_exprs)}\n"
             f"FROM {full_from_sql}{where_sql}{group_sql};"
         )
         inc_spec = IncrementalBackfillSpec(
             mode="offset_batch",
             offset_insert_template=(
-                f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
-                f"SELECT {', '.join(target_cols)}\n"
-                f"FROM (\nSELECT {', '.join(f'{ex} AS {col}' for col, ex in zip(target_cols, select_exprs))}\n"
+                f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                f"SELECT {', '.join(q_target_cols)}\n"
+                f"FROM (\nSELECT {', '.join(f'{ex} AS {col}' for col, ex in zip(q_target_cols, select_exprs))}\n"
                 f"FROM {full_from_sql}{where_sql}{group_sql}\n) AS __mv_init\n"
                 f"LIMIT ? OFFSET ?;"
             ),
@@ -8213,7 +8323,7 @@ class IncrementalViewCompiler:
         ]
 
         aliased_delta_select = ", ".join(
-            f"{ex} AS {col}" for col, ex in zip(target_cols, select_exprs)
+            f"{ex} AS {col}" for col, ex in zip(q_target_cols, select_exprs)
         )
         having_non_empty = "" if grp_exprs else "\nHAVING COUNT(*) > 0"
 
@@ -8233,7 +8343,7 @@ class IncrementalViewCompiler:
             q_pk_cols_csv = ", ".join(self._q(c) for c in pk_cols)
             if self.dialect == Dialect.MYSQL:
                 plus_stmt = (
-                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                    f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
                     f"    SELECT {', '.join(select_exprs)}\n"
                     f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
                     f"    ON DUPLICATE KEY UPDATE\n"
@@ -8249,7 +8359,7 @@ class IncrementalViewCompiler:
                 )
             else:
                 plus_stmt = (
-                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                    f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
                     f"    SELECT {', '.join(select_exprs)}\n"
                     f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
                     f"    ON CONFLICT ({q_pk_cols_csv}) DO UPDATE SET\n"
@@ -8781,12 +8891,19 @@ class IncrementalViewCompiler:
         """
         assert self.primary_schema is not None
         pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
-        can_native = bool(pk_defs) and all(
-            c.not_null
-            or "INT" in c.data_type.upper()
-            or self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
-            for c in pk_defs
-        )
+        def _pk_col_nonnull(c: ColumnDef) -> bool:
+            if c.not_null or self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+                return True
+            if self.dialect == Dialect.SQLITE:
+                # Only a single-column INTEGER PRIMARY KEY (rowid alias) is implicitly
+                # NOT NULL on SQLite; INT PRIMARY KEY and composite PKs allow NULL.
+                return (
+                    len(pk_defs) == 1
+                    and re.sub(r"\s+", " ", c.data_type.strip().upper()) == "INTEGER"
+                )
+            return False
+
+        can_native = bool(pk_defs) and all(_pk_col_nonnull(c) for c in pk_defs)
         if not can_native:
             return ["__mv_pk"], [], False
 
@@ -8957,13 +9074,26 @@ class IncrementalViewCompiler:
             upd_old_list = [upd_del_stmt]
             upd_clean_list: List[str] = []
         else:
-            pk_expr_base = self._canonical_group_pk_expr(pk_names)
-            initial_populate_sql = (
-                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
-                f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_sql};"
-            )
-            pk_new = self._canonical_group_pk_expr([f"NEW.{c}" for c in pk_names])
-            pk_old = self._canonical_group_pk_expr([f"OLD.{c}" for c in pk_names])
+            all_base_cols = list(self.primary_schema.columns.keys())
+            pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
+            has_nullable_pk = (not pk_defs) or any(not c.not_null for c in pk_defs)
+            pk_hash_cols = all_base_cols if (has_nullable_pk and all_base_cols) else (pk_names or sel_exprs)
+            pk_expr_base = self._canonical_group_pk_expr(pk_hash_cols)
+            w_pop = w_sql or "\nWHERE TRUE"
+            if self.dialect == Dialect.MYSQL:
+                initial_populate_sql = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_pop}\n"
+                    f"ON DUPLICATE KEY UPDATE __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            else:
+                initial_populate_sql = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(user_columns)}, __mv_row_count)\n"
+                    f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_pop}\n"
+                    f"ON CONFLICT (__mv_pk) DO UPDATE SET __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            pk_new = self._canonical_group_pk_expr([f"NEW.{self._q(c)}" for c in pk_hash_cols])
+            pk_old = self._canonical_group_pk_expr([f"OLD.{self._q(c)}" for c in pk_hash_cols])
             if self.dialect == Dialect.MYSQL:
                 upd_set = ", ".join(f"{c} = VALUES({c})" for c in user_columns)
                 plus_stmt = (
@@ -9361,50 +9491,27 @@ class IncrementalViewCompiler:
             target_cols.append(row_count_col)
             select_exprs.append("COUNT(*)")
 
-        already_in_target = set(target_cols)
         ekey_to_item: Dict[str, SelectItem] = {
             _expr_key(it): it for it in work_items if it.is_aggregate
         }
-        for ekey, cnt_col in col_nonnull_count_map.items():
-            if cnt_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._effective_agg_value_expr(it, record_prefix=None)
-                target_cols.append(cnt_col)
-                select_exprs.append(f"COUNT({eff})")
-                already_in_target.add(cnt_col)
-        for ekey, sum_col in col_sum_map.items():
-            if sum_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._effective_agg_value_expr(it, record_prefix=None)
-                target_cols.append(sum_col)
-                select_exprs.append(f"SUM({eff})")
-                already_in_target.add(sum_col)
-        for ekey, sum2_col in col_sum2_map.items():
-            if sum2_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._effective_agg_value_expr(it, record_prefix=None)
-                target_cols.append(sum2_col)
-                if self.dialect == Dialect.SQLITE:
-                    select_exprs.append(self._sqlite_m2_agg_sql(it, eff_override=eff))
-                else:
-                    select_exprs.append(f"SUM({self._var_sq_sql(eff)})")
-                already_in_target.add(sum2_col)
-        for ekey, tcnt_col in col_true_cnt_map.items():
-            if tcnt_col not in already_in_target:
-                it = ekey_to_item[ekey]
-                eff = self._effective_agg_value_expr(it, record_prefix=None)
-                target_cols.append(tcnt_col)
-                select_exprs.append(
-                    f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
-                )
-                already_in_target.add(tcnt_col)
+        q_target_cols = self._append_aux_stat_target_cols(
+            target_cols=target_cols,
+            select_exprs=select_exprs,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            ekey_to_item=ekey_to_item,
+            qualify_join=False,
+            include_distinct_keyword=False,
+        )
 
         w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
         grp_for_q = self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=has_nullable_grp)
         g_sql = f"\nGROUP BY {', '.join(grp_for_q)}" if grp_for_q else ""
 
         initial_populate_sql = (
-            f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+            f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
             f"SELECT {', '.join(select_exprs)} FROM (\n{inner_u_sql}\n) AS {u_alias}{w_sql}{g_sql};"
         )
 
@@ -11734,7 +11841,7 @@ def generate_materialized_view(
     eff_dialect = resolved_ev.dialect
 
     if isinstance(schema_sql_or_dict, str):
-        schemas = parse_table_schema(schema_sql_or_dict)
+        schemas = parse_table_schema(schema_sql_or_dict, dialect=eff_dialect)
     elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
         schemas = introspect_database_schemas(
             schema_sql_or_dict,
@@ -11815,7 +11922,7 @@ def generate_materialized_views(
     eff_dialect = resolved_ev.dialect
 
     if isinstance(schema_sql_or_dict, str):
-        schemas = parse_table_schema(schema_sql_or_dict)
+        schemas = parse_table_schema(schema_sql_or_dict, dialect=eff_dialect)
     elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
         schemas = introspect_database_schemas(
             schema_sql_or_dict,
@@ -12051,7 +12158,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             finally:
                 conn.close()
         elif schema_sql:
-            schemas = parse_table_schema(schema_sql)
+            schemas = parse_table_schema(schema_sql, dialect=hint_d)
             detected_ev = _resolve_dialect_and_engine_version(
                 schemas, args.dialect, args.engine_version
             )
