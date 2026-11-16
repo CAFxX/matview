@@ -898,7 +898,85 @@ class PlannerMixin:
     def _can_use_union_all_agg_algebraic(self) -> bool:
         return self._extract_union_all_agg_metadata() is not None
 
+    def _extract_window_partition_keys(self) -> Optional[Tuple[str, ...]]:
+        """Return common `PARTITION BY` expressions when a window query can use Tier 2 partition scoping."""
+        v = self.view
+        if (
+            not v.has_window_func
+            or v.has_cte
+            or v.has_compound_set_op
+            or v.has_limit_or_order
+            or v.has_subquery_in_from
+            or v.has_top_level_distinct
+            or v.having_clause
+            or v.group_by_cols
+            or any(it.is_aggregate for it in v.select_items)
+        ):
+            return None
+        if any(j.join_type not in ("FROM", "INNER JOIN") for j in v.joins):
+            return None
+        if v.where_clause and _has_subquery_ast(v.where_clause, dialect=self.dialect):
+            return None
+
+        sg_d = _sqlglot_dialect(self.dialect)
+        # Disallow named WINDOW definitions (e.g. `OVER w`) unless all partitions are inline.
+        try:
+            q_ast = parse_sql_ast(v.raw_select_sql, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None
+        if not isinstance(q_ast, sqlglot_exp.Select) or q_ast.args.get("windows"):
+            return None
+
+        window_partitions: List[List[Tuple[str, str]]] = []
+        for it in v.select_items:
+            if _has_subquery_ast(it.raw_expr, dialect=self.dialect):
+                return None
+            try:
+                it_ast = parse_sql_ast(it.raw_expr, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                return None
+            for win in it_ast.find_all(sqlglot_exp.Window):
+                part_exprs = list(win.args.get("partition_by") or ())
+                if not part_exprs:
+                    return None
+                cur_parts: List[Tuple[str, str]] = []
+                for pe in part_exprs:
+                    pe_sql = pe.sql(dialect=sg_d)
+                    if _has_subquery_ast(pe_sql, dialect=self.dialect):
+                        return None
+                    # Normalize canonical key so `t.col` and `col` or case differences align
+                    if isinstance(pe, sqlglot_exp.Column):
+                        res = self._resolve_ast_col_to_table(pe, self._alias_to_table_map())
+                        key = f"{res[0].lower()}.{res[1].lower()}" if res else pe_sql.strip().lower()
+                    else:
+                        key = pe_sql.strip().lower()
+                    cur_parts.append((key, pe_sql))
+                window_partitions.append(cur_parts)
+
+        if not window_partitions:
+            return None
+
+        common_keys = set(k for k, _ in window_partitions[0])
+        for wp in window_partitions[1:]:
+            common_keys &= {k for k, _ in wp}
+        if not common_keys:
+            return None
+
+        result: List[str] = []
+        seen: Set[str] = set()
+        for key, pe_sql in window_partitions[0]:
+            if key in common_keys and key not in seen:
+                seen.add(key)
+                result.append(pe_sql)
+        return tuple(result) if result else None
+
+    def _tier2_scope_exprs(self) -> Tuple[str, ...]:
+        if self._alg_mode == "window_partition":
+            return self._extract_window_partition_keys() or ()
+        return self._effective_group_by_exprs
+
     def _select_strategy_and_mode(self) -> Tuple[MaintenanceStrategy, str]:
+        win_part_keys = self._extract_window_partition_keys()
         if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_upsert:
             v = self.view
             has_any_agg = any(it.is_aggregate for it in v.select_items)
@@ -912,6 +990,8 @@ class PlannerMixin:
                 and not v.has_subquery_in_from
             ):
                 return MaintenanceStrategy.GROUP_SCOPED_DELTA, "single"
+            if win_part_keys:
+                return MaintenanceStrategy.GROUP_SCOPED_DELTA, "window_partition"
             return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
         if self._can_use_single_table_algebraic():
             return MaintenanceStrategy.ALGEBRAIC_DELTA, "single"
@@ -938,6 +1018,8 @@ class PlannerMixin:
             and not v.has_subquery_in_from
         ):
             return MaintenanceStrategy.GROUP_SCOPED_DELTA, "single"
+        if win_part_keys:
+            return MaintenanceStrategy.GROUP_SCOPED_DELTA, "window_partition"
 
         return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
 
@@ -1416,6 +1498,11 @@ class PlannerMixin:
         return (f"Tier 1 algebraic delta maintenance: {desc}.", None)
 
     def _diagnose_tier2_fallback(self) -> Tuple[str, str]:
+        if self._alg_mode == "window_partition":
+            return (
+                "Tier 2 partition-scoped window maintenance: recomputes only the affected PARTITION BY partition(s).",
+                "Window functions require recomputing sibling rows within the affected PARTITION BY partition rather than single-row O(1) deltas.",
+            )
         sel = "Tier 2 group-scoped delta maintenance: recomputes only the affected GROUP BY groups."
         if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_upsert:
             return (sel, "SQLite version lacks UPSERT (INSERT ... ON CONFLICT) required for Tier 1 algebraic delta maintenance.")
@@ -1667,7 +1754,7 @@ class PlannerMixin:
             alg_mode = self._alg_mode
         elif tier == 2:
             sel_reason, fb_reason = self._diagnose_tier2_fallback()
-            alg_mode = None
+            alg_mode = self._alg_mode if self._alg_mode == "window_partition" else None
         else:
             sel_reason, fb_reason = self._diagnose_tier3_fallback()
             alg_mode = None

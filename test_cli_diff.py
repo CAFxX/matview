@@ -148,10 +148,25 @@ class TestPlanDiagnostics(unittest.TestCase):
         self.assertIsNotNone(diag.fallback_reason)
         self.assertIn("Non-inner join", diag.fallback_reason)
 
-    def test_tier3_window_function_fallback_diagnostics(self) -> None:
+    def test_tier2_window_partition_scoped_diagnostics(self) -> None:
         view_sql = (
             "CREATE VIEW v_window AS "
             "SELECT id, customer_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) AS rn "
+            "FROM orders;"
+        )
+        plan = generate_materialized_view(self.schemas, view_sql, dialect=Dialect.SQLITE)
+        diag = plan.diagnostics
+        self.assertEqual(diag.strategy, "group_scoped_delta")
+        self.assertEqual(diag.tier, 2)
+        self.assertEqual(diag.algebraic_mode, "window_partition")
+        self.assertTrue(diag.is_incremental)
+        self.assertIn("partition-scoped", diag.selection_reason)
+        self.assertIn("PARTITION BY", diag.fallback_reason)
+
+    def test_tier3_window_function_fallback_diagnostics(self) -> None:
+        view_sql = (
+            "CREATE VIEW v_window AS "
+            "SELECT id, customer_id, ROW_NUMBER() OVER (ORDER BY id) AS rn "
             "FROM orders;"
         )
         plan = generate_materialized_view(self.schemas, view_sql, dialect=Dialect.SQLITE)
