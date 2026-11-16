@@ -1384,7 +1384,7 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 raw_conn.execute(pragma_sql)
             except Exception:
                 pass
-        tx_state = {"in_tx": False}
+        tx_state = {"in_tx": False, "sp_depth": 0}
 
         def _libsql_exec(s: str, p: Any = None) -> None:
             if not s.strip():
@@ -1397,22 +1397,41 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                     except Exception:
                         pass
                 tx_state["in_tx"] = True
+                tx_state["sp_depth"] = 0
                 try:
                     raw_conn.execute(s.strip())
                 except Exception as e:
                     if "within a transaction" not in str(e).lower():
                         raise
                 return
+            if s_up.startswith("SAVEPOINT "):
+                tx_state["sp_depth"] += 1
+                raw_conn.execute(s.strip())
+                return
+            if s_up.startswith("RELEASE "):
+                tx_state["sp_depth"] = max(0, tx_state["sp_depth"] - 1)
+                raw_conn.execute(s.strip())
+                if not tx_state["in_tx"] and tx_state["sp_depth"] == 0 and hasattr(raw_conn, "commit"):
+                    try:
+                        raw_conn.commit()
+                    except Exception:
+                        pass
+                return
+            if s_up.startswith("ROLLBACK TO ") or s_up.startswith("ROLLBACK TRANSACTION TO "):
+                raw_conn.execute(s.strip())
+                return
             if s_up == "COMMIT":
                 tx_state["in_tx"] = False
+                tx_state["sp_depth"] = 0
                 try:
                     raw_conn.execute(s.strip())
                 except Exception:
                     if hasattr(raw_conn, "commit"):
                         raw_conn.commit()
                 return
-            if s_up.startswith("ROLLBACK") and "TO" not in s_up:
+            if s_up == "ROLLBACK" or s_up.startswith("ROLLBACK "):
                 tx_state["in_tx"] = False
+                tx_state["sp_depth"] = 0
                 try:
                     raw_conn.execute(s.strip())
                 except Exception:
@@ -1425,13 +1444,13 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 else:
                     raw_conn.execute(s.strip())
             except Exception:
-                if not tx_state["in_tx"] and hasattr(raw_conn, "rollback"):
+                if not tx_state["in_tx"] and tx_state["sp_depth"] == 0 and hasattr(raw_conn, "rollback"):
                     try:
                         raw_conn.rollback()
                     except Exception:
                         pass
                 raise
-            if not tx_state["in_tx"] and hasattr(raw_conn, "commit"):
+            if not tx_state["in_tx"] and tx_state["sp_depth"] == 0 and hasattr(raw_conn, "commit"):
                 try:
                     raw_conn.commit()
                 except Exception:
@@ -7374,7 +7393,7 @@ class VariableSchemaDifferentialFuzzer:
             ]
             extras = []
             for extra_name, extra_type in rng.sample(
-                [("note", "VARCHAR(48)"), ("rank", "INTEGER"), ("ratio", "REAL"),
+                [("note", "VARCHAR(48)"), ("tier", "INTEGER"), ("ratio", "REAL"),
                  ("tag", "VARCHAR(24)"), ("code", "VARCHAR(12)")],
                 rng.randint(0, 3),
             ):

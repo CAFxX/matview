@@ -603,6 +603,20 @@ class QueryASTMaterializedViewTests(unittest.TestCase):
                     if order_idx != -1:
                         self.assertNotIn("id", q.sql[order_idx:].lower(), q.sql)
 
+    def test_mariadb_nested_case_int_branch_preserves_int_type(self) -> None:
+        """MariaDB returns INT (not BIGINT) for nested CASE combining INT columns and small int literals."""
+        from matview_sync import parse_engine_version
+        schema = "CREATE TABLE t (id INT PRIMARY KEY, qty INT);"
+        view = "CREATE VIEW v_case AS SELECT id, (CASE WHEN qty IS NULL THEN 1 ELSE (CASE WHEN qty IS NULL THEN 4 ELSE qty END) END) AS qv FROM t;"
+        p_maria = generate_materialized_view(
+            schema, view, dialect=Dialect.MYSQL, engine_version=parse_engine_version("mariadb-12.3"), ignore_limitations=True
+        )
+        self.assertRegex(p_maria.backing_table_ddl, r"(?i)[`\"]?qv[`\"]?\s+INT\b")
+        p_mysql = generate_materialized_view(
+            schema, view, dialect=Dialect.MYSQL, engine_version=parse_engine_version("mysql-8.4"), ignore_limitations=True
+        )
+        self.assertRegex(p_mysql.backing_table_ddl, r"(?i)[`\"]?qv[`\"]?\s+BIGINT\b")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
