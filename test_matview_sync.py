@@ -488,6 +488,12 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
 
     _create_scalar("CONCAT", -1, _concat)
     _create_scalar("CONCAT_WS", -1, _concat_ws)
+    _create_scalar("OCTET_LENGTH", 1, lambda s: len(str(s).encode("utf-8")) if s is not None else None)
+    try:
+        conn.create_collation("utf8mb4_bin", lambda a, b: (a > b) - (a < b))
+        conn.create_collation("utf8mb4_unicode_ci", lambda a, b: (a.lower() > b.lower()) - (a.lower() < b.lower()))
+    except Exception:
+        pass
     _create_scalar("PG_ROW_KEY", -1, lambda *args: "(" + ",".join("" if a is None else str(a) for a in args) + ")")
 
     class _VarPopAgg:
@@ -628,7 +634,9 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
     s = re.sub(r"(?<!ELSE )\bBIT_AND\s*\(\s*([^()]+?)\s*\)", r"COALESCE(BIT_AND(\1), -1)", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+FROM\s+DUAL\b", "", s, flags=re.IGNORECASE)
     s = s.replace("<=>", " IS ")
-    s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR\s*\)", r"CAST(\1 AS TEXT)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR(?:\(\d+\))?(?:\s+CHARACTER\s+SET\s+\w+)?\s*\)", r"CAST(\1 AS TEXT)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bCHARACTER\s+SET\s+\w+\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bCOLLATE\s+\w+\b", "", s, flags=re.IGNORECASE)
     # Replace MySQL bitwise XOR `^`
     for _ in range(3):
         s = re.sub(
@@ -1241,11 +1249,21 @@ class _CompatCursorAdapter:
 
 
 class _CompatConnectionAdapter:
-    def __init__(self, cursor_factory, close_fn, commit_fn=None, rollback_fn=None):
+    def __init__(self, cursor_factory, close_fn, commit_fn=None, rollback_fn=None, in_tx_fn=None):
         self._cursor_factory = cursor_factory
         self._close_fn = close_fn
         self._commit_fn = commit_fn
         self._rollback_fn = rollback_fn
+        self._in_tx_fn = in_tx_fn
+
+    @property
+    def in_transaction(self) -> bool:
+        if self._in_tx_fn:
+            try:
+                return bool(self._in_tx_fn())
+            except Exception:
+                return False
+        return False
 
     def cursor(self) -> _CompatCursorAdapter:
         return self._cursor_factory()
@@ -1305,7 +1323,13 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in raw_cur.execute(q)]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_apsw_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(
+            _make_apsw_cursor,
+            raw_conn.close,
+            commit_fn=lambda: raw_conn.cursor().execute("COMMIT;") if getattr(raw_conn, "in_transaction", False) else None,
+            rollback_fn=lambda: raw_conn.cursor().execute("ROLLBACK;") if getattr(raw_conn, "in_transaction", False) else None,
+            in_tx_fn=lambda: getattr(raw_conn, "in_transaction", False),
+        )
 
     elif eng == "sqlcipher":
         try:
@@ -1336,7 +1360,13 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in (c.fetchall() or [])]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_cipher_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(
+            _make_cipher_cursor,
+            raw_conn.close,
+            commit_fn=lambda: raw_conn.execute("COMMIT;") if getattr(raw_conn, "in_transaction", False) else (raw_conn.commit() if hasattr(raw_conn, "commit") else None),
+            rollback_fn=lambda: raw_conn.execute("ROLLBACK;") if getattr(raw_conn, "in_transaction", False) else (raw_conn.rollback() if hasattr(raw_conn, "rollback") else None),
+            in_tx_fn=lambda: getattr(raw_conn, "in_transaction", False),
+        )
 
     elif eng == "sqlean":
         import sqlean  # type: ignore
@@ -1363,7 +1393,13 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in (c.fetchall() or [])]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_sqlean_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(
+            _make_sqlean_cursor,
+            raw_conn.close,
+            commit_fn=lambda: raw_conn.execute("COMMIT;") if getattr(raw_conn, "in_transaction", False) else (raw_conn.commit() if hasattr(raw_conn, "commit") else None),
+            rollback_fn=lambda: raw_conn.execute("ROLLBACK;") if getattr(raw_conn, "in_transaction", False) else (raw_conn.rollback() if hasattr(raw_conn, "rollback") else None),
+            in_tx_fn=lambda: getattr(raw_conn, "in_transaction", False),
+        )
 
     elif eng == "libsql":
         try:
@@ -1466,6 +1502,9 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
         return _CompatConnectionAdapter(
             lambda: _CompatCursorAdapter(_libsql_exec, _libsql_query),
             lambda: raw_conn.close() if hasattr(raw_conn, "close") else None,
+            commit_fn=lambda: _libsql_exec("COMMIT;") if tx_state["in_tx"] else (raw_conn.commit() if hasattr(raw_conn, "commit") else None),
+            rollback_fn=lambda: _libsql_exec("ROLLBACK;") if tx_state["in_tx"] else (raw_conn.rollback() if hasattr(raw_conn, "rollback") else None),
+            in_tx_fn=lambda: tx_state["in_tx"],
         )
 
     elif eng == "sqlite3":
@@ -1499,7 +1538,13 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in (c.fetchall() or [])]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_sq3_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(
+            _make_sq3_cursor,
+            raw_conn.close,
+            commit_fn=lambda: raw_conn.execute("COMMIT;") if raw_conn.in_transaction else raw_conn.commit(),
+            rollback_fn=lambda: raw_conn.execute("ROLLBACK;") if raw_conn.in_transaction else raw_conn.rollback(),
+            in_tx_fn=lambda: raw_conn.in_transaction,
+        )
 
     else:
         raise ValueError(f"Unknown SQLITE_COMPAT_ENGINE: {engine_spec}")
@@ -1615,7 +1660,7 @@ class TranspiledConnectionAdapter:
 
     def _convert_mysql_dml_to_sqlite(self, sql: str, default_pks: Optional[Sequence[str]] = None) -> str:
         s = _transpile_mysql_expr_to_sqlite(sql, default_pks or ("__mv_pk",))
-        s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR\s*\(\d+\)\)", r"CAST(\1 AS TEXT)", s, flags=re.I)
+        s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR(?:\(\d+\))?(?:\s+CHARACTER\s+SET\s+\w+)?\s*\)", r"CAST(\1 AS TEXT)", s, flags=re.I)
         s = re.sub(r"\bINSERT\s+IGNORE\s+INTO\b", "INSERT OR IGNORE INTO", s, flags=re.I)
 
         def _repl_odku(m_ins: re.Match[str]) -> str:

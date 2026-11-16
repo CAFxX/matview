@@ -206,6 +206,12 @@ jobs:
       - name: Test bulk_changes atomic shadow swap and trigger isolation
         run: python3 test_p0_bulk_changes_isolation.py
 
+      - name: Test PK swap data loss prevention and MySQL collation safety
+        run: python3 test_p0_pk_swap_and_collation.py
+
+      - name: Test backfill watermark safety and trigger coverage
+        run: python3 test_p0_backfill_watermark_safety.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
