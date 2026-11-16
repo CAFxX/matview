@@ -1092,6 +1092,165 @@ class PlannerMixin:
                 out.add(base_c.lower())
         return out
 
+    def _build_aux_dist_index_ddls(
+        self,
+        aux_tbl: str,
+        item_alias: str,
+        aux_pk_cols: Sequence[str],
+        has_group_cols: bool = True,
+        val_col: str = "__val",
+    ) -> Tuple[List[str], List[str]]:
+        """Create optimal secondary indexes on `__matview_dist_*` auxiliary tables."""
+        ddls: List[str] = []
+        names: List[str] = []
+        p = self.object_prefix if self.object_prefix else "__matview_"
+        log_vname = self.logical_view_name
+        alias_tag = _sanitize_ident(item_alias)
+
+        # Normalize PK columns (may be quoted); strip leading group col and trailing __val
+        clean_pk = [_unquote_ident(c, dialect=self.dialect) for c in aux_pk_cols]
+        grp_cols = [c for c in clean_pk if c.lower() not in (val_col.lower(), "__mv_pk", "__mv_global_id")]
+
+        # Index trailing group columns for multi-column GROUP BY auxiliary tables.
+        if has_group_cols and len(grp_cols) > 1:
+            for idx_pos, g_col in enumerate(grp_cols[1:], start=2):
+                g_idx_name = self._bounded_ident(
+                    f"{p}idx_",
+                    f"{log_vname}__dist_{alias_tag}_{_sanitize_ident(g_col)}",
+                    f"__g{idx_pos}",
+                )
+                if g_idx_name not in names:
+                    ddls.append(
+                        build_create_index_sql(
+                            g_idx_name,
+                            aux_tbl,
+                            [self._q(g_col)],
+                            dialect=self.dialect,
+                        )
+                    )
+                    names.append(g_idx_name)
+
+        # Index __val so global value lookups/pruning avoid scanning every group partition.
+        if val_col.lower() not in {c.lower() for c in clean_pk[:1]}:
+            v_idx_name = self._bounded_ident(
+                f"{p}idx_",
+                f"{log_vname}__dist_{alias_tag}",
+                "__val",
+            )
+            if v_idx_name not in names:
+                ddls.append(
+                    build_create_index_sql(
+                        v_idx_name,
+                        aux_tbl,
+                        [self._q(val_col)],
+                        dialect=self.dialect,
+                    )
+                )
+                names.append(v_idx_name)
+        return ddls, names
+
+    def _alias_to_table_map(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        if self.view.base_table:
+            mapping[self.view.base_table.lower()] = self.view.base_table
+        for j in self.view.joins:
+            if j.table_name:
+                mapping[j.table_name.lower()] = j.table_name
+                if j.alias:
+                    mapping[j.alias.lower()] = j.table_name
+        return mapping
+
+    def _resolve_ast_col_to_table(
+        self,
+        col_node: sqlglot_exp.Column,
+        alias_map: Dict[str, str],
+    ) -> Optional[Tuple[str, str]]:
+        c_name = col_node.name
+        if not c_name:
+            return None
+        tbl_hint = col_node.table.lower() if col_node.table else ""
+        if tbl_hint:
+            actual = alias_map.get(tbl_hint)
+            if actual and actual.lower() in self._schemas_lower:
+                col_def = self._schemas_lower[actual.lower()].columns.get(c_name)
+                if col_def is None:
+                    for k, v in self._schemas_lower[actual.lower()].columns.items():
+                        if k.lower() == c_name.lower():
+                            col_def = v
+                            break
+                if col_def is not None:
+                    return (self._schemas_lower[actual.lower()].name, col_def.name)
+            return None
+        for tbl_name in self.view.referenced_tables:
+            ts = self._schemas_lower.get(tbl_name.lower())
+            if ts is None:
+                continue
+            for col_def in ts.columns.values():
+                if col_def.name.lower() == c_name.lower():
+                    return (ts.name, col_def.name)
+        return None
+
+    def _auto_backing_extra_index_cols(
+        self,
+        excluded_leading_cols: Sequence[str] = (),
+    ) -> List[str]:
+        """Identify projected group, join-key, or partition columns for auto-indexing on backing table."""
+        excluded_low = {c.lower() for c in excluded_leading_cols if c}
+        # Map lowercase base column references (tbl.col and unqualified col) -> user alias
+        expr_to_alias: Dict[str, str] = {}
+        for it in self.view.select_items:
+            if it.is_aggregate:
+                continue
+            try:
+                node = parse_sql_ast(it.raw_expr, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                continue
+            if isinstance(node, sqlglot_exp.Column) and node.name:
+                if node.table:
+                    expr_to_alias[f"{node.table.lower()}.{node.name.lower()}"] = it.alias
+                expr_to_alias.setdefault(node.name.lower(), it.alias)
+
+        candidates: List[str] = []
+        seen_low: Set[str] = set()
+
+        def _add_candidate(raw_expr: str) -> None:
+            try:
+                node = parse_sql_ast(raw_expr, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                return
+            if isinstance(node, sqlglot_exp.Column) and node.name:
+                key = f"{node.table.lower()}.{node.name.lower()}" if node.table else node.name.lower()
+                alias = expr_to_alias.get(key) or expr_to_alias.get(node.name.lower())
+                if alias and alias.lower() not in excluded_low and alias.lower() not in seen_low:
+                    seen_low.add(alias.lower())
+                    candidates.append(alias)
+
+        for g in self.view.group_by_cols:
+            _add_candidate(g)
+        for j in self.view.joins:
+            if not j.on_condition:
+                continue
+            try:
+                on_ast = parse_sql_ast(j.on_condition, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                continue
+            for eq in on_ast.find_all(sqlglot_exp.EQ):
+                if isinstance(eq.left, sqlglot_exp.Column):
+                    _add_candidate(eq.left.sql())
+                if isinstance(eq.right, sqlglot_exp.Column):
+                    _add_candidate(eq.right.sql())
+        if self.view.has_window_func:
+            for it in self.view.select_items:
+                try:
+                    ast_it = parse_sql_ast(it.raw_expr, dialect=self.dialect)
+                except sqlglot.errors.SqlglotError:
+                    continue
+                for win in ast_it.find_all(sqlglot_exp.Window):
+                    for part_e in (win.args.get("partition_by") or ()):
+                        if isinstance(part_e, sqlglot_exp.Column):
+                            _add_candidate(part_e.sql())
+        return candidates
+
     def _build_all_index_ddls(
         self,
         mv_table: str,
@@ -1099,11 +1258,22 @@ class PlannerMixin:
         has_pk_on_group_cols: bool = False,
         backing_col_map: Optional[Dict[str, str]] = None,
         unique_group_nulls_not_distinct: bool = False,
+        extra_auto_index_cols: Sequence[str] = (),
     ) -> Tuple[List[str], List[str]]:
         ddls: List[str] = []
         names: List[str] = []
         p = self.object_prefix if self.object_prefix else "__matview_"
         log_vname = self.logical_view_name
+        covered_leading_low: Set[str] = set()
+        if auto_group_cols and has_pk_on_group_cols:
+            covered_leading_low.add(auto_group_cols[0].lower())
+        elif auto_group_cols:
+            covered_leading_low.add(auto_group_cols[0].lower())
+        for idx_spec in self.user_indexes:
+            if idx_spec.columns:
+                covered_leading_low.add(
+                    self._extract_index_col_base_ident(idx_spec.columns[0]).lower()
+                )
 
         q_auto_group_cols = [self._q(c) for c in auto_group_cols]
         if q_auto_group_cols and not has_pk_on_group_cols:
@@ -1129,6 +1299,27 @@ class PlannerMixin:
                         build_create_index_sql(sub_idx_name, mv_table, [self._q(g_col)], dialect=self.dialect)
                     )
                     names.append(sub_idx_name)
+                    covered_leading_low.add(g_col.lower())
+
+        for extra_col in extra_auto_index_cols:
+            if not extra_col or extra_col.lower() in covered_leading_low:
+                continue
+            covered_leading_low.add(extra_col.lower())
+            extra_idx_name = self._bounded_ident(
+                f"{p}idx_",
+                f"{log_vname}__{_sanitize_ident(extra_col)}",
+                "__auto",
+            )
+            if extra_idx_name not in names:
+                ddls.append(
+                    build_create_index_sql(
+                        extra_idx_name,
+                        mv_table,
+                        [self._q(extra_col)],
+                        dialect=self.dialect,
+                    )
+                )
+                names.append(extra_idx_name)
 
         for i, idx_spec in enumerate(self.user_indexes, 1):
             if idx_spec.name:
@@ -1276,7 +1467,196 @@ class PlannerMixin:
             return (sel, "SQLite version lacks UPSERT support and query does not qualify for Tier 2 group-scoped maintenance.")
         return (sel, "Query structure prevents incremental maintenance; falls back to universal atomic query sync.")
 
-    def _build_compilation_diagnostics(self, raw_plan: MaterializedViewPlan) -> PlanDiagnostics:
+    def _collect_base_table_index_needs(
+        self,
+        raw_plan: MaterializedViewPlan,
+    ) -> List[Tuple[str, Tuple[str, ...], str]]:
+        """Collect `(table_name, columns, reason)` lookup patterns needed by maintenance triggers/backfill."""
+        alias_map = self._alias_to_table_map()
+        needs: List[Tuple[str, Tuple[str, ...], str]] = []
+        seen_keys: Set[Tuple[str, Tuple[str, ...]]] = set()
+
+        def _record(tbl_name: str, cols: Sequence[str], reason: str) -> None:
+            clean_cols = tuple(c for c in cols if c)
+            if not tbl_name or not clean_cols:
+                return
+            key = (tbl_name.lower(), tuple(c.lower() for c in clean_cols))
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            needs.append((tbl_name, clean_cols, reason))
+
+        # 1. Join ON equality lookup columns per table (crucial for Tier 1 JOIN triggers & Tier 2/3 join probes).
+        for j in self.view.joins:
+            if not j.on_condition:
+                continue
+            try:
+                on_ast = parse_sql_ast(j.on_condition, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                continue
+            per_tbl: Dict[str, List[str]] = {}
+            for eq in on_ast.find_all(sqlglot_exp.EQ):
+                for side in (eq.left, eq.right):
+                    if isinstance(side, sqlglot_exp.Column):
+                        res = self._resolve_ast_col_to_table(side, alias_map)
+                        if res is not None:
+                            t_n, c_n = res
+                            lst = per_tbl.setdefault(t_n, [])
+                            if c_n.lower() not in {x.lower() for x in lst}:
+                                lst.append(c_n)
+            for t_n, j_cols in per_tbl.items():
+                _record(t_n, j_cols, f"join_on_key ({j.join_type})")
+
+        # 2. Group-by lookup columns for MIN/MAX/BIT_AND/BIT_OR delete recomputation and Tier 2 group-scoped refresh.
+        needs_base_group_scan = raw_plan.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA or any(
+            it.is_aggregate
+            and it.agg_func in (AggFunc.MIN, AggFunc.MAX, AggFunc.BIT_AND, AggFunc.BIT_OR)
+            for it in self.view.select_items
+        )
+        if needs_base_group_scan and self.view.group_by_cols and self.view.base_table:
+            by_tbl: Dict[str, List[str]] = {}
+            for g in self.view.group_by_cols:
+                try:
+                    g_ast = parse_sql_ast(g, dialect=self.dialect)
+                except sqlglot.errors.SqlglotError:
+                    continue
+                if isinstance(g_ast, sqlglot_exp.Column):
+                    res = self._resolve_ast_col_to_table(g_ast, alias_map)
+                    if res is not None:
+                        t_n, c_n = res
+                        lst = by_tbl.setdefault(t_n, [])
+                        if c_n.lower() not in {x.lower() for x in lst}:
+                            lst.append(c_n)
+            reason = (
+                "tier2_group_scoped_recompute"
+                if raw_plan.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA
+                else "holistic_minmax_delete_recompute"
+            )
+            for t_n, g_cols in by_tbl.items():
+                _record(t_n, g_cols, reason)
+
+        # 3. Window PARTITION BY columns (future Tier 2 window partition scoping / partitioning reads).
+        if self.view.has_window_func:
+            part_cols: List[str] = []
+            part_tbl = self.view.base_table
+            for it in self.view.select_items:
+                try:
+                    ast_it = parse_sql_ast(it.raw_expr, dialect=self.dialect)
+                except sqlglot.errors.SqlglotError:
+                    continue
+                for win in ast_it.find_all(sqlglot_exp.Window):
+                    for part_e in (win.args.get("partition_by") or ()):
+                        if isinstance(part_e, sqlglot_exp.Column):
+                            res = self._resolve_ast_col_to_table(part_e, alias_map)
+                            if res is not None and res[0].lower() == part_tbl.lower():
+                                if res[1].lower() not in {x.lower() for x in part_cols}:
+                                    part_cols.append(res[1])
+            if part_cols and part_tbl:
+                _record(part_tbl, part_cols, "window_partition_by")
+
+        # 4. Incremental backfill PK / watermark cursor column.
+        if (
+            self.incremental_backfill
+            and raw_plan.incremental_backfill_spec is not None
+            and raw_plan.incremental_backfill_spec.pk_column
+            and raw_plan.incremental_backfill_spec.pk_column.lower() != "rowid"
+            and self.view.base_table
+        ):
+            _record(
+                self.view.base_table,
+                [raw_plan.incremental_backfill_spec.pk_column],
+                "incremental_backfill_cursor",
+            )
+
+        return needs
+
+    def _analyze_base_table_indexes(
+        self,
+        raw_plan: MaterializedViewPlan,
+    ) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+        """Evaluate base-table index coverage and propose missing `recommended_base_indexes`."""
+        rec_ddls: List[str] = []
+        rec_meta: List[Dict[str, Any]] = []
+        used_existing: List[Dict[str, Any]] = []
+        p = self.object_prefix if self.object_prefix else "__matview_"
+
+        existing_inventory: Dict[str, List[Dict[str, Any]]] = {}
+        for t_name in self.view.referenced_tables:
+            ts = self._schemas_lower.get(t_name.lower())
+            if ts is None:
+                continue
+            entries: List[Dict[str, Any]] = []
+            eff_pk = ts.effective_pk_columns()
+            if eff_pk:
+                entries.append({"name": "PRIMARY KEY", "columns": list(eff_pk), "unique": True})
+            for ix in ts.indexes:
+                entries.append({"name": ix.name, "columns": list(ix.columns), "unique": ix.unique})
+            if entries:
+                existing_inventory[ts.name] = entries
+
+        seen_rec_names: Set[str] = set()
+        for tbl_name, cols, reason in self._collect_base_table_index_needs(raw_plan):
+            ts = self._schemas_lower.get(tbl_name.lower())
+            if ts is None:
+                continue
+            matched = ts.covering_indexes_for(cols)
+            if matched:
+                used_existing.append(
+                    {
+                        "table": ts.name,
+                        "columns": list(cols),
+                        "indexes": list(matched),
+                        "reason": reason,
+                    }
+                )
+                continue
+
+            # MySQL rejects unprefixed indexes on TEXT/BLOB columns.
+            if self.dialect == Dialect.MYSQL:
+                has_unindexable = any(
+                    (cd := ts.columns.get(c)) is not None
+                    and any(tk in cd.data_type.upper() for tk in ("TEXT", "BLOB"))
+                    for c in cols
+                )
+                if has_unindexable:
+                    continue
+
+            col_tag = "_".join(_sanitize_ident(c) for c in cols)
+            idx_name = self._bounded_ident(
+                f"{p}base_idx_",
+                f"{_sanitize_ident(ts.name)}__{col_tag}",
+                "",
+            )
+            if idx_name in seen_rec_names:
+                continue
+            seen_rec_names.add(idx_name)
+            ddl = build_create_index_sql(
+                idx_name,
+                ts.name,
+                [self._q(c) for c in cols],
+                dialect=self.dialect,
+            )
+            rec_ddls.append(ddl)
+            rec_meta.append(
+                {
+                    "index_name": idx_name,
+                    "table": ts.name,
+                    "columns": list(cols),
+                    "reason": reason,
+                    "ddl": ddl,
+                }
+            )
+        return rec_ddls, rec_meta, used_existing, existing_inventory
+
+    def _build_compilation_diagnostics(
+        self,
+        raw_plan: MaterializedViewPlan,
+        *,
+        recommended_base_indexes: Sequence[str] = (),
+        base_index_recommendations: Sequence[Dict[str, Any]] = (),
+        existing_base_indexes_used: Sequence[Dict[str, Any]] = (),
+        existing_base_indexes: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    ) -> PlanDiagnostics:
         tier = (
             1 if raw_plan.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA
             else 2 if raw_plan.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA
@@ -1316,6 +1696,10 @@ class PlannerMixin:
                 "dialect": self.dialect.value,
                 "engine_version": self.engine_version.label if self.engine_version else None,
                 "base_tables": list(self.view.referenced_tables),
+                "existing_base_indexes": dict(existing_base_indexes or {}),
+                "existing_base_indexes_used": list(existing_base_indexes_used),
+                "recommended_base_indexes": list(recommended_base_indexes),
+                "base_index_recommendations": list(base_index_recommendations),
             },
         )
 
@@ -1323,7 +1707,14 @@ class PlannerMixin:
         full_sqls = list(raw_plan.initial_populate_sqls)
         inc_sqls = self._build_dialect_incremental_populate_sqls(raw_plan)
         active_sqls = inc_sqls if self.incremental_backfill else full_sqls
-        diagnostics = self._build_compilation_diagnostics(raw_plan)
+        rec_ddls, rec_meta, used_existing, existing_inv = self._analyze_base_table_indexes(raw_plan)
+        diagnostics = self._build_compilation_diagnostics(
+            raw_plan,
+            recommended_base_indexes=rec_ddls,
+            base_index_recommendations=rec_meta,
+            existing_base_indexes_used=used_existing,
+            existing_base_indexes=existing_inv,
+        )
         return MaterializedViewPlan(
             dialect=raw_plan.dialect,
             strategy=raw_plan.strategy,
@@ -1353,6 +1744,8 @@ class PlannerMixin:
             incremental_populate_sqls=inc_sqls,
             engine_version=self.engine_version,
             diagnostics=diagnostics,
+            recommended_base_indexes=rec_ddls,
+            base_index_recommendations=rec_meta,
         )
 
     def _compile_single_plan(self) -> MaterializedViewPlan:

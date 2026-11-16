@@ -27,6 +27,7 @@ from .logical_ir import (
     ColumnDef,
     JoinSpec,
     SelectItem,
+    TableIndexDef,
     TableSchema,
     ViewIndexSpec,
     ViewSpec,
@@ -860,18 +861,78 @@ def _extract_sqlite_raw_declared_types(stmt_sql: str) -> Dict[str, str]:
     return raw_types
 
 
+def parse_table_index_def(
+    index_sql: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> Optional[TableIndexDef]:
+    """Parse a single `CREATE [UNIQUE] INDEX` SQL statement into a `TableIndexDef`."""
+    eff_dialect = dialect if dialect is not None else Dialect.SQLITE
+    sg_d = _sqlglot_dialect(eff_dialect)
+    try:
+        stmt_ast = parse_sql_ast(index_sql, dialect=eff_dialect)
+    except sqlglot.errors.SqlglotError:
+        return None
+    if not isinstance(stmt_ast, sqlglot_exp.Create) or stmt_ast.kind.upper() != "INDEX":
+        return None
+    idx_node = stmt_ast.this
+    if not isinstance(idx_node, sqlglot_exp.Index):
+        return None
+    tbl_expr = idx_node.args.get("table")
+    idx_tbl = tbl_expr.name if isinstance(tbl_expr, sqlglot_exp.Table) else ""
+    idx_name = idx_node.name or ""
+    params = idx_node.args.get("params")
+    col_exprs = (
+        list(params.args.get("columns") or params.expressions or ())
+        if params is not None
+        else list(idx_node.expressions or ())
+    )
+    cols_out: List[str] = []
+    for c in col_exprs:
+        if isinstance(c, sqlglot_exp.Ordered):
+            inner = c.this
+            if isinstance(inner, (sqlglot_exp.Identifier, sqlglot_exp.Column)) and inner.name:
+                cols_out.append(inner.name)
+            elif inner is not None:
+                cols_out.append(inner.sql(dialect=sg_d))
+        elif isinstance(c, (sqlglot_exp.Identifier, sqlglot_exp.Column)) and c.name:
+            cols_out.append(c.name)
+        else:
+            cols_out.append(c.sql(dialect=sg_d))
+    where_n = params.args.get("where") if params is not None else None
+    where_s = (
+        where_n.this.sql(dialect=sg_d)
+        if isinstance(where_n, sqlglot_exp.Where) and where_n.this is not None
+        else None
+    )
+    if not idx_tbl or not cols_out:
+        return None
+    return TableIndexDef(
+        name=idx_name or f"idx_{idx_tbl}_{'_'.join(cols_out)}",
+        table_name=idx_tbl,
+        columns=tuple(cols_out),
+        unique=bool(stmt_ast.args.get("unique")),
+        where_clause=where_s,
+    )
+
+
 def parse_table_schema(
     schema_sql: str,
     dialect: Dialect = Dialect.SQLITE,
 ) -> Dict[str, TableSchema]:
-    """Parses one or more CREATE TABLE statements into TableSchema objects via `sqlglot.parse`."""
+    """Parses CREATE TABLE and CREATE [UNIQUE] INDEX statements into TableSchema objects via `sqlglot.parse`."""
     eff_dialect = dialect if dialect is not None else Dialect.SQLITE
     clean = _strip_sql_comments(schema_sql, dialect=eff_dialect)
     sg_d = _sqlglot_dialect(eff_dialect)
     schemas: Dict[str, TableSchema] = {}
+    pending_indexes: Dict[str, List[TableIndexDef]] = {}
     for raw_stmt in _split_top_level(clean, ";", dialect=eff_dialect):
         raw_stmt_s = raw_stmt.strip()
         if not raw_stmt_s:
+            continue
+        parsed_idx = parse_table_index_def(raw_stmt_s, dialect=eff_dialect)
+        if parsed_idx is not None:
+            if not parsed_idx.table_name.startswith(("__matview_", "__mv_")):
+                pending_indexes.setdefault(parsed_idx.table_name.lower(), []).append(parsed_idx)
             continue
         try:
             stmt_ast = parse_sql_ast(raw_stmt_s, dialect=eff_dialect)
@@ -891,7 +952,9 @@ def parse_table_schema(
         if not table_name or table_name.startswith(("__matview_", "__mv_")):
             continue
         cols: Dict[str, ColumnDef] = {}
+        table_pk_cols_order: List[str] = []
         table_pk_cols: Set[str] = set()
+        inline_indexes: List[TableIndexDef] = []
         fk_cascades: List[str] = []
         has_on_conflict_replace = False
 
@@ -932,14 +995,42 @@ def parse_table_schema(
         for pk_node in schema_node.find_all(sqlglot_exp.PrimaryKey):
             for pk_id in pk_node.expressions:
                 pk_name = pk_id.name or (pk_id.this.name if isinstance(pk_id.this, sqlglot_exp.Expr) else "")
-                if pk_name:
+                if pk_name and pk_name.lower() not in table_pk_cols:
                     table_pk_cols.add(pk_name.lower())
+                    table_pk_cols_order.append(pk_name)
+
+        for uq_node in schema_node.find_all(sqlglot_exp.UniqueColumnConstraint):
+            # Table-level UNIQUE(col1, col2, ...) inside Schema.expressions or Constraint.expressions
+            uq_parent = uq_node.parent
+            if isinstance(uq_parent, sqlglot_exp.ColumnConstraint):
+                continue
+            uq_schema = getattr(uq_node, "this", None)
+            uq_exprs = (
+                list(uq_schema.expressions)
+                if isinstance(uq_schema, sqlglot_exp.Schema)
+                else list(uq_node.expressions or ())
+            )
+            uq_cols = tuple(
+                c.name or (c.this.name if isinstance(c.this, sqlglot_exp.Expr) else "")
+                for c in uq_exprs
+            )
+            uq_cols = tuple(c for c in uq_cols if c)
+            if uq_cols:
+                inline_indexes.append(
+                    TableIndexDef(
+                        name=f"uq_{table_name}_{'_'.join(uq_cols)}",
+                        table_name=table_name,
+                        columns=uq_cols,
+                        unique=True,
+                    )
+                )
 
         without_rowid = dialect == Dialect.SQLITE and bool(
             re.search(r"\bWITHOUT\s+ROWID\b", raw_stmt_s, re.IGNORECASE)
         )
         col_items: List[Tuple[str, str, bool, bool]] = []
         all_pk_cols_lower: Set[str] = set(table_pk_cols)
+        ordered_pk_cols: List[str] = list(table_pk_cols_order)
         for expr_item in schema_node.expressions:
             if isinstance(expr_item, sqlglot_exp.ColumnDef):
                 col_name = expr_item.name
@@ -953,13 +1044,26 @@ def parse_table_schema(
                     isinstance(c.kind, sqlglot_exp.PrimaryKeyColumnConstraint)
                     for c in expr_item.constraints
                 )
+                if any(
+                    isinstance(c.kind, sqlglot_exp.UniqueColumnConstraint)
+                    for c in expr_item.constraints
+                ):
+                    inline_indexes.append(
+                        TableIndexDef(
+                            name=f"uq_{table_name}_{col_name}",
+                            table_name=table_name,
+                            columns=(col_name,),
+                            unique=True,
+                        )
+                    )
                 explicit_not_null = any(
                     isinstance(c.kind, sqlglot_exp.NotNullColumnConstraint)
                     and not c.kind.args.get("allow_null")
                     for c in expr_item.constraints
                 )
-                if is_pk:
+                if is_pk and col_name.lower() not in all_pk_cols_lower:
                     all_pk_cols_lower.add(col_name.lower())
+                    ordered_pk_cols.append(col_name)
                 col_items.append((col_name, data_type, is_pk, explicit_not_null))
 
         single_pk = len(all_pk_cols_lower) == 1
@@ -990,7 +1094,29 @@ def parse_table_schema(
             columns=cols,
             fk_cascade_actions=tuple(fk_cascades),
             has_on_conflict_replace=has_on_conflict_replace,
+            indexes=tuple(inline_indexes),
+            pk_columns=tuple(ordered_pk_cols),
         )
+
+    if pending_indexes:
+        low_to_key = {k.lower(): k for k in schemas}
+        for tbl_low, idx_list in pending_indexes.items():
+            tbl_key = low_to_key.get(tbl_low)
+            if tbl_key is None:
+                continue
+            existing = schemas[tbl_key]
+            existing_names = {i.name.lower() for i in existing.indexes}
+            merged = list(existing.indexes) + [
+                idx for idx in idx_list if idx.name.lower() not in existing_names
+            ]
+            schemas[tbl_key] = TableSchema(
+                name=existing.name,
+                columns=existing.columns,
+                fk_cascade_actions=existing.fk_cascade_actions,
+                has_on_conflict_replace=existing.has_on_conflict_replace,
+                indexes=tuple(merged),
+                pk_columns=existing.pk_columns,
+            )
     return schemas
 
 

@@ -206,7 +206,10 @@ class Tier1JoinMixin:
             mc = self._group_col_alias(g)
             if mc not in group_mv_cols:
                 group_mv_cols.append(mc)
-        indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
+        extra_join_cols = self._auto_backing_extra_index_cols(
+            excluded_leading_cols=group_mv_cols[:1]
+        )
+        indexed_cols_lower = self._indexed_column_names_lower(list(group_mv_cols) + list(extra_join_cols))
 
         for item in work_items:
             if not item.is_aggregate:
@@ -317,6 +320,7 @@ class Tier1JoinMixin:
             has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
             backing_col_map=backing_col_map,
             unique_group_nulls_not_distinct=can_pg15_unique_nnd,
+            extra_auto_index_cols=extra_join_cols,
         )
 
         reader_select_override = [

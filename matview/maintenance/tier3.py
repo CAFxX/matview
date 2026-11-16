@@ -53,7 +53,8 @@ class Tier3Mixin:
         col_defs_sql: List[str] = []
         user_columns: List[str] = []
 
-        indexed_cols_lower = self._indexed_column_names_lower()
+        extra_auto_cols = self._auto_backing_extra_index_cols()
+        indexed_cols_lower = self._indexed_column_names_lower(extra_auto_cols)
         if len(self.view.select_items) == 1 and self.view.select_items[0].raw_expr.strip() == "*":
             for j in self.view.joins or []:
                 t_schema = self._schemas_lower.get(j.table_name.lower())
@@ -84,6 +85,7 @@ class Tier3Mixin:
             mv_table=mv_table,
             auto_group_cols=(),
             has_pk_on_group_cols=False,
+            extra_auto_index_cols=extra_auto_cols,
         )
 
         backing_table_ddl = self._create_table_ddl(

@@ -21,8 +21,8 @@ from .engines import (
     _read_mariadb_div_precision_increment,
     parse_engine_version,
 )
-from .logical_ir import ColumnDef, TableSchema
-from .sql_frontend import parse_table_schema
+from .logical_ir import ColumnDef, TableIndexDef, TableSchema
+from .sql_frontend import parse_table_index_def, parse_table_schema
 
 def detect_engine_version(
     conn: Any,
@@ -461,7 +461,8 @@ def introspect_schemas_with_sqlalchemy(
                     continue
 
             pk_info = insp.get_pk_constraint(t_name) or {}
-            pk_cols_low = {str(c).lower() for c in (pk_info.get("constrained_columns") or ())}
+            pk_cols_seq = tuple(str(c) for c in (pk_info.get("constrained_columns") or ()))
+            pk_cols_low = {c.lower() for c in pk_cols_seq}
             cols_info = insp.get_columns(t_name) or []
             col_defs: Dict[str, ColumnDef] = {}
             for col in cols_info:
@@ -486,10 +487,56 @@ def introspect_schemas_with_sqlalchemy(
                         if act_str not in fk_actions:
                             fk_actions.append(act_str)
 
+            idx_defs: List[TableIndexDef] = []
+            seen_idx_names = set()
+            try:
+                for raw_ix in (insp.get_indexes(t_name) or []):
+                    ix_cols = tuple(str(c) for c in (raw_ix.get("column_names") or ()) if c)
+                    ix_name = str(raw_ix.get("name") or f"idx_{t_name}_{'_'.join(ix_cols)}")
+                    if not ix_cols or ix_name.lower() in seen_idx_names:
+                        continue
+                    seen_idx_names.add(ix_name.lower())
+                    d_opts = raw_ix.get("dialect_options") or {}
+                    where_c = (
+                        d_opts.get("postgresql_where")
+                        or d_opts.get("sqlite_where")
+                        or None
+                    )
+                    idx_defs.append(
+                        TableIndexDef(
+                            name=ix_name,
+                            table_name=t_name,
+                            columns=ix_cols,
+                            unique=bool(raw_ix.get("unique")),
+                            where_clause=str(where_c) if where_c else None,
+                        )
+                    )
+            except Exception:
+                pass
+            try:
+                for raw_uq in (insp.get_unique_constraints(t_name) or []):
+                    uq_cols = tuple(str(c) for c in (raw_uq.get("column_names") or ()) if c)
+                    uq_name = str(raw_uq.get("name") or f"uq_{t_name}_{'_'.join(uq_cols)}")
+                    if not uq_cols or uq_name.lower() in seen_idx_names:
+                        continue
+                    seen_idx_names.add(uq_name.lower())
+                    idx_defs.append(
+                        TableIndexDef(
+                            name=uq_name,
+                            table_name=t_name,
+                            columns=uq_cols,
+                            unique=True,
+                        )
+                    )
+            except Exception:
+                pass
+
             schemas[t_name] = TableSchema(
                 name=t_name,
                 columns=col_defs,
                 fk_cascade_actions=tuple(fk_actions),
+                indexes=tuple(idx_defs),
+                pk_columns=pk_cols_seq,
             )
         return schemas
     finally:
@@ -505,20 +552,24 @@ def introspect_sqlite_schemas(
     cur = conn.cursor()
     try:
         cur.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            "SELECT type, name, sql, tbl_name FROM sqlite_master WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'"
         )
         rows = cur.fetchall() or []
         ddl_parts: List[str] = []
         table_names: List[str] = []
-        for name, sql in rows:
+        for obj_type, name, sql, tbl_name in rows:
             if not name:
                 continue
+            owner_name = str(tbl_name or name)
             t_str = str(name)
-            if t_str.startswith(("__matview_", "__mv_")) or (
-                object_prefix and t_str.startswith(object_prefix)
+            if (
+                owner_name.startswith(("__matview_", "__mv_"))
+                or t_str.startswith(("__matview_", "__mv_"))
+                or (object_prefix and (owner_name.startswith(object_prefix) or t_str.startswith(object_prefix)))
             ):
                 continue
-            table_names.append(t_str)
+            if str(obj_type).lower() == "table":
+                table_names.append(t_str)
             if sql:
                 ddl_parts.append(str(sql).rstrip(";") + ";")
         schemas = (
@@ -528,7 +579,7 @@ def introspect_sqlite_schemas(
         )
         low_known = {k.lower(): k for k in schemas}
 
-        # Fallback / enrichment via PRAGMA table_info & foreign_key_list for tables without standard DDL (e.g. CREATE TABLE AS)
+        # Fallback / enrichment via PRAGMA table_info, index_list & foreign_key_list for tables without standard DDL
         for t_str in table_names:
             existing = schemas.get(low_known.get(t_str.lower(), t_str))
             if existing and existing.columns:
@@ -538,7 +589,9 @@ def introspect_sqlite_schemas(
                 t_info = cur.fetchall() or []
                 if not t_info:
                     continue
-                pk_count = sum(1 for r in t_info if bool(r[5]))
+                pk_entries = sorted(((int(r[5]), str(r[1])) for r in t_info if int(r[5] or 0) > 0), key=lambda x: x[0])
+                pk_cols_seq = tuple(name for _, name in pk_entries)
+                pk_count = len(pk_cols_seq)
                 cols: Dict[str, ColumnDef] = {}
                 for r in t_info:
                     c_name = str(r[1])
@@ -569,10 +622,38 @@ def introspect_sqlite_schemas(
                                 fk_actions.append(act)
                 except Exception:
                     pass
+                sq_idx_defs: List[TableIndexDef] = []
+                try:
+                    cur.execute(f'PRAGMA index_list("{t_str}")')
+                    for il_row in (cur.fetchall() or []):
+                        ix_name = str(il_row[1])
+                        ix_unique = bool(il_row[2])
+                        ix_origin = str(il_row[3]) if len(il_row) > 3 and il_row[3] else ""
+                        if ix_origin == "pk":
+                            continue
+                        cur.execute(f'PRAGMA index_info("{ix_name}")')
+                        ii_rows = sorted(
+                            (r for r in (cur.fetchall() or []) if len(r) > 2 and r[2] is not None),
+                            key=lambda r: int(r[0]),
+                        )
+                        ix_cols = tuple(str(r[2]) for r in ii_rows)
+                        if ix_cols:
+                            sq_idx_defs.append(
+                                TableIndexDef(
+                                    name=ix_name,
+                                    table_name=t_str,
+                                    columns=ix_cols,
+                                    unique=ix_unique,
+                                )
+                            )
+                except Exception:
+                    pass
                 schemas[t_str] = TableSchema(
                     name=t_str,
                     columns=cols,
                     fk_cascade_actions=tuple(fk_actions),
+                    indexes=tuple(sq_idx_defs),
+                    pk_columns=pk_cols_seq,
                 )
             except Exception:
                 pass
@@ -629,9 +710,43 @@ def introspect_database_schemas(
                  AND tc.table_name = kcu.table_name
                 WHERE tc.constraint_type = 'PRIMARY KEY'
                   AND tc.table_schema = current_schema()
+                ORDER BY kcu.table_name, kcu.ordinal_position
                 """
             )
-            pk_pairs = {(str(r[0]).lower(), str(r[1]).lower()) for r in (cur.fetchall() or [])}
+            pk_rows = cur.fetchall() or []
+            pk_pairs = {(str(r[0]).lower(), str(r[1]).lower()) for r in pk_rows}
+            pk_order_by_table: Dict[str, List[str]] = {}
+            for r in pk_rows:
+                pk_order_by_table.setdefault(str(r[0]).lower(), []).append(str(r[1]))
+            pg_idx_by_table: Dict[str, List[TableIndexDef]] = {}
+            try:
+                cur.execute(
+                    """
+                    SELECT tablename, indexname, indexdef
+                    FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND tablename NOT LIKE '__matview_%'
+                      AND tablename NOT LIKE '__mv_%'
+                    ORDER BY tablename, indexname
+                    """
+                )
+                for ix_r in (cur.fetchall() or []):
+                    t_nm, ix_nm, ix_def = str(ix_r[0]), str(ix_r[1]), str(ix_r[2] or "")
+                    if not ix_def:
+                        continue
+                    parsed_ix = parse_table_index_def(ix_def, dialect=Dialect.POSTGRES)
+                    if parsed_ix is not None:
+                        pg_idx_by_table.setdefault(t_nm.lower(), []).append(
+                            TableIndexDef(
+                                name=ix_nm,
+                                table_name=t_nm,
+                                columns=parsed_ix.columns,
+                                unique=parsed_ix.unique,
+                                where_clause=parsed_ix.where_clause,
+                            )
+                        )
+            except Exception:
+                pass
             fk_by_table: Dict[str, List[str]] = {}
             try:
                 cur.execute(
@@ -704,6 +819,8 @@ def introspect_database_schemas(
                     name=t_name,
                     columns=cols,
                     fk_cascade_actions=tuple(fk_by_table.get(t_name.lower(), ())),
+                    indexes=tuple(pg_idx_by_table.get(t_name.lower(), ())),
+                    pk_columns=tuple(pk_order_by_table.get(t_name.lower(), ())),
                 )
             return schemas
         # MySQL / MariaDB
@@ -781,11 +898,52 @@ def introspect_database_schemas(
                 not_null=(str(is_null).upper() == "NO") or is_pk,
                 primary_key=is_pk,
             )
+        my_pk_by_table: Dict[str, List[str]] = {}
+        my_idx_by_table: Dict[str, List[TableIndexDef]] = {}
+        try:
+            cur.execute(
+                """
+                SELECT table_name, index_name, non_unique, column_name
+                FROM information_schema.statistics
+                WHERE table_schema = DATABASE()
+                  AND table_name NOT LIKE '__matview_%'
+                  AND table_name NOT LIKE '__mv_%'
+                ORDER BY table_name, index_name, seq_in_index
+                """
+            )
+            raw_stats: Dict[Tuple[str, str], Tuple[bool, List[str]]] = {}
+            for st_r in (cur.fetchall() or []):
+                st_tbl = _dec(st_r[0])
+                st_ix = _dec(st_r[1])
+                st_non_uq = bool(int(st_r[2])) if st_r[2] is not None else True
+                st_col = _dec(st_r[3])
+                if not st_tbl or not st_ix or not st_col:
+                    continue
+                key = (st_tbl.lower(), st_ix)
+                entry = raw_stats.setdefault(key, (not st_non_uq, []))
+                entry[1].append(st_col)
+            for (st_tbl_low, st_ix), (is_uq, col_list) in raw_stats.items():
+                if st_ix.upper() == "PRIMARY":
+                    my_pk_by_table[st_tbl_low] = col_list
+                else:
+                    my_idx_by_table.setdefault(st_tbl_low, []).append(
+                        TableIndexDef(
+                            name=st_ix,
+                            table_name=st_tbl_low,
+                            columns=tuple(col_list),
+                            unique=is_uq,
+                        )
+                    )
+        except Exception:
+            pass
+
         for t_name, cols in grouped_my.items():
             schemas[t_name] = TableSchema(
                 name=t_name,
                 columns=cols,
                 fk_cascade_actions=tuple(fk_by_table_my.get(t_name.lower(), ())),
+                indexes=tuple(my_idx_by_table.get(t_name.lower(), ())),
+                pk_columns=tuple(my_pk_by_table.get(t_name.lower(), ())),
             )
         return schemas
     finally:

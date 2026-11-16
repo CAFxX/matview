@@ -27,12 +27,79 @@ class ColumnDef:
     primary_key: bool = False
 
 
+def _normalize_index_column_key(col_spec: str) -> str:
+    """Normalize a column or key specification for prefix-coverage comparison."""
+    s = str(col_spec or "").strip()
+    s = re.sub(r"\s+NULLS\s+(?:FIRST|LAST)\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+(?:ASC|DESC)\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+COLLATE\s+\S+\s*$", "", s, flags=re.IGNORECASE)
+    s = s.strip()
+    if "." in s and not s.startswith(("(", "\"", "`", "[")):
+        s = s.rsplit(".", 1)[-1].strip()
+    if (
+        (len(s) >= 2 and s[0] == '"' and s[-1] == '"')
+        or (len(s) >= 2 and s[0] == "`" and s[-1] == "`")
+        or (len(s) >= 2 and s[0] == "[" and s[-1] == "]")
+    ):
+        s = s[1:-1]
+    return s.strip().lower()
+
+
+@dataclass(frozen=True)
+class TableIndexDef:
+    name: str
+    table_name: str
+    columns: Tuple[str, ...]
+    unique: bool = False
+    where_clause: Optional[str] = None
+    is_primary: bool = False
+
+
 @dataclass(frozen=True)
 class TableSchema:
     name: str
     columns: Dict[str, ColumnDef]
     fk_cascade_actions: Tuple[str, ...] = ()
     has_on_conflict_replace: bool = False
+    indexes: Tuple[TableIndexDef, ...] = ()
+    pk_columns: Tuple[str, ...] = ()
+
+    def effective_pk_columns(self) -> Tuple[str, ...]:
+        if self.pk_columns:
+            return self.pk_columns
+        pks = tuple(c.name for c in self.columns.values() if c.primary_key)
+        return pks if len(pks) == 1 else ()
+
+    def covering_indexes_for(
+        self,
+        cols: Sequence[str],
+        *,
+        partial_ok: bool = False,
+    ) -> Tuple[str, ...]:
+        """Return existing index / PRIMARY KEY names whose leading columns cover `cols`."""
+        req = [_normalize_index_column_key(c) for c in cols if str(c).strip()]
+        if not req:
+            return ()
+        matches: List[str] = []
+        pk_cols = [_normalize_index_column_key(c) for c in self.effective_pk_columns()]
+        if pk_cols and len(pk_cols) >= len(req) and pk_cols[: len(req)] == req:
+            matches.append("PRIMARY KEY")
+        for idx in self.indexes:
+            if idx.where_clause and not partial_ok:
+                continue
+            idx_cols = [_normalize_index_column_key(c) for c in idx.columns]
+            if len(idx_cols) >= len(req) and idx_cols[: len(req)] == req:
+                if idx.name not in matches:
+                    matches.append(idx.name)
+        return tuple(matches)
+
+    def has_index_covering(
+        self,
+        cols: Sequence[str],
+        *,
+        partial_ok: bool = False,
+    ) -> bool:
+        return bool(self.covering_indexes_for(cols, partial_ok=partial_ok))
 
 
 @dataclass(frozen=True)
@@ -182,6 +249,8 @@ class MaterializedViewPlan:
     incremental_populate_sqls: List[str] = field(default_factory=list)
     engine_version: Optional[EngineVersion] = None
     diagnostics: Optional[PlanDiagnostics] = None
+    recommended_base_indexes: List[str] = field(default_factory=list)
+    base_index_recommendations: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.diagnostics is None:
