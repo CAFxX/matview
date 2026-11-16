@@ -169,6 +169,7 @@ class TestTier2WindowPartitionScoping(unittest.TestCase):
             "ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC, id ASC) AS rn, "
             "DENSE_RANK() OVER (PARTITION BY team ORDER BY score DESC) AS drk, "
             "COALESCE(LAG(score, 1) OVER (PARTITION BY team ORDER BY id ASC), -1) AS prev_s "
+            "SUM(score) OVER (PARTITION BY team ORDER BY id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum "
             "FROM p2_win_scores"
         )
         try:
