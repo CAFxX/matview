@@ -1,0 +1,801 @@
+"""Tier 1B: Algebraic incremental maintenance for INNER JOIN aggregate views."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+import sqlglot
+from sqlglot import exp as sqlglot_exp
+from sqlglot.tokens import TokenType as SQLGlotTokenType
+
+from ..engines import (
+    AggFunc,
+    Dialect,
+    EngineSubdialect,
+    MaintenanceStrategy,
+    UnsupportedMaterializedViewError,
+    _SIMPLE_IDENT_RE,
+    _SQL_RESERVED_KEYWORDS,
+    _sqlglot_dialect,
+)
+from ..logical_ir import (
+    ColumnDef,
+    IncrementalBackfillSpec,
+    JoinSpec,
+    MaterializedViewPlan,
+    SelectItem,
+    TableSchema,
+    ViewIndexSpec,
+    ViewSpec,
+)
+from ..sql_frontend import (
+    _contains_aggregate_call,
+    _extract_set_op_branches_from_ast,
+    _extract_verbatim_cte_or_subquery_sql,
+    _is_simple_column_expr,
+    _is_word_or_ident_token,
+    _parse_single_agg_expr,
+    _sanitize_ident,
+    _split_top_level,
+    _tokenize_sql,
+    _unquote_ident,
+    _unwrap_outer_parens,
+    build_create_view_sql,
+    build_insert_select_sql,
+    build_select_sql,
+    parse_view_ast,
+    quote_sql_identifier,
+)
+
+
+class Tier1JoinMixin:
+    def _qualify_join_expr(self, expr: Optional[str]) -> str:
+        if not expr:
+            return ""
+        col_to_aliases: Dict[str, List[Tuple[str, str]]] = {}
+        for j in self.view.joins:
+            ts = self._schemas_lower.get(j.table_name.lower())
+            if ts:
+                for c_name in ts.columns:
+                    col_to_aliases.setdefault(c_name.lower(), []).append((j.alias, c_name))
+
+        alias_remap: Dict[str, Tuple[str, Optional[TableSchema]]] = {}
+        for j in self.view.joins:
+            ts = self._schemas_lower.get(j.table_name.lower())
+            alias_remap[j.table_name.lower()] = (j.alias, ts)
+            alias_remap[j.alias.lower()] = (j.alias, ts)
+
+        try:
+            toks = _tokenize_sql(expr, read=_sqlglot_dialect(self.dialect))
+        except Exception:
+            return expr
+        out: List[str] = []
+        i = 0
+        n = len(toks)
+        cursor = 0
+        while i < n:
+            tk = toks[i]
+            if (
+                _is_word_or_ident_token(tk)
+                and i + 2 < n
+                and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                and _is_word_or_ident_token(toks[i + 2])
+            ):
+                q_low = tk.text.lower()
+                c_unq = toks[i + 2].text
+                if q_low in alias_remap:
+                    new_al, ts = alias_remap[q_low]
+                    actual_c = c_unq
+                    if ts:
+                        for sc in ts.columns:
+                            if sc.lower() == c_unq.lower():
+                                actual_c = sc
+                                break
+                    if tk.start > cursor:
+                        out.append(expr[cursor:tk.start])
+                    out.append(f"{self._q(new_al)}.{self._q(actual_c)}")
+                    cursor = toks[i + 2].end + 1
+                    i += 3
+                    continue
+            if _is_word_or_ident_token(tk):
+                is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
+                is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
+                is_fn_call = (
+                    tk.token_type != SQLGlotTokenType.IDENTIFIER
+                    and i + 1 < n
+                    and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN
+                )
+                if not is_after_dot and not is_before_dot and not is_fn_call:
+                    c_low = tk.text.lower()
+                    als = col_to_aliases.get(c_low)
+                    if als and (
+                        len(als) == 1
+                        or any(
+                            j.on_condition and c_low in {t.text.lower() for t in _tokenize_sql(j.on_condition, read=_sqlglot_dialect(self.dialect))}
+                            for j in self.view.joins
+                        )
+                    ):
+                        al, actual_c = als[0]
+                        if tk.start > cursor:
+                            out.append(expr[cursor:tk.start])
+                        out.append(f"{self._q(al)}.{self._q(actual_c)}")
+                        cursor = tk.end + 1
+                        i += 1
+                        continue
+            i += 1
+        if cursor < len(expr):
+            out.append(expr[cursor:])
+        return "".join(out)
+
+    def _compile_tier1_join_algebraic(self) -> MaterializedViewPlan:
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        work_items = self._working_select_items
+        grp_exprs = self._effective_group_by_exprs
+
+        count_star_alias: Optional[str] = None
+        for item in work_items:
+            if (
+                item.is_aggregate
+                and item.agg_func == AggFunc.COUNT_STAR
+                and not item.filter_where
+            ):
+                count_star_alias = item.alias
+                break
+        row_count_col = self._q(count_star_alias) if count_star_alias else "__mv_row_count"
+
+        col_defs_sql: List[str] = []
+        user_columns: List[str] = [it.alias for it in self.view.select_items]
+        pk_type = self._canonical_group_pk_type()
+
+        has_nullable_grp = self._has_nullable_group_col()
+        pk_cols = self._tier1_pk_cols()
+        if not grp_exprs:
+            col_defs_sql.append("__mv_global_id INTEGER NOT NULL PRIMARY KEY")
+        elif has_nullable_grp:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        non_agg_aliases_lower = {
+            item.alias.lower() for item in work_items if not item.is_aggregate
+        }
+        seen_hidden_grp: Set[str] = set()
+        for g_expr in grp_exprs:
+            mv_col = self._group_col_alias(g_expr)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
+                seen_hidden_grp.add(mv_col.lower())
+                c_def = self._lookup_col_def(self._qualify_join_expr(g_expr)) or self._lookup_col_def(g_expr)
+                if c_def:
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                else:
+                    fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
+                    dt = self._infer_expr_storage_type(fake_it)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if not has_nullable_grp else ""
+                col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
+
+        def _expr_key(item: SelectItem) -> str:
+            eff = self._effective_agg_value_expr(item, record_prefix=None).strip().lower()
+            return f"{'dist:' if item.is_distinct else ''}{eff}"
+
+        col_nonnull_count_map: Dict[str, str] = {}
+        col_sum_map: Dict[str, str] = {}
+        col_sum2_map: Dict[str, str] = {}
+        col_true_cnt_map: Dict[str, str] = {}
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            ekey = _expr_key(item)
+            if item.agg_func == AggFunc.COUNT_COL:
+                col_nonnull_count_map[ekey] = self._q(item.alias)
+            elif item.agg_func == AggFunc.SUM:
+                has_var_for_ekey = any(
+                    w.is_aggregate
+                    and _expr_key(w) == ekey
+                    and w.agg_func in (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+                    for w in work_items
+                )
+                if not has_var_for_ekey:
+                    col_sum_map[ekey] = self._q(item.alias)
+
+        group_mv_cols: List[str] = []
+        for g in grp_exprs:
+            mc = self._group_col_alias(g)
+            if mc not in group_mv_cols:
+                group_mv_cols.append(mc)
+        indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
+
+        for item in work_items:
+            if not item.is_aggregate:
+                c_def = self._lookup_col_def(self._qualify_join_expr(item.raw_expr)) or self._lookup_col_def(item.raw_expr)
+                dt = (
+                    self._normalize_dialect_type(c_def.data_type)
+                    if c_def
+                    else self._infer_expr_storage_type(item)
+                )
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    dt = "VARCHAR(255)"
+                nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
+                col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
+            else:
+                storage_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                    storage_type = "VARCHAR(255)"
+                if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
+                elif item.agg_func == AggFunc.TOTAL:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0.0")
+                else:
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type}")
+
+        if count_star_alias is None:
+            col_defs_sql.append(f"{row_count_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        aux_idx = 0
+        for item in work_items:
+            if not item.is_aggregate or item.agg_func is None:
+                continue
+            ekey = _expr_key(item)
+            safe_id = _sanitize_ident(item.alias)
+            if item.agg_func in (
+                AggFunc.SUM,
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            ) or (item.agg_func == AggFunc.COUNT_STAR and item.filter_where):
+                if item.agg_func == AggFunc.COUNT_STAR and item.filter_where:
+                    col_nonnull_count_map[ekey] = self._q(item.alias)
+                elif ekey not in col_nonnull_count_map:
+                    aux_idx += 1
+                    cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
+                    col_nonnull_count_map[ekey] = cnt_col
+                    col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+            if item.agg_func in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum_map:
+                    aux_idx += 1
+                    sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
+                    col_sum_map[ekey] = sum_col
+                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
+
+            if item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                if ekey not in col_sum2_map:
+                    aux_idx += 1
+                    s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
+                    sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
+                    col_sum2_map[ekey] = sum2_col
+                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
+
+            if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
+                if ekey not in col_true_cnt_map:
+                    aux_idx += 1
+                    tcnt_col = f"__mv_tcnt_{safe_id}_{aux_idx}"
+                    col_true_cnt_map[ekey] = tcnt_col
+                    col_defs_sql.append(f"{tcnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+
+        if grp_exprs and not has_nullable_grp:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
+
+        backing_table_ddl = self._create_table_ddl(
+            mv_table,
+            col_defs_sql,
+            is_backing_store=True,
+        )
+
+        backing_col_map = {
+            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            for u_col, expr_s in self._compound_reader_exprs.items()
+            if expr_s != u_col and "__mv_elem_" in expr_s
+        }
+        can_pg15_unique_nnd = (
+            bool(grp_exprs)
+            and has_nullable_grp
+            and len(set(c.lower() for c in group_mv_cols)) == len(grp_exprs)
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=group_mv_cols,
+            has_pk_on_group_cols=(bool(grp_exprs) and not has_nullable_grp),
+            backing_col_map=backing_col_map,
+            unique_group_nulls_not_distinct=can_pg15_unique_nnd,
+        )
+
+        reader_select_override = [
+            self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
+        ]
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                select_exprs_override=reader_select_override,
+                extra_where_filter=self._rewritten_having_clause,
+            )
+        )
+
+        qual_grp_exprs = [self._qualify_join_expr(g) for g in grp_exprs]
+        target_cols: List[str] = []
+        select_exprs: List[str] = []
+        if not grp_exprs:
+            target_cols.append("__mv_global_id")
+            select_exprs.append("1")
+        elif has_nullable_grp:
+            target_cols.append("__mv_pk")
+            select_exprs.append(self._canonical_group_pk_expr(qual_grp_exprs))
+
+        seen_hidden: Set[str] = set()
+        for g_raw, g_qual in zip(grp_exprs, qual_grp_exprs):
+            mv_col = self._group_col_alias(g_raw)
+            if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden:
+                seen_hidden.add(mv_col.lower())
+                target_cols.append(mv_col)
+                select_exprs.append(g_qual)
+
+        for item in work_items:
+            target_cols.append(item.alias)
+            if not item.is_aggregate:
+                select_exprs.append(self._qualify_join_expr(item.raw_expr))
+            else:
+                select_exprs.append(self._qualify_join_expr(self._sql_backfill_agg_expr(item)))
+
+        if count_star_alias is None:
+            target_cols.append(row_count_col)
+            select_exprs.append("COUNT(*)")
+
+        ekey_to_item: Dict[str, SelectItem] = {
+            _expr_key(it): it for it in work_items if it.is_aggregate
+        }
+        q_target_cols = self._append_aux_stat_target_cols(
+            target_cols=target_cols,
+            select_exprs=select_exprs,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            ekey_to_item=ekey_to_item,
+            qualify_join=True,
+            include_distinct_keyword=False,
+        )
+
+        def _build_join_from_clause(replace_alias: Optional[str] = None, rec_prefix: Optional[str] = None) -> str:
+            from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+            parts: List[str] = []
+            for idx, j in enumerate(self.view.joins):
+                if replace_alias and j.alias.lower() == replace_alias.lower() and rec_prefix:
+                    if rec_prefix in ("__mv_new_rows", "__mv_old_rows"):
+                        tbl_sql = f"{rec_prefix} AS {self._q(j.alias)}"
+                    else:
+                        ts = self._schemas_lower[j.table_name.lower()]
+                        rec_proj = ", ".join(f"{rec_prefix}.{self._q(c)} AS {self._q(c)}" for c in ts.columns)
+                        tbl_sql = f"(SELECT {rec_proj}{from_dual}) AS {self._q(j.alias)}"
+                else:
+                    tbl_sql = f"{self._q(j.table_name)} AS {self._q(j.alias)}"
+                if idx == 0:
+                    parts.append(tbl_sql)
+                else:
+                    on_sql = f" ON {self._qualify_join_expr(j.on_condition)}" if j.on_condition else ""
+                    parts.append(f"{j.join_type} {tbl_sql}{on_sql}")
+            return " ".join(parts)
+
+        full_from_sql = _build_join_from_clause()
+        qual_where = self._qualify_join_expr(self.view.where_clause) if self.view.where_clause else None
+        where_sql = f"\nWHERE {qual_where}" if qual_where else ""
+        qual_grp_for_q = self._group_by_exprs_for_query(qual_grp_exprs, include_canonical_pk=has_nullable_grp)
+        group_sql = f"\nGROUP BY {', '.join(qual_grp_for_q)}" if qual_grp_for_q else ""
+
+        q_target_cols = [self._q(c) for c in target_cols]
+        initial_populate_sql = (
+            f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+            f"SELECT {', '.join(select_exprs)}\n"
+            f"FROM {full_from_sql}{where_sql}{group_sql};"
+        )
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            offset_insert_template=(
+                f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                f"SELECT {', '.join(q_target_cols)}\n"
+                f"FROM (\nSELECT {', '.join(f'{ex} AS {col}' for col, ex in zip(q_target_cols, select_exprs))}\n"
+                f"FROM {full_from_sql}{where_sql}{group_sql}\n) AS __mv_init\n"
+                f"LIMIT ? OFFSET ?;"
+            ),
+        )
+
+        def _build_join_recompute_subquery(item: SelectItem) -> str:
+            alias_remap = {j.alias.lower(): f"__mv_j_{j.alias}" for j in self.view.joins}
+            for j in self.view.joins:
+                alias_remap[j.table_name.lower()] = f"__mv_j_{j.alias}"
+
+            def _remap_to_j(frag: str) -> str:
+                q_frag = self._qualify_join_expr(frag)
+                tokens = re.split(r"('(?:''|[^'])*')", q_frag)
+                out = []
+                for idx_t, tok in enumerate(tokens):
+                    if idx_t % 2 == 1:
+                        out.append(tok)
+                        continue
+                    mod = tok
+                    for old_a, new_a in sorted(alias_remap.items(), key=lambda x: len(x[0]), reverse=True):
+                        mod = re.sub(rf"\b{re.escape(old_a)}\s*\.", f"{new_a}.", mod, flags=re.IGNORECASE)
+                    out.append(mod)
+                return "".join(out)
+
+            j_parts: List[str] = []
+            for idx, j in enumerate(self.view.joins):
+                tbl_s = f"{j.table_name} AS __mv_j_{j.alias}"
+                if idx == 0:
+                    j_parts.append(tbl_s)
+                else:
+                    on_s = f" ON {_remap_to_j(j.on_condition)}" if j.on_condition else ""
+                    j_parts.append(f"{j.join_type} {tbl_s}{on_s}")
+            conds: List[str] = []
+            if self.view.where_clause:
+                conds.append(f"({_remap_to_j(self.view.where_clause)})")
+            for g_raw in grp_exprs:
+                mv_col = self._q(self._group_col_alias(g_raw))
+                lhs_j = _remap_to_j(g_raw)
+                conds.append(
+                    self._null_safe_eq(f"({lhs_j})", f"{mv_table}.{mv_col}", is_nullable=True)
+                )
+            w_sub = f" WHERE {' AND '.join(conds)}" if conds else ""
+            agg_e = _remap_to_j(self._sql_backfill_agg_expr(item))
+            return f"(SELECT {agg_e} FROM {' '.join(j_parts)}{w_sub})"
+
+        plus_merge_assignments = self._build_tier1_chunk_merge_assignments(
+            mv_table=mv_table,
+            row_count_col=row_count_col,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            expr_key_fn=_expr_key,
+            use_mysql_values=(self.dialect == Dialect.MYSQL),
+        )
+        # Native approximate aggregates must preserve the engine's operation
+        # order; algebraically equivalent sum/count updates can differ by ULPs.
+        native_recompute_aliases = {
+            self._q(item.alias)
+            for item in work_items
+            if item.is_aggregate
+            and (
+                item.agg_func in (
+                    AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                    AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                )
+                or self._requires_native_avg_recompute(item)
+            )
+        }
+        if native_recompute_aliases:
+            plus_merge_assignments = [
+                assignment for assignment in plus_merge_assignments
+                if assignment.split("=", 1)[0].strip() not in native_recompute_aliases
+            ]
+            for item in work_items:
+                if item.is_aggregate and (
+                    item.agg_func in (
+                        AggFunc.VAR_POP, AggFunc.VAR_SAMP,
+                        AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                    )
+                    or self._requires_native_avg_recompute(item)
+                ):
+                    plus_merge_assignments.append(
+                        f"{self._q(item.alias)} = {_build_join_recompute_subquery(item)}"
+                    )
+
+        # Build minus assignments from `__mv_delta`
+        minus_assignments: List[str] = []
+        minus_updated: Set[str] = set()
+
+        def _delta_sum_minus(col: str, cnt_col: str) -> str:
+            qc = self._q(col)
+            qcnt = self._q(cnt_col)
+            new_c = f"({mv_table}.{qcnt} - __mv_delta.{qcnt})"
+            return (
+                f"(CASE WHEN __mv_delta.{qc} IS NULL THEN {mv_table}.{qc} "
+                f"WHEN {new_c} <= 0 THEN NULL "
+                f"ELSE {mv_table}.{qc} - __mv_delta.{qc} END)"
+            )
+
+        def _delta_sum2_minus(ekey: str, sum2_col: str, cnt_col: str) -> str:
+            q_sum2 = self._q(sum2_col)
+            q_cnt = self._q(cnt_col)
+            if self.dialect != Dialect.SQLITE:
+                return _delta_sum_minus(q_sum2, q_cnt)
+            sum_c = self._q(col_sum_map[ekey])
+            new_c = f"({mv_table}.{q_cnt} - __mv_delta.{q_cnt})"
+            d_mu = f"(((1.0 * __mv_delta.{sum_c}) / __mv_delta.{q_cnt}) - ((1.0 * {mv_table}.{sum_c}) / {mv_table}.{cnt_c}))"
+            return (
+                f"(CASE WHEN __mv_delta.{q_cnt} <= 0 OR __mv_delta.{q_sum2} IS NULL THEN {mv_table}.{q_sum2} "
+                f"WHEN {new_c} <= 0 THEN NULL "
+                f"WHEN {new_c} = 1 THEN 0.0 "
+                f"ELSE MAX(0.0, COALESCE({mv_table}.{q_sum2}, 0.0) - COALESCE(__mv_delta.{q_sum2}, 0.0) - ({d_mu} * {d_mu} * ((1.0 * {mv_table}.{cnt_c} * __mv_delta.{q_cnt}) / {new_c}))) END)"
+            )
+
+        for item in work_items:
+            if not item.is_aggregate:
+                continue
+            c = self._q(item.alias)
+            minus_updated.add(c)
+            ekey = _expr_key(item)
+            if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
+                minus_assignments.append(f"{c} = {mv_table}.{c} - __mv_delta.{c}")
+            elif item.agg_func == AggFunc.SUM:
+                cnt_c = col_nonnull_count_map[ekey]
+                minus_assignments.append(f"{c} = {_delta_sum_minus(c, cnt_c)}")
+            elif item.agg_func == AggFunc.AVG:
+                if self._requires_native_avg_recompute(item):
+                    recomputed = _build_join_recompute_subquery(item)
+                    minus_assignments.append(f"{c} = {recomputed}")
+                else:
+                    cnt_c = col_nonnull_count_map[ekey]
+                    sum_c = col_sum_map[ekey]
+                    new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                    new_sum = _delta_sum_minus(sum_c, cnt_c)
+                    exact_avg = (
+                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
+                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+                    )
+                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    minus_assignments.append(
+                        f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL ELSE {dividend} / {new_cnt} END"
+                    )
+            elif item.agg_func in (
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+            ):
+                recomputed = _build_join_recompute_subquery(item)
+                minus_assignments.append(f"{c} = {recomputed}")
+            elif item.agg_func == AggFunc.MIN:
+                recomp = _build_join_recompute_subquery(item)
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NOT NULL AND {mv_table}.{c} >= __mv_delta.{c} "
+                    f"THEN {recomp} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.MAX:
+                recomp = _build_join_recompute_subquery(item)
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NOT NULL AND {mv_table}.{c} <= __mv_delta.{c} "
+                    f"THEN {recomp} ELSE {mv_table}.{c} END"
+                )
+            elif item.agg_func == AggFunc.BIT_XOR:
+                cnt_c = col_nonnull_count_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                xor_e = self._bitwise_xor_sql(f"{mv_table}.{c}", f"(__mv_delta.{c})")
+                minus_assignments.append(
+                    f"{c} = CASE WHEN __mv_delta.{c} IS NULL THEN {mv_table}.{c} "
+                    f"WHEN {new_cnt} <= 0 THEN NULL ELSE {xor_e} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_AND:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                new_tcnt = f"({mv_table}.{tcnt_c} - __mv_delta.{tcnt_c})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                minus_assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_cnt} = {new_tcnt} THEN {t_lit} ELSE {f_lit} END"
+                )
+            elif item.agg_func == AggFunc.BOOL_OR:
+                cnt_c = col_nonnull_count_map[ekey]
+                tcnt_c = col_true_cnt_map[ekey]
+                new_cnt = f"({mv_table}.{cnt_c} - __mv_delta.{cnt_c})"
+                new_tcnt = f"({mv_table}.{tcnt_c} - __mv_delta.{tcnt_c})"
+                t_lit = "TRUE" if self.dialect == Dialect.POSTGRES else "1"
+                f_lit = "FALSE" if self.dialect == Dialect.POSTGRES else "0"
+                minus_assignments.append(
+                    f"{c} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
+                )
+
+        q_row_count_col = self._q(row_count_col)
+        if q_row_count_col not in minus_updated:
+            minus_assignments.append(f"{q_row_count_col} = {mv_table}.{q_row_count_col} - __mv_delta.{q_row_count_col}")
+            minus_updated.add(q_row_count_col)
+
+        for ekey, cnt_c in col_nonnull_count_map.items():
+            q_cnt_c = self._q(cnt_c)
+            if q_cnt_c not in minus_updated:
+                minus_assignments.append(f"{q_cnt_c} = {mv_table}.{q_cnt_c} - __mv_delta.{q_cnt_c}")
+                minus_updated.add(q_cnt_c)
+        for ekey, sum_c in col_sum_map.items():
+            q_sum_c = self._q(sum_c)
+            if q_sum_c not in minus_updated:
+                cnt_c = self._q(col_nonnull_count_map[ekey])
+                minus_assignments.append(f"{q_sum_c} = {_delta_sum_minus(q_sum_c, cnt_c)}")
+                minus_updated.add(q_sum_c)
+        for ekey, sum2_c in col_sum2_map.items():
+            q_sum2_c = self._q(sum2_c)
+            if q_sum2_c not in minus_updated:
+                cnt_c = self._q(col_nonnull_count_map[ekey])
+                minus_assignments.append(f"{q_sum2_c} = {_delta_sum2_minus(ekey, q_sum2_c, cnt_c)}")
+                minus_updated.add(q_sum2_c)
+        for ekey, tcnt_c in col_true_cnt_map.items():
+            q_tcnt_c = self._q(tcnt_c)
+            if q_tcnt_c not in minus_updated:
+                minus_assignments.append(f"{q_tcnt_c} = {mv_table}.{q_tcnt_c} - __mv_delta.{q_tcnt_c}")
+                minus_updated.add(q_tcnt_c)
+
+        high_p = {
+            self._q(it.alias)
+            for it in work_items
+            if it.is_aggregate
+            and it.agg_func
+            in (
+                AggFunc.AVG,
+                AggFunc.VAR_POP,
+                AggFunc.VAR_SAMP,
+                AggFunc.STDDEV_POP,
+                AggFunc.STDDEV_SAMP,
+                AggFunc.BIT_XOR,
+                AggFunc.BOOL_AND,
+                AggFunc.BOOL_OR,
+            )
+        }
+        mid_p = (
+            {self._q(it.alias) for it in work_items if it.is_aggregate and it.agg_func == AggFunc.SUM}
+            | {self._q(c) for c in col_sum_map.values()}
+            | {self._q(c) for c in col_sum2_map.values()}
+            | {self._q(c) for c in col_true_cnt_map.values()}
+        )
+        ordered_minus = (
+            [a for a in minus_assignments if a.split("=")[0].strip() in high_p]
+            + [a for a in minus_assignments if a.split("=")[0].strip() not in high_p and a.split("=")[0].strip() in mid_p]
+            + [a for a in minus_assignments if a.split("=")[0].strip() not in high_p and a.split("=")[0].strip() not in mid_p]
+        )
+
+        # For MySQL multi-table UPDATE, LHS column names must be qualified with `mv_table.`
+        mysql_ordered_minus = [
+            f"{mv_table}.{a}" for a in ordered_minus
+        ]
+
+        aliased_delta_select = ", ".join(
+            f"{ex} AS {col}" for col, ex in zip(q_target_cols, select_exprs)
+        )
+        having_non_empty = "" if grp_exprs else "\nHAVING COUNT(*) > 0"
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for j in self.view.joins:
+            base_t = j.table_name
+            j_alias = j.alias
+            from_new = _build_join_from_clause(replace_alias=j_alias, rec_prefix="NEW")
+            from_old = _build_join_from_clause(replace_alias=j_alias, rec_prefix="OLD")
+
+            delta_pk_match = " AND ".join(
+                f"{mv_table}.{self._q(c)} = __mv_delta.{self._q(c)}" for c in pk_cols
+            )
+            q_pk_cols_csv = ", ".join(self._q(c) for c in pk_cols)
+            if self.dialect == Dialect.MYSQL:
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ON DUPLICATE KEY UPDATE\n"
+                    f"        {', '.join(plus_merge_assignments)};"
+                )
+                minus_stmt = (
+                    f"UPDATE {mv_table}\n"
+                    f"    INNER JOIN (\n"
+                    f"        SELECT {aliased_delta_select}\n"
+                    f"        FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ) AS __mv_delta ON {delta_pk_match}\n"
+                    f"    SET {', '.join(mysql_ordered_minus)};"
+                )
+            else:
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ON CONFLICT ({q_pk_cols_csv}) DO UPDATE SET\n"
+                    f"        {', '.join(plus_merge_assignments)};"
+                )
+                minus_stmt = (
+                    f"UPDATE {mv_table}\n"
+                    f"    SET {', '.join(ordered_minus)}\n"
+                    f"    FROM (\n"
+                    f"        SELECT {aliased_delta_select}\n"
+                    f"        FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ) AS __mv_delta\n"
+                    f"    WHERE {delta_pk_match};"
+                )
+
+            del_zero_stmt = (
+                f"DELETE FROM {mv_table} WHERE {mv_table}.{self._q(row_count_col)} <= 0;"
+                if grp_exprs
+                else None
+            )
+            del_stmts = [minus_stmt] + ([del_zero_stmt] if del_zero_stmt else [])
+            trunc_stmts = [f"DELETE FROM {mv_table};"] + (
+                [initial_populate_sql] if not grp_exprs else []
+            )
+
+            pg_ai_body: Optional[str] = None
+            pg_ad_body: Optional[str] = None
+            pg_au_body: Optional[str] = None
+
+            if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables:
+                from_vec_new = _build_join_from_clause(replace_alias=j_alias, rec_prefix="__mv_new_rows")
+                from_vec_old = _build_join_from_clause(replace_alias=j_alias, rec_prefix="__mv_old_rows")
+                vec_plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
+                    f"    SELECT {', '.join(select_exprs)}\n"
+                    f"    FROM {from_vec_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ON CONFLICT ({q_pk_cols_csv}) DO UPDATE SET\n"
+                    f"        {', '.join(plus_merge_assignments)};"
+                )
+                vec_minus_stmt = (
+                    f"UPDATE {mv_table}\n"
+                    f"    SET {', '.join(ordered_minus)}\n"
+                    f"    FROM (\n"
+                    f"        SELECT {aliased_delta_select}\n"
+                    f"        FROM {from_vec_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    ) AS __mv_delta\n"
+                    f"    WHERE {delta_pk_match};"
+                )
+                pg_ai_body = vec_plus_stmt
+                pg_ad_body = f"{vec_minus_stmt}\n{del_zero_stmt}" if del_zero_stmt else vec_minus_stmt
+                pg_au_body = f"{vec_minus_stmt}\n{vec_plus_stmt}\n{del_zero_stmt}" if del_zero_stmt else f"{vec_minus_stmt}\n{vec_plus_stmt}"
+
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=[plus_stmt],
+                del_stmts=del_stmts,
+                upd_old_stmts=[minus_stmt],
+                upd_new_stmts=[plus_stmt],
+                upd_cleanup_old_stmts=[del_zero_stmt] if del_zero_stmt else [],
+                trunc_stmts=trunc_stmts,
+                pg_ai_body=pg_ai_body,
+                pg_ad_body=pg_ad_body,
+                pg_au_body=pg_au_body,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+

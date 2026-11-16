@@ -259,15 +259,17 @@ The existing differential-testing harness is useful, but its current headline co
 - [ ] **Stateful Property-Based Fuzzing & Automatic Counterexample Shrinking (`hypothesis` + `pytest`)**:
   Complement `DifferentialSQLFuzzer` with a `hypothesis.stateful.RuleBasedStateMachine` test suite run via `pytest` so failing random schema/view/DML sequences are automatically shrunk to minimal reproducible counterexamples.
 
-- [ ] **Refactor Monolithic `matview_sync.py` into a Modular Package with a Typed IR**:
-  Split `matview_sync.py` into focused modules with a typed, immutable Intermediate Representation (`CompilationContext` / `LogicalIR`) between SQL parsing and dialect code generation instead of mutating compiler attributes (`self.view`, `self.primary_schema`, `self._working_select_items`) in place:
+- [x] **Refactor Monolithic `matview_sync.py` into a Modular Package with a Typed IR**:
+  Split `matview_sync.py` into focused modules with a typed, immutable Intermediate Representation (`CompilationContext` / `LogicalIR`) between SQL parsing and dialect code generation instead of mutating compiler attributes (`self.view`, `self.primary_schema`, `self._working_select_items`) in place (retaining `matview_sync.py` as a full backwards-compatible facade):
   - `matview/sql_frontend.py` — SQL parsing, normalization, and AST validation
-  - `matview/logical_ir.py` — Engine-independent relational & aggregate representation
+  - `matview/logical_ir.py` — Engine-independent relational & aggregate representation (`LogicalIR`, `CompilationContext`, frozen dataclasses)
   - `matview/planner.py` — Strategy selection, index analysis, and cost estimation
   - `matview/maintenance/` — Tier 1 (`single`, `join`, `zset`, `union_all_agg`), Tier 2, and Tier 3 delta rules
-  - `matview/dialects/` — SQLite, PostgreSQL, MySQL, MariaDB, and NewSQL codegen
+  - `matview/dialects/` — SQLite, PostgreSQL, MySQL, MariaDB codegen, templates, and emitters (`base`, `sqlite`, `postgres`, `mysql`, `templates`, `emitters`)
+  - `matview/connectivity.py`, `matview/engines.py`, `matview/compiler.py` — Engine/version detection, SQLAlchemy connectivity/introspection, and compiler orchestration
   - `matview/manager.py` — Catalog, backfill, schema drift, migration, and recovery
   - `matview/cli.py` — CLI commands (`compile`, `apply`, `diff`, `check-drift`, `repair`)
+  - Verified package structure, frozen `LogicalIR` immutability, facade symbol parity, and `with_ir()` non-mutation in `test_p1_modular_package.py` (wired into CI).
 - [ ] **Engine & Version-Specific Optimal Code Generation**:
   I would like the generator to support as efficiently as possible every engine and engine version (possibly considering performance features specific to each), and I would like the generated code to be optimal and as efficient as if it had been written as efficiently as possible for that specific view and that specific engine/version by a senior DBA:
   - PostgreSQL `FILLFACTOR` tuning on high-churn backing tables and `MERGE` statements on PostgreSQL 15+.

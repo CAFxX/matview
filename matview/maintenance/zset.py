@@ -1,0 +1,1140 @@
+"""Tier 1C: Z-set / multiplicity maintenance for set operations, SELECT DISTINCT, and projections."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+import sqlglot
+from sqlglot import exp as sqlglot_exp
+
+from ..engines import (
+    AggFunc,
+    Dialect,
+    EngineSubdialect,
+    MaintenanceStrategy,
+    UnsupportedMaterializedViewError,
+    _SIMPLE_IDENT_RE,
+    _SQL_RESERVED_KEYWORDS,
+    _sqlglot_dialect,
+)
+from ..logical_ir import (
+    ColumnDef,
+    IncrementalBackfillSpec,
+    JoinSpec,
+    MaterializedViewPlan,
+    SelectItem,
+    TableSchema,
+    ViewIndexSpec,
+    ViewSpec,
+)
+from ..sql_frontend import (
+    SQLTokenType,
+    _contains_aggregate_call,
+    _extract_set_op_branches_from_ast,
+    _extract_verbatim_cte_or_subquery_sql,
+    _has_subquery_ast,
+    _is_simple_column_expr,
+    _parse_single_agg_expr,
+    _parse_single_create_view_stmt,
+    _sanitize_ident,
+    _split_top_level,
+    _unquote_ident,
+    _unwrap_outer_parens,
+    build_create_view_sql,
+    build_insert_select_sql,
+    build_select_sql,
+    parse_sql_ast,
+    parse_view_ast,
+    quote_sql_identifier,
+    tokenize_sql,
+)
+
+
+class Tier1ZSetMixin:
+    def _parse_setop_branches(self) -> Optional[List[Tuple[str, ViewSpec]]]:
+        raw = self.view.raw_select_sql.strip()
+        try:
+            q_ast = parse_sql_ast(raw, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None
+        if not isinstance(q_ast, sqlglot_exp.SetOperation):
+            return None
+
+        ops, branch_sqls = _extract_set_op_branches_from_ast(q_ast, raw, dialect=self.dialect)
+        if not ops or len(set(ops)) != 1:
+            return None
+        op_type = ops[0]
+
+        if op_type in ("INTERSECT", "EXCEPT") and len(branch_sqls) != 2:
+            return None
+
+        branches: List[Tuple[str, ViewSpec]] = []
+        col_count: Optional[int] = None
+        for idx, b_sql in enumerate(branch_sqls):
+            try:
+                bs = _parse_single_create_view_stmt(
+                    f"CREATE VIEW __set_b_{idx} AS {b_sql}",
+                    known_tables=set(self._schemas_lower.keys()),
+                    dialect=self.dialect,
+                )
+            except Exception:
+                return None
+            if (
+                bs.has_cte
+                or bs.has_window_func
+                or bs.has_compound_set_op
+                or bs.has_top_level_distinct
+                or bs.has_limit_or_order
+                or bs.has_subquery_in_from
+                or len(bs.joins) != 1
+                or bs.group_by_cols
+                or any(it.is_aggregate or it.raw_expr.strip() == "*" for it in bs.select_items)
+                or bs.base_table.lower() not in self._schemas_lower
+            ):
+                return None
+            if bs.where_clause and _has_subquery_ast(bs.where_clause, dialect=self.dialect):
+                return None
+            if col_count is None:
+                col_count = len(bs.select_items)
+            elif len(bs.select_items) != col_count:
+                return None
+            if op_type == "UNION ALL":
+                ts = self._schemas_lower[bs.base_table.lower()]
+                if not any(c.primary_key for c in ts.columns.values()):
+                    return None
+            branches.append((op_type, bs))
+        return branches
+
+    def _rewrite_branch_expr(self, expr: str, ts: TableSchema, alias: str, record_prefix: Optional[str]) -> str:
+        col_map = {c.lower(): c for c in ts.columns}
+        quals_lower = {q.lower() for q in (ts.name, alias) if q}
+        toks = tokenize_sql(expr, dialect=self.dialect)
+        out: List[str] = []
+        i = 0
+        n = len(toks)
+
+        def _next_non_ws(idx: int) -> Optional[SQLToken]:
+            k = idx
+            while k < n:
+                if toks[k].kind != SQLTokenType.WHITESPACE:
+                    return toks[k]
+                k += 1
+            return None
+
+        def _prev_non_ws(idx: int) -> Optional[SQLToken]:
+            k = idx
+            while k >= 0:
+                if toks[k].kind != SQLTokenType.WHITESPACE:
+                    return toks[k]
+                k -= 1
+            return None
+
+        while i < n:
+            t = toks[i]
+            if (
+                t.kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT)
+                and i + 2 < n
+                and toks[i + 1].kind == SQLTokenType.PUNCT
+                and toks[i + 1].text == "."
+                and toks[i + 2].kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT)
+            ):
+                q_low = t.unquoted.lower()
+                c_low = toks[i + 2].unquoted.lower()
+                actual_c = col_map.get(c_low, toks[i + 2].unquoted)
+                if q_low in quals_lower:
+                    if record_prefix:
+                        out.append(f"{record_prefix}.{self._q(actual_c)}")
+                    else:
+                        out.append(f"{self._q(t.unquoted)}.{self._q(actual_c)}")
+                    i += 3
+                    continue
+            if t.kind in (SQLTokenType.IDENT, SQLTokenType.QUOTED_IDENT):
+                prev_t = _prev_non_ws(i - 1)
+                next_t = _next_non_ws(i + 1)
+                is_after_dot = prev_t is not None and prev_t.kind == SQLTokenType.PUNCT and prev_t.text == "."
+                is_before_dot = next_t is not None and next_t.kind == SQLTokenType.PUNCT and next_t.text == "."
+                is_fn_call = (
+                    t.kind == SQLTokenType.IDENT
+                    and next_t is not None
+                    and next_t.kind == SQLTokenType.PUNCT
+                    and next_t.text == "("
+                )
+                if not is_after_dot and not is_before_dot and not is_fn_call:
+                    w_low = t.unquoted.lower()
+                    if w_low in col_map:
+                        actual_c = col_map[w_low]
+                        if record_prefix:
+                            out.append(f"{record_prefix}.{self._q(actual_c)}")
+                        else:
+                            out.append(self._q(actual_c))
+                        i += 1
+                        continue
+            out.append(t.text)
+            i += 1
+        return "".join(out)
+
+    def _resolve_setop_pk_info(
+        self, branches: Optional[List[Tuple[str, ViewSpec]]] = None
+    ) -> Tuple[bool, Tuple[str, ...], List[str], List[List[ColumnDef]]]:
+        if branches is None:
+            branches = self._parse_setop_branches()
+        assert branches is not None
+        op_type = branches[0][0]
+        branch_pk_defs_list: List[List[ColumnDef]] = []
+        for _, bs in branches:
+            ts_b = self._schemas_lower[bs.base_table.lower()]
+            branch_pk_defs_list.append([c for c in ts_b.columns.values() if c.primary_key])
+
+        use_native_uall_pk = False
+        uall_pk_cols: Tuple[str, ...] = ("__mv_pk",)
+        uall_pk_col_types: List[str] = []
+        if op_type == "UNION ALL" and branch_pk_defs_list and branch_pk_defs_list[0]:
+            k_pks = len(branch_pk_defs_list[0])
+            if all(len(pks) == k_pks for pks in branch_pk_defs_list):
+                use_native_uall_pk = True
+                uall_pk_cols = ("__mv_branch_id", *(f"__mv_pk_{i}" for i in range(k_pks)))
+                for i in range(k_pks):
+                    dt_i = self._normalize_dialect_type(branch_pk_defs_list[0][i].data_type)
+                    if self.dialect == Dialect.MYSQL and dt_i.upper() == "TEXT":
+                        dt_i = "VARCHAR(255)"
+                    uall_pk_col_types.append(dt_i)
+        return use_native_uall_pk, uall_pk_cols, uall_pk_col_types, branch_pk_defs_list
+
+    def _compile_tier1_zset_setop(self) -> MaterializedViewPlan:
+        branches = self._parse_setop_branches()
+        assert branches is not None
+        op_type = branches[0][0]
+        first_bs = branches[0][1]
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        user_columns = [it.alias for it in first_bs.select_items]
+        pk_type = self._canonical_group_pk_type()
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+
+        use_native_uall_pk, uall_pk_cols_t, uall_pk_col_types, branch_pk_defs_list = (
+            self._resolve_setop_pk_info(branches)
+        )
+        uall_pk_cols = list(uall_pk_cols_t)
+
+        col_defs_sql: List[str] = []
+        if use_native_uall_pk:
+            col_defs_sql.append("__mv_branch_id INTEGER NOT NULL")
+            for i, dt_i in enumerate(uall_pk_col_types):
+                col_defs_sql.append(f"__mv_pk_{i} {dt_i} NOT NULL")
+        else:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        indexed_cols_lower = self._indexed_column_names_lower()
+        for it in first_bs.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            col_defs_sql.append(f"{self._q(it.alias)} {dt}")
+
+        if op_type in ("UNION", "UNION ALL"):
+            col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = None
+        elif op_type == "INTERSECT":
+            col_defs_sql.append(f"__mv_cnt_0 {self._int_type()} NOT NULL DEFAULT 0")
+            col_defs_sql.append(f"__mv_cnt_1 {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = "__mv_cnt_0 > 0 AND __mv_cnt_1 > 0"
+        else:  # EXCEPT
+            col_defs_sql.append(f"__mv_cnt_0 {self._int_type()} NOT NULL DEFAULT 0")
+            col_defs_sql.append(f"__mv_cnt_1 {self._int_type()} NOT NULL DEFAULT 0")
+            extra_filter = "__mv_cnt_0 > 0 AND __mv_cnt_1 = 0"
+
+        if use_native_uall_pk:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in uall_pk_cols)})")
+
+        backing_table_ddl = self._create_table_ddl(
+            mv_table,
+            col_defs_sql,
+            is_backing_store=True,
+            pk_cols=uall_pk_cols if use_native_uall_pk else None,
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                extra_where_filter=extra_filter,
+            )
+        )
+
+        initial_populate_sqls: List[str] = []
+        by_table_branches: Dict[str, List[Tuple[int, ViewSpec]]] = {}
+        for b_idx, (_, bs) in enumerate(branches):
+            by_table_branches.setdefault(bs.base_table, []).append((b_idx, bs))
+
+        q_uall_pk_cols = [self._q(c) for c in uall_pk_cols]
+        q_user_columns = [self._q(c) for c in user_columns]
+
+        if op_type == "UNION ALL":
+            for b_idx, (_, bs) in enumerate(branches):
+                ts = self._schemas_lower[bs.base_table.lower()]
+                pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                sel_exprs = [it.raw_expr for it in bs.select_items]
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                q_pk_names = [self._q(c) for c in pk_names]
+                if use_native_uall_pk:
+                    initial_populate_sqls.append(
+                        f"INSERT INTO {mv_table} ({', '.join(q_uall_pk_cols)}, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                        f"SELECT {b_idx}, {', '.join(q_pk_names)}, {', '.join(sel_exprs)}, 1 FROM {self._q(bs.base_table)}{w_sql};"
+                    )
+                else:
+                    pk_expr = self._canonical_group_pk_expr([f"'B{b_idx}'", *pk_names])
+                    initial_populate_sqls.append(
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                        f"SELECT {pk_expr}, {', '.join(sel_exprs)}, 1 FROM {self._q(bs.base_table)}{w_sql};"
+                    )
+        elif op_type == "UNION":
+            u_parts: List[str] = []
+            for _, bs in branches:
+                sel_aliased = ", ".join(
+                    f"{it.raw_expr} AS {self._q(col)}" for it, col in zip(bs.select_items, user_columns)
+                )
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                u_parts.append(f"    SELECT {sel_aliased} FROM {self._q(bs.base_table)}{w_sql}")
+            pk_u = self._canonical_group_pk_expr(user_columns)
+            grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
+            initial_populate_sqls.append(
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                f"SELECT {pk_u}, {', '.join(q_user_columns)}, COUNT(*) FROM (\n"
+                + "\n    UNION ALL\n".join(u_parts)
+                + f"\n) AS __mv_u\nGROUP BY {grp_u};"
+            )
+        else:  # INTERSECT or EXCEPT
+            u_parts = []
+            for b_idx, (_, bs) in enumerate(branches):
+                sel_aliased = ", ".join(
+                    f"{it.raw_expr} AS {self._q(col)}" for it, col in zip(bs.select_items, user_columns)
+                )
+                b0 = "1" if b_idx == 0 else "0"
+                b1 = "1" if b_idx == 1 else "0"
+                w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                u_parts.append(
+                    f"    SELECT {sel_aliased}, {b0} AS __mv_b0, {b1} AS __mv_b1 FROM {self._q(bs.base_table)}{w_sql}"
+                )
+            pk_u = self._canonical_group_pk_expr(user_columns)
+            grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
+            initial_populate_sqls.append(
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                f"SELECT {pk_u}, {', '.join(q_user_columns)}, SUM(__mv_b0), SUM(__mv_b1) FROM (\n"
+                + "\n    UNION ALL\n".join(u_parts)
+                + f"\n) AS __mv_u\nGROUP BY {grp_u};"
+            )
+
+        trigger_ddls: List[str] = []
+        trig_names: List[str] = []
+        fn_names: List[str] = []
+
+        for base_t, b_list in by_table_branches.items():
+            ts = self._schemas_lower[base_t.lower()]
+            ins_stmts: List[str] = []
+            del_stmts: List[str] = []
+            upd_old_stmts: List[str] = []
+            upd_new_stmts: List[str] = []
+            cleanup_stmts: List[str] = []
+
+            for b_idx, bs in b_list:
+                b_alias = bs.joins[0].alias if bs.joins else base_t
+                w_new = (
+                    self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "NEW")
+                    if bs.where_clause
+                    else "TRUE"
+                )
+                w_old = (
+                    self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "OLD")
+                    if bs.where_clause
+                    else "TRUE"
+                )
+                new_vals = [
+                    self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "NEW")
+                    for it in bs.select_items
+                ]
+                old_vals = [
+                    self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "OLD")
+                    for it in bs.select_items
+                ]
+
+                if op_type == "UNION ALL":
+                    pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                    if use_native_uall_pk:
+                        new_pk_vals = [str(b_idx), *[f"NEW.{self._q(c)}" for c in pk_names]]
+                        old_pk_match = f"{mv_table}.__mv_branch_id = {b_idx} AND " + " AND ".join(
+                            f"{mv_table}.__mv_pk_{i} = OLD.{self._q(c)}" for i, c in enumerate(pk_names)
+                        )
+                        if self.dialect == Dialect.MYSQL:
+                            if self.engine_version.supports_mysql_row_alias_upsert:
+                                upd_set = ", ".join(f"{self._q(c)} = __mv_new.{self._q(c)}" for c in user_columns)
+                                aliased_uall_sel = [
+                                    *[f"{expr} AS {col}" for expr, col in zip(new_pk_vals, q_uall_pk_cols)],
+                                    *[f"{expr} AS {col}" for expr, col in zip(new_vals, q_user_columns)],
+                                    "1 AS __mv_row_count",
+                                ]
+                                plus_s = (
+                                    f"INSERT INTO {mv_table} ({', '.join(q_uall_pk_cols)}, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                                    f"    SELECT * FROM (\n"
+                                    f"        SELECT {', '.join(aliased_uall_sel)}{from_dual}\n"
+                                    f"        WHERE {w_new}\n"
+                                    f"    ) AS __mv_new\n"
+                                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                                )
+                            else:
+                                upd_set = ", ".join(f"{self._q(c)} = VALUES({self._q(c)})" for c in user_columns)
+                                plus_s = (
+                                    f"INSERT INTO {mv_table} ({', '.join(q_uall_pk_cols)}, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                                    f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                    f"    WHERE {w_new}\n"
+                                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                                )
+                        else:
+                            upd_set = ", ".join(f"{self._q(c)} = excluded.{self._q(c)}" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} ({', '.join(q_uall_pk_cols)}, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {', '.join(new_pk_vals)}, {', '.join(new_vals)}, 1\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON CONFLICT ({', '.join(q_uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        minus_s = (
+                            f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                            f"    WHERE ({w_old}) AND ({old_pk_match});"
+                        )
+                        clean_s = (
+                            f"DELETE FROM {mv_table}\n"
+                            f"    WHERE ({w_old}) AND ({old_pk_match}) AND {mv_table}.__mv_row_count <= 0;"
+                        )
+                    else:
+                        pk_new = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"NEW.{self._q(c)}" for c in pk_names]])
+                        pk_old = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"OLD.{self._q(c)}" for c in pk_names]])
+                        if self.dialect == Dialect.MYSQL:
+                            if self.engine_version.supports_mysql_row_alias_upsert:
+                                upd_set = ", ".join(f"{self._q(c)} = __mv_new.{self._q(c)}" for c in user_columns)
+                                aliased_uall_sel = [
+                                    f"{pk_new} AS __mv_pk",
+                                    *[f"{expr} AS {col}" for expr, col in zip(new_vals, q_user_columns)],
+                                    "1 AS __mv_row_count",
+                                ]
+                                plus_s = (
+                                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                                    f"    SELECT * FROM (\n"
+                                    f"        SELECT {', '.join(aliased_uall_sel)}{from_dual}\n"
+                                    f"        WHERE {w_new}\n"
+                                    f"    ) AS __mv_new\n"
+                                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                                )
+                            else:
+                                upd_set = ", ".join(f"{self._q(c)} = VALUES({self._q(c)})" for c in user_columns)
+                                plus_s = (
+                                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                                    f"    WHERE {w_new}\n"
+                                    f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                                )
+                        else:
+                            upd_set = ", ".join(f"{self._q(c)} = excluded.{self._q(c)}" for c in user_columns)
+                            plus_s = (
+                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                                f"    WHERE {w_new}\n"
+                                f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            )
+                        minus_s = (
+                            f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                            f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                        )
+                        clean_s = (
+                            f"DELETE FROM {mv_table}\n"
+                            f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+                        )
+                elif op_type == "UNION":
+                    pk_new = self._canonical_group_pk_expr(new_vals)
+                    pk_old = self._canonical_group_pk_expr(old_vals)
+                    if self.dialect == Dialect.MYSQL:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON DUPLICATE KEY UPDATE __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                    else:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                    minus_s = (
+                        f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                        f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                    )
+                    clean_s = (
+                        f"DELETE FROM {mv_table}\n"
+                        f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+                    )
+                else:  # INTERSECT or EXCEPT
+                    pk_new = self._canonical_group_pk_expr(new_vals)
+                    pk_old = self._canonical_group_pk_expr(old_vals)
+                    cnt_col = f"__mv_cnt_{b_idx}"
+                    init_c0 = "1" if b_idx == 0 else "0"
+                    init_c1 = "1" if b_idx == 1 else "0"
+                    if self.dialect == Dialect.MYSQL:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}{from_dual}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON DUPLICATE KEY UPDATE {cnt_col} = {mv_table}.{cnt_col} + 1;"
+                        )
+                    else:
+                        plus_s = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
+                            f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}\n"
+                            f"    WHERE {w_new}\n"
+                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET {cnt_col} = {mv_table}.{cnt_col} + 1;"
+                        )
+                    minus_s = (
+                        f"UPDATE {mv_table} SET {cnt_col} = {mv_table}.{cnt_col} - 1\n"
+                        f"    WHERE ({w_old}) AND {mv_table}.__mv_pk = ({pk_old});"
+                    )
+                    clean_s = (
+                        f"DELETE FROM {mv_table}\n"
+                        f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_cnt_0 <= 0 AND {mv_table}.__mv_cnt_1 <= 0;"
+                    )
+
+                ins_stmts.append(plus_s)
+                del_stmts.extend([minus_s, clean_s])
+                upd_old_stmts.append(minus_s)
+                upd_new_stmts.append(plus_s)
+                cleanup_stmts.append(clean_s)
+
+            trunc_stmts = [f"DELETE FROM {mv_table};", *initial_populate_sqls]
+
+            pg_ai_body: Optional[str] = None
+            pg_ad_body: Optional[str] = None
+            pg_au_body: Optional[str] = None
+
+            if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables and len(b_list) == 1:
+                b_idx, bs = b_list[0]
+                ts = self._schemas_lower[bs.base_table.lower()]
+                b_alias = bs.joins[0].alias if bs.joins else base_t
+                w_vec_new = self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "__mv_new_rows") if bs.where_clause else None
+                w_vec_old = self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "__mv_old_rows") if bs.where_clause else None
+                vec_new_vals = [self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "__mv_new_rows") for it in bs.select_items]
+                w_n_sql = f"\n    WHERE {w_vec_new}" if w_vec_new else ""
+                w_o_sql = f"\n    WHERE {w_vec_old}" if w_vec_old else ""
+
+                if op_type == "UNION ALL" and use_native_uall_pk:
+                    pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                    new_pk_vec = [str(b_idx), *[f"__mv_new_rows.{self._q(c)}" for c in pk_names]]
+                    del_pk_vec = [str(b_idx), *[f"__mv_old_rows.{self._q(c)}" for c in pk_names]]
+                    upd_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in user_columns)
+                    grp_new = [f"__mv_new_rows.{self._q(c)}" for c in pk_names] + vec_new_vals
+                    grp_del = [f"__mv_old_rows.{self._q(c)}" for c in pk_names]
+                    old_pk_match_vec = f"{mv_table}.__mv_branch_id = {b_idx} AND " + " AND ".join(
+                        f"{mv_table}.__mv_pk_{i} = __del.{self._q(c)}" for i, c in enumerate(pk_names)
+                    )
+                    del_sel = [*del_pk_vec, "COUNT(*) AS cnt"]
+                    pg_ai_body = (
+                        f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"    SELECT {', '.join(new_pk_vec)}, {', '.join(vec_new_vals)}, COUNT(*)\n"
+                        f"    FROM __mv_new_rows{w_n_sql}\n"
+                        f"    GROUP BY {', '.join(grp_new)}\n"
+                        f"    ON CONFLICT ({', '.join(uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;"
+                    )
+                    pg_ad_body = (
+                        f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
+                        f"FROM (\n"
+                        f"    SELECT {', '.join(del_sel)}\n"
+                        f"    FROM __mv_old_rows{w_o_sql}\n"
+                        f"    GROUP BY {', '.join(grp_del)}\n"
+                        f") AS __del\n"
+                        f"WHERE {old_pk_match_vec};\n"
+                        f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
+                    )
+                    pg_au_body = (
+                        f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
+                        f"FROM (\n"
+                        f"    SELECT {', '.join(del_sel)}\n"
+                        f"    FROM __mv_old_rows{w_o_sql}\n"
+                        f"    GROUP BY {', '.join(grp_del)}\n"
+                        f") AS __del\n"
+                        f"WHERE {old_pk_match_vec};\n"
+                        f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
+                        f"    SELECT {', '.join(new_pk_vec)}, {', '.join(vec_new_vals)}, COUNT(*)\n"
+                        f"    FROM __mv_new_rows{w_n_sql}\n"
+                        f"    GROUP BY {', '.join(grp_new)}\n"
+                        f"    ON CONFLICT ({', '.join(uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;\n"
+                        f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
+                    )
+
+            t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
+                view_name=view_name,
+                base_t=base_t,
+                ins_stmts=ins_stmts,
+                del_stmts=del_stmts,
+                upd_old_stmts=upd_old_stmts,
+                upd_new_stmts=upd_new_stmts,
+                upd_cleanup_old_stmts=cleanup_stmts,
+                trunc_stmts=trunc_stmts,
+                pg_ai_body=pg_ai_body,
+                pg_ad_body=pg_ad_body,
+                pg_au_body=pg_au_body,
+            )
+            trigger_ddls.extend(t_ddls)
+            trig_names.extend(t_ns)
+            fn_names.extend(f_ns)
+
+        inc_spec = IncrementalBackfillSpec(
+            mode="offset_batch",
+            chunk_sql_templates=initial_populate_sqls,
+        )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=initial_populate_sqls,
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+
+    def _compile_tier1_zset_distinct(self) -> MaterializedViewPlan:
+        # `SELECT DISTINCT c1, c2 FROM t WHERE ...` is isomorphic to `GROUP BY c1, c2` with hidden `__mv_row_count`
+        distinct_compiler = self.with_ir(
+            effective_group_by_exprs=tuple(it.raw_expr for it in self.view.select_items)
+        )
+        return distinct_compiler._compile_tier1_algebraic()
+
+    def _projection_pk_mapping(self) -> Tuple[List[str], List[Tuple[str, str, str]], bool]:
+        """
+        Returns `(mv_pk_cols, hidden_pk_defs, uses_native_pk)` for `_compile_tier1_zset_projection`.
+        Preserves the base table's actual primary/composite key columns in the backing table
+        whenever all base PK columns are non-nullable.
+        """
+        assert self.primary_schema is not None
+        pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
+        def _pk_col_nonnull(c: ColumnDef) -> bool:
+            if c.not_null or self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+                return True
+            if self.dialect == Dialect.SQLITE:
+                # Only a single-column INTEGER PRIMARY KEY (rowid alias) is implicitly
+                # NOT NULL on SQLite; INT PRIMARY KEY and composite PKs allow NULL.
+                return (
+                    len(pk_defs) == 1
+                    and re.sub(r"\s+", " ", c.data_type.strip().upper()) == "INTEGER"
+                )
+            return False
+
+        can_native = bool(pk_defs) and all(_pk_col_nonnull(c) for c in pk_defs)
+        if not can_native:
+            return ["__mv_pk"], [], False
+
+        base_alias = self.view.joins[0].alias.lower() if self.view.joins else self.view.base_table.lower()
+        base_name = self.view.base_table.lower()
+        mv_pk_cols: List[str] = []
+        hidden_pk_defs: List[Tuple[str, str, str]] = []
+        used_user_aliases: Set[str] = set()
+
+        for c_def in pk_defs:
+            c_low = c_def.name.lower()
+            matched_alias: Optional[str] = None
+            for it in self.view.select_items:
+                raw_s = _unquote_ident(it.raw_expr.strip(), dialect=self.dialect).lower() if re.match(r'^[A-Za-z0-9_."`\[\]]+$', it.raw_expr.strip()) else ""
+                raw_full = it.raw_expr.strip().lower()
+                raw_parts = [p.strip().strip('"').strip('`').strip('[').strip(']').lower() for p in raw_full.split('.')]
+                col_match = (
+                    raw_full == c_low
+                    or raw_full == f"{base_alias}.{c_low}"
+                    or raw_full == f"{base_name}.{c_low}"
+                    or (raw_s == c_low and "." not in raw_full)
+                    or (len(raw_parts) == 2 and raw_parts[0] in (base_alias, base_name) and raw_parts[1] == c_low)
+                    or (len(raw_parts) == 1 and raw_parts[0] == c_low)
+                )
+                if col_match and it.alias.lower() not in used_user_aliases:
+                    matched_alias = it.alias
+                    used_user_aliases.add(it.alias.lower())
+                    break
+            if matched_alias is not None:
+                mv_pk_cols.append(matched_alias)
+            else:
+                hid_col = f"__mv_pk_{_sanitize_ident(c_def.name)}"
+                dt = self._normalize_dialect_type(c_def.data_type)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
+                hidden_pk_defs.append((hid_col, c_def.name, dt))
+                mv_pk_cols.append(hid_col)
+
+        return mv_pk_cols, hidden_pk_defs, True
+
+    def _projection_pk_cols(self) -> List[str]:
+        mv_pk_cols, _, _ = self._projection_pk_mapping()
+        return mv_pk_cols
+
+    def _compile_tier1_zset_projection(self) -> MaterializedViewPlan:
+        assert self.primary_schema is not None
+        view_name = self.view.view_name
+        mv_table = self._backing_table_name()
+        base_t = self.view.base_table
+        q_base_t = self._q(base_t)
+        user_columns = [it.alias for it in self.view.select_items]
+        pk_type = self._canonical_group_pk_type()
+        from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
+
+        pk_names = [c.name for c in self.primary_schema.columns.values() if c.primary_key]
+        mv_pk_cols, hidden_pk_defs, uses_native_pk = self._projection_pk_mapping()
+        pk_col_set_lower = {c.lower() for c in mv_pk_cols}
+
+        col_defs_sql: List[str] = []
+        if not uses_native_pk:
+            col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
+
+        indexed_cols_lower = self._indexed_column_names_lower(mv_pk_cols if uses_native_pk else ())
+        for it in self.view.select_items:
+            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
+                dt = "VARCHAR(255)"
+            nn = " NOT NULL" if (uses_native_pk and it.alias.lower() in pk_col_set_lower) else ""
+            col_defs_sql.append(f"{self._q(it.alias)} {dt}{nn}")
+
+        for hid_col, _, hid_dt in hidden_pk_defs:
+            col_defs_sql.append(f"{self._q(hid_col)} {hid_dt} NOT NULL")
+
+        q_mv_pk_cols = [self._q(c) for c in mv_pk_cols]
+        if uses_native_pk:
+            col_defs_sql.append(f"PRIMARY KEY ({', '.join(q_mv_pk_cols)})")
+        else:
+            col_defs_sql.append(f"__mv_row_count {self._int_type()} NOT NULL DEFAULT 0")
+
+        backing_table_ddl = self._create_table_ddl(
+            mv_table,
+            col_defs_sql,
+            is_backing_store=True,
+            pk_cols=mv_pk_cols if uses_native_pk else None,
+        )
+        index_ddls, index_names = self._build_all_index_ddls(
+            mv_table=mv_table,
+            auto_group_cols=(),
+            has_pk_on_group_cols=False,
+        )
+        reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
+            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+        )
+
+        sel_exprs = [it.raw_expr for it in self.view.select_items]
+        w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
+        new_vals = [self._rewrite_expr_for_record(it.raw_expr, "NEW") for it in self.view.select_items]
+
+        wm_pk_col: Optional[str] = None
+        int_pk_cols = [
+            c for c in self.primary_schema.columns.values()
+            if c.primary_key and "INT" in c.data_type.upper()
+        ]
+        if len(int_pk_cols) == 1:
+            wm_pk_col = int_pk_cols[0].name
+        elif self.dialect == Dialect.SQLITE and len(pk_names) <= 1:
+            wm_pk_col = pk_names[0] if pk_names else "rowid"
+
+        if uses_native_pk:
+            all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
+            q_all_backing_cols = [self._q(c) for c in all_backing_cols]
+            all_select_exprs = [*sel_exprs, *[self._q(h[1]) for h in hidden_pk_defs]]
+            all_new_vals = [*new_vals, *[f"NEW.{self._q(h[1])}" for h in hidden_pk_defs]]
+            initial_populate_sql = (
+                f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                f"SELECT {', '.join(all_select_exprs)} FROM {q_base_t}{w_sql};"
+            )
+            if self.dialect == Dialect.MYSQL:
+                if self.engine_version.supports_mysql_row_alias_upsert:
+                    upd_set = ", ".join(f"{self._q(c)} = __mv_new.{self._q(c)}" for c in all_backing_cols)
+                    plus_stmt = (
+                        f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                        f"    VALUES ({', '.join(all_new_vals)}) AS __mv_new\n"
+                        f"    ON DUPLICATE KEY UPDATE {upd_set};"
+                    )
+                else:
+                    upd_set = ", ".join(f"{self._q(c)} = VALUES({self._q(c)})" for c in all_backing_cols)
+                    plus_stmt = (
+                        f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                        f"    SELECT {', '.join(all_new_vals)}{from_dual}\n"
+                        f"    WHERE TRUE\n"
+                        f"    ON DUPLICATE KEY UPDATE {upd_set};"
+                    )
+            else:
+                upd_set = ", ".join(f"{self._q(c)} = excluded.{self._q(c)}" for c in all_backing_cols)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                    f"    SELECT {', '.join(all_new_vals)}\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                )
+            if wm_pk_col:
+                ph = "?" if self.dialect == Dialect.SQLITE else "%s"
+                q_wm_pk = self._q(wm_pk_col)
+                chunk_w = (
+                    f"({self.view.where_clause}) AND ({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
+                    if self.view.where_clause
+                    else f"({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
+                )
+                if self.dialect == Dialect.MYSQL:
+                    if self.engine_version.supports_mysql_row_alias_upsert:
+                        aliased_chunk_sel = [
+                            f"{expr} AS {col}" for expr, col in zip(all_select_exprs, q_all_backing_cols)
+                        ]
+                        chunk_upd = ", ".join(f"{c} = __mv_src.{c}" for c in q_all_backing_cols)
+                        chunk_upsert_sql: Optional[str] = (
+                            f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                            f"SELECT * FROM (\n"
+                            f"    SELECT {', '.join(aliased_chunk_sel)}\n"
+                            f"    FROM {q_base_t}\n"
+                            f"    WHERE {chunk_w}\n"
+                            f") AS __mv_src\n"
+                            f"ON DUPLICATE KEY UPDATE {chunk_upd};"
+                        )
+                    else:
+                        chunk_upsert_sql = (
+                            f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                            f"SELECT {', '.join(all_select_exprs)}\nFROM {q_base_t}\n"
+                            f"WHERE {chunk_w}\n"
+                            f"ON DUPLICATE KEY UPDATE {upd_set};"
+                        )
+                else:
+                    chunk_upsert_sql = (
+                        f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                        f"SELECT {', '.join(all_select_exprs)}\nFROM {q_base_t}\n"
+                        f"WHERE {chunk_w}\n"
+                        f"ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                    )
+            else:
+                chunk_upsert_sql = None
+            pk_old_preds = [
+                f"{mv_table}.{self._q(mv_c)} = OLD.{self._q(src_c)}"
+                for mv_c, src_c in zip(mv_pk_cols, pk_names)
+            ]
+            del_where = " AND ".join(pk_old_preds)
+            del_stmt = f"DELETE FROM {mv_table}\n    WHERE {del_where};"
+            del_stmts_list = [del_stmt]
+
+            base_pk_eq_old = " AND ".join(
+                f"{q_base_t}.{self._q(src_c)} = OLD.{self._q(src_c)}"
+                for src_c in pk_names
+            )
+            and_base_where = (
+                f" AND ({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})"
+                if self.view.where_clause
+                else ""
+            )
+            upd_del_stmt = (
+                f"DELETE FROM {mv_table}\n"
+                f"    WHERE {del_where}\n"
+                f"    AND NOT EXISTS (SELECT 1 FROM {q_base_t} WHERE {base_pk_eq_old}{and_base_where});"
+            )
+            upd_old_list = [upd_del_stmt]
+            upd_clean_list: List[str] = []
+        else:
+            all_base_cols = list(self.primary_schema.columns.keys())
+            pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
+            has_nullable_pk = (not pk_defs) or any(not c.not_null for c in pk_defs)
+            pk_hash_cols = all_base_cols if (has_nullable_pk and all_base_cols) else (pk_names or sel_exprs)
+            q_pk_hash_cols = [self._q(c) for c in pk_hash_cols] if (has_nullable_pk and all_base_cols) or pk_names else sel_exprs
+            pk_expr_base = self._canonical_group_pk_expr(q_pk_hash_cols)
+            q_user_columns = [self._q(c) for c in user_columns]
+            w_pop = w_sql or "\nWHERE TRUE"
+            if self.dialect == Dialect.MYSQL:
+                initial_populate_sql = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                    f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_pop}\n"
+                    f"ON DUPLICATE KEY UPDATE __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            else:
+                initial_populate_sql = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                    f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_pop}\n"
+                    f"ON CONFLICT (__mv_pk) DO UPDATE SET __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            pk_new = self._canonical_group_pk_expr([f"NEW.{self._q(c)}" for c in pk_hash_cols])
+            pk_old = self._canonical_group_pk_expr([f"OLD.{self._q(c)}" for c in pk_hash_cols])
+            if self.dialect == Dialect.MYSQL:
+                if self.engine_version.supports_mysql_row_alias_upsert:
+                    upd_set = ", ".join(f"{self._q(c)} = __mv_new.{self._q(c)}" for c in user_columns)
+                    plus_stmt = (
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                        f"    VALUES ({pk_new}, {', '.join(new_vals)}, 1) AS __mv_new\n"
+                        f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                    )
+                else:
+                    upd_set = ", ".join(f"{self._q(c)} = VALUES({self._q(c)})" for c in user_columns)
+                    plus_stmt = (
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                        f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
+                        f"    WHERE TRUE\n"
+                        f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                    )
+            else:
+                upd_set = ", ".join(f"{self._q(c)} = excluded.{self._q(c)}" for c in user_columns)
+                plus_stmt = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                    f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
+                    f"    WHERE TRUE\n"
+                    f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                )
+            if wm_pk_col:
+                ph = "?" if self.dialect == Dialect.SQLITE else "%s"
+                q_wm_pk = self._q(wm_pk_col)
+                chunk_w = (
+                    f"({self.view.where_clause}) AND ({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
+                    if self.view.where_clause
+                    else f"({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
+                )
+                if self.dialect == Dialect.MYSQL:
+                    if self.engine_version.supports_mysql_row_alias_upsert:
+                        aliased_chunk_sel = [
+                            f"{pk_expr_base} AS __mv_pk",
+                            *[f"{expr} AS {col}" for expr, col in zip(sel_exprs, q_user_columns)],
+                            "1 AS __mv_row_count",
+                        ]
+                        chunk_upd = ", ".join(f"{c} = __mv_src.{c}" for c in q_user_columns)
+                        chunk_upsert_sql = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                            f"SELECT * FROM (\n"
+                            f"    SELECT {', '.join(aliased_chunk_sel)}\n"
+                            f"    FROM {q_base_t}\n"
+                            f"    WHERE {chunk_w}\n"
+                            f") AS __mv_src\n"
+                            f"ON DUPLICATE KEY UPDATE {chunk_upd}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                    else:
+                        chunk_upsert_sql = (
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                            f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1\nFROM {q_base_t}\n"
+                            f"WHERE {chunk_w}\n"
+                            f"ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        )
+                else:
+                    chunk_upsert_sql = (
+                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                        f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1\nFROM {q_base_t}\n"
+                        f"WHERE {chunk_w}\n"
+                        f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                    )
+            else:
+                chunk_upsert_sql = None
+            minus_stmt = (
+                f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
+                f"    WHERE {mv_table}.__mv_pk = ({pk_old});"
+            )
+            clean_stmt = (
+                f"DELETE FROM {mv_table}\n"
+                f"    WHERE ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"
+            )
+            del_stmts_list = [minus_stmt, clean_stmt]
+            upd_old_list = [minus_stmt]
+            upd_clean_list = [clean_stmt]
+
+        where_new = (
+            self._rewrite_expr_for_record(self.view.where_clause, "NEW")
+            if self.view.where_clause
+            else None
+        )
+        where_old = (
+            self._rewrite_expr_for_record(self.view.where_clause, "OLD")
+            if self.view.where_clause
+            else None
+        )
+
+        if self.watermark_catalog_table and wm_pk_col:
+            q_pk = self._q(wm_pk_col)
+            wm_new = (
+                f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"
+            )
+            wm_old = (
+                f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"AND OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"
+            )
+            where_new = f"({where_new}) AND ({wm_new})" if where_new else wm_new
+            where_old = f"({where_old}) AND ({wm_old})" if where_old else wm_old
+
+        pg_ai_body: Optional[str] = None
+        pg_ad_body: Optional[str] = None
+        pg_au_body: Optional[str] = None
+
+        if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables:
+            vec_new_pred = self._rewrite_expr_for_record(self.view.where_clause, "__mv_new_rows") if self.view.where_clause else None
+            vec_old_pred = self._rewrite_expr_for_record(self.view.where_clause, "__mv_old_rows") if self.view.where_clause else None
+            if self.watermark_catalog_table and wm_pk_col:
+                q_pk = self._q(wm_pk_col)
+                wm_vec_new = (
+                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                    f"AND __mv_new_rows.{q_pk} > backfill_cursor_pk AND __mv_new_rows.{q_pk} <= backfill_max_pk)"
+                )
+                wm_vec_old = (
+                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                    f"AND __mv_old_rows.{q_pk} > backfill_cursor_pk AND __mv_old_rows.{q_pk} <= backfill_max_pk)"
+                )
+                vec_new_pred = f"({vec_new_pred}) AND ({wm_vec_new})" if vec_new_pred else wm_vec_new
+                vec_old_pred = f"({vec_old_pred}) AND ({wm_vec_old})" if vec_old_pred else wm_vec_old
+            w_vec_new = f"\nWHERE {vec_new_pred}" if vec_new_pred else ""
+            w_vec_old = f"\nWHERE {vec_old_pred}" if vec_old_pred else ""
+            w_vec_old_and = f" AND ({vec_old_pred})" if vec_old_pred else ""
+
+            if uses_native_pk:
+                all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
+                q_all_backing_cols = [self._q(c) for c in all_backing_cols]
+                all_vec_new_vals = [
+                    *[self._rewrite_expr_for_record(it.raw_expr, "__mv_new_rows") for it in self.view.select_items],
+                    *[f"__mv_new_rows.{self._q(h[1])}" for h in hidden_pk_defs],
+                ]
+                upd_set = ", ".join(f"{self._q(c)} = EXCLUDED.{self._q(c)}" for c in all_backing_cols)
+                del_where_vec = " AND ".join(
+                    f"{mv_table}.{self._q(mv_c)} = __mv_old_rows.{self._q(src_c)}"
+                    for mv_c, src_c in zip(mv_pk_cols, pk_names)
+                )
+                base_pk_eq_vec_old = " AND ".join(
+                    f"{q_base_t}.{self._q(src_c)} = __mv_old_rows.{self._q(src_c)}"
+                    for src_c in pk_names
+                )
+                and_base_where = (
+                    f" AND ({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})"
+                    if self.view.where_clause
+                    else ""
+                )
+
+                pg_ai_body = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                    f"SELECT {', '.join(all_vec_new_vals)}\n"
+                    f"FROM __mv_new_rows{w_vec_new}\n"
+                    f"ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};"
+                )
+                pg_ad_body = (
+                    f"DELETE FROM {mv_table}\n"
+                    f"USING __mv_old_rows\n"
+                    f"WHERE {del_where_vec}{w_vec_old_and};"
+                )
+                pg_au_body = (
+                    f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
+                    f"SELECT {', '.join(all_vec_new_vals)}\n"
+                    f"FROM __mv_new_rows{w_vec_new}\n"
+                    f"ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};\n"
+                    f"DELETE FROM {mv_table}\n"
+                    f"USING __mv_old_rows\n"
+                    f"WHERE {del_where_vec}{w_vec_old_and}\n"
+                    f"  AND NOT EXISTS (\n"
+                    f"      SELECT 1 FROM {q_base_t}\n"
+                    f"      WHERE {base_pk_eq_vec_old}{and_base_where}\n"
+                    f"  );"
+                )
+            else:
+                q_user_columns = [self._q(c) for c in user_columns]
+                pk_vec_new = self._canonical_group_pk_expr([f"__mv_new_rows.{self._q(c)}" for c in pk_hash_cols])
+                pk_vec_old = self._canonical_group_pk_expr([f"__mv_old_rows.{self._q(c)}" for c in pk_hash_cols])
+                vec_new_vals = [self._rewrite_expr_for_record(it.raw_expr, "__mv_new_rows") for it in self.view.select_items]
+                upd_set = ", ".join(f"{self._q(c)} = EXCLUDED.{self._q(c)}" for c in user_columns)
+                group_by_cols_new = f"{pk_vec_new}" + (f", {', '.join(vec_new_vals)}" if vec_new_vals else "")
+
+                pg_ai_body = (
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                    f"SELECT {pk_vec_new}, {', '.join(vec_new_vals)}, COUNT(*)\n"
+                    f"FROM __mv_new_rows{w_vec_new}\n"
+                    f"GROUP BY {group_by_cols_new}\n"
+                    f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;"
+                )
+                pg_ad_body = (
+                    f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
+                    f"FROM (\n"
+                    f"    SELECT {pk_vec_old} AS __mv_pk, COUNT(*) AS cnt\n"
+                    f"    FROM __mv_old_rows{w_vec_old}\n"
+                    f"    GROUP BY {pk_vec_old}\n"
+                    f") AS __del\n"
+                    f"WHERE {mv_table}.__mv_pk = __del.__mv_pk;\n"
+                    f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
+                )
+                pg_au_body = (
+                    f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
+                    f"FROM (\n"
+                    f"    SELECT {pk_vec_old} AS __mv_pk, COUNT(*) AS cnt\n"
+                    f"    FROM __mv_old_rows{w_vec_old}\n"
+                    f"    GROUP BY {pk_vec_old}\n"
+                    f") AS __del\n"
+                    f"WHERE {mv_table}.__mv_pk = __del.__mv_pk;\n"
+                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                    f"SELECT {pk_vec_new}, {', '.join(vec_new_vals)}, COUNT(*)\n"
+                    f"FROM __mv_new_rows{w_vec_new}\n"
+                    f"GROUP BY {group_by_cols_new}\n"
+                    f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;\n"
+                    f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
+                )
+
+        trigger_ddls, trig_names, fn_names = self._emit_dialect_triggers_for_table(
+            view_name=view_name,
+            base_t=base_t,
+            ins_stmts=[plus_stmt],
+            del_stmts=del_stmts_list,
+            upd_old_stmts=upd_old_list,
+            upd_new_stmts=[plus_stmt],
+            upd_cleanup_old_stmts=upd_clean_list,
+            trunc_stmts=[f"DELETE FROM {mv_table};"],
+            where_new=where_new,
+            where_old=where_old,
+            pg_ai_body=pg_ai_body,
+            pg_ad_body=pg_ad_body,
+            pg_au_body=pg_au_body,
+        )
+
+        if wm_pk_col and chunk_upsert_sql:
+            inc_spec = IncrementalBackfillSpec(
+                mode="pk_range_fold",
+                pk_column=wm_pk_col,
+                chunk_sql_templates=[chunk_upsert_sql],
+            )
+        else:
+            inc_spec = IncrementalBackfillSpec(
+                mode="offset_batch",
+                chunk_sql_templates=[initial_populate_sql],
+            )
+        return MaterializedViewPlan(
+            dialect=self.dialect,
+            strategy=self.strategy,
+            view_spec=self.view,
+            backing_table_name=mv_table,
+            backing_table_ddl=backing_table_ddl,
+            auxiliary_table_ddls=[],
+            index_ddls=index_ddls,
+            initial_populate_sqls=[initial_populate_sql],
+            trigger_ddls=trigger_ddls,
+            readonly_trigger_ddls=ro_trigs,
+            user_columns=user_columns,
+            reader_view_ddl=reader_view_ddl,
+            incremental_backfill_spec=inc_spec,
+            trigger_names=ro_trig_names + trig_names,
+            function_names=ro_fn_names + fn_names,
+            limitations=self.limitations,
+            object_prefix=self.object_prefix,
+            db_view_name=self.db_view_name,
+            index_names=index_names,
+            user_indexes=list(self.user_indexes),
+        )
+

@@ -254,6 +254,9 @@ jobs:
       - name: Test SQLAlchemy unified connectivity and schema introspection
         run: python3 test_p1_sqlalchemy_integration.py
 
+      - name: Test modular matview package and immutable IR compilation
+        run: python3 test_p1_modular_package.py
+
   # One representative build per distinct SQLite-compatible implementation.
   sqlite-compat:
     needs: classify
