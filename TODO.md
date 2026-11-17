@@ -302,7 +302,7 @@ The existing differential-testing harness is useful, but its current headline co
   - Reconcile the documented rebase-only merge behavior with the project's required true fast-forward-only policy; do not document a merge method that the repository ruleset or project policy forbids.
   - Define how the single native PR stack is identified and verified (including exact head/base SHAs and dependency ordering); PR base relationships alone do not prove membership or freshness.
   - Require every stacked descendant to be restacked and revalidated when a predecessor head changes. A green check on an old SHA is not validation of the current head.
-  - Require documentation-only changes to follow the explicitly configured lightweight CI policy, while all code-bearing PRs retain the required current-head checks.
+  - Require documentation-only changes to follow the explicitly configured lightweight CI policy, while all code-bearing PRs retain the required current-head checks. Current observation: PR #221 changes only `TODO.md` and `reviews/4.md`, but its workflow run queued the full engine matrix while `Documentation-only fast path` was skipped; extend the classifier/conditions to cover intended root Markdown and review paths, without exempting workflow/configuration changes.
   - Require unresolved review threads/required approvals only if the repository ruleset is updated to enforce them; keep AGENTS.md synchronized with actual branch protection/ruleset configuration.
 
 - [ ] **Add Packaging, Licensing, Static Analysis and Release Hygiene**:
