@@ -230,7 +230,10 @@ class Tier1JoinMixin:
                 if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
                     col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
                 elif item.agg_func == AggFunc.TOTAL:
-                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0.0")
+                    # SQLite TOTAL returns NULL when the floating-point sum is
+                    # NaN (e.g. inf + -inf); NOT NULL would reject the write.
+                    total_nn = "" if self.dialect == Dialect.SQLITE else " NOT NULL"
+                    col_defs_sql.append(f"{self._q(item.alias)} {storage_type}{total_nn} DEFAULT 0.0")
                 else:
                     col_defs_sql.append(f"{self._q(item.alias)} {storage_type}")
 
