@@ -6709,6 +6709,17 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(len(campaign), 12)
         self.assertGreaterEqual(coverage["distinct_structures"], 10)
         self.assertGreaterEqual(coverage["feature_count"], 15)
+        # The campaign score must account for DML grammar, not just schema
+        # topology. These features are collected from the selected scenarios.
+        campaign_features = coverage["feature_occurrences"]
+        for kind in ("INSERT_VALUES", "INSERT_SELECT", "UPDATE", "DELETE", "UPSERT"):
+            self.assertIn(f"dml_kind:{kind}", campaign_features)
+        self.assertTrue(
+            any(key.startswith("dml_expression:") for key in campaign_features)
+        )
+        self.assertTrue(
+            any(key.startswith("dml_predicate:") for key in campaign_features)
+        )
         self.assertTrue({
             "add", "safe_subtract", "multiply", "divide", "modulo",
             "abs", "round", "case", "coalesce", "literal",
@@ -8077,6 +8088,15 @@ class SchemaCoverageTracker:
         features.update(f"amount_type:{value}" for value in shape["amount_types"])
         features.update(f"fk_delete:{value}" for value in shape["fk_delete_actions"])
         features.update(f"fk_update:{value}" for value in shape["fk_update_actions"])
+        # Feed DML grammar coverage into the same deterministic candidate
+        # selection loop. A candidate with an unseen assignment/predicate
+        # production or DML statement kind now competes favorably even when
+        # its schema topology is otherwise familiar.
+        features.update(f"dml_kind:{value}" for value in shape["dml_statement_kinds"])
+        features.update(f"dml_expression:{value}" for value in shape["expression_nodes"])
+        features.update(f"dml_predicate:{value}" for value in shape["predicate_nodes"])
+        features.add(f"dml_expression_depth:{shape['max_expression_depth']}")
+        features.add(f"dml_predicate_depth:{shape['max_predicate_depth']}")
         return tuple(sorted(features))
 
     def __init__(self) -> None:
@@ -8096,6 +8116,9 @@ class SchemaCoverageTracker:
             shape["foreign_key_count"], shape["fk_delete_actions"],
             shape["fk_update_actions"], shape["generated_columns"], shape["index_count"],
             shape["unique_label_constraints"], shape["unique_label_qty_constraints"],
+            shape["dml_statement_kinds"], shape["expression_nodes"],
+            shape["predicate_nodes"], shape["max_expression_depth"],
+            shape["max_predicate_depth"],
         )
         self.signatures.add(signature)
 
