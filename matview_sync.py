@@ -4577,6 +4577,67 @@ class IncrementalViewCompiler:
 
         return None
 
+    def _postgres_modulo_result_storage_type(self, expr_sql: str) -> Optional[str]:
+        """Infer PostgreSQL's native integer/numeric result family for modulo."""
+        if self.dialect != Dialect.POSTGRES:
+            return None
+        try:
+            node = parse_sql_ast(expr_sql)
+        except (sqlglot.errors.SqlglotError, AttributeError, TypeError, ValueError):
+            return None
+        if node.__class__.__name__ not in ("Mod", "Modulo"):
+            return None
+
+        def operand_type(operand: Any) -> Optional[str]:
+            if operand is None:
+                return None
+            kind = operand.__class__.__name__
+            if kind in ("Paren", "Neg"):
+                return operand_type(operand.args.get("this"))
+            if isinstance(operand, sqlglot_exp.Column):
+                col_def = self._lookup_col_def(operand.name)
+                return self._normalize_dialect_type(col_def.data_type) if col_def else None
+            if isinstance(operand, sqlglot_exp.Literal) and not operand.args.get("is_string"):
+                literal = str(operand.this)
+                if "." in literal or "e" in literal.lower():
+                    return "NUMERIC"
+                try:
+                    value = int(literal)
+                except ValueError:
+                    return None
+                if -(2 ** 31) <= value < (2 ** 31):
+                    return "INTEGER"
+                if -(2 ** 63) <= value < (2 ** 63):
+                    return "BIGINT"
+                return "NUMERIC"
+            if kind == "Cast":
+                target = operand.args.get("to")
+                if target is not None:
+                    return self._normalize_dialect_type(target.sql())
+            return None
+
+        left_type = operand_type(node.args.get("this"))
+        right_type = operand_type(node.args.get("expression"))
+        if not left_type or not right_type:
+            return None
+        types = (left_type.upper(), right_type.upper())
+        if any("NUMERIC" in value or "DECIMAL" in value for value in types):
+            return "NUMERIC"
+
+        def integer_rank(value: str) -> Optional[int]:
+            if "SMALLINT" in value or value == "INT2":
+                return 0
+            if "BIGINT" in value or value == "INT8":
+                return 2
+            if "INT" in value or value == "INT4":
+                return 1
+            return None
+
+        ranks = [integer_rank(value) for value in types]
+        if any(rank is None for rank in ranks):
+            return None
+        return ("SMALLINT", "INTEGER", "BIGINT")[max(ranks)]
+
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
         if self.dialect == Dialect.MYSQL and item.is_aggregate and item.agg_func is None:
             # Composite projections containing aggregates (for example
@@ -4695,6 +4756,10 @@ class IncrementalViewCompiler:
                 if any(fn in raw_u for fn in ("SUM(", "AVG(", "TOTAL(", "MIN(", "MAX(")):
                     return self._float_type()
             if "%" in raw_u:
+                if self.dialect == Dialect.POSTGRES:
+                    modulo_type = self._postgres_modulo_result_storage_type(item.raw_expr)
+                    if modulo_type:
+                        return modulo_type
                 return self._int_type()
             if any(op in raw_u for op in ("*", "/", "+", "-")):
                 if "/" not in raw_u and not re.search(r"\d+\.\d+", raw_u):
