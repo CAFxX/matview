@@ -15,7 +15,7 @@ import warnings
 import uuid
 from urllib.parse import urlparse
 
-from matview_sync import Dialect, EngineLimitationWarning, MaterializedViewManager
+from matview_sync import BackfillInterruptedError, Dialect, EngineLimitationWarning, MaterializedViewManager
 from test_matview_sync import _register_sqlite_compat_udfs
 
 # Bound for replaying an application writer transaction chosen as an engine
@@ -225,6 +225,12 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             base = MaterializedViewManager._BACKFILL_RETRY_BASE_DELAY_S
             cap = MaterializedViewManager._BACKFILL_RETRY_MAX_DELAY_S
             self.assertEqual(sleeps, [min(cap, base * 2 ** i) for i in range(limit)])
+            # Fail closed: chunk (0, 4] stays committed, the watermark keeps
+            # gating (4, 12], and the error says so.
+            entry = manager.get_catalog()[plan.view_name]
+            self.assertEqual(
+                (entry["backfill_active"], entry["backfill_cursor_pk"], entry["backfill_max_pk"]), (1, 4, 12)
+            )
         finally:
             conn.close()
 
@@ -1085,6 +1091,453 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
         self._run_native_barrier_concurrent_writers(Dialect.MYSQL, dsn)
 
+
+
+V_GROUPED = "CREATE VIEW v AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t GROUP BY g;"
+V_GLOBAL = "CREATE VIEW v AS SELECT COUNT(*) AS c, SUM(amt) AS s FROM t;"
+NATIVE_OF = {
+    V_GROUPED: "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g",
+    V_GLOBAL: "SELECT COUNT(*), SUM(amt) FROM t",
+}
+
+
+class _Interrupt(Exception):
+    pass
+
+
+class InterruptedBackfillFailClosedTests(unittest.TestCase):
+    """Contract after a non-snapshot pk-range backfill stops part-way.
+
+    The committed chunks and the active watermark are kept (triggers keep
+    excluding the unfolded range), and no later call may resume, re-fold or
+    reset it: every backfill_incrementally() on the view is refused with
+    BackfillInterruptedError and leaves state untouched. The supported repair
+    is an explicit rebuild, after which the view equals the original view.
+    """
+
+    def _setup(self, view_sql: str = V_GROUPED, path: str = ":memory:"):
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, g TEXT, amt INTEGER)")
+        conn.executemany("INSERT INTO t VALUES (?, ?, ?)", [(i, f"G{i % 3}", i) for i in range(1, 21)])
+        conn.commit()
+        manager = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        plan = manager.register_view(view_sql, populate=False, ignore_limitations=True)
+        return conn, manager, plan
+
+    @staticmethod
+    def _interrupt(manager, plan, at_progress_call: int = 2) -> None:
+        calls = []
+
+        def progress(_b: int, _d: int) -> None:
+            calls.append(1)
+            if len(calls) == at_progress_call:
+                raise _Interrupt()
+
+        try:
+            manager.backfill_incrementally(plan, batch_size=5, on_progress=progress)
+        except _Interrupt as exc:
+            # The original exception propagates, annotated with the state.
+            assert any("watermark is kept active" in n for n in getattr(exc, "__notes__", [])), exc
+        else:
+            raise AssertionError("backfill was not interrupted")
+
+    @staticmethod
+    def _wm(manager, name: str):
+        e = manager.get_catalog()[name]
+        return e["backfill_cursor_pk"], e["backfill_max_pk"], e["backfill_active"]
+
+    def _rows(self, conn, sql: str):
+        return conn.execute(sql).fetchall()
+
+    def _assert_matches_native(self, conn, view_sql: str, name: str = "v") -> None:
+        self.assertEqual(
+            self._rows(conn, f"SELECT * FROM {name} ORDER BY 1"), self._rows(conn, NATIVE_OF[view_sql])
+        )
+
+    def _mutate(self, conn) -> None:
+        # Independent DML on both sides of the cursor while interrupted.
+        conn.execute("INSERT INTO t VALUES (100, 'G1', 1000)")
+        conn.execute("DELETE FROM t WHERE id IN (3, 15)")
+        conn.execute("UPDATE t SET amt = amt + 7, g = 'G2' WHERE id IN (2, 12)")
+        conn.commit()
+
+    def test_any_later_call_is_refused_without_touching_state_then_rebuild_repairs(self) -> None:
+        # B1/B3: neither a failing call (batch_size=0), a snapshot re-run, nor a
+        # plain re-run may reset, resume or re-fold the interrupted watermark.
+        conn, manager, plan = self._setup()
+        try:
+            self._interrupt(manager, plan)
+            wm = self._wm(manager, "v")
+            self.assertEqual(wm, (10, 20, 1))
+            self._mutate(conn)
+            before = self._rows(conn, "SELECT * FROM __matview_store_v ORDER BY 1")
+            for kwargs in ({"batch_size": 0}, {"batch_size": 5, "snapshot_isolation": True}, {"batch_size": 5}):
+                with self.subTest(**kwargs):
+                    with self.assertRaises(BackfillInterruptedError) as ctx:
+                        manager.backfill_incrementally(plan, **kwargs)
+                    self.assertIn("force_rebuild=True", str(ctx.exception))
+                    self.assertEqual(self._wm(manager, "v"), wm)
+                    self.assertEqual(self._rows(conn, "SELECT * FROM __matview_store_v ORDER BY 1"), before)
+            # Re-registering the same definition must not adopt it as complete.
+            with self.assertRaises(BackfillInterruptedError):
+                manager.register_view(V_GROUPED, ignore_limitations=True)
+            plan = manager.register_view(V_GROUPED, force_rebuild=True, ignore_limitations=True)
+            self._assert_matches_native(conn, V_GROUPED)
+            self._mutate_after_rebuild(conn)
+            self._assert_matches_native(conn, V_GROUPED)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _mutate_after_rebuild(conn) -> None:
+        conn.execute("INSERT INTO t VALUES (101, 'G2', 5)")
+        conn.execute("DELETE FROM t WHERE id IN (18, 100)")
+        conn.commit()
+
+    def test_drop_and_register_repairs_interrupted_view(self) -> None:
+        conn, manager, plan = self._setup()
+        try:
+            self._interrupt(manager, plan)
+            self._mutate(conn)
+            manager.drop_view(plan.view_name)
+            plan = manager.register_view(V_GROUPED, populate=False, ignore_limitations=True)
+            manager.backfill_incrementally(plan, batch_size=5)
+            self._assert_matches_native(conn, V_GROUPED)
+        finally:
+            conn.close()
+
+    def test_completed_backfill_is_not_folded_twice(self) -> None:
+        conn, manager, plan = self._setup()
+        try:
+            manager.backfill_incrementally(plan, batch_size=5)
+            self._assert_matches_native(conn, V_GROUPED)
+            for snap in (False, True):
+                with self.subTest(snapshot_isolation=snap):
+                    with self.assertRaises(BackfillInterruptedError):
+                        manager.backfill_incrementally(plan, batch_size=5, snapshot_isolation=snap)
+                    self._assert_matches_native(conn, V_GROUPED)
+                    self.assertEqual(self._wm(manager, "v"), (20, 20, 0))
+        finally:
+            conn.close()
+
+    def test_multi_view_plan_rerun_never_refolds_finished_sub_plans(self) -> None:
+        # B2: va finished, vb interrupted. A re-run must not re-fold va.
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, amt INTEGER)")
+            conn.executemany("INSERT INTO t VALUES (?, ?, ?)", [(i, f"G{i % 3}", i) for i in range(1, 21)])
+            conn.commit()
+            manager = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+            plan = manager.register_view(
+                "CREATE VIEW va AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t GROUP BY g;\n"
+                "CREATE VIEW vb AS SELECT g, COUNT(*) AS c FROM t GROUP BY g;",
+                populate=False, ignore_limitations=True,
+            )
+            self._interrupt(manager, plan, at_progress_call=6)  # va: 4 batches; vb: 2nd batch
+            self.assertEqual(self._wm(manager, "va"), (20, 20, 0))
+            self.assertEqual(self._wm(manager, "vb"), (10, 20, 1))
+            va_before = self._rows(conn, "SELECT * FROM va ORDER BY g")
+            vb_before = self._rows(conn, "SELECT * FROM vb ORDER BY g")
+            self.assertEqual(va_before, self._rows(conn, "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g"))
+            for snap in (False, True):
+                with self.subTest(snapshot_isolation=snap):
+                    with self.assertRaises(BackfillInterruptedError):
+                        manager.backfill_incrementally(plan, batch_size=5, snapshot_isolation=snap)
+                    self.assertEqual(self._rows(conn, "SELECT * FROM va ORDER BY g"), va_before)
+                    self.assertEqual(self._rows(conn, "SELECT * FROM vb ORDER BY g"), vb_before)
+                    self.assertEqual(self._wm(manager, "vb"), (10, 20, 1))
+            manager.drop_view("vb")
+            manager.register_view(
+                "CREATE VIEW vb AS SELECT g, COUNT(*) AS c FROM t GROUP BY g;", ignore_limitations=True
+            )
+            self.assertEqual(self._rows(conn, "SELECT * FROM vb ORDER BY g"),
+                             self._rows(conn, "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g"))
+            self.assertEqual(self._rows(conn, "SELECT * FROM va ORDER BY g"),
+                             self._rows(conn, "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g"))
+        finally:
+            conn.close()
+
+    def test_global_aggregate_interrupted_then_base_emptied(self) -> None:
+        # B4: no resume path exists, so the former UNIQUE(__mv_global_id)
+        # failure cannot occur; the re-run is refused and a rebuild is exact.
+        for emptied in (True, False):
+            with self.subTest(emptied=emptied):
+                conn, manager, plan = self._setup(V_GLOBAL)
+                try:
+                    self._interrupt(manager, plan)
+                    conn.execute("DELETE FROM t" if emptied else "DELETE FROM t WHERE id <= 12")
+                    conn.commit()
+                    with self.assertRaises(BackfillInterruptedError):
+                        manager.backfill_incrementally(plan, batch_size=5)
+                    self.assertEqual(self._wm(manager, "v"), (10, 20, 1))
+                    manager.register_view(V_GLOBAL, force_rebuild=True, ignore_limitations=True)
+                    self._assert_matches_native(conn, V_GLOBAL)
+                finally:
+                    conn.close()
+
+    def test_second_concurrent_backfill_from_independent_connection_is_refused(self) -> None:
+        # B5: a second session sees the live watermark and must refuse, not
+        # treat it as interrupted and re-fold or reset it.
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        conn, manager, plan = self._setup(path=path)
+        conn2 = sqlite3.connect(path, timeout=5)
+        try:
+            manager2 = MaterializedViewManager(conn2, dialect=Dialect.SQLITE)
+            plan2 = manager2.register_view(V_GROUPED, populate=False, ignore_limitations=True)
+            outcomes = []
+
+            def progress(batch: int, _d: int) -> None:
+                if batch == 1:
+                    with self.assertRaises(BackfillInterruptedError) as ctx:
+                        manager2.backfill_incrementally(plan2, batch_size=5)
+                    outcomes.append(str(ctx.exception))
+                    self.assertEqual(self._wm(manager2, "v"), (5, 20, 1))
+
+            manager.backfill_incrementally(plan, batch_size=5, on_progress=progress)
+            self.assertEqual(len(outcomes), 1)
+            self.assertIn("in progress in another session", outcomes[0])
+            self._assert_matches_native(conn, V_GROUPED)
+            self.assertEqual(self._wm(manager, "v"), (20, 20, 0))
+        finally:
+            conn2.close()
+            conn.close()
+            os.unlink(path)
+
+    def test_claim_is_atomic_between_sessions_that_both_saw_it_unclaimed(self) -> None:
+        # B5 race: both sessions pass the pre-check before either claims; the
+        # conditional claim lets exactly one of them proceed.
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        conn, manager, plan = self._setup(path=path)
+        conn2 = sqlite3.connect(path, timeout=5)
+        try:
+            manager2 = MaterializedViewManager(conn2, dialect=Dialect.SQLITE)
+            plan2 = manager2.register_view(V_GROUPED, populate=False, ignore_limitations=True)
+            original = manager._refuse_unless_backfill_unclaimed
+            raced = []
+
+            def precheck_then_let_other_claim(entry, name):
+                original(entry, name)  # passes: unclaimed
+                if not raced:
+                    raced.append(1)
+                    manager2.backfill_incrementally(plan2, batch_size=5)  # claims + completes
+
+            manager._refuse_unless_backfill_unclaimed = precheck_then_let_other_claim
+            with self.assertRaises(BackfillInterruptedError) as ctx:
+                manager.backfill_incrementally(plan, batch_size=5)
+            self.assertIn("claimed", str(ctx.exception))
+            self._assert_matches_native(conn, V_GROUPED)
+            self.assertEqual(self._wm(manager, "v"), (20, 20, 0))
+        finally:
+            conn2.close()
+            conn.close()
+            os.unlink(path)
+
+    def test_failure_before_claim_never_resets_a_watermark_claimed_by_another_session(self) -> None:
+        # A call that fails after its pre-check but before claiming owns no
+        # watermark. Its best-effort reset must not clear the watermark another
+        # session claimed in between (here: interrupted after one committed
+        # chunk); clearing it would re-enable triggers for the unfolded range
+        # and let a later backfill re-fold the committed prefix.
+        for snap in (False, True):
+            with self.subTest(snapshot_isolation=snap):
+                fd, path = tempfile.mkstemp(suffix=".db")
+                os.close(fd)
+                setup = sqlite3.connect(path)
+                setup.execute("PRAGMA journal_mode=WAL")  # readers never block the other writer
+                setup.close()
+                conn, manager, plan = self._setup(path=path)
+                conn2 = sqlite3.connect(path, timeout=5)
+                try:
+                    manager2 = MaterializedViewManager(conn2, dialect=Dialect.SQLITE)
+                    plan2 = manager2.register_view(V_GROUPED, populate=False, ignore_limitations=True)
+                    original = manager._refuse_unless_backfill_unclaimed
+
+                    class Injected(Exception):
+                        pass
+
+                    def precheck_then_other_claims_then_fail(entry, name):
+                        original(entry, name)  # passes: unclaimed
+                        self._interrupt(manager2, plan2)  # claims, commits one chunk, stops
+                        raise Injected("failure after the pre-check, before this call claims")
+
+                    manager._refuse_unless_backfill_unclaimed = precheck_then_other_claims_then_fail
+                    with self.assertRaises(Injected):
+                        manager.backfill_incrementally(plan, batch_size=5, snapshot_isolation=snap)
+                    self.assertEqual(self._wm(manager2, "v"), (10, 20, 1))
+                    with self.assertRaises(BackfillInterruptedError):
+                        manager2.backfill_incrementally(plan2, batch_size=5)
+                    self.assertEqual(self._wm(manager2, "v"), (10, 20, 1))
+                    manager2.register_view(V_GROUPED, force_rebuild=True, ignore_limitations=True)
+                    self._assert_matches_native(conn, V_GROUPED)
+                finally:
+                    conn2.close()
+                    conn.close()
+                    for suffix in ("", "-wal", "-shm"):
+                        if os.path.exists(path + suffix):
+                            os.unlink(path + suffix)
+
+    def test_native_failure_before_claim_never_resets_another_sessions_watermark(self) -> None:
+        """Native, both isolation modes: a call that fails after its pre-check
+        but before claiming must leave the watermark another session claimed
+        in between (interrupted after one chunk) exactly as it was."""
+        engines = []
+        if os.environ.get("POSTGRES_DSN"):
+            engines.append((Dialect.POSTGRES, os.environ["POSTGRES_DSN"]))
+        if os.environ.get("MYSQL_DSN"):
+            engines.append((Dialect.MYSQL, os.environ["MYSQL_DSN"]))
+        if not engines:
+            self.skipTest("POSTGRES_DSN / MYSQL_DSN not set; native engine test only")
+        for engine, dsn in engines:
+            for snap in (False, True):
+                with self.subTest(engine=engine.value, snapshot_isolation=snap):
+                    self._run_native_failure_before_claim(engine, dsn, snap)
+
+    def _run_native_failure_before_claim(self, engine: Dialect, dsn: str, snap: bool) -> None:
+        connect = IndependentSessionBackfillTests._connect_native
+        suffix = uuid.uuid4().hex[:10]
+        schema, table, view = f"mv_noreset_{suffix}", f"noreset_{suffix}", f"noreset_v_{suffix}"
+        conn = connect(engine, dsn)
+        cur = conn.cursor()
+        managers, plans, sessions = [], [], []
+        try:
+            if engine == Dialect.POSTGRES:
+                cur.execute(f'CREATE SCHEMA "{schema}"')
+                cur.execute(f'SET search_path TO "{schema}"')
+            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany(f"INSERT INTO {table} VALUES (%s, %s, %s)", [(i, f"G{i % 3}", i) for i in range(1, 21)])
+            conn.commit()
+            view_sql = f"CREATE VIEW {view} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM {table} GROUP BY g;"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                for _ in range(2):
+                    s = connect(engine, dsn)
+                    if engine == Dialect.POSTGRES:
+                        s.cursor().execute(f'SET search_path TO "{schema}"')
+                        s.commit()
+                    sessions.append(s)
+                    m = MaterializedViewManager(s, dialect=engine)
+                    managers.append(m)
+                    plans.append(m.register_view(view_sql, populate=False, ignore_limitations=True))
+            original = managers[0]._refuse_unless_backfill_unclaimed
+
+            class Injected(Exception):
+                pass
+
+            def precheck_then_other_claims_then_fail(entry, name):
+                original(entry, name)  # passes: unclaimed
+                self._interrupt(managers[1], plans[1])  # other session: claims, one chunk, stops
+                raise Injected("failure after the pre-check, before this call claims")
+
+            managers[0]._refuse_unless_backfill_unclaimed = precheck_then_other_claims_then_fail
+            with self.assertRaises(Injected):
+                managers[0].backfill_incrementally(plans[0], batch_size=5, snapshot_isolation=snap)
+            self.assertEqual(self._wm(managers[1], view), (10, 20, 1))
+            with self.assertRaises(BackfillInterruptedError):
+                managers[1].backfill_incrementally(plans[1], batch_size=5)
+            self.assertEqual(self._wm(managers[1], view), (10, 20, 1))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                managers[1].register_view(view_sql, force_rebuild=True, ignore_limitations=True)
+            sessions[1].commit()
+            conn.commit()
+            cur.execute(f"SELECT g, c, s FROM {view} ORDER BY g")
+            actual = [tuple(r) for r in cur.fetchall()]
+            cur.execute(f"SELECT g, COUNT(*), SUM(amt) FROM {table} GROUP BY g ORDER BY g")
+            self.assertEqual(actual, [tuple(r) for r in cur.fetchall()])
+            conn.commit()
+        finally:
+            for s in sessions:
+                try:
+                    s.rollback()
+                    s.close()
+                except Exception:
+                    pass
+            IndependentSessionBackfillTests._cleanup_native_fixture(
+                conn, engine, schema, table,
+                MaterializedViewManager(conn, dialect=engine) if plans else None,
+                plans[0] if plans else None,
+            )
+
+    def test_native_concurrent_backfills_exactly_one_claims(self) -> None:
+        """Independent native sessions start a backfill of the same view at
+        once (synchronized by a barrier); exactly one may fold, the other is
+        refused, and the result equals the original view."""
+        engines = []
+        if os.environ.get("POSTGRES_DSN"):
+            engines.append((Dialect.POSTGRES, os.environ["POSTGRES_DSN"]))
+        if os.environ.get("MYSQL_DSN"):
+            engines.append((Dialect.MYSQL, os.environ["MYSQL_DSN"]))
+        if not engines:
+            self.skipTest("POSTGRES_DSN / MYSQL_DSN not set; native engine test only")
+        for engine, dsn in engines:
+            with self.subTest(engine=engine.value):
+                self._run_native_concurrent_claim(engine, dsn)
+
+    def _run_native_concurrent_claim(self, engine: Dialect, dsn: str) -> None:
+        connect = IndependentSessionBackfillTests._connect_native
+        suffix = uuid.uuid4().hex[:10]
+        schema, table, view = f"mv_claim_{suffix}", f"claim_{suffix}", f"claim_v_{suffix}"
+        conn = connect(engine, dsn)
+        cur = conn.cursor()
+        managers, plans = [], []
+        sessions = []
+        try:
+            if engine == Dialect.POSTGRES:
+                cur.execute(f'CREATE SCHEMA "{schema}"')
+                cur.execute(f'SET search_path TO "{schema}"')
+            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany(f"INSERT INTO {table} VALUES (%s, %s, %s)", [(i, f"G{i % 3}", i) for i in range(1, 41)])
+            conn.commit()
+            view_sql = f"CREATE VIEW {view} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM {table} GROUP BY g;"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                for _ in range(2):
+                    s = connect(engine, dsn)
+                    if engine == Dialect.POSTGRES:
+                        s.cursor().execute(f'SET search_path TO "{schema}"')
+                        s.commit()
+                    sessions.append(s)
+                    m = MaterializedViewManager(s, dialect=engine)
+                    managers.append(m)
+                    plans.append(m.register_view(view_sql, populate=False, ignore_limitations=True))
+            barrier = threading.Barrier(2)
+            results: list = [None, None]
+
+            def run(i: int) -> None:
+                try:
+                    barrier.wait(timeout=20)
+                    results[i] = managers[i].backfill_incrementally(plans[i], batch_size=4)
+                except BaseException as exc:  # inspected below
+                    results[i] = exc
+
+            threads = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(2)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=60)
+            self.assertFalse(any(th.is_alive() for th in threads))
+            refused = [r for r in results if isinstance(r, BackfillInterruptedError)]
+            folded = [r for r in results if isinstance(r, int)]
+            self.assertEqual((len(folded), len(refused)), (1, 1), repr(results))
+            cur.execute(f"SELECT g, c, s FROM {view} ORDER BY g")
+            actual = [tuple(r) for r in cur.fetchall()]
+            cur.execute(f"SELECT g, COUNT(*), SUM(amt) FROM {table} GROUP BY g ORDER BY g")
+            self.assertEqual(actual, [tuple(r) for r in cur.fetchall()])
+            conn.commit()
+        finally:
+            for s in sessions:
+                try:
+                    s.rollback()
+                    s.close()
+                except Exception:
+                    pass
+            IndependentSessionBackfillTests._cleanup_native_fixture(
+                conn, engine, schema, table,
+                MaterializedViewManager(conn, dialect=engine) if plans else None,
+                plans[0] if plans else None,
+            )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -25,6 +25,7 @@ import threading
 import unittest
 
 from matview_sync import (
+    BackfillInterruptedError,
     Dialect,
     MaterializedViewManager,
     UnsupportedMaterializedViewError,
@@ -95,8 +96,15 @@ class BackfillWatermarkSafetyTests(unittest.TestCase):
         self.assertIsNone(catalog["backfill_cursor_pk"])
         self.assertIsNone(catalog["backfill_max_pk"])
 
-    def test_watermark_update_failure_propagates_and_resets_under_non_snapshot(self) -> None:
-        """Catalog update failure under non-snapshot backfill must propagate and reset backfill_active to 0."""
+    def test_watermark_update_failure_propagates_and_keeps_watermark_under_non_snapshot(self) -> None:
+        """Catalog update failure under non-snapshot backfill must propagate and fail closed.
+
+        The active watermark was already committed, so triggers have been
+        excluding the unfolded range. Resetting it to inactive would let a
+        re-run double-count committed chunks and let triggers apply deltas for
+        never-folded rows. It stays active, a re-run is refused, and an
+        explicit rebuild restores exact equivalence with the original view.
+        """
         self.conn.execute(
             "CREATE TABLE t_src2 (id INTEGER PRIMARY KEY, category TEXT, val INTEGER);"
         )
@@ -129,9 +137,32 @@ class BackfillWatermarkSafetyTests(unittest.TestCase):
 
         self.assertFalse(self.conn.in_transaction, "transaction was left unclosed after error")
 
-        # Must fail closed: best-effort reset must clear backfill_active so triggers do not filter writes
+        # Fail closed: batch (3, 6] was rolled back; the committed watermark
+        # after batch (0, 3] stays active.
         catalog = manager.get_catalog()[plan.view_name]
-        self.assertEqual(catalog["backfill_active"], 0, "backfill_active was not reset to 0")
+        self.assertEqual(
+            (catalog["backfill_active"], catalog["backfill_cursor_pk"], catalog["backfill_max_pk"]),
+            (1, 3, 10),
+        )
+        manager._update_backfill_watermark = original_update
+        self.conn.execute("DELETE FROM t_src2 WHERE id IN (1, 7);")
+        self.conn.execute("INSERT INTO t_src2 VALUES (20, 'c0', 5);")
+        self.conn.commit()
+        # A re-run is refused without touching the watermark.
+        with self.assertRaises(BackfillInterruptedError):
+            manager.backfill_incrementally(plan, batch_size=3, snapshot_isolation=False)
+        self.assertEqual(manager.get_catalog()[plan.view_name]["backfill_active"], 1)
+        # Explicit rebuild repairs the view.
+        plan = manager.register_view(
+            "CREATE VIEW v_totals2 AS SELECT category, COUNT(*) AS c, SUM(val) AS s FROM t_src2 GROUP BY category;",
+            force_rebuild=True,
+        )
+        self.assertEqual(
+            self.conn.execute(f"SELECT category, c, s FROM {plan.view_name} ORDER BY category;").fetchall(),
+            self.conn.execute(
+                "SELECT category, COUNT(*), SUM(val) FROM t_src2 GROUP BY category ORDER BY category;"
+            ).fetchall(),
+        )
 
     # -------------------------------------------------------------------------
     # Finding #3: Trigger Coverage & Explicit Safety Checks for Non-Snapshot Backfill

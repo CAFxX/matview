@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import warnings
 
 from matview_sync import (
+    BackfillInterruptedError,
     DEFAULT_OBJECT_PREFIX,
     AggFunc,
     Dialect,
@@ -5311,8 +5312,22 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         raw_wm_rows = conn_wm.execute("SELECT bucket, COUNT(*) AS c, SUM(amt) AS s FROM ledger GROUP BY bucket ORDER BY bucket;").fetchall()
         self.assertEqual(mv_wm_rows, raw_wm_rows)
 
-        # Also verify snapshot_isolation=True on backfill_incrementally across dialects
+        # A completed pk-range backfill must not be re-run (re-folding would
+        # double-count): it is refused before touching anything.
+        with self.assertRaises(BackfillInterruptedError):
+            mgr_wm.backfill_incrementally(plan_wm, batch_size=4, snapshot_isolation=True)
+        self.assertEqual(
+            conn_wm.execute("SELECT bucket, c, s FROM ledger_totals ORDER BY bucket;").fetchall(),
+            raw_wm_rows,
+        )
+
+        # Also verify snapshot_isolation=True on backfill_incrementally across
+        # dialects, after an explicit manual repair (empty store + reset watermark).
         conn_wm.execute("DELETE FROM __matview_store_ledger_totals;")
+        conn_wm.execute(
+            "UPDATE __matview_catalog SET backfill_cursor_pk = NULL, backfill_max_pk = NULL, "
+            "backfill_active = 0 WHERE view_name = 'ledger_totals';"
+        )
         batches_snap = mgr_wm.backfill_incrementally(plan_wm, batch_size=4, snapshot_isolation=True)
         self.assertGreaterEqual(batches_snap, 2)
         self.assertEqual(

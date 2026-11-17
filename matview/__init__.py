@@ -48,6 +48,7 @@ from .logical_ir import (
     ViewSpec,
 )
 from .manager import (
+    BackfillInterruptedError,
     MaterializedViewManager,
     generate_materialized_view,
     generate_materialized_views,
@@ -92,6 +93,7 @@ __all__ = [
     "EngineLimitationWarning",
     "StrictCompilationError",
     "UnsupportedMaterializedViewError",
+    "BackfillInterruptedError",
     "ColumnDef",
     "TableIndexDef",
     "TableSchema",
