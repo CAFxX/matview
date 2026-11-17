@@ -1980,7 +1980,8 @@ class BackfillTakeoverOwnershipTests(unittest.TestCase):
 
 class CatalogUpgradeTests(unittest.TestCase):
     """Catalogs created by older versions (no backfill_owner column; active
-    watermarks written without an ownership token)."""
+    watermarks written without an ownership token) and catalog setup on
+    every manager construction."""
 
     LEGACY_CATALOG_DDL = (
         "CREATE TABLE {cat} (view_name VARCHAR(255) NOT NULL PRIMARY KEY, view_sql TEXT NOT NULL, "
@@ -2106,6 +2107,44 @@ class CatalogUpgradeTests(unittest.TestCase):
                     admin.commit()
                 finally:
                     cleanup(manager, view)
+
+    def test_manager_construction_does_not_wait_for_open_transactions_on_the_catalog(self) -> None:
+        # On PostgreSQL an ALTER TABLE takes ACCESS EXCLUSIVE even when the
+        # column already exists, so constructing a manager queued behind any
+        # open transaction that read the catalog (every writer trigger does)
+        # and then blocked all other writers. With an up-to-date catalog
+        # construction must not need a conflicting lock.
+        engines = [e for e in self._engines() if e[0] != "sqlite"]
+        if not engines:
+            self.skipTest("POSTGRES_DSN / MYSQL_DSN not set; native engine test only")
+        for engine, dsn in engines:
+            with self.subTest(engine=engine.value):
+                connect, admin, dialect, ph, prefix, table, view, cleanup = self._fixture(engine, dsn)
+                try:
+                    MaterializedViewManager(connect(), dialect=dialect, object_prefix=prefix)
+                    holder = connect()
+                    hcur = holder.cursor()
+                    hcur.execute(f"SELECT COUNT(*) FROM {prefix}catalog")
+                    hcur.fetchall()  # transaction stays open, holding its shared lock
+                    done: list = []
+
+                    def construct() -> None:
+                        try:
+                            MaterializedViewManager(connect(), dialect=dialect, object_prefix=prefix)
+                            done.append("ok")
+                        except BaseException as exc:  # inspected below
+                            done.append(exc)
+
+                    th = threading.Thread(target=construct, daemon=True)
+                    th.start()
+                    th.join(timeout=10)
+                    blocked = th.is_alive()
+                    holder.rollback()
+                    th.join(timeout=60)
+                    self.assertFalse(blocked, "manager construction waited for an open transaction on the catalog")
+                    self.assertEqual(done, ["ok"])
+                finally:
+                    cleanup()
 
 
 class _HookedTemplates(list):
