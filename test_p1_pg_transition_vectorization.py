@@ -596,8 +596,9 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
             amount NUMERIC(12, 2)
         );
         """
-        # NUMERIC AVG keeps native recomputation (integer AVG is derived from
-        # SUM/COUNT and needs no correlated recompute; see the test below).
+        # NUMERIC AVG keeps native recomputation. Integer AVG is derived from
+        # SUM/COUNT and needs no correlated recompute; that path is covered by
+        # test_integer_avg_with_expression_group_key_is_vectorized_and_derived.
         view_sql = """
         CREATE VIEW pgtr_expr_avg AS
         SELECT COALESCE(region, 'UNK') AS reg_norm,
@@ -643,6 +644,69 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
         self.cur.execute("UPDATE orders SET amount = amount + 5 WHERE region = 'NA';")
         assert_matches_live_view()
         self.cur.execute("DELETE FROM orders WHERE id = 3;")
+        assert_matches_live_view()
+
+    def test_integer_avg_with_expression_group_key_is_vectorized_and_derived(self) -> None:
+        """Integer AVG with an expression GROUP BY on the transition-table path.
+
+        PostgreSQL AVG(int) is numeric_div(sum::numeric, count::numeric), so it
+        is derived from the SUM/COUNT folded in the same statement: no
+        correlated base-table recompute (which would force the row loop for an
+        expression group key) and no pre-lock snapshot read. Execution here is
+        the SQLite transpilation adapter, not native PostgreSQL; native value
+        and scale equality is covered by test_avg_concurrent_maintenance.py.
+        """
+        schema_sql = """
+        CREATE TABLE orders_i (
+            id INT PRIMARY KEY,
+            region TEXT,
+            amount INT
+        );
+        """
+        view_sql = """
+        CREATE VIEW pgtr_expr_avg_int AS
+        SELECT COALESCE(region, 'UNK') AS reg_norm,
+               COUNT(*) AS cnt,
+               AVG(amount) AS a_amt
+        FROM orders_i
+        GROUP BY COALESCE(region, 'UNK');
+        """
+        self._execute_script(schema_sql)
+        plan = generate_materialized_view(
+            schema_sql,
+            view_sql,
+            dialect=Dialect.POSTGRES,
+            pg_use_transition_tables=True,
+            pg_vectorize_transition_tables=True,
+        )
+        fn_sql = "\n".join(
+            statement for statement in plan.trigger_ddls
+            if "CREATE OR REPLACE FUNCTION" in statement
+        )
+        self.assertNotIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", fn_sql)
+        self.assertNotIn("FOR OLD IN SELECT * FROM __mv_old_rows LOOP", fn_sql)
+        self.assertNotRegex(fn_sql, r"\(SELECT AVG\(")
+        self.assertIn(")::NUMERIC / (", fn_sql)
+
+        for ddl in plan.create_structure_statements() + plan.trigger_ddls:
+            self.cur.execute(ddl)
+
+        def assert_matches_live_view() -> None:
+            self.cur.execute("SELECT reg_norm, cnt, a_amt FROM pgtr_expr_avg_int ORDER BY reg_norm;")
+            actual = self.cur.fetchall()
+            self.cur.execute(
+                "SELECT COALESCE(region, 'UNK') AS reg_norm, COUNT(*), AVG(amount) "
+                "FROM orders_i GROUP BY COALESCE(region, 'UNK') ORDER BY reg_norm;"
+            )
+            self.assertEqual(actual, self.cur.fetchall())
+
+        self.cur.execute(
+            "INSERT INTO orders_i VALUES (1, 'NA', 10), (2, 'NA', 25), (3, NULL, 30), (4, NULL, NULL);"
+        )
+        assert_matches_live_view()
+        self.cur.execute("UPDATE orders_i SET amount = amount + 5, region = NULL WHERE id = 2;")
+        assert_matches_live_view()
+        self.cur.execute("DELETE FROM orders_i WHERE id IN (1, 3);")
         assert_matches_live_view()
 
     def test_count_star_alias_not_duplicated_in_vectorized_dml(self) -> None:
