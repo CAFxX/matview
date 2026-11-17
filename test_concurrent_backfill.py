@@ -191,31 +191,66 @@ class IndependentSessionBackfillTests(unittest.TestCase):
 
     def test_pk_range_batch_retries_transient_victim_exactly_once_per_fold(self) -> None:
         conn, manager, plan, remaining = self._pk_range_fault_fixture({4: 2, 12: 0})
+        sleeps: list[float] = []
+        manager._backfill_sleep = sleeps.append
         try:
             batches = manager.backfill_incrementally(plan, batch_size=4)
             self.assertEqual(batches, 3)
             self.assertEqual(remaining[4], 0, "injected victims were not exercised")
+            self.assertEqual(len(sleeps), 2, "each retry must be preceded by a backoff")
             self._assert_equivalent(conn, plan)
             self.assertEqual(manager.get_catalog()[plan.view_name]["backfill_active"], 0)
         finally:
             conn.close()
 
+    class _FixedRng:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+        def random(self) -> float:
+            return self.value
+
     def test_pk_range_batch_retry_is_bounded(self) -> None:
         limit = MaterializedViewManager._BACKFILL_TRANSIENT_RETRIES
         conn, manager, plan, remaining = self._pk_range_fault_fixture({4: limit + 1})
+        sleeps: list[float] = []
+        manager._backfill_sleep = sleeps.append
+        manager._backfill_rng = self._FixedRng(1.0)
         try:
             with self.assertRaises(sqlite3.OperationalError):
                 manager.backfill_incrementally(plan, batch_size=4)
             self.assertEqual(remaining[4], 0)
+            # Exactly one backoff between consecutive attempts, exponential and
+            # capped (RNG pinned to the top of the jitter interval).
+            base = MaterializedViewManager._BACKFILL_RETRY_BASE_DELAY_S
+            cap = MaterializedViewManager._BACKFILL_RETRY_MAX_DELAY_S
+            self.assertEqual(sleeps, [min(cap, base * 2 ** i) for i in range(limit)])
         finally:
             conn.close()
+
+    def test_backoff_delay_is_jittered_within_bounds(self) -> None:
+        manager = MaterializedViewManager(sqlite3.connect(":memory:"))
+        base = MaterializedViewManager._BACKFILL_RETRY_BASE_DELAY_S
+        cap = MaterializedViewManager._BACKFILL_RETRY_MAX_DELAY_S
+        try:
+            for attempt in range(1, 12):
+                ceiling = min(cap, base * 2 ** (attempt - 1))
+                manager._backfill_rng = self._FixedRng(0.0)
+                self.assertEqual(manager._backfill_retry_delay(attempt), ceiling / 2)
+                manager._backfill_rng = self._FixedRng(0.5)
+                self.assertEqual(manager._backfill_retry_delay(attempt), ceiling * 0.75)
+        finally:
+            manager.conn.close()
 
     def test_pk_range_batch_non_transient_error_is_not_retried(self) -> None:
         conn, manager, plan, remaining = self._pk_range_fault_fixture({4: 1})
         manager._is_transient_lock_error = lambda exc: False
+        sleeps: list[float] = []
+        manager._backfill_sleep = sleeps.append
         try:
             with self.assertRaises(sqlite3.OperationalError):
                 manager.backfill_incrementally(plan, batch_size=4)
+            self.assertEqual(sleeps, [])
         finally:
             conn.close()
 

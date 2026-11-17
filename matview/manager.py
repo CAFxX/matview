@@ -6,8 +6,10 @@ from contextlib import contextmanager
 from dataclasses import replace
 import hashlib
 import json
+import random
 import re
 import sqlite3
+import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
@@ -551,6 +553,23 @@ class MaterializedViewManager:
     # Bounded retries for a non-snapshot pk-range batch chosen as a deadlock /
     # serialization victim by the engine while independent writers run.
     _BACKFILL_TRANSIENT_RETRIES = 8
+    # Bounded exponential backoff with jitter between those retries. Retrying
+    # immediately re-collides with the same still-running writer transactions;
+    # waiting lets them commit or be replayed. Sleep and RNG are injectable
+    # (instance attributes) so tests are fast and exact.
+    _BACKFILL_RETRY_BASE_DELAY_S = 0.02
+    _BACKFILL_RETRY_MAX_DELAY_S = 1.0
+    _backfill_sleep = staticmethod(time.sleep)
+    _backfill_rng: Any = random.Random()
+
+    def _backfill_retry_delay(self, attempt: int) -> float:
+        """Delay before retry number `attempt` (1-based): jitter in [d/2, d],
+        d = min(max, base * 2**(attempt-1))."""
+        ceiling = min(
+            self._BACKFILL_RETRY_MAX_DELAY_S,
+            self._BACKFILL_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
+        )
+        return ceiling * (0.5 + 0.5 * self._backfill_rng.random())
 
     def _is_transient_lock_error(self, exc: BaseException) -> bool:
         """True only for engine-reported deadlock/serialization/lock-wait victims."""
@@ -682,6 +701,7 @@ class MaterializedViewManager:
                             raise
                         attempt += 1
                         self._rollback()
+                        self._backfill_sleep(self._backfill_retry_delay(attempt))
                 batches_run += 1
                 cursor_pk = upper_pk
                 if on_progress:
