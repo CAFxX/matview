@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sqlite3
 import unittest
@@ -15,6 +16,13 @@ import matview_sync as ms
 def _engine_url_for_dialect(dsn: str, dialect: ms.Dialect):
     """Choose an installed DB-API driver when a DSN leaves it implicit."""
     url = sa.engine.make_url(dsn)
+    if dialect == ms.Dialect.POSTGRES and url.drivername in {"postgres", "postgresql"}:
+        # SQLAlchemy 2.1 defaults bare PostgreSQL URLs to psycopg (v3), but
+        # requirements.txt installs psycopg2-binary instead.
+        if importlib.util.find_spec("psycopg2") is not None:
+            return url.set(drivername="postgresql+psycopg2")
+        if importlib.util.find_spec("psycopg") is not None:
+            return url.set(drivername="postgresql+psycopg")
     if dialect == ms.Dialect.MYSQL and url.drivername == "mysql":
         # requirements.txt installs PyMySQL, not mysqlclient/MySQLdb.
         return url.set(drivername="mysql+pymysql")
@@ -170,6 +178,26 @@ class TestTier2WindowPartitionScoping(unittest.TestCase):
                 assert_equiv()
         finally:
             conn.close()
+
+    def test_postgres_dsn_selects_an_installed_driver(self) -> None:
+        if importlib.util.find_spec("psycopg2") is not None:
+            expected_driver = "psycopg2"
+        elif importlib.util.find_spec("psycopg") is not None:
+            expected_driver = "psycopg"
+        else:
+            self.skipTest("No PostgreSQL DB-API driver is installed")
+
+        eng = sa.create_engine(
+            _engine_url_for_dialect(
+                "postgresql://user:password@localhost/matview_test",
+                ms.Dialect.POSTGRES,
+            )
+        )
+        try:
+            self.assertEqual(eng.dialect.name, "postgresql")
+            self.assertEqual(eng.dialect.driver, expected_driver)
+        finally:
+            eng.dispose()
 
     def test_mysql_dsn_selects_the_installed_pymysql_driver(self) -> None:
         # SQLAlchemy's bare mysql:// default is mysqlclient (MySQLdb), which is
