@@ -651,6 +651,40 @@ class TestUntypedColumns(ExactAssertions):
                     self.assertViewExact(conn, "v", view, f"{name} step {i}: {sql}")
 
 
+class TestStorageClassOnlyUpdates(ExactAssertions):
+    """In a column without affinity, UPDATE can change INTEGER 3 into REAL 3.0
+    (or back) without changing the value: 3 IS 3.0 is true in SQLite. The
+    UPDATE trigger guard skipped such rows, so SUM kept REAL 3.0 where the
+    original view returns INTEGER 3 (found by the randomized differential:
+    UPSERT ... SET x = excluded.x * 2, then UPDATE ... SET x = CAST(x AS
+    INTEGER))."""
+
+    def test_integer_real_round_trip(self) -> None:
+        views = (
+            "SELECT g, COUNT(*) AS n, SUM(x) AS s, TOTAL(x) AS tt, AVG(x) AS a FROM t GROUP BY g",
+            "SELECT SUM(x - h) AS s, SUM(DISTINCT x) AS sd, TOTAL(DISTINCT x) AS td FROM t",
+        )
+        steps = [
+            "INSERT INTO t VALUES (1, 'k1', 'a', 1, 1.5)",
+            "INSERT INTO t VALUES (2, 'k1', 'a', 1, 1.5) ON CONFLICT(k) DO UPDATE SET x = excluded.x * 2",
+            "UPDATE t SET x = CAST(x AS INTEGER)",
+            "UPDATE t SET x = 3.0",
+            "INSERT INTO t VALUES (3, 'k3', 'a', 0, 4)",
+            "UPDATE t SET x = x * 1.0 WHERE id = 3",
+            "UPDATE t SET x = CAST(x AS INTEGER) WHERE id = 3",
+        ]
+        for typ in ("BLOB", ""):
+            for view in views:
+                with self.subTest(typ=typ, view=view):
+                    schema = f"CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE, g TEXT, h INTEGER NOT NULL DEFAULT 0, x {typ});"
+                    conn = sqlite3.connect(":memory:")
+                    conn.executescript(schema)
+                    _install(conn, "v", view, schema)
+                    for i, sql in enumerate(steps):
+                        conn.execute(sql)
+                        self.assertViewExact(conn, "v", view, f"{typ!r} step {i}: {sql}")
+
+
 class TestSqliteAffinityRules(unittest.TestCase):
     def test_affinity_rules_in_order(self) -> None:
         from matview.dialects.base import _sqlite_type_affinity
