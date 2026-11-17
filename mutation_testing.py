@@ -59,19 +59,22 @@ MUTANTS = (
             "test_filtered_projection_retracts_old_membership_on_update_and_delete"
         ),
     ),
+    # SQLite maintains SUM/TOTAL/AVG over joins by recomputing the affected
+    # group natively (exact storage-class semantics), so the retraction site
+    # exercised by the SQLite target test is the native recompute assignment.
+    # The PostgreSQL/MySQL delta fold (_delta_sum_minus) is not reachable from
+    # this SQLite-only runner; see TODO.md (mutation testing) for that gap.
     Mutant(
-        name="join-sum-retraction-adds-instead-of-subtracting",
+        name="sqlite-join-sum-retraction-keeps-stale-value",
         source_path="matview/maintenance/join.py",
-        original='f"ELSE {mv_table}.{qc} - __mv_delta.{qc} END)"',
-        replacement='f"ELSE {mv_table}.{qc} + __mv_delta.{qc} END)"',
+        original='minus_assignments.append(f"{c} = {_build_join_recompute_subquery(item)}")',
+        replacement='minus_assignments.append(f"{c} = {mv_table}.{c}")',
     ),
     Mutant(
-        name="join-sum-retraction-keeps-value-when-nonnull-count-reaches-zero",
+        name="sqlite-join-sum-retraction-coalesces-all-null-group-to-zero",
         source_path="matview/maintenance/join.py",
-        original='                f"(CASE WHEN __mv_delta.{qc} IS NULL THEN {mv_table}.{qc} "'
-        + '\n                f"WHEN {new_c} <= 0 THEN NULL "',
-        replacement='                f"(CASE WHEN __mv_delta.{qc} IS NULL THEN {mv_table}.{qc} "'
-        + '\n                f"WHEN {new_c} < 0 THEN NULL "',
+        original='minus_assignments.append(f"{c} = {_build_join_recompute_subquery(item)}")',
+        replacement='minus_assignments.append(f"{c} = COALESCE({_build_join_recompute_subquery(item)}, 0)")',
     ),
     Mutant(
         name="distinct-auxiliary-retraction-increments-reference-count",
