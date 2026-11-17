@@ -202,6 +202,9 @@ class TestTier2WindowPartitionScoping(unittest.TestCase):
                     # Change the primary-key tie-break/order expression without
                     # changing the partition or the row's other projected values.
                     "UPDATE p2_win_scores SET id = 7 WHERE id = 2",
+                    # Restore a tied score after the PK/order-key change; rank and
+                    # row-number semantics must still match the live query.
+                    "UPDATE p2_win_scores SET score = 20 WHERE id = 7",
                     # Change only the partition key, independently of ORDER BY.
                     "UPDATE p2_win_scores SET team = 'b' WHERE id = 1",
                     "DELETE FROM p2_win_scores WHERE id = 4",
