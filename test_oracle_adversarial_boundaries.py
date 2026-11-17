@@ -673,12 +673,14 @@ class LargeAggregatesAndCrossDialectPrecisionTests(unittest.TestCase):
         self.assertIn("SUM_REAL DOUBLE", mysql_plan.backing_table_ddl.upper())
         self.assertIn("AVG_REAL DOUBLE", mysql_plan.backing_table_ddl.upper())
 
-        # SQLite DDL uses affinities:
+        # SQLite DDL uses affinities. SUM over non-REAL inputs is stored
+        # without affinity (BLOB): its result is INTEGER or REAL depending on
+        # the stored values, and an affinity would convert one into the other.
         sqlite_plan = generate_materialized_view(schema, view, dialect="sqlite")
-        self.assertIn("sum_int INTEGER", sqlite_plan.backing_table_ddl)
-        self.assertIn("sum_big INTEGER", sqlite_plan.backing_table_ddl)
+        self.assertIn("sum_int BLOB", sqlite_plan.backing_table_ddl)
+        self.assertIn("sum_big BLOB", sqlite_plan.backing_table_ddl)
         self.assertIn("avg_big REAL", sqlite_plan.backing_table_ddl)
-        self.assertIn("sum_dec NUMERIC", sqlite_plan.backing_table_ddl)
+        self.assertIn("sum_dec BLOB", sqlite_plan.backing_table_ddl)
         self.assertIn("avg_dec REAL", sqlite_plan.backing_table_ddl)
         self.assertIn("sum_real REAL", sqlite_plan.backing_table_ddl)
         self.assertIn("avg_real REAL", sqlite_plan.backing_table_ddl)

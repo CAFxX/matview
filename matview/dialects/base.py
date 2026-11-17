@@ -180,6 +180,17 @@ class DialectBaseMixin:
         """Preserve the engine's native SUM result type for direct numeric columns."""
         source = self._lookup_source_col_def(item.arg_expr) if item.arg_expr else None
         source_type = source.data_type.strip().upper() if source else ""
+        if self.dialect == Dialect.SQLITE:
+            # SQLite SUM returns INTEGER when every input is an integer and REAL
+            # as soon as one input is not, whatever the declared column type
+            # (an INTEGER/NUMERIC column can store REAL values). A column with
+            # INTEGER/NUMERIC affinity would turn an integral REAL sum such as
+            # 10.0 into INTEGER 10, so only a REAL-affinity source (whose values
+            # are always REAL) keeps REAL; everything else is stored without
+            # affinity (declared BLOB), preserving the native storage class.
+            if source_type and any(t in source_type for t in ("FLOAT", "DOUBLE", "REAL")):
+                return "REAL"
+            return "BLOB"
         if not source_type:
             exact_type = self._exact_numeric_precision_scale(item.arg_expr or "")
             if exact_type is not None:
