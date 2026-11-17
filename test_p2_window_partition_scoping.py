@@ -12,6 +12,15 @@ import sqlalchemy as sa
 import matview_sync as ms
 
 
+def _engine_url_for_dialect(dsn: str, dialect: ms.Dialect):
+    """Choose an installed DB-API driver when a DSN leaves it implicit."""
+    url = sa.engine.make_url(dsn)
+    if dialect == ms.Dialect.MYSQL and url.drivername == "mysql":
+        # requirements.txt installs PyMySQL, not mysqlclient/MySQLdb.
+        return url.set(drivername="mysql+pymysql")
+    return url
+
+
 class TestTier2WindowPartitionScoping(unittest.TestCase):
     SCHEMA = """
     CREATE TABLE scores (
@@ -162,8 +171,23 @@ class TestTier2WindowPartitionScoping(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_mysql_dsn_selects_the_installed_pymysql_driver(self) -> None:
+        # SQLAlchemy's bare mysql:// default is mysqlclient (MySQLdb), which is
+        # intentionally absent from requirements.txt. The project installs PyMySQL.
+        eng = sa.create_engine(
+            _engine_url_for_dialect(
+                "mysql://user:password@localhost/matview_test",
+                ms.Dialect.MYSQL,
+            )
+        )
+        try:
+            self.assertEqual(eng.dialect.name, "mysql")
+            self.assertEqual(eng.dialect.driver, "pymysql")
+        finally:
+            eng.dispose()
+
     def _run_live_engine_window_roundtrip(self, dsn: str, dialect: ms.Dialect) -> None:
-        eng = sa.create_engine(dsn)
+        eng = sa.create_engine(_engine_url_for_dialect(dsn, dialect))
         view_sel = (
             "SELECT id, team, score, "
             "ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC, id ASC) AS rn, "
