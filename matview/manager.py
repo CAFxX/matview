@@ -55,6 +55,13 @@ from .sql_frontend import (
     quote_sql_identifier,
 )
 
+# Bump whenever generated maintenance SQL changes in a way that existing
+# installations must be rebuilt for (signature mismatch -> rebuild).
+# 2: SQLite exact SUM/TOTAL/AVG maintenance (native recompute of groups
+#    holding non-INTEGER values; join/UNION ALL native recompute).
+MATVIEW_GENERATOR_VERSION = "2"
+
+
 class MaterializedViewManager:
     """
     Setup/migration manager that connects to a database (SQLite connection/path or
@@ -335,6 +342,13 @@ class MaterializedViewManager:
 
     def _compute_signature(self, plan: MaterializedViewPlan, schemas: Dict[str, TableSchema]) -> str:
         h = hashlib.sha256()
+        # The generated maintenance shape is part of the signature: a view
+        # installed by an older generator (different backing columns, e.g. the
+        # SQLite exact-SUM bookkeeping columns, or a bumped generator version
+        # for trigger-only changes) is then rebuilt by register_view/sync_views
+        # and repair_view instead of being kept with stale triggers.
+        h.update(f"generator:{MATVIEW_GENERATOR_VERSION}".encode("utf-8"))
+        h.update(f"backing:{plan.backing_table_ddl}".encode("utf-8"))
         h.update(_strip_sql_comments(plan.view_spec.raw_select_sql).encode("utf-8"))
         h.update(f"prefix:{plan.object_prefix}".encode("utf-8"))
         for idx_ddl in plan.index_ddls:
