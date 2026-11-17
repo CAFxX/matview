@@ -1190,6 +1190,17 @@ class MaterializedViewManager:
             created_objects: List[Tuple[str, str]] = []
             catalog_inserted = False
             try:
+                if self.dialect == Dialect.SQLITE and getattr(self.conn, "in_transaction", None) is not True:
+                    # sqlite3 does not open a transaction for DDL, so without an
+                    # explicit reservation every CREATE commits on its own and an
+                    # independent writer can commit after the maintenance
+                    # triggers exist but before the initial population reads the
+                    # base tables: its row is then applied by the trigger and
+                    # again by the population. BEGIN IMMEDIATE takes the
+                    # database's single writer lock before the first DDL, so
+                    # installation, population and catalog record become one
+                    # writer-visible step.
+                    cur.execute("BEGIN IMMEDIATE;")
                 for stmt in plan.create_structure_statements():
                     obj = _extract_created_object(stmt)
                     cur.execute(stmt)
