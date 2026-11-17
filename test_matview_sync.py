@@ -5736,8 +5736,11 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("variance_approximate DOUBLE PRECISION", postgres.backing_table_ddl)
 
         sqlite = generate_materialized_view(schema, view, dialect="sqlite")
-        self.assertIn("sum_integer INTEGER", sqlite.backing_table_ddl)
-        self.assertIn("sum_decimal NUMERIC", sqlite.backing_table_ddl)
+        # SQLite SUM is INTEGER or REAL depending on the stored values, not on
+        # the declared column type: the backing column has no affinity (BLOB)
+        # so an integral REAL sum is not converted to INTEGER (or vice versa).
+        self.assertIn("sum_integer BLOB", sqlite.backing_table_ddl)
+        self.assertIn("sum_decimal BLOB", sqlite.backing_table_ddl)
         self.assertIn("avg_integer REAL", sqlite.backing_table_ddl)
         self.assertIn("avg_decimal REAL", sqlite.backing_table_ddl)
         self.assertIn("avg_approximate REAL", sqlite.backing_table_ddl)
