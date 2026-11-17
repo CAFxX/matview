@@ -196,7 +196,14 @@ class TestTier2WindowPartitionScoping(unittest.TestCase):
                 self.assertEqual(plan.strategy, ms.MaintenanceStrategy.GROUP_SCOPED_DELTA)
                 for stmt in (
                     "INSERT INTO p2_win_scores VALUES (5, 'a', 20), (6, NULL, 5)",
-                    "UPDATE p2_win_scores SET team = 'b', score = 99 WHERE id = 1",
+                    # Change only a window ORDER BY expression while keeping the
+                    # row in the same partition; every window result must converge.
+                    "UPDATE p2_win_scores SET score = 5 WHERE id = 2",
+                    # Change the primary-key tie-break/order expression without
+                    # changing the partition or the row's other projected values.
+                    "UPDATE p2_win_scores SET id = 7 WHERE id = 2",
+                    # Change only the partition key, independently of ORDER BY.
+                    "UPDATE p2_win_scores SET team = 'b' WHERE id = 1",
                     "DELETE FROM p2_win_scores WHERE id = 4",
                 ):
                     conn.exec_driver_sql(stmt)
