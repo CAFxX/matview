@@ -67,7 +67,8 @@ concurrency:
 
 on:
   push:
-    branches: ["main", "master"]
+    # Run the full required matrix on P0 and native-stack branch heads too.
+    branches: ["main", "master", "p0/**", "p1/**", "p2/**", "fix/**"]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
