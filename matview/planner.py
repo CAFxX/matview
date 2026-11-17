@@ -1595,10 +1595,27 @@ class PlannerMixin:
                 _record(t_n, j_cols, f"join_on_key ({j.join_type})")
 
         # 2. Group-by lookup columns for MIN/MAX/BIT_AND/BIT_OR delete recomputation and Tier 2 group-scoped refresh.
-        needs_base_group_scan = raw_plan.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA or any(
+        # SQLite SUM/TOTAL/AVG (any column can hold REAL values) and
+        # VAR/STDDEV are recomputed per affected group from the base table
+        # whenever a group holds a non-INTEGER value (always for join, UNION
+        # ALL and DISTINCT forms); without a group-key index each such write
+        # scans the whole base table.
+        sqlite_native_group_recompute = self.dialect == Dialect.SQLITE and any(
             it.is_aggregate
-            and it.agg_func in (AggFunc.MIN, AggFunc.MAX, AggFunc.BIT_AND, AggFunc.BIT_OR)
+            and it.agg_func in (
+                AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG,
+                AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+            )
             for it in self.view.select_items
+        )
+        needs_base_group_scan = (
+            raw_plan.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA
+            or sqlite_native_group_recompute
+            or any(
+                it.is_aggregate
+                and it.agg_func in (AggFunc.MIN, AggFunc.MAX, AggFunc.BIT_AND, AggFunc.BIT_OR)
+                for it in self.view.select_items
+            )
         )
         if needs_base_group_scan and self.view.group_by_cols and self.view.base_table:
             by_tbl: Dict[str, List[str]] = {}
@@ -1614,11 +1631,12 @@ class PlannerMixin:
                         lst = by_tbl.setdefault(t_n, [])
                         if c_n.lower() not in {x.lower() for x in lst}:
                             lst.append(c_n)
-            reason = (
-                "tier2_group_scoped_recompute"
-                if raw_plan.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA
-                else "holistic_minmax_delete_recompute"
-            )
+            if raw_plan.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA:
+                reason = "tier2_group_scoped_recompute"
+            elif sqlite_native_group_recompute:
+                reason = "sqlite_native_sum_avg_group_recompute"
+            else:
+                reason = "holistic_minmax_delete_recompute"
             for t_n, g_cols in by_tbl.items():
                 _record(t_n, g_cols, reason)
 
@@ -1787,8 +1805,36 @@ class PlannerMixin:
                 "existing_base_indexes_used": list(existing_base_indexes_used),
                 "recommended_base_indexes": list(recommended_base_indexes),
                 "base_index_recommendations": list(base_index_recommendations),
+                "performance_notes": self._performance_notes(),
             },
         )
+
+    def _performance_notes(self) -> List[str]:
+        """Documented maintenance cost classes that are not O(1) per write."""
+        notes: List[str] = []
+        if self.dialect != Dialect.SQLITE:
+            return notes
+        exact_sum_items = [
+            it for it in self.view.select_items
+            if it.is_aggregate and it.agg_func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG)
+        ]
+        if not exact_sum_items:
+            return notes
+        if self.view.joins and len(self.view.joins) > 1 or any(it.is_distinct for it in exact_sum_items) \
+                or self._alg_mode in ("union_all_agg", "join"):
+            notes.append(
+                "sqlite_sum_total_avg_native_recompute_always: join, UNION ALL and DISTINCT "
+                "SUM/TOTAL/AVG recompute each affected group from the base table(s) on every "
+                "write (O(group rows) with a group/join-key index, O(table) without)."
+            )
+        else:
+            notes.append(
+                "sqlite_sum_total_avg_native_recompute_on_real: a group holding any non-INTEGER "
+                "value (any value of a REAL-affinity column) is recomputed from the base table on "
+                "every write (O(group rows) with a group-key index, O(table) without); "
+                "integer-only groups keep the O(1) exact fold."
+            )
+        return notes
 
     def _finalize_plan_backfill(self, raw_plan: MaterializedViewPlan) -> MaterializedViewPlan:
         full_sqls = list(raw_plan.initial_populate_sqls)
