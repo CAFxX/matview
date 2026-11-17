@@ -828,5 +828,40 @@ class TestUpgradeFromPreviousGenerator(ExactAssertions):
         self._assert_drifted_then_synced(conn, mgr)
 
 
+class TestPerformanceSurface(unittest.TestCase):
+    def test_group_key_index_recommended_and_cost_documented(self) -> None:
+        from matview import generate_materialized_view, introspect_sqlite_schemas
+
+        conn = sqlite3.connect(":memory:")
+        conn.executescript("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT NOT NULL, x REAL);")
+        plan = generate_materialized_view(
+            introspect_sqlite_schemas(conn), "CREATE VIEW v AS SELECT g, SUM(x) AS s FROM t GROUP BY g;", dialect="sqlite"
+        )
+        self.assertIn("CREATE INDEX __matview_base_idx_t__g ON t (g);", plan.recommended_base_indexes)
+        notes = plan.diagnostics.details["performance_notes"]
+        self.assertTrue(any(n.startswith("sqlite_sum_total_avg_native_recompute_on_real") for n in notes), notes)
+
+    def test_integer_writes_issue_no_base_table_scan(self) -> None:
+        # Measured bound (SQLite 3.46.1, 100k rows, 2000 inserts): integer-only
+        # groups ~0.005 s total (O(1) fold); REAL groups of 10k rows ~4.9 s with
+        # a group-key index; 100-row REAL groups ~0.08 s with an index and
+        # ~7 s without one. Here: integer writes must not read the base table.
+        schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, x BIGINT);"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema)
+        conn.executemany("INSERT INTO t (g, x) VALUES (?, ?)", [(i % 10, i) for i in range(5000)])
+        _install(conn, "v", "SELECT g, SUM(x) AS s, AVG(x) AS a, TOTAL(x) AS tt FROM t GROUP BY g", schema)
+        steps_before = conn.execute("SELECT 1").fetchall()  # warm statement cache
+        del steps_before
+        vm_steps = []
+        conn.set_progress_handler(lambda: vm_steps.append(1) and 0, 1000)
+        for i in range(200):
+            conn.execute("INSERT INTO t (g, x) VALUES (?, ?)", (i % 10, i))
+        conn.set_progress_handler(None, 0)
+        # A single base-table scan of 5000 rows costs far more than 1000 VM
+        # steps; 200 O(1) folds stay well below one scan per write.
+        self.assertLess(len(vm_steps), 200, len(vm_steps))
+
+
 if __name__ == "__main__":
     unittest.main()

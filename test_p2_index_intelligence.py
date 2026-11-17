@@ -173,10 +173,18 @@ class TestRecommendedBaseIndexesAndAutoIndexes(unittest.TestCase):
         GROUP BY d.name;
         """
         plan_unindexed = ms.generate_materialized_view(base_schema, view_sql, dialect=ms.Dialect.SQLITE)
-        # depts.id is already PK (leveraged); emps.dept_id is unindexed (recommended)
-        self.assertEqual(len(plan_unindexed.recommended_base_indexes), 1)
-        self.assertIn("emps", plan_unindexed.recommended_base_indexes[0])
-        self.assertIn("dept_id", plan_unindexed.recommended_base_indexes[0])
+        # depts.id is already PK (leveraged); emps.dept_id is unindexed (join key,
+        # recommended). SQLite SUM over a join is recomputed per group from the
+        # base tables, so the group key depts.name is recommended as well.
+        recs = {r["index_name"]: r for r in plan_unindexed.diagnostics.details["base_index_recommendations"]}
+        self.assertEqual(
+            {(r["table"], tuple(r["columns"]), r["reason"]) for r in recs.values()},
+            {
+                ("emps", ("dept_id",), "join_on_key (INNER JOIN)"),
+                ("depts", ("name",), "sqlite_native_sum_avg_group_recompute"),
+            },
+        )
+        self.assertEqual(len(plan_unindexed.recommended_base_indexes), 2)
         used_tables = {u["table"] for u in plan_unindexed.diagnostics.details["existing_base_indexes_used"]}
         self.assertIn("depts", used_tables)
 
@@ -191,7 +199,7 @@ class TestRecommendedBaseIndexesAndAutoIndexes(unittest.TestCase):
             conn.close()
 
         # Recompiling with existing index eliminates recommendation and records leverage
-        indexed_schema = base_schema + "\nCREATE INDEX idx_emps_dept ON emps (dept_id);"
+        indexed_schema = base_schema + "\nCREATE INDEX idx_emps_dept ON emps (dept_id);\nCREATE INDEX idx_depts_name ON depts (name);"
         plan_indexed = ms.generate_materialized_view(indexed_schema, view_sql, dialect=ms.Dialect.SQLITE)
         self.assertEqual(plan_indexed.recommended_base_indexes, [])
         used_idx_names = {
