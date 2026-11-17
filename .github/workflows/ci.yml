@@ -67,7 +67,9 @@ concurrency:
 
 on:
   push:
-    branches: ["main", "master"]
+    # Keep exact-head CI available for every native stacked-PR layer, not
+    # only trunk pushes; merge_group below remains the queue gate.
+    branches: ["main", "master", "p0/**", "p1/**", "p2/**"]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
