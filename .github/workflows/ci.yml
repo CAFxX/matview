@@ -206,6 +206,9 @@ jobs:
       - name: Differentially test generated SELECT materialized views
         run: python3 test_query_ast_materialization.py
 
+      - name: Test schema graph counterexample shrinking
+        run: python3 -m unittest -v test_schema_graph_minimizer
+
       - name: Report test strength and honest coverage statistics
         run: python3 test_strength_reporting.py
 
