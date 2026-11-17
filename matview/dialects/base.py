@@ -41,6 +41,26 @@ from ..sql_frontend import (
 from .templates import render_procedural_sql
 
 
+def _sqlite_type_affinity(declared_type: str) -> str:
+    """SQLite column affinity of a declared type (datatype3.html section 3.1).
+
+    The rules apply in order: "INT" -> INTEGER; "CHAR", "CLOB" or "TEXT" ->
+    TEXT; "BLOB" or no type -> BLOB; "REAL", "FLOA" or "DOUB" -> REAL;
+    otherwise NUMERIC. For example "POINT REAL" has INTEGER affinity ("INT"
+    in "POINT"), and "FLOATING POINT" has INTEGER affinity too.
+    """
+    t = (declared_type or "").upper()
+    if "INT" in t:
+        return "INTEGER"
+    if "CHAR" in t or "CLOB" in t or "TEXT" in t:
+        return "TEXT"
+    if "BLOB" in t or not t.strip():
+        return "BLOB"
+    if "REAL" in t or "FLOA" in t or "DOUB" in t:
+        return "REAL"
+    return "NUMERIC"
+
+
 class DialectBaseMixin:
     def _bounded_ident(self, prefix: str, stem: str, suffix: str = "", max_len: int = 62) -> str:
         full = f"{prefix}{stem}{suffix}"
@@ -188,7 +208,7 @@ class DialectBaseMixin:
             # 10.0 into INTEGER 10, so only a REAL-affinity source (whose values
             # are always REAL) keeps REAL; everything else is stored without
             # affinity (declared BLOB), preserving the native storage class.
-            if source_type and any(t in source_type for t in ("FLOAT", "DOUBLE", "REAL")):
+            if source is not None and _sqlite_type_affinity(source_type) == "REAL":
                 return "REAL"
             return "BLOB"
         if not source_type:

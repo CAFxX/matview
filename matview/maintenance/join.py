@@ -475,17 +475,27 @@ class Tier1JoinMixin:
         )
         # Native approximate aggregates must preserve the engine's operation
         # order; algebraically equivalent sum/count updates can differ by ULPs.
-        native_recompute_aliases = {
-            self._q(item.alias)
-            for item in work_items
-            if item.is_aggregate
-            and (
+        # SQLite SUM/TOTAL/AVG switch to binary floating point as soon as one
+        # input is not an INTEGER (any SQLite column can store REAL values), and
+        # an add/retract fold then depends on the history of removed values
+        # (1e16 + 1.5 - 1e16 == 2.0). Recompute the affected group natively.
+        def _join_needs_native_recompute(item: SelectItem) -> bool:
+            return item.is_aggregate and (
                 item.agg_func in (
                     AggFunc.VAR_POP, AggFunc.VAR_SAMP,
                     AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
                 )
                 or self._requires_native_avg_recompute(item)
+                or (
+                    self.dialect == Dialect.SQLITE
+                    and item.agg_func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG)
+                )
             )
+
+        native_recompute_aliases = {
+            self._q(item.alias)
+            for item in work_items
+            if _join_needs_native_recompute(item)
         }
         if native_recompute_aliases:
             plus_merge_assignments = [
@@ -493,13 +503,7 @@ class Tier1JoinMixin:
                 if assignment.split("=", 1)[0].strip() not in native_recompute_aliases
             ]
             for item in work_items:
-                if item.is_aggregate and (
-                    item.agg_func in (
-                        AggFunc.VAR_POP, AggFunc.VAR_SAMP,
-                        AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
-                    )
-                    or self._requires_native_avg_recompute(item)
-                ):
+                if _join_needs_native_recompute(item):
                     plus_merge_assignments.append(
                         f"{self._q(item.alias)} = {_build_join_recompute_subquery(item)}"
                     )
@@ -539,7 +543,11 @@ class Tier1JoinMixin:
             c = self._q(item.alias)
             minus_updated.add(c)
             ekey = _expr_key(item)
-            if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
+            if self.dialect == Dialect.SQLITE and item.agg_func in (
+                AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG
+            ):
+                minus_assignments.append(f"{c} = {_build_join_recompute_subquery(item)}")
+            elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
                 minus_assignments.append(f"{c} = {mv_table}.{c} - __mv_delta.{c}")
             elif item.agg_func == AggFunc.SUM:
                 cnt_c = col_nonnull_count_map[ekey]
