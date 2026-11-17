@@ -5727,6 +5727,8 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertTrue(_rows_equal([("a",), ("b",), ("a",)], [("a",), ("a",), ("b",)]))
         self.assertFalse(_rows_equal([("a",), ("a",)], [("a",), ("b",)]))
         self.assertFalse(_rows_equal([("a",), ("a",)], [("a",)]))
+        # Text identity is exact; case folding must not collapse distinct values.
+        self.assertFalse(_rows_equal([("A",)], [("a",)]))
         with self.assertRaises(ValueError):
             _rows_equal([(1.0,)], [(1.0,)], tol=-1.0)
 

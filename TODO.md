@@ -179,6 +179,7 @@ The existing differential-testing harness is useful, but its current headline co
   - Test minimum supported versions and feature boundaries, including real SQLite runtime versions rather than only simulated version metadata.
 
 - [ ] **Add Mutation Testing for Test-Suite Sensitivity**:
+  - Progress: A deterministic first slice now mutates the differential row comparator with four non-equivalent faults (accept every result, coerce exact integers to binary64, discard duplicate rows, and case-fold text). The focused exact/type-aware oracle regressions must kill every mutant; CI runs this sensitivity check in the SQLite job. This does not yet cover trigger/delta/transaction/dialect mutants listed below.
   - Introduce targeted mutations to trigger predicates/actions, delta signs, aggregate maintenance, NULL handling, group/key handling, watermark comparisons, transaction boundaries, rollback/recovery, and dialect/version branches.
   - Require the relevant tests to kill each curated non-equivalent mutant; record surviving mutants and justify exclusions.
   - Use mutation testing to find blind spots, not as a substitute for semantic test design or as an unqualified global percentage target.
