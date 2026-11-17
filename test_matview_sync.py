@@ -6273,6 +6273,60 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_filtered_projection_retracts_old_membership_on_update_and_delete(self) -> None:
+        """Old-row predicate membership must govern retractions after UPDATE/DELETE."""
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE TABLE filtered_source ("
+                "id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, amount INTEGER)"
+            )
+            conn.executemany(
+                "INSERT INTO filtered_source VALUES (?, ?, ?)",
+                [(1, "A", 12), (2, "B", 5), (3, "C", None)],
+            )
+            manager = MaterializedViewManager(conn, dialect="sqlite")
+            view_sql = (
+                "CREATE VIEW filtered_rows AS "
+                "SELECT id, bucket, amount FROM filtered_source WHERE amount >= 10"
+            )
+            plan = manager.register_view(view_sql)
+            self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+
+            def assert_matches_live(label: str) -> None:
+                actual = [
+                    tuple(row)
+                    for row in conn.execute(
+                        f"SELECT id, bucket, amount FROM {plan.view_name} ORDER BY id"
+                    ).fetchall()
+                ]
+                expected = [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT id, bucket, amount FROM filtered_source "
+                        "WHERE amount >= 10 ORDER BY id"
+                    ).fetchall()
+                ]
+                self.assertEqual(
+                    actual,
+                    expected,
+                    f"{label}: filtered materialized reader differs from live SELECT",
+                )
+
+            assert_matches_live("initial")
+            conn.execute("UPDATE filtered_source SET amount = 4 WHERE id = 1")
+            assert_matches_live("update out of predicate")
+            conn.execute("UPDATE filtered_source SET amount = 15 WHERE id = 2")
+            assert_matches_live("update into predicate")
+            conn.execute("UPDATE filtered_source SET amount = 7 WHERE id = 2")
+            assert_matches_live("update out of predicate again")
+            conn.execute("UPDATE filtered_source SET amount = 20 WHERE id = 1")
+            assert_matches_live("update back into predicate")
+            conn.execute("DELETE FROM filtered_source WHERE id = 1")
+            assert_matches_live("delete formerly matching row")
+        finally:
+            conn.close()
+
     def test_25_join_aggregate_decrement_and_group_key_invariants(self) -> None:
         """Exercise join-delta retractions against an independent live SELECT oracle."""
         schema = """
