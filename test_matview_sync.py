@@ -605,8 +605,14 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
     _create_aggregate("BOOL_OR", _BoolOrAgg)
 
 
+def _strip_row_locking_clause(s: str) -> str:
+    # SQLite has no row locks (writers are serialized); emulate
+    # `SELECT ... FOR UPDATE [NOWAIT]` as a plain read.
+    return re.sub(r"\s+FOR\s+UPDATE(?:\s+NOWAIT)?\b", "", s, flags=re.IGNORECASE)
+
+
 def _transpile_pg_expr_to_sqlite(sql: str) -> str:
-    s = sql
+    s = _strip_row_locking_clause(sql)
     s = re.sub(r"\s+WITH\s*\([^)]*fillfactor[^)]*\)", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\bCAST\s*\(\s*ROW\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)\)\s+AS\s+TEXT\s*\)", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
     s = re.sub(r"\bROW\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)\)\s*::\s*TEXT\b", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
@@ -630,7 +636,7 @@ def _transpile_pg_expr_to_sqlite(sql: str) -> str:
 
 
 def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk",)) -> str:
-    s = sql
+    s = _strip_row_locking_clause(sql)
     s = re.sub(r"\bCREATE\s+ALGORITHM\s*=\s*\w+\s+VIEW\b", "CREATE VIEW", s, flags=re.IGNORECASE)
     s = re.sub(r"\bBIGINT\s+UNSIGNED\b", "INTEGER", s, flags=re.IGNORECASE)
     s = s.replace("18446744073709551615", "-1")

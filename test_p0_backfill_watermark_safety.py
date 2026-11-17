@@ -71,18 +71,18 @@ class BackfillWatermarkSafetyTests(unittest.TestCase):
             populate=False,
         )
 
-        # Inject failure into _update_backfill_watermark to simulate database/catalog corruption or lock
-        original_update = manager._update_backfill_watermark
+        # Inject failure into the per-batch watermark advance to simulate database/catalog corruption or lock
+        original_update = manager._advance_backfill_watermark
         call_count = 0
 
-        def failing_update(cur, view_name, cursor_pk, max_pk, active):
+        def failing_update(cur, view_name, cursor_pk, upper_pk, max_pk, active):
             nonlocal call_count
             call_count += 1
             if call_count >= 2:
                 raise sqlite3.OperationalError("simulated catalog write failure")
-            return original_update(cur, view_name, cursor_pk, max_pk, active)
+            return original_update(cur, view_name, cursor_pk, upper_pk, max_pk, active)
 
-        manager._update_backfill_watermark = failing_update
+        manager._advance_backfill_watermark = failing_update
 
         with self.assertRaisesRegex(sqlite3.OperationalError, "simulated catalog write failure"):
             manager.backfill_incrementally(plan, batch_size=3, snapshot_isolation=True)
@@ -120,17 +120,17 @@ class BackfillWatermarkSafetyTests(unittest.TestCase):
             populate=False,
         )
 
-        original_update = manager._update_backfill_watermark
+        original_update = manager._advance_backfill_watermark
         call_count = 0
 
-        def failing_update(cur, view_name, cursor_pk, max_pk, active):
+        def failing_update(cur, view_name, cursor_pk, upper_pk, max_pk, active):
             nonlocal call_count
             call_count += 1
             if call_count >= 2:
                 raise sqlite3.OperationalError("simulated mid-batch watermark disk error")
-            return original_update(cur, view_name, cursor_pk, max_pk, active)
+            return original_update(cur, view_name, cursor_pk, upper_pk, max_pk, active)
 
-        manager._update_backfill_watermark = failing_update
+        manager._advance_backfill_watermark = failing_update
 
         with self.assertRaisesRegex(sqlite3.OperationalError, "simulated mid-batch watermark disk error"):
             manager.backfill_incrementally(plan, batch_size=3, snapshot_isolation=False)
@@ -144,7 +144,7 @@ class BackfillWatermarkSafetyTests(unittest.TestCase):
             (catalog["backfill_active"], catalog["backfill_cursor_pk"], catalog["backfill_max_pk"]),
             (1, 3, 10),
         )
-        manager._update_backfill_watermark = original_update
+        manager._advance_backfill_watermark = original_update
         self.conn.execute("DELETE FROM t_src2 WHERE id IN (1, 7);")
         self.conn.execute("INSERT INTO t_src2 VALUES (20, 'c0', 5);")
         self.conn.commit()

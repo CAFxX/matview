@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import types
 import unittest
 import warnings
 import uuid
@@ -1296,7 +1297,7 @@ class InterruptedBackfillFailClosedTests(unittest.TestCase):
 
             manager.backfill_incrementally(plan, batch_size=5, on_progress=progress)
             self.assertEqual(len(outcomes), 1)
-            self.assertIn("in progress in another session", outcomes[0])
+            self.assertIn("RUNNING in another session or was INTERRUPTED", outcomes[0])
             self._assert_matches_native(conn, V_GROUPED)
             self.assertEqual(self._wm(manager, "v"), (20, 20, 0))
         finally:
@@ -1377,6 +1378,221 @@ class InterruptedBackfillFailClosedTests(unittest.TestCase):
                     for suffix in ("", "-wal", "-shm"):
                         if os.path.exists(path + suffix):
                             os.unlink(path + suffix)
+
+    def test_error_after_the_final_batch_does_not_report_an_incomplete_view(self) -> None:
+        # on_progress raising after the last batch: that batch's
+        # compare-and-set already recorded completion together with its fold.
+        conn, manager, plan = self._setup()
+        try:
+            with self.assertRaises(_Interrupt) as ctx:
+                manager.backfill_incrementally(
+                    plan, batch_size=5,
+                    on_progress=lambda b, _d: (_ for _ in ()).throw(_Interrupt()) if b == 4 else None,
+                )
+            notes = getattr(ctx.exception, "__notes__", [])
+            self.assertTrue(any("had already completed" in n for n in notes), notes)
+            self.assertFalse(any("incomplete" in n for n in notes), notes)
+            self.assertEqual(self._wm(manager, "v"), (20, 20, 0))
+            self.assertEqual(manager.check_schema_drift(), {"v": "ok"})
+            self._assert_matches_native(conn, V_GROUPED)
+        finally:
+            conn.close()
+
+    def test_repair_view_clears_watermark_so_later_dml_is_maintained(self) -> None:
+        # Review item 1: repair_view() repopulated the store but left the
+        # active watermark, so triggers ignored DML in (cursor, max].
+        conn, manager, plan = self._setup()
+        try:
+            self._interrupt(manager, plan)
+            self.assertEqual(self._wm(manager, "v"), (10, 20, 1))
+            self.assertEqual(manager.check_schema_drift(), {"v": "backfill_incomplete"})
+            self.assertEqual(manager.sync_views([V_GROUPED]), {"v": "backfill_incomplete"})
+            self.assertEqual(manager.repair_view("v"), {"v": "repaired"})
+            self.assertEqual(self._wm(manager, "v")[2], 0)
+            self._assert_matches_native(conn, V_GROUPED)
+            # DML inside the formerly gated range and outside it.
+            conn.execute("UPDATE t SET amt = amt + 1000 WHERE id = 18")
+            conn.execute("DELETE FROM t WHERE id IN (19, 4)")
+            conn.execute("INSERT INTO t VALUES (21, 'G9', 3)")
+            conn.commit()
+            self._assert_matches_native(conn, V_GROUPED)
+            self.assertEqual(manager.check_schema_drift(), {"v": "ok"})
+            self.assertEqual(manager.sync_views([V_GROUPED]), {"v": "unchanged"})
+            # Repaired == populated: a later backfill must not fold again.
+            with self.assertRaises(BackfillInterruptedError) as ctx:
+                manager.backfill_incrementally(plan, batch_size=5)
+            self.assertIn("already populated", str(ctx.exception))
+            self._assert_matches_native(conn, V_GROUPED)
+        finally:
+            conn.close()
+
+    def test_repair_view_fences_out_a_running_backfill_in_another_session(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        conn, manager, plan = self._setup(path=path)
+        conn2 = sqlite3.connect(path, timeout=5)
+        try:
+            manager2 = MaterializedViewManager(conn2, dialect=Dialect.SQLITE)
+            repaired = []
+
+            def progress(batch: int, _d: int) -> None:
+                if batch == 1:
+                    repaired.append(manager2.repair_view("v"))
+                    conn2.execute("UPDATE t SET amt = amt + 500 WHERE id = 17")
+                    conn2.commit()
+
+            with self.assertRaises(BackfillInterruptedError) as ctx:
+                manager.backfill_incrementally(plan, batch_size=5, on_progress=progress)
+            self.assertIn("taken over", str(ctx.exception))
+            self.assertEqual(repaired, [{"v": "repaired"}])
+            self._assert_matches_native(conn, V_GROUPED)
+            conn.execute("DELETE FROM t WHERE id = 16")
+            conn.commit()
+            self._assert_matches_native(conn, V_GROUPED)
+        finally:
+            conn2.close()
+            conn.close()
+            os.unlink(path)
+
+    def test_empty_table_backfill_records_completion(self) -> None:
+        # Review item 4: an empty-table backfill wrote (NULL, NULL, 0); rows
+        # maintained by triggers afterwards were folded again by a second run.
+        for view_sql in (V_GROUPED, V_GLOBAL):
+            with self.subTest(view=view_sql):
+                conn = sqlite3.connect(":memory:")
+                try:
+                    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, amt INTEGER)")
+                    conn.commit()
+                    manager = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+                    plan = manager.register_view(view_sql, populate=False, ignore_limitations=True)
+                    self.assertEqual(manager.backfill_incrementally(plan, batch_size=5), 0)
+                    conn.executemany("INSERT INTO t VALUES (?, ?, ?)", [(i, f"G{i % 3}", i) for i in range(1, 8)])
+                    conn.commit()
+                    self._assert_matches_native(conn, view_sql)
+                    with self.assertRaises(BackfillInterruptedError):
+                        manager.backfill_incrementally(plan, batch_size=5)
+                    self._assert_matches_native(conn, view_sql)
+                    self.assertEqual(manager.check_schema_drift(), {"v": "ok"})
+                finally:
+                    conn.close()
+
+    def test_lost_connection_during_failure_handling_keeps_original_exception(self) -> None:
+        # Review item 2: the failure handler queried the catalog, so a closed
+        # connection replaced the original error with ProgrammingError.
+        conn, manager, plan = self._setup()
+
+        class ConnLost(Exception):
+            pass
+
+        def progress(batch: int, _d: int) -> None:
+            if batch == 2:
+                conn.close()
+                raise ConnLost("server went away")
+
+        with self.assertRaises(ConnLost) as ctx:
+            manager.backfill_incrementally(plan, batch_size=5, on_progress=progress)
+        self.assertTrue(any("cursor_pk=10" in n for n in getattr(ctx.exception, "__notes__", [])))
+
+    def test_native_failed_backfill_leaves_connection_idle_and_snapshot_claim_conflict_is_refused(self) -> None:
+        """Native: after an interrupted backfill the connection is not left in
+        an open transaction (a later snapshot backfill works), and a second
+        claimer of a snapshot backfill waits for the owner and is refused."""
+        engines = []
+        if os.environ.get("POSTGRES_DSN"):
+            engines.append((Dialect.POSTGRES, os.environ["POSTGRES_DSN"]))
+        if os.environ.get("MYSQL_DSN"):
+            engines.append((Dialect.MYSQL, os.environ["MYSQL_DSN"]))
+        if not engines:
+            self.skipTest("POSTGRES_DSN / MYSQL_DSN not set; native engine test only")
+        for engine, dsn in engines:
+            with self.subTest(engine=engine.value):
+                self._run_native_idle_and_nowait(engine, dsn)
+
+    def _run_native_idle_and_nowait(self, engine: Dialect, dsn: str) -> None:
+        connect = IndependentSessionBackfillTests._connect_native
+        suffix = uuid.uuid4().hex[:10]
+        schema, table = f"mv_idle_{suffix}", f"idle_{suffix}"
+        v1, v2 = f"idle_a_{suffix}", f"idle_b_{suffix}"
+        conn = connect(engine, dsn)
+        other = connect(engine, dsn)
+        cur = conn.cursor()
+        plans = []
+        try:
+            if engine == Dialect.POSTGRES:
+                cur.execute(f'CREATE SCHEMA "{schema}"')
+                cur.execute(f'SET search_path TO "{schema}"')
+                other.cursor().execute(f'SET search_path TO "{schema}"')
+                other.commit()
+            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany(f"INSERT INTO {table} VALUES (%s, %s, %s)", [(i, f"G{i % 3}", i) for i in range(1, 21)])
+            conn.commit()
+            manager = MaterializedViewManager(conn, dialect=engine)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                for name in (v1, v2):
+                    plans.append(manager.register_view(
+                        f"CREATE VIEW {name} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM {table} GROUP BY g;",
+                        populate=False, ignore_limitations=True,
+                    ))
+            with self.assertRaises(_Interrupt):
+                manager.backfill_incrementally(
+                    plans[0], batch_size=5,
+                    on_progress=lambda b, _d: (_ for _ in ()).throw(_Interrupt()) if b == 2 else None,
+                )
+            if engine == Dialect.POSTGRES:
+                import psycopg2.extensions as ext
+                self.assertEqual(conn.get_transaction_status(), ext.TRANSACTION_STATUS_IDLE)
+            # Snapshot backfill of the second view while another session
+            # tries to claim it. The claim waits for the catalog row lock
+            # (NOWAIT cannot tell a claim from a writer's shared lock) and is
+            # refused once the first backfill commits; it never folds.
+            other_manager = MaterializedViewManager(other, dialect=engine)
+            outcome: list = []
+            waited: list = []
+
+            def claim_from_other_session() -> None:
+                try:
+                    other_manager.backfill_incrementally(plans[1], batch_size=5, snapshot_isolation=True)
+                    outcome.append("folded")
+                except BaseException as exc:  # inspected below
+                    outcome.append(exc)
+
+            th = threading.Thread(target=claim_from_other_session, daemon=True)
+
+            def on_progress(batch: int, _d: int) -> None:
+                if batch == 1:
+                    th.start()
+                    th.join(timeout=1.0)
+                    waited.append(th.is_alive())
+
+            manager.backfill_incrementally(plans[1], batch_size=5, snapshot_isolation=True, on_progress=on_progress)
+            th.join(timeout=60)
+            self.assertFalse(th.is_alive())
+            self.assertEqual(waited, [True], "the claim did not wait for the owning snapshot backfill")
+            self.assertEqual(len(outcome), 1)
+            self.assertIsInstance(outcome[0], BackfillInterruptedError, repr(outcome))
+            cur.execute(f"SELECT g, c, s FROM {v2} ORDER BY g")
+            actual = [tuple(r) for r in cur.fetchall()]
+            cur.execute(f"SELECT g, COUNT(*), SUM(amt) FROM {table} GROUP BY g ORDER BY g")
+            self.assertEqual(actual, [tuple(r) for r in cur.fetchall()])
+            conn.commit()
+        finally:
+            try:
+                other.rollback()
+                other.close()
+            except Exception:
+                pass
+            if engine == Dialect.MYSQL and plans:
+                try:
+                    conn.rollback()
+                    MaterializedViewManager(conn, dialect=engine).drop_view(plans[1].view_name)
+                except Exception:
+                    pass
+            IndependentSessionBackfillTests._cleanup_native_fixture(
+                conn, engine, schema, table,
+                MaterializedViewManager(conn, dialect=engine) if plans else None,
+                plans[0] if plans else None,
+            )
 
     def test_native_failure_before_claim_never_resets_another_sessions_watermark(self) -> None:
         """Native, both isolation modes: a call that fails after its pre-check
@@ -1538,6 +1754,742 @@ class InterruptedBackfillFailClosedTests(unittest.TestCase):
                 MaterializedViewManager(conn, dialect=engine) if plans else None,
                 plans[0] if plans else None,
             )
+
+
+class BackfillTakeoverOwnershipTests(unittest.TestCase):
+    """A backfill that was taken over (force_rebuild of the view from another
+    session while it is paused between batches) must never write the
+    watermark of, or fold into, the new owner's view.
+
+    Both sessions use independent connections and threads synchronized with
+    events at batch boundaries (on_progress). The new owner (B) runs
+    register_view(force_rebuild=True, incremental_backfill=True) and pauses
+    after one of its batches; then the stale owner (A) resumes. The final
+    view must equal the native result of B's definition and B must finish.
+    """
+
+    ROWS = 20
+    BATCH = 5
+
+    def _engines(self):
+        engines = [("sqlite", None)]
+        if os.environ.get("POSTGRES_DSN"):
+            engines.append((Dialect.POSTGRES, os.environ["POSTGRES_DSN"]))
+        if os.environ.get("MYSQL_DSN"):
+            engines.append((Dialect.MYSQL, os.environ["MYSQL_DSN"]))
+        return engines
+
+    def test_stale_owner_resuming_after_its_final_batch_does_not_overwrite_new_claim(self) -> None:
+        # A pauses in on_progress after its LAST batch (its compare-and-set
+        # already recorded completion). An unconditional completion write
+        # after that would overwrite B's freshly claimed watermark, so B is
+        # refused at its next batch and the view keeps one chunk only.
+        for engine, dsn in self._engines():
+            with self.subTest(engine=getattr(engine, "value", engine)):
+                self._run(engine, dsn, a_pause_batch=self.ROWS // self.BATCH, b_pause_batch=1, redefine=False)
+
+    def test_stale_owner_at_the_same_cursor_as_new_owner_is_fenced(self) -> None:
+        # ABA: A (old definition) pauses after batch 2; B (new definition,
+        # same view name, same pk span and batch size) pauses after batch 2,
+        # so B's watermark equals the one A committed. A must not take B's
+        # watermark for its own and fold the old definition's chunk into the
+        # new store.
+        for engine, dsn in self._engines():
+            with self.subTest(engine=getattr(engine, "value", engine)):
+                self._run(engine, dsn, a_pause_batch=2, b_pause_batch=2, redefine=True)
+
+    def test_registration_whose_backfill_is_taken_over_by_repair_keeps_the_repaired_view(self) -> None:
+        # register_view(incremental_backfill=True) is paused after batch 1;
+        # another session runs repair_view(). The registration's backfill is
+        # fenced (BackfillInterruptedError), and its failure handling must not
+        # drop the view the repair just populated (MySQL/MariaDB cleanup).
+        for engine, dsn in self._engines():
+            with self.subTest(engine=getattr(engine, "value", engine)):
+                self._run(engine, dsn, a_pause_batch=1, b_pause_batch=0, redefine=False, repair=True)
+
+    def _run(self, engine, dsn, a_pause_batch: int, b_pause_batch: int, redefine: bool,
+             repair: bool = False) -> None:
+        suffix = uuid.uuid4().hex[:10]
+        table, view, schema = f"own_{suffix}", f"own_v_{suffix}", f"mv_own_{suffix}"
+        path = None
+        sessions = []
+        if engine == "sqlite":
+            fd, path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+
+            def connect():
+                c = sqlite3.connect(path, timeout=30, check_same_thread=False)
+                sessions.append(c)
+                return c
+            dialect, ph = Dialect.SQLITE, "?"
+        else:
+            def connect():
+                c = IndependentSessionBackfillTests._connect_native(engine, dsn)
+                if engine == Dialect.POSTGRES:
+                    c.cursor().execute(f'SET search_path TO "{schema}"')
+                    c.commit()
+                sessions.append(c)
+                return c
+            dialect, ph = engine, "%s"
+        admin = (sqlite3.connect(path) if engine == "sqlite"
+                 else IndependentSessionBackfillTests._connect_native(engine, dsn))
+        cur = admin.cursor()
+        old_sql = f"CREATE VIEW {view} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM {table} GROUP BY g;"
+        new_sql = (
+            f"CREATE VIEW {view} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM {table} "
+            f"WHERE g <> 'G0' GROUP BY g;" if redefine else old_sql
+        )
+        expected_sql = (
+            f"SELECT g, COUNT(*), SUM(amt) FROM {table} "
+            + ("WHERE g <> 'G0' " if redefine else "") + "GROUP BY g ORDER BY g"
+        )
+        a_plan = b_plan = None
+        registered_name = None
+        res: dict = {}
+        try:
+            if engine == Dialect.POSTGRES:
+                cur.execute(f'CREATE SCHEMA "{schema}"')
+                cur.execute(f'SET search_path TO "{schema}"')
+            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany(
+                f"INSERT INTO {table} VALUES ({ph}, {ph}, {ph})",
+                [(i, f"G{i % 3}", i) for i in range(1, self.ROWS + 1)],
+            )
+            admin.commit()
+            ma = MaterializedViewManager(connect(), dialect=dialect)
+            mb = MaterializedViewManager(connect(), dialect=dialect)
+            if not repair:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                    a_plan = ma.register_view(old_sql, populate=False, ignore_limitations=True)
+                registered_name = a_plan.view_name
+            a_paused, a_go, b_paused, b_go = (threading.Event() for _ in range(4))
+
+            def a_progress(batch: int, _d: int) -> None:
+                if batch == a_pause_batch:
+                    a_paused.set()
+                    if not a_go.wait(60):
+                        raise AssertionError("A was never released")
+
+            def b_progress(batch: int, _d: int) -> None:
+                if batch == b_pause_batch:
+                    b_paused.set()
+                    if not b_go.wait(60):
+                        raise AssertionError("B was never released")
+
+            def run_a() -> None:
+                try:
+                    if repair:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", EngineLimitationWarning)
+                            res["a"] = ma.register_view(
+                                old_sql, populate=True, incremental_backfill=True, batch_size=self.BATCH,
+                                on_progress=a_progress, ignore_limitations=True,
+                            )
+                    else:
+                        res["a"] = ma.backfill_incrementally(
+                            a_plan, batch_size=self.BATCH, on_progress=a_progress
+                        )
+                except BaseException as exc:  # inspected below
+                    res["a"] = exc
+                a_paused.set()
+
+            def run_b() -> None:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        res["b"] = mb.register_view(
+                            new_sql, populate=True, incremental_backfill=True, batch_size=self.BATCH,
+                            force_rebuild=True, on_progress=b_progress, ignore_limitations=True,
+                        )
+                except BaseException as exc:  # inspected below
+                    res["b"] = exc
+                b_paused.set()
+
+            ta = threading.Thread(target=run_a, daemon=True)
+            tb = threading.Thread(target=run_b, daemon=True)
+            ta.start()
+            self.assertTrue(a_paused.wait(60), "A did not reach its pause point")
+            self.assertNotIn("a", res, f"A ended before its pause point: {res.get('a')!r}")
+            if repair:
+                catalog = MaterializedViewManager(connect(), dialect=dialect).get_catalog()
+                a_name = registered_name = next(n for n in catalog if n.endswith(view))
+                self.assertEqual(mb.repair_view(a_name), {a_name: "repaired"})
+                a_go.set()
+                ta.join(60)
+                self.assertFalse(ta.is_alive(), "A hung after resuming")
+                self.assertIsInstance(res["a"], BackfillInterruptedError, repr(res["a"]))
+                self.assertIn("taken over", str(res["a"]))
+                self._assert_final(cur, admin, dialect, view, expected_sql, a_name, (0, 0, 0))
+                return
+            tb.start()
+            self.assertTrue(b_paused.wait(60), "B did not reach its pause point")
+            self.assertNotIn("b", res, f"B ended before its pause point: {res.get('b')!r}")
+            a_go.set()
+            ta.join(60)
+            self.assertFalse(ta.is_alive(), "A hung after resuming")
+            b_go.set()
+            tb.join(60)
+            self.assertFalse(tb.is_alive(), "B hung after resuming")
+
+            b_plan = res["b"]
+            self.assertNotIsInstance(b_plan, BaseException, f"new owner failed: {b_plan!r}")
+            if redefine:
+                # A resumed at a cursor equal to B's watermark: fenced, rolled back.
+                self.assertIsInstance(res["a"], BackfillInterruptedError, repr(res["a"]))
+                self.assertIn("taken over", str(res["a"]))
+            else:
+                # A had completed before it paused; resuming only returns.
+                self.assertEqual(res["a"], self.ROWS // self.BATCH, repr(res["a"]))
+            self._assert_final(
+                cur, admin, dialect, view, expected_sql, b_plan.view_name, (self.ROWS, self.ROWS, 0)
+            )
+        finally:
+            for s in sessions:
+                try:
+                    s.rollback()
+                    s.close()
+                except Exception:
+                    pass
+            if engine == "sqlite":
+                admin.close()
+                os.unlink(path)
+            else:
+                IndependentSessionBackfillTests._cleanup_native_fixture(
+                    admin, engine, schema, table,
+                    MaterializedViewManager(admin, dialect=engine) if registered_name else None,
+                    types.SimpleNamespace(view_name=registered_name) if registered_name else None,
+                )
+
+    def _assert_final(self, cur, admin, dialect, view, expected_sql, view_name, watermark) -> None:
+        def rows():
+            return [tuple(int(x) if not isinstance(x, str) else x for x in r) for r in cur.fetchall()]
+        cur.execute(f"SELECT g, c, s FROM {view} ORDER BY g")
+        actual = rows()
+        cur.execute(expected_sql)
+        expected = rows()
+        admin.commit()
+        self.assertEqual(actual, expected)
+        checker = MaterializedViewManager(admin, dialect=dialect)
+        entry = checker.get_catalog()[view_name]
+        self.assertEqual(
+            (entry["backfill_cursor_pk"], entry["backfill_max_pk"], entry["backfill_active"]), watermark
+        )
+        self.assertEqual(checker.check_schema_drift()[view_name], "ok")
+
+
+class CatalogUpgradeTests(unittest.TestCase):
+    """Catalogs created by older versions (no backfill_owner column; active
+    watermarks written without an ownership token)."""
+
+    LEGACY_CATALOG_DDL = (
+        "CREATE TABLE {cat} (view_name VARCHAR(255) NOT NULL PRIMARY KEY, view_sql TEXT NOT NULL, "
+        "strategy VARCHAR(64) NOT NULL, signature_hash VARCHAR(64) NOT NULL, "
+        "backing_table VARCHAR(255) NOT NULL, aux_tables_json TEXT NOT NULL, "
+        "trigger_names_json TEXT NOT NULL, function_names_json TEXT NOT NULL, "
+        "trigger_ddls_json TEXT NOT NULL, backfill_cursor_pk BIGINT DEFAULT NULL, "
+        "backfill_max_pk BIGINT DEFAULT NULL, backfill_active INTEGER NOT NULL DEFAULT 0)"
+    )
+
+    def _engines(self):
+        return BackfillTakeoverOwnershipTests._engines(self)
+
+    def _fixture(self, engine, dsn):
+        """(connect, admin, dialect, ph, prefix, table, view, cleanup)."""
+        suffix = uuid.uuid4().hex[:8]
+        prefix, table, view, schema = f"__mvl{suffix}_", f"lg_{suffix}", f"lg_v_{suffix}", f"mv_lg_{suffix}"
+        sessions: list = []
+        if engine == "sqlite":
+            fd, path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+
+            def connect():
+                c = sqlite3.connect(path, timeout=30, check_same_thread=False)
+                sessions.append(c)
+                return c
+            dialect, ph = Dialect.SQLITE, "?"
+        else:
+            path = None
+
+            def connect():
+                c = IndependentSessionBackfillTests._connect_native(engine, dsn)
+                if engine == Dialect.POSTGRES:
+                    c.cursor().execute(f'SET search_path TO "{schema}"')
+                    c.commit()
+                sessions.append(c)
+                return c
+            dialect, ph = engine, "%s"
+        admin = sqlite3.connect(path) if engine == "sqlite" else IndependentSessionBackfillTests._connect_native(engine, dsn)
+        cur = admin.cursor()
+        if engine == Dialect.POSTGRES:
+            cur.execute(f'CREATE SCHEMA "{schema}"')
+            cur.execute(f'SET search_path TO "{schema}"')
+        cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+        cur.executemany(f"INSERT INTO {table} VALUES ({ph}, {ph}, {ph})", [(i, f"G{i % 3}", i) for i in range(1, 21)])
+        admin.commit()
+
+        def cleanup(manager=None, view_name=None):
+            for s in sessions:
+                try:
+                    s.rollback()
+                    s.close()
+                except Exception:
+                    pass
+            if engine == "sqlite":
+                admin.close()
+                os.unlink(path)
+                return
+            if manager is not None and view_name and engine != Dialect.POSTGRES:
+                try:
+                    manager.drop_view(view_name)
+                except Exception:
+                    pass
+            try:
+                admin.rollback()
+                c = admin.cursor()
+                if engine == Dialect.POSTGRES:
+                    c.execute("SET search_path TO public")
+                    c.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+                else:
+                    c.execute(f"DROP TABLE IF EXISTS {prefix}catalog")
+                    c.execute(f"DROP TABLE IF EXISTS {table}")
+                admin.commit()
+            except Exception:
+                admin.rollback()
+            admin.close()
+
+        return connect, admin, dialect, ph, prefix, table, view, cleanup
+
+    def _rows(self, cur, sql):
+        cur.execute(sql)
+        return [tuple(int(x) if not isinstance(x, str) else x for x in r) for r in cur.fetchall()]
+
+    def test_legacy_catalog_is_upgraded_and_legacy_active_watermark_fails_closed(self) -> None:
+        for engine, dsn in self._engines():
+            with self.subTest(engine=getattr(engine, "value", engine)):
+                connect, admin, dialect, ph, prefix, table, view, cleanup = self._fixture(engine, dsn)
+                manager = None
+                try:
+                    cur = admin.cursor()
+                    cur.execute(self.LEGACY_CATALOG_DDL.format(cat=f"{prefix}catalog"))
+                    admin.commit()
+                    manager = MaterializedViewManager(connect(), dialect=dialect, object_prefix=prefix)
+                    cur.execute(f"SELECT backfill_owner FROM {prefix}catalog WHERE 1 = 0")
+                    cur.fetchall()
+                    admin.commit()
+                    view_sql = f"CREATE VIEW {view} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM {table} GROUP BY g;"
+                    native = f"SELECT g, COUNT(*), SUM(amt) FROM {table} GROUP BY g ORDER BY g"
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        plan = manager.register_view(view_sql, populate=False, ignore_limitations=True)
+                    # An interrupted backfill recorded by older code: active,
+                    # no ownership token. It must stay fail-closed.
+                    cur.execute(
+                        f"UPDATE {prefix}catalog SET backfill_cursor_pk = 5, backfill_max_pk = 20, "
+                        f"backfill_active = 1, backfill_owner = NULL WHERE view_name = {ph}",
+                        (plan.view_name,),
+                    )
+                    admin.commit()
+                    with self.assertRaises(BackfillInterruptedError):
+                        manager.backfill_incrementally(plan, batch_size=5)
+                    self.assertEqual(manager.check_schema_drift()[plan.view_name], "backfill_incomplete")
+                    self.assertEqual(manager.repair_view(plan.view_name), {plan.view_name: "repaired"})
+                    self.assertEqual(self._rows(cur, f"SELECT g, c, s FROM {view} ORDER BY g"), self._rows(cur, native))
+                    admin.commit()
+                    # A fresh backfill on the upgraded catalog works end to end.
+                    manager.drop_view(plan.view_name)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        plan = manager.register_view(view_sql, populate=False, ignore_limitations=True)
+                    self.assertEqual(manager.backfill_incrementally(plan, batch_size=5), 4)
+                    self.assertEqual(self._rows(cur, f"SELECT g, c, s FROM {view} ORDER BY g"), self._rows(cur, native))
+                    admin.commit()
+                finally:
+                    cleanup(manager, view)
+
+
+class _HookedTemplates(list):
+    """chunk_sql_templates that call `hook(batch_attempt)` when a batch starts
+    folding, i.e. after the batch took its base-range row locks."""
+
+    def __init__(self, items, hook):
+        super().__init__(items)
+        self.hook = hook
+        self.calls = 0
+
+    def __iter__(self):
+        self.calls += 1
+        self.hook(self.calls)
+        return super().__iter__()
+
+
+class NativeBackfillLockingTests(unittest.TestCase):
+    """Native lock-behaviour contract of a non-snapshot pk-range backfill with
+    independent application writers (MySQL/MariaDB REPEATABLE READ triggers
+    take shared locks on the catalog row; PostgreSQL triggers take none)."""
+
+    def _engines(self):
+        out = []
+        if os.environ.get("POSTGRES_DSN"):
+            out.append((Dialect.POSTGRES, os.environ["POSTGRES_DSN"]))
+        if os.environ.get("MYSQL_DSN"):
+            out.append((Dialect.MYSQL, os.environ["MYSQL_DSN"]))
+        if not out:
+            self.skipTest("POSTGRES_DSN / MYSQL_DSN not set; native engine test only")
+        return out
+
+    def _fixture(self, engine, dsn, rows=40):
+        connect = IndependentSessionBackfillTests._connect_native
+        suffix = uuid.uuid4().hex[:10]
+        fx = {"schema": f"mv_lk_{suffix}", "table": f"lk_{suffix}", "view": f"lk_v_{suffix}", "sessions": []}
+        conn = connect(engine, dsn)
+        fx["conn"] = conn
+        cur = conn.cursor()
+        if engine == Dialect.POSTGRES:
+            schema = fx["schema"]
+            cur.execute(f'CREATE SCHEMA "{schema}"')
+            cur.execute(f'SET search_path TO "{schema}"')
+        engine_suffix = " ENGINE=InnoDB" if engine == Dialect.MYSQL else ""
+        cur.execute(
+            f"CREATE TABLE {fx['table']} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"
+            f"{engine_suffix}"
+        )
+        cur.executemany(
+            f"INSERT INTO {fx['table']} VALUES (%s, %s, %s)", [(i, f"G{i % 4}", i) for i in range(1, rows + 1)]
+        )
+        conn.commit()
+        fx["manager"] = MaterializedViewManager(conn, dialect=engine)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", EngineLimitationWarning)
+            fx["plan"] = fx["manager"].register_view(
+                f"CREATE VIEW {fx['view']} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM {fx['table']} GROUP BY g;",
+                populate=False, ignore_limitations=True,
+            )
+        return fx
+
+    def _session(self, engine, dsn, fx):
+        s = IndependentSessionBackfillTests._connect_native(engine, dsn)
+        if engine == Dialect.POSTGRES:
+            s.cursor().execute(f'SET search_path TO "{fx["schema"]}"')
+            s.commit()
+        fx["sessions"].append(s)
+        return s
+
+    def _assert_equal_live(self, fx):
+        conn = fx["conn"]
+        cur = conn.cursor()
+        conn.commit()
+        cur.execute(f"SELECT g, c, s FROM {fx['view']} ORDER BY g")
+        actual = [tuple(r) for r in cur.fetchall()]
+        cur.execute(f"SELECT g, COUNT(*), SUM(amt) FROM {fx['table']} GROUP BY g ORDER BY g")
+        expected = [tuple(r) for r in cur.fetchall()]
+        conn.commit()
+        self.assertEqual(actual, expected)
+
+    def _cleanup(self, engine, fx):
+        for s in fx["sessions"]:
+            try:
+                s.rollback()
+                s.close()
+            except Exception:
+                pass
+        IndependentSessionBackfillTests._cleanup_native_fixture(
+            fx["conn"], engine, fx["schema"], fx["table"],
+            MaterializedViewManager(fx["conn"], dialect=engine), fx["plan"],
+        )
+
+    def _for_each_engine(self, body):
+        for engine, dsn in self._engines():
+            with self.subTest(engine=engine.value):
+                fx = self._fixture(engine, dsn)
+                try:
+                    body(engine, dsn, fx)
+                finally:
+                    self._cleanup(engine, fx)
+
+    def test_writer_outside_the_batch_range_proceeds_during_a_batch(self) -> None:
+        def body(engine, dsn, fx):
+            writer = self._session(engine, dsn, fx)
+            timings = []
+
+            def write_outside() -> None:
+                started = time.monotonic()
+                c = writer.cursor()
+                c.execute(f"UPDATE {fx['table']} SET amt = amt + 1 WHERE id = 40")
+                writer.commit()
+                timings.append(time.monotonic() - started)
+
+            def hook(n: int) -> None:
+                if n == 2:  # batch (10, 20] holds its range locks
+                    th = threading.Thread(target=write_outside, daemon=True)
+                    th.start()
+                    th.join(timeout=3)
+                    timings.append(("alive", th.is_alive()))
+                    if th.is_alive():
+                        th.join(timeout=60)
+
+            spec = fx["plan"].incremental_backfill_spec
+            object.__setattr__(spec, "chunk_sql_templates", _HookedTemplates(spec.chunk_sql_templates, hook))
+            fx["manager"].backfill_incrementally(fx["plan"], batch_size=10)
+            self.assertIn(("alive", False), timings, f"writer outside the batch was blocked: {timings!r}")
+            self._assert_equal_live(fx)
+
+        self._for_each_engine(body)
+
+    def test_writer_holding_a_row_in_the_batch_range_does_not_deadlock(self) -> None:
+        from test_avg_concurrent_maintenance import _is_lock_waiting, _session_id
+
+        def body(engine, dsn, fx):
+            writer = self._session(engine, dsn, fx)
+            monitor = self._session(engine, dsn, fx)
+            backfill_sid = _session_id(engine, fx["conn"])
+            wc = writer.cursor()
+            wc.execute(f"SELECT id FROM {fx['table']} WHERE id = 3 FOR UPDATE")
+            wc.fetchall()
+            errors = []
+
+            def writer_finishes() -> None:
+                try:
+                    deadline = time.monotonic() + 20
+                    def blocked_on_range_lock() -> bool:
+                        if _is_lock_waiting(engine, monitor, backfill_sid):
+                            return True
+                        if engine != Dialect.MYSQL:
+                            return False
+                        # MariaDB may report the waiting trx as RUNNING in
+                        # innodb_trx; the range-lock statement cannot finish
+                        # while row 3 is locked, so being stuck in it counts.
+                        mc = monitor.cursor()
+                        mc.execute(
+                            "SELECT COUNT(*) FROM information_schema.processlist "
+                            "WHERE id = %s AND info LIKE %s AND time >= 1",
+                            (backfill_sid, "%FOR UPDATE%"),
+                        )
+                        stuck = int(mc.fetchone()[0]) > 0
+                        monitor.commit()
+                        return stuck
+
+                    while not blocked_on_range_lock():
+                        if time.monotonic() > deadline:
+                            from test_avg_concurrent_maintenance import _lock_diagnostics
+                            raise AssertionError(f"backfill never waited for the writer's row; sid={backfill_sid} {_lock_diagnostics(engine, monitor)!r}")
+                        time.sleep(0.02)
+                    # The backfill now waits for row 3; the writer's own
+                    # trigger-maintained update must not deadlock with it.
+                    wc.execute(f"UPDATE {fx['table']} SET amt = amt + 5 WHERE id = 3")
+                    writer.commit()
+                except BaseException as exc:
+                    errors.append(exc)
+                    writer.rollback()
+
+            th = threading.Thread(target=writer_finishes, daemon=True)
+            th.start()
+            fx["manager"].backfill_incrementally(fx["plan"], batch_size=10)
+            th.join(timeout=60)
+            self.assertEqual(errors, [])
+            self._assert_equal_live(fx)
+
+        self._for_each_engine(body)
+
+    def test_long_writer_transaction_does_not_break_a_healthy_backfill(self) -> None:
+        def body(engine, dsn, fx):
+            conn = fx["conn"]
+            c = conn.cursor()
+            if engine == Dialect.MYSQL:
+                c.execute("SET SESSION innodb_lock_wait_timeout = 1")
+            else:
+                c.execute("SET lock_timeout = '1s'")
+            conn.commit()
+            writer = self._session(engine, dsn, fx)
+
+            def progress(batch: int, _d: int) -> None:
+                if batch == 1:
+                    # Holds the store rows of already-folded groups for 2.5 s,
+                    # longer than the backfill's lock timeout.
+                    writer.cursor().execute(f"UPDATE {fx['table']} SET amt = amt + 100 WHERE id IN (2, 5, 8)")
+                    threading.Timer(2.5, writer.commit).start()
+
+            fx["manager"]._backfill_sleep = lambda d: time.sleep(max(d, 0.3))
+            fx["manager"].backfill_incrementally(fx["plan"], batch_size=10, on_progress=progress)
+            time.sleep(3)
+            self.assertEqual(fx["manager"].get_catalog()[fx["plan"].view_name]["backfill_active"], 0)
+            self._assert_equal_live(fx)
+
+        self._for_each_engine(body)
+
+    def test_open_writer_transaction_does_not_refuse_the_claim(self) -> None:
+        # The open writer transaction inserts above the current MAX(pk): its
+        # trigger runs (on MySQL/MariaDB it holds a shared lock on the catalog
+        # row) but the row is outside the range the backfill folds, so the
+        # check is not confounded by the pre-claim ungated window.
+        def body(engine, dsn, fx):
+            writer = self._session(engine, dsn, fx)
+            writer.cursor().execute(f"INSERT INTO {fx['table']} VALUES (1000, 'G2', 7)")
+            threading.Timer(1.0, writer.commit).start()
+            fx["manager"].backfill_incrementally(fx["plan"], batch_size=10)
+            time.sleep(1.2)
+            self._assert_equal_live(fx)
+
+        self._for_each_engine(body)
+
+    def test_repair_view_racing_a_live_backfill(self) -> None:
+        def body(engine, dsn, fx):
+            other = self._session(engine, dsn, fx)
+            other_manager = MaterializedViewManager(other, dialect=engine)
+            done = []
+
+            def repair_and_write() -> None:
+                done.append(other_manager.repair_view(fx["plan"].view_name))
+                c = other.cursor()
+                c.execute(f"UPDATE {fx['table']} SET amt = amt + 1000 WHERE id IN (15, 35)")
+                c.execute(f"DELETE FROM {fx['table']} WHERE id = 25")
+                other.commit()
+
+            def progress(batch: int, _d: int) -> None:
+                if batch == 1:
+                    th = threading.Thread(target=repair_and_write, daemon=True)
+                    th.start()
+                    th.join(timeout=30)
+
+            with self.assertRaises(BackfillInterruptedError) as ctx:
+                fx["manager"].backfill_incrementally(fx["plan"], batch_size=10, on_progress=progress)
+            self.assertIn("taken over", str(ctx.exception))
+            self.assertEqual(done, [{fx["plan"].view_name: "repaired"}])
+            self._assert_equal_live(fx)
+            c = fx["conn"].cursor()
+            c.execute(f"INSERT INTO {fx['table']} VALUES (100, 'G1', 3)")
+            fx["conn"].commit()
+            self._assert_equal_live(fx)
+
+        self._for_each_engine(body)
+
+    def test_repair_view_racing_a_batch_in_flight(self) -> None:
+        # repair_view starts while batch 2 has folded (holding its store-row
+        # locks) and is about to take the catalog row lock for its ownership
+        # check: the two transactions take the catalog row and the store rows
+        # in opposite orders, so the engine may pick either as a deadlock
+        # victim. Contract: neither error leaks; the repair completes, the
+        # backfill either is fenced ("taken over") or finished before the
+        # repair, and the view equals the live view and stays maintained.
+        from test_avg_concurrent_maintenance import _is_lock_waiting, _lock_diagnostics, _session_id
+
+        def body(engine, dsn, fx):
+            other = self._session(engine, dsn, fx)
+            monitor = self._session(engine, dsn, fx)
+            repair_sid = _session_id(engine, other)
+            other_manager = MaterializedViewManager(other, dialect=engine)
+            outcome = {}
+
+            def repair() -> None:
+                try:
+                    outcome["repair"] = other_manager.repair_view(fx["plan"].view_name)
+                except BaseException as exc:
+                    outcome["repair_error"] = exc
+
+            manager = fx["manager"]
+            original_advance = manager._advance_backfill_watermark
+            started = []
+
+            def repair_blocked() -> bool:
+                if _is_lock_waiting(engine, monitor, repair_sid):
+                    return True
+                if engine != Dialect.MYSQL:
+                    return False
+                # MariaDB may report the waiting trx as RUNNING in innodb_trx;
+                # a repair statement running for >= 1 s on this tiny fixture
+                # is waiting for the batch's store-row locks.
+                mc = monitor.cursor()
+                mc.execute(
+                    "SELECT COUNT(*) FROM information_schema.processlist "
+                    "WHERE id = %s AND command = 'Query' AND time >= 1",
+                    (repair_sid,),
+                )
+                stuck = int(mc.fetchone()[0]) > 0
+                monitor.commit()
+                return stuck
+
+            def advance(cur, view_name, cursor_pk, upper_pk, max_pk, active):
+                if upper_pk == 20 and not started:
+                    th = threading.Thread(target=repair, daemon=True)
+                    started.append(th)
+                    th.start()
+                    deadline = time.monotonic() + 20
+                    while not repair_blocked() and "repair" not in outcome and "repair_error" not in outcome:
+                        if time.monotonic() > deadline:
+                            raise AssertionError(f"repair never blocked: {_lock_diagnostics(engine, monitor)!r}")
+                        time.sleep(0.02)
+                return original_advance(cur, view_name, cursor_pk, upper_pk, max_pk, active)
+
+            manager._advance_backfill_watermark = advance
+            manager._backfill_sleep = lambda d: time.sleep(min(d, 0.2))
+            other_manager._backfill_sleep = lambda d: time.sleep(min(d, 0.2))
+            try:
+                manager.backfill_incrementally(fx["plan"], batch_size=10)
+                backfill = "completed"
+            except BackfillInterruptedError as exc:
+                self.assertIn("taken over", str(exc))
+                backfill = "fenced"
+            self.assertTrue(started)
+            started[0].join(timeout=60)
+            self.assertNotIn("repair_error", outcome, repr(outcome.get("repair_error")))
+            self.assertEqual(outcome.get("repair"), {fx["plan"].view_name: "repaired"}, backfill)
+            self._assert_equal_live(fx)
+            entry = manager.get_catalog()[fx["plan"].view_name]
+            self.assertEqual(entry["backfill_active"], 0)
+            c = fx["conn"].cursor()
+            c.execute(f"UPDATE {fx['table']} SET amt = amt + 7 WHERE id IN (5, 30)")
+            c.execute(f"INSERT INTO {fx['table']} VALUES (100, 'G1', 3)")
+            fx["conn"].commit()
+            self._assert_equal_live(fx)
+
+        self._for_each_engine(body)
+
+    def test_repair_view_gives_up_after_bounded_lock_retries_leaving_view_unchanged(self) -> None:
+        # A session holding the catalog row lock past every retry: repair_view
+        # re-runs its transaction a bounded number of times, then propagates
+        # the engine's lock-timeout error with the watermark and contents
+        # unchanged (all-or-nothing).
+        def body(engine, dsn, fx):
+            manager = fx["manager"]
+            manager.backfill_incrementally(fx["plan"], batch_size=10)
+            holder = self._session(engine, dsn, fx)
+            repairer = self._session(engine, dsn, fx)
+            rc = repairer.cursor()
+            if engine == Dialect.MYSQL:
+                rc.execute("SET SESSION innodb_lock_wait_timeout = 1")
+            else:
+                rc.execute("SET lock_timeout = '200ms'")
+            repairer.commit()
+            rm = MaterializedViewManager(repairer, dialect=engine)
+            rm._BACKFILL_TRANSIENT_RETRIES = 2
+            sleeps = []
+            rm._backfill_sleep = sleeps.append
+            catalog = rm.catalog_table
+            before = manager.get_catalog()[fx["plan"].view_name]
+            hc = holder.cursor()
+            hc.execute(
+                f"SELECT view_name FROM {catalog} WHERE view_name = %s FOR UPDATE", (fx["plan"].view_name,)
+            )
+            hc.fetchall()
+            try:
+                with self.assertRaises(Exception) as ctx:
+                    rm.repair_view(fx["plan"].view_name)
+                self.assertNotIsInstance(ctx.exception, BackfillInterruptedError)
+                self.assertTrue(rm._is_transient_lock_error(ctx.exception) or rm._is_lock_timeout_error(ctx.exception),
+                                repr(ctx.exception))
+                self.assertEqual(len(sleeps), 2)
+            finally:
+                holder.rollback()
+            after = manager.get_catalog()[fx["plan"].view_name]
+            self.assertEqual(
+                (after["backfill_cursor_pk"], after["backfill_max_pk"], after["backfill_active"]),
+                (before["backfill_cursor_pk"], before["backfill_max_pk"], before["backfill_active"]),
+            )
+            self._assert_equal_live(fx)
+            self.assertEqual(rm.repair_view(fx["plan"].view_name), {fx["plan"].view_name: "repaired"})
+            self._assert_equal_live(fx)
+
+        self._for_each_engine(body)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

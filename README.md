@@ -201,6 +201,10 @@ python3 matview_sync.py --db app.db --check-drift --repair
 
 The manager records installed view definitions and metadata in `__matview_catalog`. Its Python API also exposes `check_schema_drift()` and `repair_view()`.
 
+Repair repopulates each view in its own transaction. On PostgreSQL it is only exact while writes to the view's base tables are quiesced: a write that commits during the repair can be missing from the result. On MySQL/MariaDB (InnoDB, default `REPEATABLE READ`) the repopulation's locking reads serialize concurrent writers (verified natively with concurrent writers); SQLite serializes writers database-wide.
+
+`check_schema_drift()` reports `backfill_incomplete` for a view whose incremental backfill is running or was interrupted. An interrupted backfill is never resumed automatically; repopulate the view with `repair_view()` (on PostgreSQL with writers quiesced), `register_view(..., force_rebuild=True)`, or `drop_view()` followed by `register_view()`.
+
 ## Python API
 
 Use `MaterializedViewManager` when you want installation and lifecycle management inside an application or migration script:
