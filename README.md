@@ -322,6 +322,18 @@ SQLITE_COMPAT_ENGINE="apsw" \
 python3 test_matview_sync.py
 ```
 
+### Local presubmit (pre-push gate)
+
+`scripts/presubmit.py` derives its plan from `.github/workflows/ci.yml` (PyYAML: `pip install -r requirements-dev.txt`) and runs the PR-gate jobs locally with the same `run:` steps and `env:`:
+
+```bash
+make presubmit        # fast: path classification + affected SQLite-job steps on the working tree
+make presubmit-full   # every PR-gate job/matrix row of HEAD, in parallel; logs under .git/presubmit/runs/
+make install-hooks    # pre-push refuses commits whose tree lacks a full-tier stamp
+```
+
+Exit codes: 0 green, 1 failed, 2 plan error, 3 incomplete. Rows whose Python (`python3.N` or `PRESUBMIT_PYTHON_3_N`) or container runtime (`PRESUBMIT_CONTAINER_RUNTIME`, default `docker` then `podman`) is unavailable are reported as not verified and never count as green. Only a fully green full-tier run writes a stamp (`.git/presubmit/stamps/<tree>.json`). A local green run is not proof of a green GitHub run; `--help` and the stamp's `not_covered` list state what differs.
+
 ### Honest test coverage and test strength reporting
 
 The project separates **Structural & Semantic Coverage Metrics** from **Workload Statistics**:
