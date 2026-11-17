@@ -9,6 +9,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import warnings
 import uuid
@@ -16,6 +17,23 @@ from urllib.parse import urlparse
 
 from matview_sync import Dialect, EngineLimitationWarning, MaterializedViewManager
 from test_matview_sync import _register_sqlite_compat_udfs
+
+# Bound for replaying an application writer transaction chosen as an engine
+# deadlock/serialization victim. Exhausting it fails the test.
+TRANSIENT_RETRIES = 25
+
+
+def _is_transient_lock_error(engine: Dialect, exc: BaseException) -> bool:
+    """Match only engine-reported deadlock/serialization victims, independently
+    of the implementation's own classifier."""
+    if engine == Dialect.MYSQL:
+        code = getattr(exc, "errno", None)
+        if code is None and getattr(exc, "args", None):
+            code = exc.args[0]
+        return code in (1213, 1205)
+    if engine == Dialect.POSTGRES:
+        return (getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)) in ("40P01", "40001")
+    return False
 
 
 class IndependentSessionBackfillTests(unittest.TestCase):
@@ -127,6 +145,79 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             conn.close()
             os.unlink(db_path)
 
+
+    def _pk_range_fault_fixture(self, fail_batches: dict[int, int]):
+        """Register a pk-range-fold view whose chunk raises an injected victim
+        error *after* folding, so a retry without rollback would double-count."""
+        conn = sqlite3.connect(":memory:")
+        _register_sqlite_compat_udfs(conn)
+        conn.execute("CREATE TABLE fr (id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, amt INTEGER NOT NULL);")
+        conn.executemany("INSERT INTO fr VALUES (?, ?, ?);", [(i, f"b{i % 3}", i * 7) for i in range(1, 13)])
+        conn.commit()
+        remaining = dict(fail_batches)  # lower PK bound -> injected failures left
+
+        class InjectedVictim(Exception):
+            pass
+
+        def fault(lo: int, _hi: int) -> int:
+            if remaining.get(lo, 0) > 0:
+                remaining[lo] -= 1
+                raise InjectedVictim(lo)
+            return 0
+
+        conn.create_function("__mv_test_fault", 2, fault)
+        manager = MaterializedViewManager(conn)
+        plan = manager.register_view(
+            "CREATE VIEW fr_totals AS SELECT bucket, COUNT(*) AS c, SUM(amt) AS s FROM fr GROUP BY bucket;",
+            populate=False,
+        )
+        spec = plan.incremental_backfill_spec
+        self.assertEqual(spec.mode, "pk_range_fold")
+        spec.chunk_sql_templates.append("SELECT __mv_test_fault(?, ?);")
+        # Treat only the injected victim (surfaced by sqlite3 as an
+        # OperationalError from the UDF) as transient, as an engine deadlock is.
+        manager._is_transient_lock_error = (
+            lambda exc: isinstance(exc, sqlite3.OperationalError)
+            and "user-defined function raised exception" in str(exc)
+        )
+        return conn, manager, plan, remaining
+
+    def _assert_equivalent(self, conn, plan) -> None:
+        actual = conn.execute(f"SELECT bucket, c, s FROM {plan.view_name} ORDER BY bucket;").fetchall()
+        expected = conn.execute(
+            "SELECT bucket, COUNT(*), SUM(amt) FROM fr GROUP BY bucket ORDER BY bucket;"
+        ).fetchall()
+        self.assertEqual(actual, expected)
+
+    def test_pk_range_batch_retries_transient_victim_exactly_once_per_fold(self) -> None:
+        conn, manager, plan, remaining = self._pk_range_fault_fixture({4: 2, 12: 0})
+        try:
+            batches = manager.backfill_incrementally(plan, batch_size=4)
+            self.assertEqual(batches, 3)
+            self.assertEqual(remaining[4], 0, "injected victims were not exercised")
+            self._assert_equivalent(conn, plan)
+            self.assertEqual(manager.get_catalog()[plan.view_name]["backfill_active"], 0)
+        finally:
+            conn.close()
+
+    def test_pk_range_batch_retry_is_bounded(self) -> None:
+        limit = MaterializedViewManager._BACKFILL_TRANSIENT_RETRIES
+        conn, manager, plan, remaining = self._pk_range_fault_fixture({4: limit + 1})
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                manager.backfill_incrementally(plan, batch_size=4)
+            self.assertEqual(remaining[4], 0)
+        finally:
+            conn.close()
+
+    def test_pk_range_batch_non_transient_error_is_not_retried(self) -> None:
+        conn, manager, plan, remaining = self._pk_range_fault_fixture({4: 1})
+        manager._is_transient_lock_error = lambda exc: False
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                manager.backfill_incrementally(plan, batch_size=4)
+        finally:
+            conn.close()
 
     def test_snapshot_isolated_non_pk_batches_block_independent_writes_until_commit(self) -> None:
         fd, db_path = tempfile.mkstemp(prefix="matview-snapshot-backfill-", suffix=".sqlite")
@@ -726,6 +817,8 @@ class IndependentSessionBackfillTests(unittest.TestCase):
         overlap_lock = threading.Lock()
         writer_phases: dict[int, str] = {1: "not started", 2: "not started"}
         phase_lock = threading.Lock()
+        transient_retries: dict[int, int] = {1: 0, 2: 0}
+        retry_lock = threading.Lock()
 
         def set_writer_phase(writer_id: int, phase: str) -> None:
             with phase_lock:
@@ -771,33 +864,58 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                     for step in range(10):
                         bucket = f"B{((writer_id + step) % 4) + 1}"
                         new_pk = base_pk + step
-                        set_writer_phase(writer_id, f"executing insert at step {step}")
-                        second_cur.execute(
-                            f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
-                            (new_pk, bucket, (step + 1) * 19),
-                        )
-                        set_writer_phase(writer_id, f"executing update at step {step}")
-                        second_cur.execute(
-                            f"UPDATE {table_name} SET amt = amt + %s WHERE id = %s",
-                            (writer_id + 1, target_pk + (step % 4)),
-                        )
-                        if step % 3 == 2:
-                            second_cur.execute(
-                                f"DELETE FROM {table_name} WHERE id = %s",
-                                (base_pk + step - 1,),
-                            )
-                        set_writer_phase(writer_id, f"committing step {step}")
-                        second.commit()
+                        attempt = 0
+                        while True:
+                            try:
+                                set_writer_phase(writer_id, f"executing insert at step {step} (attempt {attempt})")
+                                second_cur.execute(
+                                    f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
+                                    (new_pk, bucket, (step + 1) * 19),
+                                )
+                                set_writer_phase(writer_id, f"executing update at step {step} (attempt {attempt})")
+                                second_cur.execute(
+                                    f"UPDATE {table_name} SET amt = amt + %s WHERE id = %s",
+                                    (writer_id + 1, target_pk + (step % 4)),
+                                )
+                                if step % 3 == 2:
+                                    second_cur.execute(
+                                        f"DELETE FROM {table_name} WHERE id = %s",
+                                        (base_pk + step - 1,),
+                                    )
+                                set_writer_phase(writer_id, f"committing step {step} (attempt {attempt})")
+                                second.commit()
+                                break
+                            except Exception as exc:
+                                # Concurrent trigger maintenance of shared group
+                                # rows can make an application transaction an
+                                # engine deadlock/serialization victim. The engine
+                                # rolls the transaction back atomically (base rows
+                                # and trigger deltas together), so the application
+                                # contract is to replay the whole transaction. The
+                                # final original-view equivalence check is unchanged.
+                                if attempt >= TRANSIENT_RETRIES or not _is_transient_lock_error(engine, exc):
+                                    raise
+                                second.rollback()
+                                attempt += 1
+                                with retry_lock:
+                                    transient_retries[writer_id] += 1
+                                time.sleep(0.01 * attempt)
                         set_writer_phase(writer_id, f"committed step {step}")
                         if not backfill_done.is_set():
                             with overlap_lock:
                                 overlap_commits.append(writer_id)
 
                         set_writer_phase(writer_id, f"executing rollback probe at step {step}")
-                        second_cur.execute(
-                            f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
-                            (base_pk + 500 + step, bucket, 99999),
-                        )
+                        try:
+                            second_cur.execute(
+                                f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
+                                (base_pk + 500 + step, bucket, 99999),
+                            )
+                        except Exception as exc:
+                            # The probe is rolled back either way; only an
+                            # engine deadlock/serialization victim is tolerated.
+                            if not _is_transient_lock_error(engine, exc):
+                                raise
                         second.rollback()
                         set_writer_phase(writer_id, f"rolled back probe at step {step}")
                         if step == 0:
@@ -810,7 +928,8 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 finally:
                     if second is not None:
                         second.close()
-                    set_writer_phase(writer_id, "closed")
+                    with phase_lock:
+                        writer_phases[writer_id] = f"closed after: {writer_phases[writer_id]}"
 
             def on_progress(batch_idx: int, _rows_done: int) -> None:
                 nonlocal barrier_released, mid_released
@@ -828,7 +947,8 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                         raise AssertionError(
                             f"{engine.value}: writers did not reach the mid-backfill barrier "
                             f"at batch {batch_idx}; writer_phases={phase_snapshot!r}; "
-                            f"worker_errors={error_snapshot!r}"
+                            f"worker_errors={error_snapshot!r}; "
+                            f"transient_retries={dict(transient_retries)!r}"
                         ) from exc
 
             w1 = threading.Thread(target=concurrent_writer, args=(1,), daemon=True)
