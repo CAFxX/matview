@@ -444,7 +444,7 @@ class Tier1JoinMixin:
 
             j_parts: List[str] = []
             for idx, j in enumerate(self.view.joins):
-                tbl_s = f"{j.table_name} AS __mv_j_{j.alias}"
+                tbl_s = f"{self._q(j.table_name)} AS __mv_j_{j.alias}"
                 if idx == 0:
                     j_parts.append(tbl_s)
                 else:
