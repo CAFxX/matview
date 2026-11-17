@@ -679,6 +679,7 @@ def _result_description_mismatches(
     fields = (
         ("name", 0),
         ("type_code", 1),
+        ("precision", 4),
         ("scale", 5),
     )
     for index, (mv_column, live_column) in enumerate(
@@ -7009,6 +7010,8 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         decimal_column = ("value", 1700, None, None, 12, 2, None)
         cases = (
             ((integer_column,), (decimal_column,), "type_code"),
+            # Same type code and scale, but a different native precision.
+            ((integer_column,), (("value", 23, None, None, 12, 0, None),), "precision"),
             ((integer_column,), (("value", 23, None, None, 12, 2, None),), "scale"),
             ((integer_column,), (("other", 23, None, None, 10, 0, None),), "name"),
             ((integer_column,), (integer_column, integer_column), "column count"),
