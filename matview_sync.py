@@ -1687,7 +1687,12 @@ def introspect_database_schemas(
         ):
             continue
         dt_up = d_type.upper()
-        if dt_up in ("VARCHAR", "CHAR", "TINYINT") and col_type:
+        if col_type and dt_up in (
+            "VARCHAR", "CHAR", "TINYINT",
+            "DECIMAL", "NUMERIC", "FIXED", "FLOAT", "DOUBLE", "REAL",
+        ):
+            # DATA_TYPE drops precision/scale for MySQL-family numeric columns;
+            # COLUMN_TYPE is required for native result-scale inference.
             dt_up = col_type.upper()
         is_pk = col_key.upper() == "PRI"
         grouped_my.setdefault(t_name, {})[c_name] = ColumnDef(

@@ -4345,13 +4345,14 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     f"member_id INTEGER NOT NULL, "
                     f"role {str_t} NOT NULL, "
                     f"dues {flt_t} NOT NULL, "
+                    f"exact_due NUMERIC(18,4) NOT NULL, "
                     f"PRIMARY KEY (org_id, member_id), "
                     f"FOREIGN KEY (org_id) REFERENCES parent_orgs(id) ON DELETE CASCADE"
                     f");"
                 )
                 cur.execute("INSERT INTO parent_orgs VALUES (1, 'Alpha'), (2, 'Beta');")
                 cur.execute(
-                    "INSERT INTO child_members VALUES (1, 10, 'admin', 50.0), (1, 11, 'dev', 30.0), (2, 20, 'dev', 40.0);"
+                    "INSERT INTO child_members VALUES (1, 10, 'admin', 50.0, 12.3400), (1, 11, 'dev', 30.0, 7.1250), (2, 20, 'dev', 40.0, 99.9900);"
                 )
 
                 # 1. Direct schema introspection via introspect_database_schemas
@@ -4361,6 +4362,13 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 cm_schema = next(v for k, v in pulled.items() if k.lower() == "child_members")
                 self.assertEqual({c.name.lower() for c in cm_schema.columns.values() if c.primary_key}, {"org_id", "member_id"})
                 self.assertIn("ON DELETE CASCADE", cm_schema.fk_cascade_actions)
+                if dialect == Dialect.MYSQL:
+                    # MariaDB statistical aliases need the declared source scale,
+                    # not only information_schema.DATA_TYPE == "decimal".
+                    self.assertEqual(
+                        cm_schema.columns["exact_due"].data_type.upper(),
+                        "DECIMAL(18,4)",
+                    )
 
                 # 2. On MySQL, foreign key ON DELETE CASCADE pulled from the live database triggers EngineLimitationError
                 if dialect == Dialect.MYSQL:
