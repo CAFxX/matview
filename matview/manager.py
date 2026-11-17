@@ -128,6 +128,16 @@ class TransactionOwnershipError(RuntimeError):
     """
 
 
+class UnsafeReplacementError(RuntimeError):
+    """Replacing a published materialized view would not be atomic.
+
+    Raised before any change when a complete view would have to be dropped
+    before its replacement is fully built: on MySQL/MariaDB (DDL commits
+    implicitly) and for replacements populated by an incremental backfill
+    (batches commit separately). The published view is left untouched.
+    """
+
+
 def _manager_owned_operation(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Run a public lifecycle method in a transaction the manager owns.
 
@@ -519,16 +529,72 @@ class MaterializedViewManager:
         Safely executes schema DDL changes (e.g. `CREATE TABLE`, `ALTER TABLE`) and
         automatically refreshes any registered materialized views whose underlying
         base table schema changed.
+
+        On MySQL/MariaDB the affected views cannot be replaced atomically (see
+        UnsafeReplacementError), so with ``auto_sync_views=True`` the DDL is
+        refused before any statement runs when it touches a base table of a
+        registered, complete view; the error names the views. Supported
+        recipe: ``drop_view()`` each named view, apply the DDL, then
+        ``register_view()`` them again.
         """
+        statements = [
+            stmt
+            for stmt in _split_top_level(_strip_sql_comments(ddl_sql, dialect=self.dialect), ";", dialect=self.dialect)
+            if stmt.strip()
+        ]
+        if auto_sync_views and self.dialect == Dialect.MYSQL:
+            affected = self._views_affected_by_ddl(statements)
+            if affected:
+                raise UnsafeReplacementError(
+                    f"Refusing to apply schema DDL on {self.subdialect.value}: it changes base "
+                    f"tables of the registered materialized view(s) {', '.join(affected)}, which "
+                    f"would then have to be replaced, and MySQL/MariaDB DDL commits implicitly so "
+                    f"they cannot be replaced atomically. Nothing was executed. Supported recipe: "
+                    f"drop_view() each of these views, apply the DDL, then register_view() them "
+                    f"again (readers see them disappear and fill)."
+                )
         with self._cursor() as cur:
-            for stmt in _split_top_level(_strip_sql_comments(ddl_sql, dialect=self.dialect), ";", dialect=self.dialect):
-                if stmt.strip():
-                    cur.execute(stmt)
+            for stmt in statements:
+                cur.execute(stmt)
             self._commit()
         if auto_sync_views:
             catalog = self.get_catalog()
             if catalog:
                 self.sync_views([entry["view_sql"] for entry in catalog.values()])
+
+    def _views_affected_by_ddl(self, statements: Sequence[str]) -> List[str]:
+        """Registered complete views a DDL script could force to be replaced.
+
+        A view is affected when the script mentions one of its base tables
+        (the signature covers every column of every referenced table). A
+        statement that cannot be parsed affects every view (fail closed).
+        Views with an incomplete backfill are excluded: they may be rebuilt.
+        """
+        catalog = self.get_catalog()
+        published = {n: e for n, e in catalog.items() if not self._is_backfill_incomplete(e)}
+        if not published:
+            return []
+        touched: Set[str] = set()
+        for stmt in statements:
+            try:
+                parsed = sqlglot.parse(stmt, read="mysql")
+            except Exception:
+                return sorted(published)
+            tables = [t for tree in parsed if tree is not None for t in tree.find_all(sqlglot_exp.Table)]
+            if not tables:
+                return sorted(published)
+            touched.update(t.name.lower() for t in tables if t.name)
+        affected = []
+        for name, entry in published.items():
+            try:
+                specs = parse_view_definitions(entry["view_sql"], dialect=self.dialect)
+                referenced = {r.lower().split(".")[-1].strip('`"') for s in specs for r in s.referenced_tables}
+            except Exception:
+                affected.append(name)
+                continue
+            if referenced & touched:
+                affected.append(name)
+        return sorted(affected)
 
     def _catalog_select(self, cur: Any, sql: str) -> Optional[List[Any]]:
         """Run one catalog read; None if it failed (e.g. no catalog yet).
@@ -642,31 +708,10 @@ class MaterializedViewManager:
         entry = catalog.get(resolved_name)
         with self._cursor() as cur:
             if entry:
-                for t_name in entry["trigger_names"]:
-                    if self.dialect != Dialect.POSTGRES:
-                        cur.execute(build_drop_sql("TRIGGER", t_name, dialect=self.dialect))
-                for fn_name in entry["function_names"]:
-                    cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-                cur.execute(build_drop_sql("VIEW", resolved_name, dialect=self.dialect))
-                cur.execute(build_drop_sql("TABLE", entry["backing_table"], dialect=self.dialect))
-                for aux_t in entry["aux_tables"]:
-                    cur.execute(build_drop_sql("TABLE", aux_t, dialect=self.dialect))
-                if self.dialect == Dialect.SQLITE and self.engine_version.supports_sqlite_returning:
-                    self._execute_param(
-                        cur,
-                        f"DELETE FROM {self.catalog_table} WHERE view_name = ? RETURNING view_name;",
-                        (resolved_name,),
-                    )
-                    try:
-                        cur.fetchall()
-                    except Exception:
-                        pass
-                else:
-                    self._execute_param(
-                        cur,
-                        f"DELETE FROM {self.catalog_table} WHERE view_name = ?;",
-                        (resolved_name,),
-                    )
+                # One transaction on SQLite too (its DDL otherwise commits
+                # statement by statement), so a failure drops nothing.
+                self._reserve_sqlite_writer(cur)
+                self._drop_registered_objects(cur, resolved_name, entry)
                 self._commit()
                 return True
             else:
@@ -681,6 +726,74 @@ class MaterializedViewManager:
                 cur.execute(build_drop_sql("TABLE", f"{self.object_prefix}store_{raw_logical}", dialect=self.dialect))
                 self._commit()
                 return False
+
+    def _reserve_sqlite_writer(self, cur: Any) -> None:
+        """On SQLite, open the manager-owned write transaction (BEGIN IMMEDIATE).
+
+        sqlite3 does not open a transaction for DDL, so without this every
+        CREATE/DROP commits on its own. BEGIN IMMEDIATE also takes the
+        database's single writer lock up front, so no independent writer can
+        commit between the statements that follow.
+        """
+        if self.dialect == Dialect.SQLITE and dbapi_transaction_state(self.conn) is not True:
+            cur.execute("BEGIN IMMEDIATE;")
+
+    def _drop_registered_objects(self, cur: Any, resolved_name: str, entry: Dict[str, Any]) -> None:
+        """Drop one registered generation (objects and catalog row) without committing."""
+        for t_name in entry["trigger_names"]:
+            if self.dialect != Dialect.POSTGRES:
+                cur.execute(build_drop_sql("TRIGGER", t_name, dialect=self.dialect))
+        for fn_name in entry["function_names"]:
+            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+        cur.execute(build_drop_sql("VIEW", resolved_name, dialect=self.dialect))
+        cur.execute(build_drop_sql("TABLE", entry["backing_table"], dialect=self.dialect))
+        for aux_t in entry["aux_tables"]:
+            cur.execute(build_drop_sql("TABLE", aux_t, dialect=self.dialect))
+        if self.dialect == Dialect.SQLITE and self.engine_version.supports_sqlite_returning:
+            self._execute_param(
+                cur,
+                f"DELETE FROM {self.catalog_table} WHERE view_name = ? RETURNING view_name;",
+                (resolved_name,),
+            )
+            try:
+                cur.fetchall()
+            except Exception:
+                pass
+        else:
+            self._execute_param(
+                cur,
+                f"DELETE FROM {self.catalog_table} WHERE view_name = ?;",
+                (resolved_name,),
+            )
+
+    def _replacement_refusal(
+        self, view_name: str, existing: Dict[str, Any], populate: bool, incremental_backfill: bool
+    ) -> Optional[UnsafeReplacementError]:
+        """Why replacing ``existing`` cannot keep the published view until the new one is ready.
+
+        A view whose pk-range backfill is incomplete publishes nothing correct,
+        so it may always be rebuilt (the documented recovery).
+        """
+        if self._is_backfill_incomplete(existing):
+            return None
+        if self.dialect == Dialect.MYSQL:
+            reason = (
+                "MySQL/MariaDB DDL commits implicitly, so the old generation cannot be kept "
+                "until the replacement is built and populated"
+            )
+        elif populate and incremental_backfill:
+            reason = (
+                "an incremental backfill commits batch by batch, so readers would see a "
+                "partially populated replacement"
+            )
+        else:
+            return None
+        return UnsafeReplacementError(
+            f"Refusing to replace materialized view '{view_name}' on {self.subdialect.value}: "
+            f"{reason}. The published view and its catalog entry are unchanged. To replace "
+            f"it non-atomically (readers see the view disappear and then fill), call "
+            f"drop_view() and then register_view()."
+        )
 
     def _update_backfill_watermark(
         self,
@@ -1377,6 +1490,19 @@ class MaterializedViewManager:
             return plan
 
         if existing:
+            refusal = self._replacement_refusal(plan.view_name, existing, populate, incremental_backfill)
+            if refusal is not None:
+                raise refusal
+        # A published generation is dropped inside the same transaction that
+        # builds and populates its replacement (SQLite and PostgreSQL have
+        # transactional DDL), so a failure at any stage restores it and
+        # readers never see it missing. Only an incomplete generation (nothing
+        # correct published) is dropped and committed first where that is not
+        # possible: on MySQL/MariaDB, or before an incremental backfill.
+        atomic_replacement = self.dialect in (Dialect.SQLITE, Dialect.POSTGRES) and not (
+            populate and incremental_backfill
+        )
+        if existing and not atomic_replacement:
             self.drop_view(plan.view_name)
 
         # Install structure, maintenance triggers, single-shot backfill, and catalog record
@@ -1386,17 +1512,15 @@ class MaterializedViewManager:
             created_objects: List[Tuple[str, str]] = []
             catalog_inserted = False
             try:
-                if self.dialect == Dialect.SQLITE and getattr(self.conn, "in_transaction", None) is not True:
-                    # sqlite3 does not open a transaction for DDL, so without an
-                    # explicit reservation every CREATE commits on its own and an
-                    # independent writer can commit after the maintenance
-                    # triggers exist but before the initial population reads the
-                    # base tables: its row is then applied by the trigger and
-                    # again by the population. BEGIN IMMEDIATE takes the
-                    # database's single writer lock before the first DDL, so
-                    # installation, population and catalog record become one
-                    # writer-visible step.
-                    cur.execute("BEGIN IMMEDIATE;")
+                # sqlite3 does not open a transaction for DDL, so without an
+                # explicit reservation every CREATE commits on its own and an
+                # independent writer can commit after the maintenance triggers
+                # exist but before the initial population reads the base
+                # tables: its row is then applied by the trigger and again by
+                # the population.
+                self._reserve_sqlite_writer(cur)
+                if existing and atomic_replacement:
+                    self._drop_registered_objects(cur, plan.view_name, existing)
                 for stmt in plan.create_structure_statements():
                     obj = _extract_created_object(stmt)
                     cur.execute(stmt)
@@ -1597,6 +1721,7 @@ class MaterializedViewManager:
             dialect=self.dialect,
         )
 
+        planned: List[Tuple[Any, MaterializedViewPlan, str]] = []
         for v_spec in all_specs:
             plan = generate_materialized_view(
                 schemas,
@@ -1611,9 +1736,20 @@ class MaterializedViewManager:
                 watermark_catalog_table=self.catalog_table if incremental_backfill else None,
                 pg_fillfactor=getattr(self, "pg_fillfactor", 80),
             )
+            planned.append((v_spec, plan, self._compute_signature(plan, schemas)))
+
+        # Refuse an unsafe replacement before applying anything, so a refused
+        # request leaves every view as it was.
+        for _, plan, sig in planned:
+            existing = catalog.get(plan.view_name)
+            if existing is not None and existing["signature_hash"] != sig:
+                refusal = self._replacement_refusal(plan.view_name, existing, True, incremental_backfill)
+                if refusal is not None:
+                    raise refusal
+
+        for v_spec, plan, sig in planned:
             v_name = plan.view_name
             desired_names.add(v_name)
-            sig = self._compute_signature(plan, schemas)
             if v_name not in catalog:
                 self._register_single_view_spec(
                     v_spec,

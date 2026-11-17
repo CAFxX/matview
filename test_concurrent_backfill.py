@@ -16,7 +16,14 @@ import warnings
 import uuid
 from urllib.parse import urlparse
 
-from matview_sync import BackfillInterruptedError, Dialect, EngineLimitationError, EngineLimitationWarning, MaterializedViewManager
+from matview_sync import (
+    BackfillInterruptedError,
+    Dialect,
+    EngineLimitationError,
+    EngineLimitationWarning,
+    MaterializedViewManager,
+    UnsafeReplacementError,
+)
 from test_matview_sync import _register_sqlite_compat_udfs
 
 # Bound for replaying an application writer transaction chosen as an engine
@@ -2371,7 +2378,15 @@ class BackfillTakeoverOwnershipTests(unittest.TestCase):
         # refused at its next batch and the view keeps one chunk only.
         for engine, dsn in self._engines():
             with self.subTest(engine=getattr(engine, "value", engine)):
-                self._run(engine, dsn, a_pause_batch=self.ROWS // self.BATCH, b_pause_batch=1, redefine=False)
+                # A's completion is recorded, so the view is published and
+                # complete: replacing it under an incremental backfill is
+                # refused (UnsafeReplacementError, readers would see a partial
+                # view), and the new owner takes over via drop_view() +
+                # register_view() instead.
+                self._run(
+                    engine, dsn, a_pause_batch=self.ROWS // self.BATCH, b_pause_batch=1, redefine=False,
+                    b_replaces_by_drop=True,
+                )
 
     def test_stale_owner_at_the_same_cursor_as_new_owner_is_fenced(self) -> None:
         # ABA: A (old definition) pauses after batch 2; B (new definition,
@@ -2393,7 +2408,7 @@ class BackfillTakeoverOwnershipTests(unittest.TestCase):
                 self._run(engine, dsn, a_pause_batch=1, b_pause_batch=0, redefine=False, repair=True)
 
     def _run(self, engine, dsn, a_pause_batch: int, b_pause_batch: int, redefine: bool,
-             repair: bool = False) -> None:
+             repair: bool = False, b_replaces_by_drop: bool = False) -> None:
         suffix = uuid.uuid4().hex[:10]
         table, view, schema = f"own_{suffix}", f"own_v_{suffix}", f"mv_own_{suffix}"
         path = None
@@ -2483,9 +2498,18 @@ class BackfillTakeoverOwnershipTests(unittest.TestCase):
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", EngineLimitationWarning)
+                        if b_replaces_by_drop:
+                            try:
+                                mb.register_view(
+                                    new_sql, populate=True, incremental_backfill=True, batch_size=self.BATCH,
+                                    force_rebuild=True, ignore_limitations=True,
+                                )
+                            except UnsafeReplacementError:
+                                res["b_refused"] = True
+                            mb.drop_view(registered_name)
                         res["b"] = mb.register_view(
                             new_sql, populate=True, incremental_backfill=True, batch_size=self.BATCH,
-                            force_rebuild=True, on_progress=b_progress, ignore_limitations=True,
+                            force_rebuild=not b_replaces_by_drop, on_progress=b_progress, ignore_limitations=True,
                         )
                 except BaseException as exc:  # inspected below
                     res["b"] = exc
@@ -2519,6 +2543,8 @@ class BackfillTakeoverOwnershipTests(unittest.TestCase):
 
             b_plan = res["b"]
             self.assertNotIsInstance(b_plan, BaseException, f"new owner failed: {b_plan!r}")
+            if b_replaces_by_drop:
+                self.assertTrue(res.get("b_refused"), "incremental replacement of a complete view was not refused")
             if redefine:
                 # A resumed at a cursor equal to B's watermark: fenced, rolled back.
                 self.assertIsInstance(res["a"], BackfillInterruptedError, repr(res["a"]))

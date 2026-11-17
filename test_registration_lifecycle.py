@@ -255,6 +255,55 @@ class SqliteTransactionOwnershipTests(unittest.TestCase):
         conn.commit()
         self.assertEqual(self._observed_count(70) + self._observed_count(71), 2)
 
+    def _assert_failed_drop_restores(self, conn: sqlite3.Connection, manager: MaterializedViewManager, plan: Any) -> None:
+        self.assertFalse(conn.in_transaction)
+        self.assertIn(plan.view_name, manager.get_catalog())
+        objects = {name for _, name in self.observer.execute("SELECT type, name FROM sqlite_master;").fetchall()}
+        for name in [plan.view_name, plan.backing_table_name, *plan.trigger_names]:
+            self.assertIn(name, objects, f"{name} was dropped by a failed drop_view")
+        conn.execute("INSERT INTO owned_rows VALUES (80, 'a', 2);")
+        conn.commit()
+        self.assertEqual(
+            self.observer.execute(f"SELECT bucket, n, total FROM {plan.view_name} ORDER BY bucket;").fetchall(),
+            self.observer.execute(LIVE_SQL).fetchall(),
+        )
+
+    def test_failed_drop_view_is_rolled_back_not_committed(self) -> None:
+        # The engine refuses the DROP TABLE after the triggers and reader view
+        # were dropped; the whole operation must roll back, not commit.
+        conn = self.db.connect()
+        self.addCleanup(conn.close)
+        manager = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        plan = manager.register_view(VIEW_SQL)
+
+        def deny_drop_table(action: int, *args: Any) -> int:
+            return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_DROP_TABLE else sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_drop_table)
+        try:
+            with self.assertRaises(sqlite3.DatabaseError):
+                manager.drop_view(plan.view_name)
+        finally:
+            conn.set_authorizer(None)
+        self._assert_failed_drop_restores(conn, manager, plan)
+
+    def test_python_failure_inside_drop_view_is_rolled_back(self) -> None:
+        # A failure raised outside the engine (the statements so far
+        # succeeded) must also roll back rather than commit.
+        conn = self.db.connect()
+        self.addCleanup(conn.close)
+        manager = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        plan = manager.register_view(VIEW_SQL)
+        proxy = _FailOnCatalogDelete(conn, manager.catalog_table)
+        manager.conn = proxy
+        try:
+            with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                manager.drop_view(plan.view_name)
+        finally:
+            manager.conn = conn
+        self.assertTrue(proxy.injected)
+        self._assert_failed_drop_restores(conn, manager, plan)
+
     def test_success_requires_the_commit_to_end_the_transaction(self) -> None:
         conn = self.db.connect()
         self.addCleanup(conn.close)
