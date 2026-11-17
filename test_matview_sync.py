@@ -8399,6 +8399,55 @@ def get_fuzz_regression_corpus() -> List[Dict[str, Any]]:
                 ("ins_subq_row", "INSERT INTO fc6_merchants VALUES (3, 'ORG_3', 'core', 20);"),
             ],
         },
+        {
+            "id": "corpus_07_sqlite_sum_after_real_values_retracted",
+            "description": (
+                "Discovered by VariableSchemaDifferentialFuzzer (CI seed 1586782166, scenario 3, "
+                "SQLite): a BIGINT column holds REAL 0.6 after an UPDATE (SQLite stores the "
+                "non-integral value as REAL). The add/retract SUM fold then kept the rounding of "
+                "the removed REAL values: SUM was 7.000000000000007 instead of INTEGER 7 after "
+                "they were deleted, and an INTEGER-affinity backing column turned the REAL sum "
+                "10.0 into INTEGER 10. SQLite only: PostgreSQL/MySQL integer columns cannot hold 0.6."
+            ),
+            "dialects": (Dialect.SQLITE,),
+            "schema": """
+                CREATE TABLE fc7_t (
+                    id INTEGER PRIMARY KEY,
+                    label VARCHAR(40),
+                    qty BIGINT NOT NULL DEFAULT 0,
+                    amount NUMERIC(18, 4)
+                );
+            """,
+            "views": [
+                (
+                    "fc7_v_group",
+                    "CREATE VIEW fc7_v_group AS SELECT label, COUNT(*) AS row_count, SUM(qty) AS total_qty, AVG(amount) AS average_amount, TOTAL(qty) AS total_total FROM fc7_t GROUP BY label;",
+                ),
+                (
+                    "fc7_v_all",
+                    "CREATE VIEW fc7_v_all AS SELECT COUNT(*) AS row_count, SUM(qty) AS total_qty, AVG(qty) AS average_qty FROM fc7_t;",
+                ),
+            ],
+            "seed": [
+                "INSERT INTO fc7_t VALUES (2, 'hot', 91, NULL);",
+                "INSERT INTO fc7_t VALUES (3, 'hot', 32, 65.125);",
+                "INSERT INTO fc7_t VALUES (5, 'hot', 59, 5.125);",
+                "INSERT INTO fc7_t VALUES (6, 'hot', 96, 86.125);",
+                "INSERT INTO fc7_t VALUES (7, 'hot', 72, 36.125);",
+                "INSERT INTO fc7_t VALUES (8, 'hot', 7, 49.125);",
+                "INSERT INTO fc7_t VALUES (10, 'cold', 79, 14.375);",
+            ],
+            "mutations": [
+                (
+                    "store_real_in_bigint",
+                    "UPDATE fc7_t SET qty = ((CASE WHEN (ROUND(4)) >= (1) THEN (ROUND(4)) - (1) ELSE (ROUND(4)) END) / 5) WHERE (NOT COALESCE(qty, 0) BETWEEN 5 AND 22);",
+                ),
+                ("delete_real_rows", "DELETE FROM fc7_t WHERE id < 8;"),
+                ("large_then_retract_ins", "INSERT INTO fc7_t VALUES (11, 'hot', 10000000000000000, 1.5);"),
+                ("large_then_retract_real", "INSERT INTO fc7_t VALUES (12, 'hot', 1.5, 0.1);"),
+                ("large_then_retract_del", "DELETE FROM fc7_t WHERE id = 11;"),
+            ],
+        },
     ]
 
 

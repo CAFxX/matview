@@ -595,7 +595,7 @@ def introspect_sqlite_schemas(
                 cols: Dict[str, ColumnDef] = {}
                 for r in t_info:
                     c_name = str(r[1])
-                    c_type = str(r[2]).upper() if r[2] else "TEXT"
+                    c_type = str(r[2]).upper() if r[2] else "BLOB"  # no declared type: BLOB affinity
                     c_pk = bool(r[5])
                     c_notnull = bool(r[3]) or (
                         c_pk and pk_count == 1 and re.sub(r"\s+", " ", c_type.strip()) == "INTEGER"

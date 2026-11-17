@@ -133,6 +133,229 @@ class Tier1SingleMixin:
             return f"(CASE WHEN COUNT({eff}) = 0 THEN NULL WHEN MAX(CASE WHEN ({eff}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
         return item.raw_expr
 
+    # ------------------------------------------------------------------
+    # SQLite exact SUM/TOTAL/AVG maintenance
+    # ------------------------------------------------------------------
+    # SQLite's SUM/TOTAL/AVG accumulate integer inputs exactly (int64) and
+    # switch to binary floating point (Kahan-Babuska-Neumaier) as soon as one
+    # non-integer value is seen. An add/retract fold over REAL values is not
+    # equivalent: the maintained value depends on the history of values that
+    # were added and later removed (e.g. 1e16 + 1.5 - 1e16 == 2.0, not 1.5).
+    # Every SQLite column can hold REAL values regardless of its declared type.
+    #
+    # Each non-DISTINCT SUM/TOTAL/AVG argument therefore gets a hidden
+    # "approximate count" column: the number of non-NULL values in the group
+    # whose storage class is not INTEGER. While it is zero and the delta values
+    # are integers, the fold is exact integer arithmetic (equal to the native
+    # aggregate). Otherwise the affected group is recomputed from the base
+    # table with the same native aggregate as the original view.
+    _SQLITE_EXACT_FLOAT_LIMIT = "4503599627370496.0"  # 2**52
+    _SQLITE_DIRTY_COL = "__mv_fold_dirty"
+
+    def _sqlite_exact_sum_enabled(self) -> bool:
+        return self.dialect == Dialect.SQLITE and self._alg_mode in ("single", "distinct")
+
+    def _sqlite_distinct_sum_recompute(self, item: SelectItem, col_alias: str, record_prefix: str) -> str:
+        """Native SUM(DISTINCT) for a visible SUM column; TOTAL(DISTINCT) for a
+        hidden AVG sum (REAL; native AVG(DISTINCT) never raises on overflow)."""
+        eff = self._effective_agg_value_expr(item, record_prefix=None)
+        is_visible_sum = item.agg_func == AggFunc.SUM and self._q(col_alias) == self._q(item.alias)
+        agg = "SUM" if is_visible_sum else "TOTAL"
+        return self._build_native_group_recompute(
+            f"{agg}(DISTINCT {eff})", record_prefix, processed_only=True
+        )
+
+    def _sqlite_union_native_sum(self, item: SelectItem) -> bool:
+        """SQLite UNION ALL aggregates: SUM/TOTAL/AVG are always recomputed over
+        the union (idempotent, so the OLD and NEW steps of an UPDATE agree)."""
+        return (
+            self.dialect == Dialect.SQLITE
+            and self._alg_mode == "union_all_agg"
+            and item.is_aggregate
+            and item.agg_func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG)
+        )
+
+    def _sqlite_acnt_map(self) -> Dict[str, str]:
+        if not self._sqlite_exact_sum_enabled():
+            return {}
+        return getattr(self, "_sqlite_acnt_cols", {})
+
+    @staticmethod
+    def _sqlite_is_approx_value_sql(val_e: str) -> str:
+        return f"(CASE WHEN ({val_e}) IS NOT NULL AND typeof({val_e}) <> 'integer' THEN 1 ELSE 0 END)"
+
+    def _watermark_pk_column(self) -> Optional[str]:
+        if not (self.watermark_catalog_table and self._alg_mode in ("single", "distinct")):
+            return None
+        wm_pk_col: Optional[str] = "rowid" if self.dialect == Dialect.SQLITE else None
+        if self.primary_schema:
+            for c_def in self.primary_schema.columns.values():
+                if c_def.primary_key and "INT" in c_def.data_type.upper():
+                    wm_pk_col = c_def.name
+                    break
+        return wm_pk_col
+
+    def _build_native_group_recompute(
+        self,
+        agg_sql: str,
+        record_prefix: str,
+        *,
+        processed_only: bool,
+        rows_filter: Optional[str] = None,
+    ) -> str:
+        """Native aggregate over the record's group, optionally restricted to the
+        rows the triggers have already folded (rows inside an active backfill
+        watermark range are excluded, exactly like the trigger WHERE guards)."""
+        q_base_t = self._q(self.view.base_table)
+        conds: List[str] = []
+        if self.view.where_clause:
+            conds.append(f"({self.view.where_clause})")
+        for g_expr in self._effective_group_by_exprs:
+            if record_prefix == self._backing_table_name():
+                rhs_g = f"{record_prefix}.{self._q(self._group_col_alias(g_expr))}"
+            else:
+                rhs_g = self._rewrite_expr_for_record(g_expr, record_prefix)
+            lhs_g = self._rewrite_expr_for_record(g_expr, q_base_t)
+            is_nn = self._is_simple_col_ref(g_expr) and self._col_def(g_expr).not_null
+            conds.append(self._null_safe_eq(f"({lhs_g})", f"({rhs_g})", is_nullable=not is_nn))
+        if rows_filter:
+            conds.append(f"({rows_filter})")
+        wm_pk = self._watermark_pk_column() if processed_only else None
+        if wm_pk:
+            q_pk = "rowid" if wm_pk == "rowid" else self._q(wm_pk)
+            conds.append(
+                f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"AND {q_base_t}.{q_pk} > backfill_cursor_pk AND {q_base_t}.{q_pk} <= backfill_max_pk)"
+            )
+        where_part = f" WHERE {' AND '.join(conds)}" if conds else ""
+        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part})"
+
+    def _sqlite_guarded_fold(
+        self,
+        mv_table: str,
+        acc_col: str,
+        acnt_col: str,
+        fold_expr: str,
+        own_val: str,
+        exact_conds: List[str],
+    ) -> str:
+        """Fold only when the fold is provably equal to the native aggregate.
+
+        Otherwise keep the stored value and record the condition; the caller
+        marks the row dirty and a final statement recomputes the group natively
+        after every fold step of the trigger has run. Deciding per step would be
+        wrong for UPDATE: a recompute in the OLD step already includes the NEW
+        row, so folding NEW onto it would count NEW twice.
+        """
+        q_acc = self._q(acc_col)
+        cond = (
+            f"({mv_table}.{self._q(acnt_col)} = 0 "
+            f"AND typeof({own_val}) IN ('integer', 'null') "
+            # Integer accumulator (visible SUM, stored without affinity): the
+            # fold is exact unless int64 arithmetic overflowed, which SQLite
+            # turns into REAL; native SUM raises "integer overflow" instead, so
+            # an overflowing fold is recomputed natively (and raises).
+            f"AND ((typeof({mv_table}.{q_acc}) IN ('integer', 'null') "
+            f"AND typeof({fold_expr}) IN ('integer', 'null')) OR "
+            # REAL-affinity accumulators (TOTAL, hidden AVG sums): integer
+            # arithmetic in binary64 is exact only below 2**52.
+            f"(typeof({mv_table}.{q_acc}) = 'real' AND "
+            f"ABS({mv_table}.{q_acc}) + ABS(1.0 * COALESCE({own_val}, 0)) "
+            f"< {self._SQLITE_EXACT_FLOAT_LIMIT})))"
+        )
+        exact_conds.append(cond)
+        return f"(CASE WHEN {cond} THEN {fold_expr} ELSE {mv_table}.{q_acc} END)"
+
+    def _sqlite_dirty_fold_assignment(self, mv_table: str, exact_conds: Sequence[str]) -> str:
+        q_dirty = self._q(self._SQLITE_DIRTY_COL)
+        if not exact_conds:
+            return f"{q_dirty} = {mv_table}.{q_dirty}"
+        uniq = list(dict.fromkeys(exact_conds))
+        return f"{q_dirty} = CASE WHEN {' AND '.join(uniq)} THEN {mv_table}.{q_dirty} ELSE 1 END"
+
+    def _sqlite_recompute_dirty_stmt(
+        self,
+        mv_table: str,
+        record_prefix: Optional[str],
+        col_sum_map: Dict[str, str],
+        expr_key_fn: Callable[[SelectItem], str],
+        *,
+        rows_filter: Optional[str] = None,
+    ) -> Optional[str]:
+        """Recompute SUM/TOTAL/AVG of dirty groups natively, then clear the flag.
+
+        Trigger form (``record_prefix`` OLD/NEW): the record's group, over the
+        rows the triggers have folded (active backfill range excluded).
+        Backfill-chunk form (``record_prefix`` None): every dirty group, over
+        the rows selected by ``rows_filter`` (the rows folded once the chunk
+        is merged)."""
+        processed_only = record_prefix is not None
+        acnt_map = self._sqlite_acnt_map()
+        if not acnt_map:
+            return None
+        assignments: List[str] = []
+        seen: Set[str] = set()
+        for item in self._working_select_items:
+            if not item.is_aggregate or item.is_distinct:
+                continue
+            ekey = expr_key_fn(item)
+            if ekey not in acnt_map or item.agg_func not in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG):
+                continue
+            q_col = self._q(item.alias)
+            if q_col in seen:
+                continue
+            seen.add(q_col)
+            assignments.append(
+                f"{q_col} = "
+                + self._build_native_group_recompute(
+                    self._sql_backfill_agg_expr(item), mv_table,
+                    processed_only=processed_only, rows_filter=rows_filter,
+                )
+            )
+        ekey_to_item = {expr_key_fn(it): it for it in self._working_select_items if it.is_aggregate}
+        for ekey, sum_col in col_sum_map.items():
+            q_col = self._q(sum_col)
+            if ekey not in acnt_map or q_col in seen:
+                continue
+            seen.add(q_col)
+            eff = self._effective_agg_value_expr(ekey_to_item[ekey], record_prefix=None)
+            # Hidden AVG sums have REAL affinity. TOTAL equals SUM converted to
+            # REAL but never raises "integer overflow" (native AVG does not).
+            assignments.append(
+                f"{q_col} = "
+                + self._build_native_group_recompute(
+                    f"TOTAL({eff})", mv_table, processed_only=processed_only, rows_filter=rows_filter
+                )
+            )
+        q_dirty = self._q(self._SQLITE_DIRTY_COL)
+        assignments.append(f"{q_dirty} = 0")
+        where = f"{mv_table}.{q_dirty} = 1"
+        if record_prefix is not None:
+            where = f"({self._group_match_predicate_tier1(mv_table, record_prefix)}) AND {where}"
+        return (
+            f"UPDATE {mv_table}\n"
+            f"    SET {', '.join(assignments)}\n"
+            f"    WHERE {where};"
+        )
+
+    def _sqlite_chunk_rows_filter(self, pk_col: str) -> str:
+        """Rows folded once the current pk-range chunk is merged.
+
+        The chunk statements run with (cursor_pk, upper_pk) bound; ``?2`` is the
+        chunk's upper bound. Rows above the claimed backfill range are folded
+        by the triggers (see the trigger watermark guard)."""
+        q_base_t = self._q(self.view.base_table)
+        q_pk = "rowid" if pk_col == "rowid" else self._q(pk_col)
+        cond = f"{q_base_t}.{q_pk} <= ?2"
+        if self.watermark_catalog_table:
+            cond += (
+                f" OR NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"AND {q_base_t}.{q_pk} <= backfill_max_pk)"
+            )
+        return cond
+
     def _compile_tier1_algebraic(self) -> MaterializedViewPlan:
         view_name = self.view.view_name
         mv_table = self._backing_table_name()
@@ -312,6 +535,23 @@ class Tier1SingleMixin:
                     col_true_cnt_map[ekey] = tcnt_col
                     col_defs_sql.append(f"{tcnt_col} {self._int_type()} NOT NULL DEFAULT 0")
 
+        self._sqlite_acnt_cols = {}
+        if self._sqlite_exact_sum_enabled():
+            for item in work_items:
+                if (
+                    item.is_aggregate
+                    and not item.is_distinct
+                    and item.agg_func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG)
+                ):
+                    ekey = _expr_key(item)
+                    if ekey not in self._sqlite_acnt_cols:
+                        aux_idx += 1
+                        acnt_col = f"__mv_acnt_{_sanitize_ident(item.alias)}_{aux_idx}"
+                        self._sqlite_acnt_cols[ekey] = acnt_col
+                        col_defs_sql.append(f"{acnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+            if self._sqlite_acnt_cols:
+                col_defs_sql.append(f"{self._SQLITE_DIRTY_COL} {self._int_type()} NOT NULL DEFAULT 0")
+
         pk_cols = self._tier1_pk_cols()
         if grp_exprs and not has_nullable_grp:
             col_defs_sql.append(f"PRIMARY KEY ({', '.join(self._q(c) for c in pk_cols)})")
@@ -389,6 +629,17 @@ class Tier1SingleMixin:
             )
             index_ddls.extend(a_ddls)
             index_names.extend(a_names)
+        if self._sqlite_acnt_map():
+            # Backfill chunks recompute every dirty group; a partial index keeps
+            # that lookup proportional to the dirty groups, not the store size.
+            dirty_idx = self._bounded_ident(
+                f"{self.object_prefix or '__matview_'}idx_", self.logical_view_name, "__dirty"
+            )
+            index_ddls.append(
+                f"CREATE INDEX {self._q(dirty_idx)} ON {mv_table} ({self._SQLITE_DIRTY_COL}) "
+                f"WHERE {self._SQLITE_DIRTY_COL} = 1;"
+            )
+            index_names.append(dirty_idx)
 
         reader_select_override = [
             self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
@@ -490,7 +741,11 @@ class Tier1SingleMixin:
                 it = ekey_to_item[ekey]
                 dist = "DISTINCT " if (include_distinct_keyword and it.is_distinct) else ""
                 target_cols.append(sum_col)
-                select_exprs.append(f"SUM({dist}{_eff(it)})")
+                # Hidden sums (AVG/VAR helpers) are REAL on SQLite. TOTAL is the
+                # same value as SUM but never raises "integer overflow", which
+                # native AVG/VAR do not raise either.
+                hidden_agg = "TOTAL" if self.dialect == Dialect.SQLITE else "SUM"
+                select_exprs.append(f"{hidden_agg}({dist}{_eff(it)})")
                 already_in_target_q.add(q_sum)
 
         for ekey, sum2_col in col_sum2_map.items():
@@ -515,6 +770,16 @@ class Tier1SingleMixin:
                     f"COALESCE(SUM(CASE WHEN ({eff}) IS NOT NULL AND ({eff}) THEN 1 ELSE 0 END), 0)"
                 )
                 already_in_target_q.add(q_tcnt)
+
+        for ekey, acnt_col in self._sqlite_acnt_map().items():
+            q_acnt = self._q(acnt_col)
+            if q_acnt not in already_in_target_q:
+                eff = _eff(ekey_to_item[ekey])
+                target_cols.append(acnt_col)
+                select_exprs.append(
+                    f"COALESCE(SUM({self._sqlite_is_approx_value_sql(eff)}), 0)"
+                )
+                already_in_target_q.add(q_acnt)
 
         return [self._q(c) for c in target_cols]
 
@@ -729,10 +994,17 @@ class Tier1SingleMixin:
                     f"ON CONFLICT ({', '.join(q_pk_cols)}) DO UPDATE SET\n"
                     f"    {', '.join(merge_assignments)};"
                 )
+            chunk_templates_pk = [chunk_upsert_sql]
+            dirty_chunk_stmt = self._sqlite_recompute_dirty_stmt(
+                mv_table, None, col_sum_map, expr_key_fn,
+                rows_filter=self._sqlite_chunk_rows_filter(pk_col),
+            )
+            if dirty_chunk_stmt:
+                chunk_templates_pk.append(dirty_chunk_stmt)
             inc_spec = IncrementalBackfillSpec(
                 mode="pk_range_fold",
                 pk_column=pk_col,
-                chunk_sql_templates=[chunk_upsert_sql],
+                chunk_sql_templates=chunk_templates_pk,
             )
         elif grp_exprs:
             grp_expr = self._canonical_group_pk_expr(grp_exprs)
@@ -893,6 +1165,9 @@ class Tier1SingleMixin:
         assignments: List[str] = []
         updated: Set[str] = set()
         work_items = self._working_select_items
+        ekey_to_item_m: Dict[str, SelectItem] = {
+            expr_key_fn(it): it for it in work_items if it.is_aggregate
+        }
 
         def _incoming(col: str) -> str:
             qc = self._q(col)
@@ -900,14 +1175,41 @@ class Tier1SingleMixin:
                 return f"{incoming_alias}.{qc}"
             return f"VALUES({qc})" if use_mysql_values else f"excluded.{qc}"
 
-        def _merged_sum(col: str) -> str:
+        acnt_map = self._sqlite_acnt_map()
+        col_to_ekey = {self._q(c): k for k, c in col_sum_map.items()}
+        merge_fold_conds: List[str] = []
+
+        def _merged_sum(col: str, item: Optional[SelectItem] = None, *, total: bool = False) -> str:
             qc = self._q(col)
             inc = _incoming(qc)
-            return (
+            folded = (
                 f"(CASE WHEN {inc} IS NULL THEN {mv_table}.{qc} "
                 f"WHEN {mv_table}.{qc} IS NULL THEN {inc} "
                 f"ELSE {mv_table}.{qc} + {inc} END)"
             )
+            ekey = expr_key_fn(item) if item is not None else col_to_ekey.get(qc)
+            if ekey is None or ekey not in acnt_map:
+                return folded
+            if item is None:
+                item = ekey_to_item_m[ekey]
+            # Exact only while both sides are integer-only and below 2**52 when
+            # stored with REAL affinity; otherwise recompute the whole group
+            # natively (idempotent, so concurrent trigger recomputes and later
+            # chunks converge to the native aggregate when the backfill ends).
+            q_acnt = self._q(acnt_map[ekey])
+            cond = (
+                f"({mv_table}.{q_acnt} = 0 AND {_incoming(q_acnt)} = 0 AND "
+                f"((typeof({mv_table}.{qc}) IN ('integer', 'null') AND typeof({inc}) IN ('integer', 'null') "
+                f"AND typeof({folded}) IN ('integer', 'null')) OR "
+                f"(typeof({mv_table}.{qc}) = 'real' AND "
+                f"ABS(1.0 * COALESCE({mv_table}.{qc}, 0)) + ABS(1.0 * COALESCE({inc}, 0)) < {self._SQLITE_EXACT_FLOAT_LIMIT})))"
+            )
+            # Fold only when provably exact; otherwise keep the row and mark it
+            # dirty. The chunk's follow-up statement recomputes dirty groups
+            # over exactly the rows folded so far (never rows of later chunks,
+            # which would be folded again when their chunk is merged).
+            merge_fold_conds.append(cond)
+            return f"(CASE WHEN {cond} THEN {folded} ELSE {mv_table}.{qc} END)"
 
         def _merged_sum2(ekey: str, sum2_col: str) -> str:
             q_sum2 = self._q(sum2_col)
@@ -932,10 +1234,12 @@ class Tier1SingleMixin:
             updated.add(c)
             ekey = expr_key_fn(item)
             inc_c = _incoming(c)
-            if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
+            if item.agg_func == AggFunc.TOTAL and ekey in acnt_map:
+                assignments.append(f"{c} = {_merged_sum(c, item, total=True)}")
+            elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
                 assignments.append(f"{c} = {mv_table}.{c} + {inc_c}")
             elif item.agg_func == AggFunc.SUM:
-                assignments.append(f"{c} = {_merged_sum(c)}")
+                assignments.append(f"{c} = {_merged_sum(c, item)}")
             elif item.agg_func == AggFunc.AVG:
                 if self._requires_native_avg_recompute(item):
                     # The native AVG result family is not reproduced by a
@@ -947,7 +1251,7 @@ class Tier1SingleMixin:
                     cnt_c = self._q(col_nonnull_count_map[ekey])
                     sum_c = self._q(col_sum_map[ekey])
                     new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
-                    new_sum = _merged_sum(sum_c)
+                    new_sum = _merged_sum(sum_c, item)
                     derived = self._avg_from_sum_count_sql(item, new_sum, new_cnt)
                     assignments.append(
                         f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE {derived} END"
@@ -959,7 +1263,7 @@ class Tier1SingleMixin:
                 AggFunc.STDDEV_SAMP,
             ):
                 native_stat_input = self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
-                if native_stat_input:
+                if native_stat_input or self._sqlite_exact_sum_enabled():
                     recomputed = self._build_recompute_subquery_raw(item, mv_table)
                     assignments.append(f"{c} = {recomputed}")
                 else:
@@ -1056,6 +1360,13 @@ class Tier1SingleMixin:
             if q_tcnt_c not in updated:
                 assignments.append(f"{q_tcnt_c} = {mv_table}.{q_tcnt_c} + {_incoming(q_tcnt_c)}")
                 updated.add(q_tcnt_c)
+        for acnt_c in acnt_map.values():
+            q_acnt_c = self._q(acnt_c)
+            if q_acnt_c not in updated:
+                assignments.append(f"{q_acnt_c} = {mv_table}.{q_acnt_c} + {_incoming(q_acnt_c)}")
+                updated.add(q_acnt_c)
+        if acnt_map:
+            assignments.append(self._sqlite_dirty_fold_assignment(mv_table, merge_fold_conds))
 
         derived_aliases = {
             self._q(it.alias)
@@ -1178,6 +1489,8 @@ class Tier1SingleMixin:
         record_prefix: str = "NEW",
     ) -> List[str]:
         stmts: List[str] = []
+        acnt_map = self._sqlite_acnt_map()
+        fold_conds: List[str] = []
         has_nullable_grp = self._has_nullable_group_col()
         pk_cols = self._tier1_pk_cols()
         from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
@@ -1231,6 +1544,18 @@ class Tier1SingleMixin:
             return f"(CASE WHEN {_is_newly_distinct_cond(item)} THEN 1 ELSE 0 END)"
 
         def _plus_sum_expr(item: SelectItem, col_alias: str) -> str:
+            raw = _plus_sum_expr_raw(item, col_alias)
+            ekey = expr_key_fn(item)
+            if ekey in acnt_map:
+                return self._sqlite_guarded_fold(
+                    mv_table, col_alias, acnt_map[ekey], raw,
+                    self._effective_agg_value_expr(item, record_prefix=record_prefix), fold_conds,
+                )
+            if self._sqlite_exact_sum_enabled() and item.is_distinct:
+                return self._sqlite_distinct_sum_recompute(item, col_alias, record_prefix)
+            return raw
+
+        def _plus_sum_expr_raw(item: SelectItem, col_alias: str) -> str:
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
             q_col = self._q(col_alias)
             if item.is_distinct:
@@ -1311,6 +1636,21 @@ class Tier1SingleMixin:
                 insert_vals.append("1")
             elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
                 insert_vals.append(f"(CASE WHEN ({val_e}) IS NOT NULL THEN 1 ELSE 0 END)")
+            elif self._sqlite_union_native_sum(item):
+                insert_vals.append(self._build_recompute_subquery_raw(item, record_prefix))
+            elif (
+                self._sqlite_exact_sum_enabled()
+                and item.is_distinct
+                and item.agg_func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG)
+            ):
+                # The new group holds exactly the rows the triggers have folded;
+                # the native aggregate applies SQLite's numeric conversion of
+                # TEXT/BLOB inputs that a raw copy of the value would skip.
+                insert_vals.append(
+                    self._build_native_group_recompute(
+                        self._sql_backfill_agg_expr(item), record_prefix, processed_only=True
+                    )
+                )
             elif item.agg_func == AggFunc.SUM:
                 insert_vals.append(f"({val_e})")
             elif item.agg_func == AggFunc.TOTAL:
@@ -1347,6 +1687,10 @@ class Tier1SingleMixin:
                 update_assignments.append(
                     f"{col_alias} = {mv_table}.{col_alias} + {_plus_inc_expr(item)}"
                 )
+            elif self._sqlite_union_native_sum(item):
+                update_assignments.append(
+                    f"{col_alias} = {self._build_recompute_subquery_raw(item, record_prefix)}"
+                )
             elif item.agg_func == AggFunc.SUM:
                 new_sum = _plus_sum_expr(item, col_alias)
                 update_assignments.append(f"{col_alias} = {new_sum}")
@@ -1356,10 +1700,24 @@ class Tier1SingleMixin:
                     inc_val = f"(CASE WHEN ({cond}) THEN 1.0 * ({val_e}) ELSE 0.0 END)"
                 else:
                     inc_val = f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)"
-                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} + {inc_val}")
+                folded = f"{mv_table}.{col_alias} + {inc_val}"
+                if ekey in acnt_map:
+                    folded = self._sqlite_guarded_fold(
+                        mv_table, item.alias, acnt_map[ekey], folded, val_e, fold_conds,
+                    )
+                elif self._sqlite_exact_sum_enabled() and item.is_distinct:
+                    folded = self._build_native_group_recompute(
+                        self._sql_backfill_agg_expr(item), record_prefix, processed_only=True
+                    )
+                update_assignments.append(f"{col_alias} = {folded}")
             elif item.agg_func == AggFunc.AVG:
                 if self._requires_native_avg_recompute(item):
                     recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                    update_assignments.append(f"{col_alias} = {recomputed}")
+                elif self._sqlite_exact_sum_enabled() and item.is_distinct:
+                    recomputed = self._build_native_group_recompute(
+                        self._sql_backfill_agg_expr(item), record_prefix, processed_only=True
+                    )
                     update_assignments.append(f"{col_alias} = {recomputed}")
                 else:
                     cnt_col = self._q(col_nonnull_count_map[ekey])
@@ -1498,6 +1856,31 @@ class Tier1SingleMixin:
                 update_assignments.append(f"{q_sum2_col} = {_plus_sum2_expr(it, q_sum2_col)}")
                 updated_cols.add(q_sum2_col)
 
+        for ekey, acnt_col in acnt_map.items():
+            it = ekey_to_item[ekey]
+            q_acnt = self._q(acnt_col)
+            approx_e = self._sqlite_is_approx_value_sql(
+                self._effective_agg_value_expr(it, record_prefix=record_prefix)
+            )
+            insert_cols.append(q_acnt)
+            insert_vals.append(approx_e)
+            already_in_ins.add(q_acnt)
+            update_assignments.append(f"{q_acnt} = {mv_table}.{q_acnt} + {approx_e}")
+            updated_cols.add(q_acnt)
+        if acnt_map:
+            # A new group row holds one value: exact for an integer (or NULL),
+            # recomputed natively otherwise (e.g. SUM(-0.0) is 0.0 natively).
+            q_dirty = self._q(self._SQLITE_DIRTY_COL)
+            approx_any = " OR ".join(
+                f"{self._sqlite_is_approx_value_sql(self._effective_agg_value_expr(ekey_to_item[k], record_prefix=record_prefix))} = 1"
+                for k in acnt_map
+            )
+            insert_cols.append(q_dirty)
+            insert_vals.append(f"(CASE WHEN {approx_any} THEN 1 ELSE 0 END)")
+            already_in_ins.add(q_dirty)
+            update_assignments.append(self._sqlite_dirty_fold_assignment(mv_table, fold_conds))
+            updated_cols.add(q_dirty)
+
         for ekey, tcnt_col in col_true_cnt_map.items():
             it = ekey_to_item[ekey]
             q_tcnt_col = self._q(tcnt_col)
@@ -1567,6 +1950,8 @@ class Tier1SingleMixin:
         include_delete_zero_mv: bool = True,
     ) -> Tuple[List[str], Optional[str]]:
         stmts: List[str] = []
+        acnt_map = self._sqlite_acnt_map()
+        fold_conds: List[str] = []
         work_items = self._working_select_items
         grp_exprs = self._effective_group_by_exprs
 
@@ -1592,6 +1977,18 @@ class Tier1SingleMixin:
             return f"(CASE WHEN {_is_last_distinct_cond(item)} THEN 1 ELSE 0 END)"
 
         def _minus_sum_expr(item: SelectItem, col_alias: str, cnt_col: str) -> str:
+            raw = _minus_sum_expr_raw(item, col_alias, cnt_col)
+            ekey = expr_key_fn(item)
+            if ekey in acnt_map:
+                return self._sqlite_guarded_fold(
+                    mv_table, col_alias, acnt_map[ekey], raw,
+                    self._effective_agg_value_expr(item, record_prefix=record_prefix), fold_conds,
+                )
+            if self._sqlite_exact_sum_enabled() and item.is_distinct:
+                return self._sqlite_distinct_sum_recompute(item, col_alias, record_prefix)
+            return raw
+
+        def _minus_sum_expr_raw(item: SelectItem, col_alias: str, cnt_col: str) -> str:
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
             q_col = self._q(col_alias)
             q_cnt = self._q(cnt_col)
@@ -1654,6 +2051,10 @@ class Tier1SingleMixin:
                 update_assignments.append(
                     f"{col_alias} = {mv_table}.{col_alias} - {_minus_dec_expr(item)}"
                 )
+            elif self._sqlite_union_native_sum(item):
+                update_assignments.append(
+                    f"{col_alias} = {self._build_recompute_subquery_raw(item, record_prefix)}"
+                )
             elif item.agg_func == AggFunc.SUM:
                 cnt_col = self._q(col_nonnull_count_map[ekey])
                 update_assignments.append(
@@ -1665,10 +2066,24 @@ class Tier1SingleMixin:
                     dec_val = f"(CASE WHEN ({cond}) THEN 1.0 * ({val_e}) ELSE 0.0 END)"
                 else:
                     dec_val = f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)"
-                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} - {dec_val}")
+                folded = f"{mv_table}.{col_alias} - {dec_val}"
+                if ekey in acnt_map:
+                    folded = self._sqlite_guarded_fold(
+                        mv_table, item.alias, acnt_map[ekey], folded, val_e, fold_conds,
+                    )
+                elif self._sqlite_exact_sum_enabled() and item.is_distinct:
+                    folded = self._build_native_group_recompute(
+                        self._sql_backfill_agg_expr(item), record_prefix, processed_only=True
+                    )
+                update_assignments.append(f"{col_alias} = {folded}")
             elif item.agg_func == AggFunc.AVG:
                 if self._requires_native_avg_recompute(item):
                     recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                    update_assignments.append(f"{col_alias} = {recomputed}")
+                elif self._sqlite_exact_sum_enabled() and item.is_distinct:
+                    recomputed = self._build_native_group_recompute(
+                        self._sql_backfill_agg_expr(item), record_prefix, processed_only=True
+                    )
                     update_assignments.append(f"{col_alias} = {recomputed}")
                 else:
                     cnt_col = self._q(col_nonnull_count_map[ekey])
@@ -1776,6 +2191,18 @@ class Tier1SingleMixin:
                     f"{q_sum2_col} = {_minus_sum2_expr(it, q_sum2_col, cnt_col)}"
                 )
                 updated_cols.add(q_sum2_col)
+
+        for ekey, acnt_col in acnt_map.items():
+            it = ekey_to_item[ekey]
+            q_acnt = self._q(acnt_col)
+            approx_e = self._sqlite_is_approx_value_sql(
+                self._effective_agg_value_expr(it, record_prefix=record_prefix)
+            )
+            update_assignments.append(f"{q_acnt} = {mv_table}.{q_acnt} - {approx_e}")
+            updated_cols.add(q_acnt)
+        if acnt_map:
+            update_assignments.append(self._sqlite_dirty_fold_assignment(mv_table, fold_conds))
+            updated_cols.add(self._q(self._SQLITE_DIRTY_COL))
 
         for ekey, tcnt_col in col_true_cnt_map.items():
             q_tcnt_col = self._q(tcnt_col)
@@ -1935,6 +2362,18 @@ class Tier1SingleMixin:
             record_prefix="OLD",
             include_delete_zero_mv=False,
         )
+        # SQLite SUM/TOTAL/AVG: fold steps only fold exactly or mark the group
+        # dirty; dirty groups are recomputed natively once all fold steps of the
+        # trigger have run (for UPDATE: after both the OLD and the NEW step).
+        recompute_new = self._sqlite_recompute_dirty_stmt(mv_table, "NEW", col_sum_map, expr_key_fn)
+        recompute_old = self._sqlite_recompute_dirty_stmt(mv_table, "OLD", col_sum_map, expr_key_fn)
+        plus_upd_stmts = list(plus_new_stmts)
+        upd_cleanup_stmts = [delete_zero_mv_stmt] if delete_zero_mv_stmt else []
+        if recompute_new and recompute_old:
+            plus_new_stmts = plus_new_stmts + [recompute_new]
+            plus_upd_stmts = plus_upd_stmts + [recompute_new]
+            minus_old_del_stmts = minus_old_del_stmts + [recompute_old]
+            upd_cleanup_stmts = upd_cleanup_stmts + [recompute_old]
 
         where_new = (
             self._rewrite_expr_for_record(self.view.where_clause, "NEW")
@@ -1996,8 +2435,8 @@ class Tier1SingleMixin:
             ins_stmts=plus_new_stmts,
             del_stmts=minus_old_del_stmts,
             upd_old_stmts=minus_old_upd_stmts,
-            upd_new_stmts=plus_new_stmts,
-            upd_cleanup_old_stmts=[delete_zero_mv_stmt] if delete_zero_mv_stmt else [],
+            upd_new_stmts=plus_upd_stmts,
+            upd_cleanup_old_stmts=upd_cleanup_stmts,
             trunc_stmts=trunc_stmts,
             where_new=where_new,
             where_old=where_old,

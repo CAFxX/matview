@@ -1032,12 +1032,23 @@ def parse_table_schema(
         all_pk_cols_lower: Set[str] = set(table_pk_cols)
         ordered_pk_cols: List[str] = list(table_pk_cols_order)
         for expr_item in schema_node.expressions:
+            if dialect == Dialect.SQLITE and isinstance(expr_item, sqlglot_exp.Identifier) and expr_item.name:
+                # SQLite column without a declared type or constraints
+                # ("CREATE TABLE t (id INTEGER PRIMARY KEY, x)"): sqlglot yields
+                # a bare identifier. It is a real column with BLOB affinity
+                # (values keep their storage class).
+                col_items.append((expr_item.name, "BLOB", False, False))
+                continue
             if isinstance(expr_item, sqlglot_exp.ColumnDef):
                 col_name = expr_item.name
                 if not col_name:
                     continue
                 if expr_item.kind is not None:
                     data_type = expr_item.kind.sql() if sg_d == "sqlite" else expr_item.kind.sql(sg_d)
+                elif dialect == Dialect.SQLITE:
+                    # No declared type: BLOB affinity in SQLite. Declaring the
+                    # derived backing columns TEXT would convert numbers to text.
+                    data_type = "BLOB"
                 else:
                     data_type = "TEXT"
                 is_pk = any(
