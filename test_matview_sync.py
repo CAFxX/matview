@@ -6331,17 +6331,20 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 return actual
 
             initial = assert_matches_live("initial")
+            # A key-changing UPDATE must retract the OLD joined tuples before
+            # adding the NEW tuples. Run this first so the NEW-for-OLD mutant
+            # fails by a semantic oracle assertion, not by referencing NEW in
+            # a DELETE trigger where that pseudo-row does not exist.
+            conn.execute(
+                "UPDATE join_customers SET segment = 'B' WHERE id = 2"
+            )
+            after_group_move = assert_matches_live("move joined rows between groups")
+
             # Retraction from a group with multiple joined rows exercises SUM
             # decrement while the group remains present.
             conn.execute("DELETE FROM join_orders WHERE id = 10")
             after_one_delete = assert_matches_live("delete one contributing row")
             self.assertNotEqual(initial, after_one_delete)
-
-            # A key-changing update must retract from A and add to B.
-            conn.execute(
-                "UPDATE join_customers SET segment = 'B' WHERE id = 2"
-            )
-            after_group_move = assert_matches_live("move joined rows between groups")
 
             # Leave a NULL-only group after retracting its final non-NULL value.
             # SUM must become NULL while COUNT(*) remains one and COUNT(value) zero.
