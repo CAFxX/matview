@@ -1241,11 +1241,27 @@ class _CompatCursorAdapter:
 
 
 class _CompatConnectionAdapter:
-    def __init__(self, cursor_factory, close_fn, commit_fn=None, rollback_fn=None):
+    def __init__(
+        self, cursor_factory, close_fn, commit_fn=None, rollback_fn=None,
+        in_transaction_fn=None,
+    ):
         self._cursor_factory = cursor_factory
         self._close_fn = close_fn
         self._commit_fn = commit_fn
         self._rollback_fn = rollback_fn
+        self._in_transaction_fn = in_transaction_fn
+
+    @property
+    def in_transaction(self):
+        # Preserve the underlying driver's transaction state through this
+        # adapter. The manager uses this signal to avoid issuing BEGIN
+        # IMMEDIATE inside a caller-owned SQLite transaction.
+        if self._in_transaction_fn is None:
+            return None
+        try:
+            return bool(self._in_transaction_fn())
+        except Exception:
+            return None
 
     def cursor(self) -> _CompatCursorAdapter:
         return self._cursor_factory()
@@ -1305,7 +1321,7 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in raw_cur.execute(q)]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_apsw_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(_make_apsw_cursor, raw_conn.close, in_transaction_fn=lambda: raw_conn.in_transaction)
 
     elif eng == "sqlcipher":
         try:
@@ -1336,7 +1352,7 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in (c.fetchall() or [])]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_cipher_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(_make_cipher_cursor, raw_conn.close, in_transaction_fn=lambda: raw_conn.in_transaction)
 
     elif eng == "sqlean":
         import sqlean  # type: ignore
@@ -1363,7 +1379,7 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in (c.fetchall() or [])]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_sqlean_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(_make_sqlean_cursor, raw_conn.close, in_transaction_fn=lambda: raw_conn.in_transaction)
 
     elif eng == "libsql":
         try:
@@ -1447,6 +1463,7 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
         return _CompatConnectionAdapter(
             lambda: _CompatCursorAdapter(_libsql_exec, _libsql_query),
             lambda: raw_conn.close() if hasattr(raw_conn, "close") else None,
+            in_transaction_fn=lambda: tx_state["in_tx"],
         )
 
     elif eng == "sqlite3":
@@ -1480,7 +1497,7 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in (c.fetchall() or [])]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(_make_sq3_cursor, raw_conn.close)
+        return _CompatConnectionAdapter(_make_sq3_cursor, raw_conn.close, in_transaction_fn=lambda: raw_conn.in_transaction)
 
     else:
         raise ValueError(f"Unknown SQLITE_COMPAT_ENGINE: {engine_spec}")
@@ -4021,6 +4038,16 @@ def run_suite_11_live_engine_50_view_battery_across_all_dialects(runner: MVTestR
 
 
 class TestGeneratorAndManagerCodePaths(unittest.TestCase):
+    def test_compat_connection_adapter_exposes_driver_transaction_state(self) -> None:
+        state = {"active": False}
+        adapter = _CompatConnectionAdapter(
+            lambda: None,
+            lambda: None,
+            in_transaction_fn=lambda: state["active"],
+        )
+        self.assertFalse(adapter.in_transaction)
+        state["active"] = True
+        self.assertTrue(adapter.in_transaction)
     def test_01_read_only_mv_enforcement_and_manager_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         mgr = MaterializedViewManager(conn, dialect="sqlite")
