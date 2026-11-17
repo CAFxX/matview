@@ -6,7 +6,7 @@ Manual invocation:
     python mutation_testing.py NAME [...]   # selected mutants by name
     python mutation_testing.py --list       # list mutants and their targets
 
-CI also runs this diagnostic once in the SQLite / Python 3.11 matrix leg.
+CI runs this diagnostic in every PR-gate SQLite job (Python 3.11 and 3.15).
 
 Production code lives in the modular ``matview`` package; ``matview_sync.py``
 is only a re-exporting facade. Each mutant therefore names the package module

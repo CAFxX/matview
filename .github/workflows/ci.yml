@@ -186,7 +186,6 @@ jobs:
           MATVIEW_FUZZ_TARGET: "SQLite / Python ${{ matrix.python-version }}"
         run: python3 test_matview_sync.py
       - name: Verify curated mutation sensitivity
-        if: matrix.python-version == '3.11'
         run: python3 mutation_testing.py
       - name: Archive fuzz campaign manifest
         if: always()
