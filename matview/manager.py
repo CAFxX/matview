@@ -245,12 +245,25 @@ class MaterializedViewManager:
                 """
             )
             self._commit()
-            for col_ddl in (
-                "backfill_cursor_pk BIGINT DEFAULT NULL",
-                "backfill_max_pk BIGINT DEFAULT NULL",
-                "backfill_active INTEGER NOT NULL DEFAULT 0",
-                "backfill_owner VARCHAR(64) DEFAULT NULL",
+            # Catalogs created by older versions lack some columns. Probe each
+            # column with a plain read and only ALTER when it is missing: on
+            # PostgreSQL ALTER TABLE takes ACCESS EXCLUSIVE even when ADD
+            # COLUMN then fails, so an unconditional ALTER on every manager
+            # construction queued behind any open writer transaction (whose
+            # triggers read the catalog) and stalled every other writer.
+            for col, col_ddl in (
+                ("backfill_cursor_pk", "backfill_cursor_pk BIGINT DEFAULT NULL"),
+                ("backfill_max_pk", "backfill_max_pk BIGINT DEFAULT NULL"),
+                ("backfill_active", "backfill_active INTEGER NOT NULL DEFAULT 0"),
+                ("backfill_owner", "backfill_owner VARCHAR(64) DEFAULT NULL"),
             ):
+                try:
+                    cur.execute(f"SELECT {col} FROM {self.catalog_table} WHERE 1 = 0")
+                    cur.fetchall()
+                    self._commit()
+                    continue
+                except Exception:
+                    self._rollback()
                 try:
                     cur.execute(f"ALTER TABLE {self.catalog_table} ADD COLUMN {col_ddl};")
                     self._commit()
