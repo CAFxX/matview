@@ -266,9 +266,12 @@ class TestTier2WindowPartitionScoping(unittest.TestCase):
                     live_rows = sorted(conn.exec_driver_sql(view_sel).fetchall())
                     self.assertEqual(mv_rows, live_rows)
         finally:
+            # drop_view also removes the catalog entry; dropping only the
+            # objects left a stale entry with the same signature, so the next
+            # run's register_view was a no-op and the view stayed missing.
             with eng.begin() as conn:
-                conn.exec_driver_sql("DROP VIEW IF EXISTS mv_p2_win")
-                conn.exec_driver_sql("DROP TABLE IF EXISTS __matview_store_mv_p2_win")
+                ms.MaterializedViewManager(conn, dialect=dialect).drop_view("mv_p2_win")
+            with eng.begin() as conn:
                 conn.exec_driver_sql("DROP TABLE IF EXISTS p2_win_scores")
             eng.dispose()
 
