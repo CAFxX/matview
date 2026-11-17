@@ -500,6 +500,120 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             conn.close()
             os.unlink(db_path)
 
+    def test_concurrent_independent_writers_keep_materialized_aggregates_consistent(self) -> None:
+        """Stress trigger maintenance with concurrent committed and rolled-back DML."""
+        fd, db_path = tempfile.mkstemp(prefix="matview-multiwriter-", suffix=".sqlite")
+        os.close(fd)
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        _register_sqlite_compat_udfs(conn)
+        conn.execute(
+            "CREATE TABLE concurrent_ledger ("
+            "id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, amount INTEGER);"
+        )
+        conn.commit()
+
+        manager = MaterializedViewManager(conn)
+        plan = manager.register_view(
+            "CREATE VIEW concurrent_totals AS "
+            "SELECT bucket, COUNT(*) AS row_count, COUNT(amount) AS valued_count, "
+            "SUM(amount) AS total_amount "
+            "FROM concurrent_ledger GROUP BY bucket;"
+        )
+        worker_count = 4
+        transactions_per_worker = 40
+        start = threading.Barrier(worker_count)
+        errors: list[BaseException] = []
+        completed: list[int] = []
+        error_lock = threading.Lock()
+
+        def writer(worker_id: int) -> None:
+            second = None
+            try:
+                second = sqlite3.connect(db_path, timeout=30)
+                second.execute("PRAGMA busy_timeout=30000;")
+                _register_sqlite_compat_udfs(second)
+                start.wait(timeout=15)
+                for sequence in range(transactions_per_worker):
+                    row_id = worker_id * 10000 + sequence + 1
+                    bucket = f"source_{worker_id % 2}"
+                    amount = None if sequence % 9 == 0 else worker_id * 100 + sequence
+                    second.execute("BEGIN IMMEDIATE;")
+                    second.execute(
+                        "INSERT INTO concurrent_ledger (id, bucket, amount) VALUES (?, ?, ?);",
+                        (row_id, bucket, amount),
+                    )
+                    second.execute(
+                        "UPDATE concurrent_ledger SET bucket = ?, "
+                        "amount = CASE WHEN amount IS NULL THEN NULL ELSE amount + 7 END "
+                        "WHERE id = ?;",
+                        (f"target_{worker_id % 3}", row_id),
+                    )
+                    if sequence % 4 == 0:
+                        second.execute(
+                            "DELETE FROM concurrent_ledger WHERE id = ?;", (row_id,)
+                        )
+                    if sequence % 13 == 0:
+                        second.rollback()
+                    else:
+                        second.commit()
+                with error_lock:
+                    completed.append(worker_id)
+            except BaseException as exc:
+                with error_lock:
+                    errors.append(exc)
+            finally:
+                if second is not None:
+                    second.close()
+
+        threads = [
+            threading.Thread(target=writer, args=(worker_id,), daemon=True)
+            for worker_id in range(worker_count)
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=45)
+            self.assertFalse(
+                [thread.name for thread in threads if thread.is_alive()],
+                "concurrent DML workers deadlocked or exceeded the timeout",
+            )
+            self.assertEqual(errors, [], f"concurrent writer errors: {errors!r}")
+            self.assertEqual(sorted(completed), list(range(worker_count)))
+
+            actual = conn.execute(
+                f"SELECT bucket, row_count, valued_count, total_amount "
+                f"FROM {plan.view_name} ORDER BY bucket;"
+            ).fetchall()
+            expected = conn.execute(
+                "SELECT bucket, COUNT(*) AS row_count, COUNT(amount) AS valued_count, "
+                "SUM(amount) AS total_amount FROM concurrent_ledger "
+                "GROUP BY bucket ORDER BY bucket;"
+            ).fetchall()
+            self.assertEqual(actual, expected)
+
+            expected_rows = sum(
+                1
+                for sequence in range(transactions_per_worker)
+                for _worker_id in range(worker_count)
+                if sequence % 13 != 0 and sequence % 4 != 0
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM concurrent_ledger;").fetchone()[0],
+                expected_rows,
+            )
+            self.assertEqual(
+                conn.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name};").fetchone()[0],
+                len(expected),
+                "backing table must contain exactly one row per surviving group",
+            )
+        finally:
+            conn.close()
+            os.unlink(db_path)
+
+
     @staticmethod
     def _connect_native(engine: Dialect, dsn: str):
         if engine == Dialect.POSTGRES:
@@ -702,6 +816,183 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             conn.commit()
         finally:
             self._cleanup_native_fixture(conn, engine, schema_name, table_name, manager, plan)
+
+
+    def _run_native_multiwriter_aggregate_stress(self, engine: Dialect, dsn: str) -> None:
+        """Exercise trigger-maintained grouped aggregates from independent native sessions."""
+        suffix = uuid.uuid4().hex[:10]
+        schema_name = f"mv_writers_{suffix}"
+        table_name = f"concurrent_ledger_{suffix}"
+        view_name = f"concurrent_totals_{suffix}"
+        conn = self._connect_native(engine, dsn)
+        manager = None
+        plan = None
+        worker_errors: list[BaseException] = []
+        completed: list[int] = []
+        error_lock = threading.Lock()
+        worker_count = 4
+        transactions_per_worker = 40
+        start = threading.Barrier(worker_count)
+
+        try:
+            cur = conn.cursor()
+            if engine == Dialect.POSTGRES:
+                cur.execute(f'CREATE SCHEMA "{schema_name}";')
+                cur.execute(f'SET search_path TO "{schema_name}";')
+            engine_suffix = " ENGINE=InnoDB" if engine == Dialect.MYSQL else ""
+            cur.execute(
+                f"CREATE TABLE {table_name} ("
+                "id BIGINT PRIMARY KEY, bucket VARCHAR(32) NOT NULL, amount BIGINT NULL"
+                f"){engine_suffix};"
+            )
+            conn.commit()
+            manager = MaterializedViewManager(conn, dialect=engine)
+            # MySQL cannot intercept TRUNCATE, so the manager correctly
+            # classifies general transparency as limited. This stress case
+            # deliberately exercises only INSERT/UPDATE/DELETE and therefore
+            # opts into that documented limitation without weakening the
+            # production default-rejection contract.
+            plan = manager.register_view(
+                f"CREATE VIEW {view_name} AS "
+                "SELECT bucket, COUNT(*) AS row_count, COUNT(amount) AS valued_count, "
+                f"SUM(amount) AS total_amount FROM {table_name} GROUP BY bucket;",
+                ignore_limitations=(engine == Dialect.MYSQL),
+            )
+
+            def writer(worker_id: int) -> None:
+                second = None
+                try:
+                    second = self._connect_native(engine, dsn)
+                    second_cur = second.cursor()
+                    if engine == Dialect.POSTGRES:
+                        second_cur.execute(f'SET search_path TO "{schema_name}";')
+                        second.commit()
+                    start.wait(timeout=30)
+                    for sequence in range(transactions_per_worker):
+                        row_id = worker_id * 10000 + sequence + 1
+                        bucket = f"source_{worker_id % 2}"
+                        amount = None if sequence % 9 == 0 else worker_id * 100 + sequence
+                        # InnoDB and PostgreSQL may legitimately abort one
+                        # transaction when concurrent trigger work contends on
+                        # shared aggregate groups. Retry only recognized
+                        # transaction-abort errors, from BEGIN through COMMIT,
+                        # so the workload still completes every logical DML
+                        # sequence exactly once.
+                        for attempt in range(12):
+                            try:
+                                second_cur.execute("BEGIN;")
+                                second_cur.execute(
+                                    f"INSERT INTO {table_name} (id, bucket, amount) VALUES (%s, %s, %s)",
+                                    (row_id, bucket, amount),
+                                )
+                                second_cur.execute(
+                                    f"UPDATE {table_name} SET bucket = %s, "
+                                    "amount = CASE WHEN amount IS NULL THEN NULL ELSE amount + 7 END "
+                                    "WHERE id = %s",
+                                    (f"target_{worker_id % 3}", row_id),
+                                )
+                                if sequence % 4 == 0:
+                                    second_cur.execute(
+                                        f"DELETE FROM {table_name} WHERE id = %s", (row_id,)
+                                    )
+                                if sequence % 13 == 0:
+                                    second.rollback()
+                                else:
+                                    second.commit()
+                                break
+                            except Exception as exc:
+                                second.rollback()
+                                args = getattr(exc, "args", ())
+                                mysql_code = args[0] if args and isinstance(args[0], int) else None
+                                sqlstate = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+                                retryable = (
+                                    engine == Dialect.MYSQL and mysql_code in {1205, 1213}
+                                ) or (
+                                    engine == Dialect.POSTGRES and sqlstate in {"40P01", "40001"}
+                                )
+                                if not retryable or attempt == 11:
+                                    raise
+                                time.sleep(min(0.25, 0.01 * (2 ** attempt)) + 0.003 * ((worker_id * 7 + sequence * 3 + attempt) % 5))
+                    with error_lock:
+                        completed.append(worker_id)
+                except BaseException as exc:
+                    with error_lock:
+                        worker_errors.append(exc)
+                finally:
+                    if second is not None:
+                        second.close()
+
+            threads = [
+                threading.Thread(target=writer, args=(worker_id,), daemon=True)
+                for worker_id in range(worker_count)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=90)
+            self.assertFalse(
+                [thread.name for thread in threads if thread.is_alive()],
+                f"{engine.value} concurrent writers deadlocked or exceeded timeout",
+            )
+            self.assertEqual(worker_errors, [], f"{engine.value} writer errors: {worker_errors!r}")
+            self.assertEqual(sorted(completed), list(range(worker_count)))
+
+            cur.execute(
+                f"SELECT bucket, row_count, valued_count, total_amount "
+                f"FROM {plan.view_name} ORDER BY bucket;"
+            )
+            actual = [tuple(row) for row in cur.fetchall()]
+            cur.execute(
+                f"SELECT bucket, COUNT(*) AS row_count, COUNT(amount) AS valued_count, "
+                f"SUM(amount) AS total_amount FROM {table_name} GROUP BY bucket ORDER BY bucket;"
+            )
+            expected = [tuple(row) for row in cur.fetchall()]
+            self.assertEqual(actual, expected)
+            expected_rows = sum(
+                1
+                for sequence in range(transactions_per_worker)
+                for _worker_id in range(worker_count)
+                if sequence % 13 != 0 and sequence % 4 != 0
+            )
+            cur.execute(f"SELECT COUNT(*) FROM {table_name};")
+            self.assertEqual(cur.fetchone()[0], expected_rows)
+            cur.execute(f"SELECT COUNT(*) FROM {plan.backing_table_name};")
+            self.assertEqual(
+                cur.fetchone()[0],
+                len(expected),
+                f"{engine.value} backing table must contain one row per surviving group",
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.rollback()
+                cur = conn.cursor()
+                if engine == Dialect.POSTGRES:
+                    cur.execute("SET search_path TO public;")
+                    cur.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE;')
+                else:
+                    if manager is not None and plan is not None:
+                        try:
+                            manager.drop_view(plan.view_name)
+                        except Exception:
+                            pass
+                    cur.execute(f"DROP TABLE IF EXISTS {table_name};")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+            conn.close()
+
+    def test_native_postgres_concurrent_writers_keep_aggregates_consistent(self) -> None:
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN is not set; native PostgreSQL test only")
+        self._run_native_multiwriter_aggregate_stress(Dialect.POSTGRES, dsn)
+
+    def test_native_mysql_family_concurrent_writers_keep_aggregates_consistent(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
+        self._run_native_multiwriter_aggregate_stress(Dialect.MYSQL, dsn)
 
     def test_native_postgres_watermark_gates_independent_session_dml(self) -> None:
         dsn = os.environ.get("POSTGRES_DSN")
