@@ -36,6 +36,7 @@ import warnings
 
 from matview_sync import (
     BackfillInterruptedError,
+    UnsafeReplacementError,
     DEFAULT_OBJECT_PREFIX,
     AggFunc,
     Dialect,
@@ -1078,6 +1079,18 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
 
         # 5. sync_views: unchanged, updated, dropped
         q_alg_v2 = "SELECT grp, COUNT(*) AS cnt, SUM(val) AS sv FROM mgr_items WHERE val >= 15 GROUP BY grp"
+        if dialect == Dialect.MYSQL:
+            # MySQL/MariaDB cannot replace a published view atomically (DDL
+            # commits implicitly): sync_views refuses before changing anything,
+            # and the caller replaces it explicitly with drop_view + register.
+            try:
+                mgr.sync_views([f"CREATE VIEW v_mgr_alg AS {q_alg_v2};", f"CREATE VIEW v_mgr_dist AS {q_dist};"])
+            except UnsafeReplacementError:
+                pass
+            else:
+                raise AssertionError(f"{dialect.value}: non-atomic replacement was not refused")
+            _verify_external_db_mv(cur, "v_mgr_alg", q_alg, f"{dialect.value}:mgr:alg_refused_unchanged")
+            mgr.drop_view("v_mgr_alg")
         st = mgr.sync_views(
             [
                 f"CREATE VIEW v_mgr_alg AS {q_alg_v2};",
@@ -1085,7 +1098,7 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
             ],
             prune_removed=True,
         )
-        assert st["v_mgr_alg"] == "updated"
+        assert st["v_mgr_alg"] == ("created" if dialect == Dialect.MYSQL else "updated")
         assert st["v_mgr_dist"] == "unchanged"
         assert st["v_mgr_win"] == "dropped"
         assert st["v_mgr_off"] == "dropped"
@@ -1102,7 +1115,35 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
         checks += 2
 
         # 7. ALTER TABLE schema migration via apply_schema_ddl + trigger rebuild
-        mgr.apply_schema_ddl("ALTER TABLE mgr_items ADD COLUMN note VARCHAR(32) DEFAULT 'ok';")
+        alter_sql = "ALTER TABLE mgr_items ADD COLUMN note VARCHAR(32) DEFAULT 'ok';"
+        if dialect == Dialect.MYSQL:
+            # The affected views could not be replaced atomically on
+            # MySQL/MariaDB, so apply_schema_ddl refuses before running the DDL.
+            try:
+                mgr.apply_schema_ddl(alter_sql)
+            except UnsafeReplacementError:
+                pass
+            else:
+                raise AssertionError(f"{dialect.value}: non-atomic auto-sync replacement was not refused")
+            # Refused before any DDL ran: the column does not exist.
+            try:
+                cur.execute("SELECT note FROM mgr_items")
+                cur.fetchall()
+            except Exception:
+                pass
+            else:
+                raise AssertionError(f"{dialect.value}: schema DDL was applied before the refusal")
+            if hasattr(conn, "rollback"):
+                conn.rollback()
+            # Supported recipe: drop the affected views, apply the DDL, register again.
+            entries = list(mgr.get_catalog().values())
+            for entry in entries:
+                mgr.drop_view(entry["view_name"])
+            mgr.apply_schema_ddl(alter_sql)
+            for entry in entries:
+                mgr.register_view(entry["view_sql"])
+        else:
+            mgr.apply_schema_ddl(alter_sql)
         cur.execute("INSERT INTO mgr_items (id, grp, tag, val, note) VALUES (8, 'D', 'q', 45, 'migrated');")
         if hasattr(conn, "commit"):
             conn.commit()

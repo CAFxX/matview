@@ -241,7 +241,7 @@ The manager also provides:
 - `drop_view(name)` to remove a registered view and its generated objects.
 - `bulk_changes(...)` to bypass per-row trigger maintenance during high-volume mutations, then repopulate the selected materialized views on exit; optional shadow-table swapping is available.
 - `check_schema_drift()` and `repair_view()` for schema-drift management.
-- `apply_schema_ddl(...)` to apply DDL and synchronize registered views when the source schema changes.
+- `apply_schema_ddl(...)` to apply DDL and synchronize registered views when the source schema changes. On MySQL/MariaDB, when the DDL touches a base table of a registered view (which would then need a non-atomic replacement), it raises `UnsafeReplacementError` naming the views before executing any statement; the supported recipe is `drop_view()` for each named view, then `apply_schema_ddl(...)`, then `register_view()` again. Any change to a referenced table currently counts, even a column the view does not use (see `TODO.md`).
 
 `MaterializedViewManager` accepts SQLite paths/connections and PostgreSQL or MySQL/MariaDB PEP-249 connections. For PostgreSQL and MySQL/MariaDB, DSN URL handling uses the drivers installed by `requirements.txt` (psycopg2, PyMySQL). An existing DB-API connection from another driver works only if the driver reports its transaction state (see below): mysql-connector-python and APSW do; pg8000 and mysqlclient (`MySQLdb`) do not and are refused with `TransactionOwnershipError`. psycopg 3 is not supported (known issue: schema introspection fails with `'Connection' object has no attribute 'notices'`, on master as well).
 
@@ -266,6 +266,8 @@ Correct incremental maintenance depends on the database firing the expected trig
 By default, `matview` checks for known transparency limitations and refuses installation when it cannot guarantee correctness. `--ignore-limitations` (or `ignore_limitations=True` in the API) explicitly overrides that protection and emits a warning. Do not use this option unless you understand the detected limitation and have another way to preserve consistency.
 
 For large initial populations, `--incremental-backfill` generates dialect-specific batched backfill logic. The maintenance triggers are installed before backfill, with additional snapshot/watermark handling for chunked population, so concurrent source-table writes are accounted for during the initial load.
+
+Replacing a registered view (`register_view(..., force_rebuild=True)`, a changed definition in `sync_views`, a `repair_view` rebuild) is atomic on SQLite and PostgreSQL: the old view stays published, and is restored if anything fails, until the replacement is built and populated. Where that is impossible — MySQL/MariaDB, whose DDL commits implicitly, and replacements populated with `incremental_backfill=True` — replacing a complete view raises `UnsafeReplacementError` before changing anything (`sync_views` checks all requested views first); replace it explicitly with `drop_view()` followed by `register_view()`, accepting that readers see the view disappear and fill. A view whose incremental backfill is incomplete can always be rebuilt.
 
 Materialized views are read-only. Make application writes against the source tables. Also review generated SQL and test the target engine/version before deploying schema or view changes to production.
 
