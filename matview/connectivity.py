@@ -348,6 +348,87 @@ def render_parameterized_sql(qmark_sql: str, dialect: Dialect) -> str:
     return "".join(out)
 
 
+def dbapi_connection_layers(conn: Any) -> List[Any]:
+    """Return ``conn`` followed by the physical DB-API connections it wraps.
+
+    SQLAlchemy pool proxies (``_ConnectionFairy`` / ``PoolProxiedConnection``)
+    forward attribute reads to the driver but not attribute writes, so state
+    changes such as ``autocommit`` must target the physical connection.
+    """
+    layers: List[Any] = []
+    pending = [conn]
+    # Bounded: a proxy chain is at most a few layers deep, and a permissive
+    # __getattr__ (mocks) must not produce an endless chain.
+    while pending and len(layers) < 4:
+        obj = pending.pop(0)
+        if obj is None or any(obj is seen for seen in layers):
+            continue
+        layers.append(obj)
+        for attr in ("dbapi_connection", "driver_connection"):
+            try:
+                inner = getattr(obj, attr, None)
+            except Exception:
+                inner = None
+            if inner is not None and inner is not obj:
+                pending.append(inner)
+    return layers
+
+
+def _layer_transaction_state(obj: Any) -> Optional[bool]:
+    """Positively reported transaction state of one connection layer, else None.
+
+    Recognized reports: ``in_transaction`` (sqlite3 and SQLite-compatible
+    drivers, mysql-connector), ``get_transaction_status()`` (psycopg2) and
+    ``info.transaction_status`` (psycopg 3), where only IDLE (0) is idle, and
+    PyMySQL's ``server_status`` SERVER_STATUS_IN_TRANS bit.
+    """
+    try:
+        flag = getattr(obj, "in_transaction", None)
+    except Exception:
+        flag = None
+    if isinstance(flag, bool):
+        return flag
+    try:
+        getter = getattr(obj, "get_transaction_status", None)
+    except Exception:
+        getter = None
+    if callable(getter):
+        try:
+            status = getter()
+        except Exception:
+            status = None
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status != 0
+    try:
+        info = getattr(obj, "info", None)
+        status = getattr(info, "transaction_status", None)
+    except Exception:
+        status = None
+    if isinstance(status, int) and not isinstance(status, bool):
+        return int(status) != 0
+    try:
+        server_status = getattr(obj, "server_status", None)
+    except Exception:
+        server_status = None
+    if isinstance(server_status, int) and not isinstance(server_status, bool):
+        return bool(server_status & 0x0001)  # SERVER_STATUS_IN_TRANS
+    return None
+
+
+def dbapi_transaction_state(conn: Any) -> Optional[bool]:
+    """Whether ``conn`` has an open transaction: True, False, or None if unknown.
+
+    Every layer of a wrapped connection is consulted; a transaction reported
+    by any layer (for example one opened directly on the raw driver behind an
+    idle-looking wrapper) counts as open.
+    """
+    states = [_layer_transaction_state(layer) for layer in dbapi_connection_layers(conn)]
+    known = [state for state in states if state is not None]
+    if not known:
+        return None
+    return any(known)
+
+
 class _NonClosingConnectionProxy:
     """
     Read-only connection proxy for SQLAlchemy schema inspection that keeps

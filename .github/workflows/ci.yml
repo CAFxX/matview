@@ -205,6 +205,9 @@ jobs:
       - name: Test differential-oracle mutation sensitivity
         run: python3 test_oracle_mutation_sensitivity.py
 
+      - name: Test lifecycle transaction ownership (SQLite)
+        run: python3 test_registration_lifecycle.py
+
       - name: Test recursive SELECT AST generator
         run: python3 test_query_ast_fuzzer.py
 
@@ -344,6 +347,9 @@ jobs:
         env:
           SQLITE_COMPAT_ENGINE: ${{ matrix.engine }}
         run: python3 test_p1_manager_safety.py
+
+      - name: Test lifecycle transaction ownership (raw driver connection, e.g. APSW)
+        run: python3 test_registration_lifecycle.py
       - name: Archive fuzz campaign manifest
         if: always()
         uses: actions/upload-artifact@v4
@@ -420,6 +426,11 @@ jobs:
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_avg_concurrent_maintenance.py
+
+      - name: Test lifecycle transaction ownership (PostgreSQL)
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+        run: python3 test_registration_lifecycle.py
 
       - name: Differentially test generated SELECT materialized views on PostgreSQL
         env:
@@ -536,6 +547,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_avg_concurrent_maintenance.py
+
+      - name: Test lifecycle transaction ownership (MySQL)
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_registration_lifecycle.py
 
       - name: Differentially test generated SELECT materialized views on MySQL
         env:
@@ -661,6 +677,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_avg_concurrent_maintenance.py
+
+      - name: Test lifecycle transaction ownership (MariaDB)
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_registration_lifecycle.py
 
       - name: Differentially test generated SELECT materialized views on MariaDB
         env:

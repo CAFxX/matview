@@ -1637,6 +1637,12 @@ class TranspiledConnectionAdapter:
         c.execute(sql, params)
         return c
 
+    @property
+    def in_transaction(self) -> bool:
+        # Report the emulation's real transaction state: the manager refuses
+        # lifecycle operations on connections whose state it cannot observe.
+        return bool(self._sq_conn is not None and self._sq_conn.in_transaction)
+
     def commit(self) -> None:
         pass
 
@@ -5210,6 +5216,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 auto_sync_views=False,
             )
             conn_q.execute("""INSERT INTO "order" VALUES (1, 'A', 10, 1.5), (2, 'A', 20, 2.5), (3, 'B', 5, 4.0);""")
+            conn_q.commit()
             plan_q = mgr_q.register_view(
                 '''
                 CREATE VIEW "order_summary" AS
@@ -5256,6 +5263,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 (7, "g2", 1e12 + 30.0),
             ],
         )
+        conn_w.commit()
         mgr_w = MaterializedViewManager(conn_w)
         # Test chunked incremental backfill (Chan parallel M2 merge across chunks of size 2)
         plan_w = mgr_w.register_view(
@@ -5306,6 +5314,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "INSERT INTO ledger VALUES (?, ?, ?);",
             [(i, "B1" if i % 2 == 1 else "B2", i * 10) for i in range(1, 11)],
         )
+        conn_wm.commit()
         mgr_wm = MaterializedViewManager(conn_wm)
 
         def _concurrent_dml_during_backfill(batch_idx: int, rows_done: int) -> None:
@@ -5352,6 +5361,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "UPDATE __matview_catalog SET backfill_cursor_pk = NULL, backfill_max_pk = NULL, "
             "backfill_active = 0 WHERE view_name = 'ledger_totals';"
         )
+        conn_wm.commit()
         batches_snap = mgr_wm.backfill_incrementally(plan_wm, batch_size=4, snapshot_isolation=True)
         self.assertGreaterEqual(batches_snap, 2)
         self.assertEqual(
@@ -5419,11 +5429,13 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             )
             if d_mode == Dialect.SQLITE:
                 _register_sqlite_compat_udfs(conn_j)
+            conn_j.commit()
             mgr_j = MaterializedViewManager(conn_j, dialect=d_mode, ignore_limitations=True)
             mgr_j.apply_schema_ddl(join_schema, auto_sync_views=False)
             conn_j.execute("INSERT INTO depts VALUES (1, 'ENG', 'US'), (2, 'OPS', 'EU');")
             conn_j.execute("INSERT INTO emps VALUES (1, 1, 'SWE', 100), (2, 1, 'SWE', 150), (3, 2, 'SRE', 120);")
             conn_j.execute("INSERT INTO contractors VALUES (1, 1, 'SWE', 80), (2, 2, 'QA', 90);")
+            conn_j.commit()
             mgr_j.register_view(
                 """
                 CREATE VIEW v_dept_role AS
@@ -6238,6 +6250,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             # Apply committed changes, then force a full rebuild. The rebuilt
             # materialization must equal the incrementally maintained result.
             conn.execute("UPDATE invariant_items SET value = value + 3 WHERE id IN (1, 5)")
+            conn.commit()
             incremental_result = assert_consistent("committed multi-row update")
             rebuilt = manager.register_view(
                 view_sql,
@@ -6285,6 +6298,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 "INSERT INTO filtered_source VALUES (?, ?, ?)",
                 [(1, "A", 12), (2, "B", 5), (3, "C", None)],
             )
+            conn.commit()
             manager = MaterializedViewManager(conn, dialect="sqlite")
             view_sql = (
                 "CREATE VIEW filtered_rows AS "
@@ -6338,6 +6352,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 "INSERT INTO watermark_source VALUES (?, ?, ?)",
                 [(1, "A", 10), (2, "A", 20), (3, "B", 30), (4, "B", 40)],
             )
+            conn.commit()
             manager = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
 
             def update_inclusive_cursor(batch_idx: int, rows_done: int) -> None:
@@ -6663,6 +6678,10 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     raise RuntimeError("isolation setup rejected")
 
         class FailingConnection:
+            # A driver that reports its (idle) transaction state, as the
+            # manager requires before owning the transaction.
+            in_transaction = False
+
             def __init__(self, fail_on: str) -> None:
                 self.cursor_instance = FailingCursor(fail_on)
                 self.rollback_calls = 0

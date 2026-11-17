@@ -173,6 +173,9 @@ class TestSqlAlchemyConnectivityAndIntrospection(unittest.TestCase):
                     row = cur.fetchone()
                     self.assertEqual(row[0], "g1")
                     self.assertEqual(int(row[1]), 2)
+                # End this read transaction: drop_view refuses to run inside a
+                # caller-owned transaction.
+                mgr._rollback()
                 mgr.drop_view(v_name)
                 with mgr._cursor() as cur:
                     cur.execute(f"DROP TABLE IF EXISTS {t_name}")

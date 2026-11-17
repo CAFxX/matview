@@ -257,6 +257,7 @@ class TestRecommendedBaseIndexesAndAutoIndexes(unittest.TestCase):
         try:
             conn.executescript(schema_sql)
             conn.execute("INSERT INTO orders VALUES (1, 10, 'us', 100, 50), (2, 10, 'us', 101, 25);")
+            conn.commit()
             mgr = ms.MaterializedViewManager(conn, dialect=ms.Dialect.SQLITE)
             mgr.register_view(view_distinct)
             live_idxs = mgr._get_live_index_names()

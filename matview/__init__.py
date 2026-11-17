@@ -50,6 +50,7 @@ from .logical_ir import (
 from .manager import (
     BackfillInterruptedError,
     MaterializedViewManager,
+    TransactionOwnershipError,
     generate_materialized_view,
     generate_materialized_views,
     install_materialized_view_sqlite,
@@ -94,6 +95,7 @@ __all__ = [
     "StrictCompilationError",
     "UnsupportedMaterializedViewError",
     "BackfillInterruptedError",
+    "TransactionOwnershipError",
     "ColumnDef",
     "TableIndexDef",
     "TableSchema",
