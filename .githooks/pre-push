@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Pre-push gate: refuse to push a commit whose tree has no valid full-tier
+# presubmit stamp. Install once per clone with:
+#   git config core.hooksPath .githooks
+# Environment:
+#   PRESUBMIT_PYTHON            interpreter with PyYAML (default: python3)
+#   PRESUBMIT_HOOK_RUN=0        only check the stamp; never start a run
+#   PRESUBMIT_ALLOW_INCOMPLETE=1  allow pushing when a run is INCOMPLETE (exit 3)
+#                               but nothing failed (prints a loud warning)
+# Bypass deliberately with `git push --no-verify`.
+set -u
+py="${PRESUBMIT_PYTHON:-python3}"
+root="$(git rev-parse --show-toplevel)"
+script="$root/scripts/presubmit.py"
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$local_sha" in *[!0]*) ;; *) continue ;; esac   # branch deletion
+  if "$py" "$script" --check-stamp --rev "$local_sha"; then
+    continue
+  fi
+  if [ "${PRESUBMIT_HOOK_RUN:-1}" = "0" ]; then
+    echo "pre-push: $local_ref ($local_sha) has no valid presubmit stamp; run: make presubmit-full" >&2
+    status=1
+    continue
+  fi
+  "$py" "$script" --tier full --rev "$local_sha"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    continue
+  elif [ "$rc" -eq 3 ] && [ "${PRESUBMIT_ALLOW_INCOMPLETE:-0}" = "1" ]; then
+    echo "pre-push: WARNING: presubmit INCOMPLETE for $local_ref; pushing UNVERIFIED jobs (PRESUBMIT_ALLOW_INCOMPLETE=1)" >&2
+  else
+    echo "pre-push: presubmit exit $rc for $local_ref ($local_sha); push refused" >&2
+    status=1
+  fi
+done
+exit "$status"
