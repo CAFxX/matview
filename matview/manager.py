@@ -548,6 +548,73 @@ class MaterializedViewManager:
             except Exception:
                 pass
 
+    # Bounded retries for a non-snapshot pk-range batch chosen as a deadlock /
+    # serialization victim by the engine while independent writers run.
+    _BACKFILL_TRANSIENT_RETRIES = 8
+
+    def _is_transient_lock_error(self, exc: BaseException) -> bool:
+        """True only for engine-reported deadlock/serialization/lock-wait victims."""
+        if self.dialect == Dialect.MYSQL:
+            code = getattr(exc, "errno", None)
+            if code is None and getattr(exc, "args", None):
+                code = exc.args[0]
+            # 1213 ER_LOCK_DEADLOCK (whole transaction rolled back),
+            # 1205 ER_LOCK_WAIT_TIMEOUT (statement rolled back; we roll back the rest).
+            return code in (1213, 1205)
+        if self.dialect == Dialect.POSTGRES:
+            code = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+            return code in ("40P01", "40001")
+        return False
+
+    def _run_pk_range_batch(
+        self,
+        cur: Any,
+        plan: MaterializedViewPlan,
+        spec: Any,
+        base_t: str,
+        pk_col: str,
+        cursor_pk: int,
+        upper_pk: int,
+        max_pk: int,
+        snapshot_isolation: bool,
+    ) -> None:
+        """Fold one (cursor_pk, upper_pk] range and advance the watermark."""
+        sqlite_chunk_tx_began = False
+        if not snapshot_isolation:
+            if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+                try:
+                    self._execute_param(
+                        cur,
+                        f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > ? AND {pk_col} <= ? FOR UPDATE",
+                        (cursor_pk, upper_pk),
+                    )
+                except Exception as exc:
+                    # A deadlock here has already rolled back the batch
+                    # transaction; continuing would fold without the range lock.
+                    if self._is_transient_lock_error(exc):
+                        raise
+            elif self.dialect == Dialect.SQLITE:
+                if not getattr(self.conn, "in_transaction", False):
+                    try:
+                        cur.execute("BEGIN IMMEDIATE;")
+                        sqlite_chunk_tx_began = True
+                    except Exception:
+                        pass
+        for tmpl in spec.chunk_sql_templates:
+            cur.execute(tmpl, (cursor_pk, upper_pk))
+        still_active = 1 if upper_pk < max_pk else 0
+        self._update_backfill_watermark(cur, plan.view_name, upper_pk, max_pk, still_active)
+        if not snapshot_isolation:
+            self._commit()
+            if sqlite_chunk_tx_began and (
+                not hasattr(self.conn, "commit")
+                or getattr(self.conn, "in_transaction", False)
+            ):
+                try:
+                    cur.execute("COMMIT;")
+                except Exception:
+                    pass
+
     def _backfill_incrementally_with_cursor(
         self,
         plan: MaterializedViewPlan,
@@ -591,40 +658,32 @@ class MaterializedViewManager:
                 self._commit()
             while cursor_pk < max_pk:
                 upper_pk = min(max_pk, cursor_pk + batch_size)
-                sqlite_chunk_tx_began = False
-                if not snapshot_isolation:
-                    if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
-                        try:
-                            self._execute_param(
-                                cur,
-                                f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > ? AND {pk_col} <= ? FOR UPDATE",
-                                (cursor_pk, upper_pk),
-                            )
-                        except Exception:
-                            pass
-                    elif self.dialect == Dialect.SQLITE:
-                        if not getattr(self.conn, "in_transaction", False):
-                            try:
-                                cur.execute("BEGIN IMMEDIATE;")
-                                sqlite_chunk_tx_began = True
-                            except Exception:
-                                pass
-                for tmpl in spec.chunk_sql_templates:
-                    cur.execute(tmpl, (cursor_pk, upper_pk))
+                attempt = 0
+                while True:
+                    try:
+                        self._run_pk_range_batch(
+                            cur, plan, spec, base_t, pk_col,
+                            cursor_pk, upper_pk, max_pk, snapshot_isolation,
+                        )
+                        break
+                    except Exception as exc:
+                        # A non-snapshot batch is its own transaction: the chunk
+                        # fold and its watermark advance commit together. A
+                        # deadlock/serialization victim has had that whole
+                        # transaction rolled back, the committed watermark still
+                        # gates (cursor_pk, max_pk], so re-running the identical
+                        # range is exact. Anything else, or exhausting the
+                        # bound, propagates to the caller's failure path.
+                        if (
+                            snapshot_isolation
+                            or attempt >= self._BACKFILL_TRANSIENT_RETRIES
+                            or not self._is_transient_lock_error(exc)
+                        ):
+                            raise
+                        attempt += 1
+                        self._rollback()
                 batches_run += 1
                 cursor_pk = upper_pk
-                still_active = 1 if cursor_pk < max_pk else 0
-                self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, still_active)
-                if not snapshot_isolation:
-                    self._commit()
-                    if sqlite_chunk_tx_began and (
-                        not hasattr(self.conn, "commit")
-                        or getattr(self.conn, "in_transaction", False)
-                    ):
-                        try:
-                            cur.execute("COMMIT;")
-                        except Exception:
-                            pass
                 if on_progress:
                     done = min(total_span, cursor_pk - (min_pk - 1))
                     on_progress(batches_run, done)
