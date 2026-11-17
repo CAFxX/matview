@@ -864,11 +864,52 @@ class SchemaAwareSelectFuzzer:
         )
 
 
+def _query_coverage_score(
+    query: GeneratedQuery,
+    feature_counts: dict[str, int],
+    seen_shapes: set[tuple[Any, ...]],
+) -> tuple[int, int, float, int]:
+    """Prefer candidates that expand structural coverage, then rare features."""
+    unseen_features = sum(feature_counts.get(feature, 0) == 0 for feature in query.features)
+    rarity = sum(1.0 / (1 + feature_counts.get(feature, 0)) for feature in query.features)
+    return (
+        unseen_features,
+        int(query.shape not in seen_shapes),
+        rarity,
+        len(query.features),
+    )
+
+
 class RecursiveQueryASTTests(unittest.TestCase):
-    def test_generated_select_grammar_executes_over_variable_schemas(self) -> None:
+    def test_coverage_score_prioritizes_uncovered_structure(self) -> None:
+        already_seen = GeneratedQuery(
+            sql="SELECT 1",
+            features=frozenset({"where"}),
+            shape=("seen",),
+            max_predicate_depth=0,
+            max_expression_depth=0,
+        )
+        new_structure = GeneratedQuery(
+            sql="SELECT 1",
+            features=frozenset({"join", "group_by", "having"}),
+            shape=("new",),
+            max_predicate_depth=1,
+            max_expression_depth=0,
+        )
+        counts = {"where": 4}
+        shapes = {("seen",)}
+        self.assertGreater(
+            _query_coverage_score(new_structure, counts, shapes),
+            _query_coverage_score(already_seen, counts, shapes),
+        )
+
+    def test_generated_select_grammar_executes_with_coverage_guided_selection(self) -> None:
         features: set[str] = set()
+        feature_counts: dict[str, int] = {}
         shapes: set[tuple[Any, ...]] = set()
         executed = 0
+        candidate_evaluations = 0
+        candidate_count = 8
 
         for seed in range(64):
             schema, _, seed_sql, mutations, _ = VariableSchemaDifferentialFuzzer(seed).generate_scenario(1)
@@ -884,12 +925,27 @@ class RecursiveQueryASTTests(unittest.TestCase):
                 conn.commit()
 
                 for query_index in range(20):
-                    fuzzer = SchemaAwareSelectFuzzer(seed * 1009 + query_index)
-                    query = fuzzer.generate(conn)
+                    candidates = [
+                        SchemaAwareSelectFuzzer(
+                            seed * 1009 + query_index + candidate_index * 100_003
+                        ).generate(conn)
+                        for candidate_index in range(candidate_count)
+                    ]
+                    candidate_evaluations += len(candidates)
+                    selected_index = max(
+                        range(len(candidates)),
+                        key=lambda index: (
+                            _query_coverage_score(candidates[index], feature_counts, shapes),
+                            -index,
+                        ),
+                    )
+                    query = candidates[selected_index]
                     rows = conn.execute(query.sql).fetchall()
                     self.assertIsInstance(rows, list)
                     features.update(query.features)
                     shapes.add(query.shape)
+                    for feature in query.features:
+                        feature_counts[feature] = feature_counts.get(feature, 0) + 1
                     self.assertLessEqual(query.max_predicate_depth, 4)
                     self.assertLessEqual(query.max_expression_depth, 2)
                     executed += 1
@@ -907,8 +963,11 @@ class RecursiveQueryASTTests(unittest.TestCase):
         self.assertFalse(missing, f"missing generated query features: {sorted(missing)}")
         self.assertGreaterEqual(len(shapes), 50)
         self.assertEqual(executed, 64 * 20)
+        self.assertEqual(candidate_evaluations, executed * candidate_count)
+        self.assertTrue(all(count > 0 for count in feature_counts.values()))
         print(
-            f"[QUERY AST] executed={executed}, structural_shapes={len(shapes)}, "
+            f"[QUERY AST COVERAGE-GUIDED] executed={executed}, "
+            f"candidates={candidate_evaluations}, structural_shapes={len(shapes)}, "
             f"features={','.join(sorted(features))}"
         )
 
