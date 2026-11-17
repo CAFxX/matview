@@ -429,12 +429,26 @@ class NativeAvgInterleavingTests(unittest.TestCase):
         statement snapshot predates the backing-row lock, so the same
         interleaving still stores a stale AVG. The same applies to every other
         recomputed aggregate (VAR/STDDEV, MIN/MAX/BIT_AND/BIT_OR after a delete).
-        This must start passing (and lose expectedFailure) when fixed."""
+        This must start passing (and lose expectedFailure) when fixed.
+
+        Only the specific stale-result mismatch counts as the expected
+        failure. Any other outcome (fixture error, no lock wait, timeout)
+        returns normally and is therefore reported as an unexpected success,
+        i.e. a failure, instead of being absorbed by expectedFailure."""
         dsn = os.environ.get("POSTGRES_DSN")
         if not dsn:
             self.skipTest("POSTGRES_DSN not set; native-only known-defect probe")
         name, first, second = INTERLEAVINGS[0]
-        self._run_interleaving(Dialect.POSTGRES, dsn, "NUMERIC(12,3)", False, None, name, first, second)
+        try:
+            self._run_interleaving(Dialect.POSTGRES, dsn, "NUMERIC(12,3)", False, None, name, first, second)
+        except AssertionError as exc:
+            if "materialized view != native view" in str(exc):
+                raise
+            print(f"known-race probe did not reach the expected mismatch: {exc!r}")
+            return
+        except Exception as exc:
+            print(f"known-race probe errored instead of mismatching: {exc!r}")
+            return
 
     def test_native_backfill_chunk_serialized_with_concurrent_writer(self) -> None:
         """A backfill chunk folding a group must not store an AVG that misses a
