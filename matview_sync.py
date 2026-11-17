@@ -7518,6 +7518,14 @@ class IncrementalViewCompiler:
             mv_col = self._group_col_alias(g_expr)
             if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
                 seen_hidden_grp.add(mv_col.lower())
+                c_def = self._lookup_col_def(self._qualify_join_expr(g_expr)) or self._lookup_col_def(g_expr)
+                if c_def:
+                    dt = self._normalize_dialect_type(c_def.data_type)
+                else:
+                    fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
+                    dt = self._infer_expr_storage_type(fake_it)
+                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                    dt = "VARCHAR(255)"
                 collation_match = re.search(
                     r'\bCOLLATE\s+((?:"[^"]+")|(?:`[^`]+`)|(?:\[[^\]]+\])|(?:[A-Za-z_][A-Za-z0-9_.$]*))\s*',
                     g_expr,
