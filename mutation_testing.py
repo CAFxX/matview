@@ -79,6 +79,12 @@ MUTANTS = (
         original='minus_assignments.append(f"{c} = {mv_table}.{c} - __mv_delta.{c}")',
         replacement='minus_assignments.append(f"{c} = {mv_table}.{c} + __mv_delta.{c}")',
     ),
+    Mutant(
+        name="join-retraction-reads-new-row-instead-of-old-row",
+        source_path="matview/maintenance/join.py",
+        original="upd_old_stmts=[minus_stmt],",
+        replacement='upd_old_stmts=[minus_stmt.replace("OLD.", "NEW.")],',
+    ),
 )
 
 
