@@ -50,6 +50,16 @@ class Mutant:
 
 MUTANTS = (
     Mutant(
+        name="filtered-projection-uses-new-predicate-for-old-row-retraction",
+        source_path="matview/maintenance/zset.py",
+        original="            upd_old_stmts=upd_old_list,\n            upd_new_stmts=[plus_stmt],\n            upd_cleanup_old_stmts=upd_clean_list,\n            trunc_stmts=[f\"DELETE FROM {mv_table};\"],\n            where_new=where_new,\n            where_old=where_old,",
+        replacement="            upd_old_stmts=upd_old_list,\n            upd_new_stmts=[plus_stmt],\n            upd_cleanup_old_stmts=upd_clean_list,\n            trunc_stmts=[f\"DELETE FROM {mv_table};\"],\n            where_new=where_new,\n            where_old=where_new,",
+        target_test=(
+            "test_matview_sync.TestGeneratorAndManagerCodePaths."
+            "test_filtered_projection_retracts_old_membership_on_update_and_delete"
+        ),
+    ),
+    Mutant(
         name="join-sum-retraction-adds-instead-of-subtracting",
         source_path="matview/maintenance/join.py",
         original='f"ELSE {mv_table}.{qc} - __mv_delta.{qc} END)"',
