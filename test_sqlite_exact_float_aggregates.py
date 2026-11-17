@@ -47,6 +47,8 @@ def _same_rows(mv: Sequence[Sequence[Any]], live: Sequence[Sequence[Any]]) -> bo
 
 
 def _install(conn: sqlite3.Connection, name: str, select_sql: str, schema: str, **kw: Any) -> None:
+    # The manager refuses to commit caller-owned work: commit the fixture rows first.
+    conn.commit()
     install_materialized_view_sqlite(conn, f"CREATE VIEW {name} AS {select_sql};", schema_sql=schema, **kw)
 
 

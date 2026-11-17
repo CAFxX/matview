@@ -35,6 +35,7 @@ class TestJinja2ProceduralTemplates(unittest.TestCase):
         try:
             conn.execute('CREATE TABLE "order" (id INTEGER PRIMARY KEY, amt INTEGER)')
             conn.execute('INSERT INTO "order" VALUES (1, 10), (2, 20)')
+            conn.commit()
             mgr = ms.MaterializedViewManager(conn, dialect="sqlite")
             plan = mgr.register_view(
                 'CREATE VIEW "select" AS SELECT id, amt FROM "order"',

@@ -181,6 +181,7 @@ class TestSqlglotExpBuilders(unittest.TestCase):
             mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
             mgr.apply_schema_ddl(schema)
             conn.execute("INSERT INTO sales VALUES (1, 'EU', 10), (2, 'US', 20);")
+            conn.commit()
             live_plan = mgr.register_view(view_sql)
             self.assertEqual(
                 conn.execute(f"SELECT region, cnt, total FROM {live_plan.view_name} ORDER BY region;").fetchall(),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import functools
 import hashlib
 import json
 import random
@@ -12,7 +13,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
 from sqlglot import exp as sqlglot_exp
@@ -21,6 +22,8 @@ from sqlalchemy.engine import Engine as _SAEngine
 from .compiler import IncrementalViewCompiler
 from .connectivity import (
     connect_database_via_sqlalchemy,
+    dbapi_connection_layers,
+    dbapi_transaction_state,
     detect_engine_version,
     introspect_database_schemas,
     render_parameterized_sql,
@@ -110,6 +113,65 @@ class BackfillInterruptedError(RuntimeError):
         )
 
 
+class TransactionOwnershipError(RuntimeError):
+    """A manager lifecycle operation refused a connection it cannot own.
+
+    Construction (catalog initialization), ``register_view``, ``sync_views``,
+    ``drop_view``, ``apply_schema_ddl``, ``repair_view`` and
+    ``backfill_incrementally`` execute DDL and commit their own transactions.
+    On a connection that already has an open transaction that would commit
+    (or, on MySQL/MariaDB, implicitly commit) the caller's uncommitted work,
+    so they refuse before executing any SQL. They also refuse when the driver
+    does not report its transaction state, and SQLite connections that use
+    Python's PEP 249 ``autocommit`` attribute (``True`` makes ``commit()`` a
+    no-op; ``False`` keeps a transaction permanently open).
+    """
+
+
+def _manager_owned_operation(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Run a public lifecycle method in a transaction the manager owns.
+
+    Nested calls (one lifecycle method calling another) join the outer
+    operation's transaction.
+    """
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def wrapper(self: "MaterializedViewManager", *args: Any, **kwargs: Any) -> Any:
+            if getattr(self, "_lifecycle_depth", 0):
+                return fn(self, *args, **kwargs)
+            with self._owned_transaction(name):
+                return fn(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
+def _manager_read_operation(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Run a read-only public method without leaving a transaction behind.
+
+    When the connection was idle the read transaction the method opened (on
+    drivers that open one implicitly) is rolled back; a caller-owned
+    transaction is joined and never ended.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self: "MaterializedViewManager", *args: Any, **kwargs: Any) -> Any:
+        if getattr(self, "_lifecycle_depth", 0):
+            return fn(self, *args, **kwargs)
+        owned = dbapi_transaction_state(self.conn) is False
+        self._lifecycle_depth = 1
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self._lifecycle_depth = 0
+            if owned and dbapi_transaction_state(self.conn) is True:
+                self._rollback()
+
+    return wrapper
+
+
 class MaterializedViewManager:
     """
     Setup/migration manager that connects to a database (SQLite connection/path or
@@ -176,6 +238,7 @@ class MaterializedViewManager:
             if engine_version is None and (":" in dialect or "-" in dialect or "mariadb" in dialect.lower() or any(ch.isdigit() for ch in dialect.replace("sqlite3", ""))):
                 engine_version = parsed_d
 
+        self._lifecycle_depth = 0
         self._owned_sa_engine: Optional[_SAEngine] = None
         self.sa_connection: Optional[_SAConnection] = None
         if isinstance(conn_or_url, str):
@@ -192,6 +255,15 @@ class MaterializedViewManager:
             self._owns_raw_conn = isinstance(conn_or_url, _SAEngine)
             if hint_d is None and sa_dialect is not None:
                 hint_d = sa_dialect
+
+        # Catalog initialization executes DDL and commits, and version
+        # detection runs before the dialect is known: refuse a caller-owned
+        # transaction before either touches the connection.
+        if skip_ensure_catalog:
+            owns_connection = dbapi_transaction_state(self.conn) is False
+        else:
+            self._require_idle_connection("MaterializedViewManager initialization")
+            owns_connection = True
 
         if engine_version is not None:
             self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
@@ -212,6 +284,89 @@ class MaterializedViewManager:
 
         if not skip_ensure_catalog:
             self._ensure_catalog()
+        if owns_connection and dbapi_transaction_state(self.conn) is True:
+            # Only reads (version detection) can be left open here.
+            self._rollback()
+
+    def _require_idle_connection(self, operation: str) -> None:
+        """Raise TransactionOwnershipError unless the manager can own the next transaction."""
+        for layer in dbapi_connection_layers(self.conn):
+            if isinstance(layer, sqlite3.Connection) and hasattr(sqlite3, "LEGACY_TRANSACTION_CONTROL"):
+                mode = getattr(layer, "autocommit", sqlite3.LEGACY_TRANSACTION_CONTROL)
+                if mode != sqlite3.LEGACY_TRANSACTION_CONTROL:
+                    raise TransactionOwnershipError(
+                        f"{operation} requires a sqlite3 connection with legacy transaction "
+                        f"control (autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL, the default; "
+                        f"isolation_level=None is supported); got autocommit={mode!r}"
+                    )
+        state = dbapi_transaction_state(self.conn)
+        if state is True:
+            raise TransactionOwnershipError(
+                f"{operation} cannot run inside a caller-owned transaction: it executes "
+                f"DDL and commits its own transaction, which would commit the caller's "
+                f"uncommitted work (MySQL/MariaDB DDL commits it implicitly). Commit or "
+                f"roll back the connection's transaction first."
+            )
+        if state is None:
+            raise TransactionOwnershipError(
+                f"{operation} cannot determine whether {type(self.conn).__module__}."
+                f"{type(self.conn).__qualname__} has an open transaction, so it cannot "
+                f"guarantee not to commit caller-owned work. Supported drivers report it "
+                f"through in_transaction (sqlite3, apsw, mysql-connector), "
+                f"get_transaction_status() (psycopg2) or server_status (PyMySQL). pg8000 and "
+                f"mysqlclient (MySQLdb) do not report it: connect with psycopg2 (PostgreSQL) or "
+                f"PyMySQL / mysql-connector-python (MySQL/MariaDB) instead."
+            )
+
+    @contextmanager
+    def _owned_transaction(self, operation: str) -> Iterator[None]:
+        """Own the connection's transaction for one top-level lifecycle operation.
+
+        The connection must be idle. A PostgreSQL connection in autocommit mode
+        is switched to explicit transactions for the duration (every DDL
+        statement would otherwise commit separately, exposing half-installed
+        views and the trigger-installation/population race) and restored
+        afterwards. On success a still-open transaction is committed; on
+        failure it is rolled back. Both are manager-owned by construction.
+        """
+        self._require_idle_connection(operation)
+        restore_autocommit: List[Any] = []
+        if self.dialect == Dialect.POSTGRES:
+            # Only the physical driver connection: pool proxies (SQLAlchemy's
+            # _ConnectionFairy) forward attribute reads to it, but an attribute
+            # written on the proxy would shadow the driver's setting.
+            physical = dbapi_connection_layers(self.conn)[-1]
+            if getattr(physical, "autocommit", None) is True:
+                physical.autocommit = False
+                restore_autocommit.append(physical)
+        self._lifecycle_depth = 1
+        succeeded = False
+        try:
+            yield
+            succeeded = True
+        finally:
+            self._lifecycle_depth = 0
+            try:
+                if dbapi_transaction_state(self.conn) is not False:
+                    if succeeded:
+                        self._commit()
+                        if dbapi_transaction_state(self.conn) is not False:
+                            # Never report success for work that is not
+                            # committed (e.g. a connection whose commit() is
+                            # a no-op): undo it and fail.
+                            self._rollback()
+                            raise RuntimeError(
+                                f"{operation}: committing did not end the transaction on "
+                                f"{type(self.conn).__module__}.{type(self.conn).__qualname__}; "
+                                f"the operation was rolled back"
+                            )
+                    else:
+                        self._rollback()
+            finally:
+                for layer in restore_autocommit:
+                    if dbapi_transaction_state(self.conn) is not False:
+                        self._rollback()
+                    layer.autocommit = True
 
     def _ensure_catalog(self) -> None:
         with self._cursor() as cur:
@@ -273,11 +428,22 @@ class MaterializedViewManager:
     def _commit(self) -> None:
         if hasattr(self.conn, "commit"):
             self.conn.commit()
+        elif dbapi_transaction_state(self.conn) is True:
+            # Connections without DB-API commit() (raw apsw.Connection) are
+            # committed with the SQL statement.
+            with self._cursor() as cur:
+                cur.execute("COMMIT;")
 
     def _rollback(self) -> None:
         if hasattr(self.conn, "rollback"):
             try:
                 self.conn.rollback()
+            except Exception:
+                pass
+        elif dbapi_transaction_state(self.conn) is True:
+            try:
+                with self._cursor() as cur:
+                    cur.execute("ROLLBACK;")
             except Exception:
                 pass
 
@@ -334,6 +500,7 @@ class MaterializedViewManager:
                     return unprefixed
         return name
 
+    @_manager_read_operation
     def fetch_schema(self, extra_schema_sql: Optional[str] = None) -> Dict[str, TableSchema]:
         """Fetches the live schema of all user base tables from the connected database."""
         schemas = introspect_database_schemas(
@@ -346,6 +513,7 @@ class MaterializedViewManager:
             schemas.update(parse_table_schema(extra_schema_sql, dialect=self.dialect))
         return schemas
 
+    @_manager_owned_operation("apply_schema_ddl")
     def apply_schema_ddl(self, ddl_sql: str, auto_sync_views: bool = True) -> None:
         """
         Safely executes schema DDL changes (e.g. `CREATE TABLE`, `ALTER TABLE`) and
@@ -362,29 +530,55 @@ class MaterializedViewManager:
             if catalog:
                 self.sync_views([entry["view_sql"] for entry in catalog.values()])
 
+    def _catalog_select(self, cur: Any, sql: str) -> Optional[List[Any]]:
+        """Run one catalog read; None if it failed (e.g. no catalog yet).
+
+        Never ends a transaction it does not own: inside an open transaction
+        the read runs under a savepoint that is rolled back to on failure
+        (PostgreSQL aborts the whole transaction on a failed statement). Only
+        when the connection was idle is the failed read's own transaction
+        rolled back. With unknown transaction state the error propagates.
+        """
+        state = dbapi_transaction_state(self.conn)
+        if state is True:
+            self._savepoint_create(cur, "__matview_catalog_read")
+            try:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            except Exception:
+                self._savepoint_rollback_and_release(cur, "__matview_catalog_read")
+                return None
+            self._savepoint_release(cur, "__matview_catalog_read")
+            return rows
+        try:
+            cur.execute(sql)
+            return cur.fetchall()
+        except Exception:
+            if state is None:
+                raise
+            self._rollback()
+            return None
+
+    @_manager_read_operation
     def get_catalog(self) -> Dict[str, Dict[str, Any]]:
         with self._cursor() as cur:
-            try:
-                cur.execute(
+            rows = self._catalog_select(
+                cur,
+                f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
+                f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
+                f"backfill_cursor_pk, backfill_max_pk, backfill_active "
+                f"FROM {self.catalog_table}",
+            )
+            has_wm_cols = rows is not None
+            if rows is None:
+                rows = self._catalog_select(
+                    cur,
                     f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
-                    f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
-                    f"backfill_cursor_pk, backfill_max_pk, backfill_active "
-                    f"FROM {self.catalog_table}"
+                    f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
+                    f"FROM {self.catalog_table}",
                 )
-                has_wm_cols = True
-            except Exception:
-                self._rollback()
-                try:
-                    cur.execute(
-                        f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
-                        f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
-                        f"FROM {self.catalog_table}"
-                    )
-                    has_wm_cols = False
-                except Exception:
-                    self._rollback()
+                if rows is None:
                     return {}
-            rows = cur.fetchall()
         out: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             out[row[0]] = {
@@ -440,6 +634,7 @@ class MaterializedViewManager:
             )
         return "\n".join(parts)
 
+    @_manager_owned_operation("drop_view")
     def drop_view(self, view_name: str) -> bool:
         """Drops a registered materialized view, its triggers, read-only view, and backing tables."""
         catalog = self.get_catalog()
@@ -503,6 +698,7 @@ class MaterializedViewManager:
             (cursor_pk, max_pk, active, view_name),
         )
 
+    @_manager_owned_operation("backfill_incrementally")
     def backfill_incrementally(
         self,
         plan: MaterializedViewPlan,
@@ -1293,6 +1489,7 @@ class MaterializedViewManager:
                 raise
         return plan
 
+    @_manager_owned_operation("register_view")
     def register_view(
         self,
         view_sql: ViewSpec | str,
@@ -1364,6 +1561,7 @@ class MaterializedViewManager:
             sub_plans=sub_plans,
         )
 
+    @_manager_owned_operation("sync_views")
     def sync_views(
         self,
         view_sqls: Sequence[ViewSpec | str] | ViewSpec | str,
@@ -1459,6 +1657,7 @@ class MaterializedViewManager:
 
         return status
 
+    @_manager_read_operation
     def check_schema_drift(self) -> Dict[str, str]:
         """
         Inspects all registered views in `__matview_catalog` against the current live base
@@ -1493,6 +1692,7 @@ class MaterializedViewManager:
                 report[v_name] = "invalid"
         return report
 
+    @_manager_owned_operation("repair_view")
     def repair_view(
         self,
         view_name: Optional[str] = None,
@@ -2055,6 +2255,7 @@ class MaterializedViewManager:
             )
         return None
 
+    @_manager_read_operation
     def diff_views(
         self,
         view_sqls: Optional[Sequence[str | ViewSpec] | str | ViewSpec] = None,
@@ -2376,6 +2577,7 @@ class MaterializedViewManager:
 
         return ViewDiffReport(diffs)
 
+    @_manager_read_operation
     def diff_view(
         self,
         view_sql: str | ViewSpec,

@@ -317,6 +317,7 @@ class HighOffsetsAndSpecialValuesTests(unittest.TestCase):
         try:
             conn.execute("CREATE TABLE sz_table (id INT PRIMARY KEY, val REAL);")
             conn.execute("INSERT INTO sz_table VALUES (1, -0.0), (2, 0.0);")
+            conn.commit()
             view_sql = "CREATE VIEW sz_mv AS SELECT id, val FROM sz_table;"
             install_materialized_view_sqlite(conn, view_sql)
             mv_rows = conn.execute("SELECT id, val FROM sz_mv ORDER BY id;").fetchall()
