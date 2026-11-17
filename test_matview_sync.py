@@ -4884,9 +4884,15 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 plan = generate_materialized_view(
                     schema, view_input, dialect=dialect, ignore_limitations=True
                 )
-                self.assertIn(
-                    f"AS {expected_alias}",
-                    plan.reader_view_ddl or "",
+                reader_sql = plan.reader_view_ddl or ""
+                self.assertIn(expected_alias, reader_sql)
+                reader_ast = parse_view_ast(reader_sql, dialect=dialect)
+                self.assertEqual(
+                    reader_ast.select_items[0].alias,
+                    "select",
+                    "reader view must preserve the reserved output-column name; "
+                    "a redundant AS clause is not required when the backing column "
+                    "already has the correct name",
                 )
 
     def test_preparsed_view_spec_resolves_statistical_aliases_for_target_dialect(self) -> None:
