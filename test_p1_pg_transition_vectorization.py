@@ -104,13 +104,45 @@ class TestPGTransitionTableVectorizationDDL(unittest.TestCase):
         self.assertLess(pos_old, pos_new, "OLD minus update must precede NEW plus upsert")
         self.assertLess(pos_new, pos_clean, "NEW plus upsert must precede zero-count cleanup")
 
-    def test_expression_group_native_aggregates_use_transition_rows_for_new_groups(self) -> None:
-        """New groups aggregate their transition rows without illegal outer-column correlation."""
+    def test_expression_group_supported_aggregates_remain_vectorized(self) -> None:
+        """Expression GROUP BY keys remain set-based when no native recomputation is needed."""
         schema = """
         CREATE TABLE orders (
             id INT PRIMARY KEY,
             region TEXT,
-            amount DOUBLE PRECISION NOT NULL
+            amount REAL NOT NULL
+        );
+        """
+        view = """
+        CREATE VIEW region_stats AS
+        SELECT
+            COALESCE(region, 'UNK') AS region_norm,
+            COUNT(*) AS row_count,
+            SUM(amount) AS total_amount
+        FROM orders
+        GROUP BY COALESCE(region, 'UNK');
+        """
+        plan = generate_materialized_view(
+            schema,
+            view,
+            dialect=Dialect.POSTGRES,
+            pg_use_transition_tables=True,
+            pg_vectorize_transition_tables=True,
+        )
+        ai_ddl = next(d for d in plan.trigger_ddls if "_ai()" in d)
+
+        self.assertNotIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", ai_ddl)
+        self.assertIn("COUNT(*) AS row_count", ai_ddl)
+        self.assertIn("SUM(__mv_new_rows.amount) AS total_amount", ai_ddl)
+        self.assertIn("GROUP BY COALESCE(__mv_new_rows.region, 'UNK')", ai_ddl)
+
+    def test_expression_group_native_recomputation_uses_row_loop_fallback(self) -> None:
+        """Native AVG/statistical recomputation must not correlate raw transition columns."""
+        schema = """
+        CREATE TABLE orders (
+            id INT PRIMARY KEY,
+            region TEXT,
+            amount REAL NOT NULL
         );
         """
         view = """
@@ -130,14 +162,13 @@ class TestPGTransitionTableVectorizationDDL(unittest.TestCase):
             pg_vectorize_transition_tables=True,
         )
         ai_ddl = next(d for d in plan.trigger_ddls if "_ai()" in d)
+        ad_ddl = next(d for d in plan.trigger_ddls if "_ad()" in d)
+        au_ddl = next(d for d in plan.trigger_ddls if "_au()" in d)
 
-        # A new group contains all rows in the transition table, so its initial
-        # native aggregates must be computed directly in the grouped SELECT.
-        self.assertIn("AVG(__mv_new_rows.amount) AS avg_amount", ai_ddl)
-        self.assertIn("VAR_POP(__mv_new_rows.amount) AS var_amount", ai_ddl)
-
-        # The old scalar subqueries correlated against raw transition-table
-        # columns are rejected by PostgreSQL for expression GROUP BY keys.
+        self.assertIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", ai_ddl)
+        self.assertIn("FOR OLD IN SELECT * FROM __mv_old_rows LOOP", ad_ddl)
+        self.assertIn("FOR OLD IN SELECT * FROM __mv_old_rows LOOP", au_ddl)
+        self.assertIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", au_ddl)
         self.assertNotIn(
             "IS NOT DISTINCT FROM (COALESCE(__mv_new_rows.region, 'UNK'))",
             ai_ddl,
