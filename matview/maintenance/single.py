@@ -937,9 +937,9 @@ class Tier1SingleMixin:
                     sum_c = self._q(col_sum_map[ekey])
                     new_cnt = f"({mv_table}.{cnt_c} + {_incoming(cnt_c)})"
                     new_sum = _merged_sum(sum_c)
-                    dividend = f"(1.0 * {new_sum})"
+                    derived = self._avg_from_sum_count_sql(item, new_sum, new_cnt)
                     assignments.append(
-                        f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE {dividend} / {new_cnt} END"
+                        f"{c} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE {derived} END"
                     )
             elif item.agg_func in (
                 AggFunc.VAR_POP,
@@ -1305,7 +1305,13 @@ class Tier1SingleMixin:
             elif item.agg_func == AggFunc.TOTAL:
                 insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN 0.0 ELSE 1.0 * ({val_e}) END)")
             elif item.agg_func == AggFunc.AVG:
-                insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 1.0 * ({val_e}) END)")
+                if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL) and self._avg_native_sum_scale(item) is not None:
+                    # A new group holds exactly this row: AVG = value / 1 with
+                    # the native result scale (PostgreSQL numeric_div scale).
+                    first = self._avg_from_sum_count_sql(item, f"({val_e})", "1")
+                    insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE {first} END)")
+                else:
+                    insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 1.0 * ({val_e}) END)")
             elif item.agg_func in (AggFunc.VAR_POP, AggFunc.STDDEV_POP):
                 insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 0.0 END)")
             elif item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP):
@@ -1349,14 +1355,10 @@ class Tier1SingleMixin:
                     sum_col = self._q(col_sum_map[ekey])
                     new_cnt = f"({mv_table}.{cnt_col} + {_plus_inc_expr(item)})"
                     new_sum = _plus_sum_expr(item, sum_col)
-                    exact_avg = (
-                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
-                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
-                    )
-                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    derived = self._avg_from_sum_count_sql(item, new_sum, new_cnt)
                     update_assignments.append(
                         f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
-                        f"ELSE {dividend} / {new_cnt} END"
+                        f"ELSE {derived} END"
                     )
             elif item.agg_func in (
                 AggFunc.VAR_POP,
@@ -1662,14 +1664,10 @@ class Tier1SingleMixin:
                     sum_col = self._q(col_sum_map[ekey])
                     new_cnt = f"({mv_table}.{cnt_col} - {_minus_dec_expr(item)})"
                     new_sum = _minus_sum_expr(item, sum_col, cnt_col)
-                    exact_avg = (
-                        self.dialect in (Dialect.MYSQL, Dialect.POSTGRES)
-                        and self._exact_numeric_precision_scale(item.arg_expr or "") is not None
-                    )
-                    dividend = new_sum if exact_avg else f"(1.0 * {new_sum})"
+                    derived = self._avg_from_sum_count_sql(item, new_sum, new_cnt)
                     update_assignments.append(
                         f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
-                        f"ELSE {dividend} / {new_cnt} END"
+                        f"ELSE {derived} END"
                     )
             elif item.agg_func in (
                 AggFunc.VAR_POP,

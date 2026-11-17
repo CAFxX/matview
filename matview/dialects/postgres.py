@@ -247,10 +247,9 @@ class PostgresDialectMixin:
                     else:
                         cnt_col = col_nonnull_count_map[ekey]
                         sum_col = col_sum_map[ekey]
-                        ins_vals.append(
-                            f"(CASE WHEN COUNT({val_e_new}) = 0 THEN NULL "
-                            f"ELSE (1.0 * SUM({val_e_new})) / COUNT({val_e_new}) END) AS {col_alias}"
-                        )
+                        # A previously unseen group consists entirely of the
+                        # transition rows; the native aggregate is exact.
+                        ins_vals.append(f"AVG({val_e_new}) AS {col_alias}")
                         new_cnt = f"({mv_table}.{cnt_col} + EXCLUDED.{cnt_col})"
                         new_sum = (
                             f"(CASE WHEN {mv_table}.{sum_col} IS NULL THEN EXCLUDED.{sum_col} "
@@ -258,7 +257,8 @@ class PostgresDialectMixin:
                             f"ELSE {mv_table}.{sum_col} + EXCLUDED.{sum_col} END)"
                         )
                         upd_assignments.append(
-                            f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL ELSE (1.0 * {new_sum}) / {new_cnt} END"
+                            f"{col_alias} = CASE WHEN {new_cnt} = 0 THEN NULL "
+                            f"ELSE {self._avg_from_sum_count_sql(item, new_sum, new_cnt)} END"
                         )
 
                 elif item.agg_func == AggFunc.BOOL_AND:
@@ -455,7 +455,8 @@ class PostgresDialectMixin:
                             new_cnt = f"({mv_table}.{cnt_col} - __del.{cnt_col})"
                             new_sum = f"({mv_table}.{sum_col} - COALESCE(__del.{sum_col}, 0))"
                             del_updates.append(
-                                f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL ELSE (1.0 * {new_sum}) / {new_cnt} END"
+                                f"{col_alias} = CASE WHEN {new_cnt} <= 0 THEN NULL "
+                                f"ELSE {self._avg_from_sum_count_sql(item, new_sum, new_cnt)} END"
                             )
 
                 elif item.agg_func == AggFunc.BOOL_AND:

@@ -609,7 +609,10 @@ def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     s = re.sub(r"\s+WITH\s*\([^)]*fillfactor[^)]*\)", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\bCAST\s*\(\s*ROW\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)\)\s+AS\s+TEXT\s*\)", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
     s = re.sub(r"\bROW\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)\)\s*::\s*TEXT\b", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
-    s = re.sub(r"::\s*(?:TEXT|BIGINT|DOUBLE\s+PRECISION|INTEGER|BOOLEAN|NUMERIC)\b", "", s, flags=re.IGNORECASE)
+    # PostgreSQL numeric division never truncates; emulate a `(x)::NUMERIC`
+    # operand with REAL arithmetic rather than SQLite integer division.
+    s = re.sub(r"::\s*NUMERIC\b", " * 1.0", s, flags=re.IGNORECASE)
+    s = re.sub(r"::\s*(?:TEXT|BIGINT|DOUBLE\s+PRECISION|INTEGER|BOOLEAN)\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\bIS\s+NOT\s+DISTINCT\s+FROM\b", "IS", s, flags=re.IGNORECASE)
     s = re.sub(r"\bDOUBLE\s+PRECISION\b", "REAL", s, flags=re.IGNORECASE)
     s = re.sub(r"\bBOOLEAN\b", "INTEGER", s, flags=re.IGNORECASE)
@@ -637,6 +640,9 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
     s = s.replace("<=>", " IS ")
     s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR(?:\(\d+\))?(?:\s+CHARACTER\s+SET\s+\w+)?\s*\)", r"CAST(\1 AS TEXT)", s, flags=re.IGNORECASE)
     s = re.sub(r"\bCHARACTER\s+SET\s+\w+\b", "", s, flags=re.IGNORECASE)
+    # MySQL `/` is never integer division; emulate a DECIMAL-cast dividend
+    # with REAL arithmetic rather than SQLite integer division.
+    s = re.sub(r"\bAS\s+DECIMAL\s*\(\s*\d+\s*,\s*\d+\s*\)\s*\)", "AS REAL)", s, flags=re.IGNORECASE)
     s = re.sub(r"\bCOLLATE\s+\w+\b", "", s, flags=re.IGNORECASE)
     # Replace MySQL bitwise XOR `^`
     for _ in range(3):
@@ -5825,19 +5831,30 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         single_triggers = "\\n".join(single.trigger_ddls).upper()
         self.assertGreaterEqual(single_triggers.count("SELECT VAR_POP("), 2)
-        self.assertGreaterEqual(single_triggers.count("SELECT AVG("), 6)
-        self.assertGreaterEqual(single_triggers.count("SELECT AVG(WHOLE)"), 2)
+        self.assertGreaterEqual(single_triggers.count("SELECT AVG("), 4)
+        # PostgreSQL integer AVG is numeric_div(sum::numeric, count::numeric):
+        # derive it from the locked row's SUM/COUNT with NUMERIC (never
+        # truncating BIGINT) division instead of a base-table recomputation,
+        # whose pre-lock snapshot races with concurrent group writers.
+        self.assertEqual(single_triggers.count("SELECT AVG(WHOLE)"), 0)
+        self.assertIn(")::NUMERIC / (", single_triggers)
+        # NUMERIC (data-dependent display scale, NaN) and approximate inputs
+        # keep the native recomputation.
         self.assertGreaterEqual(single_triggers.count("SELECT AVG(EXACT_VALUE)"), 2)
+        self.assertGreaterEqual(single_triggers.count("SELECT AVG(VALUE)"), 2)
         self.assertGreaterEqual(single_triggers.count("SELECT STDDEV_SAMP("), 2)
 
-        # MySQL exact-value AVG must also use the native engine result rather
-        # than relying on a scale-changing SUM/COUNT fold.
+        # MySQL exact-value AVG (integer and fixed-point DECIMAL; MySQL NUMERIC
+        # is DECIMAL(10,0)) is my_decimal_div(sum, count): derive it with the
+        # sum normalized to the native SUM scale. DOUBLE keeps recomputation.
         mysql_single = generate_materialized_view(
             single_schema, single_view, dialect="mysql", ignore_limitations=True
         )
         mysql_triggers = "\\n".join(mysql_single.trigger_ddls).upper()
-        self.assertGreaterEqual(mysql_triggers.count("SELECT AVG(WHOLE)"), 2)
-        self.assertGreaterEqual(mysql_triggers.count("SELECT AVG(EXACT_VALUE)"), 2)
+        self.assertEqual(mysql_triggers.count("SELECT AVG(WHOLE)"), 0)
+        self.assertEqual(mysql_triggers.count("SELECT AVG(EXACT_VALUE)"), 0)
+        self.assertIn("AS DECIMAL(65, 0)) / (", mysql_triggers)
+        self.assertGreaterEqual(mysql_triggers.count("SELECT AVG(VALUE)"), 2)
 
         # MySQL BIT_* aggregates return unsigned 64-bit integers. The reader
         # view's neutral values must preserve that signedness; otherwise
@@ -5985,8 +6002,10 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("SELECT VAR_POP(", chunk_sql)
         self.assertIn("SELECT STDDEV_SAMP(", chunk_sql)
         # PostgreSQL AVG(integer) returns NUMERIC; a BIGINT / BIGINT fold
-        # truncates and must not be used for incremental chunk merges.
-        self.assertIn("SELECT AVG(whole)", chunk_sql)
+        # truncates and must not be used for incremental chunk merges. The
+        # chunk merge derives it with NUMERIC division of the merged SUM/COUNT.
+        self.assertNotIn("SELECT AVG(whole)", chunk_sql)
+        self.assertIn(")::NUMERIC / (", chunk_sql)
         self.assertIn("SELECT AVG(value)", chunk_sql)
 
         # MariaDB's native VAR_POP/STDDEV result can have different rounding
@@ -6000,7 +6019,8 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertIn("SELECT VAR_POP(", mysql_chunk_sql)
         self.assertIn("SELECT STDDEV_SAMP(", mysql_chunk_sql)
-        self.assertIn("SELECT AVG(whole)", mysql_chunk_sql)
+        self.assertNotIn("SELECT AVG(whole)", mysql_chunk_sql)
+        self.assertIn("AS DECIMAL(65, 0)) / (", mysql_chunk_sql)
 
         # Chunk-fold recomputation must correlate an expression group against
         # its materialized projection alias, not a base-table column that the

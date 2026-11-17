@@ -529,18 +529,97 @@ class DialectBaseMixin:
         """Match the native AVG result family and fixed-point precision/scale."""
         return self._avg_result_storage_type_for_expr(item.arg_expr or "")
 
+    _PG_INTEGER_TYPE_RE = re.compile(
+        r"(?:SMALLINT|INTEGER|INT|INT2|INT4|INT8|BIGINT|SMALLSERIAL|SERIAL|SERIAL2|SERIAL4|SERIAL8|BIGSERIAL)"
+    )
+    _MYSQL_INTEGER_TYPE_RE = re.compile(
+        r"(?:TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT)(?:\s*\(\s*\d+\s*\))?(?:\s+UNSIGNED)?(?:\s+ZEROFILL)?"
+    )
+    _MYSQL_DECIMAL_TYPE_RE = re.compile(
+        r"(?:DECIMAL|NUMERIC|DEC|FIXED)(?:\s*\(\s*\d+\s*(?:,\s*(\d+)\s*)?\))?(?:\s+UNSIGNED)?(?:\s+ZEROFILL)?"
+    )
+
+    def _avg_native_sum_scale(self, item: SelectItem) -> Optional[int]:
+        """Return the native SUM scale when AVG(x) == SUM(x)/COUNT(x) exactly.
+
+        The engine's AVG for these argument types is, by implementation, the
+        engine's exact division of the exact running sum by the non-NULL count:
+
+        * PostgreSQL ``int2``/``int4``/``int8``: ``int8_avg``/``numeric_poly_avg``
+          return ``numeric_div(sum::numeric, count::numeric)``; an integer sum
+          always has display scale 0.
+        * MySQL/MariaDB integer and fixed-point ``DECIMAL(p, s)``:
+          ``Item_sum_avg`` returns ``my_decimal_div(sum, count,
+          div_precision_increment)`` over an exact DECIMAL sum of scale ``s``,
+          which is what the ``/`` operator computes for the same operands.
+
+        For these types the materialized AVG can therefore be derived from the
+        SUM and non-NULL COUNT maintained in the same backing row, inside the
+        same row-locked statement, with a result identical to the native AVG.
+        ``None`` means no such guarantee exists (PostgreSQL ``numeric`` has a
+        data-dependent display scale and NaN, approximate types depend on the
+        native accumulation order, DISTINCT and UNION-derived projections have
+        different maintenance, and expression result types are inferred only
+        approximately); those keep the native per-group recomputation.
+        """
+        if item.agg_func != AggFunc.AVG or item.is_distinct or not item.arg_expr:
+            return None
+        if getattr(self, "_alg_mode", "single") != "single":
+            return None
+        source = self._lookup_source_col_def(item.arg_expr)
+        if source is None:
+            return None
+        source_type = re.sub(r"\s+", " ", source.data_type.strip().upper())
+        if self.dialect == Dialect.POSTGRES:
+            return 0 if self._PG_INTEGER_TYPE_RE.fullmatch(source_type) else None
+        if self.dialect == Dialect.MYSQL:
+            if self._MYSQL_INTEGER_TYPE_RE.fullmatch(source_type):
+                return 0
+            match = self._MYSQL_DECIMAL_TYPE_RE.fullmatch(source_type)
+            if match:
+                return int(match.group(1) or 0)
+        return None
+
+    def _avg_from_sum_count_sql(self, item: SelectItem, sum_sql: str, cnt_sql: str) -> str:
+        """Division expression deriving AVG from a maintained SUM and COUNT.
+
+        Callers must guard ``cnt_sql = 0`` (the result is NULL for an empty
+        group). On PostgreSQL/MySQL this is only used for arguments accepted by
+        `_avg_native_sum_scale`, and reproduces the native AVG value and scale.
+        """
+        if self.dialect == Dialect.POSTGRES:
+            return f"(({sum_sql})::NUMERIC / ({cnt_sql})::NUMERIC)"
+        if self.dialect == Dialect.MYSQL:
+            scale = self._avg_native_sum_scale(item)
+            assert scale is not None, "MySQL AVG derivation requires an exact native sum scale"
+            # Normalize the stored sum to the native SUM scale so the decimal
+            # division sees the same operands as Item_sum_avg.
+            return f"(CAST(({sum_sql}) AS DECIMAL(65, {scale})) / ({cnt_sql}))"
+        return f"(1.0 * {sum_sql}) / {cnt_sql}"
+
     def _requires_native_avg_recompute(self, item: SelectItem) -> bool:
         """Use the engine aggregate for AVG on engines with native exact semantics.
 
         A SUM/COUNT maintenance fold is not equivalent for every exact input:
-        PostgreSQL integer division can truncate, and derived UNION projections
-        can have a native result type that is lost by the fold. Recomputing the
-        affected group preserves the source view's exact precision/scale and
-        approximate rounding semantics.
+        PostgreSQL integer division can truncate, numeric display scale is
+        data-dependent, and derived UNION projections can have a native result
+        type that is lost by the fold. Recomputing the affected group preserves
+        the source view's exact precision/scale and approximate rounding
+        semantics for those inputs.
+
+        Where `_avg_native_sum_scale` proves the fold exact, AVG is derived from
+        the SUM/COUNT columns of the same backing row instead. This is required
+        for concurrency correctness, not only speed: a recomputation subquery
+        reads the base table through the statement snapshot, which under READ
+        COMMITTED predates acquiring the group row lock, so it can miss a
+        concurrently committed writer's rows and store a stale AVG next to a
+        correct SUM/COUNT. The derived value is computed from the locked row
+        itself and is therefore serialized with every other group writer.
         """
         return (
             self.dialect in (Dialect.POSTGRES, Dialect.MYSQL)
             and item.agg_func == AggFunc.AVG
+            and self._avg_native_sum_scale(item) is None
         )
 
     def _var_accum_type(

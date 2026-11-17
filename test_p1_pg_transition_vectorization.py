@@ -593,9 +593,11 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
         CREATE TABLE orders (
             id INT PRIMARY KEY,
             region TEXT,
-            amount INT
+            amount NUMERIC(12, 2)
         );
         """
+        # NUMERIC AVG keeps native recomputation (integer AVG is derived from
+        # SUM/COUNT and needs no correlated recompute; see the test below).
         view_sql = """
         CREATE VIEW pgtr_expr_avg AS
         SELECT COALESCE(region, 'UNK') AS reg_norm,
