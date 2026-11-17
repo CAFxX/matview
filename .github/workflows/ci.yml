@@ -67,9 +67,13 @@ concurrency:
 
 on:
   push:
-    # Keep exact-head CI available for every native stacked-PR layer, not
-    # only trunk pushes; merge_group below remains the queue gate.
-    branches: ["main", "master", "p0/**", "p1/**", "p2/**"]
+    # Trunk pushes only. Stacked-PR layers get exact-head CI from the
+    # pull_request event (it has no branch filter, so it runs for PRs whose
+    # base is another stack branch). A push trigger on stack branches would
+    # start a second run in the same concurrency group on every push; one of
+    # the two is cancelled and its `CI success` aggregator records a failed
+    # check on the head commit, which leaves the PR BLOCKED.
+    branches: ["main", "master"]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
