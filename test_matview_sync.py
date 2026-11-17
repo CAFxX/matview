@@ -4365,10 +4365,12 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 if dialect == Dialect.MYSQL:
                     # MariaDB statistical aliases need the declared source scale,
                     # not only information_schema.DATA_TYPE == "decimal".
-                    self.assertEqual(
-                        cm_schema.columns["exact_due"].data_type.upper(),
-                        "DECIMAL(18,4)",
+                    # Database/SQL parsers may retain or insert whitespace
+                    # inside a type declaration; precision and scale are the contract.
+                    actual_type = "".join(
+                        cm_schema.columns["exact_due"].data_type.upper().split()
                     )
+                    self.assertEqual(actual_type, "DECIMAL(18,4)")
 
                 # 2. On MySQL, foreign key ON DELETE CASCADE pulled from the live database triggers EngineLimitationError
                 if dialect == Dialect.MYSQL:
