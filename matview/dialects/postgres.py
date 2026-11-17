@@ -206,8 +206,12 @@ class PostgresDialectMixin:
                         ins_vals.append(f"0 AS {col_alias}")
                         upd_assignments.append(f"{col_alias} = {mv_table}.{col_alias}")
                     elif self._requires_native_avg_recompute(item):
-                        ins_recomp = self._build_recompute_subquery_raw(item, "__mv_new_rows")
-                        ins_vals.append(f"{ins_recomp} AS {col_alias}")
+                        # A previously unseen group consists entirely of rows in
+                        # this transition table. Aggregate those rows directly:
+                        # a correlated subquery against raw transition-table
+                        # columns is illegal in PostgreSQL when the outer GROUP BY
+                        # key is an expression such as COALESCE(region, 'UNK').
+                        ins_vals.append(f"AVG({val_e_new}) AS {col_alias}")
                         recomp = self._build_recompute_subquery_raw(item, mv_table)
                         upd_assignments.append(f"{col_alias} = {recomp}")
                     else:
@@ -263,6 +267,20 @@ class PostgresDialectMixin:
                         f"WHEN EXCLUDED.{col_alias} IS NULL THEN {mv_table}.{col_alias} "
                         f"ELSE {mv_table}.{col_alias} {op} EXCLUDED.{col_alias} END"
                     )
+
+                elif item.agg_func in (
+                    AggFunc.VAR_POP,
+                    AggFunc.VAR_SAMP,
+                    AggFunc.STDDEV_POP,
+                    AggFunc.STDDEV_SAMP,
+                    AggFunc.BIT_XOR,
+                ):
+                    # As with AVG above, compute a new group's initial native
+                    # aggregate over the grouped transition rows. Existing
+                    # groups are recomputed from the base table on conflict.
+                    ins_vals.append(f"{item.agg_func.value}({val_e_new}) AS {col_alias}")
+                    recomp = self._build_recompute_subquery_raw(item, mv_table)
+                    upd_assignments.append(f"{col_alias} = {recomp}")
 
                 else:
                     ins_recomp = self._build_recompute_subquery_raw(item, "__mv_new_rows")

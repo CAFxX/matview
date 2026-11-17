@@ -103,6 +103,45 @@ class TestPGTransitionTableVectorizationDDL(unittest.TestCase):
         self.assertLess(pos_old, pos_new, "OLD minus update must precede NEW plus upsert")
         self.assertLess(pos_new, pos_clean, "NEW plus upsert must precede zero-count cleanup")
 
+    def test_expression_group_native_aggregates_use_transition_rows_for_new_groups(self) -> None:
+        """New groups aggregate their transition rows without illegal outer-column correlation."""
+        schema = """
+        CREATE TABLE orders (
+            id INT PRIMARY KEY,
+            region TEXT,
+            amount DOUBLE PRECISION NOT NULL
+        );
+        """
+        view = """
+        CREATE VIEW region_stats AS
+        SELECT
+            COALESCE(region, 'UNK') AS region_norm,
+            AVG(amount) AS avg_amount,
+            VAR_POP(amount) AS var_amount
+        FROM orders
+        GROUP BY COALESCE(region, 'UNK');
+        """
+        plan = generate_materialized_view(
+            schema,
+            view,
+            dialect=Dialect.POSTGRES,
+            pg_use_transition_tables=True,
+            pg_vectorize_transition_tables=True,
+        )
+        ai_ddl = next(d for d in plan.trigger_ddls if "_ai()" in d)
+
+        # A new group contains all rows in the transition table, so its initial
+        # native aggregates must be computed directly in the grouped SELECT.
+        self.assertIn("AVG(__mv_new_rows.amount) AS avg_amount", ai_ddl)
+        self.assertIn("VAR_POP(__mv_new_rows.amount) AS var_amount", ai_ddl)
+
+        # The old scalar subqueries correlated against raw transition-table
+        # columns are rejected by PostgreSQL for expression GROUP BY keys.
+        self.assertNotIn(
+            "IS NOT DISTINCT FROM (COALESCE(__mv_new_rows.region, 'UNK'))",
+            ai_ddl,
+        )
+
     def test_tier1_projection_vectorized_ddl_structure(self) -> None:
         schema = """
         CREATE TABLE users (
