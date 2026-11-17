@@ -651,6 +651,45 @@ class TestUntypedColumns(ExactAssertions):
                     self.assertViewExact(conn, "v", view, f"{name} step {i}: {sql}")
 
 
+class TestInfinityAndNaN(ExactAssertions):
+    """inf + -inf is NaN, which SQLite returns as NULL: TOTAL is then NULL,
+    not 0.0. The TOTAL backing column was NOT NULL, so the write was rejected
+    ("NOT NULL constraint failed"), or, under INSERT OR REPLACE, silently
+    stored the column default 0.0 (found by the randomized differential)."""
+
+    SCHEMA = (
+        "CREATE TABLE p (pid INTEGER PRIMARY KEY, g TEXT, w DOUBLE PRECISION);\n"
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, pid INTEGER, g TEXT, x REAL);"
+    )
+    VIEWS = {
+        "single": "SELECT g, TOTAL(x) AS tt, SUM(x) AS s, AVG(x) AS a FROM t GROUP BY g",
+        "scalar": "SELECT TOTAL(x) AS tt, SUM(x) AS s, AVG(x) AS a, COUNT(*) AS n FROM t",
+        "join": "SELECT p.g AS g, TOTAL(t.x * p.w) AS tt, SUM(p.w) AS s, AVG(t.x) AS a FROM t JOIN p ON t.pid = p.pid GROUP BY p.g",
+        "union_all": "SELECT g, TOTAL(x) AS tt, SUM(x) AS s FROM (SELECT g, x FROM t UNION ALL SELECT g, w AS x FROM p) AS u GROUP BY g",
+        "distinct": "SELECT g, TOTAL(DISTINCT x) AS tt, AVG(DISTINCT x) AS a FROM t GROUP BY g",
+    }
+
+    def test_nan_sums(self) -> None:
+        steps = [
+            "INSERT INTO p VALUES (1, 'a', 1.0)",
+            "INSERT INTO t VALUES (1, 1, 'a', 1e308 * 10), (2, 1, 'a', 2.5)",
+            "INSERT INTO t VALUES (3, 1, 'a', -1e308 * 10)",
+            "INSERT OR REPLACE INTO p VALUES (1, 'a', -1e308 * 10)",
+            "UPDATE t SET x = 4 WHERE id = 3",
+            "INSERT OR REPLACE INTO t VALUES (2, 1, 'a', -1e308 * 10)",
+            "DELETE FROM t WHERE id = 1",
+            "DELETE FROM t",
+        ]
+        for name, view in self.VIEWS.items():
+            with self.subTest(view=name):
+                conn = sqlite3.connect(":memory:")
+                conn.executescript(self.SCHEMA)
+                _install(conn, "v", view, self.SCHEMA)
+                for i, sql in enumerate(steps):
+                    conn.execute(sql)
+                    self.assertViewExact(conn, "v", view, f"{name} step {i}: {sql}")
+
+
 class TestStorageClassOnlyUpdates(ExactAssertions):
     """In a column without affinity, UPDATE can change INTEGER 3 into REAL 3.0
     (or back) without changing the value: 3 IS 3.0 is true in SQLite. The
