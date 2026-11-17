@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import re
 import unittest
+import uuid
 from typing import Any, List, Optional
 
 import sqlglot
@@ -636,6 +637,85 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
         fn_sql = "\n".join(s for s in plan.trigger_ddls if "CREATE OR REPLACE FUNCTION" in s)
         self.assertIn("(__mv_pk, org, cnt, sb, ab, __mv_cnt_sb_1)", fn_sql)
         self.assertNotIn("cnt, cnt", fn_sql)
+
+
+@unittest.skipUnless(
+    os.environ.get("POSTGRES_DSN"),
+    "POSTGRES_DSN is not set; native PostgreSQL integration test only",
+)
+class TestNativePGTransitionTableVectorizationSemantics(unittest.TestCase):
+    """Native PostgreSQL regression for expression-group native aggregates."""
+
+    def test_expression_group_avg_and_variance_match_live_view_after_batch_insert(self) -> None:
+        import psycopg2
+
+        schema_name = f"mv_pg_transition_expr_{uuid.uuid4().hex[:12]}"
+        conn = psycopg2.connect(os.environ["POSTGRES_DSN"])
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f'CREATE SCHEMA "{schema_name}"')
+                cur.execute(f'SET search_path TO "{schema_name}"')
+                schema_sql = """
+                CREATE TABLE orders (
+                    id INT PRIMARY KEY,
+                    region TEXT,
+                    amount DOUBLE PRECISION NOT NULL
+                );
+                """
+                view_sql = """
+                CREATE VIEW region_stats AS
+                SELECT
+                    COALESCE(region, 'UNK') AS region_norm,
+                    AVG(amount) AS avg_amount,
+                    VAR_POP(amount) AS var_amount,
+                    STDDEV_POP(amount) AS stddev_amount
+                FROM orders
+                GROUP BY COALESCE(region, 'UNK');
+                """
+                cur.execute(schema_sql)
+                plan = generate_materialized_view(
+                    schema_sql,
+                    view_sql,
+                    dialect=Dialect.POSTGRES,
+                    pg_use_transition_tables=True,
+                    pg_vectorize_transition_tables=True,
+                )
+                for ddl in plan.create_structure_statements() + plan.trigger_ddls:
+                    cur.execute(ddl)
+
+                oracle_sql = """
+                SELECT
+                    COALESCE(region, 'UNK') AS region_norm,
+                    AVG(amount) AS avg_amount,
+                    VAR_POP(amount) AS var_amount,
+                    STDDEV_POP(amount) AS stddev_amount
+                FROM orders
+                GROUP BY COALESCE(region, 'UNK')
+                ORDER BY region_norm;
+                """
+                batches = (
+                    "INSERT INTO orders VALUES "
+                    "(1, 'NA', 10.0), (2, 'NA', 20.0), (3, NULL, 30.0), (4, 'APAC', 40.0);",
+                    "INSERT INTO orders VALUES "
+                    "(5, 'NA', 50.0), (6, 'EU', 60.0), (7, NULL, 90.0);",
+                )
+                for statement in batches:
+                    cur.execute(statement)
+                    cur.execute(
+                        "SELECT region_norm, avg_amount, var_amount, stddev_amount "
+                        "FROM region_stats ORDER BY region_norm;"
+                    )
+                    materialized_rows = cur.fetchall()
+                    cur.execute(oracle_sql)
+                    live_rows = cur.fetchall()
+                    self.assertEqual(materialized_rows, live_rows)
+        finally:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":
