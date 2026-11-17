@@ -378,14 +378,46 @@ class MaterializedViewManager:
                         self._rollback()
                     layer.autocommit = True
 
+    @staticmethod
+    def configure_sqlite_connection(connection: Any) -> Any:
+        """Enable and verify the SQLite settings maintenance triggers rely on.
+
+        Call this on every SQLite connection that can write the base tables of
+        a materialized view (for example from a connection-pool hook) and
+        returns ``connection``. ``PRAGMA recursive_triggers`` is per
+        connection, and only when it is ON on the connection executing an
+        ``INSERT OR REPLACE`` / ``REPLACE`` does SQLite fire DELETE triggers for
+        the rows the conflict resolution removes; otherwise the materialized
+        view keeps the replaced rows. The manager configures its own
+        connection, which does not configure any other. Raises RuntimeError
+        when the setting does not take effect; idempotent.
+        """
+        if not callable(getattr(connection, "cursor", None)):
+            raise TypeError("connection must provide a DB-API cursor() method")
+        cursor = connection.cursor()
+        try:
+            cursor.execute("PRAGMA recursive_triggers = ON;")
+            cursor.execute("PRAGMA recursive_triggers;")
+            row = cursor.fetchone()
+            if row is None or int(row[0]) != 1:
+                raise RuntimeError(
+                    "SQLite PRAGMA recursive_triggers could not be enabled on this connection; "
+                    "INSERT OR REPLACE / REPLACE through it would bypass materialized-view "
+                    "DELETE maintenance"
+                )
+        finally:
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
+        return connection
+
     def _ensure_catalog(self) -> None:
+        if self.dialect == Dialect.SQLITE:
+            # Fail closed: a manager connection whose REPLACE statements skip
+            # DELETE maintenance must not be used.
+            self.configure_sqlite_connection(self.conn)
         with self._cursor() as cur:
-            if self.dialect == Dialect.SQLITE:
-                try:
-                    cur.execute("PRAGMA recursive_triggers = ON;")
-                except Exception:
-                    pass
-            elif self.dialect == Dialect.MYSQL:
+            if self.dialect == Dialect.MYSQL:
                 try:
                     cur.execute("SET SESSION collation_connection = @@collation_database;")
                 except Exception:

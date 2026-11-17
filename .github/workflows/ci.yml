@@ -205,6 +205,9 @@ jobs:
       - name: Test differential-oracle mutation sensitivity
         run: python3 test_oracle_mutation_sensitivity.py
 
+      - name: Test SQLite writer-connection initializer (REPLACE maintenance)
+        run: python3 test_sqlite_writer_connections.py
+
       - name: Test atomic MV replacement (SQLite)
         run: python3 test_registration_replacement.py
 

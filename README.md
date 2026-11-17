@@ -269,6 +269,8 @@ For large initial populations, `--incremental-backfill` generates dialect-specif
 
 Replacing a registered view (`register_view(..., force_rebuild=True)`, a changed definition in `sync_views`, a `repair_view` rebuild) is atomic on SQLite and PostgreSQL: the old view stays published, and is restored if anything fails, until the replacement is built and populated. Where that is impossible — MySQL/MariaDB, whose DDL commits implicitly, and replacements populated with `incremental_backfill=True` — replacing a complete view raises `UnsafeReplacementError` before changing anything (`sync_views` checks all requested views first); replace it explicitly with `drop_view()` followed by `register_view()`, accepting that readers see the view disappear and fill. A view whose incremental backfill is incomplete can always be rebuilt.
 
+SQLite writer connections: call `MaterializedViewManager.configure_sqlite_connection(conn)` on every SQLite connection that can write source tables (for example in a connection-pool initialization hook). It enables and verifies the connection-local `PRAGMA recursive_triggers = ON`; without it, `INSERT OR REPLACE` / `REPLACE` through that connection does not fire DELETE triggers for the rows it replaces and the materialized view silently keeps them. The manager configures (and fails closed on) its own connection only. Where update semantics are intended, prefer `INSERT ... ON CONFLICT (...) DO UPDATE`.
+
 Materialized views are read-only. Make application writes against the source tables. Also review generated SQL and test the target engine/version before deploying schema or view changes to production.
 
 ## Tests, differential fuzzing, and test strength
