@@ -64,6 +64,16 @@ MUTANTS = (
         + '\n                f"WHEN {new_c} < 0 THEN NULL "',
     ),
     Mutant(
+        name="distinct-auxiliary-retraction-increments-reference-count",
+        source_path="matview/maintenance/single.py",
+        original="f\"    SET {self._q('__ref_cnt')} = {aux_tbl}.{self._q('__ref_cnt')} - 1\\n\"",
+        replacement="f\"    SET {self._q('__ref_cnt')} = {aux_tbl}.{self._q('__ref_cnt')} + 1\\n\"",
+        target_test=(
+            "test_matview_sync.TestGeneratorAndManagerCodePaths."
+            "test_24_metamorphic_mv_invariants_and_rebuild_consistency"
+        ),
+    ),
+    Mutant(
         name="join-count-retraction-adds-instead-of-subtracting",
         source_path="matview/maintenance/join.py",
         original='minus_assignments.append(f"{c} = {mv_table}.{c} - __mv_delta.{c}")',
