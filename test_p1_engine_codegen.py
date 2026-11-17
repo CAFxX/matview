@@ -769,7 +769,7 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
 
             if mgr.engine_version.supports_pg_merge:
                 self.assertIn("MERGE INTO", "\n".join(p_agg.incremental_backfill_spec.chunk_sql_templates))
-                self.assertIn("fillfactor = 80", "\n".join(p_agg.backing_table_ddls))
+                self.assertIn("fillfactor = 80", p_agg.backing_table_ddl)
 
             cur.execute(f"INSERT INTO {base_tbl} VALUES (6, 'ops', 't2', 90.0), (7, 'solo', 's1', 42.0);")
             cur.execute(f"UPDATE {base_tbl} SET amount = 40.0 WHERE id = 1;")
