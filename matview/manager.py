@@ -9,6 +9,7 @@ import json
 import random
 import re
 import sqlite3
+import sys
 import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -62,6 +63,39 @@ from .sql_frontend import (
 # 3: SQLite UPDATE triggers also fire when only the storage class of a
 #    referenced column changes (INTEGER 3 -> REAL 3.0 in a BLOB column).
 MATVIEW_GENERATOR_VERSION = "3"
+
+
+class BackfillInterruptedError(RuntimeError):
+    """An incremental backfill cannot (or did not) complete safely.
+
+    Raised (fail-closed) when a non-snapshot pk-range backfill fails after it
+    committed its active watermark, and when a backfill is requested for a
+    view whose catalog watermark shows a backfill that is in progress,
+    interrupted, or already completed. In all of these cases the materialized
+    contents are only correct relative to that watermark: the watermark is
+    left untouched (so triggers keep excluding the unfolded range) and nothing
+    is resumed or re-folded automatically, because re-folding committed
+    chunks double-counts. Repair explicitly with
+    ``register_view(..., force_rebuild=True)`` or ``drop_view()`` followed by
+    ``register_view()``. The underlying error, if any, is ``__cause__``.
+    """
+
+    def __init__(
+        self,
+        view_name: str,
+        reason: str,
+        cursor_pk: Optional[int] = None,
+        max_pk: Optional[int] = None,
+    ) -> None:
+        self.view_name = view_name
+        self.cursor_pk = cursor_pk
+        self.max_pk = max_pk
+        super().__init__(
+            f"Materialized view '{view_name}': {reason} (backfill watermark "
+            f"cursor_pk={cursor_pk}, max_pk={max_pk}). Nothing was resumed or re-folded; "
+            f"to (re)populate from scratch use register_view(..., force_rebuild=True) "
+            f"or drop_view() + register_view()."
+        )
 
 
 class MaterializedViewManager:
@@ -456,6 +490,18 @@ class MaterializedViewManager:
         watermark (`backfill_cursor_pk`, `backfill_max_pk`, `backfill_active`) in
         `__matview_catalog` and optionally running under `snapshot_isolation=True`.
         Returns the total number of batches executed.
+
+        Fail-closed contract for pk-range backfills: the watermark is claimed
+        atomically, so at most one session folds a view. If a non-snapshot run
+        stops after committing its claim, the original exception propagates
+        (annotated) and the watermark stays active at the last committed
+        chunk, so triggers keep excluding the unfolded range. Any later call
+        for that view -- or for a view whose pk-range backfill already
+        completed, or while another session's backfill is running -- raises
+        `BackfillInterruptedError` before folding anything, in either
+        isolation mode, and leaves the watermark untouched. There is no
+        automatic resume; rebuild with ``register_view(..., force_rebuild=True)``
+        or ``drop_view()`` + ``register_view()``.
         """
         if not snapshot_isolation and batch_size > 0:
             sub_list = plan.sub_plans if plan.sub_plans else [plan]
@@ -470,6 +516,10 @@ class MaterializedViewManager:
                         )
 
         if plan.sub_plans:
+            # Each sub-plan refuses (before folding anything) if its watermark
+            # is claimed or completed, so re-running a partially completed
+            # multi-view plan fails closed on the first finished sub-plan
+            # instead of re-folding it.
             total_b = 0
             for sp in plan.sub_plans:
                 total_b += self.backfill_incrementally(
@@ -482,6 +532,7 @@ class MaterializedViewManager:
 
         cur = self.conn.cursor()
         snapshot_started = False
+        self._backfill_watermark_claimed = False
         try:
             if snapshot_isolation:
                 try:
@@ -503,6 +554,15 @@ class MaterializedViewManager:
                     ) from exc
                 snapshot_started = True
 
+            # Fail closed before folding anything: a claimed or completed
+            # pk-range watermark means another backfill is running, an earlier
+            # one was interrupted, or the view is already populated; folding
+            # again from MIN(pk) would double-count. (Read after the snapshot
+            # is established; the failure path below cannot reset a claimed
+            # watermark, see _best_effort_reset_backfill_watermark.)
+            self._refuse_unless_backfill_unclaimed(
+                self._catalog_entry(cur, plan.view_name), plan.view_name
+            )
             return self._backfill_incrementally_with_cursor(
                 plan, batch_size, on_progress, snapshot_isolation, cur
             )
@@ -521,7 +581,25 @@ class MaterializedViewManager:
                         cur.execute("ROLLBACK;")
                     except Exception:
                         pass
-                self._best_effort_reset_backfill_watermark(plan.view_name)
+                if not self._backfill_watermark_claimed:
+                    self._best_effort_reset_backfill_watermark(plan.view_name)
+                else:
+                    # Fail closed: this call committed an active pk-range
+                    # watermark (and possibly folded chunks). Keep it so
+                    # triggers keep excluding the unfolded range; refuse to
+                    # resume (see BackfillInterruptedError).
+                    # The original exception type is preserved for callers;
+                    # the note states the resulting state and the repair.
+                    exc_now = sys.exc_info()[1]
+                    if exc_now is not None and hasattr(exc_now, "add_note"):
+                        entry = self.get_catalog().get(plan.view_name) or {}
+                        exc_now.add_note(
+                            f"matview: incremental backfill of '{plan.view_name}' stopped after "
+                            f"committing progress; its watermark is kept active (cursor_pk="
+                            f"{entry.get('backfill_cursor_pk')}, max_pk={entry.get('backfill_max_pk')}) "
+                            f"and the view is incomplete. It is not resumed: rebuild with "
+                            f"register_view(..., force_rebuild=True) or drop_view() + register_view()."
+                        )
             raise
         finally:
             try:
@@ -546,6 +624,84 @@ class MaterializedViewManager:
         if view_name:
             self._best_effort_reset_backfill_watermark(view_name)
 
+    def _catalog_entry(self, cur: Any, view_name: str) -> Optional[Dict[str, Any]]:
+        self._execute_param(
+            cur,
+            f"SELECT backfill_cursor_pk, backfill_max_pk, backfill_active "
+            f"FROM {self.catalog_table} WHERE view_name = ?",
+            (view_name,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "backfill_cursor_pk": row[0],
+            "backfill_max_pk": row[1],
+            "backfill_active": int(row[2]) if row[2] is not None else 0,
+        }
+
+    @staticmethod
+    def _refuse_unless_backfill_unclaimed(entry: Optional[Dict[str, Any]], view_name: str) -> None:
+        if not entry or entry.get("backfill_cursor_pk") is None:
+            return
+        if entry.get("backfill_active") == 1:
+            reason = (
+                "a pk-range backfill is in progress in another session or was interrupted; "
+                "the view is incomplete until it finishes or is rebuilt"
+            )
+        else:
+            reason = "the view was already backfilled; backfilling again would double-count"
+        raise BackfillInterruptedError(
+            view_name, reason, entry.get("backfill_cursor_pk"), entry.get("backfill_max_pk")
+        )
+
+    def _claim_backfill_watermark(self, cur: Any, view_name: str, cursor_pk: int, max_pk: int) -> None:
+        """Atomically claim the pk-range watermark: only one backfill may own it.
+
+        The conditional UPDATE re-checks the claim on the latest row version
+        after any concurrent claimer commits, so two sessions cannot both
+        start folding the same view.
+        """
+        try:
+            self._execute_param(
+                cur,
+                f"UPDATE {self.catalog_table} "
+                f"SET backfill_cursor_pk = ?, backfill_max_pk = ?, backfill_active = 1 "
+                f"WHERE view_name = ? AND backfill_cursor_pk IS NULL",
+                (cursor_pk, max_pk, view_name),
+            )
+        except Exception as exc:
+            # A concurrent claimer changed the catalog row under our snapshot:
+            # MariaDB innodb_snapshot_isolation (1020), deadlock/serialization
+            # victims. Nothing was claimed or folded by this call.
+            mysql_code = getattr(exc, "errno", None)
+            if mysql_code is None and getattr(exc, "args", None):
+                mysql_code = exc.args[0]
+            snapshot_conflict = self.dialect == Dialect.MYSQL and mysql_code == 1020
+            if snapshot_conflict or self._is_transient_lock_error(exc):
+                self._rollback()
+                raise BackfillInterruptedError(
+                    view_name, f"a concurrent session claimed the pk-range backfill watermark ({exc!r})"
+                ) from exc
+            raise
+        claimed = getattr(cur, "rowcount", None)
+        if claimed is None or claimed < 0:
+            # Driver/adapter without a DML rowcount (all supported DB-API
+            # drivers report one): verify the claim by re-reading the row.
+            self._execute_param(
+                cur,
+                f"SELECT backfill_cursor_pk, backfill_max_pk, backfill_active "
+                f"FROM {self.catalog_table} WHERE view_name = ?",
+                (view_name,),
+            )
+            row = cur.fetchone()
+            claimed = 1 if row and (row[0], row[1], int(row[2] or 0)) == (cursor_pk, max_pk, 1) else 0
+        if claimed != 1:
+            self._rollback()
+            raise BackfillInterruptedError(
+                view_name, "another session claimed the pk-range backfill watermark first"
+            )
+
     def _best_effort_reset_backfill_watermark(self, view_name: str) -> None:
         try:
             reset_cur = self.conn.cursor()
@@ -554,7 +710,10 @@ class MaterializedViewManager:
                     reset_cur,
                     f"UPDATE {self.catalog_table} "
                     f"SET backfill_cursor_pk = NULL, backfill_max_pk = NULL, backfill_active = 0 "
-                    f"WHERE view_name = ?",
+                    # Never touch a claimed/completed pk-range watermark: a
+                    # failed call must not reset a watermark it does not own
+                    # (one this call claimed in a snapshot was rolled back).
+                    f"WHERE view_name = ? AND backfill_cursor_pk IS NULL",
                     (view_name,),
                 )
                 self._commit()
@@ -577,6 +736,7 @@ class MaterializedViewManager:
     _BACKFILL_RETRY_MAX_DELAY_S = 1.0
     _backfill_sleep = staticmethod(time.sleep)
     _backfill_rng: Any = random.Random()
+    _backfill_watermark_claimed = False
 
     def _backfill_retry_delay(self, attempt: int) -> float:
         """Delay before retry number `attempt` (1-based): jitter in [d/2, d],
@@ -688,9 +848,10 @@ class MaterializedViewManager:
             min_pk, max_pk = int(row[0]), int(row[1])
             cursor_pk = min_pk - 1
             total_span = max(1, max_pk - min_pk + 1)
-            self._update_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk, 1)
+            self._claim_backfill_watermark(cur, plan.view_name, cursor_pk, max_pk)
             if not snapshot_isolation:
                 self._commit()
+                self._backfill_watermark_claimed = True
             while cursor_pk < max_pk:
                 upper_pk = min(max_pk, cursor_pk + batch_size)
                 attempt = 0
@@ -823,6 +984,10 @@ class MaterializedViewManager:
         catalog = self.get_catalog()
         existing = catalog.get(plan.view_name)
         if existing and existing["signature_hash"] == sig and not force_rebuild:
+            if existing.get("backfill_active") == 1 and existing.get("backfill_cursor_pk") is not None:
+                # Re-registering must not silently adopt an interrupted (or
+                # concurrently running) backfill as a complete view.
+                self._refuse_unless_backfill_unclaimed(existing, plan.view_name)
             return plan
 
         if existing:
