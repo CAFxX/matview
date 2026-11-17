@@ -1,0 +1,3 @@
+# Development-only dependencies (not installed by CI).
+# scripts/presubmit.py parses .github/workflows/ci.yml with PyYAML.
+pyyaml>=6.0
