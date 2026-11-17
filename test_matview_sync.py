@@ -6288,7 +6288,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         INSERT INTO join_customers VALUES (1, 'A'), (2, 'A'), (3, 'B');
         INSERT INTO join_orders VALUES
             (10, 1, 11), (11, 1, 13), (12, 2, 17), (13, 3, 19),
-            (14, 3, NULL);
+            (14, 3, NULL), (15, 1, NULL);
         """
         view_sql = (
             "CREATE VIEW join_segment_totals AS "
@@ -6343,17 +6343,19 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             )
             after_group_move = assert_matches_live("move joined rows between groups")
 
-            # Deleting the final matching row removes that group; NULL-valued
-            # rows still contribute to COUNT(*) but not COUNT/SUM(value).
-            conn.execute("DELETE FROM join_orders WHERE customer_id = 1")
-            after_last_delete = assert_matches_live("delete final matching rows")
-            self.assertNotEqual(after_group_move, after_last_delete)
+            # Leave a NULL-only group after retracting its final non-NULL value.
+            # SUM must become NULL while COUNT(*) remains one and COUNT(value) zero.
+            conn.execute(
+                "DELETE FROM join_orders WHERE customer_id = 1 AND amount IS NOT NULL"
+            )
+            after_null_only = assert_matches_live("retract final non-NULL value")
+            self.assertIn(("A", 1, 0, None), after_null_only)
+            self.assertNotEqual(after_group_move, after_null_only)
 
-            # Restore the data through inserts and verify aggregate state
-            # returns to the independently computed relation.
+            # Restore non-NULL and NULL contributions and verify the group recovers.
             conn.execute("INSERT INTO join_orders VALUES (20, 1, 23)")
             conn.execute("INSERT INTO join_orders VALUES (21, 1, NULL)")
-            assert_matches_live("reinsert into emptied group")
+            assert_matches_live("reinsert into NULL-only group")
         finally:
             conn.close()
 
