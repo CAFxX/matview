@@ -268,10 +268,26 @@ class DriftTests(unittest.TestCase):
                 with self.assertRaises(ps.PlanError):
                     ps.build_jobs(mutated(fn), ["sqlite"])
 
-    def test_missing_matrix_property_renders_empty_like_github(self) -> None:
-        compat = [j for j in self.jobs if j.job_id == "sqlite-compat"][0]
-        step = [s for s in compat.steps if s.run == "python3 test_matview_sync.py"][0]
-        self.assertTrue(step.env["MATVIEW_FUZZ_TARGET"].endswith("/ Python "))
+    def test_matrix_properties_render_like_github(self) -> None:
+        def fuzz_targets(wf: Dict[str, Any]) -> List[str]:
+            jobs = ps.build_jobs(wf, ["sqlite-compat"])
+            return [
+                [s for s in j.steps if s.run == "python3 test_matview_sync.py"][0].env["MATVIEW_FUZZ_TARGET"]
+                for j in jobs
+            ]
+
+        wf = yaml.safe_load(CI_YML.read_text())
+        rows = wf["jobs"]["sqlite-compat"]["strategy"]["matrix"]["include"]
+        self.assertEqual(
+            fuzz_targets(wf),
+            [f"{r['label']} / Python {r['python-version']}" for r in rows],
+        )
+        # GitHub renders a property missing from a matrix row as the empty string.
+        rows[0]["extra"] = "x"
+        step = [s for s in wf["jobs"]["sqlite-compat"]["steps"] if s.get("run") == "python3 test_matview_sync.py"][0]
+        step["env"]["MATVIEW_FUZZ_TARGET"] = "${{ matrix.label }}/${{ matrix.extra }}/"
+        self.assertEqual(fuzz_targets(wf), [f"{r['label']}/{r.get('extra', '')}/" for r in rows])
+        self.assertTrue(all(t.endswith("//") for t in fuzz_targets(wf)[1:]))
 
     def test_aggregator_changes_fail_loudly(self) -> None:
         wf = yaml.safe_load(CI_YML.read_text())
