@@ -724,6 +724,13 @@ class IndependentSessionBackfillTests(unittest.TestCase):
         worker_errors: list[BaseException] = []
         overlap_commits: list[int] = []
         overlap_lock = threading.Lock()
+        writer_phases: dict[int, str] = {1: "not started", 2: "not started"}
+        phase_lock = threading.Lock()
+
+        def set_writer_phase(writer_id: int, phase: str) -> None:
+            with phase_lock:
+                writer_phases[writer_id] = phase
+
         barrier_released = False
         mid_released = False
 
@@ -749,21 +756,27 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             def concurrent_writer(writer_id: int) -> None:
                 second = None
                 try:
+                    set_writer_phase(writer_id, "connecting")
                     second = self._connect_native(engine, dsn)
                     second_cur = second.cursor()
                     if engine == Dialect.POSTGRES:
+                        set_writer_phase(writer_id, "setting PostgreSQL search_path")
                         second_cur.execute(f'SET search_path TO "{schema_name}";')
                         second.commit()
+                    set_writer_phase(writer_id, "waiting at start barrier")
                     start_barrier.wait(timeout=20)
+                    set_writer_phase(writer_id, "started")
                     base_pk = 1000 * writer_id
                     target_pk = 10 + writer_id * 5
                     for step in range(10):
                         bucket = f"B{((writer_id + step) % 4) + 1}"
                         new_pk = base_pk + step
+                        set_writer_phase(writer_id, f"executing insert at step {step}")
                         second_cur.execute(
                             f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
                             (new_pk, bucket, (step + 1) * 19),
                         )
+                        set_writer_phase(writer_id, f"executing update at step {step}")
                         second_cur.execute(
                             f"UPDATE {table_name} SET amt = amt + %s WHERE id = %s",
                             (writer_id + 1, target_pk + (step % 4)),
@@ -773,23 +786,31 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                                 f"DELETE FROM {table_name} WHERE id = %s",
                                 (base_pk + step - 1,),
                             )
+                        set_writer_phase(writer_id, f"committing step {step}")
                         second.commit()
+                        set_writer_phase(writer_id, f"committed step {step}")
                         if not backfill_done.is_set():
                             with overlap_lock:
                                 overlap_commits.append(writer_id)
 
+                        set_writer_phase(writer_id, f"executing rollback probe at step {step}")
                         second_cur.execute(
                             f"INSERT INTO {table_name} (id, bucket, amt) VALUES (%s, %s, %s)",
                             (base_pk + 500 + step, bucket, 99999),
                         )
                         second.rollback()
+                        set_writer_phase(writer_id, f"rolled back probe at step {step}")
                         if step == 0:
+                            set_writer_phase(writer_id, "waiting at mid barrier")
                             mid_barrier.wait(timeout=20)
+                            set_writer_phase(writer_id, "passed mid barrier")
                 except BaseException as exc:
+                    set_writer_phase(writer_id, f"failed: {type(exc).__name__}: {exc!r}")
                     worker_errors.append(exc)
                 finally:
                     if second is not None:
                         second.close()
+                    set_writer_phase(writer_id, "closed")
 
             def on_progress(batch_idx: int, _rows_done: int) -> None:
                 nonlocal barrier_released, mid_released
@@ -798,7 +819,17 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                     start_barrier.wait(timeout=20)
                 elif batch_idx == 3 and not mid_released:
                     mid_released = True
-                    mid_barrier.wait(timeout=20)
+                    try:
+                        mid_barrier.wait(timeout=20)
+                    except threading.BrokenBarrierError as exc:
+                        with phase_lock:
+                            phase_snapshot = dict(writer_phases)
+                        error_snapshot = [repr(error) for error in worker_errors]
+                        raise AssertionError(
+                            f"{engine.value}: writers did not reach the mid-backfill barrier "
+                            f"at batch {batch_idx}; writer_phases={phase_snapshot!r}; "
+                            f"worker_errors={error_snapshot!r}"
+                        ) from exc
 
             w1 = threading.Thread(target=concurrent_writer, args=(1,), daemon=True)
             w2 = threading.Thread(target=concurrent_writer, args=(2,), daemon=True)
