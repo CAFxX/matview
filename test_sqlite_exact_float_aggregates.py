@@ -681,5 +681,152 @@ class TestSqliteAffinityRules(unittest.TestCase):
                 self.assertTrue(_same_rows(conn.execute("SELECT * FROM v").fetchall(), live), live)
 
 
+class TestUpgradeFromPreviousGenerator(ExactAssertions):
+    """Installations created by the previous generator (fixture captured from
+    origin/p2/tier2-window-partition-scoping 0542ca6 with SQLite 3.46.1) must be
+    rebuilt -- never kept with drifting triggers or repopulated into the old
+    backing table."""
+
+    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "sqlite_install_generator_v1.json")
+    VIEWS = {
+        "v_single": "SELECT g, SUM(x) AS s, AVG(x) AS a, TOTAL(x) AS tt FROM t GROUP BY g",
+        "v_join": "SELECT p.g AS g, SUM(o.x) AS s FROM o JOIN p ON o.pid = p.pid GROUP BY p.g",
+    }
+
+    def _old_install(self) -> Tuple[sqlite3.Connection, dict]:
+        import json
+
+        with open(self.FIXTURE, encoding="utf-8") as fh:
+            fx = json.load(fh)
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(fx["schema"])
+        for ddl in fx["ddl"]:
+            conn.execute(ddl)
+        conn.executemany(
+            f"INSERT INTO __matview_catalog ({', '.join(fx['catalog_cols'])}) VALUES ({', '.join('?' for _ in fx['catalog_cols'])})",
+            [tuple(r) for r in fx["catalog"]],
+        )
+        conn.commit()
+        return conn, fx
+
+    def _drift(self, conn: sqlite3.Connection) -> None:
+        conn.execute("INSERT INTO t VALUES (1, 'a', 10000000000000000), (2, 'a', 1.5)")
+        conn.execute("DELETE FROM t WHERE id = 1")
+        conn.execute("INSERT INTO p VALUES (1, 'x')")
+        conn.execute("INSERT INTO o VALUES (1, 1, 1e16), (2, 1, 1.5)")
+        conn.execute("DELETE FROM o WHERE id = 1")
+        conn.commit()
+
+    def test_old_install_drifts_then_repair_rebuilds(self) -> None:
+        from matview.manager import MaterializedViewManager
+        from matview import Dialect
+
+        conn, _ = self._old_install()
+        self._drift(conn)
+        # The old triggers really drift (sanity check of the fixture).
+        self.assertEqual(conn.execute("SELECT s FROM v_single").fetchone()[0], 2)
+        mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        self.assertEqual(mgr.repair_view(), {"v_single": "rebuilt", "v_join": "rebuilt"})
+        for name, view in self.VIEWS.items():
+            self.assertViewExact(conn, name, view, f"{name} after repair")
+        conn.execute("INSERT INTO t VALUES (3, 'a', 0.1)")
+        conn.execute("DELETE FROM t WHERE id = 3")
+        conn.execute("INSERT INTO o VALUES (3, 1, 0.1)")
+        conn.execute("DELETE FROM o WHERE id = 3")
+        for name, view in self.VIEWS.items():
+            self.assertViewExact(conn, name, view, f"{name} maintained after repair")
+
+    def test_reregistering_an_old_install_rebuilds_it(self) -> None:
+        from matview.manager import MaterializedViewManager
+        from matview import Dialect
+
+        conn, _ = self._old_install()
+        mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        for name, view in self.VIEWS.items():
+            mgr.register_view(f"CREATE VIEW {name} AS {view};")
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(__matview_store_v_single)")]
+        self.assertIn("__mv_fold_dirty", cols)
+        self._drift(conn)
+        for name, view in self.VIEWS.items():
+            self.assertViewExact(conn, name, view, f"{name} after re-registration")
+
+    def test_old_install_reported_drifted_and_sync_views_rebuilds_it(self) -> None:
+        from matview.manager import MaterializedViewManager
+        from matview import Dialect
+
+        conn, _ = self._old_install()
+        self._drift(conn)
+        mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        self.assertEqual(mgr.check_schema_drift(), {"v_single": "drifted", "v_join": "drifted"})
+        result = mgr.sync_views([f"CREATE VIEW {name} AS {view};" for name, view in self.VIEWS.items()])
+        self.assertEqual(result, {"v_single": "updated", "v_join": "updated"})
+        self.assertEqual(mgr.check_schema_drift(), {"v_single": "ok", "v_join": "ok"})
+        for name, view in self.VIEWS.items():
+            self.assertViewExact(conn, name, view, f"{name} after sync_views")
+        conn.execute("INSERT INTO t VALUES (3, 'a', 0.1)")
+        conn.execute("DELETE FROM t WHERE id = 3")
+        conn.execute("INSERT INTO o VALUES (3, 1, 0.1)")
+        conn.execute("DELETE FROM o WHERE id = 3")
+        for name, view in self.VIEWS.items():
+            self.assertViewExact(conn, name, view, f"{name} maintained after sync_views")
+
+    def _install_with_patched_plan(self, patch_plan: Any = None, generator_version: Optional[str] = None) -> Tuple[sqlite3.Connection, Any]:
+        from unittest import mock
+
+        import matview.manager as manager_mod
+        from matview import Dialect
+        from matview.manager import MaterializedViewManager
+
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, x REAL);"
+            "CREATE TABLE p (pid INTEGER PRIMARY KEY, g TEXT);"
+            "CREATE TABLE o (id INTEGER PRIMARY KEY, pid INTEGER, x REAL);"
+        )
+        real_generate = manager_mod.generate_materialized_view
+
+        def generate(*args: Any, **kwargs: Any) -> Any:
+            plan = real_generate(*args, **kwargs)
+            return patch_plan(plan) if patch_plan else plan
+
+        mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        with mock.patch.object(manager_mod, "generate_materialized_view", generate), mock.patch.object(
+            manager_mod, "MATVIEW_GENERATOR_VERSION", generator_version or manager_mod.MATVIEW_GENERATOR_VERSION
+        ):
+            for name, view in self.VIEWS.items():
+                mgr.register_view(f"CREATE VIEW {name} AS {view};")
+            self.assertEqual(mgr.check_schema_drift(), {"v_single": "ok", "v_join": "ok"})
+        return conn, mgr
+
+    def _assert_drifted_then_synced(self, conn: sqlite3.Connection, mgr: Any) -> None:
+        self.assertEqual(mgr.check_schema_drift(), {"v_single": "drifted", "v_join": "drifted"})
+        result = mgr.sync_views([f"CREATE VIEW {name} AS {view};" for name, view in self.VIEWS.items()])
+        self.assertEqual(result, {"v_single": "updated", "v_join": "updated"})
+        self.assertEqual(mgr.check_schema_drift(), {"v_single": "ok", "v_join": "ok"})
+        self._drift(conn)
+        for name, view in self.VIEWS.items():
+            self.assertViewExact(conn, name, view, f"{name} after sync_views")
+
+    def test_generator_version_change_alone_rebuilds(self) -> None:
+        """A trigger-only generator change is signalled by bumping
+        MATVIEW_GENERATOR_VERSION: an installation made under another version,
+        with identical view SQL and backing DDL, must be reported drifted and
+        rebuilt."""
+        conn, mgr = self._install_with_patched_plan(generator_version="previous-generator")
+        self._assert_drifted_then_synced(conn, mgr)
+
+    def test_backing_ddl_change_alone_rebuilds(self) -> None:
+        """An installation whose backing-table DDL differs from what the current
+        generator emits (same view SQL, same generator version) must be
+        reported drifted and rebuilt."""
+        import dataclasses
+
+        def older_backing(plan: Any) -> Any:
+            return dataclasses.replace(plan, backing_table_ddl=plan.backing_table_ddl.rstrip().rstrip(";") + " ;")
+
+        conn, mgr = self._install_with_patched_plan(patch_plan=older_backing)
+        self._assert_drifted_then_synced(conn, mgr)
+
+
 if __name__ == "__main__":
     unittest.main()
