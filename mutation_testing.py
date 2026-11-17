@@ -96,6 +96,16 @@ MUTANTS = (
         replacement="upd_old_stmts=[],",
     ),
     Mutant(
+        name="backfill-watermark-skips-update-at-inclusive-cursor",
+        source_path="matview/maintenance/single.py",
+        original="NEW.{q_pk} > backfill_cursor_pk",
+        replacement="NEW.{q_pk} >= backfill_cursor_pk",
+        target_test=(
+            "test_matview_sync.TestGeneratorAndManagerCodePaths."
+            "test_backfill_watermark_includes_cursor_row_update"
+        ),
+    ),
+    Mutant(
         name="join-retraction-reads-new-row-instead-of-old-row",
         source_path="matview/maintenance/join.py",
         original="upd_old_stmts=[minus_stmt],",

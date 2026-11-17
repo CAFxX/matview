@@ -6327,6 +6327,53 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_backfill_watermark_includes_cursor_row_update(self) -> None:
+        """An UPDATE to the inclusive cursor row is already folded and must apply its delta."""
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE TABLE watermark_source (id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, amount INTEGER NOT NULL)"
+            )
+            conn.executemany(
+                "INSERT INTO watermark_source VALUES (?, ?, ?)",
+                [(1, "A", 10), (2, "A", 20), (3, "B", 30), (4, "B", 40)],
+            )
+            manager = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+
+            def update_inclusive_cursor(batch_idx: int, rows_done: int) -> None:
+                if batch_idx == 1:
+                    # With batch_size=2 the first committed chunk ends at PK=2.
+                    # This row is already folded, so its UPDATE must be applied by
+                    # the trigger rather than skipped by the pending-range watermark.
+                    conn.execute(
+                        "UPDATE watermark_source SET amount = 99 WHERE id = 2"
+                    )
+
+            plan = manager.register_view(
+                "CREATE VIEW watermark_totals AS "
+                "SELECT bucket, COUNT(*) AS n, SUM(amount) AS total "
+                "FROM watermark_source GROUP BY bucket",
+                incremental_backfill=True,
+                batch_size=2,
+                on_progress=update_inclusive_cursor,
+            )
+            actual = conn.execute(
+                "SELECT bucket, n, total FROM watermark_totals ORDER BY bucket"
+            ).fetchall()
+            expected = conn.execute(
+                "SELECT bucket, COUNT(*) AS n, SUM(amount) AS total "
+                "FROM watermark_source GROUP BY bucket ORDER BY bucket"
+            ).fetchall()
+            self.assertEqual(
+                actual,
+                expected,
+                "an UPDATE at the inclusive backfill cursor must not be skipped",
+            )
+            catalog = manager.get_catalog()[plan.view_name]
+            self.assertEqual(catalog["backfill_active"], 0)
+        finally:
+            conn.close()
+
     def test_25_join_aggregate_decrement_and_group_key_invariants(self) -> None:
         """Exercise join-delta retractions against an independent live SELECT oracle."""
         schema = """
