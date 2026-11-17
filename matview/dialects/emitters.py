@@ -441,9 +441,15 @@ class DialectEmitMixin:
                 c_def = t_schema.columns.get(c_name)
                 is_null = not (c_def.not_null if c_def else False)
                 qc = self._q(c_name)
-                unchanged_conds.append(
-                    self._null_safe_eq(f"OLD.{qc}", f"NEW.{qc}", is_nullable=is_null)
-                )
+                unchanged = self._null_safe_eq(f"OLD.{qc}", f"NEW.{qc}", is_nullable=is_null)
+                if self.dialect == Dialect.SQLITE:
+                    # 3 IS 3.0 is true, but a column without affinity (BLOB or
+                    # no declared type) can change INTEGER 3 to REAL 3.0, which
+                    # changes the storage class of SUM and of every value the
+                    # view returns. Only a change of neither value nor storage
+                    # class may skip maintenance.
+                    unchanged = f"({unchanged} AND typeof(OLD.{qc}) = typeof(NEW.{qc}))"
+                unchanged_conds.append(unchanged)
         changed_guard = f"NOT ({' AND '.join(unchanged_conds)})" if unchanged_conds else None
 
         cleanup_stmts = upd_cleanup_old_stmts or []

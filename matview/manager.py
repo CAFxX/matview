@@ -59,7 +59,9 @@ from .sql_frontend import (
 # installations must be rebuilt for (signature mismatch -> rebuild).
 # 2: SQLite exact SUM/TOTAL/AVG maintenance (native recompute of groups
 #    holding non-INTEGER values; join/UNION ALL native recompute).
-MATVIEW_GENERATOR_VERSION = "2"
+# 3: SQLite UPDATE triggers also fire when only the storage class of a
+#    referenced column changes (INTEGER 3 -> REAL 3.0 in a BLOB column).
+MATVIEW_GENERATOR_VERSION = "3"
 
 
 class MaterializedViewManager:
