@@ -1305,6 +1305,64 @@ class NativeMysqlBulkChangesTests(_NativeBase, unittest.TestCase):
             with manager.bulk_changes():
                 self.fail("entered on an invalidated manager")
 
+    def test_read_operations_never_end_a_callers_implicit_transaction(self) -> None:
+        """PyMySQL's default autocommit=0: a caller's implicit read transaction
+        (locking read, consistent snapshot) reports IN_TRANS=0, exactly like an
+        idle connection. Read operations must not end it (a version of this
+        branch rolled it back, releasing the caller's row lock and snapshot)."""
+        blocker = self._connect(autocommit=True)
+        with blocker.cursor() as cur:
+            cur.execute("SET SESSION innodb_lock_wait_timeout = 1")
+        reads = (
+            ("get_catalog", self.manager.get_catalog),
+            ("fetch_schema", self.manager.fetch_schema),
+            ("check_schema_drift", self.manager.check_schema_drift),
+            ("diff_views", lambda: self.manager.diff_views([self._sql(VIEW_SQL)])),
+        )
+        for step, (label, operation) in enumerate(reads):
+            with self.subTest(operation=label, held="row lock"):
+                with self.conn.cursor() as cur:
+                    cur.execute(f"SELECT * FROM {self.table} WHERE id = 1 FOR UPDATE")
+                    cur.fetchall()
+                operation()
+                with self.assertRaises(Exception, msg=f"{label} released the caller's row lock"):
+                    with blocker.cursor() as cur:
+                        cur.execute(f"UPDATE {self.table} SET amt = amt WHERE id = 1")
+                self.conn.rollback()
+            with self.subTest(operation=label, held="snapshot"):
+                with self.conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) FROM {self.table}")
+                    before = cur.fetchone()[0]
+                with blocker.cursor() as cur:
+                    cur.execute(f"INSERT INTO {self.table} VALUES ({180 + step}, 'z', 1)")
+                operation()
+                with self.conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) FROM {self.table}")
+                    self.assertEqual(cur.fetchone()[0], before, f"{label} ended the caller's snapshot")
+                self.conn.rollback()
+
+    def test_read_operations_on_an_autocommit_connection_leave_no_transaction(self) -> None:
+        """With autocommit=1 no read can leave an InnoDB transaction (and its
+        metadata locks) behind."""
+        from test_avg_concurrent_maintenance import _session_id
+
+        conn = self._connect(autocommit=True)
+        manager = MaterializedViewManager(conn, dialect=self.engine, object_prefix=self.prefix, ignore_limitations=True)
+        sid = _session_id(self.engine, conn)
+        for label, operation in (
+            ("get_catalog", manager.get_catalog),
+            ("fetch_schema", manager.fetch_schema),
+            ("check_schema_drift", manager.check_schema_drift),
+        ):
+            with self.subTest(operation=label):
+                operation()
+                time.sleep(0.2)  # information_schema.innodb_trx cache refresh
+                self.assertEqual(
+                    self._observed("SELECT COUNT(*) FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = %s", (sid,)),
+                    [(0,)],
+                    f"{label} left an InnoDB transaction open",
+                )
+
     def test_dml_path_issues_no_ddl(self) -> None:
         """MySQL/MariaDB DDL commits implicitly: neither success nor failure
         may drop/re-create triggers (it used to on failure)."""
