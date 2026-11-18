@@ -11,7 +11,7 @@ stores an AVG computed without the other writer's rows.
 
 The native tests below force exactly that interleaving with two independent
 connections and explicit synchronization (the second writer is observed in an
-engine lock wait before the first one commits), then compare the materialized
+engine lock wait attributed to the first session before the first one commits), then compare the materialized
 rows against the original view executed natively by the engine -- the only
 oracle. Values are compared with their exact decimal scale.
 
@@ -44,6 +44,12 @@ from matview_sync import (
 )
 
 LOCK_WAIT_TIMEOUT_S = 20.0
+# Once one lock-wait probe has timed out in this process, later probes wait at
+# most this long, so a systematic probe failure costs one full timeout plus a
+# bounded amount per sub-test instead of LOCK_WAIT_TIMEOUT_S each. The failure
+# itself is still reported (with diagnostics) by every affected sub-test.
+LOCK_WAIT_TIMEOUT_AFTER_FAILURE_S = 3.0
+_lock_probe_timed_out = threading.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -201,68 +207,210 @@ def _session_id(engine: Dialect, conn) -> int:
     return sid
 
 
-def _is_lock_waiting(engine: Dialect, monitor, sid: int) -> bool:
+# Lock-wait evidence.
+#
+# A session counts as blocked only on *positive* engine evidence that it is in
+# a lock wait: never because a statement is merely slow or still running.
+#
+# * PostgreSQL: pg_stat_activity.wait_event_type = 'Lock', attributed to the
+#   blocking backends by pg_blocking_pids().
+# * MySQL 8.0+: performance_schema.data_lock_waits (live), attributed through
+#   performance_schema.threads to the blocking connection.
+# * MariaDB (no data_lock_waits) and MySQL: information_schema.innodb_trx
+#   joined with innodb_lock_waits (MariaDB, MySQL 5.7), attributed to the
+#   blocking connection. These INFORMATION_SCHEMA tables are served from a
+#   cache that InnoDB refreshes only when nobody has read it for 100 ms
+#   (trx0i_s.cc, CACHE_MIN_IDLE_TIME); a monitor polling faster than that
+#   keeps reading one frozen snapshot forever (observed on MariaDB 10.11, 11.8,
+#   12.3.3 and MySQL 8.4: the waiter never appears and long-gone transactions
+#   keep being listed). Reads are therefore spaced by _IS_TRX_CACHE_IDLE_S.
+# * SHOW ENGINE INNODB STATUS (live, both families): the waiter's transaction
+#   block reports "LOCK WAIT" and "WAITING ... FOR THIS LOCK TO BE GRANTED".
+#   It does not name the blocker, so it is evidence only when no specific
+#   blocker is required.
+_IS_TRX_CACHE_IDLE_S = 0.15
+_is_trx_cache_guard = threading.Lock()
+_is_trx_last_read = [float("-inf")]
+
+
+def _is_trx_cache_due() -> bool:
+    """True (and claims the read) when the I_S trx cache can have refreshed."""
+    with _is_trx_cache_guard:
+        now = time.monotonic()
+        if now - _is_trx_last_read[0] < _IS_TRX_CACHE_IDLE_S:
+            return False
+        _is_trx_last_read[0] = now
+        return True
+
+
+def _mark_is_trx_read() -> None:
+    with _is_trx_cache_guard:
+        _is_trx_last_read[0] = time.monotonic()
+
+
+def _innodb_status_wait_block(status: str, sid: int) -> Optional[str]:
+    """The waiting transaction block for connection `sid`, if it is in a lock wait."""
+    thread = re.compile(rf"\b(?:MySQL|MariaDB) thread id {int(sid)},")
+    for block in re.split(r"\n---TRANSACTION ", status):
+        if (
+            thread.search(block)
+            and re.search(r"(?m)^LOCK WAIT\b", block)
+            and "FOR THIS LOCK TO BE GRANTED" in block
+        ):
+            return block
+    return None
+
+
+def _lock_wait_evidence(
+    engine: Dialect, monitor, sid: int, *, force_is_trx: bool = False
+) -> Tuple[List[Tuple[str, Optional[frozenset]]], dict]:
+    """Return ([(source, blocker session ids or None)], {source: raw observation}).
+
+    The first list holds only sources that positively show `sid` in a lock
+    wait; the blocker set is None when the source cannot attribute it.
+    """
     cur = monitor.cursor()
-    if engine == Dialect.POSTGRES:
-        cur.execute("SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", (sid,))
-        row = cur.fetchone()
-        monitor.commit()
-        return bool(row) and row[0] == "Lock"
-    # MySQL 8.x/9.x: performance_schema.data_lock_waits is authoritative
-    # (information_schema.innodb_trx can omit a trigger-nested waiter).
-    # MariaDB has no data_lock_waits; its innodb_trx reports LOCK WAIT.
-    queries = (
-        "SELECT COUNT(*) FROM performance_schema.data_lock_waits w "
-        "JOIN performance_schema.threads t ON t.THREAD_ID = w.REQUESTING_THREAD_ID "
-        "WHERE t.PROCESSLIST_ID = %s",
-        "SELECT COUNT(*) FROM information_schema.innodb_trx "
-        "WHERE trx_mysql_thread_id = %s AND trx_state = 'LOCK WAIT'",
-    )
-    for sql in queries:
+    evidence: List[Tuple[str, Optional[frozenset]]] = []
+    seen: dict = {}
+
+    def query(name: str, sql: str, params: Tuple = ()) -> Optional[list]:
         try:
-            cur.execute(sql, (sid,))
-            row = cur.fetchone()
-        except Exception:
+            cur.execute(sql, params)
+            rows = list(cur.fetchall())
+        except Exception as exc:
             monitor.rollback()
-            continue
+            seen[name] = f"unavailable: {exc!r}"
+            return None
         monitor.commit()
-        if row and int(row[0]) > 0:
-            return True
-    return False
+        seen[name] = rows
+        return rows
+
+    if engine == Dialect.POSTGRES:
+        rows = query(
+            "pg_stat_activity",
+            "SELECT wait_event_type, wait_event, pg_blocking_pids(pid) FROM pg_stat_activity WHERE pid = %s",
+            (sid,),
+        )
+        if rows and rows[0][0] == "Lock":
+            evidence.append(("pg_stat_activity", frozenset(int(p) for p in (rows[0][2] or []))))
+        return evidence, seen
+
+    rows = query(
+        "performance_schema.data_lock_waits",
+        "SELECT bt.PROCESSLIST_ID FROM performance_schema.data_lock_waits w "
+        "JOIN performance_schema.threads rt ON rt.THREAD_ID = w.REQUESTING_THREAD_ID "
+        "LEFT JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID "
+        "WHERE rt.PROCESSLIST_ID = %s",
+        (sid,),
+    )
+    if rows:
+        evidence.append(
+            ("performance_schema.data_lock_waits", frozenset(int(r[0]) for r in rows if r[0] is not None))
+        )
+
+    if force_is_trx:
+        time.sleep(_IS_TRX_CACHE_IDLE_S)
+        _mark_is_trx_read()
+        due = True
+    else:
+        due = _is_trx_cache_due()
+    if due:
+        name = "information_schema.innodb_trx+innodb_lock_waits"
+        rows = query(
+            name,
+            "SELECT r.trx_state, b.trx_mysql_thread_id FROM information_schema.innodb_trx r "
+            "LEFT JOIN information_schema.innodb_lock_waits w ON w.requesting_trx_id = r.trx_id "
+            "LEFT JOIN information_schema.innodb_trx b ON b.trx_id = w.blocking_trx_id "
+            "WHERE r.trx_mysql_thread_id = %s",
+            (sid,),
+        )
+        if rows is None:  # MySQL 8.0+ has no innodb_lock_waits
+            name = "information_schema.innodb_trx"
+            rows = query(
+                name,
+                "SELECT trx_state, NULL FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = %s",
+                (sid,),
+            )
+        _mark_is_trx_read()
+        if rows and any(r[0] == "LOCK WAIT" for r in rows):
+            blockers = frozenset(int(r[1]) for r in rows if r[1] is not None)
+            evidence.append((name, blockers or None))
+    else:
+        seen["information_schema.innodb_trx"] = "skipped: read within the cache idle interval"
+
+    rows = query("SHOW ENGINE INNODB STATUS", "SHOW ENGINE INNODB STATUS")
+    if rows:
+        block = _innodb_status_wait_block(str(rows[0][2]), sid)
+        seen["SHOW ENGINE INNODB STATUS"] = block[:600] if block else "no LOCK WAIT block for this connection"
+        if block:
+            evidence.append(("SHOW ENGINE INNODB STATUS", None))
+    return evidence, seen
 
 
-def _wait_until_lock_waiting(engine: Dialect, monitor, sid: int, done: threading.Event) -> None:
-    deadline = time.monotonic() + LOCK_WAIT_TIMEOUT_S
+def _is_lock_waiting(engine: Dialect, monitor, sid: int, blocker_sid: Optional[int] = None) -> bool:
+    """True only on positive evidence that `sid` waits for an engine lock.
+
+    With `blocker_sid`, the evidence must also attribute the wait to a lock
+    held by that session; sources that cannot name the blocker do not count.
+    """
+    evidence, _ = _lock_wait_evidence(engine, monitor, sid)
+    return any(
+        blocker_sid is None or (blockers is not None and blocker_sid in blockers)
+        for _, blockers in evidence
+    )
+
+
+def _wait_until_lock_waiting(
+    engine: Dialect, monitor, sid: int, done: threading.Event, blocker_sid: Optional[int] = None
+) -> None:
+    budget = LOCK_WAIT_TIMEOUT_AFTER_FAILURE_S if _lock_probe_timed_out.is_set() else LOCK_WAIT_TIMEOUT_S
+    deadline = time.monotonic() + budget
     while time.monotonic() < deadline:
-        if _is_lock_waiting(engine, monitor, sid):
+        if _is_lock_waiting(engine, monitor, sid, blocker_sid):
             return
         if done.is_set():
             raise AssertionError(
                 "second session finished without waiting for the first session's "
                 "lock; the intended interleaving was not exercised"
             )
-        time.sleep(0.01)
+        time.sleep(0.02)
+    _lock_probe_timed_out.set()
     raise AssertionError(
-        f"second session never entered an engine lock wait; diagnostics={_lock_diagnostics(engine, monitor)!r}"
+        f"session {sid} never entered an engine lock wait"
+        + (f" attributed to session {blocker_sid}" if blocker_sid is not None else "")
+        + f" within {budget}s; diagnostics={_lock_diagnostics(engine, monitor, sid)!r}"
     )
 
 
-def _lock_diagnostics(engine: Dialect, monitor) -> Any:
+def _lock_diagnostics(engine: Dialect, monitor, sid: Optional[int] = None) -> Any:
+    """What every catalog source showed (fresh I_S snapshot), for failure messages."""
     cur = monitor.cursor()
+    out: dict = {}
     try:
         if engine == Dialect.POSTGRES:
-            cur.execute("SELECT pid, state, wait_event_type, wait_event, left(query, 120) FROM pg_stat_activity")
-            return cur.fetchall()
-        out = []
-        cur.execute("SELECT id, command, time, state, LEFT(info, 120) FROM information_schema.processlist")
-        out.append(cur.fetchall())
-        cur.execute("SELECT trx_mysql_thread_id, trx_state, LEFT(trx_query, 120) FROM information_schema.innodb_trx")
-        out.append(cur.fetchall())
-        return out
+            cur.execute(
+                "SELECT pid, state, wait_event_type, wait_event, pg_blocking_pids(pid), left(query, 120) "
+                "FROM pg_stat_activity"
+            )
+            out["pg_stat_activity"] = cur.fetchall()
+        else:
+            cur.execute("SELECT id, command, time, state, LEFT(info, 120) FROM information_schema.processlist")
+            out["processlist"] = cur.fetchall()
+            monitor.commit()
+            time.sleep(_IS_TRX_CACHE_IDLE_S)  # let the I_S trx cache refresh
+            cur.execute("SELECT trx_mysql_thread_id, trx_state, LEFT(trx_query, 120) FROM information_schema.innodb_trx")
+            out["innodb_trx"] = cur.fetchall()
+            _mark_is_trx_read()
     except Exception as exc:  # diagnostics only
-        return repr(exc)
+        out["error"] = repr(exc)
     finally:
         monitor.commit()
+    if sid is not None:
+        try:
+            out["evidence"], out["sources"] = _lock_wait_evidence(engine, monitor, sid, force_is_trx=True)
+        except Exception as exc:  # diagnostics only
+            out["evidence_error"] = repr(exc)
+    return out
 
 
 def _exact(v: Any) -> Any:
@@ -371,6 +519,7 @@ class NativeAvgInterleavingTests(unittest.TestCase):
                 if isolation:
                     c.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {isolation}")
                 s.commit()
+            sid1 = _session_id(engine, s1)
             sid2 = _session_id(engine, s2)
 
             first(s1.cursor(), table)  # holds the G1 backing-row lock, uncommitted
@@ -388,10 +537,11 @@ class NativeAvgInterleavingTests(unittest.TestCase):
             th = threading.Thread(target=run_second, daemon=True)
             th.start()
             try:
-                _wait_until_lock_waiting(engine, monitor, sid2, done)
+                _wait_until_lock_waiting(engine, monitor, sid2, done, blocker_sid=sid1)
             finally:
                 s1.commit()
-            th.join(timeout=LOCK_WAIT_TIMEOUT_S)
+                # Never touch s2 (cleanup below) while the thread still uses it.
+                th.join(timeout=LOCK_WAIT_TIMEOUT_S)
             self.assertFalse(th.is_alive(), "second session did not finish after the first committed")
             if errors:
                 raise errors[0]
@@ -488,6 +638,7 @@ class NativeAvgInterleavingTests(unittest.TestCase):
             )
             conn.commit()
             backfill_sid = _session_id(engine, conn)
+            writer_sid = _session_id(engine, writer)
             manager = MaterializedViewManager(conn, dialect=engine)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", EngineLimitationWarning)
@@ -502,7 +653,7 @@ class NativeAvgInterleavingTests(unittest.TestCase):
 
             def commit_when_chunk_waits() -> None:
                 try:
-                    _wait_until_lock_waiting(engine, monitor, backfill_sid, threading.Event())
+                    _wait_until_lock_waiting(engine, monitor, backfill_sid, threading.Event(), blocker_sid=writer_sid)
                     interleaved.set()
                 except BaseException as exc:
                     helper_errors.append(exc)
