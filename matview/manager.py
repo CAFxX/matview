@@ -391,6 +391,8 @@ class MaterializedViewManager:
         self._lifecycle_depth = 1
         succeeded = False
         try:
+            if operation in self._CATALOG_CHANGING_OPERATIONS:
+                self._lock_catalog_for_change()
             yield
             succeeded = True
         finally:
@@ -416,6 +418,30 @@ class MaterializedViewManager:
                     if dbapi_transaction_state(self.conn) is not False:
                         self._rollback()
                     layer.autocommit = True
+
+    # Lifecycle operations that add, replace, drop or repopulate views. On
+    # PostgreSQL they take the catalog lock bulk_changes() holds, so they wait
+    # for an open bulk_changes() block (and it for them) instead of
+    # interleaving with it.
+    _CATALOG_CHANGING_OPERATIONS = frozenset(
+        {"register_view", "sync_views", "drop_view", "apply_schema_ddl", "repair_view"}
+    )
+
+    def _lock_catalog_for_change(self) -> None:
+        """PostgreSQL: SHARE ROW EXCLUSIVE on the catalog until the transaction ends.
+
+        Self-conflicting and conflicting with every catalog write, but not with
+        the reads writer triggers make, so writers are never blocked by it.
+        No-op on other engines (SQLite serializes writers; MySQL/MariaDB uses
+        a locking catalog read in bulk_changes()) and when no catalog exists.
+        """
+        if self.dialect != Dialect.POSTGRES:
+            return
+        with self._cursor() as cur:
+            cur.execute("SELECT to_regclass(%s)", (self.catalog_table,))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                cur.execute(f"LOCK TABLE {self.catalog_table} IN SHARE ROW EXCLUSIVE MODE")
 
     @staticmethod
     def configure_sqlite_connection(connection: Any) -> Any:
@@ -2240,6 +2266,23 @@ class MaterializedViewManager:
             pg_fillfactor=getattr(self, "pg_fillfactor", 80),
         )
 
+    @staticmethod
+    def _catalog_identity(catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Tuple[Any, ...]]:
+        return {
+            name: (e["view_sql"], e["signature_hash"], tuple(e["trigger_names"]), tuple(e["function_names"]))
+            for name, e in catalog.items()
+        }
+
+    def _bulk_require_unchanged_catalog(self, catalog: Dict[str, Dict[str, Any]], lock_clause: str) -> None:
+        """Fail closed if views were registered, replaced or dropped meanwhile."""
+        current = self._read_catalog(lock_clause, required=True)
+        if self._catalog_identity(current) != self._catalog_identity(catalog):
+            raise RuntimeError(
+                "bulk_changes(): the registered materialized views changed while the block ran "
+                f"(before: {sorted(catalog)}, now: {sorted(current)}); the bulk work was rolled "
+                "back because the refresh could not cover them consistently"
+            )
+
     def _bulk_refresh(
         self, cur: Any, targets: Sequence[Dict[str, Any]], use_shadow_swap: bool, recreate_triggers: bool
     ) -> None:
@@ -2431,6 +2474,7 @@ class MaterializedViewManager:
                 physical.autocommit = False
                 restore_autocommit.append(physical)
 
+        catalog_lock = " LOCK IN SHARE MODE" if self.dialect == Dialect.MYSQL else ""
         mysql_flag_set = False
         pending: Optional[BaseException] = None
         self._lifecycle_depth = 1
@@ -2439,14 +2483,18 @@ class MaterializedViewManager:
             cur = self.conn.cursor()
             try:
                 self._begin_bulk_transaction(cur)
-                # On MySQL/MariaDB a locking read: a plain SELECT would open
-                # the transaction's consistent snapshot here, and with
-                # MariaDB's innodb_snapshot_isolation the refresh would then
-                # fail (error 1020) on every backing row a concurrent writer
-                # committed in the meantime.
-                catalog = self._read_catalog(
-                    " LOCK IN SHARE MODE" if self.dialect == Dialect.MYSQL else "", required=True
-                )
+                # The set of registered views must not change while the block
+                # runs (the session bypass also suspends a newly registered
+                # view's triggers, and the refresh would not repopulate it):
+                # PostgreSQL holds a catalog lock that every catalog-changing
+                # lifecycle operation also takes; MySQL/MariaDB reads the
+                # catalog with a locking read (which also opens no consistent
+                # snapshot: with MariaDB's innodb_snapshot_isolation the refresh
+                # would otherwise fail with error 1020 on backing rows a
+                # concurrent writer committed); SQLite holds the writer
+                # reservation. The refresh re-checks it.
+                self._lock_catalog_for_change()
+                catalog = self._read_catalog(catalog_lock, required=True)
                 if view_names:
                     resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
                     unknown = [n for n, r in zip(view_names, resolved) if r not in catalog]
@@ -2513,6 +2561,8 @@ class MaterializedViewManager:
                     # Always the plain refresh (never the caller's shadow-swap
                     # mode): the simplest path that restores maintenance.
                     self._begin_bulk_transaction(cur)
+                    self._lock_catalog_for_change()
+                    self._bulk_require_unchanged_catalog(catalog, catalog_lock)
                     self._bulk_refresh(cur, targets, False, recreate_triggers=not session_bypass)
                     self._commit()
                 except BaseException as recovery_exc:
@@ -2542,6 +2592,7 @@ class MaterializedViewManager:
             try:
                 if self.dialect == Dialect.POSTGRES and session_bypass:
                     cur.execute("SET LOCAL matview.skip_triggers = 'off';")
+                self._bulk_require_unchanged_catalog(catalog, catalog_lock)
                 self._bulk_refresh(cur, targets, use_shadow_swap, recreate_triggers=not session_bypass)
                 self._commit()
                 if dbapi_transaction_state(self.conn) is not False:
