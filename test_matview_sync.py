@@ -1685,7 +1685,10 @@ class TranspiledConnectionAdapter:
         return bool(self._sq_conn is not None and self._sq_conn.in_transaction)
 
     def commit(self) -> None:
-        pass
+        # A DB-API commit ends an open transaction (e.g. one started with
+        # START TRANSACTION / BEGIN by bulk_changes); idle is a no-op.
+        if self._sq_conn is not None and self._sq_conn.in_transaction:
+            self._sq_conn.execute("COMMIT;")
 
     def rollback(self) -> None:
         if self._sq_conn is not None:
@@ -5510,7 +5513,17 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             )
 
             # --- 5. Session-Scoped & Shadow-Table Swap bulk_changes() Isolation ---
-            with mgr_j.bulk_changes(use_shadow_swap=True):
+            # bulk_changes() owns its transaction: commit the caller's work first.
+            conn_j.commit()
+            bulk_kwargs: Dict[str, Any] = {"use_shadow_swap": True}
+            if d_mode == Dialect.MYSQL:
+                # MySQL/MariaDB DDL commits implicitly: the shadow swap is
+                # refused before any SQL; the DML-only mode is supported.
+                with self.assertRaisesRegex(ValueError, "implicitly"):
+                    with mgr_j.bulk_changes(use_shadow_swap=True):
+                        self.fail("MySQL shadow swap was not refused")
+                bulk_kwargs = {}
+            with mgr_j.bulk_changes(**bulk_kwargs):
                 conn_j.execute("INSERT INTO emps VALUES (5, 1, 'PM', 140), (6, 2, 'SRE', 110);")
                 conn_j.execute("INSERT INTO contractors VALUES (3, 1, 'PM', 70);")
 

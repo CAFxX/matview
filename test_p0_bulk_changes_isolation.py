@@ -620,84 +620,25 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         for aux in shadow_aux_map.keys():
             self.assertIn(mgr._old_name(aux), final_drop)
 
-    def test_mysql_bulk_changes_execution_avoids_pre_delete_and_view_drop(self) -> None:
-        """Executing bulk_changes(use_shadow_swap=True) on MySQL recording mock verifies
-
-        that live auxiliary tables are never deleted prior to shadow populate, populate
-        statements are redirected to shadow tables, and view is replaced atomically.
+    def test_mysql_bulk_changes_shadow_swap_is_refused_before_any_sql(self) -> None:
+        """MySQL/MariaDB DDL commits implicitly, so bulk_changes(use_shadow_swap=True)
+        (and drop_triggers=True) is refused before touching the connection; the
+        swap SQL emission above stays covered for the generator only.
         """
-        schema = "CREATE TABLE inventory (sku INT PRIMARY KEY, loc VARCHAR(32), qty INT);"
-        v_sql = "CREATE VIEW v_loc_count AS SELECT loc, COUNT(DISTINCT qty) AS dq FROM inventory GROUP BY loc;"
-        plan = generate_materialized_view(schema, v_sql, dialect=Dialect.MYSQL, ignore_limitations=True)
+        class NoSqlConnection:
+            in_transaction = False
 
-        executed_sqls = []
-
-        class RecordingCursor:
-            def execute(self, stmt, params=None):
-                executed_sqls.append(str(stmt).strip())
-                return self
-            def fetchall(self):
-                return []
-            def fetchone(self):
-                return None
-            def close(self):
-                pass
-
-        class RecordingConnection:
             def cursor(self):
-                return RecordingCursor()
-            def commit(self):
-                executed_sqls.append("COMMIT;")
-            def rollback(self):
-                executed_sqls.append("ROLLBACK;")
+                raise AssertionError("bulk_changes issued SQL for a refused MySQL DDL mode")
 
-        rec_conn = RecordingConnection()
         mgr = MaterializedViewManager.__new__(MaterializedViewManager)
-        mgr.conn = rec_conn
+        mgr.conn = NoSqlConnection()
         mgr.dialect = Dialect.MYSQL
-        mgr.engine_version = parse_engine_version("mysql:8.4")
-        mgr.object_prefix = "__matview_"
-        mgr.catalog_table = "__matview_catalog"
-        mgr.pg_use_transition_tables = False
-
-        # Mock catalog
-        mgr.get_catalog = lambda: {
-            "v_loc_count": {
-                "view_name": "v_loc_count",
-                "view_sql": v_sql,
-                "strategy": plan.strategy.value,
-                "signature_hash": "sig123",
-                "backing_table": plan.backing_table_name,
-                "aux_tables": plan.auxiliary_table_names,
-                "trigger_names": plan.trigger_names,
-                "function_names": plan.function_names,
-                "trigger_ddls": plan.trigger_ddls,
-            }
-        }
-        mgr.fetch_schema = lambda: parse_table_schema(schema)
-
-        with mgr.bulk_changes(use_shadow_swap=True):
-            rec_conn.cursor().execute("INSERT INTO inventory VALUES (1, 'warehouse1', 50);")
-
-        # 1. Assert DELETE FROM <live_aux> was NEVER executed before shadow populate!
-        aux_table = plan.auxiliary_table_names[0]
-        live_delete = f"DELETE FROM {aux_table};"
-        self.assertNotIn(
-            live_delete,
-            executed_sqls,
-            f"Live auxiliary table was deleted in bulk_changes(use_shadow_swap=True)! Executed: {executed_sqls}",
-        )
-
-        # 2. Assert shadow auxiliary table was created and populated
-        s_aux = mgr._shadow_name(aux_table)
-        self.assertTrue(any(s.startswith(f"CREATE TABLE {s_aux}") for s in executed_sqls))
-        self.assertTrue(any(f"INSERT INTO {s_aux}" in s for s in executed_sqls))
-
-        # 3. Assert atomic RENAME TABLE executed
-        self.assertTrue(any(s.startswith("RENAME TABLE ") for s in executed_sqls))
-
-        # 4. Assert DROP VIEW was NEVER called
-        self.assertFalse(any(re.search(r"\bDROP\s+VIEW\b", s, re.IGNORECASE) for s in executed_sqls))
+        for kwargs in ({"use_shadow_swap": True}, {"drop_triggers": True}):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(ValueError, "commits the transaction implicitly"):
+                    with mgr.bulk_changes(**kwargs):
+                        self.fail("entered a refused MySQL bulk mode")
 
     def test_postgres_bulk_changes_execution_avoids_pre_delete_and_view_drop(self) -> None:
         """Executing bulk_changes(use_shadow_swap=True) on PostgreSQL recording mock verifies
@@ -724,12 +665,30 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
                 pass
 
         class RecordingConnection:
+            # Reports its transaction state (bulk_changes refuses drivers that
+            # do not): idle until a statement runs, idle again after COMMIT.
+            in_transaction = False
+
             def cursor(self):
                 return RecordingCursor()
             def commit(self):
                 executed_sqls.append("COMMIT;")
+                RecordingConnection.in_transaction = False
             def rollback(self):
                 executed_sqls.append("ROLLBACK;")
+                RecordingConnection.in_transaction = False
+
+        class RecordingCursor:  # noqa: F811 - marks the implicit transaction
+            def execute(self, stmt, params=None):
+                executed_sqls.append(str(stmt).strip())
+                RecordingConnection.in_transaction = True
+                return self
+            def fetchall(self):
+                return []
+            def fetchone(self):
+                return None
+            def close(self):
+                pass
 
         rec_conn = RecordingConnection()
         mgr = MaterializedViewManager.__new__(MaterializedViewManager)
