@@ -17,7 +17,8 @@ name: CI — Extended Random-Seed Fuzz
 #   listing the failing seeds with a replay command that pins the seed and the
 #   campaign sizes. On push and scheduled runs one GitHub issue (label
 #   ci-extended-fuzz) is opened, or commented on if already open, with the run
-#   link and the seeds (scripts/ci_failure_issue.js, shared with ci-deferred.yml).
+#   link and the seeds (scripts/ci_failure_issue.js, shared with ci-deferred.yml;
+#   with repository Issues disabled the job fails with the report in its summary).
 #   Each confirmed failure is added to the Suite 13 corpus
 #   in its fix PR; then close the issue.
 # - Concurrency: one group per event type and ref, never cancelled in progress,

@@ -1161,11 +1161,16 @@ const github = {
     getLabel: async a => { calls.push(["getLabel", a.name]); if (!state.labelExists) { const e = new Error("nf"); e.status = 404; throw e; } },
     createLabel: async a => { calls.push(["createLabel", a.name]); },
     createComment: async a => { calls.push(["createComment", a.issue_number, a.body]); },
-    create: async a => { calls.push(["create", a.title, a.labels, a.body]); return { data: { number: 99 } }; },
+    create: async a => { calls.push(["create", a.title, a.labels, a.body]);
+      if (state.issuesGone) { const e = new Error("Issues are disabled"); e.status = 410; throw e; }
+      return { data: { number: 99 } }; },
   } },
 };
-const context = { repo: { owner: "o", repo: "r" }, serverUrl: "https://gh", runId: 7, eventName: "schedule", sha: "abc" };
-const core = { info: () => {} };
+const context = { repo: { owner: "o", repo: "r" }, serverUrl: "https://gh", runId: 7, eventName: "schedule", sha: "abc",
+  payload: state.hasIssues === undefined ? {} : { repository: { has_issues: state.hasIssues } } };
+const summary = { text: "", addHeading(t) { this.text += t + "\n"; return this; }, addRaw(t) { this.text += t; return this; },
+  async write() { calls.push(["summary", this.text]); } };
+const core = { info: () => {}, error: m => calls.push(["error", m]), setFailed: m => calls.push(["setFailed", m]), summary };
 report({ github, context, core }, { title: "T", label: "L", labelDescription: "d", intro: "INTRO",
   reportsDir: state.dir, reportName: "fuzz-failures.md" })
   .then(n => { console.log(JSON.stringify({ n, calls })); })
@@ -1194,12 +1199,24 @@ report({ github, context, core }, { title: "T", label: "L", labelDescription: "d
             self.assertIn(needle, body)
 
     def test_comments_on_the_open_issue_instead_of_opening_another(self) -> None:
-        res = self._run({"open": [{"number": 5, "title": "T"}, {"number": 6, "title": "T", "pull_request": {}}],
+        res = self._run({"open": [{"number": 6, "title": "T", "pull_request": {}}, {"number": 5, "title": "T"}],
                          "labelExists": True, "dir": "/nonexistent"})
         kinds = [c[0] for c in res["calls"]]
         self.assertEqual(kinds, ["getLabel", "listForRepo", "createComment"])
         self.assertEqual(res["calls"][-1][1], 5)
         self.assertIn("No report artifact was found", res["calls"][-1][2])
+
+    def test_disabled_issues_fail_the_job_with_the_report_in_the_summary(self) -> None:
+        # Payload says so (no API write attempted) ...
+        res = self._run({"open": [], "labelExists": True, "dir": "/nonexistent", "hasIssues": False})
+        kinds = [c[0] for c in res["calls"]]
+        self.assertEqual(kinds, ["error", "summary", "setFailed"])
+        self.assertIn("Issues are disabled", res["calls"][0][1])
+        self.assertIn("https://gh/o/r/actions/runs/7", res["calls"][1][1])
+        self.assertIsNone(res["n"])
+        # ... or the API answers 410 Gone.
+        res = self._run({"open": [], "labelExists": True, "dir": "/nonexistent", "issuesGone": True})
+        self.assertEqual([c[0] for c in res["calls"]][-3:], ["error", "summary", "setFailed"])
 
     def test_other_titles_do_not_deduplicate(self) -> None:
         res = self._run({"open": [{"number": 5, "title": "other"}], "labelExists": True, "dir": "/nonexistent"})
