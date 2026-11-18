@@ -1058,8 +1058,10 @@ def _verify_external_db_mv(cur, mv_name: str, select_sql: Any, context: str = ""
         return
     cur.execute(f"SELECT * FROM {mv_name}")
     mv_rows = [tuple(row) for row in cur.fetchall()]
+    mv_description = getattr(cur, "description", None)
     cur.execute(select_sql)
     live_rows = [tuple(row) for row in cur.fetchall()]
+    live_description = getattr(cur, "description", None)
     # Every output is compared exactly, except VAR/STDDEV on SQLite (see
     # _AGGREGATE_NUMERIC_TOLERANCES); _values_equal applies that budget only
     # when at least one returned value is a float.
@@ -1093,6 +1095,17 @@ def _verify_external_db_mv(cur, mv_name: str, select_sql: Any, context: str = ""
             f"  Query: {select_sql}\n"
             f"  MV ({len(mv_rows)} rows):   {mv_rows[:10]}\n"
             f"  Live ({len(live_rows)} rows): {live_rows[:10]}"
+        )
+    metadata = _result_description_mismatches(_driver_family(cur), mv_description, live_description)
+    # A transpiled cursor runs PostgreSQL/MySQL-targeted SQL on SQLite: it
+    # emulates the target's values, not its result types, so Python value
+    # types are only meaningful on a real engine (or native SQLite).
+    if type(cur).__name__ != "TranspiledCursorAdapter":
+        metadata += _result_representation_mismatches(mv_rows, live_rows)
+    if metadata:
+        raise AssertionError(
+            f"[{context}] External DB MV result metadata mismatch on {mv_name}!\n"
+            f"  Query: {select_sql}\n  " + "\n  ".join(metadata)
         )
 
 
@@ -2810,15 +2823,19 @@ def _rewrite_live_reference_select_for_dialect(raw_select_sql: str, dialect: Dia
             )
             return s_sq
         return raw_select_sql
+    # TOTAL is SQLite-only; its emulation contract on PostgreSQL/MySQL is
+    # SQLite's: a floating-point sum that is 0.0 for no input. The reference
+    # therefore returns the engine's DOUBLE, not the exact SUM type.
+    double = "DOUBLE PRECISION" if dialect == Dialect.POSTGRES else "DOUBLE"
     s = re.sub(
         r"\bTOTAL\s*\(\s*DISTINCT\s+((?:[^()]|\([^()]*\))+)\)",
-        r"COALESCE(1.0 * SUM(DISTINCT \1), 0.0)",
+        rf"CAST(COALESCE(1.0 * SUM(DISTINCT \1), 0.0) AS {double})",
         raw_select_sql,
         flags=re.IGNORECASE,
     )
     s = re.sub(
         r"\bTOTAL\s*\(\s*((?:[^()]|\([^()]*\))+)\)",
-        r"COALESCE(1.0 * SUM(\1), 0.0)",
+        rf"CAST(COALESCE(1.0 * SUM(\1), 0.0) AS {double})",
         s,
         flags=re.IGNORECASE,
     )
@@ -6222,6 +6239,86 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             )
         )
         self.assertIsNone(_query_column_tolerances("SELECT ("))
+
+    def test_21b_differential_oracle_compares_native_result_metadata(self) -> None:
+        """The native oracle rejects metadata-only and representation-only differences.
+
+        Rows that are numerically equal must still agree on driver type code,
+        scale, precision (PostgreSQL; MySQL DECIMAL), nullability, column
+        count/name, Python value type and exact Decimal representation.
+        """
+
+        def fake_cursor(module: str, results: Dict[str, Tuple[List[Tuple[Any, ...]], List[Tuple[Any, ...]]]]):
+            class FakeCursor:
+                def __init__(self) -> None:
+                    self.description: Any = None
+                    self._rows: List[Tuple[Any, ...]] = []
+
+                def execute(self, sql: str) -> None:
+                    key = "mv" if sql.startswith("SELECT * FROM") else "live"
+                    self._rows, self.description = results[key]
+
+                def fetchall(self) -> List[Tuple[Any, ...]]:
+                    return list(self._rows)
+
+            FakeCursor.__module__ = module
+            return FakeCursor()
+
+        pg_num = ("v", 1700, None, None, 12, 2, None)
+        pg_int = ("v", 23, None, None, None, None, None)
+        my_dec = ("v", 246, None, 14, 12, 2, True)
+        my_dbl = ("v", 5, None, 22, 22, 31, True)
+
+        def check(module: str, mv: Tuple[Any, ...], live: Tuple[Any, ...]) -> None:
+            cur = fake_cursor(module, {"mv": mv, "live": live})
+            _verify_external_db_mv(cur, "mv_x", "SELECT v FROM t", "metadata-test")
+
+        accepted = [
+            ("psycopg2.extensions", ([(Decimal("1.50"),)], [pg_num]), ([(Decimal("1.50"),)], [pg_num])),
+            # PyMySQL integer/floating precision is display width, not type.
+            ("pymysql.cursors", ([(1.5,)], [my_dbl]), ([(1.5,)], [("v", 5, None, 23, 23, 31, True)])),
+            # Known unmodelled MySQL-family metadata (MYSQL_UNMODELLED_METADATA):
+            # DECIMAL precision, nullability, string decimals.
+            ("pymysql.cursors", ([(Decimal("1.50"),)], [my_dec]),
+             ([(Decimal("1.50"),)], [("v", 246, None, 22, 20, 2, True)])),
+            ("pymysql.cursors", ([(1.5,)], [my_dbl]), ([(1.5,)], [("v", 5, None, 22, 22, 31, False)])),
+            ("pymysql.cursors", ([("ab",)], [("v", 253, None, 64, 64, 0, True)]),
+             ([("ab",)], [("v", 253, None, 64, 64, 31, True)])),
+            # Unaliased live expressions are named by the engine.
+            ("psycopg2.extensions", ([(1,)], [pg_int]), ([(1,)], [("?column?", 23, None, None, None, None, None)])),
+            # SQLite drivers report no type metadata.
+            ("sqlite3", ([(1,)], [("v", None, None, None, None, None, None)]),
+             ([(1,)], [("v", None, None, None, None, None, None)])),
+        ]
+        for module, mv, live in accepted:
+            with self.subTest(accepted=(module, live[1])):
+                check(module, mv, live)
+
+        rejected = [
+            ("type_code", "psycopg2.extensions", ([(1,)], [pg_int]), ([(1,)], [("v", 20, None, None, None, None, None)])),
+            ("scale", "psycopg2.extensions", ([(Decimal("1.50"),)], [pg_num]),
+             ([(Decimal("1.50"),)], [("v", 1700, None, None, 12, 3, None)])),
+            ("precision", "psycopg2.extensions", ([(Decimal("1.50"),)], [pg_num]),
+             ([(Decimal("1.50"),)], [("v", 1700, None, None, 18, 2, None)])),
+            ("scale", "pymysql.cursors", ([(Decimal("1.50"),)], [my_dec]),
+             ([(Decimal("1.500"),)], [("v", 246, None, 22, 12, 3, True)])),
+            ("null_ok", "otherdriver", ([(1.5,)], [my_dbl]), ([(1.5,)], [("v", 5, None, 22, 22, 31, False)])),
+            ("name", "psycopg2.extensions", ([(1,)], [pg_int]), ([(1,)], [("w", 23, None, None, None, None, None)])),
+            ("column count", "psycopg2.extensions", ([], [pg_int]), ([], [pg_int, pg_int])),
+            # Numerically equal values of different Python types / Decimal scale.
+            ("value representations", "sqlite3", ([(1,)], [("v", None, None, None, None, None, None)]),
+             ([(1.0,)], [("v", None, None, None, None, None, None)])),
+            ("value representations", "psycopg2.extensions", ([(Decimal("0.0"),)], [("v", 1700, None, None, None, None, None)]),
+             ([(Decimal("0"),)], [("v", 1700, None, None, None, None, None)])),
+            ("value representations", "psycopg2.extensions", ([(2,)], [("v", 1700, None, None, None, None, None)]),
+             ([(Decimal("2"),)], [("v", 1700, None, None, None, None, None)])),
+        ]
+        for label, module, mv, live in rejected:
+            with self.subTest(rejected=label, module=module):
+                with self.assertRaises(AssertionError) as raised:
+                    check(module, mv, live)
+                self.assertIn("result metadata mismatch", str(raised.exception))
+                self.assertIn(label, str(raised.exception))
 
     def test_21_differential_oracle_decimal_float_comparison_uses_full_precision(self) -> None:
         with localcontext() as context:
