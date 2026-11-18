@@ -50,20 +50,19 @@ function renderBody({ runUrl, eventName, sha, needs, reports, noReport }) {
   return body;
 }
 
-module.exports = async function reportFailure({ github, context, core }, opts) {
-  const { title, label, labelDescription, intro, reportsDir, reportName, noReport } = opts;
-  const { owner, repo } = context.repo;
-  const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-  const needs = JSON.parse(process.env.NEEDS_JSON || "{}");
-  const body = renderBody({
-    runUrl,
-    eventName: context.eventName,
-    sha: context.sha,
-    needs,
-    reports: reportsDir && reportName ? collectReports(reportsDir, reportName) : [],
-    noReport: noReport || "No report artifact was found; see the run log.",
-  });
+async function issuesDisabled(core, title, body) {
+  const msg = `${title}: GitHub Issues are disabled for this repository, so no issue was opened. ` +
+    "Enable Issues (Settings > General > Features) to get one tracked issue per failing workflow; " +
+    "the full report is in this job's summary.";
+  core.error(msg);
+  if (core.summary) {
+    await core.summary.addHeading(title, 2).addRaw(body, true).write();
+  }
+  core.setFailed(msg);
+  return null;
+}
 
+async function openOrComment({ github, core }, { owner, repo, title, label, labelDescription, intro, body }) {
   try {
     await github.rest.issues.getLabel({ owner, repo, name: label });
   } catch (error) {
@@ -87,6 +86,35 @@ module.exports = async function reportFailure({ github, context, core }, opts) {
   const created = await github.rest.issues.create({ owner, repo, title, labels: [label], body: intro + "\n\n" + body });
   core.info(`Opened #${created.data.number}`);
   return created.data.number;
+}
+
+module.exports = async function reportFailure({ github, context, core }, opts) {
+  const { title, label, labelDescription, intro, reportsDir, reportName, noReport } = opts;
+  const { owner, repo } = context.repo;
+  const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+  const needs = JSON.parse(process.env.NEEDS_JSON || "{}");
+  const body = renderBody({
+    runUrl,
+    eventName: context.eventName,
+    sha: context.sha,
+    needs,
+    reports: reportsDir && reportName ? collectReports(reportsDir, reportName) : [],
+    noReport: noReport || "No report artifact was found; see the run log.",
+  });
+
+  // Issues can be disabled in the repository settings (the API then answers
+  // 410 Gone). Never let the failure signal disappear: put the report in the
+  // job summary, annotate the run, and fail this job so the run stays red.
+  if (context.payload && context.payload.repository && context.payload.repository.has_issues === false) {
+    return issuesDisabled(core, title, body);
+  }
+  try {
+    return await openOrComment({ github, core }, { owner, repo, title, label, labelDescription, intro, body });
+  } catch (error) {
+    // Issue creation/comment answers 410 Gone when Issues are disabled.
+    if (error.status === 410) return issuesDisabled(core, title, body);
+    throw error;
+  }
 };
 
 module.exports.renderBody = renderBody;

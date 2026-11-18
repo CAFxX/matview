@@ -943,6 +943,10 @@ green run is not proof of a green GitHub run; `--help` and the stamp's
   3.11); weekly (Sunday) and on demand for the scale-3 fuzz campaigns, which
   upload failing-seed reports with replay commands. Not a merge gate; a failing
   scheduled run opens or comments on one issue labelled `ci-deferred`.
+- Both non-required workflows report through `scripts/ci_failure_issue.js`.
+  Opening issues requires GitHub Issues to be enabled for the repository; while
+  they are disabled, the reporting job fails instead, with the full report in
+  its job summary, so a failure is never silent.
 - Every CI job has a `timeout-minutes` limit (25 minutes for PR-gate jobs).
 
 ### Executable documentation
