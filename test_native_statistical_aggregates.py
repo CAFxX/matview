@@ -9,6 +9,19 @@ Decimals including their scale: `0` and `0.0` are different results), and
 result metadata deliberately: DB-API description fields and the catalog
 column type of the reader view versus a live view of the same SELECT.
 
+`VARIANCE`, `STDDEV` and `STD` are not SQL-standard functions; every engine
+defines them itself:
+
+* PostgreSQL: `VARIANCE` = `VAR_SAMP`, `STDDEV` = `STDDEV_SAMP` (sample
+  statistics); there is no `STD`.
+* MySQL / MariaDB: `VARIANCE` = `VAR_POP`, `STDDEV` = `STD` = `STDDEV_POP`
+  (population statistics).
+* SQLite: none of them exists (a function of that name can only be an
+  application-defined UDF whose semantics the compiler cannot know).
+
+The compiler must bind each spelling to the target engine's definition and
+reject spellings the engine does not define.
+
 Native engines are selected with POSTGRES_DSN and/or MYSQL_DSN (MySQL or
 MariaDB; the product is read from the server, not trusted from a label).
 """
@@ -17,6 +30,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import unittest
 import uuid
 import warnings
@@ -30,18 +44,168 @@ from matview_sync import (
     EngineLimitationError,
     EngineLimitationWarning,
     MaterializedViewManager,
+    UnsupportedMaterializedViewError,
     generate_materialized_view,
     parse_table_schema,
+    parse_view_definition,
 )
+from matview.compiler import IncrementalViewCompiler
 
 _SCHEMA = "CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, x DOUBLE PRECISION);"
 
+# (engine version, alias -> expected AggFunc)
+_EXPECTED = {
+    "postgres:15": {"VARIANCE": AggFunc.VAR_SAMP, "STDDEV": AggFunc.STDDEV_SAMP},
+    "postgres:18": {"VARIANCE": AggFunc.VAR_SAMP, "STDDEV": AggFunc.STDDEV_SAMP},
+    "mysql:8.4": {"VARIANCE": AggFunc.VAR_POP, "STDDEV": AggFunc.STDDEV_POP, "STD": AggFunc.STDDEV_POP},
+    "mysql:9.7": {"VARIANCE": AggFunc.VAR_POP, "STDDEV": AggFunc.STDDEV_POP, "STD": AggFunc.STDDEV_POP},
+    "mariadb:10.11": {"VARIANCE": AggFunc.VAR_POP, "STDDEV": AggFunc.STDDEV_POP, "STD": AggFunc.STDDEV_POP},
+    "mariadb:12.3": {"VARIANCE": AggFunc.VAR_POP, "STDDEV": AggFunc.STDDEV_POP, "STD": AggFunc.STDDEV_POP},
+}
+# Alias spellings each native engine defines (MySQL and MariaDB agree).
+_NATIVE_ALIASES = {
+    Dialect.POSTGRES: ("VARIANCE", "STDDEV"),
+    Dialect.MYSQL: ("VARIANCE", "STDDEV", "STD"),
+}
+_NATIVE_ALIAS_PAIRS = {
+    Dialect.POSTGRES: [("VARIANCE", "STDDEV")],
+    Dialect.MYSQL: [("VARIANCE", "STDDEV"), ("VARIANCE", "STD")],
+}
 _EXPLICIT = {
     "VAR_POP": AggFunc.VAR_POP,
     "VAR_SAMP": AggFunc.VAR_SAMP,
     "STDDEV_POP": AggFunc.STDDEV_POP,
     "STDDEV_SAMP": AggFunc.STDDEV_SAMP,
 }
+
+
+def _compiled_items(view_sql_or_spec: Any, engine: str) -> Dict[str, Optional[AggFunc]]:
+    ev_dialect = Dialect.POSTGRES if engine.startswith("postgres") else Dialect.MYSQL
+    if engine.startswith("sqlite"):
+        ev_dialect = Dialect.SQLITE
+    schemas = parse_table_schema(_SCHEMA, dialect=ev_dialect)
+    spec = (
+        parse_view_definition(view_sql_or_spec, known_tables={"t"}, dialect=ev_dialect)
+        if isinstance(view_sql_or_spec, str)
+        else view_sql_or_spec
+    )
+    compiler = IncrementalViewCompiler(schemas, spec, dialect=engine, ignore_limitations=True)
+    return {it.alias: it.agg_func for it in compiler.view.select_items}
+
+
+class AliasResolutionTests(unittest.TestCase):
+    def test_aliases_bind_to_each_engines_definition(self) -> None:
+        for engine, expected in _EXPECTED.items():
+            calls = {**expected, **_EXPLICIT}
+            sel = ", ".join(f"{fn}(x) AS a_{fn.lower()}" for fn in calls)
+            with self.subTest(engine=engine):
+                items = _compiled_items(f"CREATE VIEW v AS SELECT g, {sel} FROM t GROUP BY g;", engine)
+                for fn, agg in calls.items():
+                    self.assertEqual(items[f"a_{fn.lower()}"], agg, f"{engine} {fn}")
+
+    def test_case_and_spacing_do_not_change_the_binding(self) -> None:
+        items = _compiled_items(
+            "CREATE VIEW v AS SELECT g, variance (x) AS a, StdDev( x ) AS b FROM t GROUP BY g;",
+            "postgres:18",
+        )
+        self.assertEqual(items["a"], AggFunc.VAR_SAMP)
+        self.assertEqual(items["b"], AggFunc.STDDEV_SAMP)
+
+    def test_preparsed_spec_is_rebound_to_the_compile_target(self) -> None:
+        # parse_view_definition defaults to the SQLite dialect, where the
+        # aliases are undefined; compiling the same spec for another engine
+        # must bind the aliases to that engine, not to the parse dialect.
+        sql = "CREATE VIEW v AS SELECT g, VARIANCE(x) AS v, STDDEV(x) AS s FROM t GROUP BY g;"
+        spec = parse_view_definition(sql, known_tables={"t"})
+        for engine, var_f, std_f in (
+            ("postgres:18", AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
+            ("mysql:8.4", AggFunc.VAR_POP, AggFunc.STDDEV_POP),
+            ("mariadb:12.3", AggFunc.VAR_POP, AggFunc.STDDEV_POP),
+        ):
+            with self.subTest(engine=engine):
+                items = _compiled_items(spec, engine)
+                self.assertEqual((items["v"], items["s"]), (var_f, std_f))
+        mysql_spec = parse_view_definition(sql, known_tables={"t"}, dialect=Dialect.MYSQL)
+        items = _compiled_items(mysql_spec, "postgres:15")
+        self.assertEqual((items["v"], items["s"]), (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP))
+
+    def test_aliases_nested_in_expressions_and_having_are_bound(self) -> None:
+        sql = (
+            "CREATE VIEW v AS SELECT g, VARIANCE(x) * 2 AS v2 FROM t GROUP BY g "
+            "HAVING STDDEV(x) > 0;"
+        )
+        for engine, var_f, std_f in (
+            ("postgres:18", AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP),
+            ("mysql:8.4", AggFunc.VAR_POP, AggFunc.STDDEV_POP),
+        ):
+            with self.subTest(engine=engine):
+                dialect = Dialect.POSTGRES if engine.startswith("postgres") else Dialect.MYSQL
+                compiler = IncrementalViewCompiler(
+                    parse_table_schema(_SCHEMA, dialect=dialect),
+                    parse_view_definition(sql, known_tables={"t"}, dialect=dialect),
+                    dialect=engine,
+                    ignore_limitations=True,
+                )
+                funcs = {it.agg_func for it in compiler._working_select_items if it.is_aggregate}
+                self.assertIn(var_f, funcs)
+                self.assertIn(std_f, funcs)
+                wrong = {AggFunc.VAR_POP, AggFunc.STDDEV_POP} if var_f == AggFunc.VAR_SAMP else {
+                    AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP}
+                self.assertFalse(funcs & wrong, funcs)
+
+    def test_undefined_spellings_are_rejected_explicitly(self) -> None:
+        cases = [
+            ("postgres:18", "SELECT g, STD(x) AS s FROM t GROUP BY g"),
+            ("postgres:15", "SELECT g, STD(x) + 1 AS s FROM t GROUP BY g"),
+            ("postgres:18", "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING STD(x) > 0"),
+            ("postgres:18", "SELECT id, STD(x) OVER (PARTITION BY g) AS s FROM t"),
+            ("sqlite", "SELECT g, VARIANCE(x) AS v FROM t GROUP BY g"),
+            ("sqlite", "SELECT g, STDDEV(x) AS v FROM t GROUP BY g"),
+            ("sqlite", "SELECT g, STD(x) AS v FROM t GROUP BY g"),
+            ("sqlite", "SELECT g, COALESCE(VARIANCE(x), 0) AS v FROM t GROUP BY g"),
+            ("sqlite", "SELECT g FROM t WHERE x > (SELECT STDDEV(x) FROM t)"),
+        ]
+        for engine, select in cases:
+            for ignore in (False, True):
+                with self.subTest(engine=engine, select=select, ignore_limitations=ignore):
+                    dialect = Dialect.SQLITE if engine == "sqlite" else Dialect.POSTGRES
+                    with self.assertRaises(UnsupportedMaterializedViewError) as raised:
+                        generate_materialized_view(
+                            parse_table_schema(_SCHEMA, dialect=dialect),
+                            f"CREATE VIEW v AS {select};",
+                            dialect=engine,
+                            ignore_limitations=ignore,
+                        )
+                    self.assertIn("VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP", str(raised.exception))
+
+    def test_names_that_are_not_alias_calls_are_not_rejected(self) -> None:
+        schema = "CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, std DOUBLE PRECISION, variance TEXT);"
+        for engine, dialect in (("sqlite", Dialect.SQLITE), ("postgres:18", Dialect.POSTGRES)):
+            with self.subTest(engine=engine):
+                plan = generate_materialized_view(
+                    parse_table_schema(schema, dialect=dialect),
+                    "CREATE VIEW v AS SELECT g, SUM(std) AS std, COUNT(variance) AS n, "
+                    "MAX('STD(') AS lit FROM t GROUP BY g;",
+                    dialect=engine,
+                    ignore_limitations=True,
+                )
+                self.assertTrue(plan.view_name)
+
+    def test_sqlite_manager_rejects_before_creating_objects(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, x REAL)")
+            conn.commit()
+            manager = MaterializedViewManager(conn, dialect="sqlite")
+            conn.commit()
+            before = conn.execute("SELECT type, name FROM sqlite_master ORDER BY 1, 2").fetchall()
+            with self.assertRaises(UnsupportedMaterializedViewError):
+                manager.register_view("CREATE VIEW v AS SELECT g, VARIANCE(x) AS v FROM t GROUP BY g;")
+            conn.rollback()
+            after = conn.execute("SELECT type, name FROM sqlite_master ORDER BY 1, 2").fetchall()
+            self.assertEqual(before, after)
+        finally:
+            conn.close()
 
 
 class NativeResultRepresentationPlanTests(unittest.TestCase):
@@ -248,11 +412,12 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
         return version
 
     def _views(self, engine: Dialect, t: str) -> List[Tuple[str, str]]:
-        fns = list(_EXPLICIT)
+        fns = list(_EXPLICIT) + list(_NATIVE_ALIASES[engine])
         sel = ", ".join(f"{fn}(x) AS s_{fn.lower()}" for fn in fns)
         views = [("grouped", f"SELECT g, COUNT(x) AS n, {sel} FROM {t} GROUP BY g")]
-        # Every shape is checked with sample and population functions.
-        pairs = [("VAR_SAMP", "STDDEV_SAMP"), ("VAR_POP", "STDDEV_POP")]
+        # Every shape is checked with sample and population functions and with
+        # each alias pair the engine defines.
+        pairs = [("VAR_SAMP", "STDDEV_SAMP"), ("VAR_POP", "STDDEV_POP")] + _NATIVE_ALIAS_PAIRS[engine]
         for var_fn, std_fn in pairs:
             k = f"{var_fn}_{std_fn}".lower()
             views += [
