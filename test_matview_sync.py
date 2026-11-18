@@ -31,7 +31,7 @@ import sqlglot
 from sqlglot import exp as sqlglot_exp
 import struct
 import tempfile
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import warnings
 
 from matview_sync import (
@@ -8362,6 +8362,67 @@ class SchemaCoverageTracker:
         }
 
 
+def fuzz_campaign_config(
+    env: Optional[Mapping[str, str]] = None,
+    random_seed_source: Callable[[], int] = lambda: secrets.randbits(32),
+) -> Dict[str, Any]:
+    """Resolve the Suite 12 campaign parameters from environment variables.
+
+    ``MATVIEW_FUZZ_SCALE`` defaults to 2 under CI (``CI``/``GITHUB_ACTIONS``) and 1
+    elsewhere. Without ``MATVIEW_FUZZ_SEEDS`` the seed list is the fixed seeds of
+    that scale followed by ``MATVIEW_FUZZ_RANDOM_SEEDS`` (default ``2 * scale``)
+    fresh random seeds; ``MATVIEW_FUZZ_SEEDS`` replaces the whole list. Scenario
+    count, views per schema and mutations per scenario derive from the scale
+    unless set explicitly. A generated scenario depends on (seed, scenario index,
+    dialect, views, mutations), so replaying a seed needs the same views and
+    mutations; ``replay_command`` returns a command that pins all of them.
+    """
+    if env is None:
+        env = os.environ
+    is_ci = bool(env.get("CI") or env.get("GITHUB_ACTIONS"))
+    scale = max(1, int(env.get("MATVIEW_FUZZ_SCALE", "2" if is_ci else "1")))
+    seeds_env = env.get("MATVIEW_FUZZ_SEEDS")
+    if seeds_env:
+        seeds = [int(s.strip()) for s in seeds_env.split(",") if s.strip()]
+        rand_seeds: List[int] = []
+    else:
+        det_seeds = [20261106, 1337]
+        if scale > 1:
+            extra_det = [424242, 992138513, 987654321, 104729, 314159]
+            det_seeds.extend(extra_det[: min(len(extra_det), scale)])
+        num_rand = int(env.get("MATVIEW_FUZZ_RANDOM_SEEDS", str(2 * scale)))
+        rand_seeds = [random_seed_source() for _ in range(num_rand)]
+        seeds = det_seeds + rand_seeds
+
+    num_scenarios = max(1, int(env.get("MATVIEW_FUZZ_SCENARIOS", str(2 if scale == 1 else min(4, 1 + scale)))))
+    views_count = int(env.get("MATVIEW_FUZZ_VIEWS_PER_SCHEMA", str(60 if scale == 1 else min(80, 50 + scale * 10))))
+    mutations_count = int(env.get("MATVIEW_FUZZ_MUTATIONS", str(45 if scale == 1 else min(80, 40 + scale * 10))))
+    return {
+        "scale": scale,
+        "seeds": seeds,
+        "random_seeds": rand_seeds,
+        "scenarios_per_seed": num_scenarios,
+        "views_per_schema": views_count,
+        "mutations_per_scenario": mutations_count,
+    }
+
+
+def fuzz_replay_env(config: Mapping[str, Any], seeds: Sequence[int]) -> Dict[str, str]:
+    """Environment that makes ``fuzz_campaign_config`` reproduce ``config`` for ``seeds``."""
+    return {
+        "MATVIEW_FUZZ_SCALE": str(config["scale"]),
+        "MATVIEW_FUZZ_SCENARIOS": str(config["scenarios_per_seed"]),
+        "MATVIEW_FUZZ_VIEWS_PER_SCHEMA": str(config["views_per_schema"]),
+        "MATVIEW_FUZZ_MUTATIONS": str(config["mutations_per_scenario"]),
+        "MATVIEW_FUZZ_SEEDS": ",".join(str(int(s)) for s in seeds),
+    }
+
+
+def fuzz_replay_command(config: Mapping[str, Any], seeds: Sequence[int]) -> str:
+    env = fuzz_replay_env(config, seeds)
+    return " ".join(f"{k}={v}" for k, v in env.items()) + " python3 test_matview_sync.py --fuzz"
+
+
 def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
     """
     Suite 12: Extensive Multi-Order-of-Magnitude Differential Random SQL Fuzzer.
@@ -8369,26 +8430,16 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
     self-referential hierarchy trees, and multi-hop foreign keys), up to 80 random views
     across all 7 SQL families per schema, random seed datasets, and 45-80+ random DML
     and 3-level nested SAVEPOINT/ROLLBACK/COMMIT steps per scenario.
-    Runs both deterministic baseline seeds and fresh cryptographic random 32-bit seeds
-    (logged upfront for deterministic reproduction via MATVIEW_FUZZ_SEEDS=<seed>).
+    Runs deterministic baseline seeds and, unless MATVIEW_FUZZ_RANDOM_SEEDS=0, fresh
+    cryptographic random 32-bit seeds (logged upfront with a replay command that pins
+    the seed and every size parameter; see fuzz_campaign_config).
     """
-    is_ci = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
-    scale = max(1, int(os.environ.get("MATVIEW_FUZZ_SCALE", "2" if is_ci else "1")))
-    seeds_env = os.environ.get("MATVIEW_FUZZ_SEEDS")
-    if seeds_env:
-        seeds = [int(s.strip()) for s in seeds_env.split(",") if s.strip()]
-    else:
-        det_seeds = [20261106, 1337]
-        if scale > 1:
-            extra_det = [424242, 992138513, 987654321, 104729, 314159]
-            det_seeds.extend(extra_det[: min(len(extra_det), scale)])
-        num_rand = int(os.environ.get("MATVIEW_FUZZ_RANDOM_SEEDS", str(2 * scale)))
-        rand_seeds = [secrets.randbits(32) for _ in range(num_rand)]
-        seeds = det_seeds + rand_seeds
-
-    num_scenarios = max(1, int(os.environ.get("MATVIEW_FUZZ_SCENARIOS", str(2 if scale == 1 else min(4, 1 + scale)))))
-    views_count = int(os.environ.get("MATVIEW_FUZZ_VIEWS_PER_SCHEMA", str(60 if scale == 1 else min(80, 50 + scale * 10))))
-    mutations_count = int(os.environ.get("MATVIEW_FUZZ_MUTATIONS", str(45 if scale == 1 else min(80, 40 + scale * 10))))
+    config = fuzz_campaign_config()
+    scale = config["scale"]
+    seeds = config["seeds"]
+    num_scenarios = config["scenarios_per_seed"]
+    views_count = config["views_per_schema"]
+    mutations_count = config["mutations_per_scenario"]
 
     manifest_path = os.environ.get("MATVIEW_FUZZ_MANIFEST", "fuzz-campaign.json")
     manifest = {
@@ -8402,6 +8453,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
         "default_dialect": runner.default_dialect.value,
         "scale": scale,
         "seeds": seeds,
+        "random_seeds": config["random_seeds"],
         "scenarios_per_seed": num_scenarios,
         "views_per_schema": views_count,
         "mutations_per_scenario": mutations_count,
@@ -8451,7 +8503,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
 
     for s_val in seeds:
         current_seed = s_val
-        print(f"  [FUZZ SEED] seed={s_val} (reproduce with: MATVIEW_FUZZ_SEEDS={s_val} python3 test_matview_sync.py --fuzz)")
+        print(f"  [FUZZ SEED] seed={s_val} (reproduce with: {fuzz_replay_command(config, [s_val])})")
         fuzzer = DifferentialSQLFuzzer(seed=s_val)
         for sc_idx in range(1, num_scenarios + 1):
             current_scenario = sc_idx
