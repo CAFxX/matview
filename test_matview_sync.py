@@ -941,6 +941,115 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
 # -----------------------------------------------------------------------------
 
 
+def _is_expression_result_name(name: str) -> bool:
+    """Whether a result column name was derived from an unaliased expression."""
+    return any(ch in name for ch in "()*,+-/% '\"") or name.lower().startswith(("col_", "__matview_", "?column?"))
+
+
+def _driver_family(cur: Any) -> str:
+    module = type(cur).__module__.split(".")[0].lower()
+    if module.startswith("psycopg"):
+        return "postgres"
+    if module in ("pymysql", "mysqldb", "mysql"):
+        return "mysql"
+    return module
+
+
+# Known, unmodelled MySQL/MariaDB result metadata (open TODO item "Model
+# MySQL/MariaDB Result Nullability, DECIMAL Precision and String Length").
+# These fields are NOT compared on the MySQL family until fixed; every other
+# field is. Values, Python types, Decimal scale, type codes and DECIMAL scale
+# stay exact:
+#   - nullability (NOT_NULL flag / IS_NULLABLE) of materialized columns,
+#   - the precision (max digits) of DECIMAL aggregate/expression results
+#     (MySQL derives e.g. SUM(INT) as DECIMAL(32,0); the backing column uses 65),
+#   - the declared length and the meaningless "decimals" field of string
+#     expression results (VARCHAR(191) column vs the derived VARCHAR(16)).
+MYSQL_UNMODELLED_METADATA = ("null_ok", "decimal_precision", "string_length")
+_MYSQL_STRING_TYPE_CODES = (15, 252, 253, 254)
+
+
+def _result_description_mismatches(
+    family: str, mv_description: Optional[Sequence[Any]], live_description: Optional[Sequence[Any]]
+) -> List[str]:
+    """Compare DB-API result metadata of the reader and the live SELECT.
+
+    Column count always. Names when neither side is an unaliased expression
+    (engines name those differently). Type code, scale and nullability when
+    the driver reports them (SQLite drivers report None, so only row values
+    and Python types are compared there). Precision for every PostgreSQL
+    column (psycopg2 derives it from the type modifier, e.g. NUMERIC(18,4))
+    but not for MySQL/MariaDB: PyMySQL's precision of integer and floating
+    columns is the wire display width (BIGINT column 20 vs COUNT(*) 21,
+    DOUBLE column 22 vs SUM 23), not a result-type property, and DECIMAL
+    precision is a known unmodelled gap (MYSQL_UNMODELLED_METADATA).
+    """
+    if mv_description is None or live_description is None:
+        return [] if mv_description is live_description else ["result description missing on one side"]
+    if len(mv_description) != len(live_description):
+        return [f"column count differs (materialized={len(mv_description)}, live={len(live_description)})"]
+    out: List[str] = []
+    for index, (mv_col, live_col) in enumerate(zip(mv_description, live_description)):
+        mv_t, live_t = tuple(mv_col), tuple(live_col)
+        mv_name, live_name = str(mv_t[0]), str(live_t[0])
+        if (
+            mv_name.lower() != live_name.lower()
+            and not _is_expression_result_name(mv_name)
+            and not _is_expression_result_name(live_name)
+        ):
+            out.append(f"column {index} name differs (materialized={mv_name!r}, live={live_name!r})")
+        fields = [("type_code", 1), ("scale", 5), ("null_ok", 6)]
+        if family == "postgres":
+            fields.append(("precision", 4))
+        if family == "mysql":
+            # See MYSQL_UNMODELLED_METADATA.
+            fields.remove(("null_ok", 6))
+            if live_t[1] in _MYSQL_STRING_TYPE_CODES:
+                fields.remove(("scale", 5))
+        for field_name, pos in fields:
+            a = mv_t[pos] if len(mv_t) > pos else None
+            b = live_t[pos] if len(live_t) > pos else None
+            if a is None and b is None:
+                continue
+            if a != b:
+                out.append(f"column {index} ({live_name}) {field_name} differs (materialized={a!r}, live={b!r})")
+    return out
+
+
+def _value_representation(value: Any) -> Tuple[str, Any]:
+    """Python type plus, for Decimals, the exact digits and exponent."""
+    if isinstance(value, Decimal):
+        return ("Decimal", str(value))
+    return (type(value).__name__, None)
+
+
+def _result_representation_mismatches(
+    mv_rows: Sequence[Sequence[Any]], live_rows: Sequence[Sequence[Any]]
+) -> List[str]:
+    """Per-column multisets of value types and exact Decimal representations.
+
+    Row matching compares numbers numerically (it bridges int/Decimal/float
+    for the cross-engine comparisons); a native reader must also return the
+    same Python types and the same Decimal scale (`0` vs `0.0` is a visible
+    difference in text output and arithmetic) as the live query.
+    """
+    from collections import Counter
+
+    if not mv_rows or not live_rows or len(mv_rows[0]) != len(live_rows[0]):
+        return []
+    out: List[str] = []
+    for col in range(len(live_rows[0])):
+        mv_c = Counter(_value_representation(r[col]) for r in mv_rows)
+        live_c = Counter(_value_representation(r[col]) for r in live_rows)
+        if mv_c != live_c:
+            out.append(
+                f"column {col} value representations differ: "
+                f"materialized-only={sorted((mv_c - live_c).items())[:5]} "
+                f"live-only={sorted((live_c - mv_c).items())[:5]}"
+            )
+    return out
+
+
 def _verify_external_db_mv(cur, mv_name: str, select_sql: Any, context: str = "") -> None:
     if isinstance(select_sql, NoLiveView):
         if select_sql.view_name not in NO_LIVE_VIEW_EXCLUSIONS:

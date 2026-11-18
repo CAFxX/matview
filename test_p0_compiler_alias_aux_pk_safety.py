@@ -151,7 +151,9 @@ class TestCompilerAliasAuxPkSafety(unittest.TestCase):
             # runtime storage classes (e.g. TEXT '-0' vs INTEGER 0) are never
             # coerced on insert.
             (Dialect.SQLITE, "BLOB", "BLOB"),
-            (Dialect.POSTGRES, "BIGINT", "DOUBLE PRECISION"),
+            # PostgreSQL integer + integer is integer (int4), the native type
+            # of the DISTINCT value; other engines' integer arithmetic is 64-bit.
+            (Dialect.POSTGRES, "INTEGER", "DOUBLE PRECISION"),
             (Dialect.MYSQL, "BIGINT", "DOUBLE"),
         ):
             plan = generate_materialized_view(

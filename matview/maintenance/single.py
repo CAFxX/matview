@@ -2104,6 +2104,11 @@ class Tier1SingleMixin(MixinHost):
                     # the native result scale (PostgreSQL numeric_div scale).
                     first = self._avg_from_sum_count_sql(item, f"({val_e})", "1")
                     insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE {first} END)")
+                elif self.dialect == Dialect.POSTGRES:
+                    # One-row native AVG: keeps PostgreSQL's result type and
+                    # numeric scale (AVG(int) of 50 is 50.0000000000000000,
+                    # not the 50.0 of 1.0 * 50).
+                    insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE (SELECT AVG({val_e})) END)")
                 else:
                     insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 1.0 * ({val_e}) END)")
             elif item.agg_func in (AggFunc.VAR_POP, AggFunc.STDDEV_POP):
@@ -2119,6 +2124,11 @@ class Tier1SingleMixin(MixinHost):
                 insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE {zero} END)")
             elif item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP):
                 insert_vals.append("NULL")
+            elif item.agg_func in (AggFunc.BIT_AND, AggFunc.BIT_OR, AggFunc.BIT_XOR) and self.dialect == Dialect.MYSQL:
+                # MySQL bit aggregates are unsigned 64-bit: a one-row BIT_AND(-3)
+                # is 18446744073709551613, and a raw negative value is out of
+                # range for the BIGINT UNSIGNED column.
+                insert_vals.append(f"CAST(({val_e}) AS UNSIGNED)")
             elif item.agg_func in (AggFunc.MIN, AggFunc.MAX, AggFunc.BIT_AND, AggFunc.BIT_OR, AggFunc.BIT_XOR):
                 insert_vals.append(f"({val_e})")
             elif item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):

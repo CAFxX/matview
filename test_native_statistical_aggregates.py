@@ -50,6 +50,7 @@ from matview_sync import (
     parse_view_definition,
 )
 from matview.compiler import IncrementalViewCompiler
+import test_matview_sync as _shared_oracle
 
 _SCHEMA = "CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, x DOUBLE PRECISION);"
 
@@ -259,6 +260,7 @@ class NativeResultRepresentationPlanTests(unittest.TestCase):
             ("DECIMAL(12,3)", "SELECT g, COALESCE(STDDEV_POP(x), -1) AS a FROM t GROUP BY g", True),
             ("FLOAT(7,2)", "SELECT g, VAR_SAMP(x) + 1 AS a FROM t GROUP BY g", True),
             ("INT", "SELECT id, VAR_SAMP(x) OVER (PARTITION BY g) AS a FROM t", True),
+            ("DOUBLE", "SELECT id, STDDEV_POP(x) OVER (PARTITION BY g) AS a FROM t", True),
             ("INT", "SELECT g, VAR_SAMP(CAST(x AS DOUBLE)) * 2 AS a FROM t GROUP BY g", False),
             ("DOUBLE", "SELECT g, VAR_SAMP(x) * 2 AS a FROM t GROUP BY g", False),
             ("INT", "SELECT g, VAR_SAMP(x) AS a FROM t GROUP BY g", False),
@@ -321,29 +323,14 @@ def _description(cur) -> List[Tuple[Any, ...]]:
 
 
 def _metadata_mismatches(engine: Dialect, mv: Sequence[Any], live: Sequence[Any]) -> List[str]:
-    """Compare DB-API result metadata column by column.
+    """DB-API result metadata comparison shared with the main differential oracle.
 
-    Name, type code, scale and nullability are compared whenever the driver
-    reports them. Precision is compared for every PostgreSQL column (psycopg2
-    derives it from the type modifier) and for MySQL exact DECIMAL columns.
-    PyMySQL's precision of integer and floating columns is the wire display
-    width (BIGINT column 20 vs COUNT(*) 21, DOUBLE column 22 vs aggregate 23),
-    which is not part of the result type; those columns' types are compared
-    through the catalog (`_catalog_types`) instead.
+    See test_matview_sync._result_description_mismatches: type code and scale
+    always, precision on PostgreSQL, nullability where the driver reports it,
+    minus the documented MYSQL_UNMODELLED_METADATA gaps.
     """
-    out: List[str] = []
-    if len(mv) != len(live):
-        return [f"column count {len(mv)} != {len(live)}"]
-    for idx, (a, b) in enumerate(zip(mv, live)):
-        fields = [("name", 0), ("type_code", 1), ("scale", 5), ("null_ok", 6)]
-        if engine == Dialect.POSTGRES or b[1] in (0, 246):  # MySQL DECIMAL / NEWDECIMAL
-            fields.append(("precision", 4))
-        for name, pos in fields:
-            if a[pos] is None and b[pos] is None:
-                continue
-            if a[pos] != b[pos]:
-                out.append(f"column {idx} ({b[0]}) {name}: mv={a[pos]!r} live={b[pos]!r}")
-    return out
+    family = "postgres" if engine == Dialect.POSTGRES else "mysql"
+    return _shared_oracle._result_description_mismatches(family, mv, live)
 
 
 def _catalog_types(engine: Dialect, cur, view: str) -> List[Tuple[Any, ...]]:
@@ -361,7 +348,9 @@ def _catalog_types(engine: Dialect, cur, view: str) -> List[Tuple[Any, ...]]:
             "ORDER BY ORDINAL_POSITION",
             (view,),
         )
-        return [(r[0], _normalize_mysql_column_type(r[1])) + tuple(r[2:]) for r in cur.fetchall()]
+        # IS_NULLABLE (r[2]) is a documented unmodelled gap
+        # (test_matview_sync.MYSQL_UNMODELLED_METADATA).
+        return [(r[0], _normalize_mysql_column_type(r[1])) + tuple(r[3:]) for r in cur.fetchall()]
     return [tuple(r) for r in cur.fetchall()]
 
 
@@ -372,11 +361,16 @@ def _normalize_mysql_column_type(column_type: str) -> str:
     documented as cosmetic and deprecated, and MariaDB reports a floating
     expression's maximum printed length as `double(M,D)`. The fixed number of
     decimals D of a floating result is kept: MariaDB rounds VAR/STDDEV results
-    to it, so it is part of the result. Exact DECIMAL(P,S), character lengths,
-    signedness, nullability and collation are compared unchanged.
+    to it, so it is part of the result. DECIMAL scale,
+    signedness and collation are compared unchanged; nullability, DECIMAL
+    precision and string lengths are documented unmodelled gaps (above).
     """
     t = re.sub(r"^(tinyint|smallint|mediumint|int|bigint)\(\d+\)", r"\1", column_type)
-    return re.sub(r"^(float|double)\(\d+,(\d+)\)", r"\1(*,\2)", t)
+    t = re.sub(r"^(float|double)\(\d+,(\d+)\)", r"\1(*,\2)", t)
+    # Documented unmodelled gaps (test_matview_sync.MYSQL_UNMODELLED_METADATA):
+    # DECIMAL precision (the scale is kept) and string lengths.
+    t = re.sub(r"^decimal\(\d+,(\d+)\)", r"decimal(*,\1)", t)
+    return re.sub(r"^(varchar|char|varbinary|binary)\(\d+\)", r"\1(*)", t)
 
 
 _SEED = [
@@ -445,6 +439,11 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                     f"SELECT g, {var_fn}(CAST(x AS {double})) * 2 AS v2, "
                     f"COALESCE({std_fn}(CAST(x AS {double})), -1) AS sc FROM {t} GROUP BY g",
                 ),
+                (
+                    f"window_{k}",
+                    f"SELECT id, {var_fn}(x) OVER (PARTITION BY g) AS w, "
+                    f"{std_fn}(x) OVER (PARTITION BY g) AS sw FROM {t}",
+                ),
             ]
             if engine == Dialect.POSTGRES:
                 views.append((
@@ -501,8 +500,10 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                     expected.add("MYSQL_NO_TRUNCATE_TRIGGER")
                     if (
                         is_mariadb
-                        and name.startswith("nested_")
-                        and "DOUBLE" not in col_type.upper()
+                        and (
+                            name.startswith("window_")
+                            or (name.startswith("nested_") and "DOUBLE" not in col_type.upper())
+                        )
                     ):
                         # MariaDB fixes the decimals of VAR/STDDEV over exact
                         # inputs; nested in an expression they cannot be kept.
