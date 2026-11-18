@@ -31,6 +31,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import warnings
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Dict
 
@@ -38,6 +39,7 @@ import matview_sync as mv
 from matview_sync import (
     Dialect,
     EngineLimitationError,
+    EngineLimitationWarning,
     MaintenanceStrategy,
     MaterializedViewManager,
     PlanDiagnostics,
@@ -592,6 +594,72 @@ class TestCLIDiffCommand(unittest.TestCase):
             self.assertTrue(any("CREATE VIEW" in s for s in diff_view.pending_ddls))
         finally:
             mgr.conn.close()
+
+
+
+class TestCLICompileLimitationContract(unittest.TestCase):
+    """The compile entry point honours the limitation contract (ported from PR #60).
+
+    Default: exit 2, no SQL on stdout, every structured limitation code on
+    stderr. `--ignore-limitations`: exit 0, SQL emitted, and exactly one
+    EngineLimitationWarning carrying the same codes. The expected codes come
+    from the API's structured EngineLimitationError, not from CLI text.
+    """
+
+    SCHEMA = "CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, val INT);"
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter("always", EngineLimitationWarning)
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = cli_main(argv)
+        limitation_warnings = [w for w in emitted if issubclass(w.category, EngineLimitationWarning)]
+        return rc, out.getvalue(), err.getvalue(), limitation_warnings
+
+    def test_default_rejection_and_explicit_override(self) -> None:
+        cases = [
+            ("mysql:8.4", "CREATE VIEW v AS SELECT grp, COUNT(*) AS c FROM t GROUP BY grp;"),
+            ("mariadb:10.11", "CREATE VIEW v AS SELECT grp, VAR_SAMP(val) * 2 AS v2 FROM t GROUP BY grp;"),
+            ("postgres:18", "CREATE VIEW v AS SELECT grp, RANDOM() AS r FROM t;"),
+        ]
+        for dialect, view in cases:
+            with self.subTest(dialect=dialect, view=view):
+                with self.assertRaises(EngineLimitationError) as raised:
+                    generate_materialized_view(self.SCHEMA, view, dialect=dialect, ignore_limitations=False)
+                codes = {lim.code for lim in raised.exception.limitations}
+                self.assertTrue(codes)
+                self.assertNotIn("", codes)
+
+                rc, out, err, lims = self._run(["--schema", self.SCHEMA, "--view", view, "--dialect", dialect])
+                self.assertEqual(rc, 2)
+                self.assertEqual(out, "")
+                self.assertEqual(lims, [])
+                for code in codes:
+                    self.assertIn(f"[{code}]", err)
+
+                rc, out, err, lims = self._run(
+                    ["--schema", self.SCHEMA, "--view", view, "--dialect", dialect, "--ignore-limitations"]
+                )
+                self.assertEqual(rc, 0, err)
+                self.assertIn("CREATE", out)
+                self.assertEqual(len(lims), 1)
+                for code in codes:
+                    self.assertIn(code, str(lims[0].message))
+
+    def test_unsupported_statistical_alias_is_rejected_even_with_override(self) -> None:
+        for dialect, view in (
+            ("sqlite", "CREATE VIEW v AS SELECT grp, VARIANCE(val) AS v FROM t GROUP BY grp;"),
+            ("postgres:15", "CREATE VIEW v AS SELECT grp, STD(val) AS s FROM t GROUP BY grp;"),
+        ):
+            for extra in ([], ["--ignore-limitations"]):
+                with self.subTest(dialect=dialect, extra=extra):
+                    rc, out, err, _ = self._run(
+                        ["--schema", self.SCHEMA, "--view", view, "--dialect", dialect, *extra]
+                    )
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(out, "")
+                    self.assertIn("VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP", err)
 
 
 if __name__ == "__main__":
