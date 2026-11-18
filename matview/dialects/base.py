@@ -26,6 +26,7 @@ from ..engines import (
 from ..logical_ir import ColumnDef, JoinSpec, SelectItem, TableSchema, ViewSpec
 from ..sql_frontend import (
     _has_subquery_ast,
+    _parse_single_agg_expr,
     _is_simple_column_expr,
     _is_word_or_ident_token,
     _sanitize_ident,
@@ -194,6 +195,11 @@ class DialectBaseMixin(MixinHost):
             if source is not None and _sqlite_type_affinity(source_type) == "REAL":
                 return "REAL"
             return "BLOB"
+        if not source_type and self.dialect == Dialect.POSTGRES and item.arg_expr:
+            # An expression argument (SUM(a * b), SUM(CASE ... THEN 1 ELSE 0
+            # END)) has the native type of the expression; classify it like a
+            # column of that type.
+            source_type = (self._infer_ast_expr_storage_type(item.arg_expr) or "").upper()
         if not source_type:
             exact_type = self._exact_numeric_precision_scale(item.arg_expr or "")
             if exact_type is not None:
@@ -470,6 +476,19 @@ class DialectBaseMixin(MixinHost):
                 scale = len(fraction) if dot else 0
                 precision = max(1, len((whole + fraction).lstrip("0")), scale)
                 return precision, min(self._max_decimal_scale(), scale)
+            if kind in ("Sum", "Min", "Max") and node.this is not None and not node.find(sqlglot_exp.Window):
+                # MySQL SUM over an exact argument is DECIMAL with the
+                # argument's scale (precision p + 22); MIN/MAX keep the type.
+                arg = node.this.this if isinstance(node.this, sqlglot_exp.Distinct) else node.this
+                if isinstance(node.this, sqlglot_exp.Distinct):
+                    exprs = node.this.expressions
+                    arg = exprs[0] if exprs else None
+                inner = infer(arg) if arg is not None else None
+                if inner is None:
+                    return None
+                if kind == "Sum":
+                    return min(65, inner[0] + 22), inner[1]
+                return inner
             if kind in ("Paren", "Neg", "Abs", "Floor", "Ceil", "Ceiling", "Sign", "Trunc"):
                 return infer(node.this)
             if kind == "Cast":
@@ -482,10 +501,11 @@ class DialectBaseMixin(MixinHost):
                 p1, s1 = left
                 p2, s2 = right
                 if kind == "Mod":
-                    # The remainder is bounded by the operands and keeps the
-                    # larger scale (integer % integer is an integer).
-                    return max(p1, p2), max(s1, s2)
-                if kind in ("Add", "Sub"):
+                    # MySQL/MariaDB MOD keeps the larger scale and the larger
+                    # integer part (DECIMAL(12,3) % 2 is DECIMAL(12,3)).
+                    scale = max(s1, s2)
+                    precision = max(p1 - s1, p2 - s2) + scale
+                elif kind in ("Add", "Sub"):
                     scale = max(s1, s2)
                     precision = max(p1 - s1, p2 - s2) + scale + 1
                 elif kind == "Mul":
@@ -742,7 +762,7 @@ class DialectBaseMixin(MixinHost):
                         proj_e = inner_query.expressions[idx_h]
                         src_e = proj_e.this if isinstance(proj_e, sqlglot_exp.Alias) else proj_e
                         if isinstance(src_e, sqlglot_exp.Literal):
-                            return self._float_type() if "." in str(src_e.this) else self._int_type()
+                            return self._literal_storage_type(src_e)
                         c_src = self._lookup_col_def(src_e.sql().strip())
                         if c_src:
                             return self._normalize_dialect_type(c_src.data_type)
@@ -751,7 +771,7 @@ class DialectBaseMixin(MixinHost):
                 if c_name.lower() == ident.lower():
                     src_node = proj.this if isinstance(proj, sqlglot_exp.Alias) else proj
                     if isinstance(src_node, sqlglot_exp.Literal):
-                        return self._float_type() if "." in str(src_node.this) else self._int_type()
+                        return self._literal_storage_type(src_node)
                     src_col = src_node.name or src_node.sql().strip()
                     c_src = self._lookup_col_def(src_col)
                     if c_src:
@@ -852,6 +872,11 @@ class DialectBaseMixin(MixinHost):
         }
         str_fn_names = {"UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM", "SUBSTR", "SUBSTRING", "CONCAT", "CONCAT_WS", "REPLACE"}
         int_fn_names = {"LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "INSTR", "STRPOS"}
+        agg_fn_names = {
+            "COUNT", "SUM", "TOTAL", "AVG", "MIN", "MAX", "VAR_POP", "VAR_SAMP", "STDDEV_POP",
+            "STDDEV_SAMP", "VARIANCE", "STDDEV", "STD", "BIT_AND", "BIT_OR", "BIT_XOR",
+            "BOOL_AND", "BOOL_OR", "EVERY",
+        }
 
         def canonical_type(data_type: str) -> Optional[str]:
             upper = re.sub(r"\s*\(.*\)\s*$", "", data_type.upper()).strip()
@@ -945,6 +970,17 @@ class DialectBaseMixin(MixinHost):
                 return None
             if kind in ("Neg", "Positive"):
                 return infer(node.this)
+            if kind == "Window":
+                inner = node.this
+                inner_kind = inner.__class__.__name__ if inner is not None else ""
+                if inner_kind in ("RowNumber", "Rank", "DenseRank", "Ntile", "Count"):
+                    return "BIGINT"
+                if inner_kind in ("PercentRank", "CumeDist"):
+                    return "DOUBLE PRECISION"
+                if inner is not None and inner_kind in ("Lag", "Lead", "FirstValue", "LastValue", "NthValue"):
+                    return infer(inner.this)
+                win_t = self._window_aggregate_storage_type(node.sql(_sqlglot_dialect(self.dialect)))
+                return canonical_type(win_t) if win_t else None
             if kind == "Cast":
                 target = node.args.get("to")
                 return canonical_type(target.sql()) if target is not None else None
@@ -984,7 +1020,15 @@ class DialectBaseMixin(MixinHost):
                     # MySQL/MariaDB DIV: integer result (BIGINT on MySQL;
                     # MariaDB's width rule is applied below).
                     return "BIGINT" if merged in ("SMALLINT", "INTEGER", "BIGINT") else None
-                if kind in ("Add", "Sub", "Mul") and merged in ("SMALLINT", "INTEGER"):
+                if (
+                    kind in ("Add", "Sub", "Mul")
+                    and merged in ("SMALLINT", "INTEGER")
+                    and self.dialect != Dialect.POSTGRES
+                ):
+                    # PostgreSQL integer operators keep the wider operand type
+                    # (int4 + int4 is int4, overflow raises); other engines'
+                    # integer arithmetic is 64-bit (MariaDB's width rule is
+                    # applied below).
                     return "BIGINT"
                 if merged == "REAL":
                     return "DOUBLE PRECISION"
@@ -1023,6 +1067,18 @@ class DialectBaseMixin(MixinHost):
                             return "BIGINT"
                         return "NUMERIC"
                     return None
+            if isinstance(node, sqlglot_exp.AggFunc) or (
+                kind == "Anonymous" and node.name.upper() in agg_fn_names
+            ):
+                # An aggregate inside a larger expression has the same result
+                # type as the projected aggregate (e.g. PostgreSQL
+                # 1.0 * SUM(int) is NUMERIC, not DOUBLE PRECISION).
+                agg_item = _parse_single_agg_expr(
+                    node.sql(_sqlglot_dialect(self.dialect)), "__agg", dialect=self.dialect
+                )
+                if agg_item is None or agg_item.agg_func is None:
+                    return None
+                return canonical_type(self._infer_expr_storage_type(agg_item))
             if isinstance(node, sqlglot_exp.Func):
                 fn_name = (node.sql_name() or kind).upper()
                 if fn_name in str_fn_names:
@@ -1041,6 +1097,8 @@ class DialectBaseMixin(MixinHost):
             # with the argument's scale (AVG: plus div_precision_increment);
             # 65 digits hold every such value.
             return f"DECIMAL(65, {inferred.split(':', 1)[1]})"
+        if inferred == "TEXT" and self.dialect == Dialect.POSTGRES:
+            return self._pg_string_result_type(root) or "TEXT"
         if inferred == "NUMERIC":
             if self.dialect == Dialect.POSTGRES:
                 return "NUMERIC"
@@ -1065,6 +1123,132 @@ class DialectBaseMixin(MixinHost):
         return self._normalize_dialect_type(inferred)
 
 
+    def _literal_storage_type(self, literal: Any) -> str:
+        """Storage type of a CTE/derived-table column defined by a bare literal.
+
+        PostgreSQL types an integer literal as integer (bigint/numeric only
+        when out of range) and a decimal literal as numeric; a string literal
+        resolves to text. Other engines keep the previous mapping.
+        """
+        text = str(literal.this)
+        if self.dialect == Dialect.POSTGRES:
+            if literal.args.get("is_string"):
+                return "TEXT"
+            if re.fullmatch(r"[+-]?\d+", text):
+                n = int(text)
+                if -(2 ** 31) <= n < 2 ** 31:
+                    return "INTEGER"
+                return "BIGINT" if -(2 ** 63) <= n < 2 ** 63 else "NUMERIC"
+            return "DOUBLE PRECISION" if "e" in text.lower() else "NUMERIC"
+        if (
+            self.subdialect == EngineSubdialect.MARIADB
+            and re.fullmatch(r"[+-]?\d+", text)
+            and -(2 ** 31) <= int(text) < 2 ** 31
+        ):
+            # MariaDB types a small integer literal column as INT (a recursive
+            # CTE's `0` seed column is INT; checked natively).
+            return "INT"
+        return self._float_type() if "." in text else self._int_type()
+
+    def _pg_string_result_type(self, node: Any) -> Optional[str]:
+        """PostgreSQL type of a string-valued COALESCE/CASE/NULLIF expression.
+
+        Untyped string literals adopt the type of the first typed branch with
+        its modifier dropped (COALESCE(varchar(32), 'x') is character varying,
+        COALESCE(char(3), 'x') is bpchar); string functions return text; all
+        literal branches resolve to text.
+        """
+        kind = node.__class__.__name__
+        if kind == "Paren":
+            return self._pg_string_result_type(node.this)
+        if kind == "Literal":
+            return None
+        if kind == "Null":
+            return None
+        if kind == "Column":
+            col = self._lookup_col_def(node.sql()) or self._lookup_col_def(node.name)
+            if col is None:
+                return "TEXT"
+            base = re.sub(r"\s*\(.*\)\s*$", "", col.data_type.strip().upper())
+            if base in ("VARCHAR", "CHARACTER VARYING"):
+                return "VARCHAR"
+            if base in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
+                return "BPCHAR"
+            return "TEXT"
+        if kind == "Cast":
+            target = node.args.get("to")
+            return self._pg_string_result_type_from_name(target.sql() if target is not None else "")
+        branches: List[Any] = []
+        if kind in ("Coalesce", "IfNull"):
+            branches = list(node.iter_expressions())
+        elif kind == "Nullif":
+            branches = [node.this]
+        elif kind == "Case":
+            branches = [b.args.get("true") for b in (node.args.get("ifs") or ())]
+            branches.append(node.args.get("default"))
+        elif kind == "If":
+            branches = [node.args.get("true"), node.args.get("false")]
+        else:
+            return "TEXT"
+        for branch in branches:
+            if branch is None:
+                continue
+            t = self._pg_string_result_type(branch)
+            if t is not None:
+                return t
+        return None
+
+    @staticmethod
+    def _pg_string_result_type_from_name(type_name: str) -> str:
+        base = re.sub(r"\s*\(.*\)\s*$", "", type_name.strip().upper())
+        if base in ("VARCHAR", "CHARACTER VARYING"):
+            return "VARCHAR"
+        if base in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
+            return "BPCHAR"
+        return "TEXT"
+
+    def _is_case_over_int_literals(self, expr: str) -> bool:
+        try:
+            root = parse_sql_ast(_unwrap_outer_parens(expr, dialect=self.dialect), dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return False
+        if not isinstance(root, sqlglot_exp.Case):
+            return False
+        values = [b.args.get("true") for b in (root.args.get("ifs") or ())] + [root.args.get("default")]
+
+        def small_int(v: Any) -> bool:
+            if isinstance(v, sqlglot_exp.Neg):
+                v = v.this
+            return (
+                isinstance(v, sqlglot_exp.Literal)
+                and not v.args.get("is_string")
+                and re.fullmatch(r"\d+", str(v.this)) is not None
+                and int(str(v.this)) < 2 ** 31
+            )
+
+        return all(small_int(v) for v in values if v is not None)
+
+    def _window_aggregate_storage_type(self, expr: str) -> Optional[str]:
+        """Storage type of `<aggregate>(...) OVER (...)`: the aggregate's own result type.
+
+        An aggregate used as a window function returns the same type as the
+        plain aggregate (SUM(int) is BIGINT/NUMERIC/DECIMAL, VAR_SAMP(int) is
+        NUMERIC on PostgreSQL, MIN/MAX keep the argument type), so the
+        verified aggregate inference is reused. Ranking/offset window
+        functions are not aggregates and return None.
+        """
+        try:
+            node = parse_sql_ast(_unwrap_outer_parens(expr, dialect=self.dialect), dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None
+        if not isinstance(node, sqlglot_exp.Window) or node.this is None:
+            return None
+        inner_sql = node.this.sql(_sqlglot_dialect(self.dialect))
+        agg_item = _parse_single_agg_expr(inner_sql, "__w", dialect=self.dialect)
+        if agg_item is None or agg_item.agg_func is None:
+            return None
+        return self._infer_expr_storage_type(agg_item)
+
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
         if not item.is_aggregate:
             c_def = self._lookup_col_def(item.raw_expr)
@@ -1073,6 +1257,19 @@ class DialectBaseMixin(MixinHost):
             cte_t = self._infer_cte_or_subquery_col_type(item.raw_expr)
             if cte_t:
                 return cte_t
+            window_t = self._window_aggregate_storage_type(item.raw_expr)
+            if window_t is not None:
+                return window_t
+            if (
+                self.dialect == Dialect.MYSQL
+                and self.subdialect != EngineSubdialect.MARIADB
+                and self.view.group_by_cols
+                and self._is_case_over_int_literals(item.raw_expr)
+            ):
+                # MySQL sends a CASE over small integer literals as BIGINT when
+                # projected directly but as INT once grouped through a
+                # temporary table (both checked natively).
+                return "INT"
             # Remove only balanced outer parentheses before applying the simple
             # expression-type heuristics below. CASE expressions emitted by the
             # AST generators are parenthesized, and leaving those wrappers in
@@ -1152,11 +1349,35 @@ class DialectBaseMixin(MixinHost):
                         return self._int_type()
                 return self._float_type()
             return "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
+        if item.agg_func is None and item.raw_expr and self.dialect == Dialect.SQLITE:
+            # A compound aggregate expression's SQLite storage class is chosen
+            # per value at run time (COALESCE(SUM(int), 0) is INTEGER, with a
+            # REAL input it is REAL); a column without affinity keeps it.
+            return "BLOB"
+        if item.agg_func is None and item.raw_expr and self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+            # A compound expression over aggregates (COALESCE(SUM(x), 0),
+            # 1.0 * SUM(x), ...): type it from its AST, aggregates included.
+            # (Validated natively on PostgreSQL; MySQL/SQLite keep the
+            # previous inference until their native result types are modelled.)
+            compound_t = self._infer_ast_expr_storage_type(_unwrap_outer_parens(item.raw_expr, dialect=self.dialect))
+            if compound_t is not None:
+                return compound_t
         if item.agg_func in (
             AggFunc.BIT_AND,
             AggFunc.BIT_OR,
             AggFunc.BIT_XOR,
         ):
+            if self.dialect == Dialect.POSTGRES and item.arg_expr:
+                # PostgreSQL's bit aggregates return their argument's integer
+                # type (bit_and(int4) is int4).
+                c_def = self._lookup_col_def(item.arg_expr)
+                arg_t = (
+                    c_def.data_type if c_def else (self._infer_ast_expr_storage_type(item.arg_expr) or "")
+                ).strip().upper()
+                if arg_t in ("SMALLINT", "INT2"):
+                    return "SMALLINT"
+                if arg_t in ("INTEGER", "INT", "INT4", "SERIAL"):
+                    return "INTEGER"
             return "BIGINT UNSIGNED" if self.dialect == Dialect.MYSQL else self._int_type()
         if item.agg_func in (
             AggFunc.COUNT_STAR,
@@ -1194,7 +1415,7 @@ class DialectBaseMixin(MixinHost):
                 return "BLOB"
             c_def = self._lookup_col_def(item.arg_expr)
             if c_def:
-                return self._normalize_dialect_type(c_def.data_type)
+                return self._minmax_result_type(self._normalize_dialect_type(c_def.data_type))
             arg_inferred = self._infer_expr_storage_type(
                 SelectItem(raw_expr=item.arg_expr, alias=item.alias, is_aggregate=False)
             )
@@ -1205,7 +1426,7 @@ class DialectBaseMixin(MixinHost):
                 # column) is BIGINT even where the expression itself is INT.
                 return "BIGINT"
             if arg_inferred:
-                return arg_inferred
+                return self._minmax_result_type(arg_inferred)
         if self.dialect == Dialect.SQLITE and item.agg_func is None:
             # Compound aggregate expressions (e.g. COUNT(*) + 1, COALESCE(MAX(x), 0))
             # have no affinity in SQLite live views; falling through to REAL would
@@ -1228,6 +1449,47 @@ class DialectBaseMixin(MixinHost):
             f"AND {e} >= -9223372036854775808.0 AND {e} < 9223372036854775808.0 "
             f"AND CAST({e} AS INTEGER) = {e} THEN CAST({e} AS INTEGER) ELSE {e} END)"
         )
+
+    def _minmax_result_type(self, arg_type: str) -> str:
+        """MIN/MAX result type for an argument type.
+
+        PostgreSQL's MIN/MAX are declared over unmodified base types, so the
+        result drops the argument's type modifier and character types resolve
+        to their aggregate's type: numeric(12,3) -> numeric, varchar(10) ->
+        text, char(5) -> bpchar, timestamp(0) -> timestamp. MySQL/MariaDB and
+        SQLite keep the argument type.
+        """
+        if (
+            self.dialect == Dialect.MYSQL
+            and self.subdialect != EngineSubdialect.MARIADB
+            and (self.raw_view.has_cte or self.raw_view.has_subquery_in_from)
+            and re.match(r"^\s*(TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER)\b", arg_type, re.I)
+            and "UNSIGNED" not in arg_type.upper()
+        ):
+            # MySQL widens MIN/MAX of a signed integer column read through a
+            # CTE or derived table to BIGINT (checked natively).
+            return "BIGINT"
+        if self.dialect != Dialect.POSTGRES:
+            return arg_type
+        u = re.sub(r"\s+", " ", arg_type.strip().upper())
+        base = re.sub(r"\s*\([^)]*\)", "", u).strip()
+        if base in ("NUMERIC", "DECIMAL", "DEC"):
+            return "NUMERIC"
+        if base in ("VARCHAR", "CHARACTER VARYING", "TEXT"):
+            return "TEXT"
+        if base in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
+            return "BPCHAR"
+        if base in ("TIMESTAMP", "TIMESTAMP WITHOUT TIME ZONE"):
+            return "TIMESTAMP"
+        if base in ("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"):
+            return "TIMESTAMPTZ"
+        if base in ("TIME", "TIME WITHOUT TIME ZONE"):
+            return "TIME"
+        if base in ("TIMETZ", "TIME WITH TIME ZONE"):
+            return "TIMETZ"
+        if base.startswith("INTERVAL"):
+            return "INTERVAL"
+        return arg_type
 
     def _null_safe_eq(self, left_expr: str, right_expr: str, is_nullable: bool = True) -> str:
         if not is_nullable:

@@ -154,7 +154,8 @@ class PlannerMixin(MixinHost):
                             "inputs and rounds them in results; column(s) "
                             f"{', '.join(decimals_issues)} use such a result inside a larger expression "
                             "(or over an argument whose numeric family cannot be derived), whose native "
-                            "decimals the materialized column cannot reproduce."
+                            "decimals the materialized column cannot reproduce; as window functions their "
+                            "row-order-dependent accumulation cannot be reproduced either."
                         ),
                         mitigation=(
                             "Project the VAR/STDDEV aggregate as its own column over a typed column, or "

@@ -225,7 +225,15 @@ class Tier1UnionAllAggMixin(MixinHost):
                                 else:
                                     b_types.append(self._float_type())
                         if b_types and all("INT" in bt.upper() for bt in b_types):
-                            storage_type = self._int_type() if item.agg_func == AggFunc.SUM else b_types[0]
+                            if item.agg_func != AggFunc.SUM:
+                                storage_type = b_types[0]
+                            elif self.dialect == Dialect.MYSQL:
+                                # MySQL SUM of an exact argument is DECIMAL.
+                                storage_type = "DECIMAL(65, 0)"
+                            elif self.dialect == Dialect.POSTGRES and any("BIGINT" in bt.upper() for bt in b_types):
+                                storage_type = "NUMERIC"
+                            else:
+                                storage_type = self._int_type()
                 if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
                     storage_type = "VARCHAR(255)"
                 if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):

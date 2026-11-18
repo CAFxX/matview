@@ -97,7 +97,8 @@ class MySQLDialectMixin(MixinHost):
         propagate through MariaDB's expression typing and determine the
         rounding clients observe; the materialized expression over a stored
         DOUBLE does not carry them. Only non-fixed (approximate-input) results
-        are safe there.
+        are safe there, and not as window functions: MariaDB's window
+        VAR/STDDEV accumulation is row-order dependent.
         """
         stat_funcs = {"VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "STDDEV", "STD"}
         stat_aggs = (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
@@ -127,6 +128,13 @@ class MySQLDialectMixin(MixinHost):
                             close = j
                             break
                 call = it.raw_expr[toks[idx].start : toks[close].end + 1] if close != -1 else ""
+                if close != -1 and close + 1 < len(toks) and toks[close + 1].text.upper() == "OVER":
+                    # MariaDB evaluates window VAR/STDDEV with a different,
+                    # row-order-dependent accumulation than the materializing
+                    # statement can reproduce (1-ULP differences observed over
+                    # DOUBLE), whatever the argument type.
+                    issues.append(it.alias)
+                    break
                 parsed = _parse_single_agg_expr(call, "__v", dialect=Dialect.MYSQL) if call else None
                 if (
                     parsed is None

@@ -72,7 +72,10 @@ class TestExprStorageTypeInference(unittest.TestCase):
             ddl = plan.backing_table_ddl.upper()
             if dialect == Dialect.POSTGRES:
                 self.assertIn("CHOSEN_INT INTEGER", ddl)
-                self.assertIn("CHOSEN_TAG TEXT", ddl)
+                # tag is VARCHAR(32): PostgreSQL resolves the untyped 'default'
+                # literal to the typed branch, giving character varying (no
+                # length), not text (checked natively).
+                self.assertIn("CHOSEN_TAG VARCHAR,", ddl)
                 self.assertIn("CHOSEN_REAL DOUBLE PRECISION", ddl)
             elif dialect == Dialect.SQLITE:
                 self.assertIn("CHOSEN_INT BLOB", ddl)
