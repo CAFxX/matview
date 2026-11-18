@@ -6,6 +6,8 @@ reserved keywords ('order', 'group', 'user', 'select', 'where', 'key', 'from', '
 """
 
 import sqlite3
+import sys
+
 import pytest
 from matview_sync import (
     Dialect,
@@ -387,4 +389,5 @@ def test_postgres_and_mysql_transpiled_quoting():
 
 
 if __name__ == "__main__":
-    pytest.main(["-v", __file__])
+    # Propagate the result: CI runs this file as `python3 test_p1_quote_identifiers.py`.
+    sys.exit(pytest.main(["-v", __file__]))
