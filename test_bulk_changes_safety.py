@@ -804,6 +804,43 @@ class _NativeBase:
                 cur.execute(f"ALTER TABLE {self.prefix}hidden RENAME TO {catalog}")
         self._assert_maintained_by_other_session(130)
 
+    def test_refresh_waits_for_concurrent_maintained_writer(self) -> None:
+        """An independent writer holds an uncommitted, trigger-maintained
+        write; the bulk session must wait for it (positive lock-wait evidence)
+        and the result must be exact after both commit."""
+        from test_avg_concurrent_maintenance import _session_id, _wait_until_lock_waiting
+
+        writer = self._connect()
+        monitor = self._connect(autocommit=self.engine == Dialect.POSTGRES)
+        bulk_sid = _session_id(self.engine, self.conn)
+        writer_sid = _session_id(self.engine, writer)
+        with writer.cursor() as cur:
+            cur.execute(f"INSERT INTO {self.table} VALUES (60, 'a', 6)")
+        done = threading.Event()
+        errors: List[BaseException] = []
+
+        def run_bulk() -> None:
+            try:
+                with self.manager.bulk_changes():
+                    self._write(f"INSERT INTO {self.table} VALUES (61, 'b', 7)")
+            except BaseException as exc:  # reported below
+                errors.append(exc)
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=run_bulk, daemon=True)
+        thread.start()
+        try:
+            _wait_until_lock_waiting(self.engine, monitor, bulk_sid, done, blocker_sid=writer_sid)
+        finally:
+            writer.commit()
+            thread.join(60)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIn((60, "a", 6), self._rows())
+        self.assertIn((61, "b", 7), self._rows())
+        self._assert_exact()
+
 
 class NativePostgresBulkChangesTests(_NativeBase, unittest.TestCase):
     engine = Dialect.POSTGRES

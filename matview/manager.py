@@ -684,17 +684,18 @@ class MaterializedViewManager:
     def get_catalog(self) -> Dict[str, Dict[str, Any]]:
         return self._read_catalog()
 
-    def _read_catalog(self, required: bool = False) -> Dict[str, Dict[str, Any]]:
-        """Read the catalog. With ``required`` an unreadable catalog raises
-        instead of reading as empty (callers that suspend maintenance must
-        know every view)."""
+    def _read_catalog(self, lock_clause: str = "", required: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Read the catalog; ``lock_clause`` (e.g. MySQL ``LOCK IN SHARE MODE``)
+        makes it a locking read, which does not open a consistent snapshot.
+        With ``required`` an unreadable catalog raises instead of reading as
+        empty (callers that suspend maintenance must know every view)."""
         with self._cursor() as cur:
             rows = self._catalog_select(
                 cur,
                 f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
                 f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
                 f"backfill_cursor_pk, backfill_max_pk, backfill_active "
-                f"FROM {self.catalog_table}",
+                f"FROM {self.catalog_table}{lock_clause}",
             )
             has_wm_cols = rows is not None
             if rows is None:
@@ -702,7 +703,7 @@ class MaterializedViewManager:
                     cur,
                     f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
                     f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
-                    f"FROM {self.catalog_table}",
+                    f"FROM {self.catalog_table}{lock_clause}",
                 )
                 if rows is None:
                     if required:
@@ -2375,7 +2376,14 @@ class MaterializedViewManager:
             cur = self.conn.cursor()
             try:
                 self._begin_bulk_transaction(cur)
-                catalog = self._read_catalog(required=True)
+                # On MySQL/MariaDB a locking read: a plain SELECT would open
+                # the transaction's consistent snapshot here, and with
+                # MariaDB's innodb_snapshot_isolation the refresh would then
+                # fail (error 1020) on every backing row a concurrent writer
+                # committed in the meantime.
+                catalog = self._read_catalog(
+                    " LOCK IN SHARE MODE" if self.dialect == Dialect.MYSQL else "", required=True
+                )
                 if view_names:
                     resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
                     unknown = [n for n, r in zip(view_names, resolved) if r not in catalog]
