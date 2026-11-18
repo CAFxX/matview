@@ -1,6 +1,6 @@
 name: CI — Multi-Engine Materialized View Tests
 
-# Matrix policy — keep this block and ci-deferred.yml in sync.
+# Matrix policy — keep this block, ci-deferred.yml and ci-extended.yml in sync.
 #
 # PR-gate selection criteria:
 # - Every row must exercise a distinct engine implementation, a materially
@@ -9,7 +9,7 @@ name: CI — Multi-Engine Materialized View Tests
 #   their behavior can differ. Keep one representative for each genuinely
 #   distinct engine family; do not build a Cartesian product of every engine,
 #   engine version, Python version, driver version, and distribution.
-# - Run the full deterministic suite and normal-scale fuzz campaign for every
+# - Run the full deterministic suite and the fixed-seed fuzz campaign for every
 #   PR-gate row. The stable CI success job aggregates only these required jobs.
 #
 # PR-gate dimensions:
@@ -31,8 +31,24 @@ name: CI — Multi-Engine Materialized View Tests
 #   vendor-build checks, not repeated for every upstream major. TimescaleDB,
 #   PostGIS, and pgvector images are excluded from CI until tests actually create
 #   and exercise their extensions; image startup alone is not extension coverage.
-# - Fuzzing: normal-scale differential fuzzing remains in every full-suite job.
-#   Scale-3 stress campaigns are deferred weekly, not repeated on each PR.
+# - Fuzzing: every full-suite job runs a fixed-seed differential fuzz campaign
+#   (the workflow-level MATVIEW_FUZZ_* env below): seeds 20261106 and 1337,
+#   scenarios 1-2, 70 views and 60 mutations per scenario, no random seeds.
+#   Views/mutations are pinned to the scale-2 sizes so each gate (seed,
+#   scenario) is identical to the one the former scale-2 gate campaign ran;
+#   every deterministic fuzz catch in CI history came from seed 20261106
+#   scenario 1. The gate's fuzz campaign is therefore deterministic: a fuzz
+#   failure reproduces from the tested revision, not from a fresh random seed
+#   (concurrency flakes are a separate problem). The permanent
+#   fuzz regression corpus (Suite 13) and all deterministic suites are
+#   unchanged.
+# - Random-seed fuzzing moved to ci-extended.yml (not a required check; push to
+#   master, nightly, on demand): the scale-2 campaign (4 fixed seeds incl.
+#   424242 and 992138513, scenario 3, plus 4 random seeds) on SQLite, PostgreSQL
+#   18, MySQL 8.4 and MariaDB 12.3. A failure there uploads the failing seeds
+#   with a replay command and opens or updates one GitHub issue; each confirmed
+#   failure is added to the Suite 13 corpus in its fix PR. Scale-3 stress
+#   campaigns stay in ci-deferred.yml weekly.
 #
 # Dependency and environment dimensions:
 # - requirements.txt declares packaging>=23.0, sqlglot>=25.0.0, psycopg2-binary>=2.9.9 and
@@ -57,6 +73,9 @@ name: CI — Multi-Engine Materialized View Tests
 # SQLite3MC and sqlean; minimum declared Python dependency versions; and all
 # six scale-3 fuzz campaigns. Extensions without feature tests are excluded,
 # not deferred.
+#
+# Extended exploration (ci-extended.yml, not a merge gate): random-seed scale-2
+# fuzz on SQLite (Python 3.12), PostgreSQL 18, MySQL 8.4 and MariaDB 12.3.
 
 # Keep only the newest run for a given workflow + source branch. Using the
 # same branch key for push and pull_request events also deduplicates those
@@ -86,6 +105,15 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # Stream test output so per-suite progress and timing are visible live.
+  PYTHONUNBUFFERED: "1"
+  # Fixed-seed PR-gate fuzz campaign (see the matrix policy above). Do not
+  # override these per job: test_p2_ci_matrix_verification.py checks that the
+  # gate campaign stays a subset of the scale-2 fixed-seed campaign.
+  MATVIEW_FUZZ_SCALE: "1"
+  MATVIEW_FUZZ_RANDOM_SEEDS: "0"
+  MATVIEW_FUZZ_VIEWS_PER_SCHEMA: "70"
+  MATVIEW_FUZZ_MUTATIONS: "60"
 
 jobs:
   # Only an explicitly whitelisted documentation-only PR may skip the matrix.

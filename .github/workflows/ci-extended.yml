@@ -1,0 +1,353 @@
+name: CI — Extended Random-Seed Fuzz
+
+# Extended exploration tier. Not a required check and not part of `CI success`.
+#
+# The required PR gate (ci.yml) runs only the fixed-seed fuzz campaign so that a
+# red PR is caused by the PR's tree. Fresh random seeds explore new scenarios;
+# they run here instead, after code reaches master, nightly, and on demand:
+# - Campaign: MATVIEW_FUZZ_SCALE=2, i.e. what every PR-gate job ran before the
+#   gate was reduced: fixed seeds 20261106, 1337, 424242 and 992138513 plus 4
+#   fresh random seeds, 3 scenarios per seed, 70 views and 60 mutations per
+#   scenario, followed by the Suite 13 permanent regression corpus.
+# - Targets: SQLite (Python 3.12) and the native PostgreSQL 18, MySQL 8.4 and
+#   MariaDB 12.3 servers, with the same images, server flags and product/version
+#   verification as the PR gate. A missing requested tag fails the job; there is
+#   no image fallback.
+# - On failure every job uploads its fuzz-campaign.json manifest and a report
+#   listing the failing seeds with a replay command that pins the seed and the
+#   campaign sizes. On push and scheduled runs one GitHub issue (label
+#   ci-extended-fuzz) is opened, or commented on if already open, with the run
+#   link and the seeds. Each confirmed failure is added to the Suite 13 corpus
+#   in its fix PR; then close the issue.
+# - Concurrency: one group per event type and ref, never cancelled in progress,
+#   so a push to master cannot cancel the nightly run (and vice versa) and a
+#   finished exploration run is never thrown away. GitHub keeps at most one
+#   pending run per group, so a burst of master pushes queues one run, not N.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+on:
+  push:
+    branches: ["master"]
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PYTHONUNBUFFERED: "1"
+  MATVIEW_FUZZ_SCALE: "2"
+  MATVIEW_FUZZ_RANDOM_SEEDS: "4"
+
+jobs:
+  fuzz-sqlite:
+    name: Random-seed fuzz / SQLite 3 (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      - name: Verify SQLite library version
+        run: python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
+
+      - name: Run random-seed differential fuzzer (scale 2) and regression corpus
+        env:
+          MATVIEW_FUZZ_TARGET: "SQLite 3 / Python 3.12"
+        run: python3 test_matview_sync.py --fuzz
+
+      - name: Report failing seeds with replay commands
+        if: always()
+        run: |
+          python3 scripts/fuzz_failure_report.py \
+          --target "SQLite 3 / Python 3.12" \
+          --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Archive fuzz manifest and failure report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-extended-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            fuzz-campaign.json
+            fuzz-report/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  fuzz-postgres:
+    name: Random-seed fuzz / PostgreSQL ${{ matrix.pg-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        pg-version: ["18"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg-version }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: matview_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d matview_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      - name: Verify actual PostgreSQL server version
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+          EXPECTED_PG_MAJOR: ${{ matrix.pg-version }}
+        run: python3 verify_engine_matrix.py
+
+      - name: Run random-seed differential fuzzer (scale 2) and regression corpus on PostgreSQL ${{ matrix.pg-version }}
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+          MATVIEW_FUZZ_TARGET: "PostgreSQL ${{ matrix.pg-version }}"
+        run: python3 test_matview_sync.py --fuzz
+
+      - name: Report failing seeds with replay commands
+        if: always()
+        run: |
+          python3 scripts/fuzz_failure_report.py \
+          --target "PostgreSQL ${{ matrix.pg-version }} (postgres:${{ matrix.pg-version }})" \
+          --engine-env "POSTGRES_DSN=postgresql://postgres:password@127.0.0.1:5432/matview_test" \
+          --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Archive fuzz manifest and failure report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-extended-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            fuzz-campaign.json
+            fuzz-report/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  fuzz-mysql:
+    name: Random-seed fuzz / ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "MySQL 8.4"
+            image: "mysql:8.4"
+            expected-product: "mysql"
+            expected-version: "8.4"
+          - label: "MariaDB 12.3 LTS"
+            image: "mariadb:12.3"
+            expected-product: "mariadb"
+            expected-version: "12.3"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Start ${{ matrix.label }} container
+        env:
+          MYSQL_IMAGE: ${{ matrix.image }}
+        run: |
+          docker pull "$MYSQL_IMAGE"
+          docker run -d --name fuzz-mysql-srv \
+            -e MYSQL_ROOT_PASSWORD=password \
+            -e MARIADB_ROOT_PASSWORD=password \
+            -e MYSQL_DATABASE=matview_test \
+            -e MARIADB_DATABASE=matview_test \
+            -p 3306:3306 \
+            "$MYSQL_IMAGE" \
+            --character-set-server=utf8mb4 \
+            --collation-server=utf8mb4_unicode_ci \
+            --innodb-flush-log-at-trx-commit=0 \
+            --sync-binlog=0 \
+            --skip-log-bin
+          for i in $(seq 1 60); do
+            if docker exec fuzz-mysql-srv sh -c "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent || mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent" 2>/dev/null; then
+              echo "$MYSQL_IMAGE is ready!"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs fuzz-mysql-srv
+          exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      - name: Verify actual server product and version
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          EXPECTED_MYSQL_PRODUCT: ${{ matrix.expected-product }}
+          EXPECTED_MYSQL_VERSION: ${{ matrix.expected-version }}
+          MATVIEW_CI_REQUESTED_IMAGE: ${{ matrix.image }}
+          MATVIEW_CI_ACTUAL_IMAGE: ${{ matrix.image }}
+        run: python3 verify_engine_matrix.py
+
+      - name: Run random-seed differential fuzzer (scale 2) and regression corpus on ${{ matrix.label }}
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          MATVIEW_FUZZ_TARGET: "${{ matrix.label }}"
+        run: python3 test_matview_sync.py --fuzz
+
+      - name: Report failing seeds with replay commands
+        if: always()
+        run: |
+          python3 scripts/fuzz_failure_report.py \
+          --target "${{ matrix.label }} (${{ matrix.image }})" \
+          --engine-env "MYSQL_DSN=mysql://root:password@127.0.0.1:3306/matview_test" \
+          --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Archive fuzz manifest and failure report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-extended-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            fuzz-campaign.json
+            fuzz-report/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Owned failure signal: one open issue, commented on by every later failing
+  # push/scheduled run. Manual (workflow_dispatch) runs report only in the run.
+  report-failure:
+    name: Open or update the extended-fuzz failure issue
+    needs:
+      - fuzz-sqlite
+      - fuzz-postgres
+      - fuzz-mysql
+    if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'schedule') && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Download fuzz reports
+        # A job that failed before uploading leaves nothing to download; the
+        # issue must still be opened (it then points at the run log).
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fuzz-extended-*
+          path: fuzz-reports
+
+      - name: Open or update the failure issue
+        uses: actions/github-script@v8
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const { owner, repo } = context.repo;
+            const title = "CI extended: random-seed fuzz failure";
+            const label = "ci-extended-fuzz";
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            const needs = JSON.parse(process.env.NEEDS_JSON);
+            const results = Object.entries(needs)
+              .map(([job, r]) => `- ${job}: ${r.result}`)
+              .join("\n");
+
+            const reports = [];
+            const walk = dir => {
+              if (!fs.existsSync(dir)) return;
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const p = path.join(dir, entry.name);
+                if (entry.isDirectory()) walk(p);
+                else if (entry.name === "fuzz-failures.md") reports.push(fs.readFileSync(p, "utf8"));
+              }
+            };
+            walk("fuzz-reports");
+
+            let body = [
+              `Run: ${runUrl}`,
+              `Event: ${context.eventName}; commit: ${context.sha}`,
+              "",
+              "Job results:",
+              results,
+              "",
+              reports.length
+                ? reports.join("\n")
+                : "No fuzz report artifact was found; see the run log.",
+            ].join("\n");
+            const limit = 60000;
+            if (body.length > limit) {
+              body = body.slice(0, limit) + `\n\n(truncated; full reports are in the run artifacts: ${runUrl})`;
+            }
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name: label,
+                color: "b60205",
+                description: "Failure in the non-required ci-extended.yml random-seed fuzz workflow",
+              });
+            }
+
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: "open",
+              labels: label,
+              per_page: 100,
+            });
+            const existing = open.find(issue => !issue.pull_request && issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body });
+              core.info(`Commented on #${existing.number}`);
+            } else {
+              const intro = [
+                "The non-required extended fuzz workflow (`.github/workflows/ci-extended.yml`) failed.",
+                "Replay each failing seed with the command in its report, add a minimized reproduction",
+                "to the Suite 13 permanent corpus in the fix PR, then close this issue. Later failing",
+                "runs comment here while this issue is open.",
+                "",
+              ].join("\n");
+              const created = await github.rest.issues.create({ owner, repo, title, labels: [label], body: intro + body });
+              core.info(`Opened #${created.data.number}`);
+            }

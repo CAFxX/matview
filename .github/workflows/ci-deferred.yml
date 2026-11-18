@@ -18,7 +18,9 @@ name: CI — Deferred Compatibility Sweep
 # - Optional SQLite drivers have no declared minimum versions; this workflow
 #   tests the latest installable releases, not a lower-bound compatibility claim.
 # - Scale-3 fuzz campaigns run weekly. Every PR-gate full-suite job still runs
-#   the ordinary deterministic suite and normal-scale fuzzer.
+#   the ordinary deterministic suite and the fixed-seed fuzz campaign; the
+#   random-seed scale-2 campaign runs in ci-extended.yml (push to master,
+#   nightly, on demand).
 #
 # Excluded, not deferred: TimescaleDB, PostGIS, and pgvector images. Restore them
 # only alongside tests that CREATE EXTENSION and exercise their respective APIs.

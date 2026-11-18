@@ -24,7 +24,7 @@ documentation"):
 
 The README's CI matrix tables (between ``<!-- BEGIN GENERATED: ci-matrix -->``
 and ``<!-- END GENERATED: ci-matrix -->``) must equal the rendering of
-.github/workflows/ci.yml and ci-deferred.yml produced here; run
+.github/workflows/ci.yml, ci-extended.yml and ci-deferred.yml produced here; run
 ``python3 test_readme_examples.py --print-matrix`` to regenerate them.
 """
 
@@ -289,7 +289,8 @@ def render_matrix_rows(workflow: Dict[str, Any]) -> List[Tuple[str, str, str]]:
 def render_matrix() -> str:
     parts: List[str] = []
     for title, fname in (
-        ("PR gate ([`ci.yml`](.github/workflows/ci.yml); required, every pull request)", "ci.yml"),
+        ("PR gate ([`ci.yml`](.github/workflows/ci.yml); required, every pull request; fixed fuzz seeds only)", "ci.yml"),
+        ("Extended random-seed fuzz ([`ci-extended.yml`](.github/workflows/ci-extended.yml); every push to master, nightly and on demand; not a merge gate, failures open an issue)", "ci-extended.yml"),
         ("Deferred compatibility sweep ([`ci-deferred.yml`](.github/workflows/ci-deferred.yml); weekly, not a merge gate)", "ci-deferred.yml"),
     ):
         parts.append(f"{title}:\n")
@@ -431,7 +432,7 @@ class ReadmeMatrix(unittest.TestCase):
             self.skipTest("PyYAML not installed; the stdlib parser is already the one in use")
         from test_strength_reporting import _stdlib_yaml_parse
 
-        for fname in ("ci.yml", "ci-deferred.yml"):
+        for fname in ("ci.yml", "ci-extended.yml", "ci-deferred.yml"):
             with self.subTest(workflow=fname):
                 path = WORKFLOWS / fname
                 self.assertEqual(
