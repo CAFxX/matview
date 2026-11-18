@@ -22,6 +22,7 @@ ORACLE_TESTS = (
     "test_19_differential_oracle_numeric_adversarial_boundaries",
     "test_20_differential_oracle_derives_tolerances_from_select_operations",
     "test_21_differential_oracle_decimal_float_comparison_uses_full_precision",
+    "test_21b_differential_oracle_compares_native_result_metadata",
 )
 
 
@@ -74,6 +75,45 @@ MUTANTS = (
 )
 
 
+# Mutants of the native result-metadata comparators (module attributes other
+# than _rows_equal): (name, attribute, factory, designated killer).
+def _mutant_no_description_check(original: Callable[..., Any]) -> Callable[..., Any]:
+    def mutant(*args: Any, **kwargs: Any) -> list[str]:
+        return []
+    return mutant
+
+
+def _mutant_ignore_type_code(original: Callable[..., Any]) -> Callable[..., Any]:
+    def strip(desc: Any) -> Any:
+        return None if desc is None else [(c[0], None) + tuple(c[2:]) for c in desc]
+
+    def mutant(family: str, mv: Any, live: Any) -> list[str]:
+        return original(family, strip(mv), strip(live))
+    return mutant
+
+
+def _mutant_decimal_numeric_only(original: Callable[..., Any]) -> Callable[..., Any]:
+    def normalize(rows: Any) -> Any:
+        from decimal import Decimal
+        return [tuple(v.normalize() if isinstance(v, Decimal) else v for v in r) for r in rows]
+
+    def mutant(mv_rows: Any, live_rows: Any) -> list[str]:
+        return original(normalize(mv_rows), normalize(live_rows))
+    return mutant
+
+
+METADATA_MUTANTS = (
+    ("skip_result_description", "_result_description_mismatches", _mutant_no_description_check,
+     "test_21b_differential_oracle_compares_native_result_metadata"),
+    ("ignore_driver_type_code", "_result_description_mismatches", _mutant_ignore_type_code,
+     "test_21b_differential_oracle_compares_native_result_metadata"),
+    ("skip_value_representation", "_result_representation_mismatches", _mutant_no_description_check,
+     "test_21b_differential_oracle_compares_native_result_metadata"),
+    ("decimal_scale_insensitive", "_result_representation_mismatches", _mutant_decimal_numeric_only,
+     "test_21b_differential_oracle_compares_native_result_metadata"),
+)
+
+
 def _run_focused_oracle_tests() -> unittest.TestResult:
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite(
@@ -96,7 +136,16 @@ def run_mutant(
     factory: Callable[[Callable[..., bool]], Callable[..., bool]],
     expected_killer: str,
 ) -> int:
-    original = oracle._rows_equal
+    return run_attribute_mutant(name, "_rows_equal", factory, expected_killer)
+
+
+def run_attribute_mutant(
+    name: str,
+    attribute: str,
+    factory: Callable[[Callable[..., Any]], Callable[..., Any]],
+    expected_killer: str,
+) -> int:
+    original = getattr(oracle, attribute)
     baseline = _run_focused_oracle_tests()
     if not baseline.wasSuccessful():
         raise AssertionError(
@@ -104,7 +153,7 @@ def run_mutant(
             f"{len(baseline.failures)} failures, {len(baseline.errors)} errors"
         )
 
-    oracle._rows_equal = factory(original)
+    setattr(oracle, attribute, factory(original))
     try:
         result = _run_focused_oracle_tests()
         # Count only assertion failures as kills. Import/setup/runtime errors
@@ -112,7 +161,8 @@ def run_mutant(
         failed_test_ids = {test.id() for test, _ in result.failures}
         expected_suffix = f"TestGeneratorAndManagerCodePaths.{expected_killer}"
         if result.errors or not any(
-            test_id.endswith(expected_suffix) for test_id in failed_test_ids
+            test_id.endswith(expected_suffix) or f"{expected_suffix} (" in test_id
+            for test_id in failed_test_ids
         ):
             raise AssertionError(
                 f"mutant {name!r} was not killed by its designated regression "
@@ -125,14 +175,17 @@ def run_mutant(
         )
         return len(result.failures)
     finally:
-        oracle._rows_equal = original
+        setattr(oracle, attribute, original)
 
 
 def main() -> None:
     total = 0
     for name, factory, expected_killer in MUTANTS:
         total += run_mutant(name, factory, expected_killer)
-    print(f"Oracle mutation sensitivity passed: {len(MUTANTS)} mutants killed ({total} failing test executions).")
+    for name, attribute, factory, expected_killer in METADATA_MUTANTS:
+        total += run_attribute_mutant(name, attribute, factory, expected_killer)
+    count = len(MUTANTS) + len(METADATA_MUTANTS)
+    print(f"Oracle mutation sensitivity passed: {count} mutants killed ({total} failing test executions).")
 
 
 if __name__ == "__main__":
