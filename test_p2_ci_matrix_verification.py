@@ -556,5 +556,339 @@ class TestVerifyEngineMatrixUnit(unittest.TestCase):
                         raise SystemExit("Set POSTGRES_DSN or MYSQL_DSN")
 
 
+# ==============================================================================
+# Fuzz tiering: fixed-seed PR gate (ci.yml) vs random-seed extended (ci-extended.yml)
+# ==============================================================================
+
+CI_EXTENDED_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci-extended.yml"
+FUZZ_CAMPAIGN_KEYS = (
+    "MATVIEW_FUZZ_SCALE",
+    "MATVIEW_FUZZ_SEEDS",
+    "MATVIEW_FUZZ_RANDOM_SEEDS",
+    "MATVIEW_FUZZ_SCENARIOS",
+    "MATVIEW_FUZZ_VIEWS_PER_SCHEMA",
+    "MATVIEW_FUZZ_MUTATIONS",
+)
+# Every deterministic fuzz catch in CI history (2026-11-05..18) came from this
+# (seed, scenario) of the former scale-2 gate campaign; the reduced gate must keep it.
+HISTORICAL_CATCH = (20261106, 1)
+_FUZZ_CLI_FLAGS = ("--fuzz-scale", "--fuzz-seeds", "--fuzz-scenarios", "--fuzz-views", "--fuzz-mutations")
+
+
+def _no_random(*_: Any) -> int:
+    raise AssertionError("the PR-gate fuzz campaign must not draw random seeds")
+
+
+def _workflow_triggers(workflow: Dict[str, Any]) -> Dict[str, Any]:
+    # PyYAML (YAML 1.1) parses the key `on` as boolean True.
+    on = workflow.get("on", workflow.get(True))
+    return on if isinstance(on, dict) else {}
+
+
+def gate_fuzz_campaign_errors(workflow: Dict[str, Any]) -> List[str]:
+    """Check the PR gate's fuzz campaign as GitHub Actions would configure it.
+
+    Requirements: the campaign is set once at workflow level (no job/step/CLI
+    override), draws no random seeds, contains HISTORICAL_CATCH, and every
+    (seed, scenario) it runs generates exactly the scenario that the former
+    scale-2 CI campaign generated for that pair.
+    """
+    import test_matview_sync as tms
+
+    errors: List[str] = []
+    wf_env = {str(k): str(v) for k, v in (workflow.get("env") or {}).items()}
+    if wf_env.get("PYTHONUNBUFFERED") != "1":
+        errors.append("ci.yml must set PYTHONUNBUFFERED=1 at workflow level")
+    for job_id, job in (workflow.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
+        overridden = set(job.get("env") or {}) & set(FUZZ_CAMPAIGN_KEYS)
+        if overridden:
+            errors.append(f"job {job_id!r} overrides the gate fuzz campaign: {sorted(overridden)}")
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            overridden = set(step.get("env") or {}) & set(FUZZ_CAMPAIGN_KEYS)
+            if overridden:
+                errors.append(f"job {job_id!r} step {step.get('name')!r} overrides {sorted(overridden)}")
+            run = str(step.get("run", ""))
+            if any(flag in run for flag in _FUZZ_CLI_FLAGS) or any(k in run for k in FUZZ_CAMPAIGN_KEYS):
+                errors.append(f"job {job_id!r} step {step.get('name')!r} changes the fuzz campaign in its command")
+
+    gate_env = {k: v for k, v in wf_env.items() if k in FUZZ_CAMPAIGN_KEYS}
+    gate_env["CI"] = "true"
+    try:
+        gate = tms.fuzz_campaign_config(gate_env, random_seed_source=_no_random)
+    except AssertionError as exc:
+        return errors + [str(exc)]
+    reference = tms.fuzz_campaign_config({"CI": "true", "MATVIEW_FUZZ_RANDOM_SEEDS": "0"}, random_seed_source=_no_random)
+    if reference["scale"] != 2:
+        errors.append(f"reference CI campaign is expected at scale 2, got {reference['scale']}")
+
+    if gate["random_seeds"]:
+        errors.append(f"gate campaign draws random seeds: {gate['random_seeds']}")
+    seed, scenario = HISTORICAL_CATCH
+    if seed not in gate["seeds"] or gate["scenarios_per_seed"] < scenario:
+        errors.append(f"gate campaign {gate['seeds']} x {gate['scenarios_per_seed']} scenarios drops {HISTORICAL_CATCH}")
+    extra = [s for s in gate["seeds"] if s not in reference["seeds"]]
+    if extra:
+        errors.append(f"gate seeds {extra} are not fixed seeds of the scale-2 campaign {reference['seeds']}")
+    if gate["scenarios_per_seed"] > reference["scenarios_per_seed"]:
+        errors.append("gate runs more scenarios per seed than the scale-2 campaign")
+
+    # Scenario identity: generate both and compare (generation is cheap; execution is not).
+    for s_val in gate["seeds"]:
+        fz = tms.DifferentialSQLFuzzer(seed=s_val)
+        for sc in range(1, min(gate["scenarios_per_seed"], reference["scenarios_per_seed"]) + 1):
+            for dialect in (tms.Dialect.SQLITE, tms.Dialect.POSTGRES, tms.Dialect.MYSQL):
+                a = fz.generate_scenario(sc, dialect, views_count=gate["views_per_schema"],
+                                         mutations_count=gate["mutations_per_scenario"])
+                b = fz.generate_scenario(sc, dialect, views_count=reference["views_per_schema"],
+                                         mutations_count=reference["mutations_per_scenario"])
+                if a != b:
+                    errors.append(f"gate scenario (seed={s_val}, sc={sc}, {dialect.value}) differs from the scale-2 scenario")
+        var_gate = tms.VariableSchemaDifferentialFuzzer(seed=s_val).generate_campaign(
+            gate["scenarios_per_seed"], candidates_per_scenario=6)[0]
+        var_ref = tms.VariableSchemaDifferentialFuzzer(seed=s_val).generate_campaign(
+            reference["scenarios_per_seed"], candidates_per_scenario=6)[0]
+        for idx in range(min(len(var_gate), len(var_ref))):
+            if var_gate[idx][:4] != var_ref[idx][:4]:
+                errors.append(f"gate variable-schema scenario (seed={s_val}, sc={idx + 1}) differs from scale-2")
+    return errors
+
+
+def extended_workflow_errors(extended: Dict[str, Any], gate: Dict[str, Any]) -> List[str]:
+    """Structural contract of the non-required random-seed fuzz workflow."""
+    from test_readme_examples import render_matrix_rows
+
+    errors: List[str] = []
+    triggers = _workflow_triggers(extended)
+    if set(triggers) != {"push", "schedule", "workflow_dispatch"}:
+        errors.append(f"ci-extended.yml triggers must be push/schedule/workflow_dispatch, got {sorted(triggers)}")
+    push = triggers.get("push") or {}
+    if not isinstance(push, dict) or list(push.get("branches") or []) != ["master"]:
+        errors.append("ci-extended.yml push trigger must be restricted to master")
+    if not triggers.get("schedule"):
+        errors.append("ci-extended.yml needs a schedule (nightly) trigger")
+
+    concurrency = extended.get("concurrency") or {}
+    if "github.event_name" not in str(concurrency.get("group", "")):
+        errors.append("ci-extended.yml concurrency group must separate events (push must not cancel the nightly run)")
+    if str(concurrency.get("cancel-in-progress")).lower() != "false":
+        errors.append("ci-extended.yml must not cancel in-progress exploration runs")
+
+    perms = extended.get("permissions") or {}
+    if perms != {"contents": "read"}:
+        errors.append(f"ci-extended.yml workflow-level permissions must be contents: read only, got {perms}")
+
+    env = {str(k): str(v) for k, v in (extended.get("env") or {}).items()}
+    if env.get("MATVIEW_FUZZ_SCALE") != "2":
+        errors.append("ci-extended.yml must run the scale-2 campaign")
+    if int(env.get("MATVIEW_FUZZ_RANDOM_SEEDS", "4")) < 1:
+        errors.append("ci-extended.yml must draw random seeds")
+    if "MATVIEW_FUZZ_SEEDS" in env:
+        errors.append("ci-extended.yml must not pin MATVIEW_FUZZ_SEEDS (that disables random seeds)")
+    if env.get("PYTHONUNBUFFERED") != "1":
+        errors.append("ci-extended.yml must set PYTHONUNBUFFERED=1")
+
+    jobs = extended.get("jobs") or {}
+    if any(isinstance(j, dict) and j.get("name") == "CI success" for j in jobs.values()):
+        errors.append("ci-extended.yml must not define the required `CI success` check")
+    fuzz_jobs = {jid: j for jid, j in jobs.items() if isinstance(j, dict) and any(
+        "test_matview_sync.py --fuzz" in str(s.get("run", "")) for s in j.get("steps") or [])}
+    for jid, job in fuzz_jobs.items():
+        steps = job.get("steps") or []
+        runs = [str(s.get("run", "")) for s in steps]
+        fuzz_idx = next(i for i, r in enumerate(runs) if "test_matview_sync.py --fuzz" in r)
+        if any(flag in runs[fuzz_idx] for flag in _FUZZ_CLI_FLAGS):
+            errors.append(f"ci-extended.yml {jid}: fuzz command must use the workflow campaign env")
+        native = bool(job.get("services")) or any("docker run" in r for r in runs)
+        if native:
+            verify = [i for i, r in enumerate(runs) if "verify_engine_matrix.py" in r]
+            if not verify or verify[0] > fuzz_idx:
+                errors.append(f"ci-extended.yml {jid}: verify_engine_matrix.py must run before the fuzzer")
+            else:
+                venv = steps[verify[0]].get("env") or {}
+                if "EXPECTED_PG_MAJOR" not in venv and "EXPECTED_MYSQL_VERSION" not in venv:
+                    errors.append(f"ci-extended.yml {jid}: verify step needs explicit version expectations")
+        after = steps[fuzz_idx + 1:]
+        if not any("fuzz_failure_report.py" in str(s.get("run", "")) and s.get("if") == "always()" for s in after):
+            errors.append(f"ci-extended.yml {jid}: missing always() failing-seed report step after the fuzzer")
+        uploads = [s for s in after if "upload-artifact" in str(s.get("uses", "")) and s.get("if") == "always()"]
+        if not uploads or not all("fuzz-campaign.json" in str((u.get("with") or {}).get("path", ""))
+                                  and "fuzz-report" in str((u.get("with") or {}).get("path", "")) for u in uploads):
+            errors.append(f"ci-extended.yml {jid}: must upload fuzz-campaign.json and fuzz-report/ with if: always()")
+        if not job.get("timeout-minutes"):
+            errors.append(f"ci-extended.yml {jid}: needs timeout-minutes")
+
+    gate_rows = {r[2]: r[1] for r in render_matrix_rows(gate)}
+    ext_rows = render_matrix_rows(extended)
+    ext_dbs = {db for _, _, db in ext_rows}
+    expected = {"SQLite bundled with CPython (`sqlite3`)", "`postgres:18`", "`mysql:8.4`", "`mariadb:12.3`"}
+    if ext_dbs != expected:
+        errors.append(f"ci-extended.yml targets must be {sorted(expected)}, got {sorted(ext_dbs)}")
+    for name, py, db in ext_rows:
+        if db.startswith("`") and db not in gate_rows:
+            errors.append(f"ci-extended.yml {name}: image {db} is not a PR-gate image")
+        if py != "3.12":
+            errors.append(f"ci-extended.yml {name}: expected Python 3.12, got {py}")
+
+    reporters = [(jid, j) for jid, j in jobs.items() if isinstance(j, dict) and any(
+        "github-script" in str(s.get("uses", "")) for s in j.get("steps") or [])]
+    if len(reporters) != 1:
+        errors.append("ci-extended.yml needs exactly one issue-reporting job")
+    else:
+        jid, job = reporters[0]
+        if set(job.get("needs") or []) != set(fuzz_jobs):
+            errors.append(f"ci-extended.yml {jid} must depend on every fuzz job")
+        if (job.get("permissions") or {}).get("issues") != "write":
+            errors.append(f"ci-extended.yml {jid} needs permissions issues: write")
+        cond = str(job.get("if", ""))
+        for needle in ("!cancelled()", "'push'", "'schedule'", "'failure'"):
+            if needle not in cond:
+                errors.append(f"ci-extended.yml {jid} condition must contain {needle}: {cond}")
+        script = "".join(str((s.get("with") or {}).get("script", "")) for s in job.get("steps") or [])
+        for needle in ("listForRepo", "createComment", "issues.create", "context.runId"):
+            if needle not in script:
+                errors.append(f"ci-extended.yml {jid} script must use {needle} (dedupe + run link)")
+    return errors
+
+
+class TestFuzzTiering(unittest.TestCase):
+    """The PR gate runs a fixed-seed subset of the scale-2 campaign; random seeds run in ci-extended.yml."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.gate = _parse_yaml_minimal(CI_WORKFLOW.read_text(encoding="utf-8"))
+        cls.extended = _parse_yaml_minimal(CI_EXTENDED_WORKFLOW.read_text(encoding="utf-8"))
+
+    def test_gate_fuzz_campaign_is_fixed_and_identical_to_scale2_scenarios(self) -> None:
+        self.assertEqual(gate_fuzz_campaign_errors(self.gate), [])
+
+    def test_gate_validator_detects_random_seeds(self) -> None:
+        import copy
+        wf = copy.deepcopy(self.gate)
+        del wf["env"]["MATVIEW_FUZZ_RANDOM_SEEDS"]
+        errors = gate_fuzz_campaign_errors(wf)
+        self.assertTrue(any("random seeds" in e for e in errors), errors)
+
+    def test_gate_validator_detects_unpinned_scenario_sizes(self) -> None:
+        # Scale 1 defaults (60 views, 45 mutations) generate different mutations for
+        # (20261106, 1): the historical catching scenario would silently disappear.
+        import copy
+        wf = copy.deepcopy(self.gate)
+        del wf["env"]["MATVIEW_FUZZ_MUTATIONS"]
+        errors = gate_fuzz_campaign_errors(wf)
+        self.assertTrue(any("seed=20261106, sc=1" in e for e in errors), errors)
+
+    def test_gate_validator_detects_dropped_historical_seed_and_overrides(self) -> None:
+        import copy
+        wf = copy.deepcopy(self.gate)
+        wf["env"]["MATVIEW_FUZZ_SEEDS"] = "1337"
+        wf["jobs"]["postgres"]["steps"][0].setdefault("env", {})["MATVIEW_FUZZ_SCALE"] = "3"
+        errors = gate_fuzz_campaign_errors(wf)
+        self.assertTrue(any("drops (20261106, 1)" in e for e in errors), errors)
+        self.assertTrue(any("'postgres'" in e and "MATVIEW_FUZZ_SCALE" in e for e in errors), errors)
+
+    def test_extended_workflow_contract(self) -> None:
+        self.assertEqual(extended_workflow_errors(self.extended, self.gate), [])
+
+    def test_extended_validator_detects_pull_request_trigger_and_missing_issue_permission(self) -> None:
+        import copy
+        wf = copy.deepcopy(self.extended)
+        triggers = _workflow_triggers(wf)
+        triggers["pull_request"] = None
+        wf["jobs"]["report-failure"]["permissions"] = {"contents": "read"}
+        wf["concurrency"]["cancel-in-progress"] = True
+        errors = extended_workflow_errors(wf, self.gate)
+        self.assertTrue(any("triggers" in e for e in errors), errors)
+        self.assertTrue(any("issues: write" in e for e in errors), errors)
+        self.assertTrue(any("cancel" in e for e in errors), errors)
+
+    def test_extended_validator_detects_image_not_in_gate(self) -> None:
+        import copy
+        wf = copy.deepcopy(self.extended)
+        wf["jobs"]["fuzz-mysql"]["strategy"]["matrix"]["include"][1]["image"] = "mariadb:13.1"
+        errors = extended_workflow_errors(wf, self.gate)
+        self.assertTrue(any("mariadb:13.1" in e for e in errors), errors)
+
+
+class TestFuzzFailureReport(unittest.TestCase):
+    """scripts/fuzz_failure_report.py: failing seeds and replay commands from a manifest."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        import fuzz_failure_report  # type: ignore
+        import test_matview_sync as tms
+
+        cls.ffr = fuzz_failure_report
+        cls.tms = tms
+
+    def _manifest(self, runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        rnd = iter([111, 222, 333, 444])
+        cfg = self.tms.fuzz_campaign_config({"CI": "true", "MATVIEW_FUZZ_SCALE": "2"}, random_seed_source=lambda: next(rnd))
+        return dict(cfg, schema_version=1, commit="abc", python="3.12.0", default_dialect="postgres", runs=runs)
+
+    def test_replay_env_reproduces_the_campaign_outside_ci(self) -> None:
+        manifest = self._manifest([])
+        for seed in (20261106, 222):
+            env = self.ffr.replay_env(manifest, [seed])
+            replayed = self.tms.fuzz_campaign_config(env, random_seed_source=_no_random)  # no CI variable
+            self.assertEqual(replayed["seeds"], [seed])
+            for key in ("scale", "scenarios_per_seed", "views_per_schema", "mutations_per_scenario"):
+                self.assertEqual(replayed[key], manifest[key], key)
+            self.assertEqual(self.ffr.replay_env(manifest, [seed]), self.tms.fuzz_replay_env(manifest, [seed]))
+
+    def test_failed_and_interrupted_batches_are_reported_once_per_seed(self) -> None:
+        manifest = self._manifest([
+            {"suite": "Suite 12a (seed=20261106 sc=1)", "seed": 20261106, "scenario": 1, "status": "passed"},
+            {"suite": "Suite 12a (seed=222 sc=2)", "seed": 222, "scenario": 2, "status": "failed",
+             "error_type": "AssertionError", "error": "MV mismatch | on v1\nline2"},
+            {"suite": "Suite 12c (seed=222 sc=2)", "seed": 222, "scenario": 2, "status": "failed",
+             "error_type": "AssertionError", "error": "x"},
+            {"suite": "Suite 12e (seed=444 sc=3)", "seed": 444, "scenario": 3, "status": "running"},
+        ])
+        self.assertEqual(self.ffr.failing_seeds(manifest), [222, 444])
+        md = self.ffr.render(manifest, target="PostgreSQL 18", engine_env="POSTGRES_DSN=pg://x", run_url="https://run")
+        self.assertNotIn("| 20261106 |", md)
+        self.assertIn("| 222 | random | 2 |", md)
+        self.assertIn("interrupted", md)
+        self.assertIn("MV mismatch \\| on v1 line2", md)
+        self.assertIn("POSTGRES_DSN=pg://x MATVIEW_FUZZ_SCALE=2 MATVIEW_FUZZ_SCENARIOS=3 "
+                      "MATVIEW_FUZZ_VIEWS_PER_SCHEMA=70 MATVIEW_FUZZ_MUTATIONS=60 MATVIEW_FUZZ_SEEDS=222 "
+                      "python3 test_matview_sync.py --fuzz", md)
+        self.assertEqual(md.count("MATVIEW_FUZZ_SEEDS=222 "), 1)
+        self.assertIn("https://run", md)
+
+    def test_missing_manifest_and_clean_campaign_are_explained(self) -> None:
+        self.assertIn("No fuzz-campaign.json manifest", self.ffr.render(None, target="t"))
+        clean = self.ffr.render(self._manifest([{"seed": 1337, "scenario": 1, "status": "passed"}]), target="t")
+        self.assertIn("No Suite 12 batch failed", clean)
+        self.assertNotIn("```sh", clean)
+
+    def test_main_writes_outputs_and_step_summary(self) -> None:
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mpath = Path(tmp) / "fuzz-campaign.json"
+            mpath.write_text(json.dumps(self._manifest([
+                {"suite": "s", "seed": 333, "scenario": 1, "status": "failed", "error_type": "E", "error": "e"}])))
+            summary = Path(tmp) / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}), \
+                    patch("sys.stdout", new_callable=io.StringIO):
+                rc = self.ffr.main(["--manifest", str(mpath), "--target", "SQLite", "--out-dir", str(Path(tmp) / "out")])
+            self.assertEqual(rc, 0)
+            self.assertEqual((Path(tmp) / "out" / "failing-seeds.txt").read_text(), "333\n")
+            self.assertIn("MATVIEW_FUZZ_SEEDS=333", (Path(tmp) / "out" / "fuzz-failures.md").read_text())
+            self.assertIn("MATVIEW_FUZZ_SEEDS=333", summary.read_text())
+            with patch("sys.stdout", new_callable=io.StringIO):
+                rc = self.ffr.main(["--manifest", str(Path(tmp) / "absent.json"), "--out-dir", str(Path(tmp) / "out2")])
+            self.assertEqual(rc, 0)
+            self.assertEqual((Path(tmp) / "out2" / "failing-seeds.txt").read_text(), "")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -319,10 +319,16 @@ MySQL/MariaDB), which any session can set (see
 
 Support levels used here:
 
-- Natively tested on every PR: the full deterministic suite, the normal-scale
-  differential fuzzer and the engine-specific test modules run against the real
-  server or library in the PR gate, and each server job checks the actual
-  product and version before testing.
+- Natively tested on every PR: the full deterministic suite, the fixed-seed
+  differential fuzz campaign (seeds 20261106 and 1337, two scenarios each), the
+  permanent fuzz regression corpus and the engine-specific test modules run
+  against the real server or library in the PR gate, and each server job checks
+  the actual product and version before testing.
+- Random-seed fuzzing after merge: the extended workflow runs the larger
+  scale-2 fuzz campaign with fresh random seeds against SQLite, PostgreSQL 18,
+  MySQL 8.4 and MariaDB 12.3 on every push to master, nightly and on demand. It
+  is not a merge gate; a failure opens or updates a GitHub issue that lists the
+  failing seeds with replay commands.
 - Natively tested weekly: the deferred sweep runs the main suite
   (`test_matview_sync.py`) against these targets. It is not a merge gate and can
   be red; check the latest run in the repository's Actions tab before relying
@@ -348,7 +354,7 @@ current patch release. All jobs run on GitHub-hosted `ubuntu-latest` x64; other
 operating systems and architectures are not tested.
 
 <!-- BEGIN GENERATED: ci-matrix -->
-PR gate ([`ci.yml`](.github/workflows/ci.yml); required, every pull request):
+PR gate ([`ci.yml`](.github/workflows/ci.yml); required, every pull request; fixed fuzz seeds only):
 
 | CI job | Python | Database |
 | --- | --- | --- |
@@ -364,6 +370,15 @@ PR gate ([`ci.yml`](.github/workflows/ci.yml); required, every pull request):
 | MariaDB 10.11 LTS | 3.12 | `mariadb:10.11` |
 | MariaDB 11.8 LTS | 3.12 | `mariadb:11.8` |
 | MariaDB 12.3 LTS | 3.12 | `mariadb:12.3` |
+
+Extended random-seed fuzz ([`ci-extended.yml`](.github/workflows/ci-extended.yml); every push to master, nightly and on demand; not a merge gate, failures open an issue):
+
+| CI job | Python | Database |
+| --- | --- | --- |
+| Random-seed fuzz / SQLite 3 (Python 3.12) | 3.12 | SQLite bundled with CPython (`sqlite3`) |
+| Random-seed fuzz / PostgreSQL 18 | 3.12 | `postgres:18` |
+| Random-seed fuzz / MySQL 8.4 | 3.12 | `mysql:8.4` |
+| Random-seed fuzz / MariaDB 12.3 LTS | 3.12 | `mariadb:12.3` |
 
 Deferred compatibility sweep ([`ci-deferred.yml`](.github/workflows/ci-deferred.yml); weekly, not a merge gate):
 
@@ -828,7 +843,9 @@ Commonly used entry points:
 python3 test_matview_sync.py              # main suite: unit, integration, differential fuzzing
 python3 test_matview_sync.py --fuzz       # only the differential fuzzer and regression corpus
 python3 test_matview_sync.py --fuzz --fuzz-scale 3
-MATVIEW_FUZZ_SEEDS=20261106 python3 test_matview_sync.py --fuzz   # replay a logged seed
+# replay a logged seed: copy the command printed with it ("[FUZZ SEED] ... reproduce with:"),
+# which pins the campaign sizes too; a seed alone replays different scenarios
+MATVIEW_FUZZ_SCALE=2 MATVIEW_FUZZ_SCENARIOS=3 MATVIEW_FUZZ_VIEWS_PER_SCHEMA=70 MATVIEW_FUZZ_MUTATIONS=60 MATVIEW_FUZZ_SEEDS=20261106 python3 test_matview_sync.py --fuzz
 python3 test_concurrent_backfill.py       # independent-session backfill concurrency
 python3 test_query_ast_materialization.py # generated SELECT ASTs materialized and compared
 python3 mutation_testing.py --list        # curated mutants; run without --list to check they are killed
@@ -904,6 +921,16 @@ green run is not proof of a green GitHub run; `--help` and the stamp's
   A pull request that changes only whitelisted documentation files (for
   example `TODO.md`, `AGENTS.md`, `docs/`) skips the matrix; changes to
   `README.md` run the full gate because its examples are tests.
+  Its fuzz campaign uses fixed seeds only (the workflow-level `MATVIEW_FUZZ_*`
+  settings), so a fuzz failure in the gate reproduces from the tested revision.
+- Extended random-seed fuzz
+  ([`.github/workflows/ci-extended.yml`](.github/workflows/ci-extended.yml)):
+  every push to master, nightly and on demand; the scale-2 campaign with fresh
+  random seeds on SQLite and native PostgreSQL 18, MySQL 8.4 and MariaDB 12.3.
+  Not a merge gate. Each job uploads its `fuzz-campaign.json` manifest and a
+  failing-seed report with replay commands; a failing push or nightly run
+  opens or comments on one issue labelled `ci-extended-fuzz`. Each confirmed
+  failure is added to the permanent regression corpus in its fix PR.
 - Deferred compatibility sweep
   ([`.github/workflows/ci-deferred.yml`](.github/workflows/ci-deferred.yml)):
   weekly and on demand; additional versions, minimum declared dependency
