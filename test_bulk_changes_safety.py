@@ -60,6 +60,7 @@ import matview.manager as manager_module
 from matview_sync import (
     BackfillInterruptedError,
     BulkChangesConnectionError,
+    BulkChangesRecoveryError,
     BulkChangesTransactionError,
     Dialect,
     EngineLimitationWarning,
@@ -378,6 +379,58 @@ class SqliteBulkChangesTests(_SqliteBase):
                 self.observer.execute(f"DELETE FROM {TABLE} WHERE id IN (60, 62);")
                 self.observer.commit()
                 manager.repair_view("bulk_totals")
+
+    def test_recovery_failure_is_reported_and_repairable(self) -> None:
+        """If restoring maintenance after a committing block fails, the views
+        are named, flagged by the drift check and sync_views, and repaired by
+        repair_view() (they used to look 'ok' with no triggers)."""
+        manager = self._manager()
+        _quiet_register(manager, VIEW_SQL)
+        triggers = self._triggers()
+        with self.assertRaises(BulkChangesRecoveryError) as ctx:
+            with _inject_failing_trigger_ddl():
+                with manager.bulk_changes():
+                    manager.conn.execute(f"INSERT INTO {TABLE} VALUES (65, 'a', 1);")
+                    manager.conn.commit()
+        self.assertEqual(ctx.exception.view_names, ["bulk_totals"])
+        self.assertFalse(manager.conn.in_transaction)
+        self.assertIn(65, [r[0] for r in self._rows()])
+        self.assertEqual(manager.check_schema_drift(), {"bulk_totals": "triggers_missing"})
+        self.assertEqual(manager.sync_views([VIEW_SQL]), {"bulk_totals": "triggers_missing"})
+        self.assertEqual(manager.repair_view("bulk_totals"), {"bulk_totals": "rebuilt"})
+        self.assertEqual([t[0] for t in self._triggers()], [t[0] for t in triggers])
+        self.assertEqual(manager.check_schema_drift(), {"bulk_totals": "ok"})
+        self._assert_exact()
+        self._assert_maintained_by_other_session(66)
+
+    def test_committing_block_recovers_with_plain_refresh_in_shadow_mode(self) -> None:
+        """Recovery never reuses the caller's shadow-swap mode (keyless
+        projection on a nullable INT PRIMARY KEY table: the reviewer's case)."""
+        db = _SqliteDb("id INT PRIMARY KEY, bucket TEXT, amt INT")
+        self.addCleanup(db.cleanup)
+        conn = db.connect()
+        self.addCleanup(conn.close)
+        manager = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        _quiet_register(manager, f"CREATE VIEW bs_filter AS {SHAPES['bs_filter']};")
+
+        def no_swap_in_recovery(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("the recovery refresh used the caller's shadow-swap mode")
+
+        with self.assertRaises(BulkChangesTransactionError) as ctx:
+            with mock.patch.object(manager, "_bulk_shadow_swap", no_swap_in_recovery):
+                with manager.bulk_changes(use_shadow_swap=True):
+                    conn.execute(f"INSERT INTO {TABLE} VALUES (70, 'b', 8);")
+                    conn.commit()
+        self.assertNotIsInstance(ctx.exception, BulkChangesRecoveryError)
+        observer = db.connect()
+        self.addCleanup(observer.close)
+        observer.execute(f"INSERT INTO {TABLE} VALUES (71, 'c', 50);")
+        observer.commit()
+        self.assertEqual(
+            sorted(observer.execute("SELECT * FROM bs_filter").fetchall()),
+            sorted(observer.execute(SHAPES["bs_filter"]).fetchall()),
+        )
+        self.assertEqual(manager.check_schema_drift(), {"bs_filter": "ok"})
 
     def test_failed_rollback_invalidates_connection_and_manager(self) -> None:
         manager = self._manager()
@@ -872,6 +925,56 @@ class _NativeBase:
             with self.observer.cursor() as cur:
                 cur.execute(f"ALTER TABLE {self.prefix}hidden RENAME TO {catalog}")
         self._assert_maintained_by_other_session(130)
+
+    def test_committing_block_is_detected_and_recovered(self) -> None:
+        modes = [{}, {"drop_triggers": True}] if self.engine == Dialect.POSTGRES else [{}]
+        names = [r[0] for r in self._maintenance_objects()]
+        for step, kwargs in enumerate(modes):
+            with self.subTest(**kwargs):
+                kept, dropped = 140 + 2 * step, 141 + 2 * step
+                with self.assertRaises(BulkChangesTransactionError) as ctx:
+                    with self.manager.bulk_changes(**kwargs):
+                        self._write(f"INSERT INTO {self.table} VALUES ({kept}, 'a', 1)")
+                        self.conn.commit()
+                        self._write(f"INSERT INTO {self.table} VALUES ({dropped}, 'a', 2)")
+                self.assertNotIsInstance(ctx.exception, BulkChangesRecoveryError)
+                self.assertFalse(self._in_transaction())
+                ids = [r[0] for r in self._rows()]
+                self.assertIn(kept, ids)
+                self.assertNotIn(dropped, ids)
+                self.assertEqual([r[0] for r in self._maintenance_objects()], names)
+                self._assert_exact()
+                self.assertEqual(self.manager.check_schema_drift(), {"bulk_totals": "ok"})
+                self._assert_maintained_by_other_session(150 + step)
+                if self.engine == Dialect.MYSQL:
+                    with self.conn.cursor() as cur:
+                        cur.execute("SELECT @__matview_skip_triggers")
+                        self.assertIn(cur.fetchone()[0], (None, 0))
+                    self.conn.commit()
+
+    def test_failed_recovery_in_session_bypass_mode_names_the_stale_views(self) -> None:
+        """With the session bypass no trigger is dropped, so a failed recovery
+        leaves stale contents that the drift check cannot see: the error's
+        view_names is the record, and repair_view() fixes them."""
+        def failing_refresh(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("injected recovery failure")
+
+        with self.assertRaises(BulkChangesRecoveryError) as ctx:
+            with self.manager.bulk_changes():
+                self._write(f"INSERT INTO {self.table} VALUES (190, 'a', 1)")
+                self.conn.commit()
+                self.manager._bulk_refresh = failing_refresh  # only the recovery refresh runs now
+        del self.manager._bulk_refresh
+        self.assertEqual(ctx.exception.view_names, ["bulk_totals"])
+        self.assertIn("cannot detect stale contents", str(ctx.exception))
+        self.assertNotEqual(
+            sorted(self._observed("SELECT bucket, n, total FROM bulk_totals")), sorted(self._observed(self._sql(LIVE_SQL)))
+        )
+        self.assertEqual(self.manager.check_schema_drift(), {"bulk_totals": "ok"})
+        self.conn.commit()
+        self.assertEqual(self.manager.repair_view("bulk_totals"), {"bulk_totals": "repaired"})
+        self._assert_exact()
+        self._assert_maintained_by_other_session(191)
 
     def _shape_modes(self) -> List[Dict[str, Any]]:
         if self.engine == Dialect.POSTGRES:

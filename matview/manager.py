@@ -154,9 +154,25 @@ class BulkChangesTransactionError(RuntimeError):
 
     The block must leave transaction control to the manager. Work after the
     unexpected transaction end was rolled back; maintenance was restored and
-    the views were refreshed in a new transaction (the message says so, or
-    that this recovery failed and which repair is needed).
+    the views were refreshed in a new transaction.
     """
+
+
+class BulkChangesRecoveryError(BulkChangesTransactionError):
+    """Restoring maintenance after a block that ended the transaction failed.
+
+    ``view_names`` lists the views left stale by the work the block
+    committed; ``repair_view()`` repairs them. Only when their maintenance
+    triggers are also missing (SQLite, PostgreSQL ``drop_triggers``) do
+    ``check_schema_drift()`` and ``sync_views()`` report them (as
+    ``"triggers_missing"``); stale contents alone are not detectable there
+    (PostgreSQL session bypass, MySQL/MariaDB), so ``view_names`` is the
+    only record.
+    """
+
+    def __init__(self, message: str, view_names: Sequence[str]) -> None:
+        super().__init__(message)
+        self.view_names = list(view_names)
 
 
 def _manager_owned_operation(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -1767,7 +1783,8 @@ class MaterializedViewManager:
         Declaratively synchronizes a collection of materialized view definitions against
         the connected database (supporting multi-view SQL files/strings as well).
         Returns a status map `{view_name: "created" | "updated" | "unchanged" |
-        "backfill_incomplete" | "dropped"}`; "backfill_incomplete" means the definition
+        "backfill_incomplete" | "triggers_missing" | "dropped"}` ("triggers_missing":
+        maintenance triggers of an unchanged view are gone; repair with `repair_view()`); "backfill_incomplete" means the definition
         is current but a pk-range backfill is running elsewhere or was interrupted
         (repair with `repair_view()`).
         """
@@ -1777,6 +1794,7 @@ class MaterializedViewManager:
         effective_strict = self.strict if strict is None else strict
         schemas = self.fetch_schema(extra_schema_sql=schema_sql)
         catalog = self.get_catalog()
+        missing_triggers = self._views_missing_triggers(catalog)
         status: Dict[str, str] = {}
         desired_names: Set[str] = set()
 
@@ -1844,6 +1862,10 @@ class MaterializedViewManager:
                     compiled_plan=plan,
                 )
                 status[v_name] = "updated"
+            elif v_name in missing_triggers:
+                # Same definition, but maintenance triggers are gone (e.g. a
+                # failed bulk_changes() recovery): writes are not maintained.
+                status[v_name] = "triggers_missing"
             elif self._is_backfill_incomplete(catalog[v_name]):
                 # Same definition, but a pk-range backfill is running elsewhere
                 # or was interrupted: not "unchanged" (not complete).
@@ -1859,16 +1881,44 @@ class MaterializedViewManager:
 
         return status
 
+    _LIVE_TRIGGER_SQL = {
+        Dialect.SQLITE: "SELECT name FROM sqlite_master WHERE type = 'trigger'",
+        Dialect.POSTGRES: "SELECT tgname FROM pg_catalog.pg_trigger WHERE NOT tgisinternal",
+        Dialect.MYSQL: "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE()",
+    }
+
+    def _views_missing_triggers(self, catalog: Dict[str, Dict[str, Any]]) -> Set[str]:
+        """Registered views some of whose recorded triggers no longer exist.
+
+        Never ends a caller transaction (savepoint-protected read); when the
+        trigger list cannot be read nothing is reported.
+        """
+        sql = self._LIVE_TRIGGER_SQL.get(self.dialect)
+        if sql is None or not catalog:
+            return set()
+        with self._cursor() as cur:
+            rows = self._catalog_select(cur, sql)
+        if rows is None:
+            return set()
+        live = {str(r[0]).lower() for r in rows if r[0]}
+        return {
+            name for name, entry in catalog.items()
+            if any(str(t).lower() not in live for t in entry.get("trigger_names") or [])
+        }
+
     @_manager_read_operation
     def check_schema_drift(self) -> Dict[str, str]:
         """
         Inspects all registered views in `__matview_catalog` against the current live base
         table schemas and returns `{view_name: "ok" | "drifted" | "invalid" |
-        "backfill_incomplete"}`; "backfill_incomplete" (definition current, but a
-        pk-range backfill is running elsewhere or was interrupted) is never "ok".
+        "backfill_incomplete" | "triggers_missing"}`; "backfill_incomplete" (definition current, but a
+        pk-range backfill is running elsewhere or was interrupted) is never "ok";
+        "triggers_missing" means maintenance triggers recorded for the view do not
+        exist (writes are not maintained; repair with `repair_view()`).
         """
         schemas = self.fetch_schema()
         catalog = self.get_catalog()
+        missing_triggers = self._views_missing_triggers(catalog)
         report: Dict[str, str] = {}
         for v_name, entry in catalog.items():
             try:
@@ -1886,6 +1936,8 @@ class MaterializedViewManager:
                 sig = self._compute_signature(plan, schemas)
                 if sig != entry["signature_hash"]:
                     report[v_name] = "drifted"
+                elif v_name in missing_triggers:
+                    report[v_name] = "triggers_missing"
                 elif self._is_backfill_incomplete(entry):
                     report[v_name] = "backfill_incomplete"
                 else:
@@ -1903,7 +1955,8 @@ class MaterializedViewManager:
         """
         Reconciles and repairs one or all registered materialized views,
         eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
-        Returns `{view_name: "repaired" | "rebuilt"}`. Each view is repaired
+        Returns `{view_name: "repaired" | "rebuilt"}` ("rebuilt" also when
+        maintenance triggers were missing). Each view is repaired
         in its own transaction (no all-view atomicity).
 
         A "repaired" view is repopulated in one transaction that also takes
@@ -1933,6 +1986,8 @@ class MaterializedViewManager:
             targets = list(catalog.values())
 
         schemas = self.fetch_schema()
+        # Views whose maintenance triggers are gone are rebuilt like drifted ones.
+        missing_triggers = self._views_missing_triggers(catalog)
         results: Dict[str, str] = {}
         for entry in targets:
             v_name = entry["view_name"]
@@ -1947,7 +2002,7 @@ class MaterializedViewManager:
                 pg_fillfactor=getattr(self, "pg_fillfactor", 80),
             )
             sig = self._compute_signature(plan, schemas)
-            if rebuild_on_schema_drift and sig != entry["signature_hash"]:
+            if rebuild_on_schema_drift and (sig != entry["signature_hash"] or v_name in missing_triggers):
                 self.register_view(
                     entry["view_sql"],
                     populate=True,
@@ -2455,17 +2510,27 @@ class MaterializedViewManager:
             if body_ended_transaction is not None:
                 self._bulk_rollback("the bulk_changes() block ended the transaction")
                 try:
+                    # Always the plain refresh (never the caller's shadow-swap
+                    # mode): the simplest path that restores maintenance.
                     self._begin_bulk_transaction(cur)
-                    self._bulk_refresh(cur, targets, use_shadow_swap, recreate_triggers=not session_bypass)
+                    self._bulk_refresh(cur, targets, False, recreate_triggers=not session_bypass)
                     self._commit()
                 except BaseException as recovery_exc:
                     self._bulk_rollback("recovering from a block that ended the transaction failed")
-                    raise BulkChangesTransactionError(
+                    names = [t["view_name"] for t in targets]
+                    raise BulkChangesRecoveryError(
                         "the bulk_changes() block committed or rolled back the manager's transaction, "
-                        "and restoring maintenance/refreshing the views afterwards failed "
-                        f"({recovery_exc!r}): work the block committed is not reflected in the views "
-                        "and maintenance triggers may be missing; run repair_view() or "
-                        "register_view(..., force_rebuild=True)"
+                        f"and restoring maintenance/refreshing the views afterwards failed ({recovery_exc!r}). "
+                        f"Views {names} do not reflect the work the block committed"
+                        + (
+                            "; their contents are stale although check_schema_drift() reports them "
+                            "as ok (it cannot detect stale contents)"
+                            if session_bypass
+                            else " and their maintenance triggers are missing (check_schema_drift() "
+                            "and sync_views() report \"triggers_missing\")"
+                        )
+                        + "; repair them with repair_view()",
+                        names,
                     ) from recovery_exc
                 raise BulkChangesTransactionError(
                     "the bulk_changes() block committed or rolled back the manager's transaction "
