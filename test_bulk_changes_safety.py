@@ -80,6 +80,32 @@ LIVE_SQL = f"SELECT bucket, COUNT(*), SUM(amt) FROM {TABLE} GROUP BY bucket ORDE
 OTHER_LIVE_SQL = f"SELECT bucket, COUNT(*), SUM(amt) FROM {TABLE} WHERE amt > 15 GROUP BY bucket ORDER BY bucket"
 INITIAL_ROWS = [(1, "a", 10), (2, "a", 20), (3, "b", 30)]
 INJECTED = "matview_injected_restore_failure"
+DIM = "bulk_dim"
+# View shapes exercised by every refresh mode (maintenance strategies differ:
+# algebraic aggregates, holistic MIN/MAX, DISTINCT refcounts, joins and
+# filtered projections with row counts).
+SHAPES = {
+    "bs_agg": f"SELECT bucket, COUNT(*) AS n, SUM(amt) AS total FROM {TABLE} GROUP BY bucket",
+    "bs_minmax": f"SELECT bucket, MIN(amt) AS lo, MAX(amt) AS hi FROM {TABLE} GROUP BY bucket",
+    "bs_distinct": f"SELECT bucket, COUNT(DISTINCT amt) AS d FROM {TABLE} GROUP BY bucket",
+    "bs_join": f"SELECT r.id, r.amt, d.label FROM {TABLE} r JOIN {DIM} d ON d.bucket = r.bucket",
+    "bs_filter": f"SELECT id, bucket, amt FROM {TABLE} WHERE amt > 5",
+    # No key in the projection: duplicate rows are kept with a row count.
+    "bs_proj": f"SELECT bucket, amt FROM {TABLE} WHERE amt > 5",
+}
+
+
+def _shape_body(base: int) -> List[str]:
+    """Mixed DML for the shape tests: new rows in old and new groups, a group
+    move, a value change and a delete (ids from ``base``)."""
+    return [
+        f"INSERT INTO {TABLE} VALUES ({base}, 'a', 7)",
+        f"INSERT INTO {TABLE} VALUES ({base + 1}, 'n', 3)",
+        f"INSERT INTO {TABLE} VALUES ({base + 2}, 'c', 30)",
+        f"UPDATE {TABLE} SET bucket = CASE WHEN bucket = 'a' THEN 'b' ELSE 'a' END WHERE id = 1",
+        f"UPDATE {TABLE} SET amt = amt + 100 WHERE id = 2",
+        f"DELETE FROM {TABLE} WHERE id = {base - 1000 if base > 1000 else 3}",
+    ]
 
 
 def _inject_failing_trigger_ddl(position: str = "middle") -> Any:
@@ -112,11 +138,13 @@ def _quiet_register(manager: MaterializedViewManager, sql: str, **kwargs: Any) -
 
 
 class _SqliteDb:
-    def __init__(self) -> None:
+    def __init__(
+        self, columns: str = "id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, amt INTEGER NOT NULL"
+    ) -> None:
         fd, self.path = tempfile.mkstemp(prefix="matview-bulk-", suffix=".sqlite")
         os.close(fd)
         conn = sqlite3.connect(self.path)
-        conn.execute(f"CREATE TABLE {TABLE} (id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, amt INTEGER NOT NULL);")
+        conn.execute(f"CREATE TABLE {TABLE} ({columns});")
         conn.executemany(f"INSERT INTO {TABLE} VALUES (?, ?, ?);", INITIAL_ROWS)
         conn.commit()
         conn.close()
@@ -463,6 +491,45 @@ class SqliteBulkChangesTests(_SqliteBase):
                 self.assertFalse(real.in_transaction)
 
 
+class SqliteBulkShapeTests(_SqliteBase):
+    def test_every_mode_is_exact_for_every_view_shape(self) -> None:
+        # INT (not INTEGER) PRIMARY KEY with nullable columns: SQLite then
+        # keeps keyless projections with a row count (ON CONFLICT populate).
+        for kwargs in ({}, {"use_shadow_swap": True}, {"drop_triggers": True}):
+            with self.subTest(**kwargs):
+                db = _SqliteDb("id INT PRIMARY KEY, bucket TEXT, amt INT")
+                self.addCleanup(db.cleanup)
+                conn = db.connect()
+                self.addCleanup(conn.close)
+                conn.execute(f"CREATE TABLE {DIM} (bucket TEXT PRIMARY KEY, label TEXT NOT NULL);")
+                conn.executemany(f"INSERT INTO {DIM} VALUES (?, ?);", [("a", "A"), ("b", "B"), ("c", "C")])
+                conn.commit()
+                manager = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+                for name, sql in SHAPES.items():
+                    _quiet_register(manager, f"CREATE VIEW {name} AS {sql};")
+                with manager.bulk_changes(**kwargs):
+                    for stmt in _shape_body(200):
+                        conn.execute(stmt)
+                observer = db.connect()
+                self.addCleanup(observer.close)
+                for name, sql in SHAPES.items():
+                    self.assertEqual(
+                        sorted(observer.execute(f"SELECT * FROM {name}").fetchall()),
+                        sorted(observer.execute(sql).fetchall()),
+                        f"{name} diverged after bulk_changes({kwargs})",
+                    )
+                # Still maintained afterwards, by another connection.
+                observer.execute(f"INSERT INTO {TABLE} VALUES (210, 'b', 9);")
+                observer.execute(f"DELETE FROM {TABLE} WHERE id = 200;")
+                observer.commit()
+                for name, sql in SHAPES.items():
+                    self.assertEqual(
+                        sorted(observer.execute(f"SELECT * FROM {name}").fetchall()),
+                        sorted(observer.execute(sql).fetchall()),
+                        f"{name} not maintained after bulk_changes({kwargs})",
+                    )
+
+
 class SqliteBulkBackfillWatermarkTests(_SqliteBase):
     def setUp(self) -> None:
         super().setUp()
@@ -635,8 +702,10 @@ class _NativeBase:
                     for name, kind in rows:
                         if kind == "VIEW":
                             cur.execute(f"DROP VIEW IF EXISTS `{name}`")
-                    for view in ("bulk_totals", "bulk_maxes"):
+                    for view in ("bulk_totals", "bulk_maxes", "rv_concurrent", *SHAPES):
                         cur.execute(f"DROP VIEW IF EXISTS {view}")
+                    if getattr(self, "dim", None):
+                        cur.execute(f"DROP TABLE IF EXISTS {self.dim}")
                     for name, kind in rows:
                         if kind != "VIEW":
                             cur.execute(f"DROP TABLE IF EXISTS `{name}`")
@@ -803,6 +872,44 @@ class _NativeBase:
             with self.observer.cursor() as cur:
                 cur.execute(f"ALTER TABLE {self.prefix}hidden RENAME TO {catalog}")
         self._assert_maintained_by_other_session(130)
+
+    def _shape_modes(self) -> List[Dict[str, Any]]:
+        if self.engine == Dialect.POSTGRES:
+            return [{}, {"use_shadow_swap": True}, {"drop_triggers": True}]
+        return [{}]
+
+    def test_every_mode_is_exact_for_every_view_shape(self) -> None:
+        dim = self._sql(DIM) if self.engine == Dialect.POSTGRES else f"{DIM}_{self.table[-10:]}"
+        self.dim = dim
+        with self.conn.cursor() as cur:
+            cur.execute(f"CREATE TABLE {dim} (bucket VARCHAR(8) PRIMARY KEY, label VARCHAR(8) NOT NULL)")
+            cur.execute(f"INSERT INTO {dim} VALUES ('a', 'A'), ('b', 'B'), ('c', 'C')")
+        self.conn.commit()
+        shapes = {name: self._sql(sql).replace(DIM, dim) for name, sql in SHAPES.items()}
+        for name, sql in shapes.items():
+            _quiet_register(self.manager, f"CREATE VIEW {name} AS {sql}")
+        for step, kwargs in enumerate(self._shape_modes()):
+            with self.subTest(**kwargs):
+                offset = 1000 * step
+                with self.manager.bulk_changes(**kwargs):
+                    for stmt in _shape_body(offset + 200):
+                        self._write(self._sql(stmt))
+                self.assertFalse(self._in_transaction())
+                for name, sql in shapes.items():
+                    self.assertEqual(
+                        sorted(self._observed(f"SELECT * FROM {name}")),
+                        sorted(self._observed(sql)),
+                        f"{name} diverged after bulk_changes({kwargs})",
+                    )
+                with self.observer.cursor() as cur:
+                    cur.execute(f"INSERT INTO {self.table} VALUES ({offset + 300}, 'b', 9)")
+                    cur.execute(f"DELETE FROM {self.table} WHERE id = {offset + 200}")
+                for name, sql in shapes.items():
+                    self.assertEqual(
+                        sorted(self._observed(f"SELECT * FROM {name}")),
+                        sorted(self._observed(sql)),
+                        f"{name} not maintained after bulk_changes({kwargs})",
+                    )
 
     def test_refresh_waits_for_concurrent_maintained_writer(self) -> None:
         """An independent writer holds an uncommitted, trigger-maintained

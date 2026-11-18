@@ -2275,6 +2275,14 @@ class MaterializedViewManager:
                         s_stmt,
                         flags=re.IGNORECASE,
                     )
+            # Column references qualified by a live table name (e.g. SQLite's
+            # ON CONFLICT ... SET __mv_row_count = <store>.__mv_row_count + 1)
+            # must name the shadow table being populated, or the statement
+            # fails (or reads the live table).
+            for live_t, shadow_t in [(plan.backing_table_name, shadow_tbl), *shadow_aux_map.items()]:
+                s_stmt = re.sub(
+                    rf"(?<![\w.]){any_quoting(live_t)}\.", f"{shadow_t}.", s_stmt, flags=re.IGNORECASE
+                )
             cur.execute(s_stmt)
 
         # The maintenance functions/triggers reference the backing table by
