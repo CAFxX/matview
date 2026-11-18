@@ -699,7 +699,7 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         mgr.catalog_table = "__matview_catalog"
         mgr.pg_use_transition_tables = False
 
-        mgr.get_catalog = lambda: {
+        mgr._read_catalog = lambda *a, **k: {
             "v_zone_distinct": {
                 "view_name": "v_zone_distinct",
                 "view_sql": v_sql,

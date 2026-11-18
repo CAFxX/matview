@@ -672,6 +672,12 @@ class MaterializedViewManager:
 
     @_manager_read_operation
     def get_catalog(self) -> Dict[str, Dict[str, Any]]:
+        return self._read_catalog()
+
+    def _read_catalog(self, required: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Read the catalog. With ``required`` an unreadable catalog raises
+        instead of reading as empty (callers that suspend maintenance must
+        know every view)."""
         with self._cursor() as cur:
             rows = self._catalog_select(
                 cur,
@@ -689,6 +695,10 @@ class MaterializedViewManager:
                     f"FROM {self.catalog_table}",
                 )
                 if rows is None:
+                    if required:
+                        raise RuntimeError(
+                            f"the materialized-view catalog {self.catalog_table} could not be read"
+                        )
                     return {}
         out: Dict[str, Dict[str, Any]] = {}
         for row in rows:
@@ -2294,6 +2304,11 @@ class MaterializedViewManager:
           then the maintenance triggers are dropped and re-created inside the
           transaction.
 
+        The session bypass suspends the triggers of every registered view on
+        this connection, so on PostgreSQL (without ``drop_triggers``) and
+        MySQL/MariaDB ``view_names`` must name every registered view
+        (``ValueError`` otherwise); unknown names raise ``KeyError``.
+
         Every target view is repopulated in the same transaction.
         Concurrent writers: same caveats as ``repair_view`` (PostgreSQL READ COMMITTED repopulation is not exact
         while other sessions commit writes to the base tables during the
@@ -2331,12 +2346,24 @@ class MaterializedViewManager:
             cur = self.conn.cursor()
             try:
                 self._begin_bulk_transaction(cur)
-                catalog = self.get_catalog()
+                catalog = self._read_catalog(required=True)
                 if view_names:
                     resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
-                    targets = [catalog[n] for n in resolved if n in catalog]
+                    unknown = [n for n, r in zip(view_names, resolved) if r not in catalog]
+                    if unknown:
+                        raise KeyError(f"bulk_changes(): views not registered in {self.catalog_table}: {unknown}")
+                    targets = [catalog[r] for r in dict.fromkeys(resolved)]
                 else:
                     targets = list(catalog.values())
+                if session_bypass:
+                    left_out = sorted(set(catalog) - {t["view_name"] for t in targets})
+                    if left_out:
+                        raise ValueError(
+                            f"bulk_changes(view_names=...) on {self.dialect.value}: the session "
+                            f"trigger bypass also suspends maintenance of {left_out}, which would "
+                            f"then be stale; include them in view_names (or pass none)"
+                            + (" or use drop_triggers=True" if self.dialect == Dialect.POSTGRES else "")
+                        )
                 if self.dialect == Dialect.POSTGRES and session_bypass:
                     cur.execute("SET LOCAL matview.skip_triggers = 'on';")
                 elif self.dialect == Dialect.MYSQL:

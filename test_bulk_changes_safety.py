@@ -16,7 +16,9 @@ Contract under test (``MaterializedViewManager.bulk_changes``):
   SQLite drops triggers under ``BEGIN IMMEDIATE``, and MySQL/MariaDB uses
   only the session variable and DML. On MySQL/MariaDB, ``use_shadow_swap``
   and ``drop_triggers`` (DDL, which commits implicitly) are refused before
-  any SQL.
+  any SQL. An unreadable catalog and unknown view names are refused; on
+  PostgreSQL (session bypass) and MySQL/MariaDB a ``view_names`` subset that
+  would leave other views unmaintained is refused.
 * A failure anywhere (setup, body, refresh, restoration) rolls the whole
   transaction back, which restores the original maintenance objects; it is
   never swallowed. When the connection state cannot be restored (rollback
@@ -183,6 +185,18 @@ class SqliteBulkChangesTests(_SqliteBase):
                 self.observer.rollback()
                 self._assert_maintained_by_other_session(base + 1)
 
+    def test_unreadable_catalog_is_refused(self) -> None:
+        manager = self._manager()
+        _quiet_register(manager, VIEW_SQL)
+        triggers = self._triggers()
+        self.observer.execute(f"ALTER TABLE {manager.catalog_table} RENAME TO hidden_catalog;")
+        self.observer.commit()
+        with self.assertRaisesRegex(RuntimeError, "could not be read"):
+            with manager.bulk_changes():
+                self.fail("entered without knowing the registered views")
+        self.assertFalse(manager.conn.in_transaction)
+        self.assertEqual(self._triggers(), triggers)
+
     def test_caller_transaction_is_refused_before_any_sql(self) -> None:
         manager = self._manager()
         _quiet_register(manager, VIEW_SQL)
@@ -285,6 +299,25 @@ class SqliteBulkChangesTests(_SqliteBase):
                         self.observer.execute(f"DELETE FROM {TABLE} WHERE id = 41;")
                         self.observer.commit()
 
+    def test_unknown_view_name_is_refused_before_any_change(self) -> None:
+        manager = self._manager()
+        _quiet_register(manager, VIEW_SQL)
+        triggers = self._triggers()
+        with self.assertRaises(KeyError):
+            with manager.bulk_changes(view_names=["bulk_totals", "no_such_view"]):
+                self.fail("entered")
+        self.assertFalse(manager.conn.in_transaction)
+        self.assertEqual(self._triggers(), triggers)
+
+    def test_view_subset_keeps_other_views_maintained(self) -> None:
+        manager = self._manager()
+        _quiet_register(manager, VIEW_SQL)
+        _quiet_register(manager, OTHER_VIEW_SQL)
+        with manager.bulk_changes(view_names=["bulk_totals"]):
+            manager.conn.execute(f"INSERT INTO {TABLE} VALUES (50, 'b', 99);")
+        self._assert_exact()
+        self._assert_exact("bulk_maxes", OTHER_LIVE_SQL)
+
     def test_failed_rollback_invalidates_connection_and_manager(self) -> None:
         manager = self._manager()
         _quiet_register(manager, VIEW_SQL)
@@ -331,6 +364,70 @@ class SqliteBulkChangesTests(_SqliteBase):
         with self.assertRaises(BulkChangesConnectionError):
             with manager.bulk_changes():
                 self.fail("entered on an invalidated manager")
+
+    def test_cursor_is_closed_on_every_exit(self) -> None:
+        manager = self._manager()
+        _quiet_register(manager, VIEW_SQL)
+        real = manager.conn
+        opened: List[Any] = []
+
+        class CountingCursor:
+            def __init__(self, cur: Any) -> None:
+                self._cur = cur
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+                self._cur.close()
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._cur, name)
+
+        class Counting:
+            def __init__(self) -> None:
+                self.dbapi_connection = real
+
+            def cursor(self) -> Any:
+                cur = CountingCursor(real.cursor())
+                opened.append(cur)
+                return cur
+
+            def commit(self) -> None:
+                real.commit()
+
+            def rollback(self) -> None:
+                real.rollback()
+
+        manager.conn = Counting()
+        scenarios: Dict[str, Callable[[], None]] = {}
+
+        def success() -> None:
+            with manager.bulk_changes():
+                real.execute(f"INSERT INTO {TABLE} VALUES (80, 'a', 1);")
+
+        def body_failure() -> None:
+            with self.assertRaises(ValueError):
+                with manager.bulk_changes():
+                    raise ValueError("body failed")
+
+        def refresh_failure() -> None:
+            with self.assertRaises(Exception):
+                with _inject_failing_trigger_ddl():
+                    with manager.bulk_changes():
+                        pass
+
+        def unknown_view() -> None:
+            with self.assertRaises(KeyError):
+                with manager.bulk_changes(view_names=["nope"]):
+                    pass
+
+        scenarios.update(success=success, body_failure=body_failure, refresh_failure=refresh_failure, unknown_view=unknown_view)
+        for label, run in scenarios.items():
+            with self.subTest(scenario=label):
+                opened.clear()
+                run()
+                self.assertTrue(all(c.closed for c in opened), f"{label}: {sum(not c.closed for c in opened)} cursor(s) left open")
+                self.assertFalse(real.in_transaction)
 
 
 
@@ -573,6 +670,39 @@ class _NativeBase:
         with conn.cursor() as cur:
             cur.execute(f"INSERT INTO {self.table} VALUES (42, 'b', 2)")
         self._assert_exact()
+
+    def test_view_subset_cannot_leave_other_views_unmaintained(self) -> None:
+        """The session bypass suspends every view's triggers on this session;
+        a subset that would leave another view stale must be refused (or the
+        other view refreshed)."""
+        _quiet_register(self.manager, self._sql(OTHER_VIEW_SQL))
+        try:
+            with self.manager.bulk_changes(view_names=["bulk_totals"]):
+                self._write(f"INSERT INTO {self.table} VALUES (50, 'b', 99)")
+        except ValueError as exc:
+            self.assertIn("bulk_maxes", str(exc))
+            self.assertFalse(self._in_transaction())
+            self.assertNotIn(50, [r[0] for r in self._rows()])
+        self._assert_exact()
+        self._assert_exact("bulk_maxes", OTHER_LIVE_SQL)
+
+    def test_unreadable_catalog_is_refused(self) -> None:
+        """Without the catalog the bypass would suspend maintenance of views
+        nobody refreshes: refuse (it used to proceed with no views)."""
+        catalog = f"{self.prefix}catalog"
+        with self.observer.cursor() as cur:
+            cur.execute(f"ALTER TABLE {catalog} RENAME TO {self.prefix}hidden")
+        try:
+            rows = self._rows()
+            with self.assertRaisesRegex(RuntimeError, "could not be read"):
+                with self.manager.bulk_changes():
+                    self.fail("entered without knowing the registered views")
+            self.assertFalse(self._in_transaction())
+            self.assertEqual(self._rows(), rows)
+        finally:
+            with self.observer.cursor() as cur:
+                cur.execute(f"ALTER TABLE {self.prefix}hidden RENAME TO {catalog}")
+        self._assert_maintained_by_other_session(130)
 
 
 class NativePostgresBulkChangesTests(_NativeBase, unittest.TestCase):
