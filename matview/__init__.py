@@ -50,6 +50,7 @@ from .logical_ir import (
 from .manager import (
     BackfillInterruptedError,
     BulkChangesConnectionError,
+    BulkChangesTransactionError,
     MaterializedViewManager,
     TransactionOwnershipError,
     UnsafeReplacementError,
@@ -98,6 +99,7 @@ __all__ = [
     "UnsupportedMaterializedViewError",
     "BackfillInterruptedError",
     "BulkChangesConnectionError",
+    "BulkChangesTransactionError",
     "TransactionOwnershipError",
     "UnsafeReplacementError",
     "ColumnDef",
