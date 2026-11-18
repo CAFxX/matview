@@ -7046,6 +7046,72 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_25b_commuting_dml_orders_preserve_distinct_aggregate_state(self) -> None:
+        """Disjoint DML in every order: same reader rows and same DISTINCT bookkeeping (ported from PR #59).
+
+        Each transition is checked against the live SELECT; the final reader
+        rows and the DISTINCT auxiliary reference counts must be identical for
+        all six permutations of an INSERT, a grouping-key/DISTINCT-value UPDATE
+        and a DELETE touching disjoint rows.
+        """
+        import itertools
+
+        schema = """
+        CREATE TABLE commuting_items (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, tag TEXT, value INTEGER NOT NULL);
+        INSERT INTO commuting_items VALUES (1, 'A', 'x', 10), (2, 'A', 'x', 20), (3, 'A', 'y', 30),
+            (4, 'B', 'x', 5), (5, 'B', NULL, 7);
+        """
+        live_sql = (
+            "SELECT grp, COUNT(*) AS row_count, COUNT(DISTINCT tag) AS distinct_tags, "
+            "SUM(value) AS total_value FROM commuting_items GROUP BY grp"
+        )
+        mutations = {
+            "insert": "INSERT INTO commuting_items VALUES (10, 'A', 'z', 13)",
+            "update": "UPDATE commuting_items SET grp = 'B', tag = 'z', value = 31 WHERE id = 2",
+            "delete": "DELETE FROM commuting_items WHERE id = 4",
+        }
+
+        def run_order(order: Sequence[str]) -> Tuple[List[Tuple[Any, ...]], List[Tuple[Any, ...]]]:
+            conn = sqlite3.connect(":memory:")
+            try:
+                manager = MaterializedViewManager(conn, dialect="sqlite")
+                manager.apply_schema_ddl(schema)
+                plan = manager.register_view(f"CREATE VIEW commuting_summary AS {live_sql};")
+                self.assertTrue(plan.auxiliary_table_names)
+
+                def reader() -> List[Tuple[Any, ...]]:
+                    return sorted(tuple(r) for r in conn.execute(
+                        f"SELECT grp, row_count, distinct_tags, total_value FROM {plan.view_name}"))
+
+                def check(label: str) -> None:
+                    live = sorted(tuple(r) for r in conn.execute(live_sql))
+                    self.assertTrue(_rows_equal(reader(), live), f"{order} {label}: {reader()!r} != {live!r}")
+
+                check("initial")
+                for name in order:
+                    conn.execute(mutations[name])
+                    check(f"after {name}")
+                aux = sorted(
+                    tuple(r)
+                    for a in plan.auxiliary_table_names
+                    for r in conn.execute(f"SELECT grp, __val, __ref_cnt FROM {a}")
+                )
+                return reader(), aux
+            finally:
+                conn.close()
+
+        results = {order: run_order(order) for order in itertools.permutations(mutations)}
+        first_order, (first_rows, first_aux) = next(iter(results.items()))
+        # Reference counts are exactly the live per-group tag multiplicities.
+        self.assertEqual(
+            first_aux,
+            [("A", "x", 1), ("A", "y", 1), ("A", "z", 1), ("B", "z", 1)],
+        )
+        for order, (rows, aux) in results.items():
+            with self.subTest(order=order):
+                self.assertEqual(rows, first_rows, f"{order} vs {first_order}")
+                self.assertEqual(aux, first_aux, f"{order} vs {first_order}")
+
     def test_25_join_aggregate_decrement_and_group_key_invariants(self) -> None:
         """Exercise join-delta retractions against an independent live SELECT oracle."""
         schema = """
