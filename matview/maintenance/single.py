@@ -2107,7 +2107,16 @@ class Tier1SingleMixin(MixinHost):
                 else:
                     insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 1.0 * ({val_e}) END)")
             elif item.agg_func in (AggFunc.VAR_POP, AggFunc.STDDEV_POP):
-                insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE 0.0 END)")
+                # A one-row population statistic is zero. PostgreSQL's NUMERIC
+                # variants return it with scale 0 (`0`, not `0.0`); keep the
+                # native representation, which is observable as text.
+                zero = (
+                    "0"
+                    if self.dialect == Dialect.POSTGRES
+                    and self._statistical_result_storage_type(item) == "NUMERIC"
+                    else "0.0"
+                )
+                insert_vals.append(f"(CASE WHEN ({val_e}) IS NULL THEN NULL ELSE {zero} END)")
             elif item.agg_func in (AggFunc.VAR_SAMP, AggFunc.STDDEV_SAMP):
                 insert_vals.append("NULL")
             elif item.agg_func in (AggFunc.MIN, AggFunc.MAX, AggFunc.BIT_AND, AggFunc.BIT_OR, AggFunc.BIT_XOR):

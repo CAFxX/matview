@@ -279,6 +279,7 @@ Errors raised before anything is installed:
 | `ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE` | PostgreSQL/MySQL/MariaDB: any floating-point `SUM`/`AVG`/`VAR`/`STDDEV`, in any shape (see [Floating-point aggregates](#floating-point-aggregates)). Per-code opt-in only. | The original view's own result depends on its plan; no maintained value can equal it under every plan. |
 | `ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE` | Such an aggregate over a join, a window, or (MySQL/MariaDB) `UNION ALL`. Per-code opt-in only. | It is folded or re-evaluated without the lock-then-recompute protocol: values can drift until `repair_view()`. |
 | `MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX` | MySQL/MariaDB: a grouped view with such an aggregate and no source-table index whose leading columns are the `GROUP BY` columns. Per-code opt-in only. | The recompute is a locking read; without the index it share-locks the whole table and concurrent writers deadlock. |
+| `MARIADB_STAT_RESULT_DECIMALS` | On MariaDB, a `VAR_*`/`STDDEV_*` over an exact (integer/`DECIMAL`) or `FLOAT(M,D)` argument is used inside a larger expression or as a window function, or its argument's numeric type cannot be derived. | MariaDB fixes such a result's decimals and rounds it in results; a materialized expression cannot reproduce that. Project the aggregate as its own column or cast its argument to `DOUBLE`. |
 
 ```python run
 import warnings

@@ -40,13 +40,25 @@ from .templates import render_procedural_sql
 
 
 class MySQLDialectMixin(MixinHost):
-    def _mariadb_statistical_result_scale(self, item: SelectItem) -> str:
-        """Return MariaDB's native VAR/STDDEV result scale as a view-safe literal.
+    # MariaDB's NOT_FIXED_DEC: a DOUBLE result without a fixed number of
+    # decimals. Rounding such a value to 31 decimals is *not* an identity in
+    # MariaDB (ROUND(3.3323552986941074, 31) = 3.332355298694107).
+    MARIADB_NOT_FIXED_DEC = 31
+    # The result decimals cannot be derived from the argument.
+    MARIADB_UNKNOWN_DEC = -1
+
+    def _mariadb_statistical_result_scale(self, item: SelectItem) -> int:
+        """Return the fixed decimals of MariaDB's native VAR/STDDEV result for `item`.
 
         MariaDB derives exact-input scale from argument scale plus the session's
-        div_precision_increment (capped at 30). Capture that setting during engine
-        detection: CREATE VIEW rejects system-variable references. Approximate
-        inputs retain their native DOUBLE display precision.
+        div_precision_increment (capped at 30) and fixes the DOUBLE result to
+        that many decimals; the text protocol rounds the value to them.
+        Capture that setting during engine detection: CREATE VIEW rejects
+        system-variable references. `FLOAT(M,D)`/`DOUBLE(M,D)` inputs fix
+        D + 4 decimals. Plain approximate inputs return `MARIADB_NOT_FIXED_DEC`
+        (no rounding), and arguments whose family cannot be derived return
+        `MARIADB_UNKNOWN_DEC` (the planner reports a limitation instead of
+        guessing).
         """
         source = self._lookup_source_col_def(item.arg_expr) if item.arg_expr else None
         source_type = source.data_type.strip().upper() if source else ""
@@ -54,24 +66,75 @@ class MySQLDialectMixin(MixinHost):
         if re.search(r"\b(?:DECIMAL|NUMERIC|DEC|FIXED)\b", source_type):
             precision_scale = self._numeric_precision_scale_from_type(source_type)
             scale = precision_scale[1] if precision_scale else 0
-            return str(min(30, scale + self.engine_version.mariadb_div_precision_increment))
+            return min(30, scale + self.engine_version.mariadb_div_precision_increment)
 
         if re.search(r"\b(?:TINYINT|SMALLINT|MEDIUMINT|INTEGER|INT|BIGINT|SERIAL)\b", source_type):
-            return str(min(30, self.engine_version.mariadb_div_precision_increment))
+            return min(30, self.engine_version.mariadb_div_precision_increment)
 
         float_match = re.search(
             r"\b(?:FLOAT|DOUBLE|REAL)\s*\(\s*\d+\s*,\s*(\d+)\s*\)",
             source_type,
         )
         if float_match:
-            return str(min(int(float_match.group(1)) + 4, 31))
+            return min(int(float_match.group(1)) + 4, self.MARIADB_NOT_FIXED_DEC)
         if any(token in source_type for token in ("FLOAT", "DOUBLE", "REAL")):
-            return "31"
+            return self.MARIADB_NOT_FIXED_DEC
 
         exact_type = self._exact_numeric_precision_scale(item.arg_expr or "")
         if exact_type is not None:
-            return str(min(30, exact_type[1] + self.engine_version.mariadb_div_precision_increment))
-        return "31"
+            return min(30, exact_type[1] + self.engine_version.mariadb_div_precision_increment)
+        inferred = self._infer_ast_expr_storage_type(item.arg_expr) if item.arg_expr else None
+        if inferred is not None and re.fullmatch(r"(?:DOUBLE(?: PRECISION)?|FLOAT|REAL)", inferred.strip().upper()):
+            return self.MARIADB_NOT_FIXED_DEC
+        return self.MARIADB_UNKNOWN_DEC
+
+    def _mariadb_statistical_decimals_issues(self) -> List[str]:
+        """Projections whose MariaDB VAR/STDDEV result decimals cannot be preserved.
+
+        A top-level VAR/STDDEV aggregate keeps its native decimals through a
+        reader-side ROUND. Nested in a larger projection expression (arithmetic,
+        COALESCE, window, scalar subquery), the native result's fixed decimals
+        propagate through MariaDB's expression typing and determine the
+        rounding clients observe; the materialized expression over a stored
+        DOUBLE does not carry them. Only non-fixed (approximate-input) results
+        are safe there.
+        """
+        stat_funcs = {"VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "STDDEV", "STD"}
+        stat_aggs = (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+        from ..sql_frontend import _parse_single_agg_expr
+
+        issues: List[str] = []
+        for it in self.view.select_items:
+            if it.is_aggregate and it.agg_func in stat_aggs:
+                if self._mariadb_statistical_result_scale(it) == self.MARIADB_UNKNOWN_DEC:
+                    issues.append(it.alias)
+                continue
+            toks = sqlglot.tokenize(it.raw_expr, read="mysql")
+            for idx in range(len(toks) - 1):
+                if (
+                    toks[idx].text.upper() not in stat_funcs
+                    or toks[idx + 1].token_type != SQLGlotTokenType.L_PAREN
+                ):
+                    continue
+                depth = 0
+                close = -1
+                for j in range(idx + 1, len(toks)):
+                    if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                        depth += 1
+                    elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                        depth -= 1
+                        if depth == 0:
+                            close = j
+                            break
+                call = it.raw_expr[toks[idx].start : toks[close].end + 1] if close != -1 else ""
+                parsed = _parse_single_agg_expr(call, "__v", dialect=Dialect.MYSQL) if call else None
+                if (
+                    parsed is None
+                    or self._mariadb_statistical_result_scale(parsed) != self.MARIADB_NOT_FIXED_DEC
+                ):
+                    issues.append(it.alias)
+                    break
+        return issues
 
 
     def _rewrite_mysql_not_in_subquery(self, sql: str) -> str:

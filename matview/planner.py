@@ -140,6 +140,28 @@ class PlannerMixin(MixinHost):
                     mitigation="Upgrade PostgreSQL to 11 or later.",
                 )
             )
+        if self.subdialect == EngineSubdialect.MARIADB:
+            decimals_issues = self._mariadb_statistical_decimals_issues()
+            if decimals_issues:
+                lims.append(
+                    TransparencyLimitation(
+                        code="MARIADB_STAT_RESULT_DECIMALS",
+                        severity=LimitationSeverity.BLOCKER,
+                        dialect=Dialect.MYSQL,
+                        affected_object=f"{self.logical_view_name} ({', '.join(decimals_issues)})",
+                        description=(
+                            "MariaDB fixes the number of decimals of VAR/STDDEV results over exact "
+                            "inputs and rounds them in results; column(s) "
+                            f"{', '.join(decimals_issues)} use such a result inside a larger expression "
+                            "(or over an argument whose numeric family cannot be derived), whose native "
+                            "decimals the materialized column cannot reproduce."
+                        ),
+                        mitigation=(
+                            "Project the VAR/STDDEV aggregate as its own column over a typed column, or "
+                            "CAST its argument to DOUBLE."
+                        ),
+                    )
+                )
         if self.view.has_window_func:
             if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_window_functions:
                 lims.append(
@@ -782,14 +804,10 @@ class PlannerMixin(MixinHost):
                     )
                 ):
                     result_scale = self._mariadb_statistical_result_scale(it)
-                    if result_scale == "31":
-                        # Approximate input: the native result is a DOUBLE
-                        # with "not fixed" decimals, like the backing column.
-                        # ROUND(x, 31) is not the identity in MariaDB (it
-                        # scales by 10**31: 1.25 -> 1.2499999999999998).
-                        reader_exprs[it.alias] = it.alias
-                    else:
+                    if 0 <= result_scale < self.MARIADB_NOT_FIXED_DEC:
                         reader_exprs[it.alias] = f"ROUND({it.alias}, {result_scale}) AS {it.alias}"
+                    else:
+                        reader_exprs[it.alias] = it.alias
                 elif self.dialect == Dialect.MYSQL and it.agg_func in (AggFunc.BIT_OR, AggFunc.BIT_XOR):
                     # Keep COALESCE's result type unsigned, matching MySQL's
                     # BIT_* aggregate contract (unsigned 64-bit integer).
