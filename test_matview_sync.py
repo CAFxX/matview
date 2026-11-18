@@ -1861,6 +1861,15 @@ class TranspiledConnectionAdapter:
                 return [(raw_v,)], 1
         if s_up == "SELECT SQLITE_VERSION()":
             raise sqlite3.OperationalError("function sqlite_version() does not exist")
+        if self.dialect == Dialect.POSTGRES and s_up.startswith("SELECT TO_REGCLASS("):
+            name = str((params or [None])[0])
+            found = self._sq_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+            ).fetchone()
+            return [(found[0] if found else None,)], 1
+        if self.dialect == Dialect.POSTGRES and s_up.startswith("LOCK TABLE "):
+            # SQLite serializes writers database-wide: table locks are implied.
+            return [], 0
 
         if s_up.startswith("DROP SCHEMA PUBLIC") or s_up.startswith("DROP DATABASE"):
             self._reset_sqlite()
