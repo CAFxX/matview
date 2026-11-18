@@ -2189,11 +2189,21 @@ class MaterializedViewManager:
     ) -> None:
         """Repopulate every target view inside the current transaction.
 
-        Any error propagates; the caller rolls back.
+        Each view's pk-range backfill watermark is taken over first, as
+        repair_view() does: a running backfill stops at its next batch and an
+        interrupted one is recorded as complete (the view is fully
+        repopulated). Any error propagates; the caller rolls back.
         """
         schemas = self.fetch_schema()
         for entry in targets:
             plan = self._bulk_plan(schemas, entry)
+            self._execute_param(
+                cur,
+                f"UPDATE {self.catalog_table} SET backfill_cursor_pk = ?, "
+                f"backfill_max_pk = ?, backfill_active = 0, backfill_owner = NULL "
+                f"WHERE view_name = ?",
+                (self._COMPLETED_MARKER_PK, self._COMPLETED_MARKER_PK, entry["view_name"]),
+            )
             if use_shadow_swap:
                 self._bulk_shadow_swap(cur, plan, entry)
             else:
@@ -2325,8 +2335,11 @@ class MaterializedViewManager:
         MySQL/MariaDB ``view_names`` must name every registered view
         (``ValueError`` otherwise); unknown names raise ``KeyError``.
 
-        Every target view is repopulated in the same transaction.
-        Concurrent writers: same caveats as ``repair_view`` (PostgreSQL READ COMMITTED repopulation is not exact
+        Every target view is repopulated and its pk-range backfill watermark
+        is taken over in the same transaction (as ``repair_view`` does): a
+        running backfill stops at its next batch, an interrupted one is
+        recorded as complete. Concurrent writers: same caveats as
+        ``repair_view`` (PostgreSQL READ COMMITTED repopulation is not exact
         while other sessions commit writes to the base tables during the
         refresh; quiesce them or use ``drop_triggers=True``, which makes them
         wait).
