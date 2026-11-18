@@ -395,7 +395,7 @@ def collect_test_strength_report(
             },
             {
                 "name": "MySQL / MariaDB",
-                "versions": "MySQL 8.4 LTS, 9.7 LTS, MariaDB 10.11, 11.4, 11.8, 12.3 LTS, 13.1 Rolling",
+                "versions": "MySQL 8.4 LTS, 9.7 LTS, MariaDB 10.11, 11.4, 11.8, 12.3 LTS, 13.0 Rolling (13.1 when GA)",
                 "fidelity": "Native server execution",
                 "notes": "Exercises native trigger engine, ON DUPLICATE KEY UPDATE, and unsigned/DECIMAL types.",
             },

@@ -1,3 +1,4 @@
-# Development-only dependencies (not installed by CI).
-# scripts/presubmit.py parses .github/workflows/ci.yml with PyYAML.
+# Development and CI tooling dependencies (not needed to use matview).
+# scripts/presubmit.py parses .github/workflows/ci.yml with PyYAML; the CI
+# SQLite jobs install this file to run scripts/test_presubmit.py.
 pyyaml>=6.0

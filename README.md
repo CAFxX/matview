@@ -329,16 +329,21 @@ Support levels used here:
   MySQL 8.4 and MariaDB 12.3 on every push to master, nightly and on demand. It
   is not a merge gate; a failure opens or updates a GitHub issue that lists the
   failing seeds with replay commands.
-- Natively tested weekly: the deferred sweep runs the main suite
-  (`test_matview_sync.py`) against these targets. It is not a merge gate and can
-  be red; check the latest run in the repository's Actions tab before relying
-  on it.
+- Natively tested nightly: the deferred sweep runs the main suite
+  (`test_matview_sync.py`) against these targets every night (scale-3 fuzz
+  campaigns weekly). It is not a merge gate and can be red; a failing scheduled
+  run opens or updates one issue labelled `ci-deferred`. Check that issue and
+  the latest run in the repository's Actions tab before relying on it.
 - Transpiled: in `test_matview_sync.py`, the PostgreSQL and MySQL code paths are
   also exercised against SQLite through `TranspiledConnectionAdapter` (sqlglot
   transpilation). These are auxiliary checks, not evidence of native engine
   semantics.
-- Best-effort: SQLite3 Multiple Ciphers and sqlean run the main suite weekly as
-  SQLite builds; cipher and extension functionality is not tested. Products not
+- Best-effort: SQLite3 Multiple Ciphers and sqlean run the main suite nightly as
+  SQLite builds; cipher and extension functionality is not tested. The sqlean
+  lane is allowed to fail: sqlean's own `VAR_*`/`STDDEV_*` functions differ
+  from matview's SQLite results (a single-value sample statistic is `0.0` in
+  sqlean and NULL in the MV; rounding also differs), see
+  [sqlean Native Statistical Aggregates (MVs Diverge From sqlean's Own VAR/STDDEV)](TODO.md). Products not
   listed in the matrix (for example other PostgreSQL or MySQL forks) are
   untested.
 - Not supported: TimescaleDB, PostGIS and pgvector are excluded from CI until
@@ -380,7 +385,7 @@ Extended random-seed fuzz ([`ci-extended.yml`](.github/workflows/ci-extended.yml
 | Random-seed fuzz / MySQL 8.4 | 3.12 | `mysql:8.4` |
 | Random-seed fuzz / MariaDB 12.3 LTS | 3.12 | `mariadb:12.3` |
 
-Deferred compatibility sweep ([`ci-deferred.yml`](.github/workflows/ci-deferred.yml); weekly, not a merge gate):
+Deferred compatibility sweep ([`ci-deferred.yml`](.github/workflows/ci-deferred.yml); nightly, scale-3 fuzz weekly; not a merge gate, scheduled failures open an issue):
 
 | CI job | Python | Database |
 | --- | --- | --- |
@@ -393,7 +398,7 @@ Deferred compatibility sweep ([`ci-deferred.yml`](.github/workflows/ci-deferred.
 | Percona PostgreSQL 18 | 3.12 | `percona/percona-distribution-postgresql:18` |
 | MySQL 26.10 Innovation | 3.12 | `mysql:26.10` |
 | MariaDB 11.4 LTS | 3.12 | `mariadb:11.4` |
-| MariaDB 13.1 Rolling | 3.12 | `mariadb:13.1` |
+| MariaDB 13.0 Rolling | 3.12 | `mariadb:13.0` |
 | Percona Server for MySQL 8.4 | 3.12 | `percona/percona-server:8.4` |
 | Percona Server for MySQL 9.7 | 3.12 | `percona/percona-server:9.7` |
 | Minimum declared dependencies / PostgreSQL 18 | 3.11 | `postgres:18` |
@@ -933,8 +938,12 @@ green run is not proof of a green GitHub run; `--help` and the stamp's
   failure is added to the permanent regression corpus in its fix PR.
 - Deferred compatibility sweep
   ([`.github/workflows/ci-deferred.yml`](.github/workflows/ci-deferred.yml)):
-  weekly and on demand; additional versions, minimum declared dependency
-  versions and scale-3 fuzz campaigns. Not a merge gate.
+  nightly and on demand for additional versions and the minimum declared
+  dependency versions (exact pins derived from `requirements.txt`, Python
+  3.11); weekly (Sunday) and on demand for the scale-3 fuzz campaigns, which
+  upload failing-seed reports with replay commands. Not a merge gate; a failing
+  scheduled run opens or comments on one issue labelled `ci-deferred`.
+- Every CI job has a `timeout-minutes` limit (25 minutes for PR-gate jobs).
 
 ### Executable documentation
 

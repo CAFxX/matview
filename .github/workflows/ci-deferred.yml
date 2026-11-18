@@ -1,20 +1,45 @@
 name: CI — Deferred Compatibility Sweep
 
 # This workflow owns the compatibility dimensions intentionally removed from
-# the per-PR gate. Run weekly and on demand; it is not a required branch check.
+# the per-PR gate. It is not a required branch check.
+#
+# Schedule (measured job wall times from the 2026-11-09/16 runs in brackets):
+# - Nightly (Mon-Sat 03:17 UTC): python-deferred [9-17 min], compatibility-sweep
+#   [11-24 min] and dependency-minimum (~14 jobs, ~200 runner-minutes, about one
+#   PR-gate run before stage 1).
+# - Weekly (Sunday 03:17 UTC) and on demand: everything above plus the six
+#   scale-3 fuzz-stress jobs [11-49 min, ~210 runner-minutes]; they stay weekly
+#   because they cost as much as the rest of the sweep together.
+# - Timeouts: 60 min for sweep jobs (2.5x the slowest measured), 90 min for
+#   scale-3 fuzz (slowest measured 49 min), 10 min for the bookkeeping jobs.
+#
+# Ownership: a failing scheduled run opens, or comments on, ONE GitHub issue
+# (label ci-deferred, scripts/ci_failure_issue.js, shared with ci-extended.yml).
+# Scale-3 fuzz jobs upload fuzz-campaign.json and a failing-seed report with a
+# replay command (scripts/fuzz_failure_report.py), as ci-extended.yml does.
 #
 # Deferred dimensions:
 # - CPython 3.13 and 3.14 on standard SQLite. Python 3.11/3.15 are gate endpoints;
 #   Python 3.12 is the runtime for all live-engine gate jobs.
 # - PostgreSQL 16 and 17; one Percona Distribution for PostgreSQL 18 representative.
 #   PostgreSQL 14 is retired because upstream support ends 2026-11-12.
-# - MySQL 26.10 Innovation; MariaDB 11.4 LTS and 13.1 rolling; Percona Server for
+# - MySQL 26.10 Innovation; MariaDB 11.4 LTS and 13.0 rolling; Percona Server for
 #   MySQL 8.4 and 9.7. Gate coverage remains MySQL 8.4/9.7 LTS and MariaDB
-#   10.11/11.8/12.3 LTS.
+#   10.11/11.8/12.3 LTS. MariaDB 13.1 has no stable Docker tag yet (only
+#   13.1-rc and 13.1.1-rc on 2026-11-18; `mariadb:13.1` does not exist), so the
+#   rolling row uses 13.0 (13.0.2 GA) until 13.1 is GA; then switch the row to
+#   13.1. Release candidates are not support claims.
 # - SQLite3MC and sqlean are periodic SQLite-build smoke checks. The current
 #   suite does not verify cipher correctness or sqlean-specific extension APIs.
+#   The sqlean row is allowed to fail (continue-on-error, with a warning
+#   annotation): sqlean's bundled stats extension defines VAR_*/STDDEV_* with
+#   different semantics from matview's SQLite maintenance (see TODO.md, "sqlean
+#   Native Statistical Aggregates"). Remove allow-failure when that is resolved.
 # - Minimum declared Python dependency versions are tested on Python 3.11 against
-#   live PostgreSQL and MySQL. The PR gate installs latest compatible versions.
+#   live PostgreSQL and MySQL. The pins are derived from requirements.txt at run
+#   time (every `>=` floor becomes `==`), so the lane cannot drift from the
+#   declared floors. Undeclared transitive dependencies resolve to their newest
+#   compatible releases. The PR gate installs latest compatible versions.
 # - Optional SQLite drivers have no declared minimum versions; this workflow
 #   tests the latest installable releases, not a lower-bound compatibility claim.
 # - Scale-3 fuzz campaigns run weekly. Every PR-gate full-suite job still runs
@@ -25,13 +50,19 @@ name: CI — Deferred Compatibility Sweep
 # Excluded, not deferred: TimescaleDB, PostGIS, and pgvector images. Restore them
 # only alongside tests that CREATE EXTENSION and exercise their respective APIs.
 
+# One group per event and ref; never cancel a running sweep (a manual dispatch
+# must not discard the nightly run, and vice versa).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref_name }}
+  cancel-in-progress: false
 
 on:
   schedule:
-    - cron: "17 3 * * 1"
+    # Nightly sweep without scale-3 fuzz (Monday-Saturday).
+    - cron: "17 3 * * 1-6"
+    # Weekly full sweep including scale-3 fuzz (Sunday). Keep this string in
+    # sync with the fuzz-stress `if:` and the deferred-success script.
+    - cron: "17 3 * * 0"
   workflow_dispatch:
 
 permissions:
@@ -39,11 +70,13 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   python-deferred:
     name: CPython ${{ matrix.python-version }} / SQLite
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +101,10 @@ jobs:
   compatibility-sweep:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Only rows marked allow-failure (see the policy comment above) may fail
+    # without failing the sweep; their failure still raises a warning.
+    continue-on-error: ${{ matrix.allow-failure == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -80,6 +117,7 @@ jobs:
             kind: sqlite
             sqlite-engine: sqlean
             driver-package: sqlean.py
+            allow-failure: true
           - name: "PostgreSQL 16"
             kind: postgres
             image: postgres:16
@@ -102,11 +140,11 @@ jobs:
             image: mariadb:11.4
             expected-product: "mariadb"
             expected-version: "11.4"
-          - name: "MariaDB 13.1 Rolling"
+          - name: "MariaDB 13.0 Rolling"
             kind: mysql
-            image: mariadb:13.1
+            image: mariadb:13.0
             expected-product: "mariadb"
-            expected-version: "13.1"
+            expected-version: "13.0"
           - name: "Percona Server for MySQL 8.4"
             kind: mysql
             image: percona/percona-server:8.4
@@ -206,9 +244,20 @@ jobs:
           SQLITE_COMPAT_ENGINE: ${{ matrix.sqlite-engine || '' }}
         run: python3 test_matview_sync.py
 
+      - name: Flag an allowed failure
+        if: ${{ failure() && matrix.allow-failure == true }}
+        env:
+          LABEL: ${{ matrix.name }}
+        run: |
+          msg="$LABEL failed but is allowed to fail (known divergence, see TODO.md and the ci-deferred.yml policy comment); it does not fail the sweep."
+          echo "::warning title=Allowed failure: $LABEL::$msg"
+          echo "### Allowed failure: $LABEL" >> "$GITHUB_STEP_SUMMARY"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
   dependency-minimum:
     name: Minimum declared dependencies / ${{ matrix.name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -274,18 +323,16 @@ jobs:
       - name: Set up minimum supported Python dependency versions
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install -r requirements.txt
-          python3 -m pip install --force-reinstall \
-            "packaging==23.0" \
-            "sqlglot==25.0.0" \
-            "jinja2==3.1.0" \
-            "sqlalchemy==2.0.0" \
-            "psycopg2-binary==2.9.9" \
-            "pymysql==1.1.0" \
-            "cryptography==41.0.0" \
-            "hypothesis==6.100.0" \
-            "pytest==8.0.0"
+          # Pin every declared floor exactly; fail if a requirement has none.
+          if grep -vE '^\s*(#|$)' requirements.txt | grep -v '>='; then
+            echo "::error::every requirements.txt entry needs a >= floor for this lane"
+            exit 1
+          fi
+          sed -E 's/>=/==/' requirements.txt > min-requirements.txt
+          cat min-requirements.txt
+          python3 -m pip install -r min-requirements.txt
           python3 -m pip check
+          python3 -m pip freeze
 
       - name: Verify actual PostgreSQL/MySQL/MariaDB server version
         env:
@@ -309,6 +356,9 @@ jobs:
   fuzz-stress:
     name: Scale-3 differential fuzz / ${{ matrix.label }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Weekly schedule and manual runs only; the nightly schedule skips it.
+    if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 3 * * 0' }}
     strategy:
       fail-fast: false
       matrix:
@@ -316,31 +366,37 @@ jobs:
           - label: "SQLite 3 + transpiled PostgreSQL/MySQL"
             backend: sqlite
             scale: "3"
+            replay-env: ""
           - label: "APSW SQLite"
             backend: apsw
             scale: "3"
+            replay-env: "SQLITE_COMPAT_ENGINE=apsw"
           - label: "PostgreSQL 17"
             backend: postgres
             pg-image: postgres:17
             scale: "3"
             expected-pg-major: "17"
+            replay-env: "POSTGRES_DSN=postgresql://postgres:password@127.0.0.1:5432/matview_test"
           - label: "PostgreSQL 18"
             backend: postgres
             pg-image: postgres:18
             scale: "3"
             expected-pg-major: "18"
+            replay-env: "POSTGRES_DSN=postgresql://postgres:password@127.0.0.1:5432/matview_test"
           - label: "MySQL 8.4"
             backend: mysql
             mysql-image: mysql:8.4
             scale: "3"
             expected-product: "mysql"
             expected-version: "8.4"
+            replay-env: "MYSQL_DSN=mysql://root:password@127.0.0.1:3306/matview_test"
           - label: "MariaDB 11.4"
             backend: mysql
             mysql-image: mariadb:11.4
             scale: "3"
             expected-product: "mariadb"
             expected-version: "11.4"
+            replay-env: "MYSQL_DSN=mysql://root:password@127.0.0.1:3306/matview_test"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -423,18 +479,38 @@ jobs:
         env:
           BACKEND: ${{ matrix.backend }}
           FUZZ_SCALE: ${{ matrix.scale }}
+          MATVIEW_FUZZ_TARGET: "Scale-3 / ${{ matrix.label }}"
           POSTGRES_DSN: ${{ matrix.backend == 'postgres' && 'postgresql://postgres:password@127.0.0.1:5432/matview_test' || '' }}
           MYSQL_DSN: ${{ matrix.backend == 'mysql' && 'mysql://root:password@127.0.0.1:3306/matview_test' || '' }}
         run: |
           if [ "$BACKEND" = "apsw" ]; then
             SQLITE_COMPAT_ENGINE=apsw python3 test_matview_sync.py --fuzz --fuzz-scale "$FUZZ_SCALE"
-          elif [ "$BACKEND" = "postgres" ]; then
-            python3 test_matview_sync.py --fuzz --fuzz-scale "$FUZZ_SCALE"
-          elif [ "$BACKEND" = "mysql" ]; then
-            python3 test_matview_sync.py --fuzz --fuzz-scale "$FUZZ_SCALE"
           else
             python3 test_matview_sync.py --fuzz --fuzz-scale "$FUZZ_SCALE"
           fi
+
+      - name: Report failing seeds with replay commands
+        if: always()
+        env:
+          TARGET: "Scale-3 / ${{ matrix.label }} (${{ matrix.pg-image || matrix.mysql-image || matrix.backend }})"
+          REPLAY_ENV: ${{ matrix.replay-env }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/fuzz_failure_report.py \
+          --target "$TARGET" \
+          --engine-env "$REPLAY_ENV" \
+          --run-url "$RUN_URL"
+
+      - name: Archive fuzz manifest and failure report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-deferred-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            fuzz-campaign.json
+            fuzz-report/
+          if-no-files-found: ignore
+          retention-days: 30
 
   deferred-success:
     name: Deferred CI success
@@ -445,10 +521,13 @@ jobs:
       - dependency-minimum
       - fuzz-stress
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Require every deferred job to succeed
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
           python3 - <<'PY'
           import json
@@ -456,10 +535,15 @@ jobs:
           import sys
 
           results = json.loads(os.environ["NEEDS_JSON"])
+          # Only the nightly schedule skips the weekly scale-3 fuzz jobs; any
+          # other skip (or a skip of another job) is a failure.
+          nightly = os.environ["EVENT_NAME"] == "schedule" and os.environ["EVENT_SCHEDULE"] != "17 3 * * 0"
+          may_skip = {"fuzz-stress"} if nightly else set()
           unsuccessful = {
               name: result["result"]
               for name, result in results.items()
               if result["result"] != "success"
+              and not (result["result"] == "skipped" and name in may_skip)
           }
           if unsuccessful:
               for name, result in sorted(unsuccessful.items()):
@@ -468,3 +552,55 @@ jobs:
 
           print(f"All {len(results)} deferred CI jobs succeeded.")
           PY
+
+  # Owned failure signal: one open issue (label ci-deferred), commented on by
+  # every later failing scheduled run. Manual runs report only in the run.
+  report-failure:
+    name: Open or update the deferred-sweep failure issue
+    needs:
+      - python-deferred
+      - compatibility-sweep
+      - dependency-minimum
+      - fuzz-stress
+      - deferred-success
+    if: ${{ !cancelled() && github.event_name == 'schedule' && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download fuzz reports
+        # A job that failed before uploading leaves nothing to download; the
+        # issue must still be opened (it then points at the run log).
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fuzz-deferred-*
+          path: fuzz-reports
+
+      - name: Open or update the failure issue
+        uses: actions/github-script@v8
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const reportFailure = require("./scripts/ci_failure_issue.js");
+            await reportFailure({ github, context, core }, {
+              title: "CI deferred: compatibility sweep failure",
+              label: "ci-deferred",
+              labelDescription: "Failure in the non-required ci-deferred.yml compatibility sweep",
+              intro: [
+                "The non-required deferred compatibility sweep (`.github/workflows/ci-deferred.yml`) failed.",
+                "Fix the failing lane (or record an explicit, documented exclusion), then close this issue.",
+                "Scale-3 fuzz failures list each failing seed with a replay command; add a minimized",
+                "reproduction to the Suite 13 permanent corpus in the fix PR. Later failing runs comment",
+                "here while this issue is open.",
+              ].join("\n"),
+              reportsDir: "fuzz-reports",
+              reportName: "fuzz-failures.md",
+              noReport: "No fuzz report artifact was found (no scale-3 fuzz failure, or it failed before uploading); see the run log.",
+            });

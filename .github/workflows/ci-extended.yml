@@ -17,7 +17,8 @@ name: CI — Extended Random-Seed Fuzz
 #   listing the failing seeds with a replay command that pins the seed and the
 #   campaign sizes. On push and scheduled runs one GitHub issue (label
 #   ci-extended-fuzz) is opened, or commented on if already open, with the run
-#   link and the seeds. Each confirmed failure is added to the Suite 13 corpus
+#   link and the seeds (scripts/ci_failure_issue.js, shared with ci-deferred.yml).
+#   Each confirmed failure is added to the Suite 13 corpus
 #   in its fix PR; then close the issue.
 # - Concurrency: one group per event type and ref, never cancelled in progress,
 #   so a push to master cannot cancel the nightly run (and vice versa) and a
@@ -262,6 +263,9 @@ jobs:
       contents: read
       issues: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download fuzz reports
         # A job that failed before uploading leaves nothing to download; the
         # issue must still be opened (it then points at the run log).
@@ -277,77 +281,18 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
         with:
           script: |
-            const fs = require("fs");
-            const path = require("path");
-            const { owner, repo } = context.repo;
-            const title = "CI extended: random-seed fuzz failure";
-            const label = "ci-extended-fuzz";
-            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-
-            const needs = JSON.parse(process.env.NEEDS_JSON);
-            const results = Object.entries(needs)
-              .map(([job, r]) => `- ${job}: ${r.result}`)
-              .join("\n");
-
-            const reports = [];
-            const walk = dir => {
-              if (!fs.existsSync(dir)) return;
-              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                const p = path.join(dir, entry.name);
-                if (entry.isDirectory()) walk(p);
-                else if (entry.name === "fuzz-failures.md") reports.push(fs.readFileSync(p, "utf8"));
-              }
-            };
-            walk("fuzz-reports");
-
-            let body = [
-              `Run: ${runUrl}`,
-              `Event: ${context.eventName}; commit: ${context.sha}`,
-              "",
-              "Job results:",
-              results,
-              "",
-              reports.length
-                ? reports.join("\n")
-                : "No fuzz report artifact was found; see the run log.",
-            ].join("\n");
-            const limit = 60000;
-            if (body.length > limit) {
-              body = body.slice(0, limit) + `\n\n(truncated; full reports are in the run artifacts: ${runUrl})`;
-            }
-
-            try {
-              await github.rest.issues.getLabel({ owner, repo, name: label });
-            } catch (error) {
-              if (error.status !== 404) throw error;
-              await github.rest.issues.createLabel({
-                owner,
-                repo,
-                name: label,
-                color: "b60205",
-                description: "Failure in the non-required ci-extended.yml random-seed fuzz workflow",
-              });
-            }
-
-            const open = await github.paginate(github.rest.issues.listForRepo, {
-              owner,
-              repo,
-              state: "open",
-              labels: label,
-              per_page: 100,
-            });
-            const existing = open.find(issue => !issue.pull_request && issue.title === title);
-            if (existing) {
-              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body });
-              core.info(`Commented on #${existing.number}`);
-            } else {
-              const intro = [
+            const reportFailure = require("./scripts/ci_failure_issue.js");
+            await reportFailure({ github, context, core }, {
+              title: "CI extended: random-seed fuzz failure",
+              label: "ci-extended-fuzz",
+              labelDescription: "Failure in the non-required ci-extended.yml random-seed fuzz workflow",
+              intro: [
                 "The non-required extended fuzz workflow (`.github/workflows/ci-extended.yml`) failed.",
                 "Replay each failing seed with the command in its report, add a minimized reproduction",
                 "to the Suite 13 permanent corpus in the fix PR, then close this issue. Later failing",
                 "runs comment here while this issue is open.",
-                "",
-              ].join("\n");
-              const created = await github.rest.issues.create({ owner, repo, title, labels: [label], body: intro + body });
-              core.info(`Opened #${created.data.number}`);
-            }
+              ].join("\n"),
+              reportsDir: "fuzz-reports",
+              reportName: "fuzz-failures.md",
+              noReport: "No fuzz report artifact was found; see the run log.",
+            });

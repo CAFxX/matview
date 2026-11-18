@@ -604,7 +604,8 @@ def build_jobs(workflow: Mapping[str, Any], job_ids: Sequence[str]) -> List[Job]
 def step_test_file(step: Step) -> Optional[str]:
     if step.kind != "run" or not step.run:
         return None
-    m = re.search(r"(?:python3?|pytest)\b[^\n]*?\b(test_[\w]+\.py)\b", step.run)
+    # Keep the directory (e.g. scripts/test_presubmit.py) so the file can be read.
+    m = re.search(r"(?:python3?|pytest)\b[^\n]*?(?<![\w./-])((?:[\w.-]+/)*test_\w+\.py)\b", step.run)
     return m.group(1) if m else None
 
 
