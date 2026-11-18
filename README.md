@@ -310,7 +310,9 @@ MySQL/MariaDB every view currently needs this opt-in.
 Some trigger-bypassing operations are not detected and not refused: `INSERT OR
 REPLACE`/`REPLACE` on a SQLite connection that was not configured with
 [`configure_sqlite_connection()`](#sqlite-writer-connections), and other engine
-features that skip row triggers (see
+features that skip row triggers, and the session flags `bulk_changes()` uses
+(`matview.skip_triggers` on PostgreSQL, `@__matview_skip_triggers` on
+MySQL/MariaDB), which any session can set (see
 [Close Unsafe DML Paths That Bypass Trigger-Based Maintenance](TODO.md)).
 
 ## Engine support
@@ -406,8 +408,23 @@ commit their own transactions. Before executing any SQL they raise
 otherwise commit it implicitly) or if the driver does not report its
 transaction state. Read-only methods (`get_catalog`, `fetch_schema`,
 `check_schema_drift`, `diff_views`) join an open caller transaction without
-ending it. `bulk_changes()` is not covered by this contract yet (see
-[Bulk changes](#bulk-changes)).
+ending it. `bulk_changes()` follows the same contract (refusal before any SQL,
+then one manager-owned transaction; see [Bulk changes](#bulk-changes)).
+
+MySQL/MariaDB with `autocommit=0` (PyMySQL's default): the server reports a
+transaction only after a write, so a caller's implicit read-only transaction (a
+consistent snapshot, or row locks from `SELECT ... FOR UPDATE`) looks idle.
+Read-only methods never end it (they join it, and the metadata locks their
+`information_schema` reads take are held until the caller commits or rolls
+back; with `autocommit=1` they leave nothing open). Lifecycle methods and
+`bulk_changes()` cannot tell such a transaction from an idle connection: they
+take ownership and commit or roll it back, which releases its locks and
+snapshot (no caller writes are affected: a written transaction is detected and
+refused). Supported usage on MySQL/MariaDB is `autocommit=1`, or ending your
+own transaction before calling a lifecycle method or `bulk_changes()`.
+Detecting implicit read transactions (`information_schema.innodb_trx` is a
+cached snapshot refreshed at most every 100 ms; `performance_schema` is off by
+default on MariaDB) was evaluated and rejected as unreliable.
 
 ```python run
 import sqlite3
@@ -550,14 +567,67 @@ protocol at all: run it with writes to the source tables stopped.
 
 `with manager.bulk_changes(view_names=None, use_shadow_swap=False,
 drop_triggers=False):` suspends per-row maintenance of the named views (all
-registered views by default) inside the block, then repopulates each of them
-from the source tables and commits when the block exits normally. If the block
-raises, its changes are rolled back to a savepoint and the triggers are
-restored. Per-row maintenance is suspended with a session-local setting on
-PostgreSQL and MySQL/MariaDB; on SQLite the maintenance triggers are dropped and
-recreated inside a `BEGIN IMMEDIATE` transaction, which blocks other writers.
-`use_shadow_swap=True` builds the new contents in shadow tables and swaps them
-in.
+registered views by default) while the block runs DML on the manager's
+connection, then repopulates each of them from the source tables. The block,
+the refresh and any trigger DDL run in one manager-owned transaction: it is
+committed when the block exits normally and rolled back on any exception
+(including `KeyboardInterrupt`), which also restores the original maintenance
+objects. Like the lifecycle methods, `bulk_changes()` raises
+`TransactionOwnershipError` before executing any SQL when the connection
+already has an open transaction or its driver does not report transaction
+state; it opens its transaction explicitly (`BEGIN IMMEDIATE` on SQLite,
+`START TRANSACTION` on MySQL/MariaDB also for autocommit connections; a
+PostgreSQL autocommit connection is switched off and back).
+
+Maintenance is suspended only for that transaction or session, never globally:
+
+- PostgreSQL: a transaction-local setting (`SET LOCAL`). It suspends every
+  registered view, so unless `drop_triggers=True` `view_names` must include
+  all of them. `drop_triggers=True` and the shadow swap use transactional DDL,
+  which makes other writers of the source tables wait until the block ends.
+- MySQL/MariaDB: a session variable, DML only. `use_shadow_swap` and
+  `drop_triggers` need DDL that commits implicitly and are refused with
+  `ValueError` before any SQL. The variable suspends every registered view, so
+  `view_names` must include all of them; it is cleared before the commit.
+- SQLite: the maintenance triggers are dropped and recreated inside the
+  `BEGIN IMMEDIATE` transaction, which blocks other writers.
+
+`use_shadow_swap=True` (PostgreSQL, SQLite) builds the new contents in shadow
+tables and swaps them in. Unknown view names, and a `view_names` subset that
+would leave other views unmaintained, are refused before the block runs.
+
+```python run
+import sqlite3
+from matview import MaterializedViewManager, TransactionOwnershipError
+
+conn = sqlite3.connect(":memory:")
+conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, amount INTEGER NOT NULL)")
+manager = MaterializedViewManager(conn)
+manager.register_view("CREATE VIEW totals AS SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id")
+
+conn.execute("INSERT INTO orders VALUES (1, 1, 10)")  # the caller's transaction is open
+try:
+    with manager.bulk_changes():
+        pass
+except TransactionOwnershipError:
+    print("refused while the caller's transaction is open")
+conn.commit()
+
+try:
+    with manager.bulk_changes():
+        conn.execute("INSERT INTO orders VALUES (2, 1, 5)")
+        raise RuntimeError("fails mid-block")
+except RuntimeError:
+    pass
+print(conn.execute("SELECT * FROM totals").fetchall())
+print(conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'").fetchone()[0] > 0)
+```
+
+```text output
+refused while the caller's transaction is open
+[(1, 10)]
+True
+```
 
 ```python run
 import sqlite3
@@ -578,12 +648,72 @@ print(conn.execute("SELECT * FROM customer_totals ORDER BY customer_id").fetchal
 [(0, 250500), (1, 250000)]
 ```
 
-`bulk_changes()` is not yet fail-closed or transaction-ownership-safe: it
-participates in a caller's open transaction and commits it on exit, it
-suppresses some restoration errors, and on MySQL/MariaDB the shadow-swap and
-`drop_triggers` paths execute DDL that implicitly commits the caller's
-transaction. See
-[Make `bulk_changes()` Fail-Closed, Exception-Safe and Transaction-Ownership-Safe](TODO.md).
+Failures are raised, never suppressed:
+
+- Any failure in setup, the block, the refresh or the restoration of
+  maintenance rolls everything back and is raised. If the connection's state
+  cannot be restored (the rollback fails, or the MySQL/MariaDB bypass variable
+  cannot be cleared) the connection is closed, so nothing half-done is
+  committed and no session keeps skipping maintenance, and
+  `BulkChangesConnectionError` is raised; the manager then refuses every later
+  operation.
+- The block must leave transaction control to the manager. A block that
+  commits or rolls back the connection itself is detected: its later work is
+  rolled back, maintenance is restored and the views are refreshed in a new
+  transaction, then `BulkChangesTransactionError` is raised. If that recovery
+  fails, `BulkChangesRecoveryError` (a subclass) is raised and its
+  `view_names` lists the views left stale by the work the block committed;
+  repair them with `repair_view()`. Only where their maintenance triggers are
+  also missing (SQLite, PostgreSQL `drop_triggers`) do `check_schema_drift()`
+  and `sync_views()` report them (as `"triggers_missing"`, rebuilt by
+  `repair_view()`); with the session bypass (PostgreSQL default, MySQL/MariaDB)
+  stale contents are not detectable by the drift check, so `view_names` is the
+  only record.
+
+Inside the block, lifecycle methods (`register_view`, `sync_views`,
+`drop_view`, `apply_schema_ddl`, `repair_view`, `backfill_incrementally`) are
+refused with `TransactionOwnershipError`; read methods join the block's
+transaction. The refresh takes over an incremental backfill's watermark like
+`repair_view()`: a running backfill stops at its next batch, and an
+interrupted one is recorded as complete.
+
+The set of registered views is fixed while a block is open, and other
+sessions wait as follows:
+
+- PostgreSQL: the block holds `SHARE ROW EXCLUSIVE` on the catalog table,
+  which the catalog-changing lifecycle methods also take, so they wait in other
+  sessions until the block ends. Writers are not blocked by it; backfill
+  batches wait at their watermark update.
+- MySQL/MariaDB: the catalog is read with a locking read (`LOCK IN SHARE
+  MODE`), so other sessions' `register_view` and backfill watermark updates
+  wait up to `innodb_lock_wait_timeout` (and then fail with a lock-wait
+  timeout) or are chosen as InnoDB deadlock victims.
+- SQLite: the writer reservation of `BEGIN IMMEDIATE` serializes everything.
+
+The catalog is checked again at refresh time; if it nevertheless changed, the
+block is rolled back.
+
+Concurrent writers that commit while the refresh runs have the same caveats as
+`repair_view()` (see [Concurrency notes](#concurrency-notes)). Other known
+limitations:
+
+- On MariaDB with `innodb_snapshot_isolation` (on by default in 12.3), a
+  block that only reads with a consistent snapshot can make the refresh fail
+  with error 1020 when a concurrent writer has committed; the bulk is rolled
+  back cleanly, not left divergent.
+- Views registered by another manager (a different `object_prefix`/catalog)
+  are also suspended by the session bypass but are not refreshed.
+- On PostgreSQL, a writer that commits a row of a new group while the refresh
+  runs makes the refresh fail with a unique violation, and the block's work is
+  rolled back (fails closed).
+- PostgreSQL transition-table triggers (`pg_use_transition_tables=True`) do
+  not check the bypass setting: the block's rows are maintained row by row and
+  then repopulated (correct, but slow).
+- Participation in a caller's transaction through savepoints is not offered.
+
+See
+[Make `bulk_changes()` Fail-Closed, Exception-Safe and Transaction-Ownership-Safe](TODO.md)
+for the remaining work.
 
 ### SQLite writer connections
 
@@ -626,6 +756,15 @@ observe depends on the engine:
   tables are quiesced: a write that commits during the repair can be missing
   from the result
   ([Make `repair_view()` Exact on PostgreSQL Under Concurrent Writers (silent divergence today)](TODO.md)).
+- PostgreSQL views maintained by full-recompute (`ATOMIC_QUERY_SYNC`)
+  triggers, for example a plain join without aggregation, can double their rows
+  when two writers commit concurrently, and when a writer commits during or
+  after a `bulk_changes()` refresh: each recompute deletes and re-inserts from
+  its own statement snapshot
+  ([Serialize PostgreSQL ATOMIC_QUERY_SYNC (Full-Recompute) Maintenance Under Concurrent Writers (silent row doubling today)](TODO.md)).
+- PostgreSQL `bulk_changes()` refreshes like `repair_view()`: a write that
+  commits during the refresh can be missing unless `drop_triggers=True` makes
+  writers wait.
 - MySQL/MariaDB (InnoDB, default `REPEATABLE READ`): the repopulating
   `INSERT ... SELECT` of `repair_view()` takes shared locks on the rows it reads,
   so writers serialize with it (verified natively with concurrent writers).
@@ -799,6 +938,7 @@ Correctness gaps (the materialized view can differ from the original view):
 - [Make Floating-Point Aggregates Exactly Equal to the Live View on PostgreSQL and MySQL/MariaDB (silent divergence today)](TODO.md)
 - [Race-Free Recomputation for the Remaining Recomputed Aggregates (stale snapshot after a row-lock wait)](TODO.md)
 - [Make `repair_view()` Exact on PostgreSQL Under Concurrent Writers (silent divergence today)](TODO.md)
+- [Serialize PostgreSQL ATOMIC_QUERY_SYNC (Full-Recompute) Maintenance Under Concurrent Writers (silent row doubling today)](TODO.md)
 - [Fail-Closed Incremental Backfill (no silent missing or double-counted rows after a failed backfill)](TODO.md) (remaining known exclusions)
 - [Fix Pre-Existing SQLite Divergences Found by the Exact SUM/TOTAL/AVG Differential](TODO.md) (storage-class changes for `MIN`/`MAX`/group keys, `LEFT JOIN` group moves, primary-key updates during backfill)
 - [Preserve Dialect-Native Statistical Aggregate Alias Semantics](TODO.md) (`VARIANCE`/`STDDEV` are sample statistics on PostgreSQL)
