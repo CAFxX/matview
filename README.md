@@ -181,7 +181,7 @@ GROUP BY customer_id;
 
 Install into a live database. `--schema` together with `--apply` first executes
 the schema DDL against the database (omit it when the tables exist). `--apply`
-prints the SQL it executed; here it is saved to a file:
+also prints the generated SQL script; here it is saved to a file:
 
 ```sh run
 python3 matview_sync.py --db app.db --schema schema.sql --view views.sql --apply > applied.sql
@@ -233,7 +233,7 @@ Main options (`python3 matview_sync.py --help` lists all):
 | `--view FILE_OR_SQL` | One or more `CREATE VIEW` statements, optionally with `CREATE INDEX` statements on the view. |
 | `--dialect`, `--engine-version` | Target for offline generation, e.g. `postgres` or `mysql:8.4`. |
 | `--apply` | Register the views in `--db`. |
-| `--incremental-backfill`, `--batch-size N` | Populate in batches (default 500 rows). |
+| `--incremental-backfill`, `--batch-size N` | Populate in batches (default batch size 500). |
 | `--no-populate` | Install without populating. |
 | `--index SPEC` | Extra index on the materialized view (repeatable). |
 | `--strict` | Refuse views that cannot use `algebraic_delta`. |
@@ -454,8 +454,8 @@ watermark in the catalog makes the triggers ignore rows that the backfill has
 not reached yet, so writes can continue during the backfill. View shapes that
 cannot use primary-key ranges (group-key or offset batches) run the backfill in
 a snapshot (`REPEATABLE READ` on PostgreSQL and MySQL/MariaDB, a savepoint on
-SQLite) instead. Readers see a partially populated view until the backfill
-finishes.
+SQLite) instead. While a primary-key-range backfill runs, readers see a
+partially populated view.
 
 A backfill fails closed. If it stops after committing progress, the original
 exception propagates, the watermark stays at the last committed batch (so the
@@ -619,8 +619,8 @@ observe depends on the engine:
   tables after waiting for a row lock can read a stale snapshot under
   concurrent writers (confirmed for `AVG` over `NUMERIC`/`DOUBLE`,
   `AVG(DISTINCT)`, `AVG` in join/`UNION` views, `VAR_*`/`STDDEV_*`, and
-  `MIN`/`MAX`/`BIT_AND`/`BIT_OR` after a delete; integer and decimal `AVG` are
-  derived from the locked row and are not affected). See
+  `MIN`/`MAX`/`BIT_AND`/`BIT_OR` after a delete; `AVG` over integer columns is
+  derived from the locked row's `SUM`/`COUNT` and is not affected). See
   [Race-Free Recomputation for the Remaining Recomputed Aggregates (stale snapshot after a row-lock wait)](TODO.md).
 - PostgreSQL `repair_view()` is exact only while writes to the view's source
   tables are quiesced: a write that commits during the repair can be missing
