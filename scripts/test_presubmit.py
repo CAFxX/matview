@@ -397,7 +397,7 @@ class DocsParityTests(unittest.TestCase):
     def test_hand_labelled_js_semantics(self) -> None:
         """Expectations written from ECMAScript semantics (no node needed)."""
         expect = {
-            "README.md": True, "readme.MD": True, "README.md\n": False, "docs/a\rb.md": False,
+            "README.md": False, "readme.MD": False, "TODO.md": True, "todo.MD": True, "TODO.md\n": False, "docs/a\rb.md": False,
             "docs/a b.md": False, "docs/a\u0085b.md": True, "ſECURITY.md": False,
             "sub/README.md": False, ".github/workflows/README.md": True, ".github/workflows/ci.yml": False,
             "docs/a.jpgg": False, "LICENSE.py": False,
@@ -406,8 +406,8 @@ class DocsParityTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.clf.docs_only([path]), want)
         self.assertFalse(self.clf.docs_only([]))
-        self.assertFalse(self.clf.docs_only(["README.md"] * 3000))
-        self.assertTrue(self.clf.docs_only(["README.md"] * 2999))
+        self.assertFalse(self.clf.docs_only(["TODO.md"] * 3000))
+        self.assertTrue(self.clf.docs_only(["TODO.md"] * 2999))
 
     def test_whitelist_extraction_fails_loudly_on_unsupported_changes(self) -> None:
         script = RAW_WF["jobs"]["classify"]["steps"][0]["with"]["script"]
@@ -816,7 +816,9 @@ class FastTierTests(TmpCase):
                "helper.py": "from matview_sync import y", "matview_sync.py": "", "other.py": ""}
         read = src.get
         mods = [m for m in src if m.endswith(".py")]
-        self.assertEqual(ps.affected_tests(tests, ["README.md"], clf, read, mods)[0], set())
+        self.assertEqual(ps.affected_tests(tests, ["TODO.md"], clf, read, mods)[0], set())
+        # README.md is executable documentation (test_readme_examples.py), not whitelisted.
+        self.assertEqual(ps.affected_tests(tests, ["README.md"], clf, read, mods)[0], set(tests))
         self.assertEqual(ps.affected_tests(tests, ["test_c.py"], clf, read, mods)[0], {"test_c.py"})
         self.assertEqual(ps.affected_tests(tests, ["matview_sync.py"], clf, read, mods)[0], {"test_a.py", "test_b.py"})
         self.assertEqual(ps.affected_tests(tests, ["helper.py"], clf, read, mods)[0], {"test_b.py"})
