@@ -27,6 +27,7 @@ from .logical_ir import (
 )
 from .maintenance import MaintenanceMixin
 from .planner import PlannerMixin
+from .sql_frontend import resolve_statistical_aggregate_aliases
 
 
 class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
@@ -108,6 +109,8 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
         resolved_dialect: Dialect = parsed_ev.dialect
         resolved_subdialect: EngineSubdialect = parsed_ev.subdialect
         eff_batch = max(1, int(batch_size)) if batch_size else 1000
+
+        view_spec = resolve_statistical_aggregate_aliases(view_spec, resolved_dialect)
 
         raw_vname = view_spec.view_name
         logical_view_name = (

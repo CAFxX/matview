@@ -267,6 +267,13 @@ Errors raised before anything is installed:
   invalid index specification.
 - `StrictCompilationError` when `strict=True` and the view would not use
   `algebraic_delta`.
+- `UnsupportedMaterializedViewError` (a `ValueError`, also with
+  `ignore_limitations=True`) for a function the target engine does not define
+  with a known meaning. `VARIANCE`, `STDDEV` and `STD` are bound to each
+  engine's own definition: sample statistics on PostgreSQL (`VAR_SAMP`,
+  `STDDEV_SAMP`), population statistics on MySQL/MariaDB (`VAR_POP`,
+  `STDDEV_POP`). PostgreSQL has no `STD`, and SQLite has none of the three, so
+  they are refused there; use `VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`.
 - `EngineLimitationError` when the view or the engine has a known limitation
   that would break the guarantee. Each limitation has a code:
 
@@ -1215,7 +1222,6 @@ Correctness gaps (the materialized view can differ from the original view):
 - [Detect PostgreSQL Maintenance Triggers Disabled by `session_replication_role = replica` or `ALTER TABLE ... DISABLE TRIGGER`](TODO.md)
 - [Fail-Closed Incremental Backfill (no silent missing or double-counted rows after a failed backfill)](TODO.md) (remaining known exclusions)
 - [Fix Pre-Existing SQLite Divergences Found by the Exact SUM/TOTAL/AVG Differential](TODO.md) (storage-class changes for `MIN`/`MAX`/group keys, `LEFT JOIN` group moves, primary-key updates during backfill)
-- [Preserve Dialect-Native Statistical Aggregate Alias Semantics](TODO.md) (`VARIANCE`/`STDDEV` are sample statistics on PostgreSQL)
 - [Close Unsafe DML Paths That Bypass Trigger-Based Maintenance](TODO.md)
 - [Resolve SQLite SUM Overflow Edge Cases](TODO.md)
 - [Canonical Group Keys on MySQL/MariaDB and SQLite](TODO.md) (a nullable `DECIMAL` key 1.0 next to 1.00, a float 0 next to -0, or keys equal under a case-insensitive collation can be split into two groups)

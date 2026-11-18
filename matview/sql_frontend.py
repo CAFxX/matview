@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -1256,11 +1256,8 @@ _FN_TO_AGG_ENUM: Dict[str, AggFunc] = {
     "JSON_GROUP_OBJECT": AggFunc.JSON_GROUP_OBJECT,
     "ARRAY_AGG": AggFunc.ARRAY_AGG,
     "VAR_POP": AggFunc.VAR_POP,
-    "VARIANCE": AggFunc.VAR_POP,
     "VAR_SAMP": AggFunc.VAR_SAMP,
     "STDDEV_POP": AggFunc.STDDEV_POP,
-    "STDDEV": AggFunc.STDDEV_POP,
-    "STD": AggFunc.STDDEV_POP,
     "STDDEV_SAMP": AggFunc.STDDEV_SAMP,
     "BIT_AND": AggFunc.BIT_AND,
     "BIT_OR": AggFunc.BIT_OR,
@@ -1269,6 +1266,111 @@ _FN_TO_AGG_ENUM: Dict[str, AggFunc] = {
     "EVERY": AggFunc.BOOL_AND,
     "BOOL_OR": AggFunc.BOOL_OR,
 }
+
+
+# Non-standard statistical aggregate spellings whose meaning is defined by
+# each engine, not by SQL: PostgreSQL's VARIANCE/STDDEV are the *sample*
+# statistics, MySQL's and MariaDB's VARIANCE/STDDEV/STD the *population*
+# ones. PostgreSQL has no STD() aggregate and SQLite has none of them (any
+# function with such a name is an application-defined UDF of unknown
+# semantics). A spelling missing from a dialect's map is rejected.
+STATISTICAL_AGGREGATE_ALIASES: Dict[Dialect, Dict[str, AggFunc]] = {
+    Dialect.POSTGRES: {
+        "VARIANCE": AggFunc.VAR_SAMP,
+        "STDDEV": AggFunc.STDDEV_SAMP,
+    },
+    Dialect.MYSQL: {
+        "VARIANCE": AggFunc.VAR_POP,
+        "STDDEV": AggFunc.STDDEV_POP,
+        "STD": AggFunc.STDDEV_POP,
+    },
+    Dialect.SQLITE: {},
+}
+_STATISTICAL_ALIAS_NAMES = frozenset({"VARIANCE", "STDDEV", "STD"})
+
+
+def _aggregate_function_for_dialect(fn_name: str, dialect: Dialect) -> Optional[AggFunc]:
+    """Resolve an aggregate function name against the target dialect.
+
+    Returns None for names that are not maintained aggregates, including a
+    statistical alias the dialect does not define (callers reject those via
+    `undefined_statistical_aggregate_aliases`).
+    """
+    fn_up = fn_name.upper()
+    if fn_up in _STATISTICAL_ALIAS_NAMES:
+        return STATISTICAL_AGGREGATE_ALIASES.get(Dialect(dialect), {}).get(fn_up)
+    return _FN_TO_AGG_ENUM.get(fn_up)
+
+
+def undefined_statistical_aggregate_aliases(sql: str, dialect: Dialect) -> List[str]:
+    """Return the statistical alias calls in `sql` that `dialect` does not define."""
+    defined = STATISTICAL_AGGREGATE_ALIASES.get(Dialect(dialect), {})
+    try:
+        toks = _tokenize_sql(sql, read=_sqlglot_dialect(dialect))
+    except sqlglot.errors.SqlglotError:
+        return []
+    found: List[str] = []
+    for idx in range(len(toks) - 1):
+        name = toks[idx].text.upper()
+        if (
+            name in _STATISTICAL_ALIAS_NAMES
+            and name not in defined
+            and toks[idx + 1].token_type == SQLGlotTokenType.L_PAREN
+            and toks[idx].token_type != SQLGlotTokenType.STRING
+            and (idx == 0 or toks[idx - 1].token_type != SQLGlotTokenType.DOT)
+            and name not in found
+        ):
+            found.append(name)
+    return found
+
+
+def _leading_function_name(expr: str, dialect: Dialect) -> Optional[str]:
+    s = _unwrap_outer_parens(expr, dialect=dialect)
+    try:
+        toks = _tokenize_sql(s, read=_sqlglot_dialect(dialect))
+    except sqlglot.errors.SqlglotError:
+        return None
+    if len(toks) >= 2 and toks[1].token_type == SQLGlotTokenType.L_PAREN:
+        return toks[0].text.upper()
+    return None
+
+
+def resolve_statistical_aggregate_aliases(view_spec: ViewSpec, dialect: Dialect) -> ViewSpec:
+    """Bind statistical alias spellings to the target engine's semantics.
+
+    A `ViewSpec` may have been parsed for a different dialect than the one it
+    is compiled for (the parser defaults to SQLite), so every top-level
+    aggregate spelled as an alias is re-parsed for `dialect`. Spellings the
+    engine does not define are rejected rather than guessed.
+    """
+    dialect = Dialect(dialect)
+    undefined = undefined_statistical_aggregate_aliases(view_spec.raw_select_sql, dialect)
+    if undefined:
+        native = ", ".join(f"{name}()" for name in undefined)
+        raise UnsupportedMaterializedViewError(
+            f"View '{view_spec.view_name}' uses {native}, which is not a native {dialect.value} "
+            "aggregate; statistical alias semantics (sample vs population) are engine-specific, "
+            "so it is not materialized. Use VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP explicitly."
+        )
+    changed = False
+    items: List[SelectItem] = []
+    for it in view_spec.select_items:
+        fn = _leading_function_name(it.raw_expr, dialect) if it.is_aggregate else None
+        if fn in _STATISTICAL_ALIAS_NAMES:
+            reparsed = _parse_single_agg_expr(it.raw_expr, it.alias, dialect=dialect)
+            if reparsed is not None and reparsed != it:
+                items.append(reparsed)
+                changed = True
+                continue
+        items.append(it)
+    additional = tuple(
+        resolve_statistical_aggregate_aliases(extra, dialect) for extra in view_spec.additional_views
+    )
+    if additional != view_spec.additional_views:
+        changed = True
+    if not changed:
+        return view_spec
+    return replace(view_spec, select_items=tuple(items), additional_views=additional)
 
 
 def _unwrap_outer_parens(
@@ -1440,14 +1542,15 @@ def _parse_single_agg_expr(
             source_col=src_col,
         )
 
-    if fn_raw not in _FN_TO_AGG_ENUM:
+    agg_func = _aggregate_function_for_dialect(fn_raw, dialect)
+    if agg_func is None:
         return None
 
     return SelectItem(
         raw_expr=expr.strip(),
         alias=alias,
         is_aggregate=True,
-        agg_func=_FN_TO_AGG_ENUM[fn_raw],
+        agg_func=agg_func,
         arg_expr=first_arg,
         extra_args=extra_args,
         is_distinct=is_dist,
@@ -1470,7 +1573,8 @@ def _contains_aggregate_call(
     if ast_node.find(sqlglot_exp.AggFunc):
         return True
     for anon_node in ast_node.find_all(sqlglot_exp.Anonymous):
-        if anon_node.name.upper() in _FN_TO_AGG_ENUM or anon_node.name.upper() == "COUNT":
+        name_up = anon_node.name.upper()
+        if name_up in _FN_TO_AGG_ENUM or name_up in _STATISTICAL_ALIAS_NAMES or name_up == "COUNT":
             return True
     return False
 
