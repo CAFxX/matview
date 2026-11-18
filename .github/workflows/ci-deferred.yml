@@ -3,15 +3,16 @@ name: CI — Deferred Compatibility Sweep
 # This workflow owns the compatibility dimensions intentionally removed from
 # the per-PR gate. It is not a required branch check.
 #
-# Schedule (measured job wall times from the 2026-11-09/16 runs in brackets):
-# - Nightly (Mon-Sat 03:17 UTC): python-deferred [9-17 min], compatibility-sweep
-#   [11-24 min] and dependency-minimum (~14 jobs, ~200 runner-minutes, about one
-#   PR-gate run before stage 1).
+# Schedule (measured job wall times from the 2026-11-09/16/18 runs in brackets):
+# - Nightly (Mon-Sat 03:17 UTC): python-deferred [9-20 min], compatibility-sweep
+#   [11-30 min] and dependency-minimum (14 jobs, ~290 runner-minutes on the
+#   2026-11-18 dispatch, a little more than one PR-gate run before stage 1).
 # - Weekly (Sunday 03:17 UTC) and on demand: everything above plus the six
-#   scale-3 fuzz-stress jobs [11-49 min, ~210 runner-minutes]; they stay weekly
+#   scale-3 fuzz-stress jobs [22-53 min, ~245 runner-minutes]; they stay weekly
 #   because they cost as much as the rest of the sweep together.
-# - Timeouts: 60 min for sweep jobs (2.5x the slowest measured), 90 min for
-#   scale-3 fuzz (slowest measured 49 min), 10 min for the bookkeeping jobs.
+# - Timeouts: 60 min for sweep jobs (slowest measured 30 min, MariaDB 13.0 on
+#   2026-11-18), 90 min for scale-3 fuzz (slowest measured 53 min), 10 min for
+#   the bookkeeping jobs.
 #
 # Ownership: a failing scheduled run opens, or comments on, ONE GitHub issue
 # (label ci-deferred, scripts/ci_failure_issue.js, shared with ci-extended.yml).
