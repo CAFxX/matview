@@ -2753,6 +2753,7 @@ class NativeBackfillLockingTests(unittest.TestCase):
             writer = self._session(engine, dsn, fx)
             monitor = self._session(engine, dsn, fx)
             backfill_sid = _session_id(engine, fx["conn"])
+            writer_sid = _session_id(engine, writer)
             wc = writer.cursor()
             wc.execute(f"SELECT id FROM {fx['table']} WHERE id = 3 FOR UPDATE")
             wc.fetchall()
@@ -2762,27 +2763,17 @@ class NativeBackfillLockingTests(unittest.TestCase):
                 try:
                     deadline = time.monotonic() + 20
                     def blocked_on_range_lock() -> bool:
-                        if _is_lock_waiting(engine, monitor, backfill_sid):
-                            return True
-                        if engine != Dialect.MYSQL:
-                            return False
-                        # MariaDB may report the waiting trx as RUNNING in
-                        # innodb_trx; the range-lock statement cannot finish
-                        # while row 3 is locked, so being stuck in it counts.
-                        mc = monitor.cursor()
-                        mc.execute(
-                            "SELECT COUNT(*) FROM information_schema.processlist "
-                            "WHERE id = %s AND info LIKE %s AND time >= 1",
-                            (backfill_sid, "%FOR UPDATE%"),
-                        )
-                        stuck = int(mc.fetchone()[0]) > 0
-                        monitor.commit()
-                        return stuck
+                        # Positive engine evidence only, attributed to the
+                        # writer holding row 3 (see _lock_wait_evidence).
+                        return _is_lock_waiting(engine, monitor, backfill_sid, blocker_sid=writer_sid)
 
                     while not blocked_on_range_lock():
                         if time.monotonic() > deadline:
                             from test_avg_concurrent_maintenance import _lock_diagnostics
-                            raise AssertionError(f"backfill never waited for the writer's row; sid={backfill_sid} {_lock_diagnostics(engine, monitor)!r}")
+                            raise AssertionError(
+                                f"backfill never waited for the writer's row; sid={backfill_sid} "
+                                f"{_lock_diagnostics(engine, monitor, backfill_sid)!r}"
+                            )
                         time.sleep(0.02)
                     # The backfill now waits for row 3; the writer's own
                     # trigger-maintained update must not deadlock with it.
@@ -2887,6 +2878,7 @@ class NativeBackfillLockingTests(unittest.TestCase):
             other = self._session(engine, dsn, fx)
             monitor = self._session(engine, dsn, fx)
             repair_sid = _session_id(engine, other)
+            backfill_sid = _session_id(engine, fx["conn"])
             other_manager = MaterializedViewManager(other, dialect=engine)
             outcome = {}
 
@@ -2901,22 +2893,10 @@ class NativeBackfillLockingTests(unittest.TestCase):
             started = []
 
             def repair_blocked() -> bool:
-                if _is_lock_waiting(engine, monitor, repair_sid):
-                    return True
-                if engine != Dialect.MYSQL:
-                    return False
-                # MariaDB may report the waiting trx as RUNNING in innodb_trx;
-                # a repair statement running for >= 1 s on this tiny fixture
-                # is waiting for the batch's store-row locks.
-                mc = monitor.cursor()
-                mc.execute(
-                    "SELECT COUNT(*) FROM information_schema.processlist "
-                    "WHERE id = %s AND command = 'Query' AND time >= 1",
-                    (repair_sid,),
-                )
-                stuck = int(mc.fetchone()[0]) > 0
-                monitor.commit()
-                return stuck
+                # Positive engine evidence only: the repair waits for a lock
+                # held by the in-flight batch's session (see
+                # _lock_wait_evidence).
+                return _is_lock_waiting(engine, monitor, repair_sid, blocker_sid=backfill_sid)
 
             def advance(cur, view_name, cursor_pk, upper_pk, max_pk, active):
                 if upper_pk == 20 and not started:
@@ -2926,7 +2906,9 @@ class NativeBackfillLockingTests(unittest.TestCase):
                     deadline = time.monotonic() + 20
                     while not repair_blocked() and "repair" not in outcome and "repair_error" not in outcome:
                         if time.monotonic() > deadline:
-                            raise AssertionError(f"repair never blocked: {_lock_diagnostics(engine, monitor)!r}")
+                            raise AssertionError(
+                                f"repair never blocked: {_lock_diagnostics(engine, monitor, repair_sid)!r}"
+                            )
                         time.sleep(0.02)
                 return original_advance(cur, view_name, cursor_pk, upper_pk, max_pk, active)
 
