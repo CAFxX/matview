@@ -25,6 +25,9 @@ Contract under test (``MaterializedViewManager.bulk_changes``):
   fails, MySQL session flag cannot be cleared) the physical connection is
   closed, the manager refuses further use, and ``BulkChangesConnectionError``
   is raised.
+* A body that ends the manager's transaction itself is detected; its later
+  work is rolled back, maintenance is restored and the views are refreshed in
+  a new transaction, and ``BulkChangesTransactionError`` is raised.
 
 Oracle: the original view's SELECT evaluated natively on the same database
 state by an independent connection; equality is exact.
@@ -53,6 +56,7 @@ from urllib.parse import urlparse
 import matview.manager as manager_module
 from matview_sync import (
     BulkChangesConnectionError,
+    BulkChangesTransactionError,
     Dialect,
     EngineLimitationWarning,
     MaterializedViewManager,
@@ -317,6 +321,31 @@ class SqliteBulkChangesTests(_SqliteBase):
             manager.conn.execute(f"INSERT INTO {TABLE} VALUES (50, 'b', 99);")
         self._assert_exact()
         self._assert_exact("bulk_maxes", OTHER_LIVE_SQL)
+
+    def test_body_ending_the_transaction_is_detected_and_repaired(self) -> None:
+        """A body that commits the manager's transaction must not leave
+        maintenance suspended or the view stale, and is reported."""
+        for kwargs in ({}, {"use_shadow_swap": True}):
+            with self.subTest(**kwargs):
+                manager = self._manager()
+                if not manager.get_catalog():
+                    _quiet_register(manager, VIEW_SQL)
+                triggers = self._triggers()
+                with self.assertRaises(BulkChangesTransactionError):
+                    with manager.bulk_changes(**kwargs):
+                        manager.conn.execute(f"INSERT INTO {TABLE} VALUES (60, 'a', 1);")
+                        manager.conn.commit()  # ends the manager's transaction
+                        manager.conn.execute(f"INSERT INTO {TABLE} VALUES (61, 'a', 2);")
+                self.assertFalse(manager.conn.in_transaction)
+                ids = [r[0] for r in self._rows()]
+                self.assertIn(60, ids, "work the body committed itself is kept")
+                self.assertNotIn(61, ids, "work after the unexpected commit must be rolled back")
+                self.assertEqual(self._triggers(), triggers)
+                self._assert_exact()
+                self._assert_maintained_by_other_session(62)
+                self.observer.execute(f"DELETE FROM {TABLE} WHERE id IN (60, 62);")
+                self.observer.commit()
+                manager.repair_view("bulk_totals")
 
     def test_failed_rollback_invalidates_connection_and_manager(self) -> None:
         manager = self._manager()

@@ -149,6 +149,16 @@ class BulkChangesConnectionError(RuntimeError):
     """
 
 
+class BulkChangesTransactionError(RuntimeError):
+    """The ``bulk_changes()`` block committed or rolled back the manager's transaction.
+
+    The block must leave transaction control to the manager. Work after the
+    unexpected transaction end was rolled back; maintenance was restored and
+    the views were refreshed in a new transaction (the message says so, or
+    that this recovery failed and which repair is needed).
+    """
+
+
 def _manager_owned_operation(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Run a public lifecycle method in a transaction the manager owns.
 
@@ -2089,6 +2099,8 @@ class MaterializedViewManager:
     # bulk_changes(): one manager-owned transaction, fail closed
     # ------------------------------------------------------------------
 
+    _BULK_GUARD_SAVEPOINT = "__mv_bulk_guard"
+
     def _require_usable(self) -> None:
         reason = getattr(self, "_invalidated_reason", None)
         if reason is not None:
@@ -2287,7 +2299,11 @@ class MaterializedViewManager:
         rolled back on any exception (including ``KeyboardInterrupt``); the
         exception propagates. Autocommit connections run in one explicit
         transaction (PostgreSQL autocommit is switched off for the duration and
-        restored). The body must not commit or roll back the connection.
+        restored). The body must not commit or roll back the connection:
+        that is detected, the work after it is rolled back, maintenance is
+        restored and the views are refreshed in a new transaction, and
+        ``BulkChangesTransactionError`` is raised (work the body committed
+        itself stays committed).
 
         How maintenance is suspended for the body (never globally outside a
         transaction):
@@ -2372,6 +2388,7 @@ class MaterializedViewManager:
                 if not session_bypass:
                     for entry in targets:
                         self._bulk_maintenance_ddl_drop(cur, entry)
+                self._savepoint_create(cur, self._BULK_GUARD_SAVEPOINT)
             except BaseException:
                 self._bulk_rollback("bulk_changes() setup failed")
                 raise
@@ -2397,6 +2414,36 @@ class MaterializedViewManager:
                         f"the session trigger-bypass flag could not be cleared ({reset_exc!r})"
                     ) from reset_exc
                 mysql_flag_set = False
+
+            body_ended_transaction: Optional[BaseException] = None
+            if dbapi_transaction_state(self.conn) is not True:
+                body_ended_transaction = RuntimeError("no transaction is open after the block")
+            else:
+                try:
+                    self._savepoint_release(cur, self._BULK_GUARD_SAVEPOINT)
+                except Exception as exc:
+                    body_ended_transaction = exc
+            if body_ended_transaction is not None:
+                self._bulk_rollback("the bulk_changes() block ended the transaction")
+                try:
+                    self._begin_bulk_transaction(cur)
+                    self._bulk_refresh(cur, targets, use_shadow_swap, recreate_triggers=not session_bypass)
+                    self._commit()
+                except BaseException as recovery_exc:
+                    self._bulk_rollback("recovering from a block that ended the transaction failed")
+                    raise BulkChangesTransactionError(
+                        "the bulk_changes() block committed or rolled back the manager's transaction, "
+                        "and restoring maintenance/refreshing the views afterwards failed "
+                        f"({recovery_exc!r}): work the block committed is not reflected in the views "
+                        "and maintenance triggers may be missing; run repair_view() or "
+                        "register_view(..., force_rebuild=True)"
+                    ) from recovery_exc
+                raise BulkChangesTransactionError(
+                    "the bulk_changes() block committed or rolled back the manager's transaction "
+                    f"({body_ended_transaction!r}). Work after that point was rolled back; work it "
+                    "committed is kept, maintenance was restored and the views were refreshed in a "
+                    "new transaction"
+                ) from body_ended_transaction
 
             try:
                 if self.dialect == Dialect.POSTGRES and session_bypass:
