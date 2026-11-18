@@ -291,7 +291,7 @@ def render_matrix() -> str:
     for title, fname in (
         ("PR gate ([`ci.yml`](.github/workflows/ci.yml); required, every pull request; fixed fuzz seeds only)", "ci.yml"),
         ("Extended random-seed fuzz ([`ci-extended.yml`](.github/workflows/ci-extended.yml); every push to master, nightly and on demand; not a merge gate, failures open an issue)", "ci-extended.yml"),
-        ("Deferred compatibility sweep ([`ci-deferred.yml`](.github/workflows/ci-deferred.yml); weekly, not a merge gate)", "ci-deferred.yml"),
+        ("Deferred compatibility sweep ([`ci-deferred.yml`](.github/workflows/ci-deferred.yml); nightly, scale-3 fuzz weekly; not a merge gate, scheduled failures open an issue)", "ci-deferred.yml"),
     ):
         parts.append(f"{title}:\n")
         parts.append("| CI job | Python | Database |")

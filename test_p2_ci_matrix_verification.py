@@ -14,7 +14,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Sequence, Set, Tuple
 from unittest.mock import MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -733,24 +733,54 @@ def extended_workflow_errors(extended: Dict[str, Any], gate: Dict[str, Any]) -> 
         if py != "3.12":
             errors.append(f"ci-extended.yml {name}: expected Python 3.12, got {py}")
 
+    errors += issue_reporter_errors("ci-extended.yml", extended, set(fuzz_jobs), ("'push'", "'schedule'"),
+                                    "fuzz-extended-*")
+    return errors
+
+
+CI_FAILURE_ISSUE_JS = REPO_ROOT / "scripts" / "ci_failure_issue.js"
+
+
+def issue_reporter_errors(fname: str, workflow: Dict[str, Any], expected_needs: set,
+                          event_needles: Sequence[str], artifact_pattern: str) -> List[str]:
+    """One job opens/updates ONE issue through scripts/ci_failure_issue.js."""
+    errors: List[str] = []
+    jobs = workflow.get("jobs") or {}
     reporters = [(jid, j) for jid, j in jobs.items() if isinstance(j, dict) and any(
         "github-script" in str(s.get("uses", "")) for s in j.get("steps") or [])]
     if len(reporters) != 1:
-        errors.append("ci-extended.yml needs exactly one issue-reporting job")
-    else:
-        jid, job = reporters[0]
-        if set(job.get("needs") or []) != set(fuzz_jobs):
-            errors.append(f"ci-extended.yml {jid} must depend on every fuzz job")
-        if (job.get("permissions") or {}).get("issues") != "write":
-            errors.append(f"ci-extended.yml {jid} needs permissions issues: write")
-        cond = str(job.get("if", ""))
-        for needle in ("!cancelled()", "'push'", "'schedule'", "'failure'"):
-            if needle not in cond:
-                errors.append(f"ci-extended.yml {jid} condition must contain {needle}: {cond}")
-        script = "".join(str((s.get("with") or {}).get("script", "")) for s in job.get("steps") or [])
-        for needle in ("listForRepo", "createComment", "issues.create", "context.runId"):
-            if needle not in script:
-                errors.append(f"ci-extended.yml {jid} script must use {needle} (dedupe + run link)")
+        return [f"{fname} needs exactly one issue-reporting job"]
+    jid, job = reporters[0]
+    if set(job.get("needs") or []) != set(expected_needs):
+        errors.append(f"{fname} {jid} must depend on exactly {sorted(expected_needs)}, got {job.get('needs')}")
+    if (job.get("permissions") or {}).get("issues") != "write":
+        errors.append(f"{fname} {jid} needs permissions issues: write")
+    if not job.get("timeout-minutes"):
+        errors.append(f"{fname} {jid}: needs timeout-minutes")
+    cond = str(job.get("if", ""))
+    for needle in ("!cancelled()", "'failure'", *event_needles):
+        if needle not in cond:
+            errors.append(f"{fname} {jid} condition must contain {needle}: {cond}")
+    steps = job.get("steps") or []
+    uses = [str(s.get("uses", "")) for s in steps]
+    script_idx = next(i for i, u in enumerate(uses) if "github-script" in u)
+    if not any(u.startswith("actions/checkout@") for u in uses[:script_idx]):
+        errors.append(f"{fname} {jid}: must check out the repository before requiring the shared script")
+    downloads = [s for s in steps[:script_idx] if "download-artifact" in str(s.get("uses", ""))]
+    if not downloads or str((downloads[0].get("with") or {}).get("pattern")) != artifact_pattern:
+        errors.append(f"{fname} {jid}: must download the {artifact_pattern} report artifacts")
+    script = str((steps[script_idx].get("with") or {}).get("script", ""))
+    if 'require("./scripts/ci_failure_issue.js")' not in script:
+        errors.append(f"{fname} {jid}: must use scripts/ci_failure_issue.js")
+    if "NEEDS_JSON" not in (steps[script_idx].get("env") or {}):
+        errors.append(f"{fname} {jid}: must pass NEEDS_JSON (job results) to the script")
+    for key in ("title:", "label:", "reportsDir:", "reportName:"):
+        if key not in script:
+            errors.append(f"{fname} {jid}: script must set {key}")
+    shared = CI_FAILURE_ISSUE_JS.read_text(encoding="utf-8")
+    for needle in ("listForRepo", "createComment", "issues.create", "context.runId"):
+        if needle not in shared:
+            errors.append(f"scripts/ci_failure_issue.js must use {needle} (dedupe + run link)")
     return errors
 
 
@@ -887,6 +917,293 @@ class TestFuzzFailureReport(unittest.TestCase):
                 rc = self.ffr.main(["--manifest", str(Path(tmp) / "absent.json"), "--out-dir", str(Path(tmp) / "out2")])
             self.assertEqual(rc, 0)
             self.assertEqual((Path(tmp) / "out2" / "failing-seeds.txt").read_text(), "")
+
+
+
+# ==============================================================================
+# Workflow hygiene: timeouts, every test file runs in CI, deferred sweep contract
+# ==============================================================================
+
+CI_DEFERRED_WEEKLY_CRON = "17 3 * * 0"
+CI_DEFERRED_NIGHTLY_CRON = "17 3 * * 1-6"
+GATE_JOB_TIMEOUT_MAX = 25
+DEFERRED_JOB_TIMEOUT_MAX = {"python-deferred": 60, "compatibility-sweep": 60, "dependency-minimum": 60,
+                            "fuzz-stress": 90}
+DEFERRED_REPORTED_JOBS = {"python-deferred", "compatibility-sweep", "dependency-minimum", "fuzz-stress",
+                          "deferred-success"}
+
+
+def _all_workflows() -> Dict[str, Dict[str, Any]]:
+    return {p.name: _parse_yaml_minimal(p.read_text(encoding="utf-8"))
+            for p in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))}
+
+
+def timeout_errors(workflows: Dict[str, Dict[str, Any]]) -> List[str]:
+    errors: List[str] = []
+    for fname, wf in workflows.items():
+        for jid, job in (wf.get("jobs") or {}).items():
+            if not isinstance(job, dict):
+                continue
+            tmo = job.get("timeout-minutes")
+            if not str(tmo or "").isdigit() or int(tmo) <= 0:
+                errors.append(f"{fname} {jid}: needs a positive integer timeout-minutes, got {tmo!r}")
+                continue
+            if fname == "ci.yml" and int(tmo) > GATE_JOB_TIMEOUT_MAX:
+                errors.append(f"ci.yml {jid}: timeout {tmo} exceeds the gate budget {GATE_JOB_TIMEOUT_MAX}")
+            if fname == "ci-deferred.yml" and jid in DEFERRED_JOB_TIMEOUT_MAX and int(tmo) > DEFERRED_JOB_TIMEOUT_MAX[jid]:
+                errors.append(f"ci-deferred.yml {jid}: timeout {tmo} exceeds {DEFERRED_JOB_TIMEOUT_MAX[jid]}")
+    return errors
+
+
+def unexecuted_test_files(workflows: Dict[str, Dict[str, Any]], root: Path = REPO_ROOT) -> List[str]:
+    """Test files in the repository that no workflow step executes."""
+    commands = "\n".join(
+        str(step.get("run", ""))
+        for wf in workflows.values()
+        for job in (wf.get("jobs") or {}).values() if isinstance(job, dict)
+        for step in job.get("steps") or [] if isinstance(step, dict)
+    )
+    missing = []
+    for path in sorted([*root.glob("test_*.py"), *root.glob("scripts/test_*.py")]):
+        rel = path.relative_to(root).as_posix()
+        module = rel[:-3].replace("/", ".")
+        if not re.search(rf"(?<![\w/.-]){re.escape(rel)}\b|-m unittest\b[^\n]*\b{re.escape(module)}\b", commands):
+            missing.append(rel)
+    return missing
+
+
+def deferred_workflow_errors(deferred: Dict[str, Any], requirements: str) -> List[str]:
+    errors: List[str] = []
+    triggers = _workflow_triggers(deferred)
+    crons = sorted(str(c.get("cron")) for c in triggers.get("schedule") or [] if isinstance(c, dict))
+    if crons != sorted([CI_DEFERRED_NIGHTLY_CRON, CI_DEFERRED_WEEKLY_CRON]):
+        errors.append(f"ci-deferred.yml schedules must be nightly {CI_DEFERRED_NIGHTLY_CRON!r} + weekly "
+                      f"{CI_DEFERRED_WEEKLY_CRON!r}, got {crons}")
+    if "workflow_dispatch" not in triggers:
+        errors.append("ci-deferred.yml must keep workflow_dispatch")
+    concurrency = deferred.get("concurrency") or {}
+    if "github.event_name" not in str(concurrency.get("group", "")) or \
+            str(concurrency.get("cancel-in-progress")).lower() != "false":
+        errors.append("ci-deferred.yml concurrency must separate events and never cancel a running sweep")
+    if str((deferred.get("env") or {}).get("PYTHONUNBUFFERED")) != "1":
+        errors.append("ci-deferred.yml must set PYTHONUNBUFFERED=1")
+
+    jobs = deferred.get("jobs") or {}
+    fuzz = jobs.get("fuzz-stress") or {}
+    if CI_DEFERRED_WEEKLY_CRON not in str(fuzz.get("if", "")):
+        errors.append("ci-deferred.yml fuzz-stress must be gated to the weekly schedule / manual runs")
+    for jid, job in jobs.items():
+        if jid != "fuzz-stress" and isinstance(job, dict) and CI_DEFERRED_WEEKLY_CRON in str(job.get("if", "")):
+            errors.append(f"ci-deferred.yml {jid} must run nightly, not only weekly")
+    agg = "".join(str(s.get("run", "")) for s in (jobs.get("deferred-success") or {}).get("steps") or [])
+    if CI_DEFERRED_WEEKLY_CRON not in agg:
+        errors.append("ci-deferred.yml deferred-success must recognise the weekly schedule")
+
+    # Scale-3 fuzz: failing-seed report with replay env, artifacts like ci-extended.yml.
+    steps = fuzz.get("steps") or []
+    runs = [str(s.get("run", "")) for s in steps]
+    fuzz_idx = next((i for i, r in enumerate(runs) if "test_matview_sync.py --fuzz" in r), None)
+    if fuzz_idx is None:
+        errors.append("ci-deferred.yml fuzz-stress has no fuzz step")
+    else:
+        after = steps[fuzz_idx + 1:]
+        report = [s for s in after if "fuzz_failure_report.py" in str(s.get("run", "")) and s.get("if") == "always()"]
+        if not report or "--engine-env" not in str(report[0].get("run", "")):
+            errors.append("ci-deferred.yml fuzz-stress: missing always() failing-seed report with --engine-env")
+        uploads = [s for s in after if "upload-artifact" in str(s.get("uses", "")) and s.get("if") == "always()"]
+        if not uploads or not all(
+                "fuzz-campaign.json" in str((u.get("with") or {}).get("path", ""))
+                and "fuzz-report" in str((u.get("with") or {}).get("path", ""))
+                and str((u.get("with") or {}).get("name", "")).startswith("fuzz-deferred-") for u in uploads):
+            errors.append("ci-deferred.yml fuzz-stress: must upload fuzz-campaign.json and fuzz-report/ "
+                          "as fuzz-deferred-* with if: always()")
+    expected_replay = {"sqlite": "", "apsw": "SQLITE_COMPAT_ENGINE=apsw",
+                       "postgres": "POSTGRES_DSN=postgresql://postgres:password@127.0.0.1:5432/matview_test",
+                       "mysql": "MYSQL_DSN=mysql://root:password@127.0.0.1:3306/matview_test"}
+    for row in ((fuzz.get("strategy") or {}).get("matrix") or {}).get("include") or []:
+        if str(row.get("replay-env", None)) != expected_replay.get(str(row.get("backend"))):
+            errors.append(f"ci-deferred.yml fuzz-stress {row.get('label')}: replay-env {row.get('replay-env')!r} "
+                          f"does not select backend {row.get('backend')!r}")
+
+    # Minimum dependencies: pins derived from requirements.txt, never hand-copied.
+    dep_runs = "\n".join(str(s.get("run", "")) for s in (jobs.get("dependency-minimum") or {}).get("steps") or [])
+    if "sed -E 's/>=/==/' requirements.txt > min-requirements.txt" not in dep_runs or \
+            "pip install -r min-requirements.txt" not in dep_runs:
+        errors.append("ci-deferred.yml dependency-minimum must derive its exact pins from requirements.txt")
+    if re.search(r"[\"'][A-Za-z0-9_.-]+==\d", dep_runs):
+        errors.append("ci-deferred.yml dependency-minimum must not hand-copy version pins")
+    for line in requirements.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line and ">=" not in line:
+            errors.append(f"requirements.txt entry without a >= floor: {line!r}")
+
+    # Allowed failures are explicit, warned about, and limited to documented rows.
+    sweep = jobs.get("compatibility-sweep") or {}
+    rows = ((sweep.get("strategy") or {}).get("matrix") or {}).get("include") or []
+    allowed = sorted(str(r.get("name")) for r in rows if r.get("allow-failure") is True)
+    if allowed != ["sqlean SQLite"]:
+        errors.append(f"ci-deferred.yml allow-failure rows must be exactly the documented sqlean row, got {allowed}")
+    if "matrix.allow-failure == true" not in str(sweep.get("continue-on-error", "")):
+        errors.append("ci-deferred.yml compatibility-sweep continue-on-error must be driven by matrix.allow-failure")
+    if not any("failure()" in str(s.get("if", "")) and "::warning" in str(s.get("run", ""))
+               for s in sweep.get("steps") or []):
+        errors.append("ci-deferred.yml compatibility-sweep must emit a warning for an allowed failure")
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        for row in ((job.get("strategy") or {}).get("matrix") or {}).get("include") or []:
+            for key in ("image", "pg-image", "mysql-image"):
+                if re.search(r"(?i)[-.]?rc\b|alpha|beta", str(row.get(key, ""))):
+                    errors.append(f"ci-deferred.yml: pre-release image {row.get(key)!r} is not a support claim")
+
+    errors += issue_reporter_errors("ci-deferred.yml", deferred, DEFERRED_REPORTED_JOBS, ("'schedule'",),
+                                    "fuzz-deferred-*")
+    return errors
+
+
+def _deferred_success_script(deferred: Dict[str, Any]) -> str:
+    run = "".join(str(s.get("run", "")) for s in deferred["jobs"]["deferred-success"]["steps"])
+    return run.split("<<'PY'\n", 1)[1].rsplit("PY", 1)[0]
+
+
+class TestWorkflowHygiene(unittest.TestCase):
+    """Timeouts, CI coverage of every test file, and the deferred sweep's contract."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.workflows = _all_workflows()
+        cls.deferred = cls.workflows["ci-deferred.yml"]
+        cls.requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+    def test_every_job_has_a_bounded_timeout(self) -> None:
+        self.assertEqual(timeout_errors(self.workflows), [])
+
+    def test_timeout_validator_detects_missing_and_excessive_timeouts(self) -> None:
+        import copy
+        wfs = copy.deepcopy(self.workflows)
+        del wfs["ci.yml"]["jobs"]["postgres"]["timeout-minutes"]
+        wfs["ci.yml"]["jobs"]["mysql"]["timeout-minutes"] = 360
+        errors = timeout_errors(wfs)
+        self.assertTrue(any("ci.yml postgres" in e for e in errors), errors)
+        self.assertTrue(any("ci.yml mysql" in e and "exceeds" in e for e in errors), errors)
+
+    def test_every_test_file_is_executed_by_a_workflow(self) -> None:
+        self.assertEqual(unexecuted_test_files(self.workflows), [])
+
+    def test_unexecuted_test_file_detection(self) -> None:
+        import copy
+        import tempfile
+        wfs = copy.deepcopy(self.workflows)
+        for job in wfs["ci.yml"]["jobs"].values():
+            job["steps"] = [st for st in job.get("steps") or [] if "scripts/test_presubmit.py" not in str(st.get("run", ""))]
+        self.assertEqual(unexecuted_test_files(wfs), ["scripts/test_presubmit.py"])
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "test_new_feature.py").write_text("")
+            self.assertEqual(unexecuted_test_files(self.workflows, Path(tmp)), ["test_new_feature.py"])
+
+    def test_presubmit_selftest_runs_in_the_sqlite_gate_job_with_pyyaml(self) -> None:
+        steps = self.workflows["ci.yml"]["jobs"]["sqlite"]["steps"]
+        runs = [str(st.get("run", "")) for st in steps]
+        install = next(i for i, r in enumerate(runs) if "pip install -r requirements.txt" in r)
+        self.assertIn("pip install -r requirements-dev.txt", runs[install])
+        self.assertIn("python3 scripts/test_presubmit.py", runs)
+        self.assertRegex((REPO_ROOT / "requirements-dev.txt").read_text(encoding="utf-8"), r"(?mi)^pyyaml>=")
+
+    def test_deferred_workflow_contract(self) -> None:
+        self.assertEqual(deferred_workflow_errors(self.deferred, self.requirements), [])
+
+    def test_deferred_validator_detects_regressions(self) -> None:
+        import copy
+        wf = copy.deepcopy(self.deferred)
+        _workflow_triggers(wf)["schedule"] = [{"cron": "17 3 * * 1"}]
+        wf["jobs"]["fuzz-stress"]["strategy"]["matrix"]["include"][1]["replay-env"] = ""
+        for st in wf["jobs"]["dependency-minimum"]["steps"]:
+            if "min-requirements.txt" in str(st.get("run", "")):
+                st["run"] = 'pip install "sqlglot==25.0.0"'
+        wf["jobs"]["compatibility-sweep"]["strategy"]["matrix"]["include"][-1]["allow-failure"] = True
+        wf["jobs"]["compatibility-sweep"]["strategy"]["matrix"]["include"][0]["image"] = "mariadb:13.1-rc"
+        del wf["jobs"]["report-failure"]
+        errors = deferred_workflow_errors(wf, self.requirements + "\nnewdep\n")
+        for needle in ("schedules", "APSW SQLite", "derive its exact pins", "hand-copy", "allow-failure rows",
+                       "pre-release", "issue-reporting", "'newdep'"):
+            self.assertTrue(any(needle in e for e in errors), (needle, errors))
+
+    def test_deferred_success_skips_fuzz_only_on_the_nightly_schedule(self) -> None:
+        import subprocess
+        script = _deferred_success_script(self.deferred)
+
+        def run(event: str, schedule: str, results: Dict[str, str]) -> int:
+            needs = {k: {"result": v} for k, v in results.items()}
+            env = dict(os.environ, NEEDS_JSON=__import__("json").dumps(needs), EVENT_NAME=event, EVENT_SCHEDULE=schedule)
+            return subprocess.run([sys.executable, "-c", script], env=env, capture_output=True).returncode
+
+        ok = {"python-deferred": "success", "compatibility-sweep": "success", "dependency-minimum": "success"}
+        self.assertEqual(run("schedule", CI_DEFERRED_NIGHTLY_CRON, dict(ok, **{"fuzz-stress": "skipped"})), 0)
+        self.assertEqual(run("schedule", CI_DEFERRED_WEEKLY_CRON, dict(ok, **{"fuzz-stress": "skipped"})), 1)
+        self.assertEqual(run("workflow_dispatch", "", dict(ok, **{"fuzz-stress": "skipped"})), 1)
+        self.assertEqual(run("schedule", CI_DEFERRED_NIGHTLY_CRON, dict(ok, **{"python-deferred": "skipped", "fuzz-stress": "skipped"})), 1)
+        self.assertEqual(run("schedule", CI_DEFERRED_WEEKLY_CRON, dict(ok, **{"fuzz-stress": "success"})), 0)
+        self.assertEqual(run("schedule", CI_DEFERRED_WEEKLY_CRON, dict(ok, **{"fuzz-stress": "failure"})), 1)
+
+
+@unittest.skipUnless(__import__("shutil").which("node"), "node is required to execute scripts/ci_failure_issue.js")
+class TestCiFailureIssueScript(unittest.TestCase):
+    """Executes scripts/ci_failure_issue.js against a fake GitHub client (dedupe, labels, reports)."""
+
+    DRIVER = r"""
+const report = require(process.argv[1]);
+const state = JSON.parse(process.argv[2]);
+const calls = [];
+const github = {
+  paginate: async (fn, args) => { calls.push(["listForRepo", args.labels, args.state]); return state.open; },
+  rest: { issues: {
+    listForRepo: "listForRepo",
+    getLabel: async a => { calls.push(["getLabel", a.name]); if (!state.labelExists) { const e = new Error("nf"); e.status = 404; throw e; } },
+    createLabel: async a => { calls.push(["createLabel", a.name]); },
+    createComment: async a => { calls.push(["createComment", a.issue_number, a.body]); },
+    create: async a => { calls.push(["create", a.title, a.labels, a.body]); return { data: { number: 99 } }; },
+  } },
+};
+const context = { repo: { owner: "o", repo: "r" }, serverUrl: "https://gh", runId: 7, eventName: "schedule", sha: "abc" };
+const core = { info: () => {} };
+report({ github, context, core }, { title: "T", label: "L", labelDescription: "d", intro: "INTRO",
+  reportsDir: state.dir, reportName: "fuzz-failures.md" })
+  .then(n => { console.log(JSON.stringify({ n, calls })); })
+  .catch(e => { console.error(e); process.exit(1); });
+"""
+
+    def _run(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        import json
+        import subprocess
+        out = subprocess.run(["node", "-e", self.DRIVER, str(CI_FAILURE_ISSUE_JS), json.dumps(state)],
+                             env=dict(os.environ, NEEDS_JSON=json.dumps({"fuzz-stress": {"result": "failure"}})),
+                             capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    def test_opens_one_labelled_issue_with_run_link_results_and_reports(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "a").mkdir()
+            (Path(tmp) / "a" / "fuzz-failures.md").write_text("SEED 222 replay")
+            res = self._run({"open": [], "labelExists": False, "dir": tmp})
+        kinds = [c[0] for c in res["calls"]]
+        self.assertEqual(kinds, ["getLabel", "createLabel", "listForRepo", "create"])
+        _, title, labels, body = res["calls"][-1]
+        self.assertEqual((title, labels, res["n"]), ("T", ["L"], 99))
+        for needle in ("INTRO", "https://gh/o/r/actions/runs/7", "fuzz-stress: failure", "SEED 222 replay"):
+            self.assertIn(needle, body)
+
+    def test_comments_on_the_open_issue_instead_of_opening_another(self) -> None:
+        res = self._run({"open": [{"number": 5, "title": "T"}, {"number": 6, "title": "T", "pull_request": {}}],
+                         "labelExists": True, "dir": "/nonexistent"})
+        kinds = [c[0] for c in res["calls"]]
+        self.assertEqual(kinds, ["getLabel", "listForRepo", "createComment"])
+        self.assertEqual(res["calls"][-1][1], 5)
+        self.assertIn("No report artifact was found", res["calls"][-1][2])
+
+    def test_other_titles_do_not_deduplicate(self) -> None:
+        res = self._run({"open": [{"number": 5, "title": "other"}], "labelExists": True, "dir": "/nonexistent"})
+        self.assertEqual(res["calls"][-1][0], "create")
 
 
 

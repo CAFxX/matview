@@ -20,13 +20,15 @@ name: CI — Multi-Engine Materialized View Tests
 #   SQLCipher, and libSQL. The alternative drivers run on Python 3.12, not across
 #   every Python version.
 # - PostgreSQL: native upstream 15 (oldest supported major) and 18 (newest).
-#   PostgreSQL 16–17 and one Percona PostgreSQL 18 build are deferred weekly.
+#   PostgreSQL 16–17 and one Percona PostgreSQL 18 build are deferred (nightly).
 #   PostgreSQL 14 is removed: upstream support ends 2026-11-12.
 # - MySQL: upstream 8.4 and 9.7 LTS lines are both required. Innovation 26.10
-#   and Percona Server 8.4/9.7 are deferred weekly.
+#   and Percona Server 8.4/9.7 are deferred (nightly).
 # - MariaDB: 10.11 (oldest selected LTS), 11.8, and 12.3 (newest LTS) are
-#   required. LTS 11.4 and current rolling 13.1 are deferred weekly. MariaDB
-#   13.0 is not carried forward because its community maintenance ends Q4 2026.
+#   required. LTS 11.4 and the current rolling release are deferred (nightly).
+#   The rolling row is 13.0 (13.0.2 GA) because 13.1 has no stable Docker tag
+#   yet (only 13.1-rc); move it to 13.1 when 13.1 is GA. 13.0's community
+#   maintenance ends Q4 2026, so it is not a long-term support claim.
 # - Vendor/extension images: Percona distributions are deferred as representative
 #   vendor-build checks, not repeated for every upstream major. TimescaleDB,
 #   PostGIS, and pgvector images are excluded from CI until tests actually create
@@ -48,13 +50,19 @@ name: CI — Multi-Engine Materialized View Tests
 #   18, MySQL 8.4 and MariaDB 12.3. A failure there uploads the failing seeds
 #   with a replay command and opens or updates one GitHub issue; each confirmed
 #   failure is added to the Suite 13 corpus in its fix PR. Scale-3 stress
-#   campaigns stay in ci-deferred.yml weekly.
+#   campaigns stay in ci-deferred.yml (weekly schedule).
 #
 # Dependency and environment dimensions:
-# - requirements.txt declares packaging>=23.0, sqlglot>=25.0.0, psycopg2-binary>=2.9.9 and
-#   cryptography>=41.0.0 for Python <3.15, pymysql>=1.1.0, hypothesis>=6.100, and
-#   pytest>=8.0. PR jobs resolve the newest compatible releases; ci-deferred.yml tests
-#   these declared lower bounds on Python 3.11 against live PostgreSQL and MySQL.
+# - requirements.txt declares packaging>=23.0, sqlglot>=30.23.0, jinja2>=3.1.0,
+#   sqlalchemy>=2.0.0, psycopg2-binary>=2.9.9 and cryptography>=41.0.0 for Python
+#   <3.15, pymysql>=1.1.0, hypothesis>=6.100, and pytest>=8.0. PR jobs resolve the
+#   newest compatible releases; ci-deferred.yml derives exact pins from these
+#   floors and tests them nightly on Python 3.11 against live PostgreSQL and MySQL.
+#   sqlglot 30.22 and older fail (e.g. no TokenType.NATIONAL_RAW_STRING; before
+#   25.2 no exp.SetOperation). requirements-dev.txt (PyYAML) is installed only
+#   by the SQLite jobs for scripts/test_presubmit.py.
+# - Timeouts: 25 minutes per gate job (the slowest gate job measured 11 min
+#   after the fixed-seed gate, 30-34 min before it), 5 for bookkeeping jobs.
 # - Optional SQLite drivers (apsw, apsw-sqlite3mc, sqlcipher3-binary,
 #   sqlean.py, libsql-experimental) have no declared lower bounds. CI therefore
 #   tests the newest installable release only; it makes no oldest-driver-version
@@ -67,12 +75,13 @@ name: CI — Multi-Engine Materialized View Tests
 #   Action versions are pinned by major (checkout v4, setup-python v5), not
 #   cross-producted. Review action upgrades separately.
 #
-# Deferred weekly coverage is implemented in ci-deferred.yml:
+# Deferred coverage is implemented in ci-deferred.yml (nightly; the six scale-3
+# fuzz campaigns weekly; a failing scheduled run opens or updates one issue):
 # Python 3.13–3.14; PostgreSQL 16–17 and Percona PostgreSQL 18; MySQL 26.10
-# Innovation; MariaDB 11.4 and 13.1 rolling; Percona MySQL 8.4 and 9.7;
-# SQLite3MC and sqlean; minimum declared Python dependency versions; and all
-# six scale-3 fuzz campaigns. Extensions without feature tests are excluded,
-# not deferred.
+# Innovation; MariaDB 11.4 and 13.0 rolling; Percona MySQL 8.4 and 9.7;
+# SQLite3MC and sqlean (allowed to fail: see TODO.md); minimum declared Python
+# dependency versions. Extensions without feature tests are excluded, not
+# deferred.
 #
 # Extended exploration (ci-extended.yml, not a merge gate): random-seed scale-2
 # fuzz on SQLite (Python 3.12), PostgreSQL 18, MySQL 8.4 and MariaDB 12.3.
@@ -121,6 +130,7 @@ jobs:
   classify:
     name: Classify changed paths
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       docs_only: ${{ steps.paths.outputs.docs_only }}
     steps:
@@ -176,6 +186,7 @@ jobs:
     needs: classify
     if: needs.classify.outputs.docs_only == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Accept the whitelisted documentation-only change
         run: echo "Only explicitly whitelisted documentation paths changed."
@@ -186,6 +197,7 @@ jobs:
     if: needs.classify.outputs.docs_only != 'true'
     name: SQLite 3 (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -203,6 +215,8 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
+          # PyYAML: the presubmit self-test step parses this workflow file.
+          python3 -m pip install -r requirements-dev.txt
 
       - name: Verify SQLite library version
         run: python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
@@ -324,6 +338,9 @@ jobs:
       - name: Verify CI matrix definitions and engine verification
         run: python3 test_p2_ci_matrix_verification.py
 
+      - name: Test the local presubmit gate derived from this workflow
+        run: python3 scripts/test_presubmit.py
+
       - name: Test P2 base index introspection, recommendations, and auto-indexes
         run: python3 test_p2_index_intelligence.py
 
@@ -336,6 +353,7 @@ jobs:
     if: needs.classify.outputs.docs_only != 'true'
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -406,6 +424,7 @@ jobs:
     if: needs.classify.outputs.docs_only != 'true'
     name: PostgreSQL ${{ matrix.pg-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -523,6 +542,7 @@ jobs:
     if: needs.classify.outputs.docs_only != 'true'
     name: MySQL ${{ matrix.mysql-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -649,6 +669,7 @@ jobs:
     if: needs.classify.outputs.docs_only != 'true'
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -797,6 +818,7 @@ jobs:
       - mysql
       - mysql-compat
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Require every CI gate job to succeed
         env:
