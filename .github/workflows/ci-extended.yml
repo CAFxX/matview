@@ -21,6 +21,9 @@ name: CI — Extended Random-Seed Fuzz
 #   with repository Issues disabled the job fails with the report in its summary).
 #   Each confirmed failure is added to the Suite 13 corpus
 #   in its fix PR; then close the issue.
+# - Measured (first run, 2026-11-18): SQLite 11 min, PostgreSQL 18 12 min,
+#   MySQL 8.4 15 min, MariaDB 12.3 26 min (about 2x the others; the critical
+#   path). The 120 min timeouts leave >4x margin.
 # - Concurrency: one group per event type and ref, never cancelled in progress,
 #   so a push to master cannot cancel the nightly run (and vice versa) and a
 #   finished exploration run is never thrown away. GitHub keeps at most one
