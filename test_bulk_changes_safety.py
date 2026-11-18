@@ -28,6 +28,9 @@ Contract under test (``MaterializedViewManager.bulk_changes``):
 * A body that ends the manager's transaction itself is detected; its later
   work is rolled back, maintenance is restored and the views are refreshed in
   a new transaction, and ``BulkChangesTransactionError`` is raised.
+* The refresh takes over the pk-range backfill watermark in the same
+  transaction, so a running backfill stops and an interrupted view is no
+  longer reported as ``backfill_incomplete``.
 
 Oracle: the original view's SELECT evaluated natively on the same database
 state by an independent connection; equality is exact.
@@ -55,6 +58,7 @@ from urllib.parse import urlparse
 
 import matview.manager as manager_module
 from matview_sync import (
+    BackfillInterruptedError,
     BulkChangesConnectionError,
     BulkChangesTransactionError,
     Dialect,
@@ -458,6 +462,73 @@ class SqliteBulkChangesTests(_SqliteBase):
                 self.assertTrue(all(c.closed for c in opened), f"{label}: {sum(not c.closed for c in opened)} cursor(s) left open")
                 self.assertFalse(real.in_transaction)
 
+
+class SqliteBulkBackfillWatermarkTests(_SqliteBase):
+    def setUp(self) -> None:
+        super().setUp()
+        conn = self.db.connect()
+        conn.executemany(
+            f"INSERT INTO {TABLE} VALUES (?, ?, ?);",
+            [(i, "ab"[i % 2], i) for i in range(100, 130)],
+        )
+        conn.commit()
+        conn.close()
+
+    def _drift(self, manager: MaterializedViewManager) -> str:
+        return manager.check_schema_drift()["bulk_totals"]
+
+    def test_refresh_fences_a_running_backfill(self) -> None:
+        for kwargs in ({}, {"use_shadow_swap": True}):
+            with self.subTest(**kwargs):
+                backfiller = self._manager()
+                for name in list(backfiller.get_catalog()):
+                    backfiller.drop_view(name)
+                plan = _quiet_register(backfiller, VIEW_SQL, populate=False)
+                bulk_manager = self._manager()
+                ran = []
+
+                def on_progress(batch_idx: int, _done: int) -> None:
+                    # Deliberate interleaving: the backfill session has
+                    # committed batch 2 and is paused; an independent session
+                    # runs bulk_changes to completion.
+                    if batch_idx == 2 and not ran:
+                        ran.append(True)
+                        with bulk_manager.bulk_changes(**kwargs):
+                            bulk_manager.conn.execute(f"INSERT INTO {TABLE} VALUES (500, 'a', 3);")
+
+                with self.assertRaises(BackfillInterruptedError):
+                    backfiller.backfill_incrementally(plan, batch_size=5, on_progress=on_progress)
+                self.assertTrue(ran)
+                self._assert_exact()
+                self.assertEqual(self._drift(backfiller), "ok")
+                self.observer.execute(f"DELETE FROM {TABLE} WHERE id = 500;")
+                self.observer.commit()
+
+    def test_refresh_completes_an_interrupted_backfill(self) -> None:
+        for kwargs in ({}, {"use_shadow_swap": True}):
+            with self.subTest(**kwargs):
+                manager = self._manager()
+                for name in list(manager.get_catalog()):
+                    manager.drop_view(name)
+                plan = _quiet_register(manager, VIEW_SQL, populate=False)
+
+                def interrupt(batch_idx: int, _done: int) -> None:
+                    if batch_idx == 2:
+                        raise RuntimeError("interrupted")
+
+                with self.assertRaises(RuntimeError):
+                    manager.backfill_incrementally(plan, batch_size=5, on_progress=interrupt)
+                self.assertEqual(self._drift(manager), "backfill_incomplete")
+                with manager.bulk_changes(**kwargs):
+                    manager.conn.execute(f"INSERT INTO {TABLE} VALUES (501, 'b', 4);")
+                self._assert_exact()
+                self.assertEqual(self._drift(manager), "ok")
+                # Populated: a further backfill would double count and is refused.
+                with self.assertRaises(BackfillInterruptedError):
+                    manager.backfill_incrementally(plan, batch_size=5)
+                self._assert_maintained_by_other_session(502)
+                self.observer.execute(f"DELETE FROM {TABLE} WHERE id IN (501, 502);")
+                self.observer.commit()
 
 
 # ---------------------------------------------------------------------------
