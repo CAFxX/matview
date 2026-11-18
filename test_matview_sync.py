@@ -2393,8 +2393,19 @@ def _rewrite_live_reference_select_for_dialect(raw_select_sql: str, dialect: Dia
             "", "sqlite3", "apsw", "sqlite3mc", "sqlcipher"
         ):
             s_sq = raw_select_sql
-            s_sq = re.sub(
-                r"\bVAR_POP\s*\(\s*([^()]+?)\s*\)",
+            # sqlean's bundled `stats` extension provides a native, numerically
+            # stable VAR_POP (and STDDEV_*), so the live reference must use it.
+            # The textbook E[x^2]-E[x]^2 rewrite below is only a fallback for
+            # engines without one (libSQL): it cancels catastrophically for
+            # large-magnitude, low-variance groups (e.g. values ~1e6 with
+            # variance ~0.015 evaluate to 2**-6), which made the reference, not
+            # the MV, wrong in s1_avg_native_types on sqlean.
+            if os.environ.get("SQLITE_COMPAT_ENGINE", "").strip().lower() == "sqlean":
+                var_pop_pattern = None
+            else:
+                var_pop_pattern = r"\bVAR_POP\s*\(\s*([^()]+?)\s*\)"
+            s_sq = s_sq if var_pop_pattern is None else re.sub(
+                var_pop_pattern,
                 lambda m: (
                     f"(CASE WHEN COUNT({m.group(1)}) < 1 THEN NULL "
                     f"WHEN ((1.0 * SUM(1.0 * ({m.group(1)}) * ({m.group(1)})) - ((1.0 * SUM(1.0 * ({m.group(1)}))) * (1.0 * SUM(1.0 * ({m.group(1)})))) / COUNT({m.group(1)})) / COUNT({m.group(1)})) < 0.0 THEN 0.0 "
