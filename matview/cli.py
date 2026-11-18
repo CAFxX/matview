@@ -20,11 +20,19 @@ from .engines import (
 from .logical_ir import ViewDiff, ViewDiffReport
 from .manager import (
     MaterializedViewManager,
+    TransactionOwnershipError,
+    UnsafeReplacementError,
     _resolve_dialect_and_engine_version,
     generate_materialized_view,
     generate_materialized_views,
 )
 from .sql_frontend import parse_table_schema
+
+# Exit codes besides 0 (success), 1 (drift/changes found) and 2 (usage,
+# limitation or compilation error).
+EXIT_UNSAFE_REPLACEMENT = 3  # a published view cannot be replaced atomically here
+EXIT_TRANSACTION_OWNERSHIP = 4  # the connection's transaction state cannot be owned
+
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
@@ -373,6 +381,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         )
         return 0
+    except UnsafeReplacementError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print(
+            "The CLI has no drop command: drop the named view(s) through the Python API "
+            "(MaterializedViewManager(<--db>).drop_view(<name>)), then re-run this command "
+            "(apply any schema DDL in between). Readers see the view disappear until it is "
+            "registered and populated again.",
+            file=sys.stderr,
+        )
+        return EXIT_UNSAFE_REPLACEMENT
+    except TransactionOwnershipError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_TRANSACTION_OWNERSHIP
     except (EngineLimitationError, StrictCompilationError) as exc:
         print(f"WARNING: {exc}", file=sys.stderr)
         return 2

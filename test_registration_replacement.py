@@ -329,6 +329,41 @@ class SqliteReplacementTests(_ReplacementScenarios, unittest.TestCase):
         self.assertEqual(writes, [], "a refused sync_views changed the database")
         self.assertNotIn("other_totals", manager.get_catalog())
 
+    def test_cli_reports_refusals_with_distinct_exit_codes(self) -> None:
+        import contextlib
+        import io
+
+        from matview.cli import EXIT_TRANSACTION_OWNERSHIP, EXIT_UNSAFE_REPLACEMENT, main
+        from matview_sync import TransactionOwnershipError
+
+        manager = self.manager(self.conn)
+        manager.register_view(V1)
+        before = self.published_state(manager)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = main(["--db", self.path, "--view", V2, "--apply", "--incremental-backfill"])
+        self.assertEqual(code, EXIT_UNSAFE_REPLACEMENT)
+        self.assertIn("Refusing to replace materialized view", err.getvalue())
+        self.assertIn("drop_view", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertEqual(self.published_state(manager), before)
+
+        original = MaterializedViewManager.register_view
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise TransactionOwnershipError("injected ownership refusal")
+
+        MaterializedViewManager.register_view = refuse  # type: ignore[assignment]
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = main(["--db", self.path, "--view", V2, "--apply"])
+        finally:
+            MaterializedViewManager.register_view = original  # type: ignore[assignment]
+        self.assertEqual(code, EXIT_TRANSACTION_OWNERSHIP)
+        self.assertIn("injected ownership refusal", err.getvalue())
+        self.assertNotEqual(EXIT_UNSAFE_REPLACEMENT, EXIT_TRANSACTION_OWNERSHIP)
+
     def test_incomplete_view_can_still_be_rebuilt_incrementally(self) -> None:
         manager = self.manager(self.conn)
 
