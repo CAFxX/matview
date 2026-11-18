@@ -19,7 +19,10 @@ Contract under test (``MaterializedViewManager.bulk_changes``):
   any SQL.
 * A failure anywhere (setup, body, refresh, restoration) rolls the whole
   transaction back, which restores the original maintenance objects; it is
-  never swallowed.
+  never swallowed. When the connection state cannot be restored (rollback
+  fails, MySQL session flag cannot be cleared) the physical connection is
+  closed, the manager refuses further use, and ``BulkChangesConnectionError``
+  is raised.
 
 Oracle: the original view's SELECT evaluated natively on the same database
 state by an independent connection; equality is exact.
@@ -47,6 +50,7 @@ from urllib.parse import urlparse
 
 import matview.manager as manager_module
 from matview_sync import (
+    BulkChangesConnectionError,
     Dialect,
     EngineLimitationWarning,
     MaterializedViewManager,
@@ -280,6 +284,53 @@ class SqliteBulkChangesTests(_SqliteBase):
                         self._assert_maintained_by_other_session(41)
                         self.observer.execute(f"DELETE FROM {TABLE} WHERE id = 41;")
                         self.observer.commit()
+
+    def test_failed_rollback_invalidates_connection_and_manager(self) -> None:
+        manager = self._manager()
+        _quiet_register(manager, VIEW_SQL)
+        real = manager.conn
+        triggers = self._triggers()
+
+        class RollbackFails:
+            """A connection whose rollback fails (e.g. a lost server)."""
+
+            closed = False
+
+            def __init__(self) -> None:
+                self.dbapi_connection = real
+
+            def cursor(self) -> Any:
+                return real.cursor()
+
+            def commit(self) -> None:
+                real.commit()
+
+            def rollback(self) -> None:
+                raise sqlite3.OperationalError("injected rollback failure")
+
+            def close(self) -> None:
+                self.closed = True
+                real.close()
+
+        wrapper = RollbackFails()
+        manager.conn = wrapper
+        with self.assertRaises(BulkChangesConnectionError) as ctx:
+            with manager.bulk_changes():
+                real.execute(f"INSERT INTO {TABLE} VALUES (70, 'a', 1);")
+                raise ValueError("body failed")
+        self.assertIsInstance(ctx.exception.__cause__ or ctx.exception.__context__, BaseException)
+        self.assertTrue(wrapper.closed, "the connection with an unknown transaction state was not closed")
+        # Closing rolled the transaction back: nothing was committed and the
+        # triggers are intact for every other connection.
+        self.assertNotIn(70, [r[0] for r in self._rows()])
+        self.assertEqual(self._triggers(), triggers)
+        self._assert_maintained_by_other_session(71)
+        for operation in (manager.get_catalog, manager.check_schema_drift, lambda: manager.repair_view("bulk_totals")):
+            with self.assertRaises(BulkChangesConnectionError):
+                operation()
+        with self.assertRaises(BulkChangesConnectionError):
+            with manager.bulk_changes():
+                self.fail("entered on an invalidated manager")
 
 
 
@@ -605,6 +656,68 @@ class NativeMysqlBulkChangesTests(_NativeBase, unittest.TestCase):
                 self.assertFalse(self._in_transaction())
         self.assertEqual(self._maintenance_objects(), objects)
         self._assert_exact()
+
+    def test_session_flag_reset_failure_discards_the_connection(self) -> None:
+        conn = self._connect()
+        manager = MaterializedViewManager(conn, dialect=self.engine, object_prefix=self.prefix, ignore_limitations=True)
+        flag_seen: List[Any] = []
+
+        class ResetFailingCursor:
+            def __init__(self, cur: Any) -> None:
+                self._cur = cur
+
+            def execute(self, sql: Any, *args: Any) -> Any:
+                compact = str(sql).replace(" ", "").rstrip(";").upper()
+                if compact.startswith("SET@__MATVIEW_SKIP_TRIGGERS=") and not compact.endswith("=1"):
+                    raise RuntimeError("injected lost reset response")
+                return self._cur.execute(sql, *args)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._cur, name)
+
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *exc: Any) -> None:
+                self._cur.close()
+
+        class ResetFailing:
+            def __init__(self) -> None:
+                self.dbapi_connection = conn
+                self.closed = False
+
+            def cursor(self) -> Any:
+                return ResetFailingCursor(conn.cursor())
+
+            def commit(self) -> None:
+                conn.commit()
+
+            def rollback(self) -> None:
+                conn.rollback()
+
+            def close(self) -> None:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT @__matview_skip_triggers")
+                    flag_seen.append(cur.fetchone()[0])
+                self.closed = True
+                conn.close()
+
+        wrapper = ResetFailing()
+        manager.conn = wrapper
+        rows = self._rows()
+        with self.assertRaises(BulkChangesConnectionError):
+            with manager.bulk_changes():
+                with conn.cursor() as cur:
+                    cur.execute(f"INSERT INTO {self.table} VALUES (110, 'a', 1)")
+        self.assertTrue(wrapper.closed, "a session with the bypass flag set was left usable")
+        self.assertFalse(conn.open)
+        # The hazard was real: the flag was still set when the session was discarded.
+        self.assertEqual(flag_seen, [1])
+        self.assertEqual(self._rows(), rows, "work was committed although the session flag could not be cleared")
+        self._assert_exact()
+        with self.assertRaises(BulkChangesConnectionError):
+            with manager.bulk_changes():
+                self.fail("entered on an invalidated manager")
 
     def test_dml_path_issues_no_ddl(self) -> None:
         """MySQL/MariaDB DDL commits implicitly: neither success nor failure

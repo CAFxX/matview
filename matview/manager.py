@@ -138,6 +138,17 @@ class UnsafeReplacementError(RuntimeError):
     """
 
 
+class BulkChangesConnectionError(RuntimeError):
+    """``bulk_changes()`` could not restore its connection's state.
+
+    Raised when rolling back the manager-owned transaction failed, or when
+    the MySQL/MariaDB session trigger-bypass flag could not be cleared. The
+    connection was closed (the server rolls back its open transaction, so
+    nothing half-done is committed and no session keeps skipping
+    maintenance) and the manager refuses every later operation.
+    """
+
+
 def _manager_owned_operation(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Run a public lifecycle method in a transaction the manager owns.
 
@@ -148,6 +159,7 @@ def _manager_owned_operation(name: str) -> Callable[[Callable[..., Any]], Callab
     def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(fn)
         def wrapper(self: "MaterializedViewManager", *args: Any, **kwargs: Any) -> Any:
+            self._require_usable()
             if getattr(self, "_lifecycle_depth", 0):
                 return fn(self, *args, **kwargs)
             with self._owned_transaction(name):
@@ -168,6 +180,7 @@ def _manager_read_operation(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(fn)
     def wrapper(self: "MaterializedViewManager", *args: Any, **kwargs: Any) -> Any:
+        self._require_usable()
         if getattr(self, "_lifecycle_depth", 0):
             return fn(self, *args, **kwargs)
         owned = dbapi_transaction_state(self.conn) is False
@@ -2066,8 +2079,41 @@ class MaterializedViewManager:
     # bulk_changes(): one manager-owned transaction, fail closed
     # ------------------------------------------------------------------
 
+    def _require_usable(self) -> None:
+        reason = getattr(self, "_invalidated_reason", None)
+        if reason is not None:
+            raise BulkChangesConnectionError(
+                f"this manager's connection was closed and discarded ({reason}); create a new "
+                f"connection and manager"
+            )
+
+    def _invalidate_connection(self, reason: str) -> BulkChangesConnectionError:
+        """Discard a connection whose state can no longer be trusted.
+
+        Closing it makes the server (or SQLite) roll back whatever transaction
+        it still has, so neither the caller nor a connection pool can commit
+        half-restored state or reuse a session whose trigger-bypass flag is
+        still set. SQLAlchemy pool proxies are invalidated (not returned to
+        the pool). The manager refuses every later operation.
+        """
+        self._invalidated_reason = reason
+        for layer in dbapi_connection_layers(self.conn):
+            for method in ("invalidate", "close"):
+                fn = getattr(layer, method, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+                    break
+        return BulkChangesConnectionError(
+            f"bulk_changes(): {reason}. The connection was closed (its open transaction is rolled "
+            f"back by the server) and this manager can no longer be used. Maintenance objects of "
+            f"other connections were never changed outside a transaction."
+        )
+
     def _bulk_rollback(self, reason: str) -> None:
-        """Roll back the manager-owned transaction; never swallow a failure."""
+        """Roll back the manager-owned transaction or discard the connection."""
         try:
             if hasattr(self.conn, "rollback"):
                 self.conn.rollback()
@@ -2077,7 +2123,7 @@ class MaterializedViewManager:
             if dbapi_transaction_state(self.conn) is not False:
                 raise RuntimeError("the transaction is still open after rollback")
         except Exception as exc:
-            raise RuntimeError(f"bulk_changes(): {reason}, and rolling back failed ({exc!r})") from exc
+            raise self._invalidate_connection(f"{reason}, and rolling back failed ({exc!r})") from exc
 
     def _begin_bulk_transaction(self, cur: Any) -> None:
         if self.dialect == Dialect.SQLITE:
@@ -2242,7 +2288,8 @@ class MaterializedViewManager:
         - MySQL/MariaDB: the session variable ``@__matview_skip_triggers``
           and DML only. ``use_shadow_swap`` and ``drop_triggers`` need DDL,
           which commits implicitly, and are refused with ``ValueError``
-          before any SQL. The variable is cleared on every exit.
+          before any SQL. The variable is cleared on every exit; if that
+          fails the connection is closed (``BulkChangesConnectionError``).
         - SQLite: ``BEGIN IMMEDIATE`` (database-wide writer reservation),
           then the maintenance triggers are dropped and re-created inside the
           transaction.
@@ -2254,8 +2301,11 @@ class MaterializedViewManager:
         wait).
 
         Failures are never swallowed: any error rolls the whole transaction
-        back, which also restores the original maintenance objects.
+        back, which also restores the original maintenance objects. If the
+        rollback itself fails, the connection is closed and the manager
+        becomes unusable (``BulkChangesConnectionError``).
         """
+        self._require_usable()
         if self.dialect == Dialect.MYSQL and (use_shadow_swap or drop_triggers):
             raise ValueError(
                 "bulk_changes(use_shadow_swap=True / drop_triggers=True) is not supported on "
@@ -2311,12 +2361,14 @@ class MaterializedViewManager:
                 self._lifecycle_depth = 1
 
             if mysql_flag_set:
-                # Cleared inside the transaction, before anything commits.
+                # Cleared inside the transaction, before anything commits: if
+                # it cannot be cleared, closing the connection rolls back.
                 try:
                     cur.execute("SET @__matview_skip_triggers = 0;")
-                except BaseException:
-                    self._bulk_rollback("the session trigger-bypass flag could not be cleared")
-                    raise
+                except Exception as reset_exc:
+                    raise self._invalidate_connection(
+                        f"the session trigger-bypass flag could not be cleared ({reset_exc!r})"
+                    ) from reset_exc
                 mysql_flag_set = False
 
             try:
@@ -2343,7 +2395,7 @@ class MaterializedViewManager:
                         cur.close()
                     except Exception:
                         pass  # never mask the operation's own outcome
-                if mysql_flag_set:
+                if mysql_flag_set and getattr(self, "_invalidated_reason", None) is None:
                     # User variables are not transactional: on every failure
                     # exit (after the rollback) the flag must be cleared, or the
                     # session keeps skipping maintenance.
@@ -2351,13 +2403,13 @@ class MaterializedViewManager:
                         with self._cursor() as reset_cur:
                             reset_cur.execute("SET @__matview_skip_triggers = 0;")
                     except Exception as reset_exc:
-                        raise RuntimeError(
-                            f"bulk_changes(): the session trigger-bypass flag could not be cleared "
-                            f"({reset_exc!r}); discard this connection"
+                        raise self._invalidate_connection(
+                            f"the session trigger-bypass flag could not be cleared ({reset_exc!r})"
                         ) from (pending or reset_exc)
             finally:
-                for layer in restore_autocommit:
-                    layer.autocommit = True
+                if getattr(self, "_invalidated_reason", None) is None:
+                    for layer in restore_autocommit:
+                        layer.autocommit = True
 
     def _query_lower_name_set(self, sql: str) -> Optional[Set[str]]:
         """Execute a metadata query returning lowercase object names, or None if unavailable."""
