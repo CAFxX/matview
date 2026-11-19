@@ -9,8 +9,10 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 import sqlglot
 from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
+from sqlglot.errors import SqlglotError
 
 from .._host import MixinHost
+from ..dialects.base import DialectBaseMixin
 from ..dialects.pg_statement import SIGN, PgAggregateSpec, PgDeltaSource
 from ..engines import (
     AggFunc,
@@ -47,6 +49,7 @@ from ..sql_frontend import (
     build_create_view_sql,
     build_insert_select_sql,
     build_select_sql,
+    parse_sql_ast,
     parse_view_ast,
     quote_sql_identifier,
 )
@@ -210,6 +213,7 @@ class Tier1SingleMixin(MixinHost):
         processed_only: bool,
         rows_filter: Optional[str] = None,
         limit_one: bool = False,
+        locking_read: bool = False,
     ) -> str:
         """Native aggregate over the record's group, optionally restricted to the
         rows the triggers have already folded (rows inside an active backfill
@@ -238,7 +242,8 @@ class Tier1SingleMixin(MixinHost):
             )
         where_part = f" WHERE {' AND '.join(conds)}" if conds else ""
         limit_part = " LIMIT 1" if limit_one else ""
-        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part}{limit_part})"
+        lock_part = " LOCK IN SHARE MODE" if locking_read else ""
+        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part}{limit_part}{lock_part})"
 
     def _sqlite_refresh_group_keys_stmts(
         self, mv_table: str, record_prefix: str = "OLD"
@@ -313,6 +318,313 @@ class Tier1SingleMixin(MixinHost):
                 f"    WHERE ({grp_pred}) AND ({guard});"
             )
         return stmts
+
+    # ------------------------------------------------------------------
+    # PostgreSQL / MySQL / MariaDB: order-sensitive aggregates
+    # ------------------------------------------------------------------
+    # The native SUM/AVG of approximate (FLOAT/REAL/DOUBLE) values is a
+    # floating-point accumulation in scan order, and VAR/STDDEV use the
+    # engine's own streaming algorithm. An add/retract fold is not equivalent:
+    # the folded value depends on values that were added and later removed
+    # (1e16 + 1.5 - 1e16 folds to 2.0, the view returns 1.5). These columns are
+    # never folded. After every fold statement of a trigger, backfill chunk or
+    # transition-table body has locked the affected group rows, a SEPARATE
+    # statement recomputes them with the view's own aggregate:
+    #
+    # * PostgreSQL READ COMMITTED takes a new snapshot per statement of a
+    #   VOLATILE trigger function, so the recompute sees every writer that
+    #   committed before this transaction obtained the group-row lock. (A
+    #   recompute subquery inside the locking statement reads the snapshot
+    #   taken before the lock wait and misses such writers.) REPEATABLE READ /
+    #   SERIALIZABLE writers of the same group fail with a serialization error
+    #   instead of waiting, so they never fold onto a stale row.
+    # * MySQL/MariaDB InnoDB: the recompute is a locking read (LOCK IN SHARE
+    #   MODE), which reads the latest committed row versions under every
+    #   isolation level (a consistent read is stale under REPEATABLE READ and
+    #   READ COMMITTED alike once the statement waited for the group row).
+    #
+    # Integer and fixed-point SUM, and AVG derivable from them, stay algebraic
+    # and exact.
+    _PGMY_STAT_FUNCS = (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
+
+    def _pgmy_native_recompute_item(self, item: SelectItem) -> bool:
+        """True when a PostgreSQL/MySQL single-table aggregate column is
+        maintained by a post-lock native recompute instead of a fold."""
+        mode = getattr(self, "_alg_mode", "single")
+        if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL) or not item.is_aggregate:
+            return False
+        # UNION ALL aggregates: PostgreSQL only. Order-sensitive ones are
+        # rejected (see _order_sensitive_aggregate_limitations); the recompute
+        # keeps exact ones race-free and is best effort under the opt-in.
+        if mode == "union_all_agg" and self.dialect == Dialect.POSTGRES:
+            # Statement-level maintenance decides once over the UNION ALL
+            # column (orig_work_items), so a per-branch type cannot disagree.
+            return self._is_order_sensitive_aggregate(item)
+        if mode != "single":
+            return False
+        return self._is_order_sensitive_aggregate(item, recomputed_anyway=True)
+
+    def _is_order_sensitive_aggregate(self, item: SelectItem, *, recomputed_anyway: bool = False) -> bool:
+        """Whether the engine's native result depends on the order in which
+        the group's rows are accumulated (PostgreSQL/MySQL/MariaDB).
+
+        Approximate (or not provably exact) SUM/AVG arguments accumulate in
+        binary floating point; MySQL/MariaDB VAR/STDDEV accumulate in DOUBLE
+        for every argument type; PostgreSQL VAR/STDDEV are exact NUMERIC for
+        integer/numeric arguments. ``recomputed_anyway`` also selects the
+        aggregates that are natively recomputed for other reasons (exact
+        PostgreSQL VAR/STDDEV, AVG whose native scale a fold cannot
+        reproduce), so that they share the race-free recompute statement.
+        """
+        if not item.is_aggregate:
+            return False
+        func = item.agg_func
+        exact_arg = self._exact_numeric_precision_scale(item.arg_expr or "") is not None
+        if func in self._PGMY_STAT_FUNCS:
+            return recomputed_anyway or self.dialect == Dialect.MYSQL or not exact_arg
+        if func == AggFunc.AVG and not item.is_distinct and recomputed_anyway and self._requires_native_avg_recompute(item):
+            return True
+        if (
+            recomputed_anyway
+            and func == AggFunc.SUM
+            and exact_arg
+            and self.dialect == Dialect.POSTGRES
+            and not self._pg_numeric_scale_is_fixed(item.arg_expr or "")
+        ):
+            # PostgreSQL numeric addition keeps the larger display scale, so a
+            # fold remembers the scale of removed rows (1.50 + 2 - 1.50 folds
+            # to 2.00, the view returns 2). Only a fixed per-row scale folds.
+            return True
+        if func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG):
+            # Only a provably exact (integer / fixed-point) argument may be
+            # folded; anything else, including expressions of unknown type, is
+            # treated as approximate.
+            return not exact_arg
+        return False
+
+    def _pg_numeric_scale_is_fixed(self, expr: str) -> bool:
+        """Whether every row of a PostgreSQL exact-numeric expression has the
+        same display scale: integer columns, NUMERIC(p, s) columns with an
+        explicit scale, numeric literals, combined only by +, - and *.
+        (Unconstrained NUMERIC columns, division, CASE/COALESCE and functions
+        can produce a data-dependent scale.)"""
+        try:
+            root = parse_sql_ast(expr, dialect=self.dialect)
+        except (SqlglotError, AttributeError, TypeError, ValueError):
+            return False
+
+        def fixed(node: Any) -> bool:
+            if isinstance(node, sqlglot_exp.Column):
+                c_def = self._lookup_col_def(node.sql(dialect=_sqlglot_dialect(self.dialect)))
+                if c_def is None:
+                    return False
+                t = re.sub(r"\s+", " ", c_def.data_type.strip().upper())
+                if DialectBaseMixin._PG_INTEGER_TYPE_RE.fullmatch(t):
+                    return True
+                return bool(re.fullmatch(r"(?:NUMERIC|DECIMAL)\s*\(\s*\d+\s*,\s*\d+\s*\)", t))
+            if isinstance(node, sqlglot_exp.Literal):
+                return not node.args.get("is_string")
+            if isinstance(node, (sqlglot_exp.Paren, sqlglot_exp.Neg)):
+                return fixed(node.this)
+            if isinstance(node, (sqlglot_exp.Add, sqlglot_exp.Sub, sqlglot_exp.Mul)):
+                return fixed(node.this) and fixed(node.expression)
+            return False
+
+        return fixed(root)
+
+    def _pgmy_scan_ordered_agg_sql(self, item: SelectItem) -> str:
+        """The view's aggregate, accumulated in the order the original view
+        reads the group's rows.
+
+        PostgreSQL: a sequential scan (the plan of a full ``GROUP BY`` over a
+        table: Seq Scan + HashAggregate / plain Aggregate) returns rows in
+        ``ctid`` order, while a group-filtered recompute may use an index or
+        bitmap scan, which returns HOT-updated rows in root line-pointer order
+        and can therefore accumulate in a different order (measured: 1-ulp
+        VAR_SAMP difference). ``AGG(x ORDER BY ctid)`` pins the accumulation
+        order to the sequential-scan order whatever access path is chosen.
+        DISTINCT aggregates accumulate their sorted distinct values and need
+        no pinning. MySQL/MariaDB InnoDB returns a group's rows in clustered
+        primary-key order through the table scan and through any secondary
+        index on the group key (whose entries are ordered by (key, pk)).
+        """
+        agg_sql = self._sql_backfill_agg_expr(item)
+        if self.dialect != Dialect.POSTGRES or item.is_distinct or not self._is_order_sensitive_aggregate(item):
+            # Exact NUMERIC accumulation does not depend on the order.
+            return agg_sql
+        func = item.agg_func
+        if func is None or func not in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG, *self._PGMY_STAT_FUNCS):
+            return agg_sql
+        eff = self._effective_agg_value_expr(item, record_prefix=None)
+        order = f" ORDER BY {self._q(self.view.base_table)}.ctid"
+        if func == AggFunc.TOTAL:
+            return f"COALESCE(1.0 * SUM({eff}{order}), 0.0)"
+        return f"{func.value}({eff}{order})"
+
+    def _pgmy_native_recompute_items(self) -> List[SelectItem]:
+        seen: Set[str] = set()
+        out: List[SelectItem] = []
+        for item in self._working_select_items:
+            if not self._pgmy_native_recompute_item(item):
+                continue
+            q_col = self._q(item.alias)
+            if q_col in seen:
+                continue
+            seen.add(q_col)
+            out.append(item)
+        return out
+
+    def _pgmy_native_recompute_stmt(
+        self,
+        mv_table: str,
+        where_sql: str,
+        *,
+        processed_only: bool = True,
+        rows_filter: Optional[str] = None,
+        from_params: Optional[str] = None,
+        record_prefix: Optional[str] = None,
+    ) -> Optional[str]:
+        """``UPDATE`` recomputing every order-sensitive column of the backing
+        rows selected by ``where_sql`` from the base table natively.
+
+        Callers must only select group rows that an earlier statement of the
+        same transaction has already locked (see the class comment above).
+        ``from_params`` adds a one-row derived table (PostgreSQL ``FROM``,
+        MySQL multi-table ``JOIN``) that ``rows_filter``/``where_sql`` may use.
+        """
+        items = self._pgmy_native_recompute_items()
+        if not items:
+            return None
+        locking = self.dialect == Dialect.MYSQL
+        if (
+            self.dialect == Dialect.MYSQL
+            and record_prefix is not None
+            and getattr(self, "_alg_mode", "single") == "single"
+        ):
+            # One locking scan of the record's group computing every column
+            # (a derived table cannot correlate to the backing row on MySQL
+            # 8.0 < 8.0.14 / MariaDB, so the group is matched against the
+            # trigger record). Besides reading the group once instead of once
+            # per column, this keeps the stored trigger programs small: MySQL
+            # 8.4 caches a parse tree per trigger and opened table instance
+            # (`memory/sql/sp_head::main_mem_root` reached 2.6 GiB in the
+            # native differential suite with one scalar subquery per column).
+            agg_list = ", ".join(
+                f"{self._pgmy_scan_ordered_agg_sql(item)} AS {self._q(item.alias)}" for item in items
+            )
+            scan = self._build_native_group_recompute(
+                agg_list, record_prefix, processed_only=processed_only,
+                rows_filter=rows_filter, locking_read=True,
+            )
+            sets = ", ".join(
+                f"{mv_table}.{self._q(item.alias)} = __mv_r.{self._q(item.alias)}" for item in items
+            )
+            return (
+                f"UPDATE {mv_table} INNER JOIN {scan} AS __mv_r ON TRUE\n"
+                f"    SET {sets}\n"
+                f"    WHERE {where_sql};"
+            )
+        assignments: List[str] = []
+        for item in items:
+            target = (
+                f"{mv_table}.{self._q(item.alias)}"
+                if (self.dialect == Dialect.MYSQL and from_params)
+                else self._q(item.alias)
+            )
+            if getattr(self, "_alg_mode", "single") == "union_all_agg":
+                # PostgreSQL only: the view's own aggregate over the UNION ALL,
+                # correlated to the backing row's group columns.
+                recompute = self._build_recompute_subquery_raw(item, mv_table)
+            else:
+                recompute = self._build_native_group_recompute(
+                    self._pgmy_scan_ordered_agg_sql(item),
+                    mv_table,
+                    processed_only=processed_only,
+                    rows_filter=rows_filter,
+                    locking_read=locking,
+                )
+            assignments.append(f"{target} = {recompute}")
+        sep = ",\n        "
+        if from_params and self.dialect == Dialect.MYSQL:
+            return (
+                f"UPDATE {mv_table} INNER JOIN {from_params} ON TRUE\n"
+                f"    SET {sep.join(assignments)}\n"
+                f"    WHERE {where_sql};"
+            )
+        from_part = f"\n    FROM {from_params}" if from_params else ""
+        return (
+            f"UPDATE {mv_table}\n"
+            f"    SET {sep.join(assignments)}{from_part}\n"
+            f"    WHERE {where_sql};"
+        )
+
+    def _mysql_group_prelock(self, mv_table: str, row_count_col: str) -> Optional[Dict[str, str]]:
+        """MySQL/MariaDB: statements for BEFORE triggers that lock the affected
+        existing backing rows before the base row is written.
+
+        The post-lock recompute is a locking read of the group's base rows.
+        If a writer wrote its base row first and then waited for the group
+        row, the group-row holder's locking read would wait for that base row
+        and InnoDB would report a deadlock. Locking the group row first makes
+        every writer of an existing group queue on the group row before it
+        writes base rows of that group (measured, MySQL 9.7, 4 writers / 6
+        indexed groups, 600 single-write transactions: 15-26 -> 0-3
+        deadlocks). A group that does not exist yet is not pre-created: a
+        placeholder row created by BEFORE INSERT can be orphaned when the
+        INSERT turns into an UPDATE of another group (INSERT ... ON DUPLICATE
+        KEY UPDATE, found by the native differential fuzzer); concurrent
+        creators of one new group can still deadlock (reported, retryable).
+        """
+        if self.dialect != Dialect.MYSQL or not self._pgmy_native_recompute_items():
+            return None
+        grp_exprs = self._effective_group_by_exprs
+        q_rc = self._q(row_count_col)
+
+        def lock(record: str) -> str:
+            return (
+                f"UPDATE {mv_table} SET {q_rc} = {mv_table}.{q_rc}\n"
+                f"        WHERE {self._group_match_predicate_tier1(mv_table, record)};"
+            )
+
+        if grp_exprs:
+            new_key = self._canonical_group_pk_expr([self._rewrite_expr_for_record(g, "NEW") for g in grp_exprs])
+            old_key = self._canonical_group_pk_expr([self._rewrite_expr_for_record(g, "OLD") for g in grp_exprs])
+            new_first = f"({new_key}) < ({old_key})"
+        else:
+            new_first = "FALSE"
+        return {"lock_new": lock("NEW"), "lock_old": lock("OLD"), "new_first": new_first}
+
+    def _pgmy_chunk_recompute_stmt(self, mv_table: str, pk_col: str) -> Optional[str]:
+        """Backfill-chunk follow-up: recompute the groups the chunk merged,
+        over the rows folded once the chunk is merged (rows up to the chunk's
+        upper bound, plus rows above the claimed range, which the triggers
+        maintain). Bound with (cursor_pk, upper_pk), in that order."""
+        if not self._pgmy_native_recompute_items():
+            return None
+        q_base_t = self._q(self.view.base_table)
+        q_pk = self._q(pk_col)
+        if self.dialect == Dialect.POSTGRES:
+            params = "(SELECT CAST(%s AS BIGINT) AS lo, CAST(%s AS BIGINT) AS hi) AS __mv_p"
+        else:
+            params = "(SELECT CAST(%s AS SIGNED) AS lo, CAST(%s AS SIGNED) AS hi) AS __mv_p"
+        folded = f"{q_base_t}.{q_pk} <= __mv_p.hi"
+        if self.watermark_catalog_table:
+            folded += (
+                f" OR NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"AND {q_base_t}.{q_pk} <= backfill_max_pk)"
+            )
+        touched = self._build_native_group_recompute(
+            "1", mv_table, processed_only=False,
+            rows_filter=f"{q_base_t}.{q_pk} > __mv_p.lo AND {q_base_t}.{q_pk} <= __mv_p.hi",
+        )
+        return self._pgmy_native_recompute_stmt(
+            mv_table,
+            f"EXISTS {touched}",
+            processed_only=False,
+            rows_filter=folded,
+            from_params=params,
+        )
 
     def _sqlite_guarded_fold(
         self,
@@ -599,7 +911,11 @@ class Tier1SingleMixin(MixinHost):
                     col_nonnull_count_map[ekey] = cnt_col
                     col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
 
-            if item.agg_func in (
+            # Natively recomputed (PostgreSQL/MySQL order-sensitive) AVG and
+            # VAR/STDDEV need no running sums; folding them would only risk
+            # overflow/underflow errors in columns nothing reads.
+            hidden_sums_needed = not self._pgmy_native_recompute_item(item)
+            if hidden_sums_needed and item.agg_func in (
                 AggFunc.AVG,
                 AggFunc.VAR_POP,
                 AggFunc.VAR_SAMP,
@@ -612,7 +928,7 @@ class Tier1SingleMixin(MixinHost):
                     col_sum_map[ekey] = sum_col
                     col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
 
-            if item.agg_func in (
+            if hidden_sums_needed and item.agg_func in (
                 AggFunc.VAR_POP,
                 AggFunc.VAR_SAMP,
                 AggFunc.STDDEV_POP,
@@ -1101,6 +1417,9 @@ class Tier1SingleMixin(MixinHost):
             )
             if dirty_chunk_stmt:
                 chunk_templates_pk.append(dirty_chunk_stmt)
+            pgmy_chunk_stmt = self._pgmy_chunk_recompute_stmt(mv_table, pk_col)
+            if pgmy_chunk_stmt:
+                chunk_templates_pk.append(pgmy_chunk_stmt)
             inc_spec = IncrementalBackfillSpec(
                 mode="pk_range_fold",
                 pk_column=pk_col,
@@ -1334,7 +1653,10 @@ class Tier1SingleMixin(MixinHost):
             updated.add(c)
             ekey = expr_key_fn(item)
             inc_c = _incoming(c)
-            if item.agg_func == AggFunc.TOTAL and ekey in acnt_map:
+            if self._pgmy_native_recompute_item(item):
+                # Recomputed by the chunk's follow-up statement.
+                assignments.append(f"{c} = {mv_table}.{c}")
+            elif item.agg_func == AggFunc.TOTAL and ekey in acnt_map:
                 assignments.append(f"{c} = {_merged_sum(c, item, total=True)}")
             elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL, AggFunc.TOTAL):
                 assignments.append(f"{c} = {mv_table}.{c} + {inc_c}")
@@ -1544,7 +1866,9 @@ class Tier1SingleMixin(MixinHost):
                     is_nullable=not is_nn,
                 )
             )
-        agg_sql = self._sql_backfill_agg_expr(item)
+        # PostgreSQL order-sensitive aggregates (opt-in only) accumulate in
+        # sequential-scan (ctid) order whatever access path the group filter uses.
+        agg_sql = self._pgmy_scan_ordered_agg_sql(item)
 
         def _sub(key_conds: List[str]) -> str:
             all_c = conds + key_conds
@@ -1800,7 +2124,11 @@ class Tier1SingleMixin(MixinHost):
             else:
                 insert_vals.append(f"({val_e})")
 
-            if item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
+            if self._pgmy_native_recompute_item(item):
+                # Recomputed natively by a separate statement once this
+                # statement holds the group-row lock (never folded).
+                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias}")
+            elif item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
                 update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} + 1")
             elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
                 update_assignments.append(
@@ -2164,7 +2492,9 @@ class Tier1SingleMixin(MixinHost):
             ekey = expr_key_fn(item)
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
 
-            if item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
+            if self._pgmy_native_recompute_item(item):
+                update_assignments.append(f"{col_alias} = {mv_table}.{col_alias}")
+            elif item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
                 update_assignments.append(f"{col_alias} = {mv_table}.{col_alias} - 1")
             elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
                 update_assignments.append(
@@ -2474,7 +2804,11 @@ class Tier1SingleMixin(MixinHost):
             distinct_aux=distinct_aux_tables,
             value_key=expr_key_fn,
             recompute=lambda it: self._build_recompute_subquery_raw(it, mv_table),
-            native_recompute=self._requires_native_avg_recompute,
+            # Order-sensitive aggregates (opt-in) are never folded: recomputed
+            # natively in the statement after the lock statement.
+            native_recompute=lambda it: (
+                self._requires_native_avg_recompute(it) or self._pgmy_native_recompute_item(it)
+            ),
         )
         return self._pg_aggregate_bodies(spec, [source])
 
@@ -2533,6 +2867,15 @@ class Tier1SingleMixin(MixinHost):
         recompute_new = self._sqlite_recompute_dirty_stmt(mv_table, "NEW", col_sum_map, expr_key_fn)
         recompute_old = self._sqlite_recompute_dirty_stmt(mv_table, "OLD", col_sum_map, expr_key_fn)
         refresh_grp_old = self._sqlite_refresh_group_keys_stmts(mv_table, record_prefix="OLD")
+        if recompute_new is None and recompute_old is None:
+            # PostgreSQL/MySQL order-sensitive aggregates: a separate statement
+            # after the fold statements, which locked the group row(s).
+            recompute_new = self._pgmy_native_recompute_stmt(
+                mv_table, self._group_match_predicate_tier1(mv_table, "NEW"), record_prefix="NEW"
+            )
+            recompute_old = self._pgmy_native_recompute_stmt(
+                mv_table, self._group_match_predicate_tier1(mv_table, "OLD"), record_prefix="OLD"
+            )
         plus_upd_stmts = list(plus_new_stmts)
         upd_cleanup_stmts = [delete_zero_mv_stmt] if delete_zero_mv_stmt else []
         if refresh_grp_old:
@@ -2601,9 +2944,12 @@ class Tier1SingleMixin(MixinHost):
             )
             pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
 
+        mysql_prelock = self._mysql_group_prelock(mv_table, row_count_col)
+
         return self._emit_dialect_triggers_for_table(
             view_name=view_name,
             base_t=base_t,
+            mysql_prelock=mysql_prelock,
             ins_stmts=plus_new_stmts,
             del_stmts=minus_old_del_stmts,
             upd_old_stmts=minus_old_upd_stmts,

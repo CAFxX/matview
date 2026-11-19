@@ -199,6 +199,33 @@ class DialectEmitMixin(MixinHost):
             q_base_t = self._q(base_t)
             q_pk_col = self._q(pk_col)
 
+            def _bound_follow_up_templates() -> List[str]:
+                # Follow-up chunk statements (PostgreSQL/MySQL native
+                # recompute of order-sensitive aggregates) are bound with
+                # (cursor_pk, upper_pk) in that order, like the chunk itself.
+                out: List[str] = []
+                for extra in spec.chunk_sql_templates[1:]:
+                    bound = extra.strip().rstrip(";")
+                    # The procedural loop has the bounds in variables: drop the
+                    # one-row bounds table (MariaDB rejects references to it
+                    # from the EXISTS subquery of a multi-table UPDATE inside
+                    # a stored procedure: 1054 Unknown column '__mv_p.lo').
+                    for params_sql in (
+                        "\n    FROM (SELECT CAST(%s AS BIGINT) AS lo, CAST(%s AS BIGINT) AS hi) AS __mv_p",
+                        " INNER JOIN (SELECT CAST(%s AS SIGNED) AS lo, CAST(%s AS SIGNED) AS hi) AS __mv_p ON TRUE",
+                    ):
+                        if params_sql in bound:
+                            bound = bound.replace(params_sql, "")
+                            bound = bound.replace("__mv_p.lo", "__mv_cur_pk").replace("__mv_p.hi", "__mv_top_pk")
+                            # Single-table UPDATE now: unqualified SET targets.
+                            bound = re.sub(
+                                r"(\bSET\s+|,\n\s+)[`\w]+\.([`\w]+ = \(SELECT\b)", r"\1\2", bound
+                            )
+                    for var in ("__mv_cur_pk", "__mv_top_pk"):
+                        bound = bound.replace("%s", var, 1)
+                    out.append(bound)
+                return out
+
             if self.dialect == Dialect.SQLITE:
                 # Replace `(pk_col > ? AND pk_col <= ?)` with recursive CTE batch join
                 cond_pat = f"({q_pk_col} > {ph} AND {q_pk_col} <= {ph})"
@@ -235,6 +262,7 @@ class DialectEmitMixin(MixinHost):
                         pg_chunk,
                         count=1,
                     )
+                pg_chunk = ";\n            ".join([pg_chunk, *_bound_follow_up_templates()])
                 fallback_populate_sqls = (
                     [pop_s.strip().rstrip(";") for pop_s in raw_plan.initial_populate_sqls]
                     if is_global_agg
@@ -271,6 +299,7 @@ class DialectEmitMixin(MixinHost):
                             my_chunk,
                             count=1,
                         )
+                my_chunk = ";\n            ".join([my_chunk, *_bound_follow_up_templates()])
                 fallback_populate_sqls = (
                     [pop_s.strip().rstrip(";") for pop_s in raw_plan.initial_populate_sqls]
                     if is_global_agg
@@ -517,6 +546,7 @@ class DialectEmitMixin(MixinHost):
         pg_ai_body: Optional[str] = None,
         pg_ad_body: Optional[str] = None,
         pg_au_body: Optional[str] = None,
+        mysql_prelock: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         if self.dialect == Dialect.POSTGRES:
             # Statement-level transition-table triggers are the only
@@ -565,6 +595,18 @@ class DialectEmitMixin(MixinHost):
                 qc = self._q(c_name)
                 unchanged_conds.append(self._identical_row_values_sql(f"OLD.{qc}", f"NEW.{qc}", is_null))
         changed_guard = f"NOT ({' AND '.join(unchanged_conds)})" if unchanged_conds else None
+        if (
+            self.dialect == Dialect.POSTGRES
+            and getattr(self, "_alg_mode", None) == "single"
+            and self._pgmy_native_recompute_items()
+        ):
+            # PostgreSQL order-sensitive aggregates follow the group's
+            # sequential-scan (ctid) order. Every UPDATE writes a new row
+            # version at a new ctid -- also one that changes no referenced
+            # column -- and can thereby change the original view's float
+            # result. Maintain (recompute) on every UPDATE.
+            upd_of_clause = ""
+            changed_guard = None
 
         cleanup_stmts = upd_cleanup_old_stmts or []
 
@@ -662,7 +704,42 @@ class DialectEmitMixin(MixinHost):
                 body=f"{upd_guard_open}{upd_inner}{upd_guard_close}",
             )
             t_names = [t_ai_name, t_ad_name, t_au_name]
-            return [trig_ins, trig_del, trig_upd], t_names, []
+            if not mysql_prelock:
+                return [trig_ins, trig_del, trig_upd], t_names, []
+
+            # Lock the affected existing group rows before the base row is
+            # written (see _mysql_group_prelock).
+            def _guarded(cond: Optional[str], stmt: str) -> str:
+                return f"IF ({cond}) THEN\n        {stmt}\n    END IF;" if cond else stmt
+
+            lock_new = mysql_prelock["lock_new"]
+            lock_old = mysql_prelock["lock_old"]
+            g_new = _guarded(where_new, lock_new)
+            g_old = _guarded(where_old, lock_old)
+            bu_body = (
+                f"IF ({mysql_prelock['new_first']}) THEN\n    {g_new}\n    {g_old}\n"
+                f"    ELSE\n    {g_old}\n    {g_new}\n    END IF;"
+            )
+            t_bi_name = self._bounded_ident(f"{p}trg_", stem, "_bi")
+            t_bd_name = self._bounded_ident(f"{p}trg_", stem, "_bd")
+            t_bu_name = self._bounded_ident(f"{p}trg_", stem, "_bu")
+            trig_bi = render_procedural_sql(
+                "mysql_row_trigger", trg_name=t_bi_name, timing="BEFORE", event="INSERT",
+                q_base_t=q_base_t, body=g_new,
+            )
+            trig_bd = render_procedural_sql(
+                "mysql_row_trigger", trg_name=t_bd_name, timing="BEFORE", event="DELETE",
+                q_base_t=q_base_t, body=g_old,
+            )
+            trig_bu = render_procedural_sql(
+                "mysql_row_trigger", trg_name=t_bu_name, timing="BEFORE", event="UPDATE",
+                q_base_t=q_base_t, body=f"{upd_guard_open}{bu_body}{upd_guard_close}",
+            )
+            return (
+                [trig_bi, trig_bd, trig_bu, trig_ins, trig_del, trig_upd],
+                [t_bi_name, t_bd_name, t_bu_name, *t_names],
+                [],
+            )
 
         return [], [], []
 

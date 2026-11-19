@@ -231,7 +231,7 @@ BEGIN
 END
 $mv_install$;""",
     "mysql_row_trigger": """CREATE TRIGGER {{ trg_name }}
-AFTER {{ event }} ON {{ q_base_t }}
+{{ timing | default('AFTER') }} {{ event }} ON {{ q_base_t }}
 FOR EACH ROW
 BEGIN
     IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN

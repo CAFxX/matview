@@ -461,7 +461,8 @@ class PgStatementMaintenanceMixin(MixinHost):
                 add(it.alias, ins, f"{mv}.{col}")
             elif it.is_distinct or spec.native_recompute(it) or fn not in _FOLDED_AGGS:
                 always_recompute.append(it)
-                add(it.alias, "NULL", f"{mv}.{col}")
+                # Placeholder until the recompute statement; TOTAL is NOT NULL.
+                add(it.alias, "0.0" if fn == AggFunc.TOTAL else "NULL", f"{mv}.{col}")
             elif fn == AggFunc.COUNT_STAR and not it.filter_where:
                 add(it.alias, f"SUM({s})", f"{mv}.{col} + EXCLUDED.{col}")
             elif fn in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
@@ -618,12 +619,15 @@ class PgStatementMaintenanceMixin(MixinHost):
             for it in distinct_items:
                 aux_tbl = spec.distinct_aux[spec.value_key(it)][0]
                 src = f"(SELECT {{agg}} FROM {aux_tbl} AS __mv_a WHERE {match_aux})"
+                # A DISTINCT aggregate accumulates its distinct values in sort
+                # order; accumulate the auxiliary values in the same order (a
+                # float sum depends on it).
                 if it.agg_func == AggFunc.SUM:
-                    rhs = src.format(agg="SUM(__mv_a.__val)")
+                    rhs = src.format(agg="SUM(__mv_a.__val ORDER BY __mv_a.__val)")
                 elif it.agg_func == AggFunc.TOTAL:
-                    rhs = f"COALESCE({src.format(agg='1.0 * SUM(__mv_a.__val)')}, 0.0)"
+                    rhs = f"COALESCE({src.format(agg='1.0 * SUM(__mv_a.__val ORDER BY __mv_a.__val)')}, 0.0)"
                 elif it.agg_func == AggFunc.AVG:
-                    rhs = src.format(agg="AVG(__mv_a.__val)")
+                    rhs = src.format(agg="AVG(__mv_a.__val ORDER BY __mv_a.__val)")
                 else:
                     rhs = f"COALESCE({src.format(agg='COUNT(*)')}, 0)"
                 assigns.append(f"{q(it.alias)} = {rhs}")
