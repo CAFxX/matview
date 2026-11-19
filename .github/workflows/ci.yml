@@ -256,6 +256,9 @@ jobs:
       - name: Test AVG maintenance exactness and concurrency contract
         run: python3 test_avg_concurrent_maintenance.py
 
+      - name: Differentially test native bulk statements (SQLite)
+        run: pytest -v -rxXs test_native_bulk_statements.py
+
       - name: Test differential-oracle mutation sensitivity
         run: python3 test_oracle_mutation_sensitivity.py
 
@@ -504,6 +507,11 @@ jobs:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: python3 test_avg_concurrent_maintenance.py
 
+      - name: Differentially test native bulk statements on PostgreSQL
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+        run: pytest -v -rxXs test_native_bulk_statements.py
+
       - name: Test atomic MV replacement (PostgreSQL)
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
@@ -635,6 +643,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_avg_concurrent_maintenance.py
+
+      - name: Differentially test native bulk statements on MySQL
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: pytest -v -rxXs test_native_bulk_statements.py
 
       - name: Test atomic MV replacement (MySQL)
         env:
@@ -776,6 +789,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_avg_concurrent_maintenance.py
+
+      - name: Differentially test native bulk statements on MariaDB
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: pytest -v -rxXs test_native_bulk_statements.py
 
       - name: Test atomic MV replacement (MariaDB)
         env:
