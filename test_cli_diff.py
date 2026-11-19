@@ -620,7 +620,7 @@ class TestCLICompileLimitationContract(unittest.TestCase):
     def test_default_rejection_and_explicit_override(self) -> None:
         cases = [
             ("mysql:8.4", "CREATE VIEW v AS SELECT grp, COUNT(*) AS c FROM t GROUP BY grp;"),
-            ("mariadb:10.11", "CREATE VIEW v AS SELECT grp, VAR_SAMP(val) * 2 AS v2 FROM t GROUP BY grp;"),
+            ("mariadb:10.11", "CREATE VIEW v AS SELECT grp, MAX(val) AS m FROM t GROUP BY grp;"),
             ("postgres:18", "CREATE VIEW v AS SELECT grp, RANDOM() AS r FROM t;"),
         ]
         for dialect, view in cases:
@@ -647,19 +647,23 @@ class TestCLICompileLimitationContract(unittest.TestCase):
                 for code in codes:
                     self.assertIn(code, str(lims[0].message))
 
-    def test_unsupported_statistical_alias_is_rejected_even_with_override(self) -> None:
-        for dialect, view in (
-            ("sqlite", "CREATE VIEW v AS SELECT grp, VARIANCE(val) AS v FROM t GROUP BY grp;"),
-            ("postgres:15", "CREATE VIEW v AS SELECT grp, STD(val) AS s FROM t GROUP BY grp;"),
+    def test_unsupported_statistics_are_rejected_even_with_override(self) -> None:
+        for dialect, view, extras in (
+            ("sqlite", "CREATE VIEW v AS SELECT grp, VARIANCE(val) AS v FROM t GROUP BY grp;", ([], ["--ignore-limitations"])),
+            ("postgres:15", "CREATE VIEW v AS SELECT grp, STD(val) AS s FROM t GROUP BY grp;", ([], ["--ignore-limitations"])),
+            # MariaDB statistics it cannot reproduce exactly: the override (needed
+            # for every MySQL-family view) must not get past the refusal.
+            ("mariadb:10.11", "CREATE VIEW v AS SELECT grp, VAR_SAMP(val) * 2 AS v2 FROM t GROUP BY grp;",
+             (["--ignore-limitations"],)),
         ):
-            for extra in ([], ["--ignore-limitations"]):
+            for extra in extras:
                 with self.subTest(dialect=dialect, extra=extra):
                     rc, out, err, _ = self._run(
                         ["--schema", self.SCHEMA, "--view", view, "--dialect", dialect, *extra]
                     )
                     self.assertEqual(rc, 2)
                     self.assertEqual(out, "")
-                    self.assertIn("VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP", err)
+                    self.assertRegex(err, r"VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP|cannot reproduce exactly")
 
 
 if __name__ == "__main__":

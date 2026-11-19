@@ -140,29 +140,6 @@ class PlannerMixin(MixinHost):
                     mitigation="Upgrade PostgreSQL to 11 or later.",
                 )
             )
-        if self.subdialect == EngineSubdialect.MARIADB:
-            decimals_issues = self._mariadb_statistical_decimals_issues()
-            if decimals_issues:
-                lims.append(
-                    TransparencyLimitation(
-                        code="MARIADB_STAT_RESULT_DECIMALS",
-                        severity=LimitationSeverity.BLOCKER,
-                        dialect=Dialect.MYSQL,
-                        affected_object=f"{self.logical_view_name} ({', '.join(decimals_issues)})",
-                        description=(
-                            "MariaDB fixes the number of decimals of VAR/STDDEV results over exact "
-                            "inputs and rounds them in results; column(s) "
-                            f"{', '.join(decimals_issues)} use such a result inside a larger expression "
-                            "(or over an argument whose numeric family cannot be derived), whose native "
-                            "decimals the materialized column cannot reproduce; as window functions their "
-                            "row-order-dependent accumulation cannot be reproduced either."
-                        ),
-                        mitigation=(
-                            "Project the VAR/STDDEV aggregate as its own column over a typed column, or "
-                            "CAST its argument to DOUBLE."
-                        ),
-                    )
-                )
         if self.view.has_window_func:
             if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_window_functions:
                 lims.append(
@@ -2208,6 +2185,8 @@ class PlannerMixin(MixinHost):
             raw = self._compile_tier2_group_scoped()
         else:
             raw = self._compile_tier3_atomic_sync()
+        if self.dialect == Dialect.MYSQL:
+            self._enforce_mariadb_statistical_exactness(raw.reader_view_ddl or "")
         return self._finalize_plan_backfill(raw)
 
     def compile(self) -> MaterializedViewPlan:

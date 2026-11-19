@@ -735,6 +735,14 @@ class DialectBaseMixin(MixinHost):
                 if isinstance(inner, sqlglot_exp.Avg):
                     arg_expr = inner.this.sql() if inner.this is not None else ""
                     return self._avg_result_storage_type_for_expr(arg_expr)
+                if isinstance(inner, (sqlglot_exp.AggFunc, sqlglot_exp.Anonymous)) and not isinstance(inner, sqlglot_exp.Count):
+                    # Any other aggregate: its verified projection result type
+                    # (e.g. PostgreSQL VAR_SAMP(int) is NUMERIC, not DOUBLE).
+                    agg_item = _parse_single_agg_expr(
+                        inner.sql(_sqlglot_dialect(self.dialect)), ident, dialect=self.dialect
+                    )
+                    if agg_item is not None and agg_item.agg_func is not None:
+                        return self._infer_expr_storage_type(agg_item)
                 if isinstance(inner, (sqlglot_exp.AggFunc, sqlglot_exp.Func, sqlglot_exp.Anonymous)):
                     fn_up = (inner.sql_name().upper() if hasattr(inner, "sql_name") else "") or inner.name.upper()
                     if fn_up in ("COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "BIT_AND", "BIT_OR", "BIT_XOR", "BITWISEANDAGG", "BITWISEORAGG", "BITWISEXORAGG", "BOOL_AND", "BOOL_OR", "LOGICALAND", "LOGICALOR"):

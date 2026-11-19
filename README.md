@@ -274,6 +274,12 @@ Errors raised before anything is installed:
   `STDDEV_SAMP`), population statistics on MySQL/MariaDB (`VAR_POP`,
   `STDDEV_POP`). PostgreSQL has no `STD`, and SQLite has none of the three, so
   they are refused there; use `VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`.
+  On MariaDB it is also raised for `VAR_*`/`STDDEV_*` results the view cannot
+  reproduce exactly: window statistics, and statistics over exact
+  (integer/`DECIMAL`) or `FLOAT(M,D)` arguments anywhere except as a top-level
+  projected aggregate of a single query or inside `HAVING` (MariaDB fixes their
+  decimals and rounds results to them). Cast the argument to `DOUBLE` to keep
+  such shapes.
 - `EngineLimitationError` when the view or the engine has a known limitation
   that would break the guarantee. Each limitation has a code:
 
@@ -283,7 +289,6 @@ Errors raised before anything is installed:
 | `MYSQL_NO_TRUNCATE_TRIGGER` | Every view on MySQL/MariaDB. | `TRUNCATE TABLE` bypasses triggers there. |
 | `MYSQL_FK_CASCADE_NO_TRIGGER` | A source table on MySQL/MariaDB has `ON DELETE`/`ON UPDATE` cascading foreign keys. | InnoDB cascades do not fire triggers. |
 | `SQLITE_VERSION_NO_WINDOW_FUNC`, `MYSQL_VERSION_NO_WINDOW_FUNC` | Window functions on an engine version without them. | The query cannot run there. |
-| `MARIADB_STAT_RESULT_DECIMALS` | On MariaDB, a `VAR_*`/`STDDEV_*` is used as a window function, or over an exact (integer/`DECIMAL`) or `FLOAT(M,D)` argument inside a larger expression, or its argument's numeric type cannot be derived. | MariaDB fixes such a result's decimals and rounds it in results, and accumulates window statistics in a row-order-dependent way; a materialized column cannot reproduce either. Project the aggregate as its own column (cast its argument to `DOUBLE` inside expressions). |
 
 ```python run
 import warnings

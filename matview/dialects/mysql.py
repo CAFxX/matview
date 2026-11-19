@@ -88,61 +88,94 @@ class MySQLDialectMixin(MixinHost):
             return self.MARIADB_NOT_FIXED_DEC
         return self.MARIADB_UNKNOWN_DEC
 
-    def _mariadb_statistical_decimals_issues(self) -> List[str]:
-        """Projections whose MariaDB VAR/STDDEV result decimals cannot be preserved.
+    def _mariadb_unreproducible_statistics(self, reader_view_ddl: str) -> List[str]:
+        """VAR/STDDEV calls whose MariaDB result the plan cannot reproduce exactly.
 
-        A top-level VAR/STDDEV aggregate keeps its native decimals through a
-        reader-side ROUND. Nested in a larger projection expression (arithmetic,
-        COALESCE, window, scalar subquery), the native result's fixed decimals
-        propagate through MariaDB's expression typing and determine the
-        rounding clients observe; the materialized expression over a stored
-        DOUBLE does not carry them. Only non-fixed (approximate-input) results
-        are safe there, and not as window functions: MariaDB's window
-        VAR/STDDEV accumulation is row-order dependent.
+        MariaDB fixes the decimals of VAR/STDDEV over exact (integer/DECIMAL) or
+        FLOAT(M,D) arguments and rounds the result to them on output; those
+        decimals then propagate through any enclosing expression, CTE, derived
+        table, UNION branch or join, and window VAR/STDDEV accumulate in a
+        row-order-dependent way. Every call anywhere in the view is therefore
+        checked:
+        - window calls are never reproducible;
+        - calls over approximate arguments (no fixed decimals) are exact
+          wherever they appear (native recomputation);
+        - a fixed-decimal call is reproducible only as a top-level projected
+          aggregate whose reader column is ROUND(col, <native decimals>) --
+          verified on the compiled reader DDL, whatever the strategy -- or
+          when it is used only in HAVING (compared unrounded on both sides).
+        Returns the offending call texts (empty when the plan is exact).
         """
         stat_funcs = {"VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "STDDEV", "STD"}
-        stat_aggs = (AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP)
         from ..sql_frontend import _parse_single_agg_expr
 
+        sql = self.raw_view.raw_select_sql
+        toks = sqlglot.tokenize(sql, read="mysql")
+        compact = lambda text: re.sub(r"\s+", "", text).upper()
+        top_level = {
+            compact(it.raw_expr): it
+            for it in self.raw_view.select_items
+            if it.is_aggregate and it.agg_func is not None
+        }
+        simple_query = not (
+            self.raw_view.has_cte
+            or self.raw_view.has_subquery_in_from
+            or self.raw_view.has_compound_set_op
+            or self.raw_view.has_window_func
+        )
+        projected = " ".join(compact(it.raw_expr) for it in self.raw_view.select_items)
+        reader_compact = compact(reader_view_ddl)
         issues: List[str] = []
-        for it in self.view.select_items:
-            if it.is_aggregate and it.agg_func in stat_aggs:
-                if self._mariadb_statistical_result_scale(it) == self.MARIADB_UNKNOWN_DEC:
-                    issues.append(it.alias)
+        for idx in range(len(toks) - 1):
+            if (
+                toks[idx].text.upper() not in stat_funcs
+                or toks[idx + 1].token_type != SQLGlotTokenType.L_PAREN
+                or (idx > 0 and toks[idx - 1].token_type == SQLGlotTokenType.DOT)
+            ):
                 continue
-            toks = sqlglot.tokenize(it.raw_expr, read="mysql")
-            for idx in range(len(toks) - 1):
-                if (
-                    toks[idx].text.upper() not in stat_funcs
-                    or toks[idx + 1].token_type != SQLGlotTokenType.L_PAREN
-                ):
+            depth, close = 0, -1
+            for j in range(idx + 1, len(toks)):
+                if toks[j].token_type == SQLGlotTokenType.L_PAREN:
+                    depth += 1
+                elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
+                    depth -= 1
+                    if depth == 0:
+                        close = j
+                        break
+            if close == -1:
+                issues.append(toks[idx].text)
+                continue
+            call = sql[toks[idx].start : toks[close].end + 1]
+            if close + 1 < len(toks) and toks[close + 1].text.upper() == "OVER":
+                issues.append(call)
+                continue
+            parsed = _parse_single_agg_expr(call, "__v", dialect=Dialect.MYSQL)
+            scale = self._mariadb_statistical_result_scale(parsed) if parsed is not None else self.MARIADB_UNKNOWN_DEC
+            if scale == self.MARIADB_NOT_FIXED_DEC:
+                continue
+            if scale != self.MARIADB_UNKNOWN_DEC and simple_query:
+                item = top_level.get(compact(call))
+                if item is not None and compact(f"ROUND({item.alias},{scale})AS{item.alias}") in reader_compact:
                     continue
-                depth = 0
-                close = -1
-                for j in range(idx + 1, len(toks)):
-                    if toks[j].token_type == SQLGlotTokenType.L_PAREN:
-                        depth += 1
-                    elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
-                        depth -= 1
-                        if depth == 0:
-                            close = j
-                            break
-                call = it.raw_expr[toks[idx].start : toks[close].end + 1] if close != -1 else ""
-                if close != -1 and close + 1 < len(toks) and toks[close + 1].text.upper() == "OVER":
-                    # MariaDB evaluates window VAR/STDDEV with a different,
-                    # row-order-dependent accumulation than the materializing
-                    # statement can reproduce (1-ULP differences observed over
-                    # DOUBLE), whatever the argument type.
-                    issues.append(it.alias)
-                    break
-                parsed = _parse_single_agg_expr(call, "__v", dialect=Dialect.MYSQL) if call else None
-                if (
-                    parsed is None
-                    or self._mariadb_statistical_result_scale(parsed) != self.MARIADB_NOT_FIXED_DEC
-                ):
-                    issues.append(it.alias)
-                    break
+                if item is None and compact(call) not in projected and self.raw_view.having_clause and compact(call) in compact(self.raw_view.having_clause):
+                    continue
+            issues.append(call)
         return issues
+
+    def _enforce_mariadb_statistical_exactness(self, reader_view_ddl: str) -> None:
+        if self.subdialect != EngineSubdialect.MARIADB:
+            return
+        issues = self._mariadb_unreproducible_statistics(reader_view_ddl)
+        if issues:
+            from ..engines import UnsupportedMaterializedViewError
+
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}' uses {', '.join(dict.fromkeys(issues))} on MariaDB, "
+                "whose result the materialized view cannot reproduce exactly: MariaDB fixes the "
+                "decimals of VAR/STDDEV over exact or FLOAT(M,D) arguments and rounds results to them, "
+                "and accumulates window VAR/STDDEV in row order. Project such a statistic as its own "
+                "top-level column of a single-query view, or CAST its argument to DOUBLE."
+            )
 
 
     def _rewrite_mysql_not_in_subquery(self, sql: str) -> str:
