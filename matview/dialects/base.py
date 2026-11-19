@@ -1161,8 +1161,9 @@ class DialectBaseMixin(MixinHost):
     def _pg_string_result_type(self, node: Any) -> Optional[str]:
         """PostgreSQL type of a string-valued COALESCE/CASE/NULLIF expression.
 
-        Untyped string literals adopt the type of the first typed branch with
-        its modifier dropped (COALESCE(varchar(32), 'x') is character varying,
+        Untyped string literals adopt the type of the first typed input in
+        PostgreSQL's resolution order (COALESCE: argument order; CASE: ELSE
+        first) with its modifier dropped (COALESCE(varchar(32), 'x') is character varying,
         COALESCE(char(3), 'x') is bpchar); string functions return text; all
         literal branches resolve to text.
         """
@@ -1192,8 +1193,13 @@ class DialectBaseMixin(MixinHost):
         elif kind == "Nullif":
             branches = [node.this]
         elif kind == "Case":
-            branches = [b.args.get("true") for b in (node.args.get("ifs") or ())]
-            branches.append(node.args.get("default"))
+            # PostgreSQL resolves a CASE with its ELSE result first, then the
+            # THEN results in order (transformCaseExpr), and keeps the first
+            # typed string input: varchar, bpchar and text convert implicitly
+            # into each other (checked natively: CASE ... THEN varchar ELSE
+            # char(3) END is bpchar, the reverse is varchar).
+            branches = [node.args.get("default")]
+            branches += [b.args.get("true") for b in (node.args.get("ifs") or ())]
         elif kind == "If":
             branches = [node.args.get("true"), node.args.get("false")]
         else:

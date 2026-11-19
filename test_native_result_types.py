@@ -120,6 +120,13 @@ def _views(engine: Dialect, t: str) -> List[Tuple[str, str]]:
                                 f"WHERE tr.depth < 3) SELECT id, depth FROM tr"),
         ("union_sum", f"SELECT g, SUM(v) AS r FROM (SELECT g, i AS v FROM {t} UNION ALL SELECT g, s AS v FROM {t}) AS u GROUP BY g"),
     ]
+    views += [
+        # String CASE/COALESCE resolution order (PostgreSQL: CASE resolves its
+        # ELSE first; MySQL/MariaDB: common VARCHAR).
+        ("case_varchar_char", f"SELECT id, CASE WHEN g = 1 THEN v ELSE c END AS r FROM {t}"),
+        ("case_char_varchar", f"SELECT id, CASE WHEN g = 1 THEN c ELSE v END AS r FROM {t}"),
+        ("coalesce_char_varchar", f"SELECT id, COALESCE(c, v) AS r FROM {t}"),
+    ]
     if engine == Dialect.POSTGRES:
         views.append(("min_char", f"SELECT g, MIN(c) AS r FROM {t} GROUP BY g"))
         views.append(("coalesce_char", f"SELECT id, COALESCE(c, 'q') AS r FROM {t}"))
@@ -148,6 +155,10 @@ class PostgresPlannedResultTypeTests(unittest.TestCase):
             "SELECT id, COALESCE(v, 'none') AS r FROM t": "VARCHAR",
             "SELECT id, COALESCE(c, 'q') AS r FROM t": "BPCHAR",
             "SELECT id, UPPER(v) AS r FROM t": "TEXT",
+            "SELECT id, CASE WHEN g = 1 THEN v ELSE c END AS r FROM t": "BPCHAR",
+            "SELECT id, CASE WHEN g = 1 THEN c ELSE v END AS r FROM t": "VARCHAR",
+            "SELECT id, CASE WHEN g = 1 THEN v ELSE 'z' END AS r FROM t": "VARCHAR",
+            "SELECT id, COALESCE(c, v) AS r FROM t": "BPCHAR",
             "SELECT id, SUM(i) OVER (PARTITION BY g) AS r FROM t": "BIGINT",
             "SELECT id, MIN(d) OVER (PARTITION BY g) AS r FROM t": "NUMERIC",
             "SELECT g, SUM(i * s) AS r FROM t GROUP BY g": "BIGINT",
