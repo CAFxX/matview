@@ -83,6 +83,9 @@ _PROJECTIONS = [
     ("win_sum", "SUM(i) OVER (PARTITION BY g)"),
     ("win_min_dec", "MIN(d) OVER (PARTITION BY g)"),
     ("win_count", "COUNT(i) OVER (PARTITION BY g)"),
+    ("win_max_small", "MAX(s) OVER (PARTITION BY g)"),
+    ("win_min_int", "MIN(i) OVER (PARTITION BY g)"),
+    ("win_max_big", "MAX(b) OVER (PARTITION BY g)"),
 ]
 
 _AGGREGATES = [
