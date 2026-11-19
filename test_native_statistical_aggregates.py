@@ -640,5 +640,127 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                     self._run(engine, dsn, col_type)
 
 
+# Every statistic spelling x every wrapper of a second copy of the same call
+# next to the projected call itself. On MariaDB a fixed-decimal copy that is
+# not itself a whole top-level item must be refused (even under the
+# override); everything accepted must be exact. MySQL accepts all of them.
+_STAT_NAMES = ("VARIANCE", "VAR_POP", "VAR_SAMP", "STD", "STDDEV", "STDDEV_POP", "STDDEV_SAMP")
+_WRAPPERS = {
+    "plus0": "{c} + 0",
+    "case": "CASE WHEN COUNT(*) > 1 THEN {c} END",
+    "coalesce": "COALESCE({c}, 0)",
+    "round": "ROUND({c}, 2)",
+    "cast": "CAST({c} AS DOUBLE)",
+    "arith": "{c} * 2 - 1",
+    "funcarg": "ABS({c})",
+    "dup": "{c}",
+    "lower_space": "{lc} + 0",
+    "quoted": "{qc} + 0",
+}
+
+
+def _wrapper_views(t: str) -> List[Tuple[str, str, bool]]:
+    """(name, select, is_plain_top_level_duplicate) for every name x wrapper."""
+    out = []
+    for fn in _STAT_NAMES:
+        call = f"{fn}(x)"
+        lc = f"{fn.lower()}( x )"
+        qc = f"{fn}(`x`)"
+        for wname, tmpl in _WRAPPERS.items():
+            expr = tmpl.format(c=call, lc=lc, qc=qc)
+            out.append((f"{fn.lower()}_{wname}", f"SELECT g, {call} AS top, {expr} AS w FROM {t} GROUP BY g", wname == "dup"))
+    return out
+
+
+class StatisticWrapperRefusalTests(unittest.TestCase):
+    """Offline: refusal is decided per call position, never by call text."""
+
+    def test_mariadb_refuses_every_wrapped_copy_of_a_fixed_decimal_call(self) -> None:
+        for col_type, fixed in (("INT", True), ("DECIMAL(10,2)", True), ("DOUBLE", False)):
+            schema = f"CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, x {col_type});"
+            for name, select, plain_dup in _wrapper_views("t"):
+                for engine in ("mariadb:10.11", "mysql:8.4"):
+                    with self.subTest(type=col_type, view=name, engine=engine):
+                        refused = fixed and not plain_dup and engine.startswith("mariadb")
+                        compile_ = lambda: generate_materialized_view(
+                            parse_table_schema(schema, dialect=Dialect.MYSQL),
+                            f"CREATE VIEW v AS {select};",
+                            dialect=engine,
+                            ignore_limitations=True,
+                        )
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", EngineLimitationWarning)
+                            if refused:
+                                with self.assertRaises(UnsupportedMaterializedViewError):
+                                    compile_()
+                            else:
+                                compile_()
+
+
+class NativeStatisticWrapperTests(unittest.TestCase):
+    """Native: on MySQL/MariaDB every wrapper view is exact or (MariaDB) refused."""
+
+    def test_wrapped_statistics_are_exact_or_refused(self) -> None:
+        engines = [(e, d) for e, d in _native_engines() if e == Dialect.MYSQL]
+        if not engines:
+            self.skipTest("set MYSQL_DSN for the native statistic wrapper matrix")
+        for engine, dsn in engines:
+            for col_type in ("INT", "DECIMAL(10,2)", "DOUBLE"):
+                with self.subTest(type=col_type):
+                    self._run(engine, dsn, col_type)
+
+    def _run(self, engine: Dialect, dsn: str, col_type: str) -> None:
+        conn = _connect(engine, dsn)
+        cur = conn.cursor()
+        cur.execute("SELECT VERSION()")
+        is_mariadb = "mariadb" in str(cur.fetchone()[0]).lower()
+        conn.commit()
+        tag = uuid.uuid4().hex[:8]
+        t = f"w_{tag}"
+        try:
+            cur.execute(f"CREATE TABLE {t} (id INT PRIMARY KEY, g INT NOT NULL, x {col_type}) ENGINE=InnoDB")
+            seed = _INT_SEED if "INT" in col_type else _SEED
+            cur.executemany(f"INSERT INTO {t} (id, g, x) VALUES (%s, %s, %s)", seed)
+            conn.commit()
+            manager = MaterializedViewManager(conn, dialect=engine)
+            pairs, refused = [], []
+            for name, select, plain_dup in _wrapper_views(t):
+                mv, live = f"mv_{name}_{tag}", f"lv_{name}_{tag}"
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        manager.register_view(f"CREATE VIEW {mv} AS {select};", ignore_limitations=True)
+                except UnsupportedMaterializedViewError:
+                    conn.rollback()
+                    refused.append(name)
+                    continue
+                conn.commit()
+                cur.execute(f"CREATE VIEW {live} AS {select}")
+                conn.commit()
+                pairs.append((name, mv, live))
+            if not is_mariadb or "DOUBLE" in col_type:
+                self.assertEqual(refused, [], "nothing may be refused here")
+            else:
+                # Only the plain top-level duplicates are reproducible.
+                self.assertEqual(sorted(n for n, _, _ in pairs), sorted(f"{fn.lower()}_dup" for fn in _STAT_NAMES))
+            checker = NativeStatisticalAggregateTests()
+            for step, stmt in [("initial", None)] + list(_DML):
+                if stmt:
+                    cur.execute(stmt.format(t=t))
+                    conn.commit()
+                for name, mv, live in pairs:
+                    checker._assert_equivalent(engine, conn, mv, live, f"{col_type} {name} {step}")
+        finally:
+            conn.rollback()
+            cur.execute(
+                "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE %s", (f"%{tag}%",),
+            )
+            for name, kind in sorted(cur.fetchall(), key=lambda o: o[1] != "VIEW"):
+                cur.execute(f"DROP {'VIEW' if kind == 'VIEW' else 'TABLE'} IF EXISTS `{name}`")
+            conn.commit()
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

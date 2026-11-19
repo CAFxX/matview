@@ -95,72 +95,86 @@ class MySQLDialectMixin(MixinHost):
         FLOAT(M,D) arguments and rounds the result to them on output; those
         decimals then propagate through any enclosing expression, CTE, derived
         table, UNION branch or join, and window VAR/STDDEV accumulate in a
-        row-order-dependent way. Every call anywhere in the view is therefore
-        checked:
+        row-order-dependent way. Every call node in the view's AST is checked
+        by its position, never by its text:
         - window calls are never reproducible;
         - calls over approximate arguments (no fixed decimals) are exact
           wherever they appear (native recomputation);
-        - a fixed-decimal call is reproducible only as a top-level projected
-          aggregate whose reader column is ROUND(col, <native decimals>) --
-          verified on the compiled reader DDL, whatever the strategy -- or
-          when it is used only in HAVING (compared unrounded on both sides).
+        - a fixed-decimal call is reproducible only when that very node is a
+          whole top-level select item of a single query whose compiled reader
+          column is ROUND(col, <native decimals>), or when it lies inside the
+          top-level HAVING (compared unrounded on both sides). Another copy of
+          the same call text elsewhere (e.g. `VARIANCE(x) + 0` next to a
+          projected `VARIANCE(x)`) is refused.
         Returns the offending call texts (empty when the plan is exact).
         """
-        stat_funcs = {"VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "STDDEV", "STD"}
         from ..sql_frontend import _parse_single_agg_expr
 
-        sql = self.raw_view.raw_select_sql
-        toks = sqlglot.tokenize(sql, read="mysql")
-        compact = lambda text: re.sub(r"\s+", "", text).upper()
-        top_level = {
-            compact(it.raw_expr): it
-            for it in self.raw_view.select_items
-            if it.is_aggregate and it.agg_func is not None
-        }
-        simple_query = not (
+        stat_classes = (
+            sqlglot_exp.Variance, sqlglot_exp.VariancePop, sqlglot_exp.Stddev,
+            sqlglot_exp.StddevPop, sqlglot_exp.StddevSamp,
+        )
+        stat_names = {"VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "STDDEV", "STD"}
+        try:
+            root = sqlglot.parse_one(self.raw_view.raw_select_sql, read="mysql")
+        except sqlglot.errors.SqlglotError:
+            return ["<unparseable view>"]
+        calls = [
+            n for n in root.walk()
+            if isinstance(n, stat_classes)
+            or (isinstance(n, sqlglot_exp.Anonymous) and n.name.upper() in stat_names)
+        ]
+        if not calls:
+            return []
+        simple_query = isinstance(root, sqlglot_exp.Select) and not (
             self.raw_view.has_cte
             or self.raw_view.has_subquery_in_from
             or self.raw_view.has_compound_set_op
             or self.raw_view.has_window_func
         )
-        projected = " ".join(compact(it.raw_expr) for it in self.raw_view.select_items)
+        compact = lambda text: re.sub(r"\s+", "", text).upper()
         reader_compact = compact(reader_view_ddl)
+        top_items = list(root.expressions) if isinstance(root, sqlglot_exp.Select) else []
+        having = root.args.get("having") if isinstance(root, sqlglot_exp.Select) else None
         issues: List[str] = []
-        for idx in range(len(toks) - 1):
-            if (
-                toks[idx].text.upper() not in stat_funcs
-                or toks[idx + 1].token_type != SQLGlotTokenType.L_PAREN
-                or (idx > 0 and toks[idx - 1].token_type == SQLGlotTokenType.DOT)
-            ):
+        for node in calls:
+            text = node.sql(dialect="mysql")
+            if isinstance(node.parent, sqlglot_exp.Window):
+                issues.append(text)
                 continue
-            depth, close = 0, -1
-            for j in range(idx + 1, len(toks)):
-                if toks[j].token_type == SQLGlotTokenType.L_PAREN:
-                    depth += 1
-                elif toks[j].token_type == SQLGlotTokenType.R_PAREN:
-                    depth -= 1
-                    if depth == 0:
-                        close = j
-                        break
-            if close == -1:
-                issues.append(toks[idx].text)
-                continue
-            call = sql[toks[idx].start : toks[close].end + 1]
-            if close + 1 < len(toks) and toks[close + 1].text.upper() == "OVER":
-                issues.append(call)
-                continue
-            parsed = _parse_single_agg_expr(call, "__v", dialect=Dialect.MYSQL)
-            scale = self._mariadb_statistical_result_scale(parsed) if parsed is not None else self.MARIADB_UNKNOWN_DEC
+            parsed = _parse_single_agg_expr(text, "__v", dialect=Dialect.MYSQL)
+            scale = (
+                self._mariadb_statistical_result_scale(parsed)
+                if parsed is not None and parsed.agg_func is not None
+                else self.MARIADB_UNKNOWN_DEC
+            )
             if scale == self.MARIADB_NOT_FIXED_DEC:
                 continue
             if scale != self.MARIADB_UNKNOWN_DEC and simple_query:
-                item = top_level.get(compact(call))
-                if item is not None and compact(f"ROUND({item.alias},{scale})AS{item.alias}") in reader_compact:
+                position = next(
+                    (
+                        i for i, item in enumerate(top_items)
+                        if item is node or (isinstance(item, sqlglot_exp.Alias) and item.this is node)
+                    ),
+                    None,
+                )
+                if position is not None and position < len(self.raw_view.select_items):
+                    alias = self.raw_view.select_items[position].alias
+                    if compact(f"ROUND({alias},{scale})AS{alias}") in reader_compact:
+                        continue
+                if having is not None and any(anc is having for anc in self._ancestors(node)):
                     continue
-                if item is None and compact(call) not in projected and self.raw_view.having_clause and compact(call) in compact(self.raw_view.having_clause):
-                    continue
-            issues.append(call)
+            issues.append(text)
         return issues
+
+    @staticmethod
+    def _ancestors(node: Any) -> List[Any]:
+        out = []
+        cur = node.parent
+        while cur is not None:
+            out.append(cur)
+            cur = cur.parent
+        return out
 
     def _enforce_mariadb_statistical_exactness(self, reader_view_ddl: str) -> None:
         if self.subdialect != EngineSubdialect.MARIADB:
