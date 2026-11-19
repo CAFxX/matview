@@ -480,6 +480,15 @@ The existing differential-testing harness is useful, but its current headline co
   - Handle SQLite `WITHOUT ROWID` sources: select a valid stable key for backfill or reject incremental strategies that require `rowid`.
   - Use engine-version capability flags in code generation. In particular, actually select MySQL 8.0.19+ row-alias upsert syntax where supported and avoid deprecated `VALUES()` references on versions that support aliases; test MySQL and MariaDB separately.
 
+- [ ] **Fix Pre-Existing Result-Type and Registration Defects Found by the Dialect-Native Review**:
+  - UNION ALL aggregates whose branches mix SMALLINT and BIGINT store the first branch's type: base DML then fails ("smallint out of range" on PostgreSQL, error 1264 on MySQL/MariaDB). Use the branches' common type.
+  - AVG over a DOUBLE near 1e308 fails at registration (the hidden SUM column overflows) on PostgreSQL/MySQL/MariaDB.
+  - Scalar-subquery projections (`(SELECT SUM(..) ...) AS c`) are stored as TEXT/VARCHAR on PostgreSQL/MySQL (values come back as strings).
+  - MySQL `COALESCE(MIN(smallint), 0)` returns a Decimal where the live view returns an int.
+  - A single-table view with a table alias (`SELECT t.g, SUM(t.x) FROM tt t GROUP BY t.g`) fails to register (1054 on MySQL/MariaDB; the populate/recompute SQL drops the alias, so PostgreSQL is affected the same way): loud, not silent.
+  - PostgreSQL `pg_catalog.variance(x)` / `pg_catalog.var_pop(x)` fail to register ("missing FROM-clause entry for table pg_catalog"): loud.
+  - PostgreSQL self-join VAR/STDDEV over DOUBLE can differ by 1 ULP after DML (row-order-dependent accumulation in the join recompute); part of "Make Floating-Point Aggregates Exactly Equal".
+
 - [ ] **Model MySQL/MariaDB Result Nullability, DECIMAL Precision and String Length**:
   - Materialized MySQL/MariaDB reader columns are nullable where the live expression is NOT NULL (COALESCE/CASE with a non-null default, COUNT windows, pass-through NOT NULL columns of window/projection views), derived DECIMAL results are stored as DECIMAL(65,s) where MySQL derives e.g. SUM(INT) as DECIMAL(32,0) and 1.0 * SUM(INT) as DECIMAL(34,1), and string expressions are stored as VARCHAR(191) where MySQL derives VARCHAR(16). Values, scale and type codes match; these fields are excluded from the oracle only through `MYSQL_UNMODELLED_METADATA` (test_matview_sync.py) and the catalog normalization in test_native_statistical_aggregates.py. Model them (or prove them unobservable) and delete the exclusion.
 
