@@ -266,7 +266,9 @@ class Tier1UnionAllAggMixin(MixinHost):
                     col_nonnull_count_map[ekey] = cnt_col
                     col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
 
-            if item.agg_func in (
+            # Natively recomputed aggregates (PostgreSQL) need no running sums.
+            hidden_sums_needed = not self._pgmy_native_recompute_item(item)
+            if hidden_sums_needed and item.agg_func in (
                 AggFunc.AVG,
                 AggFunc.VAR_POP,
                 AggFunc.VAR_SAMP,
@@ -279,7 +281,7 @@ class Tier1UnionAllAggMixin(MixinHost):
                     col_sum_map[ekey] = sum_col
                     col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
 
-            if item.agg_func in (
+            if hidden_sums_needed and item.agg_func in (
                 AggFunc.VAR_POP,
                 AggFunc.VAR_SAMP,
                 AggFunc.STDDEV_POP,
@@ -606,12 +608,28 @@ class Tier1UnionAllAggMixin(MixinHost):
                     mv_table, record_prefix="OLD"
                 )
 
+                # PostgreSQL order-sensitive aggregates (approximate SUM/AVG,
+                # VAR/STDDEV): recompute the locked group over the UNION ALL in
+                # a separate statement (fresh READ COMMITTED snapshot).
+                rec_new_b = branch_ctx._pgmy_native_recompute_stmt(
+                    mv_table, branch_ctx._group_match_predicate_tier1(mv_table, "NEW")
+                )
+                rec_old_b = branch_ctx._pgmy_native_recompute_stmt(
+                    mv_table, branch_ctx._group_match_predicate_tier1(mv_table, "OLD")
+                )
+                if rec_new_b and rec_old_b:
+                    plus_b = [*plus_b, rec_new_b]
+                    minus_del_b = [*minus_del_b, rec_old_b]
+
                 ins_all.extend(branch_ctx._apply_where_guard_to_stmt(s, w_new_b) for s in plus_b)
                 del_all.extend(branch_ctx._apply_where_guard_to_stmt(s, w_old_b) for s in minus_del_b)
                 upd_old_all.extend(branch_ctx._apply_where_guard_to_stmt(s, w_old_b) for s in minus_upd_b)
                 upd_new_all.extend(branch_ctx._apply_where_guard_to_stmt(s, w_new_b) for s in plus_b)
                 if del_zero_b:
                     cleanup_all.append(branch_ctx._apply_where_guard_to_stmt(del_zero_b, w_old_b))
+                if rec_new_b and rec_old_b:
+                    # After the OLD group's cleanup, as in the single-table path.
+                    cleanup_all.append(branch_ctx._apply_where_guard_to_stmt(rec_old_b, w_old_b))
                 refresh_grp_all.extend(
                     branch_ctx._apply_where_guard_to_stmt(s, w_old_b) for s in refresh_grp_b
                 )
@@ -639,7 +657,9 @@ class Tier1UnionAllAggMixin(MixinHost):
                     distinct_aux={},
                     value_key=_expr_key,
                     recompute=lambda it: self._build_recompute_subquery_raw(it, mv_table),
-                    native_recompute=self._requires_native_avg_recompute,
+                    native_recompute=lambda it: (
+                        self._requires_native_avg_recompute(it) or self._pgmy_native_recompute_item(it)
+                    ),
                 )
                 pg_bodies.update(self._pg_aggregate_bodies(spec, pg_sources))
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
