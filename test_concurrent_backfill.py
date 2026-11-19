@@ -24,7 +24,7 @@ from matview_sync import (
     MaterializedViewManager,
     UnsafeReplacementError,
 )
-from test_matview_sync import _register_sqlite_compat_udfs
+from test_matview_sync import FLOAT_OPT_IN, _register_sqlite_compat_udfs, pin_native_plan
 
 # Bound for replaying an application writer transaction chosen as an engine
 # deadlock/serialization victim. Exhausting it fails the test.
@@ -885,24 +885,30 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                     batch_size=3,
                     on_progress=on_progress,
                     ignore_limitations=True,
+                    # AVG over DOUBLE PRECISION is refused by default
+                    # (plan-dependent accumulation order); per-code opt-in.
+                    accept_limitations=FLOAT_OPT_IN,
                 )
             limitation_warnings = [
                 warning for warning in emitted
                 if issubclass(warning.category, EngineLimitationWarning)
             ]
             expected_limitation_codes = (
-                {"MYSQL_NO_TRUNCATE_TRIGGER"} if engine == Dialect.MYSQL else set()
+                {
+                    "MYSQL_NO_TRUNCATE_TRIGGER",
+                    "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
+                    "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+                }
+                if engine == Dialect.MYSQL
+                else {"ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"}
             )
             self.assertEqual(
                 {lim.code for lim in plan.limitations},
                 expected_limitation_codes,
             )
-            self.assertEqual(len(limitation_warnings), len(expected_limitation_codes))
-            if expected_limitation_codes:
-                self.assertIn(
-                    "MYSQL_NO_TRUNCATE_TRIGGER",
-                    str(limitation_warnings[0].message),
-                )
+            self.assertEqual(len(limitation_warnings), 1)
+            for code in expected_limitation_codes:
+                self.assertIn(code, str(limitation_warnings[0].message))
 
             self.assertTrue(
                 progress_calls,
@@ -917,12 +923,15 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 f"FROM {plan.view_name} ORDER BY bucket;"
             )
             actual = [tuple(row) for row in cur.fetchall()]
+            # Opted-in approximate AVG: exact only under the pinned plan (small
+            # table, PostgreSQL serial seq scan + HashAggregate).
+            pin_native_plan(cur, engine)
             cur.execute(
                 f"SELECT bucket, COUNT(*) AS c, SUM(amt) AS s, "
                 f"AVG(amt) AS avg_amt, AVG(approx_amt) AS avg_approx_amt "
-                f"FROM {table_name} GROUP BY bucket ORDER BY bucket;"
+                f"FROM {table_name} GROUP BY bucket;"
             )
-            expected = [tuple(row) for row in cur.fetchall()]
+            expected = sorted((tuple(row) for row in cur.fetchall()), key=lambda r: r[0])
             self.assertEqual(actual, expected)
             for row in actual:
                 self.assertIsInstance(row[3], Decimal)

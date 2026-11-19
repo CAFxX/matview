@@ -37,7 +37,7 @@ from matview_sync import (
     generate_materialized_view,
     main as cli_main,
 )
-from test_matview_sync import TranspiledConnectionAdapter
+from test_matview_sync import FLOAT_OPT_IN, TranspiledConnectionAdapter
 
 
 def _functions(plan: MaterializedViewPlan) -> dict:
@@ -68,7 +68,7 @@ CREATE TABLE sales (
 
 class TestPGStatementLevelDDL(unittest.TestCase):
     def _plan(self, view: str, schema: str = SALES) -> MaterializedViewPlan:
-        return generate_materialized_view(schema, view, dialect=Dialect.POSTGRES, ignore_limitations=True)
+        return generate_materialized_view(schema, view, dialect=Dialect.POSTGRES, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
 
     def assert_statement_level_only(self, plan: MaterializedViewPlan) -> None:
         ddls = "\n".join(plan.trigger_ddls)
@@ -529,10 +529,13 @@ class TestNativePGTransitionTableVectorizationSemantics(unittest.TestCase):
                 GROUP BY COALESCE(region, 'UNK');
                 """
                 cur.execute(schema_sql)
+                # AVG/VAR over DOUBLE PRECISION: per-code opt-in (values are
+                # small integers, so the result does not depend on the order).
                 plan = generate_materialized_view(
                     schema_sql,
                     view_sql,
                     dialect=Dialect.POSTGRES,
+                    accept_limitations=FLOAT_OPT_IN,
                 )
                 for ddl in plan.create_structure_statements() + plan.trigger_ddls:
                     cur.execute(ddl)

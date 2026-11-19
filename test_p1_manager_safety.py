@@ -25,6 +25,7 @@ import unittest
 from typing import Any, List, Optional, Set, Tuple
 from unittest.mock import MagicMock
 
+from test_matview_sync import FLOAT_OPT_IN
 from matview_sync import (
     DEFAULT_OBJECT_PREFIX,
     Dialect,
@@ -417,7 +418,7 @@ class TestMySqlNonAtomicRegistrationRollback(unittest.TestCase):
         """
         raw_conn = sqlite3.connect(":memory:")
         tracked = CursorTrackingConnection(raw_conn)
-        manager = MaterializedViewManager(tracked, dialect=Dialect.MYSQL, ignore_limitations=True)
+        manager = MaterializedViewManager(tracked, dialect=Dialect.MYSQL, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
 
         # Create base table in SQLite
         with raw_conn:
@@ -481,7 +482,7 @@ class TestMySqlNonAtomicRegistrationRollback(unittest.TestCase):
         """
         raw_conn = sqlite3.connect(":memory:")
         tracked = CursorTrackingConnection(raw_conn)
-        manager = MaterializedViewManager(tracked, dialect=Dialect.MYSQL, ignore_limitations=True)
+        manager = MaterializedViewManager(tracked, dialect=Dialect.MYSQL, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
 
         # Create base table and pre-existing collision table with important user data
         store_tbl_name = f"{manager.object_prefix}store_mv_collision"
@@ -545,7 +546,7 @@ class TestNativeEngineManagerSafety(unittest.TestCase):
             autocommit=False,
         )
         tracked = CursorTrackingConnection(raw_conn)
-        manager = MaterializedViewManager(tracked, dialect=Dialect.MYSQL, ignore_limitations=True)
+        manager = MaterializedViewManager(tracked, dialect=Dialect.MYSQL, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
 
         prefix = "t_p1_my_"
         base_tbl = f"{prefix}items"
@@ -614,7 +615,7 @@ class TestNativeEngineManagerSafety(unittest.TestCase):
                 return Wrap(real_c, tracked)
 
             tracked.cursor_factory = col_fail_cursor
-            manager_col = MaterializedViewManager(tracked, dialect=Dialect.MYSQL, ignore_limitations=True)
+            manager_col = MaterializedViewManager(tracked, dialect=Dialect.MYSQL, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
             with self.assertRaises(pymysql.err.OperationalError):
                 manager_col.register_view(
                     col_view_sql,
@@ -654,7 +655,7 @@ class TestNativeEngineManagerSafety(unittest.TestCase):
         import psycopg2
         raw_conn = psycopg2.connect(dsn)
         tracked = CursorTrackingConnection(raw_conn)
-        manager = MaterializedViewManager(tracked, dialect=Dialect.POSTGRES, ignore_limitations=True)
+        manager = MaterializedViewManager(tracked, dialect=Dialect.POSTGRES, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
 
         prefix = "t_p1_pg_"
         base_tbl = f"{prefix}items"
