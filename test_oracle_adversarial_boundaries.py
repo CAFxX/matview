@@ -23,12 +23,18 @@ import unittest
 from typing import Any, List, Optional, Sequence, Tuple
 
 from matview_sync import (
+    parse_table_schema,
     Dialect,
     generate_materialized_view,
     install_materialized_view_sqlite,
 )
 from test_matview_sync import (
+    FLOAT_OPT_IN,
+    VALUE_NOT_COMPARED,
     NumericTolerance,
+    _ORDER_SENSITIVE_OPT_IN_VIEWS,
+    _verify_external_db_mv,
+    _order_sensitive_projection_indices,
     _float_ulp_distance,
     _numeric_values_equal,
     _values_equal,
@@ -36,6 +42,196 @@ from test_matview_sync import (
     _query_column_tolerances,
     _AGGREGATE_NUMERIC_TOLERANCES,
 )
+
+# The differential oracle no longer applies any budget to SUM/TOTAL/AVG
+# (exact on every engine). These tests verify the NumericTolerance mechanism
+# itself with an explicit SUM-like budget, as a caller could still supply one.
+_SUM_LIKE_BUDGET = NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=8)
+
+
+class NoLiveStatisticsExclusionTests(unittest.TestCase):
+    """libSQL has no native statistical aggregate (and cannot register the
+    UDF the other SQLite engines use), so a VAR/STDDEV view has no live view
+    there: such views are excluded from the libSQL differential by name, with
+    that reason. Everything else on libSQL, and every engine, is compared."""
+
+    def test_exclusion_is_named_and_limited(self) -> None:
+        import os
+        from unittest import mock
+
+        from test_matview_sync import NO_LIVE_STATISTICAL_AGGREGATE, NoLiveView, _live_reference_select
+
+        schema = parse_table_schema("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, w INTEGER)")
+        stat = generate_materialized_view(schema, "CREATE VIEW v AS SELECT g, VAR_POP(w) AS vp FROM t GROUP BY g")
+        sd = generate_materialized_view(schema, "CREATE VIEW v2 AS SELECT g, STDDEV_SAMP(w) AS sd FROM t GROUP BY g")
+        plain = generate_materialized_view(schema, "CREATE VIEW v3 AS SELECT g, SUM(w) AS s FROM t GROUP BY g")
+        with mock.patch.dict(os.environ, {"SQLITE_COMPAT_ENGINE": "libsql"}):
+            for plan in (stat, sd):
+                ref = _live_reference_select(plan, plan.view_spec.raw_select_sql, Dialect.SQLITE)
+                self.assertIsInstance(ref, NoLiveView)
+                self.assertEqual(ref.reason, NO_LIVE_STATISTICAL_AGGREGATE)
+            self.assertIsInstance(_live_reference_select(plain, plain.view_spec.raw_select_sql, Dialect.SQLITE), str)
+        for engine in ("", "apsw", "sqlcipher"):
+            with mock.patch.dict(os.environ, {"SQLITE_COMPAT_ENGINE": engine}):
+                self.assertIsInstance(_live_reference_select(stat, stat.view_spec.raw_select_sql, Dialect.SQLITE), str)
+
+
+class SqliteStatisticsExactReferenceTests(unittest.TestCase):
+    """SQLite VAR/STDDEV maintenance against exact references: the variance
+    over the exact row values in rational arithmetic (fractions.Fraction),
+    rounded once to the nearest float (STDDEV: the square root of the exact
+    variance to 60 digits, rounded once). Deterministic datasets whose
+    correctly rounded result the maintained value must reproduce exactly."""
+
+    @staticmethod
+    def _exact(values, sample: bool, sqrt: bool):
+        from fractions import Fraction
+        from decimal import Decimal, getcontext
+
+        vals = [Fraction(v) for v in values if v is not None]
+        n = len(vals)
+        if n == 0 or (sample and n < 2):
+            return None
+        mean = sum(vals) / n
+        var = sum((v - mean) ** 2 for v in vals) / (n - 1 if sample else n)
+        if not sqrt:
+            return float(var)
+        getcontext().prec = 60
+        return float((Decimal(var.numerator) / Decimal(var.denominator)).sqrt())
+
+    # Known product defect (TODO.md 'Make SQLite VAR/STDDEV Correctly Rounded'):
+    # the folded (count, mean, M2) maintenance is not correctly rounded
+    # (VAR_POP 12.559999999999999 where the exact value rounds to 12.56).
+    @unittest.expectedFailure
+    def test_maintained_statistics_equal_exact_references(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, w INTEGER)")
+        conn.commit()
+        from matview_sync import MaterializedViewManager
+
+        mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        mgr.register_view(
+            "CREATE VIEW v AS SELECT g, VAR_POP(w) AS vp, VAR_SAMP(w) AS vs, STDDEV_POP(w) AS sp, "
+            "STDDEV_SAMP(w) AS ss FROM t GROUP BY g;"
+        )
+        rows = {}
+
+        def apply(sql, params=()):
+            conn.execute(sql, params)
+            conn.commit()
+
+        steps = [("INSERT INTO t VALUES (?, ?, ?)", (i, i % 3, (i * 7) % 11 - 5)) for i in range(1, 25)]
+        steps += [("UPDATE t SET w = w * 2 + 1 WHERE id = ?", (i,)) for i in range(1, 25, 5)]
+        steps += [("DELETE FROM t WHERE id = ?", (i,)) for i in range(2, 25, 6)]
+        steps += [("UPDATE t SET g = (g + 1) % 3 WHERE id = ?", (i,)) for i in range(3, 25, 7)]
+        for sql, params in steps:
+            apply(sql, params)
+            rows = {}
+            for g, w in conn.execute("SELECT g, w FROM t"):
+                rows.setdefault(g, []).append(w)
+            got = {r[0]: r[1:] for r in conn.execute("SELECT g, vp, vs, sp, ss FROM v")}
+            self.assertEqual(set(got), set(rows), sql)
+            for g, vals in rows.items():
+                expected = (
+                    self._exact(vals, False, False), self._exact(vals, True, False),
+                    self._exact(vals, False, True), self._exact(vals, True, True),
+                )
+                self.assertEqual(got[g], expected, (sql, params, g, vals))
+
+
+class OptedInColumnExclusionTests(unittest.TestCase):
+    """Columns of views installed under the per-code float opt-in are not
+    value-compared, but only when both values are floats: NULL-ness, exact
+    (integer/Decimal) values and every other column stay exact."""
+
+    def test_value_not_compared_policy(self) -> None:
+        self.assertTrue(_values_equal(1.5, 2.0, VALUE_NOT_COMPARED))
+        self.assertTrue(_values_equal(None, None, VALUE_NOT_COMPARED))
+        self.assertFalse(_values_equal(None, 1.5, VALUE_NOT_COMPARED))
+        self.assertFalse(_values_equal(1.5, None, VALUE_NOT_COMPARED))
+        self.assertFalse(_values_equal(1, 2, VALUE_NOT_COMPARED))
+        self.assertFalse(_values_equal(Decimal("1.5"), Decimal("1.50001"), VALUE_NOT_COMPARED))
+        self.assertTrue(_values_equal(Decimal("1.5"), Decimal("1.5"), VALUE_NOT_COMPARED))
+        self.assertFalse(_values_equal("a", "b", VALUE_NOT_COMPARED))
+        self.assertFalse(_values_equal(2.0, 3, VALUE_NOT_COMPARED))
+        # Non-finite classes must match exactly.
+        nan, inf = float("nan"), float("inf")
+        for a, b, same in (
+            (nan, nan, True), (inf, inf, True), (-inf, -inf, True), (1.0, -2.5, True),
+            (nan, 1.0, False), (1.0, nan, False), (inf, 1.0, False), (1.0, -inf, False),
+            (inf, -inf, False), (nan, inf, False), (-inf, nan, False),
+        ):
+            with self.subTest(a=a, b=b):
+                self.assertEqual(_values_equal(a, b, VALUE_NOT_COMPARED), same)
+
+    def test_verify_compares_exact_derived_float_columns_of_opted_in_views(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t2 (g INT, x REAL, k INTEGER)")
+        cur.executemany("INSERT INTO t2 VALUES (?, ?, ?)", [(1, 1.5, 2), (1, 2.5, 3)])
+        live = "SELECT g, SUM(x) AS s, SUM(k) * 1.5e0 AS sk FROM t2 GROUP BY g"
+        for name, rows, ok in (
+            ("same", [(1, 4.0, 7.5)], True),
+            ("float_sum_differs", [(1, 4.000000000000001, 7.5)], True),
+            ("exact_derived_differs", [(1, 4.0, 7.500000000000001)], False),
+            ("float_sum_nan", [(1, float("nan"), 7.5)], False),
+        ):
+            with self.subTest(case=name):
+                mv = f"mv2_{name}"
+                cur.execute(f"CREATE TABLE {mv} (g INT, s REAL, sk REAL)")
+                cur.executemany(f"INSERT INTO {mv} VALUES (?, ?, ?)", rows)
+                _ORDER_SENSITIVE_OPT_IN_VIEWS.add(mv)
+                try:
+                    if ok:
+                        _verify_external_db_mv(cur, mv, live, name)
+                    else:
+                        with self.assertRaises(AssertionError):
+                            _verify_external_db_mv(cur, mv, live, name)
+                finally:
+                    _ORDER_SENSITIVE_OPT_IN_VIEWS.discard(mv)
+
+    def test_exclusion_is_limited_to_order_sensitive_aggregates(self) -> None:
+        types = {"x": ["DOUBLE PRECISION"], "k": ["BIGINT"], "d": ["NUMERIC(12,3)"], "g": ["INTEGER"]}
+        sql = (
+            "SELECT g, SUM(x) AS s, SUM(k) * 1.5e0 AS sk, AVG(d) AS ad, SUM(k + 1) AS sk1, "
+            "SUM(k * 1.5e0) AS skf, VAR_POP(k) AS vk, AVG(x) OVER (PARTITION BY g) AS w FROM t GROUP BY g"
+        )
+        self.assertEqual(_order_sensitive_projection_indices(sql, types, "postgres"), {1, 5, 7})
+        self.assertEqual(_order_sensitive_projection_indices(sql, types, "mysql"), {1, 5, 6, 7})
+        # Unknown column types are treated as order-sensitive.
+        self.assertEqual(_order_sensitive_projection_indices("SELECT SUM(z) AS s FROM t", types), {0})
+
+    def test_verify_excludes_only_order_sensitive_columns_of_opted_in_views(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (g INT, x REAL, k INT)")
+        cur.executemany("INSERT INTO t VALUES (?, ?, ?)", [(1, 1.5, 2), (1, 2.5, 3), (2, 4.0, 5)])
+        live = "SELECT g, COUNT(*) AS c, SUM(x) AS s, MAX(k) AS mk FROM t GROUP BY g"
+        good = [(1, 2, 4.0, 3), (2, 1, 4.0, 5)]
+        cases = {
+            "float_differs": ([(1, 2, 4.000000000000001, 3), (2, 1, 4.0, 5)], True),
+            "count_differs": ([(1, 3, 4.0, 3), (2, 1, 4.0, 5)], False),
+            "other_column_differs": ([(1, 2, 4.0, 4), (2, 1, 4.0, 5)], False),
+            "null_instead_of_float": ([(1, 2, None, 3), (2, 1, 4.0, 5)], False),
+            "group_missing": ([(1, 2, 4.0, 3)], False),
+            "extra_duplicate": (good + [(2, 1, 4.0, 5)], False),
+        }
+        for name, (rows, accepted_when_opted_in) in cases.items():
+            for opted_in in (False, True):
+                with self.subTest(case=name, opted_in=opted_in):
+                    mv = f"mv_{name}_{int(opted_in)}"
+                    cur.execute(f"CREATE TABLE {mv} (g INT, c INT, s REAL, mk INT)")
+                    cur.executemany(f"INSERT INTO {mv} VALUES (?, ?, ?, ?)", rows)
+                    if opted_in:
+                        _ORDER_SENSITIVE_OPT_IN_VIEWS.add(mv)
+                    try:
+                        if opted_in and accepted_when_opted_in:
+                            _verify_external_db_mv(cur, mv, live, name)
+                        else:
+                            with self.assertRaises(AssertionError):
+                                _verify_external_db_mv(cur, mv, live, name)
+                    finally:
+                        _ORDER_SENSITIVE_OPT_IN_VIEWS.discard(mv)
 
 
 class FloatingPointCancellationTests(unittest.TestCase):
@@ -55,7 +251,7 @@ class FloatingPointCancellationTests(unittest.TestCase):
                     _rows_equal(
                         [(cancelled,)],
                         [(Decimal(str(delta)),)],
-                        tol=_AGGREGATE_NUMERIC_TOLERANCES["SUM"],
+                        tol=_SUM_LIKE_BUDGET,
                     )
                 )
 
@@ -69,14 +265,14 @@ class FloatingPointCancellationTests(unittest.TestCase):
             _rows_equal(
                 [(vanished,)],
                 [(Decimal("0.0625"),)],
-                tol=_AGGREGATE_NUMERIC_TOLERANCES["SUM"],
+                tol=_SUM_LIKE_BUDGET,
             )
         )
 
         # However, tiny differences below the documented 1e-12 noise floor must be accepted:
         near_floor_within = 0.9e-12
         near_floor_exceed = 1.1e-12
-        sum_tol = _AGGREGATE_NUMERIC_TOLERANCES["SUM"]
+        sum_tol = _SUM_LIKE_BUDGET
         self.assertTrue(_rows_equal([(0.0,)], [(near_floor_within,)], tol=sum_tol))
         self.assertFalse(_rows_equal([(0.0,)], [(near_floor_exceed,)], tol=sum_tol))
 
@@ -96,7 +292,7 @@ class FloatingPointCancellationTests(unittest.TestCase):
             _rows_equal(
                 [(0.0,)],
                 [(0.5,)],
-                tol=_AGGREGATE_NUMERIC_TOLERANCES["SUM"],
+                tol=_SUM_LIKE_BUDGET,
             )
         )
 
@@ -109,7 +305,7 @@ class FloatingPointCancellationTests(unittest.TestCase):
             _rows_equal(
                 [(collapsed,)],
                 [(1.0,)],
-                tol=_AGGREGATE_NUMERIC_TOLERANCES["SUM"],
+                tol=_SUM_LIKE_BUDGET,
             )
         )
 
@@ -206,13 +402,12 @@ class FloatingPointCancellationTests(unittest.TestCase):
             conn.close()
 
     def test_05_cancellation_in_scalar_floating_arithmetic(self) -> None:
-        # Scalar arithmetic whitelist derives a tight budget (max_ulps=4, relative=4.5e-16, absolute=1e-12):
+        # Scalar arithmetic is evaluated identically by the reader and the
+        # original view: no inferred budget.
         policies = _query_column_tolerances("SELECT amount - (amount - 0.125) AS delta FROM items;")
-        self.assertIsNotNone(policies)
-        assert policies is not None
-        scalar_policy = policies[0]
-        self.assertEqual(scalar_policy.max_ulps, 4)
-        self.assertEqual(scalar_policy.absolute, 1e-12)
+        self.assertEqual(policies, (NumericTolerance(),))
+        # The mechanism with an explicit 4-ULP budget, as a caller could supply:
+        scalar_policy = NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=4)
 
         # At scale 1e15 (where absolute=1e-12 and relative=4.5e-16*1e15=0.45 are binding),
         # 1 ULP is 0.125. Exactly 4 ULPs away is 0.5 (which exceeds relative 0.45, but is allowed by max_ulps=4):
@@ -464,14 +659,14 @@ class SubnormalAndTinyMagnitudeTests(unittest.TestCase):
         val1 = 5e-13
         val2 = -4e-13  # diff = 9e-13 <= 1e-12
         self.assertTrue(
-            _rows_equal([(val1,)], [(val2,)], tol=_AGGREGATE_NUMERIC_TOLERANCES["SUM"])
+            _rows_equal([(val1,)], [(val2,)], tol=_SUM_LIKE_BUDGET)
         )
 
         # Exceeding the noise floor:
         val3 = 7e-13
         val4 = -6e-13  # diff = 1.3e-12 > 1e-12
         self.assertFalse(
-            _rows_equal([(val3,)], [(val4,)], tol=_AGGREGATE_NUMERIC_TOLERANCES["SUM"])
+            _rows_equal([(val3,)], [(val4,)], tol=_SUM_LIKE_BUDGET)
         )
 
         # Relative tolerance alone breaks down on tiny values:
@@ -595,7 +790,7 @@ class LargeAggregatesAndCrossDialectPrecisionTests(unittest.TestCase):
         self.assertFalse(_rows_equal([(sum_1e15 + 1,)], [(d_1e15,)]))
 
         # Float vs exact Decimal under SUM aggregate budget:
-        sum_tol = _AGGREGATE_NUMERIC_TOLERANCES["SUM"]
+        sum_tol = _SUM_LIKE_BUDGET
         self.assertTrue(_rows_equal([(f_1e15,)], [(d_1e15,)], tol=sum_tol))
 
         # Modifying float by 8 ULPs (8 * 0.125 = 1.0) is allowed under max_ulps=8:
@@ -653,7 +848,7 @@ class LargeAggregatesAndCrossDialectPrecisionTests(unittest.TestCase):
         """
 
         # PostgreSQL DDL preserves native exact types (SUM(int) -> BIGINT, SUM(bigint) -> NUMERIC):
-        pg_plan = generate_materialized_view(schema, view, dialect="postgres")
+        pg_plan = generate_materialized_view(schema, view, dialect="postgres", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         self.assertIn("sum_int BIGINT", pg_plan.backing_table_ddl)
         self.assertIn("sum_big NUMERIC", pg_plan.backing_table_ddl)
         self.assertIn("avg_big NUMERIC", pg_plan.backing_table_ddl)
@@ -664,7 +859,7 @@ class LargeAggregatesAndCrossDialectPrecisionTests(unittest.TestCase):
 
         # MySQL DDL preserves native exact types:
         mysql_plan = generate_materialized_view(
-            schema, view, dialect="mysql", ignore_limitations=True
+            schema, view, dialect="mysql", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         self.assertIn("sum_int DECIMAL(65, 0)", mysql_plan.backing_table_ddl)
         self.assertIn("sum_big DECIMAL(65, 0)", mysql_plan.backing_table_ddl)
@@ -686,20 +881,21 @@ class LargeAggregatesAndCrossDialectPrecisionTests(unittest.TestCase):
         self.assertIn("sum_real REAL", sqlite_plan.backing_table_ddl)
         self.assertIn("avg_real REAL", sqlite_plan.backing_table_ddl)
 
-        # Inferred column tolerances assign exact policy to grouping and count, approximate to sums/avgs:
+        # Inferred column tolerances: every column exact (SUM/AVG have no
+        # budget on any engine; only SQLite VAR/STDDEV keep one):
         policies = _query_column_tolerances(view)
         self.assertIsNotNone(policies)
         assert policies is not None
         self.assertEqual(len(policies), 9)
         self.assertEqual(policies[0], NumericTolerance())  # grp exact
         self.assertEqual(policies[1], NumericTolerance())  # cnt exact
-        self.assertEqual(policies[2], _AGGREGATE_NUMERIC_TOLERANCES["SUM"])
-        self.assertEqual(policies[3], _AGGREGATE_NUMERIC_TOLERANCES["SUM"])
-        self.assertEqual(policies[4], _AGGREGATE_NUMERIC_TOLERANCES["AVG"])
-        self.assertEqual(policies[5], _AGGREGATE_NUMERIC_TOLERANCES["SUM"])
-        self.assertEqual(policies[6], _AGGREGATE_NUMERIC_TOLERANCES["AVG"])
-        self.assertEqual(policies[7], _AGGREGATE_NUMERIC_TOLERANCES["SUM"])
-        self.assertEqual(policies[8], _AGGREGATE_NUMERIC_TOLERANCES["AVG"])
+        self.assertEqual(policies[2], NumericTolerance())
+        self.assertEqual(policies[3], NumericTolerance())
+        self.assertEqual(policies[4], NumericTolerance())
+        self.assertEqual(policies[5], NumericTolerance())
+        self.assertEqual(policies[6], NumericTolerance())
+        self.assertEqual(policies[7], NumericTolerance())
+        self.assertEqual(policies[8], NumericTolerance())
 
     def test_05_negative_large_aggregates_and_64bit_overflow_boundaries(self) -> None:
         # Large negative sums: -10^15
@@ -712,7 +908,7 @@ class LargeAggregatesAndCrossDialectPrecisionTests(unittest.TestCase):
         self.assertFalse(_rows_equal([(neg_1e15 - 1,)], [(d_neg_1e15,)]))
 
         # Float negative match under SUM tolerance:
-        sum_tol = _AGGREGATE_NUMERIC_TOLERANCES["SUM"]
+        sum_tol = _SUM_LIKE_BUDGET
         self.assertTrue(_rows_equal([(f_neg_1e15,)], [(d_neg_1e15,)], tol=sum_tol))
 
         # Rejection when negative float diverges beyond 8 ULPs:
@@ -810,9 +1006,10 @@ class ToleranceBoundarySensitivityAndRejectionTests(unittest.TestCase):
 
         row_ref = [("Engineering", 10, 500000.0)]
 
-        # Permitted float variation in SUM column:
-        row_float_delta = [("Engineering", 10, 500000.0000000001)]
-        self.assertTrue(_rows_equal(row_ref, row_float_delta, column_tolerances=policies))
+        # SUM has no budget: even a 1-ULP float variation is rejected.
+        row_float_delta = [("Engineering", 10, math.nextafter(500000.0, math.inf))]
+        self.assertFalse(_rows_equal(row_ref, row_float_delta, column_tolerances=policies))
+        self.assertTrue(_rows_equal(row_ref, [("Engineering", 10, 500000.0)], column_tolerances=policies))
 
         # Excessive float variation in SUM column rejected:
         row_float_bad = [("Engineering", 10, 500000.1)]

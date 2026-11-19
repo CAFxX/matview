@@ -32,7 +32,7 @@ import sqlglot
 from sqlglot import exp as sqlglot_exp
 import struct
 import tempfile
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 import warnings
 
 from matview_sync import (
@@ -47,6 +47,7 @@ from matview_sync import (
     detect_engine_version,
     parse_engine_version,
     EngineLimitationWarning,
+    PER_CODE_OPT_IN_LIMITATIONS,
     IncrementalViewCompiler,
     LimitationSeverity,
     MaintenanceStrategy,
@@ -69,6 +70,62 @@ from matview_sync import (
     parse_view_definitions,
     parse_view_index_spec,
 )
+import matview_sync as _matview_sync_module
+
+# Explicit per-code acceptance used by tests that install floating-point
+# SUM/AVG/VAR/STDDEV views on PostgreSQL/MySQL/MariaDB for a purpose other
+# than float exactness. Views compiled with it have their order-sensitive
+# columns excluded from value comparison (see _ORDER_SENSITIVE_OPT_IN_VIEWS).
+FLOAT_OPT_IN = (
+    "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+    "ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE",
+    "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
+)
+
+
+# Deterministic plan for the original view on PostgreSQL in exactness tests of
+# opted-in order-sensitive aggregates: a serial sequential scan feeding a
+# HashAggregate visits each group's rows in ctid order, the order the
+# best-effort recompute uses. Exactness is only claimed under this pinned
+# plan (and on small single-table views on MySQL/MariaDB, whose grouping
+# reads the clustered primary key without a secondary index).
+PG_PINNED_PLAN_SETTINGS = (
+    "SET LOCAL enable_indexscan = off",
+    "SET LOCAL enable_indexonlyscan = off",
+    "SET LOCAL enable_bitmapscan = off",
+    "SET LOCAL enable_sort = off",
+    "SET LOCAL max_parallel_workers_per_gather = 0",
+)
+
+
+def pin_native_plan(cur: Any, dialect: Any) -> None:
+    """Apply PG_PINNED_PLAN_SETTINGS for the current transaction (PostgreSQL only)."""
+    if dialect in (Dialect.POSTGRES, "postgres", "postgresql", "pg"):
+        for stmt in PG_PINNED_PLAN_SETTINGS:
+            cur.execute(stmt)
+
+
+def _record_opt_in(plans: Any) -> Any:
+    """Note views whose plan carries ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE
+    (they could only compile with the explicit acceptance)."""
+    seq = plans if isinstance(plans, (list, tuple)) else [plans]
+    for plan in seq:
+        for sub in (getattr(plan, "sub_plans", None) or [plan]):
+            # View names repeat across suites and engines: the latest
+            # compilation of a name decides.
+            if any(l.code == "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE" for l in sub.limitations):
+                _ORDER_SENSITIVE_OPT_IN_VIEWS.add(sub.view_name.lower())
+            else:
+                _ORDER_SENSITIVE_OPT_IN_VIEWS.discard(sub.view_name.lower())
+    return plans
+
+
+def generate_materialized_view(*args: Any, **kwargs: Any) -> Any:  # noqa: F811
+    return _record_opt_in(_matview_sync_module.generate_materialized_view(*args, **kwargs))
+
+
+def generate_materialized_views(*args: Any, **kwargs: Any) -> Any:  # noqa: F811
+    return _record_opt_in(_matview_sync_module.generate_materialized_views(*args, **kwargs))
 
 
 # -----------------------------------------------------------------------------
@@ -161,6 +218,28 @@ class NumericTolerance:
         return False
 
 
+@dataclass(frozen=True)
+class ValueNotCompared(NumericTolerance):
+    """Column policy for best-effort columns of views installed under an
+    explicit per-code opt-in (ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE):
+    the library does not claim their float values equal the original view,
+    so when both values are floats only NULL-ness and the float type are
+    compared -- never the value under some error budget. Non-float values in
+    such columns (integer/DECIMAL results), row multiplicity and every other
+    column are still compared exactly."""
+
+
+VALUE_NOT_COMPARED = ValueNotCompared()
+
+
+def _float_class(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    if math.isinf(value):
+        return "+inf" if value > 0 else "-inf"
+    return "finite"
+
+
 def _float_ulp_distance(a: float, b: float) -> int:
     """Return the exact distance between finite IEEE-754 binary64 values."""
     sign = 1 << 63
@@ -239,6 +318,15 @@ def _numeric_values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool
 def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
     if a is None or b is None:
         return a is b
+    if isinstance(tol, ValueNotCompared):
+        if isinstance(a, float) and isinstance(b, float):
+            # Only the finite value is not compared: NaN, +inf and -inf must
+            # match exactly (a best-effort sum cannot legitimately turn into
+            # or out of a non-finite value).
+            return _float_class(a) == _float_class(b)
+        # Exact results (integers, DECIMAL/NUMERIC) of such columns are
+        # still compared exactly.
+        tol = NumericTolerance()
 
     if isinstance(a, (bool, int, float, Decimal)) and isinstance(b, (bool, int, float, Decimal)):
         return _numeric_values_equal(a, b, tol)
@@ -251,23 +339,164 @@ def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
     return type(a) is type(b) and a == b
 
 
-# Arithmetic aggregates have different numerical error profiles. The budgets
-# are intentionally expressed in a few ULPs with only a tiny absolute floor;
-# exact aggregates (COUNT/MIN/MAX and unrecognized functions) remain strict.
+# Comparison budgets. The contract is exact equality with the original view
+# (AGENTS.md): SUM/TOTAL/AVG and scalar arithmetic over the materialized
+# columns have no budget on any engine (SQLite folds only provably exact
+# integer sums and recomputes everything else natively). On PostgreSQL/MySQL/
+# MariaDB floating-point SUM/AVG/VAR/STDDEV are refused by default
+# (ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE: the original view's value
+# depends on its plan); views the battery installs under the explicit per-code
+# opt-in have exactly those columns excluded from value comparison
+# (ValueNotCompared: NULL-ness and type only), never compared under a budget.
+#
+# The only remaining budget: VAR/STDDEV evaluated on SQLite, which has no
+# native variance aggregate -- both the materialized value and the "live"
+# reference come from different formulas (the generated SQL vs. the test's
+# Python UDF), ~1 ULP apart. On PostgreSQL/MySQL/MariaDB VAR/STDDEV are the
+# engine's own aggregate on both sides and are compared exactly.
+_SQLITE_STATISTICAL_TOLERANCE = NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64)
+# Views installed only under the per-code opt-in for
+# ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE: their order-sensitive aggregate
+# columns are excluded from value comparison by name (VALUE_NOT_COMPARED).
+_ORDER_SENSITIVE_OPT_IN_VIEWS: Set[str] = set()
+_ORDER_SENSITIVE_FUNCTIONS = frozenset({
+    "SUM", "AVG", "TOTAL", "VAR_POP", "VAR_SAMP", "VARIANCE", "VARIANCE_POP", "VARIANCE_SAMP",
+    "STDDEV", "STDDEV_POP", "STDDEV_SAMP", "STD",
+})
+
+
+_EXACT_TYPE_RE = re.compile(
+    r"(?i)^\s*(?:(?:tiny|small|medium|big)?int(?:eger)?\d?|int[248]|serial\d?|bigserial|smallserial|"
+    r"numeric|decimal|dec|fixed|bool(?:ean)?)\b"
+)
+_STAT_FUNCTIONS = frozenset({
+    "VAR_POP", "VAR_SAMP", "VARIANCE", "VARIANCE_POP", "VARIANCE_SAMP",
+    "STDDEV", "STDDEV_POP", "STDDEV_SAMP", "STD",
+})
+
+
+def _cursor_flavor(cur: Any) -> str:
+    """'postgres', 'mysql' or 'sqlite' for native and transpiled cursors."""
+    ca = getattr(cur, "_ca", None)
+    if ca is not None:
+        return getattr(getattr(ca, "dialect", None), "value", "sqlite")
+    module = type(cur).__module__.split(".")[0]
+    if module in ("psycopg2", "psycopg"):
+        return "postgres"
+    if module in ("pymysql", "MySQLdb", "mysql", "mariadb"):
+        return "mysql"
+    return "sqlite"
+
+
+def _column_types(cur: Any, tables: Sequence[str]) -> Dict[str, List[str]]:
+    """Declared types of the columns of ``tables`` (column name -> types),
+    read from the database the cursor is connected to."""
+    out: Dict[str, List[str]] = {}
+    ca = getattr(cur, "_ca", None)
+    for table in tables:
+        rows: List[Tuple[Any, ...]] = []
+        try:
+            if ca is not None and getattr(ca, "_sq_conn", None) is not None:
+                rows = [(r[1], r[2]) for r in ca._sq_conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            elif _cursor_flavor(cur) == "postgres":
+                cur.execute(
+                    "SELECT column_name, data_type FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = %s",
+                    (table.lower(),),
+                )
+                rows = cur.fetchall()
+            elif _cursor_flavor(cur) == "mysql":
+                cur.execute(
+                    "SELECT column_name, data_type FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = %s",
+                    (table,),
+                )
+                rows = cur.fetchall()
+            else:
+                cur.execute(f'PRAGMA table_info("{table}")')
+                rows = [(r[1], r[2]) for r in cur.fetchall()]
+        except Exception:
+            rows = []
+        for name, data_type in rows:
+            out.setdefault(str(name).lower(), []).append(str(data_type or ""))
+    return out
+
+
+def _order_sensitive_projection_indices(
+    select_sql: str, column_types: Optional[Dict[str, List[str]]] = None, flavor: str = "postgres"
+) -> Optional[Set[int]]:
+    """Top-level output positions whose expression contains an order-sensitive
+    aggregate: SUM/AVG/TOTAL (aggregate or window) whose argument is not
+    provably exact, and VAR/STDDEV (always on MySQL/MariaDB, which compute them
+    in DOUBLE). An argument is exact when it combines only exact-typed columns
+    (integer, NUMERIC/DECIMAL, boolean per ``column_types``), non-exponent
+    numeric literals, +, -, *, / and CAST to an exact type; anything else
+    (approximate or unknown columns, exponent literals, functions) is treated
+    as order-sensitive. A projection derived from an exact aggregate (e.g.
+    ``SUM(k) * 1.5e0``) is NOT excluded. None when the projection list is not
+    statically known (SELECT *). Independent of the library's planner."""
+    try:
+        tree = sqlglot.parse_one(select_sql)
+    except sqlglot.errors.ParseError:
+        return None
+    select = tree if isinstance(tree, sqlglot_exp.Select) else tree.find(sqlglot_exp.Select)
+    if select is None or not select.expressions:
+        return None
+    types = column_types or {}
+
+    def exact(node: Any) -> bool:
+        if node is None:
+            return False
+        if isinstance(node, (sqlglot_exp.Paren, sqlglot_exp.Neg)):
+            return exact(node.this)
+        if isinstance(node, sqlglot_exp.Distinct):
+            return bool(node.expressions) and all(exact(e) for e in node.expressions)
+        if isinstance(node, sqlglot_exp.Column):
+            declared = types.get(node.name.lower())
+            return bool(declared) and all(_EXACT_TYPE_RE.match(t) for t in declared)
+        if isinstance(node, sqlglot_exp.Literal):
+            return not node.is_string and "e" not in str(node.this).lower()
+        if isinstance(node, sqlglot_exp.Boolean):
+            return True
+        if isinstance(node, (sqlglot_exp.Add, sqlglot_exp.Sub, sqlglot_exp.Mul, sqlglot_exp.Div)):
+            return exact(node.this) and exact(node.expression)
+        if isinstance(node, sqlglot_exp.Cast):
+            return bool(_EXACT_TYPE_RE.match(node.to.sql())) and exact(node.this)
+        return False
+
+    out: Set[int] = set()
+    for index, projection in enumerate(select.expressions):
+        if isinstance(projection, sqlglot_exp.Star) or (
+            isinstance(projection, sqlglot_exp.Column) and isinstance(projection.this, sqlglot_exp.Star)
+        ):
+            return None
+        for node in projection.walk():
+            if not isinstance(node, sqlglot_exp.Func):
+                continue
+            names = {node.sql_name().upper(), str(getattr(node, "name", "") or "").upper()}
+            if not names & _ORDER_SENSITIVE_FUNCTIONS:
+                continue
+            if names & _STAT_FUNCTIONS and flavor == "mysql":
+                out.add(index)
+                break
+            if not exact(node.this):
+                out.add(index)
+                break
+    return out
 _AGGREGATE_NUMERIC_TOLERANCES = {
-    "SUM": NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=8),
-    "TOTAL": NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=8),
-    "AVG": NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=8),
-    "VAR_POP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
-    "VAR_SAMP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
-    "VARIANCE": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
-    "STDDEV": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
-    "STDDEV_POP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
-    "STDDEV_SAMP": NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64),
+    name: _SQLITE_STATISTICAL_TOLERANCE
+    for name in ("VAR_POP", "VAR_SAMP", "VARIANCE", "STDDEV", "STDDEV_POP", "STDDEV_SAMP")
 }
 
 
-def _query_column_tolerances(select_sql: str) -> Optional[Tuple[NumericTolerance, ...]]:
+def _cursor_is_native_server(cur: Any) -> bool:
+    """True for PostgreSQL/MySQL/MariaDB DB-API cursors (native aggregates);
+    False for SQLite and the SQLite-backed transpiling emulation."""
+    module = type(cur).__module__.split(".")[0]
+    return module in ("psycopg2", "psycopg", "pymysql", "MySQLdb", "mysql", "mariadb")
+
+
+def _query_column_tolerances(select_sql: str, *, native_statistics: bool = False) -> Optional[Tuple[NumericTolerance, ...]]:
     """Infer conservative per-output comparison budgets from top-level SELECT expressions.
 
     The inference is deliberately whitelist-based: only known arithmetic
@@ -296,14 +525,10 @@ def _query_column_tolerances(select_sql: str) -> Optional[Tuple[NumericTolerance
             return None
 
     policies: List[NumericTolerance] = []
-    scalar_arithmetic_names = {
-        "ADD", "SUB", "MUL", "DIV", "POW", "SQRT", "POWER",
-        "EXP", "LN", "LOG", "LOG2", "LOG10", "SIN", "COS", "TAN",
-    }
-    scalar_arithmetic = NumericTolerance(
-        absolute=1e-12, relative=4.5e-16, max_ulps=4
-    )
     for projection in select.expressions:
+        if native_statistics:
+            policies.append(NumericTolerance())
+            continue
         matching = []
         for node in projection.walk():
             if not isinstance(node, sqlglot_exp.Func):
@@ -325,8 +550,6 @@ def _query_column_tolerances(select_sql: str) -> Optional[Tuple[NumericTolerance
                 if policy is not None:
                     matching.append(policy)
                     break
-        if any(type(node).__name__.upper() in scalar_arithmetic_names for node in projection.walk()):
-            matching.append(scalar_arithmetic)
         if matching:
             policies.append(
                 NumericTolerance(
@@ -657,6 +880,9 @@ _PAREN_BALANCED = _paren_balanced_pattern(5)
 
 def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     s = _strip_row_locking_clause(sql)
+    # `AGG(x ORDER BY t.ctid)` pins PostgreSQL's accumulation to sequential-scan
+    # order; SQLite has no ctid (and visits a table in rowid order).
+    s = re.sub(r"\s+ORDER\s+BY\s+(?:[A-Za-z0-9_]+|\"[^\"]+\")\.ctid\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+WITH\s*\([^)]*fillfactor[^)]*\)", "", s, flags=re.IGNORECASE)
     s = re.sub(rf"\bCAST\s*\(\s*ROW\s*\(({_PAREN_BALANCED}+)\)\s+AS\s+TEXT\s*\)", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
     s = re.sub(rf"\bROW\s*\(({_PAREN_BALANCED}+)\)\s*::\s*TEXT\b", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
@@ -715,16 +941,41 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
 # -----------------------------------------------------------------------------
 
 
-def _verify_external_db_mv(cur, mv_name: str, select_sql: str, context: str = "") -> None:
+def _verify_external_db_mv(cur, mv_name: str, select_sql: Any, context: str = "") -> None:
+    if isinstance(select_sql, NoLiveView):
+        if select_sql.view_name not in NO_LIVE_VIEW_EXCLUSIONS:
+            NO_LIVE_VIEW_EXCLUSIONS[select_sql.view_name] = select_sql.reason
+            print(f"  [EXCLUDED] {select_sql.view_name}: {select_sql.reason}")
+        return
     cur.execute(f"SELECT * FROM {mv_name}")
     mv_rows = [tuple(row) for row in cur.fetchall()]
     cur.execute(select_sql)
     live_rows = [tuple(row) for row in cur.fetchall()]
-    # Keep integer, Decimal, text, binary, grouping-key and unknown outputs
-    # exact. Only recognized floating arithmetic/aggregate projections receive
-    # their narrowly scoped per-column budget; _values_equal applies that budget
-    # only when at least one returned value is a float.
-    column_policies = _query_column_tolerances(select_sql)
+    # Every output is compared exactly, except VAR/STDDEV on SQLite (see
+    # _AGGREGATE_NUMERIC_TOLERANCES); _values_equal applies that budget only
+    # when at least one returned value is a float.
+    column_policies = _query_column_tolerances(
+        select_sql, native_statistics=_cursor_is_native_server(cur)
+    )
+    if mv_name.lower() in _ORDER_SENSITIVE_OPT_IN_VIEWS:
+        try:
+            tables = [t.name for t in sqlglot.parse_one(select_sql).find_all(sqlglot_exp.Table) if t.name]
+        except sqlglot.errors.ParseError:
+            tables = []
+        excluded = _order_sensitive_projection_indices(
+            select_sql, _column_types(cur, tables), _cursor_flavor(cur)
+        )
+        if excluded is None or column_policies is None:
+            raise AssertionError(
+                f"[{context}] opted-in order-sensitive view {mv_name} needs a statically known "
+                f"projection list to exclude its best-effort columns by name"
+            )
+        # A view the library refused although the oracle finds every
+        # aggregate exact keeps every column compared exactly.
+        column_policies = tuple(
+            VALUE_NOT_COMPARED if index in excluded else policy
+            for index, policy in enumerate(column_policies)
+        )
     if not _rows_equal(
         mv_rows, live_rows, column_tolerances=column_policies
     ):
@@ -1032,7 +1283,7 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", EngineLimitationWarning)
-        mgr = MaterializedViewManager(conn, dialect=dialect, ignore_limitations=True)
+        mgr = MaterializedViewManager(conn, dialect=dialect, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         mgr.apply_schema_ddl(
             """
             CREATE TABLE mgr_items (
@@ -1802,6 +2053,22 @@ class TranspiledConnectionAdapter:
             ]
             return f"UPDATE {tbl}\n    SET {', '.join(cleaned_assigns)}\n    FROM ({subq}) AS __mv_delta\n    WHERE {on_c};"
 
+        def _repl_param_upd(m_p: re.Match[str]) -> str:
+            # `UPDATE t INNER JOIN (SELECT <bound params>) AS __mv_p ON TRUE
+            # SET t.c = ... WHERE ...` (backfill-chunk native recompute).
+            tbl, params, alias, set_cl, where_cl = m_p.group(1), m_p.group(2), m_p.group(3), m_p.group(4), m_p.group(5)
+            cleaned_assigns = [
+                re.sub(rf"^\s*{re.escape(tbl)}\.", "", a_part.strip())
+                for a_part in _split_top_level(set_cl, ",")
+            ]
+            return f"UPDATE {tbl}\n    SET {', '.join(cleaned_assigns)}\n    FROM {params} AS {alias}\n    WHERE {where_cl};"
+
+        s = re.sub(
+            r"UPDATE\s+([A-Za-z0-9_]+)\s+INNER\s+JOIN\s+(\(SELECT\s.*?\))\s+AS\s+(__mv_[pr])\s+ON\s+TRUE\s+SET\s+(.*?)\n\s*WHERE\s+([^;]*);",
+            _repl_param_upd,
+            s,
+            flags=re.I | re.S,
+        )
         s = re.sub(
             r"UPDATE\s+([A-Za-z0-9_]+)\s+INNER\s+JOIN\s*\((.*?)\)\s*AS\s+__mv_delta\s+ON\s+([^\n]+?)\s+SET\s+([^;]+);?",
             _repl_multi_upd,
@@ -1843,7 +2110,11 @@ class TranspiledConnectionAdapter:
                     top_pk = min(max_pk, cur_pk + batch_size)
                     stmt = ins_tmpl.replace("__mv_cur_pk", str(cur_pk)).replace("__mv_top_pk", str(top_pk))
                     try:
-                        self._execute_sql(stmt)
+                        # A chunk can be followed by further statements (the
+                        # native recompute of order-sensitive aggregates).
+                        for part in _split_top_level(stmt, ";"):
+                            if part.strip():
+                                self._execute_sql(part.strip() + ";")
                     except Exception as exc:
                         raise AssertionError(
                             "Translated PostgreSQL incremental-backfill batch failed. "
@@ -2197,6 +2468,14 @@ class TranspiledConnectionAdapter:
                 self._pg_fn_triggers.setdefault(fn_name, []).append(t_name)
                 return [], 0
 
+        if self.dialect == Dialect.MYSQL and re.match(
+            r"^CREATE\s+TRIGGER\s+\S+\s+BEFORE\s", s, flags=re.I
+        ):
+            # MySQL/MariaDB BEFORE triggers only pre-lock the backing group
+            # row; SQLite serializes writers, so the emulation skips them.
+            # Native runs test them.
+            return [], 0
+
         if self.dialect == Dialect.MYSQL and s_up.startswith("CREATE TRIGGER"):
             m_tr = re.match(
                 r'CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+(INSERT|DELETE|UPDATE)\s+ON\s+([A-Za-z0-9_]+|"[^"]+"|`[^`]+`)\s+FOR\s+EACH\s+ROW\s+BEGIN\s*(.*)\s*END;?',
@@ -2336,6 +2615,43 @@ class TranspiledConnectionAdapter:
             cur = self._sq_conn.execute(s_exec)
         rows = cur.fetchall() or []
         return rows, cur.rowcount
+
+
+def _engine_has_no_variance_aggregate(dialect: Dialect) -> bool:
+    """libSQL cannot register the VAR_POP UDF the other SQLite engines use as
+    the live reference, so a VAR_POP view has no live view to compare with."""
+    return dialect == Dialect.SQLITE and os.environ.get("SQLITE_COMPAT_ENGINE", "").strip().lower() == "libsql"
+
+
+class NoLiveView:
+    """Named differential exclusion: the view has no live view on this engine,
+    so there is nothing to compare its contents with."""
+
+    def __init__(self, view_name: str, reason: str) -> None:
+        self.view_name = view_name
+        self.reason = reason
+
+
+NO_LIVE_STATISTICAL_AGGREGATE = (
+    "libSQL has no native statistical aggregate: no live view exists to compare against"
+)
+_STATISTICAL_CALL_RE = re.compile(r"(?i)\b(?:VAR_POP|VAR_SAMP|VARIANCE|STDDEV_POP|STDDEV_SAMP|STDDEV|STD)\s*\(")
+# Views excluded from the differential by NoLiveView, with their reason
+# (printed when first seen and asserted by the oracle tests).
+NO_LIVE_VIEW_EXCLUSIONS: Dict[str, str] = {}
+
+
+def _live_reference_select(plan: Any, raw_select_sql: str, dialect: Dialect) -> Any:
+    """Reference query for ``plan``: the original view (rewritten only where
+    the engine spells a function differently). A view with a statistical
+    aggregate on libSQL, which has none (and cannot register the UDF the other
+    SQLite engines use), has no live view at all: it is excluded from the
+    differential by name (NoLiveView, NO_LIVE_STATISTICAL_AGGREGATE); its
+    maintenance is tested against exact (Fraction) references in
+    test_oracle_adversarial_boundaries.SqliteStatisticsExactReferenceTests."""
+    if _engine_has_no_variance_aggregate(dialect) and _STATISTICAL_CALL_RE.search(raw_select_sql):
+        return NoLiveView(plan.view_name, NO_LIVE_STATISTICAL_AGGREGATE)
+    return _rewrite_live_reference_select_for_dialect(raw_select_sql, dialect)
 
 
 def _rewrite_live_reference_select_for_dialect(raw_select_sql: str, dialect: Dialect) -> str:
@@ -2513,10 +2829,28 @@ def _compile_plan_for_test(
                 "EngineLimitationError must expose non-empty, identifiable limitations"
             ) from default_error
 
+        per_code = sorted(expected_codes & set(PER_CODE_OPT_IN_LIMITATIONS))
+        if per_code:
+            # The global override alone must not satisfy per-code limitations.
+            try:
+                generate_materialized_view(
+                    schema_source, view_ddl, ignore_limitations=True, **options
+                )
+            except EngineLimitationError as global_error:
+                if {lim.code for lim in global_error.limitations} != set(per_code):
+                    raise AssertionError(
+                        f"ignore_limitations alone refused {sorted(lim.code for lim in global_error.limitations)}, "
+                        f"expected exactly the per-code limitations {per_code}"
+                    ) from global_error
+            else:
+                raise AssertionError(
+                    f"ignore_limitations alone satisfied per-code limitations {per_code}"
+                )
         with warnings.catch_warnings(record=True) as emitted:
             warnings.simplefilter("always", EngineLimitationWarning)
             plan = generate_materialized_view(
-                schema_source, view_ddl, ignore_limitations=True, **options
+                schema_source, view_ddl, ignore_limitations=True,
+                accept_limitations=per_code, **options
             )
         limitation_warnings = [
             warning for warning in emitted
@@ -2542,6 +2876,10 @@ def _compile_plan_for_test(
                 "Override warning omitted limitation codes: "
                 + ", ".join(sorted(missing_warning_codes))
             )
+        if "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE" in expected_codes:
+            if "BEST-EFFORT" not in warning_text:
+                raise AssertionError("Opt-in warning does not state the best-effort contract")
+            _ORDER_SENSITIVE_OPT_IN_VIEWS.add(plan.view_name.lower())
         return plan, True, tuple(sorted(expected_codes))
 
 
@@ -2601,7 +2939,7 @@ def _run_unified_50_view_battery(
             supported_views += 1
         for stmt in p.all_statements():
             cur.execute(stmt)
-        live_sel = _rewrite_live_reference_select_for_dialect(v_sel, dialect)
+        live_sel = _live_reference_select(p, v_sel, dialect)
         plans.append((p, live_sel))
         views_installed += 1
         _verify_external_db_mv(cur, p.view_name, live_sel, f"{label}:inc={inc_mode}:{v_name}:init")
@@ -2758,11 +3096,21 @@ class MVTestRunner:
                     "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci; "
                     "SET SESSION collation_connection = @@collation_database;"
                 )
+                # 25 views per database at a time: MySQL parses every trigger of
+                # a table once per table instance a statement opens, and each
+                # trigger that reads the source table (the recompute of the
+                # battery's opted-in float aggregates, and MIN/MAX/VAR) opens
+                # another instance, so trigger memory grows with (views on the
+                # table)^2 (measured, MySQL 8.4, sp_head retained by one session
+                # after one UPDATE over 10 / 20 float SUM views: 106.7 / 405.0
+                # MiB vs 4.6 / 9.3 for exact sums; the full suite at 50 views per
+                # database exceeded 10 GiB server memory). See TODO.md "Share
+                # Float-Recompute Triggers Per Table on MySQL/MariaDB".
                 return (
                     my_conn,
                     my_conn.cursor(),
                     reset_sql,
-                    50,
+                    25,
                     "LIVE MYSQL",
                     my_conn.close,
                 )
@@ -2887,9 +3235,7 @@ class MVTestRunner:
                     for stmt in plan.all_statements():
                         cur.execute(stmt)
                     v_spec = parse_view_definition(eff_v_ddl)
-                    live_sel = _rewrite_live_reference_select_for_dialect(
-                        v_spec.raw_select_sql, eff_dialect
-                    )
+                    live_sel = _live_reference_select(plan, v_spec.raw_select_sql, eff_dialect)
                     plans_and_selects.append((plan, live_sel))
                     self.total_views += 1
                     _verify_external_db_mv(
@@ -4378,10 +4724,10 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         with self.assertRaises(EngineLimitationError):
             generate_materialized_view(schema, view, dialect="mysql", ignore_limitations=False)
 
-        # With ignore_limitations=True, MySQL emits EngineLimitationWarning and succeeds
+        # With ignore_limitations=True, accept_limitations=FLOAT_OPT_IN, MySQL emits EngineLimitationWarning and succeeds
         with warnings.catch_warnings(record=True) as w_rec:
             warnings.simplefilter("always", EngineLimitationWarning)
-            plan = generate_materialized_view(schema, view, dialect="mysql", ignore_limitations=True)
+            plan = generate_materialized_view(schema, view, dialect="mysql", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
             self.assertGreaterEqual(len(plan.limitations), 1)
             self.assertGreaterEqual(len(w_rec), 1)
             self.assertIn("CREATE ALGORITHM = TEMPTABLE VIEW", plan.reader_view_ddl)
@@ -4391,7 +4737,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, aval TEXT);
         CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER, bval TEXT);
         """
-        # Non-deterministic function rejection (raises EngineLimitationError by default; emits warning with ignore_limitations=True)
+        # Non-deterministic function rejection (raises EngineLimitationError by default; emits warning with ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         with self.assertRaises(EngineLimitationError):
             generate_materialized_view(schema, "CREATE VIEW v_bad AS SELECT id, RANDOM() AS r FROM a;", dialect="sqlite")
         with warnings.catch_warnings(record=True) as w_nd:
@@ -4400,7 +4746,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 schema,
                 "CREATE VIEW v_bad AS SELECT id, RANDOM() AS r FROM a;",
                 dialect="sqlite",
-                ignore_limitations=True,
+                ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
             )
             self.assertTrue(any(lim.code == "NONDETERMINISTIC_EXPR" for lim in p_nd.limitations))
             self.assertGreaterEqual(len(w_nd), 1)
@@ -4577,7 +4923,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                             "CREATE VIEW v_pulled_join AS SELECT p.name AS org_name, COUNT(c.member_id) AS m_cnt, SUM(c.dues) AS org_dues FROM parent_orgs p LEFT JOIN child_members c ON p.id = c.org_id GROUP BY p.name;",
                         ],
                         dialect=dialect,
-                        ignore_limitations=True,
+                        ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                     )
                 for p in plans:
                     for st in p.all_statements():
@@ -4604,7 +4950,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                         conn,
                         "CREATE VIEW v_pulled_bonus AS SELECT name, bonus FROM parent_orgs WHERE bonus >= 10;",
                         dialect=dialect,
-                        ignore_limitations=True,
+                        ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                     )
                 for st in p_after_alter.all_statements():
                     cur.execute(st)
@@ -4693,7 +5039,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         for d in (Dialect.POSTGRES, Dialect.MYSQL):
             for _, vddl in c2["views"]:
                 p2 = generate_materialized_view(
-                    c2["schema"], vddl, dialect=d, incremental_backfill=True, batch_size=2, ignore_limitations=True
+                    c2["schema"], vddl, dialect=d, incremental_backfill=True, batch_size=2, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
                 )
                 for pop_sql in p2.initial_populate_sqls:
                     if "OFFSET" in pop_sql.upper():
@@ -4702,7 +5048,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         # Corpus 3: MySQL empty-set bitwise identity in reader view
         c3 = corpus["corpus_03_mysql_empty_set_and_all_null_bitwise_identity"]
         p3 = generate_materialized_view(
-            c3["schema"], c3["views"][0][1], dialect=Dialect.MYSQL, ignore_limitations=True
+            c3["schema"], c3["views"][0][1], dialect=Dialect.MYSQL, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         self.assertIn("COALESCE(bx, CAST(0 AS UNSIGNED)) AS bx", p3.reader_view_ddl)
         self.assertIn("COALESCE(bo, CAST(0 AS UNSIGNED)) AS bo", p3.reader_view_ddl)
@@ -4711,13 +5057,14 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         # Corpus 4: FILTER (WHERE ...) compiles as ALGEBRAIC_DELTA
         c4 = corpus["corpus_04_filter_where_greedy_regex_algebraic_delta"]
         for d in (Dialect.SQLITE, Dialect.POSTGRES):
-            p4 = generate_materialized_view(c4["schema"], c4["views"][0][1], dialect=d)
+            p4 = generate_materialized_view(c4["schema"], c4["views"][0][1], dialect=d, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
             self.assertEqual(p4.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
 
         # Corpus 5: PostgreSQL statement-level function & trigger names strictly <= 62 chars and distinct
         c5 = corpus["corpus_05_pg_63char_identifier_truncation_collision"]
         p5 = generate_materialized_view(
-            c5["schema"], c5["views"][0][1], dialect=Dialect.POSTGRES
+            c5["schema"], c5["views"][0][1], dialect=Dialect.POSTGRES,
+            accept_limitations=FLOAT_OPT_IN,
         )
         self.assertEqual(len(set(p5.function_names)), len(p5.function_names))
         self.assertEqual(len(set(p5.trigger_names)), len(p5.trigger_names))
@@ -4729,7 +5076,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         # Corpus 6: MariaDB NOT IN (SELECT ...) lowered to NOT EXISTS (...) in MySQL trigger SQL
         c6 = corpus["corpus_06_mariadb_not_in_subquery_empty_transition_with_null_lhs"]
         p6 = generate_materialized_view(
-            c6["schema"], c6["views"][0][1], dialect=Dialect.MYSQL, ignore_limitations=True
+            c6["schema"], c6["views"][0][1], dialect=Dialect.MYSQL, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         for tr_ddl in p6.trigger_ddls:
             self.assertNotIn("NOT IN", tr_ddl.upper())
@@ -4804,7 +5151,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             known_tables={name.lower() for name in schemas},
         )
         compiler = IncrementalViewCompiler(
-            schemas, view, dialect=Dialect.MYSQL, ignore_limitations=True
+            schemas, view, dialect=Dialect.MYSQL, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         avg_item = next(
             item for item in compiler.view.select_items if item.alias == "avg_amount"
@@ -4834,7 +5181,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "CREATE VIEW v_lit500 AS SELECT tenant_id, SUM(price) AS sp FROM rev_items WHERE price > 500 GROUP BY tenant_id;",
             dialect=Dialect.POSTGRES,
             incremental_backfill=True,
-            batch_size=500,
+            batch_size=500, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         stmts_100 = p_batch.get_populate_statements(incremental_backfill=True, batch_size=100)
         joined_100 = "\n".join(stmts_100)
@@ -4875,6 +5222,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "CREATE VIEW v_my_grp AS SELECT tenant_id, category, SUM(price) AS sp FROM rev_items GROUP BY tenant_id, category;",
             dialect=Dialect.MYSQL,
             ignore_limitations=True,
+            accept_limitations=FLOAT_OPT_IN,
         )
         self.assertIn("PRIMARY KEY (tenant_id, category)", p_my_grp.backing_table_ddl)
         self.assertNotIn("__mv_pk ", p_my_grp.backing_table_ddl)
@@ -4907,22 +5255,27 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         row_mv_after = conn.execute("SELECT ba, bo, bx FROM v_bit64 WHERE tenant_id = 1;").fetchone()
         self.assertEqual(row_mv_after, (v2, v2, v2))
 
-        # 6. High-precision NUMERIC / DECIMAL accumulation for variance & stddev on Postgres & MySQL
+        # 6. Variance & stddev on Postgres & MySQL use the engine's own
+        # aggregate (recomputed after the group-row lock), never running
+        # NUMERIC/DECIMAL sum-of-squares accumulators.
         p_pg_var = generate_materialized_view(
             schema,
             "CREATE VIEW v_pg_var AS SELECT tenant_id, SUM(price) AS s, VAR_POP(price) AS vp, STDDEV_SAMP(price) AS ss FROM rev_items GROUP BY tenant_id;",
-            dialect=Dialect.POSTGRES,
+            dialect=Dialect.POSTGRES, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
-        self.assertIn("NUMERIC", p_pg_var.backing_table_ddl)
-        self.assertIn("::NUMERIC", "\n".join(p_pg_var.trigger_ddls))
+        self.assertNotIn("__mv_sum2_", p_pg_var.backing_table_ddl)
+        pg_var_triggers = "\n".join(p_pg_var.trigger_ddls)
+        self.assertIn("SELECT VAR_POP(price ORDER BY rev_items.ctid)", pg_var_triggers)
+        self.assertIn("SELECT STDDEV_SAMP(price ORDER BY rev_items.ctid)", pg_var_triggers)
 
         p_my_var = generate_materialized_view(
             schema,
             "CREATE VIEW v_my_var AS SELECT tenant_id, SUM(price) AS s, VAR_POP(price) AS vp FROM rev_items GROUP BY tenant_id;",
             dialect=Dialect.MYSQL,
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
-        self.assertIn("DECIMAL(65, 12)", p_my_var.backing_table_ddl)
+        self.assertNotIn("__mv_sum2_", p_my_var.backing_table_ddl)
+        self.assertRegex("\n".join(p_my_var.trigger_ddls), r"SELECT SUM\(price\) AS s, VAR_POP\(price\) AS vp FROM rev_items .* LOCK IN SHARE MODE")
 
         # 7. strict=True raises StrictCompilationError on fallback to Tier 2 or Tier 3
         with self.assertRaises(StrictCompilationError):
@@ -5066,12 +5419,12 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         view_sql = "CREATE VIEW v_ev_reg AS SELECT region, COUNT(*) AS c, SUM(amount) AS s FROM ev_sales GROUP BY region;"
 
         # PostgreSQL 14 vs PostgreSQL 17 on nullable GROUP BY column (`UNIQUE ... NULLS NOT DISTINCT`)
-        p_pg14 = generate_materialized_view(schema, view_sql, engine_version="postgres:14.5")
+        p_pg14 = generate_materialized_view(schema, view_sql, engine_version="postgres:14.5", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         self.assertEqual(p_pg14.engine_version.version, (14, 5, 0))
         self.assertTrue(any("CREATE INDEX __matview_idx_v_ev_reg__grp ON" in d for d in p_pg14.index_ddls))
         self.assertFalse(any("NULLS NOT DISTINCT" in d for d in p_pg14.index_ddls))
 
-        p_pg17 = generate_materialized_view(schema, view_sql, engine_version="postgres:17.1")
+        p_pg17 = generate_materialized_view(schema, view_sql, engine_version="postgres:17.1", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         self.assertEqual(p_pg17.engine_version.version, (17, 1, 0))
         self.assertTrue(
             any("CREATE UNIQUE INDEX __matview_idx_v_ev_reg__grp ON __matview_store_v_ev_reg (region) NULLS NOT DISTINCT;" in d for d in p_pg17.index_ddls)
@@ -5082,9 +5435,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         # EXECUTE FUNCTION; < 10 has no transition tables) is refused.
         for old_pg in ("postgres:9.6", "postgres:10.23"):
             with self.assertRaises(EngineLimitationError) as ctx_old_pg:
-                generate_materialized_view(schema, view_sql, engine_version=old_pg)
+                generate_materialized_view(schema, view_sql, engine_version=old_pg, accept_limitations=FLOAT_OPT_IN)
             self.assertIn("POSTGRES_VERSION_NO_STATEMENT_TRIGGERS", str(ctx_old_pg.exception))
-        p_pg11 = generate_materialized_view(schema, view_sql, engine_version="postgres:11.0")
+        p_pg11 = generate_materialized_view(schema, view_sql, engine_version="postgres:11.0", accept_limitations=FLOAT_OPT_IN)
         self.assertIn("REFERENCING NEW TABLE", "\n".join(p_pg11.trigger_ddls))
         self.assertNotIn("FOR EACH ROW", "\n".join(p_pg11.trigger_ddls))
 
@@ -5110,7 +5463,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(mgr_pg17.engine_version.version, (17, 2, 0))
         mgr_pg17.apply_schema_ddl(schema, auto_sync_views=False)
         tr_pg17.execute("INSERT INTO ev_sales VALUES (1, 'EU', 10.0), (2, NULL, 25.0);")
-        plan_reg = mgr_pg17.register_view(view_sql)
+        plan_reg = mgr_pg17.register_view(view_sql, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         self.assertEqual(plan_reg.engine_version.version, (17, 2, 0))
         self.assertTrue(any("NULLS NOT DISTINCT" in d for d in plan_reg.index_ddls))
         tr_pg17.execute("INSERT INTO ev_sales VALUES (3, NULL, 15.0);")
@@ -5118,7 +5471,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(rows_pg17, [("EU", 1, 10.0), (None, 2, 40.0)])
         tr_pg17.close()
 
-        mgr_maria = MaterializedViewManager(tr_maria11, ignore_limitations=True)
+        mgr_maria = MaterializedViewManager(tr_maria11, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         self.assertEqual(mgr_maria.dialect, Dialect.MYSQL)
         self.assertEqual(mgr_maria.subdialect, EngineSubdialect.MARIADB)
         self.assertEqual(mgr_maria.engine_version.version, (11, 4, 3))
@@ -5133,6 +5486,17 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "--schema", schema,
             "--view", view_sql,
             "--engine-version", "postgres:17.2",
+            "--ignore-limitations",
+        ])
+        # SUM over DOUBLE PRECISION: --ignore-limitations alone does not
+        # accept ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE.
+        self.assertNotEqual(rc_ev, 0)
+        rc_ev = cli_main([
+            "--schema", schema,
+            "--view", view_sql,
+            "--engine-version", "postgres:17.2",
+            "--ignore-limitations",
+            "--accept-limitation", "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
         ])
         self.assertEqual(rc_ev, 0)
         rc_maria = cli_main([
@@ -5140,6 +5504,8 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "--view", view_sql,
             "--dialect", "mariadb:11.4",
             "--ignore-limitations",
+            "--accept-limitation", "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+            "--accept-limitation", "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
         ])
         self.assertEqual(rc_maria, 0)
 
@@ -5212,7 +5578,11 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 _register_sqlite_compat_udfs(conn_q)
             else:
                 conn_q = TranspiledConnectionAdapter(d_mode)
-            mgr_q = MaterializedViewManager(conn_q, dialect=d_mode, ignore_limitations=True)
+            # AVG over DOUBLE PRECISION is order-sensitive: refused by default on
+            # PostgreSQL/MySQL, installed here under the per-code opt-in.
+            mgr_q = MaterializedViewManager(
+                conn_q, dialect=d_mode, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
+            )
             mgr_q.apply_schema_ddl(
                 '''
                 CREATE TABLE "order" (
@@ -5250,7 +5620,14 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             self.assertEqual(mv_q_rows[0][0], "A")
             self.assertEqual(mv_q_rows[0][1], 3)
             self.assertEqual(mv_q_rows[0][2], 65)
-            self.assertAlmostEqual(float(mv_q_rows[0][3]), 11.0 / 3.0, places=5)
+            if d_mode == Dialect.SQLITE:
+                live_avg = conn_q.execute(
+                    """SELECT AVG("unit price") FROM "order" WHERE "select" > 0 AND "group" = 'A';"""
+                ).fetchone()[0]
+                self.assertEqual(mv_q_rows[0][3], live_avg)
+            else:
+                # Best-effort column under the opt-in: value not compared.
+                self.assertIsInstance(mv_q_rows[0][3], float)
             if hasattr(conn_q, "close"):
                 conn_q.close()
 
@@ -5424,7 +5801,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             join_schema,
             "CREATE VIEW v_role_comp AS SELECT role, COUNT(*) AS n, SUM(comp) AS total_comp FROM (SELECT role, salary AS comp FROM emps UNION ALL SELECT role, fee AS comp FROM contractors) u GROUP BY role;",
             dialect=Dialect.MYSQL,
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         self.assertIn("PRIMARY KEY (role)", p_uall_agg_native.backing_table_ddl)
         self.assertNotIn("__mv_pk", p_uall_agg_native.backing_table_ddl)
@@ -5439,7 +5816,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             if d_mode == Dialect.SQLITE:
                 _register_sqlite_compat_udfs(conn_j)
             conn_j.commit()
-            mgr_j = MaterializedViewManager(conn_j, dialect=d_mode, ignore_limitations=True)
+            mgr_j = MaterializedViewManager(conn_j, dialect=d_mode, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
             mgr_j.apply_schema_ddl(join_schema, auto_sync_views=False)
             conn_j.execute("INSERT INTO depts VALUES (1, 'ENG', 'US'), (2, 'OPS', 'EU');")
             conn_j.execute("INSERT INTO emps VALUES (1, 1, 'SWE', 100), (2, 1, 'SWE', 150), (3, 2, 'SRE', 120);")
@@ -5633,13 +6010,24 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIsNone(_query_column_tolerances("SELECT i.* FROM items AS i"))
         count_policy = _query_column_tolerances("SELECT COUNT(*) FROM items")
         self.assertEqual(count_policy, (NumericTolerance(),))
+        # No budget for scalar arithmetic or SUM/TOTAL/AVG on any engine.
         arithmetic = _query_column_tolerances("SELECT amount * 1.25 AS scaled FROM items")
-        self.assertEqual(arithmetic, (NumericTolerance(absolute=1e-12, relative=4.5e-16, max_ulps=4),))
-        arithmetic_aggregate = _query_column_tolerances("SELECT SUM(amount * 1.25) FROM items")
-        self.assertEqual(
-            arithmetic_aggregate,
-            (_AGGREGATE_NUMERIC_TOLERANCES["SUM"],),
+        self.assertEqual(arithmetic, (NumericTolerance(),))
+        arithmetic_aggregate = _query_column_tolerances(
+            "SELECT SUM(amount * 1.25), TOTAL(amount), AVG(amount) / 3 FROM items"
         )
+        self.assertEqual(arithmetic_aggregate, (NumericTolerance(),) * 3)
+        # Window SUM/AVG have no budget either (floating-point window
+        # aggregates are refused by default on PostgreSQL/MySQL/MariaDB and
+        # excluded by name under the opt-in).
+        for native in (False, True):
+            self.assertEqual(
+                _query_column_tolerances(
+                    "SELECT id, AVG(score) OVER (PARTITION BY team ORDER BY id) AS r, SUM(score) AS s FROM nodes",
+                    native_statistics=native,
+                ),
+                (NumericTolerance(),) * 3,
+            )
 
     def test_query_tolerance_recognizes_native_variance_and_stddev_functions(self) -> None:
         for function_name, expected in (
@@ -5671,6 +6059,13 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 _AGGREGATE_NUMERIC_TOLERANCES["STDDEV_SAMP"],
             ),
         )
+        # PostgreSQL/MySQL/MariaDB evaluate VAR/STDDEV natively on both sides.
+        self.assertEqual(
+            _query_column_tolerances(
+                "SELECT COUNT(*) AS n, VAR_POP(amount) AS vp FROM orders", native_statistics=True
+            ),
+            (NumericTolerance(), NumericTolerance()),
+        )
 
     def test_20_differential_oracle_derives_tolerances_from_select_operations(self) -> None:
         policies = _query_column_tolerances(
@@ -5683,15 +6078,30 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(len(policies), 6)
         self.assertEqual(policies[0], NumericTolerance())
         self.assertEqual(policies[1], NumericTolerance())  # COUNT stays exact.
-        self.assertEqual(policies[2], _AGGREGATE_NUMERIC_TOLERANCES["SUM"])
-        self.assertEqual(policies[3], _AGGREGATE_NUMERIC_TOLERANCES["AVG"])
-        self.assertEqual(policies[4], _AGGREGATE_NUMERIC_TOLERANCES["VAR_POP"])
+        self.assertEqual(policies[2], NumericTolerance())  # SUM: exact on every engine.
+        self.assertEqual(policies[3], NumericTolerance())  # AVG: exact on every engine.
+        self.assertEqual(policies[4], _AGGREGATE_NUMERIC_TOLERANCES["VAR_POP"])  # SQLite UDF reference only.
         self.assertEqual(policies[5], NumericTolerance())  # MIN is a selection, not arithmetic.
 
         self.assertTrue(
             _rows_equal(
                 [("A", 10, 12.5, 1.25, 0.125, 2.0)],
-                [("A", 10, 12.500000000000002, 1.2500000000000002, 0.125000000000001, 2.0)],
+                [("A", 10, 12.5, 1.25, 0.125000000000001, 2.0)],
+                column_tolerances=policies,
+            )
+        )
+        # One ULP on SUM or AVG is a mismatch.
+        self.assertFalse(
+            _rows_equal(
+                [("A", 10, 12.5, 1.25, 0.125, 2.0)],
+                [("A", 10, 12.500000000000002, 1.25, 0.125, 2.0)],
+                column_tolerances=policies,
+            )
+        )
+        self.assertFalse(
+            _rows_equal(
+                [("A", 10, 12.5, 1.25, 0.125, 2.0)],
+                [("A", 10, 12.5, 1.2500000000000002, 0.125, 2.0)],
                 column_tolerances=policies,
             )
         )
@@ -5794,7 +6204,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         """
 
         mysql = generate_materialized_view(
-            schema, view, dialect="mysql", ignore_limitations=True
+            schema, view, dialect="mysql", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         self.assertIn("sum_integer DECIMAL(65, 0)", mysql.backing_table_ddl)
         self.assertIn("sum_decimal DECIMAL(65, 8)", mysql.backing_table_ddl)
@@ -5805,7 +6215,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("STDDEV_DECIMAL DOUBLE", mysql.backing_table_ddl.upper())
         self.assertIn("VARIANCE_APPROXIMATE DOUBLE", mysql.backing_table_ddl.upper())
 
-        postgres = generate_materialized_view(schema, view, dialect="postgres")
+        postgres = generate_materialized_view(
+            schema, view, dialect="postgres", accept_limitations=FLOAT_OPT_IN
+        )
         self.assertIn("sum_integer BIGINT", postgres.backing_table_ddl)
         self.assertIn("sum_decimal NUMERIC", postgres.backing_table_ddl)
         self.assertIn("avg_integer NUMERIC", postgres.backing_table_ddl)
@@ -5836,7 +6248,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         FROM avg_source;
         """
         mysql_expression = generate_materialized_view(
-            schema, expression_view, dialect="mysql", ignore_limitations=True
+            schema, expression_view, dialect="mysql", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         self.assertIn("avg_expression DECIMAL(23, 12)", mysql_expression.backing_table_ddl)
         self.assertIn("avg_coalesce DECIMAL(22, 12)", mysql_expression.backing_table_ddl)
@@ -5875,7 +6287,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         GROUP BY k;
         """
         union_mysql = generate_materialized_view(
-            union_schema, union_view, dialect="mysql", ignore_limitations=True
+            union_schema, union_view, dialect="mysql", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         self.assertIn("average DECIMAL(22, 8)", union_mysql.backing_table_ddl)
         union_mysql_triggers = "\\n".join(union_mysql.trigger_ddls).upper()
@@ -5910,7 +6322,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         FROM measurements GROUP BY grp;
         """
         single = generate_materialized_view(
-            single_schema, single_view, dialect="postgres"
+            single_schema, single_view, dialect="postgres", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         single_triggers = "\\n".join(single.trigger_ddls).upper()
         self.assertGreaterEqual(single_triggers.count("SELECT VAR_POP("), 2)
@@ -5923,15 +6335,18 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn(")::NUMERIC / (", single_triggers)
         # NUMERIC (data-dependent display scale, NaN) and approximate inputs
         # keep the native recomputation.
+        # Accumulation pinned to sequential-scan order (ORDER BY ctid).
+        # (Exact NUMERIC accumulation needs no ordering.)
         self.assertGreaterEqual(single_triggers.count("SELECT AVG(EXACT_VALUE)"), 2)
-        self.assertGreaterEqual(single_triggers.count("SELECT AVG(VALUE)"), 2)
+        self.assertGreaterEqual(single_triggers.count("SELECT AVG(VALUE ORDER BY MEASUREMENTS.CTID)"), 2)
         self.assertGreaterEqual(single_triggers.count("SELECT STDDEV_SAMP("), 2)
 
         # MySQL exact-value AVG (integer and fixed-point DECIMAL; MySQL NUMERIC
         # is DECIMAL(10,0)) is my_decimal_div(sum, count): derive it with the
         # sum normalized to the native SUM scale. DOUBLE keeps recomputation.
         mysql_single = generate_materialized_view(
-            single_schema, single_view, dialect="mysql", ignore_limitations=True
+            single_schema, single_view, dialect="mysql", ignore_limitations=True,
+            accept_limitations=FLOAT_OPT_IN,
         )
         mysql_triggers = "\\n".join(mysql_single.trigger_ddls).upper()
         self.assertEqual(mysql_triggers.count("SELECT AVG(WHOLE)"), 0)
@@ -5953,7 +6368,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         FROM bitwise_values;
         """
         mysql_bitwise = generate_materialized_view(
-            bitwise_schema, bitwise_view, dialect="mysql", ignore_limitations=True
+            bitwise_schema, bitwise_view, dialect="mysql", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         reader_sql = (mysql_bitwise.reader_view_ddl or "").lower().replace("`", "")
         self.assertIn("coalesce(bit_and_value, cast(18446744073709551615 as unsigned))", reader_sql)
@@ -5981,7 +6396,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             mariadb_variance_view,
             dialect="mysql",
             engine_version="mariadb:10.11",
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         mariadb_reader_sql = (mariadb_variance.reader_view_ddl or "").lower().replace("`", "")
         self.assertIn("round(vp_integer, 4) as vp_integer", mariadb_reader_sql)
@@ -6018,7 +6433,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             mariadb_variance_view,
             dialect="mysql",
             engine_version=detected_mariadb,
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         custom_reader_sql = (custom_mariadb.reader_view_ddl or "").lower().replace("`", "")
         self.assertIn("round(vp_integer, 6) as vp_integer", custom_reader_sql)
@@ -6031,7 +6446,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             mariadb_variance_view,
             dialect="mysql",
             engine_version="mysql:8.4",
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         mysql_reader_sql = (mysql_variance.reader_view_ddl or "").lower().replace("`", "")
         self.assertNotIn("round(vp_integer", mysql_reader_sql)
@@ -6053,9 +6468,18 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         JOIN measurements AS m ON m.category_id = c.id
         GROUP BY c.label;
         """
-        joined = generate_materialized_view(
-            join_schema, join_view, dialect="postgres"
-        )
+        # Approximate join aggregates are rejected by default (accumulation
+        # order of a join is plan-dependent); the opt-in still recomputes them.
+        with self.assertRaisesRegex(EngineLimitationError, "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"):
+            generate_materialized_view(join_schema, join_view, dialect="postgres")
+        # The global override does not accept per-code limitations; join
+        # aggregates are additionally not recomputed race-free.
+        with self.assertRaisesRegex(EngineLimitationError, "ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE"):
+            generate_materialized_view(join_schema, join_view, dialect="postgres", ignore_limitations=True)
+        with self.assertWarnsRegex(EngineLimitationWarning, "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"):
+            joined = generate_materialized_view(
+                join_schema, join_view, dialect="postgres", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
+            )
         join_triggers = "\\n".join(joined.trigger_ddls).upper()
         self.assertIn("SELECT VAR_POP(", join_triggers)
         self.assertIn("SELECT AVG(", join_triggers)
@@ -6095,7 +6519,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         # from a raw-moment fold. The chunk merge must call the native aggregate
         # for MySQL-family engines too, not only PostgreSQL.
         mysql_exact_plan = generate_materialized_view(
-            exact_schema, exact_view, dialect="mysql", ignore_limitations=True
+            exact_schema, exact_view, dialect="mysql", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         mysql_chunk_sql = "\\n".join(
             mysql_exact_plan.incremental_backfill_spec.chunk_sql_templates
@@ -6538,7 +6962,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             override_manager = MaterializedViewManager(
                 conn,
                 engine_version="sqlite:3.24.0",
-                ignore_limitations=True,
+                ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
             )
             with warnings.catch_warnings(record=True) as emitted:
                 warnings.simplefilter("always", EngineLimitationWarning)
@@ -6589,7 +7013,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     view_sql,
                     incremental_backfill=True,
                     batch_size=1,
-                    ignore_limitations=True,
+                    ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                 )
             self.assertEqual(created, {"limited_window": "created"})
             self.assertEqual(
@@ -6606,7 +7030,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     view_sql,
                     incremental_backfill=True,
                     batch_size=1,
-                    ignore_limitations=True,
+                    ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                 )
             self.assertEqual(unchanged, {"limited_window": "unchanged"})
             self.assertEqual(
