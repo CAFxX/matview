@@ -18,6 +18,7 @@ from .engines import (
     Dialect,
     EngineSubdialect,
     EngineVersion,
+    UnsupportedMaterializedViewError,
     _IDENT_TOKEN_PATTERN,
     _SIMPLE_IDENT_RE,
     _SQL_RESERVED_KEYWORDS,
@@ -1385,6 +1386,26 @@ def _parse_single_agg_expr(
         is_dist = False
         inner_args_sql = inner_args_sql[in_toks[0].end + 1 :].strip()
 
+    if fn_raw == "COUNT" or (
+        fn_raw in _FN_TO_AGG_ENUM
+        and _FN_TO_AGG_ENUM[fn_raw] not in (
+            AggFunc.GROUP_CONCAT, AggFunc.STRING_AGG, AggFunc.JSON_GROUP_ARRAY,
+            AggFunc.JSON_GROUP_OBJECT, AggFunc.ARRAY_AGG,
+        )
+    ):
+        depth = 0
+        for itk in _tokenize_sql(inner_args_sql, read=sg_d):
+            if itk.token_type == SQLGlotTokenType.L_PAREN:
+                depth += 1
+            elif itk.token_type == SQLGlotTokenType.R_PAREN:
+                depth -= 1
+            elif depth == 0 and itk.token_type == SQLGlotTokenType.ORDER_BY:
+                # PostgreSQL accepts SUM(x ORDER BY y); the maintenance SQL
+                # would carry the clause into positions where it is a syntax
+                # error (native: "syntax error at or near ORDER").
+                raise UnsupportedMaterializedViewError(
+                    f"ORDER BY inside {fn_raw}(...) is not supported in materialized views: {expr.strip()!r}"
+                )
     arg_parts = [p.strip() for p in _split_top_level(inner_args_sql, ",", dialect=dialect) if p.strip()] if inner_args_sql else []
     first_arg = arg_parts[0] if arg_parts else ""
     extra_args = ", ".join(arg_parts[1:]) if len(arg_parts) > 1 else None
