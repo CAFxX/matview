@@ -6243,9 +6243,12 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
     def test_21b_differential_oracle_compares_native_result_metadata(self) -> None:
         """The native oracle rejects metadata-only and representation-only differences.
 
-        Rows that are numerically equal must still agree on driver type code,
-        scale, precision (PostgreSQL; MySQL DECIMAL), nullability, column
-        count/name, Python value type and exact Decimal representation.
+        Rows that are numerically equal must still agree on driver type code
+        (every driver family, MySQL included), scale, precision (PostgreSQL
+        only: MySQL/MariaDB DECIMAL precision is a MYSQL_UNMODELLED_METADATA
+        gap), nullability where reported, column count/name, Python value type
+        and exact Decimal representation. A field reported on one side only
+        (None vs a value) is a difference.
         """
 
         def fake_cursor(module: str, results: Dict[str, Tuple[List[Tuple[Any, ...]], List[Tuple[Any, ...]]]]):
@@ -6296,6 +6299,12 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
 
         rejected = [
             ("type_code", "psycopg2.extensions", ([(1,)], [pg_int]), ([(1,)], [("v", 20, None, None, None, None, None)])),
+            # MySQL family: INT (LONG) vs BIGINT (LONGLONG) for equal values.
+            ("type_code", "pymysql.cursors", ([(1,)], [("v", 3, None, 11, 11, 0, True)]),
+             ([(1,)], [("v", 8, None, 20, 20, 0, True)])),
+            # A field reported on one side only: unconstrained NUMERIC vs NUMERIC(12,2).
+            ("precision", "psycopg2.extensions", ([(Decimal("1.50"),)], [("v", 1700, None, None, None, 2, None)]),
+             ([(Decimal("1.50"),)], [pg_num])),
             ("scale", "psycopg2.extensions", ([(Decimal("1.50"),)], [pg_num]),
              ([(Decimal("1.50"),)], [("v", 1700, None, None, 12, 3, None)])),
             ("precision", "psycopg2.extensions", ([(Decimal("1.50"),)], [pg_num]),
