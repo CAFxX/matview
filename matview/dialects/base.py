@@ -475,12 +475,16 @@ class DialectBaseMixin(MixinHost):
             if kind == "Cast":
                 target = node.args.get("to")
                 return self._numeric_precision_scale_from_type(target.sql()) if target is not None else None
-            if kind in ("Add", "Sub", "Mul", "Div"):
+            if kind in ("Add", "Sub", "Mul", "Div", "Mod"):
                 left, right = infer(node.this), infer(node.expression)
                 if left is None or right is None:
                     return None
                 p1, s1 = left
                 p2, s2 = right
+                if kind == "Mod":
+                    # The remainder is bounded by the operands and keeps the
+                    # larger scale (integer % integer is an integer).
+                    return max(p1, p2), max(s1, s2)
                 if kind in ("Add", "Sub"):
                     scale = max(s1, s2)
                     precision = max(p1 - s1, p2 - s2) + scale + 1
@@ -985,6 +989,40 @@ class DialectBaseMixin(MixinHost):
                 if merged == "REAL":
                     return "DOUBLE PRECISION"
                 return merged
+            if kind == "Window" and self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+                # Window SUM/AVG/COUNT keep the engine's native result type
+                # (stored as DOUBLE they lost the exact NUMERIC/DECIMAL value:
+                # PostgreSQL AVG(int) 53.3333333333333333 vs 53.333333333333336).
+                fn = node.this
+                if fn is None:
+                    return None
+                fn_kind = fn.__class__.__name__
+                if fn_kind == "Count":
+                    return "BIGINT"
+                if fn_kind in ("Sum", "Avg"):
+                    arg = fn.this
+                    if isinstance(arg, sqlglot_exp.Distinct):
+                        arg = arg.expressions[0] if arg.expressions else None
+                    arg_t = infer(arg) if arg is not None else None
+                    if arg_t in ("REAL", "DOUBLE PRECISION"):
+                        if self.dialect == Dialect.POSTGRES and fn_kind == "Sum":
+                            return arg_t
+                        return "DOUBLE PRECISION"
+                    if arg_t in ("SMALLINT", "INTEGER", "BIGINT", "NUMERIC"):
+                        if self.dialect == Dialect.MYSQL and arg is not None:
+                            ps = self._exact_numeric_precision_scale(
+                                arg.sql(dialect=_sqlglot_dialect(self.dialect))
+                            )
+                            if ps is None:
+                                return None
+                            scale = int(ps[1])
+                            if fn_kind == "Avg":
+                                scale += self.engine_version.mariadb_div_precision_increment
+                            return f"MYSQL_WINDOW_DECIMAL:{min(30, scale)}"
+                        if fn_kind == "Sum" and arg_t in ("SMALLINT", "INTEGER"):
+                            return "BIGINT"
+                        return "NUMERIC"
+                    return None
             if isinstance(node, sqlglot_exp.Func):
                 fn_name = (node.sql_name() or kind).upper()
                 if fn_name in str_fn_names:
@@ -998,6 +1036,11 @@ class DialectBaseMixin(MixinHost):
         inferred = infer(root)
         if inferred is None or inferred == "UNKNOWN":
             return None
+        if inferred.startswith("MYSQL_WINDOW_DECIMAL:"):
+            # MySQL/MariaDB window SUM/AVG of exact arguments return DECIMAL
+            # with the argument's scale (AVG: plus div_precision_increment);
+            # 65 digits hold every such value.
+            return f"DECIMAL(65, {inferred.split(':', 1)[1]})"
         if inferred == "NUMERIC":
             if self.dialect == Dialect.POSTGRES:
                 return "NUMERIC"
