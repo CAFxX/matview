@@ -1261,7 +1261,23 @@ class DialectBaseMixin(MixinHost):
         agg_item = _parse_single_agg_expr(inner_sql, "__w", dialect=self.dialect)
         if agg_item is None or agg_item.agg_func is None:
             return None
-        return self._infer_expr_storage_type(agg_item)
+        result = self._infer_expr_storage_type(agg_item)
+        if (
+            self.dialect == Dialect.MYSQL
+            and self.subdialect != EngineSubdialect.MARIADB
+            and agg_item.agg_func in (AggFunc.MIN, AggFunc.MAX)
+        ):
+            # MySQL widens window MIN/MAX of integers (checked natively on 8.4:
+            # TINYINT/SMALLINT/MEDIUMINT -> INT, INT -> BIGINT, INT UNSIGNED ->
+            # BIGINT UNSIGNED); MariaDB keeps the argument type.
+            u = re.sub(r"\s*\(\d+\)", "", result.strip().upper())
+            if u in ("TINYINT", "SMALLINT", "MEDIUMINT"):
+                return "INT"
+            if u in ("INT", "INTEGER"):
+                return "BIGINT"
+            if u in ("INT UNSIGNED", "INTEGER UNSIGNED"):
+                return "BIGINT UNSIGNED"
+        return result
 
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
         if not item.is_aggregate:
