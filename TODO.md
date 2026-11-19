@@ -487,6 +487,8 @@ The existing differential-testing harness is useful, but its current headline co
   - MySQL `COALESCE(MIN(smallint), 0)` returns a Decimal where the live view returns an int.
   - A single-table view with a table alias (`SELECT t.g, SUM(t.x) FROM tt t GROUP BY t.g`) fails to register (1054 on MySQL/MariaDB; the populate/recompute SQL drops the alias, so PostgreSQL is affected the same way): loud, not silent.
   - PostgreSQL `pg_catalog.variance(x)` / `pg_catalog.var_pop(x)` fail to register ("missing FROM-clause entry for table pg_catalog"): loud.
+  - PostgreSQL `COALESCE(name_col, char_col)` is natively of type `name`; the materialized column is text.
+  - MySQL/MariaDB grouped `MIN`/`MAX` over a `BIT(n)` column fails to register ("Data too long for column"): loud.
   - PostgreSQL self-join VAR/STDDEV over DOUBLE can differ by 1 ULP after DML (row-order-dependent accumulation in the join recompute); part of "Make Floating-Point Aggregates Exactly Equal".
 
 - [ ] **Model MySQL/MariaDB Result Nullability, DECIMAL Precision and String Length**:

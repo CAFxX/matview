@@ -331,5 +331,115 @@ class NativeResultTypeTests(unittest.TestCase):
                 self.assertEqual(failures, [], "\n".join(failures))
 
 
+_INT_FAMILY = [
+    "TINYINT", "TINYINT UNSIGNED", "SMALLINT", "SMALLINT UNSIGNED", "MEDIUMINT", "MEDIUMINT UNSIGNED",
+    "INT", "INT UNSIGNED", "BIGINT", "BIGINT UNSIGNED", "YEAR", "BIT(8)", "BIT(16)", "BOOL", "TINYINT(1)",
+]
+
+
+class NativeMySQLIntegerMinMaxTests(unittest.TestCase):
+    """Window / CTE / grouped MIN and MAX over every MySQL integer-like type.
+
+    MySQL widens these results (and MariaDB does not); the materialized view
+    must return the type readers of the live view receive.
+    """
+
+    def test_integer_minmax_types_match_live_views(self) -> None:
+        engines = [(e, d) for e, d in _native_engines() if e == Dialect.MYSQL]
+        if not engines:
+            self.skipTest("set MYSQL_DSN for the MySQL integer MIN/MAX matrix")
+        for engine, dsn in engines:
+            failures = self._run(engine, dsn)
+            self.assertEqual(failures, [], "\n".join(failures))
+
+    def _run(self, engine: Dialect, dsn: str) -> List[str]:
+        conn = _connect(engine, dsn)
+        cur = conn.cursor()
+        cur.execute("SELECT VERSION()")
+        version = str(cur.fetchone()[0])
+        is_mariadb = "mariadb" in version.lower()
+        conn.commit()
+        tag = uuid.uuid4().hex[:8]
+        t = f"im_{tag}"
+        cols = ", ".join(f"c{i} {ty}" for i, ty in enumerate(_INT_FAMILY))
+
+        def value(ty: str, n: int) -> str:
+            if ty == "YEAR":
+                return str(2000 + n)
+            if ty.startswith("BIT"):
+                return f"b'{n:b}'"
+            if ty in ("BOOL", "TINYINT(1)"):
+                return str(n % 2)
+            return str(n)
+
+        def row(rid: int, g: int, n: int) -> str:
+            return f"({rid}, {g}, " + ", ".join(value(ty, n) for ty in _INT_FAMILY) + ")"
+
+        failures: List[str] = []
+        try:
+            cur.execute(f"CREATE TABLE {t} (id INT PRIMARY KEY, g INT NOT NULL, {cols}) ENGINE=InnoDB")
+            cur.execute(f"INSERT INTO {t} VALUES " + ", ".join(row(i, i % 2, i * 3 % 7 + 1) for i in range(1, 7)))
+            conn.commit()
+            manager = MaterializedViewManager(conn, dialect=engine)
+            pairs = []
+            for i, ty in enumerate(_INT_FAMILY):
+                for kind, select in (
+                    ("winmin", f"SELECT id, MIN(c{i}) OVER (PARTITION BY g) AS r FROM {t}"),
+                    ("winmax", f"SELECT id, MAX(c{i}) OVER (PARTITION BY g) AS r FROM {t}"),
+                    ("ctemax", f"WITH a AS (SELECT g, c{i} FROM {t}) SELECT g, MAX(c{i}) AS r FROM a GROUP BY g"),
+                    ("grpmin", f"SELECT g, MIN(c{i}) AS r FROM {t} GROUP BY g"),
+                ):
+                    if kind == "grpmin" and ty.startswith("BIT"):
+                        # Pre-existing, loud: grouped MIN(BIT) fails to register
+                        # ("Data too long"); recorded in TODO.md.
+                        continue
+                    name = f"{kind}_{i}"
+                    mv, live = f"mv_{name}_{tag}", f"lv_{name}_{tag}"
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        manager.register_view(f"CREATE VIEW {mv} AS {select};", ignore_limitations=True)
+                    conn.commit()
+                    cur.execute(f"CREATE VIEW {live} AS {select}")
+                    conn.commit()
+                    pairs.append((f"{ty} {kind}", mv, live))
+
+            def check(step: str) -> None:
+                for label, mv, live in pairs:
+                    cur.execute(f"SELECT * FROM {mv}")
+                    a = sorted((tuple(_exact(x) for x in r) for r in cur.fetchall()), key=repr)
+                    da = _description(cur)
+                    cur.execute(f"SELECT * FROM {live}")
+                    b = sorted((tuple(_exact(x) for x in r) for r in cur.fetchall()), key=repr)
+                    db = _description(cur)
+                    conn.commit()
+                    if a != b:
+                        failures.append(f"{version} {label} {step}: rows {a[:3]} != {b[:3]}")
+                    meta = _metadata_mismatches(engine, da, db)
+                    if meta:
+                        failures.append(f"{version} {label} {step}: {meta}")
+
+            check("initial")
+            for step, stmt in (
+                ("insert", f"INSERT INTO {t} VALUES " + row(20, 0, 6) + ", " + row(21, 1, 0)),
+                ("update", f"UPDATE {t} SET g = 1 - g WHERE id = 2"),
+                ("delete", f"DELETE FROM {t} WHERE id IN (1, 20)"),
+            ):
+                cur.execute(stmt)
+                conn.commit()
+                check(step)
+        finally:
+            conn.rollback()
+            cur.execute(
+                "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE %s", (f"%{tag}%",),
+            )
+            for name, kind in sorted(cur.fetchall(), key=lambda o: o[1] != "VIEW"):
+                cur.execute(f"DROP {'VIEW' if kind == 'VIEW' else 'TABLE'} IF EXISTS `{name}`")
+            conn.commit()
+            conn.close()
+        del is_mariadb
+        return failures
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

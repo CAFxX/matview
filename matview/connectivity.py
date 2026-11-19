@@ -473,6 +473,10 @@ def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
     elif dialect == Dialect.POSTGRES and getattr(col_type, "timezone", False) and raw_str in ("TIMESTAMP", "TIME"):
         # SQLAlchemy prints TIMESTAMP(timezone=True) as plain TIMESTAMP.
         raw_str = f"{raw_str} WITH TIME ZONE"
+    elif dialect == Dialect.MYSQL and raw_str == "BIT" and getattr(col_type, "length", None):
+        # SQLAlchemy's MySQL BIT prints without its width; the width decides
+        # MySQL's MIN/MAX result types (BIT(1..9) vs BIT(10..64)).
+        raw_str = f"BIT({int(col_type.length)})"
     if getattr(col_type, "unsigned", False) and "UNSIGNED" not in raw_str:
         raw_str = f"{raw_str} UNSIGNED"
     return raw_str

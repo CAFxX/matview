@@ -1263,20 +1263,13 @@ class DialectBaseMixin(MixinHost):
             return None
         result = self._infer_expr_storage_type(agg_item)
         if (
-            self.dialect == Dialect.MYSQL
-            and self.subdialect != EngineSubdialect.MARIADB
-            and agg_item.agg_func in (AggFunc.MIN, AggFunc.MAX)
+            agg_item.agg_func in (AggFunc.MIN, AggFunc.MAX)
+            and not (self.raw_view.has_cte or self.raw_view.has_subquery_in_from)
         ):
-            # MySQL widens window MIN/MAX of integers (checked natively on 8.4:
-            # TINYINT/SMALLINT/MEDIUMINT -> INT, INT -> BIGINT, INT UNSIGNED ->
-            # BIGINT UNSIGNED); MariaDB keeps the argument type.
-            u = re.sub(r"\s*\(\d+\)", "", result.strip().upper())
-            if u in ("TINYINT", "SMALLINT", "MEDIUMINT"):
-                return "INT"
-            if u in ("INT", "INTEGER"):
-                return "BIGINT"
-            if u in ("INT UNSIGNED", "INTEGER UNSIGNED"):
-                return "BIGINT UNSIGNED"
+            # Window MIN/MAX: MySQL widens integer types (see
+            # _mysql_widened_minmax_type). Through a CTE/derived table the
+            # MIN/MAX type is already BIGINT (_mysql_derived_minmax_type).
+            return self._mysql_widened_minmax_type(result)
         return result
 
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
@@ -1480,6 +1473,53 @@ class DialectBaseMixin(MixinHost):
             f"AND CAST({e} AS INTEGER) = {e} THEN CAST({e} AS INTEGER) ELSE {e} END)"
         )
 
+    def _mysql_widened_minmax_type(self, arg_type: str) -> str:
+        """MySQL's window MIN/MAX result type.
+
+        Measured natively on MySQL 8.4 and 9.7 (wire type and catalog):
+        TINYINT/SMALLINT/MEDIUMINT (incl. BOOL, TINYINT(1)) -> INT, INT ->
+        BIGINT, each keeping UNSIGNED; YEAR -> INT UNSIGNED; BIGINT unchanged;
+        BIT(1..9) -> INT UNSIGNED and BIT(10..64) -> BIGINT UNSIGNED on 8.4,
+        while 9.x keeps BIT. MariaDB and other
+        dialects keep the argument type.
+        """
+        if self.dialect != Dialect.MYSQL or self.subdialect == EngineSubdialect.MARIADB:
+            return arg_type
+        u = re.sub(r"\s+", " ", arg_type.strip().upper())
+        unsigned = " UNSIGNED" if "UNSIGNED" in u else ""
+        base = re.sub(r"\s*\(\d+\)", "", u).replace(" UNSIGNED", "").replace(" ZEROFILL", "").strip()
+        if base in ("TINYINT", "SMALLINT", "MEDIUMINT", "BOOL", "BOOLEAN"):
+            return "INT" + unsigned
+        if base in ("INT", "INTEGER"):
+            return "BIGINT" + unsigned
+        if base == "YEAR":
+            return "INT UNSIGNED"
+        bit = re.match(r"^BIT(?:\s*\((\d+)\))?", u)
+        if bit:
+            if self.engine_version.version >= (9, 0, 0):
+                # MySQL 9.7 keeps BIT for window MIN/MAX (measured on 9.7.4;
+                # 8.4.13 widens it to an integer).
+                return arg_type
+            width = int(bit.group(1) or 1)
+            return "INT UNSIGNED" if width <= 9 else "BIGINT UNSIGNED"
+        return arg_type
+
+    def _mysql_derived_minmax_type(self, arg_type: str) -> str:
+        """MySQL's MIN/MAX of an integer-like column read through a CTE or
+        derived table: always sent as BIGINT (LONGLONG) on MySQL 8.4/9.7,
+        whatever the argument's integer type (TINYINT .. BIGINT, UNSIGNED,
+        YEAR, BIT, BOOL; measured natively), although the catalog keeps the
+        argument type. Unsigned and BIT values keep an unsigned column."""
+        if self.dialect != Dialect.MYSQL or self.subdialect == EngineSubdialect.MARIADB:
+            return arg_type
+        u = re.sub(r"\s+", " ", arg_type.strip().upper())
+        base = re.sub(r"\s*\(\d+\)", "", u).replace(" UNSIGNED", "").replace(" ZEROFILL", "").strip()
+        if base in ("TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "BOOL", "BOOLEAN", "YEAR"):
+            return "BIGINT UNSIGNED" if "UNSIGNED" in u else "BIGINT"
+        if base.startswith("BIT"):
+            return "BIGINT UNSIGNED"
+        return arg_type
+
     def _minmax_result_type(self, arg_type: str) -> str:
         """MIN/MAX result type for an argument type.
 
@@ -1489,16 +1529,8 @@ class DialectBaseMixin(MixinHost):
         text, char(5) -> bpchar, timestamp(0) -> timestamp. MySQL/MariaDB and
         SQLite keep the argument type.
         """
-        if (
-            self.dialect == Dialect.MYSQL
-            and self.subdialect != EngineSubdialect.MARIADB
-            and (self.raw_view.has_cte or self.raw_view.has_subquery_in_from)
-            and re.match(r"^\s*(TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER)\b", arg_type, re.I)
-            and "UNSIGNED" not in arg_type.upper()
-        ):
-            # MySQL widens MIN/MAX of a signed integer column read through a
-            # CTE or derived table to BIGINT (checked natively).
-            return "BIGINT"
+        if self.raw_view.has_cte or self.raw_view.has_subquery_in_from:
+            arg_type = self._mysql_derived_minmax_type(arg_type)
         if self.dialect != Dialect.POSTGRES:
             return arg_type
         u = re.sub(r"\s+", " ", arg_type.strip().upper())
