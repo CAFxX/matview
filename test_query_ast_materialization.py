@@ -102,9 +102,12 @@ def _assert_rows_match(
     expected: Sequence[Sequence[Any]],
     select_sql: str,
     context: str = "",
+    *,
+    native_statistics: bool = False,
 ) -> None:
-    """Compare materialized view rows against live query rows using AST-derived numeric tolerances."""
-    column_policies = _query_column_tolerances(select_sql)
+    """Compare materialized view rows against live query rows exactly (the
+    only inferred budget is VAR/STDDEV on SQLite, see test_matview_sync)."""
+    column_policies = _query_column_tolerances(select_sql, native_statistics=native_statistics)
     if not _rows_equal(actual, expected, column_tolerances=column_policies):
         raise AssertionError(
             f"[{context}] Materialized view rows do not match live query!\n"
@@ -359,6 +362,7 @@ class QueryASTMaterializedViewTests(unittest.TestCase):
                                 expected,
                                 generated.sql,
                                 context=f"{dialect.value}:{schema_seed}:{query_index}:{stage}",
+                                native_statistics=dialect in (Dialect.POSTGRES, Dialect.MYSQL),
                             )
 
                         assert_matches("initial population")
@@ -522,11 +526,13 @@ class QueryASTMaterializedViewTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _assert_rows_match([(1, 10)], [(1, 11)], "SELECT id, qty FROM t")
 
-        # 5. Row matching oracle: tolerant floating aggregates
-        _assert_rows_match(
-            [(1, 10.000000000001)], [(1, 10.0)],
-            "SELECT id, AVG(amount) FROM t GROUP BY id",
-        )
+        # 5. Row matching oracle: floating aggregates are exact (no budget)
+        _assert_rows_match([(1, 10.0)], [(1, 10.0)], "SELECT id, AVG(amount) FROM t GROUP BY id")
+        with self.assertRaises(AssertionError):
+            _assert_rows_match(
+                [(1, 10.000000000001)], [(1, 10.0)],
+                "SELECT id, AVG(amount) FROM t GROUP BY id",
+            )
 
     def test_deterministic_schema_introspection_across_dialects(self) -> None:
         """Verify SchemaAwareSelectFuzzer introspection and AST generation across simulated schemas."""
