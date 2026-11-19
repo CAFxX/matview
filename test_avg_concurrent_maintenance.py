@@ -42,6 +42,7 @@ from matview_sync import (
     generate_materialized_view,
     parse_table_schema,
 )
+from test_matview_sync import FLOAT_OPT_IN, pin_native_plan
 
 LOCK_WAIT_TIMEOUT_S = 20.0
 # Once one lock-wait probe has timed out in this process, later probes wait at
@@ -75,6 +76,7 @@ def _plan_statements(dialect: Dialect, version: str, amt_type: str) -> Tuple[str
             dialect=dialect,
             engine_version=version,
             ignore_limitations=True,
+            accept_limitations=FLOAT_OPT_IN,
             incremental_backfill=True,
         )
     stmts = list(plan.trigger_ddls)
@@ -136,8 +138,9 @@ class AvgMaintenanceShapeTests(unittest.TestCase):
                         self.assertIn(backing, expr)
 
     def test_inexact_avg_types_keep_native_recompute(self) -> None:
-        # Documented exclusion: these keep native recomputation (exact scale /
-        # approximate accumulation order) and are not covered by derivation.
+        # These keep native recomputation (exact scale / approximate
+        # accumulation order), as a separate statement after the row lock
+        # (see test_pgmy_exact_float_aggregates.py).
         for dialect, version, amt_type in self.RECOMPUTED:
             with self.subTest(dialect=dialect.value, type=amt_type):
                 _, stmts = _plan_statements(dialect, version, amt_type)
@@ -483,6 +486,7 @@ class NativeAvgInterleavingTests(unittest.TestCase):
                 f"CREATE VIEW v_{table} AS SELECT grp, COUNT(*) AS c, SUM(amt) AS s, "
                 f"COUNT(amt) AS n, AVG(amt) AS a FROM {table} GROUP BY grp;",
                 ignore_limitations=True,
+                accept_limitations=FLOAT_OPT_IN,
             )
         conn.commit()
         return conn, manager, plan, schema, table
@@ -492,10 +496,9 @@ class NativeAvgInterleavingTests(unittest.TestCase):
         conn.commit()
         cur.execute(f"SELECT grp, c, s, n, a FROM {plan.view_name} ORDER BY grp")
         actual = [tuple(_exact(v) for v in row) for row in cur.fetchall()]
-        cur.execute(
-            f"SELECT grp, COUNT(*), SUM(amt), COUNT(amt), AVG(amt) FROM {table} GROUP BY grp ORDER BY grp"
-        )
-        expected = [tuple(_exact(v) for v in row) for row in cur.fetchall()]
+        pin_native_plan(cur, engine)
+        cur.execute(f"SELECT grp, COUNT(*), SUM(amt), COUNT(amt), AVG(amt) FROM {table} GROUP BY grp")
+        expected = sorted((tuple(_exact(v) for v in row) for row in cur.fetchall()), key=lambda r: r[0])
         conn.commit()
         self.assertEqual(actual, expected, f"{engine.value} {label}: materialized view != native view")
 
@@ -619,6 +622,7 @@ class NativeAvgInterleavingTests(unittest.TestCase):
                     f"COUNT(amt) AS n, AVG(amt) AS a FROM {table} GROUP BY grp;",
                     populate=False,
                     ignore_limitations=True,
+                    accept_limitations=FLOAT_OPT_IN,
                 )
             interleaved = threading.Event()
             helper_errors: List[BaseException] = []
@@ -723,6 +727,7 @@ class NativeAvgExactnessTests(unittest.TestCase):
                     f"CREATE VIEW v_{table} AS SELECT grp, COUNT(*) AS c, COUNT(amt) AS n, AVG(amt) AS a "
                     f"FROM {table} GROUP BY grp;",
                     ignore_limitations=True,
+                    accept_limitations=FLOAT_OPT_IN,
                 )
             conn.commit()
             vals = self._values(amt_type)
@@ -732,8 +737,9 @@ class NativeAvgExactnessTests(unittest.TestCase):
                 conn.commit()
                 cur.execute(f"SELECT grp, c, n, a FROM {plan.view_name} ORDER BY grp")
                 actual = [tuple(_exact(v) for v in r) for r in cur.fetchall()]
-                cur.execute(f"SELECT grp, COUNT(*), COUNT(amt), AVG(amt) FROM {table} GROUP BY grp ORDER BY grp")
-                expected = [tuple(_exact(v) for v in r) for r in cur.fetchall()]
+                pin_native_plan(cur, engine)
+                cur.execute(f"SELECT grp, COUNT(*), COUNT(amt), AVG(amt) FROM {table} GROUP BY grp")
+                expected = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=lambda r: r[0])
                 conn.commit()
                 self.assertEqual(actual, expected, f"{engine.value} {amt_type} {label}")
 

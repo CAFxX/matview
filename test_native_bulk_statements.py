@@ -72,6 +72,8 @@ from urllib.parse import urlparse
 
 import pytest
 
+from test_matview_sync import FLOAT_OPT_IN
+
 from matview import (
     Dialect,
     EngineLimitationError,
@@ -380,16 +382,27 @@ class Env:
             "(" + ", ".join(_sql_lit(x) for x in r) + ")" for r in rows))
         self.conn.commit()
 
-    def register(self, vd: ViewDef, ignore_limitations: Optional[bool] = None) -> None:
+    def register(
+        self, vd: ViewDef, ignore_limitations: Optional[bool] = None,
+        accept_limitations: Optional[Sequence[str]] = None,
+    ) -> None:
         # MySQL/MariaDB registration requires acknowledging the documented
         # MYSQL_NO_TRUNCATE_TRIGGER limitation; that is asserted, not silenced.
+        # Floating-point order-sensitive aggregates need an explicit per-code
+        # acceptance (accept_limitations); those codes are asserted too.
         ignore = (self.family == "mysql") if ignore_limitations is None else ignore_limitations
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            plan = self.manager.register_view(f"CREATE VIEW {vd.name} AS {vd.select};", ignore_limitations=ignore)
+            plan = self.manager.register_view(
+                f"CREATE VIEW {vd.name} AS {vd.select};", ignore_limitations=ignore,
+                accept_limitations=accept_limitations,
+            )
         self.conn.commit()
         codes = sorted({lim.code for lim in plan.limitations})
         self.limitation_codes[vd.name] = codes
+        if accept_limitations:
+            assert set(codes) <= {"MYSQL_NO_TRUNCATE_TRIGGER", *accept_limitations}, (vd.name, codes)
+            codes = [c for c in codes if c not in accept_limitations]
         if self.family == "mysql" and ignore_limitations is None:
             assert codes == ["MYSQL_NO_TRUNCATE_TRIGGER"], (vd.name, codes)
             assert any(
@@ -1023,7 +1036,9 @@ def test_avg_new_group_result_type_and_scale(make_env, target: Target, col: str,
         vd = ViewDef("av", f"SELECT d.name, AVG(a.{col}) AS a, COUNT(*) AS c FROM a JOIN d ON a.g = d.g "
                            "GROUP BY d.name", join=True)
     env.views = [vd]
-    env.register(vd)
+    # AVG over REAL/FLOAT is refused by default (order-sensitive); this test
+    # uses exactly representable values and opts in per code.
+    env.register(vd, accept_limitations=FLOAT_OPT_IN if col in ("r", "f") else None)
     env.check("registration")
     for label, sql in [
         ("INSERT creating a group", f"INSERT INTO a (id, g, {col}) VALUES (1, 1, 3)"),
@@ -1092,12 +1107,12 @@ def test_min_max_of_integer_expression_result_type(make_env, request, target: Ta
         ViewDef("ik_a", f"SELECT s, {agg}({e}) AS a FROM ik GROUP BY s")))
 
 
-_E4 = ("SUM of an integer expression (not a bare column) is stored with a fallback type: PostgreSQL "
-       "NUMERIC/DOUBLE PRECISION instead of BIGINT/NUMERIC, MySQL/MariaDB DOUBLE instead of DECIMAL for "
-       "%/MOD/DIV. TODO.md 'Store SUM of Integer Expressions With the Native Result Type'")
+_E4 = ("SUM of an integer expression (not a bare column) is stored with a fallback type on PostgreSQL "
+       "(NUMERIC/DOUBLE PRECISION instead of BIGINT/NUMERIC; MySQL/MariaDB are exact since `%`/MOD keep "
+       "their operands' exact type). TODO.md 'Store SUM of Integer Expressions With the Native Result Type'")
 
 
-@pytest.mark.parametrize("target", _params(xfail={"pg": known_defect(_E4), "mysql": known_defect(_E4)}))
+@pytest.mark.parametrize("target", _params(xfail={"pg": known_defect(_E4)}))
 def test_sum_of_integer_expression_result_type(make_env, request, target: Target) -> None:
     _check_integer_expression_view(make_env, request, target, "i % 3", lambda e: (
         ViewDef("ik_s", f"SELECT s, SUM({e}) AS a FROM ik GROUP BY s")))

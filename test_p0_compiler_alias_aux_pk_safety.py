@@ -8,6 +8,7 @@ import sqlite3
 import unittest
 from typing import List
 
+from test_matview_sync import FLOAT_OPT_IN
 from matview_sync import (
     Dialect,
     MaterializedViewManager,
@@ -77,7 +78,7 @@ class TestCompilerAliasAuxPkSafety(unittest.TestCase):
         view_sql = f"CREATE VIEW mv_kw AS {live_sql};"
         for dialect in (Dialect.POSTGRES, Dialect.MYSQL):
             d_plan = generate_materialized_view(
-                schema_sql, view_sql, dialect=dialect, ignore_limitations=(dialect == Dialect.MYSQL)
+                schema_sql, view_sql, dialect=dialect, ignore_limitations=(dialect == Dialect.MYSQL), accept_limitations=FLOAT_OPT_IN
             )
             for stmt in [
                 *d_plan.initial_populate_sql,
@@ -154,7 +155,7 @@ class TestCompilerAliasAuxPkSafety(unittest.TestCase):
             (Dialect.MYSQL, "BIGINT", "DOUBLE"),
         ):
             plan = generate_materialized_view(
-                schema_sql, view_sql, dialect=dialect, ignore_limitations=(dialect == Dialect.MYSQL)
+                schema_sql, view_sql, dialect=dialect, ignore_limitations=(dialect == Dialect.MYSQL), accept_limitations=FLOAT_OPT_IN
             )
             aux_ddls = [d for d in plan.auxiliary_table_ddls if "dist_" in d]
             self.assertEqual(len(aux_ddls), 2, f"expected 2 distinct aux tables: {plan.auxiliary_table_ddls}")

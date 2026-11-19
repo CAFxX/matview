@@ -13,6 +13,7 @@ import unittest
 from typing import Dict
 from urllib.parse import urlparse
 
+from test_matview_sync import FLOAT_OPT_IN, pin_native_plan
 from matview_sync import (
     Dialect,
     EngineVersion,
@@ -33,8 +34,8 @@ class TestPostgresVarianceNullifGuards(unittest.TestCase):
         schema_sql = "CREATE TABLE metrics (id INT PRIMARY KEY, grp INT, val DOUBLE PRECISION);"
         schemas = parse_table_schema(schema_sql)
         view_sql = "CREATE VIEW mv_var AS SELECT grp, VAR_SAMP(val) AS metric_val FROM metrics GROUP BY grp;"
-        plan = generate_materialized_view(schemas, view_sql, dialect=Dialect.POSTGRES)
-        compiler = IncrementalViewCompiler(schemas, plan.view_spec, dialect=Dialect.POSTGRES)
+        plan = generate_materialized_view(schemas, view_sql, dialect=Dialect.POSTGRES, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
+        compiler = IncrementalViewCompiler(schemas, plan.view_spec, dialect=Dialect.POSTGRES, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
 
         # 1. PostgreSQL sample variance & stddev
         pg_var_samp = compiler._variance_formula_sql("new_cnt", "new_sum", "new_sum2", is_sample=True, is_stddev=False)
@@ -51,7 +52,7 @@ class TestPostgresVarianceNullifGuards(unittest.TestCase):
         self.assertIn("NULLIF(new_cnt, 0)", pg_var_pop)
 
         # 3. MySQL safe guards
-        compiler_mysql = IncrementalViewCompiler(schemas, plan.view_spec, dialect=Dialect.MYSQL, ignore_limitations=True)
+        compiler_mysql = IncrementalViewCompiler(schemas, plan.view_spec, dialect=Dialect.MYSQL, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         my_var = compiler_mysql._variance_formula_sql("c", "s", "s2", is_sample=True, is_stddev=False)
         self.assertIn("NULLIF(c, 0)", my_var)
         self.assertIn("NULLIF((c - 1), 0)", my_var)
@@ -91,9 +92,9 @@ class TestPostgresVarianceNullifGuards(unittest.TestCase):
         self.assertIsNotNone(row)
         cnt, total, v_pop, v_samp, s_pop, s_samp = row
         self.assertEqual(cnt, 1)
-        self.assertAlmostEqual(total, 42.0)
-        self.assertAlmostEqual(v_pop, 0.0)
-        self.assertAlmostEqual(s_pop, 0.0)
+        self.assertEqual(total, 42.0)
+        self.assertEqual(v_pop, 0.0)
+        self.assertEqual(s_pop, 0.0)
         self.assertIsNone(v_samp, "VAR_SAMP with N=1 must be NULL, not division by zero")
         self.assertIsNone(s_samp, "STDDEV_SAMP with N=1 must be NULL, not division by zero")
 
@@ -102,23 +103,23 @@ class TestPostgresVarianceNullifGuards(unittest.TestCase):
         row = conn.execute("SELECT cnt, total, v_pop, v_samp, s_pop, s_samp FROM mv_stats WHERE grp = 100;").fetchone()
         cnt, total, v_pop, v_samp, s_pop, s_samp = row
         self.assertEqual(cnt, 2)
-        self.assertAlmostEqual(total, 90.0)
+        self.assertEqual(total, 90.0)
         # vals: 42, 48. mean = 45. diffs: -3, +3. sq diffs: 9, 9.
         # sum sq diffs = 18.
         # pop var = 18 / 2 = 9.0, pop stddev = 3.0
         # samp var = 18 / 1 = 18.0, samp stddev = sqrt(18) = 4.24264...
-        self.assertAlmostEqual(v_pop, 9.0)
-        self.assertAlmostEqual(s_pop, 3.0)
-        self.assertAlmostEqual(v_samp, 18.0)
-        self.assertAlmostEqual(s_samp, math.sqrt(18.0))
+        self.assertEqual(v_pop, 9.0)
+        self.assertEqual(s_pop, 3.0)
+        self.assertEqual(v_samp, 18.0)
+        self.assertEqual(s_samp, math.sqrt(18.0))
 
         # 4. Delete 1 row: back to N = 1
         conn.execute("DELETE FROM sample_data WHERE id = 2;")
         row = conn.execute("SELECT cnt, total, v_pop, v_samp, s_pop, s_samp FROM mv_stats WHERE grp = 100;").fetchone()
         cnt, total, v_pop, v_samp, s_pop, s_samp = row
         self.assertEqual(cnt, 1)
-        self.assertAlmostEqual(total, 42.0)
-        self.assertAlmostEqual(v_pop, 0.0)
+        self.assertEqual(total, 42.0)
+        self.assertEqual(v_pop, 0.0)
         self.assertIsNone(v_samp)
         self.assertIsNone(s_samp)
 
@@ -152,7 +153,7 @@ class TestMySQLRowAliasUpsertCodegen(unittest.TestCase):
                 view_sql,
                 dialect=Dialect.MYSQL,
                 engine_version=ver_str,
-                ignore_limitations=True,
+                ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
             )
             trigger_sql = "\n".join(plan.trigger_ddls)
             self.assertIn("AS __mv_new", trigger_sql, f"Expected row alias in {ver_str}")
@@ -173,7 +174,7 @@ class TestMySQLRowAliasUpsertCodegen(unittest.TestCase):
                 view_sql,
                 dialect=Dialect.MYSQL,
                 engine_version=ver_str,
-                ignore_limitations=True,
+                ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
             )
             trigger_sql = "\n".join(plan.trigger_ddls)
             self.assertIn("AS __mv_new", trigger_sql, f"Expected row alias in {ver_str}")
@@ -190,7 +191,7 @@ class TestMySQLRowAliasUpsertCodegen(unittest.TestCase):
                 dialect=Dialect.MYSQL,
                 engine_version=ver_str,
                 incremental_backfill=True,
-                ignore_limitations=True,
+                ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
             )
             self.assertIsNotNone(plan.incremental_backfill_spec)
             chunk_sql = "\n".join(plan.incremental_backfill_spec.chunk_sql_templates)
@@ -214,7 +215,7 @@ class TestMySQLRowAliasUpsertCodegen(unittest.TestCase):
                 dialect=Dialect.MYSQL,
                 engine_version=ver_str,
                 incremental_backfill=True,
-                ignore_limitations=True,
+                ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
             )
             pop_str = "\n".join(plan_str.get_populate_statements(incremental_backfill=True))
             self.assertIn("__mv_init.", pop_str, f"Expected __mv_init column reference in {ver_str}")
@@ -226,7 +227,7 @@ class TestMySQLRowAliasUpsertCodegen(unittest.TestCase):
                 dialect=Dialect.MYSQL,
                 engine_version=ver_str,
                 incremental_backfill=True,
-                ignore_limitations=True,
+                ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
             )
             pop_int = "\n".join(plan_int.get_populate_statements(incremental_backfill=True))
             self.assertIn("AS __mv_src", pop_int, f"Expected __mv_src derived alias in {ver_str}")
@@ -242,7 +243,7 @@ class TestMySQLRowAliasUpsertCodegen(unittest.TestCase):
             view_sql,
             dialect=Dialect.MYSQL,
             engine_version="mysql:5.7.0",
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         trigger_sql = "\n".join(plan.trigger_ddls)
         self.assertIn("VALUES(", trigger_sql, "Expected legacy VALUES() in MySQL 5.7")
@@ -257,7 +258,7 @@ class TestMySQLRowAliasUpsertCodegen(unittest.TestCase):
                 view_sql,
                 dialect=Dialect.MYSQL,
                 engine_version=ver_str,
-                ignore_limitations=True,
+                ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
             )
             trigger_sql = "\n".join(plan.trigger_ddls)
             self.assertIn("VALUES(", trigger_sql, f"Expected VALUES() in {ver_str}")
@@ -286,7 +287,7 @@ class TestPostgresMergeAndFillfactor(unittest.TestCase):
                 view_sql,
                 dialect=Dialect.POSTGRES,
                 engine_version=ver_str,
-                incremental_backfill=True,
+                incremental_backfill=True, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
             )
             self.assertIsNotNone(plan.incremental_backfill_spec)
             chunk_sql = "\n".join(plan.incremental_backfill_spec.chunk_sql_templates)
@@ -305,7 +306,7 @@ class TestPostgresMergeAndFillfactor(unittest.TestCase):
             view_sql,
             dialect=Dialect.POSTGRES,
             engine_version="postgres:14.0",
-            incremental_backfill=True,
+            incremental_backfill=True, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         self.assertIsNotNone(plan.incremental_backfill_spec)
         chunk_sql = "\n".join(plan.incremental_backfill_spec.chunk_sql_templates)
@@ -320,7 +321,7 @@ class TestPostgresMergeAndFillfactor(unittest.TestCase):
             view_sql,
             dialect=Dialect.POSTGRES,
             engine_version="postgres:15.0",
-            incremental_backfill=True,
+            incremental_backfill=True, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         pop_stmts = plan.get_populate_statements(incremental_backfill=True)
         pop_sql = "\n".join(pop_stmts)
@@ -360,7 +361,7 @@ class TestPostgresMergeAndFillfactor(unittest.TestCase):
             self.schemas,
             view_sql,
             dialect=Dialect.POSTGRES,
-            pg_fillfactor=90,
+            pg_fillfactor=90, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         self.assertIn("WITH (fillfactor = 90)", plan90.backing_table_ddl)
 
@@ -369,7 +370,7 @@ class TestPostgresMergeAndFillfactor(unittest.TestCase):
             self.schemas,
             view_sql,
             dialect=Dialect.POSTGRES,
-            pg_fillfactor=None,
+            pg_fillfactor=None, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         self.assertNotIn("fillfactor", plan_none.backing_table_ddl)
 
@@ -459,7 +460,7 @@ class TestSQLiteWithoutRowidAndReturning(unittest.TestCase):
         # Update an existing row
         conn.execute("UPDATE sales SET amount = 150.0 WHERE store_id = 1 AND dept_id = 10;")
         val = conn.execute("SELECT total FROM mv_sales WHERE store_id = 1 AND dept_id = 10;").fetchone()[0]
-        self.assertAlmostEqual(val, 150.0)
+        self.assertEqual(val, 150.0)
 
         # Delete a row
         conn.execute("DELETE FROM sales WHERE store_id = 2 AND dept_id = 10;")
@@ -530,7 +531,7 @@ class TestDerivedAliasContractValidation(unittest.TestCase):
             dialect=Dialect.MYSQL,
             engine_version="mysql:8.4.0",
             incremental_backfill=True,
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         self._assert_subquery_aliases_cover_refs(p_grp.incremental_backfill_spec.chunk_sql_templates[0], "__mv_src", "mysql")
 
@@ -541,7 +542,7 @@ class TestDerivedAliasContractValidation(unittest.TestCase):
             dialect=Dialect.MYSQL,
             engine_version="mysql:8.4.0",
             incremental_backfill=True,
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         pop_sql = "\n".join(p_glob.get_populate_statements(incremental_backfill=True))
         self.assertIn("HAVING COUNT(*) > 0\n) AS __mv_src\nON DUPLICATE KEY UPDATE", pop_sql)
@@ -554,7 +555,7 @@ class TestDerivedAliasContractValidation(unittest.TestCase):
             dialect=Dialect.MYSQL,
             engine_version="mysql:8.4.0",
             incremental_backfill=True,
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         for tmpl in p_dist.incremental_backfill_spec.chunk_sql_templates:
             self._assert_subquery_aliases_cover_refs(tmpl.format(placeholders="'A'"), "__mv_src", "mysql")
@@ -591,7 +592,7 @@ class TestDerivedAliasContractValidation(unittest.TestCase):
             dialect=Dialect.MYSQL,
             engine_version="mysql:8.4.0",
             incremental_backfill=True,
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         self._assert_subquery_aliases_cover_refs(p_proj.incremental_backfill_spec.chunk_sql_templates[0], "__mv_src", "mysql")
         p_proj_bag = generate_materialized_view(
@@ -600,7 +601,7 @@ class TestDerivedAliasContractValidation(unittest.TestCase):
             dialect=Dialect.MYSQL,
             engine_version="mysql:8.4.0",
             incremental_backfill=True,
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         self._assert_subquery_aliases_cover_refs(p_proj_bag.incremental_backfill_spec.chunk_sql_templates[0], "__mv_src", "mysql")
         p_no_pk = generate_materialized_view(
@@ -609,7 +610,7 @@ class TestDerivedAliasContractValidation(unittest.TestCase):
             dialect=Dialect.MYSQL,
             engine_version="mysql:8.4.0",
             incremental_backfill=True,
-            ignore_limitations=True,
+            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
         )
         pop_sql = "\n".join(p_no_pk.get_populate_statements(incremental_backfill=True))
         self.assertIn("AS __mv_init", pop_sql)
@@ -638,7 +639,7 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
         base_tbl = "t_cg_my_sales"
         mv_proj = "t_cg_my_mv_proj"
         mv_agg = "t_cg_my_mv_agg"
-        mgr = MaterializedViewManager(conn, dialect=Dialect.MYSQL, ignore_limitations=True)
+        mgr = MaterializedViewManager(conn, dialect=Dialect.MYSQL, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         cur = conn.cursor()
         try:
             for vn in (mv_proj, mv_agg):
@@ -692,6 +693,9 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
 
             cur.execute(f"SELECT dept, s, sd, dc FROM {mv_agg} ORDER BY dept;")
             mv_agg_rows = cur.fetchall()
+            # Small single-table view, no secondary index: the original view
+            # reads in the recompute's order (PostgreSQL: pinned plan).
+            pin_native_plan(cur, mgr.dialect)
             cur.execute(
                 f"SELECT dept, SUM(amount) AS s, STDDEV_SAMP(amount) AS sd, COUNT(DISTINCT tag) AS dc FROM {base_tbl} GROUP BY dept ORDER BY dept;"
             )
@@ -704,7 +708,7 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
                 if r_ora[2] is None:
                     self.assertIsNone(r_mv[2])
                 else:
-                    self.assertAlmostEqual(float(r_mv[2]), float(r_ora[2]), places=6)
+                    self.assertEqual(r_mv[2], r_ora[2])
         finally:
             try:
                 conn.rollback()
@@ -734,7 +738,7 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
         base_tbl = "t_cg_pg_sales"
         mv_proj = "t_cg_pg_mv_proj"
         mv_agg = "t_cg_pg_mv_agg"
-        mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES, ignore_limitations=True)
+        mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         cur = conn.cursor()
         try:
             for vn in (mv_proj, mv_agg):
@@ -783,6 +787,9 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
 
             cur.execute(f"SELECT dept, s, sd, dc FROM {mv_agg} ORDER BY dept;")
             mv_agg_rows = cur.fetchall()
+            # Small single-table view, no secondary index: the original view
+            # reads in the recompute's order (PostgreSQL: pinned plan).
+            pin_native_plan(cur, mgr.dialect)
             cur.execute(
                 f"SELECT dept, SUM(amount) AS s, STDDEV_SAMP(amount) AS sd, COUNT(DISTINCT tag) AS dc FROM {base_tbl} GROUP BY dept ORDER BY dept;"
             )
@@ -790,12 +797,12 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             self.assertEqual(len(mv_agg_rows), len(ora_agg_rows))
             for r_mv, r_ora in zip(mv_agg_rows, ora_agg_rows):
                 self.assertEqual(r_mv[0], r_ora[0])
-                self.assertAlmostEqual(float(r_mv[1]), float(r_ora[1]), places=6)
+                self.assertEqual(r_mv[1], r_ora[1])
                 self.assertEqual(r_mv[3], r_ora[3])
                 if r_ora[2] is None:
                     self.assertIsNone(r_mv[2])
                 else:
-                    self.assertAlmostEqual(float(r_mv[2]), float(r_ora[2]), places=6)
+                    self.assertEqual(r_mv[2], r_ora[2])
         finally:
             try:
                 conn.rollback()
