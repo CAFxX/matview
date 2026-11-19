@@ -81,6 +81,23 @@ from .sql_frontend import (
 #    and track all hashed columns in UPDATE triggers.
 MATVIEW_GENERATOR_VERSION = "6"
 
+
+def _definition_digest(select_sql: str) -> str:
+    """Digest of a view's SELECT (comments and whitespace normalized), used to
+    bind accepted limitation codes to the definition they were accepted for."""
+    norm = re.sub(r"\s+", " ", _strip_sql_comments(select_sql or "")).strip().rstrip(";").strip()
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def _stored_select_sql(view_sql: str) -> str:
+    """The SELECT of a catalog ``view_sql`` (as written by
+    ``_serialize_view_sql_with_indexes``: ``CREATE VIEW n AS <select>;``
+    followed by optional ``CREATE INDEX`` lines)."""
+    first = re.split(r";\s*\n\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b", view_sql or "", maxsplit=1, flags=re.IGNORECASE)[0]
+    m = re.match(r"\s*CREATE\s+VIEW\s+\S+\s+AS\s+(.*)$", first, flags=re.IGNORECASE | re.DOTALL)
+    return m.group(1) if m else first
+
+
 # How to repopulate a view whose pk-range backfill is incomplete.
 _REPAIR_GUIDANCE = (
     "to (re)populate from scratch use register_view(..., force_rebuild=True), "
@@ -375,6 +392,8 @@ class MaterializedViewManager:
       - Maintain a persistent metadata registry (`__matview_catalog`) of installed MVs
       - Safely create, diff, update, or drop materialized views (`register_view`, `sync_views`, `drop_view`)
       - Enforce transparency limitation checks unless `ignore_limitations=True`
+        (per-code limitations such as ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE
+        only with `accept_limitations=[code, ...]`, stored with each view)
       - Perform incremental (chunked/batched) initial backfills (`backfill_incrementally`)
       - Execute high-throughput multi-statement bulk changes (`bulk_changes`)
     Once setup/backfill finishes, all views and triggers operate 100% natively inside
@@ -417,6 +436,7 @@ class MaterializedViewManager:
         engine_version: Optional[EngineVersion | str] = None,
         skip_ensure_catalog: bool = False,
         pg_fillfactor: Optional[int] = 80,
+        accept_limitations: Optional[Sequence[str]] = None,
     ) -> None:
         hint_d: Optional[Dialect] = None
         if isinstance(dialect, Dialect):
@@ -466,6 +486,13 @@ class MaterializedViewManager:
         self.dialect: Dialect = self.engine_version.dialect
         self.subdialect: EngineSubdialect = self.engine_version.subdialect
         self.ignore_limitations = ignore_limitations
+        if isinstance(accept_limitations, str):
+            accept_limitations = [accept_limitations]
+        # Limitation codes accepted for every view this manager installs, in
+        # addition to the codes stored with each view (see register_view).
+        self.accept_limitations: Tuple[str, ...] = tuple(
+            sorted({str(c).strip() for c in (accept_limitations or ()) if str(c).strip()})
+        )
         self.object_prefix = object_prefix
         self.strict = strict
         self.pg_fillfactor = pg_fillfactor
@@ -646,7 +673,8 @@ class MaterializedViewManager:
                     backfill_cursor_pk BIGINT DEFAULT NULL,
                     backfill_max_pk BIGINT DEFAULT NULL,
                     backfill_active INTEGER NOT NULL DEFAULT 0,
-                    backfill_owner VARCHAR(64) DEFAULT NULL
+                    backfill_owner VARCHAR(64) DEFAULT NULL,
+                    accepted_limitations_json TEXT DEFAULT NULL
                 );
                 """
             )
@@ -662,6 +690,7 @@ class MaterializedViewManager:
                 ("backfill_max_pk", "backfill_max_pk BIGINT DEFAULT NULL"),
                 ("backfill_active", "backfill_active INTEGER NOT NULL DEFAULT 0"),
                 ("backfill_owner", "backfill_owner VARCHAR(64) DEFAULT NULL"),
+                ("accepted_limitations_json", "accepted_limitations_json TEXT DEFAULT NULL"),
             ):
                 try:
                     cur.execute(f"SELECT {col} FROM {self.catalog_table} WHERE 1 = 0")
@@ -897,6 +926,16 @@ class MaterializedViewManager:
                             f"the materialized-view catalog {self.catalog_table} could not be read"
                         )
                     return {}
+            accepted_rows = self._catalog_select(
+                cur,
+                f"SELECT view_name, accepted_limitations_json FROM {self.catalog_table}{lock_clause}",
+            )
+        accepted_by_view: Dict[str, Any] = {}
+        for arow in accepted_rows or ():
+            try:
+                accepted_by_view[arow[0]] = None if arow[1] is None else json.loads(arow[1])
+            except (TypeError, ValueError):
+                accepted_by_view[arow[0]] = {"definition": None, "codes": []}
         out: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             out[row[0]] = {
@@ -913,6 +952,26 @@ class MaterializedViewManager:
                 "backfill_max_pk": row[10] if has_wm_cols and len(row) > 10 else None,
                 "backfill_active": int(row[11]) if has_wm_cols and len(row) > 11 and row[11] is not None else 0,
             }
+            # Limitation codes overridden when the view was installed, bound
+            # to the definition they were accepted for. A record that does not
+            # match the stored definition (or is malformed) accepts nothing,
+            # so recompiling the view refuses instead of carrying an
+            # acceptance over to another definition.
+            rec = accepted_by_view.get(row[0])
+            codes: List[str] = []
+            mismatch = False
+            if rec is not None:
+                if (
+                    isinstance(rec, dict)
+                    and isinstance(rec.get("codes"), list)
+                    and rec.get("definition") == _definition_digest(_stored_select_sql(row[1]))
+                ):
+                    codes = [str(c) for c in rec["codes"]]
+                else:
+                    mismatch = True
+            out[row[0]]["accepted_limitations"] = codes
+            out[row[0]]["accepted_definition"] = rec.get("definition") if isinstance(rec, dict) else None
+            out[row[0]]["accepted_limitations_mismatch"] = mismatch
         return out
 
     def _compute_signature(self, plan: MaterializedViewPlan, schemas: Dict[str, TableSchema]) -> str:
@@ -1468,6 +1527,8 @@ class MaterializedViewManager:
     _backfill_rng: Any = random.Random()
     _backfill_watermark_claimed = False
     _backfill_owner_token: Optional[str] = None
+    accept_limitations: Tuple[str, ...] = ()
+    ignore_limitations: bool = False
 
     def _backfill_retry_delay(self, attempt: int) -> float:
         """Delay before retry number `attempt` (1-based): jitter in [d/2, d],
@@ -1704,6 +1765,73 @@ class MaterializedViewManager:
         self._commit()
         return 1
 
+    @staticmethod
+    def _normalize_accept(codes: Optional[Sequence[str] | str]) -> Optional[Tuple[str, ...]]:
+        if codes is None:
+            return None
+        if isinstance(codes, str):
+            codes = [codes]
+        return tuple(sorted({str(c).strip() for c in codes if str(c).strip()}))
+
+    def _effective_accept(
+        self,
+        v_spec: ViewSpec,
+        catalog: Dict[str, Dict[str, Any]],
+        explicit: Optional[Sequence[str] | str],
+    ) -> Tuple[str, ...]:
+        """Limitation codes accepted for one view: the explicit argument when
+        given, else the manager default plus the codes stored with the
+        installed view of that name -- only when they were accepted for the
+        same definition. A changed definition needs an explicit acceptance
+        again (the stored codes were consent to the old one)."""
+        exp = self._normalize_accept(explicit)
+        if exp is not None:
+            return exp
+        entry = catalog.get(self._resolve_catalog_name(v_spec.view_name, catalog)) or {}
+        stored: Sequence[str] = ()
+        if entry.get("accepted_limitations") and entry.get("accepted_definition") == _definition_digest(
+            v_spec.raw_select_sql
+        ):
+            stored = entry["accepted_limitations"]
+        return tuple(sorted(set(self.accept_limitations) | set(stored)))
+
+    def _compile_view(
+        self,
+        schemas: Dict[str, TableSchema],
+        view: Any,
+        *,
+        accept: Sequence[str],
+        ignore: bool,
+        strict: bool = False,
+        watermark_catalog_table: Optional[str] = None,
+    ) -> MaterializedViewPlan:
+        return generate_materialized_view(
+            schemas,
+            view,
+            dialect=self.dialect,
+            ignore_limitations=ignore,
+            accept_limitations=accept,
+            object_prefix=self.object_prefix,
+            strict=strict,
+            engine_version=self.engine_version,
+            watermark_catalog_table=watermark_catalog_table,
+            pg_fillfactor=getattr(self, "pg_fillfactor", 80),
+        )
+
+    def _stored_plan(self, schemas: Dict[str, TableSchema], entry: Dict[str, Any]) -> MaterializedViewPlan:
+        """Recompile an installed view under exactly the limitation codes it
+        was installed with (plus the manager's accept_limitations); never a
+        blanket override."""
+        return self._compile_view(
+            schemas,
+            entry["view_sql"],
+            accept=self._stored_accept(entry),
+            ignore=self.ignore_limitations,
+        )
+
+    def _stored_accept(self, entry: Dict[str, Any]) -> Tuple[str, ...]:
+        return tuple(sorted(set(entry.get("accepted_limitations") or ()) | set(self.accept_limitations)))
+
     def _register_single_view_spec(
         self,
         v_spec: ViewSpec,
@@ -1716,21 +1844,22 @@ class MaterializedViewManager:
         effective_ignore: bool,
         effective_strict: bool = False,
         compiled_plan: Optional[MaterializedViewPlan] = None,
+        accept_limitations: Optional[Sequence[str]] = None,
     ) -> MaterializedViewPlan:
-        plan = compiled_plan or generate_materialized_view(
-            schemas,
-            v_spec,
-            dialect=self.dialect,
-            ignore_limitations=effective_ignore,
-            object_prefix=self.object_prefix,
-            strict=effective_strict,
-            engine_version=self.engine_version,
-            watermark_catalog_table=self.catalog_table if (incremental_backfill or not populate) else None,
-            pg_fillfactor=getattr(self, "pg_fillfactor", 80),
-        )
+        catalog = self.get_catalog()
+        if compiled_plan is not None:
+            plan = compiled_plan
+        else:
+            plan = self._compile_view(
+                schemas,
+                v_spec,
+                accept=self._effective_accept(v_spec, catalog, accept_limitations),
+                ignore=effective_ignore,
+                strict=effective_strict,
+                watermark_catalog_table=self.catalog_table if (incremental_backfill or not populate) else None,
+            )
         sig = self._compute_signature(plan, schemas)
 
-        catalog = self.get_catalog()
         existing = catalog.get(plan.view_name)
         if existing and existing["signature_hash"] == sig and not force_rebuild:
             if self._is_backfill_incomplete(existing):
@@ -1790,8 +1919,9 @@ class MaterializedViewManager:
                     INSERT INTO {self.catalog_table} (
                         view_name, view_sql, strategy, signature_hash, backing_table,
                         aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
-                        backfill_cursor_pk, backfill_max_pk, backfill_active
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        backfill_cursor_pk, backfill_max_pk, backfill_active,
+                        accepted_limitations_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         plan.view_name,
@@ -1806,6 +1936,10 @@ class MaterializedViewManager:
                         None,
                         None,
                         init_active,
+                        json.dumps({
+                            "definition": _definition_digest(plan.view_spec.raw_select_sql),
+                            "codes": sorted({lim.code for lim in plan.limitations}),
+                        }),
                     ),
                 )
                 catalog_inserted = True
@@ -1876,10 +2010,18 @@ class MaterializedViewManager:
         ignore_limitations: Optional[bool] = None,
         indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
         strict: Optional[bool] = None,
+        accept_limitations: Optional[Sequence[str]] = None,
     ) -> MaterializedViewPlan:
         """
         Safely installs or updates one or more materialized views on the connected database.
         Supports both single-view and multi-view SQL scripts seamlessly.
+
+        ``accept_limitations`` names limitation codes accepted explicitly;
+        codes in ``PER_CODE_OPT_IN_LIMITATIONS`` (best-effort results) are
+        only overridden this way, never by ``ignore_limitations``. When it is
+        None, the manager's ``accept_limitations`` plus the codes stored with
+        an installed view of the same name apply. The overridden codes are
+        stored with the view.
         """
         effective_ignore = (
             self.ignore_limitations if ignore_limitations is None else ignore_limitations
@@ -1905,6 +2047,7 @@ class MaterializedViewManager:
                     force_rebuild=force_rebuild,
                     effective_ignore=effective_ignore,
                     effective_strict=effective_strict,
+                    accept_limitations=accept_limitations,
                 )
             )
         if len(sub_plans) == 1:
@@ -1946,6 +2089,7 @@ class MaterializedViewManager:
         ignore_limitations: Optional[bool] = None,
         indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
         strict: Optional[bool] = None,
+        accept_limitations: Optional[Sequence[str]] = None,
     ) -> Dict[str, str]:
         """
         Declaratively synchronizes a collection of materialized view definitions against
@@ -1955,7 +2099,8 @@ class MaterializedViewManager:
         maintenance triggers of an unchanged view are gone; "triggers_orphaned": a PostgreSQL
         maintenance trigger is on a DETACHed partition; repair both with `repair_view()`); "backfill_incomplete" means the definition
         is current but a pk-range backfill is running elsewhere or was interrupted
-        (repair with `repair_view()`).
+        (repair with `repair_view()`). ``accept_limitations`` behaves as in
+        `register_view()`.
         """
         effective_ignore = (
             self.ignore_limitations if ignore_limitations is None else ignore_limitations
@@ -1976,16 +2121,13 @@ class MaterializedViewManager:
 
         planned: List[Tuple[Any, MaterializedViewPlan, str]] = []
         for v_spec in all_specs:
-            plan = generate_materialized_view(
+            plan = self._compile_view(
                 schemas,
                 v_spec,
-                dialect=self.dialect,
-                ignore_limitations=effective_ignore,
-                object_prefix=self.object_prefix,
+                accept=self._effective_accept(v_spec, catalog, accept_limitations),
+                ignore=effective_ignore,
                 strict=effective_strict,
-                engine_version=self.engine_version,
                 watermark_catalog_table=self.catalog_table if incremental_backfill else None,
-                pg_fillfactor=getattr(self, "pg_fillfactor", 80),
             )
             planned.append((v_spec, plan, self._compute_signature(plan, schemas)))
 
@@ -2163,15 +2305,11 @@ class MaterializedViewManager:
         report: Dict[str, str] = {}
         for v_name, entry in catalog.items():
             try:
-                plan = generate_materialized_view(
-                    schemas,
-                    entry["view_sql"],
-                    dialect=self.dialect,
-                    ignore_limitations=True,
-                    object_prefix=self.object_prefix,
-                    engine_version=self.engine_version,
-                    pg_fillfactor=getattr(self, "pg_fillfactor", 80),
-                )
+                plan = self._stored_plan(schemas, entry)
+            except Exception:
+                report[v_name] = "invalid"
+                continue
+            try:
                 sig = self._compute_signature(plan, schemas)
                 if sig != entry["signature_hash"]:
                     report[v_name] = "drifted"
@@ -2196,7 +2334,10 @@ class MaterializedViewManager:
         eliminating any floating-point accumulation drift or out-of-band base table DDL changes.
         Returns `{view_name: "repaired" | "rebuilt"}` ("rebuilt" also when
         maintenance triggers were missing). Each view is repaired
-        in its own transaction (no all-view atomicity).
+        in its own transaction (no all-view atomicity). Views are recompiled
+        and rebuilt under exactly the limitation codes stored with them
+        (never a blanket override); a view refused under them raises
+        EngineLimitationError.
 
         A "repaired" view is repopulated in one transaction that also takes
         over the pk-range backfill watermark (records it as complete), so an
@@ -2254,22 +2395,17 @@ class MaterializedViewManager:
                 missing_triggers = self._views_missing_triggers(catalog)
             entry = catalog[target_name]
             v_name = entry["view_name"]
-            plan = generate_materialized_view(
-                schemas,
-                entry["view_sql"],
-                dialect=self.dialect,
-                ignore_limitations=True,
-                object_prefix=self.object_prefix,
-                engine_version=self.engine_version,
-                pg_fillfactor=getattr(self, "pg_fillfactor", 80),
-            )
+            plan = self._stored_plan(schemas, entry)
             sig = self._compute_signature(plan, schemas)
             if rebuild_on_schema_drift and (sig != entry["signature_hash"] or v_name in missing_triggers):
+                # Rebuilt under exactly the acceptance stored with the view
+                # (never a blanket override of per-code limitations).
                 self.register_view(
                     entry["view_sql"],
                     populate=True,
                     force_rebuild=True,
-                    ignore_limitations=True,
+                    ignore_limitations=self.ignore_limitations,
+                    accept_limitations=self._stored_accept(entry),
                 )
                 results[v_name] = "rebuilt"
             else:
@@ -2481,15 +2617,7 @@ class MaterializedViewManager:
             raise AssertionError(f"maintenance DDL is not transactional on {self.dialect}")
 
     def _bulk_plan(self, schemas: Dict[str, TableSchema], entry: Dict[str, Any]) -> MaterializedViewPlan:
-        return generate_materialized_view(
-            schemas,
-            entry["view_sql"],
-            dialect=self.dialect,
-            ignore_limitations=True,
-            object_prefix=self.object_prefix,
-            engine_version=self.engine_version,
-            pg_fillfactor=getattr(self, "pg_fillfactor", 80),
-        )
+        return self._stored_plan(schemas, entry)
 
     @staticmethod
     def _catalog_identity(catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Tuple[Any, ...]]:
@@ -2934,6 +3062,7 @@ class MaterializedViewManager:
         ignore_limitations: Optional[bool] = None,
         incremental_backfill: Optional[bool] = None,
         batch_size: Optional[int] = None,
+        accept_limitations: Optional[Sequence[str]] = None,
     ) -> ViewDiffReport:
         """
         Compares desired compiled view plan(s) against `__matview_catalog` and live database
@@ -2972,6 +3101,7 @@ class MaterializedViewManager:
                 v_spec,
                 dialect=self.dialect,
                 ignore_limitations=effective_ignore,
+                accept_limitations=self._effective_accept(v_spec, catalog, accept_limitations),
                 object_prefix=self.object_prefix,
                 strict=effective_strict,
                 engine_version=self.engine_version,
@@ -3310,6 +3440,7 @@ def generate_materialized_view(
     view_sql_or_spec: str | ViewSpec,
     dialect: Optional[Dialect | str | EngineVersion] = None,
     ignore_limitations: bool = False,
+    accept_limitations: Sequence[str] = (),
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     incremental_backfill: bool = False,
@@ -3378,6 +3509,7 @@ def generate_materialized_view(
         view_spec=view_spec,
         dialect=eff_dialect,
         ignore_limitations=ignore_limitations,
+        accept_limitations=accept_limitations,
         object_prefix=object_prefix,
         incremental_backfill=incremental_backfill,
         batch_size=batch_size,
@@ -3394,6 +3526,7 @@ def generate_materialized_views(
     view_sqls: Sequence[str | ViewSpec] | str | ViewSpec,
     dialect: Optional[Dialect | str | EngineVersion] = None,
     ignore_limitations: bool = False,
+    accept_limitations: Sequence[str] = (),
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     incremental_backfill: bool = False,
@@ -3433,6 +3566,7 @@ def generate_materialized_views(
             view_spec=vs,
             dialect=eff_dialect,
             ignore_limitations=ignore_limitations,
+            accept_limitations=accept_limitations,
             object_prefix=object_prefix,
             incremental_backfill=incremental_backfill,
             batch_size=batch_size,
@@ -3453,6 +3587,7 @@ def install_materialized_view_sqlite(
     batch_size: int = 500,
     on_progress: Optional[Callable[[int, int], None]] = None,
     ignore_limitations: bool = False,
+    accept_limitations: Sequence[str] = (),
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     strict: bool = False,
@@ -3462,6 +3597,7 @@ def install_materialized_view_sqlite(
         conn,
         dialect=Dialect.SQLITE,
         ignore_limitations=ignore_limitations,
+        accept_limitations=accept_limitations,
         object_prefix=object_prefix,
         strict=strict,
     )
