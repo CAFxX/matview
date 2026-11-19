@@ -26,6 +26,7 @@ from .engines import (
     TransparencyLimitation,
     UnsupportedMaterializedViewError,
     _sqlglot_dialect,
+    PER_CODE_OPT_IN_LIMITATIONS,
 )
 from .logical_ir import (
     ColumnDef,
@@ -170,15 +171,217 @@ class PlannerMixin(MixinHost):
                 )
         return lims
 
-    def _enforce_limitations(self) -> None:
-        if not self.limitations:
+    def _order_sensitive_aggregate_limitations(
+        self, strategy: MaintenanceStrategy, alg_mode: str
+    ) -> List[TransparencyLimitation]:
+        return (
+            self._order_sensitive_shape_limitations(strategy, alg_mode)
+            + self._mysql_group_index_limitations(strategy, alg_mode)
+        )
+
+    def _window_order_sensitive_exprs(self) -> List[str]:
+        """Window SUM/AVG/VAR/STDDEV over arguments that are not provably
+        exact (their running value also accumulates in plan order)."""
+        if not self.view.has_window_func:
+            return []
+        try:
+            root = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return ["<window aggregate>"]
+        names = {"SUM", "AVG", "VARIANCE", "VARIANCE_POP", "VAR_POP", "VAR_SAMP", "STDDEV",
+                 "STDDEV_POP", "STDDEV_SAMP", "STD"}
+        out: List[str] = []
+        sg = _sqlglot_dialect(self.dialect)
+        for w in root.find_all(sqlglot_exp.Window):
+            fn = w.this
+            if not isinstance(fn, sqlglot_exp.Func):
+                continue
+            fname = fn.sql_name().upper()
+            if fname not in names and str(getattr(fn, "name", "")).upper() not in names:
+                continue
+            arg = fn.this
+            if isinstance(arg, sqlglot_exp.Distinct):
+                arg = arg.expressions[0] if arg.expressions else None
+            arg_sql = arg.sql(dialect=sg) if arg is not None else ""
+            if self._exact_numeric_precision_scale(arg_sql) is None or fname not in ("SUM", "AVG"):
+                out.append(w.sql(dialect=sg))
+        return out
+
+    def _order_sensitive_shape_limitations(
+        self, strategy: MaintenanceStrategy, alg_mode: str
+    ) -> List[TransparencyLimitation]:
+        """PostgreSQL/MySQL/MariaDB refuse floating-point order-sensitive
+        aggregates by default, whatever the shape.
+
+        SUM/AVG over approximate (or not provably exact) arguments accumulate
+        in binary floating point in the order the engine reads the rows, and
+        VAR/STDDEV use the engine's streaming algorithm (MySQL/MariaDB in
+        DOUBLE for every argument type). That order is chosen by the plan of
+        the original view and is not a function of the data: an index or range
+        scan for a WHERE clause, sort-based grouping, parallel aggregation and
+        the join order all change it (measured natively: PostgreSQL ungrouped
+        `SUM(x) WHERE y < 10` with an index on y and MySQL 8.4 / MariaDB 10.11
+        grouped views with an index on the WHERE column: original view 1.5,
+        any fixed recompute order 2.0; PostgreSQL parallel aggregation makes
+        the original view itself nondeterministic). No maintained value can
+        equal the original view under every plan, so these views are only
+        installed with an explicit per-code opt-in (``accept_limitations``),
+        which gives best-effort maintenance: race-free, and equal to the
+        original view when it evaluates in the recompute's order.
+        """
+        if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL):
+            return []
+        items = [
+            it.raw_expr for it in self._working_select_items
+            if it.is_aggregate and self._is_order_sensitive_aggregate(it)
+        ]
+        items += self._window_order_sensitive_exprs()
+        if not items:
+            return []
+        order = (
+            "sequential-scan (ctid) order" if self.dialect == Dialect.POSTGRES
+            else "primary-key order"
+        )
+        listed = ", ".join(dict.fromkeys(items))
+        lims: List[TransparencyLimitation] = []
+        recomputed = strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and (
+            alg_mode == "single" or (alg_mode == "union_all_agg" and self.dialect == Dialect.POSTGRES)
+        )
+        if not recomputed:
+            # Only single-table algebraic views (and PostgreSQL UNION ALL
+            # aggregates) recompute the order-sensitive aggregate race-free
+            # after locking; join folds, MySQL/MariaDB UNION ALL folds and
+            # group-scoped / atomic re-evaluation (joins, window functions)
+            # are neither drift-free nor verified race-free.
+            lims.append(
+                TransparencyLimitation(
+                    code="ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE",
+                    severity=LimitationSeverity.BLOCKER,
+                    dialect=self.dialect,
+                    affected_object=self.logical_view_name,
+                    description=(
+                        f"Aggregate(s) {listed} in a {strategy.value}/{alg_mode} view are maintained by "
+                        f"folding deltas or by re-evaluating the group without the lock-then-recompute "
+                        f"protocol of single-table views: rounding can accumulate across writes and "
+                        f"concurrent writers are not verified to be serialized. With accept_limitations=['ORDER_SENSITIVE_AGGREGATE_"
+                        f"NO_RACE_FREE_RECOMPUTE'] values can drift from the original view until "
+                        f"repair_view()."
+                    ),
+                    mitigation=(
+                        "Aggregate an exact type (integer/DECIMAL/NUMERIC), materialize the aggregate over "
+                        "a single table, or accept the code explicitly."
+                    ),
+                )
+            )
+        return lims + [
+            TransparencyLimitation(
+                code="ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+                severity=LimitationSeverity.BLOCKER,
+                dialect=self.dialect,
+                affected_object=self.logical_view_name,
+                description=(
+                    f"Aggregate(s) {listed} accumulate in floating point in the order the original "
+                    f"view's plan reads the rows (index and range scans, sort-based grouping, "
+                    f"parallel aggregation, join order), so no maintained value equals the original "
+                    f"view under every plan. With accept_limitations=['ORDER_SENSITIVE_AGGREGATE_"
+                    f"NOT_REPRODUCIBLE'] the view is maintained on a BEST-EFFORT basis: race-free "
+                    f"native recompute in {order}, equal to the original view only when it "
+                    f"evaluates in that order."
+                ),
+                mitigation=(
+                    "Aggregate an exact type (integer/DECIMAL/NUMERIC), or accept the code explicitly "
+                    "(accept_limitations / --accept-limitation)."
+                ),
+            )
+        ]
+
+    def _mysql_group_index_limitations(
+        self, strategy: MaintenanceStrategy, alg_mode: str
+    ) -> List[TransparencyLimitation]:
+        """MySQL/MariaDB: the race-free recompute of order-sensitive aggregates
+        is a locking read of the group's base rows. Without an index whose
+        leading columns are the group-key columns InnoDB scans and share-locks
+        the whole table under REPEATABLE READ, and concurrent writers of
+        different groups deadlock constantly (measured, MySQL 9.7 / MariaDB
+        10.11, 4 writers on 6 groups: 135 / 28 of 600 single-statement
+        transactions rolled back with 1213, vs 1 / 0 with the index). Refuse
+        such views until the index exists."""
+        if self.dialect != Dialect.MYSQL or strategy != MaintenanceStrategy.ALGEBRAIC_DELTA or alg_mode != "single":
+            return []
+        grp_exprs = list(self._effective_group_by_exprs)
+        if not grp_exprs:
+            return []
+        try:
+            items = self._pgmy_native_recompute_items()
+        except Exception:
+            items = []
+        if not items:
+            return []
+        schema = self.primary_schema
+        group_cols: List[str] = []
+        for g in grp_exprs:
+            if not self._is_simple_col_ref(g):
+                group_cols = []
+                break
+            group_cols.append(self._col_def(g).name.lower())
+        covered = False
+        if schema is not None and group_cols:
+            want = set(group_cols)
+            candidates = [list(schema.effective_pk_columns())] + [list(idx.columns) for idx in schema.indexes if not idx.where_clause]
+            for cols in candidates:
+                lead = [str(c).strip().strip('`"').lower() for c in cols[: len(want)]]
+                if len(lead) == len(want) and set(lead) == want:
+                    covered = True
+                    break
+        if covered:
+            return []
+        listed = ", ".join(it.raw_expr for it in items)
+        return [
+            TransparencyLimitation(
+                code="MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
+                severity=LimitationSeverity.BLOCKER,
+                dialect=self.dialect,
+                affected_object=self.logical_view_name,
+                description=(
+                    f"Aggregate(s) {listed} are recomputed per group with a locking read; without an index "
+                    f"whose leading columns are the GROUP BY columns ({', '.join(grp_exprs)}) InnoDB "
+                    f"share-locks the whole table and concurrent writers deadlock."
+                ),
+                mitigation=(
+                    "Create an index on the base table's GROUP BY columns (see "
+                    "plan.recommended_base_indexes), group by plain columns, or aggregate an exact type."
+                ),
+            )
+        ]
+
+    def _enforce_limitations(self, limitations: Optional[Sequence[TransparencyLimitation]] = None) -> None:
+        """Refuse unless every limitation is overridden.
+
+        Codes in PER_CODE_OPT_IN_LIMITATIONS are only overridden by naming
+        them in ``accept_limitations``; the global ``ignore_limitations``
+        does not cover them (on MySQL/MariaDB every view already needs it for
+        MYSQL_NO_TRUNCATE_TRIGGER, so it cannot express consent to a weaker
+        result contract). Other codes are overridden by either."""
+        lims = list(self.limitations if limitations is None else limitations)
+        if not lims:
             return
-        if not self.ignore_limitations:
-            raise EngineLimitationError(self.logical_view_name, self.dialect, self.limitations)
-        summary = "; ".join(f"[{l.code}] {l.description}" for l in self.limitations)
+        accepted = set(self.accepted_limitations)
+        unaccepted = [
+            l for l in lims
+            if l.code not in accepted
+            and (l.code in PER_CODE_OPT_IN_LIMITATIONS or not self.ignore_limitations)
+        ]
+        if unaccepted:
+            raise EngineLimitationError(self.logical_view_name, self.dialect, unaccepted)
+        summary = "; ".join(f"[{l.code}] {l.description}" for l in lims)
+        how = []
+        if any(l.code in accepted for l in lims):
+            how.append("accept_limitations")
+        if any(l.code not in accepted for l in lims):
+            how.append("--ignore-limitations")
         warnings.warn(
             f"Proceeding with materialized view '{self.logical_view_name}' on '{self.dialect.value}' "
-            f"with --ignore-limitations: {summary}",
+            f"with {' and '.join(how)}: {summary}",
             EngineLimitationWarning,
             stacklevel=2,
         )
@@ -579,7 +782,14 @@ class PlannerMixin(MixinHost):
                     )
                 ):
                     result_scale = self._mariadb_statistical_result_scale(it)
-                    reader_exprs[it.alias] = f"ROUND({it.alias}, {result_scale}) AS {it.alias}"
+                    if result_scale == "31":
+                        # Approximate input: the native result is a DOUBLE
+                        # with "not fixed" decimals, like the backing column.
+                        # ROUND(x, 31) is not the identity in MariaDB (it
+                        # scales by 10**31: 1.25 -> 1.2499999999999998).
+                        reader_exprs[it.alias] = it.alias
+                    else:
+                        reader_exprs[it.alias] = f"ROUND({it.alias}, {result_scale}) AS {it.alias}"
                 elif self.dialect == Dialect.MYSQL and it.agg_func in (AggFunc.BIT_OR, AggFunc.BIT_XOR):
                     # Keep COALESCE's result type unsigned, matching MySQL's
                     # BIT_* aggregate contract (unsigned 64-bit integer).
@@ -1624,9 +1834,18 @@ class PlannerMixin(MixinHost):
             )
             for it in self.view.select_items
         )
+        # PostgreSQL/MySQL/MariaDB order-sensitive aggregates (approximate
+        # SUM/AVG, VAR/STDDEV, natively recomputed AVG) recompute every
+        # affected group on every write; on MySQL/MariaDB that is a locking
+        # read, which without a group-key index share-locks the whole table.
+        pgmy_native_group_recompute = (
+            raw_plan.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA
+            and self._pgmy_native_recompute_items_for_plan()
+        )
         needs_base_group_scan = (
             raw_plan.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA
             or sqlite_native_group_recompute
+            or pgmy_native_group_recompute
             or any(
                 it.is_aggregate
                 and it.agg_func in (AggFunc.MIN, AggFunc.MAX, AggFunc.BIT_AND, AggFunc.BIT_OR)
@@ -1651,6 +1870,8 @@ class PlannerMixin(MixinHost):
                 reason = "tier2_group_scoped_recompute"
             elif sqlite_native_group_recompute:
                 reason = "sqlite_native_sum_avg_group_recompute"
+            elif pgmy_native_group_recompute:
+                reason = "native_order_sensitive_group_recompute"
             else:
                 reason = "holistic_minmax_delete_recompute"
             for t_n, g_cols in by_tbl.items():
@@ -1825,9 +2046,32 @@ class PlannerMixin(MixinHost):
             },
         )
 
+    def _pgmy_native_recompute_items_for_plan(self) -> bool:
+        try:
+            return bool(self._pgmy_native_recompute_items())
+        except Exception:
+            return False
+
     def _performance_notes(self) -> List[str]:
         """Documented maintenance cost classes that are not O(1) per write."""
         notes: List[str] = []
+        if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL) and self._alg_mode in ("single", "union_all_agg"):
+            if self._pgmy_native_recompute_items_for_plan():
+                notes.append(
+                    "native_order_sensitive_group_recompute: approximate SUM/AVG, VAR/STDDEV and "
+                    "natively recomputed AVG columns are recomputed from the base table for every "
+                    "affected group on every write, in a separate statement after the group row is "
+                    "locked (O(group rows) with a group-key index, O(table) without)."
+                )
+                if self.dialect == Dialect.MYSQL:
+                    notes.append(
+                        "mysql_locking_group_recompute: on MySQL/MariaDB that recompute is a locking "
+                        "read (LOCK IN SHARE MODE). Without an index on the group-key columns InnoDB "
+                        "share-locks every scanned base row until commit, so concurrent writers to "
+                        "different groups deadlock frequently (InnoDB rolls one back with error 1213; "
+                        "retry it). Create the indexes in recommended_base_indexes."
+                    )
+            return notes
         if self.dialect != Dialect.SQLITE:
             return notes
         exact_sum_items = [
@@ -1959,6 +2203,7 @@ class PlannerMixin(MixinHost):
                 view_spec=extra_v,
                 dialect=self.dialect,
                 ignore_limitations=self.ignore_limitations,
+                accept_limitations=self.accepted_limitations,
                 object_prefix=self.object_prefix,
                 incremental_backfill=self.incremental_backfill,
                 batch_size=self.batch_size,
