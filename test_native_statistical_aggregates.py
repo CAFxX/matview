@@ -254,27 +254,51 @@ class NativeResultRepresentationPlanTests(unittest.TestCase):
         reader = self._plan("mysql:8.4", "INT", select).reader_view_ddl
         self.assertNotIn("ROUND(", reader)
 
-    def test_mariadb_nested_fixed_decimal_statistics_are_a_limitation(self) -> None:
+    def test_mariadb_unreproducible_statistics_are_refused(self) -> None:
+        """Every MariaDB VAR/STDDEV shape is exact or refused, never bypassable.
+
+        Fixed-decimal results (exact or FLOAT(M,D) arguments) are reproducible
+        only as top-level projected aggregates of a single query (reader-side
+        ROUND to the native decimals) or inside HAVING; window statistics never.
+        """
         cases = [
             ("INT", "SELECT g, VAR_SAMP(x) * 2 AS a FROM t GROUP BY g", True),
             ("DECIMAL(12,3)", "SELECT g, COALESCE(STDDEV_POP(x), -1) AS a FROM t GROUP BY g", True),
             ("FLOAT(7,2)", "SELECT g, VAR_SAMP(x) + 1 AS a FROM t GROUP BY g", True),
             ("INT", "SELECT id, VAR_SAMP(x) OVER (PARTITION BY g) AS a FROM t", True),
             ("DOUBLE", "SELECT id, STDDEV_POP(x) OVER (PARTITION BY g) AS a FROM t", True),
+            ("INT", "WITH c AS (SELECT g, VARIANCE(x) AS v FROM t GROUP BY g) SELECT g, v FROM c", True),
+            ("INT", "SELECT s.g, s.v FROM (SELECT g, STD(x) AS v FROM t GROUP BY g) s", True),
+            ("INT", "SELECT g, VAR_POP(x) AS v FROM (SELECT g, x FROM t UNION ALL SELECT g, x FROM t) u GROUP BY g", True),
+            ("INT", "SELECT a.g, VARIANCE(b.x) AS v FROM t a JOIN t b ON b.g = a.g GROUP BY a.g", True),
+            ("INT", "SELECT g, VAR_SAMP(x) AS v FROM t GROUP BY g ORDER BY v LIMIT 2", True),
             ("INT", "SELECT g, VAR_SAMP(CAST(x AS DOUBLE)) * 2 AS a FROM t GROUP BY g", False),
             ("DOUBLE", "SELECT g, VAR_SAMP(x) * 2 AS a FROM t GROUP BY g", False),
+            ("DOUBLE", "WITH c AS (SELECT g, VARIANCE(x) AS v FROM t GROUP BY g) SELECT g, v FROM c", False),
             ("INT", "SELECT g, VAR_SAMP(x) AS a FROM t GROUP BY g", False),
+            ("DECIMAL(12,3)", "SELECT g, STDDEV_POP(x) AS a, VARIANCE(x) AS b FROM t GROUP BY g", False),
             ("INT", "SELECT g, VAR_SAMP(x * 2) AS a FROM t GROUP BY g", False),
             ("INT", "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING VAR_SAMP(x) > 1", False),
         ]
-        for col_type, select, limited in cases:
+        for col_type, select, refused in cases:
             for engine in ("mariadb:10.11", "mariadb:12.3", "mysql:8.4"):
-                with self.subTest(engine=engine, type=col_type, select=select):
-                    with self.assertRaises(EngineLimitationError) as raised:
-                        self._plan(engine, col_type, select, ignore_limitations=False)
-                    codes = {lim.code for lim in raised.exception.limitations}
-                    expect = limited and engine.startswith("mariadb")
-                    self.assertEqual("MARIADB_STAT_RESULT_DECIMALS" in codes, expect, codes)
+                for ignore in (False, True):
+                    with self.subTest(engine=engine, type=col_type, select=select, ignore=ignore):
+                        expect = refused and engine.startswith("mariadb")
+                        # Without the override every MySQL-family view stops at
+                        # MYSQL_NO_TRUNCATE_TRIGGER first; the override must
+                        # not get past the refusal.
+                        if expect and ignore:
+                            with self.assertRaises(UnsupportedMaterializedViewError):
+                                self._plan(engine, col_type, select, ignore_limitations=ignore)
+                        elif ignore:
+                            self._plan(engine, col_type, select, ignore_limitations=True)
+                        else:
+                            with self.assertRaises(EngineLimitationError) as raised:
+                                self._plan(engine, col_type, select, ignore_limitations=False)
+                            self.assertEqual(
+                                {lim.code for lim in raised.exception.limitations}, {"MYSQL_NO_TRUNCATE_TRIGGER"}
+                            )
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +468,15 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                     f"SELECT id, {var_fn}(x) OVER (PARTITION BY g) AS w, "
                     f"{std_fn}(x) OVER (PARTITION BY g) AS sw FROM {t}",
                 ),
+                # Shape audit: on MariaDB each must be exact or refused.
+                (f"audit_cte_{k}", f"WITH c AS (SELECT g, {var_fn}(x) AS v FROM {t} GROUP BY g) SELECT g, v FROM c"),
+                (f"audit_derived_{k}", f"SELECT s.g, s.v FROM (SELECT g, {std_fn}(x) AS v FROM {t} GROUP BY g) s"),
+                (
+                    f"audit_union_{k}",
+                    f"SELECT g, {var_fn}(x) AS v FROM (SELECT g, x FROM {t} UNION ALL "
+                    f"SELECT g, x FROM {t} WHERE id > 2) u GROUP BY g",
+                ),
+                (f"audit_orderlimit_{k}", f"SELECT g, {std_fn}(x) AS v FROM {t} GROUP BY g ORDER BY g LIMIT 3"),
             ]
             if engine == Dialect.POSTGRES:
                 views.append((
@@ -451,6 +484,16 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                     f"SELECT g, {var_fn}(x) FILTER (WHERE x > 0) AS vf, {std_fn}(DISTINCT x) AS sd "
                     f"FROM {t} GROUP BY g",
                 ))
+        # Self-join statistics over DOUBLE are left out on PostgreSQL: its
+        # floating VAR/STDDEV accumulation depends on row order and the join
+        # recompute visits rows in another order (1-ULP differences observed);
+        # tracked in TODO "Make Floating-Point Aggregates Exactly Equal".
+        for var_fn, std_fn in pairs:
+            k = f"{var_fn}_{std_fn}".lower()
+            views.append((
+                f"audit_selfjoin_{k}",
+                f"SELECT a.g, {var_fn}(b.x) AS v FROM {t} a JOIN {t} b ON b.g = a.g GROUP BY a.g",
+            ))
         return views
 
     def _assert_equivalent(self, engine, conn, mv: str, live: str, label: str) -> None:
@@ -489,43 +532,54 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
             conn.commit()
             manager = MaterializedViewManager(conn, dialect=engine)
             pairs: List[Tuple[str, str, str]] = []
+            refused: List[str] = []
             for name, select in self._views(engine, t):
                 mv, live = f"mv_{name}_{tag}", f"live_{name}_{tag}"
                 cur.execute(f"CREATE VIEW {live} AS {select}")
                 conn.commit()
                 view_sql = f"CREATE VIEW {mv} AS {select};"
-                expected = set()
+                if (
+                    engine == Dialect.POSTGRES
+                    and name.startswith("audit_selfjoin_")
+                    and "DOUBLE" in col_type.upper()
+                ):
+                    continue
+                if is_mariadb and name.startswith("audit_"):
+                    # Exact or refused: a refusal must hold under the override.
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", EngineLimitationWarning)
+                            manager.register_view(view_sql, ignore_limitations=True)
+                    except UnsupportedMaterializedViewError:
+                        conn.rollback()
+                        refused.append(name)
+                        continue
+                    conn.commit()
+                    pairs.append((name, mv, live))
+                    continue
+                if is_mariadb and (
+                    name.startswith("window_")
+                    or (name.startswith("nested_") and "DOUBLE" not in col_type.upper())
+                ):
+                    # MariaDB statistics it cannot reproduce exactly are refused,
+                    # also with ignore_limitations.
+                    with self.assertRaises(UnsupportedMaterializedViewError, msg=name):
+                        manager.register_view(view_sql, ignore_limitations=True)
+                    conn.rollback()
+                    continue
                 if engine == Dialect.MYSQL:
-                    # MySQL has no TRUNCATE trigger.
-                    expected.add("MYSQL_NO_TRUNCATE_TRIGGER")
-                    if (
-                        is_mariadb
-                        and (
-                            name.startswith("window_")
-                            or (name.startswith("nested_") and "DOUBLE" not in col_type.upper())
-                        )
-                    ):
-                        # MariaDB fixes the decimals of VAR/STDDEV over exact
-                        # inputs; nested in an expression they cannot be kept.
-                        expected.add("MARIADB_STAT_RESULT_DECIMALS")
-                if expected:
-                    # The default refuses with exactly the expected codes; the
-                    # override must warn with exactly those codes.
+                    # MySQL has no TRUNCATE trigger: the default refuses, the
+                    # override must warn with exactly that limitation.
                     with self.assertRaises(EngineLimitationError) as raised:
                         manager.register_view(view_sql)
-                    self.assertEqual({lim.code for lim in raised.exception.limitations}, expected, name)
+                    self.assertEqual({lim.code for lim in raised.exception.limitations}, {"MYSQL_NO_TRUNCATE_TRIGGER"}, name)
                     conn.rollback()
                     with warnings.catch_warnings(record=True) as caught:
                         warnings.simplefilter("always")
                         manager.register_view(view_sql, ignore_limitations=True)
                     lim_warnings = [w for w in caught if issubclass(w.category, EngineLimitationWarning)]
                     self.assertEqual(len(lim_warnings), 1)
-                    for code in expected:
-                        self.assertIn(code, str(lim_warnings[0].message))
-                    if "MARIADB_STAT_RESULT_DECIMALS" in expected:
-                        # Overridden known divergence: not compared.
-                        conn.commit()
-                        continue
+                    self.assertIn("MYSQL_NO_TRUNCATE_TRIGGER", str(lim_warnings[0].message))
                 else:
                     manager.register_view(view_sql)
                 conn.commit()
