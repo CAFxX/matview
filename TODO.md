@@ -58,6 +58,77 @@ This document tracks all feature goals, architectural improvements, and verified
 
 ## P0 — Test Correctness & Coverage Gaps
 
+The following seven items are the in-database bulk-maintenance roadmap. Decisions, measurements and rejected alternatives are in [docs/design-bulk-maintenance.md](docs/design-bulk-maintenance.md). There is one reviewable PR per stage. Stage 1 comes first. Stages 2 → 3 (PostgreSQL) and 4 → 5 → 6 (SQLite/MySQL/MariaDB) are independent tracks. Stage 7 comes last.
+
+- [ ] **Bulk maintenance stage 1: Native Bulk-Statement Differential and Benchmark Harness**:
+  - Add a native suite that runs every multi-row statement kind on every engine/version and compares the reader with the live view after each statement. Statement kinds:
+    - multi-row `VALUES` and `INSERT ... SELECT`;
+    - `UPDATE` that moves rows between groups or changes keys;
+    - `DELETE`;
+    - `ON CONFLICT` / `ON DUPLICATE KEY` / `REPLACE` / `INSERT OR REPLACE`;
+    - `MERGE` (PG 15+);
+    - `COPY` / `LOAD DATA LOCAL`;
+    - writable CTEs, and multi-table `UPDATE`/`DELETE` on MySQL/MariaDB;
+    - FK cascades, partitioned tables (parent and direct partition writes), `TRUNCATE`;
+    - zero-row statements, rollback and savepoint rollback.
+  - Cover grouped SUM/COUNT/AVG, MIN/MAX, join aggregate, DISTINCT, plain join and window shapes.
+  - Add the four PostgreSQL defects the design measurements found, as strict expected failures, each linked to the stage that fixes it:
+    - stale MIN/MAX recompute after a row-lock wait under READ COMMITTED (row and transition-table paths);
+    - row-trigger deadlocks between concurrent opposite-order multi-row statements, with two independent connections;
+    - double-counted or missed `Δt ⋈ Δd` when one query (writable CTE or FK cascade) modifies two sources of an algebraic join view;
+    - direct writes to a partition bypassing parent statement triggers.
+  - Commit the benchmark: 1k/100k-row statements, per-engine timings and trigger-invocation counts. Run it as a CI job that reports results and is not a required check.
+- [ ] **Bulk maintenance stage 2: PostgreSQL Statement-Level Transition-Table Maintenance as the Only PostgreSQL Mechanism**:
+  - Generate `AFTER INSERT/UPDATE/DELETE ... FOR EACH STATEMENT` triggers with `REFERENCING NEW/OLD TABLE`, plus `AFTER TRUNCATE`, for every planner strategy.
+  - Each statement applies one consolidated signed delta per group (UPDATE = new +1 `UNION ALL` old −1) and returns early on an empty transition table.
+  - Lock and upsert backing/auxiliary rows in group-key order (`INSERT ... SELECT ... ORDER BY key ON CONFLICT`, or `SELECT ... ORDER BY key FOR UPDATE` before a recompute).
+  - Run native recomputes (MIN/MAX after retraction, approximate SUM/AVG, statistics, group-scoped windows) once per statement for the affected groups, in a separate statement after the lock, so READ COMMITTED sees committed writes. Under REPEATABLE READ/SERIALIZABLE, a concurrent change must fail closed with a serialization error.
+  - Restrict empty-group deletes to the affected keys. Today an unrestricted `DELETE ... WHERE __mv_row_count <= 0` costs 550 µs per single-row statement with 10k groups.
+  - Install the triggers on partitioned parents and on every partition. Drift checks report partitions without triggers, and repair installs them. Refuse non-partition inheritance children.
+  - Remove the PostgreSQL row-trigger codegen, `pg_use_transition_tables`, `pg_vectorize_transition_tables` and the PL/pgSQL row loop. This also fixes the expression GROUP BY recompute failure.
+  - Tests:
+    - flip the stale-recompute, deadlock and partition expected failures from stage 1;
+    - independent-connection interleavings under READ COMMITTED, REPEATABLE READ and SERIALIZABLE;
+    - the single-row overhead budget (measured prototype: +6–10 µs per statement compared with row triggers);
+    - a 1M-row statement (tuplestore spill);
+    - several views on one table;
+    - mutation checks: drop the ORDER BY, merge the lock statement into the recompute, drop the partition triggers, drop the key restriction.
+- [ ] **Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View**:
+  - Writable CTEs and FK cascades into two sources of an algebraic join view currently get `Δt ⋈ Δd` wrong, with both row triggers and transition tables (PG 15/18).
+  - Detect the overlap exactly: a `BEFORE`/`AFTER STATEMENT` bracket counter per view, kept in a transaction-local setting. Overlapping firings store their signed deltas, and the last one applies `−(Δt ⋈ Δd)`. Three or more co-modified sources use inclusion–exclusion or fail closed.
+  - First verify the bracket firing order natively on every supported PostgreSQL version and statement kind.
+  - Tests:
+    - 2- and 3-source CTEs with insert, update and delete mixes;
+    - FK cascades into both sides;
+    - savepoint rollback with an open bracket;
+    - sequential PL/pgSQL statements, which must not be flagged;
+    - a mutation check that drops the correction.
+- [ ] **Bulk maintenance stage 4: Lean Row-Trigger Bodies on SQLite, MySQL and MariaDB**:
+  - Every per-row body must be O(1) indexed statements:
+    - restrict empty-group deletes to the row's key (join views emit an unrestricted `DELETE ... WHERE n <= 0` per row today);
+    - remove single-row derived tables with `GROUP BY`;
+    - compute derived columns such as AVG in the reader view instead of storing them;
+    - minimise statements per row.
+  - Measured headroom: the SQLite generated agg body costs 1.5–2x a hand-minimised exact body.
+  - Tests: the stage 1 differential, plus per-row cost budgets relative to the measured trigger floor and to the hand-minimised bodies. Measured: the floor is SQLite 0.3–0.4 µs and MySQL/MariaDB 0–3 µs per row; the generated MariaDB 12.3 agg body costs 66 µs per row against 10 µs lean.
+- [ ] **Bulk maintenance stage 5: Per-Row Cost Classes and Explicit Refusal of Super-Linear Row Maintenance**:
+  - Classify every row-trigger body as O(1), O(log n) with a named supporting index, O(group) or O(table).
+  - On SQLite/MySQL/MariaDB, refuse O(group) and O(table) plans by default with an explicit limitation code that names the cost and the missing index. Measured costs of such plans:
+    - MIN/MAX without the (g, v) index: 28 s against 0.2 s for 100k rows on SQLite;
+    - ATOMIC_QUERY_SYNC plain join: 21 s for 10k rows;
+    - SQLite join SUM recompute: 13.6 s for 100k rows.
+  - An opt-in `allow_superlinear_row_maintenance=True` installs such plans anyway and warns. Test the opt-in, its warning and its documented consequences separately.
+  - `recommended_base_indexes` becomes a registration requirement for O(log n) plans, checked against the live schema and rechecked by drift detection.
+- [ ] **Bulk maintenance stage 6: Algebraic Coverage That Removes Super-Linear Plans**:
+  - Plan plain select-project-join views as delta joins (`Δt ⋈ d`) instead of ATOMIC_QUERY_SYNC.
+  - Fold integer-only join SUM incrementally on SQLite, as the single-table path does.
+  - Tests: native differentials for the new shapes; stage 5 refusals shrink accordingly.
+- [ ] **Bulk maintenance stage 7: Multi-Row Fuzz and Concurrency Coverage; Reposition `bulk_changes()`**:
+  - The schema-aware DML AST generator emits every multi-row statement kind from stage 1 and reports production and combination coverage.
+  - Run two- and three-connection randomized bulk workloads that check exactness or a fail-closed outcome, and retain their seeds.
+  - On PostgreSQL, `bulk_changes()` keeps its transaction-ownership contract but no longer suspends or refreshes. Statement-level maintenance is faster there: 0.33–0.75 s against 0.59–1.64 s for 100k rows.
+  - Elsewhere, document `bulk_changes()` as a Python-only optional optimisation that no other feature depends on.
+
 - [ ] **Make Floating-Point Aggregates Exactly Equal to the Live View on PostgreSQL and MySQL/MariaDB (silent divergence today)**:
   - Confirmed natively (PG 18, MySQL 8.4, master and branches): SUM/TOTAL over FLOAT/REAL/DOUBLE maintained by add/retract is history-dependent: `0.1+0.2+0.3` with `0.2` removed gives `0.4000000000000001` instead of `0.4`; `1e16 + 1.5 - 1e16` gives `2.0` instead of `1.5`; PG REAL can give `0.0` instead of `1.5`. This is not evaluation-order noise over the current rows; the maintained value depends on values that were added and later removed. AVG is unaffected where the engine already recomputes it.
   - Target design: lock the group row in one statement, then recompute the affected group with the engine's own aggregate in a separate statement (PostgreSQL READ COMMITTED then takes a fresh snapshot after the lock wait; avoid locking reads inside the DML statement on MySQL/MariaDB because they deadlock and stall writers). Integers and decimals stay algebraic and exact. If a shape cannot be made exact, reject it explicitly (AGENTS.md); do not widen tolerances.
@@ -89,7 +160,7 @@ This document tracks all feature goals, architectural improvements, and verified
 - [ ] **Rewrite the PK-Swap Mutation-Sensitivity Test for Refcount Triggers**:
   - PR #96's `test_pk_swap_mutation_sensitivity.py` mutates a SQLite trigger text (`AND NOT EXISTS (SELECT 1 FROM ...)`) that the current code no longer emits (it uses `__mv_row_count` refcounting), so the mutant step fails with "expected to remove exactly one OLD-key guard". Re-derive the mutant from the current trigger design and demonstrate it is killed; do not weaken the test.
  
-- [ ] **Fix PostgreSQL Transition-Table Recomputations for Expression GROUP BY Keys**:
+- [ ] **Fix PostgreSQL Transition-Table Recomputations for Expression GROUP BY Keys** (to be closed by "Bulk maintenance stage 2", which removes the row-loop fallback):
   Native PostgreSQL 15/18 CI on PRs #197 and #219 fails when an AVG recomputation is correlated against a raw transition-row expression while the grouped query uses COALESCE(region, 'UNK'). PostgreSQL rejects the generated statement with an ungrouped-column error. Trace planner fallback selection through transition-table body generation; use projected group keys or fall back to row-level maintenance for the complete affected plan. Add native initial-population and INSERT/UPDATE/DELETE differential regressions for COALESCE, CASE, CAST and arithmetic grouping expressions, with vectorization enabled and disabled.
 - [ ] **Make Native MySQL/MariaDB Multi-Writer Backfill Interleavings Deterministic and Correct**:
   PRs #217/#219 add a native barrier test, but exact-head CI fails on MySQL 8.4/9.7 and MariaDB 10.11/11.8/12.3 with BrokenBarrierError at the mid-run barrier. Expose worker exceptions and statement/commit progress before waiting; replace callback-blocking barriers with a bounded event schedule; determine whether writers are blocked by backfill/trigger locks or fail before reaching the barrier. Prove no lost/double deltas and successful retry under independent sessions. Do not skip or relax the test to manufacture a pass.
@@ -362,7 +433,7 @@ The existing differential-testing harness is useful, but its current headline co
   - PostgreSQL `FILLFACTOR` tuning on high-churn backing tables and `MERGE` statements on PostgreSQL 15+.
   - MySQL 8.0.19+ `AS new` row alias in `ON DUPLICATE KEY UPDATE` where supported, and MariaDB vs MySQL optimizer-specific rewrites.
   - SQLite 3.35+ `RETURNING` and `WITHOUT ROWID` on clustered composite-PK backing/auxiliary tables.
-- [ ] **Cross-Engine Set-Based Delta Maintenance for Bulk DML**:
+- [ ] **Cross-Engine Set-Based Delta Maintenance for Bulk DML** (superseded by the P0 "Bulk maintenance stage 1–7" items and [docs/design-bulk-maintenance.md](docs/design-bulk-maintenance.md); the text below is kept for history):
   Implement a unified incremental-maintenance pipeline that consolidates the changes from bulk `INSERT`, `UPDATE`, and `DELETE` operations into set-based deltas, avoiding row-at-a-time materialized-view maintenance wherever the target engine and execution context permit it.
   - **Shared logical delta layer:** Represent changes as signed row contributions (new rows positive, old rows negative), consolidate contributions by affected materialized-view group keys, and derive aggregate/backing-table and auxiliary-state updates from the consolidated deltas. Keep this logical maintenance model independent of dialect-specific change capture.
   - **PostgreSQL:** When `--pg-transition-tables` is enabled and supported by the server/version, use statement-level triggers and transition tables to collect the complete statement delta, aggregate it once, and apply it with set-based SQL (including appropriate UPSERT, `UPDATE ... FROM`, and deletion of groups whose resulting row count reaches zero). Avoid the current PL/pgSQL per-row loop.
