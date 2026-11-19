@@ -237,7 +237,7 @@ class MaterializedViewPlan:
     auxiliary_table_names: List[str] = field(default_factory=list)
     trigger_names: List[str] = field(default_factory=list)
     function_names: List[str] = field(default_factory=list)
-    limitations: List[TransparencyLimitation] = field(default_factory=list)
+    limitations: Sequence[TransparencyLimitation] = field(default_factory=list)
     object_prefix: str = DEFAULT_OBJECT_PREFIX
     db_view_name: str = ""
     index_names: List[str] = field(default_factory=list)

@@ -268,6 +268,43 @@ class DriftTests(unittest.TestCase):
                 with self.assertRaises(ps.PlanError):
                     ps.build_jobs(mutated(fn), ["sqlite"])
 
+    def test_matrix_restricted_step_is_planned_for_exactly_the_matching_cells(self) -> None:
+        restricted = [s for s in RAW_WF["jobs"]["sqlite"]["steps"] if "matrix." in str(s.get("if", ""))]
+        self.assertTrue(restricted, "the sqlite job is expected to carry a matrix-restricted step (pyright)")
+        jobs = ps.build_jobs(RAW_WF, ["sqlite"])
+        self.assertGreater(len(jobs), 1)
+        for raw in restricted:
+            m = re.fullmatch(r"(?:\$\{\{\s*)?matrix\.([\w-]+)\s*==\s*'([^']*)'(?:\s*\}\})?", str(raw["if"]).strip())
+            self.assertIsNotNone(m, raw["if"])
+            runs = 0
+            for pj in jobs:
+                planned = [s for s in pj.steps if s.name == raw["name"]]
+                self.assertEqual(len(planned), 1, pj.key)
+                applies = str(pj.matrix[m.group(1)]).lower() == m.group(2).lower()
+                self.assertEqual(planned[0].condition, "success" if applies else "never", pj.key)
+                runs += applies
+            self.assertEqual(runs, 1, f"{raw['name']!r} must apply to exactly one matrix cell")
+
+    def test_matrix_condition_forms_and_failures(self) -> None:
+        def sqlite_with_if(cond: str) -> Dict[str, Any]:
+            wf = yaml.safe_load(CI_YML.read_text())
+            wf["jobs"]["sqlite"]["steps"][3]["if"] = cond
+            return wf
+
+        def conditions(cond: str) -> Dict[str, str]:
+            jobs = ps.build_jobs(sqlite_with_if(cond), ["sqlite"])
+            return {j.matrix["python-version"]: j.steps[3].condition for j in jobs}
+
+        self.assertEqual(conditions("matrix.python-version == '3.15'"), {"3.11": "never", "3.15": "success"})
+        # GitHub expression braces and case-insensitive string comparison.
+        self.assertEqual(conditions("${{ matrix.python-version == '3.11' }}"), {"3.11": "success", "3.15": "never"})
+        self.assertEqual(conditions("matrix.python-version == '3.11 '"), {"3.11": "never", "3.15": "never"})
+        for bad in ("matrix.python-version != '3.11'", "matrix.nope == 'x'",
+                    "matrix.python-version == 3.11", "always() || matrix.python-version == '3.11'"):
+            with self.subTest(bad):
+                with self.assertRaises(ps.PlanError):
+                    ps.build_jobs(sqlite_with_if(bad), ["sqlite"])
+
     def test_matrix_properties_render_like_github(self) -> None:
         def fuzz_targets(wf: Dict[str, Any]) -> List[str]:
             jobs = ps.build_jobs(wf, ["sqlite-compat"])
@@ -676,6 +713,28 @@ class FailureTests(TmpCase):
         self.assertTrue(Path(r.steps[idx].log).is_file())
         summary = json.loads((self.tmp / "run" / "summary.json").read_text())
         self.assertEqual(summary["exit_code"], 1)
+
+    def test_matrix_restricted_step_runs_once_and_is_reported_skipped_elsewhere(self) -> None:
+        repo = make_repo(self.tmp)
+        runner = FakeRunner()
+        outcome, _ = run_fake(repo, runner, self.tmp, only=["sqlite"])
+        executed = [s for s, _ in runner.scripts() if re.search(r"(?m)^pyright\b", s)]
+        self.assertEqual(len(executed), 1, executed)
+        results = {r.key: r for r in outcome.results}
+        step = "Static type check (pyright)"
+        by_cell = {k: [s for s in r.steps if s.name == step] for k, r in results.items() if k.startswith("sqlite[")}
+        self.assertEqual({k: [s.status for s in v] for k, v in by_cell.items()},
+                         {"sqlite[python-version=3.11]": ["passed"], "sqlite[python-version=3.15]": ["skipped"]})
+        self.assertIn("matrix cell", by_cell["sqlite[python-version=3.15]"][0].detail)
+
+    def test_failing_pyright_fails_the_gate(self) -> None:
+        repo = make_repo(self.tmp)
+        runner = FakeRunner(fail_when="pyright")
+        outcome, text = run_fake(repo, runner, self.tmp, only=["sqlite"])
+        self.assertEqual(outcome.exit_code, ps.EXIT_FAILED)
+        r = {x.key: x for x in outcome.results}["sqlite[python-version=3.11]"]
+        self.assertEqual({s.name: s.status for s in r.steps}["Static type check (pyright)"], "failed")
+        self.assertIn("FAILED step 'Static type check (pyright)'", text)
 
     def test_keep_going_runs_remaining_steps(self) -> None:
         repo = make_repo(self.tmp)

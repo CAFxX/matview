@@ -8,9 +8,11 @@ import warnings
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
+import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
-from sqlglot.tokens import TokenType as SQLGlotTokenType
+from sqlglot import TokenType as SQLGlotTokenType
 
+from ._host import MixinHost
 from .engines import (
     AggFunc,
     Dialect,
@@ -63,7 +65,7 @@ from .sql_frontend import (
 )
 
 
-class PlannerMixin:
+class PlannerMixin(MixinHost):
     """Planner methods for view unwrapping, decomposition, validation, strategy selection, and indexing."""
 
     def _enforce_or_warn(self) -> None:
@@ -376,7 +378,7 @@ class PlannerMixin:
                     if tbl_u in {outer_alias.lower(), (cte_or_sub_alias or "").lower()}:
                         if tk.start > cursor:
                             out.append(frag[cursor:tk.start])
-                        rep = col_map.get(col_u, toks[i + 2].text)
+                        rep = col_map[col_u] if col_u in col_map else toks[i + 2].text
                         out.append(rep)
                         cursor = toks[i + 2].end + 1
                         i += 3
@@ -1095,8 +1097,7 @@ class PlannerMixin:
             return cols
         return [item.alias for item in self.view.select_items]
 
-    @staticmethod
-    def _extract_index_col_base_ident(col_spec: str) -> str:
+    def _extract_index_col_base_ident(self, col_spec: str) -> str:
         cleaned = re.sub(
             r"\b(?:ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST|COLLATE\s+[A-Za-z0-9_.\"'`]+)\b",
             "",
@@ -1515,10 +1516,10 @@ class PlannerMixin:
         }
         for it in self._working_select_items:
             if it.is_aggregate and it.agg_func not in allowed_aggs:
-                fn_name = it.agg_func.value if hasattr(it.agg_func, "value") else str(it.agg_func or it.raw_expr)
+                fn_name = it.agg_func.value if it.agg_func is not None else str(it.raw_expr)
                 return (sel, f"Holistic aggregate function '{fn_name}' cannot be maintained algebraically with O(1) deltas.")
             if it.is_aggregate and it.is_distinct:
-                fn_name = it.agg_func.value if hasattr(it.agg_func, "value") else str(it.agg_func or it.raw_expr)
+                fn_name = it.agg_func.value if it.agg_func is not None else str(it.raw_expr)
                 return (sel, f"DISTINCT aggregate expression '{fn_name}' requires group-scoped recomputation.")
 
         for j in self.view.joins:

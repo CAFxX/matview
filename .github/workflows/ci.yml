@@ -59,8 +59,10 @@ name: CI — Multi-Engine Materialized View Tests
 #   newest compatible releases; ci-deferred.yml derives exact pins from these
 #   floors and tests them nightly on Python 3.11 against live PostgreSQL and MySQL.
 #   sqlglot 30.22 and older fail (e.g. no TokenType.NATIONAL_RAW_STRING; before
-#   25.2 no exp.SetOperation). requirements-dev.txt (PyYAML) is installed only
-#   by the SQLite jobs for scripts/test_presubmit.py.
+#   25.2 no exp.SetOperation). requirements-dev.txt (PyYAML, pyright) is installed
+#   only by the SQLite jobs: PyYAML for scripts/test_presubmit.py, pyright for the
+#   static type check, which runs once (the oldest-Python SQLite cell) against
+#   pythonVersion 3.11 in pyrightconfig.json and fails the required gate.
 # - Timeouts: 25 minutes per gate job (the slowest gate job measured 11 min
 #   after the fixed-seed gate, 30-34 min before it), 5 for bookkeeping jobs.
 # - Optional SQLite drivers (apsw, apsw-sqlite3mc, sqlcipher3-binary,
@@ -216,10 +218,19 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
           # PyYAML: the presubmit self-test step parses this workflow file.
+          # The type checker (requirements-dev.txt) is used by the static type check step below.
           python3 -m pip install -r requirements-dev.txt
 
       - name: Verify SQLite library version
         run: python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
+
+      # Runs once, in the oldest-Python cell: the check targets pythonVersion
+      # 3.11 (pyrightconfig.json) whichever interpreter runs it, so repeating it
+      # in the 3.15 cell would only duplicate the result. Keep this literal equal
+      # to the oldest matrix entry (test_p1_static_typing_gate.py checks it).
+      - name: Static type check (pyright)
+        if: matrix.python-version == '3.11'
+        run: pyright
 
       - name: Verify SQLite runtime feature boundaries
         run: python3 test_sqlite_runtime_boundaries.py
@@ -340,6 +351,12 @@ jobs:
 
       - name: Test the local presubmit gate derived from this workflow
         run: python3 scripts/test_presubmit.py
+
+      - name: Test the pyright gate configuration, mixin contract, and fault detection
+        run: python3 test_p1_static_typing_gate.py
+
+      - name: Test user-declared view indexes (CREATE INDEX and indexes=)
+        run: python3 test_p1_user_view_indexes.py
 
       - name: Test P2 base index introspection, recommendations, and auto-indexes
         run: python3 test_p2_index_intelligence.py

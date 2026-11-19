@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
 from sqlglot import exp as sqlglot_exp
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     Dialect,
@@ -47,7 +48,7 @@ from ..sql_frontend import (
 )
 
 
-class Tier1SingleMixin:
+class Tier1SingleMixin(MixinHost):
     def _effective_agg_value_expr(
         self, item: SelectItem, record_prefix: Optional[str] = None
     ) -> str:
@@ -101,6 +102,7 @@ class Tier1SingleMixin:
             AggFunc.STDDEV_SAMP,
         ):
             if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+                assert item.agg_func is not None
                 fn_s = item.agg_func.value
                 return f"{fn_s}({eff})"
             cnt_e = f"COUNT({eff})"
@@ -115,6 +117,7 @@ class Tier1SingleMixin:
             )
         if item.agg_func in (AggFunc.BIT_AND, AggFunc.BIT_OR, AggFunc.BIT_XOR):
             if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+                assert item.agg_func is not None
                 if self.dialect == Dialect.MYSQL:
                     return f"(CASE WHEN COUNT({eff}) = 0 THEN NULL ELSE {item.agg_func.value}({eff}) END)"
                 return f"{item.agg_func.value}({eff})"

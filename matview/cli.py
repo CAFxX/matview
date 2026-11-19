@@ -7,13 +7,14 @@ import hashlib
 import json
 import re
 import sys
-from typing import Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .connectivity import detect_engine_version, introspect_database_schemas
 from .engines import (
     DEFAULT_OBJECT_PREFIX,
     Dialect,
     EngineLimitationError,
+    EngineVersion,
     StrictCompilationError,
     parse_engine_version,
 )
@@ -203,6 +204,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if not view_sql:
                     print("ERROR: --view is required when --db is not provided.", file=sys.stderr)
                     return 2
+                # Guarded above: without --db, --schema is required for `diff`.
+                assert schema_sql is not None
                 schemas = parse_table_schema(schema_sql)
                 detected_ev = _resolve_dialect_and_engine_version(
                     schemas, args.dialect, args.engine_version

@@ -413,6 +413,11 @@ The existing differential-testing harness is useful, but its current headline co
   - Make repair idempotent and failure-recoverable; expose per-view outcomes rather than claiming all-view atomicity when commits occur per view.
   - Add tests for dropped/modified triggers, functions, reader views, backing/auxiliary tables and indexes, and for repair under concurrent readers/writers.
 
+- [ ] **Bring the Tests and `scripts/test_presubmit.py` Under the Pyright Gate**:
+  `pyrightconfig.json` checks production code (`matview/`, `matview_sync.py`, non-test `scripts/` and the root tooling modules) in `standard` mode with zero errors; the root `test_*.py` files and `scripts/test_presubmit.py` are excluded (about 340 standard-mode errors on pyright 1.1.408: untyped `sqlglot`/driver results, Optional narrowing, `Any`-typed fixtures, redeclared test names). Fix them per file, drop the `scripts/test_*.py` exclusion and add the test files to `include`.
+- [ ] **Tighten the Type-Check Gate Beyond `standard`**:
+  Move to `strict` (or enable `reportMissingParameterType`/`reportUnknown*` for `matview/`) in small steps. Replace the nine `# pyright: ignore` suppressions (eight correlated possibly-unbound variables in `dialects/postgres.py` and `maintenance/zset.py`, one `len()` narrowing in `maintenance/tier2.py`) by restructuring the code, and replace the type-checking-only `matview/_host.py` mixin contract (kept honest by `test_p1_static_typing_gate.py`) with real composition or Protocols. `MaterializedViewPlan.limitations` is a tuple on single-view plans and a list on multi-view plans: pick one representation.
+
 ## P2 — Index Intelligence & Incremental SQL Feature Coverage
 
 - [x] **Introspect & Leverage Existing Base-Table Indexes**:

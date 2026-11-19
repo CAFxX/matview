@@ -62,7 +62,9 @@ def verify_postgres() -> None:
     with psycopg2.connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT version(), current_setting('server_version_num')::integer")
-            version_text, version_num = cur.fetchone()
+            row = cur.fetchone()
+            assert row is not None
+            version_text, version_num = row
 
             check_label = f"{label} {requested_image}".lower()
             extension = (
@@ -76,7 +78,9 @@ def verify_postgres() -> None:
                     "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = %s)",
                     (extension,),
                 )
-                available_exts = {extension} if cur.fetchone()[0] else set()
+                ext_row = cur.fetchone()
+                assert ext_row is not None
+                available_exts = {extension} if ext_row[0] else set()
 
             major = check_postgres_version(
                 version_text=version_text,
@@ -195,7 +199,9 @@ def verify_mysql() -> None:
     ) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT VERSION(), @@version_comment")
-            version, comment = cur.fetchone()
+            row = cur.fetchone()
+            assert row is not None
+            version, comment = row
 
     expected_product = os.environ.get("EXPECTED_MYSQL_PRODUCT")
     expected_version = os.environ.get("EXPECTED_MYSQL_VERSION")

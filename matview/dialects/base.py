@@ -7,9 +7,11 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
+import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
-from sqlglot.tokens import TokenType as SQLGlotTokenType
+from sqlglot import TokenType as SQLGlotTokenType
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     DEFAULT_OBJECT_PREFIX,
@@ -61,7 +63,7 @@ def _sqlite_type_affinity(declared_type: str) -> str:
     return "NUMERIC"
 
 
-class DialectBaseMixin:
+class DialectBaseMixin(MixinHost):
     def _bounded_ident(self, prefix: str, stem: str, suffix: str = "", max_len: int = 62) -> str:
         full = f"{prefix}{stem}{suffix}"
         if len(full) <= max_len:
@@ -1221,7 +1223,7 @@ class DialectBaseMixin:
             ):
                 q_unq = tk.text.lower()
                 c_unq = toks[i + 2].text.lower()
-                actual_c = col_names_lower.get(c_unq, toks[i + 2].text)
+                actual_c = col_names_lower[c_unq] if c_unq in col_names_lower else toks[i + 2].text
                 if q_unq in quals_lower:
                     if tk.start > cursor:
                         out.append(expr[cursor:tk.start])

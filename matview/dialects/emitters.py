@@ -7,9 +7,11 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
+import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
-from sqlglot.tokens import TokenType as SQLGlotTokenType
+from sqlglot import TokenType as SQLGlotTokenType
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     DEFAULT_OBJECT_PREFIX,
@@ -21,7 +23,7 @@ from ..engines import (
     _SQL_RESERVED_KEYWORDS,
     _sqlglot_dialect,
 )
-from ..logical_ir import ColumnDef, JoinSpec, SelectItem, TableSchema, ViewSpec
+from ..logical_ir import ColumnDef, JoinSpec, MaterializedViewPlan, SelectItem, TableSchema, ViewSpec
 from ..sql_frontend import (
     _find_top_level_token,
     _has_subquery_ast,
@@ -39,7 +41,7 @@ from ..sql_frontend import (
 from .templates import render_procedural_sql
 
 
-class DialectEmitMixin:
+class DialectEmitMixin(MixinHost):
     def _build_readonly_view_and_triggers(
         self,
         view_name: str,
