@@ -276,6 +276,9 @@ Errors raised before anything is installed:
 | `MYSQL_NO_TRUNCATE_TRIGGER` | Every view on MySQL/MariaDB. | `TRUNCATE TABLE` bypasses triggers there. |
 | `MYSQL_FK_CASCADE_NO_TRIGGER` | A source table on MySQL/MariaDB has `ON DELETE`/`ON UPDATE` cascading foreign keys. | InnoDB cascades do not fire triggers. |
 | `SQLITE_VERSION_NO_WINDOW_FUNC`, `MYSQL_VERSION_NO_WINDOW_FUNC` | Window functions on an engine version without them. | The query cannot run there. |
+| `ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE` | PostgreSQL/MySQL/MariaDB: any floating-point `SUM`/`AVG`/`VAR`/`STDDEV`, in any shape (see [Floating-point aggregates](#floating-point-aggregates)). Per-code opt-in only. | The original view's own result depends on its plan; no maintained value can equal it under every plan. |
+| `ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE` | Such an aggregate over a join, a window, or (MySQL/MariaDB) `UNION ALL`. Per-code opt-in only. | It is folded or re-evaluated without the lock-then-recompute protocol: values can drift until `repair_view()`. |
+| `MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX` | MySQL/MariaDB: a grouped view with such an aggregate and no source-table index whose leading columns are the `GROUP BY` columns. Per-code opt-in only. | The recompute is a locking read; without the index it share-locks the whole table and concurrent writers deadlock. |
 
 ```python run
 import warnings
@@ -310,6 +313,22 @@ emits an `EngineLimitationWarning`. The guarantee then holds only as long as the
 application never performs the operation the limitation names (for
 `MYSQL_NO_TRUNCATE_TRIGGER`: never `TRUNCATE` a source table; use `DELETE`). On
 MySQL/MariaDB every view currently needs this opt-in.
+
+Codes marked "per-code opt-in only" weaken the result contract itself, so
+`ignore_limitations` does not override them: name each one in
+`accept_limitations=[...]` (`register_view`, `sync_views`, `diff_views`,
+`generate_materialized_view(s)`, or `MaterializedViewManager(...)` for every
+view) or `--accept-limitation CODE` (repeatable). The codes a view was
+installed with are stored in its catalog row, bound to that definition (a
+different definition under the same name needs its own explicit acceptance;
+a stored record that does not match the stored definition accepts nothing);
+later `register_view()`,
+`sync_views()`, `repair_view()` and `bulk_changes()` reuse them (an explicit
+`accept_limitations` replaces them). `repair_view()` never overrides a
+per-code limitation that is not stored with the view: if a schema change makes
+the definition need one (for example a `DECIMAL` column becomes `DOUBLE`), the
+rebuild raises `EngineLimitationError` and `check_schema_drift()` reports the
+view as `invalid`.
 
 Some trigger-bypassing operations are not detected and not refused: `INSERT OR
 REPLACE`/`REPLACE` on a SQLite connection that was not configured with
@@ -576,7 +595,8 @@ protocol at all: run it with writes to the source tables stopped.
   change to a referenced table currently counts, even to a column the view
   does not use.
 - `check_schema_drift()` (`--check-drift`) compares each registered view with
-  the live schema: `ok`, `drifted`, `invalid` or `backfill_incomplete`.
+  the live schema: `ok`, `drifted`, `invalid`, `backfill_incomplete` or
+  `triggers_missing`.
   `diff_views()` / `matview diff` shows what a registration would change.
 - `repair_view(name=None)` (`--repair`) repopulates (or rebuilds after drift)
   each view in its own transaction; there is no all-view atomicity (see
@@ -919,15 +939,128 @@ views, each key value is mapped to a canonical text by a per-view function
   floating-point sums depend on the order its plan visits rows, which leaves
   edge cases open: [Resolve SQLite SUM Overflow Edge Cases](TODO.md) and
   [Make SQLite Join SUM/TOTAL/AVG Recompute Visit Rows in the Original View's Order (or Reject)](TODO.md).
-- PostgreSQL and MySQL/MariaDB: `SUM`/`TOTAL` over `REAL`/`DOUBLE`/`FLOAT` are
-  still maintained by adding and subtracting, so after deletes or updates the
-  result can differ from the original view (for example `0.1 + 0.2 + 0.3` with
-  `0.2` removed gives `0.4000000000000001` instead of `0.4`). Integer and
-  `DECIMAL`/`NUMERIC` sums are exact. See
-  [Make Floating-Point Aggregates Exactly Equal to the Live View on PostgreSQL and MySQL/MariaDB (silent divergence today)](TODO.md).
-- `VAR_*`/`STDDEV_*` over floating-point values are still compared with small
-  error budgets by the differential tests, so exact equality is not
-  established for them on any engine.
+- PostgreSQL and MySQL/MariaDB: integer and `DECIMAL`/`NUMERIC` `SUM`/`AVG`
+  (and PostgreSQL `VAR`/`STDDEV` of them, computed in `NUMERIC`) are
+  maintained exactly (PostgreSQL sums of variable-scale `NUMERIC` are
+  recomputed, because numeric addition keeps the largest display scale).
+- PostgreSQL and MySQL/MariaDB: `SUM`/`AVG` over approximate values
+  (`REAL`/`DOUBLE`/`FLOAT`, or any argument not provably integer/fixed-point)
+  and MySQL/MariaDB `VAR_*`/`STDDEV_*` (computed in `DOUBLE` for every argument
+  type) are **refused by default in every shape**
+  (`ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE`). Their result depends on the
+  order in which the original view's plan reads the rows, and that order is not
+  a function of the data. Measured natively with the rows 1.5, 1e16, -1e16:
+
+  | Plan of the original view | Engines | Original view | Fixed (scan / primary-key) order |
+  | --- | --- | --- | --- |
+  | `SUM(x) ... WHERE y < 10` through an index on `y` (global and grouped) | PostgreSQL 18, MySQL 8.4, MariaDB 10.11 | 1.5 | 2.0 |
+  | Parallel aggregate (default `max_parallel_workers_per_gather`, 600k rows) | PostgreSQL 18 | varies between runs | 2.0 |
+  | Sort + GroupAggregate instead of HashAggregate | PostgreSQL 15/18 | 1 ulp off (`VAR_SAMP`) | |
+
+  Window `SUM`/`AVG` (`OVER (...)`), joins, `UNION ALL` and `DISTINCT` mixes
+  are refused the same way.
+
+- Opt-in (`accept_limitations=["ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"]`,
+  plus the other codes the refusal names): **best effort**, never exact in
+  general. Per engine:
+
+  | | PostgreSQL 15/18 | MySQL 8.4/9.7, MariaDB 10.11/11.8/12.3 |
+  | --- | --- | --- |
+  | Default | refused | refused |
+  | Single table (grouped, global, `WHERE`, `HAVING`, `DISTINCT`) | each affected group recomputed after its row lock, in sequential-scan order (`AGG(x ORDER BY ctid)`), race-free | each affected group recomputed with a locking read (`LOCK IN SHARE MODE`) after `BEFORE` triggers lock the group row, race-free; grouped views also need `MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX` accepted, or a group-key index |
+  | Equal to the original view when | it runs a serial sequential scan feeding HashAggregate (the tests pin `enable_indexscan/indexonlyscan/bitmapscan/sort = off`, `max_parallel_workers_per_gather = 0`) | both it and the recompute read the group in primary-key order: no index usable for a `WHERE` column (the recompute's own locking read may use it and then reads in that index's order), small tables |
+  | Joins, windows | not race-free: `ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE` must be accepted too; values can drift until `repair_view()` | same, also for `UNION ALL` |
+
+  Other known differences under the opt-in: PostgreSQL `CLUSTER` and other
+  table rewrites reorder rows without firing triggers (run `repair_view()`);
+  on MySQL (not MariaDB) a group whose values are all `-0.0` sums to `-0.0` or
+  `0.0` depending on the grouping plan.
+- Opt-in costs. PostgreSQL: one recompute per affected group and write,
+  O(rows in the group) with the group-key index; a view without `GROUP BY`
+  re-reads and sorts the whole table by `ctid` on every write.
+  MySQL/MariaDB: the same recompute, plus:
+  - Deadlocks: writers lock the group row and then read the group with a
+    locking read, so transactions that write several groups in different
+    orders deadlock more often than with plain incremental sums. InnoDB rolls
+    one transaction back with error 1213; applications must retry it. Measured
+    with 4 concurrent writers on 6 groups, 600 transactions, group-key index
+    present (deadlocks per 600):
+
+    | Writes per transaction | MySQL 9.7 | MariaDB 10.11 | before this change (inexact sums), MySQL 9.7 / MariaDB 10.11 |
+    | --- | --- | --- | --- |
+    | 1 | 0-10 (6 seeds, median 2) | 1 | 0 / 0 |
+    | 3 | 27 | 71 | 7 / 5 |
+
+    Rates are workload-specific (an independent mixed workload on MySQL 8.4
+    measured 56/600 grouped and 216/600 global). Without a group-key index
+    the single-write case deadlocked 122 (MySQL 9.7) and 34 (MariaDB 10.11)
+    of 600.
+  - Memory: every trigger that reads the source table makes a statement open
+    another instance of that table, and the server parses all of the table's
+    triggers for each instance, so parsed trigger memory per session grows
+    with the square of the number of opted-in views on one table. MySQL 8.4,
+    `SUM(x + i) ... GROUP BY g` views on one table, one `UPDATE`, retained
+    per session: 10 views 106.7 MiB (exact-typed views: 4.6), 20 views
+    405.0 MiB (exact: 9.3); every pooled connection keeps its own copy. Keep
+    such views per source table to a handful
+    ([Share Float-Recompute Triggers Per Table on MySQL/MariaDB](TODO.md)).
+- The differential tests compare every column exactly, except `VAR_*`/
+  `STDDEV_*` on SQLite (a small error budget: SQLite has no native variance
+  aggregate, and the reference is a Python function; on libSQL, which cannot
+  register that function, VAR/STDDEV views have no live view and are excluded
+  from the differential by name; the maintained value is not yet correctly
+  rounded, see [Make SQLite VAR/STDDEV Correctly Rounded (exact against a rational reference)](TODO.md)), and except the
+  floating-point aggregate columns of opted-in views, whose values are not
+  compared at all (only NULL-ness and type); exactness of the opt-in is only
+  asserted under the pinned plans above.
+
+```python run
+import warnings
+from matview import EngineLimitationError, generate_materialized_view, parse_table_schema
+
+ddl = "CREATE TABLE readings (id BIGINT PRIMARY KEY, sensor INT NOT NULL, value DOUBLE PRECISION)"
+grouped = "CREATE VIEW per_sensor AS SELECT sensor, SUM(value) AS total FROM readings GROUP BY sensor"
+overall = "CREATE VIEW overall AS SELECT COUNT(*) AS n, SUM(value) AS total FROM readings"
+
+pg = parse_table_schema(ddl, dialect="postgres")
+for view in (grouped, overall):
+    for kwargs in ({}, {"ignore_limitations": True}):
+        try:
+            generate_materialized_view(pg, view, dialect="postgres", **kwargs)
+        except EngineLimitationError as exc:
+            print("postgres refused", sorted(kwargs), [lim.code for lim in exc.limitations])
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    plan = generate_materialized_view(
+        pg, overall, dialect="postgres",
+        accept_limitations=["ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"],
+    )
+print("postgres opt-in:", plan.strategy.value, "BEST-EFFORT" in str(caught[0].message))
+
+def mysql_refusal(schema_sql):
+    try:
+        generate_materialized_view(
+            parse_table_schema(schema_sql, dialect="mysql"), grouped.replace("PRECISION", ""),
+            dialect="mysql", ignore_limitations=True,
+        )
+    except EngineLimitationError as exc:
+        return sorted(lim.code for lim in exc.limitations)
+
+my_ddl = ddl.replace("DOUBLE PRECISION", "DOUBLE")
+print("mysql without index:", mysql_refusal(my_ddl))
+print("mysql with index:", mysql_refusal(my_ddl + "; CREATE INDEX ix_sensor ON readings (sensor)"))
+```
+
+```text output
+postgres refused [] ['ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE']
+postgres refused ['ignore_limitations'] ['ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE']
+postgres refused [] ['ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE']
+postgres refused ['ignore_limitations'] ['ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE']
+postgres opt-in: algebraic_delta True
+mysql without index: ['MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX', 'ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE']
+mysql with index: ['ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE']
+```
 
 ## Testing and contributing
 
@@ -1074,7 +1207,7 @@ regenerates them).
 Each item names its entry in [TODO.md](TODO.md), which has the details.
 Correctness gaps (the materialized view can differ from the original view):
 
-- [Make Floating-Point Aggregates Exactly Equal to the Live View on PostgreSQL and MySQL/MariaDB (silent divergence today)](TODO.md)
+- [Refuse Floating-Point Aggregates on PostgreSQL and MySQL/MariaDB by Default (best-effort per-code opt-in)](TODO.md)
 - [Race-Free Recomputation for the Remaining Recomputed Aggregates (stale snapshot after a row-lock wait)](TODO.md) (MySQL/MariaDB untested; PostgreSQL closed)
 - [Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View](TODO.md) (writable CTE or FK cascade into two sources of a join view)
 - [Serialize Concurrent Writers of Different Sources of a PostgreSQL Join View](TODO.md)
