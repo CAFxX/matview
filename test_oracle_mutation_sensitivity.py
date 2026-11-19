@@ -102,7 +102,38 @@ def _mutant_decimal_numeric_only(original: Callable[..., Any]) -> Callable[..., 
     return mutant
 
 
+def _mutant_mysql_without_type_code(original: Callable[..., Any]) -> Callable[..., Any]:
+    def strip(desc: Any) -> Any:
+        return None if desc is None else [(c[0], None) + tuple(c[2:]) for c in desc]
+
+    def mutant(family: str, mv: Any, live: Any) -> list[str]:
+        if family == "mysql":
+            return original(family, strip(mv), strip(live))
+        return original(family, mv, live)
+    return mutant
+
+
+def _mutant_one_sided_fields_equal(original: Callable[..., Any]) -> Callable[..., Any]:
+    def mutant(family: str, mv: Any, live: Any) -> list[str]:
+        if mv is None or live is None or len(mv) != len(live):
+            return original(family, mv, live)
+        a, b = [], []
+        for x, y in zip(mv, live):
+            x, y = list(x), list(y)
+            for pos in range(1, min(len(x), len(y))):
+                if x[pos] is None or y[pos] is None:
+                    x[pos] = y[pos] = None
+            a.append(tuple(x))
+            b.append(tuple(y))
+        return original(family, a, b)
+    return mutant
+
+
 METADATA_MUTANTS = (
+    ("mysql_family_ignores_type_code", "_result_description_mismatches", _mutant_mysql_without_type_code,
+     "test_21b_differential_oracle_compares_native_result_metadata"),
+    ("one_sided_field_counts_as_equal", "_result_description_mismatches", _mutant_one_sided_fields_equal,
+     "test_21b_differential_oracle_compares_native_result_metadata"),
     ("skip_result_description", "_result_description_mismatches", _mutant_no_description_check,
      "test_21b_differential_oracle_compares_native_result_metadata"),
     ("ignore_driver_type_code", "_result_description_mismatches", _mutant_ignore_type_code,

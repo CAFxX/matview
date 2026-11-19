@@ -105,6 +105,15 @@ _AGGREGATES = [
 ]
 
 
+# Grouped aggregate views whose MySQL/MariaDB column nullability is compared
+# despite the general MYSQL_UNMODELLED_METADATA exclusion (expression group
+# keys such as a CASE that is never NULL are part of the open gap).
+_NULLABILITY_CHECKED = {
+    "sum_mul", "sum_case", "min_dec", "max_varchar", "bit_and_int", "bit_or_small", "bit_xor_big",
+    "avg_int", "avg_distinct_int", "count_plus", "sum_dec_expr",
+}
+
+
 def _views(engine: Dialect, t: str) -> List[Tuple[str, str]]:
     views = [(name, f"SELECT id, {expr} AS r FROM {t}") for name, expr in _PROJECTIONS]
     views += [(name, f"SELECT g, {expr} AS r FROM {t} GROUP BY g") for name, expr in _AGGREGATES]
@@ -238,6 +247,21 @@ class NativeResultTypeTests(unittest.TestCase):
                 pairs.append((name, mv, live))
                 mv_cat = [r[1:] for r in _catalog_types(engine, cur, mv)]
                 live_cat = [r[1:] for r in _catalog_types(engine, cur, live)]
+                if engine == Dialect.MYSQL and name in _NULLABILITY_CHECKED:
+                    # Nullability is a documented MYSQL_UNMODELLED_METADATA gap
+                    # in general; for grouped aggregates (NOT NULL group key,
+                    # COUNT, nullable SUM/MIN/MAX/AVG/BIT_*) the materialized
+                    # columns must already agree with the live view.
+                    nulls = []
+                    for view in (mv, live):
+                        cur.execute(
+                            "SELECT COLUMN_NAME, IS_NULLABLE FROM information_schema.COLUMNS "
+                            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s ORDER BY ORDINAL_POSITION",
+                            (view,),
+                        )
+                        nulls.append([tuple(r) for r in cur.fetchall()])
+                    if nulls[0] != nulls[1]:
+                        failures.append(f"{version} {name}: nullability {nulls[0]} != {nulls[1]}")
                 conn.commit()
                 if engine == Dialect.MYSQL and not is_mariadb:
                     # MySQL reports some results as `int` in information_schema
