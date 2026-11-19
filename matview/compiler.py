@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from .dialects import DialectMixin
 from .engines import (
@@ -61,6 +61,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
         engine_version: Optional[EngineVersion | str] = None,
         watermark_catalog_table: Optional[str] = None,
         pg_fillfactor: Optional[int] = 80,
+        accept_limitations: Sequence[str] = (),
     ) -> None:
         self._context: CompilationContext = self._build_compilation_context(
             schemas=schemas,
@@ -74,6 +75,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
             engine_version=engine_version,
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=pg_fillfactor,
+            accept_limitations=accept_limitations,
         )
 
     @classmethod
@@ -90,6 +92,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
         engine_version: Optional[EngineVersion | str] = None,
         watermark_catalog_table: Optional[str] = None,
         pg_fillfactor: Optional[int] = 80,
+        accept_limitations: Sequence[str] = (),
     ) -> CompilationContext:
         schemas_ro = MappingProxyType(dict(schemas))
         schemas_lower_ro = MappingProxyType({k.lower(): v for k, v in schemas_ro.items()})
@@ -147,6 +150,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
             strategy=MaintenanceStrategy.ATOMIC_QUERY_SYNC,
             alg_mode="single",
             ir=base_ir,
+            accepted_limitations=tuple(sorted({str(c).strip() for c in (accept_limitations or ()) if str(c).strip()})),
         )
         stage1 = cls._from_context(stage_ctx)
 
@@ -187,6 +191,18 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
 
         limitations = tuple(stage4._detect_limitations())
         stage5 = stage4._with_context(stage4.context.with_updates(limitations=limitations))
+        # Limitations that depend on the maintenance mode (order-sensitive
+        # aggregates over joins/UNION ALL) are reported together with the
+        # others, so a rejection lists every code and an opt-in warns once.
+        try:
+            pre_strategy, pre_mode = stage5._select_strategy_and_mode()
+        except Exception:
+            pre_strategy = pre_mode = None  # surfaced by validation below
+        if pre_strategy is not None and pre_mode is not None:
+            mode_limitations = tuple(stage5._order_sensitive_aggregate_limitations(pre_strategy, pre_mode))
+            if mode_limitations:
+                limitations = limitations + mode_limitations
+                stage5 = stage5._with_context(stage5.context.with_updates(limitations=limitations))
         stage5._enforce_limitations()
         stage5._validate_schema_and_view()
 
@@ -248,6 +264,10 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
     @property
     def ignore_limitations(self) -> bool:
         return self._context.ignore_limitations
+
+    @property
+    def accepted_limitations(self) -> Tuple[str, ...]:
+        return self._context.accepted_limitations
 
     @property
     def object_prefix(self) -> str:

@@ -83,7 +83,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--ignore-limitations",
         action="store_true",
-        help="Proceed with warning even if engine transparency limitations exist.",
+        help="Proceed with warning even if engine transparency limitations exist "
+        "(except codes that need --accept-limitation).",
+    )
+    parser.add_argument(
+        "--accept-limitation",
+        dest="accept_limitations",
+        action="append",
+        default=[],
+        metavar="CODE",
+        help="Accept one limitation code explicitly (repeatable). Required for codes that "
+        "weaken the result contract, e.g. ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE "
+        "(best-effort floating-point aggregates on PostgreSQL/MySQL/MariaDB) and "
+        "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX; --ignore-limitations does not cover them.",
     )
     parser.add_argument(
         "--strict",
@@ -162,6 +174,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.db,
                     dialect=args.dialect,
                     ignore_limitations=args.ignore_limitations,
+                    accept_limitations=args.accept_limitations or None,
                     object_prefix=args.object_prefix,
                     strict=args.strict,
                     engine_version=args.engine_version,
@@ -179,6 +192,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         indexes=args.indexes,
                         strict=args.strict,
                         ignore_limitations=args.ignore_limitations,
+                        accept_limitations=args.accept_limitations or None,
                         incremental_backfill=args.incremental_backfill,
                         batch_size=args.batch_size,
                     )
@@ -202,6 +216,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     view_sql,
                     dialect=detected_ev.dialect,
                     ignore_limitations=args.ignore_limitations,
+                    accept_limitations=args.accept_limitations or (),
                     object_prefix=args.object_prefix,
                     indexes=args.indexes,
                     incremental_backfill=args.incremental_backfill,
@@ -251,6 +266,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.db,
                 dialect=args.dialect,
                 ignore_limitations=args.ignore_limitations,
+                accept_limitations=args.accept_limitations or None,
                 object_prefix=args.object_prefix,
                 strict=args.strict,
                 engine_version=args.engine_version,
@@ -286,6 +302,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.db,
                 dialect=args.dialect,
                 ignore_limitations=args.ignore_limitations,
+                accept_limitations=args.accept_limitations or None,
                 object_prefix=args.object_prefix,
                 strict=args.strict,
                 engine_version=args.engine_version,
@@ -349,6 +366,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             view_sql,
             dialect=detected_ev.dialect,
             ignore_limitations=args.ignore_limitations,
+            accept_limitations=args.accept_limitations or (),
             object_prefix=args.object_prefix,
             indexes=args.indexes,
             incremental_backfill=args.incremental_backfill,

@@ -713,6 +713,8 @@ class CompilationContext:
     strategy: MaintenanceStrategy
     alg_mode: str
     ir: LogicalIR
+    # Limitation codes explicitly accepted by the caller (accept_limitations).
+    accepted_limitations: Tuple[str, ...] = ()
 
     def with_ir(self, **ir_changes: Any) -> "CompilationContext":
         return replace(self, ir=self.ir.with_updates(**ir_changes))

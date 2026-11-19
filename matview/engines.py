@@ -517,6 +517,17 @@ class TransparencyLimitation:
     mitigation: str
 
 
+# Limitations whose override changes the result contract (best effort instead
+# of exact). Only an explicit per-code acceptance (``accept_limitations`` /
+# ``--accept-limitation CODE``) overrides them; the global
+# ``ignore_limitations`` does not.
+PER_CODE_OPT_IN_LIMITATIONS = frozenset({
+    "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+    "ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE",
+    "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
+})
+
+
 class EngineLimitationError(RuntimeError):
     """Raised when a materialized view encounters engine transparency limitations and ignore_limitations=False."""
 
@@ -531,10 +542,26 @@ class EngineLimitationError(RuntimeError):
         msg = (
             f"Refusing to create materialized view '{view_name}' on engine '{dialect.value}' "
             f"because full transparency cannot be guaranteed for all cases:\n{bullet_lines}\n"
-            f"Pass `--ignore-limitations` (CLI) or `ignore_limitations=True` (API) to override "
-            f"this check and proceed anyway."
+            + self._override_hint()
         )
         super().__init__(msg)
+
+    def _override_hint(self) -> str:
+        per_code = sorted({l.code for l in self.limitations if l.code in PER_CODE_OPT_IN_LIMITATIONS})
+        other = sorted({l.code for l in self.limitations if l.code not in PER_CODE_OPT_IN_LIMITATIONS})
+        parts = []
+        if per_code:
+            parts.append(
+                "Accept " + ", ".join(per_code) + " explicitly with `--accept-limitation CODE` (CLI) or "
+                "`accept_limitations=[...]` (API) to install the view with BEST-EFFORT results "
+                "(`ignore_limitations` does not cover these codes)."
+            )
+        if other:
+            parts.append(
+                "Pass `--ignore-limitations` (CLI) or `ignore_limitations=True` (API) to override "
+                + ", ".join(other) + " and proceed anyway."
+            )
+        return " ".join(parts)
 
 
 class EngineLimitationWarning(UserWarning):
