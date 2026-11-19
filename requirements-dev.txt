@@ -2,3 +2,7 @@
 # scripts/presubmit.py parses .github/workflows/ci.yml with PyYAML; the CI
 # SQLite jobs install this file to run scripts/test_presubmit.py.
 pyyaml>=6.0
+# The type-check gate (pyrightconfig.json; one step of the CI sqlite job). Pinned
+# with an upper bound because each pyright release can add diagnostics; bump it
+# deliberately together with any new findings.
+pyright>=1.1.414,<1.1.415

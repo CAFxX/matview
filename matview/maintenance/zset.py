@@ -7,8 +7,10 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
+import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     Dialect,
@@ -30,6 +32,7 @@ from ..logical_ir import (
     ViewSpec,
 )
 from ..sql_frontend import (
+    SQLToken,
     SQLTokenType,
     _contains_aggregate_call,
     _extract_set_op_branches_from_ast,
@@ -52,7 +55,7 @@ from ..sql_frontend import (
 )
 
 
-class Tier1ZSetMixin:
+class Tier1ZSetMixin(MixinHost):
     def _parse_setop_branches(self) -> Optional[List[Tuple[str, ViewSpec]]]:
         raw = self.view.raw_select_sql.strip()
         try:
@@ -1055,8 +1058,8 @@ class Tier1ZSetMixin:
                 )
             else:
                 q_user_columns = [self._q(c) for c in user_columns]
-                pk_vec_new = self._canonical_group_pk_expr([f"__mv_new_rows.{self._q(c)}" for c in pk_hash_cols])
-                pk_vec_old = self._canonical_group_pk_expr([f"__mv_old_rows.{self._q(c)}" for c in pk_hash_cols])
+                pk_vec_new = self._canonical_group_pk_expr([f"__mv_new_rows.{self._q(c)}" for c in pk_hash_cols])  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
+                pk_vec_old = self._canonical_group_pk_expr([f"__mv_old_rows.{self._q(c)}" for c in pk_hash_cols])  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
                 vec_new_vals = [self._rewrite_expr_for_record(it.raw_expr, "__mv_new_rows") for it in self.view.select_items]
                 upd_set = ", ".join(f"{self._q(c)} = EXCLUDED.{self._q(c)}" for c in user_columns)
                 group_by_cols_new = f"{pk_vec_new}" + (f", {', '.join(vec_new_vals)}" if vec_new_vals else "")

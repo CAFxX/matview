@@ -1,0 +1,17 @@
+{
+  "include": [
+    "matview",
+    "matview_sync.py",
+    "scripts",
+    "mutation_testing.py",
+    "run_docker_tests.py",
+    "schema_graph_minimizer.py",
+    "verify_engine_matrix.py"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "scripts/test_*.py"
+  ],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "standard"
+}

@@ -8,8 +8,9 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
 from sqlglot import exp as sqlglot_exp
-from sqlglot.tokens import TokenType as SQLGlotTokenType
+from sqlglot import TokenType as SQLGlotTokenType
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     Dialect,
@@ -51,7 +52,7 @@ from ..sql_frontend import (
 )
 
 
-class Tier2Mixin:
+class Tier2Mixin(MixinHost):
     def _can_push_down_group_filter_into_where(self) -> bool:
         if not self.view.where_clause:
             return True
@@ -245,7 +246,7 @@ class Tier2Mixin:
             f"        WHERE {' AND '.join(match_conds)}\n"
             f"    )"
         )
-        if any(j.join_type == "LEFT JOIN" for j in self.view.joins) and target_join != self.view.joins[0]:
+        if any(j.join_type == "LEFT JOIN" for j in self.view.joins) and target_join != self.view.joins[0]:  # pyright: ignore[reportGeneralTypeIssues]  # pyright's len() narrowing wrongly infers empty joins here; any() guards it
             null_preds = " AND ".join(
                 f"{_lhs_expr(g_expr, mv_col)} IS NULL" for g_expr, mv_col in group_mv_cols
             )

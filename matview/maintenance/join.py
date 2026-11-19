@@ -8,8 +8,9 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
 from sqlglot import exp as sqlglot_exp
-from sqlglot.tokens import TokenType as SQLGlotTokenType
+from sqlglot import TokenType as SQLGlotTokenType
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     Dialect,
@@ -50,7 +51,7 @@ from ..sql_frontend import (
 )
 
 
-class Tier1JoinMixin:
+class Tier1JoinMixin(MixinHost):
     def _qualify_join_expr(self, expr: Optional[str]) -> str:
         if not expr:
             return ""

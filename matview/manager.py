@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set,
 
 import sqlglot
 from sqlglot import exp as sqlglot_exp
-from sqlalchemy.engine import Engine as _SAEngine
+from sqlalchemy.engine import Connection as _SAConnection, Engine as _SAEngine
 
 from .compiler import IncrementalViewCompiler
 from .connectivity import (
@@ -32,6 +32,7 @@ from .connectivity import (
 from .engines import (
     DEFAULT_OBJECT_PREFIX,
     Dialect,
+    EngineSubdialect,
     EngineVersion,
     MaintenanceStrategy,
     UnsupportedMaterializedViewError,
@@ -340,9 +341,11 @@ class MaterializedViewManager:
     def _require_idle_connection(self, operation: str) -> None:
         """Raise TransactionOwnershipError unless the manager can own the next transaction."""
         for layer in dbapi_connection_layers(self.conn):
-            if isinstance(layer, sqlite3.Connection) and hasattr(sqlite3, "LEGACY_TRANSACTION_CONTROL"):
-                mode = getattr(layer, "autocommit", sqlite3.LEGACY_TRANSACTION_CONTROL)
-                if mode != sqlite3.LEGACY_TRANSACTION_CONTROL:
+            # sqlite3.LEGACY_TRANSACTION_CONTROL exists only on Python 3.12+.
+            legacy_control = getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", None)
+            if isinstance(layer, sqlite3.Connection) and legacy_control is not None:
+                mode = getattr(layer, "autocommit", legacy_control)
+                if mode != legacy_control:
                     raise TransactionOwnershipError(
                         f"{operation} requires a sqlite3 connection with legacy transaction "
                         f"control (autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL, the default; "

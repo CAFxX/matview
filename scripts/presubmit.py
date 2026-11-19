@@ -108,7 +108,7 @@ class PlanError(Exception):
 
 def parse_workflow_text(text: str) -> Dict[str, Any]:
     try:
-        import yaml  # type: ignore
+        import yaml
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise PlanError(
             "PyYAML is required to parse the workflow: pip install -r requirements-dev.txt"
@@ -385,7 +385,7 @@ class Step:
     index: int
     name: str
     kind: str  # run | checkout | setup-python | upload-artifact
-    condition: str  # success | always
+    condition: str  # success | always | never (matrix condition false for this cell)
     run: Optional[str] = None
     env: Dict[str, str] = dataclasses.field(default_factory=dict)  # merged workflow+job+step env
     python_version: Optional[str] = None
@@ -513,6 +513,12 @@ def _parse_duration(val: str) -> float:
     return {"ms": n / 1000, "s": n, "m": n * 60, None: n}[m.group(2)]
 
 
+# A step may be restricted to some matrix cells with ``if: matrix.<key> == '<literal>'``
+# (GitHub compares strings case-insensitively). It is evaluated at plan time: a
+# cell for which it is false keeps the step with condition "never", so the step
+# list still mirrors the workflow one-to-one and the skip is reported.
+_MATRIX_EQ_COND_RE = re.compile(r"matrix\.([A-Za-z0-9_-]+)\s*==\s*'([^']*)'")
+
 _ALLOWED_JOB_KEYS = {"name", "needs", "if", "runs-on", "strategy", "services", "steps", "outputs", "env", "timeout-minutes", "permissions"}
 _ALLOWED_STEP_KEYS = {"name", "id", "if", "env", "run", "uses", "with", "shell"}
 _DOCKER_RE = re.compile(r"(?<![\w-])docker(?![\w-])")
@@ -556,6 +562,10 @@ def build_jobs(workflow: Mapping[str, Any], job_ids: Sequence[str]) -> List[Job]
                     cond = "success"
                 elif _strip_expr(cond_raw) == "always()":
                     cond = "always"
+                elif (mcond := _MATRIX_EQ_COND_RE.fullmatch(_strip_expr(cond_raw))) is not None:
+                    if mcond.group(1) not in matrix:
+                        raise PlanError(f"{job_id} step {sidx}: if: refers to missing matrix key {mcond.group(1)!r}")
+                    cond = "success" if _fmt_value(matrix[mcond.group(1)]).lower() == mcond.group(2).lower() else "never"
                 else:
                     raise PlanError(f"{job_id} step {sidx}: unsupported if: {cond_raw!r}")
                 name = ev(s.get("name") or s.get("run") or s.get("uses") or f"step {sidx}", "name", strict=False)
@@ -1014,6 +1024,9 @@ class Executor:
                     if res.status == "passed":
                         res.status = "incomplete"
                         res.reasons.append("interrupted by user")
+                    continue
+                if step.condition == "never":
+                    res.steps.append(StepResult(step.name, "skipped", "step condition is false for this matrix cell"))
                     continue
                 if failed and step.condition != "always" and not self.opts.keep_going:
                     res.steps.append(StepResult(step.name, "skipped", "previous step failed"))
@@ -1489,7 +1502,12 @@ def _fast_plan(ex: Executor, repo: Path, jobs: List[Job], files: Sequence[str], 
     notes.append(f"fast tier: {len(run_tests)}/{len(test_files)} test steps selected ({why})")
     # Cached venv per interpreter + requirements to keep the fast tier fast.
     interp = ex.find_python(chosen.python_version or "") or (ex.opts.substitute_python, "")
-    req = (repo / "requirements.txt").read_bytes() if (repo / "requirements.txt").exists() else b""
+    # Every requirements file the CI install steps read must key the cached venv,
+    # or a new dev tool (e.g. pyright) would never be installed into a stale cache.
+    req = b"".join(
+        (repo / name).read_bytes() if (repo / name).exists() else b""
+        for name in ("requirements.txt", "requirements-dev.txt")
+    )
     key = hashlib.sha256(str(interp).encode() + req).hexdigest()[:16]
     ex.venv_cache = git_common_dir(repo) / "presubmit" / "venv-cache" / key
     return [chosen], {chosen.key: sel}, notes

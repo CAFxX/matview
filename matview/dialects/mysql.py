@@ -7,9 +7,11 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
+import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
-from sqlglot.tokens import TokenType as SQLGlotTokenType
+from sqlglot import TokenType as SQLGlotTokenType
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     DEFAULT_OBJECT_PREFIX,
@@ -37,7 +39,7 @@ from ..sql_frontend import (
 from .templates import render_procedural_sql
 
 
-class MySQLDialectMixin:
+class MySQLDialectMixin(MixinHost):
     def _mariadb_statistical_result_scale(self, item: SelectItem) -> str:
         """Return MariaDB's native VAR/STDDEV result scale as a view-safe literal.
 
@@ -112,8 +114,13 @@ class MySQLDialectMixin:
                         sub_ast = parse_sql_ast(inner_sql, dialect=Dialect.MYSQL)
                     except sqlglot.errors.SqlglotError:
                         sub_ast = None
-                    if isinstance(sub_ast, sqlglot_exp.Select) and (sub_ast.args.get("from_") or sub_ast.args.get("from")):
-                        in_from = (sub_ast.args.get("from_") or sub_ast.args.get("from")).this
+                    from_node = (
+                        (sub_ast.args.get("from_") or sub_ast.args.get("from"))
+                        if isinstance(sub_ast, sqlglot_exp.Select)
+                        else None
+                    )
+                    if isinstance(sub_ast, sqlglot_exp.Select) and from_node:
+                        in_from = from_node.this
                         in_tbl = in_from.name
                         in_alias = in_from.alias or "__mv_not_in"
                         rhs_col = sub_ast.expressions[0].name if sub_ast.expressions else "id"

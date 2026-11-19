@@ -7,9 +7,11 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
+import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
-from sqlglot.tokens import TokenType as SQLGlotTokenType
+from sqlglot import TokenType as SQLGlotTokenType
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     DEFAULT_OBJECT_PREFIX,
@@ -38,7 +40,7 @@ from ..sql_frontend import (
 from .templates import render_procedural_sql
 
 
-class SQLiteDialectMixin:
+class SQLiteDialectMixin(MixinHost):
     def _sqlite_m2_agg_sql(
         self,
         item: SelectItem,
@@ -205,8 +207,9 @@ class SQLiteDialectMixin:
                 sel_ast = None
             if isinstance(sel_ast, sqlglot_exp.Select) and sel_ast.args.get("joins"):
                 j0 = sel_ast.args["joins"][0]
-                if j0.side.upper() == "FULL" and (sel_ast.args.get("from_") or sel_ast.args.get("from")) and j0.args.get("on"):
-                    from_t = (sel_ast.args.get("from_") or sel_ast.args.get("from")).this.sql("mysql")
+                from_node = sel_ast.args.get("from_") or sel_ast.args.get("from")
+                if j0.side.upper() == "FULL" and from_node and j0.args.get("on"):
+                    from_t = from_node.this.sql("mysql")
                     j0_t = j0.this.sql("mysql")
                     on_s = j0.args["on"].sql("mysql")
                     sel_s = ", ".join(e.sql("mysql") for e in sel_ast.expressions)

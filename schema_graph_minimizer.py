@@ -200,7 +200,7 @@ def _drop_leaf_table(scenario: Scenario, table: str) -> Optional[Scenario]:
     table_statements = [stmt for stmt in statements if _TABLE_RE.match(stmt)]
     target_statement = next(
         (stmt for stmt in table_statements
-         if (_TABLE_RE.match(stmt).group(1).lower() == table.lower())),
+         if (m := _TABLE_RE.match(stmt)) and m.group(1).lower() == table.lower()),
         None,
     )
     if target_statement is None:

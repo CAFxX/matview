@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import sqlglot
 from sqlglot import exp as sqlglot_exp
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     Dialect,
@@ -46,7 +47,7 @@ from ..sql_frontend import (
 )
 
 
-class Tier3Mixin:
+class Tier3Mixin(MixinHost):
     def _compile_tier3_atomic_sync(self) -> MaterializedViewPlan:
         view_name = self.view.view_name
         mv_table = self._backing_table_name()

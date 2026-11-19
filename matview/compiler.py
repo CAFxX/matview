@@ -50,7 +50,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
 
     def __init__(
         self,
-        schemas: Dict[str, TableSchema],
+        schemas: Mapping[str, TableSchema],
         view_spec: ViewSpec,
         dialect: Dialect | str | EngineVersion = Dialect.SQLITE,
         pg_use_transition_tables: bool = False,

@@ -9,8 +9,9 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
 from sqlglot import exp as sqlglot_exp
-from sqlglot.tokens import TokenType as SQLGlotTokenType
+from sqlglot import TokenType as SQLGlotTokenType
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     Dialect,
@@ -51,7 +52,7 @@ from ..sql_frontend import (
 )
 
 
-class Tier1UnionAllAggMixin:
+class Tier1UnionAllAggMixin(MixinHost):
     def _compile_tier1_union_all_agg(self) -> MaterializedViewPlan:
         """
         Compiles an aggregation query over a `UNION ALL` CTE or derived subquery into Tier 1 O(1)

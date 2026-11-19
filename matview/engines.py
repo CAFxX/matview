@@ -7,7 +7,7 @@ from enum import Enum
 import functools
 import re
 import sqlite3
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Sequence, Tuple, Union
 
 from packaging.version import InvalidVersion, Version
 
@@ -124,6 +124,7 @@ class EngineVersion:
         version tuple (e.g. (15, 0, 0)), or another EngineVersion.
         """
         if isinstance(target, EngineVersion):
+            assert target.packaging_version is not None
             target_v = target.packaging_version
         elif isinstance(target, Version):
             target_v = target
@@ -377,7 +378,7 @@ def parse_engine_version(
                 packaging_version=Version("14.0.0"),
             )
         if spec == Dialect.MYSQL:
-            sub = def_sub if def_sub in (EngineSubdialect.MYSQL, EngineSubdialect.MARIADB) else EngineSubdialect.MYSQL
+            sub = EngineSubdialect.MARIADB if def_sub == EngineSubdialect.MARIADB else EngineSubdialect.MYSQL
             ver = (11, 4, 0) if sub == EngineSubdialect.MARIADB else (8, 0, 0)
             v_str = f"{ver[0]}.{ver[1]}.{ver[2]}"
             return EngineVersion(
@@ -431,7 +432,7 @@ def parse_engine_version(
             target_sub = EngineSubdialect.POSTGRES
             def_ver = (14, 0, 0)
         elif def_d == Dialect.MYSQL:
-            target_sub = def_sub if def_sub in (EngineSubdialect.MYSQL, EngineSubdialect.MARIADB) else EngineSubdialect.MYSQL
+            target_sub = EngineSubdialect.MARIADB if def_sub == EngineSubdialect.MARIADB else EngineSubdialect.MYSQL
             def_ver = (11, 4, 0) if target_sub == EngineSubdialect.MARIADB else (8, 0, 0)
         else:
             target_sub = EngineSubdialect.SQLITE

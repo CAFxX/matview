@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
 from sqlglot import exp as sqlglot_exp
 
+from .._host import MixinHost
 from ..engines import (
     AggFunc,
     DEFAULT_OBJECT_PREFIX,
@@ -35,7 +36,7 @@ from ..sql_frontend import (
 from .templates import render_procedural_sql
 
 
-class PostgresDialectMixin:
+class PostgresDialectMixin(MixinHost):
     def _postgres_case_result_storage_type(self, expr: str) -> Optional[str]:
         """Infer PostgreSQL CASE common types, including nested column branches."""
         if self.dialect != Dialect.POSTGRES:
@@ -155,7 +156,7 @@ class PostgresDialectMixin:
                 ins_vals.append("1 AS __mv_global_id")
             elif has_nullable_grp:
                 ins_cols.append("__mv_pk")
-                ins_vals.append(f"{pk_new_val} AS __mv_pk")
+                ins_vals.append(f"{pk_new_val} AS __mv_pk")  # pyright: ignore[reportPossiblyUnboundVariable]  # bound whenever grp_exprs and has_nullable_grp, as here
 
             for i, g_expr in enumerate(grp_exprs):
                 mv_col = self._group_col_alias(g_expr)
@@ -308,6 +309,7 @@ class PostgresDialectMixin:
                     # As with AVG above, compute a new group's initial native
                     # aggregate over the grouped transition rows. Existing
                     # groups are recomputed from the base table on conflict.
+                    assert item.agg_func is not None
                     ins_vals.append(f"{item.agg_func.value}({val_e_new}) AS {col_alias}")
                     recomp = self._build_recompute_subquery_raw(item, mv_table)
                     upd_assignments.append(f"{col_alias} = {recomp}")
@@ -387,7 +389,7 @@ class PostgresDialectMixin:
             if not grp_exprs:
                 del_select_exprs.append("1 AS __mv_global_id")
             elif has_nullable_grp:
-                del_select_exprs.append(f"{pk_old_val} AS __mv_pk")
+                del_select_exprs.append(f"{pk_old_val} AS __mv_pk")  # pyright: ignore[reportPossiblyUnboundVariable]  # bound whenever grp_exprs and has_nullable_grp, as here
             else:
                 for i, g_expr in enumerate(grp_exprs):
                     mv_col = self._group_col_alias(g_expr)
@@ -558,10 +560,10 @@ class PostgresDialectMixin:
                     grp_match_aux = f"{aux_tbl}.__mv_global_id = {mv_table}.__mv_global_id"
                 elif has_nullable_grp:
                     aux_cols = ["__mv_pk", "__val", "__ref_cnt"]
-                    aux_sel_new = [f"{pk_new_val} AS __mv_pk", f"({ve_new}) AS __val", "COUNT(*) AS __ref_cnt"]
-                    aux_grp_new = [pk_new_val, f"({ve_new})"]
-                    aux_sel_old = [f"{pk_old_val} AS __mv_pk", f"({ve_old}) AS __val", "COUNT(*) AS __ref_cnt"]
-                    aux_grp_old = [pk_old_val, f"({ve_old})"]
+                    aux_sel_new = [f"{pk_new_val} AS __mv_pk", f"({ve_new}) AS __val", "COUNT(*) AS __ref_cnt"]  # pyright: ignore[reportPossiblyUnboundVariable]  # bound whenever grp_exprs and has_nullable_grp, as here
+                    aux_grp_new = [pk_new_val, f"({ve_new})"]  # pyright: ignore[reportPossiblyUnboundVariable]  # bound whenever grp_exprs and has_nullable_grp, as here
+                    aux_sel_old = [f"{pk_old_val} AS __mv_pk", f"({ve_old}) AS __val", "COUNT(*) AS __ref_cnt"]  # pyright: ignore[reportPossiblyUnboundVariable]  # bound whenever grp_exprs and has_nullable_grp, as here
+                    aux_grp_old = [pk_old_val, f"({ve_old})"]  # pyright: ignore[reportPossiblyUnboundVariable]  # bound whenever grp_exprs and has_nullable_grp, as here
                     aux_match = f"{aux_tbl}.__mv_pk = __d.__mv_pk AND {aux_tbl}.__val = __d.__val"
                     grp_match_aux = f"{aux_tbl}.__mv_pk = {mv_table}.__mv_pk"
                 else:

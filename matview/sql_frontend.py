@@ -8,8 +8,9 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import sqlglot
+import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
-from sqlglot.tokens import TokenType as SQLGlotTokenType
+from sqlglot import TokenType as SQLGlotTokenType
 
 from .engines import (
     AggFunc,
@@ -872,7 +873,7 @@ def parse_table_index_def(
         stmt_ast = parse_sql_ast(index_sql, dialect=eff_dialect)
     except sqlglot.errors.SqlglotError:
         return None
-    if not isinstance(stmt_ast, sqlglot_exp.Create) or stmt_ast.kind.upper() != "INDEX":
+    if not isinstance(stmt_ast, sqlglot_exp.Create) or (stmt_ast.kind or "").upper() != "INDEX":
         return None
     idx_node = stmt_ast.this
     if not isinstance(idx_node, sqlglot_exp.Index):
@@ -938,7 +939,7 @@ def parse_table_schema(
             stmt_ast = parse_sql_ast(raw_stmt_s, dialect=eff_dialect)
         except sqlglot.errors.SqlglotError:
             continue
-        if not isinstance(stmt_ast, sqlglot_exp.Create) or stmt_ast.kind.upper() != "TABLE":
+        if not isinstance(stmt_ast, sqlglot_exp.Create) or (stmt_ast.kind or "").upper() != "TABLE":
             continue
         raw_col_types = (
             _extract_sqlite_raw_declared_types(raw_stmt_s)
@@ -1731,11 +1732,11 @@ def parse_view_index_spec(
     toks = _tokenize_sql(s, read=sg_d)
     if toks and toks[0].token_type == SQLGlotTokenType.CREATE:
         idx_create = parse_sql_ast(s, dialect=dialect)
-        if isinstance(idx_create, sqlglot_exp.Create) and idx_create.kind.upper() == "INDEX":
+        if isinstance(idx_create, sqlglot_exp.Create) and (idx_create.kind or "").upper() == "INDEX":
             idx_node = idx_create.this
             params_node = idx_node.args.get("params") if isinstance(idx_node, sqlglot_exp.Index) else None
             if isinstance(idx_node, sqlglot_exp.Index) and isinstance(params_node, sqlglot_exp.IndexParameters):
-                cols = tuple(c.sql(sg_d).strip() for c in params_node.columns if c.sql(sg_d).strip())
+                cols = tuple(c.sql(sg_d).strip() for c in (params_node.args.get("columns") or []) if c.sql(sg_d).strip())
                 if not cols:
                     raise ValueError(f"CREATE INDEX statement has no columns: {spec!r}")
                 tbl_node = idx_node.args.get("table")
@@ -1838,7 +1839,7 @@ def _parse_single_create_view_stmt(
     except sqlglot.errors.SqlglotError as exc:
         raise ValueError(f"Invalid CREATE VIEW syntax: {stmt_sql!r}") from exc
 
-    if not isinstance(create_ast, sqlglot_exp.Create) or create_ast.kind.upper() != "VIEW":
+    if not isinstance(create_ast, sqlglot_exp.Create) or (create_ast.kind or "").upper() != "VIEW":
         raise ValueError(f"Invalid CREATE VIEW syntax: {stmt_sql!r}")
 
     view_tbl = create_ast.this
@@ -2020,9 +2021,9 @@ def parse_view_definitions(
             raise ValueError(f"Invalid CREATE VIEW syntax: {item!r}")
         for st in stmts:
             st_ast = parse_sql_ast(st, dialect=dialect)
-            if isinstance(st_ast, sqlglot_exp.Create) and st_ast.kind.upper() == "VIEW":
+            if isinstance(st_ast, sqlglot_exp.Create) and (st_ast.kind or "").upper() == "VIEW":
                 initial_specs.append(_parse_single_create_view_stmt(st, known_tables=known_tables, dialect=dialect))
-            elif isinstance(st_ast, sqlglot_exp.Create) and st_ast.kind.upper() == "INDEX":
+            elif isinstance(st_ast, sqlglot_exp.Create) and (st_ast.kind or "").upper() == "INDEX":
                 pending_index_specs.append(parse_view_index_spec(st, dialect=dialect))
             else:
                 raise ValueError(f"Unsupported statement in view definition script: {st!r}")

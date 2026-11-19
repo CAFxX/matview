@@ -15,7 +15,7 @@ import sys
 from packaging.version import InvalidVersion, Version
 import sqlglot
 from sqlglot import exp as sqlglot_exp
-from sqlglot.tokens import TokenType as SQLGlotTokenType
+from sqlglot import TokenType as SQLGlotTokenType
 
 from matview import *  # noqa: F401, F403
 from matview.cli import main
