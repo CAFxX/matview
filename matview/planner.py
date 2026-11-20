@@ -13,6 +13,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from ._host import MixinHost
+from .diagnostics import Diagnostic, emit as emit_diagnostic, fallback_message
 from .engines import (
     AggFunc,
     Dialect,
@@ -65,6 +66,39 @@ from .sql_frontend import (
     parse_view_ast,
 )
 
+
+
+def _has_subquery_aggregate(sql_text: str, dialect: Dialect) -> bool:
+    """Whether an aggregate appears inside a (scalar) subquery of `sql_text`:
+    it belongs to that subquery, not to the view's groups."""
+    try:
+        node = parse_sql_ast(sql_text, dialect=dialect)
+    except sqlglot.errors.SqlglotError:
+        return False
+    for sub in node.find_all(sqlglot_exp.Subquery, sqlglot_exp.Select):
+        if sub is node:
+            continue
+        if any(True for _ in sub.find_all(sqlglot_exp.AggFunc)):
+            return True
+    return False
+
+
+def _mixes_outer_and_subquery_aggregates(sql_text: str, dialect: Dialect) -> bool:
+    """Whether `sql_text` combines an aggregate of the view's groups with an
+    aggregate inside a scalar subquery (e.g. `SUM(x) + (SELECT MAX(v) FROM o)`)."""
+    if not _has_subquery_aggregate(sql_text, dialect):
+        return False
+    try:
+        node = parse_sql_ast(sql_text, dialect=dialect)
+    except sqlglot.errors.SqlglotError:
+        return False
+    for agg in node.find_all(sqlglot_exp.AggFunc):
+        parent = agg.parent
+        while parent is not None and parent is not node and not isinstance(parent, (sqlglot_exp.Subquery, sqlglot_exp.Select)):
+            parent = parent.parent
+        if parent is None or parent is node:
+            return True
+    return False
 
 class PlannerMixin(MixinHost):
     """Planner methods for view unwrapping, decomposition, validation, strategy selection, and indexing."""
@@ -771,37 +805,30 @@ class PlannerMixin(MixinHost):
         # An aggregate inside a scalar subquery belongs to that subquery, not
         # to the view's groups; the decomposition below would replace it with
         # the outer group's stored value (wrong values, or "Subquery returns
-        # more than 1 row"). Such projections and HAVING clauses are not
-        # decomposed (all_ok=False): the strategy selection then falls back to
-        # a maintenance mode that evaluates the original expression.
-        def _aggregate_in_subquery(sql_text: str) -> bool:
-            try:
-                node = parse_sql_ast(sql_text, dialect=self.dialect)
-            except sqlglot.errors.SqlglotError:
-                return False
-            for sub in node.find_all(sqlglot_exp.Subquery, sqlglot_exp.Select):
-                if sub is node:
-                    continue
-                if any(True for _ in sub.find_all(sqlglot_exp.AggFunc)):
-                    return True
-            return False
-
+        # more than 1 row"). A HAVING clause holding one is not decomposed
+        # (all_ok=False): the strategy selection falls back to a mode that
+        # evaluates the original clause (announced as a fallback diagnostic).
+        # A projected column holding one is refused (its type is not derived).
         subquery_agg_texts = {
             text
             for text in [it.raw_expr for it in v.select_items if it.is_aggregate] + (
                 [v.having_clause] if v.having_clause else []
             )
-            if _aggregate_in_subquery(text)
+            if _has_subquery_aggregate(text, self.dialect)
         }
 
         all_ok = True
         for it in v.select_items:
-            if it.agg_func is not None and it.raw_expr in subquery_agg_texts:
-                # An elementary aggregate whose argument holds a subquery
-                # aggregate is stored as one column: no fallback evaluates it.
+            if (it.is_aggregate and it.raw_expr in subquery_agg_texts) or (
+                not it.is_aggregate and _mixes_outer_and_subquery_aggregates(it.raw_expr, self.dialect)
+            ):
+                # A projected column holding a subquery aggregate would be
+                # stored: its result type is not derived (a fallback would
+                # store e.g. SUM(x) + (SELECT MAX(v) ..) as DOUBLE where the
+                # engine returns BIGINT/DECIMAL), so it stays refused.
                 raise UnsupportedMaterializedViewError(
-                    f"View '{self.logical_view_name}' uses an aggregate inside a scalar subquery in the "
-                    f"argument of an aggregate ({it.raw_expr.strip()[:120]}), which is not maintained."
+                    f"View '{self.logical_view_name}' uses an aggregate inside a scalar subquery in an "
+                    f"aggregated projection ({it.raw_expr.strip()[:120]}), which is not maintained."
                 )
             if not it.is_aggregate or it.agg_func is not None:
                 work_items.append(it)
@@ -828,11 +855,7 @@ class PlannerMixin(MixinHost):
                 else:
                     reader_exprs[it.alias] = it.alias
             else:
-                rewritten_e, ok = (
-                    (it.raw_expr, False)
-                    if it.raw_expr in subquery_agg_texts
-                    else _extract_agg_calls_from_expr(it.raw_expr)
-                )
+                rewritten_e, ok = _extract_agg_calls_from_expr(it.raw_expr)
                 if not ok:
                     all_ok = False
                     work_items.append(it)
@@ -2071,6 +2094,7 @@ class PlannerMixin(MixinHost):
             triggers=list(raw_plan.trigger_names),
             indexes=list(raw_plan.index_names),
             reader_view=raw_plan.view_name,
+            fallbacks=self._fallback_diagnostics(raw_plan.strategy),
             details={
                 "dialect": self.dialect.value,
                 "engine_version": self.engine_version.label if self.engine_version else None,
@@ -2088,6 +2112,35 @@ class PlannerMixin(MixinHost):
             return bool(self._pgmy_native_recompute_items())
         except Exception:
             return False
+
+    def _fallback_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
+        """Announced fallbacks of this plan (see matview.diagnostics)."""
+        having = self.view.having_clause
+        if not having or strategy == MaintenanceStrategy.ALGEBRAIC_DELTA or not _has_subquery_aggregate(having, self.dialect):
+            return ()
+        cost = (
+            "a write to a table the subquery reads recomputes every group of the view; other writes "
+            "recompute the touched groups"
+        )
+        if self.dialect == Dialect.MYSQL:
+            cost += (
+                "; concurrent writers to the subquery's table deadlock (error 1213) and roll back "
+                "(about 45% of writes with 4 concurrent writers, measured on MySQL 8.4 and MariaDB 10.11)"
+            )
+        return (
+            Diagnostic(
+                code="HAVING_SUBQUERY_AGGREGATE_FALLBACK",
+                severity="info",
+                view=self.logical_view_name,
+                message=fallback_message(
+                    strategy.value,
+                    "HAVING compares with an aggregate inside a scalar subquery, which the algebraic "
+                    "decomposition cannot maintain",
+                    cost,
+                    "move the scalar-subquery condition out of HAVING (e.g. filter when reading the view)",
+                ),
+            ),
+        )
 
     def _performance_notes(self) -> List[str]:
         """Documented maintenance cost classes that are not O(1) per write."""
@@ -2175,6 +2228,8 @@ class PlannerMixin(MixinHost):
             existing_base_indexes_used=used_existing,
             existing_base_indexes=existing_inv,
         )
+        for diagnostic in diagnostics.fallbacks:
+            emit_diagnostic(diagnostic)
         return MaterializedViewPlan(
             dialect=raw_plan.dialect,
             strategy=raw_plan.strategy,

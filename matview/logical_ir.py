@@ -179,6 +179,8 @@ class PlanDiagnostics:
     indexes: List[str] = field(default_factory=list)
     reader_view: Optional[str] = None
     details: Dict[str, Any] = field(default_factory=dict)
+    # Announced fallbacks / relaxed modes (matview.diagnostics.Diagnostic).
+    fallbacks: Tuple[Any, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -195,6 +197,7 @@ class PlanDiagnostics:
             "indexes": list(self.indexes),
             "reader_view": self.reader_view,
             "details": dict(self.details),
+            "fallbacks": [d.to_dict() for d in self.fallbacks],
         }
 
     def __getitem__(self, key: str) -> Any:
