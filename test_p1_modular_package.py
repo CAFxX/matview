@@ -215,8 +215,10 @@ for name in matview.__all__:
         self.assertIn("--schema", r2.stdout)
         # argparse uses a different executable name for the two entrypoints;
         # compare the actual advertised option surface rather than the usage prefix.
-        options = lambda output: set(re.findall(r"(?<![\\w-])--[a-z][a-z0-9-]*", output))
-        self.assertEqual(options(r1.stdout), options(r2.stdout))
+        def long_options(output: str) -> set[str]:
+            return set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]*", output))
+
+        self.assertEqual(long_options(r1.stdout), long_options(r2.stdout))
 
 
 if __name__ == "__main__":
