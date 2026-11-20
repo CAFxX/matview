@@ -664,6 +664,12 @@ class DialectBaseMixin(MixinHost):
                 return "DOUBLE PRECISION"
             if u == "CHARACTER VARYING":
                 return "VARCHAR(255)"
+            if u in ("SMALLSERIAL", "SERIAL2"):
+                return "SMALLINT"
+            if u in ("SERIAL", "SERIAL4"):
+                return "INTEGER"
+            if u in ("BIGSERIAL", "SERIAL8"):
+                return "BIGINT"
         if self.dialect == Dialect.MYSQL:
             if u == "DOUBLE PRECISION":
                 return "DOUBLE"
@@ -887,6 +893,26 @@ class DialectBaseMixin(MixinHost):
                 return "UNKNOWN"
             if kind == "Boolean":
                 return "BOOLEAN"
+            if kind in (
+                "EQ",
+                "NEQ",
+                "LT",
+                "LTE",
+                "GT",
+                "GTE",
+                "Is",
+                "In",
+                "Between",
+                "Like",
+                "ILike",
+                "And",
+                "Or",
+                "Not",
+                "Exists",
+            ):
+                return "BOOLEAN"
+            if kind == "Abs":
+                return infer(node.this)
             if kind == "Column":
                 column = self._lookup_col_def(node.sql())
                 if column is None:

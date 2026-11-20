@@ -7,6 +7,7 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
+import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
@@ -48,6 +49,7 @@ from ..sql_frontend import (
     build_create_view_sql,
     build_insert_select_sql,
     build_select_sql,
+    parse_sql_ast,
     parse_view_ast,
     quote_sql_identifier,
 )
@@ -78,6 +80,497 @@ class Tier2Mixin(MixinHost):
             return f"{before}\nWHERE ({extra_predicate})\n{after}"
         return f"{s}\nWHERE ({extra_predicate})"
 
+    def _tier2_subquery_tables(self) -> Set[str]:
+        """Return lowercased table names referenced inside any subquery in
+        WHERE, HAVING, SELECT expressions, or JOIN ON conditions."""
+        clauses: List[str] = []
+        if self.view.where_clause:
+            clauses.append(self.view.where_clause)
+        if self.view.having_clause:
+            clauses.append(self.view.having_clause)
+        for it in self.view.select_items:
+            if it.raw_expr:
+                clauses.append(it.raw_expr)
+        for j in self.view.joins:
+            if j.on_condition:
+                clauses.append(j.on_condition)
+        all_tables = {j.table_name.lower() for j in self.view.joins} | {self.view.base_table.lower()}
+        subq_tables: Set[str] = set()
+        for clause in clauses:
+            try:
+                ast = parse_sql_ast(clause, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                return all_tables
+            for subq in ast.find_all(sqlglot_exp.Select):
+                for tbl in subq.find_all(sqlglot_exp.Table):
+                    if tbl.name:
+                        subq_tables.add(tbl.name.lower())
+        return subq_tables
+
+    def _tier2_ident_expr(
+        self,
+        name: str,
+        original_ident: Optional[sqlglot_exp.Identifier] = None,
+    ) -> sqlglot_exp.Identifier:
+        if isinstance(original_ident, sqlglot_exp.Identifier) and original_ident.quoted:
+            return sqlglot_exp.to_identifier(original_ident.name, quoted=True)
+        needs_q = (
+            name.upper() in _SQL_RESERVED_KEYWORDS
+            or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name)
+        )
+        return sqlglot_exp.to_identifier(name, quoted=needs_q)
+
+    def _tier2_raw_join_metadata(
+        self,
+    ) -> Tuple[List[str], List[sqlglot_exp.Identifier]]:
+        """Extract raw table SQL (preserving schema qualification and quoting)
+        and exact outer alias Identifiers for each join from ``raw_select_sql``."""
+        sg_d = _sqlglot_dialect(self.dialect)
+        fallback_tables = [self._q(j.table_name) for j in self.view.joins]
+        fallback_aliases = [self._tier2_ident_expr(j.alias) for j in self.view.joins]
+        try:
+            q_ast = parse_sql_ast(self.view.raw_select_sql.strip().rstrip(";"), dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return fallback_tables, fallback_aliases
+        if not isinstance(q_ast, sqlglot_exp.Select):
+            return fallback_tables, fallback_aliases
+        from_node = q_ast.args.get("from_") or q_ast.args.get("from")
+        if from_node is None or not isinstance(from_node.this, sqlglot_exp.Table):
+            return fallback_tables, fallback_aliases
+        tbl_nodes: List[sqlglot_exp.Table] = [from_node.this]
+        for j_node in q_ast.args.get("joins") or ():
+            if isinstance(j_node.this, sqlglot_exp.Table):
+                tbl_nodes.append(j_node.this)
+            else:
+                return fallback_tables, fallback_aliases
+        if len(tbl_nodes) != len(self.view.joins):
+            return fallback_tables, fallback_aliases
+        raw_tables: List[str] = []
+        outer_aliases: List[sqlglot_exp.Identifier] = []
+        for idx, tbl_node in enumerate(tbl_nodes):
+            bare_tbl = tbl_node.copy()
+            bare_tbl.set("alias", None)
+            raw_tables.append(bare_tbl.sql(dialect=sg_d))
+            alias_arg = tbl_node.args.get("alias")
+            if isinstance(alias_arg, sqlglot_exp.TableAlias) and isinstance(alias_arg.this, sqlglot_exp.Identifier):
+                outer_aliases.append(alias_arg.this.copy())
+            elif isinstance(tbl_node.this, sqlglot_exp.Identifier):
+                outer_aliases.append(tbl_node.this.copy())
+            else:
+                outer_aliases.append(fallback_aliases[idx])
+        return raw_tables, outer_aliases
+
+    def _tier2_typed_null_node(
+        self,
+        col_def: Optional[ColumnDef],
+        *,
+        allow_untyped_null: bool = True,
+    ) -> Optional[sqlglot_exp.Expr]:
+        if self.dialect != Dialect.POSTGRES or col_def is None:
+            return sqlglot_exp.Null()
+        dt = self._normalize_dialect_type(col_def.data_type).strip()
+        if not dt or dt.upper() in ("ARRAY", "USER-DEFINED"):
+            return sqlglot_exp.Null() if allow_untyped_null else None
+        try:
+            return parse_sql_ast(f"CAST(NULL AS {dt})", dialect=Dialect.POSTGRES)
+        except sqlglot.errors.SqlglotError:
+            return sqlglot_exp.Null() if allow_untyped_null else None
+
+    def _tier2_join_graph_info(
+        self,
+    ) -> Tuple[
+        Dict[str, int],
+        Dict[str, int],
+        List[Optional[TableSchema]],
+        Set[int],
+        bool,
+        bool,
+    ]:
+        """Build join-graph lookup maps and outer-join nullability metadata."""
+        tbl_counts: Dict[str, int] = {}
+        for j in self.view.joins:
+            t_low = j.table_name.lower()
+            tbl_counts[t_low] = tbl_counts.get(t_low, 0) + 1
+
+        join_quals: Dict[str, int] = {}
+        schemas_by_idx: List[Optional[TableSchema]] = []
+        col_owners: Dict[str, List[int]] = {}
+        nullable_join_indices: Set[int] = set()
+        has_fk_cascade = False
+        has_natural_join = False
+
+        for idx, j in enumerate(self.view.joins):
+            join_quals[j.alias.lower()] = idx
+            if tbl_counts.get(j.table_name.lower(), 0) == 1:
+                join_quals.setdefault(j.table_name.lower(), idx)
+            ts_j = self._schemas_lower.get(j.table_name.lower())
+            schemas_by_idx.append(ts_j)
+            if ts_j:
+                if ts_j.fk_cascade_actions:
+                    has_fk_cascade = True
+                for c_name in ts_j.columns:
+                    col_owners.setdefault(c_name.lower(), []).append(idx)
+            jt_up = j.join_type.upper()
+            if "NATURAL" in jt_up:
+                has_natural_join = True
+            if "LEFT" in jt_up:
+                nullable_join_indices.add(idx)
+            elif "RIGHT" in jt_up:
+                nullable_join_indices.update(range(idx))
+            elif "FULL" in jt_up:
+                nullable_join_indices.update(range(idx + 1))
+
+        unqual_col_to_join = {
+            c_low: idxs[0] for c_low, idxs in col_owners.items() if len(idxs) == 1
+        }
+        return (
+            join_quals,
+            unqual_col_to_join,
+            schemas_by_idx,
+            nullable_join_indices,
+            has_fk_cascade,
+            has_natural_join,
+        )
+
+    def _tier2_resolve_col(
+        self,
+        col: sqlglot_exp.Column,
+        join_quals: Dict[str, int],
+        unqual_col_to_join: Dict[str, int],
+        schemas_by_idx: List[Optional[TableSchema]],
+    ) -> Optional[Tuple[int, ColumnDef]]:
+        col_low = col.name.lower()
+        if not col_low:
+            return None
+        if col.table:
+            j_idx = join_quals.get(col.table.lower())
+            if j_idx is None:
+                return None
+        else:
+            j_idx = unqual_col_to_join.get(col_low)
+            if j_idx is None:
+                return None
+        ts_j = schemas_by_idx[j_idx]
+        if ts_j is None:
+            return None
+        for c_def in ts_j.columns.values():
+            if c_def.name.lower() == col_low:
+                return j_idx, c_def
+        return None
+
+    def _tier2_on_strict_null_rejecting(
+        self,
+        on_sql: str,
+        nullified: Set[int],
+        join_quals: Dict[str, int],
+        unqual_col_to_join: Dict[str, int],
+        schemas_by_idx: List[Optional[TableSchema]],
+    ) -> Tuple[Optional[Set[int]], bool]:
+        """Return ``(referenced_join_indices, is_strict_null_rejecting)`` for an ON clause."""
+        try:
+            ast = parse_sql_ast(on_sql, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None, False
+        if ast.find(sqlglot_exp.Select) is not None or ast.find(sqlglot_exp.Subquery) is not None:
+            return None, False
+
+        refs: Set[int] = set()
+        for col in ast.find_all(sqlglot_exp.Column):
+            resolved = self._tier2_resolve_col(col, join_quals, unqual_col_to_join, schemas_by_idx)
+            if resolved is None:
+                return None, False
+            refs.add(resolved[0])
+
+        def _strict_null_prop(node: Optional[sqlglot_exp.Expr]) -> bool:
+            if node is None:
+                return False
+            if isinstance(node, sqlglot_exp.Column):
+                res = self._tier2_resolve_col(node, join_quals, unqual_col_to_join, schemas_by_idx)
+                return res is not None and res[0] in nullified
+            if isinstance(node, (sqlglot_exp.Paren, sqlglot_exp.Neg, sqlglot_exp.Cast)):
+                return _strict_null_prop(node.this)
+            if isinstance(
+                node,
+                (
+                    sqlglot_exp.Add,
+                    sqlglot_exp.Sub,
+                    sqlglot_exp.Mul,
+                    sqlglot_exp.Div,
+                    sqlglot_exp.Mod,
+                ),
+            ):
+                return _strict_null_prop(node.this) or _strict_null_prop(node.expression)
+            return False
+
+        conjuncts: List[sqlglot_exp.Expr] = []
+        stack: List[sqlglot_exp.Expr] = [ast]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, sqlglot_exp.Paren) and cur.this is not None:
+                stack.append(cur.this)
+            elif isinstance(cur, sqlglot_exp.And):
+                if cur.this is not None:
+                    stack.append(cur.this)
+                if cur.expression is not None:
+                    stack.append(cur.expression)
+            else:
+                conjuncts.append(cur)
+
+        strict_cmp_types = (
+            sqlglot_exp.EQ,
+            sqlglot_exp.NEQ,
+            sqlglot_exp.LT,
+            sqlglot_exp.LTE,
+            sqlglot_exp.GT,
+            sqlglot_exp.GTE,
+        )
+        is_strict = any(
+            isinstance(c, strict_cmp_types)
+            and (_strict_null_prop(c.this) or _strict_null_prop(c.expression))
+            for c in conjuncts
+        )
+        return refs, is_strict
+
+    def _tier2_nullified_join_indices(
+        self,
+        target_idx: int,
+        nullable_join_indices: Set[int],
+        join_quals: Dict[str, int],
+        unqual_col_to_join: Dict[str, int],
+        schemas_by_idx: List[Optional[TableSchema]],
+    ) -> Optional[Set[int]]:
+        """Compute the exact set of join indices that become NULL-extended when
+        ``self.view.joins[target_idx]`` stops matching, or ``None`` if scoping
+        must fail closed to a full view refresh."""
+        # Fail closed on 3+-table FULL OUTER JOINs (two-sided nullification).
+        if len(self.view.joins) > 2 and any("FULL" in j.join_type.upper() for j in self.view.joins):
+            return None
+        own_on = self.view.joins[target_idx].on_condition
+        if own_on:
+            try:
+                own_ast = parse_sql_ast(own_on, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                return None
+            if own_ast.find(sqlglot_exp.Select) is not None or own_ast.find(sqlglot_exp.Subquery) is not None:
+                return None
+        if target_idx not in nullable_join_indices:
+            return set()
+        target_jt = self.view.joins[target_idx].join_type.upper()
+        # A LEFT or FULL join at target_idx is immediately nullified at target_idx;
+        # a FROM/INNER/CROSS/RIGHT join is only nullified once a subsequent RIGHT or
+        # FULL join null-extends its left subtree (0..k-1).
+        immediately_nullified = "LEFT" in target_jt or "FULL" in target_jt
+        nullified: Set[int] = {target_idx} if immediately_nullified else set()
+        eliminates_left_subtree = "LEFT" not in target_jt
+        for k in range(target_idx + 1, len(self.view.joins)):
+            j_k = self.view.joins[k]
+            jt_k = j_k.join_type.upper()
+            on_refs: Optional[Set[int]] = set()
+            is_strict = False
+            if j_k.on_condition:
+                check_nulls = nullified | ({target_idx} if "FULL" in jt_k and len(self.view.joins) == 2 else set())
+                on_refs, is_strict = self._tier2_on_strict_null_rejecting(
+                    j_k.on_condition, check_nulls, join_quals, unqual_col_to_join, schemas_by_idx
+                )
+                if on_refs is None:
+                    return None
+            touches_nullified = bool(on_refs & nullified)
+            if "FULL" in jt_k:
+                # 2-table `o FULL OUTER JOIN p`: modifying o nullifies only o.
+                if len(self.view.joins) == 2 and target_idx == 0 and k == 1 and is_strict:
+                    nullified.add(0)
+                    continue
+                return None
+            if "RIGHT" in jt_k:
+                if touches_nullified and not is_strict:
+                    return None
+                if touches_nullified or eliminates_left_subtree:
+                    nullified.update(range(k))
+                eliminates_left_subtree = False
+                continue
+            if not touches_nullified:
+                continue
+            if not is_strict:
+                return None
+            if "LEFT" in jt_k:
+                nullified.add(k)
+            else:
+                # INNER JOIN depending on a nullified table can change match set.
+                return None
+        return nullified
+
+    def _tier2_ast_qualify_outer(
+        self,
+        expr: str,
+        join_quals: Dict[str, int],
+        unqual_col_to_join: Dict[str, int],
+        schemas_by_idx: List[Optional[TableSchema]],
+        outer_aliases: Sequence[sqlglot_exp.Identifier],
+    ) -> Optional[str]:
+        """Qualify all column references in ``expr`` against the outer join aliases."""
+        sg_d = _sqlglot_dialect(self.dialect)
+        try:
+            ast = parse_sql_ast(expr, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None
+        failed = False
+
+        def _tx(node: sqlglot_exp.Expr) -> sqlglot_exp.Expr:
+            nonlocal failed
+            if isinstance(node, sqlglot_exp.Column):
+                resolved = self._tier2_resolve_col(node, join_quals, unqual_col_to_join, schemas_by_idx)
+                if resolved is None:
+                    failed = True
+                    return node
+                j_idx, c_def = resolved
+                orig_col = node.this if isinstance(node.this, sqlglot_exp.Identifier) else None
+                return sqlglot_exp.Column(
+                    this=self._tier2_ident_expr(c_def.name, orig_col),
+                    table=outer_aliases[j_idx].copy(),
+                )
+            return node
+
+        out_ast = ast.transform(_tx)
+        if failed:
+            return None
+        return out_ast.sql(dialect=sg_d)
+
+    def _tier2_ast_rewrite_single_join(
+        self,
+        expr: str,
+        target_idx: int,
+        rec_prefix: str,
+        join_quals: Dict[str, int],
+        unqual_col_to_join: Dict[str, int],
+        schemas_by_idx: List[Optional[TableSchema]],
+    ) -> Optional[str]:
+        """Rewrite ``expr`` against ``rec_prefix`` if every column reference
+        resolves to ``self.view.joins[target_idx]``."""
+        sg_d = _sqlglot_dialect(self.dialect)
+        try:
+            ast = parse_sql_ast(expr, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None
+        saw_col = False
+        failed = False
+
+        def _tx(node: sqlglot_exp.Expr) -> sqlglot_exp.Expr:
+            nonlocal saw_col, failed
+            if isinstance(node, sqlglot_exp.Column):
+                resolved = self._tier2_resolve_col(node, join_quals, unqual_col_to_join, schemas_by_idx)
+                if resolved is None or resolved[0] != target_idx:
+                    failed = True
+                    return node
+                saw_col = True
+                _, c_def = resolved
+                orig_col = node.this if isinstance(node.this, sqlglot_exp.Identifier) else None
+                return sqlglot_exp.Column(
+                    this=self._tier2_ident_expr(c_def.name, orig_col),
+                    table=sqlglot_exp.to_identifier(rec_prefix, quoted=False),
+                )
+            return node
+
+        out_ast = ast.transform(_tx)
+        if failed or not saw_col:
+            return None
+        return out_ast.sql(dialect=sg_d)
+
+    def _tier2_ast_remap_and_nullify(
+        self,
+        expr: str,
+        alias_by_idx: Optional[Dict[int, str]],
+        nullified_indices: Set[int],
+        join_quals: Dict[str, int],
+        unqual_col_to_join: Dict[str, int],
+        schemas_by_idx: List[Optional[TableSchema]],
+    ) -> Optional[str]:
+        """AST-remap column references to ``alias_by_idx`` and replace columns
+        from ``nullified_indices`` with (typed) NULL."""
+        sg_d = _sqlglot_dialect(self.dialect)
+        try:
+            ast = parse_sql_ast(expr, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None
+        is_bare_col = isinstance(ast, sqlglot_exp.Column)
+        failed = False
+
+        def _tx(node: sqlglot_exp.Expr) -> sqlglot_exp.Expr:
+            nonlocal failed
+            if isinstance(node, sqlglot_exp.Column):
+                resolved = self._tier2_resolve_col(node, join_quals, unqual_col_to_join, schemas_by_idx)
+                if resolved is None:
+                    failed = True
+                    return node
+                j_idx, c_def = resolved
+                if j_idx in nullified_indices:
+                    tn = self._tier2_typed_null_node(c_def, allow_untyped_null=is_bare_col)
+                    if tn is None:
+                        failed = True
+                        return node
+                    return tn
+                if alias_by_idx is not None:
+                    orig_col = node.this if isinstance(node.this, sqlglot_exp.Identifier) else None
+                    return sqlglot_exp.Column(
+                        this=self._tier2_ident_expr(c_def.name, orig_col),
+                        table=sqlglot_exp.to_identifier(alias_by_idx[j_idx], quoted=False),
+                    )
+            return node
+
+        out_ast = ast.transform(_tx)
+        if failed:
+            return None
+        return out_ast.sql(dialect=sg_d)
+
+    def _tier2_build_inner_from_sql(
+        self,
+        target_idx: int,
+        inline_row_table: str,
+        alias_by_idx: Dict[int, str],
+        raw_tables: Sequence[str],
+        join_quals: Dict[str, int],
+        unqual_col_to_join: Dict[str, int],
+        schemas_by_idx: List[Optional[TableSchema]],
+    ) -> Optional[str]:
+        """Build the join graph with ``self.view.joins[target_idx]`` replaced by
+        ``inline_row_table`` and all ON clauses remapped to ``alias_by_idx``."""
+        is_two_table_full = (
+            len(self.view.joins) == 2
+            and "FULL" in self.view.joins[1].join_type.upper()
+        )
+        join_parts: List[str] = []
+        for idx, j in enumerate(self.view.joins):
+            remapped_alias = alias_by_idx[idx]
+            tbl_expr = (
+                inline_row_table
+                if idx == target_idx
+                else f"{raw_tables[idx]} AS {remapped_alias}"
+            )
+            if idx == 0:
+                join_parts.append(tbl_expr)
+            else:
+                on_sql = ""
+                if j.on_condition:
+                    remapped_on = self._tier2_ast_remap_and_nullify(
+                        j.on_condition,
+                        alias_by_idx,
+                        set(),
+                        join_quals,
+                        unqual_col_to_join,
+                        schemas_by_idx,
+                    )
+                    if remapped_on is None:
+                        return None
+                    on_sql = f" ON {remapped_on}"
+                jt_up = j.join_type.upper()
+                if is_two_table_full and idx == 1:
+                    eff_join_type = "LEFT JOIN" if target_idx == 0 else "RIGHT JOIN"
+                elif idx == target_idx and j.on_condition and "RIGHT" not in jt_up and "FULL" not in jt_up:
+                    eff_join_type = "INNER JOIN"
+                else:
+                    eff_join_type = j.join_type
+                join_parts.append(f"{eff_join_type} {tbl_expr}{on_sql}")
+        return " ".join(join_parts)
+
     def _group_scope_predicate_for_table(
         self,
         base_t: str,
@@ -90,169 +583,168 @@ class Tier2Mixin(MixinHost):
 
         if len(self.view.joins) <= 1 and base_t.lower() != self.view.base_table.lower():
             return None
-        if self.view.where_clause and re.search(r"\b(?:EXISTS|IN)\s*\(", self.view.where_clause, flags=re.IGNORECASE):
-            if base_t.lower() != self.view.base_table.lower():
-                return None
-
-        def _lhs_expr(g_expr: str, mv_col: str) -> str:
-            if lhs_table_alias:
-                return f"{lhs_table_alias}.{self._q(mv_col)}"
-            if record_prefix in ("__mv_new_rows", "__mv_old_rows") and self.view.joins:
-                outer_alias = self._q(self.view.joins[0].alias or base_t)
-                return f"({self._rewrite_expr_for_record(g_expr, outer_alias)})"
-            return f"({g_expr})"
+        if base_t.lower() in self._tier2_subquery_tables():
+            return None
 
         if len(self.view.joins) == 1:
+            def _single_lhs_expr(g_expr: str, mv_col: str) -> str:
+                if lhs_table_alias:
+                    return f"{lhs_table_alias}.{self._q(mv_col)}"
+                if record_prefix in ("__mv_new_rows", "__mv_old_rows") and self.view.joins:
+                    outer_alias = self._q(self.view.joins[0].alias or base_t)
+                    return f"({self._rewrite_expr_for_record(g_expr, outer_alias)})"
+                return f"({g_expr})"
+
             conds: List[str] = []
             for g_expr, mv_col in group_mv_cols:
                 rhs_e = self._rewrite_expr_for_record(g_expr, record_prefix)
-                conds.append(self._null_safe_eq(_lhs_expr(g_expr, mv_col), f"({rhs_e})", is_nullable=True))
+                conds.append(self._null_safe_eq(_single_lhs_expr(g_expr, mv_col), f"({rhs_e})", is_nullable=True))
             cond_str = " AND ".join(conds)
             if record_prefix in ("__mv_new_rows", "__mv_old_rows"):
                 return f"EXISTS (SELECT 1 FROM {record_prefix} WHERE {cond_str})"
             return cond_str
 
-        target_join: Optional[JoinSpec] = None
-        for j in self.view.joins:
-            if j.table_name.lower() == base_t.lower():
-                target_join = j
-                break
-        if target_join is None:
+        matching_joins = [
+            (idx, j)
+            for idx, j in enumerate(self.view.joins)
+            if j.table_name.lower() == base_t.lower()
+        ]
+        if not matching_joins:
             return None
 
-        # If base_t is the table that owns all group columns directly, compare directly
-        target_alias = target_join.alias
-        all_owned = True
-        direct_conds: List[str] = []
-        ts_target = self._schemas_lower[base_t.lower()]
+        (
+            join_quals,
+            unqual_col_to_join,
+            schemas_by_idx,
+            nullable_join_indices,
+            has_fk_cascade,
+            has_natural_join,
+        ) = self._tier2_join_graph_info()
+        if has_natural_join:
+            return None
+
+        raw_tables, outer_aliases = self._tier2_raw_join_metadata()
+
+        lhs_exprs: List[str] = []
         for g_expr, mv_col in group_mv_cols:
-            gs = g_expr.strip()
-            if "." in gs:
-                p_al, c_part = gs.split(".", 1)
-                if p_al.strip().lower() in (target_alias.lower(), base_t.lower()):
-                    direct_conds.append(
-                        self._null_safe_eq(
-                            _lhs_expr(g_expr, mv_col),
-                            f"({record_prefix}.{self._q(_unquote_ident(c_part, dialect=self.dialect))})",
-                            is_nullable=True,
-                        )
-                    )
-                else:
-                    all_owned = False
-                    break
-            elif _unquote_ident(gs, dialect=self.dialect) in ts_target.columns:
-                direct_conds.append(
-                    self._null_safe_eq(
-                        _lhs_expr(g_expr, mv_col),
-                        f"({record_prefix}.{self._q(_unquote_ident(gs, dialect=self.dialect))})",
-                        is_nullable=True,
-                    )
-                )
+            if lhs_table_alias:
+                lhs_exprs.append(f"{lhs_table_alias}.{self._q(mv_col)}")
             else:
-                all_owned = False
-                break
+                qual_g = self._tier2_ast_qualify_outer(
+                    g_expr, join_quals, unqual_col_to_join, schemas_by_idx, outer_aliases
+                )
+                if qual_g is None:
+                    return None
+                lhs_exprs.append(f"({qual_g})")
 
-        if all_owned and direct_conds:
-            cond_str = " AND ".join(direct_conds)
-            if record_prefix in ("__mv_new_rows", "__mv_old_rows"):
-                return f"EXISTS (SELECT 1 FROM {record_prefix} WHERE {cond_str})"
-            return cond_str
-
-        # Otherwise build an EXISTS subquery over the join graph with `target_join` replaced by `(SELECT NEW/OLD.*)`
+        ts_target = self._schemas_lower[base_t.lower()]
         from_dual = " FROM DUAL" if self.dialect == Dialect.MYSQL else ""
         rec_proj = ", ".join(f"{record_prefix}.{self._q(c)} AS {self._q(c)}" for c in ts_target.columns)
-        alias_remap: Dict[str, str] = {}
-        for j in self.view.joins:
-            alias_remap[j.alias.lower()] = f"__mv_j_{j.alias}"
-            alias_remap[j.table_name.lower()] = f"__mv_j_{j.alias}"
+        alias_by_idx = {idx: f"__mv_j_{idx}" for idx in range(len(self.view.joins))}
 
-        def _remap_aliases_in_sql(frag: str) -> str:
-            toks = _tokenize_sql(frag, read=_sqlglot_dialect(self.dialect))
-            if not toks:
-                return frag
-            out: List[str] = []
-            cursor = 0
-            i = 0
-            n = len(toks)
-            while i < n:
-                tk = toks[i]
-                if (
-                    _is_word_or_ident_token(tk)
-                    and i + 2 < n
-                    and toks[i + 1].token_type == SQLGlotTokenType.DOT
-                    and _is_word_or_ident_token(toks[i + 2])
-                ):
-                    tbl_low = tk.text.lower()
-                    if tbl_low in alias_remap:
-                        if tk.start > cursor:
-                            out.append(frag[cursor:tk.start])
-                        out.append(f"{alias_remap[tbl_low]}.{toks[i + 2].text}")
-                        cursor = toks[i + 2].end + 1
-                        i += 3
-                        continue
-                i += 1
-            if cursor < len(frag):
-                out.append(frag[cursor:])
-            return "".join(out)
-
-        if record_prefix in ("__mv_new_rows", "__mv_old_rows"):
-            inline_row_table = f"{record_prefix} AS __mv_j_{target_alias}"
-        else:
-            inline_row_table = f"(SELECT {rec_proj}{from_dual}) AS __mv_j_{target_alias}"
-        join_parts: List[str] = []
-        for idx, j in enumerate(self.view.joins):
-            remapped_alias = f"__mv_j_{j.alias}"
-            tbl_expr = (
-                inline_row_table
-                if j.alias.lower() == target_alias.lower()
-                else f"{self._q(j.table_name)} AS {remapped_alias}"
+        occurrence_preds: List[str] = []
+        for target_idx, _target_join in matching_joins:
+            nullified_indices = self._tier2_nullified_join_indices(
+                target_idx, nullable_join_indices, join_quals, unqual_col_to_join, schemas_by_idx
             )
-            if idx == 0:
-                join_parts.append(tbl_expr)
-            else:
-                on_sql = (
-                    f" ON {_remap_aliases_in_sql(j.on_condition)}"
-                    if j.on_condition
-                    else ""
-                )
-                eff_join_type = (
-                    "INNER JOIN"
-                    if j.alias.lower() == target_alias.lower() and j.on_condition
-                    else j.join_type
-                )
-                join_parts.append(f"{eff_join_type} {tbl_expr}{on_sql}")
+            if nullified_indices is None:
+                return None
 
-        from_join_sql = " ".join(join_parts)
-        left_join_remapped = {
-            f"__mv_j_{j.alias}".lower()
-            for j in self.view.joins
-            if j.join_type == "LEFT JOIN"
-        }
-        match_conds: List[str] = []
-        for g_expr, mv_col in group_mv_cols:
-            remapped_g = _remap_aliases_in_sql(g_expr)
-            lhs_e = _lhs_expr(g_expr, mv_col)
-            eq_cond = self._null_safe_eq(lhs_e, f"({remapped_g})", is_nullable=True)
-            if any(
-                re.search(rf"\b{re.escape(la)}\.", remapped_g, flags=re.IGNORECASE)
-                for la in left_join_remapped
-            ):
-                match_conds.append(f"({eq_cond} OR {lhs_e} IS NULL)")
-            else:
-                match_conds.append(eq_cond)
+            # If this join occurrence owns all group expressions directly, compare
+            # directly against OLD/NEW (plus the NULL-extended group key when
+            # this join is on the nullable side of an outer join).
+            direct_conds: List[str] = []
+            all_owned = True
+            for (g_expr, _mv_col), lhs_e in zip(group_mv_cols, lhs_exprs):
+                rewritten = self._tier2_ast_rewrite_single_join(
+                    g_expr, target_idx, record_prefix, join_quals, unqual_col_to_join, schemas_by_idx
+                )
+                if rewritten is None:
+                    all_owned = False
+                    break
+                direct_conds.append(self._null_safe_eq(lhs_e, f"({rewritten})", is_nullable=True))
 
-        exists_pred = (
-            f"EXISTS (\n"
-            f"        SELECT 1 FROM {from_join_sql}\n"
-            f"        WHERE {' AND '.join(match_conds)}\n"
-            f"    )"
-        )
-        if any(j.join_type == "LEFT JOIN" for j in self.view.joins) and target_join != self.view.joins[0]:  # pyright: ignore[reportGeneralTypeIssues]  # pyright's len() narrowing wrongly infers empty joins here; any() guards it
-            null_preds = " AND ".join(
-                f"{_lhs_expr(g_expr, mv_col)} IS NULL" for g_expr, mv_col in group_mv_cols
+            if all_owned and direct_conds:
+                cond_str = " AND ".join(direct_conds)
+                if record_prefix in ("__mv_new_rows", "__mv_old_rows"):
+                    matched_pred = f"EXISTS (SELECT 1 FROM {record_prefix} WHERE {cond_str})"
+                else:
+                    matched_pred = cond_str
+                if nullified_indices:
+                    unmatched_conds: List[str] = []
+                    for (g_expr, _mv_col), lhs_e in zip(group_mv_cols, lhs_exprs):
+                        unmatched_e = self._tier2_ast_remap_and_nullify(
+                            g_expr, None, nullified_indices, join_quals, unqual_col_to_join, schemas_by_idx
+                        )
+                        if unmatched_e is None:
+                            return None
+                        unmatched_conds.append(
+                            self._null_safe_eq(lhs_e, f"({unmatched_e})", is_nullable=True)
+                        )
+                    unmatched_pred = " AND ".join(unmatched_conds)
+                    if record_prefix in ("__mv_new_rows", "__mv_old_rows"):
+                        unmatched_pred = f"(EXISTS (SELECT 1 FROM {record_prefix}) AND {unmatched_pred})"
+                    occurrence_preds.append(f"(({matched_pred}) OR ({unmatched_pred}))")
+                else:
+                    occurrence_preds.append(matched_pred)
+                continue
+
+            # When FK cascades can mutate joined tables before triggers see the
+            # pre-cascade join pair, or when self-joins require correlating two
+            # aliases against OLD/NEW simultaneously, fall back safely to full
+            # refresh (all_owned keys do not join other tables and stay scoped).
+            if has_fk_cascade or len(matching_joins) > 1:
+                return None
+
+            if record_prefix in ("__mv_new_rows", "__mv_old_rows"):
+                inline_row_table = f"{record_prefix} AS {alias_by_idx[target_idx]}"
+            else:
+                inline_row_table = f"(SELECT {rec_proj}{from_dual}) AS {alias_by_idx[target_idx]}"
+
+            from_join_sql = self._tier2_build_inner_from_sql(
+                target_idx,
+                inline_row_table,
+                alias_by_idx,
+                raw_tables,
+                join_quals,
+                unqual_col_to_join,
+                schemas_by_idx,
             )
-            return f"({exists_pred} OR ({null_preds}))"
-        return exists_pred
+            if from_join_sql is None:
+                return None
+
+            match_conds: List[str] = []
+            for (g_expr, _mv_col), lhs_e in zip(group_mv_cols, lhs_exprs):
+                remapped_g = self._tier2_ast_remap_and_nullify(
+                    g_expr, alias_by_idx, set(), join_quals, unqual_col_to_join, schemas_by_idx
+                )
+                if remapped_g is None:
+                    return None
+                eq_cond = self._null_safe_eq(lhs_e, f"({remapped_g})", is_nullable=True)
+                if nullified_indices:
+                    unmatched_g = self._tier2_ast_remap_and_nullify(
+                        g_expr, alias_by_idx, nullified_indices, join_quals, unqual_col_to_join, schemas_by_idx
+                    )
+                    if unmatched_g is None:
+                        return None
+                    if unmatched_g != remapped_g:
+                        unmatched_eq = self._null_safe_eq(lhs_e, f"({unmatched_g})", is_nullable=True)
+                        match_conds.append(f"({eq_cond} OR {unmatched_eq})")
+                    else:
+                        match_conds.append(eq_cond)
+                else:
+                    match_conds.append(eq_cond)
+
+            occurrence_preds.append(
+                f"EXISTS (\n"
+                f"        SELECT 1 FROM {from_join_sql}\n"
+                f"        WHERE {' AND '.join(match_conds)}\n"
+                f"    )"
+            )
+
+        if len(occurrence_preds) == 1:
+            return occurrence_preds[0]
+        return "(" + " OR ".join(f"({p})" for p in occurrence_preds) + ")"
 
     def _build_tier2_triggers_for_table(
         self,
@@ -262,6 +754,7 @@ class Tier2Mixin(MixinHost):
         target_cols: List[str],
         group_mv_cols: List[Tuple[str, str]],
         source_query_sql: str,
+        group_col_types: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         q_target_cols = [self._q(c) for c in target_cols]
         cols_csv = ", ".join(q_target_cols)
@@ -348,7 +841,7 @@ class Tier2Mixin(MixinHost):
         if self.dialect == Dialect.POSTGRES:
             pg_bodies = self._pg_group_scoped_bodies(
                 base_t, mv_table, cols_csv, src_cols_csv, group_mv_cols, source_query_sql,
-                can_push_down, full_refresh,
+                can_push_down, full_refresh, group_col_types or {},
             )
             pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
             # TRUNCATE recomputes everything: the whole-view lock key.
@@ -377,65 +870,131 @@ class Tier2Mixin(MixinHost):
 
         Mirrors ``_group_scope_predicate_for_table``: single-source views and
         keys owned by ``base_t`` read them from the signed rows; otherwise the
-        signed rows replace ``base_t`` in the view's join graph. A LEFT JOIN
-        whose nullable side is ``base_t`` also affects the NULL-key group.
+        signed rows replace ``base_t`` in the view's join graph. An outer join
+        whose nullable side includes ``base_t`` also emits the NULL-extended
+        group keys (including ``COALESCE``/expression keys and chained outer
+        joins).
         """
         if not group_mv_cols:
             return None
         if len(self.view.joins) <= 1 and base_t.lower() != self.view.base_table.lower():
             return None
-        if self.view.where_clause and re.search(r"\b(?:EXISTS|IN)\s*\(", self.view.where_clause, flags=re.IGNORECASE):
-            if base_t.lower() != self.view.base_table.lower():
-                return None
+        if base_t.lower() in self._tier2_subquery_tables():
+            return None
         rec = "__mv_d"
         signed_from = f"(\n        {signed_sql}\n        ) AS {rec}"
         if len(self.view.joins) <= 1:
             return signed_from, [self._rewrite_expr_for_record(g, rec) for g, _ in group_mv_cols]
-        target_join: Optional[JoinSpec] = None
-        for j in self.view.joins:
-            if j.table_name.lower() == base_t.lower():
-                target_join = j
-                break
-        if target_join is None:
+
+        matching_joins = [
+            (idx, j)
+            for idx, j in enumerate(self.view.joins)
+            if j.table_name.lower() == base_t.lower()
+        ]
+        if not matching_joins:
             return None
-        ts_target = self._schemas_lower[base_t.lower()]
-        owned: List[str] = []
-        for g_expr, _mv_col in group_mv_cols:
-            gs = g_expr.strip()
-            if "." in gs:
-                p_al, c_part = gs.split(".", 1)
-                if p_al.strip().lower() in (target_join.alias.lower(), base_t.lower()):
-                    owned.append(f"{rec}.{self._q(_unquote_ident(c_part, dialect=self.dialect))}")
-                    continue
-                break
-            if _unquote_ident(gs, dialect=self.dialect) in ts_target.columns:
-                owned.append(f"{rec}.{self._q(_unquote_ident(gs, dialect=self.dialect))}")
-                continue
-            break
-        if len(owned) == len(group_mv_cols):
-            return signed_from, owned
-        parts: List[str] = []
-        for idx, j in enumerate(self.view.joins):
-            if j.alias.lower() == target_join.alias.lower():
-                tbl = f"(\n        {signed_sql}\n        ) AS {self._q(j.alias)}"
-            else:
-                tbl = f"{self._q(j.table_name)} AS {self._q(j.alias)}"
-            if idx == 0:
-                parts.append(tbl)
-            else:
-                join_type = "INNER JOIN" if (j.alias.lower() == target_join.alias.lower() and j.on_condition) else j.join_type
-                on_sql = f" ON {j.on_condition}" if j.on_condition else ""
-                parts.append(f"{join_type} {tbl}{on_sql}")
-        from_sql = "\n        ".join(parts)
-        keys = [g for g, _ in group_mv_cols]
-        if any(j.join_type == "LEFT JOIN" for j in self.view.joins) and target_join != self.view.joins[0]:
-            nulls = ", ".join("NULL" for _ in keys)
-            sel = ", ".join(f"{k} AS __mv_k{i}" for i, k in enumerate(keys))
-            from_sql = (
-                f"(SELECT {sel} FROM {from_sql}\n        UNION ALL SELECT {nulls}) AS __mv_kk"
+
+        (
+            join_quals,
+            unqual_col_to_join,
+            schemas_by_idx,
+            nullable_join_indices,
+            has_fk_cascade,
+            has_natural_join,
+        ) = self._tier2_join_graph_info()
+        if has_natural_join:
+            return None
+
+        alias_by_idx = {idx: f"__mv_j_{idx}" for idx in range(len(self.view.joins))}
+        raw_tables, _outer_aliases = self._tier2_raw_join_metadata()
+        key_branches: List[str] = []
+
+        for target_idx, _target_join in matching_joins:
+            nullified_indices = self._tier2_nullified_join_indices(
+                target_idx, nullable_join_indices, join_quals, unqual_col_to_join, schemas_by_idx
             )
-            keys = [f"__mv_kk.__mv_k{i}" for i in range(len(keys))]
-        return from_sql, keys
+            if nullified_indices is None:
+                return None
+
+            owned_exprs: List[str] = []
+            all_owned = True
+            for g_expr, _mv_col in group_mv_cols:
+                rewritten = self._tier2_ast_rewrite_single_join(
+                    g_expr, target_idx, rec, join_quals, unqual_col_to_join, schemas_by_idx
+                )
+                if rewritten is None:
+                    all_owned = False
+                    break
+                owned_exprs.append(rewritten)
+
+            if all_owned and owned_exprs:
+                sel_owned = ", ".join(f"({k}) AS __mv_k{i}" for i, k in enumerate(owned_exprs))
+                key_branches.append(f"SELECT {sel_owned} FROM {signed_from}")
+                if nullified_indices:
+                    unmatched_exprs: List[str] = []
+                    for g_expr, _mv_col in group_mv_cols:
+                        u_e = self._tier2_ast_remap_and_nullify(
+                            g_expr, None, nullified_indices, join_quals, unqual_col_to_join, schemas_by_idx
+                        )
+                        if u_e is None:
+                            return None
+                        unmatched_exprs.append(u_e)
+                    sel_unmatched = ", ".join(
+                        f"({k}) AS __mv_k{i}" for i, k in enumerate(unmatched_exprs)
+                    )
+                    key_branches.append(
+                        f"SELECT {sel_unmatched} WHERE EXISTS (SELECT 1 FROM {signed_from})"
+                    )
+                continue
+
+            if has_fk_cascade or len(matching_joins) > 1:
+                return None
+
+            inline_row_table = f"(\n        {signed_sql}\n        ) AS {alias_by_idx[target_idx]}"
+            from_join_sql = self._tier2_build_inner_from_sql(
+                target_idx,
+                inline_row_table,
+                alias_by_idx,
+                raw_tables,
+                join_quals,
+                unqual_col_to_join,
+                schemas_by_idx,
+            )
+            if from_join_sql is None:
+                return None
+
+            matched_exprs: List[str] = []
+            unmatched_exprs = []
+            any_diff = False
+            for g_expr, _mv_col in group_mv_cols:
+                remapped_g = self._tier2_ast_remap_and_nullify(
+                    g_expr, alias_by_idx, set(), join_quals, unqual_col_to_join, schemas_by_idx
+                )
+                if remapped_g is None:
+                    return None
+                matched_exprs.append(remapped_g)
+                if nullified_indices:
+                    u_g = self._tier2_ast_remap_and_nullify(
+                        g_expr, alias_by_idx, nullified_indices, join_quals, unqual_col_to_join, schemas_by_idx
+                    )
+                    if u_g is None:
+                        return None
+                    unmatched_exprs.append(u_g)
+                    if u_g != remapped_g:
+                        any_diff = True
+
+            sel_matched = ", ".join(f"({k}) AS __mv_k{i}" for i, k in enumerate(matched_exprs))
+            key_branches.append(f"SELECT {sel_matched} FROM {from_join_sql}")
+            if nullified_indices and any_diff:
+                sel_unmatched = ", ".join(
+                    f"({k}) AS __mv_k{i}" for i, k in enumerate(unmatched_exprs)
+                )
+                key_branches.append(f"SELECT {sel_unmatched} FROM {from_join_sql}")
+
+        if not key_branches:
+            return None
+        from_sql = "(\n        " + "\n        UNION ALL\n        ".join(key_branches) + "\n        ) AS __mv_kk"
+        return from_sql, [f"__mv_kk.__mv_k{i}" for i in range(len(group_mv_cols))]
 
     def _pg_group_scoped_bodies(
         self,
@@ -447,6 +1006,7 @@ class Tier2Mixin(MixinHost):
         source_query_sql: str,
         can_push_down: bool,
         full_refresh: List[str],
+        group_col_types: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
         """PostgreSQL statement-level bodies for group-scoped recompute.
 
@@ -461,12 +1021,35 @@ class Tier2Mixin(MixinHost):
            neither wait nor deadlock on it.
         2. Delete and re-insert the affected groups in later statements,
            matching keys with index-usable predicates: ``col = ANY(ARRAY(...))``
-           for keys without NULLs, and a separate statement for keys with a
-           NULL part, guarded so it does no work when there is none.
+           for scalar keys without NULLs (``IN (SELECT ...)`` for array /
+           user-defined types that PostgreSQL forbids in ``ARRAY(...)``), and a
+           separate statement for keys with a NULL part, guarded so it does no
+           work when there is none.
         """
         bodies: Dict[str, str] = {}
         refresh = "\n".join([self._pg_view_lock_stmt(), *full_refresh])
         lock_t = self._pg_view_lock_table()
+        col_types_map = group_col_types or {}
+        src_lhs_push: Optional[List[str]] = None
+        if len(self.view.joins) > 1:
+            jq_pg, uq_pg, sb_pg, _, _, _ = self._tier2_join_graph_info()
+            _, outer_aliases_pg = self._tier2_raw_join_metadata()
+            qual_list = [
+                self._tier2_ast_qualify_outer(g, jq_pg, uq_pg, sb_pg, outer_aliases_pg)
+                for g, _ in group_mv_cols
+            ]
+            if all(q is not None for q in qual_list):
+                src_lhs_push = [f"({q})" for q in qual_list if q is not None]
+        else:
+            src_lhs_push = [f"({g})" for g, _ in group_mv_cols]
+        if can_push_down and src_lhs_push is None:
+            return {event: refresh for event in ("INSERT", "UPDATE", "DELETE")}
+
+        key_uses_in = [
+            ("[]" in dt or dt.strip().upper() in ("ARRAY", "USER-DEFINED"))
+            for dt in (col_types_map.get(mv_c.lower(), "") for _g, mv_c in group_mv_cols)
+        ]
+
         for event in ("INSERT", "UPDATE", "DELETE"):
             got = self._pg_group_scope_keys(base_t, group_mv_cols, pg_signed_rows_sql(event))
             if got is None:
@@ -490,7 +1073,11 @@ class Tier2Mixin(MixinHost):
 
             def _match_nonnull(lhs: List[str]) -> str:
                 conds = [
-                    f"{l} = ANY (ARRAY(SELECT __mv_kset.__mv_k{i} FROM {kset} WHERE {no_null}))"
+                    (
+                        f"{l} IN (SELECT __mv_kset.__mv_k{i} FROM {kset} WHERE {no_null})"
+                        if key_uses_in[i]
+                        else f"{l} = ANY (ARRAY(SELECT __mv_kset.__mv_k{i} FROM {kset} WHERE {no_null}))"
+                    )
                     for i, l in enumerate(lhs)
                 ]
                 if n > 1:
@@ -507,12 +1094,11 @@ class Tier2Mixin(MixinHost):
                 )
 
             mv_lhs = [f"{mv_table}.{self._q(mv_c)}" for _g, mv_c in group_mv_cols]
-            src_lhs_push = [g for g, _ in group_mv_cols]
             src_lhs_out = [f"__mv_src.{self._q(mv_c)}" for _g, mv_c in group_mv_cols]
             for match in (_match_nonnull, _match_null):
                 stmts.append(f"DELETE FROM {mv_table}\n    WHERE {match(mv_lhs)};")
             for match in (_match_nonnull, _match_null):
-                if can_push_down:
+                if can_push_down and src_lhs_push is not None:
                     q = self._inject_where_into_source_query(source_query_sql, match(src_lhs_push))
                     stmts.append(f"INSERT INTO {mv_table} ({cols_csv})\n    {q};")
                 else:
@@ -524,7 +1110,22 @@ class Tier2Mixin(MixinHost):
             bodies[event] = "\n".join(stmts)
         return bodies
 
+    def _tier2_norm_expr(self, expr: str) -> str:
+        """Canonicalize an expression via sqlglot AST for matching GROUP BY keys
+        to projected SELECT items regardless of whitespace/formatting."""
+        try:
+            return parse_sql_ast(expr, dialect=self.dialect).sql(dialect=_sqlglot_dialect(self.dialect)).lower()
+        except sqlglot.errors.SqlglotError:
+            return expr.strip().lower()
+
     def _compile_tier2_group_scoped(self) -> MaterializedViewPlan:
+        if self.dialect == Dialect.MYSQL and any(
+            "FULL" in j.join_type.upper() for j in self.view.joins
+        ):
+            raise UnsupportedMaterializedViewError(
+                "MySQL/MariaDB do not support FULL OUTER JOIN with GROUP BY or aggregation; "
+                "rewrite as a UNION ALL of LEFT JOIN and RIGHT JOIN."
+            )
         view_name = self.view.view_name
         mv_table = self._backing_table_name()
         user_columns = [it.alias for it in self.view.select_items]
@@ -535,17 +1136,26 @@ class Tier2Mixin(MixinHost):
         hidden_grp_defs: List[Tuple[str, str, str]] = []
 
         non_agg_map: Dict[str, str] = {}
+        is_multi_join = len(self.view.joins) > 1
         for it in self.view.select_items:
             if not it.is_aggregate:
                 non_agg_map[it.raw_expr.strip().lower()] = it.alias
-                if it.source_col:
+                non_agg_map[self._tier2_norm_expr(it.raw_expr)] = it.alias
+                if it.source_col and not is_multi_join:
                     non_agg_map[it.source_col.lower()] = it.alias
 
         for idx_g, g_expr in enumerate(grp_exprs):
             g_low = g_expr.strip().lower()
-            g_unq = _unquote_ident(g_expr, dialect=self.dialect).lower() if self._is_simple_col_ref(g_expr) else ""
+            g_norm = self._tier2_norm_expr(g_expr)
+            g_unq = (
+                _unquote_ident(g_expr, dialect=self.dialect).lower()
+                if (not is_multi_join and self._is_simple_col_ref(g_expr))
+                else ""
+            )
             if g_low in non_agg_map:
                 mv_c = non_agg_map[g_low]
+            elif g_norm in non_agg_map:
+                mv_c = non_agg_map[g_norm]
             elif g_unq and g_unq in non_agg_map:
                 mv_c = non_agg_map[g_unq]
             else:
@@ -554,11 +1164,8 @@ class Tier2Mixin(MixinHost):
                 if self.dialect == Dialect.SQLITE:
                     dt = "BLOB"
                 else:
-                    c_def = self._lookup_col_def(g_expr)
-                    dt = (
-                        self._normalize_dialect_type(c_def.data_type)
-                        if c_def
-                        else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
+                    dt = self._infer_expr_storage_type(
+                        SelectItem(raw_expr=g_expr, alias=mv_c, is_aggregate=False)
                     )
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
                         dt = "VARCHAR(255)"
@@ -570,6 +1177,7 @@ class Tier2Mixin(MixinHost):
         grp_mv_cols_lower = {mc.lower() for _, mc in group_mv_cols}
 
         col_defs_sql: List[str] = []
+        col_types_by_lower: Dict[str, str] = {}
         for it in self.view.select_items:
             if self.dialect == Dialect.SQLITE and (
                 (
@@ -588,8 +1196,10 @@ class Tier2Mixin(MixinHost):
                 dt = self._infer_expr_storage_type(it)
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
+            col_types_by_lower[it.alias.lower()] = dt
             col_defs_sql.append(f"{self._q(it.alias)} {dt}")
         for mv_c, _, dt in hidden_grp_defs:
+            col_types_by_lower[mv_c.lower()] = dt
             col_defs_sql.append(f"{self._q(mv_c)} {dt}")
 
         backing_table_ddl = self._create_table_ddl(
@@ -643,6 +1253,7 @@ class Tier2Mixin(MixinHost):
                 target_cols=target_cols,
                 group_mv_cols=group_mv_cols,
                 source_query_sql=source_query_sql,
+                group_col_types=col_types_by_lower,
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)
