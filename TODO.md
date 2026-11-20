@@ -63,6 +63,27 @@ This document tracks all feature goals, architectural improvements, and verified
 
 The following seven items are the in-database bulk-maintenance roadmap. Decisions, measurements and rejected alternatives are in [docs/design-bulk-maintenance.md](docs/design-bulk-maintenance.md). There is one reviewable PR per stage. Stage 1 comes first. Stages 2 → 3 (PostgreSQL) and 4 → 5 → 6 (SQLite/MySQL/MariaDB) are independent tracks. Stage 7 comes last.
 
+- [ ] **Strategy ladder: replace refusals with fallbacks** (product principles in [AGENTS.md](AGENTS.md); the cost-class refusal of stage 5 in [docs/design-bulk-maintenance.md](docs/design-bulk-maintenance.md) is superseded by this initiative):
+  - First step (design doc first): introduce the strategy registry/interface and migrate the existing maintenance paths onto it. The set of strategies is open, not closed: a strategy is a pluggable unit that declares (1) the view shapes/engines it can maintain, (2) its result guarantee (exact, or which relaxed classes), (3) its cost class per engine (per row, per statement, per group, per table) and (4) its concurrency/race-safety properties. The planner selects the cheapest registered strategy, ordered by the cost model, whose guarantee satisfies the user's constraints (exactness requirement, cost/latency budget, allowed staleness), and refuses only when none qualifies. Known strategies (algebraic delta, scoped recompute, full refresh of the original query, statement-level transition-table delta) are the initial entries, not the definition. Adding a strategy must not require changes to callers, diagnostics, the capability-matrix generator or the README table; all are derived from the registry. Every strategy ships with its own differential tests against the live view and a declared guarantee that the tests verify.
+  - Inventory every current refusal/limitation code and every `UnsupportedMaterializedViewError` site. Classify each as truly impossible, replaceable by scoped recompute, or replaceable by full refresh of the original query.
+  - Implement the full-refresh strategy (the original query, unmodified) for every shape where it is exact:
+    - MariaDB statistics shapes currently refused (HAVING, nested, window);
+    - scalar subqueries in HAVING;
+    - window MIN/MAX type-code cases;
+    - float order-sensitive aggregates (in progress as the follow-up of PR #242);
+    - joins and windows previously refused as having "no race-free recompute";
+    - `GROUP_CONCAT` and other order-sensitive aggregates;
+    - other plan-dependent aggregates.
+  - Derive MV column types by asking the server (for example `CREATE TEMPORARY TABLE ... AS SELECT ... LIMIT 0`, or `cursor.description`) wherever the compiler cannot prove them. Replace the hand-written version-dependent type rules.
+  - Add user-facing constraint knobs:
+    - exactness, `exact|relaxed`, per code;
+    - cost budget, such as a maximum per-statement or per-row cost class, that selects a cheaper strategy or refuses with the budget as the stated reason;
+    - allowed staleness, only if an explicit opt-in tier is ever added.
+  - Reframe stage 5 (per-row cost classes) of the bulk-maintenance design from "refuse by default" to "choose the best strategy and print the cost; refuse only when the user's cost budget forbids it".
+  - Build a shared diagnostics framework with the two fixed lead phrases (`exact result required: falling back to strategy <X>`, `relaxed result allowed: using strategy <Y>`), exposed programmatically and in CLI text/JSON. Strategy names come from the shared enum/registry.
+  - Add a capability matrix to the README: for each view shape and engine, the strategy used by default and with relaxation. Generate it from the registry.
+  - Add a CI gate: every `UnsupportedMaterializedViewError` site has a test proving that no strategy can handle that shape.
+
 - [ ] **Bulk maintenance stage 1: Native Bulk-Statement Differential and Benchmark Harness**:
   - Add a native suite that runs every multi-row statement kind on every engine/version and compares the reader with the live view after each statement. Statement kinds:
     - multi-row `VALUES` and `INSERT ... SELECT`;

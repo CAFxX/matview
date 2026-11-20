@@ -472,7 +472,12 @@ expressed without it.
    columns computed in the reader, and the per-row statement count
    minimised. Tests: the exact differential from stage 1, plus a per-row cost
    budget relative to the measured floor.
-5. **Per-row cost classes and refusal on row-trigger engines.** The planner
+5. **Per-row cost classes and refusal on row-trigger engines.**
+   *Superseded by the strategy ladder (see the P0 TODO item "Strategy ladder:
+   replace refusals with fallbacks" and the product principles in
+   `AGENTS.md`): the planner chooses the best strategy and prints the cost
+   class; it refuses only when the user's cost budget forbids it. The
+   classification below stays; "refused by default" does not.* The planner
    classifies each trigger body as O(1), O(log n) with a named index, O(group)
    or O(table). The two super-linear classes are refused by default, with the
    opt-in override and its warning tested separately. `recommended_base_indexes`
