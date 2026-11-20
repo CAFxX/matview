@@ -5,9 +5,12 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import importlib
+import pkgutil
+import re
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 
 import matview
 import matview_sync as ms
@@ -39,9 +42,16 @@ class TestModularPackageArchitecture(unittest.TestCase):
             "matview.maintenance.tier2",
             "matview.maintenance.tier3",
         ]
-        for mod_name in modules:
-            mod = importlib.import_module(mod_name)
-            self.assertIsNotNone(mod)
+        # Discover package modules as well as pinning the established public
+        # architecture. This keeps newly added modules inside the import check.
+        modules.extend(
+            info.name
+            for info in pkgutil.walk_packages(matview.__path__, matview.__name__ + ".")
+        )
+        for mod_name in sorted(set(modules)):
+            with self.subTest(module=mod_name):
+                mod = importlib.import_module(mod_name)
+                self.assertIsNotNone(mod)
 
     def test_facade_reexports_identical_objects(self) -> None:
         for attr in (
@@ -127,6 +137,64 @@ class TestModularPackageArchitecture(unittest.TestCase):
                 self.assertEqual(comp._effective_group_by_exprs, grp_before)
                 self.assertIs(comp.primary_schema, schema_before)
 
+    def test_every_public_package_export_is_identical_on_the_legacy_facade(self) -> None:
+        public_names = tuple(matview.__all__)
+        self.assertTrue(public_names)
+        self.assertEqual(
+            len(public_names),
+            len(set(public_names)),
+            "matview.__all__ must not contain duplicate exports",
+        )
+
+        package_cli = importlib.import_module("matview.cli")
+        self.assertIs(matview.main, package_cli.main)
+        for name in public_names:
+            with self.subTest(public_export=name):
+                self.assertFalse(name.startswith("_"), f"Private name exported: {name}")
+                self.assertTrue(hasattr(matview, name), f"Missing package export: {name}")
+                self.assertTrue(hasattr(ms, name), f"Missing facade export: {name}")
+                self.assertIs(getattr(ms, name), getattr(matview, name))
+
+    def test_package_and_facade_import_cleanly_in_fresh_interpreters(self) -> None:
+        # A fresh interpreter is essential here: importlib.reload() in the test
+        # process would retain modules imported by the other tests and can hide
+        # order-dependent circular-import failures.
+        script = r"""
+import importlib
+import pkgutil
+import sys
+
+if sys.argv[1] == "facade-first":
+    import matview_sync as facade
+    import matview
+else:
+    import matview
+    import matview_sync as facade
+
+module_names = sorted(
+    item.name for item in pkgutil.walk_packages(matview.__path__, matview.__name__ + ".")
+)
+if sys.argv[1] == "package-first":
+    module_names.reverse()
+for module_name in module_names:
+    module = importlib.import_module(module_name)
+    assert sys.modules[module_name] is module, module_name
+
+for name in matview.__all__:
+    assert getattr(facade, name) is getattr(matview, name), name
+"""
+        repo_root = Path(__file__).resolve().parent
+        for order in ("facade-first", "package-first"):
+            with self.subTest(import_order=order):
+                result = subprocess.run(
+                    [sys.executable, "-c", script, order],
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_cli_entrypoints_help(self) -> None:
         r1 = subprocess.run(
             [sys.executable, "matview_sync.py", "--help"],
@@ -142,8 +210,13 @@ class TestModularPackageArchitecture(unittest.TestCase):
         )
         self.assertEqual(r1.returncode, 0, r1.stderr)
         self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(r1.stderr, r2.stderr)
         self.assertIn("--schema", r1.stdout)
         self.assertIn("--schema", r2.stdout)
+        # argparse uses a different executable name for the two entrypoints;
+        # compare the actual advertised option surface rather than the usage prefix.
+        options = lambda output: set(re.findall(r"(?<![\\w-])--[a-z][a-z0-9-]*", output))
+        self.assertEqual(options(r1.stdout), options(r2.stdout))
 
 
 if __name__ == "__main__":
