@@ -386,6 +386,118 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
         self.assertIn("__mv_pk TEXT NOT NULL PRIMARY KEY", plan.backing_table_ddl)
         self.assertIn("__mv_row_count", plan.backing_table_ddl)
 
+    def test_filtered_native_pk_projection_where_exit_and_swap_live_equivalence(self) -> None:
+        """Live SQLite filtered native-PK projection: when a row stays at OLD.pk
+        but stops satisfying the WHERE predicate, the NOT EXISTS guard must check
+        the WHERE predicate so the old row is retracted cleanly."""
+        con = sqlite3.connect(":memory:")
+        try:
+            con.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, val TEXT NOT NULL);")
+            con.executemany("INSERT INTO tasks (id, val) VALUES (?, ?);", [(1, "keep"), (2, "keep"), (3, "drop")])
+            con.commit()
+
+            mgr = MaterializedViewManager(con, dialect=Dialect.SQLITE)
+            plan = mgr.register_view(
+                "CREATE VIEW active_tasks_mv AS SELECT id, val FROM tasks WHERE val = 'keep';"
+            )
+            self.assertIn("NOT EXISTS", "\n".join(plan.trigger_ddls))
+
+            def assert_matches_live(step: str) -> None:
+                self.assertEqual(
+                    con.execute("SELECT id, val FROM active_tasks_mv ORDER BY id;").fetchall(),
+                    con.execute("SELECT id, val FROM tasks WHERE val = 'keep' ORDER BY id;").fetchall(),
+                    f"active_tasks_mv diverged after {step}",
+                )
+
+            assert_matches_live("initial population")
+
+            # Row 2 keeps id=2 (so `EXISTS (SELECT 1 FROM tasks WHERE id = 2)` is
+            # still TRUE) but leaves the WHERE predicate. Dropping `and_base_where`
+            # from the NOT EXISTS guard leaves a phantom (2, 'keep') row.
+            con.execute("UPDATE tasks SET val = 'drop' WHERE id = 2;")
+            con.commit()
+            assert_matches_live("in-place filter exit")
+
+            # Re-enter filter on row 3 and move row 1 to a new key while exiting filter.
+            con.execute("UPDATE tasks SET val = 'keep' WHERE id = 3;")
+            con.execute("UPDATE tasks SET id = 10, val = 'drop' WHERE id = 1;")
+            con.commit()
+            assert_matches_live("filter re-entry and key move out of filter")
+        finally:
+            con.close()
+
+    def test_refcount_projection_pk_swap_live_equivalence(self) -> None:
+        """Live SQLite refcount (__mv_row_count) projection: single-statement swaps,
+        key-changing updates, and filtered transitions on a nullable composite PK
+        must match the live original SELECT."""
+        con = sqlite3.connect(":memory:")
+        try:
+            # Nullable composite PRIMARY KEY compiles to Tier 1 ALGEBRAIC_DELTA
+            # projection with uses_native_pk=False (__mv_row_count refcounting),
+            # and rows with id IS NULL permit single-statement swaps without
+            # hitting SQLite's row-by-row UNIQUE check.
+            con.execute("CREATE TABLE logs (id INT, label TEXT, PRIMARY KEY (id, label));")
+            con.executemany(
+                "INSERT INTO logs (id, label) VALUES (?, ?);",
+                [(None, "A"), (None, "B"), (1, "C")],
+            )
+            con.commit()
+
+            mgr = MaterializedViewManager(con, dialect=Dialect.SQLITE)
+            plan_all = mgr.register_view("CREATE VIEW logs_mv AS SELECT id, label FROM logs;")
+            plan_filt = mgr.register_view(
+                "CREATE VIEW logs_ab_mv AS SELECT id, label FROM logs WHERE label IN ('A', 'B');"
+            )
+            self.assertIn("__mv_row_count", plan_all.backing_table_ddl)
+            self.assertIn("__mv_row_count", plan_filt.backing_table_ddl)
+
+            def assert_matches_live(step: str) -> None:
+                self.assertEqual(
+                    con.execute("SELECT id, label FROM logs_mv ORDER BY id, label;").fetchall(),
+                    con.execute("SELECT id, label FROM logs ORDER BY id, label;").fetchall(),
+                    f"logs_mv diverged after {step}",
+                )
+                self.assertEqual(
+                    con.execute("SELECT id, label FROM logs_ab_mv ORDER BY id, label;").fetchall(),
+                    con.execute(
+                        "SELECT id, label FROM logs WHERE label IN ('A', 'B') ORDER BY id, label;"
+                    ).fetchall(),
+                    f"logs_ab_mv diverged after {step}",
+                )
+
+            assert_matches_live("initial population")
+
+            # Single-statement 2-row swap: row 1 moves (NULL,'A')->(NULL,'B')
+            # (refcount of (NULL,'B') becomes 2), then row 2 moves (NULL,'B')->(NULL,'A')
+            # (refcount of (NULL,'B') drops to 1). Dropping `__mv_row_count <= 0`
+            # deletes (NULL,'B') and loses 50% of swapped rows.
+            con.execute(
+                "UPDATE logs SET label = CASE WHEN label = 'A' THEN 'B' ELSE 'A' END "
+                "WHERE id IS NULL AND label IN ('A', 'B');"
+            )
+            con.commit()
+            assert_matches_live("single-statement refcount swap")
+
+            # Key-changing update: omitting OLD decrement leaves phantom (1, 'C').
+            con.execute("UPDATE logs SET id = 99, label = 'Z' WHERE id = 1 AND label = 'C';")
+            con.commit()
+            assert_matches_live("key-changing update")
+
+            # Filtered swap where one row exits the WHERE filter.
+            con.execute(
+                "UPDATE logs SET label = CASE WHEN label = 'A' THEN 'B' ELSE 'DROP' END "
+                "WHERE id IS NULL AND label IN ('A', 'B');"
+            )
+            con.commit()
+            assert_matches_live("filtered refcount swap with exit")
+
+            # Delete a remaining row.
+            con.execute("DELETE FROM logs WHERE id = 99 AND label = 'Z';")
+            con.commit()
+            assert_matches_live("delete row")
+        finally:
+            con.close()
+
 
 class TestFinding7CollationAndGroupPk(unittest.TestCase):
     """Exhaustive tests for Finding #7: MySQL __mv_pk binary collation and case-sensitivity."""

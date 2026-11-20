@@ -28,11 +28,11 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parent
 PACKAGE_DIR = "matview"
-COPIED_FILES = ("matview_sync.py", "test_matview_sync.py")
+COPIED_FILES: Tuple[str, ...] = ("matview_sync.py", "test_matview_sync.py")
 TARGET_TEST = (
     "test_matview_sync.TestGeneratorAndManagerCodePaths."
     "test_25_join_aggregate_decrement_and_group_key_invariants"
@@ -114,14 +114,91 @@ MUTANTS = (
         original="upd_old_stmts=[minus_stmt],",
         replacement='upd_old_stmts=[minus_stmt.replace("OLD.", "NEW.")],',
     ),
+    Mutant(
+        name="pk-swap-native-projection-drops-not-exists-guard",
+        source_path="matview/maintenance/zset.py",
+        original='f"    AND NOT EXISTS (SELECT 1 FROM {q_base_t} WHERE {base_pk_eq_old}{and_base_where});"',
+        replacement='";"',
+        target_test=(
+            "test_p0_pk_swap_and_collation.TestFinding6PkSwapAndShift."
+            "test_pk_swap_execution_data_loss_prevention"
+        ),
+    ),
+    Mutant(
+        name="pk-swap-native-projection-drops-where-from-not-exists-guard",
+        source_path="matview/maintenance/zset.py",
+        original='f"    AND NOT EXISTS (SELECT 1 FROM {q_base_t} WHERE {base_pk_eq_old}{and_base_where});"',
+        replacement='f"    AND NOT EXISTS (SELECT 1 FROM {q_base_t} WHERE {base_pk_eq_old});"',
+        target_test=(
+            "test_p0_pk_swap_and_collation.TestFinding6PkSwapAndShift."
+            "test_filtered_native_pk_projection_where_exit_and_swap_live_equivalence"
+        ),
+    ),
+    Mutant(
+        name="pk-swap-refcount-projection-drops-row-count-guard",
+        source_path="matview/maintenance/zset.py",
+        original='f"    WHERE ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_row_count <= 0;"',
+        replacement='f"    WHERE ({mv_table}.__mv_pk = ({pk_old}));"',
+        target_test=(
+            "test_p0_pk_swap_and_collation.TestFinding6PkSwapAndShift."
+            "test_refcount_projection_pk_swap_live_equivalence"
+        ),
+    ),
+    Mutant(
+        name="pk-swap-refcount-projection-update-omits-old-decrement",
+        source_path="matview/maintenance/zset.py",
+        original=(
+            "            del_stmts_list = [minus_stmt, clean_stmt]\n"
+            "            upd_old_list = [minus_stmt]\n"
+            "            upd_clean_list = [clean_stmt]"
+        ),
+        replacement=(
+            "            del_stmts_list = [minus_stmt, clean_stmt]\n"
+            "            upd_old_list = []\n"
+            "            upd_clean_list = [clean_stmt]"
+        ),
+        target_test=(
+            "test_p0_pk_swap_and_collation.TestFinding6PkSwapAndShift."
+            "test_refcount_projection_pk_swap_live_equivalence"
+        ),
+    ),
+    Mutant(
+        name="zset-watermark-new-skips-update-at-inclusive-cursor",
+        source_path="matview/maintenance/zset.py",
+        original='                f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"',
+        replacement='                f"AND NEW.{q_pk} >= backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"',
+        target_test=(
+            "test_p0_backfill_watermark_safety.BackfillWatermarkSafetyTests."
+            "test_projection_watermark_updates_exact_inclusive_cursor_row"
+        ),
+    ),
+    Mutant(
+        name="zset-watermark-old-skips-retraction-at-inclusive-cursor",
+        source_path="matview/maintenance/zset.py",
+        original='                f"AND OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"',
+        replacement='                f"AND OLD.{q_pk} >= backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"',
+        target_test=(
+            "test_p0_backfill_watermark_safety.BackfillWatermarkSafetyTests."
+            "test_projection_watermark_deletes_exact_inclusive_cursor_row"
+        ),
+    ),
 )
+
+
+def _target_test_module(target_test: str) -> str:
+    parts = [p.strip() for p in target_test.split(".")]
+    if len(parts) < 3 or any(not p or not p.isidentifier() for p in parts):
+        raise RuntimeError(
+            f"invalid target_test {target_test!r}: expected 'module.TestClass.test_method'"
+        )
+    return parts[0]
 
 
 def _resolve_source(root: Path, mutant: Mutant) -> Path:
     relative = Path(mutant.source_path)
-    if relative.is_absolute() or ".." in relative.parts:
-        raise RuntimeError(f"{mutant.name}: source path must be repository-relative")
-    if relative.parts[0] != PACKAGE_DIR and relative.name not in COPIED_FILES:
+    if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError(f"{mutant.name}: source path must be a non-empty repository-relative path")
+    if relative.parts[0] != PACKAGE_DIR and relative.as_posix() not in COPIED_FILES:
         raise RuntimeError(
             f"{mutant.name}: {mutant.source_path} is not part of the copied mutation tree"
         )
@@ -152,15 +229,24 @@ def validate_catalog(mutants: Sequence[Mutant]) -> None:
         raise RuntimeError(f"duplicate mutant names: {', '.join(duplicates)}")
     for mutant in mutants:
         _require_single_site(ROOT, mutant)
+        target_mod = _target_test_module(mutant.target_test)
+        if not (ROOT / f"{target_mod}.py").is_file():
+            raise RuntimeError(
+                f"{mutant.name}: target test module {target_mod}.py does not exist"
+            )
 
 
-def _copy_tree(worktree: Path) -> None:
+def _copy_tree(worktree: Path, target_module: str) -> None:
     shutil.copytree(
         ROOT / PACKAGE_DIR,
         worktree / PACKAGE_DIR,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
-    for filename in COPIED_FILES:
+    files_to_copy: List[str] = list(COPIED_FILES)
+    target_file = f"{target_module}.py"
+    if target_file not in files_to_copy:
+        files_to_copy.append(target_file)
+    for filename in files_to_copy:
         shutil.copy2(ROOT / filename, worktree / filename)
 
 
@@ -175,20 +261,35 @@ def _run(root: Path, args: List[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _require_isolated_import(worktree: Path, label: str) -> None:
+def _require_isolated_import(worktree: Path, label: str, target_module: str) -> None:
+    expected = worktree.resolve()
+    repo_root = ROOT.resolve()
     probe = _run(
         worktree,
         [
             "-c",
-            "import matview, matview_sync, test_matview_sync; "
-            "print(matview.__file__); print(matview_sync.__file__)",
+            "import importlib, pathlib, sys; "
+            f"mods = [importlib.import_module(m) for m in ('matview', 'matview_sync', {target_module!r})]; "
+            f"wt = pathlib.Path({str(expected)!r}).resolve(); "
+            f"repo = pathlib.Path({str(repo_root)!r}).resolve(); "
+            "leaked = ["
+            "  (name, str(pathlib.Path(getattr(mod, '__file__', '')).resolve())) "
+            "  for name, mod in list(sys.modules.items()) "
+            "  if getattr(mod, '__file__', None) "
+            "  and repo in pathlib.Path(mod.__file__).resolve().parents "
+            "  and wt not in pathlib.Path(mod.__file__).resolve().parents"
+            "]; "
+            "assert not leaked, f'leaked repo imports: {leaked}'; "
+            "print('\\n'.join(str(pathlib.Path(m.__file__).resolve()) for m in mods))",
         ],
     )
-    expected = worktree.resolve()
-    paths = [Path(line).resolve() for line in probe.stdout.strip().splitlines()[-2:]]
-    if probe.returncode != 0 or len(paths) != 2 or any(
-        expected not in p.parents for p in paths
-    ):
+    if probe.returncode != 0:
+        raise RuntimeError(
+            f"{label}: isolated import probe failed.\n{probe.stdout}"
+        )
+    lines = probe.stdout.strip().splitlines()
+    paths = [Path(line).resolve() for line in lines[-3:]] if len(lines) >= 3 else []
+    if len(paths) != 3 or any(expected not in p.parents for p in paths):
         raise RuntimeError(
             f"{label}: mutation copy is not the imported implementation "
             f"(expected modules under {expected}).\n{probe.stdout}"
@@ -219,10 +320,11 @@ def _is_assertion_kill(result: subprocess.CompletedProcess[str]) -> bool:
 
 
 def run_mutation(mutant: Mutant) -> None:
+    target_module = _target_test_module(mutant.target_test)
     with tempfile.TemporaryDirectory(prefix="matview-mutant-") as temp:
         worktree = Path(temp)
-        _copy_tree(worktree)
-        _require_isolated_import(worktree, mutant.name)
+        _copy_tree(worktree, target_module)
+        _require_isolated_import(worktree, mutant.name, target_module)
 
         contents = _require_single_site(worktree, mutant)
         source = _resolve_source(worktree, mutant)
