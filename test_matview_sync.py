@@ -647,6 +647,9 @@ def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk
     s = re.sub(r"(?<!ELSE )\bBIT_AND\s*\(\s*([^()]+?)\s*\)", r"COALESCE(BIT_AND(\1), -1)", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+FROM\s+DUAL\b", "", s, flags=re.IGNORECASE)
     s = s.replace("<=>", " IS ")
+    # Unchanged-row guard: MySQL binary-string comparison; SQLite compares
+    # BLOBs bytewise (a cast to "BINARY" would get NUMERIC affinity).
+    s = re.sub(r"\bAS\s+BINARY\s*\)", "AS BLOB)", s, flags=re.IGNORECASE)
     s = re.sub(r"\bCAST\s*\(([^)]+?)\s+AS\s+CHAR(?:\(\d+\))?(?:\s+CHARACTER\s+SET\s+\w+)?\s*\)", r"CAST(\1 AS TEXT)", s, flags=re.IGNORECASE)
     s = re.sub(r"\bCHARACTER\s+SET\s+\w+\b", "", s, flags=re.IGNORECASE)
     # MySQL `/` is never integer division; emulate a DECIMAL-cast dividend
