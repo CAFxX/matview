@@ -213,8 +213,10 @@ class NativeResultRepresentationPlanTests(unittest.TestCase):
     """Offline guards for the native representation of VAR/STDDEV results.
 
     Structural only: the native tests below establish the engine semantics
-    (PostgreSQL returns a one-row NUMERIC population statistic as `0`, MariaDB
-    fixes exact-input result decimals and ROUND(x, 31) is not an identity).
+    (MariaDB fixes exact-input result decimals and ROUND(x, 31) is not an
+    identity). PostgreSQL's one-row population statistic (`0` for NUMERIC) is
+    checked natively by the "insert new group" step: its statement-level
+    maintenance has no row-trigger first-row literal to inspect.
     """
 
     def _plan(self, engine: str, col_type: str, select: str, **kw: Any):
@@ -229,15 +231,6 @@ class NativeResultRepresentationPlanTests(unittest.TestCase):
                 ignore_limitations=kw.pop("ignore_limitations", True),
                 **kw,
             )
-
-    def test_postgres_first_row_population_statistic_keeps_native_scale(self) -> None:
-        for col_type, zero in (("NUMERIC(12,3)", "0"), ("INTEGER", "0"), ("DOUBLE PRECISION", "0.0")):
-            with self.subTest(type=col_type):
-                plan = self._plan("postgres:18", col_type, "SELECT g, VAR_POP(x) AS vp, STDDEV_POP(x) AS sp FROM t GROUP BY g")
-                trigger = "\n".join(plan.trigger_ddls)
-                self.assertIn(f"(CASE WHEN (NEW.x) IS NULL THEN NULL ELSE {zero} END)", trigger)
-                other = "0.0" if zero == "0" else "0"
-                self.assertNotIn(f"(CASE WHEN (NEW.x) IS NULL THEN NULL ELSE {other} END)", trigger)
 
     def test_mariadb_reader_rounds_only_fixed_decimal_results(self) -> None:
         select = "SELECT g, VAR_POP(x) AS vp, STDDEV_SAMP(x) AS ss FROM t GROUP BY g"
