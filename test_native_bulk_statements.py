@@ -240,8 +240,8 @@ VIEWS: List[ViewDef] = [
     # ... and without an index on w.
     ViewDef("v_mmw", "SELECT g, MIN(w) AS lo, MAX(w) AS hi, COUNT(*) AS c FROM t GROUP BY g"),
     ViewDef("v_ds", "SELECT DISTINCT g FROM t"),
-    # Filtered single-table bag projection without the key (duplicates: multiplicities
-    # matter; known row-trigger defect, see KNOWN_DEFECT_EXCLUDED_VIEWS).
+    # Filtered single-table bag projection without the key (duplicates:
+    # multiplicities matter; the hidden source key still drives maintenance).
     ViewDef("v_pr", "SELECT g, v FROM t WHERE w > 0"),
     # The same projection with the key column (not affected by that defect).
     ViewDef("v_prk", "SELECT id, g, v FROM t WHERE w > 0"),
@@ -263,10 +263,7 @@ VIEWS: List[ViewDef] = [
 # keeps testing every other shape on that target). Remove an entry together
 # with the marker of the test named next to it.
 KNOWN_DEFECT_EXCLUDED_VIEWS: Dict[str, Tuple[str, ...]] = {
-    "pg-row": ("v_avgd",   # test_avg_decimal_new_group_scale
-               "v_pr"),    # test_projection_without_key_after_primary_key_update
-    "mysql": ("v_pr",),    # test_projection_without_key_after_primary_key_update
-    "sqlite": ("v_pr",),   # test_projection_without_key_after_primary_key_update
+    "pg-row": ("v_avgd",),  # test_avg_decimal_new_group_scale
     # Keyed by product (read from the server), not by target id:
     "mariadb": ("v_exk",),  # test_expression_group_key_result_type
 }
@@ -992,14 +989,11 @@ def test_avg_decimal_new_group_scale(make_env, target: Target) -> None:
     env.check("multi-row INSERT creating a group")
 
 
-_E2 = ("Row triggers on a single-table projection that does not select the primary key ignore an "
-       "UPDATE that changes only the primary key (UPDATE OF lists the projected/filtered columns), but "
-       "the stored row stays keyed by the old key, so a later UPDATE/DELETE of the row does not retract "
-       "it. TODO.md 'Track Source-Key Changes in Projection Views Without the Key Column'")
+_E2 = ("A single-table projection without its source primary key must still maintain hidden-key "
+       "identity across primary-key-only updates. TODO.md 'Track Source-Key Changes in Projection Views Without the Key Column'")
 
 
-@pytest.mark.parametrize("target", _params(xfail={"pg-row": known_defect(_E2), "mysql": known_defect(_E2),
-                                                  "sqlite": known_defect(_E2)}))
+@pytest.mark.parametrize("target", _params())
 def test_projection_without_key_after_primary_key_update(make_env, target: Target) -> None:
     """Minimal repro: change only the key, then delete the row."""
     env = make_env(target, views=[vd for vd in VIEWS if vd.name == "v_pr"], seed=False)
