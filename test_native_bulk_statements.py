@@ -1107,12 +1107,7 @@ def test_min_max_of_integer_expression_result_type(make_env, request, target: Ta
         ViewDef("ik_a", f"SELECT s, {agg}({e}) AS a FROM ik GROUP BY s")))
 
 
-_E4 = ("SUM of an integer expression (not a bare column) is stored with a fallback type on PostgreSQL "
-       "(NUMERIC/DOUBLE PRECISION instead of BIGINT/NUMERIC; MySQL/MariaDB are exact since `%`/MOD keep "
-       "their operands' exact type). TODO.md 'Store SUM of Integer Expressions With the Native Result Type'")
-
-
-@pytest.mark.parametrize("target", _params(xfail={"pg": known_defect(_E4)}))
+@pytest.mark.parametrize("target", _params())
 def test_sum_of_integer_expression_result_type(make_env, request, target: Target) -> None:
     _check_integer_expression_view(make_env, request, target, "i % 3", lambda e: (
         ViewDef("ik_s", f"SELECT s, SUM({e}) AS a FROM ik GROUP BY s")))
@@ -1121,14 +1116,10 @@ def test_sum_of_integer_expression_result_type(make_env, request, target: Target
 _E6 = ("MySQL reports a GROUP BY expression over TINYINT/SMALLINT/MEDIUMINT arithmetic as INT (LONG) "
        "while a plain SELECT of it is BIGINT; the backing column is BIGINT. TODO.md "
        "'Integer Expression Result Types Not Yet Derived Exactly'")
-_E7 = ("PostgreSQL integer +, -, * keep the operand type (int4 + int4 is int4, int2 + int2 is int2), "
-       "but the backing column of a key or MIN/MAX over them is BIGINT. TODO.md "
-       "'Integer Expression Result Types Not Yet Derived Exactly'")
 # (product, view name, expression) -> reason. Applied at run time because the
 # product (MySQL or MariaDB) is read from the server.
 KNOWN_INT_EXPR_TYPE_DEFECTS: Dict[Tuple[str, str, str], str] = {
     **{("mysql", "ik_v", e): _E6 for e in ("s % 2", "ti % 2", "mi % 2", "s + s")},
-    **{("postgres", v, e): _E7 for v in ("ik_v", "ik_a") for e in ("i + 1", "s + s", "i * 2")},
 }
 
 
