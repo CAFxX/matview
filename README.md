@@ -347,7 +347,118 @@ REPLACE`/`REPLACE` on a SQLite connection that was not configured with
 [`configure_sqlite_connection()`](#sqlite-writer-connections), and other engine
 features that skip triggers, and the session flag `bulk_changes()` uses
 on MySQL/MariaDB (`@__matview_skip_triggers`), which any session can set (see
-[Close Unsafe DML Paths That Bypass Trigger-Based Maintenance](TODO.md)).
+[Close Unsafe DML Paths That Bypass Trigger-Based Maintenance](TODO.md)). The
+tested per-engine list is in
+[DML and trigger interaction support](#dml-and-trigger-interaction-support).
+
+## DML and trigger interaction support
+
+Maintenance runs in triggers on the source tables, so the guarantee depends on
+how rows change and on what else runs on those tables. The matrix below is the
+tested answer per engine. Each row is a cell of
+[`test_native_dml_interactions.py`](test_native_dml_interactions.py): a native
+differential test that runs the scenario and compares every view with its
+original query after each step (in the open transaction and after commit),
+exactly. Cells marked "twin" in the test also run each statement on an
+identical table without views and require the same affected-row count,
+`RETURNING` rows, generated ids and final contents. The table is generated
+from the test (`python3 test_native_dml_interactions.py --print-matrix`) and
+the test fails when this copy differs.
+
+- exact: the views stay equal to their queries.
+- limited: a documented limitation applies, and the test asserts it (for
+  example, out-of-band DDL that `check_schema_drift()` reports and
+  `repair_view()` repairs).
+- refused: the operation fails closed: registration is refused, or the write
+  fails and is rolled back with the views unchanged.
+- **WRONG**: the view silently diverges. The test is a strict expected
+  failure and the note names the TODO.md item.
+- n/a: the engine has no such feature. "(17+)" and similar: the feature
+  exists only from that version and older servers skip the cell.
+
+Engines: the PR-gate jobs run the cells against PostgreSQL 15 and 18, MySQL
+8.4 and 9.7, MariaDB 10.11, 11.8 and 12.3 and SQLite through the
+standard-library `sqlite3` driver. The SQLite compatibility drivers (APSW,
+SQLCipher, libSQL) do not run this module. PostgreSQL two-phase commit needs
+`max_prepared_transactions > 0`, which the CI service does not set, so that
+cell is skipped there (verified on PostgreSQL 18 locally).
+
+<!-- BEGIN GENERATED: dml-matrix -->
+| Cell | Interaction | SQLite | PostgreSQL | MySQL | MariaDB | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| **A. Row-changing statements** | | | | | | |
+| `upsert_do_nothing` | INSERT ... ON CONFLICT DO NOTHING (PK and non-PK unique) / INSERT IGNORE | exact | exact | exact | exact | twin; conflict target on the PK, on the UNIQUE column, and untargeted |
+| `upsert_do_update` | ON CONFLICT DO UPDATE with EXCLUDED / ON DUPLICATE KEY UPDATE (row alias, VALUES()) | exact | exact | exact | exact | twin; updates move rows between groups, to and from NULL |
+| `upsert_where_false` | ON CONFLICT DO UPDATE ... WHERE false / ON DUPLICATE KEY UPDATE id = id (no-op) | exact | exact | exact | exact | twin; conflicting rows are untouched, others inserted |
+| `upsert_where_partial` | ON CONFLICT DO UPDATE ... WHERE <predicate on the existing row> | exact | exact | exact | exact | twin; MySQL/MariaDB express the predicate with IF() in the assignments |
+| `upsert_unique_non_pk` | Upsert conflicting on a non-PK UNIQUE column that rewrites the primary key | exact | exact | exact | exact | twin; the projection view carries the key |
+| `upsert_duplicate_keys_in_statement` | One upsert statement whose rows repeat the same key | exact | exact | exact | exact | twin; PostgreSQL rejects DO UPDATE touching a row twice (SQLSTATE 21000) and the view is unchanged; DO NOTHING, SQLite and MySQL/MariaDB apply the rows in order |
+| `merge_all_branches` | MERGE with WHEN MATCHED [AND] UPDATE / DELETE / DO NOTHING and WHEN NOT MATCHED [AND] INSERT / DO NOTHING | n/a | exact (15+) | n/a | n/a | twin |
+| `merge_by_source_returning` | MERGE ... WHEN NOT MATCHED BY SOURCE ... RETURNING merge_action() | n/a | exact (17+) | n/a | n/a | twin (returned rows compared) |
+| `sqlite_replace_configured` | INSERT OR REPLACE / REPLACE / UPDATE OR REPLACE deleting PK- and UNIQUE-conflicting rows | exact | n/a | n/a | n/a | writer connection configured with configure_sqlite_connection() (recursive_triggers ON); twin |
+| `sqlite_replace_unconfigured_writer` | INSERT OR REPLACE / REPLACE through a writer connection with recursive_triggers OFF (SQLite default) | **WRONG** | n/a | n/a | n/a | the replaced rows' DELETE triggers do not fire, so the view keeps them (documented under SQLite writer connections; nothing detects it); TODO: Close Unsafe DML Paths That Bypass Trigger-Based Maintenance |
+| `sqlite_table_on_conflict_replace` | Plain INSERT/UPDATE into a table whose UNIQUE constraint declares ON CONFLICT REPLACE | exact | n/a | n/a | n/a | configured writer connection |
+| `sqlite_or_ignore` | INSERT OR IGNORE / UPDATE OR IGNORE (PK, UNIQUE and CHECK conflicts) | exact | n/a | n/a | n/a | twin |
+| `sqlite_or_abort_fail` | INSERT/UPDATE OR ABORT (statement rolled back) and OR FAIL (earlier rows of the statement kept) | exact | n/a | n/a | n/a | twin; failures inside an open transaction |
+| `sqlite_or_rollback` | INSERT OR ROLLBACK (the whole transaction is rolled back) | exact | n/a | n/a | n/a |  |
+| `mysql_replace` | REPLACE deleting PK- and UNIQUE-conflicting rows (VALUES and SELECT forms) | n/a | n/a | exact | exact | twin |
+| `mysql_insert_ignore_data_errors` | INSERT IGNORE / UPDATE IGNORE converting CHECK, range and duplicate-key errors to warnings | n/a | n/a | exact | exact | twin |
+| `mysql_update_ignore_duplicate_key` | UPDATE IGNORE whose rows hit a duplicate key on a UNIQUE column and are skipped | n/a | n/a | exact | **WRONG** | MariaDB fires the AFTER UPDATE trigger for a row whose update was ignored (reproduced without matview: the trigger logs a change the table never had), so the view applies it; MySQL does not fire it; TODO: Exact Maintenance Under MariaDB UPDATE IGNORE (AFTER UPDATE Triggers Fire for Ignored Rows) |
+| `defaults_identity_upsert_gaps` | Column defaults, DEFAULT VALUES, identity/AUTO_INCREMENT keys and the id gaps upserts leave | exact | exact | exact | exact | twin incl. affected rows and lastval()/LAST_INSERT_ID()/last_insert_rowid() after each statement |
+| `update_delete_self_join` | UPDATE ... FROM / multi-table UPDATE and DELETE ... USING / multi-table DELETE joining the source to itself | exact | exact | exact | exact | twin |
+| `one_statement_both_join_sources` | One statement modifying both sources of a join view (multi-table UPDATE/DELETE; PostgreSQL writable CTE) | n/a | **WRONG** | exact | exact | PostgreSQL: the join aggregate counts the delta-delta term wrongly (statement triggers of the two tables each see the other table's final state); TODO: Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View |
+| `pg_copy` | COPY FROM STDIN, and COPY ... (FREEZE) after TRUNCATE in the same transaction | n/a | exact | n/a | n/a | twin |
+| `mysql_load_data_local` | LOAD DATA LOCAL INFILE (plain, REPLACE and IGNORE) | n/a | n/a | exact | exact | twin; needs local_infile on the server (the test enables it for its duration) |
+| `insert_select_own_source` | INSERT ... SELECT reading the source table itself | exact | exact | exact | exact | twin |
+| `dml_reading_the_view` | INSERT/UPDATE/DELETE of a source whose statement reads the materialized view itself | exact | exact | refused | refused | MySQL/MariaDB: the maintenance trigger cannot write the backing table the statement reads (error 1442), the statement fails and is rolled back |
+| `returning` | INSERT / UPDATE / DELETE / upsert ... RETURNING | exact (3.35+) | exact | n/a | exact (10.5+) | twin (returned rows compared) |
+| `truncate` | TRUNCATE (PostgreSQL: of both join sources in one statement; SQLite: DELETE without WHERE) | exact | exact | refused | refused | MySQL/MariaDB TRUNCATE fires no triggers: registration refuses with MYSQL_NO_TRUNCATE_TRIGGER unless acknowledged (ignore_limitations=True, then TRUNCATE must not be used) |
+| **B. Other triggers, objects and settings** | | | | | | |
+| `user_before_trigger_rewrites_row` | User BEFORE row trigger on the source that rewrites NEW (also during upserts) | n/a | exact | exact | exact | SQLite cannot assign NEW (see user_after_trigger_writes_same_table) |
+| `user_before_trigger_skips_row` | User BEFORE row trigger that suppresses some rows (RETURN NULL / RAISE(IGNORE)) | exact | exact | n/a | n/a | MySQL/MariaDB triggers cannot skip a row |
+| `user_after_trigger_writes_same_table` | User AFTER row trigger that updates the same row and inserts/deletes other rows of the source | **WRONG** | exact | n/a | n/a | SQLite fires the newest trigger first, so a user trigger created after registration updates a row whose INSERT maintenance has not run yet; the transient empty group is deleted with its other rows' sums. MySQL/MariaDB forbid a trigger writing its own table (error 1442); TODO: Exact Maintenance When a User Trigger or FK Action Runs Before the Maintenance Trigger |
+| `sqlite_recursive_user_trigger` | A user trigger that re-fires itself (unguarded self-UPDATE) | limited | n/a | n/a | n/a | configure_sqlite_connection() turns recursive_triggers ON, so such a trigger recurses until SQLite's depth limit and the statement fails (it ran once with the SQLite default); the view stays exact either way; PostgreSQL user triggers recurse regardless (guard with pg_trigger_depth()) |
+| `user_trigger_raises` | A user trigger raising an error mid-statement (RAISE EXCEPTION / SIGNAL / RAISE(ABORT/FAIL/ROLLBACK)) | exact | exact | exact | exact | rollback atomicity of the statement (SQLite FAIL keeps the earlier rows, ROLLBACK ends the transaction) |
+| `sqlite_user_trigger_raise_fail` | A user AFTER trigger created after registration raising RAISE(FAIL) on the second row of a statement | **WRONG** | n/a | n/a | n/a | FAIL keeps the rows already written, including the failing row itself, but the newer user trigger ran first and the failing row's maintenance trigger never runs; TODO: Exact Maintenance When a User Trigger or FK Action Runs Before the Maintenance Trigger |
+| `sqlite_user_triggers_older_than_views` | The same self-writing and RAISE(FAIL) user triggers created before the views were registered | exact | n/a | n/a | n/a | SQLite then fires them after the maintenance triggers |
+| `pg_statement_trigger_ordering` | User statement-level AFTER triggers ordered before and after the maintenance triggers (by name) that write the source again | n/a | exact | n/a | n/a |  |
+| `user_trigger_writes_other_source_first` | User trigger on one join source that writes the other source, firing BEFORE the maintenance trigger | **WRONG** | **WRONG** | **WRONG** | **WRONG** | PostgreSQL row trigger (row triggers fire before statement triggers); SQLite trigger created after registration (SQLite fires the newest trigger first); MySQL/MariaDB PRECEDES. The join aggregate counts the new pair twice where it is maintained algebraically; TODO: Exact Maintenance When a User Trigger or FK Action Runs Before the Maintenance Trigger |
+| `user_trigger_writes_other_source_last` | User trigger on one join source that writes the other source, firing AFTER the maintenance trigger | exact | exact | exact | exact | PostgreSQL statement trigger sorting after the maintenance triggers; SQLite trigger created before registration; MySQL/MariaDB FOLLOWS |
+| `dml_through_views` | DML through an updatable view and through an INSTEAD OF trigger on a view over the source | exact | exact | exact | exact | MySQL/MariaDB have no INSTEAD OF; their updatable single-table and join views are used |
+| `view_as_source` | Registering a materialized view whose FROM names a plain (non-materialized) view | refused | refused | refused | refused | refused at registration: a view has no triggers to maintain it |
+| `pg_rules` | Rewrite rules on the source: conditional DO INSTEAD (soft delete) and DO ALSO | n/a | exact | n/a | n/a |  |
+| `generated_stored` | Views over a STORED generated column (aggregated, grouped by, filtered) while its inputs change | exact | exact | exact | exact | SQLite fixed here: the maintenance UPDATE trigger was limited to the referenced columns (UPDATE OF), which skipped updates of the generated column's inputs |
+| `generated_virtual` | Views over a VIRTUAL generated column while its inputs change | exact | refused (18+) | exact | exact | PostgreSQL 18 (the first with VIRTUAL) rejects reading such a column from the statement triggers' transition tables ('unexpected virtual generated column reference'): with a view reading it every write of the source fails and is rolled back (UPDATEs fail even when no view reads it); registration does not refuse; TODO: Support or Refuse PostgreSQL 18 VIRTUAL Generated Columns in Source Tables |
+| `pg_domains` | Source columns of domain types: grouped by, aggregated, projected (incl. a domain CHECK violation) | n/a | exact | n/a | n/a | fixed here: registration failed (backing column declared as type DOMAIN) and a domain group key was refused by the canonical group-key function |
+| `fk_referential_actions` | FK ON DELETE SET NULL / SET DEFAULT / CASCADE and ON UPDATE CASCADE / SET NULL into a view's source | exact | exact | refused | refused | MySQL/MariaDB: InnoDB referential actions fire no triggers, so registration refuses (MYSQL_FK_CASCADE_NO_TRIGGER, also for SET NULL); InnoDB has no SET DEFAULT |
+| `fk_action_into_both_join_sources` | An FK action (ON UPDATE CASCADE / ON DELETE SET NULL of the join key) modifying both sources of a join view | **WRONG** | **WRONG** | n/a | n/a | PostgreSQL: the cascaded change runs as a separate statement whose triggers see the other source's final state; SQLite runs the cascade before the parent row's maintenance trigger; MySQL/MariaDB refuse as in fk_referential_actions; TODO: Exact Maintenance When a User Trigger or FK Action Runs Before the Maintenance Trigger |
+| `fk_cascade_added_after_registration` | A cascading FK added to a source table after the view was registered (out-of-band ALTER TABLE) | n/a | exact | **WRONG** | **WRONG** | MySQL/MariaDB: the cascaded deletes fire no triggers and check_schema_drift() still reports ok (the registration-time refusal is never re-evaluated); SQLite cannot add an FK to an existing table; TODO: Make Schema Introspection and Drift Signatures Semantically Complete and Fail-Closed |
+| `fk_enforcement_off` | Writes with FK enforcement switched off (SET foreign_key_checks = 0 / PRAGMA foreign_keys = OFF) | exact | n/a | exact | exact | no referential action runs, so only the statement's own rows change; PostgreSQL has no such switch (see pg_session_replication_role) |
+| `mariadb_system_versioning` | System-versioned (temporal) source table: UPDATE/DELETE create history rows; DELETE HISTORY | n/a | n/a | n/a | exact | the view and its oracle read the current rows |
+| `pg_disable_trigger` | ALTER TABLE ... DISABLE TRIGGER USER/ALL on a source (as pg_restore --disable-triggers does) | n/a | limited | n/a | n/a | writes are not maintained while disabled; check_schema_drift() reports triggers_disabled (added here; it reported ok) and repair_view() rebuilds the views with enabled triggers |
+| `pg_session_replication_role` | Writes under session_replication_role = replica (logical-replication apply workers, some restore tools) | n/a | **WRONG** | n/a | n/a | ENABLE (origin) triggers do not fire; not detectable afterwards. A real subscription was not exercised: apply workers use this setting; TODO: Detect PostgreSQL Maintenance Triggers Disabled by `session_replication_role = replica` or `ALTER TABLE ... DISABLE TRIGGER` |
+| `mysql_session_skip_flag` | An application session setting @__matview_skip_triggers (the bulk_changes() bypass flag) | n/a | n/a | **WRONG** | **WRONG** | any session can set it and its writes are silently not maintained (documented); TODO: Close Unsafe DML Paths That Bypass Trigger-Based Maintenance |
+| `ddl_add_unused_column` | Out-of-band ALTER TABLE ADD COLUMN on a source (column unused by the view) | exact | exact | exact | exact | maintenance continues exactly; check_schema_drift() reports drifted (the signature covers every column) |
+| `ddl_drop_used_column` | Out-of-band ALTER TABLE DROP COLUMN of a column the view uses | refused | refused | refused | refused | SQLite refuses the DDL (a trigger references the column); PostgreSQL/MySQL/MariaDB accept it, then every INSERT/UPDATE of the source fails in the maintenance trigger and check_schema_drift() reports invalid |
+| `ddl_rename_used_column` | Out-of-band ALTER TABLE RENAME COLUMN of a column the view uses | limited | refused | refused | refused | SQLite rewrites the trigger bodies, so maintenance continues on the renamed column while the registered definition no longer compiles (check_schema_drift() reports invalid); PostgreSQL/MySQL/MariaDB maintenance fails on every write, so writes fail closed |
+| `ddl_drop_recreate_source` | Out-of-band DROP TABLE and re-CREATE of a source, then writes | limited | limited | limited | limited | the new table has no maintenance triggers, so the view is stale; check_schema_drift() reports it and repair_view() restores exactness |
+| **C. Transactions** | | | | | | |
+| `savepoints_with_upserts` | Upserts and REPLACE inside nested savepoints, ROLLBACK TO and RELEASE | exact | exact | exact | exact | twin |
+| `deferred_constraints` | Deferred UNIQUE/FK constraints failing at COMMIT or at SET CONSTRAINTS ... IMMEDIATE | exact | exact | n/a | n/a | SQLite: a failed COMMIT keeps the transaction open (rolled back by the test); MySQL/MariaDB have no deferred constraints |
+| `autocommit_writers` | Writes from an autocommit connection (each statement its own transaction), including a failing statement | exact | exact | exact | exact |  |
+| `two_phase_commit` | Two-phase commit: PREPARE TRANSACTION / COMMIT/ROLLBACK PREPARED; XA START ... XA COMMIT/ROLLBACK | n/a | exact | exact | exact | PostgreSQL needs max_prepared_transactions > 0 (the CI service runs with the default 0, so it is skipped there and was verified locally on 18) |
+| `statement_fails_midway` | An upsert failing on its third row (CHECK) inside a multi-statement transaction, then more statements | exact | exact | exact | exact | twin; PostgreSQL continues after ROLLBACK TO SAVEPOINT, the others after the statement-level rollback |
+
+Counts per product (exact, limited, refused, WRONG, n/a): sqlite 31/3/2/5/18; postgres 33/2/4/4/16; mysql 26/1/6/3/23; mariadb 27/1/6/4/21.
+<!-- END GENERATED: dml-matrix -->
+
+Not covered by the matrix: a real logical-replication subscription (its apply
+workers write with `session_replication_role = replica`, the cell's setting),
+MySQL/MariaDB replication appliers, running `pg_restore` itself (cell
+`pg_disable_trigger` uses the `ALTER TABLE ... DISABLE TRIGGER` it issues),
+server-side `LOAD DATA INFILE`, binary `COPY`, concurrent sessions (see
+[Concurrency notes](#concurrency-notes)) and PostgreSQL partitions and
+inheritance (`test_pg_statement_maintenance.py`).
 
 ## Engine support
 
@@ -607,8 +718,10 @@ protocol at all: run it with writes to the source tables stopped.
   change to a referenced table currently counts, even to a column the view
   does not use.
 - `check_schema_drift()` (`--check-drift`) compares each registered view with
-  the live schema: `ok`, `drifted`, `invalid`, `backfill_incomplete` or
-  `triggers_missing`.
+  the live schema: `ok`, `drifted`, `invalid`, `backfill_incomplete`, or
+  `triggers_missing`, `triggers_disabled` (PostgreSQL `ALTER TABLE ... DISABLE
+  TRIGGER`) or `triggers_orphaned` when maintenance triggers are gone,
+  disabled or on a detached partition (`repair_view()` rebuilds them).
   `diff_views()` / `matview diff` shows what a registration would change.
 - `repair_view(name=None)` (`--repair`) repopulates (or rebuilds after drift)
   each view in its own transaction; there is no all-view atomicity (see
@@ -1238,6 +1351,8 @@ Correctness gaps (the materialized view can differ from the original view):
 - [Fix Pre-Existing SQLite Divergences Found by the Exact SUM/TOTAL/AVG Differential](TODO.md) (storage-class changes for `MIN`/`MAX`/group keys, `LEFT JOIN` group moves, primary-key updates during backfill)
 - [Model MySQL/MariaDB Result Nullability, DECIMAL Precision and String Length](TODO.md) (result metadata only; values match)
 - [Close Unsafe DML Paths That Bypass Trigger-Based Maintenance](TODO.md)
+- [Exact Maintenance When a User Trigger or FK Action Runs Before the Maintenance Trigger](TODO.md)
+- [Exact Maintenance Under MariaDB UPDATE IGNORE (AFTER UPDATE Triggers Fire for Ignored Rows)](TODO.md)
 - [Resolve SQLite SUM Overflow Edge Cases](TODO.md)
 - [Canonical Group Keys on MySQL/MariaDB and SQLite](TODO.md) (a nullable `DECIMAL` key 1.0 next to 1.00, a float 0 next to -0, or keys equal under a case-insensitive collation can be split into two groups)
 
@@ -1246,6 +1361,7 @@ Operational gaps:
 - [Make `bulk_changes()` Fail-Closed, Exception-Safe and Transaction-Ownership-Safe](TODO.md)
 - [Support Nondeterministic Collations](TODO.md) and [Canonical Keys for Composite and Multirange Types](TODO.md) (PostgreSQL refuses them)
 - [Prune PostgreSQL Group Lock Rows](TODO.md)
+- [Support or Refuse PostgreSQL 18 VIRTUAL Generated Columns in Source Tables](TODO.md) (registration succeeds, then writes fail)
 - [Native Backing Column Types for Array Keys](TODO.md) (PostgreSQL: a view with an array column fails registration)
 - [Make Registration, Replacement, Backfill, Publication and Recovery One Explicit Lifecycle Protocol](TODO.md) (no atomic replacement on MySQL/MariaDB, no readiness gate for new incremental registrations)
 - [Make Schema Introspection and Drift Signatures Semantically Complete and Fail-Closed](TODO.md)

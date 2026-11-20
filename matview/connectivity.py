@@ -461,6 +461,15 @@ def _can_use_sqlalchemy_inspector(conn: Any) -> bool:
 
 
 def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
+    # A PostgreSQL domain (SQLAlchemy's postgresql.DOMAIN, possibly over
+    # another domain) is stored and compared as its base type; its name is not
+    # a type the backing table can be declared with. SQLAlchemy does not
+    # reflect the base type's modifiers (VARCHAR(10) comes back as VARCHAR), so
+    # an unconstrained VARCHAR stays VARCHAR (the result type the view reports).
+    from_domain = False
+    while type(col_type).__name__ == "DOMAIN" and getattr(col_type, "data_type", None) is not None:
+        col_type = col_type.data_type
+        from_domain = True
     precision = getattr(col_type, "precision", None)
     scale = getattr(col_type, "scale", None)
     raw_str = str(col_type).upper()
@@ -468,6 +477,8 @@ def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
         "NUMERIC" in raw_str or "DECIMAL" in raw_str
     ):
         raw_str = f"DECIMAL({int(precision)}, {int(scale)})"
+    elif from_domain and raw_str.startswith("VARCHAR"):
+        raw_str = "VARCHAR"
     elif dialect == Dialect.POSTGRES and raw_str.startswith("VARCHAR") and not getattr(col_type, "length", None):
         raw_str = "TEXT"
     elif dialect == Dialect.POSTGRES and getattr(col_type, "timezone", False) and raw_str in ("TIMESTAMP", "TIME"):

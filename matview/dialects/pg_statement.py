@@ -899,7 +899,8 @@ class PgStatementMaintenanceMixin(MixinHost):
         microseconds), bytea (hex), citext (lowercase), jsonb (numbers
         normalized, keys sorted), arrays and ranges (recursively). Types whose
         text output is canonical are returned as text. Composite, record and
-        multirange values raise ``feature_not_supported``. Text under a
+        multirange values raise ``feature_not_supported``. A domain value is
+        canonicalized as its base type (dynamic SQL, only on that path). Text under a
         nondeterministic collation is refused at registration
         (``_pg_collation_guard_ddl``).
 
@@ -986,7 +987,15 @@ class PgStatementMaintenanceMixin(MixinHost):
             "    END IF;\n"
             "    RETURN v::pg_catalog.text;\n"
             "  END IF;\n"
-            "  SELECT typ.typname, typ.typtype, typ.typcategory INTO ty FROM pg_catalog.pg_type AS typ WHERE typ.oid = t;\n"
+            "  SELECT typ.typname, typ.typtype, typ.typcategory, typ.typbasetype, typ.typtypmod INTO ty\n"
+            "    FROM pg_catalog.pg_type AS typ WHERE typ.oid = t;\n"
+            "  IF ty.typtype = 'd' THEN\n"
+            "    -- A domain value groups like its base type (domains share its equality).\n"
+            "    EXECUTE pg_catalog.format('SELECT %s($1::%s)', "
+            f"'{fn}', pg_catalog.format_type(ty.typbasetype, ty.typtypmod))\n"
+            "      INTO s USING v;\n"
+            "    RETURN s;\n"
+            "  END IF;\n"
             "  IF ty.typcategory = 'A' THEN\n"
             "    SELECT COALESCE(pg_catalog.array_dims(v), '') || '{' || COALESCE(pg_catalog.string_agg(\n"
             "             CASE WHEN u.c IS NULL THEN 'N' ELSE pg_catalog.length(u.c) || ':' || u.c END, ',' ORDER BY u.o), '') || '}'\n"
