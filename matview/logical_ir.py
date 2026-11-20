@@ -25,6 +25,9 @@ class ColumnDef:
     data_type: str
     not_null: bool = False
     primary_key: bool = False
+    # A generated (computed) column changes without being named in an
+    # UPDATE's SET list. Set by DDL parsing (the SQLite introspection path).
+    generated: bool = False
 
 
 def _normalize_index_column_key(col_spec: str) -> str:

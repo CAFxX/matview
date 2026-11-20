@@ -259,6 +259,9 @@ jobs:
       - name: Differentially test native bulk statements (SQLite)
         run: pytest -v -rxXs test_native_bulk_statements.py
 
+      - name: Differentially test the DML and trigger interaction matrix (SQLite)
+        run: pytest -v -rxXs test_native_dml_interactions.py
+
       - name: Test differential-oracle mutation sensitivity
         run: python3 test_oracle_mutation_sensitivity.py
 
@@ -520,6 +523,11 @@ jobs:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: pytest -v -rxXs test_native_bulk_statements.py
 
+      - name: Differentially test the DML and trigger interaction matrix on PostgreSQL
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+        run: pytest -v -rxXs test_native_dml_interactions.py
+
       - name: Test PostgreSQL statement-level maintenance contract
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
@@ -666,6 +674,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: pytest -v -rxXs test_native_bulk_statements.py
+
+      - name: Differentially test the DML and trigger interaction matrix on MySQL
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: pytest -v -rxXs test_native_dml_interactions.py
 
       - name: Test atomic MV replacement (MySQL)
         env:
@@ -817,6 +830,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: pytest -v -rxXs test_native_bulk_statements.py
+
+      - name: Differentially test the DML and trigger interaction matrix on MariaDB
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: pytest -v -rxXs test_native_dml_interactions.py
 
       - name: Test atomic MV replacement (MariaDB)
         env:

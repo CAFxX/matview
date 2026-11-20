@@ -2095,8 +2095,9 @@ class MaterializedViewManager:
         Declaratively synchronizes a collection of materialized view definitions against
         the connected database (supporting multi-view SQL files/strings as well).
         Returns a status map `{view_name: "created" | "updated" | "unchanged" |
-        "backfill_incomplete" | "triggers_missing" | "triggers_orphaned" | "dropped"}` ("triggers_missing":
-        maintenance triggers of an unchanged view are gone; "triggers_orphaned": a PostgreSQL
+        "backfill_incomplete" | "triggers_missing" | "triggers_disabled" | "triggers_orphaned" | "dropped"}`
+        ("triggers_missing": maintenance triggers of an unchanged view are gone; "triggers_disabled": a
+        PostgreSQL maintenance trigger is disabled; "triggers_orphaned": a PostgreSQL
         maintenance trigger is on a DETACHed partition; repair both with `repair_view()`); "backfill_incomplete" means the definition
         is current but a pk-range backfill is running elsewhere or was interrupted
         (repair with `repair_view()`). ``accept_limitations`` behaves as in
@@ -2209,12 +2210,15 @@ class MaterializedViewManager:
     )
 
     def _views_trigger_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
-        """``{view: "triggers_missing" | "triggers_orphaned"}`` for views whose
-        maintenance triggers drifted.
+        """``{view: "triggers_missing" | "triggers_disabled" | "triggers_orphaned"}``
+        for views whose maintenance triggers drifted.
 
         "triggers_missing": a recorded trigger does not exist (PostgreSQL: on
         the source table or on one of its current partitions, e.g. one
-        attached or created after registration). "triggers_orphaned"
+        attached or created after registration). "triggers_disabled"
+        (PostgreSQL): a maintenance trigger exists but does not fire for
+        ordinary sessions (``ALTER TABLE ... DISABLE TRIGGER`` or ``ENABLE
+        REPLICA TRIGGER``). "triggers_orphaned"
         (PostgreSQL): a maintenance trigger function also fires for a table
         that is no longer in the source's partition tree (a DETACHed
         partition, whose writes would still change the view). Never ends a
@@ -2260,15 +2264,22 @@ class MaterializedViewManager:
                         f"  SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = __mv_tree.relid"
                         f"  AND t.tgname = {lit_n})),"
                         f" (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgfoid IN (SELECT tgfoid FROM __mv_fn)"
-                        f"  AND t.tgrelid NOT IN (SELECT relid FROM __mv_tree WHERE relid IS NOT NULL))",
+                        f"  AND t.tgrelid NOT IN (SELECT relid FROM __mv_tree WHERE relid IS NOT NULL)),"
+                        # ALTER TABLE ... DISABLE TRIGGER ('D') or ENABLE REPLICA
+                        # TRIGGER ('R'): the trigger does not fire for ordinary
+                        # sessions, so their writes are not maintained.
+                        f" (SELECT count(*) FROM pg_catalog.pg_trigger t JOIN __mv_tree ON t.tgrelid = __mv_tree.relid"
+                        f"  WHERE t.tgname = {lit_n} AND t.tgenabled NOT IN ('O', 'A'))",
                     )
                     if rows is None:
                         continue
-                    missing, orphaned = int(rows[0][0]), int(rows[0][1])
+                    missing, orphaned, disabled = int(rows[0][0]), int(rows[0][1]), int(rows[0][2])
                     if missing:
                         status = "triggers_missing"
                         break
-                    if orphaned:
+                    if disabled:
+                        status = "triggers_disabled"
+                    elif orphaned and status is None:
                         status = "triggers_orphaned"
                 if status is None:
                     # Read-only/other triggers recorded by name only.
@@ -2289,12 +2300,15 @@ class MaterializedViewManager:
         """
         Inspects all registered views in `__matview_catalog` against the current live base
         table schemas and returns `{view_name: "ok" | "drifted" | "invalid" |
-        "backfill_incomplete" | "triggers_missing" | "triggers_orphaned"}`;
+        "backfill_incomplete" | "triggers_missing" | "triggers_disabled" |
+        "triggers_orphaned"}`;
         "backfill_incomplete" (definition current, but a pk-range backfill is
         running elsewhere or was interrupted) is never "ok"; "triggers_missing"
         means maintenance triggers recorded for the view do not exist, also on a
         PostgreSQL partition attached or created later (writes are not
-        maintained); "triggers_orphaned" means a PostgreSQL maintenance trigger
+        maintained); "triggers_disabled" means a PostgreSQL maintenance trigger
+        was disabled (`ALTER TABLE ... DISABLE TRIGGER`, as `pg_restore
+        --disable-triggers` does; writes are not maintained); "triggers_orphaned" means a PostgreSQL maintenance trigger
         is on a table outside the source's partition tree, e.g. a DETACHed
         partition (its writes still change the view, and its rows are still in
         the view). Repair both with `repair_view()`, which rebuilds the view.
