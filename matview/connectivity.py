@@ -477,6 +477,12 @@ def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
         # SQLAlchemy's MySQL BIT prints without its width; the width decides
         # MySQL's MIN/MAX result types (BIT(1..9) vs BIT(10..64)).
         raw_str = f"BIT({int(col_type.length)})"
+    elif dialect == Dialect.MYSQL and raw_str in ("ENUM", "SET"):
+        # SQLAlchemy prints MySQL ENUM/SET without their members, which is
+        # not valid DDL for a backing column that keeps the type.
+        members = getattr(col_type, "enums", None) or getattr(col_type, "values", None)
+        if members:
+            raw_str = raw_str + "(" + ", ".join("'" + str(m).replace("'", "''") + "'" for m in members) + ")"
     if getattr(col_type, "unsigned", False) and "UNSIGNED" not in raw_str:
         raw_str = f"{raw_str} UNSIGNED"
     return raw_str
