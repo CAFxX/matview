@@ -75,7 +75,11 @@ from .sql_frontend import (
 # 5: Tier 2 outer-join group scoping refreshes matched and NULL-extended groups
 #    (including COALESCE/expression keys, chained outer joins, self-joins, and
 #    PostgreSQL statement-level triggers).
-MATVIEW_GENERATOR_VERSION = "5"
+# 6: Bag-projection and nullable-PK UNION ALL reader views expand __mv_row_count
+#    multiplicity, preserve exact SQLite/PostgreSQL row-identity keys, pre-aggregate
+#    initial/chunk population, use non-null SQLite rowid for nullable-PK backfill,
+#    and track all hashed columns in UPDATE triggers.
+MATVIEW_GENERATOR_VERSION = "6"
 
 # How to repopulate a view whose pk-range backfill is incomplete.
 _REPAIR_GUIDANCE = (

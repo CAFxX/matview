@@ -25,6 +25,7 @@ from ..engines import (
 )
 from ..logical_ir import ColumnDef, JoinSpec, MaterializedViewPlan, SelectItem, TableSchema, ViewSpec
 from ..sql_frontend import (
+    _ast_table_expr,
     _find_top_level_token,
     _has_subquery_ast,
     _split_top_level,
@@ -49,17 +50,83 @@ class DialectEmitMixin(MixinHost):
         user_columns: Sequence[str],
         select_exprs_override: Optional[Sequence[str]] = None,
         extra_where_filter: Optional[str] = None,
+        repeat_count_col: Optional[str] = None,
     ) -> Tuple[str, List[str], List[str], List[str]]:
         db_view = self.db_view_name
         log_vname = self.logical_view_name
         p = self.object_prefix if self.object_prefix else "__matview_"
+        sg_d = _sqlglot_dialect(self.dialect)
+        q_db_view = _ast_table_expr(db_view, self.dialect).sql(dialect=sg_d)
+        user_cols_lower = {c.lower() for c in user_columns}
         proj_exprs = (
-            [self._q(ex) if ex in user_columns else ex for ex in select_exprs_override]
+            [self._q(ex) if ex.lower() in user_cols_lower else ex for ex in select_exprs_override]
             if select_exprs_override
             else [self._q(c) for c in user_columns]
         )
 
-        if self.dialect == Dialect.MYSQL:
+        if repeat_count_col:
+            q_mv_table = _ast_table_expr(mv_table, self.dialect).sql(dialect=sg_d)
+            q_rep = self._q(repeat_count_col)
+            qual_proj = (
+                [
+                    f"{q_mv_table}.{self._q(ex)}" if ex.lower() in user_cols_lower else ex
+                    for ex in select_exprs_override
+                ]
+                if select_exprs_override
+                else [f"{q_mv_table}.{self._q(c)}" for c in user_columns]
+            )
+            proj_csv = ", ".join(qual_proj)
+            base_where = (
+                f"({extra_where_filter}) AND {q_mv_table}.{q_rep} > 0"
+                if extra_where_filter
+                else f"{q_mv_table}.{q_rep} > 0"
+            )
+            if self.dialect == Dialect.POSTGRES:
+                reader_view_ddl = (
+                    f"CREATE VIEW {q_db_view} AS\n"
+                    f"SELECT {proj_csv}\n"
+                    f"FROM {q_mv_table}\n"
+                    f"CROSS JOIN LATERAL generate_series(1, {q_mv_table}.{q_rep}) AS __mv_rep(__mv_n)\n"
+                    f"WHERE {base_where};"
+                )
+            elif self.dialect == Dialect.MYSQL:
+                reader_view_ddl = (
+                    f"CREATE ALGORITHM = TEMPTABLE VIEW {q_db_view} AS\n"
+                    f"WITH RECURSIVE __mv_bits(__mv_b) AS (\n"
+                    f"    SELECT 0 UNION ALL SELECT 1\n"
+                    f"), __mv_seq(__mv_n, __mv_max) AS (\n"
+                    f"    SELECT CAST(1 AS SIGNED), COALESCE(MAX({q_rep}), 0) FROM {q_mv_table}\n"
+                    f"    UNION ALL\n"
+                    f"    SELECT __mv_seq.__mv_n * 2 + __mv_bits.__mv_b, __mv_seq.__mv_max\n"
+                    f"    FROM __mv_seq\n"
+                    f"    CROSS JOIN __mv_bits\n"
+                    f"    WHERE __mv_seq.__mv_n * 2 + __mv_bits.__mv_b <= __mv_seq.__mv_max\n"
+                    f")\n"
+                    f"SELECT {proj_csv}\n"
+                    f"FROM {q_mv_table}\n"
+                    f"JOIN __mv_seq ON __mv_seq.__mv_n <= {q_mv_table}.{q_rep}\n"
+                    f"WHERE {base_where} AND EXISTS (SELECT 1);"
+                )
+                return reader_view_ddl, [], [], []
+            else:
+                reader_view_ddl = (
+                    f"CREATE VIEW {q_db_view} AS\n"
+                    f"WITH RECURSIVE __mv_bits(__mv_b) AS (\n"
+                    f"    SELECT 0 UNION ALL SELECT 1\n"
+                    f"), __mv_seq(__mv_n, __mv_max) AS (\n"
+                    f"    SELECT 1, COALESCE(MAX({q_rep}), 0) FROM {q_mv_table}\n"
+                    f"    UNION ALL\n"
+                    f"    SELECT __mv_seq.__mv_n * 2 + __mv_bits.__mv_b, __mv_seq.__mv_max\n"
+                    f"    FROM __mv_seq\n"
+                    f"    CROSS JOIN __mv_bits\n"
+                    f"    WHERE __mv_seq.__mv_n * 2 + __mv_bits.__mv_b <= __mv_seq.__mv_max\n"
+                    f")\n"
+                    f"SELECT {proj_csv}\n"
+                    f"FROM {q_mv_table}\n"
+                    f"JOIN __mv_seq ON __mv_seq.__mv_n <= {q_mv_table}.{q_rep}\n"
+                    f"WHERE {base_where};"
+                )
+        elif self.dialect == Dialect.MYSQL:
             where_cond = (
                 f"({extra_where_filter}) AND EXISTS (SELECT 1)"
                 if extra_where_filter
@@ -74,14 +141,14 @@ class DialectEmitMixin(MixinHost):
                 algorithm="TEMPTABLE",
             )
             return reader_view_ddl, [], [], []
-
-        reader_view_ddl = build_create_view_sql(
-            db_view,
-            mv_table,
-            proj_exprs,
-            where_sql=extra_where_filter,
-            dialect=self.dialect,
-        )
+        else:
+            reader_view_ddl = build_create_view_sql(
+                db_view,
+                mv_table,
+                proj_exprs,
+                where_sql=extra_where_filter,
+                dialect=self.dialect,
+            )
 
         if self.dialect == Dialect.SQLITE:
             ro_trigs: List[str] = []
@@ -94,7 +161,7 @@ class DialectEmitMixin(MixinHost):
                         "ro_trigger_sqlite",
                         trg_name=self._q(t_name),
                         op=op,
-                        db_view=self._q(db_view),
+                        db_view=q_db_view,
                         raw_db_view=db_view,
                     )
                 )
@@ -107,7 +174,7 @@ class DialectEmitMixin(MixinHost):
         t_ddl = render_procedural_sql(
             "ro_trigger_pg",
             trg_name=self._q(t_ro),
-            db_view=self._q(db_view),
+            db_view=q_db_view,
             fn_name=self._q(fn_ro),
         )
         return reader_view_ddl, [fn_ddl, t_ddl], [t_ro], [fn_ro]
@@ -263,16 +330,22 @@ class DialectEmitMixin(MixinHost):
 
             pop_toks = _tokenize_sql(clean_pop, read=sg_dial)
             sel_tok_pos: Optional[int] = None
+            sel_end_pos: int = len(clean_pop)
             p_depth = 0
-            for ptk in pop_toks:
+            for idx_tk, ptk in enumerate(pop_toks):
                 if ptk.token_type == SQLGlotTokenType.L_PAREN:
                     p_depth += 1
                 elif ptk.token_type == SQLGlotTokenType.R_PAREN and p_depth > 0:
                     p_depth -= 1
-                elif p_depth == 0 and ptk.token_type in (SQLGlotTokenType.SELECT, getattr(SQLGlotTokenType, "WITH", SQLGlotTokenType.SELECT)):
-                    sel_tok_pos = ptk.start
-                    break
-            select_body = clean_pop[sel_tok_pos:].strip() if sel_tok_pos is not None else sel_node.sql(sg_dial).strip()
+                elif p_depth == 0:
+                    if sel_tok_pos is None and ptk.token_type in (SQLGlotTokenType.SELECT, getattr(SQLGlotTokenType, "WITH", SQLGlotTokenType.SELECT)):
+                        sel_tok_pos = ptk.start
+                    elif sel_tok_pos is not None and ptk.token_type == SQLGlotTokenType.ON and idx_tk + 1 < len(pop_toks):
+                        nxt_up = pop_toks[idx_tk + 1].text.upper()
+                        if nxt_up in ("CONFLICT", "DUPLICATE"):
+                            sel_end_pos = ptk.start
+                            break
+            select_body = clean_pop[sel_tok_pos:sel_end_pos].strip() if sel_tok_pos is not None else sel_node.sql(sg_dial).strip()
 
             aliased_inner = select_body
             sb_toks = _tokenize_sql(select_body, read=sg_dial)

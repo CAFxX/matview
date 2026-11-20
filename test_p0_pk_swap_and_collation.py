@@ -23,6 +23,7 @@ Finding #7: MySQL/MariaDB __mv_pk Collation Safety & Case-Insensitive Collision 
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import unittest
@@ -409,6 +410,486 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
             assert_matches_live("delete row")
         finally:
             con.close()
+
+    def test_refcount_projection_duplicate_null_pk_multiplicity_live_equivalence(self) -> None:
+        """Live SQLite refcount projection (`uses_native_pk=False`): duplicate NULL-PK
+        rows must preserve exact multiplicity in the reader view across initial
+        population, inserts, unprojected-column updates, filtered views, deletes,
+        large multiplicity (>1000), and read-only enforcement."""
+        con = sqlite3.connect(":memory:")
+        try:
+            con.execute("CREATE TABLE items (id INT PRIMARY KEY, val TEXT, extra TEXT);")
+            con.executemany(
+                "INSERT INTO items (id, val, extra) VALUES (?, ?, ?);",
+                [
+                    (None, "a", "e1"),
+                    (None, "a", "e1"),
+                    (None, "a", "e2"),
+                    (None, None, "e3"),
+                    (1, "b", "e4"),
+                ],
+            )
+            con.commit()
+
+            mgr = MaterializedViewManager(con, dialect=Dialect.SQLITE)
+            plan_all = mgr.register_view("CREATE VIEW items_mv AS SELECT id, val FROM items;")
+            plan_filt = mgr.register_view(
+                "CREATE VIEW items_nonnull_mv AS SELECT id, val FROM items WHERE val IS NOT NULL;"
+            )
+            self.assertIn("__mv_row_count", plan_all.backing_table_ddl)
+            self.assertIn("WITH RECURSIVE", plan_all.reader_view_ddl or "")
+
+            def assert_matches_live(step: str) -> None:
+                self.assertEqual(
+                    sorted(con.execute("SELECT id, val FROM items_mv;").fetchall(), key=repr),
+                    sorted(con.execute("SELECT id, val FROM items;").fetchall(), key=repr),
+                    f"items_mv diverged after {step}",
+                )
+                self.assertEqual(
+                    sorted(con.execute("SELECT id, val FROM items_nonnull_mv;").fetchall(), key=repr),
+                    sorted(
+                        con.execute("SELECT id, val FROM items WHERE val IS NOT NULL;").fetchall(),
+                        key=repr,
+                    ),
+                    f"items_nonnull_mv diverged after {step}",
+                )
+
+            assert_matches_live("initial duplicate NULL-PK population")
+
+            # Add a 3rd identical (NULL, 'a', 'e1') row -> backing __mv_row_count = 3.
+            con.execute("INSERT INTO items (id, val, extra) VALUES (NULL, 'a', 'e1');")
+            con.commit()
+            assert_matches_live("insert 3rd duplicate NULL-PK row")
+
+            # Update unprojected column `extra` (which is part of pk_hash_cols):
+            # trigger must fire so later DELETE does not leave a phantom row.
+            con.execute("UPDATE items SET extra = 'e9' WHERE id IS NULL AND val = 'a' AND extra = 'e2';")
+            con.commit()
+            assert_matches_live("update unprojected hashed column")
+
+            con.execute("DELETE FROM items WHERE id IS NULL AND val = 'a' AND extra = 'e9';")
+            con.commit()
+            assert_matches_live("delete after unprojected column update")
+
+            # Delete one of the 3 identical (NULL, 'a', 'e1') rows via rowid.
+            con.execute(
+                "DELETE FROM items WHERE rowid = ("
+                "SELECT MIN(rowid) FROM items WHERE id IS NULL AND val = 'a' AND extra = 'e1');"
+            )
+            con.commit()
+            assert_matches_live("delete 1 of 3 identical duplicates")
+
+            # High multiplicity (>1000) exercises O(log N) binary-doubling CTE.
+            con.executemany(
+                "INSERT INTO items (id, val, extra) VALUES (?, ?, ?);",
+                [(None, "bulk", "x")] * 1200,
+            )
+            con.commit()
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM items_mv WHERE val = 'bulk';").fetchone()[0],
+                1200,
+            )
+            assert_matches_live("insert 1200 identical duplicates")
+
+            # Clear all rows -> empty reader view.
+            con.execute("DELETE FROM items;")
+            con.commit()
+            assert_matches_live("delete all rows")
+
+            # Reader view remains read-only (INSERT, UPDATE, DELETE all rejected).
+            con.execute("INSERT INTO items (id, val, extra) VALUES (NULL, 'al', 'e1'), (NULL, 'al', 'e1');")
+            con.commit()
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute("INSERT INTO items_mv (id, val) VALUES (99, 'ro');")
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute("UPDATE items_mv SET val = 'bad';")
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute("DELETE FROM items_mv;")
+            con.rollback()
+
+            # Aliased projection on nullable-PK table works cleanly.
+            mgr.register_view("CREATE VIEW items_alias_mv AS SELECT t.id, t.val FROM items AS t;")
+            self.assertEqual(
+                sorted(con.execute("SELECT id, val FROM items_alias_mv;").fetchall(), key=repr),
+                sorted(con.execute("SELECT t.id, t.val FROM items AS t;").fetchall(), key=repr),
+            )
+        finally:
+            con.close()
+
+    def test_refcount_projection_and_union_all_incremental_backfill_paths(self) -> None:
+        """Incremental backfill (`pk_range_fold` and `offset_batch`) must preserve
+        all duplicate NULL-PK rows on nullable INT/TEXT/composite PKs and UNION ALL."""
+        con = sqlite3.connect(":memory:")
+        try:
+            # 1. Nullable INT PRIMARY KEY with duplicate NULL-PK rows + incremental_backfill=True
+            con.execute("CREATE TABLE ib (id INT PRIMARY KEY, val TEXT);")
+            con.executemany(
+                "INSERT INTO ib (id, val) VALUES (?, ?);",
+                [(None, "n1"), (None, "n1"), (1, "k1"), (2, "k2")],
+            )
+            # 2. Nullable TEXT PRIMARY KEY with NULL-PK rows + incremental_backfill=True
+            con.execute("CREATE TABLE ibt (id TEXT PRIMARY KEY, val TEXT);")
+            con.executemany(
+                "INSERT INTO ibt (id, val) VALUES (?, ?);",
+                [(None, "t1"), (None, "t1"), ("a", "k1")],
+            )
+            # 3. Composite nullable PK (offset_batch) + incremental_backfill=True
+            con.execute("CREATE TABLE ibc (a INT, b TEXT, PRIMARY KEY (a, b));")
+            con.executemany(
+                "INSERT INTO ibc (a, b) VALUES (?, ?);",
+                [(None, "c1"), (None, "c1"), (1, "c2")],
+            )
+            con.commit()
+
+            mgr = MaterializedViewManager(con, dialect=Dialect.SQLITE)
+            p_ib = mgr.register_view(
+                "CREATE VIEW ib_mv AS SELECT id, val FROM ib;",
+                incremental_backfill=True,
+                batch_size=2,
+            )
+            self.assertEqual(p_ib.incremental_backfill_spec.pk_column, "rowid")
+            self.assertEqual(
+                sorted(con.execute("SELECT id, val FROM ib_mv;").fetchall(), key=repr),
+                sorted(con.execute("SELECT id, val FROM ib;").fetchall(), key=repr),
+            )
+
+            p_ibt = mgr.register_view(
+                "CREATE VIEW ibt_mv AS SELECT id, val FROM ibt;",
+                incremental_backfill=True,
+                batch_size=2,
+            )
+            self.assertEqual(p_ibt.incremental_backfill_spec.pk_column, "rowid")
+            self.assertEqual(
+                sorted(con.execute("SELECT id, val FROM ibt_mv;").fetchall(), key=repr),
+                sorted(con.execute("SELECT id, val FROM ibt;").fetchall(), key=repr),
+            )
+
+            # Verify get_populate_statements(incremental_backfill=True) SQL executes
+            # cleanly for both pk_range_fold (SQLite recursive batch CTE) and offset_batch
+            # (nullable-PK UNION ALL) with zero embedded ON CONFLICT syntax errors.
+            p_ibc = mgr.register_view(
+                "CREATE VIEW ibc_mv AS SELECT a, b FROM ibc;",
+                incremental_backfill=True,
+                batch_size=2,
+            )
+            self.assertEqual(
+                sorted(con.execute("SELECT a, b FROM ibc_mv;").fetchall(), key=repr),
+                sorted(con.execute("SELECT a, b FROM ibc;").fetchall(), key=repr),
+            )
+
+            p_uall = generate_materialized_view(
+                "CREATE TABLE ib (id INT PRIMARY KEY, val TEXT);",
+                "CREATE VIEW ua_inc_mv AS SELECT id, val FROM ib UNION ALL SELECT id, val FROM ib;",
+                dialect=Dialect.SQLITE,
+                incremental_backfill=True,
+                batch_size=2,
+            )
+            con.execute(p_uall.backing_table_ddl)
+            assert p_uall.reader_view_ddl is not None
+            con.execute(p_uall.reader_view_ddl)
+            for stmt in p_uall.get_populate_statements(incremental_backfill=True):
+                con.execute(stmt)
+            self.assertEqual(
+                sorted(con.execute("SELECT id, val FROM ua_inc_mv;").fetchall(), key=repr),
+                sorted(
+                    con.execute("SELECT id, val FROM ib UNION ALL SELECT id, val FROM ib;").fetchall(),
+                    key=repr,
+                ),
+            )
+        finally:
+            con.close()
+
+    def test_refcount_projection_sqlite_storage_class_preserved(self) -> None:
+        """On SQLite, `(NULL, 1)` and `(NULL, 1.0)` in a BLOB/untyped column have
+        distinct storage classes and must not collapse in a bag projection."""
+        con = sqlite3.connect(":memory:")
+        try:
+            con.execute("CREATE TABLE vals (id INT PRIMARY KEY, v BLOB);")
+            con.executemany(
+                "INSERT INTO vals (id, v) VALUES (?, ?);",
+                [(None, 1), (None, 1), (None, 1.0), (None, "1"), (None, b"1")],
+            )
+            con.commit()
+
+            mgr = MaterializedViewManager(con, dialect=Dialect.SQLITE)
+            mgr.register_view("CREATE VIEW vals_mv AS SELECT id, v FROM vals;")
+
+            def typed_rows(sql: str) -> List[Tuple[str, str, object]]:
+                return sorted(
+                    [(type(r[0]).__name__, type(r[1]).__name__, r[1]) for r in con.execute(sql).fetchall()],
+                    key=repr,
+                )
+
+            self.assertEqual(typed_rows("SELECT id, v FROM vals_mv;"), typed_rows("SELECT id, v FROM vals;"))
+
+            con.execute("DELETE FROM vals WHERE rowid = (SELECT MIN(rowid) FROM vals WHERE typeof(v) = 'integer');")
+            con.commit()
+            self.assertEqual(typed_rows("SELECT id, v FROM vals_mv;"), typed_rows("SELECT id, v FROM vals;"))
+
+            con.execute("INSERT INTO vals (id, v) VALUES (NULL, 1.0);")
+            con.commit()
+            self.assertEqual(typed_rows("SELECT id, v FROM vals_mv;"), typed_rows("SELECT id, v FROM vals;"))
+        finally:
+            con.close()
+
+    def test_nullable_pk_union_all_duplicate_null_pk_multiplicity_live_equivalence(self) -> None:
+        """UNION ALL over SQLite nullable-PK tables (and mixed PK types) must not
+        fail NOT NULL / UNIQUE constraints and must preserve exact row multiplicity."""
+        con = sqlite3.connect(":memory:")
+        try:
+            con.execute("CREATE TABLE a (id INT PRIMARY KEY, val TEXT, extra TEXT);")
+            con.execute("CREATE TABLE b (id INT PRIMARY KEY, val TEXT, extra TEXT);")
+            con.executemany(
+                "INSERT INTO a (id, val, extra) VALUES (?, ?, ?);",
+                [(None, "x", "e1"), (None, "x", "e1"), (None, "y", "e2"), (1, "z", "e3")],
+            )
+            con.executemany(
+                "INSERT INTO b (id, val, extra) VALUES (?, ?, ?);",
+                [(None, "x", "e1"), (2, "w", "e4")],
+            )
+            con.commit()
+
+            mgr = MaterializedViewManager(con, dialect=Dialect.SQLITE)
+            plan = mgr.register_view(
+                "CREATE VIEW ab_uall_mv AS SELECT id, val FROM a UNION ALL SELECT id, val FROM b;"
+            )
+            self.assertIn("WITH RECURSIVE", plan.reader_view_ddl or "")
+
+            def assert_matches_live(step: str) -> None:
+                self.assertEqual(
+                    sorted(con.execute("SELECT id, val FROM ab_uall_mv;").fetchall(), key=repr),
+                    sorted(
+                        con.execute("SELECT id, val FROM a UNION ALL SELECT id, val FROM b;").fetchall(),
+                        key=repr,
+                    ),
+                    f"ab_uall_mv diverged after {step}",
+                )
+
+            assert_matches_live("initial population")
+            con.execute("INSERT INTO a VALUES (NULL, 'x', 'e1');")
+            con.execute("UPDATE a SET extra = 'e9' WHERE id IS NULL AND val = 'y';")
+            con.commit()
+            assert_matches_live("insert duplicate and update unprojected column")
+
+            con.execute("DELETE FROM a WHERE id IS NULL AND val = 'y';")
+            con.execute("DELETE FROM b WHERE id IS NULL;")
+            con.commit()
+            assert_matches_live("deletes across both branches")
+
+            # Mixed PK types across UNION ALL branches (INTEGER vs TEXT) also work safely.
+            con.execute("CREATE TABLE m_int (id INTEGER PRIMARY KEY, val TEXT);")
+            con.execute("CREATE TABLE m_txt (id TEXT NOT NULL PRIMARY KEY, val TEXT);")
+            con.execute("INSERT INTO m_int VALUES (1, 'i1');")
+            con.execute("INSERT INTO m_txt VALUES ('k1', 't1');")
+            con.commit()
+            mgr.register_view(
+                "CREATE VIEW mixed_uall_mv AS SELECT val FROM m_int UNION ALL SELECT val FROM m_txt;"
+            )
+            self.assertEqual(
+                sorted(con.execute("SELECT val FROM mixed_uall_mv;").fetchall()),
+                sorted(con.execute("SELECT val FROM m_int UNION ALL SELECT val FROM m_txt;").fetchall()),
+            )
+
+            # Aliased UNION ALL branches and case-differing table names share triggers cleanly.
+            con.execute("CREATE TABLE CaseTbl (id INT PRIMARY KEY, val TEXT);")
+            con.execute("INSERT INTO CaseTbl VALUES (NULL, 'c1'), (NULL, 'c1'), (1, 'c2');")
+            con.commit()
+            mgr.register_view(
+                "CREATE VIEW case_alias_uall_mv AS "
+                "SELECT t1.id, t1.val FROM CaseTbl AS t1 "
+                "UNION ALL SELECT t2.id, t2.val FROM casetbl AS t2;"
+            )
+            self.assertEqual(
+                sorted(con.execute("SELECT id, val FROM case_alias_uall_mv;").fetchall(), key=repr),
+                sorted(
+                    con.execute(
+                        "SELECT t1.id, t1.val FROM CaseTbl AS t1 "
+                        "UNION ALL SELECT t2.id, t2.val FROM casetbl AS t2;"
+                    ).fetchall(),
+                    key=repr,
+                ),
+            )
+        finally:
+            con.close()
+
+    def test_bag_projection_reader_view_codegen_postgres_and_mysql(self) -> None:
+        """Verify PostgreSQL and MySQL bag-projection codegen expands __mv_row_count."""
+        schema_map = {
+            "logs": TableSchema(
+                "logs",
+                {
+                    "msg": ColumnDef("msg", "TEXT", not_null=False),
+                    "code": ColumnDef("code", "INT", not_null=False),
+                },
+            )
+        }
+        v = parse_view_definition("CREATE VIEW v_bag AS SELECT msg, code FROM logs;")
+
+        pg_plan = IncrementalViewCompiler(schema_map, v, dialect=Dialect.POSTGRES)._compile_tier1_zset_projection()
+        self.assertIn("CROSS JOIN LATERAL generate_series(1,", pg_plan.reader_view_ddl or "")
+        self.assertIn("GROUP BY", pg_plan.initial_populate_sqls[0])
+        self.assertIn("COUNT(*)", pg_plan.initial_populate_sqls[0])
+
+        my_plan = IncrementalViewCompiler(
+            schema_map, v, dialect=Dialect.MYSQL, ignore_limitations=True
+        )._compile_tier1_zset_projection()
+        self.assertIn("CREATE ALGORITHM = TEMPTABLE VIEW", my_plan.reader_view_ddl or "")
+        self.assertIn("WITH RECURSIVE __mv_bits(__mv_b)", my_plan.reader_view_ddl or "")
+        self.assertIn("AND EXISTS (SELECT 1)", my_plan.reader_view_ddl or "")
+
+    def test_native_postgres_bag_projection_multiplicity_roundtrip(self) -> None:
+        """Native PostgreSQL end-to-end verification of LATERAL generate_series
+        bag-projection reader view, grouped initial population, statement-level
+        counted triggers, and read-only enforcement on a keyless table."""
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN is not set; native PostgreSQL test only")
+        try:
+            import psycopg2 as pg_driver  # type: ignore[import-not-found]
+            conn = pg_driver.connect(dsn)
+        except ImportError:
+            import psycopg as pg_driver  # type: ignore[import-not-found]
+            conn = pg_driver.connect(dsn)
+        conn.autocommit = True
+        cur = conn.cursor()
+        try:
+            cur.execute("DROP VIEW IF EXISTS pg_bag_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS __matview_store_pg_bag_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS pg_bag_logs CASCADE;")
+            cur.execute("CREATE TABLE pg_bag_logs (code INT, msg TEXT);")
+            cur.execute(
+                "INSERT INTO pg_bag_logs VALUES (1, 'a'), (1, 'a'), (NULL, 'b'), (NULL, 'b'), (2, 'c');"
+            )
+
+            schema_map = {
+                "pg_bag_logs": TableSchema(
+                    "pg_bag_logs",
+                    {
+                        "code": ColumnDef("code", "INT", not_null=False),
+                        "msg": ColumnDef("msg", "TEXT", not_null=False),
+                    },
+                )
+            }
+            v = parse_view_definition("CREATE VIEW pg_bag_mv AS SELECT code, msg FROM pg_bag_logs;")
+            compiler = IncrementalViewCompiler(schema_map, v, dialect=Dialect.POSTGRES)
+            raw_plan = compiler._compile_tier1_zset_projection()
+            plan = compiler._finalize_plan_backfill(raw_plan)
+
+            cur.execute(plan.backing_table_ddl)
+            for idx_ddl in plan.index_ddls:
+                cur.execute(idx_ddl)
+            assert plan.reader_view_ddl is not None
+            cur.execute(plan.reader_view_ddl)
+            for ro_ddl in plan.readonly_trigger_ddls:
+                cur.execute(ro_ddl)
+            for trig_ddl in plan.trigger_ddls:
+                cur.execute(trig_ddl)
+            for pop_sql in plan.initial_populate_sqls:
+                cur.execute(pop_sql)
+
+            def assert_pg_matches(step: str) -> None:
+                cur.execute("SELECT code, msg FROM pg_bag_mv;")
+                mv_rows = sorted(cur.fetchall(), key=repr)
+                cur.execute("SELECT code, msg FROM pg_bag_logs;")
+                live_rows = sorted(cur.fetchall(), key=repr)
+                self.assertEqual(mv_rows, live_rows, f"pg_bag_mv diverged after {step}")
+
+            assert_pg_matches("initial duplicate population")
+            cur.execute("INSERT INTO pg_bag_logs VALUES (1, 'a'), (NULL, 'b');")
+            assert_pg_matches("multi-row duplicate insert")
+            cur.execute("UPDATE pg_bag_logs SET msg = 'a2' WHERE code = 1;")
+            assert_pg_matches("update all duplicates")
+            cur.execute(
+                "DELETE FROM pg_bag_logs WHERE ctid = ("
+                "SELECT ctid FROM pg_bag_logs WHERE code IS NULL AND msg = 'b' LIMIT 1);"
+            )
+            assert_pg_matches("delete 1 of 3 NULL duplicates")
+            cur.execute("DELETE FROM pg_bag_logs;")
+            assert_pg_matches("delete all rows")
+
+            with self.assertRaises(Exception):
+                cur.execute("INSERT INTO pg_bag_mv VALUES (9, 'ro');")
+
+            # Also verify literal constants in SELECT + NUMERIC 1.0 vs 1.00 + FLOAT8 0.0 vs -0.0
+            # + schema-qualified reader view & INSTEAD OF trigger.
+            cur.execute("DROP SCHEMA IF EXISTS mv_bag_sch CASCADE;")
+            cur.execute("CREATE SCHEMA mv_bag_sch;")
+            cur.execute("DROP VIEW IF EXISTS pg_bag_const_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS __matview_store_pg_bag_const_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS pg_bag_num CASCADE;")
+            cur.execute("CREATE TABLE pg_bag_num (n NUMERIC, f FLOAT8, msg TEXT);")
+            cur.execute(
+                "INSERT INTO pg_bag_num VALUES "
+                "(1.0, 0.0::float8, 'x'), (1.00, -0.0::float8, 'x'), (1.0, 0.0::float8, 'x');"
+            )
+            num_schemas = {
+                "pg_bag_num": TableSchema(
+                    "pg_bag_num",
+                    {
+                        "n": ColumnDef("n", "NUMERIC", not_null=False),
+                        "f": ColumnDef("f", "DOUBLE PRECISION", not_null=False),
+                        "msg": ColumnDef("msg", "TEXT", not_null=False),
+                    },
+                )
+            }
+            v_const = parse_view_definition(
+                "CREATE VIEW pg_bag_const_mv AS "
+                "SELECT 5 AS k, 'hello' AS tag, NULL::TEXT AS nlit, TRUE AS flg, 1.5 AS decv, "
+                "n::text AS ns, f::text AS fs, msg FROM pg_bag_num;"
+            )
+            comp_const = IncrementalViewCompiler(num_schemas, v_const, dialect=Dialect.POSTGRES)
+            plan_const = comp_const._finalize_plan_backfill(comp_const._compile_tier1_zset_projection())
+            cur.execute(plan_const.backing_table_ddl)
+            assert plan_const.reader_view_ddl is not None
+            cur.execute(plan_const.reader_view_ddl)
+            for ro_ddl in plan_const.readonly_trigger_ddls:
+                cur.execute(ro_ddl)
+            for trig_ddl in plan_const.trigger_ddls:
+                cur.execute(trig_ddl)
+            for pop_sql in plan_const.initial_populate_sqls:
+                cur.execute(pop_sql)
+            cur.execute("SELECT k, tag, nlit, flg, decv, ns, fs, msg FROM pg_bag_const_mv;")
+            mv_const = sorted(cur.fetchall(), key=repr)
+            cur.execute(
+                "SELECT 5 AS k, 'hello' AS tag, NULL::TEXT AS nlit, TRUE AS flg, 1.5 AS decv, "
+                "n::text AS ns, f::text AS fs, msg FROM pg_bag_num;"
+            )
+            live_const = sorted(cur.fetchall(), key=repr)
+            self.assertEqual(mv_const, live_const)
+            with self.assertRaises(Exception):
+                cur.execute(
+                    "INSERT INTO pg_bag_const_mv VALUES (5, 'hello', NULL, TRUE, 1.5, '1', '0', 'x');"
+                )
+
+            # Schema-qualified reader view + INSTEAD OF trigger execute cleanly on PostgreSQL.
+            from dataclasses import replace as dc_replace
+            v_sq = dc_replace(v_const, view_name="mv_bag_sch.pg_bag_sq_v")
+            comp_sq = IncrementalViewCompiler(num_schemas, v_sq, dialect=Dialect.POSTGRES)
+            sq_view_ddl, sq_ro_trigs, _, _ = comp_sq._build_readonly_view_and_triggers(
+                "mv_bag_sch.pg_bag_sq_v",
+                plan_const.backing_table_name,
+                plan_const.user_columns,
+                repeat_count_col="__mv_row_count",
+            )
+            cur.execute(sq_view_ddl)
+            for ro_ddl in sq_ro_trigs:
+                cur.execute(ro_ddl)
+            cur.execute("SELECT COUNT(*) FROM mv_bag_sch.pg_bag_sq_v;")
+            self.assertEqual(cur.fetchone()[0], 3)
+            with self.assertRaises(Exception):
+                cur.execute(
+                    "INSERT INTO mv_bag_sch.pg_bag_sq_v VALUES (5, 'hello', NULL, TRUE, 1.5, '1', '0', 'x');"
+                )
+        finally:
+            cur.execute("DROP SCHEMA IF EXISTS mv_bag_sch CASCADE;")
+            cur.execute("DROP VIEW IF EXISTS pg_bag_const_mv CASCADE;")
+            cur.execute("DROP VIEW IF EXISTS pg_bag_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS __matview_store_pg_bag_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS __matview_store_pg_bag_const_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS pg_bag_num CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS pg_bag_logs CASCADE;")
+            cur.close()
+            conn.close()
 
 
 class TestFinding7CollationAndGroupPk(unittest.TestCase):
