@@ -20,6 +20,7 @@ SQLite and MySQL/MariaDB). Views (as in the design):
   agg  SUM, COUNT(*), AVG by g          mm  MIN, MAX by g (index on (g, v))
   j    SUM, COUNT(*) of t JOIN d by d.name
   ds   SELECT DISTINCT g                pj  plain t JOIN d, no aggregation
+  rank RANK() OVER (PARTITION BY g)      sagg STRING_AGG(v) by g (group-scoped)
 
 ``--latency N`` (PostgreSQL only) also measures single-row statements
 server-side, as in the design: a ``DO`` loop of N single-row INSERT, UPDATE and
@@ -90,6 +91,8 @@ VIEWS: Dict[str, str] = {
     "j": "SELECT d.name, SUM(t.v) AS s, COUNT(*) AS c FROM t JOIN d ON t.g = d.g GROUP BY d.name",
     "ds": "SELECT DISTINCT g FROM t",
     "pj": "SELECT t.id, t.v, d.name FROM t JOIN d ON t.g = d.g",
+    "rank": "SELECT id, g, RANK() OVER (PARTITION BY g ORDER BY v) AS r FROM t",
+    "sagg": "SELECT g, STRING_AGG(CAST(v AS TEXT), ',' ORDER BY v) AS sa FROM t GROUP BY g",
 }
 
 DDL: Dict[str, List[str]] = {
