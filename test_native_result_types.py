@@ -338,6 +338,122 @@ _INT_FAMILY = [
 ]
 
 
+_MINMAX_CONTEXT_TABLE = (
+    "CREATE TABLE {t} (id INT PRIMARY KEY, g INT NOT NULL, ti TINYINT, tu TINYINT UNSIGNED, "
+    "s SMALLINT, i INT, iu INT UNSIGNED, b BIGINT, y YEAR)"
+)
+# (select, refused on MySQL/MariaDB)
+_MINMAX_CONTEXT_VIEWS = [
+    ("SELECT id, COALESCE(MIN(ti) OVER (PARTITION BY g), 0) AS a, COALESCE(MIN(iu) OVER (PARTITION BY g), 0) AS c FROM {t}", True),
+    ("SELECT id, MAX(ti) OVER (PARTITION BY g) + 1 AS a, -MAX(tu) OVER () AS c FROM {t}", True),
+    ("SELECT g, COALESCE(MAX(ti), 0) AS a, COALESCE(MIN(iu), 0) AS b, MAX(s) + 0 AS c, CAST(MAX(y) AS UNSIGNED) AS d FROM {t} GROUP BY g", True),
+    ("WITH c AS (SELECT g, i FROM {t}) SELECT g, COALESCE(MIN(i), 0) AS e FROM c GROUP BY g", True),
+    ("SELECT d.id, MAX(d.ti) OVER (PARTITION BY d.g) AS a FROM (SELECT id, g, ti FROM {t}) d", True),
+    ("SELECT g, MIN(ti) AS a, MAX(iu) AS b, MIN(y) AS c, COALESCE(MAX(b), 0) AS d FROM {t} GROUP BY g", False),
+    ("SELECT id, MAX(ti) OVER (PARTITION BY g) AS a, MIN(s) OVER (PARTITION BY g) AS b FROM {t}", False),
+    ("SELECT g, COUNT(*) AS n FROM {t} GROUP BY g HAVING MAX(ti) + 0 > 1", False),
+    ("WITH c AS (SELECT g, ti FROM {t}) SELECT g, MAX(ti) AS a FROM c GROUP BY g", False),
+]
+
+
+class MinMaxContextTypingTests(unittest.TestCase):
+    """MIN/MAX of integers narrower than BIGINT: exact where typed, refused elsewhere.
+
+    MySQL types these results by context (window vs grouped vs nested,
+    INT vs BIGINT on the wire) and MariaDB loses UNSIGNED through
+    COALESCE/arithmetic around windowed MIN/MAX; nested and derived-table
+    window uses are refused (not bypassable), the rest must be exact.
+    """
+
+    def test_offline_decisions(self) -> None:
+        schema = _MINMAX_CONTEXT_TABLE.format(t="t") + ";"
+        for engine in ("mysql:8.4.13", "mysql:9.7.4", "mariadb:10.11"):
+            for select, refused in _MINMAX_CONTEXT_VIEWS:
+                with self.subTest(engine=engine, select=select):
+                    compile_ = lambda: generate_materialized_view(
+                        schema, f"CREATE VIEW v AS {select.format(t='t')};", dialect=engine, ignore_limitations=True
+                    )
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        if refused:
+                            with self.assertRaises(UnsupportedMaterializedViewError):
+                                compile_()
+                        else:
+                            compile_()
+
+    def test_native_exact_or_refused(self) -> None:
+        engines = [(e, d) for e, d in _native_engines() if e == Dialect.MYSQL]
+        if not engines:
+            self.skipTest("set MYSQL_DSN")
+        for engine, dsn in engines:
+            conn = _connect(engine, dsn)
+            cur = conn.cursor()
+            tag = uuid.uuid4().hex[:8]
+            t = f"mc_{tag}"
+            failures: List[str] = []
+            try:
+                cur.execute(_MINMAX_CONTEXT_TABLE.format(t=t))
+                cur.executemany(
+                    f"INSERT INTO {t} VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    [(1, 1, -3, 200, 7, 5, 4000000000, 9, 2001), (2, 1, 4, 3, -2, -8, 1, -7, 1999),
+                     (3, 2, None, None, None, None, None, None, None), (4, 2, 0, 0, 0, 0, 0, 0, 2000)],
+                )
+                conn.commit()
+                manager = MaterializedViewManager(conn, dialect=engine)
+                pairs = []
+                for n, (select, refused) in enumerate(_MINMAX_CONTEXT_VIEWS):
+                    sql = select.format(t=t)
+                    mv, live = f"mv{n}_{tag}", f"lv{n}_{tag}"
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", EngineLimitationWarning)
+                            manager.register_view(f"CREATE VIEW {mv} AS {sql};", ignore_limitations=True)
+                    except UnsupportedMaterializedViewError:
+                        conn.rollback()
+                        if not refused:
+                            failures.append(f"unexpected refusal: {sql}")
+                        continue
+                    conn.commit()
+                    if refused:
+                        failures.append(f"not refused: {sql}")
+                    cur.execute(f"CREATE VIEW {live} AS {sql}")
+                    conn.commit()
+                    pairs.append((sql, mv, live))
+                for step, stmt in (
+                    ("initial", None),
+                    ("insert", f"INSERT INTO {t} VALUES (5, 1, 100, 250, 30000, 2000000000, 4294967295, 5, 2155)"),
+                    ("update", f"UPDATE {t} SET g = 2 WHERE id = 1"),
+                    ("delete", f"DELETE FROM {t} WHERE id = 2"),
+                ):
+                    if stmt:
+                        cur.execute(stmt)
+                        conn.commit()
+                    for sql, mv, live in pairs:
+                        cur.execute(f"SELECT * FROM {mv}")
+                        a = sorted((tuple(_exact(x) for x in r) for r in cur.fetchall()), key=repr)
+                        da = _description(cur)
+                        cur.execute(f"SELECT * FROM {live}")
+                        b = sorted((tuple(_exact(x) for x in r) for r in cur.fetchall()), key=repr)
+                        db = _description(cur)
+                        conn.commit()
+                        if a != b:
+                            failures.append(f"{step} {sql}: rows {a[:3]} != {b[:3]}")
+                        meta = _metadata_mismatches(engine, da, db)
+                        if meta:
+                            failures.append(f"{step} {sql}: {meta}")
+            finally:
+                conn.rollback()
+                cur.execute(
+                    "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE %s", (f"%{tag}%",),
+                )
+                for name, kind in sorted(cur.fetchall(), key=lambda o: o[1] != "VIEW"):
+                    cur.execute(f"DROP {'VIEW' if kind == 'VIEW' else 'TABLE'} IF EXISTS `{name}`")
+                conn.commit()
+                conn.close()
+            self.assertEqual(failures, [], "\n".join(failures))
+
+
 class MySQLBitWindowVersionGateTests(unittest.TestCase):
     """Offline: window MIN/MAX over BIT is typed only for measured MySQL releases."""
 
