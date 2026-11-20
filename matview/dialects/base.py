@@ -19,6 +19,7 @@ from ..engines import (
     EngineSubdialect,
     EngineVersion,
     MaintenanceStrategy,
+    UnsupportedMaterializedViewError,
     _SIMPLE_IDENT_RE,
     _SQL_RESERVED_KEYWORDS,
     _sqlglot_dialect,
@@ -1496,12 +1497,20 @@ class DialectBaseMixin(MixinHost):
             return "INT UNSIGNED"
         bit = re.match(r"^BIT(?:\s*\((\d+)\))?", u)
         if bit:
-            if self.engine_version.version >= (9, 0, 0):
-                # MySQL 9.7 keeps BIT for window MIN/MAX (measured on 9.7.4;
-                # 8.4.13 widens it to an integer).
+            # Window MIN/MAX over BIT changed between the measured releases:
+            # MySQL 8.4 widens it to an integer, 9.7 keeps BIT (bytes vs int
+            # values). Only those release series are known; any other version
+            # (8.0, 9.0-9.6, later, or an unspecified version) is refused.
+            major_minor = tuple(self.engine_version.version[:2])
+            if major_minor == (9, 7):
                 return arg_type
-            width = int(bit.group(1) or 1)
-            return "INT UNSIGNED" if width <= 9 else "BIGINT UNSIGNED"
+            if major_minor == (8, 4):
+                width = int(bit.group(1) or 1)
+                return "INT UNSIGNED" if width <= 9 else "BIGINT UNSIGNED"
+            raise UnsupportedMaterializedViewError(
+                f"Window MIN/MAX over {arg_type} on MySQL {self.engine_version.label}: its result type "
+                "is only known for MySQL 8.4 (integer) and 9.7 (BIT); this version was not measured."
+            )
         return arg_type
 
     def _mysql_derived_minmax_type(self, arg_type: str) -> str:
