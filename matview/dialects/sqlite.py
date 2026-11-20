@@ -205,7 +205,14 @@ class SQLiteDialectMixin(MixinHost):
                 sel_ast = parse_sql_ast(s.strip(), dialect=Dialect.MYSQL)
             except sqlglot.errors.SqlglotError:
                 sel_ast = None
-            if isinstance(sel_ast, sqlglot_exp.Select) and sel_ast.args.get("joins"):
+            if (
+                isinstance(sel_ast, sqlglot_exp.Select)
+                and sel_ast.args.get("joins")
+                and len(sel_ast.args["joins"]) == 1
+                and not sel_ast.args.get("group")
+                and not sel_ast.args.get("having")
+                and not sel_ast.args.get("where")
+            ):
                 j0 = sel_ast.args["joins"][0]
                 from_node = sel_ast.args.get("from_") or sel_ast.args.get("from")
                 if j0.side.upper() == "FULL" and from_node and j0.args.get("on"):

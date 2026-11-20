@@ -72,7 +72,10 @@ from .sql_frontend import (
 # 4: SQLite no-affinity (BLOB) storage for MIN/MAX, group keys, DISTINCT aux
 #    values, set-ops, and computed expressions; canonicalized numeric __mv_pk
 #    keys and surviving group-key representative refresh.
-MATVIEW_GENERATOR_VERSION = "4"
+# 5: Tier 2 outer-join group scoping refreshes matched and NULL-extended groups
+#    (including COALESCE/expression keys, chained outer joins, self-joins, and
+#    PostgreSQL statement-level triggers).
+MATVIEW_GENERATOR_VERSION = "5"
 
 # How to repopulate a view whose pk-range backfill is incomplete.
 _REPAIR_GUIDANCE = (
