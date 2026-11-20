@@ -1852,9 +1852,39 @@ class PlannerMixin(MixinHost):
             )
         return notes
 
+    def _pg_plan_prologue(
+        self, raw_plan: MaterializedViewPlan, extra_sqls: Sequence[str]
+    ) -> Tuple[List[str], List[str]]:
+        """PostgreSQL objects every plan statement may depend on, run first in
+        the trigger DDLs (after the structure, before population): the
+        collation guard, and the canonical-key-text function when any
+        statement calls it. Returns ``(trigger_ddls, function_names)``."""
+        trigger_ddls = list(raw_plan.trigger_ddls)
+        function_names = list(raw_plan.function_names)
+        if self.dialect != Dialect.POSTGRES:
+            return trigger_ddls, function_names
+        prologue: List[str] = []
+        guard = self._pg_collation_guard_ddl()
+        if guard:
+            prologue.append(guard)
+        fn = self._pg_key_text_fn()
+        statements = [
+            raw_plan.backing_table_ddl, raw_plan.reader_view_ddl or "",
+            *raw_plan.auxiliary_table_ddls, *raw_plan.index_ddls, *raw_plan.readonly_trigger_ddls,
+            *trigger_ddls, *raw_plan.initial_populate_sqls, *extra_sqls,
+        ]
+        fn_re = re.compile(rf"(?<![A-Za-z0-9_$]){re.escape(fn)}\(")
+        # The flag covers statements outside the plan's SQL lists (e.g. the
+        # incremental backfill spec's queries).
+        if getattr(self, "_pg_key_text_fn_used", False) or any(fn_re.search(s) for s in statements):
+            prologue.append(self._pg_key_text_fn_ddl())
+            function_names.append(f"{fn}(anyelement)")
+        return prologue + trigger_ddls, function_names
+
     def _finalize_plan_backfill(self, raw_plan: MaterializedViewPlan) -> MaterializedViewPlan:
         full_sqls = list(raw_plan.initial_populate_sqls)
         inc_sqls = self._build_dialect_incremental_populate_sqls(raw_plan)
+        pg_trigger_ddls, pg_function_names = self._pg_plan_prologue(raw_plan, inc_sqls)
         active_sqls = inc_sqls if self.incremental_backfill else full_sqls
         rec_ddls, rec_meta, used_existing, existing_inv = self._analyze_base_table_indexes(raw_plan)
         diagnostics = self._build_compilation_diagnostics(
@@ -1873,14 +1903,14 @@ class PlannerMixin(MixinHost):
             auxiliary_table_ddls=raw_plan.auxiliary_table_ddls,
             index_ddls=raw_plan.index_ddls,
             initial_populate_sqls=active_sqls,
-            trigger_ddls=raw_plan.trigger_ddls,
+            trigger_ddls=pg_trigger_ddls,
             readonly_trigger_ddls=raw_plan.readonly_trigger_ddls,
             user_columns=raw_plan.user_columns,
             reader_view_ddl=raw_plan.reader_view_ddl,
             incremental_backfill_spec=raw_plan.incremental_backfill_spec,
             auxiliary_table_names=raw_plan.auxiliary_table_names,
             trigger_names=raw_plan.trigger_names,
-            function_names=raw_plan.function_names,
+            function_names=pg_function_names,
             limitations=raw_plan.limitations,
             object_prefix=raw_plan.object_prefix,
             db_view_name=raw_plan.db_view_name,

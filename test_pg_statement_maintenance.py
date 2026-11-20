@@ -28,6 +28,7 @@ Every test needs ``POSTGRES_DSN`` and is skipped without it.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Any, List, Optional
 
@@ -615,6 +616,11 @@ def test_writer_search_path_does_not_redirect_maintenance(make_env) -> None:
         wc.execute(f'INSERT INTO "{env.ns}".t (id, g, v) VALUES (700, 3, 1)')
         w.commit()
         env.check("writer with a hostile search_path")
+        # TRUNCATE has its own maintenance function (a full recompute).
+        wc.execute(f'TRUNCATE "{env.ns}".t')
+        wc.execute(f'INSERT INTO "{env.ns}".t (id, g, v) VALUES (701, 1, 2), (702, 2, 3)')
+        w.commit()
+        env.check("TRUNCATE by a writer with a hostile search_path")
     finally:
         cur.execute(f'DROP SCHEMA "{evil}" CASCADE')
         env.commit()
@@ -720,3 +726,361 @@ def test_group_scoped_single_row_cost_close_to_no_view(make_env) -> None:
     for name, costs in results.items():
         for b, c in zip(base, costs):
             assert c < 20 * b + 1000, (name, base, costs)
+
+
+# ---------------------------------------------------------------------------
+# Group identity: keys that are equal but print differently
+# ---------------------------------------------------------------------------
+#
+# GROUP BY, DISTINCT and set operations use the key type's equality: NUMERIC
+# 1.0 = 1.00, FLOAT8 0 = -0 (and NaN = NaN), INTERVAL '1 day' = '24 hours',
+# and a TIMESTAMPTZ instant is one value whatever the session TimeZone. A
+# nullable group key is identified in the backing table by a canonical text
+# (__mv_pk), and a group-scoped view locks a row whose id hashes that text:
+# both must be equal exactly when the keys are equal, in any session.
+#
+# Which equal value a group reports (1.0 or 1.00) is unspecified for native
+# GROUP BY as well, so these checks compare a normalized form of the key
+# (KEY_TYPES[...][3]) with exact counts and sums, and require exactly one
+# backing row per native group.
+
+# name -> (column type, groups of equal literals, distinct literal, key normalization for the comparison)
+KEY_TYPES = {
+    "numeric": ("NUMERIC", [["1.0", "1.00", "1", "1.000"], ["-2.50", "-2.5"]], "3.25", "trim_scale({k})::text"),
+    "float8": ("DOUBLE PRECISION", [["0::float8", "'-0'::float8"], ["'NaN'::float8", "'Infinity'::float8 - 'Infinity'::float8"]],
+               "0.1::float8", "({k} + 0)::text"),
+    "real": ("REAL", [["0::real", "'-0'::real"]], "0.1::real", "({k} + 0)::text"),
+    "timestamptz": ("TIMESTAMPTZ", [["'2026-01-01 00:00:00+00'", "'2026-01-01 09:00:00+09'", "'2025-12-31 19:00:00-05'"]],
+                    "'2026-01-02 00:00:00+00'", "({k} AT TIME ZONE 'UTC')::text"),
+    "timestamp": ("TIMESTAMP", [["'2026-01-01 10:00:00'", "'2026-01-01 10:00:00.000'"]], "'2026-01-02 10:00:00'",
+                  "{k}::text"),
+    "date": ("DATE", [["'2026-03-04'", "'2026-03-04'::timestamp"]], "'2026-03-05'", "{k}::text"),
+    "interval": ("INTERVAL", [["'1 day'", "'24 hours'", "'1440 minutes'"], ["'1 mon'", "'30 days'"]], "'1 hour'",
+                 "justify_interval({k})::text"),
+    "bytea": ("BYTEA", [["'\\x00ff'::bytea", "decode('00ff', 'hex')"]], "'\\x01'::bytea", "encode({k}, 'hex')"),
+    "jsonb": ("JSONB", [["'{\"a\": 1.0, \"b\": [2]}'", "'{\"b\": [2.00], \"a\": 1}'"]], "'{\"a\": 2}'",
+              "trim_scale(({k}->>'a')::numeric)::text || ':' || trim_scale(({k}->'b'->>0)::numeric)::text"),
+    "numeric_array": ("NUMERIC[]", [["'{1.0,NULL,2}'", "'{1,NULL,2.00}'"]], "'{1,2}'",
+                      "(SELECT array_agg(trim_scale(x) ORDER BY o) FROM unnest({k}) WITH ORDINALITY u(x, o))::text"),
+    "numrange": ("NUMRANGE", [["'[1.0,2.50)'", "'[1,2.5)'"]], "'[1,3)'",
+                 "numrange(trim_scale(lower({k})), trim_scale(upper({k})))::text"),
+}
+
+# Session settings that change how values print; writes alternate between them.
+SESSION_PROFILES = [
+    ["SET extra_float_digits = 0", "SET TimeZone = 'Asia/Tokyo'", "SET DateStyle = 'SQL, DMY'",
+     "SET IntervalStyle = 'sql_standard'", "SET bytea_output = 'escape'"],
+    ["SET extra_float_digits = 3", "SET TimeZone = 'UTC'", "SET DateStyle = 'ISO, MDY'",
+     "SET IntervalStyle = 'postgres'", "SET bytea_output = 'hex'"],
+]
+
+
+def _key_views(kind: str) -> List[ViewDef]:
+    views = [
+        ViewDef("ck_agg", "SELECT k, COUNT(*) AS n, SUM(v) AS s FROM ck GROUP BY k"),
+        ViewDef("ck_two", "SELECT k, g, COUNT(*) AS n, SUM(v) AS s FROM ck GROUP BY k, g"),
+        ViewDef("ck_str", "SELECT k, STRING_AGG(CAST(v AS TEXT), ',' ORDER BY v) AS a, COUNT(*) AS n FROM ck GROUP BY k"),
+        ViewDef("ck_dst", "SELECT DISTINCT k FROM ck"),
+        ViewDef("ck_un", "SELECT k FROM ck WHERE v > 0 UNION SELECT k FROM ck WHERE v < 100"),
+    ]
+    if kind in ("numeric", "float8"):
+        views.append(ViewDef("ck_expr", "SELECT k * 2 AS k2, COUNT(*) AS n, SUM(v) AS s FROM ck GROUP BY k * 2"))
+    return views
+
+
+def _check_key_groups(env: Env, kind: str, label: str) -> None:
+    """Each view equals its query up to the reported representative of a
+    group, and stores exactly one row per group."""
+    norm = KEY_TYPES[kind][3]
+    cur = env.conn.cursor()
+    for vd in env.views:
+        key = "k2" if vd.name == "ck_expr" else "k"
+        cur.execute(f"SELECT * FROM {vd.name} LIMIT 0")
+        cols = [d[0] for d in cur.description]
+        sel = ", ".join(norm.format(k=c) if c == key else c for c in cols)
+        cur.execute(f"SELECT COUNT(*) FROM {env.plans[vd.name].backing_table_name}")
+        stored = cur.fetchone()[0]
+        cur.execute(f"SELECT COUNT(*) FROM ({vd.select}) AS q")
+        assert stored == cur.fetchone()[0], f"{label}: {vd.name} stores {stored} rows"
+        got = []
+        for src in (vd.name, f"({vd.select}) AS q"):
+            cur.execute(f"SELECT {sel} FROM {src}")
+            got.append(sorted(map(repr, cur.fetchall())))
+        assert got[0] == got[1], f"{label}: {vd.name}\n view:  {got[0]}\n query: {got[1]}"
+    env.conn.commit()
+
+
+def _key_env(make_env, kind: str) -> Env:
+    col_type = KEY_TYPES[kind][0]
+    return make_env(views=[], seed=False,
+                    schema_sql=[f"CREATE TABLE ck (id INT PRIMARY KEY, k {col_type}, g INT, v INT)"])
+
+
+try:
+    from psycopg2.errors import SyntaxError as _PgSyntaxError
+except ImportError:  # the module is skipped without POSTGRES_DSN
+    _PgSyntaxError = Exception  # type: ignore[misc,assignment]
+
+_ARRAY_KEY_TYPE = (
+    "An array-typed view column gets the invalid backing column type ARRAY (pre-existing): registration "
+    "fails. TODO.md 'Native Backing Column Types for Array Keys'"
+)
+
+
+@pytest.mark.parametrize("kind", [
+    pytest.param(k, marks=pytest.mark.xfail(strict=True, raises=_PgSyntaxError, reason=_ARRAY_KEY_TYPE))
+    if k == "numeric_array" else k
+    for k in KEY_TYPES
+])
+def test_equal_keys_that_print_differently_form_one_group(make_env, kind: str) -> None:
+    _, groups, other, _ = KEY_TYPES[kind]
+    env = _key_env(make_env, kind)
+    cur = env.conn.cursor()
+    ids = iter(range(1, 1000))
+
+    def write(sql: str, profile: int) -> None:
+        for s in SESSION_PROFILES[profile]:
+            cur.execute(s)
+        cur.execute(sql)
+        env.conn.commit()
+
+    # One existing row per group before registration (initial population).
+    for grp in groups:
+        write(f"INSERT INTO ck VALUES ({next(ids)}, {grp[0]}, 1, 10)", 0)
+    write(f"INSERT INTO ck VALUES ({next(ids)}, NULL, 1, 5)", 0)
+    env.views = _key_views(kind)
+    for vd in env.views:
+        env.register(vd)
+    _check_key_groups(env, kind, "registration")
+    step = 0
+    for grp in groups:
+        for lit in grp[1:]:
+            step += 1
+            write(f"INSERT INTO ck VALUES ({next(ids)}, {lit}, {step % 2}, {step})", step % 2)
+            _check_key_groups(env, kind, f"INSERT {lit}")
+        rows = ", ".join(f"({next(ids)}, {lit}, 2, {50 + i})" for i, lit in enumerate(grp))
+        write(f"INSERT INTO ck VALUES {rows}", 1)
+        _check_key_groups(env, kind, f"multi-row INSERT {grp}")
+        oid = next(ids)
+        write(f"INSERT INTO ck VALUES ({oid}, {other}, 1, 7)", 0)
+        write(f"UPDATE ck SET k = {grp[-1]} WHERE id = {oid}", 1)
+        _check_key_groups(env, kind, f"UPDATE moving a row into {grp[-1]}")
+        write(f"UPDATE ck SET k = {grp[0]} WHERE k = {grp[0]}", 0)
+        _check_key_groups(env, kind, f"UPDATE rewriting {grp[0]} in place")
+    write("UPDATE ck SET k = NULL WHERE id % 3 = 0", 1)
+    _check_key_groups(env, kind, "UPDATE to NULL")
+    for i in sorted({r for r in range(1, 60)}):
+        cur.execute("DELETE FROM ck WHERE id = %s", (i,))
+        env.conn.commit()
+        if i % 4 == 0:
+            _check_key_groups(env, kind, f"DELETE {i}")
+    _check_key_groups(env, kind, "DELETE all")
+
+
+def test_timestamptz_key_value_independent_of_session_timezone(make_env) -> None:
+    """A TIMESTAMPTZ key is stored as TIMESTAMPTZ (SQLAlchemy reflects it as
+    TIMESTAMP(timezone=True)), not as a TIMESTAMP whose value would depend on
+    the writer's TimeZone."""
+    env = _key_env(make_env, "timestamptz")
+    env.views = [ViewDef("ck_agg", "SELECT k, COUNT(*) AS n, SUM(v) AS s FROM ck GROUP BY k")]
+    env.register(env.views[0])
+    cur = env.conn.cursor()
+    cur.execute("SET TimeZone = 'Asia/Tokyo'")
+    cur.execute("INSERT INTO ck VALUES (1, '2026-01-01 00:00:00+00', 1, 1)")
+    env.conn.commit()
+    cur.execute("SET TimeZone = 'UTC'")
+    cur.execute("SELECT (SELECT k FROM ck_agg) = (SELECT k FROM ck)")
+    assert cur.fetchone()[0] is True
+    env.conn.commit()
+
+
+@pytest.mark.parametrize("kind,view", [("numeric", "ck_str"), ("numeric", "ck_agg"), ("float8", "ck_str"),
+                                       ("interval", "ck_str")])
+def test_concurrent_writers_of_equal_keys_that_print_differently(make_env, kind: str, view: str) -> None:
+    """READ COMMITTED: A inserts one spelling of a key and stays open; B
+    inserts another spelling of the same key from a session with other print
+    settings. They are one group, so B must wait for A's lock (the backing
+    row of an algebraic view, the group lock row of a group-scoped one)."""
+    _, groups, _, _ = KEY_TYPES[kind]
+    env = _key_env(make_env, kind)
+    env.views = [vd for vd in _key_views(kind) if vd.name == view]
+    env.register(env.views[0])
+    env.execute(f"INSERT INTO ck VALUES (1, {groups[0][0]}, 1, 1)")
+    env.commit()
+    a, b, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_b = _session_id(env, a), _session_id(env, b)
+    ca = a.cursor()
+    for s in SESSION_PROFILES[0]:
+        ca.execute(s)
+    ca.execute(f"INSERT INTO ck VALUES (10, {groups[0][0]}, 1, 10)")
+    worker = _Worker(b, [*SESSION_PROFILES[1], f"INSERT INTO ck VALUES (11, {groups[0][1]}, 1, 11)"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "B waits for A's group lock")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    _check_key_groups(env, kind, "concurrent writers of one group")
+
+
+def test_nondeterministic_collation_keys_are_refused_at_registration(make_env) -> None:
+    """Under a nondeterministic collation 'A' = 'a': no stored value or
+    canonical text identifies the group. Registration refuses (0A000) a view
+    that groups, deduplicates or takes MIN/MAX over such a column or
+    collation; views not mentioning one, and projections, are maintained."""
+    env = make_env(views=[], seed=False, schema_sql=[
+        "CREATE COLLATION IF NOT EXISTS mv_test_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+        "CREATE TABLE tc (id INT PRIMARY KEY, c TEXT COLLATE mv_test_ci, d TEXT, v INT)",
+    ])
+    env.execute("INSERT INTO tc VALUES (1, 'A', 'A', 1), (2, 'a', 'a', 2)")
+    env.commit()
+    refused = [
+        ViewDef("vc_grp", "SELECT c, COUNT(*) AS n FROM tc GROUP BY c"),
+        ViewDef("vc_dst", "SELECT DISTINCT c FROM tc"),
+        ViewDef("vc_max", "SELECT v, MAX(c) AS m FROM tc GROUP BY v"),
+        ViewDef("vc_coll", "SELECT d COLLATE mv_test_ci AS d2, COUNT(*) AS n FROM tc GROUP BY d COLLATE mv_test_ci"),
+        ViewDef("vc_str", "SELECT c, STRING_AGG(d, ',' ORDER BY d) AS a FROM tc GROUP BY c"),
+    ]
+    for vd in refused:
+        with pytest.raises(Exception) as excinfo:
+            env.register(vd)
+        env.conn.rollback()
+        assert _pgcode(excinfo.value) == "0A000", (vd.name, repr(excinfo.value))
+        assert "mv_test_ci" in str(excinfo.value), (vd.name, str(excinfo.value))
+    allowed = [
+        ViewDef("vd_grp", "SELECT d, COUNT(*) AS n, SUM(v) AS s FROM tc GROUP BY d"),
+        ViewDef("vc_proj", "SELECT id, c, v FROM tc WHERE v > 0"),
+    ]
+    env.views = allowed
+    for vd in allowed:
+        env.register(vd)
+    env.execute("INSERT INTO tc VALUES (3, 'B', 'b', 3)")
+    env.execute("UPDATE tc SET c = 'b', d = 'B' WHERE id = 1")
+    env.commit()
+    env.check("views without a nondeterministic key")
+
+
+def test_unsupported_key_type_fails_closed(make_env) -> None:
+    """A multirange-typed nullable group key has no canonical text (yet): the
+    write fails with 0A000 instead of possibly splitting a group."""
+    env = make_env(views=[], seed=False, schema_sql=[
+        "CREATE TABLE cp (id INT PRIMARY KEY, p NUMMULTIRANGE, v INT)",
+    ])
+    vd = ViewDef("vp", "SELECT p, COUNT(*) AS n FROM cp GROUP BY p")
+    env.views = [vd]
+    env.register(vd)
+    with pytest.raises(Exception) as excinfo:
+        env.execute("INSERT INTO cp VALUES (1, '{[1.0,2)}', 1)")
+        env.commit()
+    env.conn.rollback()
+    assert _pgcode(excinfo.value) == "0A000", repr(excinfo.value)
+    assert "nummultirange" in str(excinfo.value), str(excinfo.value)
+    env.check("after the refused write")
+
+
+# ---------------------------------------------------------------------------
+# Lock-id hash collisions and repair_view under concurrent writers
+# ---------------------------------------------------------------------------
+
+
+def test_group_lock_id_collisions_only_serialize(make_env, monkeypatch) -> None:
+    """Every group hashes to the same lock row (forced): writers of different
+    groups then wait for each other but stay exact."""
+    from matview.compiler import IncrementalViewCompiler
+
+    monkeypatch.setattr(IncrementalViewCompiler, "_pg_group_lock_id_sql", lambda self, canonical_key: "1")
+    env = make_env(views=[V_STRAGG, V_WIN], seed=True)
+    a, b, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_b = _session_id(env, a), _session_id(env, b)
+    a.cursor().execute("UPDATE t SET v = v + 1 WHERE id = 10")  # g = 4
+    worker = _Worker(b, ["UPDATE t SET v = v + 1 WHERE id = 20"]).start()  # g = 2
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "B waits on the shared lock row")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check("colliding lock ids")
+
+
+@pytest.mark.parametrize("view", [VIEW_BY_NAME["v_agg"], V_STRAGG, VIEW_BY_NAME["v_pj"]], ids=lambda v: v.name)
+def test_repair_view_waits_for_writers_and_writers_wait_for_it(make_env, view: ViewDef) -> None:
+    """repair_view() repopulates under SHARE locks on the sources: a repair
+    started while a writer is open waits for it and includes its commit; a
+    writer started during a repair waits for it and is maintained after."""
+    from matview.manager import MaterializedViewManager
+
+    env = make_env(views=[view], seed=True)
+    cur = env.conn.cursor()
+    cur.execute(f"DELETE FROM {env.plans[view.name].backing_table_name}")  # damage it: repair must repopulate
+    env.commit()
+    a, r, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_r = _session_id(env, a), _session_id(env, r)
+    a.cursor().execute("INSERT INTO t (id, g, v) VALUES (7001, 1, 3)")
+    repair_mgr = MaterializedViewManager(r, dialect=env.target.dialect)
+    result: dict = {}
+
+    def run_repair() -> None:
+        try:
+            result["status"] = repair_mgr.repair_view(view.name)
+            r.commit()
+        except BaseException as exc:  # inspected below
+            result["error"] = exc
+            r.rollback()
+
+    th = threading.Thread(target=run_repair, daemon=True)
+    done = threading.Event()
+    th.start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_r, sid_a), done, "the repair waits for the writer")
+    finally:
+        a.commit()
+        th.join(60)
+    assert "error" not in result, result
+    env.check("repair after a concurrent writer")
+    # A writer during a repair: X holds the backing table in SHARE mode, so
+    # the repair (holding its source locks) waits for X; the writer then waits
+    # for the repair.
+    store = env.plans[view.name].backing_table_name
+    cur.execute(f"DELETE FROM {store}")
+    env.commit()
+    x = env.connect()
+    sid_x = _session_id(env, x)
+    x.cursor().execute(f"LOCK TABLE {store} IN SHARE MODE")
+    result.clear()
+    th = threading.Thread(target=run_repair, daemon=True)
+    th.start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_r, sid_x), done, "the repair waits for X")
+        worker = _Worker(a, ["INSERT INTO t (id, g, v) VALUES (7002, 2, 4)"]).start()
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_a, sid_r), worker.done, "the writer waits for the repair")
+    finally:
+        x.commit()
+        th.join(60)
+    worker.join()
+    assert "error" not in result, result
+    if worker.error is not None:
+        raise worker.error
+    env.check("writer during a repair")
+
+
+def test_key_text_function_is_created_and_dropped_with_the_view(make_env) -> None:
+    env = _key_env(make_env, "numeric")
+    vd = ViewDef("ck_agg", "SELECT k, COUNT(*) AS n, SUM(v) AS s FROM ck GROUP BY k")
+    env.views = [vd]
+    env.register(vd)
+    plan = env.plans[vd.name]
+    key_fns = [f for f in plan.function_names if f.endswith("(anyelement)")]
+    assert len(key_fns) == 1, plan.function_names
+    cur = env.conn.cursor()
+    count = "SELECT COUNT(*) FROM pg_proc WHERE proname = %s AND pronamespace = %s::regnamespace"
+    cur.execute(count, (key_fns[0].split("(")[0], env.ns))
+    assert cur.fetchone()[0] == 1
+    env.conn.commit()
+    env.manager.drop_view(vd.name)
+    env.views = []
+    cur.execute(count, (key_fns[0].split("(")[0], env.ns))
+    assert cur.fetchone()[0] == 0
+    env.conn.commit()

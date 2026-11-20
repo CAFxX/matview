@@ -421,7 +421,7 @@ class MaterializedViewPlan:
             for t_name in self.trigger_names:
                 stmts.append(build_drop_sql("TRIGGER", t_name, dialect=self.dialect))
         for fn_name in self.function_names:
-            stmts.append(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+            stmts.append(f"DROP FUNCTION IF EXISTS {fn_name if '(' in fn_name else fn_name + '()'} CASCADE;")
         stmts.append(build_drop_sql("VIEW", self.view_name, dialect=self.dialect))
         stmts.append(build_drop_sql("TABLE", self.backing_table_name, dialect=self.dialect))
         for aux_t in self.auxiliary_table_names:

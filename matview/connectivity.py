@@ -470,6 +470,9 @@ def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
         raw_str = f"DECIMAL({int(precision)}, {int(scale)})"
     elif dialect == Dialect.POSTGRES and raw_str.startswith("VARCHAR") and not getattr(col_type, "length", None):
         raw_str = "TEXT"
+    elif dialect == Dialect.POSTGRES and getattr(col_type, "timezone", False) and raw_str in ("TIMESTAMP", "TIME"):
+        # SQLAlchemy prints TIMESTAMP(timezone=True) as plain TIMESTAMP.
+        raw_str = f"{raw_str} WITH TIME ZONE"
     if getattr(col_type, "unsigned", False) and "UNSIGNED" not in raw_str:
         raw_str = f"{raw_str} UNSIGNED"
     return raw_str
