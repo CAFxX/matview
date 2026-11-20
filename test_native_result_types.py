@@ -30,6 +30,7 @@ from matview_sync import (
     Dialect,
     EngineLimitationError,
     EngineLimitationWarning,
+    MaintenanceStrategy,
     MaterializedViewManager,
     UnsupportedMaterializedViewError,
     generate_materialized_view,
@@ -350,31 +351,53 @@ _SUBQUERY_AGG_VIEWS = [
 ]
 
 
-class ScalarSubqueryAggregateRefusalTests(unittest.TestCase):
-    """An aggregate inside a scalar subquery in HAVING is refused on every engine.
+class ScalarSubqueryAggregateFallbackTests(unittest.TestCase):
+    """An aggregate inside a scalar subquery in HAVING is not decomposed.
 
     It used to be rewritten to the outer group's stored value: a reader with
     `(select __mv_elem_1 + 0 from t)` ("Subquery returns more than 1 row", or
     silently wrong on a one-row table); the correlated form failed with 1054.
+    Now the HAVING clause is left whole and the view takes a fallback
+    strategy, which must match the live view after every DML step (the
+    uncorrelated subquery depends on every row of the table, not only on the
+    touched groups).
     """
 
-    def test_refused_offline(self) -> None:
+    def test_not_decomposed_offline(self) -> None:
         schema = _TABLE.format(t="t", dp=" PRECISION") + ";"
         for engine in ("sqlite", "postgres:18", "mysql:8.4", "mariadb:10.11"):
             for view in _SUBQUERY_AGG_VIEWS:
                 with self.subTest(engine=engine, view=view):
-                    with self.assertRaises(UnsupportedMaterializedViewError):
-                        generate_materialized_view(
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        plan = generate_materialized_view(
                             schema.replace("DOUBLE PRECISION", "DOUBLE") if not engine.startswith("postgres") else schema,
                             f"CREATE VIEW v AS {view.format(t='t')};",
                             dialect=engine,
                             ignore_limitations=True,
                         )
+                    self.assertNotEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+                    self.assertNotIn("__mv_elem", plan.reader_view_ddl or "")
 
-    def test_refused_natively_without_objects(self) -> None:
+    def test_elementary_aggregate_over_subquery_aggregate_is_refused(self) -> None:
+        schema = _TABLE.format(t="t", dp=" PRECISION") + ";"
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            generate_materialized_view(
+                schema, "CREATE VIEW v AS SELECT g, SUM(i + (SELECT MAX(i) FROM t)) AS s FROM t GROUP BY g;",
+                dialect="postgres:18", ignore_limitations=True,
+            )
+
+    def test_matches_live_view_natively(self) -> None:
         engines = _native_engines()
         if not engines:
             self.skipTest("set POSTGRES_DSN and/or MYSQL_DSN")
+        steps = [
+            ("initial", None),
+            ("insert into a group", "INSERT INTO {t} (id, g, i) VALUES (100, 1, 40)"),
+            ("insert elsewhere", "INSERT INTO {t} (id, g, i) VALUES (101, 7, 1)"),
+            ("update elsewhere", "UPDATE {t} SET i = i + 60 WHERE id = 101"),
+            ("delete", "DELETE FROM {t} WHERE id IN (100, 101)"),
+        ]
         for engine, dsn in engines:
             conn = _connect(engine, dsn)
             cur = conn.cursor()
@@ -389,14 +412,28 @@ class ScalarSubqueryAggregateRefusalTests(unittest.TestCase):
                 cur.executemany(f"INSERT INTO {t} VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)", _SEED)
                 conn.commit()
                 manager = MaterializedViewManager(conn, dialect=engine)
-                for view in _SUBQUERY_AGG_VIEWS:
-                    with self.subTest(engine=engine.value, view=view):
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", EngineLimitationWarning)
-                            with self.assertRaises(UnsupportedMaterializedViewError):
-                                manager.register_view(f"CREATE VIEW mv_{tag} AS {view.format(t=t)};", ignore_limitations=True)
-                        conn.rollback()
-                        self.assertNotIn(f"mv_{tag}", manager.get_catalog())
+                for n, view in enumerate(_SUBQUERY_AGG_VIEWS):
+                    sql = view.format(t=t)
+                    mv, live = f"mv{n}_{tag}", f"lv{n}_{tag}"
+                    cur.execute(f"CREATE VIEW {live} AS {sql}")
+                    conn.commit()
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        manager.register_view(f"CREATE VIEW {mv} AS {sql};", ignore_limitations=True)
+                    conn.commit()
+                    for step, stmt in steps:
+                        if stmt:
+                            cur.execute(stmt.format(t=t))
+                            conn.commit()
+                        with self.subTest(engine=engine.value, view=view, step=step):
+                            cur.execute(f"SELECT g, n FROM {mv} ORDER BY g")
+                            got = list(cur.fetchall())
+                            cur.execute(f"SELECT g, n FROM {live} ORDER BY g")
+                            self.assertEqual(got, list(cur.fetchall()))
+                        conn.commit()
+                    manager.drop_view(mv)
+                    cur.execute(f"DROP VIEW {live}")
+                    conn.commit()
             finally:
                 conn.rollback()
                 if engine == Dialect.POSTGRES:
