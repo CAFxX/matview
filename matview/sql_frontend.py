@@ -1110,6 +1110,7 @@ def parse_table_schema(
             re.search(r"\bWITHOUT\s+ROWID\b", raw_stmt_s, re.IGNORECASE)
         )
         col_items: List[Tuple[str, str, bool, bool]] = []
+        generated_cols_lower: Set[str] = set()
         all_pk_cols_lower: Set[str] = set(table_pk_cols)
         ordered_pk_cols: List[str] = list(table_pk_cols_order)
         for expr_item in schema_node.expressions:
@@ -1168,6 +1169,11 @@ def parse_table_schema(
                     and not c.kind.args.get("allow_null")
                     for c in expr_item.constraints
                 )
+                if any(
+                    isinstance(c.kind, sqlglot_exp.ComputedColumnConstraint)
+                    for c in expr_item.constraints
+                ):
+                    generated_cols_lower.add(col_name.lower())
                 if is_pk and col_name.lower() not in all_pk_cols_lower:
                     all_pk_cols_lower.add(col_name.lower())
                     ordered_pk_cols.append(col_name)
@@ -1194,6 +1200,7 @@ def parse_table_schema(
                 data_type=data_type,
                 not_null=not_null,
                 primary_key=eff_pk,
+                generated=col_name.lower() in generated_cols_lower,
             )
 
         schemas[table_name] = TableSchema(

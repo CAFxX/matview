@@ -585,13 +585,20 @@ class DialectEmitMixin(MixinHost):
             if key_col.lower() not in seen_ref_cols:
                 ref_cols.append(key_col)
                 seen_ref_cols.add(key_col.lower())
+        t_schema = self._schemas_lower.get(base_t.lower())
+        # SQLite fires "AFTER UPDATE OF cols" only when a listed column is in
+        # the SET list; a referenced generated column changes when the columns
+        # it is computed from do, so it disables the column filter (the WHEN
+        # guard below still skips rows whose referenced values are unchanged).
+        refs_generated = t_schema is not None and any(
+            (cd := t_schema.columns.get(c)) is not None and cd.generated for c in ref_cols
+        )
         upd_of_clause = (
             f" OF {', '.join(self._q(c) for c in ref_cols)}"
-            if ref_cols and self.dialect == Dialect.SQLITE
+            if ref_cols and self.dialect == Dialect.SQLITE and not refs_generated
             else ""
         )
 
-        t_schema = self._schemas_lower.get(base_t.lower())
         unchanged_conds: List[str] = []
         if t_schema and ref_cols:
             for c_name in ref_cols:
