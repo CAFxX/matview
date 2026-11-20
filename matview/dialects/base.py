@@ -1443,11 +1443,17 @@ class DialectBaseMixin(MixinHost):
             arg_inferred = self._infer_expr_storage_type(
                 SelectItem(raw_expr=item.arg_expr, alias=item.alias, is_aggregate=False)
             )
-            if self.dialect == Dialect.MYSQL and arg_inferred and re.fullmatch(
-                r"(?:TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT)", arg_inferred.strip().upper()
+            if (
+                self.dialect == Dialect.MYSQL
+                and arg_inferred
+                and re.fullmatch(r"(?:TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT)", arg_inferred.strip().upper())
+                and not re.fullmatch(r"(?:`?\w+`?\.)?`?\w+`?", item.arg_expr.strip())
             ):
-                # MySQL/MariaDB MIN/MAX of an integer expression (not a bare
-                # column) is BIGINT even where the expression itself is INT.
+                # MySQL/MariaDB MIN/MAX of an integer expression is BIGINT even
+                # where the expression itself is INT. A bare column of a CTE or
+                # derived table is not an expression: MariaDB keeps its type
+                # (MAX(depth) of a recursive CTE's INT column is INT), and
+                # MySQL's derived-table rule applies in _minmax_result_type.
                 return "BIGINT"
             if arg_inferred:
                 return self._minmax_result_type(arg_inferred)
