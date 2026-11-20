@@ -16,6 +16,7 @@ import uuid
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
+import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
 from sqlalchemy.engine import Connection as _SAConnection, Engine as _SAEngine
 
@@ -54,6 +55,7 @@ from .sql_frontend import (
     build_alter_rename_table_sql,
     build_create_view_sql,
     build_drop_sql,
+    parse_sql_ast,
     parse_table_schema,
     parse_view_definition,
     parse_view_definitions,
@@ -69,15 +71,149 @@ from .sql_frontend import (
 #    referenced column changes (INTEGER 3 -> REAL 3.0 in a BLOB column).
 MATVIEW_GENERATOR_VERSION = "3"
 
-# How to repopulate a view whose pk-range backfill is incomplete. repair_view()
-# is only exact on PostgreSQL while writers to the base tables are quiesced
-# (see MaterializedViewManager.repair_view).
+# How to repopulate a view whose pk-range backfill is incomplete.
 _REPAIR_GUIDANCE = (
     "to (re)populate from scratch use register_view(..., force_rebuild=True), "
-    "drop_view() + register_view(), or repair_view() (on PostgreSQL repair_view() is only "
-    "exact while writes to the view's base tables are quiesced; concurrent writes during "
-    "the repair can be lost)."
+    "drop_view() + register_view(), or repair_view()."
 )
+
+
+def _is_postgres_cte_in_scope(tbl_node: sqlglot_exp.Table) -> bool:
+    """Return True if an unqualified table node resolves to an enclosing CTE
+    under PostgreSQL scoping rules (non-recursive WITH CTEs see only earlier
+    CTEs; WITH RECURSIVE CTEs see every CTE in the same WITH clause)."""
+    if tbl_node.db or tbl_node.catalog:
+        return False
+    id_node = tbl_node.this
+    if not isinstance(id_node, sqlglot_exp.Identifier):
+        return False
+    target = id_node.name if id_node.quoted else id_node.name.lower()
+    prev_node: sqlglot_exp.Expr = tbl_node
+    cur_node: Optional[sqlglot_exp.Expr] = tbl_node.parent
+    cte_in_prev_with: Optional[sqlglot_exp.CTE] = None
+    while cur_node is not None:
+        if isinstance(cur_node, sqlglot_exp.With):
+            cte_in_prev_with = prev_node if isinstance(prev_node, sqlglot_exp.CTE) else None
+        with_clause = cur_node.args.get("with_")
+        if isinstance(with_clause, sqlglot_exp.With):
+            ctes = list(with_clause.expressions)
+            if prev_node is with_clause and not bool(with_clause.args.get("recursive")):
+                if cte_in_prev_with is not None and cte_in_prev_with in ctes:
+                    visible = ctes[: ctes.index(cte_in_prev_with)]
+                else:
+                    visible = []
+            else:
+                visible = ctes
+            for cte in visible:
+                alias_node = cte.args.get("alias")
+                if isinstance(alias_node, sqlglot_exp.TableAlias) and isinstance(
+                    alias_node.this, sqlglot_exp.Identifier
+                ):
+                    cte_id = alias_node.this
+                    cte_key = cte_id.name if cte_id.quoted else cte_id.name.lower()
+                    if cte_key == target:
+                        return True
+        prev_node = cur_node
+        cur_node = cur_node.parent
+    return False
+
+
+def _postgres_ident_sort_key(part: Any) -> Optional[str]:
+    if isinstance(part, sqlglot_exp.Identifier):
+        return part.name if part.quoted else part.name.lower()
+    return None
+
+
+def _quote_postgres_fallback_table(ref_t: str) -> Tuple[Tuple[str, str, str], str]:
+    """Quote a fallback table reference (possibly schema-qualified) for PostgreSQL
+    and return ``((table_key, schema_key, catalog_key), sql_ref)``."""
+    parts = [p.strip() for p in ref_t.split(".") if p.strip()]
+    quoted_parts = [quote_sql_identifier(p, Dialect.POSTGRES) for p in parts]
+    raw_keys = [
+        p[1:-1].replace('""', '"') if len(p) >= 2 and p[0] == '"' and p[-1] == '"' else p.lower()
+        for p in parts
+    ]
+    if len(raw_keys) == 1:
+        key = (raw_keys[0], "", "")
+    elif len(raw_keys) == 2:
+        key = (raw_keys[1], raw_keys[0], "")
+    else:
+        key = (raw_keys[-1], raw_keys[-2], raw_keys[-3])
+    return key, ".".join(quoted_parts)
+
+
+def _postgres_base_table_lock_targets(
+    plan: Any,
+    *,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+) -> List[str]:
+    """Return deduplicated, deterministically ordered PostgreSQL LOCK TABLE targets
+    for every base table referenced by ``plan`` (preserving quoting and schema qualifiers).
+
+    Targets are sorted primarily by table name, then schema and catalog, so lock
+    acquisition order is invariant to optional schema qualification (e.g. ``a_tbl``
+    and ``public.a_tbl`` both sort before ``m_tbl``).
+    """
+    sub_plans = list(getattr(plan, "sub_plans", None) or ())
+    plans = sub_plans if sub_plans else [plan]
+    internal_prefixes = tuple({p.lower() for p in (object_prefix, DEFAULT_OBJECT_PREFIX, "__mv_") if p})
+    targets_by_key: Dict[Tuple[str, str, str], str] = {}
+
+    for sp in plans:
+        vs = getattr(sp, "view_spec", None)
+        if vs is None:
+            continue
+        raw_select = getattr(vs, "raw_select_sql", None) or ""
+        found_from_ast = False
+        if raw_select.strip():
+            try:
+                ast_node = parse_sql_ast(raw_select, dialect=Dialect.POSTGRES)
+                if isinstance(ast_node, sqlglot_exp.Create) and isinstance(
+                    ast_node.expression, sqlglot_exp.Expr
+                ):
+                    ast_node = ast_node.expression
+                for tbl_node in ast_node.find_all(sqlglot_exp.Table):
+                    this_part = tbl_node.this
+                    if not isinstance(this_part, sqlglot_exp.Identifier) or not this_part.name:
+                        continue
+                    if _is_postgres_cte_in_scope(tbl_node):
+                        continue
+                    if this_part.name.lower().startswith(internal_prefixes):
+                        continue
+                    db_part = tbl_node.args.get("db")
+                    cat_part = tbl_node.args.get("catalog")
+                    clean_tbl = sqlglot_exp.Table(
+                        this=this_part.copy(),
+                        db=db_part.copy() if isinstance(db_part, sqlglot_exp.Expr) else None,
+                        catalog=cat_part.copy() if isinstance(cat_part, sqlglot_exp.Expr) else None,
+                    )
+                    tbl_key = _postgres_ident_sort_key(this_part)
+                    if tbl_key is None:
+                        continue
+                    key = (
+                        tbl_key,
+                        _postgres_ident_sort_key(db_part) or "",
+                        _postgres_ident_sort_key(cat_part) or "",
+                    )
+                    if key not in targets_by_key:
+                        targets_by_key[key] = clean_tbl.sql(dialect="postgres")
+                    found_from_ast = True
+            except sqlglot.errors.SqlglotError:
+                pass
+
+        if not found_from_ast:
+            for ref_t in getattr(vs, "referenced_tables", ()) or ():
+                ref_s = str(ref_t).strip()
+                if not ref_s:
+                    continue
+                leaf = ref_s.rsplit(".", 1)[-1].strip('"').lower()
+                if leaf.startswith(internal_prefixes):
+                    continue
+                key, sql_ref = _quote_postgres_fallback_table(ref_s)
+                if key not in targets_by_key:
+                    targets_by_key[key] = sql_ref
+
+    return [sql_ref for _, sql_ref in sorted(targets_by_key.items())]
 
 
 class BackfillInterruptedError(RuntimeError):
@@ -92,9 +228,8 @@ class BackfillInterruptedError(RuntimeError):
     is resumed or re-folded automatically, because re-folding committed
     chunks double-counts. Repair explicitly with
     ``register_view(..., force_rebuild=True)``, ``drop_view()`` followed by
-    ``register_view()``, or ``repair_view()`` (on PostgreSQL only with writers
-    quiesced, see ``repair_view``). The underlying error, if any, is
-    ``__cause__``.
+    ``register_view()``, or ``repair_view()`` (see ``repair_view``). The
+    underlying error, if any, is ``__cause__``.
     """
 
     def __init__(
@@ -1994,11 +2129,24 @@ class MaterializedViewManager:
         batch without folding more.
 
         Concurrent writers to the view's base tables:
-        - PostgreSQL (READ COMMITTED): NOT exact. The repopulation reads a
-          statement snapshot while writer triggers still act on the previously
-          committed catalog/backing state, so the effect of a write that
-          commits during the repair can be missing from the result (observed
-          natively). Quiesce writers to the base tables during the repair.
+        - PostgreSQL:
+          - On the `"repaired"` path, acquires the catalog lock (`SHARE ROW
+            EXCLUSIVE`) and then `SHARE` locks on the view's referenced base
+            tables in deterministic sorted order before clearing and
+            repopulating the store (with bounded retry on lock timeout /
+            deadlock). Under `READ COMMITTED` (and for transactions whose
+            snapshot starts after the repair commits), in-flight writers commit
+            or roll back first, later writers wait until the repair commits,
+            and concurrent readers (`ACCESS SHARE`) remain unblocked.
+            Caveat: a concurrent `REPEATABLE READ` / `SERIALIZABLE` writer
+            whose snapshot was already established *before* `repair_view()`
+            committed can still observe the pre-repair catalog/backing snapshot
+            in its trigger (for example an active backfill watermark or an
+            empty `ATOMIC_QUERY_SYNC` store) and silently diverge.
+          - On the `"rebuilt"` path (schema drift or missing triggers),
+            rebuilds via `register_view(..., force_rebuild=True)`, whose
+            `DROP`/`CREATE TRIGGER` DDL serializes writers (`ACCESS EXCLUSIVE`
+            / `SHARE ROW EXCLUSIVE`, which also blocks readers while running).
         - MySQL/MariaDB (InnoDB, REPEATABLE READ): the repopulating
           INSERT ... SELECT takes shared locks on the base rows it reads, so
           writers serialize with the repair (verified natively with
@@ -2010,15 +2158,26 @@ class MaterializedViewManager:
             resolved = self._resolve_catalog_name(view_name, catalog)
             if resolved not in catalog:
                 raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
-            targets = [catalog[resolved]]
+            target_names = [resolved]
         else:
-            targets = list(catalog.values())
+            target_names = list(catalog.keys())
 
         schemas = self.fetch_schema()
         # Views whose maintenance triggers are gone are rebuilt like drifted ones.
         missing_triggers = self._views_missing_triggers(catalog)
         results: Dict[str, str] = {}
-        for entry in targets:
+        for idx, target_name in enumerate(target_names):
+            if idx > 0:
+                # Each prior view committed its own transaction, releasing the
+                # catalog lock; re-acquire it and refresh metadata before
+                # repairing or rebuilding the next view.
+                self._lock_catalog_for_change()
+                catalog = self.get_catalog()
+                if target_name not in catalog:
+                    continue
+                schemas = self.fetch_schema()
+                missing_triggers = self._views_missing_triggers(catalog)
+            entry = catalog[target_name]
             v_name = entry["view_name"]
             plan = generate_materialized_view(
                 schemas,
@@ -2058,10 +2217,26 @@ class MaterializedViewManager:
         after the retries are exhausted the engine error propagates with the
         view unchanged.
         """
+        pg_lock_targets = (
+            _postgres_base_table_lock_targets(plan, object_prefix=self.object_prefix)
+            if self.dialect == Dialect.POSTGRES
+            else []
+        )
         attempt = 0
         while True:
             with self._cursor() as cur:
                 try:
+                    if self.dialect == Dialect.POSTGRES:
+                        # Re-acquire the catalog lock on retries and across
+                        # multiple views in one repair_view() call (each view
+                        # commits its own transaction) before locking base
+                        # tables, preserving catalog -> base-table lock order
+                        # with bulk_changes() and other lifecycle operations.
+                        self._lock_catalog_for_change()
+                        if pg_lock_targets:
+                            cur.execute(
+                                f"LOCK TABLE {', '.join(pg_lock_targets)} IN SHARE MODE;"
+                            )
                     self._execute_param(
                         cur,
                         f"UPDATE {self.catalog_table} SET backfill_cursor_pk = ?, "
@@ -2448,11 +2623,11 @@ class MaterializedViewManager:
         Every target view is repopulated and its pk-range backfill watermark
         is taken over in the same transaction (as ``repair_view`` does): a
         running backfill stops at its next batch, an interrupted one is
-        recorded as complete. Concurrent writers: same caveats as
-        ``repair_view`` (PostgreSQL READ COMMITTED repopulation is not exact
-        while other sessions commit writes to the base tables during the
-        refresh; quiesce them or use ``drop_triggers=True``, which makes them
-        wait).
+        recorded as complete. Concurrent writers: on PostgreSQL with the
+        default session bypass (``drop_triggers=False``), READ COMMITTED
+        repopulation does not lock base tables and is not exact while other
+        sessions commit writes to the base tables during the refresh; quiesce
+        them or use ``drop_triggers=True``, which makes them wait.
 
         Failures are never swallowed: any error rolls the whole transaction
         back, which also restores the original maintenance objects. If the
