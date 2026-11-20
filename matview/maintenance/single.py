@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
 from sqlglot import exp as sqlglot_exp
+from sqlglot import TokenType as SQLGlotTokenType
 
 from .._host import MixinHost
 from ..engines import (
@@ -34,10 +35,12 @@ from ..sql_frontend import (
     _contains_aggregate_call,
     _extract_set_op_branches_from_ast,
     _extract_verbatim_cte_or_subquery_sql,
+    _find_top_level_token,
     _is_simple_column_expr,
     _parse_single_agg_expr,
     _sanitize_ident,
     _split_top_level,
+    _sqlite_type_affinity,
     _unquote_ident,
     _unwrap_outer_parens,
     build_create_view_sql,
@@ -205,6 +208,7 @@ class Tier1SingleMixin(MixinHost):
         *,
         processed_only: bool,
         rows_filter: Optional[str] = None,
+        limit_one: bool = False,
     ) -> str:
         """Native aggregate over the record's group, optionally restricted to the
         rows the triggers have already folded (rows inside an active backfill
@@ -232,7 +236,82 @@ class Tier1SingleMixin(MixinHost):
                 f"AND {q_base_t}.{q_pk} > backfill_cursor_pk AND {q_base_t}.{q_pk} <= backfill_max_pk)"
             )
         where_part = f" WHERE {' AND '.join(conds)}" if conds else ""
-        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part})"
+        limit_part = " LIMIT 1" if limit_one else ""
+        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part}{limit_part})"
+
+    def _sqlite_refresh_group_keys_stmts(
+        self, mv_table: str, record_prefix: str = "OLD"
+    ) -> List[str]:
+        """Refresh projected SQLite group-key columns after DELETE/UPDATE.
+
+        In SQLite, INTEGER 1 and REAL 1.0 (or 0 and -0.0, or -2^63 and -2^63.0)
+        belong to the same GROUP BY / DISTINCT group. If the row whose storage
+        class was stored as the backing row's representative leaves the group
+        while other rows remain, refresh the stored column from a surviving row
+        so the backing table never retains a storage class absent from the group.
+        """
+        if self.dialect != Dialect.SQLITE or not self._effective_group_by_exprs:
+            return []
+        mode = getattr(self, "_alg_mode", "single")
+        grp_pred = self._group_match_predicate_tier1(mv_table, record_prefix)
+        stmts: List[str] = []
+        seen_cols: Set[str] = set()
+        for item in self._working_select_items:
+            if item.is_aggregate:
+                continue
+            q_col = self._q(item.alias)
+            if q_col in seen_cols:
+                continue
+            seen_cols.add(q_col)
+            old_val = self._rewrite_expr_for_record(item.raw_expr, record_prefix)
+            if mode != "union_all_agg":
+                c_def = self._lookup_col_def(item.raw_expr)
+                if c_def is not None:
+                    aff = _sqlite_type_affinity(c_def.data_type)
+                    if aff in ("TEXT", "REAL"):
+                        continue
+                    if aff in ("INTEGER", "NUMERIC"):
+                        guard = (
+                            f"({old_val}) = -9223372036854775808 "
+                            f"AND typeof({mv_table}.{q_col}) = typeof({old_val})"
+                        )
+                    else:
+                        guard = (
+                            f"typeof({old_val}) IN ('integer', 'real') "
+                            f"AND typeof({mv_table}.{q_col}) = typeof({old_val})"
+                        )
+                else:
+                    guard = (
+                        f"typeof({old_val}) IN ('integer', 'real') "
+                        f"AND typeof({mv_table}.{q_col}) = typeof({old_val})"
+                    )
+                sel_e = self._rewrite_expr_for_record(item.raw_expr, self._q(self.view.base_table))
+                subq = self._build_native_group_recompute(
+                    sel_e, mv_table, processed_only=True, limit_one=True
+                )
+            else:
+                guard = (
+                    f"typeof({old_val}) IN ('integer', 'real') "
+                    f"AND typeof({mv_table}.{q_col}) = typeof({old_val})"
+                )
+                inner_u = getattr(self, "_union_all_inner_sql", "")
+                u_alias = getattr(self, "_union_all_sub_alias", "__mv_u")
+                orig_item = getattr(self, "_uall_orig_item_map", {}).get(id(item), item)
+                orig_grps = getattr(self, "_uall_orig_grp_exprs", self._effective_group_by_exprs)
+                u_conds: List[str] = []
+                if self.view.where_clause:
+                    u_conds.append(f"({self.view.where_clause})")
+                for orig_g, branch_g in zip(orig_grps, self._effective_group_by_exprs):
+                    rhs_g = f"{mv_table}.{self._q(self._group_col_alias(branch_g))}"
+                    u_conds.append(self._null_safe_eq(f"({orig_g})", f"({rhs_g})", is_nullable=True))
+                w_u = f" WHERE {' AND '.join(u_conds)}" if u_conds else ""
+                subq = f"(SELECT {orig_item.raw_expr} FROM ({inner_u}) AS {u_alias}{w_u} LIMIT 1)"
+            stmts.append(
+                f"UPDATE {mv_table}\n"
+                f"    SET {q_col} = COALESCE({subq}, {mv_table}.{q_col})\n"
+                f"    WHERE ({grp_pred}) AND ({guard});"
+            )
+        return stmts
 
     def _sqlite_guarded_fold(
         self,
@@ -394,14 +473,17 @@ class Tier1SingleMixin(MixinHost):
             mv_col = self._group_col_alias(g_expr)
             if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
                 seen_hidden_grp.add(mv_col.lower())
-                c_def = self._lookup_col_def(g_expr)
-                if c_def:
-                    dt = self._normalize_dialect_type(c_def.data_type)
+                if self.dialect == Dialect.SQLITE:
+                    dt = "BLOB"
                 else:
-                    fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
-                    dt = self._infer_expr_storage_type(fake_it)
-                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
-                    dt = "VARCHAR(255)"
+                    c_def = self._lookup_col_def(g_expr)
+                    if c_def:
+                        dt = self._normalize_dialect_type(c_def.data_type)
+                    else:
+                        fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
+                        dt = self._infer_expr_storage_type(fake_it)
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                        dt = "VARCHAR(255)"
                 nn = " NOT NULL" if not has_nullable_grp else ""
                 col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
 
@@ -433,18 +515,23 @@ class Tier1SingleMixin(MixinHost):
             if item.is_distinct and ekey not in distinct_aux_tables:
                 p = self.object_prefix if self.object_prefix else "__matview_"
                 aux_tbl = self._bounded_ident(f"{p}dist_", f"{self.logical_view_name}__{_sanitize_ident(item.alias)}")
-                c_arg = self._lookup_col_def(item.arg_expr)
-                if c_arg:
-                    val_dt = self._normalize_dialect_type(c_arg.data_type)
+                if self.dialect == Dialect.SQLITE:
+                    # BLOB (no affinity) preserves SQLite's exact storage classes
+                    # in __val so e.g. TEXT '-0' and INTEGER 0 remain distinct.
+                    val_dt = "BLOB"
                 else:
-                    fake_val = SelectItem(
-                        raw_expr=item.arg_expr or "",
-                        alias="__val",
-                        is_aggregate=False,
-                    )
-                    val_dt = self._infer_expr_storage_type(fake_val)
-                if self.dialect == Dialect.MYSQL and val_dt.upper() == "TEXT":
-                    val_dt = "VARCHAR(255)"
+                    c_arg = self._lookup_col_def(item.arg_expr)
+                    if c_arg:
+                        val_dt = self._normalize_dialect_type(c_arg.data_type)
+                    else:
+                        fake_val = SelectItem(
+                            raw_expr=item.arg_expr or "",
+                            alias="__val",
+                            is_aggregate=False,
+                        )
+                        val_dt = self._infer_expr_storage_type(fake_val)
+                    if self.dialect == Dialect.MYSQL and val_dt.upper() == "TEXT":
+                        val_dt = "VARCHAR(255)"
                 distinct_aux_tables[ekey] = (aux_tbl, item, val_dt)
 
         group_mv_cols: List[str] = []
@@ -456,14 +543,17 @@ class Tier1SingleMixin(MixinHost):
 
         for item in work_items:
             if not item.is_aggregate:
-                c_def = self._lookup_col_def(item.raw_expr)
-                dt = (
-                    self._normalize_dialect_type(c_def.data_type)
-                    if c_def
-                    else self._infer_expr_storage_type(item)
-                )
-                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
-                    dt = "VARCHAR(255)"
+                if self.dialect == Dialect.SQLITE:
+                    dt = "BLOB"
+                else:
+                    c_def = self._lookup_col_def(item.raw_expr)
+                    dt = (
+                        self._normalize_dialect_type(c_def.data_type)
+                        if c_def
+                        else self._infer_expr_storage_type(item)
+                    )
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                        dt = "VARCHAR(255)"
                 nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
                 col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
             else:
@@ -584,14 +674,17 @@ class Tier1SingleMixin(MixinHost):
                 aux_pk = []
                 for g_expr in grp_exprs:
                     mc = self._group_col_alias(g_expr)
-                    c_def = self._lookup_col_def(g_expr)
-                    if c_def:
-                        dt = self._normalize_dialect_type(c_def.data_type)
+                    if self.dialect == Dialect.SQLITE:
+                        dt = "BLOB"
                     else:
-                        fake_grp = SelectItem(raw_expr=g_expr, alias=mc, is_aggregate=False)
-                        dt = self._infer_expr_storage_type(fake_grp)
-                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
-                        dt = "VARCHAR(255)"
+                        c_def = self._lookup_col_def(g_expr)
+                        if c_def:
+                            dt = self._normalize_dialect_type(c_def.data_type)
+                        else:
+                            fake_grp = SelectItem(raw_expr=g_expr, alias=mc, is_aggregate=False)
+                            dt = self._infer_expr_storage_type(fake_grp)
+                        if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                            dt = "VARCHAR(255)"
                     aux_col_defs.append(f"{self._q(mc)} {dt} NOT NULL")
                     aux_pk.append(self._q(mc))
                 aux_pk.append(self._q("__val"))
@@ -2292,30 +2385,16 @@ class Tier1SingleMixin(MixinHost):
         if not where_cond:
             return stmt
         s = stmt.strip()
-        if re.match(r"^INSERT\s+INTO\b", s, flags=re.IGNORECASE):
-            if re.search(r"\n\s*WHERE\s+TRUE\b", s, flags=re.IGNORECASE):
-                return re.sub(
-                    r"\n\s*WHERE\s+TRUE\b",
-                    f"\n    WHERE ({where_cond})",
-                    s,
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
-            return re.sub(
-                r"\n\s*WHERE\s+",
-                f"\n    WHERE ({where_cond}) AND ",
-                s,
-                count=1,
-                flags=re.IGNORECASE,
-            )
-        if re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", s, flags=re.IGNORECASE):
-            return re.sub(
-                r"\n\s*WHERE\s+",
-                f"\n    WHERE ({where_cond}) AND ",
-                s,
-                count=1,
-                flags=re.IGNORECASE,
-            )
+        if re.match(r"^(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b", s, flags=re.IGNORECASE):
+            tk_where = _find_top_level_token(s, (SQLGlotTokenType.WHERE,), dialect=self.dialect)
+            if tk_where is not None:
+                after_pos = tk_where.end + 1
+                after = s[after_pos:]
+                if re.match(r"^INSERT\s+INTO\b", s, flags=re.IGNORECASE):
+                    m_true = re.match(r"^(\s*)TRUE\b", after, flags=re.IGNORECASE)
+                    if m_true:
+                        return f"{s[:after_pos]}{m_true.group(1)}({where_cond}){after[m_true.end():]}"
+                return f"{s[:after_pos]} ({where_cond}) AND {after.lstrip()}"
         return stmt
 
 
@@ -2373,8 +2452,12 @@ class Tier1SingleMixin(MixinHost):
         # trigger have run (for UPDATE: after both the OLD and the NEW step).
         recompute_new = self._sqlite_recompute_dirty_stmt(mv_table, "NEW", col_sum_map, expr_key_fn)
         recompute_old = self._sqlite_recompute_dirty_stmt(mv_table, "OLD", col_sum_map, expr_key_fn)
+        refresh_grp_old = self._sqlite_refresh_group_keys_stmts(mv_table, record_prefix="OLD")
         plus_upd_stmts = list(plus_new_stmts)
         upd_cleanup_stmts = [delete_zero_mv_stmt] if delete_zero_mv_stmt else []
+        if refresh_grp_old:
+            minus_old_del_stmts = minus_old_del_stmts + refresh_grp_old
+            upd_cleanup_stmts = upd_cleanup_stmts + refresh_grp_old
         if recompute_new and recompute_old:
             plus_new_stmts = plus_new_stmts + [recompute_new]
             plus_upd_stmts = plus_upd_stmts + [recompute_new]

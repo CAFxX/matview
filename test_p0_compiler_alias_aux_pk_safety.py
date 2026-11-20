@@ -146,7 +146,10 @@ class TestCompilerAliasAuxPkSafety(unittest.TestCase):
             "FROM events GROUP BY (grp + 1);"
         )
         for dialect, expected_int, expected_float in (
-            (Dialect.SQLITE, "BIGINT", "REAL"),
+            # SQLite stores DISTINCT aux values without affinity (BLOB) so
+            # runtime storage classes (e.g. TEXT '-0' vs INTEGER 0) are never
+            # coerced on insert.
+            (Dialect.SQLITE, "BLOB", "BLOB"),
             (Dialect.POSTGRES, "BIGINT", "DOUBLE PRECISION"),
             (Dialect.MYSQL, "BIGINT", "DOUBLE"),
         ):

@@ -148,10 +148,13 @@ class Tier1UnionAllAggMixin(MixinHost):
             mv_col = self._group_col_alias(g_expr)
             if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
                 seen_hidden_grp.add(mv_col.lower())
-                fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
-                dt = self._infer_expr_storage_type(fake_it)
-                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
-                    dt = "VARCHAR(255)"
+                if self.dialect == Dialect.SQLITE:
+                    dt = "BLOB"
+                else:
+                    fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
+                    dt = self._infer_expr_storage_type(fake_it)
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                        dt = "VARCHAR(255)"
                 nn = " NOT NULL" if not has_nullable_grp else ""
                 col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
 
@@ -193,15 +196,18 @@ class Tier1UnionAllAggMixin(MixinHost):
 
         for item in work_items:
             if not item.is_aggregate:
-                dt = self._infer_expr_storage_type(item)
-                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
-                    dt = "VARCHAR(255)"
+                if self.dialect == Dialect.SQLITE:
+                    dt = "BLOB"
+                else:
+                    dt = self._infer_expr_storage_type(item)
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                        dt = "VARCHAR(255)"
                 nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
                 col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
             else:
                 # Check if arg_expr maps to an integer column across all branches
                 storage_type = self._infer_expr_storage_type(item)
-                if item.agg_func in (AggFunc.SUM, AggFunc.MIN, AggFunc.MAX) and item.arg_expr:
+                if self.dialect != Dialect.SQLITE and item.agg_func in (AggFunc.SUM, AggFunc.MIN, AggFunc.MAX) and item.arg_expr:
                     arg_id = _unquote_ident(item.arg_expr, dialect=self.dialect).lower()
                     if arg_id in first_b_map:
                         b_types = []
@@ -404,6 +410,7 @@ class Tier1UnionAllAggMixin(MixinHost):
             upd_old_all: List[str] = []
             upd_new_all: List[str] = []
             cleanup_all: List[str] = []
+            refresh_grp_all: List[str] = []
 
             for bs in b_list:
                 b_alias = bs.joins[0].alias if bs.joins else base_t
@@ -573,6 +580,9 @@ class Tier1UnionAllAggMixin(MixinHost):
 
                 w_new_b = branch_ctx._rewrite_expr_for_record(comb_w, "NEW") if comb_w else None
                 w_old_b = branch_ctx._rewrite_expr_for_record(comb_w, "OLD") if comb_w else None
+                refresh_grp_b = branch_ctx._sqlite_refresh_group_keys_stmts(
+                    mv_table, record_prefix="OLD"
+                )
 
                 ins_all.extend(branch_ctx._apply_where_guard_to_stmt(s, w_new_b) for s in plus_b)
                 del_all.extend(branch_ctx._apply_where_guard_to_stmt(s, w_old_b) for s in minus_del_b)
@@ -580,6 +590,15 @@ class Tier1UnionAllAggMixin(MixinHost):
                 upd_new_all.extend(branch_ctx._apply_where_guard_to_stmt(s, w_new_b) for s in plus_b)
                 if del_zero_b:
                     cleanup_all.append(branch_ctx._apply_where_guard_to_stmt(del_zero_b, w_old_b))
+                refresh_grp_all.extend(
+                    branch_ctx._apply_where_guard_to_stmt(s, w_old_b) for s in refresh_grp_b
+                )
+
+            # Run SQLite group-key representative refreshes after ALL branches
+            # for base_t have decremented/deleted empty rows so a multi-branch
+            # table delete never refreshes an about-to-be-deleted row.
+            del_all.extend(refresh_grp_all)
+            cleanup_all.extend(refresh_grp_all)
 
             trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(

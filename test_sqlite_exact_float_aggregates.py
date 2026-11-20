@@ -938,5 +938,441 @@ class TestPerformanceSurface(unittest.TestCase):
         self.assertLess(len(vm_steps), 200, len(vm_steps))
 
 
+class TestSqliteStorageClassAndGroupKeyExactness(ExactAssertions):
+    """Regression coverage for SQLite storage-class preservation, raw affinity
+    parsing, canonical numeric group keys (1 vs 1.0, 0 vs -0.0, +/-2^63),
+    and surviving group-key representative refresh on DELETE/UPDATE."""
+
+    def test_parse_table_schema_preserves_sqlite_affinity(self) -> None:
+        from matview import Dialect, parse_table_schema
+        from matview.dialects.base import _sqlite_type_affinity
+
+        ddl = """
+        CREATE TABLE raw_types (
+            id INTEGER PRIMARY KEY,
+            b BLOB,
+            s STRING,
+            pr POINT REAL NOT NULL,
+            fp FLOATING POINT,
+            ubi UNSIGNED BIG INT,
+            any_col ANY,
+            "primary" BLOB,
+            dec DECIMAL(12, 4),
+            vc VARCHAR(32)
+        );
+        """
+        schemas = parse_table_schema(ddl, dialect=Dialect.SQLITE)
+        cols = schemas["raw_types"].columns
+        self.assertEqual(_sqlite_type_affinity(cols["b"].data_type), "BLOB")
+        self.assertEqual(_sqlite_type_affinity(cols["s"].data_type), "NUMERIC")
+        self.assertEqual(_sqlite_type_affinity(cols["pr"].data_type), "INTEGER")
+        self.assertTrue(cols["pr"].not_null)
+        self.assertEqual(_sqlite_type_affinity(cols["fp"].data_type), "INTEGER")
+        self.assertEqual(_sqlite_type_affinity(cols["ubi"].data_type), "INTEGER")
+        self.assertEqual(_sqlite_type_affinity(cols["any_col"].data_type), "BLOB")
+        self.assertEqual(_sqlite_type_affinity(cols["primary"].data_type), "BLOB")
+        self.assertEqual(_sqlite_type_affinity(cols["dec"].data_type), "NUMERIC")
+        self.assertEqual(_sqlite_type_affinity(cols["vc"].data_type), "TEXT")
+
+    def test_minmax_group_key_and_distinct_preserve_storage_classes(self) -> None:
+        cases = (
+            (
+                "max_min_blob_real_4000",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, x BLOB);",
+                "SELECT g, MAX(x) AS mx, MIN(x) AS mn FROM t GROUP BY g",
+                [(1, "a", 4000.0)],
+                [
+                    ("INSERT INTO t VALUES (2, 'a', 3000.0)", ()),
+                    ("DELETE FROM t WHERE id = 2", ()),
+                    ("UPDATE t SET x = 5000.0 WHERE id = 1", ()),
+                    ("UPDATE t SET x = 5000 WHERE id = 1", ()),
+                ],
+            ),
+            (
+                "min_case_real_not_coerced_to_text",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, y REAL, z TEXT);",
+                "SELECT g, MIN(CASE WHEN y < 0 THEN y ELSE z END) AS mn FROM t GROUP BY g",
+                [(1, "a", -995.788, "hi")],
+                [
+                    ("INSERT INTO t VALUES (2, 'a', 5.0, 'zz')", ()),
+                    ("UPDATE t SET y = -1000.0 WHERE id = 1", ()),
+                    ("DELETE FROM t WHERE id = 1", ()),
+                ],
+            ),
+            (
+                "max_min_decimal_sum_real",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, x DECIMAL(10, 2), y DECIMAL(10, 2));",
+                "SELECT g, MAX(x + y) AS mx, MIN(x + y) AS mn FROM t GROUP BY g",
+                [(1, "a", 1.5, 2.5)],
+                [
+                    ("INSERT INTO t VALUES (2, 'a', 0.5, 0.5)", ()),
+                    ("DELETE FROM t WHERE id = 2", ()),
+                ],
+            ),
+            (
+                "group_by_string_column_numeric_affinity",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, s STRING, x INTEGER);",
+                "SELECT s, COUNT(*) AS c, SUM(x) AS sx FROM t GROUP BY s",
+                [(1, 1.5, 10)],
+                [
+                    ("INSERT INTO t VALUES (2, 1.5, 20)", ()),
+                    ("INSERT INTO t VALUES (3, 'abc', 5)", ()),
+                    ("UPDATE t SET s = 2.5 WHERE id = 2", ()),
+                    ("DELETE FROM t WHERE id = 1", ()),
+                ],
+            ),
+            (
+                "count_and_sum_distinct_blob_text_neg_zero_vs_int_zero",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, y BLOB);",
+                "SELECT g, COUNT(DISTINCT y) AS dc, SUM(DISTINCT y) AS ds FROM t GROUP BY g",
+                [(1, "a", "-0"), (2, "a", 0)],
+                [
+                    ("INSERT INTO t VALUES (3, 'a', 0.0)", ()),
+                    ("DELETE FROM t WHERE id = 1", ()),
+                    ("DELETE FROM t WHERE id = 2", ()),
+                    ("INSERT INTO t VALUES (4, 'a', '-0')", ()),
+                ],
+            ),
+        )
+        for name, schema, view, seed_rows, steps in cases:
+            with self.subTest(case=name):
+                conn = sqlite3.connect(":memory:")
+                conn.executescript(schema)
+                if seed_rows:
+                    placeholders = ", ".join("?" for _ in seed_rows[0])
+                    conn.executemany(f"INSERT INTO t VALUES ({placeholders})", seed_rows)
+                _install(conn, "v", view, schema)
+                self.assertViewExact(conn, "v", view, f"{name} initial")
+                for idx, (sql, params) in enumerate(steps):
+                    conn.execute(sql, params)
+                    self.assertViewExact(conn, "v", view, f"{name} step {idx}: {sql}")
+                conn.close()
+
+    def test_numeric_group_key_equivalence_and_boundaries(self) -> None:
+        # 1 == 1.0, 0 == 0.0 == -0.0, 2^53 == 2^53.0, -2^63 == -2^63.0 form one
+        # group each; 2^53+1, 2^63-1 vs 2^63.0, '1', b'1', '-0', and NULL stay
+        # distinct groups.
+        for col_decl in ("BLOB", "BLOB NOT NULL"):
+            with self.subTest(col_decl=col_decl):
+                schema = f"CREATE TABLE t (id INTEGER PRIMARY KEY, g {col_decl}, x INTEGER);"
+                view = "SELECT g, COUNT(*) AS c, SUM(x) AS sx FROM t GROUP BY g"
+                conn = sqlite3.connect(":memory:")
+                conn.executescript(schema)
+                _install(conn, "v", view, schema)
+
+                # Equivalent pairs collapse into one group, and deleting one
+                # refreshes the stored representative to the surviving class.
+                steps: List[Tuple[str, Tuple[Any, ...]]] = [
+                    ("INSERT INTO t VALUES (1, ?, 10)", (1,)),
+                    ("INSERT INTO t VALUES (2, ?, 20)", (1.0,)),
+                    ("DELETE FROM t WHERE id = 1", ()),
+                    ("UPDATE t SET g = ? WHERE id = 2", (1,)),
+                    ("UPDATE t SET g = ? WHERE id = 2", (1.0,)),
+                    ("INSERT INTO t VALUES (3, ?, 3)", (0,)),
+                    ("INSERT INTO t VALUES (4, ?, 4)", (-0.0,)),
+                    ("DELETE FROM t WHERE id = 3", ()),
+                    ("INSERT INTO t VALUES (5, ?, 5)", (2**53,)),
+                    ("INSERT INTO t VALUES (6, ?, 6)", (float(2**53),)),
+                    ("INSERT INTO t VALUES (7, ?, 7)", (2**53 + 1,)),
+                    ("DELETE FROM t WHERE id = 5", ()),
+                    ("INSERT INTO t VALUES (8, ?, 8)", (-(2**63),)),
+                    ("INSERT INTO t VALUES (9, ?, 9)", (float(-(2**63)),)),
+                    ("DELETE FROM t WHERE id = 8", ()),
+                    ("INSERT INTO t VALUES (10, ?, 10)", (2**63 - 1,)),
+                    ("INSERT INTO t VALUES (11, ?, 11)", (float(2**63),)),
+                    ("INSERT INTO t VALUES (12, ?, 12)", ("1",)),
+                    ("INSERT INTO t VALUES (13, ?, 13)", (b"1",)),
+                    ("INSERT INTO t VALUES (14, ?, 14)", ("-0",)),
+                ]
+                if "NOT NULL" not in col_decl:
+                    steps.append(("INSERT INTO t VALUES (15, ?, 15)", (None,)))
+                for idx, (sql, params) in enumerate(steps):
+                    conn.execute(sql, params)
+                    self.assertViewExact(conn, "v", view, f"{col_decl} step {idx}: {sql} {params}")
+                conn.close()
+
+    def test_distinct_setops_join_union_all_and_computed_projections(self) -> None:
+        # SELECT DISTINCT over BLOB 1 and 1.0
+        schema_d = "CREATE TABLE t (id INTEGER PRIMARY KEY, g BLOB);"
+        view_d = "SELECT DISTINCT g FROM t"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_d)
+        _install(conn, "v", view_d, schema_d)
+        conn.execute("INSERT INTO t VALUES (1, 1)")
+        self.assertViewExact(conn, "v", view_d, "distinct ins 1")
+        conn.execute("INSERT INTO t VALUES (2, 1.0)")
+        self.assertEqual(len(conn.execute("SELECT * FROM v").fetchall()), 1)
+        conn.execute("DELETE FROM t WHERE id = 1")
+        self.assertViewExact(conn, "v", view_d, "distinct after del 1 -> 1.0")
+        conn.close()
+
+        # UNION mixed INT and BLOB + 1 vs 1.0
+        schema_u = (
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, g INTEGER);\n"
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, g BLOB);"
+        )
+        view_u = "SELECT g FROM t1 UNION SELECT g FROM t2"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_u)
+        _install(conn, "v", view_u, schema_u)
+        conn.execute("INSERT INTO t1 VALUES (1, 10), (2, 1)")
+        conn.execute("INSERT INTO t2 VALUES (1, 4000.0), (2, 1.0)")
+        self.assertEqual(len(conn.execute("SELECT * FROM v").fetchall()), 3)
+        conn.execute("DELETE FROM t1 WHERE id = 2")
+        self.assertViewExact(conn, "v", view_u, "union after del t1(1) -> 1.0 and 4000.0")
+        conn.close()
+
+        # EXCEPT: branch 1 inserts 1.0 first, branch 0 inserts 1, then branch 1 deletes 1.0
+        schema_e = (
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, g BLOB);\n"
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, g BLOB);"
+        )
+        view_e = "SELECT g FROM t1 EXCEPT SELECT g FROM t2"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_e)
+        _install(conn, "v", view_e, schema_e)
+        conn.execute("INSERT INTO t2 VALUES (1, 1.0)")
+        conn.execute("INSERT INTO t1 VALUES (1, 1)")
+        self.assertViewExact(conn, "v", view_e, "except hidden while matched")
+        conn.execute("DELETE FROM t2 WHERE id = 1")
+        self.assertViewExact(conn, "v", view_e, "except revealed with branch 0 storage class")
+        conn.close()
+
+        # INNER JOIN grouped MIN/MAX over BLOB and 1.0 -> 1 deletion
+        schema_j = (
+            "CREATE TABLE p (id INTEGER PRIMARY KEY, g BLOB);\n"
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER, x BLOB);"
+        )
+        view_j = "SELECT p.g AS g, MAX(c.x) AS mx, MIN(c.x) AS mn FROM c JOIN p ON c.pid = p.id GROUP BY p.g"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_j)
+        _install(conn, "v", view_j, schema_j)
+        conn.execute("INSERT INTO p VALUES (1, 1.0), (2, 1)")
+        conn.execute("INSERT INTO c VALUES (1, 1, 4000.0), (2, 2, 3000.0)")
+        self.assertEqual(len(conn.execute("SELECT * FROM v").fetchall()), 1)
+        conn.execute("DELETE FROM c WHERE id = 1")
+        self.assertViewExact(conn, "v", view_j, "join after del 1.0 -> int 1")
+        conn.close()
+
+        # UNION ALL grouped MAX over BLOB and 1 -> 1.0 deletion
+        schema_ua = (
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, g BLOB, x BLOB);\n"
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, g BLOB, x BLOB);"
+        )
+        view_ua = (
+            "SELECT g, MAX(x) AS mx, COUNT(*) AS cnt "
+            "FROM (SELECT g, x FROM t1 UNION ALL SELECT g, x FROM t2) AS u GROUP BY g"
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_ua)
+        _install(conn, "v", view_ua, schema_ua)
+        conn.execute("INSERT INTO t1 VALUES (1, 1, 4000.0)")
+        conn.execute("INSERT INTO t2 VALUES (1, 1.0, 3000.0)")
+        self.assertEqual(len(conn.execute("SELECT * FROM v").fetchall()), 1)
+        conn.execute("DELETE FROM t1 WHERE id = 1")
+        self.assertViewExact(conn, "v", view_ua, "union_all_agg after del 1 -> 1.0")
+        conn.close()
+
+        # Computed projection over DECIMAL and mixed CASE must not coerce storage class
+        schema_p = (
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, flag INT NOT NULL, "
+            "x DECIMAL(10, 2), y DECIMAL(10, 2), qty INT, rate REAL);"
+        )
+        view_p = (
+            "SELECT id, x + y AS s, "
+            "CASE WHEN flag = 1 THEN qty ELSE rate END AS chosen FROM t"
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_p)
+        _install(conn, "v", view_p, schema_p)
+        conn.execute("INSERT INTO t VALUES (1, 1, 1.5, 2.5, 5, 1.25)")
+        conn.execute("INSERT INTO t VALUES (2, 0, 2.0, 3.0, 5, 1.25)")
+        self.assertViewExact(conn, "v", view_p, "computed projection exact storage classes")
+        conn.close()
+
+    def test_failed_initial_population_overflow_rolls_back_cleanly(self) -> None:
+        from matview import MaterializedViewManager
+
+        schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, x BIGINT);"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema)
+        conn.execute("INSERT INTO t VALUES (1, ?), (2, ?)", (2**62, 2**62))
+        conn.commit()
+        mgr = MaterializedViewManager(conn)
+        with self.assertRaisesRegex(sqlite3.OperationalError, "integer overflow"):
+            mgr.register_view("CREATE VIEW v_ovf AS SELECT SUM(x) AS s FROM t;")
+        objs = conn.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE name LIKE '%v_ovf%' OR name LIKE '__matview_trg_%' OR name LIKE '__matview_store_%'"
+        ).fetchall()
+        self.assertEqual(objs, [], f"failed registration left objects behind: {objs}")
+        self.assertEqual(mgr.get_catalog(), {})
+        # Subsequent writes to base table must still succeed without stray triggers.
+        conn.execute("INSERT INTO t VALUES (3, 1)")
+        conn.close()
+
+    def test_adversarial_sqlite_edge_cases(self) -> None:
+        # 1. Multiline UNION ALL aggregate with inner WHERE deleting a filtered-out row
+        schema_ml = (
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, g BLOB, x INT);\n"
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, g BLOB, x INT);"
+        )
+        view_ml = (
+            "SELECT g, COUNT(*) AS cnt FROM (\n"
+            "    SELECT g, x FROM t1\n"
+            "    WHERE x > 0\n"
+            "    UNION ALL\n"
+            "    SELECT g, x FROM t2\n"
+            "    WHERE x > 0\n"
+            ") AS u GROUP BY g"
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_ml)
+        _install(conn, "v", view_ml, schema_ml)
+        conn.execute("INSERT INTO t1 VALUES (1, 1.0, 10), (2, 1.0, -5)")
+        self.assertViewExact(conn, "v", view_ml, "multiline union_all insert")
+        conn.execute("DELETE FROM t1 WHERE id = 2")
+        self.assertViewExact(conn, "v", view_ml, "multiline union_all delete filtered-out row")
+        conn.close()
+
+        # 2. UNION ALL aggregate over multiple branches of the same table with NOT NULL group key
+        schema_sb = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, x BLOB NOT NULL, y BLOB NOT NULL);"
+        view_sb = (
+            "SELECT g, COUNT(*) AS cnt "
+            "FROM (SELECT x AS g FROM t1 UNION ALL SELECT y AS g FROM t1) AS u GROUP BY g"
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_sb)
+        _install(conn, "v", view_sb, schema_sb)
+        conn.execute("INSERT INTO t1 VALUES (1, 1, 1.0)")
+        self.assertEqual(len(conn.execute("SELECT * FROM v").fetchall()), 1)
+        conn.execute("DELETE FROM t1 WHERE id = 1")
+        self.assertViewExact(conn, "v", view_sb, "same-table multi-branch delete last row")
+        conn.close()
+
+        # 3. -0.0 <-> 0.0 UPDATE triggers must fire across projection, MIN/MAX, DISTINCT, GROUP BY, UNION
+        for label, view_z in (
+            ("projection", "SELECT id, x FROM t"),
+            ("minmax", "SELECT MIN(x) AS mn, MAX(x) AS mx FROM t"),
+            ("distinct", "SELECT DISTINCT x FROM t"),
+            ("group_by", "SELECT x, COUNT(*) AS c FROM t GROUP BY x"),
+        ):
+            with self.subTest(signed_zero_view=label):
+                schema_z = "CREATE TABLE t (id INTEGER PRIMARY KEY, x BLOB);"
+                conn = sqlite3.connect(":memory:")
+                conn.executescript(schema_z)
+                _install(conn, "v", view_z, schema_z)
+                conn.execute("INSERT INTO t VALUES (1, -0.0)")
+                self.assertViewExact(conn, "v", view_z, f"{label} after insert -0.0")
+                conn.execute("UPDATE t SET x = 0.0 WHERE id = 1")
+                self.assertViewExact(conn, "v", view_z, f"{label} after update -0.0 -> +0.0")
+                conn.execute("UPDATE t SET x = -0.0 WHERE id = 1")
+                self.assertViewExact(conn, "v", view_z, f"{label} after update +0.0 -> -0.0")
+                conn.close()
+
+        # 4. INTERSECT insert order & EXCEPT cnt0: 1 -> 0 -> 1 & UNION aliased branches
+        schema_set = (
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, g BLOB);\n"
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, g BLOB);"
+        )
+        view_int = "SELECT g FROM t1 INTERSECT SELECT g FROM t2"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_set)
+        _install(conn, "v", view_int, schema_set)
+        conn.execute("INSERT INTO t2 VALUES (1, 1.0)")
+        conn.execute("INSERT INTO t1 VALUES (1, 1)")
+        self.assertViewExact(conn, "v", view_int, "intersect t2(1.0) before t1(1)")
+        conn.execute("UPDATE t1 SET g = 1.0 WHERE id = 1")
+        self.assertViewExact(conn, "v", view_int, "intersect t1 updated 1 -> 1.0")
+        conn.close()
+
+        view_exc = "SELECT g FROM t1 EXCEPT SELECT g FROM t2"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_set)
+        _install(conn, "v", view_exc, schema_set)
+        conn.execute("INSERT INTO t1 VALUES (1, 1)")
+        conn.execute("INSERT INTO t2 VALUES (1, 1.0)")
+        conn.execute("DELETE FROM t1 WHERE id = 1")
+        conn.execute("INSERT INTO t1 VALUES (2, 1.0)")
+        conn.execute("DELETE FROM t2 WHERE id = 1")
+        self.assertViewExact(conn, "v", view_exc, "except cnt0 1->0->1 reveals 1.0")
+        conn.close()
+
+        view_ualias = "SELECT a.g AS g FROM t1 AS a UNION SELECT b.g AS g FROM t2 AS b"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_set)
+        _install(conn, "v", view_ualias, schema_set)
+        conn.execute("INSERT INTO t1 VALUES (1, 1)")
+        conn.execute("INSERT INTO t2 VALUES (1, 1.0)")
+        conn.execute("DELETE FROM t1 WHERE id = 1")
+        self.assertViewExact(conn, "v", view_ualias, "union aliased branches delete 1 -> 1.0")
+        conn.close()
+
+        # 5. Compound expression starting/ending with quotes in UNION must still canonicalize
+        view_qexpr = "SELECT '1' + '0.0' AS g FROM t1 UNION SELECT g FROM t2"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_set)
+        _install(conn, "v", view_qexpr, schema_set)
+        conn.execute("INSERT INTO t1 VALUES (1, 99)")
+        conn.execute("INSERT INTO t2 VALUES (1, 1)")
+        self.assertEqual(len(conn.execute("SELECT * FROM v").fetchall()), 1)
+        conn.close()
+
+        # 6. Tier 2 compound aggregates and Tier 3 set-op / CTE storage-class preservation
+        schema_t2 = "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, x BLOB);"
+        view_t2 = (
+            "SELECT g, COUNT(*) + 1 AS cp1, COALESCE(MAX(x), 0) AS mx "
+            "FROM t GROUP BY g ORDER BY g"
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_t2)
+        _install(conn, "v", view_t2, schema_t2)
+        conn.execute("INSERT INTO t VALUES (1, 'a', 4000.0)")
+        self.assertViewExact(conn, "v", view_t2, "tier3 compound aggregate exact types")
+        conn.close()
+
+        schema_t3 = (
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, g INTEGER);\n"
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, g BLOB);"
+        )
+        view_t3 = "SELECT g FROM t1 UNION SELECT g FROM t2 ORDER BY g"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_t3)
+        _install(conn, "v", view_t3, schema_t3)
+        conn.execute("INSERT INTO t1 VALUES (1, 10)")
+        conn.execute("INSERT INTO t2 VALUES (1, 4000.0)")
+        self.assertViewExact(conn, "v", view_t3, "tier3 union order by preserves float 4000.0")
+        conn.close()
+
+        schema_cte = "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);"
+        view_cte = (
+            "WITH c AS (SELECT id, x + 1.0 AS x FROM t) "
+            "SELECT id, x FROM c ORDER BY id"
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_cte)
+        _install(conn, "v", view_cte, schema_cte)
+        conn.execute("INSERT INTO t VALUES (1, 1)")
+        self.assertViewExact(conn, "v", view_cte, "tier3 cte shadowing base column preserves float")
+        conn.close()
+
+        # 7. WHERE membership toggle + incremental_backfill=True with 1 and 1.0
+        schema_w = "CREATE TABLE t (id INTEGER PRIMARY KEY, g BLOB, flag INT NOT NULL, x INT);"
+        view_w = "SELECT g, COUNT(*) AS c, SUM(x) AS sx FROM t WHERE flag > 0 GROUP BY g"
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_w)
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?, ?, ?)",
+            [(1, 1, 1, 10), (2, 1.0, 1, 20), (3, 1.0, 0, 30)],
+        )
+        _install(conn, "v", view_w, schema_w, incremental_backfill=True, batch_size=1)
+        self.assertEqual(len(conn.execute("SELECT * FROM v").fetchall()), 1)
+        conn.execute("UPDATE t SET flag = 0 WHERE id = 1")
+        self.assertViewExact(conn, "v", view_w, "where exit of int 1 refreshes to float 1.0")
+        conn.execute("UPDATE t SET flag = 1 WHERE id = 3")
+        self.assertViewExact(conn, "v", view_w, "where entry of id=3")
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
