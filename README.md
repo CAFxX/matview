@@ -772,7 +772,11 @@ observe depends on the engine:
     group (its backing row, or for group-scoped views a per-group lock row)
     and every recompute runs in a statement after that lock, so under
     `READ COMMITTED` it reflects every committed writer of the group. Writers
-    of different groups do not wait for each other.
+    of different groups do not wait for each other (unless their lock ids
+    collide: the id is a 64-bit hash, and a collision only makes them wait).
+    A group is identified by a canonical text of its key that is equal
+    exactly when the keys are equal under the key type's equality, in any
+    session (see [Group keys](#group-keys)).
   - Full-recompute views (`atomic_query_sync`, for example a plain join)
     serialize all their writers on one per-view lock row. A writer can then
     also deadlock (SQLSTATE 40P01) with another transaction that holds a row
@@ -859,6 +863,48 @@ transition tables, its only mechanism: one `AFTER INSERT`, `AFTER UPDATE` and
 - One query that modifies two sources of a join view (a writable CTE, or an FK
   cascade into both) is not maintained exactly yet
   ([Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View](TODO.md)).
+- The lock table of a group-scoped view keeps one row per group ever written
+  (it is not pruned, see [Prune PostgreSQL Group Lock Rows](TODO.md)), each
+  write updates its group's row, and every group-scoped write also holds the
+  whole-view row in `SHARE` mode, which creates multixacts under concurrent
+  writers; autovacuum must keep up with both.
+- Large statements stay exact but slow down when their transition tables and
+  recompute sorts exceed `work_mem` (measured: a 300k-row update of a `RANK()`
+  view over 100k groups took 4.9 s at 4MB and 41 s at 64kB).
+- Not tested: PostgreSQL 16 and 17 (CI and the measurements use 15 and 18);
+  `pg_dump`/restore of a database with registered views (the drift check
+  matches trigger functions by oid); replacing a maintenance function by hand
+  (`CREATE OR REPLACE FUNCTION` keeps its oid).
+
+#### Group keys
+
+A view stores one row per group of its key (`GROUP BY`, `DISTINCT`, set
+operations, window partitions). Grouping uses the key type's equality, under
+which values can be equal but print differently, and printing depends on
+session settings. When a key is nullable (the backing table then identifies a
+group by a text primary key) and for the per-group locks of group-scoped
+views, each key value is mapped to a canonical text by a per-view function
+(`__matview_key_<view>`):
+
+- `NUMERIC`/`money`: trailing fractional zeros removed (1.0, 1.00 and 1 are
+  one group); `REAL`/`DOUBLE PRECISION`: 0 and -0 are one group, every NaN is
+  one group, other values by their exact binary value (independent of
+  `extra_float_digits`);
+- `DATE`, `TIMESTAMP`, `TIMESTAMPTZ` (as UTC), `INTERVAL` (its comparison
+  span, so `'1 day'` and `'24 hours'` are one group), `BYTEA`: independent of
+  `DateStyle`, `TimeZone`, `IntervalStyle` and `bytea_output`;
+- `citext`: lowercase; `JSONB`: numbers normalized and object keys sorted;
+  arrays and ranges: element-wise; other base and enum types: their text.
+- Composite, record and multirange keys have no canonical text yet: a write
+  that would maintain such a key fails with SQLSTATE 0A000
+  ([Canonical Keys for Composite and Multirange Types](TODO.md)).
+- Nondeterministic collations (PostgreSQL 12+, for example case-insensitive
+  ICU collations) make distinct strings equal, so no stored value identifies
+  their group: a view that groups, deduplicates, partitions or takes
+  `MIN`/`MAX` and mentions a column with such a collation, or names one after
+  `COLLATE`, is refused at registration (SQLSTATE 0A000). The check is by
+  name in the view text, so it can also refuse a view that only filters on
+  such a column ([Support Nondeterministic Collations](TODO.md)).
 
 ### Floating-point aggregates
 
@@ -1038,10 +1084,14 @@ Correctness gaps (the materialized view can differ from the original view):
 - [Preserve Dialect-Native Statistical Aggregate Alias Semantics](TODO.md) (`VARIANCE`/`STDDEV` are sample statistics on PostgreSQL)
 - [Close Unsafe DML Paths That Bypass Trigger-Based Maintenance](TODO.md)
 - [Resolve SQLite SUM Overflow Edge Cases](TODO.md)
+- [Canonical Group Keys on MySQL/MariaDB and SQLite](TODO.md) (a nullable `DECIMAL` key 1.0 next to 1.00, a float 0 next to -0, or keys equal under a case-insensitive collation can be split into two groups)
 
 Operational gaps:
 
 - [Make `bulk_changes()` Fail-Closed, Exception-Safe and Transaction-Ownership-Safe](TODO.md)
+- [Support Nondeterministic Collations](TODO.md) and [Canonical Keys for Composite and Multirange Types](TODO.md) (PostgreSQL refuses them)
+- [Prune PostgreSQL Group Lock Rows](TODO.md)
+- [Native Backing Column Types for Array Keys](TODO.md) (PostgreSQL: a view with an array column fails registration)
 - [Make Registration, Replacement, Backfill, Publication and Recovery One Explicit Lifecycle Protocol](TODO.md) (no atomic replacement on MySQL/MariaDB, no readiness gate for new incremental registrations)
 - [Make Schema Introspection and Drift Signatures Semantically Complete and Fail-Closed](TODO.md)
 - [Make Standalone SQL Generation and Manager-Driven Installation Guarantees Consistent](TODO.md)

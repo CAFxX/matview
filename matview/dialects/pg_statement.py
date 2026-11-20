@@ -43,6 +43,7 @@ The rules every body follows:
 from __future__ import annotations
 
 import itertools
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -857,3 +858,202 @@ class PgStatementMaintenanceMixin(MixinHost):
             self._pg_view_lock_ddl(),
             f"INSERT INTO {self._pg_view_lock_table()} (__mv_id, __mv_n) VALUES (0, 0) ON CONFLICT (__mv_id) DO NOTHING;",
         ]
+
+    def _pg_group_lock_id_sql(self, canonical_key: str) -> str:
+        """Lock-table row id of a group (never 0, the whole-view row).
+
+        Equal groups get equal ids because ``canonical_key`` is the canonical
+        text (``_pg_key_text_fn``); unequal groups whose hashes collide share a
+        row, which only makes their writers wait for each other.
+        """
+        return f"hashtextextended({canonical_key}, 0) | 1"
+
+    # ------------------------------------------------------------------
+    # Canonical group identity
+    # ------------------------------------------------------------------
+    def _pg_key_text_fn(self) -> str:
+        """Name of the view's canonical-key-text function (see ``_pg_key_text_fn_ddl``)."""
+        p = self.object_prefix if self.object_prefix else "__matview_"
+        return self._bounded_ident(f"{p}key_", self.logical_view_name)
+
+    def _pg_key_text_fn_ddl(self) -> str:
+        """``<fn>(anyelement) RETURNS text``: equal values give equal text.
+
+        The canonical text identifies a group in a backing primary key
+        (``__mv_pk``) and in a lock id, so two values that the type's equality
+        (the one ``GROUP BY``, ``DISTINCT`` and set operations use) treats as
+        equal must map to the same text, and the text must not depend on
+        session settings. ``ROW(v)::text`` meets neither: ``NUMERIC`` 1.0 and
+        1.00, ``FLOAT8`` 0 and -0, ``INTERVAL`` '1 day' and '24 hours' are equal
+        but print differently, and timestamps, ``bytea``, ``money`` and floats
+        print according to ``TimeZone``/``DateStyle``, ``bytea_output``,
+        ``lc_monetary`` and ``extra_float_digits``.
+
+        Normalized: numeric and money (trailing fractional zeros), float4/8
+        (both zeros, every NaN, otherwise the exact binary value), date,
+        timestamp, timestamptz (UTC), interval (its comparison span in
+        microseconds), bytea (hex), citext (lowercase), jsonb (numbers
+        normalized, keys sorted), arrays and ranges (recursively). Types whose
+        text output is canonical are returned as text. Composite, record and
+        multirange values raise ``feature_not_supported``. Text under a
+        nondeterministic collation is refused at registration
+        (``_pg_collation_guard_ddl``).
+
+        PL/pgSQL plans each statement only when it first runs, per argument
+        type, so the casts in branches for other types are never planned.
+        Built-ins are schema-qualified: the function does not depend on the
+        caller's ``search_path``.
+        """
+        fn = self._pg_key_text_fn()
+        text_types = (
+            "int4", "int8", "int2", "text", "varchar", "bpchar", "bool", "uuid", "time", "timetz",
+            "name", "char", "oid", "inet", "cidr", "macaddr",
+        )
+        text_list = ",\n           ".join(f"'pg_catalog.{t}'::pg_catalog.regtype" for t in text_types)
+        num = "pg_catalog.numeric"
+        ivl = "v::pg_catalog.interval"
+        return (
+            f"CREATE OR REPLACE FUNCTION {fn}(v anyelement) RETURNS text\n"
+            "LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $mv_key$\n"
+            "DECLARE\n"
+            "  t pg_catalog.regtype := pg_catalog.pg_typeof(v);\n"
+            "  s pg_catalog.text;\n"
+            "  f pg_catalog.float8;\n"
+            "  ty record;\n"
+            "BEGIN\n"
+            f"  IF t IN ({text_list}) THEN\n"
+            "    RETURN v::pg_catalog.text;\n"
+            "  ELSIF t IN ('pg_catalog.numeric'::pg_catalog.regtype, 'pg_catalog.money'::pg_catalog.regtype) THEN\n"
+            f"    s := v::{num}::pg_catalog.text;\n"
+            "    IF pg_catalog.strpos(s, '.') > 0 THEN\n"
+            "      s := pg_catalog.rtrim(pg_catalog.rtrim(s, '0'), '.');\n"
+            "    END IF;\n"
+            "    RETURN s;\n"
+            "  ELSIF t IN ('pg_catalog.float8'::pg_catalog.regtype, 'pg_catalog.float4'::pg_catalog.regtype) THEN\n"
+            "    f := v::pg_catalog.float8;\n"
+            "    IF f = 0 THEN\n"
+            "      RETURN '0';\n"
+            "    ELSIF f = 'NaN'::pg_catalog.float8 THEN\n"
+            "      RETURN 'NaN';\n"
+            "    END IF;\n"
+            "    RETURN pg_catalog.encode(pg_catalog.float8send(f), 'hex');\n"
+            "  ELSIF t = 'pg_catalog.timestamptz'::pg_catalog.regtype THEN\n"
+            "    IF pg_catalog.isfinite(v::pg_catalog.timestamptz) THEN\n"
+            "      RETURN pg_catalog.to_char(v::pg_catalog.timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US BC');\n"
+            "    END IF;\n"
+            "    RETURN v::pg_catalog.text;\n"
+            "  ELSIF t = 'pg_catalog.timestamp'::pg_catalog.regtype THEN\n"
+            "    IF pg_catalog.isfinite(v::pg_catalog.timestamp) THEN\n"
+            "      RETURN pg_catalog.to_char(v::pg_catalog.timestamp, 'YYYY-MM-DD HH24:MI:SS.US BC');\n"
+            "    END IF;\n"
+            "    RETURN v::pg_catalog.text;\n"
+            "  ELSIF t = 'pg_catalog.date'::pg_catalog.regtype THEN\n"
+            "    IF pg_catalog.isfinite(v::pg_catalog.date) THEN\n"
+            "      RETURN (v::pg_catalog.date - '2000-01-01'::pg_catalog.date)::pg_catalog.text;\n"
+            "    END IF;\n"
+            "    RETURN v::pg_catalog.text;\n"
+            "  ELSIF t = 'pg_catalog.interval'::pg_catalog.regtype THEN\n"
+            "    s := v::pg_catalog.text;\n"
+            "    IF s IN ('infinity', '-infinity') THEN\n"
+            "      RETURN s;\n"
+            "    END IF;\n"
+            "    -- interval equality compares months * 30 days + days + time.\n"
+            f"    RETURN (((pg_catalog.date_part('year', {ivl})::{num} * 12\n"
+            f"              + pg_catalog.date_part('month', {ivl})::{num}) * 30\n"
+            f"             + pg_catalog.date_part('day', {ivl})::{num}) * 86400000000\n"
+            f"            + pg_catalog.date_part('hour', {ivl})::{num} * 3600000000\n"
+            f"            + pg_catalog.date_part('minute', {ivl})::{num} * 60000000\n"
+            f"            + pg_catalog.date_part('microseconds', {ivl})::{num})::pg_catalog.text;\n"
+            "  ELSIF t = 'pg_catalog.bytea'::pg_catalog.regtype THEN\n"
+            "    RETURN pg_catalog.encode(v::pg_catalog.bytea, 'hex');\n"
+            "  ELSIF t = 'pg_catalog.jsonb'::pg_catalog.regtype THEN\n"
+            "    s := pg_catalog.jsonb_typeof(v::pg_catalog.jsonb);\n"
+            "    IF s = 'number' THEN\n"
+            f"      RETURN 'n' || {fn}((v::pg_catalog.jsonb #>> '{{}}')::{num});\n"
+            "    ELSIF s = 'object' THEN\n"
+            "      SELECT '{' || pg_catalog.string_agg(pg_catalog.length(e.key) || ':' || e.key || '=' || "
+            f"{fn}(e.value), ',' ORDER BY e.key COLLATE \"C\") || '}}'\n"
+            "        INTO s FROM pg_catalog.jsonb_each(v::pg_catalog.jsonb) AS e;\n"
+            "      RETURN COALESCE(s, '{}');\n"
+            "    ELSIF s = 'array' THEN\n"
+            f"      SELECT '[' || pg_catalog.string_agg({fn}(e.value), ',' ORDER BY e.o) || ']'\n"
+            "        INTO s FROM pg_catalog.jsonb_array_elements(v::pg_catalog.jsonb) WITH ORDINALITY AS e(value, o);\n"
+            "      RETURN COALESCE(s, '[]');\n"
+            "    END IF;\n"
+            "    RETURN v::pg_catalog.text;\n"
+            "  END IF;\n"
+            "  SELECT typ.typname, typ.typtype, typ.typcategory INTO ty FROM pg_catalog.pg_type AS typ WHERE typ.oid = t;\n"
+            "  IF ty.typcategory = 'A' THEN\n"
+            "    SELECT COALESCE(pg_catalog.array_dims(v), '') || '{' || COALESCE(pg_catalog.string_agg(\n"
+            "             CASE WHEN u.c IS NULL THEN 'N' ELSE pg_catalog.length(u.c) || ':' || u.c END, ',' ORDER BY u.o), '') || '}'\n"
+            f"      INTO s FROM (SELECT {fn}(x.e) AS c, x.o FROM pg_catalog.unnest(v) WITH ORDINALITY AS x(e, o)) AS u;\n"
+            "    RETURN s;\n"
+            "  ELSIF ty.typtype = 'r' THEN\n"
+            "    IF pg_catalog.isempty(v) THEN\n"
+            "      RETURN 'empty';\n"
+            "    END IF;\n"
+            f"    s := {fn}(pg_catalog.lower(v));\n"
+            "    s := (CASE WHEN pg_catalog.lower_inc(v) THEN '[' ELSE '(' END) || COALESCE(pg_catalog.length(s) || ':' || s, '') || ',';\n"
+            f"    RETURN s || COALESCE(pg_catalog.length({fn}(pg_catalog.upper(v))) || ':' || {fn}(pg_catalog.upper(v)), '')\n"
+            "           || (CASE WHEN pg_catalog.upper_inc(v) THEN ']' ELSE ')' END);\n"
+            "  ELSIF ty.typname = 'citext' THEN\n"
+            "    RETURN pg_catalog.lower(v::pg_catalog.text);\n"
+            "  ELSIF ty.typtype IN ('b', 'e') THEN\n"
+            "    RETURN v::pg_catalog.text;\n"
+            "  END IF;\n"
+            "  RAISE EXCEPTION 'matview: a grouping key of type % is not supported', pg_catalog.format_type(t, NULL)\n"
+            "    USING ERRCODE = 'feature_not_supported';\n"
+            "END\n"
+            "$mv_key$;"
+        )
+
+    def _pg_collation_guard_ddl(self) -> Optional[str]:
+        """Refuse (0A000) a view whose groups could compare under a
+        nondeterministic collation.
+
+        Under such a collation (PostgreSQL 12+) distinct strings compare equal
+        ('A' = 'a' under a case-insensitive ICU collation): ``GROUP BY`` merges
+        them, so no canonical text or index on the stored value identifies the
+        group. Returns None when the view neither groups, deduplicates nor
+        takes MIN/MAX. Otherwise the block checks, at registration, every
+        column of a source table that the view text mentions and every
+        collation it names after ``COLLATE``; it can refuse a view whose
+        mention is not a key (a conservative refusal, never a silent one).
+        """
+        sql = self.view.raw_select_sql
+        if not re.search(r"\b(?:GROUP|DISTINCT|UNION|INTERSECT|EXCEPT|PARTITION|MIN|MAX)\b", sql, re.IGNORECASE):
+            return None
+        tables = sorted({t for t in self.view.referenced_tables})
+        if not tables:
+            return None
+        tag = "$mv_sql$"
+        while tag in sql:
+            tag = tag[:-1] + "x$"
+        table_list = ", ".join("'" + self._q(t).replace("'", "''") + "'" for t in tables)
+        return (
+            "DO $mv_coll$\n"
+            "DECLARE\n"
+            f"  q pg_catalog.text := {tag}{sql}{tag};\n"
+            "  r record;\n"
+            "BEGIN\n"
+            "  IF pg_catalog.current_setting('server_version_num')::pg_catalog.int4 < 120000 THEN\n"
+            "    RETURN;\n"
+            "  END IF;\n"
+            "  FOR r IN EXECUTE\n"
+            "      'SELECT a.attrelid::pg_catalog.regclass::pg_catalog.text AS rel, a.attname::pg_catalog.text AS what, c.collname::pg_catalog.text AS coll'\n"
+            "      ' FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation'\n"
+            "      ' WHERE a.attrelid = ANY ($1) AND a.attnum > 0 AND NOT a.attisdropped AND NOT c.collisdeterministic'\n"
+            "      ' UNION ALL SELECT NULL, NULL, c.collname::pg_catalog.text FROM pg_catalog.pg_collation c'\n"
+            "      ' WHERE NOT c.collisdeterministic'\n"
+            f"      USING ARRAY[{table_list}]::pg_catalog.regclass[]\n"
+            "  LOOP\n"
+            "    IF (r.what IS NOT NULL AND q ~* ('(^|[^A-Za-z0-9_$])\"?' || pg_catalog.regexp_replace(r.what, '([^A-Za-z0-9_])', '\\\\\\1', 'g') || '\"?($|[^A-Za-z0-9_$])'))\n"
+            "       OR (r.what IS NULL AND q ~* ('COLLATE\\s+(\"?[A-Za-z0-9_]+\"?\\.)?\"?' || pg_catalog.regexp_replace(r.coll, '([^A-Za-z0-9_])', '\\\\\\1', 'g') || '\"?($|[^A-Za-z0-9_$])')) THEN\n"
+            "      RAISE EXCEPTION 'matview: % uses the nondeterministic collation %, which is not supported for grouping, DISTINCT, set operations, window partitions or MIN/MAX',\n"
+            "        COALESCE(r.rel || '.' || pg_catalog.quote_ident(r.what), 'the view'), pg_catalog.quote_ident(r.coll)\n"
+            "        USING ERRCODE = 'feature_not_supported';\n"
+            "    END IF;\n"
+            "  END LOOP;\n"
+            "END\n"
+            "$mv_coll$;"
+        )

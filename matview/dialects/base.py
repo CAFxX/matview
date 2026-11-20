@@ -1195,10 +1195,21 @@ class DialectBaseMixin(MixinHost):
         if self.dialect == Dialect.SQLITE:
             return " || '|' || ".join(self._sqlite_canonical_pk_term(e) for e in cleaned_exprs)
         elif self.dialect == Dialect.POSTGRES:
-            pg_parts = [
-                f"CAST({e} AS TEXT)" if e.strip().startswith("'") and e.strip().endswith("'") else e
-                for e in cleaned_exprs
-            ]
+            # Each member goes through the view's canonical-key-text function
+            # (_pg_key_text_fn_ddl), so keys equal under their type's equality
+            # (NUMERIC 1.0 and 1.00, FLOAT8 0 and -0, ...) get the same text in
+            # any session. The planner creates the function with the plan.
+            fn = self._pg_key_text_fn()
+            self._pg_key_text_fn_used = True
+            pg_parts = []
+            for e in cleaned_exprs:
+                s = e.strip()
+                if s.upper() == "NULL":
+                    pg_parts.append("NULL::TEXT")
+                elif s.startswith("'") and s.endswith("'"):
+                    pg_parts.append(f"{fn}(CAST({e} AS TEXT))")
+                else:
+                    pg_parts.append(f"{fn}({e})")
             return f"ROW({', '.join(pg_parts)})::TEXT"
         elif self.dialect == Dialect.MYSQL:
             parts = [

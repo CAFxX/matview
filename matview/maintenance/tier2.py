@@ -483,7 +483,7 @@ class Tier2Mixin(MixinHost):
             stmts = [
                 *self._pg_view_shared_lock_stmts(),
                 f"INSERT INTO {lock_t} (__mv_id, __mv_n)\n"
-                f"    SELECT DISTINCT hashtextextended({canon}, 0) | 1, 1 FROM {kset}\n"
+                f"    SELECT DISTINCT {self._pg_group_lock_id_sql(canon)}, 1 FROM {kset}\n"
                 f"    ORDER BY 1\n"
                 f"    ON CONFLICT (__mv_id) DO UPDATE SET __mv_n = {lock_t}.__mv_n + 1;"
             ]

@@ -643,11 +643,23 @@ def _strip_row_locking_clause(s: str) -> str:
     return re.sub(r"\s+FOR\s+UPDATE(?:\s+NOWAIT)?\b", "", s, flags=re.IGNORECASE)
 
 
+def _paren_balanced_pattern(depth: int) -> str:
+    """A regex for one character or parenthesized group, nested `depth` deep."""
+    pat = r"[^()]"
+    for _ in range(depth):
+        pat = rf"(?:[^()]|\({pat}*\))"
+    return pat
+
+
+# Canonical keys nest calls (ROW(<key fn>(CAST(... AS TEXT)))::TEXT).
+_PAREN_BALANCED = _paren_balanced_pattern(5)
+
+
 def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     s = _strip_row_locking_clause(sql)
     s = re.sub(r"\s+WITH\s*\([^)]*fillfactor[^)]*\)", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bCAST\s*\(\s*ROW\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)\)\s+AS\s+TEXT\s*\)", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bROW\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))+)\)\s*::\s*TEXT\b", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
+    s = re.sub(rf"\bCAST\s*\(\s*ROW\s*\(({_PAREN_BALANCED}+)\)\s+AS\s+TEXT\s*\)", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
+    s = re.sub(rf"\bROW\s*\(({_PAREN_BALANCED}+)\)\s*::\s*TEXT\b", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
     # PostgreSQL numeric division never truncates; emulate a `(x)::NUMERIC`
     # operand with REAL arithmetic rather than SQLite integer division.
     s = re.sub(r"::\s*NUMERIC\b", " * 1.0", s, flags=re.IGNORECASE)
@@ -1967,6 +1979,33 @@ class TranspiledConnectionAdapter:
         if s_up.startswith("DO $MV_INSTALL$"):
             # Installs the statement triggers on every partition; SQLite has
             # no partitions or inheritance, so there is nothing to emulate.
+            return [], 0
+        if s_up.startswith("DO $MV_COLL$"):
+            # Refuses nondeterministic collations, which SQLite does not have.
+            return [], 0
+        m_key_fn = re.match(
+            r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+([A-Za-z0-9_]+)\(v\s+anyelement\)\s+RETURNS\s+text\b",
+            s,
+            flags=re.I,
+        )
+        if m_key_fn:
+            # The canonical-key-text function, emulated for SQLite values:
+            # values SQLite compares equal (1 and 1.0, 0.0 and -0.0) map to
+            # the same text.
+            def _key_text(v: Any) -> Optional[str]:
+                if v is None:
+                    return None
+                if isinstance(v, float):
+                    if v != v:
+                        return "NaN"
+                    if v.is_integer() and abs(v) < 2 ** 63:
+                        return str(int(v))
+                    return repr(v)
+                if isinstance(v, (bytes, bytearray, memoryview)):
+                    return bytes(v).hex()
+                return str(v)
+
+            self._sq_conn.create_function(m_key_fn.group(1), 1, _key_text)
             return [], 0
         if s_up.startswith("DO $$"):
             self._exec_loop_backfill_in_sqlite(s)

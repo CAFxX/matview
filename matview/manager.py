@@ -989,7 +989,7 @@ class MaterializedViewManager:
             if self.dialect != Dialect.POSTGRES:
                 cur.execute(build_drop_sql("TRIGGER", t_name, dialect=self.dialect))
         for fn_name in entry["function_names"]:
-            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+            cur.execute(f"DROP FUNCTION IF EXISTS {fn_name if '(' in fn_name else fn_name + '()'} CASCADE;")
         cur.execute(build_drop_sql("VIEW", resolved_name, dialect=self.dialect))
         cur.execute(build_drop_sql("TABLE", entry["backing_table"], dialect=self.dialect))
         for aux_t in entry["aux_tables"]:
@@ -3197,7 +3197,7 @@ class MaterializedViewManager:
                         for t_name in cat_entry.get("trigger_names", []):
                             drop_ddls.append(f"DROP TRIGGER IF EXISTS {t_name};")
                     for fn_name in cat_entry.get("function_names", []):
-                        drop_ddls.append(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
+                        drop_ddls.append(f"DROP FUNCTION IF EXISTS {fn_name if '(' in fn_name else fn_name + '()'} CASCADE;")
                     drop_ddls.append(f"DROP VIEW IF EXISTS {cat_name};")
                     if cat_entry.get("backing_table"):
                         drop_ddls.append(f"DROP TABLE IF EXISTS {cat_entry['backing_table']};")
