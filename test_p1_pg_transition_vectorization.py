@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 """
-Comprehensive unit and integration tests for PostgreSQL statement-level
-transition-table trigger vectorization (pg_use_transition_tables + pg_vectorize_transition_tables).
+PostgreSQL statement-level maintenance (transition tables): code shape and
+emulated semantics.
 
-Verifies:
-1. DDL inspection:
-   - Default pg_vectorize_transition_tables=True eliminates PL/pgSQL row-by-row loops
-     (FOR NEW/OLD IN SELECT * FROM __mv_*_rows LOOP) in favor of genuine set-based SQL.
-   - Trigger ordering invariant from 5f2f0be: In AFTER UPDATE (au), OLD minus deltas
-     and NEW plus deltas/upserts execute before zero-count cleanup.
-   - Fallback loop path is preserved when pg_vectorize_transition_tables=False.
-2. PostgreSQL dialect syntax validation via sqlglot for all generated DDL.
-3. Behavior and semantics:
-   - Multi-row batch INSERT / UPDATE / DELETE.
-   - Multi-row PK swaps in a single UPDATE statement.
-   - Self-cancelling deltas (+1 and -1 in same statement).
-   - Multi-row updates collapsing into the same group.
-   - NULL group keys with canonical PK surrogate.
-   - Count hitting zero & re-inserting in same statement.
-   - Distinct auxiliary table refcounts (COUNT(DISTINCT)).
-   - Tier 1 projection, Tier 1 aggregation, Tier 1 joins, Tier 2 group-scoped, Tier 3 atomic sync.
-4. Live PostgreSQL verification if POSTGRES_DSN is available.
+1. DDL structure for every strategy: statement-level triggers only (no row
+   trigger, no row loop), an early return on an empty transition table, one
+   consolidated signed delta (UPDATE = old -1 UNION ALL new +1), key-ordered
+   upserts, empty-group deletes restricted to retracted keys, native
+   recomputes in a statement after the lock statement, a per-view lock row
+   for group-scoped and full recomputes, and the partition install block.
+2. sqlglot parses every generated statement as PostgreSQL.
+3. Behaviour through TranspiledConnectionAdapter (an EMULATION: SQLite row
+   triggers run the set-based body for one-row deltas). Native semantics are
+   in test_native_bulk_statements.py and test_pg_statement_maintenance.py.
+4. A native check of expression GROUP BY recomputes when POSTGRES_DSN is set.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import re
 import unittest
@@ -45,360 +40,169 @@ from matview_sync import (
 from test_matview_sync import TranspiledConnectionAdapter
 
 
-class TestPGTransitionTableVectorizationDDL(unittest.TestCase):
-    """DDL inspection and structural tests for transition-table vectorization."""
+def _functions(plan: MaterializedViewPlan) -> dict:
+    """Trigger function DDL by suffix (ai, au, ad, trunc) for a single-source view."""
+    out = {}
+    for ddl in plan.trigger_ddls:
+        m = re.match(r"CREATE OR REPLACE FUNCTION \S+_(ai|au|ad|trunc)\(\)", ddl)
+        if m and "fn_readonly_" not in ddl:
+            out[m.group(1)] = ddl
+    return out
 
-    def test_tier1_aggregation_vectorized_ddl_structure(self) -> None:
-        schema = """
-        CREATE TABLE sales (
-            id INT PRIMARY KEY,
-            region VARCHAR(32) NOT NULL,
-            amount NUMERIC(10, 2) NOT NULL,
-            qty INT NOT NULL
-        );
-        """
-        view = """
-        CREATE VIEW regional_sales AS
-        SELECT region, COUNT(*) AS cnt, SUM(amount) AS total_amount, AVG(qty) AS avg_qty
-        FROM sales
-        GROUP BY region;
-        """
-        plan = generate_materialized_view(
-            schema,
-            view,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
+
+def _body(fn_ddl: str) -> str:
+    m = re.search(r"END IF;\n(.*)\n    RETURN NULL;\nEND;", fn_ddl, flags=re.S)
+    assert m, fn_ddl
+    return m.group(1)
+
+
+SALES = """
+CREATE TABLE sales (
+    id INT PRIMARY KEY,
+    region VARCHAR(32),
+    amount NUMERIC(10, 2) NOT NULL,
+    qty INT NOT NULL
+);
+"""
+
+
+class TestPGStatementLevelDDL(unittest.TestCase):
+    def _plan(self, view: str, schema: str = SALES) -> MaterializedViewPlan:
+        return generate_materialized_view(schema, view, dialect=Dialect.POSTGRES, ignore_limitations=True)
+
+    def assert_statement_level_only(self, plan: MaterializedViewPlan) -> None:
+        ddls = "\n".join(plan.trigger_ddls)
+        self.assertNotIn("FOR EACH ROW", ddls)
+        self.assertNotRegex(ddls, r"FOR\s+(NEW|OLD)\s+IN\s+SELECT")
+        self.assertNotIn("skip_triggers", ddls)
+        triggers = [d for d in plan.trigger_ddls if d.startswith("CREATE TRIGGER")]
+        events = sorted(re.search(r"AFTER (\w+)", t).group(1) for t in triggers)  # type: ignore[union-attr]
+        n_sources = len(plan.view_spec.referenced_tables)
+        self.assertEqual(events, sorted(["DELETE", "INSERT", "TRUNCATE", "UPDATE"] * n_sources))
+        for t in triggers:
+            self.assertIn("FOR EACH STATEMENT", t)
+            if "TRUNCATE" not in t:
+                self.assertIn("REFERENCING", t)
+        self.assertEqual(sum(d.startswith("DO $mv_install$") for d in plan.trigger_ddls), n_sources)
+        for suffix, fn in _functions(plan).items():
+            if suffix != "trunc":
+                table = "__mv_old_rows" if suffix == "ad" else "__mv_new_rows"
+                self.assertIn(f"IF NOT EXISTS (SELECT 1 FROM {table}) THEN\n        RETURN NULL;", fn)
+
+    def test_grouped_aggregate_signed_ordered_restricted(self) -> None:
+        plan = self._plan(
+            "CREATE VIEW v AS SELECT region, COUNT(*) AS cnt, SUM(amount) AS total, MIN(qty) AS lo "
+            "FROM sales GROUP BY region;"
         )
         self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
-        ddls = "\n\n".join(plan.trigger_ddls)
+        self.assert_statement_level_only(plan)
+        fns = _functions(plan)
+        au = _body(fns["au"])
+        # One consolidated signed delta: both transition tables in one relation.
+        self.assertRegex(au, r"SELECT -1 AS __mv_s, __mv_o\.\* FROM __mv_old_rows AS __mv_o\s+UNION ALL\s+SELECT 1 AS __mv_s")
+        upsert, rest = au.split(";", 1)
+        self.assertRegex(upsert, r"(?s)GROUP BY .*\n    ORDER BY .*\n    ON CONFLICT")
+        # Empty-group delete restricted to retracted keys, after the upsert.
+        self.assertRegex(rest, r"DELETE FROM __matview_store_v\s+WHERE __matview_store_v\.__mv_pk IN \(SELECT .*")
+        self.assertIn("WHERE __mv_p.__mv_s < 0)", rest)
+        # MIN recompute: its own UPDATE statement after the upsert, only for
+        # groups whose retracted value reaches the stored minimum.
+        self.assertNotIn("SELECT MIN(", upsert)
+        self.assertRegex(rest, r"(?s)UPDATE __matview_store_v SET\s+lo = CASE WHEN \(__mv_r\.__mv_r0 IS NOT NULL")
+        # Insert-only statements never retract: no delete, no recompute.
+        ai = _body(fns["ai"])
+        self.assertNotIn("DELETE FROM", ai)
+        self.assertNotIn("UPDATE __matview_store_v", ai)
+        self.assertNotIn("__mv_old_rows", ai)
 
-        # No row-by-row loops in vectorized mode
-        self.assertNotIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", ddls)
-        self.assertNotIn("FOR OLD IN SELECT * FROM __mv_old_rows LOOP", ddls)
-        self.assertNotIn("LOOP", ddls)
-
-        # AI trigger function: set-based INSERT ... ON CONFLICT DO UPDATE
-        ai_ddl = [d for d in plan.trigger_ddls if "_ai()" in d][0]
-        self.assertIn("INSERT INTO __matview_store_regional_sales", ai_ddl)
-        self.assertIn("FROM __mv_new_rows", ai_ddl)
-        self.assertIn("GROUP BY", ai_ddl)
-        self.assertIn("ON CONFLICT (region) DO UPDATE SET", ai_ddl)
-
-        # AD trigger function: set-based UPDATE ... FROM __mv_old_rows and DELETE count <= 0
-        ad_ddl = [d for d in plan.trigger_ddls if "_ad()" in d][0]
-        self.assertIn("UPDATE __matview_store_regional_sales", ad_ddl)
-        self.assertIn("FROM (", ad_ddl)
-        self.assertIn("FROM __mv_old_rows", ad_ddl)
-        self.assertIn("DELETE FROM __matview_store_regional_sales WHERE cnt <= 0;", ad_ddl)
-
-        # AU trigger function: OLD update -> NEW upsert -> cleanup
-        au_ddl = [d for d in plan.trigger_ddls if "_au()" in d][0]
-        pos_old = au_ddl.find("__mv_old_rows")
-        pos_new = au_ddl.find("__mv_new_rows")
-        pos_clean = au_ddl.find("DELETE FROM __matview_store_regional_sales WHERE cnt <= 0;")
-
-        self.assertNotEqual(pos_old, -1)
-        self.assertNotEqual(pos_new, -1)
-        self.assertNotEqual(pos_clean, -1)
-        self.assertLess(pos_old, pos_new, "OLD minus update must precede NEW plus upsert")
-        self.assertLess(pos_new, pos_clean, "NEW plus upsert must precede zero-count cleanup")
-
-    def test_expression_group_supported_aggregates_remain_vectorized(self) -> None:
-        """Expression GROUP BY keys remain set-based when no native recomputation is needed."""
-        schema = """
-        CREATE TABLE orders (
-            id INT PRIMARY KEY,
-            region TEXT,
-            amount REAL NOT NULL
-        );
-        """
-        view = """
-        CREATE VIEW region_stats AS
-        SELECT
-            COALESCE(region, 'UNK') AS region_norm,
-            COUNT(*) AS row_count,
-            SUM(amount) AS total_amount
-        FROM orders
-        GROUP BY COALESCE(region, 'UNK');
-        """
-        plan = generate_materialized_view(
-            schema,
-            view,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
+    def test_expression_group_key_native_recompute_is_set_based(self) -> None:
+        plan = self._plan(
+            "CREATE VIEW v AS SELECT COALESCE(region, 'UNK') AS r, AVG(amount) AS a, VAR_POP(qty) AS vq "
+            "FROM sales GROUP BY COALESCE(region, 'UNK');"
         )
-        ai_ddl = next(d for d in plan.trigger_ddls if "_ai()" in d)
+        self.assert_statement_level_only(plan)
+        ai = _body(_functions(plan)["ai"])
+        # Natively recomputed per affected group, correlated with the stored
+        # group column (not with a raw transition-table column).
+        self.assertRegex(ai, r"(?s)UPDATE __matview_store_v SET\s+a = [^\n]*\(SELECT AVG\(amount\) FROM sales WHERE")
+        self.assertIn("__matview_store_v.r", ai)
 
-        self.assertNotIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", ai_ddl)
-        self.assertIn("COUNT(*) AS row_count", ai_ddl)
-        self.assertIn("SUM(__mv_new_rows.amount) AS total_amount", ai_ddl)
-        self.assertIn("GROUP BY COALESCE(__mv_new_rows.region, 'UNK')", ai_ddl)
+    def test_projection_keyed_by_source_primary_key(self) -> None:
+        plan = self._plan("CREATE VIEW v AS SELECT id, region, amount FROM sales WHERE qty > 0;")
+        self.assert_statement_level_only(plan)
+        au = _body(_functions(plan)["au"])
+        self.assertRegex(au, r"(?s)^\s*DELETE FROM __matview_store_v\s+WHERE .* IN \(SELECT .*\)\s+AND NOT .* IN \(SELECT")
+        self.assertRegex(au, r"ORDER BY __mv_p\.__mv_k0\n    ON CONFLICT \(id\) DO UPDATE SET")
 
-    def test_expression_group_native_recomputation_uses_row_loop_fallback(self) -> None:
-        """Native AVG/statistical recomputation must not correlate raw transition columns."""
-        schema = """
-        CREATE TABLE orders (
-            id INT PRIMARY KEY,
-            region TEXT,
-            amount REAL NOT NULL
-        );
-        """
-        view = """
-        CREATE VIEW region_stats AS
-        SELECT
-            COALESCE(region, 'UNK') AS region_norm,
-            AVG(amount) AS avg_amount,
-            VAR_POP(amount) AS var_amount
-        FROM orders
-        GROUP BY COALESCE(region, 'UNK');
-        """
-        plan = generate_materialized_view(
+    def test_distinct_aux_tables_follow_the_group_upsert(self) -> None:
+        plan = self._plan("CREATE VIEW v AS SELECT region, COUNT(DISTINCT qty) AS dq FROM sales GROUP BY region;")
+        self.assert_statement_level_only(plan)
+        au = _body(_functions(plan)["au"])
+        aux = plan.auxiliary_table_names[0]
+        self.assertLess(au.index("INSERT INTO __matview_store_v"), au.index(f"INSERT INTO {aux}"))
+        self.assertIn(f"DELETE FROM {aux}", au)
+        self.assertIn(f"{aux}.__ref_cnt <= 0", au)
+
+    def test_join_aggregate_joins_the_signed_delta(self) -> None:
+        schema = SALES + "CREATE TABLE regions (region VARCHAR(32) PRIMARY KEY, zone VARCHAR(8) NOT NULL);"
+        plan = self._plan(
+            "CREATE VIEW v AS SELECT r.zone, SUM(s.amount) AS total, COUNT(*) AS c "
+            "FROM sales s JOIN regions r ON s.region = r.region GROUP BY r.zone;",
             schema,
-            view,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
-        )
-        ai_ddl = next(d for d in plan.trigger_ddls if "_ai()" in d)
-        ad_ddl = next(d for d in plan.trigger_ddls if "_ad()" in d)
-        au_ddl = next(d for d in plan.trigger_ddls if "_au()" in d)
-
-        self.assertIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", ai_ddl)
-        self.assertIn("FOR OLD IN SELECT * FROM __mv_old_rows LOOP", ad_ddl)
-        self.assertIn("FOR OLD IN SELECT * FROM __mv_old_rows LOOP", au_ddl)
-        self.assertIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", au_ddl)
-        self.assertNotIn(
-            "IS NOT DISTINCT FROM (COALESCE(__mv_new_rows.region, 'UNK'))",
-            ai_ddl,
-        )
-
-    def test_tier1_projection_vectorized_ddl_structure(self) -> None:
-        schema = """
-        CREATE TABLE users (
-            id INT PRIMARY KEY,
-            username VARCHAR(64) NOT NULL,
-            email VARCHAR(128) NOT NULL
-        );
-        """
-        view = "CREATE VIEW active_users AS SELECT id, username FROM users;"
-        plan = generate_materialized_view(
-            schema,
-            view,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
         )
         self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
-        ddls = "\n\n".join(plan.trigger_ddls)
+        self.assert_statement_level_only(plan)
+        ddls = "\n".join(plan.trigger_ddls)
+        self.assertRegex(ddls, r"FROM \(\s+SELECT 1 AS __mv_s, __mv_n\.\* FROM __mv_new_rows AS __mv_n\s+\) AS s\s+INNER JOIN regions AS r")
 
-        self.assertNotIn("LOOP", ddls)
-        ai_ddl = [d for d in plan.trigger_ddls if "_ai()" in d][0]
-        self.assertIn("INSERT INTO __matview_store_active_users", ai_ddl)
-        self.assertIn("FROM __mv_new_rows", ai_ddl)
-        self.assertIn("ON CONFLICT (id) DO UPDATE SET", ai_ddl)
-
-        au_ddl = [d for d in plan.trigger_ddls if "_au()" in d][0]
-        self.assertIn("INSERT INTO __matview_store_active_users", au_ddl)
-        self.assertIn("DELETE FROM __matview_store_active_users", au_ddl)
-        self.assertIn("USING __mv_old_rows", au_ddl)
-        self.assertIn("NOT EXISTS", au_ddl)
-
-    def test_tier1_distinct_aux_tables_vectorized_ddl(self) -> None:
-        schema = """
-        CREATE TABLE web_events (
-            id INT PRIMARY KEY,
-            domain VARCHAR(64) NOT NULL,
-            visitor_id INT NOT NULL
-        );
-        """
-        view = """
-        CREATE VIEW domain_visitors AS
-        SELECT domain, COUNT(DISTINCT visitor_id) AS unique_visitors
-        FROM web_events
-        GROUP BY domain;
-        """
-        plan = generate_materialized_view(
-            schema,
-            view,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
-        )
-        ddls = "\n\n".join(plan.trigger_ddls)
-        self.assertNotIn("LOOP", ddls)
-
-        # Aux table refcount maintenance is set-based
-        self.assertIn("ON CONFLICT (domain, __val) DO UPDATE SET", ddls)
-        self.assertIn("DELETE FROM __matview_dist_domain_visitors__unique_visitors WHERE __ref_cnt <= 0;", ddls)
-
-    def test_tier1_join_algebraic_vectorized_ddl(self) -> None:
-        schema = """
-        CREATE TABLE departments (
-            dept_id INT PRIMARY KEY,
-            dept_name VARCHAR(64) NOT NULL
-        );
-        CREATE TABLE employees (
-            emp_id INT PRIMARY KEY,
-            dept_id INT NOT NULL,
-            salary NUMERIC(10, 2) NOT NULL
-        );
-        """
-        view = """
-        CREATE VIEW dept_salaries AS
-        SELECT d.dept_name, COUNT(*) AS emp_cnt, SUM(e.salary) AS total_sal
-        FROM departments d
-        JOIN employees e ON d.dept_id = e.dept_id
-        GROUP BY d.dept_name;
-        """
-        plan = generate_materialized_view(
-            schema,
-            view,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
-        )
-        self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
-        ddls = "\n\n".join(plan.trigger_ddls)
-        self.assertNotIn("LOOP", ddls)
-
-        # Trigger on departments uses __mv_new_rows AS d in FROM clause
-        ai_ddl = [d for d in plan.trigger_ddls if "departments_ai" in d][0]
-        self.assertIn("__mv_new_rows AS d", ai_ddl)
-        self.assertIn("ON CONFLICT (dept_name) DO UPDATE SET", ai_ddl)
-
-    def test_tier2_group_scoped_vectorized_ddl(self) -> None:
-        schema = """
-        CREATE TABLE categories (
-            cat_id INT PRIMARY KEY,
-            cat_name VARCHAR(32) NOT NULL
-        );
-        CREATE TABLE products (
-            prod_id INT PRIMARY KEY,
-            cat_id INT NOT NULL,
-            prod_name VARCHAR(64) NOT NULL
-        );
-        """
-        # Tier 2: holistic aggregate STRING_AGG falls back to GROUP_SCOPED_DELTA
-        view = """
-        CREATE VIEW cat_prod_names AS
-        SELECT c.cat_name, STRING_AGG(p.prod_name, ',') AS names
-        FROM categories c
-        JOIN products p ON c.cat_id = p.cat_id
-        GROUP BY c.cat_name;
-        """
-        plan = generate_materialized_view(
-            schema,
-            view,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
-        )
-        self.assertEqual(plan.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA)
-        ddls = "\n\n".join(plan.trigger_ddls)
-        self.assertNotIn("LOOP", ddls)
-        self.assertIn("EXISTS (SELECT 1 FROM __mv_new_rows", ddls)
-
-    def test_fallback_when_vectorization_disabled(self) -> None:
-        schema = """
-        CREATE TABLE items (
-            id INT PRIMARY KEY,
-            cat VARCHAR(32) NOT NULL,
-            qty INT NOT NULL
-        );
-        """
-        view = "CREATE VIEW item_summary AS SELECT cat, SUM(qty) AS tot FROM items GROUP BY cat;"
-        plan = generate_materialized_view(
-            schema,
-            view,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=False,
-        )
-        ddls = "\n\n".join(plan.trigger_ddls)
-        self.assertIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", ddls)
-        self.assertIn("FOR OLD IN SELECT * FROM __mv_old_rows LOOP", ddls)
+    def test_recompute_strategies_take_the_view_lock_first(self) -> None:
+        for view in (
+            "CREATE VIEW v AS SELECT id, region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY id) AS rn FROM sales;",
+            "CREATE VIEW v AS SELECT region, STRING_AGG(CAST(id AS TEXT), ',') AS ids FROM sales GROUP BY region;",
+        ):
+            with self.subTest(view=view):
+                plan = self._plan(view)
+                self.assertIn(plan.strategy, (MaintenanceStrategy.GROUP_SCOPED_DELTA, MaintenanceStrategy.ATOMIC_QUERY_SYNC))
+                self.assert_statement_level_only(plan)
+                self.assertIn("__matview_lock_v", plan.auxiliary_table_names)
+                for suffix, fn in _functions(plan).items():
+                    body = _body(fn) if suffix != "trunc" else fn
+                    lock = body.index("INSERT INTO __matview_lock_v")
+                    self.assertLess(lock, body.index("DELETE FROM __matview_store_v"), suffix)
 
     def test_sqlglot_postgres_syntax_validity(self) -> None:
-        """Parse all generated PL/pgSQL SQL statements with sqlglot on postgres dialect."""
-        schema = """
-        CREATE TABLE metrics (
-            id INT PRIMARY KEY,
-            tag VARCHAR(32),
-            val DOUBLE PRECISION NOT NULL,
-            flag BOOLEAN NOT NULL
-        );
-        """
-        view = """
-        CREATE VIEW metrics_summary AS
-        SELECT
-            tag,
-            COUNT(*) AS row_cnt,
-            SUM(val) AS sum_val,
-            MIN(val) AS min_val,
-            MAX(val) AS max_val,
-            BOOL_AND(flag) AS all_flags,
-            BOOL_OR(flag) AS any_flags
-        FROM metrics
-        GROUP BY tag;
-        """
-        plan = generate_materialized_view(
-            schema,
-            view,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
-        )
+        """Every statement of every trigger function body parses as PostgreSQL."""
+        schema = SALES + "CREATE TABLE regions (region VARCHAR(32) PRIMARY KEY, zone VARCHAR(8) NOT NULL);"
+        views = [
+            "CREATE VIEW v1 AS SELECT region, COUNT(*) AS c, SUM(amount) AS s, AVG(qty) AS a, MAX(qty) AS hi FROM sales GROUP BY region;",
+            "CREATE VIEW v2 AS SELECT id, region FROM sales WHERE qty > 1;",
+            "CREATE VIEW v3 AS SELECT DISTINCT region FROM sales;",
+            "CREATE VIEW v4 AS SELECT r.zone, COUNT(*) AS c FROM sales s JOIN regions r ON s.region = r.region GROUP BY r.zone;",
+            "CREATE VIEW v5 AS SELECT region, COUNT(DISTINCT qty) AS dq FROM sales GROUP BY region;",
+            "CREATE VIEW v6 AS SELECT region FROM sales UNION SELECT region FROM regions;",
+        ]
+        for view in views:
+            plan = self._plan(view, schema)
+            for ddl in plan.trigger_ddls:
+                m = re.search(r"AS \$\$(.*)\$\$ LANGUAGE plpgsql", ddl, flags=re.S)
+                if not m:
+                    continue
+                body = re.sub(r"(?s)^\s*BEGIN\s*(IF NOT EXISTS .*?END IF;)?", "", m.group(1))
+                body = re.sub(r"(?s)RETURN NULL;\s*END;\s*$", "", body)
+                for stmt in _split_top_level(body, ";"):
+                    if stmt.strip() and stmt.strip().upper() not in ("BEGIN",):
+                        try:
+                            sqlglot.parse(stmt, read="postgres")
+                        except Exception as exc:  # pragma: no cover - failure path
+                            self.fail(f"sqlglot cannot parse {stmt!r}: {exc}")
 
-        for ddl in plan.trigger_ddls:
-            # Check function definition
-            m_fn = re.search(r"BEGIN\s*(.*?)\s*RETURN NULL;\s*END;", ddl, flags=re.I | re.S)
-            if m_fn:
-                body = m_fn.group(1).strip()
-                for stmt in body.split(";"):
-                    s = stmt.strip()
-                    if not s:
-                        continue
-                    # Parse each inner SQL statement with sqlglot postgres parser
-                    try:
-                        parsed = sqlglot.parse(s, read="postgres")
-                        self.assertTrue(len(parsed) > 0, f"Failed to parse statement: {s}")
-                    except Exception as exc:
-                        self.fail(f"sqlglot postgres dialect failed to parse: {s}\nError: {exc}")
-
-    def test_cli_flags_vectorize_option(self) -> None:
-        """Verify CLI parser honors --pg-transition-tables and --no-pg-vectorize-transition-tables."""
-        schema = """
-        CREATE TABLE t (id INT PRIMARY KEY, grp INT, v INT);
-        """
-        view = "CREATE VIEW v AS SELECT grp, SUM(v) AS tot FROM t GROUP BY grp;"
-
-        import io
-        from contextlib import redirect_stdout
-
-        out_vec = io.StringIO()
-        with redirect_stdout(out_vec):
-            cli_main([
-                "--schema", schema,
-                "--view", view,
-                "--dialect", "postgres",
-                "--pg-transition-tables",
-            ])
-        sql_vec = out_vec.getvalue()
-        self.assertNotIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", sql_vec)
-
-        out_loop = io.StringIO()
-        with redirect_stdout(out_loop):
-            cli_main([
-                "--schema", schema,
-                "--view", view,
-                "--dialect", "postgres",
-                "--pg-transition-tables",
-                "--no-pg-vectorize-transition-tables",
-            ])
-        sql_loop = out_loop.getvalue()
-        self.assertIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", sql_loop)
+    def test_cli_rejects_removed_transition_table_flags(self) -> None:
+        for flag in ("--pg-transition-tables", "--no-pg-vectorize-transition-tables"):
+            with self.subTest(flag=flag):
+                with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                    cli_main(["--schema", SALES, "--view", "CREATE VIEW v AS SELECT region FROM sales;",
+                              "--dialect", "postgres", flag])
+                self.assertIn("unrecognized arguments", err.getvalue())
 
 
 class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
@@ -437,8 +241,6 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
             schema_sql,
             view_sql,
             dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
         )
         for ddl in plan.create_structure_statements() + plan.trigger_ddls:
             self.cur.execute(ddl)
@@ -464,43 +266,9 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
         self.cur.execute("SELECT warehouse, item_cnt, total_qty FROM wh_totals ORDER BY warehouse;")
         self.assertEqual(self.cur.fetchall(), [])
 
-    def test_single_statement_pk_swap(self) -> None:
-        """In-statement swap of primary key / group key values."""
-        # SQLite base table omits UNIQUE constraint on the base table so SQLite doesn't fail
-        # the in-place UPDATE with an immediate uniqueness check; the MV table retains the PK.
-        db_schema = """
-        CREATE TABLE bins (
-            bin_id INT,
-            val INT NOT NULL
-        );
-        """
-        plan_schema = """
-        CREATE TABLE bins (
-            bin_id INT PRIMARY KEY,
-            val INT NOT NULL
-        );
-        """
-        view_sql = "CREATE VIEW bin_view AS SELECT bin_id, val FROM bins;"
-        self._execute_script(db_schema)
-        plan = generate_materialized_view(
-            plan_schema,
-            view_sql,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
-        )
-        for ddl in plan.create_structure_statements() + plan.trigger_ddls:
-            self.cur.execute(ddl)
-
-        self.cur.execute("INSERT INTO bins VALUES (1, 100), (2, 200);")
-        self.cur.execute("SELECT bin_id, val FROM bin_view ORDER BY bin_id;")
-        self.assertEqual(self.cur.fetchall(), [(1, 100), (2, 200)])
-
-        # Swap bin_id 1 <-> 2 in a single statement
-        self.cur.execute("UPDATE bins SET bin_id = CASE WHEN bin_id = 1 THEN 2 ELSE 1 END;")
-        self.cur.execute("SELECT bin_id, val FROM bin_view ORDER BY bin_id;")
-        # Row 1 now has 200, row 2 now has 100
-        self.assertEqual(self.cur.fetchall(), [(1, 200), (2, 100)])
+    # A single-statement primary-key swap is a statement-level property: the
+    # per-row emulation cannot represent it. Native coverage:
+    # test_pg_statement_maintenance.py::test_primary_key_permutations.
 
     def test_null_group_keys_with_canonical_pk(self) -> None:
         """NULL group key handling with surrogate canonical PK."""
@@ -522,8 +290,6 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
             schema_sql,
             view_sql,
             dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
         )
         for ddl in plan.create_structure_statements() + plan.trigger_ddls:
             self.cur.execute(ddl)
@@ -564,8 +330,6 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
             schema_sql,
             view_sql,
             dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
         )
         for ddl in plan.create_structure_statements() + plan.trigger_ddls:
             self.cur.execute(ddl)
@@ -587,7 +351,7 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
         self.cur.execute("SELECT page, reach FROM page_reach ORDER BY page;")
         self.assertEqual(self.cur.fetchall(), [("faq", 1), ("home", 1)])
 
-    def test_native_avg_recompute_with_expression_group_key_uses_safe_row_loop(self) -> None:
+    def test_native_avg_recompute_with_expression_group_key_is_set_based(self) -> None:
         """Expression GROUP BY plus native AVG recomputation must not correlate an ungrouped raw column."""
         schema_sql = """
         CREATE TABLE orders (
@@ -613,14 +377,12 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
             schema_sql,
             view_sql,
             dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
         )
         fn_sql = "\n".join(
             statement for statement in plan.trigger_ddls
             if "CREATE OR REPLACE FUNCTION" in statement
         )
-        self.assertIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", fn_sql)
+        self.assertNotRegex(fn_sql, r"FOR\s+(NEW|OLD)\s+IN\s+SELECT")
 
         for ddl in plan.create_structure_statements() + plan.trigger_ddls:
             self.cur.execute(ddl)
@@ -676,8 +438,6 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
             schema_sql,
             view_sql,
             dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
         )
         fn_sql = "\n".join(
             statement for statement in plan.trigger_ddls
@@ -728,8 +488,6 @@ class TestPGTransitionTableVectorizationSemantics(unittest.TestCase):
             schema_sql,
             view_sql,
             dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
         )
         fn_sql = "\n".join(s for s in plan.trigger_ddls if "CREATE OR REPLACE FUNCTION" in s)
         self.assertIn("(__mv_pk, org, cnt, sb, ab, __mv_cnt_sb_1)", fn_sql)
@@ -775,8 +533,6 @@ class TestNativePGTransitionTableVectorizationSemantics(unittest.TestCase):
                     schema_sql,
                     view_sql,
                     dialect=Dialect.POSTGRES,
-                    pg_use_transition_tables=True,
-                    pg_vectorize_transition_tables=True,
                 )
                 for ddl in plan.create_structure_statements() + plan.trigger_ddls:
                     cur.execute(ddl)

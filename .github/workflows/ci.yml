@@ -512,6 +512,11 @@ jobs:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
         run: pytest -v -rxXs test_native_bulk_statements.py
 
+      - name: Test PostgreSQL statement-level maintenance contract
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+        run: pytest -v -rxXs -s test_pg_statement_maintenance.py
+
       - name: Test atomic MV replacement (PostgreSQL)
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"

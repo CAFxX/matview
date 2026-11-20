@@ -11,6 +11,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from .._host import MixinHost
+from ..dialects.pg_statement import SIGN, PgAggregateSpec, PgDeltaSource
 from ..engines import (
     AggFunc,
     Dialect,
@@ -697,6 +698,58 @@ class Tier1JoinMixin(MixinHost):
         )
         having_non_empty = "" if grp_exprs else "\nHAVING COUNT(*) > 0"
 
+        # PostgreSQL statement-level maintenance: the signed delta of the
+        # firing table joined with the other sources' current state.
+        pg_group_aliases = {self._group_col_alias(g).lower() for g in grp_exprs}
+        pg_spec = PgAggregateSpec(
+            mv_table=mv_table,
+            row_count_col=row_count_col,
+            items=work_items,
+            grp_exprs=grp_exprs,
+            has_nullable_grp=has_nullable_grp,
+            pk_cols=pk_cols,
+            nonnull_map=col_nonnull_count_map,
+            sum_map=col_sum_map,
+            sum2_map=col_sum2_map,
+            tcnt_map=col_true_cnt_map,
+            distinct_aux={},
+            value_key=_expr_key,
+            recompute=_build_join_recompute_subquery,
+            native_recompute=_join_needs_native_recompute,
+        )
+
+        def _pg_join_source(delta_alias: str) -> PgDeltaSource:
+            def _from(signed: str) -> str:
+                parts: List[str] = []
+                for idx, jj in enumerate(self.view.joins):
+                    if jj.alias.lower() == delta_alias.lower():
+                        tbl_sql = f"(\n        {signed}\n        ) AS {self._q(jj.alias)}"
+                    else:
+                        tbl_sql = f"{self._q(jj.table_name)} AS {self._q(jj.alias)}"
+                    if idx == 0:
+                        parts.append(tbl_sql)
+                    else:
+                        on_sql = f" ON {self._qualify_join_expr(jj.on_condition)}" if jj.on_condition else ""
+                        parts.append(f"{jj.join_type} {tbl_sql}{on_sql}")
+                return "\n        ".join(parts)
+
+            return PgDeltaSource(
+                from_sql=_from,
+                sign=f"{self._q(delta_alias)}.{SIGN}",
+                where=qual_where,
+                keys=qual_grp_exprs,
+                values={
+                    _expr_key(it): self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                    for it in work_items
+                    if it.is_aggregate
+                },
+                extras={
+                    it.alias.lower(): self._qualify_join_expr(it.raw_expr)
+                    for it in work_items
+                    if not it.is_aggregate and it.alias.lower() not in pg_group_aliases
+                },
+            )
+
         trigger_ddls: List[str] = []
         trig_names: List[str] = []
         fn_names: List[str] = []
@@ -808,28 +861,10 @@ class Tier1JoinMixin(MixinHost):
             pg_ad_body: Optional[str] = None
             pg_au_body: Optional[str] = None
 
-            if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables:
-                from_vec_new = _build_join_from_clause(replace_alias=j_alias, rec_prefix="__mv_new_rows")
-                from_vec_old = _build_join_from_clause(replace_alias=j_alias, rec_prefix="__mv_old_rows")
-                vec_plus_stmt = (
-                    f"INSERT INTO {mv_table} ({', '.join(target_cols)})\n"
-                    f"    SELECT {', '.join(select_exprs)}\n"
-                    f"    FROM {from_vec_new}{where_sql}{group_sql}{having_non_empty}\n"
-                    f"    ON CONFLICT ({q_pk_cols_csv}) DO UPDATE SET\n"
-                    f"        {', '.join(plus_merge_assignments)};"
-                )
-                vec_minus_stmt = (
-                    f"UPDATE {mv_table}\n"
-                    f"    SET {', '.join(ordered_minus)}\n"
-                    f"    FROM (\n"
-                    f"        SELECT {aliased_delta_select}\n"
-                    f"        FROM {from_vec_old}{where_sql}{group_sql}{having_non_empty}\n"
-                    f"    ) AS __mv_delta\n"
-                    f"    WHERE {delta_pk_match};"
-                )
-                pg_ai_body = vec_plus_stmt
-                pg_ad_body = f"{vec_minus_stmt}\n{del_zero_stmt}" if del_zero_stmt else vec_minus_stmt
-                pg_au_body = f"{vec_minus_stmt}\n{vec_plus_stmt}\n{del_zero_stmt}" if del_zero_stmt else f"{vec_minus_stmt}\n{vec_plus_stmt}"
+            if self.dialect == Dialect.POSTGRES:
+                trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
+                pg_bodies = self._pg_aggregate_bodies(pg_spec, [_pg_join_source(j_alias)])
+                pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
 
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
                 view_name=view_name,

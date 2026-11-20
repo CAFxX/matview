@@ -483,74 +483,23 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
     # Dialect emission checks: PostgreSQL and MySQL atomic RENAME
     # -------------------------------------------------------------------------
 
-    def test_postgres_atomic_shadow_swap_sql_emission(self) -> None:
-        """PostgreSQL shadow swap must emit ALTER TABLE live RENAME TO old,
+    def test_postgres_bulk_changes_suspending_modes_are_refused_before_any_sql(self) -> None:
+        """PostgreSQL never suspends its statement-level maintenance, so the
+        shadow swap and drop_triggers modes are refused before any SQL."""
+        class NoSqlConnection:
+            in_transaction = False
 
-        ALTER TABLE shadow RENAME TO live, CREATE OR REPLACE VIEW (never DROP VIEW),
-        and DROP TABLE IF EXISTS old for backing and auxiliary tables.
-        """
-        schema = "CREATE TABLE orders (id INT PRIMARY KEY, region TEXT, amount NUMERIC);"
-        v_sql = "CREATE VIEW v_regional_orders AS SELECT region, COUNT(DISTINCT amount) AS da, SUM(amount) AS tot FROM orders GROUP BY region;"
+            def cursor(self):
+                raise AssertionError("bulk_changes issued SQL for a refused PostgreSQL mode")
 
-        plan = generate_materialized_view(schema, v_sql, dialect=Dialect.POSTGRES, ignore_limitations=True)
-
-        # Create manager instance with postgres dialect hint
-        mock_conn = MagicMock()
         mgr = MaterializedViewManager.__new__(MaterializedViewManager)
-        mgr.conn = mock_conn
+        mgr.conn = NoSqlConnection()
         mgr.dialect = Dialect.POSTGRES
-        mgr.engine_version = parse_engine_version("postgres:16")
-        mgr.object_prefix = "__matview_"
-        mgr.catalog_table = "__matview_catalog"
-        mgr.pg_use_transition_tables = False
-
-        shadow_tbl = mgr._shadow_name(plan.backing_table_name)
-        shadow_aux_map = {aux: mgr._shadow_name(aux) for aux in plan.auxiliary_table_names}
-
-        swap_sqls = mgr._build_shadow_swap_sqls(plan, shadow_tbl, shadow_aux_map)
-
-        # 1. Assert DROP VIEW is NEVER emitted for PostgreSQL
-        for sql in swap_sqls:
-            self.assertFalse(
-                re.search(r"\bDROP\s+VIEW\b", sql, re.IGNORECASE),
-                f"PostgreSQL shadow swap must never drop public view! Found: {sql}",
-            )
-
-        # 2. Assert CREATE OR REPLACE VIEW is emitted
-        has_create_or_replace_view = any(
-            re.search(r"^\s*CREATE\s+OR\s+REPLACE\s+VIEW\s+v_regional_orders\b", s, re.IGNORECASE)
-            for s in swap_sqls
-        )
-        self.assertTrue(
-            has_create_or_replace_view,
-            f"Expected CREATE OR REPLACE VIEW in swap_sqls: {swap_sqls}",
-        )
-
-        # 3. Assert backing table rename live -> old, shadow -> live, drop old
-        old_backing = mgr._old_name(plan.backing_table_name)
-        self.assertIn(f"ALTER TABLE {plan.backing_table_name} RENAME TO {old_backing};", swap_sqls)
-        self.assertIn(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};", swap_sqls)
-        self.assertIn(f"DROP TABLE IF EXISTS {old_backing};", swap_sqls)
-
-        # 4. Assert auxiliary tables rename live -> old, shadow -> live, drop old
-        for aux, s_aux in shadow_aux_map.items():
-            old_aux = mgr._old_name(aux)
-            self.assertIn(f"ALTER TABLE {aux} RENAME TO {old_aux};", swap_sqls)
-            self.assertIn(f"ALTER TABLE {s_aux} RENAME TO {aux};", swap_sqls)
-            self.assertIn(f"DROP TABLE IF EXISTS {old_aux};", swap_sqls)
-
-        # 5. Verify ordering: RENAME live -> old, RENAME shadow -> live, CREATE OR REPLACE VIEW, DROP old
-        idx_rename_old = swap_sqls.index(f"ALTER TABLE {plan.backing_table_name} RENAME TO {old_backing};")
-        idx_rename_live = swap_sqls.index(f"ALTER TABLE {shadow_tbl} RENAME TO {plan.backing_table_name};")
-        idx_replace_view = next(
-            i for i, s in enumerate(swap_sqls) if re.search(r"^\s*CREATE\s+OR\s+REPLACE\s+VIEW\b", s, re.IGNORECASE)
-        )
-        # DROP old must appear AFTER CREATE OR REPLACE VIEW (or at the cleanup step)
-        idx_drop_old = [i for i, s in enumerate(swap_sqls) if s == f"DROP TABLE IF EXISTS {old_backing};"][-1]
-
-        self.assertLess(idx_rename_old, idx_rename_live)
-        self.assertLess(idx_rename_live, idx_replace_view)
-        self.assertLess(idx_replace_view, idx_drop_old)
+        for kwargs in ({"use_shadow_swap": True}, {"drop_triggers": True}):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(ValueError, "statement-level triggers maintain the views"):
+                    with mgr.bulk_changes(**kwargs):
+                        self.fail("entered a refused PostgreSQL bulk mode")
 
     def test_mysql_atomic_shadow_swap_sql_emission(self) -> None:
         """MySQL/MariaDB shadow swap must emit a single atomic RENAME TABLE statement
@@ -570,7 +519,6 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         mgr.engine_version = parse_engine_version("mysql:8.4")
         mgr.object_prefix = "__matview_"
         mgr.catalog_table = "__matview_catalog"
-        mgr.pg_use_transition_tables = False
 
         shadow_tbl = mgr._shadow_name(plan.backing_table_name)
         shadow_aux_map = {aux: mgr._shadow_name(aux) for aux in plan.auxiliary_table_names}
@@ -640,13 +588,10 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
                     with mgr.bulk_changes(**kwargs):
                         self.fail("entered a refused MySQL bulk mode")
 
-    def test_postgres_bulk_changes_execution_avoids_pre_delete_and_view_drop(self) -> None:
-        """Executing bulk_changes(use_shadow_swap=True) on PostgreSQL recording mock verifies
-
-        that live auxiliary tables are never deleted prior to shadow populate, populate
-        statements are redirected to shadow tables, and view is replaced atomically via
-        CREATE OR REPLACE VIEW without ever dropping the public view.
-        """
+    def test_postgres_bulk_changes_keeps_maintenance_and_only_owns_the_transaction(self) -> None:
+        """On PostgreSQL the block runs in one manager-owned transaction with the
+        statement-level triggers active: no session bypass, no trigger DDL, no
+        repopulation, one COMMIT (recording connection, no server)."""
         schema = "CREATE TABLE warehouse (id INT PRIMARY KEY, zone TEXT, val INT);"
         v_sql = "CREATE VIEW v_zone_distinct AS SELECT zone, COUNT(DISTINCT val) AS dv FROM warehouse GROUP BY zone;"
         plan = generate_materialized_view(schema, v_sql, dialect=Dialect.POSTGRES, ignore_limitations=True)
@@ -697,7 +642,6 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         mgr.engine_version = parse_engine_version("postgres:16")
         mgr.object_prefix = "__matview_"
         mgr.catalog_table = "__matview_catalog"
-        mgr.pg_use_transition_tables = False
 
         mgr._read_catalog = lambda *a, **k: {
             "v_zone_distinct": {
@@ -714,32 +658,19 @@ class TestP0BulkChangesAtomicIsolation(unittest.TestCase):
         }
         mgr.fetch_schema = lambda: parse_table_schema(schema)
 
-        with mgr.bulk_changes(use_shadow_swap=True):
+        with mgr.bulk_changes():
             rec_conn.cursor().execute("INSERT INTO warehouse VALUES (1, 'east', 100);")
 
-        # 1. Assert DELETE FROM <live_aux> was NEVER executed before shadow populate
-        aux_table = plan.auxiliary_table_names[0]
-        live_delete = f"DELETE FROM {aux_table};"
-        self.assertNotIn(
-            live_delete,
-            executed_sqls,
-            f"Live auxiliary table was deleted in PostgreSQL bulk_changes(use_shadow_swap=True)! Executed: {executed_sqls}",
-        )
-
-        # 2. Assert shadow auxiliary table was created and populated
-        s_aux = mgr._shadow_name(aux_table)
-        self.assertTrue(any(s.startswith(f"CREATE TABLE {s_aux}") for s in executed_sqls))
-        self.assertTrue(any(f"INSERT INTO {s_aux}" in s for s in executed_sqls))
-
-        # 3. Assert CREATE OR REPLACE VIEW was executed
-        self.assertTrue(
-            any(re.search(r"^\s*CREATE\s+OR\s+REPLACE\s+VIEW\s+v_zone_distinct\b", s, re.IGNORECASE) for s in executed_sqls),
-            f"Expected CREATE OR REPLACE VIEW in executed_sqls: {executed_sqls}",
-        )
-
-        # 4. Assert DROP VIEW was NEVER called
-        self.assertFalse(any(re.search(r"\bDROP\s+VIEW\b", s, re.IGNORECASE) for s in executed_sqls))
-
+        joined = "\n".join(executed_sqls)
+        self.assertNotIn("skip_triggers", joined)
+        self.assertNotRegex(joined, r"(?i)\bDROP\s+(FUNCTION|TRIGGER|VIEW|TABLE)\b")
+        self.assertNotRegex(joined, r"(?i)\bCREATE\b")
+        for tbl in [plan.backing_table_name, *plan.auxiliary_table_names]:
+            self.assertNotIn(f"DELETE FROM {tbl}", joined)
+            self.assertNotIn(f"INSERT INTO {tbl}", joined)
+        self.assertIn("INSERT INTO warehouse VALUES (1, 'east', 100);", executed_sqls)
+        self.assertEqual(executed_sqls[-1], "COMMIT;")
+        self.assertEqual(executed_sqls.count("COMMIT;"), 1)
 
 
 if __name__ == "__main__":

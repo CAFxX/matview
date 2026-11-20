@@ -8,7 +8,7 @@ assertions) plus live database integration suites when `POSTGRES_DSN`, `MYSQL_DS
 or `SQLITE_COMPAT_ENGINE` is set:
   - Suite 1: Core Single-Table Algebraic, Distinct, Holistic & Window Matrix (192 views)
   - Suite 2 & 3: Joins, Set Operations, CTEs, Subqueries, Manager Lifecycle & Edge Cases (134 views)
-  - Suite 4: Cross-Dialect PostgreSQL (Row & Statement Transition Tables) & MySQL Trigger Execution (132 views)
+  - Suite 4: Cross-Dialect PostgreSQL (Statement-Level Transition Tables) & MySQL Trigger Execution (132 views)
   - Suite 5: Multi-View SQL Bundles & Declarative Index Attachment (160 views)
   - Suite 6: Exhaustive ALGEBRAIC_DELTA Feature Permutations (1,552 views)
   - Suite 7: Adversarial & Multi-Dialect Algebraic Stress Matrix (1,560 views)
@@ -1934,6 +1934,10 @@ class TranspiledConnectionAdapter:
                         )
             return rows, len(rows)
 
+        if s_up.startswith("DO $MV_INSTALL$"):
+            # Installs the statement triggers on every partition; SQLite has
+            # no partitions or inheritance, so there is nothing to emulate.
+            return [], 0
         if s_up.startswith("DO $$"):
             self._exec_loop_backfill_in_sqlite(s)
             return [], 0
@@ -2019,103 +2023,8 @@ class TranspiledConnectionAdapter:
                 self._pg_fn_triggers.setdefault(fn_name, []).extend(created)
                 return [], 0
 
-            m_tr = re.match(
-                r'CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+INSERT\s+OR\s+UPDATE(?:\s+OF\s+[^;]+?)?\s+OR\s+DELETE\s+ON\s+([A-Za-z0-9_]+|"[^"]+"|`[^`]+`)\s+FOR\s+EACH\s+ROW\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);?',
-                s,
-                flags=re.I | re.S,
-            )
-            if m_tr:
-                t_name, base_t, fn_name = m_tr.group(1), m_tr.group(2), m_tr.group(3)
-                body = self._pg_functions.get(fn_name, "")
-                m_parts = re.search(
-                    r"IF\s*\(TG_OP\s*=\s*'DELETE'\)\s*THEN\s*(.*?)\s*ELSIF\s*\(TG_OP\s*=\s*'INSERT'\)\s*THEN\s*(.*?)\s*ELSIF\s*\(TG_OP\s*=\s*'UPDATE'\)\s*THEN\s*(.*?)\s*END\s+IF;\s*RETURN\s+NULL;",
-                    body,
-                    flags=re.I | re.S,
-                )
-                if m_parts:
-                    del_b, ins_b, upd_b = (
-                        m_parts.group(1).strip(),
-                        m_parts.group(2).strip(),
-                        m_parts.group(3).strip(),
-                    )
-                    created = []
-                    for op, b_raw, suf in (("DELETE", del_b, "ad"), ("INSERT", ins_b, "ai"), ("UPDATE", upd_b, "au")):
-                        b_clean = _transpile_pg_expr_to_sqlite(b_raw)
-                        when_cl = ""
-                        m_if = re.match(
-                            r"^IF\s*\(([^\n]+?)\)\s*THEN\s*(.*)\s*END\s+IF;$",
-                            b_clean.strip(),
-                            flags=re.I | re.S,
-                        )
-                        if m_if:
-                            inner_s = m_if.group(2).strip()
-                            if m_if.group(1).strip().upper().startswith("NOT ") or "END IF;" not in inner_s.upper():
-                                when_cl = f" WHEN ({m_if.group(1)})"
-                                b_clean = inner_s
-
-                        def _unwrap_if(m_inner: re.Match[str]) -> str:
-                            c_in, st_in = m_inner.group(1).strip(), m_inner.group(2).strip()
-                            out_sts = []
-                            for st_p in _split_top_level(st_in, ";"):
-                                sp = st_p.strip()
-                                if not sp:
-                                    continue
-                                if re.match(r"^INSERT\s+INTO\b", sp, flags=re.I):
-                                    if re.search(r"\bWHERE\s+(?:TRUE|1)\b", sp, flags=re.I):
-                                        sp = re.sub(
-                                            r"\bWHERE\s+(?:TRUE|1)\b",
-                                            f"WHERE ({c_in})",
-                                            sp,
-                                            count=1,
-                                            flags=re.I,
-                                        )
-                                    else:
-                                        sp = re.sub(
-                                            r"\n\s*WHERE\s+",
-                                            f"\n    WHERE ({c_in}) AND ",
-                                            sp,
-                                            count=1,
-                                            flags=re.I,
-                                        )
-                                elif re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", sp, flags=re.I):
-                                    sp = re.sub(
-                                        r"\n\s*WHERE\s+",
-                                        f"\n    WHERE ({c_in}) AND ",
-                                        sp,
-                                        count=1,
-                                        flags=re.I,
-                                    )
-                                out_sts.append(sp + ";")
-                            return "\n".join(out_sts)
-
-                        b_clean = re.sub(
-                            r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
-                            _unwrap_if,
-                            b_clean,
-                            flags=re.I | re.S,
-                        )
-                        m_outer_if = re.match(
-                            r"^IF\s*\(([^\n]+?)\)\s*THEN\s*(.*)\s*END\s+IF;$",
-                            b_clean.strip(),
-                            flags=re.I | re.S,
-                        )
-                        if m_outer_if:
-                            when_cl = f" WHEN ({m_outer_if.group(1)})"
-                            b_clean = m_outer_if.group(2).strip()
-                        if when_cl:
-                            when_cl = f" WHEN ({when_cl[len(' WHEN '):]}) AND (__mv_skip_triggers() = 0)"
-                        else:
-                            when_cl = " WHEN (__mv_skip_triggers() = 0)"
-                        tn = f"{t_name}_{suf}"
-                        self._sq_conn.execute(
-                            f"CREATE TRIGGER {tn} AFTER {op} ON {base_t} FOR EACH ROW{when_cl}\nBEGIN\n{b_clean}\nEND;"
-                        )
-                        created.append(tn)
-                    self._pg_fn_triggers.setdefault(fn_name, []).extend(created)
-                return [], 0
-
             m_stmt_tr = re.match(
-                r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+(INSERT|DELETE|UPDATE)\s+ON\s+([A-Za-z0-9_]+)\s+REFERENCING\s+[^\n]+\s+FOR\s+EACH\s+STATEMENT\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);?",
+                r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+AFTER\s+(INSERT|DELETE|UPDATE)\s+ON\s+([A-Za-z0-9_]+|\"[^\"]+\")\s+REFERENCING\s+[^\n]+\s+FOR\s+EACH\s+STATEMENT\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);?",
                 s,
                 flags=re.I | re.S,
             )
@@ -2127,122 +2036,82 @@ class TranspiledConnectionAdapter:
                     m_stmt_tr.group(4),
                 )
                 body = self._pg_functions.get(fn_name, "")
-                loop_bodies = re.findall(
-                    r"FOR\s+(?:NEW|OLD)\s+IN\s+SELECT\s+\*\s+FROM\s+__mv_(?:new|old)_rows\s+LOOP\s*(.*?)\s*END\s+LOOP;",
+                # Statement-level bodies start with an early return on an
+                # empty transition table; a SQLite row trigger always has
+                # its one row.
+                body = re.sub(
+                    r"\bIF\s+NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+__mv_(?:new|old)_rows\s*\)\s*THEN\s*RETURN\s+NULL;\s*END\s+IF;",
+                    "",
                     body,
                     flags=re.I | re.S,
                 )
-                if loop_bodies:
-                    b_clean = _transpile_pg_expr_to_sqlite("\n".join(loop_bodies))
+                m_code = re.search(r"\bBEGIN\s*(.*?)\s*RETURN\s+NULL;", body, flags=re.I | re.S)
+                raw_code = m_code.group(1).strip() if m_code else ""
+                # table_xinfo also lists generated columns (hidden 2/3).
+                cols_info = self._sq_conn.execute(f"PRAGMA table_xinfo({base_t})").fetchall()
+                col_names = [r[1] for r in cols_info if r[6] != 1]
 
-                    def _unwrap_if_tr(m_inner: re.Match[str]) -> str:
-                        c_in, st_in = m_inner.group(1).strip(), m_inner.group(2).strip()
-                        out_sts = []
-                        for st_p in _split_top_level(st_in, ";"):
-                            sp = st_p.strip()
-                            if not sp:
-                                continue
-                            if re.match(r"^INSERT\s+INTO\b", sp, flags=re.I):
-                                if re.search(r"\bWHERE\s+(?:TRUE|1)\b", sp, flags=re.I):
-                                    sp = re.sub(
-                                        r"\bWHERE\s+(?:TRUE|1)\b",
-                                        f"WHERE ({c_in})",
-                                        sp,
-                                        count=1,
-                                        flags=re.I,
-                                    )
-                                else:
-                                    sp = re.sub(
-                                        r"\n\s*WHERE\s+",
-                                        f"\n    WHERE ({c_in}) AND ",
-                                        sp,
-                                        count=1,
-                                        flags=re.I,
-                                    )
-                            elif re.match(r"^(?:UPDATE|DELETE\s+FROM)\b", sp, flags=re.I):
-                                sp = re.sub(
-                                    r"\n\s*WHERE\s+",
-                                    f"\n    WHERE ({c_in}) AND ",
-                                    sp,
-                                    count=1,
-                                    flags=re.I,
-                                )
-                            out_sts.append(sp + ";")
-                        return "\n".join(out_sts)
+                def _conv_delete_using(m_del: re.Match[str]) -> str:
+                    del_tbl = m_del.group(1)
+                    using_src = m_del.group(2).strip()
+                    where_clause = m_del.group(3).strip().rstrip(";")
+                    return f"DELETE FROM {del_tbl} WHERE EXISTS (SELECT 1 FROM {using_src} WHERE {where_clause});"
 
-                    b_clean = re.sub(
-                        r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
-                        _unwrap_if_tr,
-                        b_clean,
-                        flags=re.I | re.S,
-                    )
-                else:
-                    m_code = re.search(r"\bBEGIN\s*(.*?)\s*RETURN\s+NULL;", body, flags=re.I | re.S)
-                    raw_code = m_code.group(1).strip() if m_code else ""
-                    cols_info = self._sq_conn.execute(f"PRAGMA table_info({base_t})").fetchall()
-                    col_names = [r[1] for r in cols_info]
+                raw_code = re.sub(
+                    r"\bDELETE\s+FROM\s+([A-Za-z0-9_]+)\s+USING\s+([^\n;]+?)\s+WHERE\s+(.+?);",
+                    _conv_delete_using,
+                    raw_code,
+                    flags=re.I | re.S,
+                )
 
-                    def _conv_delete_using(m_del: re.Match[str]) -> str:
-                        del_tbl = m_del.group(1)
-                        using_src = m_del.group(2).strip()
-                        where_clause = m_del.group(3).strip().rstrip(";")
-                        return f"DELETE FROM {del_tbl} WHERE EXISTS (SELECT 1 FROM {using_src} WHERE {where_clause});"
+                cols_s_new = ', '.join(f'NEW."{c}" AS "{c}"' for c in col_names)
+                cols_s_old = ', '.join(f'OLD."{c}" AS "{c}"' for c in col_names)
+                raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_new_rows\s+AS\s+([A-Za-z0-9_]+)\b", rf"\1 (SELECT {cols_s_new}) AS \2", raw_code)
+                raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_old_rows\s+AS\s+([A-Za-z0-9_]+)\b", rf"\1 (SELECT {cols_s_old}) AS \2", raw_code)
+                raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_new_rows\b", rf"\1 (SELECT {cols_s_new}) AS __mv_new_rows", raw_code)
+                raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_old_rows\b", rf"\1 (SELECT {cols_s_old}) AS __mv_old_rows", raw_code)
 
-                    raw_code = re.sub(
-                        r"\bDELETE\s+FROM\s+([A-Za-z0-9_]+)\s+USING\s+([^\n;]+?)\s+WHERE\s+(.+?);",
-                        _conv_delete_using,
-                        raw_code,
-                        flags=re.I | re.S,
-                    )
+                def _strip_target_tbl_in_do_update(m_upsert: re.Match[str]) -> str:
+                    pre = m_upsert.group(1)
+                    tbl = m_upsert.group(2)
+                    assignments = m_upsert.group(3)
+                    out = []
+                    i = 0
+                    n = len(assignments)
+                    while i < n:
+                        if assignments[i:i+7].upper() == "(SELECT":
+                            depth = 1
+                            j = i + 1
+                            while j < n and depth > 0:
+                                if assignments[j] == "(":
+                                    depth += 1
+                                elif assignments[j] == ")":
+                                    depth -= 1
+                                j += 1
+                            subq = assignments[i:j]
+                            subq = re.sub(rf"\b{re.escape(tbl)}\.([A-Za-z0-9_]+)\b", r"EXCLUDED.\1", subq)
+                            out.append(subq)
+                            i = j
+                        else:
+                            out.append(assignments[i])
+                            i += 1
+                    assignments = "".join(out)
+                    assignments = re.sub(rf"\b{re.escape(tbl)}\.", "", assignments)
+                    return f"{pre}{assignments}"
 
-                    cols_s_new = ', '.join(f'NEW.{c} AS {c}' for c in col_names)
-                    cols_s_old = ', '.join(f'OLD.{c} AS {c}' for c in col_names)
-                    raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_new_rows\s+AS\s+([A-Za-z0-9_]+)\b", rf"\1 (SELECT {cols_s_new}) AS \2", raw_code)
-                    raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_old_rows\s+AS\s+([A-Za-z0-9_]+)\b", rf"\1 (SELECT {cols_s_old}) AS \2", raw_code)
-                    raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_new_rows\b", rf"\1 (SELECT {cols_s_new}) AS __mv_new_rows", raw_code)
-                    raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_old_rows\b", rf"\1 (SELECT {cols_s_old}) AS __mv_old_rows", raw_code)
-
-                    def _strip_target_tbl_in_do_update(m_upsert: re.Match[str]) -> str:
-                        pre = m_upsert.group(1)
-                        tbl = m_upsert.group(2)
-                        assignments = m_upsert.group(3)
-                        out = []
-                        i = 0
-                        n = len(assignments)
-                        while i < n:
-                            if assignments[i:i+7].upper() == "(SELECT":
-                                depth = 1
-                                j = i + 1
-                                while j < n and depth > 0:
-                                    if assignments[j] == "(":
-                                        depth += 1
-                                    elif assignments[j] == ")":
-                                        depth -= 1
-                                    j += 1
-                                subq = assignments[i:j]
-                                subq = re.sub(rf"\b{re.escape(tbl)}\.([A-Za-z0-9_]+)\b", r"EXCLUDED.\1", subq)
-                                out.append(subq)
-                                i = j
-                            else:
-                                out.append(assignments[i])
-                                i += 1
-                        assignments = "".join(out)
-                        assignments = re.sub(rf"\b{re.escape(tbl)}\.", "", assignments)
-                        return f"{pre}{assignments}"
-
-                    raw_code = re.sub(
-                        r"(INSERT\s+INTO\s+([A-Za-z0-9_]+)\b.*?ON\s+CONFLICT\s*\(.*?\)\s*DO\s+UPDATE\s+SET\s+)([^;]+;)",
-                        _strip_target_tbl_in_do_update,
-                        raw_code,
-                        flags=re.I | re.S,
-                    )
-                    raw_code = re.sub(
-                        r"(FROM\s+[^\n;]+?)\s*\n\s*(ON\s+CONFLICT\b)",
-                        r"\1\nWHERE 1=1\n\2",
-                        raw_code,
-                        flags=re.I,
-                    )
-                    b_clean = _transpile_pg_expr_to_sqlite(raw_code)
+                raw_code = re.sub(
+                    r"(INSERT\s+INTO\s+([A-Za-z0-9_]+)\b.*?ON\s+CONFLICT\s*\(.*?\)\s*DO\s+UPDATE\s+SET\s+)([^;]+;)",
+                    _strip_target_tbl_in_do_update,
+                    raw_code,
+                    flags=re.I | re.S,
+                )
+                raw_code = re.sub(
+                    r"(FROM\s+[^\n;]+?)\s*\n\s*(ON\s+CONFLICT\b)",
+                    r"\1\nWHERE 1=1\n\2",
+                    raw_code,
+                    flags=re.I,
+                )
+                b_clean = _transpile_pg_expr_to_sqlite(raw_code)
                 self._sq_conn.execute(
                     f"CREATE TRIGGER {t_name} AFTER {op} ON {base_t} FOR EACH ROW\nBEGIN\n{b_clean}\nEND;"
                 )
@@ -2603,7 +2472,6 @@ def _run_unified_50_view_battery(
     dialect: Dialect,
     *,
     inc_mode: bool = False,
-    use_trans: bool = False,
     label: str = "",
     reset_sql: Optional[str] = None,
 ) -> Tuple[int, int]:
@@ -2644,7 +2512,6 @@ def _run_unified_50_view_battery(
             schema_source,
             f"CREATE VIEW {v_name} AS {v_sel};",
             dialect=dialect,
-            pg_use_transition_tables=use_trans,
             incremental_backfill=inc_mode,
             batch_size=2,
         )
@@ -2658,7 +2525,7 @@ def _run_unified_50_view_battery(
         live_sel = _rewrite_live_reference_select_for_dialect(v_sel, dialect)
         plans.append((p, live_sel))
         views_installed += 1
-        _verify_external_db_mv(cur, p.view_name, live_sel, f"{label}:inc={inc_mode}:tr={use_trans}:{v_name}:init")
+        _verify_external_db_mv(cur, p.view_name, live_sel, f"{label}:inc={inc_mode}:{v_name}:init")
         checks_run += 1
 
     ro_raised = False
@@ -2672,7 +2539,7 @@ def _run_unified_50_view_battery(
     for step_lbl, m_sql in steps:
         cur.execute(m_sql)
         for p, live_sel in plans:
-            _verify_external_db_mv(cur, p.view_name, live_sel, f"{label}:inc={inc_mode}:tr={use_trans}:{p.logical_view_name}:{step_lbl}")
+            _verify_external_db_mv(cur, p.view_name, live_sel, f"{label}:inc={inc_mode}:{p.logical_view_name}:{step_lbl}")
             checks_run += 1
 
     for p, _ in reversed(plans):
@@ -2687,7 +2554,7 @@ def _run_unified_50_view_battery(
 
 
 def run_live_postgres_tests_if_available(dsn: str) -> None:
-    """Runs comprehensive 50-view x 3-mode (full, incremental, transition-tables) + manager tests against a real PostgreSQL instance."""
+    """Runs comprehensive 50-view x 2-mode (full, incremental) + manager tests against a real PostgreSQL instance."""
     conn = _open_live_postgres_connection(dsn)
     if conn is None:
         print("Skipping live PostgreSQL test: psycopg2/psycopg not installed.")
@@ -2696,9 +2563,9 @@ def run_live_postgres_tests_if_available(dsn: str) -> None:
     total_views = 0
     total_checks = 0
     reset_sql = "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
-    for inc_mode, use_trans in ((False, False), (True, False), (False, True)):
+    for inc_mode in (False, True):
         v_cnt, c_cnt = _run_unified_50_view_battery(
-            conn, cur, Dialect.POSTGRES, inc_mode=inc_mode, use_trans=use_trans, label="live_pg", reset_sql=reset_sql
+            conn, cur, Dialect.POSTGRES, inc_mode=inc_mode, label="live_pg", reset_sql=reset_sql
         )
         total_views += v_cnt
         total_checks += c_cnt
@@ -2725,7 +2592,7 @@ def run_live_mysql_tests_if_available(dsn: str) -> None:
     )
     for inc_mode in (False, True):
         v_cnt, c_cnt = _run_unified_50_view_battery(
-            conn, cur, Dialect.MYSQL, inc_mode=inc_mode, use_trans=False, label="live_mysql", reset_sql=reset_sql
+            conn, cur, Dialect.MYSQL, inc_mode=inc_mode, label="live_mysql", reset_sql=reset_sql
         )
         total_views += v_cnt
         total_checks += c_cnt
@@ -2749,7 +2616,7 @@ def run_live_sqlite_compat_tests_if_available(engine_spec: str) -> None:
             cur = conn.cursor()
             try:
                 v_cnt, c_cnt = _run_unified_50_view_battery(
-                    conn, cur, Dialect.SQLITE, inc_mode=inc_mode, use_trans=False, label=f"live_{eng}"
+                    conn, cur, Dialect.SQLITE, inc_mode=inc_mode, label=f"live_{eng}"
                 )
                 total_views += v_cnt
                 total_checks += c_cnt
@@ -2875,7 +2742,6 @@ class MVTestRunner:
         mutations: Sequence[Tuple[str, str]],
         *,
         dialect: Optional[Dialect] = None,
-        pg_use_transition_tables: bool = False,
         incremental_backfill: bool = False,
         batch_size: int = 1000,
     ) -> None:
@@ -2926,7 +2792,6 @@ class MVTestRunner:
                         eff_v_ddl,
                         dialect=eff_dialect,
                         engine_version=engine_version,
-                        pg_use_transition_tables=pg_use_transition_tables,
                         incremental_backfill=incremental_backfill,
                         batch_size=batch_size,
                     )
@@ -3926,29 +3791,27 @@ def run_suite_9_cross_dialect_execution(runner: MVTestRunner) -> None:
 
     assert len(view_defs) == 100
 
-    # 9A: PostgreSQL Row-Level Triggers
+    # 9A: PostgreSQL statement-level maintenance
     pg_views = [(f"pg_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW pg_{n}")) for n, sql in view_defs]
     runner.run_batch(
-        "Suite 9A (100 PostgreSQL Row-Level Trigger Views)",
+        "Suite 9A (100 PostgreSQL Statement-Level Views)",
         schema,
         pg_views,
         seed,
         mutations,
         dialect=Dialect.POSTGRES,
-        pg_use_transition_tables=False,
         incremental_backfill=False,
     )
 
-    # 9B: PostgreSQL Statement-Level Transition Tables & Incremental DO-Block Backfill
+    # 9B: PostgreSQL statement-level maintenance & incremental DO-block backfill
     pg_tr_views = [(f"pgtr_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW pgtr_{n}")) for n, sql in view_defs]
     runner.run_batch(
-        "Suite 9B (100 PostgreSQL Transition-Table & Incremental Backfill Views)",
+        "Suite 9B (100 PostgreSQL Statement-Level & Incremental Backfill Views)",
         schema,
         pg_tr_views,
         seed,
         mutations,
         dialect=Dialect.POSTGRES,
-        pg_use_transition_tables=True,
         incremental_backfill=True,
         batch_size=2,
     )
@@ -4190,28 +4053,26 @@ def run_suite_10_torture_dml_and_transactions(runner: MVTestRunner) -> None:
         batch_size=2,
     )
 
-    # 10C: Execute on PostgreSQL Row-Level Triggers (Transpiled to SQLite)
+    # 10C: PostgreSQL statement-level maintenance (transpiled to SQLite offline)
     pg_row_views = [(f"pgr_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW pgr_{n}")) for n, sql in views]
     runner.run_batch(
-        "Suite 10C (125 Torture-DML & Intermediate-Tx Views on PostgreSQL Row-Level)",
+        "Suite 10C (125 Torture-DML & Intermediate-Tx Views on PostgreSQL Statement-Level)",
         schema,
         pg_row_views,
         seed,
         torture_mutations,
         dialect=Dialect.POSTGRES,
-        pg_use_transition_tables=False,
     )
 
-    # 10D: Execute on PostgreSQL Statement-Level Transition Tables (Transpiled to SQLite)
+    # 10D: PostgreSQL statement-level maintenance & incremental backfill
     pg_stmt_views = [(f"pgs_{n}", sql.replace(f"CREATE VIEW {n}", f"CREATE VIEW pgs_{n}")) for n, sql in views]
     runner.run_batch(
-        "Suite 10D (125 Torture-DML & Intermediate-Tx Views on PostgreSQL Transition Tables)",
+        "Suite 10D (125 Torture-DML & Intermediate-Tx Views on PostgreSQL Statement-Level + Incremental)",
         schema,
         pg_stmt_views,
         seed,
         torture_mutations,
         dialect=Dialect.POSTGRES,
-        pg_use_transition_tables=True,
         incremental_backfill=True,
         batch_size=2,
     )
@@ -4243,10 +4104,10 @@ def run_suite_11_live_engine_50_view_battery_across_all_dialects(runner: MVTestR
     executes directly against that live database engine while the remaining dialects execute
     through the unified in-memory transpiled adapters.
     """
-    dialect_configs: List[Tuple[Dialect, List[Tuple[bool, bool]]]] = [
-        (Dialect.SQLITE, [(False, False), (True, False)]),
-        (Dialect.POSTGRES, [(False, False), (True, False), (False, True)]),
-        (Dialect.MYSQL, [(False, False), (True, False)]),
+    dialect_configs: List[Tuple[Dialect, List[bool]]] = [
+        (Dialect.SQLITE, [False, True]),
+        (Dialect.POSTGRES, [False, True]),
+        (Dialect.MYSQL, [False, True]),
     ]
     for dialect, mode_list in dialect_configs:
         conn, cur, reset_sql, _, engine_label, close_fn = runner._open_backend_session(
@@ -4254,20 +4115,19 @@ def run_suite_11_live_engine_50_view_battery_across_all_dialects(runner: MVTestR
         )
         eff_reset = reset_sql or "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
         try:
-            for inc_mode, use_trans in mode_list:
+            for inc_mode in mode_list:
                 v_cnt, c_cnt = _run_unified_50_view_battery(
                     conn,
                     cur,
                     dialect,
                     inc_mode=inc_mode,
-                    use_trans=use_trans,
                     label=f"s11_{dialect.value}",
                     reset_sql=eff_reset,
                 )
                 runner.total_views += v_cnt
                 runner.total_assertions += c_cnt
                 print(
-                    f"  [PASS] Suite 11 (Unified 50-View Battery {dialect.value.upper()} inc={inc_mode} tr={use_trans}) [{engine_label}]: {v_cnt} views, {c_cnt} assertions"
+                    f"  [PASS] Suite 11 (Unified 50-View Battery {dialect.value.upper()} inc={inc_mode}) [{engine_label}]: {v_cnt} views, {c_cnt} assertions"
                 )
             mgr_checks = _run_live_manager_lifecycle_check(conn, cur, dialect)
             runner.total_assertions += mgr_checks
@@ -4564,7 +4424,6 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     seed,
                     mutations,
                     dialect=dialect,
-                    pg_use_transition_tables=(dialect == Dialect.POSTGRES and inc_mode),
                     incremental_backfill=inc_mode,
                     batch_size=1,
                 )
@@ -4776,10 +4635,10 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             p4 = generate_materialized_view(c4["schema"], c4["views"][0][1], dialect=d)
             self.assertEqual(p4.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
 
-        # Corpus 5: PostgreSQL transition-table function & trigger names strictly <= 62 chars and distinct
+        # Corpus 5: PostgreSQL statement-level function & trigger names strictly <= 62 chars and distinct
         c5 = corpus["corpus_05_pg_63char_identifier_truncation_collision"]
         p5 = generate_materialized_view(
-            c5["schema"], c5["views"][0][1], dialect=Dialect.POSTGRES, pg_use_transition_tables=True
+            c5["schema"], c5["views"][0][1], dialect=Dialect.POSTGRES
         )
         self.assertEqual(len(set(p5.function_names)), len(p5.function_names))
         self.assertEqual(len(set(p5.trigger_names)), len(p5.trigger_names))
@@ -5046,17 +4905,17 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertEqual(ev_pg17.dialect, Dialect.POSTGRES)
         self.assertEqual(ev_pg17.subdialect, EngineSubdialect.POSTGRES)
         self.assertEqual(ev_pg17.version, (17, 2, 0))
-        self.assertTrue(ev_pg17.supports_pg_transition_tables)
+        self.assertTrue(ev_pg17.supports_pg_statement_maintenance)
         self.assertTrue(ev_pg17.supports_pg_nulls_not_distinct)
 
         ev_pg14 = parse_engine_version("postgresql-14.11")
         self.assertEqual(ev_pg14.version, (14, 11, 0))
-        self.assertTrue(ev_pg14.supports_pg_transition_tables)
+        self.assertTrue(ev_pg14.supports_pg_statement_maintenance)
         self.assertFalse(ev_pg14.supports_pg_nulls_not_distinct)
 
         ev_pg96 = parse_engine_version("pg9.6.24")
         self.assertEqual(ev_pg96.version, (9, 6, 24))
-        self.assertFalse(ev_pg96.supports_pg_transition_tables)
+        self.assertFalse(ev_pg96.supports_pg_statement_maintenance)
 
         ev_maria = parse_engine_version("5.5.5-10.11.8-MariaDB-1:10.11.8+maria~ubu2204")
         self.assertEqual(ev_maria.dialect, Dialect.MYSQL)
@@ -5140,12 +4999,15 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertIn("Engine: postgres 17.1.0", p_pg17.render_sql_script())
 
-        # PostgreSQL 9.6 automatically disables transition tables and falls back to FOR EACH ROW triggers
-        p_pg96 = generate_materialized_view(
-            schema, view_sql, engine_version="postgres:9.6", pg_use_transition_tables=True
-        )
-        self.assertNotIn("REFERENCING NEW TABLE", "\n".join(p_pg96.trigger_ddls))
-        self.assertIn("FOR EACH ROW EXECUTE FUNCTION", "\n".join(p_pg96.trigger_ddls))
+        # PostgreSQL maintenance is statement-level only: PostgreSQL < 11 (no
+        # EXECUTE FUNCTION; < 10 has no transition tables) is refused.
+        for old_pg in ("postgres:9.6", "postgres:10.23"):
+            with self.assertRaises(EngineLimitationError) as ctx_old_pg:
+                generate_materialized_view(schema, view_sql, engine_version=old_pg)
+            self.assertIn("POSTGRES_VERSION_NO_STATEMENT_TRIGGERS", str(ctx_old_pg.exception))
+        p_pg11 = generate_materialized_view(schema, view_sql, engine_version="postgres:11.0")
+        self.assertIn("REFERENCING NEW TABLE", "\n".join(p_pg11.trigger_ddls))
+        self.assertNotIn("FOR EACH ROW", "\n".join(p_pg11.trigger_ddls))
 
         # SQLite 3.20 (before 3.24 UPSERT) automatically selects GROUP_SCOPED_DELTA instead of ALGEBRAIC_DELTA
         p_sq320 = generate_materialized_view(schema, view_sql, engine_version="sqlite:3.20.0")
@@ -5546,6 +5408,14 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "implicitly"):
                     with mgr_j.bulk_changes(use_shadow_swap=True):
                         self.fail("MySQL shadow swap was not refused")
+                bulk_kwargs = {}
+            elif d_mode == Dialect.POSTGRES:
+                # PostgreSQL never suspends its statement-level maintenance:
+                # the shadow swap is refused; the plain block keeps the
+                # transaction contract.
+                with self.assertRaisesRegex(ValueError, "statement-level"):
+                    with mgr_j.bulk_changes(use_shadow_swap=True):
+                        self.fail("PostgreSQL shadow swap was not refused")
                 bulk_kwargs = {}
             with mgr_j.bulk_changes(**bulk_kwargs):
                 conn_j.execute("INSERT INTO emps VALUES (5, 1, 'PM', 140), (6, 2, 'SRE', 110);")
@@ -8489,7 +8359,6 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
             "seed": current_seed,
             "scenario": current_scenario,
             "dialect": dialect.value,
-            "transition_tables": bool(kwargs.get("pg_use_transition_tables", False)),
             "incremental_backfill": bool(kwargs.get("incremental_backfill", False)),
             "status": "running",
         }
@@ -8534,27 +8403,25 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
                 dialect=runner.default_dialect,
             )
 
-            # 2. PostgreSQL dialect (row-level triggers & statement-level transition tables + incremental backfill)
+            # 2. PostgreSQL dialect (statement-level maintenance, without and with incremental backfill)
             s_pg, v_pg, seed_pg, m_pg = fuzzer.generate_scenario(
                 sc_idx, Dialect.POSTGRES, views_count=views_count, mutations_count=mutations_count
             )
             run_fuzz_batch(
-                f"Suite 12b (Differential Fuzzer seed={s_val} sc={sc_idx} - PostgreSQL Row Triggers)",
+                f"Suite 12b (Differential Fuzzer seed={s_val} sc={sc_idx} - PostgreSQL Statement-Level)",
                 s_pg,
                 v_pg,
                 seed_pg,
                 m_pg,
                 dialect=Dialect.POSTGRES,
-                pg_use_transition_tables=False,
             )
             run_fuzz_batch(
-                f"Suite 12c (Differential Fuzzer seed={s_val} sc={sc_idx} - PostgreSQL Transition Tables + Incremental)",
+                f"Suite 12c (Differential Fuzzer seed={s_val} sc={sc_idx} - PostgreSQL Statement-Level + Incremental)",
                 s_pg,
                 v_pg,
                 seed_pg,
                 m_pg,
                 dialect=Dialect.POSTGRES,
-                pg_use_transition_tables=True,
                 incremental_backfill=True,
                 batch_size=2,
             )
@@ -8947,7 +8814,6 @@ def run_suite_13_fuzz_regression_corpus(runner: MVTestRunner) -> None:
                 seed,
                 muts,
                 dialect=dialect,
-                pg_use_transition_tables=(dialect == Dialect.POSTGRES),
                 incremental_backfill=True,
                 batch_size=2,
             )

@@ -11,6 +11,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from .._host import MixinHost
+from ..dialects.pg_statement import SIGN, PgAggregateSpec, PgDeltaSource
 from ..engines import (
     AggFunc,
     Dialect,
@@ -1507,21 +1508,35 @@ class Tier1SingleMixin(MixinHost):
             u_conds: List[str] = []
             if self.view.where_clause:
                 u_conds.append(f"({self.view.where_clause})")
+            u_nullable: List[Tuple[str, str]] = []
             for orig_g, branch_g in zip(orig_grps, self._effective_group_by_exprs):
                 rhs_g = _group_record_expr(branch_g)
-                u_conds.append(self._null_safe_eq(f"({orig_g})", f"({rhs_g})", is_nullable=True))
-            w_u = f" WHERE {' AND '.join(u_conds)}" if u_conds else ""
+                if self.dialect == Dialect.POSTGRES:
+                    u_nullable.append((f"({orig_g})", f"({rhs_g})"))
+                else:
+                    u_conds.append(self._null_safe_eq(f"({orig_g})", f"({rhs_g})", is_nullable=True))
             u_agg_sql = self._sql_backfill_agg_expr(orig_item)
-            return f"(SELECT {u_agg_sql} FROM ({inner_u}) AS {u_alias}{w_u})"
+
+            def _u_sub(key_conds: List[str]) -> str:
+                all_c = u_conds + key_conds
+                w_u = f" WHERE {' AND '.join(all_c)}" if all_c else ""
+                return f"(SELECT {u_agg_sql} FROM ({inner_u}) AS {u_alias}{w_u})"
+
+            return self._pg_null_split_subquery(_u_sub, u_nullable) if u_nullable else _u_sub([])
         base_t = self.view.base_table
         q_base_t = self._q(base_t)
         conds: List[str] = []
         if self.view.where_clause:
             conds.append(f"({self.view.where_clause})")
+        nullable_keys: List[Tuple[str, str]] = []
         for g_expr in self._effective_group_by_exprs:
             lhs_g = self._rewrite_expr_for_record(g_expr, q_base_t)
             rhs_g = _group_record_expr(g_expr)
             is_nn = self._is_simple_col_ref(g_expr) and self._col_def(g_expr).not_null
+            if self.dialect == Dialect.POSTGRES and not is_nn:
+                # IS NOT DISTINCT FROM cannot use an index: split on NULL.
+                nullable_keys.append((f"({lhs_g})", f"({rhs_g})"))
+                continue
             conds.append(
                 self._null_safe_eq(
                     f"({lhs_g})",
@@ -1529,9 +1544,14 @@ class Tier1SingleMixin(MixinHost):
                     is_nullable=not is_nn,
                 )
             )
-        where_part = f" WHERE {' AND '.join(conds)}" if conds else ""
         agg_sql = self._sql_backfill_agg_expr(item)
-        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part})"
+
+        def _sub(key_conds: List[str]) -> str:
+            all_c = conds + key_conds
+            where_part = f" WHERE {' AND '.join(all_c)}" if all_c else ""
+            return f"(SELECT {agg_sql} FROM {q_base_t}{where_part})"
+
+        return self._pg_null_split_subquery(_sub, nullable_keys) if nullable_keys else _sub([])
 
     def _variance_formula_sql(
         self,
@@ -2398,6 +2418,66 @@ class Tier1SingleMixin(MixinHost):
         return stmt
 
 
+    def _pg_single_table_aggregate_bodies(
+        self,
+        mv_table: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+    ) -> Dict[str, str]:
+        """PostgreSQL statement-level bodies of a single-table aggregate view."""
+        rec = "__mv_d"
+        work_items = list(self._working_select_items)
+        grp_exprs = list(self._effective_group_by_exprs)
+        ekey_to_item: Dict[str, SelectItem] = {}
+        for it in work_items:
+            if it.is_aggregate:
+                ekey_to_item.setdefault(expr_key_fn(it), it)
+        for ekey, (_tbl, rep_item, _dt) in distinct_aux_tables.items():
+            ekey_to_item.setdefault(ekey, rep_item)
+        values = {
+            ekey: self._effective_agg_value_expr(it, record_prefix=rec) for ekey, it in ekey_to_item.items()
+        }
+        group_aliases = {self._group_col_alias(g).lower() for g in grp_exprs}
+        extras = {
+            it.alias.lower(): self._rewrite_expr_for_record(it.raw_expr, rec)
+            for it in work_items
+            if not it.is_aggregate and it.alias.lower() not in group_aliases
+        }
+        where = self._rewrite_expr_for_record(self.view.where_clause, rec) if self.view.where_clause else None
+        wm = self._pg_watermark_predicate(rec) if self._alg_mode in ("single", "distinct") else None
+        if wm:
+            where = f"({where}) AND ({wm})" if where else wm
+        source = PgDeltaSource(
+            from_sql=lambda signed: f"(\n        {signed}\n        ) AS {rec}",
+            sign=f"{rec}.{SIGN}",
+            where=where,
+            keys=[self._rewrite_expr_for_record(g, rec) for g in grp_exprs],
+            values=values,
+            extras=extras,
+        )
+        spec = PgAggregateSpec(
+            mv_table=mv_table,
+            row_count_col=row_count_col,
+            items=work_items,
+            grp_exprs=grp_exprs,
+            has_nullable_grp=self._has_nullable_group_col(),
+            pk_cols=self._tier1_pk_cols(),
+            nonnull_map=col_nonnull_count_map,
+            sum_map=col_sum_map,
+            sum2_map=col_sum2_map,
+            tcnt_map=col_true_cnt_map,
+            distinct_aux=distinct_aux_tables,
+            value_key=expr_key_fn,
+            recompute=lambda it: self._build_recompute_subquery_raw(it, mv_table),
+            native_recompute=self._requires_native_avg_recompute,
+        )
+        return self._pg_aggregate_bodies(spec, [source])
+
     def _build_tier1_triggers(
         self,
         view_name: str,
@@ -2505,10 +2585,12 @@ class Tier1SingleMixin(MixinHost):
         pg_ai_body: Optional[str] = None
         pg_ad_body: Optional[str] = None
         pg_au_body: Optional[str] = None
-        if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables:
-            pg_ai_body, pg_ad_body, pg_au_body = self._build_tier1_vectorized_pg_bodies(
+        if self.dialect == Dialect.POSTGRES:
+            trunc_stmts = [
+                f"DELETE FROM {aux_tbl};" for aux_tbl, _, _ in distinct_aux_tables.values()
+            ] + [f"DELETE FROM {mv_table};"] + list(initial_populate_sqls or [])
+            pg_bodies = self._pg_single_table_aggregate_bodies(
                 mv_table=mv_table,
-                base_t=base_t,
                 row_count_col=row_count_col,
                 col_nonnull_count_map=col_nonnull_count_map,
                 col_sum_map=col_sum_map,
@@ -2517,6 +2599,7 @@ class Tier1SingleMixin(MixinHost):
                 distinct_aux_tables=distinct_aux_tables,
                 expr_key_fn=expr_key_fn,
             )
+            pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
 
         return self._emit_dialect_triggers_for_table(
             view_name=view_name,

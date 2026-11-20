@@ -162,8 +162,11 @@ class EngineVersion:
         return hash((self.dialect, self.subdialect, self.packaging_version))
 
     @property
-    def supports_pg_transition_tables(self) -> bool:
-        return self.is_postgres and self.at_least((10, 0, 0))
+    def supports_pg_statement_maintenance(self) -> bool:
+        """Statement-level triggers with transition tables (PostgreSQL 10)
+        created with ``EXECUTE FUNCTION`` (PostgreSQL 11): the only
+        PostgreSQL maintenance mechanism."""
+        return self.is_postgres and self.at_least((11, 0, 0))
 
     @property
     def supports_pg_nulls_not_distinct(self) -> bool:

@@ -13,12 +13,18 @@ transaction (commit included):
   del_all  DELETE FROM t
 
 Configurations: ``none`` (no materialized view: the cost of the statement
-alone), ``row`` (the default row-level triggers) and, on PostgreSQL only,
-``tt`` (``pg_use_transition_tables=True``). Views (as in the design):
+alone) and ``mv`` (the view maintained by the engine's only mechanism:
+statement-level triggers with transition tables on PostgreSQL, row triggers on
+SQLite and MySQL/MariaDB). Views (as in the design):
 
   agg  SUM, COUNT(*), AVG by g          mm  MIN, MAX by g (index on (g, v))
   j    SUM, COUNT(*) of t JOIN d by d.name
   ds   SELECT DISTINCT g                pj  plain t JOIN d, no aggregation
+
+``--latency N`` (PostgreSQL only) also measures single-row statements
+server-side, as in the design: a ``DO`` loop of N single-row INSERT, UPDATE and
+DELETE statements against 100k rows in 10k groups, without client round trips,
+reported in microseconds per statement.
 
 After every statement of a maintained run the materialized view is compared
 with the original view query executed natively (exact multiset comparison,
@@ -48,9 +54,9 @@ MariaDB uses ``--mysql-dsn`` too (the product is read from the server). Each
 run creates and drops its own schema (PostgreSQL) or database (MySQL/MariaDB);
 SQLite runs on a temporary file in WAL mode. ``--statement-timeout`` bounds a
 single statement (PostgreSQL ``statement_timeout``; SQLite progress handler;
-not enforceable for MySQL/MariaDB DML) and records ``timeout``: PostgreSQL row
-triggers are quadratic in rows per group, so 100k rows in one group runs for a
-very long time.
+not enforceable for MySQL/MariaDB DML) and records ``timeout``: row-trigger
+maintenance can be quadratic in rows per group (PostgreSQL row triggers were,
+before stage 2), so 100k rows in one group can run for a very long time.
 """
 
 from __future__ import annotations
@@ -279,7 +285,7 @@ def run_case(family: str, dsn: str, view: str, config: str, rows: int, groups: i
         eng.conn.commit()
         manager: Optional[MaterializedViewManager] = None
         if config != "none":
-            manager = MaterializedViewManager(eng.conn, dialect=eng.dialect, pg_use_transition_tables=(config == "tt"))
+            manager = MaterializedViewManager(eng.conn, dialect=eng.dialect)
             with warnings.catch_warnings():
                 # MySQL/MariaDB registration must acknowledge the documented
                 # MYSQL_NO_TRUNCATE_TRIGGER limitation; this benchmark never truncates.
@@ -310,6 +316,39 @@ def run_case(family: str, dsn: str, view: str, config: str, rows: int, groups: i
         if manager is not None:
             manager.close()
         return res
+
+
+def run_latency(dsn: str, view: str, config: str, n: int) -> Dict[str, Any]:
+    """Server-side single-row statement cost (PostgreSQL), as in the design:
+    100k rows in 10k groups, N statements of each kind in one DO loop."""
+    with Engine("postgres", dsn, None) as eng:
+        cur = eng.conn.cursor()
+        for ddl in DDL["postgres"]:
+            cur.execute(ddl)
+        cur.execute("INSERT INTO d (g, name) SELECT i, 'n' || (i % 50) FROM generate_series(0, 10000) AS s(i)")
+        cur.execute("INSERT INTO t (id, g, v) SELECT i, i % 10000, i FROM generate_series(1, 100000) AS s(i)")
+        eng.conn.commit()
+        manager: Optional[MaterializedViewManager] = None
+        if config != "none":
+            manager = MaterializedViewManager(eng.conn, dialect=eng.dialect)
+            manager.register_view(f"CREATE VIEW mv AS {VIEWS[view]};")
+            eng.conn.commit()
+        cur.execute("ANALYZE")
+        eng.conn.commit()
+        out: Dict[str, Any] = {"version": eng.version, "view": view if config != "none" else "-", "config": config}
+        for key, sql in (
+            ("insert_us", "INSERT INTO t (id, g, v) VALUES (200000 + i, i % 10000, i)"),
+            ("update_us", "UPDATE t SET v = v + 1 WHERE id = i"),
+            ("delete_us", "DELETE FROM t WHERE id = i"),
+        ):
+            t0 = time.perf_counter()
+            cur.execute(f"DO $$ BEGIN FOR i IN 1..{n} LOOP {sql}; END LOOP; END $$")
+            eng.conn.commit()
+            out[key] = (time.perf_counter() - t0) / n * 1e6
+        out["exact"] = (eng.relation("SELECT * FROM mv") == eng.relation(VIEWS[view])) if manager is not None else None
+        if manager is not None:
+            manager.close()
+        return out
 
 
 def _parse_ints(text: str) -> List[int]:
@@ -343,7 +382,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--rows", default="1,1000,100000", help="rows per statement (comma list)")
     ap.add_argument("--groups", default="1,100,10000", help="distinct group keys (comma list)")
     ap.add_argument("--views", default="agg,mm,j,ds,pj", help=f"comma list of {sorted(VIEWS)}")
-    ap.add_argument("--configs", default="none,row,tt", help="comma list of none,row,tt (tt: PostgreSQL only)")
+    ap.add_argument("--configs", default="none,mv", help="comma list of none,mv")
+    ap.add_argument("--latency", type=int, default=0,
+                    help="PostgreSQL: also time N single-row statements of each kind server-side (us/stmt)")
     ap.add_argument("--statement-timeout", type=float, default=None, help="seconds per statement (see docstring)")
     ap.add_argument("--no-verify", action="store_true", help="skip the exact comparison after each statement")
     ap.add_argument("--json", default=None, help="also write the results as JSON to this path")
@@ -365,16 +406,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if unknown:
         ap.error(f"unknown views {unknown}")
     configs = [c for c in args.configs.split(",") if c]
-    if set(configs) - {"none", "row", "tt"}:
-        ap.error("configs must be none, row or tt")
+    if set(configs) - {"none", "mv"}:
+        ap.error("configs must be none or mv")
 
     results: List[Result] = []
     for family, dsn in engines:
         for rows in _parse_ints(args.rows):
             for groups in _parse_ints(args.groups):
                 for config in configs:
-                    if config == "tt" and family != "postgres":
-                        continue
                     for view in (views if config != "none" else views[:1]):
                         r = run_case(family, dsn, view, config, rows, groups, not args.no_verify,
                                      args.statement_timeout)
@@ -383,9 +422,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         print(f"[bench] {r.version} {r.view} {config} rows={rows} groups={groups} {cells} "
                               f"exact={r.exact} {r.note}", file=sys.stderr, flush=True)
     print(render_table(results))
+    latency: List[Dict[str, Any]] = []
+    if args.latency and pg:
+        for config in configs:
+            for view in (views if config != "none" else views[:1]):
+                lat = run_latency(pg, view, config, args.latency)
+                latency.append(lat)
+                print(f"[latency] {lat}", file=sys.stderr, flush=True)
+        print()
+        print("| engine | view | config | INSERT us | UPDATE us | DELETE us | exact |")
+        print("|---|---|---|---|---|---|---|")
+        for lat in latency:
+            print(f"| {lat['version']} | {lat['view']} | {lat['config']} | {lat['insert_us']:.1f} | "
+                  f"{lat['update_us']:.1f} | {lat['delete_us']:.1f} | {lat['exact']} |")
     if args.json:
-        Path(args.json).write_text(json.dumps([asdict(r) for r in results], indent=2) + "\n")
-    return 1 if any(r.exact is False for r in results) else 0
+        Path(args.json).write_text(json.dumps({"bulk": [asdict(r) for r in results], "latency": latency}, indent=2) + "\n")
+    return 1 if any(r.exact is False for r in results) or any(lat["exact"] is False for lat in latency) else 0
 
 
 if __name__ == "__main__":

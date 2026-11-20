@@ -124,6 +124,21 @@ class PlannerMixin(MixinHost):
                             mitigation="Perform cascading deletes/updates explicitly in application SQL or use PostgreSQL/SQLite.",
                         )
                     )
+        if self.dialect == Dialect.POSTGRES and not self.engine_version.supports_pg_statement_maintenance:
+            lims.append(
+                TransparencyLimitation(
+                    code="POSTGRES_VERSION_NO_STATEMENT_TRIGGERS",
+                    severity=LimitationSeverity.BLOCKER,
+                    dialect=Dialect.POSTGRES,
+                    affected_object=self.logical_view_name,
+                    description=(
+                        "PostgreSQL maintenance uses statement-level triggers with transition tables "
+                        f"created with EXECUTE FUNCTION, which require PostgreSQL >= 11 (target engine is "
+                        f"{self.engine_version.label})."
+                    ),
+                    mitigation="Upgrade PostgreSQL to 11 or later.",
+                )
+            )
         if self.view.has_window_func:
             if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_window_functions:
                 lims.append(
@@ -1913,8 +1928,6 @@ class PlannerMixin(MixinHost):
                 schemas=self.schemas,
                 view_spec=extra_v,
                 dialect=self.dialect,
-                pg_use_transition_tables=self.pg_use_transition_tables,
-                pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
                 ignore_limitations=self.ignore_limitations,
                 object_prefix=self.object_prefix,
                 incremental_backfill=self.incremental_backfill,

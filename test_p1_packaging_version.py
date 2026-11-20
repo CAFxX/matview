@@ -258,11 +258,13 @@ class TestEngineVersionFeatureFlags(unittest.TestCase):
         pg15 = parse_engine_version("postgres:15.0")
         pg17 = parse_engine_version("postgres:17.2")
 
-        # Transition tables (PG 10+)
-        self.assertFalse(pg9.supports_pg_transition_tables)
-        self.assertTrue(pg10.supports_pg_transition_tables)
-        self.assertTrue(pg14.supports_pg_transition_tables)
-        self.assertTrue(pg17.supports_pg_transition_tables)
+        # Statement-level maintenance: transition tables (PG 10) created with
+        # EXECUTE FUNCTION (PG 11)
+        self.assertFalse(pg9.supports_pg_statement_maintenance)
+        self.assertFalse(pg10.supports_pg_statement_maintenance)
+        self.assertTrue(parse_engine_version("postgres:11.0").supports_pg_statement_maintenance)
+        self.assertTrue(pg14.supports_pg_statement_maintenance)
+        self.assertTrue(pg17.supports_pg_statement_maintenance)
 
         # NULLS NOT DISTINCT (PG 15+)
         self.assertFalse(pg14.supports_pg_nulls_not_distinct)

@@ -445,14 +445,27 @@ class DialectEmitMixin(MixinHost):
         pg_ad_body: Optional[str] = None,
         pg_au_body: Optional[str] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
+        if self.dialect == Dialect.POSTGRES:
+            # Statement-level transition-table triggers are the only
+            # PostgreSQL mechanism (matview/dialects/pg_statement.py); every
+            # strategy supplies set-based bodies, there is no row fallback.
+            if pg_ai_body is None or pg_ad_body is None or pg_au_body is None:
+                raise AssertionError(
+                    f"no set-based PostgreSQL statement-level bodies for view {self.logical_view_name!r} on {base_t!r}"
+                )
+            trunc_body = "\n".join(trunc_stmts or [f"DELETE FROM {self._backing_table_name()};"])
+            return self._pg_emit_statement_triggers(
+                base_t,
+                {"INSERT": pg_ai_body, "UPDATE": pg_au_body, "DELETE": pg_ad_body},
+                trunc_body,
+            )
+
         log_vname = self.logical_view_name
         p = self.object_prefix if self.object_prefix else "__matview_"
         stem = f"{log_vname}__{base_t}"
         t_ai_name = self._bounded_ident(f"{p}trg_", stem, "_ai")
         t_ad_name = self._bounded_ident(f"{p}trg_", stem, "_ad")
         t_au_name = self._bounded_ident(f"{p}trg_", stem, "_au")
-        t_trunc_name = self._bounded_ident(f"{p}trg_", stem, "_trunc")
-        t_sync_name = self._bounded_ident(f"{p}trg_", stem, "_sync")
         q_base_t = self._q(base_t)
         ref_cols = self._referenced_columns_for_table(base_t)
         # Projection backing rows are keyed by the source PK even when the
@@ -466,7 +479,7 @@ class DialectEmitMixin(MixinHost):
                 seen_ref_cols.add(key_col.lower())
         upd_of_clause = (
             f" OF {', '.join(self._q(c) for c in ref_cols)}"
-            if ref_cols and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES)
+            if ref_cols and self.dialect == Dialect.SQLITE
             else ""
         )
 
@@ -512,206 +525,6 @@ class DialectEmitMixin(MixinHost):
             )
             t_names = [t_ai_name, t_ad_name, t_au_name]
             return [trig_ins, trig_del, trig_upd], t_names, []
-
-        elif self.dialect == Dialect.POSTGRES:
-            ins_block = "\n            ".join(ins_stmts)
-            minus_block = "\n            ".join(upd_old_stmts)
-            plus_block = "\n            ".join(upd_new_stmts)
-            cleanup_block = "\n            ".join(cleanup_stmts)
-            trunc_block = "\n        ".join(trunc_stmts or [f"DELETE FROM {self._backing_table_name()};"])
-
-            ins_section = (
-                f"IF ({where_new}) THEN\n            {ins_block}\n        END IF;"
-                if where_new and ins_block
-                else ins_block
-            )
-            old_section = (
-                f"IF ({where_old}) THEN\n            {minus_block}\n        END IF;"
-                if where_old and minus_block
-                else minus_block
-            )
-            new_section = (
-                f"IF ({where_new}) THEN\n            {plus_block}\n        END IF;"
-                if where_new and plus_block
-                else plus_block
-            )
-            clean_section = (
-                f"\n        IF ({where_old}) THEN\n            {cleanup_block}\n        END IF;"
-                if where_old and cleanup_block
-                else (f"\n        {cleanup_block}" if cleanup_block else "")
-            )
-            del_full_block = "\n            ".join(del_stmts)
-            del_section = (
-                f"IF ({where_old}) THEN\n            {del_full_block}\n        END IF;"
-                if where_old
-                else del_full_block
-            )
-
-            fn_trunc = self._bounded_ident(f"{p}fn_sync_", stem, "_trunc")
-            fn_trunc_ddl = render_procedural_sql(
-                "pg_truncate_function",
-                fn_name=fn_trunc,
-                trunc_block=trunc_block,
-            )
-            t_trunc = render_procedural_sql(
-                "pg_truncate_trigger",
-                trg_name=t_trunc_name,
-                q_base_t=q_base_t,
-                fn_name=fn_trunc,
-            )
-
-            if self.pg_use_transition_tables:
-                fn_ai = self._bounded_ident(f"{p}fn_sync_", stem, "_ai")
-                fn_ad = self._bounded_ident(f"{p}fn_sync_", stem, "_ad")
-                fn_au = self._bounded_ident(f"{p}fn_sync_", stem, "_au")
-
-                use_vec = bool(self.pg_vectorize_transition_tables)
-
-                if use_vec and pg_ai_body is not None:
-                    fn_ai_ddl = render_procedural_sql(
-                        "pg_transition_simple_function",
-                        fn_name=fn_ai,
-                        body_sql=pg_ai_body.strip(),
-                    )
-                elif use_vec and ("NEW." not in ins_section and ":NEW" not in ins_section):
-                    fn_ai_ddl = render_procedural_sql(
-                        "pg_transition_simple_function",
-                        fn_name=fn_ai,
-                        body_sql=ins_section.strip(),
-                    )
-                else:
-                    fn_ai_ddl = render_procedural_sql(
-                        "pg_transition_loop_function",
-                        fn_name=fn_ai,
-                        row_var="NEW",
-                        transition_table="__mv_new_rows",
-                        section_sql=ins_section,
-                    )
-
-                if use_vec and pg_ad_body is not None:
-                    fn_ad_ddl = render_procedural_sql(
-                        "pg_transition_simple_function",
-                        fn_name=fn_ad,
-                        body_sql=pg_ad_body.strip(),
-                    )
-                elif use_vec and ("OLD." not in del_section and ":OLD" not in del_section):
-                    fn_ad_ddl = render_procedural_sql(
-                        "pg_transition_simple_function",
-                        fn_name=fn_ad,
-                        body_sql=del_section.strip(),
-                    )
-                else:
-                    fn_ad_ddl = render_procedural_sql(
-                        "pg_transition_loop_function",
-                        fn_name=fn_ad,
-                        row_var="OLD",
-                        transition_table="__mv_old_rows",
-                        section_sql=del_section,
-                    )
-
-                if use_vec and pg_au_body is not None:
-                    fn_au_ddl = render_procedural_sql(
-                        "pg_transition_simple_function",
-                        fn_name=fn_au,
-                        body_sql=pg_au_body.strip(),
-                    )
-                elif use_vec and (
-                    "OLD." not in old_section
-                    and ":OLD" not in old_section
-                    and "NEW." not in new_section
-                    and ":NEW" not in new_section
-                    and "OLD." not in clean_section
-                    and ":OLD" not in clean_section
-                ):
-                    au_parts = [s.strip() for s in (old_section, new_section, clean_section) if s.strip()]
-                    fn_au_ddl = render_procedural_sql(
-                        "pg_transition_simple_function",
-                        fn_name=fn_au,
-                        body_sql="\n    ".join(au_parts),
-                    )
-                else:
-                    au_loops: List[Dict[str, str]] = []
-                    if old_section.strip():
-                        au_loops.append({
-                            "row_var": "OLD",
-                            "transition_table": "__mv_old_rows",
-                            "section_sql": old_section,
-                        })
-                    if new_section.strip():
-                        au_loops.append({
-                            "row_var": "NEW",
-                            "transition_table": "__mv_new_rows",
-                            "section_sql": new_section,
-                        })
-                    if clean_section.strip():
-                        au_loops.append({
-                            "row_var": "OLD",
-                            "transition_table": "__mv_old_rows",
-                            "section_sql": clean_section.strip(),
-                        })
-                    fn_au_ddl = render_procedural_sql(
-                        "pg_transition_au_loop_function",
-                        fn_name=fn_au,
-                        loops=au_loops,
-                    )
-
-                t_ai = render_procedural_sql(
-                    "pg_transition_trigger",
-                    trg_name=t_ai_name,
-                    event="INSERT",
-                    q_base_t=q_base_t,
-                    referencing="NEW TABLE AS __mv_new_rows",
-                    fn_name=fn_ai,
-                )
-                t_ad = render_procedural_sql(
-                    "pg_transition_trigger",
-                    trg_name=t_ad_name,
-                    event="DELETE",
-                    q_base_t=q_base_t,
-                    referencing="OLD TABLE AS __mv_old_rows",
-                    fn_name=fn_ad,
-                )
-                t_au = render_procedural_sql(
-                    "pg_transition_trigger",
-                    trg_name=t_au_name,
-                    event="UPDATE",
-                    q_base_t=q_base_t,
-                    referencing="OLD TABLE AS __mv_old_rows NEW TABLE AS __mv_new_rows",
-                    fn_name=fn_au,
-                )
-                return (
-                    [fn_ai_ddl, t_ai, fn_ad_ddl, t_ad, fn_au_ddl, t_au, fn_trunc_ddl, t_trunc],
-                    [t_ai_name, t_ad_name, t_au_name, t_trunc_name],
-                    [fn_ai, fn_ad, fn_au, fn_trunc],
-                )
-
-            fn_name = self._bounded_ident(f"{p}fn_sync_", stem)
-            upd_guard_open = f"IF ({changed_guard}) THEN\n        " if changed_guard else ""
-            upd_guard_close = "\n        END IF;" if changed_guard else ""
-            upd_inner = (
-                f"{old_section}\n        {new_section}{clean_section}"
-                if old_section.strip()
-                else f"{new_section}{clean_section}"
-            )
-            fn_ddl = render_procedural_sql(
-                "pg_row_sync_function",
-                fn_name=fn_name,
-                del_section=del_section,
-                ins_section=ins_section,
-                upd_body=f"{upd_guard_open}{upd_inner}{upd_guard_close}",
-            )
-            t_sync = render_procedural_sql(
-                "pg_row_sync_trigger",
-                trg_name=t_sync_name,
-                upd_of_clause=upd_of_clause,
-                q_base_t=q_base_t,
-                fn_name=fn_name,
-            )
-            return (
-                [fn_ddl, t_sync, fn_trunc_ddl, t_trunc],
-                [t_sync_name, t_trunc_name],
-                [fn_name, fn_trunc],
-            )
 
         elif self.dialect == Dialect.MYSQL:
             ins_block = "\n        ".join(ins_stmts)

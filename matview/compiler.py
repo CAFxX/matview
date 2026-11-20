@@ -53,8 +53,6 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
         schemas: Mapping[str, TableSchema],
         view_spec: ViewSpec,
         dialect: Dialect | str | EngineVersion = Dialect.SQLITE,
-        pg_use_transition_tables: bool = False,
-        pg_vectorize_transition_tables: bool = True,
         ignore_limitations: bool = False,
         object_prefix: str = DEFAULT_OBJECT_PREFIX,
         incremental_backfill: bool = False,
@@ -68,8 +66,6 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
             schemas=schemas,
             view_spec=view_spec,
             dialect=dialect,
-            pg_use_transition_tables=pg_use_transition_tables,
-            pg_vectorize_transition_tables=pg_vectorize_transition_tables,
             ignore_limitations=ignore_limitations,
             object_prefix=object_prefix,
             incremental_backfill=incremental_backfill,
@@ -86,8 +82,6 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
         schemas: Mapping[str, TableSchema],
         view_spec: ViewSpec,
         dialect: Dialect | str | EngineVersion = Dialect.SQLITE,
-        pg_use_transition_tables: bool = False,
-        pg_vectorize_transition_tables: bool = True,
         ignore_limitations: bool = False,
         object_prefix: str = DEFAULT_OBJECT_PREFIX,
         incremental_backfill: bool = False,
@@ -110,8 +104,6 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
 
         resolved_dialect: Dialect = parsed_ev.dialect
         resolved_subdialect: EngineSubdialect = parsed_ev.subdialect
-        eff_pg_tt = bool(pg_use_transition_tables and parsed_ev.supports_pg_transition_tables)
-        eff_pg_vec = bool(pg_vectorize_transition_tables)
         eff_batch = max(1, int(batch_size)) if batch_size else 1000
 
         raw_vname = view_spec.view_name
@@ -144,8 +136,6 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
             engine_version=parsed_ev,
             dialect=resolved_dialect,
             subdialect=resolved_subdialect,
-            pg_use_transition_tables=eff_pg_tt,
-            pg_vectorize_transition_tables=eff_pg_vec,
             ignore_limitations=ignore_limitations,
             object_prefix=object_prefix,
             incremental_backfill=incremental_backfill,
@@ -254,14 +244,6 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
     @property
     def subdialect(self) -> EngineSubdialect:
         return self._context.subdialect
-
-    @property
-    def pg_use_transition_tables(self) -> bool:
-        return self._context.pg_use_transition_tables
-
-    @property
-    def pg_vectorize_transition_tables(self) -> bool:
-        return self._context.pg_vectorize_transition_tables
 
     @property
     def ignore_limitations(self) -> bool:

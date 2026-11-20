@@ -181,61 +181,55 @@ $$ LANGUAGE plpgsql;""",
     "pg_truncate_trigger": """CREATE TRIGGER {{ trg_name }}
 AFTER TRUNCATE ON {{ q_base_t }}
 FOR EACH STATEMENT EXECUTE FUNCTION {{ fn_name }}();""",
-    "pg_transition_simple_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+    "pg_statement_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
 RETURNS TRIGGER AS $$
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM {{ guard_table }}) THEN
+        RETURN NULL;
+    END IF;
     {{ body_sql }}
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;""",
-    "pg_transition_loop_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
-RETURNS TRIGGER AS $$
-DECLARE
-    {{ row_var }} RECORD;
-BEGIN
-    FOR {{ row_var }} IN SELECT * FROM {{ transition_table }} LOOP
-        {{ section_sql }}
-    END LOOP;
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;""",
-    "pg_transition_au_loop_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
-RETURNS TRIGGER AS $$
-DECLARE
-    OLD RECORD;
-    NEW RECORD;
-BEGIN
-{% for loop_spec in loops %}
-    FOR {{ loop_spec.row_var }} IN SELECT * FROM {{ loop_spec.transition_table }} LOOP
-        {{ loop_spec.section_sql }}
-    END LOOP;
-{% endfor %}
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;""",
-    "pg_transition_trigger": """CREATE TRIGGER {{ trg_name }}
+    "pg_statement_trigger": """CREATE TRIGGER {{ trg_name }}
 AFTER {{ event }} ON {{ q_base_t }}
 REFERENCING {{ referencing }}
 FOR EACH STATEMENT EXECUTE FUNCTION {{ fn_name }}();""",
-    "pg_row_sync_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
-RETURNS TRIGGER AS $$
+    "pg_partition_trigger_install": """DO $mv_install$
+DECLARE
+    __mv_child regclass;
 BEGIN
-    IF COALESCE(current_setting('matview.skip_triggers', true), '') = 'on' THEN
-        RETURN NULL;
+    IF EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = {{ reg }}::regclass) THEN
+        RAISE EXCEPTION USING ERRCODE = 'feature_not_supported',
+            MESSAGE = 'matview: source table {{ table_label }} is a partition or an inheritance child; '
+                || 'statements on its parent do not fire its statement-level triggers. '
+                || 'Register the view over the partitioned root table.';
     END IF;
-    IF (TG_OP = 'DELETE') THEN
-        {{ del_section }}
-    ELSIF (TG_OP = 'INSERT') THEN
-        {{ ins_section }}
-    ELSIF (TG_OP = 'UPDATE') THEN
-        {{ upd_body }}
+    IF EXISTS (
+        WITH RECURSIVE __mv_tree(relid) AS (
+            SELECT inhrelid FROM pg_inherits WHERE inhparent = {{ reg }}::regclass
+            UNION ALL
+            SELECT i.inhrelid FROM pg_inherits i JOIN __mv_tree t ON i.inhparent = t.relid
+        )
+        SELECT 1 FROM __mv_tree JOIN pg_class c ON c.oid = __mv_tree.relid WHERE NOT c.relispartition
+    ) THEN
+        RAISE EXCEPTION USING ERRCODE = 'feature_not_supported',
+            MESSAGE = 'matview: source table {{ table_label }} has inheritance (INHERITS) children; '
+                || 'statements on the parent do not fire their statement-level triggers. '
+                || 'Only declarative partitioning is supported.';
     END IF;
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;""",
-    "pg_row_sync_trigger": """CREATE TRIGGER {{ trg_name }}
-AFTER INSERT OR UPDATE{{ upd_of_clause }} OR DELETE ON {{ q_base_t }}
-FOR EACH ROW EXECUTE FUNCTION {{ fn_name }}();""",
+    FOR __mv_child IN
+        WITH RECURSIVE __mv_tree(relid) AS (
+            SELECT inhrelid FROM pg_inherits WHERE inhparent = {{ reg }}::regclass
+            UNION ALL
+            SELECT i.inhrelid FROM pg_inherits i JOIN __mv_tree t ON i.inhparent = t.relid
+        )
+        SELECT relid::regclass FROM __mv_tree ORDER BY relid
+    LOOP
+{{ creates }}
+    END LOOP;
+END
+$mv_install$;""",
     "mysql_row_trigger": """CREATE TRIGGER {{ trg_name }}
 AFTER {{ event }} ON {{ q_base_t }}
 FOR EACH ROW
