@@ -433,8 +433,8 @@ class DialectEmitMixin(MixinHost):
         ref_cols = self._referenced_columns_for_table(base_t)
         # Projection backing rows are keyed by the source PK even when the
         # public SELECT omits it. A PK-only UPDATE must therefore fire the
-        # maintenance trigger and must not be suppressed by SQLite's
-        # unchanged-column guard.
+        # maintenance trigger and must not be suppressed by the dialect's
+        # unchanged-column guard (SQLite and MySQL/MariaDB).
         seen_ref_cols = {c.lower() for c in ref_cols}
         for key_col in update_key_columns or ():
             if key_col.lower() not in seen_ref_cols:
