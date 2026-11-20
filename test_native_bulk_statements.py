@@ -253,7 +253,7 @@ VIEWS: List[ViewDef] = [
     ViewDef("v_wh", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM t WHERE v > 0 GROUP BY g HAVING COUNT(*) > 1"),
     # Aggregated expression.
     ViewDef("v_ex", "SELECT g, SUM(v * 2 + w) AS s, COUNT(*) AS c FROM t GROUP BY g"),
-    # Expression group key (known MariaDB type defect, see KNOWN_DEFECT_EXCLUDED_VIEWS).
+    # Expression group key.
     ViewDef("v_exk", "SELECT id % 7 AS k, SUM(v) AS s, COUNT(*) AS c FROM t GROUP BY id % 7"),
 ]
 
@@ -264,8 +264,6 @@ VIEWS: List[ViewDef] = [
 # with the marker of the test named next to it.
 KNOWN_DEFECT_EXCLUDED_VIEWS: Dict[str, Tuple[str, ...]] = {
     "pg-row": ("v_avgd",),  # test_avg_decimal_new_group_scale
-    # Keyed by product (read from the server), not by target id:
-    "mariadb": ("v_exk",),  # test_expression_group_key_result_type
 }
 
 
@@ -993,6 +991,15 @@ _E2 = ("A single-table projection without its source primary key must still main
        "identity across primary-key-only updates. TODO.md 'Track Source-Key Changes in Projection Views Without the Key Column'")
 
 
+def _params_without_pg_row(families: Iterable[str] = ("postgres", "mysql", "sqlite")) -> List[Any]:
+    """Like `_params`, but the PostgreSQL row-trigger target is skipped: its
+    known defects here (_E1; the unchanged-row guard compares by equality, so
+    an unconstrained NUMERIC scale change is skipped) are fixed by replacing
+    PostgreSQL row triggers with statement-level maintenance (bulk stage 2)."""
+    skip = pytest.mark.skip(reason=f"pg-row: _E1 and the equality guard. {STAGE2}")
+    return [pytest.param(p.values[0], id=p.id, marks=[skip]) if p.id == "pg-row" else p for p in _params(families)]
+
+
 @pytest.mark.parametrize("target", _params())
 def test_projection_without_key_after_primary_key_update(make_env, target: Target) -> None:
     """Minimal repro: change only the key, then delete the row."""
@@ -1007,23 +1014,301 @@ def test_projection_without_key_after_primary_key_update(make_env, target: Targe
     env.check("DELETE of the re-keyed rows")
 
 
-_E3 = ("MariaDB types the expression group key `id % 7` over INT as BIGINT, but the backing column is "
-       "INT, so the reader's column type differs from the view's (values are equal). TODO.md "
-       "'Store Expression Group Keys With the Engine's Result Type on MariaDB'")
+AVG_TYPE_SCHEMA = {
+    "postgres": ["CREATE TABLE d (g INT PRIMARY KEY, name VARCHAR(20) NOT NULL)",
+                 "CREATE TABLE a (id INT PRIMARY KEY, g INT, n3 NUMERIC(12,3), n NUMERIC, r REAL, f DOUBLE PRECISION, "
+                 "i INT, s SMALLINT)"],
+    "mysql": ["CREATE TABLE d (g INT PRIMARY KEY, name VARCHAR(20) NOT NULL) ENGINE=InnoDB",
+              "CREATE TABLE a (id INT PRIMARY KEY, g INT, n3 DECIMAL(12,3), n DECIMAL(30,10), r FLOAT, f DOUBLE, "
+              "i INT, s SMALLINT) ENGINE=InnoDB"],
+    "sqlite": ["CREATE TABLE d (g INTEGER PRIMARY KEY, name VARCHAR(20) NOT NULL)",
+               "CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER, n3 INTEGER, n INTEGER, r REAL, f REAL, "
+               "i INTEGER, s SMALLINT)"],
+}
+
+
+@pytest.mark.parametrize("target", _params_without_pg_row())
+@pytest.mark.parametrize("col", ["n3", "n", "r", "f", "i", "s"])
+@pytest.mark.parametrize("shape", ["single", "join"])
+def test_avg_new_group_result_type_and_scale(make_env, target: Target, col: str, shape: str) -> None:
+    """AVG of a group created by an INSERT or by an UPDATE moving a row into a
+    new group equals the native AVG (type and decimal scale) for each argument
+    type; values are exactly representable, so no float ordering is involved."""
+    env = make_env(target, views=[], schema_sql=AVG_TYPE_SCHEMA[target.family], seed=False)
+    env.execute("INSERT INTO d (g, name) VALUES " + ", ".join(f"({g}, 'n{g}')" for g in range(1, 9)))
+    env.commit()
+    if shape == "single":
+        vd = ViewDef("av", f"SELECT g, AVG({col}) AS a, COUNT(*) AS c FROM a GROUP BY g")
+    else:
+        vd = ViewDef("av", f"SELECT d.name, AVG(a.{col}) AS a, COUNT(*) AS c FROM a JOIN d ON a.g = d.g "
+                           "GROUP BY d.name", join=True)
+    env.views = [vd]
+    env.register(vd)
+    env.check("registration")
+    for label, sql in [
+        ("INSERT creating a group", f"INSERT INTO a (id, g, {col}) VALUES (1, 1, 3)"),
+        ("multi-row INSERT creating groups", f"INSERT INTO a (id, g, {col}) VALUES (2, 1, 4), (3, 2, 1), (4, 3, NULL)"),
+        ("UPDATE moving a row into a new group", "UPDATE a SET g = 4 WHERE id = 2"),
+        ("UPDATE of the value in a one-row group", f"UPDATE a SET {col} = 2 WHERE id = 3"),
+        ("DELETE emptying a group", "DELETE FROM a WHERE id = 1"),
+    ]:
+        env.execute(sql)
+        env.commit()
+        env.check(label)
 
 
 @pytest.mark.parametrize("target", _params())
-def test_expression_group_key_result_type(make_env, request, target: Target) -> None:
-    """Minimal repro: register the view; the reader's column types must equal
-    the view's. The MariaDB marker is applied at run time because the product
-    is read from the server (MYSQL_DSN serves both MySQL and MariaDB)."""
+def test_expression_group_key_result_type(make_env, target: Target) -> None:
+    """Regression: register the view; the reader's column types must equal
+    the view's (MariaDB types `id % 7` over INT as BIGINT; the backing column
+    was INT)."""
     env = make_env(target, views=[vd for vd in VIEWS if vd.name == "v_exk"])
-    if env.is_mariadb:
-        request.node.add_marker(known_defect(_E3))
     env.check("registration")
     env.execute("INSERT INTO t (id, g, v) VALUES (1001, 1, 2), (1002, 2, 3)")
     env.commit()
     env.check("multi-row INSERT")
+
+
+# Integer expression group keys over every integer column type: the reader's
+# column type (driver type code) and values must equal the view's.
+INT_KEY_SCHEMA = {
+    "postgres": ["CREATE TABLE ik (id INT PRIMARY KEY, i INT, s SMALLINT, b BIGINT)"],
+    "mysql": ["CREATE TABLE ik (id INT PRIMARY KEY, i INT, s SMALLINT, b BIGINT, ti TINYINT, mi MEDIUMINT, "
+              "u INT UNSIGNED) ENGINE=InnoDB"],
+    "sqlite": ["CREATE TABLE ik (id INTEGER PRIMARY KEY, i INTEGER, s SMALLINT, b BIGINT)"],
+}
+INT_KEY_EXPRS: List[Tuple[str, Tuple[str, ...]]] = [
+    ("id % 7", ("postgres", "mysql", "sqlite")),
+    ("i % 3", ("postgres", "mysql", "sqlite")),
+    ("MOD(i, 3)", ("postgres", "mysql", "sqlite")),
+    ("s % 2", ("postgres", "mysql", "sqlite")),
+    ("b % 7", ("postgres", "mysql", "sqlite")),
+    ("i % b", ("postgres", "mysql", "sqlite")),
+    ("ti % 2", ("mysql",)),
+    ("mi % 2", ("mysql",)),
+    ("u % 7", ("mysql",)),
+    ("-i", ("postgres", "mysql", "sqlite")),
+    ("i + 1", ("postgres", "mysql", "sqlite")),
+    ("s + s", ("postgres", "mysql", "sqlite")),
+    ("i * 2", ("postgres", "mysql", "sqlite")),
+    ("CASE WHEN i > 0 THEN i ELSE 0 END", ("postgres", "mysql", "sqlite")),
+    ("COALESCE(i, 0)", ("postgres", "mysql", "sqlite")),
+    ("i DIV 2", ("mysql",)),
+]
+
+
+@pytest.mark.parametrize("target", _params())
+@pytest.mark.parametrize("expr", [e for e, _ in INT_KEY_EXPRS], ids=[e for e, _ in INT_KEY_EXPRS])
+def test_integer_expression_group_key_result_type(make_env, request, target: Target, expr: str) -> None:
+    _check_integer_expression_view(make_env, request, target, expr, lambda e: (
+        ViewDef("ik_v", f"SELECT {e} AS k, COUNT(*) AS c FROM ik GROUP BY {e}")))
+
+
+@pytest.mark.parametrize("target", _params())
+@pytest.mark.parametrize("expr", [e for e, _ in INT_KEY_EXPRS], ids=[e for e, _ in INT_KEY_EXPRS])
+@pytest.mark.parametrize("agg", ["MIN", "MAX"])
+def test_min_max_of_integer_expression_result_type(make_env, request, target: Target, expr: str, agg: str) -> None:
+    _check_integer_expression_view(make_env, request, target, expr, lambda e: (
+        ViewDef("ik_a", f"SELECT s, {agg}({e}) AS a FROM ik GROUP BY s")))
+
+
+_E4 = ("SUM of an integer expression (not a bare column) is stored with a fallback type: PostgreSQL "
+       "NUMERIC/DOUBLE PRECISION instead of BIGINT/NUMERIC, MySQL/MariaDB DOUBLE instead of DECIMAL for "
+       "%/MOD/DIV. TODO.md 'Store SUM of Integer Expressions With the Native Result Type'")
+
+
+@pytest.mark.parametrize("target", _params(xfail={"pg-row": known_defect(_E4), "pg-tt": known_defect(_E4),
+                                                  "mysql": known_defect(_E4)}))
+def test_sum_of_integer_expression_result_type(make_env, request, target: Target) -> None:
+    _check_integer_expression_view(make_env, request, target, "i % 3", lambda e: (
+        ViewDef("ik_s", f"SELECT s, SUM({e}) AS a FROM ik GROUP BY s")))
+
+
+_E5 = ("SQLite MOD(x, y) returns REAL, but sqlglot parses it as the `%` operator (INTEGER), so the "
+       "backing column has INTEGER affinity. TODO.md 'Integer Expression Result Types Not Yet Derived Exactly'")
+_E6 = ("MySQL reports a GROUP BY expression over TINYINT/SMALLINT/MEDIUMINT arithmetic as INT (LONG) "
+       "while a plain SELECT of it is BIGINT; the backing column is BIGINT. TODO.md "
+       "'Integer Expression Result Types Not Yet Derived Exactly'")
+_E7 = ("PostgreSQL integer +, -, * keep the operand type (int4 + int4 is int4, int2 + int2 is int2), "
+       "but the backing column of a key or MIN/MAX over them is BIGINT. TODO.md "
+       "'Integer Expression Result Types Not Yet Derived Exactly'")
+# (product, view name, expression) -> reason. Applied at run time because the
+# product (MySQL or MariaDB) is read from the server.
+KNOWN_INT_EXPR_TYPE_DEFECTS: Dict[Tuple[str, str, str], str] = {
+    **{("sqlite", v, "MOD(i, 3)"): _E5 for v in ("ik_v", "ik_a")},
+    **{("mysql", "ik_v", e): _E6 for e in ("s % 2", "ti % 2", "mi % 2", "s + s")},
+    **{("postgres", v, e): _E7 for v in ("ik_v", "ik_a") for e in ("i + 1", "s + s", "i * 2")},
+}
+
+
+def _check_integer_expression_view(make_env, request, target: Target, expr: str,
+                                   view: Callable[[str], ViewDef]) -> None:
+    families = dict(INT_KEY_EXPRS)[expr]
+    if target.family not in families:
+        pytest.skip(f"{expr} is not {target.family} syntax")
+    env = make_env(target, views=[], schema_sql=INT_KEY_SCHEMA[target.family], seed=False)
+    reason = KNOWN_INT_EXPR_TYPE_DEFECTS.get((env.product, view(expr).name, expr))
+    if reason:
+        request.node.add_marker(known_defect(reason))
+    cols = "id, i, s, b" + (", ti, mi, u" if target.family == "mysql" else "")
+    rows = []
+    for n in range(1, 13):
+        base = [n, (n * 5) % 11 - 3 if n % 6 else None, n % 4, n * 1000003]
+        if target.family == "mysql":
+            base += [n % 3, n * 7, n * 13]
+        rows.append("(" + ", ".join("NULL" if x is None else str(x) for x in base) + ")")
+    env.execute(f"INSERT INTO ik ({cols}) VALUES " + ", ".join(rows))
+    env.commit()
+    vd = view(expr)
+    env.views = [vd]
+    env.register(vd)
+    env.check("registration")
+    env.execute("UPDATE ik SET i = i + 1, s = s + 1 WHERE id % 2 = 0")
+    env.commit()
+    env.check("UPDATE")
+
+
+# ---------------------------------------------------------------------------
+# UPDATE of each single column, on view shapes whose stored rows are keyed by
+# something other than the updated column
+# ---------------------------------------------------------------------------
+#
+# Contract: an UPDATE of any column of a source table, alone, keeps every view
+# exact, including when the column is not in the view's output (primary key
+# omitted by a projection; column used only in WHERE, HAVING, a join
+# condition, an expression group key or a DISTINCT key) and when the new value
+# equals the old one under the column's comparison but is not identical
+# (case or trailing-space change under a case-insensitive or PAD SPACE
+# collation, numeric scale, the sign of a floating-point zero). A later
+# DELETE of the updated rows must retract them (no phantom rows).
+
+UPDATE_COLUMN_VIEWS: List[ViewDef] = [
+    ViewDef("u_pr", "SELECT g, v FROM t WHERE w > 0"),
+    ViewDef("u_bare", "SELECT v FROM t"),
+    ViewDef("u_prm", "SELECT m FROM t WHERE g IS NOT NULL"),
+    ViewDef("u_ds", "SELECT DISTINCT g FROM t"),
+    ViewDef("u_dsw", "SELECT DISTINCT v FROM t WHERE w > 0"),
+    ViewDef("u_wh", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM t WHERE w > 0 GROUP BY g HAVING COUNT(*) > 1"),
+    ViewDef("u_hv", "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING SUM(w) > 3"),
+    ViewDef("u_exk", "SELECT id % 7 AS k, COUNT(*) AS c FROM t GROUP BY id % 7"),
+    ViewDef("u_exg", "SELECT g % 3 AS k, SUM(v) AS s, COUNT(*) AS c FROM t GROUP BY g % 3"),
+    ViewDef("u_mm", "SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM t WHERE w > 0 GROUP BY g"),
+    ViewDef("u_pj", "SELECT t.v, d.name FROM t JOIN d ON t.g = d.g", join=True),
+    ViewDef("u_pjw", "SELECT t.g, t.v FROM t JOIN d ON t.g = d.g WHERE t.w > 0", join=True),
+    ViewDef("u_ja", "SELECT d.name, COUNT(*) AS c, SUM(t.v) AS s FROM t JOIN d ON t.g = d.g "
+                    "WHERE t.w > 0 GROUP BY d.name", join=True),
+]
+
+# (label, SQL) of single-column UPDATEs, applied in order to one state; each
+# changes one column of some rows (or rewrites it with its own value).
+UPDATE_COLUMN_STEPS: List[Tuple[str, str]] = [
+    ("t.id changed", "UPDATE t SET id = id + 1000 WHERE id % 3 = 0"),
+    ("t.g changed", "UPDATE t SET g = (g + 1) % 7 WHERE id % 4 = 1"),
+    ("t.v changed", "UPDATE t SET v = v + 1 WHERE id % 5 = 2"),
+    ("t.w changed (filter membership)", "UPDATE t SET w = CASE WHEN w > 0 THEN 0 ELSE 1 END WHERE id % 2 = 0"),
+    ("t.m changed", "UPDATE t SET m = m + 1 WHERE id % 3 = 1"),
+    ("t.id changed again", "UPDATE t SET id = id + 2000 WHERE id % 2 = 1"),
+    ("every t column rewritten with its own value", "UPDATE t SET id = id, g = g, v = v, w = w, m = m"),
+    ("d.g changed (join key)", "UPDATE d SET g = g + 100 WHERE g IN (1, 4)"),
+    ("d.name changed", "UPDATE d SET name = 'n7' WHERE g IN (2, 104)"),
+    ("d.g restored", "UPDATE d SET g = g - 100 WHERE g >= 100"),
+    ("DELETE of re-keyed and moved t rows", "DELETE FROM t WHERE id > 1000 OR id % 4 = 1"),
+    ("DELETE of d rows", "DELETE FROM d WHERE g IN (2, 3)"),
+    ("DELETE of every t row", "DELETE FROM t"),
+]
+
+
+@pytest.mark.parametrize("target", _params())
+@pytest.mark.parametrize("view", UPDATE_COLUMN_VIEWS, ids=[vd.name for vd in UPDATE_COLUMN_VIEWS])
+def test_single_column_update_on_every_column(make_env, target: Target, view: ViewDef) -> None:
+    env = make_env(target, views=[view])
+    env.check("registration")
+    for label, sql in UPDATE_COLUMN_STEPS:
+        env.execute(sql)
+        env.commit()
+        env.check(label)
+
+
+# Composite primary key: an UPDATE of one key column only.
+COMPOSITE_KEY_SCHEMA = {
+    "postgres": ["CREATE TABLE t2 (a INT NOT NULL, b INT NOT NULL, x INT, PRIMARY KEY (a, b))"],
+    "mysql": ["CREATE TABLE t2 (a INT NOT NULL, b INT NOT NULL, x INT, PRIMARY KEY (a, b)) ENGINE=InnoDB"],
+    "sqlite": ["CREATE TABLE t2 (a INTEGER NOT NULL, b INTEGER NOT NULL, x INTEGER, PRIMARY KEY (a, b))"],
+}
+COMPOSITE_KEY_VIEWS = [
+    ViewDef("c_x", "SELECT x FROM t2"),
+    ViewDef("c_ax", "SELECT a, x FROM t2 WHERE x > 0"),
+    ViewDef("c_bx", "SELECT b, x FROM t2"),
+    ViewDef("c_dx", "SELECT DISTINCT x FROM t2"),
+    ViewDef("c_agg", "SELECT a, SUM(x) AS s, COUNT(*) AS c FROM t2 GROUP BY a"),
+]
+
+
+@pytest.mark.parametrize("target", _params())
+@pytest.mark.parametrize("view", COMPOSITE_KEY_VIEWS, ids=[vd.name for vd in COMPOSITE_KEY_VIEWS])
+def test_composite_key_partial_update(make_env, target: Target, view: ViewDef) -> None:
+    env = make_env(target, views=[], schema_sql=COMPOSITE_KEY_SCHEMA[target.family], seed=False)
+    env.execute("INSERT INTO t2 (a, b, x) VALUES " + ", ".join(
+        f"({i % 4}, {i}, {(i * 7) % 5 - 1})" for i in range(1, 21)))
+    env.commit()
+    env.views = [view]
+    env.register(view)
+    env.check("registration")
+    for label, sql in [
+        ("b only", "UPDATE t2 SET b = b + 100 WHERE b % 3 = 0"),
+        ("a only", "UPDATE t2 SET a = a + 10 WHERE b % 2 = 0"),
+        ("a and b swapped", "UPDATE t2 SET a = b, b = a WHERE b % 5 = 1"),
+        ("both key columns rewritten with their own value", "UPDATE t2 SET a = a, b = b"),
+        ("DELETE of re-keyed rows", "DELETE FROM t2 WHERE b > 100 OR a >= 10"),
+        ("DELETE of every row", "DELETE FROM t2"),
+    ]:
+        env.execute(sql)
+        env.commit()
+        env.check(label)
+
+
+# UPDATEs whose new value compares equal to the old one but is not identical.
+SAME_VALUE_CASES: Dict[str, Tuple[List[str], List[str], List[Tuple[str, str]]]] = {
+    # family: (schema, views (select texts), [(label, UPDATE)])
+    "postgres": (
+        ["CREATE TABLE s (id INT PRIMARY KEY, n NUMERIC, f DOUBLE PRECISION, txt VARCHAR(20))",
+         "INSERT INTO s VALUES (1, 1.5, 0.0, 'ab'), (2, 2, 1.0, 'cd'), (3, NULL, NULL, NULL)"],
+        ["SELECT n, f, txt FROM s", "SELECT id, n FROM s", "SELECT txt, COUNT(*) AS c FROM s GROUP BY txt"],
+        [("numeric scale only", "UPDATE s SET n = n * 1.00"),
+         ("float zero sign only", "UPDATE s SET f = -f WHERE f = 0")],
+    ),
+    "mysql": (
+        ["CREATE TABLE s (id INT PRIMARY KEY, txt VARCHAR(20), f DOUBLE) ENGINE=InnoDB",
+         "INSERT INTO s VALUES (1, 'ab', 0.0), (2, 'cd', 1.0), (3, NULL, NULL)"],
+        ["SELECT txt, f FROM s", "SELECT id, txt FROM s"],
+        [("string case only (case-insensitive collation)", "UPDATE s SET txt = UPPER(txt)"),
+         ("trailing space only", "UPDATE s SET txt = CONCAT(txt, ' ')"),
+         ("float zero sign only", "UPDATE s SET f = -f WHERE f = 0")],
+    ),
+    "sqlite": (
+        ["CREATE TABLE s (id INTEGER PRIMARY KEY, txt TEXT COLLATE NOCASE, r TEXT COLLATE RTRIM, f REAL)",
+         "INSERT INTO s VALUES (1, 'ab', 'x', 0.0), (2, 'cd', 'y', 1.0), (3, NULL, NULL, NULL)"],
+        ["SELECT txt, r, f FROM s", "SELECT id, txt, r FROM s"],
+        [("string case only (NOCASE)", "UPDATE s SET txt = UPPER(txt)"),
+         ("trailing space only (RTRIM)", "UPDATE s SET r = r || ' '"),
+         ("float zero sign only", "UPDATE s SET f = -f WHERE f = 0")],
+    ),
+}
+
+
+@pytest.mark.parametrize("target", _params_without_pg_row())
+def test_update_to_equal_but_not_identical_value(make_env, target: Target) -> None:
+    schema, selects, steps = SAME_VALUE_CASES[target.family]
+    env = make_env(target, views=[], schema_sql=schema, seed=False)
+    env.commit()
+    env.views = [ViewDef(f"s_{i}", sel) for i, sel in enumerate(selects)]
+    for vd in env.views:
+        env.register(vd)
+    env.check("registration")
+    for label, sql in steps:
+        env.execute(sql)
+        env.commit()
+        env.check(label)
 
 
 # ---------------------------------------------------------------------------

@@ -754,6 +754,77 @@ class DialectBaseMixin(MixinHost):
 
         return None
 
+    # MariaDB integer column display lengths (sign included when signed); the
+    # declared display width (INT(5)) does not change arithmetic lengths.
+    _MARIADB_INT_DIGITS = {"TINYINT": (3, 3), "SMALLINT": (5, 5), "MEDIUMINT": (8, 8),
+                           "INT": (10, 10), "INTEGER": (10, 10), "BIGINT": (19, 20)}
+    _MARIADB_INT_COLUMN_RE = re.compile(
+        r"(TINYINT|SMALLINT|MEDIUMINT|INTEGER|INT|BIGINT)(?:\s*\(\s*\d+\s*\))?(\s+UNSIGNED)?(?:\s+ZEROFILL)?"
+    )
+
+    def _mariadb_int_arithmetic_length(self, root: Any) -> Optional[int]:
+        """MariaDB's display length of an integer arithmetic expression.
+
+        MariaDB types an integer expression result as INT when its display
+        length is below 10 characters and as BIGINT otherwise, so `i % 7` over
+        INT is BIGINT while `s % 2` over SMALLINT is INT. The length follows
+        the operators' rules (digits, sign): column of the integer type;
+        literal (digits, unsigned); -x (d + 1 if x is signed else d, signed);
+        x + y, x - y (max(d) + 1, either signed); x * y (sum(d), either
+        signed); x % y (max(d), signedness of x); top-level x DIV y (length
+        d(x)). Verified natively on MariaDB 10.11 and 12.3 (test_native_bulk_
+        statements.py::test_integer_expression_group_key_result_type).
+        Returns None when the top-level node is not integer arithmetic or an
+        operand is outside these rules, leaving the caller's default.
+        """
+        def shape(node: Any) -> Optional[Tuple[int, bool]]:
+            kind = node.__class__.__name__
+            if kind == "Paren":
+                return shape(node.this)
+            if kind == "Column":
+                c_def = self._lookup_col_def(node.sql()) or self._lookup_col_def(node.name)
+                if c_def is None:
+                    return None
+                m = self._MARIADB_INT_COLUMN_RE.fullmatch(re.sub(r"\s+", " ", c_def.data_type.strip().upper()))
+                if m is None:
+                    return None
+                signed_d, unsigned_d = self._MARIADB_INT_DIGITS[m.group(1)]
+                return (unsigned_d, False) if m.group(2) else (signed_d, True)
+            if kind == "Literal":
+                text = str(node.this)
+                return (len(text), False) if not node.args.get("is_string") and text.isdigit() else None
+            if kind == "Neg":
+                inner = node.this
+                while inner.__class__.__name__ == "Paren":
+                    inner = inner.this
+                if inner.__class__.__name__ == "Literal":
+                    lit = shape(inner)
+                    return (lit[0], True) if lit else None
+                x = shape(inner)
+                return (x[0] + 1, True) if x and x[1] else ((x[0], True) if x else None)
+            if kind in ("Add", "Sub", "Mul", "Mod"):
+                a, b = shape(node.this), shape(node.expression)
+                if a is None or b is None:
+                    return None
+                if kind == "Mul":
+                    return (a[0] + b[0], a[1] or b[1])
+                if kind == "Mod":
+                    return (max(a[0], b[0]), a[1])
+                return (max(a[0], b[0]) + 1, a[1] or b[1])
+            return None
+
+        top = root
+        while top.__class__.__name__ == "Paren":
+            top = top.this
+        kind = top.__class__.__name__
+        if kind == "IntDiv":
+            left = shape(top.this)
+            return left[0] if left and shape(top.expression) else None
+        if kind not in ("Add", "Sub", "Mul", "Mod", "Neg"):
+            return None
+        s = shape(top)
+        return s[0] + (1 if s[1] else 0) if s else None
+
     def _infer_ast_expr_storage_type(self, expr: str) -> Optional[str]:
         """Infer storage type across dialects from AST nodes (CASE, COALESCE, arithmetic, scalars)."""
         try:
@@ -868,13 +939,17 @@ class DialectBaseMixin(MixinHost):
                         return None
                     branches.append(inferred)
                 return merge(branches)
-            if kind in ("Add", "Sub", "Mul", "Div", "Mod"):
+            if kind in ("Add", "Sub", "Mul", "Div", "Mod", "IntDiv"):
                 left, right = infer(node.this), infer(node.expression)
                 if left is None or right is None:
                     return None
                 merged = merge((left, right))
                 if kind == "Div" and merged in ("SMALLINT", "INTEGER", "BIGINT") and self.dialect != Dialect.POSTGRES:
                     return "DOUBLE PRECISION"
+                if kind == "IntDiv":
+                    # MySQL/MariaDB DIV: integer result (BIGINT on MySQL;
+                    # MariaDB's width rule is applied below).
+                    return "BIGINT" if merged in ("SMALLINT", "INTEGER", "BIGINT") else None
                 if kind in ("Add", "Sub", "Mul") and merged in ("SMALLINT", "INTEGER"):
                     return "BIGINT"
                 if merged == "REAL":
@@ -905,12 +980,12 @@ class DialectBaseMixin(MixinHost):
         if inferred == "BOOLEAN":
             return "BOOLEAN" if self.dialect == Dialect.POSTGRES else "INTEGER"
         if inferred in ("SMALLINT", "INTEGER", "BIGINT") and self.dialect != Dialect.POSTGRES:
-            if (
-                self.dialect == Dialect.MYSQL
-                and self.subdialect == EngineSubdialect.MARIADB
-                and inferred == "INTEGER"
-            ):
-                return "INT"
+            if self.dialect == Dialect.MYSQL and self.subdialect == EngineSubdialect.MARIADB:
+                arith_len = self._mariadb_int_arithmetic_length(root)
+                if arith_len is not None:
+                    return "BIGINT" if arith_len >= 10 else "INT"
+                if inferred == "INTEGER":
+                    return "INT"
             return self._int_type()
         if inferred in ("REAL", "DOUBLE PRECISION") and self.dialect != Dialect.POSTGRES:
             return self._float_type()
@@ -1050,6 +1125,12 @@ class DialectBaseMixin(MixinHost):
             arg_inferred = self._infer_expr_storage_type(
                 SelectItem(raw_expr=item.arg_expr, alias=item.alias, is_aggregate=False)
             )
+            if self.dialect == Dialect.MYSQL and arg_inferred and re.fullmatch(
+                r"(?:TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT)", arg_inferred.strip().upper()
+            ):
+                # MySQL/MariaDB MIN/MAX of an integer expression (not a bare
+                # column) is BIGINT even where the expression itself is INT.
+                return "BIGINT"
             if arg_inferred:
                 return arg_inferred
         if self.dialect == Dialect.SQLITE and item.agg_func is None:

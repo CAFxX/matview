@@ -404,6 +404,30 @@ class DialectEmitMixin(MixinHost):
         return inc_stmts
 
 
+    def _identical_row_values_sql(self, old: str, new: str, is_nullable: bool) -> str:
+        """True only when the OLD and NEW values are identical, not merely equal.
+
+        Equality is not identity: under a case-insensitive or PAD SPACE
+        collation 'ab' = 'AB ' holds, yet the view returns the new value.
+        A guard that treats such an UPDATE as a no-op leaves the old value
+        stored, so the comparison must be by value representation.
+        """
+        if self.dialect == Dialect.POSTGRES:
+            # PostgreSQL row triggers are being replaced by statement-level
+            # maintenance (bulk stage 2); keep their existing comparison.
+            return self._null_safe_eq(old, new, is_nullable=is_nullable)
+        if self.dialect == Dialect.MYSQL:
+            return f"(CAST({old} AS BINARY) <=> CAST({new} AS BINARY))"
+        # SQLite: IS compares with the column's collation (NOCASE, RTRIM), so
+        # force BINARY. 3 IS 3.0 is true, but a column without affinity (BLOB
+        # or no declared type) can change INTEGER 3 to REAL 3.0, which changes
+        # the storage class of SUM and of every value the view returns; only a
+        # change of neither value nor storage class may skip maintenance.
+        # REAL -0.0 IS 0.0 is true with matching typeof('real') yet the stored
+        # sign differs, so a REAL zero is never treated as unchanged.
+        eq = f"{old} IS {new} COLLATE BINARY" if is_nullable else f"{old} = {new} COLLATE BINARY"
+        return f"({eq} AND typeof({old}) = typeof({new}) AND NOT (typeof({old}) = 'real' AND {old} = 0.0))"
+
     def _emit_dialect_triggers_for_table(
         self,
         view_name: str,
@@ -453,19 +477,7 @@ class DialectEmitMixin(MixinHost):
                 c_def = t_schema.columns.get(c_name)
                 is_null = not (c_def.not_null if c_def else False)
                 qc = self._q(c_name)
-                unchanged = self._null_safe_eq(f"OLD.{qc}", f"NEW.{qc}", is_nullable=is_null)
-                if self.dialect == Dialect.SQLITE:
-                    # 3 IS 3.0 is true, and -0.0 IS 0.0 is true with matching
-                    # typeof('real'), but a column without affinity (BLOB or no
-                    # declared type) can change INTEGER 3 <-> REAL 3.0 or
-                    # REAL -0.0 <-> REAL 0.0, changing the exact output value.
-                    # Only a change of neither value, storage class, nor zero
-                    # sign may skip maintenance.
-                    unchanged = (
-                        f"({unchanged} AND typeof(OLD.{qc}) = typeof(NEW.{qc}) "
-                        f"AND NOT (typeof(OLD.{qc}) = 'real' AND OLD.{qc} = 0.0))"
-                    )
-                unchanged_conds.append(unchanged)
+                unchanged_conds.append(self._identical_row_values_sql(f"OLD.{qc}", f"NEW.{qc}", is_null))
         changed_guard = f"NOT ({' AND '.join(unchanged_conds)})" if unchanged_conds else None
 
         cleanup_stmts = upd_cleanup_old_stmts or []
