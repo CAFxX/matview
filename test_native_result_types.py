@@ -36,6 +36,7 @@ from matview_sync import (
     UnsupportedMaterializedViewError,
     generate_materialized_view,
 )
+from test_matview_sync import FLOAT_OPT_IN
 from test_native_statistical_aggregates import (
     _catalog_types,
     _connect,
@@ -258,14 +259,14 @@ class NativeResultTypeTests(unittest.TestCase):
                     warnings.simplefilter("always")
                     if engine == Dialect.MYSQL:
                         with self.assertRaises(EngineLimitationError):
-                            manager.register_view(f"CREATE VIEW {mv} AS {select};")
+                            manager.register_view(f"CREATE VIEW {mv} AS {select};", accept_limitations=FLOAT_OPT_IN)
                         conn.rollback()
-                        manager.register_view(f"CREATE VIEW {mv} AS {select};", ignore_limitations=True)
+                        manager.register_view(f"CREATE VIEW {mv} AS {select};", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
                         codes = [str(w.message) for w in caught if issubclass(w.category, EngineLimitationWarning)]
                         self.assertEqual(len(codes), 1)
                         self.assertIn("MYSQL_NO_TRUNCATE_TRIGGER", codes[0])
                     else:
-                        manager.register_view(f"CREATE VIEW {mv} AS {select};")
+                        manager.register_view(f"CREATE VIEW {mv} AS {select};", accept_limitations=FLOAT_OPT_IN)
                 conn.commit()
                 pairs.append((name, mv, live))
                 mv_cat = [r[1:] for r in _catalog_types(engine, cur, mv)]
@@ -390,7 +391,7 @@ class ScalarSubqueryAggregateFallbackTests(unittest.TestCase):
                             schema.replace("DOUBLE PRECISION", "DOUBLE") if not engine.startswith("postgres") else schema,
                             f"CREATE VIEW v AS {view.format(t='t')};",
                             dialect=engine,
-                            ignore_limitations=True,
+                            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                         )
                     self.assertNotEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
                     self.assertNotIn("__mv_elem", plan.reader_view_ddl or "")
@@ -404,7 +405,7 @@ class ScalarSubqueryAggregateFallbackTests(unittest.TestCase):
                     warnings.simplefilter("always")
                     plan = generate_materialized_view(
                         schema.replace("DOUBLE PRECISION", "DOUBLE") if not engine.startswith("postgres") else schema,
-                        f"CREATE VIEW v AS {view};", dialect=engine, ignore_limitations=True,
+                        f"CREATE VIEW v AS {view};", dialect=engine, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                     )
                 lead = f"exact result required: falling back to strategy {plan.strategy.value}: "
                 msgs = [str(w.message) for w in caught if issubclass(w.category, MaintenanceFallbackWarning)]
@@ -434,7 +435,7 @@ class ScalarSubqueryAggregateFallbackTests(unittest.TestCase):
                     with self.assertRaises(UnsupportedMaterializedViewError):
                         generate_materialized_view(
                             schema.replace("DOUBLE PRECISION", "DOUBLE") if not engine.startswith("postgres") else schema,
-                            f"CREATE VIEW v AS {view};", dialect=engine, ignore_limitations=True,
+                            f"CREATE VIEW v AS {view};", dialect=engine, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                         )
 
     def test_matches_live_view_natively(self) -> None:
@@ -469,7 +470,7 @@ class ScalarSubqueryAggregateFallbackTests(unittest.TestCase):
                     conn.commit()
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", EngineLimitationWarning)
-                        manager.register_view(f"CREATE VIEW {mv} AS {sql};", ignore_limitations=True)
+                        manager.register_view(f"CREATE VIEW {mv} AS {sql};", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
                     conn.commit()
                     for step, stmt in steps:
                         if stmt:
@@ -541,7 +542,7 @@ class MinMaxContextTypingTests(unittest.TestCase):
                 with self.subTest(engine=engine, col=col, ctx=ctx):
                     compile_ = lambda: generate_materialized_view(
                         schema, f"CREATE VIEW v AS {sql.format(c=col, t='t')};", dialect=engine,
-                        ignore_limitations=True,
+                        ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                     )
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", EngineLimitationWarning)
@@ -581,7 +582,7 @@ class MinMaxContextTypingTests(unittest.TestCase):
                     try:
                         with warnings.catch_warnings():
                             warnings.simplefilter("ignore", EngineLimitationWarning)
-                            manager.register_view(f"CREATE VIEW {mv} AS {sql};", ignore_limitations=True)
+                            manager.register_view(f"CREATE VIEW {mv} AS {sql};", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
                     except UnsupportedMaterializedViewError:
                         conn.rollback()
                         if not refused:
@@ -638,7 +639,7 @@ class MySQLBitWindowVersionGateTests(unittest.TestCase):
     def _col(self, engine: str) -> str:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", EngineLimitationWarning)
-            plan = generate_materialized_view(self.SCHEMA, self.VIEW, dialect=engine, ignore_limitations=True)
+            plan = generate_materialized_view(self.SCHEMA, self.VIEW, dialect=engine, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
         return next(l.strip().rstrip(",") for l in plan.backing_table_ddl.splitlines() if l.strip().startswith("r "))
 
     def test_measured_releases_are_typed(self) -> None:
@@ -713,7 +714,7 @@ class NativeMySQLIntegerMinMaxTests(unittest.TestCase):
                     mv, live = f"mv_{name}_{tag}", f"lv_{name}_{tag}"
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", EngineLimitationWarning)
-                        manager.register_view(f"CREATE VIEW {mv} AS {select};", ignore_limitations=True)
+                        manager.register_view(f"CREATE VIEW {mv} AS {select};", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
                     conn.commit()
                     cur.execute(f"CREATE VIEW {live} AS {select}")
                     conn.commit()
