@@ -576,8 +576,8 @@ protocol at all: run it with writes to the source tables stopped.
   the live schema: `ok`, `drifted`, `invalid` or `backfill_incomplete`.
   `diff_views()` / `matview diff` shows what a registration would change.
 - `repair_view(name=None)` (`--repair`) repopulates (or rebuilds after drift)
-  each view in its own transaction; there is no all-view atomicity. See
-  [Concurrency notes](#concurrency-notes) before running it on PostgreSQL.
+  each view in its own transaction; there is no all-view atomicity (see
+  [Concurrency notes](#concurrency-notes) for locking and isolation details).
 - Upgrades: a view's catalog signature includes a generator version, so after
   an upgrade that changes the generated maintenance SQL, `check_schema_drift()`
   reports the view as `drifted` and `register_view()` / `sync_views()` rebuild
@@ -713,9 +713,10 @@ sessions wait as follows:
 The catalog is checked again at refresh time; if it nevertheless changed, the
 block is rolled back.
 
-Concurrent writers that commit while the refresh runs have the same caveats as
-`repair_view()` (see [Concurrency notes](#concurrency-notes)). Other known
-limitations:
+On PostgreSQL with the default session bypass (`drop_triggers=False`),
+concurrent writers that commit during the refresh can be missed because the
+refresh does not lock source tables (see
+[Concurrency notes](#concurrency-notes)). Other known limitations:
 
 - On MariaDB with `innodb_snapshot_isolation` (on by default in 12.3), a
   block that only reads with a consistent snapshot can make the refresh fail
@@ -772,19 +773,26 @@ observe depends on the engine:
   `MIN`/`MAX`/`BIT_AND`/`BIT_OR` after a delete; `AVG` over integer columns is
   derived from the locked row's `SUM`/`COUNT` and is not affected). See
   [Race-Free Recomputation for the Remaining Recomputed Aggregates (stale snapshot after a row-lock wait)](TODO.md).
-- PostgreSQL `repair_view()` is exact only while writes to the view's source
-  tables are quiesced: a write that commits during the repair can be missing
-  from the result
-  ([Make `repair_view()` Exact on PostgreSQL Under Concurrent Writers (silent divergence today)](TODO.md)).
+- PostgreSQL `repair_view()`: on the repopulate (`"repaired"`) path, acquires
+  `SHARE` locks on the view's referenced source tables (in deterministic sorted
+  order, after the catalog lock) before clearing and repopulating, so under
+  `READ COMMITTED` writers serialize cleanly while concurrent readers
+  (`ACCESS SHARE`) remain unblocked (verified natively). Rebuilding after
+  schema drift or missing triggers (`"rebuilt"`) uses `register_view(...,
+  force_rebuild=True)` DDL locks (which block readers while running). Known
+  exclusion: a concurrent `REPEATABLE READ` or `SERIALIZABLE` transaction whose
+  snapshot was already established *before* `repair_view()` committed can still
+  observe the pre-repair catalog/backing snapshot in its trigger (e.g. an
+  active watermark or empty `ATOMIC_QUERY_SYNC` store) and silently diverge.
 - PostgreSQL views maintained by full-recompute (`ATOMIC_QUERY_SYNC`)
   triggers, for example a plain join without aggregation, can double their rows
   when two writers commit concurrently, and when a writer commits during or
   after a `bulk_changes()` refresh: each recompute deletes and re-inserts from
   its own statement snapshot
   ([Serialize PostgreSQL ATOMIC_QUERY_SYNC (Full-Recompute) Maintenance Under Concurrent Writers (silent row doubling today)](TODO.md)).
-- PostgreSQL `bulk_changes()` refreshes like `repair_view()`: a write that
-  commits during the refresh can be missing unless `drop_triggers=True` makes
-  writers wait.
+- PostgreSQL `bulk_changes()` with the default session bypass does not lock
+  source tables during its refresh: a write that commits during the refresh can
+  be missing unless `drop_triggers=True` makes writers wait.
 - MySQL/MariaDB (InnoDB, default `REPEATABLE READ`): the repopulating
   `INSERT ... SELECT` of `repair_view()` takes shared locks on the rows it reads,
   so writers serialize with it (verified natively with concurrent writers).
@@ -977,7 +985,6 @@ Correctness gaps (the materialized view can differ from the original view):
 
 - [Make Floating-Point Aggregates Exactly Equal to the Live View on PostgreSQL and MySQL/MariaDB (silent divergence today)](TODO.md)
 - [Race-Free Recomputation for the Remaining Recomputed Aggregates (stale snapshot after a row-lock wait)](TODO.md)
-- [Make `repair_view()` Exact on PostgreSQL Under Concurrent Writers (silent divergence today)](TODO.md)
 - [Serialize PostgreSQL ATOMIC_QUERY_SYNC (Full-Recompute) Maintenance Under Concurrent Writers (silent row doubling today)](TODO.md)
 - [Fail-Closed Incremental Backfill (no silent missing or double-counted rows after a failed backfill)](TODO.md) (remaining known exclusions)
 - [Fix Pre-Existing SQLite Divergences Found by the Exact SUM/TOTAL/AVG Differential](TODO.md) (storage-class changes for `MIN`/`MAX`/group keys, `LEFT JOIN` group moves, primary-key updates during backfill)

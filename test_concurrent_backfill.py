@@ -3124,5 +3124,1214 @@ class NativeBackfillLockingTests(unittest.TestCase):
         self._for_each_engine(body)
 
 
+class PostgresRepairLockTargetsTests(unittest.TestCase):
+    """Offline structural checks for PostgreSQL repair_view() table locking."""
+
+    def test_lock_targets_deduplicates_sorts_and_preserves_postgres_quoting(self) -> None:
+        from matview.manager import _postgres_base_table_lock_targets
+        from matview_sync import generate_materialized_view, parse_table_schema
+
+        schema = parse_table_schema(
+            """
+            CREATE TABLE z_tbl (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL);
+            CREATE TABLE a_tbl (id INT PRIMARY KEY, z_id INT NOT NULL, w INT NOT NULL);
+            """,
+            dialect=Dialect.POSTGRES,
+        )
+
+        # Reversed join order -> deterministic sorted order.
+        p_join = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_join AS SELECT z.g, SUM(a.w) AS s FROM z_tbl z JOIN a_tbl a ON a.z_id = z.id GROUP BY z.g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(_postgres_base_table_lock_targets(p_join), ["a_tbl", "z_tbl"])
+
+        # Self-join -> deduplicated to one target.
+        p_self = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_self AS SELECT a.g, COUNT(*) AS c FROM z_tbl a JOIN Z_TBL b ON a.id = b.id GROUP BY a.g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(_postgres_base_table_lock_targets(p_self), ["z_tbl"])
+
+        # UNION ALL -> both tables sorted.
+        p_union = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_union AS SELECT id, g FROM z_tbl UNION ALL SELECT id, z_id FROM a_tbl;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(_postgres_base_table_lock_targets(p_union), ["a_tbl", "z_tbl"])
+
+        # CTE + EXISTS subquery -> CTE excluded, real tables sorted.
+        p_cte = generate_materialized_view(
+            schema,
+            (
+                "CREATE VIEW v_cte AS "
+                "WITH filtered AS (SELECT id, g FROM z_tbl WHERE v > 0) "
+                "SELECT f.g, COUNT(*) AS c FROM filtered f "
+                "WHERE EXISTS (SELECT 1 FROM a_tbl a WHERE a.z_id = f.id) GROUP BY f.g;"
+            ),
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(_postgres_base_table_lock_targets(p_cte), ["a_tbl", "z_tbl"])
+
+        # Quoted reserved keyword, mixed-case, spaces, embedded quotes, schema qualifiers,
+        # shadowed subquery CTE, and table-valued function (not lockable).
+        fake_spec = types.SimpleNamespace(
+            raw_select_sql=(
+                'WITH "Shadow" AS (SELECT 1 AS x) '
+                'SELECT * FROM "Shadow" '
+                'JOIN s2."MixedCase" AS m ON true '
+                'JOIN "order" AS o ON true '
+                'JOIN "my table" AS mt ON true '
+                'JOIN "a""b" AS ab ON true '
+                'JOIN s1.plain AS p ON true '
+                'LEFT JOIN generate_series(1, 3) AS gs ON true '
+                'WHERE EXISTS (SELECT 1 FROM (WITH z AS (SELECT * FROM "order") SELECT * FROM z) sub)'
+            ),
+            referenced_tables=(),
+        )
+        fake_plan = types.SimpleNamespace(sub_plans=[], view_spec=fake_spec)
+        self.assertEqual(
+            _postgres_base_table_lock_targets(fake_plan),
+            ['s2."MixedCase"', '"a""b"', '"my table"', '"order"', "s1.plain"],
+        )
+
+        # Sort order is invariant to optional schema qualification: public.a_tbl < m_tbl.
+        qual_plan = types.SimpleNamespace(
+            sub_plans=[],
+            view_spec=types.SimpleNamespace(
+                raw_select_sql="SELECT * FROM m_tbl m JOIN public.a_tbl a ON m.id = a.id",
+                referenced_tables=(),
+            ),
+        )
+        self.assertEqual(_postgres_base_table_lock_targets(qual_plan), ["public.a_tbl", "m_tbl"])
+
+        # Non-recursive self-shadowing CTE: inner `t` resolves to base table `t`.
+        self_shadow_plan = types.SimpleNamespace(
+            sub_plans=[],
+            view_spec=types.SimpleNamespace(
+                raw_select_sql="WITH t AS (SELECT * FROM t WHERE v > 0) SELECT * FROM t JOIN u ON t.id = u.id",
+                referenced_tables=(),
+            ),
+        )
+        self.assertEqual(_postgres_base_table_lock_targets(self_shadow_plan), ["t", "u"])
+
+        # Non-recursive forward-referenced CTE: `b` inside `a` resolves to base table `b`.
+        fwd_cte_plan = types.SimpleNamespace(
+            sub_plans=[],
+            view_spec=types.SimpleNamespace(
+                raw_select_sql="WITH a AS (SELECT * FROM b), b AS (SELECT * FROM real_b) SELECT * FROM a",
+                referenced_tables=(),
+            ),
+        )
+        self.assertEqual(_postgres_base_table_lock_targets(fwd_cte_plan), ["b", "real_b"])
+
+        # WITH RECURSIVE: all CTEs in the WITH clause are mutually visible.
+        rec_cte_plan = types.SimpleNamespace(
+            sub_plans=[],
+            view_spec=types.SimpleNamespace(
+                raw_select_sql=(
+                    "WITH RECURSIVE a AS (SELECT * FROM b), "
+                    "b AS (SELECT * FROM base_t UNION ALL SELECT * FROM b) "
+                    "SELECT * FROM a"
+                ),
+                referenced_tables=(),
+            ),
+        )
+        self.assertEqual(_postgres_base_table_lock_targets(rec_cte_plan), ["base_t"])
+
+        # ONLY and LATERAL references.
+        only_lat_plan = types.SimpleNamespace(
+            sub_plans=[],
+            view_spec=types.SimpleNamespace(
+                raw_select_sql=(
+                    "SELECT * FROM ONLY z_tbl, "
+                    "LATERAL (SELECT * FROM a_tbl WHERE a_tbl.z_id = z_tbl.id) s"
+                ),
+                referenced_tables=(),
+            ),
+        )
+        self.assertEqual(_postgres_base_table_lock_targets(only_lat_plan), ["a_tbl", "z_tbl"])
+
+        # Fallback when raw_select_sql fails AST parsing (e.g. ONLY (t)) + custom object_prefix.
+        fallback_plan = types.SimpleNamespace(
+            sub_plans=[],
+            view_spec=types.SimpleNamespace(
+                raw_select_sql="SELECT * FROM ONLY (z_tbl)",
+                referenced_tables=("public.z_tbl", "a_tbl", "__custom_store"),
+            ),
+        )
+        self.assertEqual(
+            _postgres_base_table_lock_targets(fallback_plan, object_prefix="__custom_"),
+            ["a_tbl", "public.z_tbl"],
+        )
+
+        # Tableless constant query -> nothing to lock.
+        const_plan = types.SimpleNamespace(
+            sub_plans=[],
+            view_spec=types.SimpleNamespace(raw_select_sql="SELECT 1 AS one", referenced_tables=()),
+        )
+        self.assertEqual(_postgres_base_table_lock_targets(const_plan), [])
+
+    def test_repair_view_contents_locks_catalog_then_base_tables_and_reacquires_on_retry(self) -> None:
+        from matview_sync import generate_materialized_view, parse_table_schema
+
+        schema = parse_table_schema(
+            """
+            CREATE TABLE z_tbl (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL);
+            CREATE TABLE a_tbl (id INT PRIMARY KEY, z_id INT NOT NULL, w INT NOT NULL);
+            """,
+            dialect=Dialect.POSTGRES,
+        )
+        plan = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_j AS SELECT z.g, SUM(a.w) AS s FROM z_tbl z JOIN a_tbl a ON a.z_id = z.id GROUP BY z.g;",
+            dialect=Dialect.POSTGRES,
+        )
+
+        executed: List[str] = []
+        fail_once = {"done": False}
+
+        class _DeadlockError(Exception):
+            pgcode = "40P01"
+
+        class _FakeCursor:
+            def __init__(self) -> None:
+                self._rows: List[Tuple[Any, ...]] = []
+
+            def execute(self, sql: str, params: Any = None) -> None:
+                executed.append(sql.strip())
+                if sql.strip().startswith("SELECT to_regclass"):
+                    self._rows = [("__matview_catalog",)]
+                else:
+                    self._rows = []
+                if sql.strip().startswith(f"DELETE FROM {plan.backing_table_name}") and not fail_once["done"]:
+                    fail_once["done"] = True
+                    raise _DeadlockError("deadlock detected")
+
+            def fetchone(self) -> Any:
+                return self._rows[0] if self._rows else None
+
+            def close(self) -> None:
+                pass
+
+        class _FakePgConn:
+            def cursor(self) -> _FakeCursor:
+                return _FakeCursor()
+
+            def commit(self) -> None:
+                executed.append("COMMIT")
+
+            def rollback(self) -> None:
+                executed.append("ROLLBACK")
+
+        mgr = MaterializedViewManager(
+            _FakePgConn(),
+            dialect=Dialect.POSTGRES,
+            engine_version="postgresql 18",
+            skip_ensure_catalog=True,
+        )
+        sleeps: List[float] = []
+        mgr._backfill_sleep = sleeps.append
+        mgr._repair_view_contents(plan, plan.view_name)
+
+        self.assertEqual(len(sleeps), 1)
+        rb_idx = executed.index("ROLLBACK")
+        attempt_0 = executed[:rb_idx]
+        attempt_1 = executed[rb_idx + 1 :]
+        for attempt_sqls in (attempt_0, attempt_1):
+            cat_lock = next(
+                i for i, s in enumerate(attempt_sqls)
+                if s == "LOCK TABLE __matview_catalog IN SHARE ROW EXCLUSIVE MODE"
+            )
+            base_lock = next(
+                i for i, s in enumerate(attempt_sqls)
+                if s == "LOCK TABLE a_tbl, z_tbl IN SHARE MODE;"
+            )
+            cat_upd = next(
+                i for i, s in enumerate(attempt_sqls)
+                if s.startswith("UPDATE __matview_catalog SET backfill_cursor_pk")
+            )
+            del_store = next(
+                i for i, s in enumerate(attempt_sqls)
+                if s.startswith(f"DELETE FROM {plan.backing_table_name}")
+            )
+            self.assertLess(cat_lock, base_lock)
+            self.assertLess(base_lock, cat_upd)
+            self.assertLess(cat_upd, del_store)
+        self.assertEqual(attempt_1[-1], "COMMIT")
+
+
+class NativePostgresRepairConcurrencyTests(unittest.TestCase):
+    """Native PostgreSQL concurrency tests proving repair_view() is exact under
+    concurrent READ COMMITTED writers without blocking readers."""
+
+    def _dsn(self) -> str:
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN not set; native PostgreSQL test only")
+        return dsn
+
+    def _connect_in_schema(self, dsn: str, schema: str):
+        conn = IndependentSessionBackfillTests._connect_native(Dialect.POSTGRES, dsn)
+        cur = conn.cursor()
+        cur.execute(f'SET search_path TO "{schema}"')
+        conn.commit()
+        cur.close()
+        return conn
+
+    def _make_schema(self, dsn: str) -> Tuple[str, Any]:
+        schema = f"mv_rep_{uuid.uuid4().hex[:10]}"
+        conn = IndependentSessionBackfillTests._connect_native(Dialect.POSTGRES, dsn)
+        cur = conn.cursor()
+        cur.execute(f'CREATE SCHEMA "{schema}"')
+        cur.execute(f'SET search_path TO "{schema}"')
+        conn.commit()
+        cur.close()
+        return schema, conn
+
+    def _drop_schema(self, dsn: str, schema: str, sessions: Sequence[Any]) -> None:
+        for s in sessions:
+            try:
+                s.rollback()
+                s.close()
+            except Exception:
+                pass
+        cleaner = IndependentSessionBackfillTests._connect_native(Dialect.POSTGRES, dsn)
+        try:
+            cur = cleaner.cursor()
+            cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            cleaner.commit()
+            cur.close()
+        finally:
+            cleaner.close()
+
+    def _assert_view_matches_live(self, conn: Any, view_sql: str, live_sql: str) -> None:
+        conn.commit()
+        cur = conn.cursor()
+        try:
+            cur.execute(view_sql)
+            actual_rows = [tuple(r) for r in cur.fetchall()]
+            cur.execute(live_sql)
+            expected_rows = [tuple(r) for r in cur.fetchall()]
+            conn.commit()
+        finally:
+            cur.close()
+
+        def _typed(rows: Sequence[Tuple[Any, ...]]) -> List[Tuple[Tuple[type, Any], ...]]:
+            return [
+                tuple(
+                    (type(v), v.as_tuple() if isinstance(v, Decimal) else v)
+                    for v in row
+                )
+                for row in rows
+            ]
+
+        self.assertEqual(_typed(actual_rows), _typed(expected_rows), f"actual={actual_rows!r} expected={expected_rows!r}")
+
+    def test_writer_in_flight_before_repair_blocks_repair_and_commits_cleanly(self) -> None:
+        from test_avg_concurrent_maintenance import _is_lock_waiting, _lock_diagnostics, _session_id
+
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany(
+                "INSERT INTO t VALUES (%s, %s, %s)", [(i, f"G{i % 4}", i) for i in range(1, 21)]
+            )
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            mgr.register_view("CREATE VIEW v AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t GROUP BY g;")
+
+            writer = self._connect_in_schema(dsn, schema)
+            repairer = self._connect_in_schema(dsn, schema)
+            reader = self._connect_in_schema(dsn, schema)
+            monitor = self._connect_in_schema(dsn, schema)
+            sessions.extend([writer, repairer, reader, monitor])
+
+            writer_sid = _session_id(Dialect.POSTGRES, writer)
+            repair_sid = _session_id(Dialect.POSTGRES, repairer)
+            rmgr = MaterializedViewManager(repairer, dialect=Dialect.POSTGRES)
+
+            # Writer modifies base table with a NEW group (no lock on any
+            # pre-existing backing row) and holds ROW EXCLUSIVE on `t`.
+            wcur = writer.cursor()
+            wcur.execute("INSERT INTO t VALUES (101, 'G_NEW', 1000)")
+
+            outcome: Dict[str, Any] = {}
+
+            def run_repair() -> None:
+                try:
+                    outcome["res"] = rmgr.repair_view("v")
+                except BaseException as exc:
+                    outcome["err"] = exc
+
+            th = threading.Thread(target=run_repair, daemon=True)
+            th.start()
+
+            deadline = time.monotonic() + 20.0
+            waited = False
+            while time.monotonic() < deadline:
+                if _is_lock_waiting(Dialect.POSTGRES, monitor, repair_sid, blocker_sid=writer_sid):
+                    waited = True
+                    break
+                if "res" in outcome or "err" in outcome:
+                    break
+                time.sleep(0.02)
+            self.assertTrue(
+                waited,
+                f"repair_view() did not wait for in-flight writer: outcome={outcome!r} "
+                f"diag={_lock_diagnostics(Dialect.POSTGRES, monitor, repair_sid)!r}",
+            )
+
+            # Readers are never blocked while repair waits for the writer.
+            rcur = reader.cursor()
+            rcur.execute("SELECT g, c, s FROM v ORDER BY g")
+            self.assertEqual(len(rcur.fetchall()), 4)
+            reader.commit()
+            rcur.close()
+
+            # In-flight writer runs another DML statement and commits without deadlocking.
+            wcur.execute("UPDATE t SET amt = amt + 500 WHERE id = 1")
+            writer.commit()
+            wcur.close()
+
+            th.join(timeout=20.0)
+            self.assertFalse(th.is_alive())
+            self.assertNotIn("err", outcome, repr(outcome.get("err")))
+            self.assertEqual(outcome.get("res"), {"v": "repaired"})
+
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g",
+            )
+            # Subsequent write continues to be maintained accurately.
+            cur = admin.cursor()
+            cur.execute("INSERT INTO t VALUES (102, 'G2', 77)")
+            admin.commit()
+            cur.close()
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g",
+            )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+    def test_writer_during_repair_is_serialized_and_never_lost(self) -> None:
+        from test_avg_concurrent_maintenance import _is_lock_waiting, _lock_diagnostics, _session_id
+
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany(
+                "INSERT INTO t VALUES (%s, %s, %s)", [(i, f"G{i % 4}", i) for i in range(1, 21)]
+            )
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            plan = mgr.register_view(
+                "CREATE VIEW v AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t GROUP BY g;"
+            )
+
+            writer = self._connect_in_schema(dsn, schema)
+            repairer = self._connect_in_schema(dsn, schema)
+            reader = self._connect_in_schema(dsn, schema)
+            monitor = self._connect_in_schema(dsn, schema)
+            sessions.extend([writer, repairer, reader, monitor])
+
+            writer_sid = _session_id(Dialect.POSTGRES, writer)
+            repair_sid = _session_id(Dialect.POSTGRES, repairer)
+
+            entered_window = threading.Event()
+            release_repair = threading.Event()
+            backing_tbl = plan.backing_table_name
+
+            class _PausingCursor:
+                def __init__(self, inner: Any) -> None:
+                    self._inner = inner
+
+                def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                    res = self._inner.execute(sql, *args, **kwargs)
+                    if sql.strip().startswith(f"DELETE FROM {backing_tbl}"):
+                        entered_window.set()
+                        release_repair.wait(timeout=20.0)
+                    return res
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+            class _PausingConn:
+                def __init__(self, inner: Any) -> None:
+                    self._inner = inner
+
+                def cursor(self, *args: Any, **kwargs: Any) -> Any:
+                    return _PausingCursor(self._inner.cursor(*args, **kwargs))
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+            rmgr = MaterializedViewManager(_PausingConn(repairer), dialect=Dialect.POSTGRES)
+            repair_out: Dict[str, Any] = {}
+            writer_out: Dict[str, Any] = {}
+
+            def run_repair() -> None:
+                try:
+                    repair_out["res"] = rmgr.repair_view("v")
+                except BaseException as exc:
+                    repair_out["err"] = exc
+
+            def run_writer() -> None:
+                try:
+                    # Insert into a brand-new group so the writer never
+                    # collides with rows deleted by DELETE FROM backing_table;
+                    # only a SHARE lock on `t` serializes this writer.
+                    wcur = writer.cursor()
+                    wcur.execute("INSERT INTO t VALUES (201, 'G_NEW', 5000)")
+                    writer.commit()
+                    wcur.close()
+                    writer_out["ok"] = True
+                except BaseException as exc:
+                    writer_out["err"] = exc
+
+            r_th = threading.Thread(target=run_repair, daemon=True)
+            r_th.start()
+            self.assertTrue(entered_window.wait(timeout=20.0), f"repair never reached DELETE: {repair_out!r}")
+
+            try:
+                # Readers still see the committed pre-repair view without blocking.
+                rcur = reader.cursor()
+                rcur.execute("SELECT g, c, s FROM v ORDER BY g")
+                self.assertEqual(len(rcur.fetchall()), 4)
+                reader.commit()
+                rcur.close()
+
+                w_th = threading.Thread(target=run_writer, daemon=True)
+                w_th.start()
+
+                deadline = time.monotonic() + 20.0
+                writer_waited = False
+                while time.monotonic() < deadline:
+                    if _is_lock_waiting(Dialect.POSTGRES, monitor, writer_sid, blocker_sid=repair_sid):
+                        writer_waited = True
+                        break
+                    if "ok" in writer_out or "err" in writer_out:
+                        break
+                    time.sleep(0.02)
+            finally:
+                release_repair.set()
+
+            r_th.join(timeout=20.0)
+            w_th.join(timeout=20.0)
+            self.assertFalse(r_th.is_alive())
+            self.assertFalse(w_th.is_alive())
+            self.assertNotIn("err", repair_out, repr(repair_out.get("err")))
+            self.assertNotIn("err", writer_out, repr(writer_out.get("err")))
+            self.assertEqual(repair_out.get("res"), {"v": "repaired"})
+            self.assertTrue(
+                writer_waited,
+                "writer committed during repair instead of waiting for repair_view()'s SHARE lock "
+                f"(diag={_lock_diagnostics(Dialect.POSTGRES, monitor, writer_sid)!r})",
+            )
+
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g",
+            )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+    def test_interrupted_and_completed_views_repaired_under_concurrent_writers_stay_exact(self) -> None:
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany(
+                "INSERT INTO t VALUES (%s, %s, %s)", [(i, f"G{i % 4}", i) for i in range(1, 41)]
+            )
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            plan = mgr.register_view(
+                "CREATE VIEW v AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t GROUP BY g;",
+                populate=False,
+            )
+
+            # Round 1: interrupted backfill (active watermark gating rows in (10, 40]).
+            # Round 2: completed view repaired repeatedly under concurrent writers.
+            for mode in ("interrupted", "completed"):
+                with self.subTest(mode=mode):
+                    if mode == "interrupted":
+                        def boom(batch_idx: int, _done: int) -> None:
+                            if batch_idx == 1:
+                                raise RuntimeError("simulated crash after chunk 1")
+
+                        with self.assertRaises(RuntimeError):
+                            mgr.backfill_incrementally(plan, batch_size=10, on_progress=boom)
+                        entry = mgr.get_catalog()["v"]
+                        self.assertEqual(entry["backfill_active"], 1)
+
+                    stop = threading.Event()
+                    ready = threading.Barrier(4)
+                    writer_errors: List[BaseException] = []
+                    writes_done = [0, 0, 0]
+                    worker_conns = [self._connect_in_schema(dsn, schema) for _ in range(3)]
+                    sessions.extend(worker_conns)
+
+                    def worker(wid: int) -> None:
+                        wconn = worker_conns[wid]
+                        base_id = (10_000 if mode == "interrupted" else 1_000_000) + wid * 200_000
+                        ready.wait(timeout=20.0)
+                        step = 0
+                        wcur = wconn.cursor()
+                        while not stop.is_set():
+                            step += 1
+                            try:
+                                op = step % 3
+                                if op == 0:
+                                    # Insert into both existing and new groups.
+                                    grp = f"N{wid}_{step % 5}" if step % 6 == 0 else f"G{(wid + step) % 4}"
+                                    wcur.execute(
+                                        "INSERT INTO t VALUES (%s, %s, %s)",
+                                        (base_id + step, grp, step * 3),
+                                    )
+                                elif op == 1:
+                                    # Update rows on both sides of the watermark without opposite-order group cycles.
+                                    target_id = ((wid * 11 + step) % 40) + 1
+                                    wcur.execute(
+                                        "UPDATE t SET amt = amt + %s WHERE id = %s",
+                                        (5, target_id),
+                                    )
+                                else:
+                                    wcur.execute(
+                                        "DELETE FROM t WHERE id = %s",
+                                        (base_id + step - 2,),
+                                    )
+                                wconn.commit()
+                                writes_done[wid] += 1
+                            except BaseException as exc:
+                                wconn.rollback()
+                                writer_errors.append(exc)
+                                break
+                        wcur.close()
+
+                    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(3)]
+                    for th in threads:
+                        th.start()
+                    ready.wait(timeout=20.0)
+
+                    repairer = self._connect_in_schema(dsn, schema)
+                    sessions.append(repairer)
+                    rmgr = MaterializedViewManager(repairer, dialect=Dialect.POSTGRES)
+                    try:
+                        for _ in range(4):
+                            time.sleep(0.015)
+                            self.assertEqual(rmgr.repair_view("v"), {"v": "repaired"})
+                    finally:
+                        stop.set()
+                        for th in threads:
+                            th.join(timeout=30.0)
+
+                    self.assertEqual(writer_errors, [], repr(writer_errors))
+                    self.assertTrue(all(c > 0 for c in writes_done), f"writes_done={writes_done!r}")
+                    self.assertEqual(mgr.get_catalog()["v"]["backfill_active"], 0)
+                    self._assert_view_matches_live(
+                        admin,
+                        "SELECT g, c, s FROM v ORDER BY g",
+                        "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g",
+                    )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+    def test_join_view_repair_serializes_writers_on_both_base_tables(self) -> None:
+        from test_avg_concurrent_maintenance import _is_lock_waiting, _session_id
+
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE customers (id BIGINT PRIMARY KEY, region VARCHAR(8) NOT NULL)")
+            cur.execute("CREATE TABLE orders (id BIGINT PRIMARY KEY, cust_id BIGINT NOT NULL, amt BIGINT NOT NULL)")
+            # Customers 4 ('W') and 5 ('X') have no initial orders, so neither
+            # group exists in the backing table prior to repair: writing orders
+            # for cust_id=4 or updating customer 5 will NOT collide with rows
+            # deleted by DELETE FROM backing_table, proving both base tables
+            # must be ShareLock'd explicitly.
+            cur.executemany(
+                "INSERT INTO customers VALUES (%s, %s)",
+                [(1, "N"), (2, "S"), (3, "E"), (4, "W"), (5, "X")],
+            )
+            cur.executemany(
+                "INSERT INTO orders VALUES (%s, %s, %s)",
+                [(1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 3, 40)],
+            )
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            plan = mgr.register_view(
+                "CREATE VIEW v_join AS "
+                "SELECT c.region, COUNT(*) AS cnt, SUM(o.amt) AS total "
+                "FROM orders o JOIN customers c ON o.cust_id = c.id GROUP BY c.region;"
+            )
+
+            w_orders = self._connect_in_schema(dsn, schema)
+            w_customers = self._connect_in_schema(dsn, schema)
+            repairer = self._connect_in_schema(dsn, schema)
+            monitor = self._connect_in_schema(dsn, schema)
+            sessions.extend([w_orders, w_customers, repairer, monitor])
+
+            w_ord_sid = _session_id(Dialect.POSTGRES, w_orders)
+            w_cust_sid = _session_id(Dialect.POSTGRES, w_customers)
+            repair_sid = _session_id(Dialect.POSTGRES, repairer)
+
+            entered = threading.Event()
+            release = threading.Event()
+            backing_tbl = plan.backing_table_name
+
+            class _PausingCursor:
+                def __init__(self, inner: Any) -> None:
+                    self._inner = inner
+
+                def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                    res = self._inner.execute(sql, *args, **kwargs)
+                    if sql.strip().startswith(f"DELETE FROM {backing_tbl}"):
+                        entered.set()
+                        release.wait(timeout=20.0)
+                    return res
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+            class _PausingConn:
+                def __init__(self, inner: Any) -> None:
+                    self._inner = inner
+
+                def cursor(self, *args: Any, **kwargs: Any) -> Any:
+                    return _PausingCursor(self._inner.cursor(*args, **kwargs))
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+            rmgr = MaterializedViewManager(_PausingConn(repairer), dialect=Dialect.POSTGRES)
+            outcomes: Dict[str, Any] = {}
+
+            def run_repair() -> None:
+                try:
+                    outcomes["repair"] = rmgr.repair_view("v_join")
+                except BaseException as exc:
+                    outcomes["repair_err"] = exc
+
+            def run_ord_writer() -> None:
+                try:
+                    c = w_orders.cursor()
+                    c.execute("INSERT INTO orders VALUES (10, 4, 100)")
+                    w_orders.commit()
+                    c.close()
+                    outcomes["ord"] = True
+                except BaseException as exc:
+                    outcomes["ord_err"] = exc
+
+            def run_cust_writer() -> None:
+                try:
+                    c = w_customers.cursor()
+                    c.execute("UPDATE customers SET region = 'Y' WHERE id = 5")
+                    c.execute("INSERT INTO customers VALUES (6, 'Z')")
+                    w_customers.commit()
+                    c.close()
+                    outcomes["cust"] = True
+                except BaseException as exc:
+                    outcomes["cust_err"] = exc
+
+            r_th = threading.Thread(target=run_repair, daemon=True)
+            r_th.start()
+            self.assertTrue(entered.wait(timeout=20.0), repr(outcomes))
+            held_share_tables: List[str] = []
+            try:
+                mcur = monitor.cursor()
+                mcur.execute(
+                    "SELECT c.relname FROM pg_locks l "
+                    "JOIN pg_class c ON c.oid = l.relation "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE l.pid = %s AND l.granted AND l.mode = 'ShareLock' AND n.nspname = %s "
+                    "ORDER BY c.relname",
+                    (repair_sid, schema),
+                )
+                held_share_tables = [r[0] for r in mcur.fetchall()]
+                monitor.commit()
+                mcur.close()
+
+                o_th = threading.Thread(target=run_ord_writer, daemon=True)
+                c_th = threading.Thread(target=run_cust_writer, daemon=True)
+                o_th.start()
+                c_th.start()
+
+                deadline = time.monotonic() + 20.0
+                both_waited = False
+                while time.monotonic() < deadline:
+                    if (
+                        _is_lock_waiting(Dialect.POSTGRES, monitor, w_ord_sid, blocker_sid=repair_sid)
+                        and _is_lock_waiting(Dialect.POSTGRES, monitor, w_cust_sid, blocker_sid=repair_sid)
+                    ):
+                        both_waited = True
+                        break
+                    if any(k in outcomes for k in ("ord", "cust", "ord_err", "cust_err")):
+                        break
+                    time.sleep(0.02)
+            finally:
+                release.set()
+
+            for th in (r_th, o_th, c_th):
+                th.join(timeout=20.0)
+                self.assertFalse(th.is_alive())
+            self.assertEqual(held_share_tables, ["customers", "orders"])
+            self.assertNotIn("repair_err", outcomes, repr(outcomes.get("repair_err")))
+            self.assertNotIn("ord_err", outcomes, repr(outcomes.get("ord_err")))
+            self.assertNotIn("cust_err", outcomes, repr(outcomes.get("cust_err")))
+            self.assertTrue(both_waited, f"expected both join-table writers to block on repair: {outcomes!r}")
+            self._assert_view_matches_live(
+                admin,
+                "SELECT region, cnt, total FROM v_join ORDER BY region",
+                "SELECT c.region, COUNT(*), SUM(o.amt) FROM orders o JOIN customers c ON o.cust_id = c.id GROUP BY c.region ORDER BY c.region",
+            )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+    def test_partitioned_table_repair_serializes_direct_partition_writer(self) -> None:
+        from test_avg_concurrent_maintenance import _is_lock_waiting, _session_id
+
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute(
+                "CREATE TABLE p_parent (id BIGINT NOT NULL, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL, "
+                "PRIMARY KEY (id)) PARTITION BY RANGE (id)"
+            )
+            cur.execute("CREATE TABLE p_part_0 PARTITION OF p_parent FOR VALUES FROM (0) TO (100)")
+            cur.execute("CREATE TABLE p_part_1 PARTITION OF p_parent FOR VALUES FROM (100) TO (200)")
+            cur.executemany(
+                "INSERT INTO p_parent VALUES (%s, %s, %s)",
+                [(1, "A", 10), (2, "B", 20), (101, "A", 30)],
+            )
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            plan = mgr.register_view(
+                "CREATE VIEW v_part AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM p_parent GROUP BY g;"
+            )
+
+            writer = self._connect_in_schema(dsn, schema)
+            repairer = self._connect_in_schema(dsn, schema)
+            monitor = self._connect_in_schema(dsn, schema)
+            sessions.extend([writer, repairer, monitor])
+
+            writer_sid = _session_id(Dialect.POSTGRES, writer)
+            repair_sid = _session_id(Dialect.POSTGRES, repairer)
+            entered = threading.Event()
+            release = threading.Event()
+            backing_tbl = plan.backing_table_name
+
+            class _PausingCursor:
+                def __init__(self, inner: Any) -> None:
+                    self._inner = inner
+
+                def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                    res = self._inner.execute(sql, *args, **kwargs)
+                    if sql.strip().startswith(f"DELETE FROM {backing_tbl}"):
+                        entered.set()
+                        release.wait(timeout=20.0)
+                    return res
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+            class _PausingConn:
+                def __init__(self, inner: Any) -> None:
+                    self._inner = inner
+
+                def cursor(self, *args: Any, **kwargs: Any) -> Any:
+                    return _PausingCursor(self._inner.cursor(*args, **kwargs))
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+            rmgr = MaterializedViewManager(_PausingConn(repairer), dialect=Dialect.POSTGRES)
+            outcomes: Dict[str, Any] = {}
+
+            def run_repair() -> None:
+                try:
+                    outcomes["repair"] = rmgr.repair_view("v_part")
+                except BaseException as exc:
+                    outcomes["repair_err"] = exc
+
+            def run_direct_part_writer() -> None:
+                try:
+                    # Insert a new group so only the SHARE lock on p_parent
+                    # (inherited by p_part_0) blocks the writer.
+                    c = writer.cursor()
+                    c.execute("INSERT INTO p_part_0 VALUES (50, 'Z_NEW', 999)")
+                    writer.commit()
+                    c.close()
+                    outcomes["writer"] = True
+                except BaseException as exc:
+                    outcomes["writer_err"] = exc
+
+            r_th = threading.Thread(target=run_repair, daemon=True)
+            r_th.start()
+            self.assertTrue(entered.wait(timeout=20.0), repr(outcomes))
+            try:
+                w_th = threading.Thread(target=run_direct_part_writer, daemon=True)
+                w_th.start()
+
+                deadline = time.monotonic() + 20.0
+                waited = False
+                while time.monotonic() < deadline:
+                    if _is_lock_waiting(Dialect.POSTGRES, monitor, writer_sid, blocker_sid=repair_sid):
+                        waited = True
+                        break
+                    if "writer" in outcomes or "writer_err" in outcomes:
+                        break
+                    time.sleep(0.02)
+            finally:
+                release.set()
+
+            r_th.join(timeout=20.0)
+            w_th.join(timeout=20.0)
+            self.assertFalse(r_th.is_alive())
+            self.assertFalse(w_th.is_alive())
+            self.assertNotIn("repair_err", outcomes, repr(outcomes.get("repair_err")))
+            self.assertNotIn("writer_err", outcomes, repr(outcomes.get("writer_err")))
+            self.assertTrue(waited, f"direct child-partition write did not block on repair_view(): {outcomes!r}")
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v_part ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM p_parent GROUP BY g ORDER BY g",
+            )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+    def test_base_table_lock_timeout_retries_and_leaves_view_unchanged(self) -> None:
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany("INSERT INTO t VALUES (%s, %s, %s)", [(1, "A", 10), (2, "B", 20)])
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            mgr.register_view("CREATE VIEW v AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t GROUP BY g;")
+
+            holder = self._connect_in_schema(dsn, schema)
+            repairer = self._connect_in_schema(dsn, schema)
+            sessions.extend([holder, repairer])
+
+            rc = repairer.cursor()
+            rc.execute("SET lock_timeout = '200ms'")
+            repairer.commit()
+            rc.close()
+
+            rmgr = MaterializedViewManager(repairer, dialect=Dialect.POSTGRES)
+            rmgr._BACKFILL_TRANSIENT_RETRIES = 2
+            sleeps: List[float] = []
+            rmgr._backfill_sleep = sleeps.append
+
+            hc = holder.cursor()
+            # Insert into a brand-new group so the holder only blocks
+            # repair_view() via the base-table SHARE lock, not a backing row.
+            hc.execute("INSERT INTO t VALUES (3, 'Z_NEW', 30)")
+            try:
+                with self.assertRaises(Exception) as ctx:
+                    rmgr.repair_view("v")
+                self.assertTrue(
+                    rmgr._is_lock_timeout_error(ctx.exception)
+                    or rmgr._is_transient_lock_error(ctx.exception),
+                    repr(ctx.exception),
+                )
+                self.assertEqual(len(sleeps), 2)
+            finally:
+                holder.commit()
+                hc.close()
+
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g",
+            )
+            self.assertEqual(rmgr.repair_view("v"), {"v": "repaired"})
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g",
+            )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+    def test_autocommit_connection_repair_is_exact_and_preserves_autocommit(self) -> None:
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany("INSERT INTO t VALUES (%s, %s, %s)", [(1, "A", 10), (2, "B", 20)])
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            mgr.register_view("CREATE VIEW v AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t GROUP BY g;")
+
+            holder = self._connect_in_schema(dsn, schema)
+            repairer = self._connect_in_schema(dsn, schema)
+            sessions.extend([holder, repairer])
+            repairer.autocommit = True
+
+            rc = repairer.cursor()
+            rc.execute("SET lock_timeout = '200ms'")
+            rc.close()
+
+            rmgr = MaterializedViewManager(repairer, dialect=Dialect.POSTGRES)
+            rmgr._BACKFILL_TRANSIENT_RETRIES = 1
+            rmgr._backfill_sleep = lambda _: None
+
+            # Failure path under autocommit=True must restore autocommit=True.
+            hc = holder.cursor()
+            hc.execute("INSERT INTO t VALUES (3, 'Z_NEW', 30)")
+            try:
+                with self.assertRaises(Exception) as ctx:
+                    rmgr.repair_view("v")
+                self.assertTrue(rmgr._is_lock_timeout_error(ctx.exception), repr(ctx.exception))
+                self.assertTrue(repairer.autocommit)
+            finally:
+                holder.commit()
+                hc.close()
+
+            # Success path under autocommit=True must restore autocommit=True and match live.
+            self.assertEqual(rmgr.repair_view("v"), {"v": "repaired"})
+            self.assertTrue(repairer.autocommit)
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g",
+            )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+    def test_multiview_repair_reacquires_catalog_lock_for_rebuilt_view_and_stays_exact(self) -> None:
+        from test_avg_concurrent_maintenance import _session_id
+
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE t1 (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.execute("CREATE TABLE t2 (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany("INSERT INTO t1 VALUES (%s, %s, %s)", [(1, "A", 10), (2, "B", 20)])
+            cur.executemany("INSERT INTO t2 VALUES (%s, %s, %s)", [(1, "X", 5), (2, "Y", 15)])
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            mgr.register_view("CREATE VIEW v1 AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t1 GROUP BY g;")
+            p2 = mgr.register_view("CREATE VIEW v2 AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t2 GROUP BY g;")
+
+            # Drop v2's triggers so repair_view(None) repairs v1 and rebuilds v2.
+            cur = admin.cursor()
+            for trig in p2.trigger_names:
+                cur.execute(f"DROP TRIGGER IF EXISTS {trig} ON t2;")
+            admin.commit()
+            cur.close()
+
+            repairer = self._connect_in_schema(dsn, schema)
+            monitor = self._connect_in_schema(dsn, schema)
+            sessions.extend([repairer, monitor])
+            repair_sid = _session_id(Dialect.POSTGRES, repairer)
+
+            rmgr = MaterializedViewManager(repairer, dialect=Dialect.POSTGRES)
+            orig_register = rmgr.register_view
+            catalog_locks_at_rebuild: List[str] = []
+
+            def spy_register(*args: Any, **kwargs: Any) -> Any:
+                mcur = monitor.cursor()
+                mcur.execute(
+                    "SELECT l.mode FROM pg_locks l "
+                    "JOIN pg_class c ON c.oid = l.relation "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE l.pid = %s AND l.granted AND n.nspname = %s AND c.relname = %s",
+                    (repair_sid, schema, rmgr.catalog_table),
+                )
+                catalog_locks_at_rebuild.extend(r[0] for r in mcur.fetchall())
+                monitor.commit()
+                mcur.close()
+                return orig_register(*args, **kwargs)
+
+            rmgr.register_view = spy_register  # type: ignore[method-assign]
+            res = rmgr.repair_view()
+            self.assertEqual(res, {"v1": "repaired", "v2": "rebuilt"})
+            self.assertIn("ShareRowExclusiveLock", catalog_locks_at_rebuild)
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v1 ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM t1 GROUP BY g ORDER BY g",
+            )
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v2 ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM t2 GROUP BY g ORDER BY g",
+            )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+    def test_union_all_view_repair_serializes_writers_on_both_branches(self) -> None:
+        from test_avg_concurrent_maintenance import _is_lock_waiting, _session_id
+
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE b1 (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt INT NOT NULL)")
+            cur.execute("CREATE TABLE b2 (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt INT NOT NULL)")
+            cur.executemany("INSERT INTO b1 VALUES (%s, %s, %s)", [(1, "A", 10), (2, "B", 20)])
+            cur.executemany("INSERT INTO b2 VALUES (%s, %s, %s)", [(1, "A", 30), (2, "C", 40)])
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            plan = mgr.register_view(
+                "CREATE VIEW v_uall AS "
+                "SELECT g, SUM(amt) AS total FROM ("
+                "SELECT g, amt FROM b1 UNION ALL SELECT g, amt FROM b2"
+                ") u GROUP BY g;"
+            )
+
+            w1 = self._connect_in_schema(dsn, schema)
+            w2 = self._connect_in_schema(dsn, schema)
+            repairer = self._connect_in_schema(dsn, schema)
+            monitor = self._connect_in_schema(dsn, schema)
+            sessions.extend([w1, w2, repairer, monitor])
+
+            w1_sid = _session_id(Dialect.POSTGRES, w1)
+            w2_sid = _session_id(Dialect.POSTGRES, w2)
+            repair_sid = _session_id(Dialect.POSTGRES, repairer)
+            entered = threading.Event()
+            release = threading.Event()
+            backing_tbl = plan.backing_table_name
+
+            class _PausingCursor:
+                def __init__(self, inner: Any) -> None:
+                    self._inner = inner
+
+                def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                    res = self._inner.execute(sql, *args, **kwargs)
+                    if sql.strip().startswith(f"DELETE FROM {backing_tbl}"):
+                        entered.set()
+                        release.wait(timeout=20.0)
+                    return res
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+            class _PausingConn:
+                def __init__(self, inner: Any) -> None:
+                    self._inner = inner
+
+                def cursor(self, *args: Any, **kwargs: Any) -> Any:
+                    return _PausingCursor(self._inner.cursor(*args, **kwargs))
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+            rmgr = MaterializedViewManager(_PausingConn(repairer), dialect=Dialect.POSTGRES)
+            outcomes: Dict[str, Any] = {}
+
+            def run_repair() -> None:
+                try:
+                    outcomes["repair"] = rmgr.repair_view("v_uall")
+                except BaseException as exc:
+                    outcomes["repair_err"] = exc
+
+            def run_w1() -> None:
+                try:
+                    c = w1.cursor()
+                    c.execute("INSERT INTO b1 VALUES (10, 'Z1', 100)")
+                    w1.commit()
+                    c.close()
+                    outcomes["w1"] = True
+                except BaseException as exc:
+                    outcomes["w1_err"] = exc
+
+            def run_w2() -> None:
+                try:
+                    c = w2.cursor()
+                    c.execute("INSERT INTO b2 VALUES (10, 'Z2', 200)")
+                    w2.commit()
+                    c.close()
+                    outcomes["w2"] = True
+                except BaseException as exc:
+                    outcomes["w2_err"] = exc
+
+            r_th = threading.Thread(target=run_repair, daemon=True)
+            r_th.start()
+            self.assertTrue(entered.wait(timeout=20.0), repr(outcomes))
+            try:
+                t1 = threading.Thread(target=run_w1, daemon=True)
+                t2 = threading.Thread(target=run_w2, daemon=True)
+                t1.start()
+                t2.start()
+
+                deadline = time.monotonic() + 20.0
+                both_waited = False
+                while time.monotonic() < deadline:
+                    if (
+                        _is_lock_waiting(Dialect.POSTGRES, monitor, w1_sid, blocker_sid=repair_sid)
+                        and _is_lock_waiting(Dialect.POSTGRES, monitor, w2_sid, blocker_sid=repair_sid)
+                    ):
+                        both_waited = True
+                        break
+                    if any(k in outcomes for k in ("w1", "w2", "w1_err", "w2_err")):
+                        break
+                    time.sleep(0.02)
+            finally:
+                release.set()
+
+            for th in (r_th, t1, t2):
+                th.join(timeout=20.0)
+                self.assertFalse(th.is_alive())
+            self.assertNotIn("repair_err", outcomes, repr(outcomes.get("repair_err")))
+            self.assertNotIn("w1_err", outcomes, repr(outcomes.get("w1_err")))
+            self.assertNotIn("w2_err", outcomes, repr(outcomes.get("w2_err")))
+            self.assertTrue(both_waited, f"expected both UNION ALL branch writers to block: {outcomes!r}")
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, total FROM v_uall ORDER BY g",
+                "SELECT g, SUM(amt) FROM (SELECT g, amt FROM b1 UNION ALL SELECT g, amt FROM b2) u GROUP BY g ORDER BY g",
+            )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
