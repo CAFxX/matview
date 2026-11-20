@@ -79,7 +79,9 @@ from .sql_frontend import (
 #    multiplicity, preserve exact SQLite/PostgreSQL row-identity keys, pre-aggregate
 #    initial/chunk population, use non-null SQLite rowid for nullable-PK backfill,
 #    and track all hashed columns in UPDATE triggers.
-MATVIEW_GENERATOR_VERSION = "6"
+# 7: dialect-native statistical aliases and native result representation
+#    (trigger/reader-only changes).
+MATVIEW_GENERATOR_VERSION = "7"
 
 
 def _definition_digest(select_sql: str) -> str:
