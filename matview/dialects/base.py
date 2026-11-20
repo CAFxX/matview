@@ -888,7 +888,11 @@ class DialectBaseMixin(MixinHost):
         }
 
         def canonical_type(data_type: str) -> Optional[str]:
-            upper = re.sub(r"\s*\(.*\)\s*$", "", data_type.upper()).strip()
+            # Introspected MySQL/MariaDB string types carry their collation
+            # ("CHAR(5) COLLATE UTF8MB4_UNICODE_CI" under a non-default
+            # server collation): the clause does not change the family.
+            bare = re.sub(r"\s+(?:COLLATE|CHARACTER\s+SET|CHARSET)\s+\S+", "", data_type.upper())
+            upper = re.sub(r"\s*\(.*\)\s*$", "", bare).strip()
             if upper in ("SMALLINT", "INT2"):
                 return "SMALLINT"
             if upper in ("INTEGER", "INT", "INT4", "MEDIUMINT", "TINYINT"):
