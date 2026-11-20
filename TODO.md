@@ -487,6 +487,9 @@ The existing differential-testing harness is useful, but its current headline co
   - Fixed (refused): an aggregate inside a scalar subquery in HAVING or in an aggregated projection was replaced by the outer group's stored value (`(select __mv_elem_1 + 0 from t)`: "Subquery returns more than 1 row", silently wrong on a one-row table; the correlated form failed with 1054). Such views now raise `UnsupportedMaterializedViewError` on every engine.
   - MariaDB conservative refusals of exact statistic shapes: `SELECT DISTINCT g, VARIANCE(x)`, `ORDER BY v LIMIT n`, a parenthesized `(VARIANCE(x)) AS v`.
   - MySQL `COALESCE(MIN(smallint), 0)` returns a Decimal where the live view returns an int.
+  - `ABS(int)` is stored as DOUBLE on PostgreSQL and MariaDB: a group key `ABS(s)` reads back `1.0` where the view returns `1` (pre-existing; same on master).
+  - MariaDB `smallint_unsigned + 1` is stored as BIGINT where the view returns INT (pre-existing; same on master).
+  - MariaDB `CASE` over TINYINT/SMALLINT branches is stored as INT where the view returns SMALLINT (pre-existing; same on master).
   - A single-table view with a table alias (`SELECT t.g, SUM(t.x) FROM tt t GROUP BY t.g`) fails to register (1054 on MySQL/MariaDB; the populate/recompute SQL drops the alias, so PostgreSQL is affected the same way): loud, not silent.
   - PostgreSQL `pg_catalog.variance(x)` / `pg_catalog.var_pop(x)` fail to register ("missing FROM-clause entry for table pg_catalog"): loud.
   - PostgreSQL `COALESCE(name_col, char_col)` is natively of type `name`; the materialized column is text.
