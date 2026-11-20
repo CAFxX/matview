@@ -338,6 +338,117 @@ class BackfillWatermarkSafetyTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(len(actual), 10)  # 10 initial - 1 deleted (id=2) + 1 inserted (id=12) = 10
 
+    def _run_projection_inclusive_cursor_boundary(
+        self,
+        table_name: str,
+        view_name: str,
+        worker_sqls: tuple[str, ...],
+        *,
+        where_clause: str = "",
+    ) -> None:
+        self.conn.execute(f"CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, note TEXT, amt INT);")
+        self.conn.executemany(
+            f"INSERT INTO {table_name} VALUES (?, ?, ?);",
+            [(i, f"note_{i}", i * 10) for i in range(1, 11)],
+        )
+        self.conn.commit()
+
+        observed_watermark: list[tuple[int, int, int]] = []
+        worker_errors: list[BaseException] = []
+
+        def on_progress(batch_idx: int, _rows_done: int) -> None:
+            if batch_idx != 1:
+                return
+            done = threading.Event()
+
+            def independent_worker() -> None:
+                try:
+                    second = sqlite3.connect(self.db_path, timeout=10)
+                    try:
+                        second.execute("PRAGMA busy_timeout=10000;")
+                        _register_sqlite_compat_udfs(second)
+                        wm = second.execute(
+                            "SELECT backfill_active, backfill_cursor_pk, backfill_max_pk "
+                            "FROM __matview_catalog WHERE view_name = ?;",
+                            (view_name,),
+                        ).fetchone()
+                        self.assertEqual(wm, (1, 3, 10))
+                        observed_watermark.append(wm)
+                        for stmt in worker_sqls:
+                            second.execute(stmt)
+                        second.commit()
+                    finally:
+                        second.close()
+                except BaseException as exc:
+                    worker_errors.append(exc)
+                finally:
+                    done.set()
+
+            th = threading.Thread(target=independent_worker, daemon=True)
+            th.start()
+            if not done.wait(timeout=10):
+                raise AssertionError("independent cursor-boundary worker timed out")
+            th.join(timeout=5)
+            self.assertFalse(th.is_alive(), "independent cursor-boundary worker thread did not exit")
+            if worker_errors:
+                raise worker_errors[0]
+
+        where_sql = f" WHERE {where_clause}" if where_clause else ""
+        manager = MaterializedViewManager(self.conn)
+        plan = manager.register_view(
+            f"CREATE VIEW {view_name} AS SELECT id, note, amt FROM {table_name}{where_sql};",
+            populate=False,
+        )
+        batches = manager.backfill_incrementally(
+            plan,
+            batch_size=3,
+            on_progress=on_progress,
+            snapshot_isolation=False,
+        )
+        self.assertGreaterEqual(batches, 2)
+        self.assertEqual(observed_watermark, [(1, 3, 10)])
+
+        actual = self.conn.execute(f"SELECT id, note, amt FROM {view_name} ORDER BY id;").fetchall()
+        expected = self.conn.execute(
+            f"SELECT id, note, amt FROM {table_name}{where_sql} ORDER BY id;"
+        ).fetchall()
+        self.assertEqual(actual, expected)
+
+    def test_projection_watermark_updates_exact_inclusive_cursor_row(self) -> None:
+        """Updating the exact inclusive cursor row (id = backfill_cursor_pk) during
+        projection backfill must fire NEW-row maintenance and match the live SELECT."""
+        self._run_projection_inclusive_cursor_boundary(
+            "proj_wm_upd",
+            "v_proj_wm_upd",
+            ("UPDATE proj_wm_upd SET note = 'cursor_updated', amt = 9999 WHERE id = 3;",),
+        )
+
+    def test_projection_watermark_deletes_exact_inclusive_cursor_row(self) -> None:
+        """Deleting the exact inclusive cursor row (id = backfill_cursor_pk) during
+        projection backfill must fire OLD-row retraction and match the live SELECT."""
+        self._run_projection_inclusive_cursor_boundary(
+            "proj_wm_del",
+            "v_proj_wm_del",
+            ("DELETE FROM proj_wm_del WHERE id = 3;",),
+        )
+
+    def test_projection_watermark_filtered_boundaries_and_max_pk(self) -> None:
+        """Filtered projection (with OR predicate) during pk_range_fold backfill
+        must stay exact across cursor_pk, max_pk, and max_pk + 1 boundaries."""
+        self._run_projection_inclusive_cursor_boundary(
+            "proj_wm_filt",
+            "v_proj_wm_filt",
+            (
+                # Exact inclusive cursor row exits WHERE filter
+                "UPDATE proj_wm_filt SET amt = 5, note = 'dropped' WHERE id = 3;",
+                # Exact inclusive max_pk row updated inside pending range (suppressed, folded later)
+                "UPDATE proj_wm_filt SET amt = 1005, note = 'max_updated' WHERE id = 10;",
+                # Row above max_pk inserted (trigger must fire)
+                "INSERT INTO proj_wm_filt VALUES (11, 'above_max', 110);",
+            ),
+            where_clause="amt >= 20 OR note = 'keep_extra'",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
