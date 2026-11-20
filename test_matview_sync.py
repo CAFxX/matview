@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from decimal import Decimal, localcontext
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -454,6 +455,30 @@ def _rows_equal(rows_a: Sequence[Sequence[Any]], rows_b: Sequence[Sequence[Any]]
     return matched == count
 
 
+def _rewrite_pg_any_array_subqueries(sql: str) -> str:
+    """Emulation only: ``x = ANY (ARRAY(<subquery>))`` -> ``x IN (<subquery>)``."""
+    out: List[str] = []
+    i = 0
+    marker = "= ANY (ARRAY("
+    while True:
+        j = sql.find(marker, i)
+        if j < 0:
+            out.append(sql[i:])
+            return "".join(out)
+        out.append(sql[i:j])
+        k = j + len(marker)
+        depth = 1
+        m = k
+        while depth:
+            if sql[m] == "(":
+                depth += 1
+            elif sql[m] == ")":
+                depth -= 1
+            m += 1
+        out.append("IN (" + sql[k:m - 1] + ")")
+        i = m + 1  # skip the closing parenthesis of ANY (...)
+
+
 def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Dialect.SQLITE) -> None:
     """Registers PostgreSQL/MySQL compatibility functions & aggregates on a SQLite connection for cross-dialect testing."""
     import math
@@ -477,6 +502,11 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
     _create_scalar("LEAST", 2, lambda a, b: min(a, b) if (a is not None and b is not None) else None)
     _create_scalar("GREATEST", 2, lambda a, b: max(a, b) if (a is not None and b is not None) else None)
     _create_scalar("IF", 3, lambda cond, a, b: a if cond else b)
+    # PostgreSQL group-lock keys (emulation: any stable 63-bit hash).
+    _create_scalar(
+        "hashtextextended", 2,
+        lambda text, seed: int.from_bytes(hashlib.sha256(f"{seed}:{text}".encode()).digest()[:8], "big") >> 1,
+    )
 
     def _concat(*args: Any) -> Optional[str]:
         if any(a is None for a in args):
@@ -1982,7 +2012,7 @@ class TranspiledConnectionAdapter:
             s_up = s.upper().rstrip(";").strip()
 
         m_pg_fn = re.match(
-            r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\)\s+RETURNS\s+TRIGGER\s+AS\s+\$\$(.*)\$\$\s+LANGUAGE\s+plpgsql;?",
+            r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\)\s+RETURNS\s+TRIGGER\s+AS\s+\$\$(.*)\$\$\s+LANGUAGE\s+plpgsql(?:\s+SET\s+search_path\s+FROM\s+CURRENT)?;?",
             s,
             flags=re.I | re.S,
         )
@@ -2066,6 +2096,16 @@ class TranspiledConnectionAdapter:
 
                 cols_s_new = ', '.join(f'NEW."{c}" AS "{c}"' for c in col_names)
                 cols_s_old = ', '.join(f'OLD."{c}" AS "{c}"' for c in col_names)
+                # Group-scoped lock statements: SQLite serializes writers, so
+                # the SHARE lock is a no-op; `x = ANY (ARRAY(<subquery>))`
+                # becomes `x IN (<subquery>)`.
+                raw_code = re.sub(
+                    r"PERFORM\s+1\s+FROM\s+\S+\s+WHERE\s+__mv_id\s*=\s*0\s+FOR\s+SHARE;\s*IF\s+NOT\s+FOUND\s+THEN.*?END\s+IF;",
+                    "",
+                    raw_code,
+                    flags=re.I | re.S,
+                )
+                raw_code = _rewrite_pg_any_array_subqueries(raw_code)
                 raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_new_rows\s+AS\s+([A-Za-z0-9_]+)\b", rf"\1 (SELECT {cols_s_new}) AS \2", raw_code)
                 raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_old_rows\s+AS\s+([A-Za-z0-9_]+)\b", rf"\1 (SELECT {cols_s_old}) AS \2", raw_code)
                 raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_new_rows\b", rf"\1 (SELECT {cols_s_new}) AS __mv_new_rows", raw_code)

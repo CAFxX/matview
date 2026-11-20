@@ -177,7 +177,7 @@ BEGIN
     {{ trunc_block }}
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;""",
+$$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
     "pg_truncate_trigger": """CREATE TRIGGER {{ trg_name }}
 AFTER TRUNCATE ON {{ q_base_t }}
 FOR EACH STATEMENT EXECUTE FUNCTION {{ fn_name }}();""",
@@ -190,7 +190,7 @@ BEGIN
     {{ body_sql }}
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;""",
+$$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
     "pg_statement_trigger": """CREATE TRIGGER {{ trg_name }}
 AFTER {{ event }} ON {{ q_base_t }}
 REFERENCING {{ referencing }}

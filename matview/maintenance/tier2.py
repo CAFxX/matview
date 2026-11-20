@@ -11,6 +11,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from .._host import MixinHost
+from ..dialects.pg_statement import signed_rows_sql as pg_signed_rows_sql
 from ..engines import (
     AggFunc,
     Dialect,
@@ -343,77 +344,15 @@ class Tier2Mixin(MixinHost):
         pg_ai_body: Optional[str] = None
         pg_ad_body: Optional[str] = None
         pg_au_body: Optional[str] = None
-
-        if self.dialect == Dialect.POSTGRES and pred_mv_old and pred_mv_new:
-            pred_vec_old = self._group_scope_predicate_for_table(
-                base_t, group_mv_cols, mv_table, "__mv_old_rows"
-            )
-            pred_vec_new = self._group_scope_predicate_for_table(
-                base_t, group_mv_cols, mv_table, "__mv_new_rows"
-            )
-            if can_push_down:
-                pred_inner_vec_old = self._group_scope_predicate_for_table(
-                    base_t, group_mv_cols, None, "__mv_old_rows"
-                )
-                pred_inner_vec_new = self._group_scope_predicate_for_table(
-                    base_t, group_mv_cols, None, "__mv_new_rows"
-                )
-                if pred_inner_vec_old and pred_inner_vec_new and pred_vec_old and pred_vec_new:
-                    q_vec_ins = self._inject_where_into_source_query(source_query_sql, pred_inner_vec_new)
-                    q_vec_del = self._inject_where_into_source_query(source_query_sql, pred_inner_vec_old)
-                    q_vec_upd = self._inject_where_into_source_query(
-                        source_query_sql, f"({pred_inner_vec_old}) OR ({pred_inner_vec_new})"
-                    )
-                    pg_ai_body = (
-                        f"DELETE FROM {mv_table} WHERE {pred_vec_new};\n"
-                        f"INSERT INTO {mv_table} ({cols_csv})\n    {q_vec_ins};"
-                    )
-                    pg_ad_body = (
-                        f"DELETE FROM {mv_table} WHERE {pred_vec_old};\n"
-                        f"INSERT INTO {mv_table} ({cols_csv})\n    {q_vec_del};"
-                    )
-                    pg_au_body = (
-                        f"DELETE FROM {mv_table} WHERE ({pred_vec_old}) OR ({pred_vec_new});\n"
-                        f"INSERT INTO {mv_table} ({cols_csv})\n    {q_vec_upd};"
-                    )
-            else:
-                pred_src_vec_old = self._group_scope_predicate_for_table(
-                    base_t, group_mv_cols, "__mv_src", "__mv_old_rows"
-                )
-                pred_src_vec_new = self._group_scope_predicate_for_table(
-                    base_t, group_mv_cols, "__mv_src", "__mv_new_rows"
-                )
-                if pred_src_vec_old and pred_src_vec_new and pred_vec_old and pred_vec_new:
-                    pg_ai_body = (
-                        f"DELETE FROM {mv_table} WHERE {pred_vec_new};\n"
-                        f"INSERT INTO {mv_table} ({cols_csv})\n"
-                        f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
-                        f"    WHERE {pred_src_vec_new};"
-                    )
-                    pg_ad_body = (
-                        f"DELETE FROM {mv_table} WHERE {pred_vec_old};\n"
-                        f"INSERT INTO {mv_table} ({cols_csv})\n"
-                        f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
-                        f"    WHERE {pred_src_vec_old};"
-                    )
-                    pg_au_body = (
-                        f"DELETE FROM {mv_table} WHERE ({pred_vec_old}) OR ({pred_vec_new});\n"
-                        f"INSERT INTO {mv_table} ({cols_csv})\n"
-                        f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
-                        f"    WHERE ({pred_src_vec_old}) OR ({pred_src_vec_new});"
-                    )
-
         pg_trunc_stmts = full_refresh
         if self.dialect == Dialect.POSTGRES:
-            # Group-scoped recompute: one per-view lock row serializes the
-            # maintenance statements; the DELETE/INSERT below run after it,
-            # so under READ COMMITTED they see every committed writer.
-            lock_stmt = self._pg_view_lock_stmt()
-            refresh_body = "\n".join(full_refresh)
-            pg_ai_body = f"{lock_stmt}\n{pg_ai_body or refresh_body}"
-            pg_ad_body = f"{lock_stmt}\n{pg_ad_body or refresh_body}"
-            pg_au_body = f"{lock_stmt}\n{pg_au_body or refresh_body}"
-            pg_trunc_stmts = [lock_stmt, *full_refresh]
+            pg_bodies = self._pg_group_scoped_bodies(
+                base_t, mv_table, cols_csv, src_cols_csv, group_mv_cols, source_query_sql,
+                can_push_down, full_refresh,
+            )
+            pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
+            # TRUNCATE recomputes everything: the whole-view lock key.
+            pg_trunc_stmts = [self._pg_view_lock_stmt(), *full_refresh]
 
         return self._emit_dialect_triggers_for_table(
             view_name=view_name,
@@ -428,6 +367,162 @@ class Tier2Mixin(MixinHost):
             pg_au_body=pg_au_body,
         )
 
+
+    def _pg_group_scope_keys(
+        self, base_t: str, group_mv_cols: List[Tuple[str, str]], signed_sql: str
+    ) -> Optional[Tuple[str, List[str]]]:
+        """``(FROM clause, key expressions)`` listing the group keys a statement
+        on ``base_t`` affects (PostgreSQL), or ``None`` when they cannot be
+        derived from the delta (the caller recomputes the whole view).
+
+        Mirrors ``_group_scope_predicate_for_table``: single-source views and
+        keys owned by ``base_t`` read them from the signed rows; otherwise the
+        signed rows replace ``base_t`` in the view's join graph. A LEFT JOIN
+        whose nullable side is ``base_t`` also affects the NULL-key group.
+        """
+        if not group_mv_cols:
+            return None
+        if len(self.view.joins) <= 1 and base_t.lower() != self.view.base_table.lower():
+            return None
+        if self.view.where_clause and re.search(r"\b(?:EXISTS|IN)\s*\(", self.view.where_clause, flags=re.IGNORECASE):
+            if base_t.lower() != self.view.base_table.lower():
+                return None
+        rec = "__mv_d"
+        signed_from = f"(\n        {signed_sql}\n        ) AS {rec}"
+        if len(self.view.joins) <= 1:
+            return signed_from, [self._rewrite_expr_for_record(g, rec) for g, _ in group_mv_cols]
+        target_join: Optional[JoinSpec] = None
+        for j in self.view.joins:
+            if j.table_name.lower() == base_t.lower():
+                target_join = j
+                break
+        if target_join is None:
+            return None
+        ts_target = self._schemas_lower[base_t.lower()]
+        owned: List[str] = []
+        for g_expr, _mv_col in group_mv_cols:
+            gs = g_expr.strip()
+            if "." in gs:
+                p_al, c_part = gs.split(".", 1)
+                if p_al.strip().lower() in (target_join.alias.lower(), base_t.lower()):
+                    owned.append(f"{rec}.{self._q(_unquote_ident(c_part, dialect=self.dialect))}")
+                    continue
+                break
+            if _unquote_ident(gs, dialect=self.dialect) in ts_target.columns:
+                owned.append(f"{rec}.{self._q(_unquote_ident(gs, dialect=self.dialect))}")
+                continue
+            break
+        if len(owned) == len(group_mv_cols):
+            return signed_from, owned
+        parts: List[str] = []
+        for idx, j in enumerate(self.view.joins):
+            if j.alias.lower() == target_join.alias.lower():
+                tbl = f"(\n        {signed_sql}\n        ) AS {self._q(j.alias)}"
+            else:
+                tbl = f"{self._q(j.table_name)} AS {self._q(j.alias)}"
+            if idx == 0:
+                parts.append(tbl)
+            else:
+                join_type = "INNER JOIN" if (j.alias.lower() == target_join.alias.lower() and j.on_condition) else j.join_type
+                on_sql = f" ON {j.on_condition}" if j.on_condition else ""
+                parts.append(f"{join_type} {tbl}{on_sql}")
+        from_sql = "\n        ".join(parts)
+        keys = [g for g, _ in group_mv_cols]
+        if any(j.join_type == "LEFT JOIN" for j in self.view.joins) and target_join != self.view.joins[0]:
+            nulls = ", ".join("NULL" for _ in keys)
+            sel = ", ".join(f"{k} AS __mv_k{i}" for i, k in enumerate(keys))
+            from_sql = (
+                f"(SELECT {sel} FROM {from_sql}\n        UNION ALL SELECT {nulls}) AS __mv_kk"
+            )
+            keys = [f"__mv_kk.__mv_k{i}" for i in range(len(keys))]
+        return from_sql, keys
+
+    def _pg_group_scoped_bodies(
+        self,
+        base_t: str,
+        mv_table: str,
+        cols_csv: str,
+        src_cols_csv: str,
+        group_mv_cols: List[Tuple[str, str]],
+        source_query_sql: str,
+        can_push_down: bool,
+        full_refresh: List[str],
+    ) -> Dict[str, str]:
+        """PostgreSQL statement-level bodies for group-scoped recompute.
+
+        1. Take the view-wide lock row (id 0) in SHARE mode, so a whole-view
+           recompute (UPDATE of that row, e.g. TRUNCATE or a source whose
+           affected groups cannot be derived) excludes group writers, then
+           lock the affected groups only, in key order: one row per group key
+           hash (odd ids) in the view's lock table, upserted in hash order (READ
+           COMMITTED: later statements see every committed writer of those
+           groups; REPEATABLE READ/SERIALIZABLE: a concurrent change of the
+           group fails with a serialization error). Writers of other groups
+           neither wait nor deadlock on it.
+        2. Delete and re-insert the affected groups in later statements,
+           matching keys with index-usable predicates: ``col = ANY(ARRAY(...))``
+           for keys without NULLs, and a separate statement for keys with a
+           NULL part, guarded so it does no work when there is none.
+        """
+        bodies: Dict[str, str] = {}
+        refresh = "\n".join([self._pg_view_lock_stmt(), *full_refresh])
+        lock_t = self._pg_view_lock_table()
+        for event in ("INSERT", "UPDATE", "DELETE"):
+            got = self._pg_group_scope_keys(base_t, group_mv_cols, pg_signed_rows_sql(event))
+            if got is None:
+                bodies[event] = refresh
+                continue
+            from_sql, keys = got
+            n = len(keys)
+            sel = ", ".join(f"{k} AS __mv_k{i}" for i, k in enumerate(keys))
+            kset = f"(SELECT DISTINCT {sel} FROM {from_sql}) AS __mv_kset"
+            kcols = [f"__mv_kset.__mv_k{i}" for i in range(n)]
+            canon = self._canonical_group_pk_expr(kcols)
+            no_null = " AND ".join(f"{k} IS NOT NULL" for k in kcols)
+            any_null = " OR ".join(f"{k} IS NULL" for k in kcols)
+            stmts = [
+                *self._pg_view_shared_lock_stmts(),
+                f"INSERT INTO {lock_t} (__mv_id, __mv_n)\n"
+                f"    SELECT DISTINCT hashtextextended({canon}, 0) | 1, 1 FROM {kset}\n"
+                f"    ORDER BY 1\n"
+                f"    ON CONFLICT (__mv_id) DO UPDATE SET __mv_n = {lock_t}.__mv_n + 1;"
+            ]
+
+            def _match_nonnull(lhs: List[str]) -> str:
+                conds = [
+                    f"{l} = ANY (ARRAY(SELECT __mv_kset.__mv_k{i} FROM {kset} WHERE {no_null}))"
+                    for i, l in enumerate(lhs)
+                ]
+                if n > 1:
+                    conds.append(f"({', '.join(lhs)}) IN (SELECT {', '.join(kcols)} FROM {kset} WHERE {no_null})")
+                return " AND ".join(conds)
+
+            def _match_null(lhs: List[str]) -> str:
+                eq = " AND ".join(
+                    f"({l} = {k} OR ({l} IS NULL AND {k} IS NULL))" for l, k in zip(lhs, kcols)
+                )
+                return (
+                    f"EXISTS (SELECT 1 FROM {kset} WHERE {any_null})\n"
+                    f"    AND EXISTS (SELECT 1 FROM {kset} WHERE ({any_null}) AND {eq})"
+                )
+
+            mv_lhs = [f"{mv_table}.{self._q(mv_c)}" for _g, mv_c in group_mv_cols]
+            src_lhs_push = [g for g, _ in group_mv_cols]
+            src_lhs_out = [f"__mv_src.{self._q(mv_c)}" for _g, mv_c in group_mv_cols]
+            for match in (_match_nonnull, _match_null):
+                stmts.append(f"DELETE FROM {mv_table}\n    WHERE {match(mv_lhs)};")
+            for match in (_match_nonnull, _match_null):
+                if can_push_down:
+                    q = self._inject_where_into_source_query(source_query_sql, match(src_lhs_push))
+                    stmts.append(f"INSERT INTO {mv_table} ({cols_csv})\n    {q};")
+                else:
+                    stmts.append(
+                        f"INSERT INTO {mv_table} ({cols_csv})\n"
+                        f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                        f"    WHERE {match(src_lhs_out)};"
+                    )
+            bodies[event] = "\n".join(stmts)
+        return bodies
 
     def _compile_tier2_group_scoped(self) -> MaterializedViewPlan:
         view_name = self.view.view_name
@@ -559,7 +654,7 @@ class Tier2Mixin(MixinHost):
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=[self._pg_view_lock_ddl()] if self.dialect == Dialect.POSTGRES else [],
+            auxiliary_table_ddls=self._pg_view_lock_ddls() if self.dialect == Dialect.POSTGRES else [],
             auxiliary_table_names=[self._pg_view_lock_table()] if self.dialect == Dialect.POSTGRES else [],
             index_ddls=index_ddls,
             initial_populate_sqls=[initial_populate_sql],

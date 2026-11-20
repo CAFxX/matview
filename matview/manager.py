@@ -1944,8 +1944,9 @@ class MaterializedViewManager:
         Declaratively synchronizes a collection of materialized view definitions against
         the connected database (supporting multi-view SQL files/strings as well).
         Returns a status map `{view_name: "created" | "updated" | "unchanged" |
-        "backfill_incomplete" | "triggers_missing" | "dropped"}` ("triggers_missing":
-        maintenance triggers of an unchanged view are gone; repair with `repair_view()`); "backfill_incomplete" means the definition
+        "backfill_incomplete" | "triggers_missing" | "triggers_orphaned" | "dropped"}` ("triggers_missing":
+        maintenance triggers of an unchanged view are gone; "triggers_orphaned": a PostgreSQL
+        maintenance trigger is on a DETACHed partition; repair both with `repair_view()`); "backfill_incomplete" means the definition
         is current but a pk-range backfill is running elsewhere or was interrupted
         (repair with `repair_view()`).
         """
@@ -1955,7 +1956,7 @@ class MaterializedViewManager:
         effective_strict = self.strict if strict is None else strict
         schemas = self.fetch_schema(extra_schema_sql=schema_sql)
         catalog = self.get_catalog()
-        missing_triggers = self._views_missing_triggers(catalog)
+        trigger_drift = self._views_trigger_drift(catalog)
         status: Dict[str, str] = {}
         desired_names: Set[str] = set()
 
@@ -2021,10 +2022,12 @@ class MaterializedViewManager:
                     compiled_plan=plan,
                 )
                 status[v_name] = "updated"
-            elif v_name in missing_triggers:
+            elif v_name in trigger_drift:
                 # Same definition, but maintenance triggers are gone (e.g. a
-                # failed bulk_changes() recovery): writes are not maintained.
-                status[v_name] = "triggers_missing"
+                # failed bulk_changes() recovery) or misplaced (PostgreSQL
+                # partitions attached/detached later): writes are not
+                # maintained exactly.
+                status[v_name] = trigger_drift[v_name]
             elif self._is_backfill_incomplete(catalog[v_name]):
                 # Same definition, but a pk-range backfill is running elsewhere
                 # or was interrupted: not "unchanged" (not complete).
@@ -2042,62 +2045,114 @@ class MaterializedViewManager:
 
     _LIVE_TRIGGER_SQL = {
         Dialect.SQLITE: "SELECT name FROM sqlite_master WHERE type = 'trigger'",
-        # A maintenance trigger counts as present only on a table that is
-        # visible through the search_path (the manager creates its objects
-        # unqualified; same-named triggers of other schemas do not count) and
-        # is not a partition, and only when every partition below it (all
-        # levels) has a trigger of the same name: statement-level triggers do
-        # not fire for direct writes to a partition that lacks them (for
-        # example one attached or created after registration).
-        Dialect.POSTGRES: (
-            "WITH RECURSIVE __mv_tree(root, relid) AS ("
-            " SELECT inhparent, inhrelid FROM pg_catalog.pg_inherits"
-            " UNION ALL"
-            " SELECT __mv_tree.root, i.inhrelid FROM pg_catalog.pg_inherits i"
-            " JOIN __mv_tree ON i.inhparent = __mv_tree.relid)"
-            " SELECT t.tgname FROM pg_catalog.pg_trigger t"
-            " JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid"
-            " WHERE NOT t.tgisinternal AND NOT c.relispartition"
-            " AND pg_catalog.pg_table_is_visible(c.oid)"
-            " AND NOT EXISTS (SELECT 1 FROM __mv_tree WHERE __mv_tree.root = t.tgrelid"
-            " AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t2"
-            " WHERE t2.tgrelid = __mv_tree.relid AND t2.tgname = t.tgname))"
-        ),
+        # PostgreSQL: see _pg_trigger_drift (partition-aware).
+        Dialect.POSTGRES: "SELECT tgname FROM pg_catalog.pg_trigger WHERE NOT tgisinternal",
         Dialect.MYSQL: "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE()",
     }
 
     def _views_missing_triggers(self, catalog: Dict[str, Dict[str, Any]]) -> Set[str]:
-        """Registered views some of whose recorded triggers no longer exist.
+        """Registered views whose maintenance triggers are not exactly where
+        they must be (see ``_views_trigger_drift``)."""
+        return set(self._views_trigger_drift(catalog))
 
-        Never ends a caller transaction (savepoint-protected read); when the
-        trigger list cannot be read nothing is reported.
+    _PG_CREATE_TRIGGER_RE = re.compile(
+        r"^CREATE TRIGGER (\S+)\s+AFTER \w+ ON (\S+)", flags=re.IGNORECASE | re.MULTILINE
+    )
+
+    def _views_trigger_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+        """``{view: "triggers_missing" | "triggers_orphaned"}`` for views whose
+        maintenance triggers drifted.
+
+        "triggers_missing": a recorded trigger does not exist (PostgreSQL: on
+        the source table or on one of its current partitions, e.g. one
+        attached or created after registration). "triggers_orphaned"
+        (PostgreSQL): a maintenance trigger function also fires for a table
+        that is no longer in the source's partition tree (a DETACHed
+        partition, whose writes would still change the view). Never ends a
+        caller transaction (savepoint-protected reads); when the trigger list
+        cannot be read nothing is reported.
         """
+        if not catalog:
+            return {}
+        if self.dialect == Dialect.POSTGRES:
+            return self._pg_trigger_drift(catalog)
         sql = self._LIVE_TRIGGER_SQL.get(self.dialect)
-        if sql is None or not catalog:
-            return set()
+        if sql is None:
+            return {}
         with self._cursor() as cur:
             rows = self._catalog_select(cur, sql)
         if rows is None:
-            return set()
+            return {}
         live = {str(r[0]).lower() for r in rows if r[0]}
         return {
-            name for name, entry in catalog.items()
+            name: "triggers_missing" for name, entry in catalog.items()
             if any(str(t).lower() not in live for t in entry.get("trigger_names") or [])
         }
+
+    def _pg_trigger_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        with self._cursor() as cur:
+            for name, entry in catalog.items():
+                status: Optional[str] = None
+                ddls = "\n".join(entry.get("trigger_ddls") or [])
+                for trg, table in self._PG_CREATE_TRIGGER_RE.findall(ddls):
+                    lit_t = "'" + table.replace("'", "''") + "'"
+                    lit_n = "'" + trg.replace("'", "''") + "'"
+                    rows = self._catalog_select(
+                        cur,
+                        f"WITH RECURSIVE __mv_tree(relid) AS ("
+                        f" SELECT pg_catalog.to_regclass({lit_t})::oid"
+                        f" UNION ALL SELECT i.inhrelid FROM pg_catalog.pg_inherits i"
+                        f" JOIN __mv_tree ON i.inhparent = __mv_tree.relid),"
+                        f" __mv_fn AS (SELECT t.tgfoid FROM pg_catalog.pg_trigger t"
+                        f" WHERE t.tgrelid = pg_catalog.to_regclass({lit_t})::oid AND t.tgname = {lit_n})"
+                        f" SELECT"
+                        f" (SELECT count(*) FROM __mv_tree WHERE __mv_tree.relid IS NULL OR NOT EXISTS ("
+                        f"  SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = __mv_tree.relid"
+                        f"  AND t.tgname = {lit_n})),"
+                        f" (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgfoid IN (SELECT tgfoid FROM __mv_fn)"
+                        f"  AND t.tgrelid NOT IN (SELECT relid FROM __mv_tree WHERE relid IS NOT NULL))",
+                    )
+                    if rows is None:
+                        continue
+                    missing, orphaned = int(rows[0][0]), int(rows[0][1])
+                    if missing:
+                        status = "triggers_missing"
+                        break
+                    if orphaned:
+                        status = "triggers_orphaned"
+                if status is None:
+                    # Read-only/other triggers recorded by name only.
+                    names = [t for t in entry.get("trigger_names") or [] if t not in ddls]
+                    if names:
+                        lits = ", ".join("'" + t.replace("'", "''") + "'" for t in names)
+                        rows = self._catalog_select(
+                            cur, f"SELECT count(DISTINCT tgname) FROM pg_catalog.pg_trigger WHERE tgname IN ({lits})"
+                        )
+                        if rows is not None and int(rows[0][0]) < len(set(names)):
+                            status = "triggers_missing"
+                if status:
+                    out[name] = status
+        return out
 
     @_manager_read_operation
     def check_schema_drift(self) -> Dict[str, str]:
         """
         Inspects all registered views in `__matview_catalog` against the current live base
         table schemas and returns `{view_name: "ok" | "drifted" | "invalid" |
-        "backfill_incomplete" | "triggers_missing"}`; "backfill_incomplete" (definition current, but a
-        pk-range backfill is running elsewhere or was interrupted) is never "ok";
-        "triggers_missing" means maintenance triggers recorded for the view do not
-        exist (writes are not maintained; repair with `repair_view()`).
+        "backfill_incomplete" | "triggers_missing" | "triggers_orphaned"}`;
+        "backfill_incomplete" (definition current, but a pk-range backfill is
+        running elsewhere or was interrupted) is never "ok"; "triggers_missing"
+        means maintenance triggers recorded for the view do not exist, also on a
+        PostgreSQL partition attached or created later (writes are not
+        maintained); "triggers_orphaned" means a PostgreSQL maintenance trigger
+        is on a table outside the source's partition tree, e.g. a DETACHed
+        partition (its writes still change the view, and its rows are still in
+        the view). Repair both with `repair_view()`, which rebuilds the view.
         """
         schemas = self.fetch_schema()
         catalog = self.get_catalog()
-        missing_triggers = self._views_missing_triggers(catalog)
+        trigger_drift = self._views_trigger_drift(catalog)
         report: Dict[str, str] = {}
         for v_name, entry in catalog.items():
             try:
@@ -2113,8 +2168,8 @@ class MaterializedViewManager:
                 sig = self._compute_signature(plan, schemas)
                 if sig != entry["signature_hash"]:
                     report[v_name] = "drifted"
-                elif v_name in missing_triggers:
-                    report[v_name] = "triggers_missing"
+                elif v_name in trigger_drift:
+                    report[v_name] = trigger_drift[v_name]
                 elif self._is_backfill_incomplete(entry):
                     report[v_name] = "backfill_incomplete"
                 else:
