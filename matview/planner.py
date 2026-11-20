@@ -771,7 +771,9 @@ class PlannerMixin(MixinHost):
         # An aggregate inside a scalar subquery belongs to that subquery, not
         # to the view's groups; the decomposition below would replace it with
         # the outer group's stored value (wrong values, or "Subquery returns
-        # more than 1 row"). Refuse such projections and HAVING clauses.
+        # more than 1 row"). Such projections and HAVING clauses are not
+        # decomposed (all_ok=False): the strategy selection then falls back to
+        # a maintenance mode that evaluates the original expression.
         def _aggregate_in_subquery(sql_text: str) -> bool:
             try:
                 node = parse_sql_ast(sql_text, dialect=self.dialect)
@@ -784,17 +786,23 @@ class PlannerMixin(MixinHost):
                     return True
             return False
 
-        for text in [it.raw_expr for it in v.select_items if it.is_aggregate] + (
-            [v.having_clause] if v.having_clause else []
-        ):
-            if _aggregate_in_subquery(text):
-                raise UnsupportedMaterializedViewError(
-                    f"View '{self.logical_view_name}' uses an aggregate inside a scalar subquery in an "
-                    f"aggregated projection or HAVING ({text.strip()[:120]}), which is not maintained."
-                )
+        subquery_agg_texts = {
+            text
+            for text in [it.raw_expr for it in v.select_items if it.is_aggregate] + (
+                [v.having_clause] if v.having_clause else []
+            )
+            if _aggregate_in_subquery(text)
+        }
 
         all_ok = True
         for it in v.select_items:
+            if it.agg_func is not None and it.raw_expr in subquery_agg_texts:
+                # An elementary aggregate whose argument holds a subquery
+                # aggregate is stored as one column: no fallback evaluates it.
+                raise UnsupportedMaterializedViewError(
+                    f"View '{self.logical_view_name}' uses an aggregate inside a scalar subquery in the "
+                    f"argument of an aggregate ({it.raw_expr.strip()[:120]}), which is not maintained."
+                )
             if not it.is_aggregate or it.agg_func is not None:
                 work_items.append(it)
                 if (
@@ -820,7 +828,11 @@ class PlannerMixin(MixinHost):
                 else:
                     reader_exprs[it.alias] = it.alias
             else:
-                rewritten_e, ok = _extract_agg_calls_from_expr(it.raw_expr)
+                rewritten_e, ok = (
+                    (it.raw_expr, False)
+                    if it.raw_expr in subquery_agg_texts
+                    else _extract_agg_calls_from_expr(it.raw_expr)
+                )
                 if not ok:
                     all_ok = False
                     work_items.append(it)
@@ -830,7 +842,11 @@ class PlannerMixin(MixinHost):
 
         rewritten_having: Optional[str] = None
         if v.having_clause:
-            rh, ok_h = _extract_agg_calls_from_expr(v.having_clause)
+            rh, ok_h = (
+                (v.having_clause, False)
+                if v.having_clause in subquery_agg_texts
+                else _extract_agg_calls_from_expr(v.having_clause)
+            )
             if ok_h:
                 # Also strip table qualifiers on group columns in HAVING if they match group aliases
                 for g_it in v.select_items:
