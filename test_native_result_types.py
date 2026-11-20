@@ -131,6 +131,11 @@ def _views(engine: Dialect, t: str) -> List[Tuple[str, str]]:
         ("recursive_cte_depth", f"WITH RECURSIVE tr(id, depth) AS (SELECT id, 0 FROM {t} WHERE g = 1 "
                                 f"UNION ALL SELECT x.id, tr.depth + 1 FROM {t} x JOIN tr ON x.g = tr.id + 1 "
                                 f"WHERE tr.depth < 3) SELECT id, depth FROM tr"),
+        # MIN/MAX of a recursive CTE's integer column (a bare column, not an
+        # expression: MariaDB keeps INT; MySQL's derived-table rule gives BIGINT).
+        ("recursive_cte_max_depth", f"WITH RECURSIVE tr(id, depth) AS (SELECT id, 0 FROM {t} WHERE g = 1 "
+                                    f"UNION ALL SELECT x.id, tr.depth + 1 FROM {t} x JOIN tr ON x.g = tr.id + 1 "
+                                    f"WHERE tr.depth < 3) SELECT id, MAX(depth) AS r FROM tr GROUP BY id"),
         ("union_sum", f"SELECT g, SUM(v) AS r FROM (SELECT g, i AS v FROM {t} UNION ALL SELECT g, s AS v FROM {t}) AS u GROUP BY g"),
     ]
     views += [
