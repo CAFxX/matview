@@ -403,43 +403,57 @@ class ScalarSubqueryAggregateRefusalTests(unittest.TestCase):
 
 
 _MINMAX_CONTEXT_TABLE = (
-    "CREATE TABLE {t} (id INT PRIMARY KEY, g INT NOT NULL, ti TINYINT, tu TINYINT UNSIGNED, "
-    "s SMALLINT, i INT, iu INT UNSIGNED, b BIGINT, y YEAR)"
+    "CREATE TABLE {t} (id INT PRIMARY KEY, g INT NOT NULL, ti TINYINT, tu TINYINT UNSIGNED, s SMALLINT, "
+    "m MEDIUMINT UNSIGNED, i INT, iu INT UNSIGNED, b BIGINT, y YEAR, bt BIT(4), bo BOOL)"
 )
-# (select, refused on MySQL/MariaDB)
-_MINMAX_CONTEXT_VIEWS = [
-    ("SELECT id, COALESCE(MIN(ti) OVER (PARTITION BY g), 0) AS a, COALESCE(MIN(iu) OVER (PARTITION BY g), 0) AS c FROM {t}", True),
-    ("SELECT id, MAX(ti) OVER (PARTITION BY g) + 1 AS a, -MAX(tu) OVER () AS c FROM {t}", True),
-    ("SELECT g, COALESCE(MAX(ti), 0) AS a, COALESCE(MIN(iu), 0) AS b, MAX(s) + 0 AS c, CAST(MAX(y) AS UNSIGNED) AS d FROM {t} GROUP BY g", True),
-    ("WITH c AS (SELECT g, i FROM {t}) SELECT g, COALESCE(MIN(i), 0) AS e FROM c GROUP BY g", True),
-    ("SELECT d.id, MAX(d.ti) OVER (PARTITION BY d.g) AS a FROM (SELECT id, g, ti FROM {t}) d", True),
-    ("SELECT g, MIN(ti) AS a, MAX(iu) AS b, MIN(y) AS c, COALESCE(MAX(b), 0) AS d FROM {t} GROUP BY g", False),
-    ("SELECT id, MAX(ti) OVER (PARTITION BY g) AS a, MIN(s) OVER (PARTITION BY g) AS b FROM {t}", False),
-    ("SELECT g, COUNT(*) AS n FROM {t} GROUP BY g HAVING MAX(ti) + 0 > 1", False),
-    ("WITH c AS (SELECT g, ti FROM {t}) SELECT g, MAX(ti) AS a FROM c GROUP BY g", False),
-]
+_MINMAX_NARROW = ("ti", "tu", "s", "m", "y", "bt", "bo")
+_MINMAX_CONTEXTS = {
+    "grpco": "SELECT g, COALESCE(MAX({c}), 0) AS a FROM {t} GROUP BY g",
+    "grpp": "SELECT g, MAX({c}) + 0 AS a FROM {t} GROUP BY g",
+    "winco": "SELECT id, COALESCE(MIN({c}) OVER (PARTITION BY g), 0) AS a FROM {t}",
+    "winp": "SELECT id, MAX({c}) OVER (PARTITION BY g) + 1 AS a FROM {t}",
+    "dwin": "SELECT d.id, MAX(d.{c}) OVER (PARTITION BY d.g) AS a FROM (SELECT id, g, {c} FROM {t}) d",
+    "plain": "SELECT g, MIN({c}) AS a, MAX({c}) AS z FROM {t} GROUP BY g",
+    "having": "SELECT g, COUNT(*) AS n FROM {t} GROUP BY g HAVING MAX({c}) + 0 >= 0",
+}
+
+
+def _minmax_refused(mariadb: bool, col: str, ctx: str) -> bool:
+    """The measured rule (see MySQLDialectMixin._mysql_untyped_minmax_uses)."""
+    if ctx in ("plain", "having"):
+        return False
+    if mariadb:
+        return ctx in ("winco", "winp") and (col in _MINMAX_NARROW or col == "iu")
+    return col in _MINMAX_NARROW
+
+
+def _minmax_context_views() -> List[Tuple[str, str, str]]:
+    return [(col, ctx, sql) for col in _MINMAX_NARROW + ("i", "iu", "b") for ctx, sql in _MINMAX_CONTEXTS.items()]
 
 
 class MinMaxContextTypingTests(unittest.TestCase):
-    """MIN/MAX of integers narrower than BIGINT: exact where typed, refused elsewhere.
+    """MIN/MAX of integer-like arguments: exact where typed, refused where the server types by context.
 
-    MySQL types these results by context (window vs grouped vs nested,
-    INT vs BIGINT on the wire) and MariaDB loses UNSIGNED through
-    COALESCE/arithmetic around windowed MIN/MAX; nested and derived-table
-    window uses are refused (not bypassable), the rest must be exact.
+    Matrix: argument type (TINYINT, TINYINT UNSIGNED, SMALLINT, MEDIUMINT
+    UNSIGNED, YEAR, BIT(4), BOOL, INT, INT UNSIGNED, BIGINT) x context
+    (COALESCE/arithmetic around grouped and window MIN/MAX, window over a
+    derived table, plain projection, HAVING). Natively every view must be
+    exactly what `_minmax_refused` predicts: refused (not bypassable), or
+    exact in rows and wire type codes through DML.
     """
 
     def test_offline_decisions(self) -> None:
         schema = _MINMAX_CONTEXT_TABLE.format(t="t") + ";"
         for engine in ("mysql:8.4.13", "mysql:9.7.4", "mariadb:10.11"):
-            for select, refused in _MINMAX_CONTEXT_VIEWS:
-                with self.subTest(engine=engine, select=select):
+            for col, ctx, sql in _minmax_context_views():
+                with self.subTest(engine=engine, col=col, ctx=ctx):
                     compile_ = lambda: generate_materialized_view(
-                        schema, f"CREATE VIEW v AS {select.format(t='t')};", dialect=engine, ignore_limitations=True
+                        schema, f"CREATE VIEW v AS {sql.format(c=col, t='t')};", dialect=engine,
+                        ignore_limitations=True,
                     )
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", EngineLimitationWarning)
-                        if refused:
+                        if _minmax_refused(engine.startswith("mariadb"), col, ctx):
                             with self.assertRaises(UnsupportedMaterializedViewError):
                                 compile_()
                         else:
@@ -452,21 +466,25 @@ class MinMaxContextTypingTests(unittest.TestCase):
         for engine, dsn in engines:
             conn = _connect(engine, dsn)
             cur = conn.cursor()
+            cur.execute("SELECT VERSION()")
+            mariadb = "mariadb" in str(cur.fetchone()[0]).lower()
+            conn.commit()
             tag = uuid.uuid4().hex[:8]
             t = f"mc_{tag}"
             failures: List[str] = []
             try:
                 cur.execute(_MINMAX_CONTEXT_TABLE.format(t=t))
-                cur.executemany(
-                    f"INSERT INTO {t} VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                    [(1, 1, -3, 200, 7, 5, 4000000000, 9, 2001), (2, 1, 4, 3, -2, -8, 1, -7, 1999),
-                     (3, 2, None, None, None, None, None, None, None), (4, 2, 0, 0, 0, 0, 0, 0, 2000)],
+                cur.execute(
+                    f"INSERT INTO {t} VALUES (1, 1, -3, 200, 7, 5, 5, 4000000000, 9, 2001, b'101', 1), "
+                    f"(2, 1, 4, 3, -2, 1, -8, 1, -7, 1999, b'1', 0), "
+                    f"(3, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
                 )
                 conn.commit()
                 manager = MaterializedViewManager(conn, dialect=engine)
                 pairs = []
-                for n, (select, refused) in enumerate(_MINMAX_CONTEXT_VIEWS):
-                    sql = select.format(t=t)
+                for n, (col, ctx, sql_t) in enumerate(_minmax_context_views()):
+                    sql = sql_t.format(c=col, t=t)
+                    refused = _minmax_refused(mariadb, col, ctx)
                     mv, live = f"mv{n}_{tag}", f"lv{n}_{tag}"
                     try:
                         with warnings.catch_warnings():
@@ -485,7 +503,8 @@ class MinMaxContextTypingTests(unittest.TestCase):
                     pairs.append((sql, mv, live))
                 for step, stmt in (
                     ("initial", None),
-                    ("insert", f"INSERT INTO {t} VALUES (5, 1, 100, 250, 30000, 2000000000, 4294967295, 5, 2155)"),
+                    ("insert", f"INSERT INTO {t} VALUES (4, 2, 0, 0, 0, 0, 0, 0, 0, 2000, b'0', 1), "
+                               f"(5, 1, 100, 250, 30000, 16000000, 2000000000, 4294967295, 5, 2155, b'1111', 0)"),
                     ("update", f"UPDATE {t} SET g = 2 WHERE id = 1"),
                     ("delete", f"DELETE FROM {t} WHERE id = 2"),
                 ):
