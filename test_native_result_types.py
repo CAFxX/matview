@@ -338,6 +338,70 @@ _INT_FAMILY = [
 ]
 
 
+_SUBQUERY_AGG_VIEWS = [
+    "SELECT g, COUNT(*) AS n FROM {t} GROUP BY g HAVING COUNT(*) > (SELECT SUM(i) FROM {t}) - 100",
+    "SELECT g, COUNT(*) AS n FROM {t} a GROUP BY g HAVING COUNT(*) > (SELECT SUM(b.i) FROM {t} b WHERE b.g = a.g)",
+    "SELECT g, COUNT(*) AS n FROM {t} GROUP BY g HAVING MAX(i) < (SELECT AVG(i) FROM {t}) + 10",
+]
+
+
+class ScalarSubqueryAggregateRefusalTests(unittest.TestCase):
+    """An aggregate inside a scalar subquery in HAVING is refused on every engine.
+
+    It used to be rewritten to the outer group's stored value: a reader with
+    `(select __mv_elem_1 + 0 from t)` ("Subquery returns more than 1 row", or
+    silently wrong on a one-row table); the correlated form failed with 1054.
+    """
+
+    def test_refused_offline(self) -> None:
+        schema = _TABLE.format(t="t", dp=" PRECISION") + ";"
+        for engine in ("sqlite", "postgres:18", "mysql:8.4", "mariadb:10.11"):
+            for view in _SUBQUERY_AGG_VIEWS:
+                with self.subTest(engine=engine, view=view):
+                    with self.assertRaises(UnsupportedMaterializedViewError):
+                        generate_materialized_view(
+                            schema.replace("DOUBLE PRECISION", "DOUBLE") if not engine.startswith("postgres") else schema,
+                            f"CREATE VIEW v AS {view.format(t='t')};",
+                            dialect=engine,
+                            ignore_limitations=True,
+                        )
+
+    def test_refused_natively_without_objects(self) -> None:
+        engines = _native_engines()
+        if not engines:
+            self.skipTest("set POSTGRES_DSN and/or MYSQL_DSN")
+        for engine, dsn in engines:
+            conn = _connect(engine, dsn)
+            cur = conn.cursor()
+            tag = uuid.uuid4().hex[:8]
+            t = f"sq_{tag}"
+            try:
+                if engine == Dialect.POSTGRES:
+                    cur.execute(f'CREATE SCHEMA "{t}"')
+                    cur.execute(f'SET search_path TO "{t}"')
+                dp = " PRECISION" if engine == Dialect.POSTGRES else ""
+                cur.execute(_TABLE.format(t=t, dp=dp))
+                cur.executemany(f"INSERT INTO {t} VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)", _SEED)
+                conn.commit()
+                manager = MaterializedViewManager(conn, dialect=engine)
+                for view in _SUBQUERY_AGG_VIEWS:
+                    with self.subTest(engine=engine.value, view=view):
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", EngineLimitationWarning)
+                            with self.assertRaises(UnsupportedMaterializedViewError):
+                                manager.register_view(f"CREATE VIEW mv_{tag} AS {view.format(t=t)};", ignore_limitations=True)
+                        conn.rollback()
+                        self.assertNotIn(f"mv_{tag}", manager.get_catalog())
+            finally:
+                conn.rollback()
+                if engine == Dialect.POSTGRES:
+                    cur.execute(f'DROP SCHEMA IF EXISTS "{t}" CASCADE')
+                else:
+                    cur.execute(f"DROP TABLE IF EXISTS {t}")
+                conn.commit()
+                conn.close()
+
+
 _MINMAX_CONTEXT_TABLE = (
     "CREATE TABLE {t} (id INT PRIMARY KEY, g INT NOT NULL, ti TINYINT, tu TINYINT UNSIGNED, "
     "s SMALLINT, i INT, iu INT UNSIGNED, b BIGINT, y YEAR)"

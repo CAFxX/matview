@@ -483,7 +483,9 @@ The existing differential-testing harness is useful, but its current headline co
 - [ ] **Fix Pre-Existing Result-Type and Registration Defects Found by the Dialect-Native Review**:
   - UNION ALL aggregates whose branches mix SMALLINT and BIGINT store the first branch's type: base DML then fails ("smallint out of range" on PostgreSQL, error 1264 on MySQL/MariaDB). Use the branches' common type.
   - AVG over a DOUBLE near 1e308 fails at registration (the hidden SUM column overflows) on PostgreSQL/MySQL/MariaDB.
-  - Scalar-subquery projections (`(SELECT SUM(..) ...) AS c`) are stored as TEXT/VARCHAR on PostgreSQL/MySQL (values come back as strings).
+  - Scalar-subquery projections (`(SELECT SUM(..) ...) AS c`) are stored as TEXT/VARCHAR on PostgreSQL/MySQL (values come back as strings); `COUNT(*) - (SELECT SUM(x) FROM t)` comes back BIGINT where MySQL returns DECIMAL (values exact).
+  - Fixed (refused): an aggregate inside a scalar subquery in HAVING or in an aggregated projection was replaced by the outer group's stored value (`(select __mv_elem_1 + 0 from t)`: "Subquery returns more than 1 row", silently wrong on a one-row table; the correlated form failed with 1054). Such views now raise `UnsupportedMaterializedViewError` on every engine.
+  - MariaDB conservative refusals of exact statistic shapes: `SELECT DISTINCT g, VARIANCE(x)`, `ORDER BY v LIMIT n`, a parenthesized `(VARIANCE(x)) AS v`.
   - MySQL `COALESCE(MIN(smallint), 0)` returns a Decimal where the live view returns an int.
   - A single-table view with a table alias (`SELECT t.g, SUM(t.x) FROM tt t GROUP BY t.g`) fails to register (1054 on MySQL/MariaDB; the populate/recompute SQL drops the alias, so PostgreSQL is affected the same way): loud, not silent.
   - PostgreSQL `pg_catalog.variance(x)` / `pg_catalog.var_pop(x)` fail to register ("missing FROM-clause entry for table pg_catalog"): loud.
