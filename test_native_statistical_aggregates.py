@@ -51,6 +51,7 @@ from matview_sync import (
 )
 from matview.compiler import IncrementalViewCompiler
 import test_matview_sync as _shared_oracle
+from test_matview_sync import FLOAT_OPT_IN
 
 _SCHEMA = "CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, x DOUBLE PRECISION);"
 
@@ -90,7 +91,7 @@ def _compiled_items(view_sql_or_spec: Any, engine: str) -> Dict[str, Optional[Ag
         if isinstance(view_sql_or_spec, str)
         else view_sql_or_spec
     )
-    compiler = IncrementalViewCompiler(schemas, spec, dialect=engine, ignore_limitations=True)
+    compiler = IncrementalViewCompiler(schemas, spec, dialect=engine, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
     return {it.alias: it.agg_func for it in compiler.view.select_items}
 
 
@@ -145,7 +146,7 @@ class AliasResolutionTests(unittest.TestCase):
                     parse_table_schema(_SCHEMA, dialect=dialect),
                     parse_view_definition(sql, known_tables={"t"}, dialect=dialect),
                     dialect=engine,
-                    ignore_limitations=True,
+                    ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                 )
                 funcs = {it.agg_func for it in compiler._working_select_items if it.is_aggregate}
                 self.assertIn(var_f, funcs)
@@ -188,7 +189,7 @@ class AliasResolutionTests(unittest.TestCase):
                     "CREATE VIEW v AS SELECT g, SUM(std) AS std, COUNT(variance) AS n, "
                     "MAX('STD(') AS lit FROM t GROUP BY g;",
                     dialect=engine,
-                    ignore_limitations=True,
+                    ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                 )
                 self.assertTrue(plan.view_name)
 
@@ -207,6 +208,38 @@ class AliasResolutionTests(unittest.TestCase):
             self.assertEqual(before, after)
         finally:
             conn.close()
+
+
+class AliasFloatRefusalTests(unittest.TestCase):
+    """An alias-resolved statistic over a floating-point column takes the same
+    path as its canonical spelling: refused by default with the per-code
+    order-sensitivity limitation, accepted only when that code is accepted."""
+
+    CODE = "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"
+
+    def test_alias_over_float_is_refused_by_default_and_accepted_per_code(self) -> None:
+        for engine, canonical in (("postgres:18", {"VARIANCE": "VAR_SAMP", "STDDEV": "STDDEV_SAMP"}),
+                                  ("mysql:8.4", {"VARIANCE": "VAR_POP", "STDDEV": "STDDEV_POP", "STD": "STDDEV_POP"}),
+                                  ("mariadb:10.11", {"VARIANCE": "VAR_POP", "STDDEV": "STDDEV_POP", "STD": "STDDEV_POP"})):
+            schema = _SCHEMA if engine.startswith("postgres") else _SCHEMA.replace("DOUBLE PRECISION", "DOUBLE")
+            # The group index keeps MySQL's recompute-index limitation out of the way.
+            schema += " CREATE INDEX t_g ON t (g);"
+            for alias, canon in canonical.items():
+                with self.subTest(engine=engine, alias=alias):
+                    view = f"CREATE VIEW v AS SELECT g, {alias}(x) AS s FROM t GROUP BY g;"
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        with self.assertRaisesRegex(EngineLimitationError, self.CODE):
+                            generate_materialized_view(schema, view, dialect=engine, ignore_limitations=True)
+                        plan = generate_materialized_view(
+                            schema, view, dialect=engine, ignore_limitations=True, accept_limitations=[self.CODE]
+                        )
+                        canon_plan = generate_materialized_view(
+                            schema, view.replace(f"{alias}(x)", f"{canon}(x)"), dialect=engine,
+                            ignore_limitations=True, accept_limitations=[self.CODE],
+                        )
+                    self.assertIn(self.CODE, {l.code for l in plan.limitations})
+                    self.assertEqual({l.code for l in plan.limitations}, {l.code for l in canon_plan.limitations})
 
 
 class NativeResultRepresentationPlanTests(unittest.TestCase):
@@ -229,6 +262,9 @@ class NativeResultRepresentationPlanTests(unittest.TestCase):
                 f"CREATE VIEW v AS {select};",
                 dialect=engine,
                 ignore_limitations=kw.pop("ignore_limitations", True),
+                # Past #242's float opt-in: these tests target the statistic
+                # semantics, not the order-sensitivity limitation.
+                accept_limitations=kw.pop("accept_limitations", FLOAT_OPT_IN),
                 **kw,
             )
 
@@ -547,7 +583,7 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                     try:
                         with warnings.catch_warnings():
                             warnings.simplefilter("ignore", EngineLimitationWarning)
-                            manager.register_view(view_sql, ignore_limitations=True)
+                            manager.register_view(view_sql, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
                     except UnsupportedMaterializedViewError:
                         conn.rollback()
                         refused.append(name)
@@ -562,7 +598,7 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                     # MariaDB statistics it cannot reproduce exactly are refused,
                     # also with ignore_limitations.
                     with self.assertRaises(UnsupportedMaterializedViewError, msg=name):
-                        manager.register_view(view_sql, ignore_limitations=True)
+                        manager.register_view(view_sql, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
                     conn.rollback()
                     continue
                 if engine == Dialect.MYSQL:
@@ -570,16 +606,20 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                     # override must warn with exactly that limitation.
                     with self.assertRaises(EngineLimitationError) as raised:
                         manager.register_view(view_sql)
-                    self.assertEqual({lim.code for lim in raised.exception.limitations}, {"MYSQL_NO_TRUNCATE_TRIGGER"}, name)
+                    # Besides #242's per-code float limitations (accepted below).
+                    self.assertEqual(
+                        {lim.code for lim in raised.exception.limitations} - set(FLOAT_OPT_IN),
+                        {"MYSQL_NO_TRUNCATE_TRIGGER"}, name,
+                    )
                     conn.rollback()
                     with warnings.catch_warnings(record=True) as caught:
                         warnings.simplefilter("always")
-                        manager.register_view(view_sql, ignore_limitations=True)
+                        manager.register_view(view_sql, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
                     lim_warnings = [w for w in caught if issubclass(w.category, EngineLimitationWarning)]
                     self.assertEqual(len(lim_warnings), 1)
                     self.assertIn("MYSQL_NO_TRUNCATE_TRIGGER", str(lim_warnings[0].message))
                 else:
-                    manager.register_view(view_sql)
+                    manager.register_view(view_sql, accept_limitations=FLOAT_OPT_IN)
                 conn.commit()
                 pairs.append((name, mv, live))
                 self.assertEqual(
@@ -700,7 +740,7 @@ class StatisticWrapperRefusalTests(unittest.TestCase):
                             parse_table_schema(schema, dialect=Dialect.MYSQL),
                             f"CREATE VIEW v AS {select};",
                             dialect=engine,
-                            ignore_limitations=True,
+                            ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                         )
                         with warnings.catch_warnings():
                             warnings.simplefilter("ignore", EngineLimitationWarning)
@@ -770,7 +810,7 @@ class NativeStatisticWrapperTests(unittest.TestCase):
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", EngineLimitationWarning)
-                        manager.register_view(f"CREATE VIEW {mv} AS {select};", ignore_limitations=True)
+                        manager.register_view(f"CREATE VIEW {mv} AS {select};", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
                 except UnsupportedMaterializedViewError:
                     conn.rollback()
                     refused.append(name)

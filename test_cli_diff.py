@@ -654,7 +654,10 @@ class TestCLICompileLimitationContract(unittest.TestCase):
             # MariaDB statistics it cannot reproduce exactly: the override (needed
             # for every MySQL-family view) must not get past the refusal.
             ("mariadb:10.11", "CREATE VIEW v AS SELECT grp, VAR_SAMP(val) * 2 AS v2 FROM t GROUP BY grp;",
-             (["--ignore-limitations"],)),
+             (["--ignore-limitations"],
+              # Past the order-sensitivity opt-in too: MariaDB's own refusal must hold.
+              ["--ignore-limitations", "--accept-limitation", "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+               "--accept-limitation", "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX"])),
         ):
             for extra in extras:
                 with self.subTest(dialect=dialect, extra=extra):
@@ -663,7 +666,9 @@ class TestCLICompileLimitationContract(unittest.TestCase):
                     )
                     self.assertEqual(rc, 2)
                     self.assertEqual(out, "")
-                    self.assertRegex(err, r"VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP|cannot reproduce exactly")
+                    self.assertRegex(
+                        err, r"VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP|cannot reproduce exactly|ORDER_SENSITIVE_AGGREGATE"
+                    )
 
 
 if __name__ == "__main__":
