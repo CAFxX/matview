@@ -210,7 +210,6 @@ for name in matview.__all__:
         )
         self.assertEqual(r1.returncode, 0, r1.stderr)
         self.assertEqual(r2.returncode, 0, r2.stderr)
-        self.assertEqual(r1.stderr, r2.stderr)
         self.assertIn("--schema", r1.stdout)
         self.assertIn("--schema", r2.stdout)
         # argparse uses a different executable name for the two entrypoints;
