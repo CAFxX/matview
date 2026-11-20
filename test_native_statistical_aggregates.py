@@ -278,7 +278,11 @@ class NativeResultRepresentationPlanTests(unittest.TestCase):
             ("INT", "SELECT g, VAR_SAMP(x) AS a FROM t GROUP BY g", False),
             ("DECIMAL(12,3)", "SELECT g, STDDEV_POP(x) AS a, VARIANCE(x) AS b FROM t GROUP BY g", False),
             ("INT", "SELECT g, VAR_SAMP(x * 2) AS a FROM t GROUP BY g", False),
-            ("INT", "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING VAR_SAMP(x) > 1", False),
+            ("INT", "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING VAR_SAMP(x) > 1", True),
+            ("INT", "SELECT g, VAR_SAMP(x) AS v FROM t GROUP BY g HAVING v > 1", True),
+            ("INT", "SELECT g, VAR_SAMP(x) AS v FROM t GROUP BY g HAVING CONCAT(v, '') = '1'", True),
+            ("INT", "SELECT g, VAR_SAMP(x) AS v FROM t GROUP BY g HAVING COUNT(*) > 1", False),
+            ("DOUBLE", "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING VAR_SAMP(x) > 1", False),
         ]
         for col_type, select, refused in cases:
             for engine in ("mariadb:10.11", "mariadb:12.3", "mysql:8.4"):
@@ -446,7 +450,8 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                     f"COALESCE({var_fn}(x), -1) AS vc FROM {t} GROUP BY g",
                 ),
                 # Singleton groups have a NULL sample but a 0 population
-                # variance: the HAVING filter keeps different groups.
+                # variance: the HAVING filter keeps different groups. (MariaDB
+                # refuses fixed-decimal statistics in HAVING.)
                 (f"having_{k}", f"SELECT g, COUNT(*) AS c FROM {t} GROUP BY g HAVING {var_fn}(x) >= 0"),
                 (
                     f"join_{k}",
@@ -559,7 +564,7 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                     continue
                 if is_mariadb and (
                     name.startswith("window_")
-                    or (name.startswith("nested_") and "DOUBLE" not in col_type.upper())
+                    or (name.startswith(("nested_", "having_")) and "DOUBLE" not in col_type.upper())
                 ):
                     # MariaDB statistics it cannot reproduce exactly are refused,
                     # also with ignore_limitations.
@@ -659,6 +664,18 @@ _WRAPPERS = {
 }
 
 
+# HAVING uses of a statistic, directly or through its select alias: MariaDB
+# evaluates them on the fixed-decimal value (string conversions included).
+_HAVING_WRAPPERS = {
+    "cast_like": "CAST({c} AS CHAR) LIKE '%.____'",
+    "concat": "CONCAT({c}, '') <> ''",
+    "cmp": "{c} >= 0",
+    "arith": "{c} * 2 + 1 > 0",
+    "alias_concat": "CONCAT(top, '') LIKE '%.%'",
+    "alias_cmp": "top >= 0",
+}
+
+
 def _wrapper_views(t: str) -> List[Tuple[str, str, bool]]:
     """(name, select, is_plain_top_level_duplicate) for every name x wrapper."""
     out = []
@@ -669,6 +686,10 @@ def _wrapper_views(t: str) -> List[Tuple[str, str, bool]]:
         for wname, tmpl in _WRAPPERS.items():
             expr = tmpl.format(c=call, lc=lc, qc=qc)
             out.append((f"{fn.lower()}_{wname}", f"SELECT g, {call} AS top, {expr} AS w FROM {t} GROUP BY g", wname == "dup"))
+        for hname, cond in _HAVING_WRAPPERS.items():
+            projected = hname == "alias_concat" or hname == "alias_cmp"
+            sel = f"SELECT g, COUNT(*) AS n{', ' + call + ' AS top' if projected else ''} FROM {t} GROUP BY g"
+            out.append((f"{fn.lower()}_having_{hname}", f"{sel} HAVING {cond.format(c=call)}", False))
     return out
 
 
@@ -741,7 +762,8 @@ class NativeStatisticWrapperTests(unittest.TestCase):
             if not is_mariadb or "DOUBLE" in col_type:
                 self.assertEqual(refused, [], "nothing may be refused here")
             else:
-                # Only the plain top-level duplicates are reproducible.
+                # Only the plain top-level duplicates are reproducible; every
+                # HAVING use is refused.
                 self.assertEqual(sorted(n for n, _, _ in pairs), sorted(f"{fn.lower()}_dup" for fn in _STAT_NAMES))
             checker = NativeStatisticalAggregateTests()
             for step, stmt in [("initial", None)] + list(_DML):

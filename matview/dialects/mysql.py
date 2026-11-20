@@ -102,10 +102,11 @@ class MySQLDialectMixin(MixinHost):
           wherever they appear (native recomputation);
         - a fixed-decimal call is reproducible only when that very node is a
           whole top-level select item of a single query whose compiled reader
-          column is ROUND(col, <native decimals>), or when it lies inside the
-          top-level HAVING (compared unrounded on both sides). Another copy of
-          the same call text elsewhere (e.g. `VARIANCE(x) + 0` next to a
-          projected `VARIANCE(x)`) is refused.
+          column is ROUND(col, <native decimals>). Any other occurrence is
+          refused, including another copy of the same call text (e.g.
+          `VARIANCE(x) + 0` next to a projected `VARIANCE(x)`) and any use in
+          HAVING: string conversions there (CAST(VARIANCE(x) AS CHAR),
+          CONCAT(STD(x), '')) observe the fixed decimals too.
         Returns the offending call texts (empty when the plan is exact).
         """
         from ..sql_frontend import _parse_single_agg_expr
@@ -135,8 +136,8 @@ class MySQLDialectMixin(MixinHost):
         compact = lambda text: re.sub(r"\s+", "", text).upper()
         reader_compact = compact(reader_view_ddl)
         top_items = list(root.expressions) if isinstance(root, sqlglot_exp.Select) else []
-        having = root.args.get("having") if isinstance(root, sqlglot_exp.Select) else None
         issues: List[str] = []
+        fixed_aliases: Set[str] = set()
         for node in calls:
             text = node.sql(dialect="mysql")
             if isinstance(node.parent, sqlglot_exp.Window):
@@ -161,20 +162,18 @@ class MySQLDialectMixin(MixinHost):
                 if position is not None and position < len(self.raw_view.select_items):
                     alias = self.raw_view.select_items[position].alias
                     if compact(f"ROUND({alias},{scale})AS{alias}") in reader_compact:
+                        fixed_aliases.add(alias.lower())
                         continue
-                if having is not None and any(anc is having for anc in self._ancestors(node)):
-                    continue
             issues.append(text)
+        # HAVING may also reach an accepted statistic through its select alias
+        # (`HAVING CONCAT(v, '') = ...`), which MariaDB evaluates on the
+        # fixed-decimal value: refused as well.
+        having = root.args.get("having") if isinstance(root, sqlglot_exp.Select) else None
+        if having is not None and fixed_aliases:
+            for col in having.find_all(sqlglot_exp.Column):
+                if not col.table and col.name.lower() in fixed_aliases:
+                    issues.append(f"HAVING reference to {col.name}")
         return issues
-
-    @staticmethod
-    def _ancestors(node: Any) -> List[Any]:
-        out = []
-        cur = node.parent
-        while cur is not None:
-            out.append(cur)
-            cur = cur.parent
-        return out
 
     def _enforce_mariadb_statistical_exactness(self, reader_view_ddl: str) -> None:
         if self.subdialect != EngineSubdialect.MARIADB:

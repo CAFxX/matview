@@ -276,10 +276,12 @@ Errors raised before anything is installed:
   they are refused there; use `VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`.
   On MariaDB it is also raised for `VAR_*`/`STDDEV_*` results the view cannot
   reproduce exactly: window statistics, and statistics over exact
-  (integer/`DECIMAL`) or `FLOAT(M,D)` arguments anywhere except as a top-level
-  projected aggregate of a single query or inside `HAVING` (MariaDB fixes their
-  decimals and rounds results to them). Cast the argument to `DOUBLE` to keep
-  such shapes.
+  (integer/`DECIMAL`) or `FLOAT(M,D)` arguments anywhere except as a whole
+  top-level projected aggregate of a single query (also not in `HAVING`; MariaDB
+  fixes their decimals and rounds results to them). Some exact shapes are
+  refused conservatively too (`SELECT DISTINCT`, `ORDER BY ... LIMIT`, a
+  parenthesized `(VARIANCE(x))`). Cast the argument to `DOUBLE` to keep such
+  shapes.
 - `EngineLimitationError` when the view or the engine has a known limitation
   that would break the guarantee. Each limitation has a code:
 
