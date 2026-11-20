@@ -767,14 +767,26 @@ observe depends on the engine:
 
 - SQLite serializes writers database-wide; manager operations reserve the
   writer lock before their DDL.
-- PostgreSQL: see [PostgreSQL maintenance](#postgresql-maintenance). Under
-  `READ COMMITTED` concurrent writers of the same group serialize on its
-  backing row (or, for group-scoped and full recomputes, on a per-view lock
-  row) and every recompute runs in a statement after that lock, so it sees
-  every committed writer. Under `REPEATABLE READ` and `SERIALIZABLE` a writer
-  whose snapshot predates a committed change of a group it maintains fails
-  with a serialization error (SQLSTATE 40001), which the application retries.
-  Group-scoped and full-recompute views therefore serialize all their writers.
+- PostgreSQL: see [PostgreSQL maintenance](#postgresql-maintenance).
+  - Writers of the same source table and the same group serialize on that
+    group (its backing row, or for group-scoped views a per-group lock row)
+    and every recompute runs in a statement after that lock, so under
+    `READ COMMITTED` it reflects every committed writer of the group. Writers
+    of different groups do not wait for each other.
+  - Full-recompute views (`atomic_query_sync`, for example a plain join)
+    serialize all their writers on one per-view lock row. A writer can then
+    also deadlock (SQLSTATE 40P01) with another transaction that holds a row
+    lock it needs, where independent row writes would only have waited.
+  - Under `REPEATABLE READ` and `SERIALIZABLE` a writer whose snapshot
+    predates a committed change of a group (or of a full-recompute view) it
+    maintains fails with a serialization error (SQLSTATE 40001).
+  - Applications must retry on 40001 and 40P01.
+  - Not exact under `READ COMMITTED`: two transactions that write *different*
+    sources of a join aggregate (for example one inserts into `t`, the other
+    renames a row of `d` in `SELECT d.name, SUM(t.v) FROM t JOIN d ...`)
+    each join their delta with the other table's committed state and miss
+    each other's change ([Serialize Concurrent Writers of Different Sources of a PostgreSQL Join View](TODO.md)).
+    Under `REPEATABLE READ`/`SERIALIZABLE` the second writer fails with 40001.
 - PostgreSQL `repair_view()`: on the repopulate (`"repaired"`) path, acquires
   `SHARE` locks on the view's referenced source tables (in deterministic sorted
   order, after the catalog lock) before clearing and repopulating, so under
@@ -834,8 +846,16 @@ transition tables, its only mechanism: one `AFTER INSERT`, `AFTER UPDATE` and
   `"triggers_missing"`; `repair_view()` reinstalls the triggers. Writes through
   the parent are maintained meanwhile, direct writes to the new partition are
   not. A source that is itself a partition, or that has (or is) an `INHERITS`
-  child, is refused at registration (SQLSTATE 0A000).
+  child, is refused at registration (SQLSTATE 0A000). `DETACH PARTITION`
+  leaves the detached rows in the view and the maintenance triggers on the
+  detached table (its writes still change the view): `check_schema_drift()`
+  reports `"triggers_orphaned"` and `repair_view()` rebuilds the view.
+  `DROP` of a partition fires no trigger and is not detected: the view keeps
+  the dropped rows until `repair_view()`.
 - `TRUNCATE` of a source (or of one partition) recomputes the view.
+- The trigger functions run with the `search_path` of their creation
+  (`SET search_path FROM CURRENT`), so a writer's own `search_path` cannot
+  redirect the recomputes to other tables.
 - One query that modifies two sources of a join view (a writable CTE, or an FK
   cascade into both) is not maintained exactly yet
   ([Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View](TODO.md)).
@@ -1011,6 +1031,8 @@ Correctness gaps (the materialized view can differ from the original view):
 - [Make Floating-Point Aggregates Exactly Equal to the Live View on PostgreSQL and MySQL/MariaDB (silent divergence today)](TODO.md)
 - [Race-Free Recomputation for the Remaining Recomputed Aggregates (stale snapshot after a row-lock wait)](TODO.md) (MySQL/MariaDB untested; PostgreSQL closed)
 - [Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View](TODO.md) (writable CTE or FK cascade into two sources of a join view)
+- [Serialize Concurrent Writers of Different Sources of a PostgreSQL Join View](TODO.md)
+- [Detect PostgreSQL Maintenance Triggers Disabled by `session_replication_role = replica` or `ALTER TABLE ... DISABLE TRIGGER`](TODO.md)
 - [Fail-Closed Incremental Backfill (no silent missing or double-counted rows after a failed backfill)](TODO.md) (remaining known exclusions)
 - [Fix Pre-Existing SQLite Divergences Found by the Exact SUM/TOTAL/AVG Differential](TODO.md) (storage-class changes for `MIN`/`MAX`/group keys, `LEFT JOIN` group moves, primary-key updates during backfill)
 - [Preserve Dialect-Native Statistical Aggregate Alias Semantics](TODO.md) (`VARIANCE`/`STDDEV` are sample statistics on PostgreSQL)
