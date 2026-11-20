@@ -332,12 +332,8 @@ class Tier2Mixin(MixinHost):
                     f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
                     f"    WHERE ({pred_src_old}) OR ({pred_src_new});",
                 ]
-            if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables:
-                upd_old_stmts = del_stmts
-                upd_new_stmts = ins_stmts
-            else:
-                upd_old_stmts = []
-                upd_new_stmts = upd_coalesced_stmts
+            upd_old_stmts = []
+            upd_new_stmts = upd_coalesced_stmts
         else:
             ins_stmts = full_refresh
             del_stmts = full_refresh
@@ -348,13 +344,7 @@ class Tier2Mixin(MixinHost):
         pg_ad_body: Optional[str] = None
         pg_au_body: Optional[str] = None
 
-        if (
-            self.dialect == Dialect.POSTGRES
-            and self.pg_use_transition_tables
-            and self.pg_vectorize_transition_tables
-            and pred_mv_old
-            and pred_mv_new
-        ):
+        if self.dialect == Dialect.POSTGRES and pred_mv_old and pred_mv_new:
             pred_vec_old = self._group_scope_predicate_for_table(
                 base_t, group_mv_cols, mv_table, "__mv_old_rows"
             )
@@ -413,6 +403,18 @@ class Tier2Mixin(MixinHost):
                         f"    WHERE ({pred_src_vec_old}) OR ({pred_src_vec_new});"
                     )
 
+        pg_trunc_stmts = full_refresh
+        if self.dialect == Dialect.POSTGRES:
+            # Group-scoped recompute: one per-view lock row serializes the
+            # maintenance statements; the DELETE/INSERT below run after it,
+            # so under READ COMMITTED they see every committed writer.
+            lock_stmt = self._pg_view_lock_stmt()
+            refresh_body = "\n".join(full_refresh)
+            pg_ai_body = f"{lock_stmt}\n{pg_ai_body or refresh_body}"
+            pg_ad_body = f"{lock_stmt}\n{pg_ad_body or refresh_body}"
+            pg_au_body = f"{lock_stmt}\n{pg_au_body or refresh_body}"
+            pg_trunc_stmts = [lock_stmt, *full_refresh]
+
         return self._emit_dialect_triggers_for_table(
             view_name=view_name,
             base_t=base_t,
@@ -420,7 +422,7 @@ class Tier2Mixin(MixinHost):
             del_stmts=del_stmts,
             upd_old_stmts=upd_old_stmts,
             upd_new_stmts=upd_new_stmts,
-            trunc_stmts=full_refresh,
+            trunc_stmts=pg_trunc_stmts,
             pg_ai_body=pg_ai_body,
             pg_ad_body=pg_ad_body,
             pg_au_body=pg_au_body,
@@ -557,7 +559,8 @@ class Tier2Mixin(MixinHost):
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=[],
+            auxiliary_table_ddls=[self._pg_view_lock_ddl()] if self.dialect == Dialect.POSTGRES else [],
+            auxiliary_table_names=[self._pg_view_lock_table()] if self.dialect == Dialect.POSTGRES else [],
             index_ddls=index_ddls,
             initial_populate_sqls=[initial_populate_sql],
             trigger_ddls=trigger_ddls,

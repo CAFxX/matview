@@ -12,6 +12,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from .._host import MixinHost
+from ..dialects.pg_statement import SIGN, PgAggregateSpec, PgDeltaSource
 from ..engines import (
     AggFunc,
     Dialect,
@@ -403,8 +404,10 @@ class Tier1UnionAllAggMixin(MixinHost):
         trig_names: List[str] = []
         fn_names: List[str] = []
 
+        pg_group_aliases = {self._group_col_alias(g).lower() for g in orig_grp_exprs}
         for base_t, b_list in by_table.items():
             ts = self._schemas_lower[base_t.lower()]
+            pg_sources: List[PgDeltaSource] = []
             ins_all: List[str] = []
             del_all: List[str] = []
             upd_old_all: List[str] = []
@@ -578,6 +581,25 @@ class Tier1UnionAllAggMixin(MixinHost):
                     include_delete_zero_mv=False,
                 )
 
+                if self.dialect == Dialect.POSTGRES:
+                    rec = "__mv_d"
+                    pg_sources.append(PgDeltaSource(
+                        from_sql=lambda signed, rec=rec: f"(\n        {signed}\n        ) AS {rec}",
+                        sign=f"{rec}.{SIGN}",
+                        where=branch_ctx._rewrite_expr_for_record(comb_w, rec) if comb_w else None,
+                        keys=[branch_ctx._rewrite_expr_for_record(g, rec) for g in mapped_grps],
+                        values={
+                            _expr_key(orig_it): branch_ctx._effective_agg_value_expr(new_it, record_prefix=rec)
+                            for orig_it, new_it in zip(orig_work_items, mapped_work_items)
+                            if orig_it.is_aggregate
+                        },
+                        extras={
+                            orig_it.alias.lower(): branch_ctx._rewrite_expr_for_record(new_it.raw_expr, rec)
+                            for orig_it, new_it in zip(orig_work_items, mapped_work_items)
+                            if not orig_it.is_aggregate and orig_it.alias.lower() not in pg_group_aliases
+                        },
+                    ))
+
                 w_new_b = branch_ctx._rewrite_expr_for_record(comb_w, "NEW") if comb_w else None
                 w_old_b = branch_ctx._rewrite_expr_for_record(comb_w, "OLD") if comb_w else None
                 refresh_grp_b = branch_ctx._sqlite_refresh_group_keys_stmts(
@@ -601,6 +623,25 @@ class Tier1UnionAllAggMixin(MixinHost):
             cleanup_all.extend(refresh_grp_all)
 
             trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
+            pg_bodies: Dict[str, Optional[str]] = {"INSERT": None, "UPDATE": None, "DELETE": None}
+            if self.dialect == Dialect.POSTGRES:
+                spec = PgAggregateSpec(
+                    mv_table=mv_table,
+                    row_count_col=row_count_col,
+                    items=orig_work_items,
+                    grp_exprs=orig_grp_exprs,
+                    has_nullable_grp=has_nullable_grp,
+                    pk_cols=pk_cols,
+                    nonnull_map=col_nonnull_count_map,
+                    sum_map=col_sum_map,
+                    sum2_map=col_sum2_map,
+                    tcnt_map=col_true_cnt_map,
+                    distinct_aux={},
+                    value_key=_expr_key,
+                    recompute=lambda it: self._build_recompute_subquery_raw(it, mv_table),
+                    native_recompute=self._requires_native_avg_recompute,
+                )
+                pg_bodies.update(self._pg_aggregate_bodies(spec, pg_sources))
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
                 view_name=view_name,
                 base_t=base_t,
@@ -610,6 +651,9 @@ class Tier1UnionAllAggMixin(MixinHost):
                 upd_new_stmts=upd_new_all,
                 upd_cleanup_old_stmts=cleanup_all,
                 trunc_stmts=trunc_stmts,
+                pg_ai_body=pg_bodies["INSERT"],
+                pg_ad_body=pg_bodies["DELETE"],
+                pg_au_body=pg_bodies["UPDATE"],
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)

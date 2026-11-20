@@ -702,8 +702,6 @@ class CompilationContext:
     engine_version: EngineVersion
     dialect: Dialect
     subdialect: EngineSubdialect
-    pg_use_transition_tables: bool
-    pg_vectorize_transition_tables: bool
     ignore_limitations: bool
     object_prefix: str
     incremental_backfill: bool

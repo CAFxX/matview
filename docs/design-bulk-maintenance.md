@@ -1,7 +1,10 @@
 # Design: In-Database Maintenance for Bulk Statements
 
-Status: decided, not implemented. The stages are tracked as P0 items in
-[TODO.md](../TODO.md) ("Bulk maintenance stage 1" to "stage 7").
+Status: decided. Stage 1 (harness) and stage 2 (PostgreSQL statement-level
+maintenance, `matview/dialects/pg_statement.py`) are implemented; the other
+stages are tracked as P0 items in [TODO.md](../TODO.md) ("Bulk maintenance
+stage 1" to "stage 7"). The "Current state" section below describes master
+before stage 2.
 
 ## Goal and contract
 
@@ -23,7 +26,7 @@ A mechanism that makes the view lag, depends on a process outside the
 database, or exists only in a Python client is not the default. If it is
 offered at all, it is a separate, documented opt-in.
 
-## Current state (master `f1f6561`)
+## Current state before stage 2 (master `f1f6561`)
 
 - SQLite, MySQL and MariaDB have only row-level triggers. Every row of a
   statement runs the view's whole maintenance body.

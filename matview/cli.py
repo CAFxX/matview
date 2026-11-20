@@ -54,18 +54,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Target engine and version (e.g. 'postgres:17', 'mysql:8.4', 'mariadb:11.4', 'sqlite:3.45').",
     )
     parser.add_argument(
-        "--pg-transition-tables",
-        action="store_true",
-        help="Use PostgreSQL statement-level transition table triggers.",
-    )
-    parser.add_argument(
-        "--no-pg-vectorize-transition-tables",
-        action="store_false",
-        dest="pg_vectorize_transition_tables",
-        default=True,
-        help="Disable set-based vectorization of PostgreSQL transition tables and fall back to row-by-row loops.",
-    )
-    parser.add_argument(
         "--object-prefix",
         default=DEFAULT_OBJECT_PREFIX,
         help="Prefix for generated database objects (default: __matview_).",
@@ -175,7 +163,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     dialect=args.dialect,
                     ignore_limitations=args.ignore_limitations,
                     object_prefix=args.object_prefix,
-                    pg_use_transition_tables=args.pg_transition_tables,
                     strict=args.strict,
                     engine_version=args.engine_version,
                 )
@@ -214,7 +201,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     schemas,
                     view_sql,
                     dialect=detected_ev.dialect,
-                    pg_use_transition_tables=args.pg_transition_tables,
                     ignore_limitations=args.ignore_limitations,
                     object_prefix=args.object_prefix,
                     indexes=args.indexes,
@@ -266,8 +252,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dialect=args.dialect,
                 ignore_limitations=args.ignore_limitations,
                 object_prefix=args.object_prefix,
-                pg_use_transition_tables=args.pg_transition_tables,
-                pg_vectorize_transition_tables=args.pg_vectorize_transition_tables,
                 strict=args.strict,
                 engine_version=args.engine_version,
             )
@@ -303,8 +287,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dialect=args.dialect,
                 ignore_limitations=args.ignore_limitations,
                 object_prefix=args.object_prefix,
-                pg_use_transition_tables=args.pg_transition_tables,
-                pg_vectorize_transition_tables=args.pg_vectorize_transition_tables,
                 strict=args.strict,
                 engine_version=args.engine_version,
             )
@@ -366,8 +348,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             schemas,
             view_sql,
             dialect=detected_ev.dialect,
-            pg_use_transition_tables=args.pg_transition_tables,
-            pg_vectorize_transition_tables=args.pg_vectorize_transition_tables,
             ignore_limitations=args.ignore_limitations,
             object_prefix=args.object_prefix,
             indexes=args.indexes,

@@ -11,6 +11,7 @@ import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
 
 from .._host import MixinHost
+from ..dialects.pg_statement import SIGN, PgDeltaSource
 from ..engines import (
     AggFunc,
     Dialect,
@@ -583,59 +584,11 @@ class Tier1ZSetMixin(MixinHost):
             pg_ad_body: Optional[str] = None
             pg_au_body: Optional[str] = None
 
-            if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables and len(b_list) == 1:
-                b_idx, bs = b_list[0]
-                ts = self._schemas_lower[bs.base_table.lower()]
-                b_alias = bs.joins[0].alias if bs.joins else base_t
-                w_vec_new = self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "__mv_new_rows") if bs.where_clause else None
-                w_vec_old = self._rewrite_branch_expr(bs.where_clause, ts, b_alias, "__mv_old_rows") if bs.where_clause else None
-                vec_new_vals = [self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "__mv_new_rows") for it in bs.select_items]
-                w_n_sql = f"\n    WHERE {w_vec_new}" if w_vec_new else ""
-                w_o_sql = f"\n    WHERE {w_vec_old}" if w_vec_old else ""
-
-                if op_type == "UNION ALL" and use_native_uall_pk:
-                    pk_names = [c.name for c in ts.columns.values() if c.primary_key]
-                    new_pk_vec = [str(b_idx), *[f"__mv_new_rows.{self._q(c)}" for c in pk_names]]
-                    del_pk_vec = [str(b_idx), *[f"__mv_old_rows.{self._q(c)}" for c in pk_names]]
-                    upd_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in user_columns)
-                    grp_new = [f"__mv_new_rows.{self._q(c)}" for c in pk_names] + vec_new_vals
-                    grp_del = [f"__mv_old_rows.{self._q(c)}" for c in pk_names]
-                    old_pk_match_vec = f"{mv_table}.__mv_branch_id = {b_idx} AND " + " AND ".join(
-                        f"{mv_table}.__mv_pk_{i} = __del.{self._q(c)}" for i, c in enumerate(pk_names)
-                    )
-                    del_sel = [*del_pk_vec, "COUNT(*) AS cnt"]
-                    pg_ai_body = (
-                        f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
-                        f"    SELECT {', '.join(new_pk_vec)}, {', '.join(vec_new_vals)}, COUNT(*)\n"
-                        f"    FROM __mv_new_rows{w_n_sql}\n"
-                        f"    GROUP BY {', '.join(grp_new)}\n"
-                        f"    ON CONFLICT ({', '.join(uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;"
-                    )
-                    pg_ad_body = (
-                        f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
-                        f"FROM (\n"
-                        f"    SELECT {', '.join(del_sel)}\n"
-                        f"    FROM __mv_old_rows{w_o_sql}\n"
-                        f"    GROUP BY {', '.join(grp_del)}\n"
-                        f") AS __del\n"
-                        f"WHERE {old_pk_match_vec};\n"
-                        f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
-                    )
-                    pg_au_body = (
-                        f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
-                        f"FROM (\n"
-                        f"    SELECT {', '.join(del_sel)}\n"
-                        f"    FROM __mv_old_rows{w_o_sql}\n"
-                        f"    GROUP BY {', '.join(grp_del)}\n"
-                        f") AS __del\n"
-                        f"WHERE {old_pk_match_vec};\n"
-                        f"INSERT INTO {mv_table} ({', '.join(uall_pk_cols)}, {', '.join(user_columns)}, __mv_row_count)\n"
-                        f"    SELECT {', '.join(new_pk_vec)}, {', '.join(vec_new_vals)}, COUNT(*)\n"
-                        f"    FROM __mv_new_rows{w_n_sql}\n"
-                        f"    GROUP BY {', '.join(grp_new)}\n"
-                        f"    ON CONFLICT ({', '.join(uall_pk_cols)}) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;\n"
-                        f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
-                    )
+            if self.dialect == Dialect.POSTGRES:
+                pg_bodies = self._pg_setop_bodies(
+                    op_type, b_list, mv_table, user_columns, use_native_uall_pk, uall_pk_cols
+                )
+                pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
 
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
                 view_name=view_name,
@@ -679,6 +632,65 @@ class Tier1ZSetMixin(MixinHost):
             db_view_name=self.db_view_name,
             index_names=index_names,
             user_indexes=list(self.user_indexes),
+        )
+
+    def _pg_setop_bodies(
+        self,
+        op_type: str,
+        b_list: Sequence[Tuple[int, ViewSpec]],
+        mv_table: str,
+        user_columns: Sequence[str],
+        use_native_uall_pk: bool,
+        uall_pk_cols: Sequence[str],
+    ) -> Dict[str, str]:
+        """PostgreSQL statement-level bodies for the branches of one source table.
+
+        UNION ALL rows are keyed by (branch, source primary key); UNION,
+        INTERSECT and EXCEPT rows are counted per distinct value tuple.
+        """
+        rec = "__mv_d"
+
+        def _pg_from(signed: str) -> str:
+            return f"(\n        {signed}\n        ) AS {rec}"
+
+        sources: List[Tuple[PgDeltaSource, Dict[str, str]]] = []
+        for b_idx, bs in b_list:
+            ts = self._schemas_lower[bs.base_table.lower()]
+            b_alias = bs.joins[0].alias if bs.joins else bs.base_table
+            where = self._rewrite_branch_expr(bs.where_clause, ts, b_alias, rec) if bs.where_clause else None
+            vals = [self._rewrite_branch_expr(it.raw_expr, ts, b_alias, rec) for it in bs.select_items]
+            values = dict(zip(user_columns, vals))
+            pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+            if op_type == "UNION ALL":
+                if use_native_uall_pk:
+                    keys = [str(b_idx), *[f"{rec}.{self._q(c)}" for c in pk_names]]
+                else:
+                    keys = [self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"{rec}.{self._q(c)}" for c in pk_names]])]
+                contrib: Dict[str, str] = {}
+            elif op_type == "UNION":
+                keys = [self._canonical_group_pk_expr(vals)]
+                contrib = {"__mv_row_count": "1"}
+            else:
+                keys = [self._canonical_group_pk_expr(vals)]
+                contrib = {"__mv_cnt_0": "1" if b_idx == 0 else "0", "__mv_cnt_1": "1" if b_idx == 1 else "0"}
+            sources.append((
+                PgDeltaSource(from_sql=_pg_from, sign=f"{rec}.{SIGN}", where=where, keys=keys, values=values),
+                contrib,
+            ))
+
+        if op_type == "UNION ALL":
+            key_cols = list(uall_pk_cols) if use_native_uall_pk else ["__mv_pk"]
+            return self._pg_keyed_rows_bodies(
+                mv_table, key_cols, list(user_columns), [src for src, _ in sources], count_col="__mv_row_count"
+            )
+        if op_type == "UNION":
+            return self._pg_counted_rows_bodies(
+                mv_table, "__mv_pk", user_columns, ["__mv_row_count"], sources,
+                f"{mv_table}.__mv_row_count <= 0",
+            )
+        return self._pg_counted_rows_bodies(
+            mv_table, "__mv_pk", user_columns, ["__mv_cnt_0", "__mv_cnt_1"], sources,
+            f"{mv_table}.__mv_cnt_0 <= 0 AND {mv_table}.__mv_cnt_1 <= 0",
         )
 
     def _compile_tier1_zset_distinct(self) -> MaterializedViewPlan:
@@ -1052,113 +1064,57 @@ class Tier1ZSetMixin(MixinHost):
         pg_ad_body: Optional[str] = None
         pg_au_body: Optional[str] = None
 
-        if self.dialect == Dialect.POSTGRES and self.pg_use_transition_tables and self.pg_vectorize_transition_tables:
-            vec_new_pred = self._rewrite_expr_for_record(self.view.where_clause, "__mv_new_rows") if self.view.where_clause else None
-            vec_old_pred = self._rewrite_expr_for_record(self.view.where_clause, "__mv_old_rows") if self.view.where_clause else None
-            if self.watermark_catalog_table and wm_pk_col:
-                q_pk = self._q(wm_pk_col)
-                wm_vec_new = (
-                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
-                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
-                    f"AND __mv_new_rows.{q_pk} > backfill_cursor_pk AND __mv_new_rows.{q_pk} <= backfill_max_pk)"
-                )
-                wm_vec_old = (
-                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
-                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
-                    f"AND __mv_old_rows.{q_pk} > backfill_cursor_pk AND __mv_old_rows.{q_pk} <= backfill_max_pk)"
-                )
-                vec_new_pred = f"({vec_new_pred}) AND ({wm_vec_new})" if vec_new_pred else wm_vec_new
-                vec_old_pred = f"({vec_old_pred}) AND ({wm_vec_old})" if vec_old_pred else wm_vec_old
-            w_vec_new = f"\nWHERE {vec_new_pred}" if vec_new_pred else ""
-            w_vec_old = f"\nWHERE {vec_old_pred}" if vec_old_pred else ""
-            w_vec_old_and = f" AND ({vec_old_pred})" if vec_old_pred else ""
+        trunc_stmts = [f"DELETE FROM {mv_table};"]
+        if self.dialect == Dialect.POSTGRES:
+            rec = "__mv_d"
+            pg_where = self._rewrite_expr_for_record(self.view.where_clause, rec) if self.view.where_clause else None
+            pg_wm = self._pg_watermark_predicate(rec, wm_pk_col) if wm_pk_col else None
+            if pg_wm:
+                pg_where = f"({pg_where}) AND ({pg_wm})" if pg_where else pg_wm
+            pg_values = {
+                it.alias: self._rewrite_expr_for_record(it.raw_expr, rec) for it in self.view.select_items
+            }
+
+            def _pg_from(signed: str) -> str:
+                return f"(\n        {signed}\n        ) AS {rec}"
 
             if uses_native_pk:
-                all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
-                q_all_backing_cols = [self._q(c) for c in all_backing_cols]
-                all_vec_new_vals = [
-                    *[self._rewrite_expr_for_record(it.raw_expr, "__mv_new_rows") for it in self.view.select_items],
-                    *[f"__mv_new_rows.{self._q(h[1])}" for h in hidden_pk_defs],
-                ]
-                upd_set = ", ".join(f"{self._q(c)} = EXCLUDED.{self._q(c)}" for c in all_backing_cols)
-                del_where_vec = " AND ".join(
-                    f"{mv_table}.{self._q(mv_c)} = __mv_old_rows.{self._q(src_c)}"
-                    for mv_c, src_c in zip(mv_pk_cols, pk_names)
-                )
-                base_pk_eq_vec_old = " AND ".join(
-                    f"{q_base_t}.{self._q(src_c)} = __mv_old_rows.{self._q(src_c)}"
-                    for src_c in pk_names
-                )
-                and_base_where = (
-                    f" AND ({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})"
-                    if self.view.where_clause
-                    else ""
-                )
-
-                pg_ai_body = (
-                    f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
-                    f"SELECT {', '.join(all_vec_new_vals)}\n"
-                    f"FROM __mv_new_rows{w_vec_new}\n"
-                    f"ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};"
-                )
-                pg_ad_body = (
-                    f"DELETE FROM {mv_table}\n"
-                    f"USING __mv_old_rows\n"
-                    f"WHERE {del_where_vec}{w_vec_old_and};"
-                )
-                pg_au_body = (
-                    f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
-                    f"SELECT {', '.join(all_vec_new_vals)}\n"
-                    f"FROM __mv_new_rows{w_vec_new}\n"
-                    f"ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};\n"
-                    f"DELETE FROM {mv_table}\n"
-                    f"USING __mv_old_rows\n"
-                    f"WHERE {del_where_vec}{w_vec_old_and}\n"
-                    f"  AND NOT EXISTS (\n"
-                    f"      SELECT 1 FROM {q_base_t}\n"
-                    f"      WHERE {base_pk_eq_vec_old}{and_base_where}\n"
-                    f"  );"
+                pk_col_lower = {c.lower() for c in mv_pk_cols}
+                for hid_col, src_col, _dt in hidden_pk_defs:
+                    pg_values[hid_col] = f"{rec}.{self._q(src_col)}"
+                value_cols = [c for c in [*user_columns, *[h[0] for h in hidden_pk_defs]] if c.lower() not in pk_col_lower]
+                pg_bodies = self._pg_keyed_rows_bodies(
+                    mv_table,
+                    mv_pk_cols,
+                    value_cols,
+                    [PgDeltaSource(
+                        from_sql=_pg_from,
+                        sign=f"{rec}.{SIGN}",
+                        where=pg_where,
+                        keys=[f"{rec}.{self._q(src_c)}" for src_c in pk_names],
+                        values=pg_values,
+                    )],
                 )
             else:
-                q_user_columns = [self._q(c) for c in user_columns]
-                pk_vec_new = self._canonical_group_pk_expr([f"__mv_new_rows.{self._q(c)}" for c in pk_hash_cols])  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
-                pk_vec_old = self._canonical_group_pk_expr([f"__mv_old_rows.{self._q(c)}" for c in pk_hash_cols])  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
-                vec_new_vals = [self._rewrite_expr_for_record(it.raw_expr, "__mv_new_rows") for it in self.view.select_items]
-                upd_set = ", ".join(f"{self._q(c)} = EXCLUDED.{self._q(c)}" for c in user_columns)
-                group_by_cols_new = f"{pk_vec_new}" + (f", {', '.join(vec_new_vals)}" if vec_new_vals else "")
-
-                pg_ai_body = (
-                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
-                    f"SELECT {pk_vec_new}, {', '.join(vec_new_vals)}, COUNT(*)\n"
-                    f"FROM __mv_new_rows{w_vec_new}\n"
-                    f"GROUP BY {group_by_cols_new}\n"
-                    f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;"
+                pg_bodies = self._pg_counted_rows_bodies(
+                    mv_table,
+                    "__mv_pk",
+                    user_columns,
+                    ["__mv_row_count"],
+                    [(
+                        PgDeltaSource(
+                            from_sql=_pg_from,
+                            sign=f"{rec}.{SIGN}",
+                            where=pg_where,
+                            keys=[self._canonical_group_pk_expr([f"{rec}.{self._q(c)}" for c in pk_hash_cols])],  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
+                            values=pg_values,
+                        ),
+                        {"__mv_row_count": "1"},
+                    )],
+                    f"{mv_table}.__mv_row_count <= 0",
                 )
-                pg_ad_body = (
-                    f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
-                    f"FROM (\n"
-                    f"    SELECT {pk_vec_old} AS __mv_pk, COUNT(*) AS cnt\n"
-                    f"    FROM __mv_old_rows{w_vec_old}\n"
-                    f"    GROUP BY {pk_vec_old}\n"
-                    f") AS __del\n"
-                    f"WHERE {mv_table}.__mv_pk = __del.__mv_pk;\n"
-                    f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
-                )
-                pg_au_body = (
-                    f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - __del.cnt\n"
-                    f"FROM (\n"
-                    f"    SELECT {pk_vec_old} AS __mv_pk, COUNT(*) AS cnt\n"
-                    f"    FROM __mv_old_rows{w_vec_old}\n"
-                    f"    GROUP BY {pk_vec_old}\n"
-                    f") AS __del\n"
-                    f"WHERE {mv_table}.__mv_pk = __del.__mv_pk;\n"
-                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
-                    f"SELECT {pk_vec_new}, {', '.join(vec_new_vals)}, COUNT(*)\n"
-                    f"FROM __mv_new_rows{w_vec_new}\n"
-                    f"GROUP BY {group_by_cols_new}\n"
-                    f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + EXCLUDED.__mv_row_count;\n"
-                    f"DELETE FROM {mv_table} WHERE __mv_row_count <= 0;"
-                )
+            pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
+            trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
 
         trigger_ddls, trig_names, fn_names = self._emit_dialect_triggers_for_table(
             view_name=view_name,
@@ -1168,7 +1124,7 @@ class Tier1ZSetMixin(MixinHost):
             upd_old_stmts=upd_old_list,
             upd_new_stmts=[plus_stmt],
             upd_cleanup_old_stmts=upd_clean_list,
-            trunc_stmts=[f"DELETE FROM {mv_table};"],
+            trunc_stmts=trunc_stmts,
             where_new=where_new,
             where_old=where_old,
             update_key_columns=pk_names,

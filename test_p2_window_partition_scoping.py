@@ -98,13 +98,11 @@ class TestTier2WindowPartitionScoping(unittest.TestCase):
         )
         self.assertEqual(p_global.strategy, ms.MaintenanceStrategy.ATOMIC_QUERY_SYNC)
 
-        # PostgreSQL transition-table vectorized codegen stays scoped to __mv_new_rows / __mv_old_rows
+        # PostgreSQL statement-level codegen stays scoped to __mv_new_rows / __mv_old_rows
         p_pg = ms.generate_materialized_view(
             self.SCHEMA,
             "CREATE VIEW mv_pg_win AS SELECT id, team, LAG(score, 1) OVER (PARTITION BY team ORDER BY id) AS prev_s FROM scores;",
             dialect=ms.Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
         )
         self.assertEqual(p_pg.strategy, ms.MaintenanceStrategy.GROUP_SCOPED_DELTA)
         joined_pg = "\n".join(p_pg.trigger_ddls)
@@ -240,8 +238,6 @@ class TestTier2WindowPartitionScoping(unittest.TestCase):
                 mgr = ms.MaterializedViewManager(
                     conn,
                     dialect=dialect,
-                    pg_use_transition_tables=(dialect == ms.Dialect.POSTGRES),
-                    pg_vectorize_transition_tables=True,
                     ignore_limitations=(dialect == ms.Dialect.MYSQL),
                 )
                 plan = mgr.register_view(f"CREATE VIEW mv_p2_win AS {view_sel};")

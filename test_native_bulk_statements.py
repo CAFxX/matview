@@ -23,8 +23,8 @@ aggregate).
 
 Engines. One run tests the engines named by the environment:
 
-* ``POSTGRES_DSN``: PostgreSQL with the default row-level triggers
-  (``pg-row``) and with ``pg_use_transition_tables=True`` (``pg-tt``).
+* ``POSTGRES_DSN``: PostgreSQL (``pg``), maintained by statement-level
+  triggers with transition tables, its only mechanism.
 * ``MYSQL_DSN``: MySQL or MariaDB (the product is read from the server).
 * neither: SQLite through the standard-library driver, on a file database so
   that independent connections exist. SQLite runs only when no server DSN is
@@ -81,7 +81,6 @@ from matview import (
 
 LOCK_WAIT_TIMEOUT_S = 30.0
 
-STAGE2 = "TODO.md 'Bulk maintenance stage 2' (PostgreSQL statement-level maintenance)"
 STAGE3 = "TODO.md 'Bulk maintenance stage 3' (multi-source co-modification)"
 
 
@@ -106,13 +105,10 @@ def known_defect(reason: str, raises: type = ViewMismatch) -> pytest.MarkDecorat
 class Target:
     family: str  # "postgres" | "mysql" | "sqlite"
     dsn: str
-    pg_tt: bool = False
 
     @property
     def id(self) -> str:
-        if self.family == "postgres":
-            return "pg-tt" if self.pg_tt else "pg-row"
-        return self.family
+        return "pg" if self.family == "postgres" else self.family
 
     @property
     def dialect(self) -> Dialect:
@@ -122,7 +118,7 @@ class Target:
 def _targets() -> List[Target]:
     out: List[Target] = []
     if os.environ.get("POSTGRES_DSN"):
-        out += [Target("postgres", os.environ["POSTGRES_DSN"]), Target("postgres", os.environ["POSTGRES_DSN"], True)]
+        out.append(Target("postgres", os.environ["POSTGRES_DSN"]))
     if os.environ.get("MYSQL_DSN"):
         out.append(Target("mysql", os.environ["MYSQL_DSN"]))
     if not out:
@@ -139,7 +135,7 @@ def _params(
 ) -> List[Any]:
     """pytest params for the targets of this run, restricted to `families`.
 
-    `xfail` maps a target id (pg-row, pg-tt, mysql, sqlite) to its marker."""
+    `xfail` maps a target id (pg, mysql, sqlite) to its marker."""
     fam = set(families)
     out = []
     for t in TARGETS:
@@ -233,7 +229,7 @@ VIEWS: List[ViewDef] = [
     ViewDef("v_agg", "SELECT g, SUM(v) AS s, COUNT(*) AS c, COUNT(v) AS cv, AVG(v) AS a FROM t GROUP BY g"),
     # Grouped exact aggregates (DECIMAL). SQLite has no exact decimal type.
     ViewDef("v_aggd", "SELECT g, SUM(m) AS s, COUNT(m) AS c FROM t GROUP BY g", ("postgres", "mysql")),
-    # AVG(DECIMAL) separately (known pg-row defect, see KNOWN_DEFECT_EXCLUDED_VIEWS).
+    # AVG(DECIMAL): the PostgreSQL native AVG result scale (see test_avg_decimal_new_group_scale).
     ViewDef("v_avgd", "SELECT g, AVG(m) AS a, COUNT(*) AS c FROM t GROUP BY g", ("postgres", "mysql")),
     # Group-scoped MIN/MAX with a supporting (g, v) index ...
     ViewDef("v_mm", "SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY g"),
@@ -263,7 +259,6 @@ VIEWS: List[ViewDef] = [
 # keeps testing every other shape on that target). Remove an entry together
 # with the marker of the test named next to it.
 KNOWN_DEFECT_EXCLUDED_VIEWS: Dict[str, Tuple[str, ...]] = {
-    "pg-row": ("v_avgd",),  # test_avg_decimal_new_group_scale
 }
 
 
@@ -317,9 +312,7 @@ class Env:
         self.conn.commit()
         if seed:
             self.seed()
-        self.manager = MaterializedViewManager(
-            self.conn, dialect=target.dialect, pg_use_transition_tables=target.pg_tt
-        )
+        self.manager = MaterializedViewManager(self.conn, dialect=target.dialect)
         if views is None:
             views = [vd for vd in VIEWS if self.family in vd.families
                      and vd.name not in KNOWN_DEFECT_EXCLUDED_VIEWS.get(target.id, ())
@@ -912,8 +905,7 @@ def test_fk_cascade_into_single_source_views(make_env, target: Target) -> None:
 
 
 @pytest.mark.parametrize("target", _params(("postgres", "sqlite"), xfail={
-    "pg-row": known_defect(f"finding 3: one query (FK cascade) modifies both join sources; Δt⋈Δd is wrong. {STAGE3}"),
-    "pg-tt": known_defect(f"finding 3: one query (FK cascade) modifies both join sources; Δt⋈Δd is wrong. {STAGE3}"),
+    "pg": known_defect(f"finding 3: one query (FK cascade) modifies both join sources; Δt⋈Δd is wrong. {STAGE3}"),
 }))
 def test_fk_cascade_into_both_join_sources(make_env, target: Target) -> None:
     env = _fk_env(make_env, target, JOIN_VIEWS)
@@ -957,7 +949,7 @@ def test_pg_writable_cte_both_sources_non_algebraic_views(shared_env, target: Ta
 _F3 = f"finding 3: a writable CTE modifies both sources of the join aggregate; Δt⋈Δd is wrong. {STAGE3}"
 
 
-@pytest.mark.parametrize("target", _params(("postgres",), xfail={"pg-row": known_defect(_F3), "pg-tt": known_defect(_F3)}))
+@pytest.mark.parametrize("target", _params(("postgres",), xfail={"pg": known_defect(_F3)}))
 @pytest.mark.parametrize("name,sql", CO_MODIFYING, ids=[c[0] for c in CO_MODIFYING])
 def test_pg_writable_cte_both_sources_join_aggregate(make_env, target: Target, name: str, sql: str) -> None:
     env = make_env(target, views=[vd for vd in VIEWS if vd.name == "v_j"])
@@ -970,14 +962,11 @@ def test_pg_writable_cte_both_sources_join_aggregate(make_env, target: Target, n
 # Other divergences found while building this harness
 # ---------------------------------------------------------------------------
 
-_E1 = ("PostgreSQL row triggers store AVG(NUMERIC) of a group created by an INSERT as `1.0 * NEW.m` "
-       "(scale 4 for NUMERIC(12,3)) instead of the native AVG result scale (16). TODO.md "
-       "'Exact PostgreSQL AVG(NUMERIC) Result Scale for Groups Created by INSERT'")
-
-
-@pytest.mark.parametrize("target", _params(("postgres", "mysql"), xfail={"pg-row": known_defect(_E1)}))
+@pytest.mark.parametrize("target", _params(("postgres", "mysql")))
 def test_avg_decimal_new_group_scale(make_env, target: Target) -> None:
-    """Minimal repro: one single-row INSERT that creates a group."""
+    """A group created by an INSERT must have the native AVG(NUMERIC) result
+    scale (PostgreSQL row triggers stored `1.0 * NEW.m`; statement-level
+    maintenance recomputes AVG(NUMERIC) natively)."""
     env = make_env(target, views=[vd for vd in VIEWS if vd.name == "v_avgd"], seed=False)
     env.execute("INSERT INTO t (id, g, m) VALUES (1, 9, 3.000)")
     env.commit()
@@ -989,15 +978,6 @@ def test_avg_decimal_new_group_scale(make_env, target: Target) -> None:
 
 _E2 = ("A single-table projection without its source primary key must still maintain hidden-key "
        "identity across primary-key-only updates. TODO.md 'Track Source-Key Changes in Projection Views Without the Key Column'")
-
-
-def _params_without_pg_row(families: Iterable[str] = ("postgres", "mysql", "sqlite")) -> List[Any]:
-    """Like `_params`, but the PostgreSQL row-trigger target is skipped: its
-    known defects here (_E1; the unchanged-row guard compares by equality, so
-    an unconstrained NUMERIC scale change is skipped) are fixed by replacing
-    PostgreSQL row triggers with statement-level maintenance (bulk stage 2)."""
-    skip = pytest.mark.skip(reason=f"pg-row: _E1 and the equality guard. {STAGE2}")
-    return [pytest.param(p.values[0], id=p.id, marks=[skip]) if p.id == "pg-row" else p for p in _params(families)]
 
 
 @pytest.mark.parametrize("target", _params())
@@ -1027,7 +1007,7 @@ AVG_TYPE_SCHEMA = {
 }
 
 
-@pytest.mark.parametrize("target", _params_without_pg_row())
+@pytest.mark.parametrize("target", _params())
 @pytest.mark.parametrize("col", ["n3", "n", "r", "f", "i", "s"])
 @pytest.mark.parametrize("shape", ["single", "join"])
 def test_avg_new_group_result_type_and_scale(make_env, target: Target, col: str, shape: str) -> None:
@@ -1117,8 +1097,7 @@ _E4 = ("SUM of an integer expression (not a bare column) is stored with a fallba
        "%/MOD/DIV. TODO.md 'Store SUM of Integer Expressions With the Native Result Type'")
 
 
-@pytest.mark.parametrize("target", _params(xfail={"pg-row": known_defect(_E4), "pg-tt": known_defect(_E4),
-                                                  "mysql": known_defect(_E4)}))
+@pytest.mark.parametrize("target", _params(xfail={"pg": known_defect(_E4), "mysql": known_defect(_E4)}))
 def test_sum_of_integer_expression_result_type(make_env, request, target: Target) -> None:
     _check_integer_expression_view(make_env, request, target, "i % 3", lambda e: (
         ViewDef("ik_s", f"SELECT s, SUM({e}) AS a FROM ik GROUP BY s")))
@@ -1293,7 +1272,7 @@ SAME_VALUE_CASES: Dict[str, Tuple[List[str], List[str], List[Tuple[str, str]]]] 
 }
 
 
-@pytest.mark.parametrize("target", _params_without_pg_row())
+@pytest.mark.parametrize("target", _params())
 def test_update_to_equal_but_not_identical_value(make_env, target: Target) -> None:
     schema, selects, steps = SAME_VALUE_CASES[target.family]
     env = make_env(target, views=[], schema_sql=schema, seed=False)
@@ -1349,11 +1328,10 @@ def test_pg_partitioned_parent_writes(make_env, target: Target) -> None:
         env.check(label)
 
 
-_F4 = f"finding 4: direct writes to a partition skip the parent's statement-level triggers. {STAGE2}"
-
-
-@pytest.mark.parametrize("target", _params(("postgres",), xfail={"pg-tt": known_defect(_F4)}))
+@pytest.mark.parametrize("target", _params(("postgres",)))
 def test_pg_direct_partition_writes(make_env, target: Target) -> None:
+    """Direct writes to a partition fire only the partition's statement
+    triggers (finding 4); maintenance installs them on every partition."""
     env = _partition_env(make_env, target)
     for label, sql in [
         ("direct partition insert", "INSERT INTO t_p1 (id, g, v) VALUES (200, 3, 9), (201, 4, -9), (202, 5, 0)"),
@@ -1437,15 +1415,13 @@ class _Worker:
         assert not self.thread.is_alive(), "worker did not finish"
 
 
-_F1 = f"finding 1: MIN/MAX recompute after a row-lock wait reads a pre-wait snapshot under READ COMMITTED. {STAGE2}"
-
-
-@pytest.mark.parametrize("target", _params(("postgres", "mysql"), xfail={
-    "pg-row": known_defect(_F1), "pg-tt": known_defect(_F1)}))
+@pytest.mark.parametrize("target", _params(("postgres", "mysql")))
 def test_minmax_recompute_after_lock_wait(make_env, target: Target) -> None:
     """A deletes group 1's minimum (holds the group's backing row); B deletes
     another row of group 1 plus rows of other groups and waits for A; A
-    commits; B commits. The view must reflect both deletions."""
+    commits; B commits. The view must reflect both deletions (finding 1: the
+    PostgreSQL recompute runs in a statement after the lock, with a fresh
+    READ COMMITTED snapshot)."""
     env = make_env(target, views=[vd for vd in VIEWS if vd.name in ("v_mm", "v_mmw")], seed=False)
     env.execute("INSERT INTO t (id, g, v, w) VALUES (1, 1, 1, 1), (2, 1, 2, 2), (3, 1, 3, 3), (4, 2, 10, 10), "
                 "(5, 2, 20, 20), (6, 3, 7, 7)")
@@ -1465,21 +1441,24 @@ def test_minmax_recompute_after_lock_wait(make_env, target: Target) -> None:
 
 
 def _install_pause_trigger(env: Env, marker: int, lock_key: int) -> None:
-    """A user row trigger that blocks on a lock held by the test when the row
-    with id = `marker` is processed, BEFORE that row's maintenance runs."""
+    """Make writer A pause, while it holds some group locks and not others,
+    on a lock held by the test.
+
+    PostgreSQL (statement-level maintenance): a BEFORE UPDATE row trigger on
+    the ``v_agg`` backing table pauses A's key-ordered upsert after it has
+    locked group 1's backing row and before it locks group 2's (only in a
+    session that set ``bulk.pause``). MySQL/MariaDB (row triggers): a BEFORE
+    INSERT row trigger pauses before the row with id = ``marker`` is
+    maintained."""
     if env.family == "postgres":
+        store = env.plans["v_agg"].backing_table_name
         env.execute(
             f"CREATE FUNCTION bulk_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
-            f"IF NEW.id = {marker} THEN PERFORM pg_advisory_xact_lock_shared({lock_key}); END IF; "
-            f"RETURN NULL; END $$")
-        # AFTER ROW triggers fire per row in name order; '0' sorts before '_'.
-        env.execute('CREATE TRIGGER "0_bulk_pause" AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION bulk_pause()')
+            f"IF current_setting('bulk.pause', true) = 'on' AND OLD.g = 1 THEN "
+            f"PERFORM pg_advisory_xact_lock_shared({lock_key}); END IF; "
+            f"RETURN NEW; END $$")
+        env.execute(f"CREATE TRIGGER bulk_pause BEFORE UPDATE ON {store} FOR EACH ROW EXECUTE FUNCTION bulk_pause()")
         env.commit()
-        cur = env.conn.cursor()
-        cur.execute("SELECT tgname FROM pg_trigger WHERE tgrelid = 't'::regclass AND NOT tgisinternal ORDER BY tgname")
-        names = [r[0] for r in cur.fetchall()]
-        env.commit()
-        assert names[0] == "0_bulk_pause" and len(names) > 1, names
     else:
         env.execute(
             f"CREATE TRIGGER bulk_pause BEFORE INSERT ON t FOR EACH ROW BEGIN "
@@ -1488,9 +1467,10 @@ def _install_pause_trigger(env: Env, marker: int, lock_key: int) -> None:
 
 
 def _run_opposite_order_inserts(env: Env) -> Tuple[Optional[BaseException], Optional[BaseException]]:
-    """A inserts (group 1, group 2) and pauses before maintaining its group-2
-    row; B inserts (group 2, group 1) and waits for A's group-1 lock; then A
-    resumes. Under row triggers that is a lock-order cycle."""
+    """A inserts (group 1, group 2, group 3) and pauses holding group 1's
+    maintenance lock but not group 2's; B inserts (group 2, group 1, group 3)
+    and must wait for A; then A resumes. Locking groups in statement row order
+    (row triggers) makes that a lock-order cycle; key-ordered locking does not."""
     lock_key = 4242
     marker = 1002
     _install_pause_trigger(env, marker, lock_key)
@@ -1502,7 +1482,10 @@ def _run_opposite_order_inserts(env: Env) -> Tuple[Optional[BaseException], Opti
     else:
         cur.execute(f"SELECT GET_LOCK('bulk_pause_{lock_key}', 10)")
         assert cur.fetchone()[0] == 1
-    wa = _Worker(a, ["INSERT INTO t (id, g, v) VALUES (1001, 1, 5), (1002, 2, 6), (1003, 3, 7)"]).start()
+    a_stmts = ["INSERT INTO t (id, g, v) VALUES (1001, 1, 5), (1002, 2, 6), (1003, 3, 7)"]
+    if env.family == "postgres":
+        a_stmts.insert(0, "SET LOCAL bulk.pause = 'on'")
+    wa = _Worker(a, a_stmts).start()
     wb = None
     try:
         def a_paused() -> bool:
@@ -1518,11 +1501,7 @@ def _run_opposite_order_inserts(env: Env) -> Tuple[Optional[BaseException], Opti
 
         _wait_for(a_paused, wa.done, "A pauses on the test lock")
         wb = _Worker(b, ["INSERT INTO t (id, g, v) VALUES (2001, 2, 8), (2002, 1, 9), (2003, 3, 1)"]).start()
-        statement_level = env.target.pg_tt
-        if not statement_level:
-            _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), wb.done, "B waits for A's group-1 lock")
-        else:
-            wb.join()  # statement-level maintenance: A holds no maintenance lock yet
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), wb.done, "B waits for A's group-1 lock")
     finally:
         if env.family == "postgres":
             cur.execute(f"SELECT pg_advisory_unlock({lock_key})")
@@ -1564,14 +1543,12 @@ def test_opposite_order_multi_row_inserts_fail_closed(make_env, target: Target) 
         assert (ea is None) != (eb is None), f"expected exactly one deadlock victim, got {ea!r} / {eb!r}"
 
 
-_F2 = f"finding 2: row triggers lock groups in statement row order; opposite-order multi-row statements deadlock. {STAGE2}"
-
-
-@pytest.mark.parametrize("target", _params(("postgres",), xfail={"pg-row": known_defect(_F2, DeadlockObserved)}))
+@pytest.mark.parametrize("target", _params(("postgres",)))
 def test_pg_opposite_order_multi_row_inserts_do_not_deadlock(make_env, target: Target) -> None:
-    """The decided PostgreSQL design (statement-level, key-ordered locking)
-    must not deadlock here. MySQL/MariaDB keep row triggers and their
-    documented deadlocks, so they are not part of this contract."""
+    """PostgreSQL statement-level maintenance locks groups in key order, so
+    this interleaving (finding 2) must not deadlock. MySQL/MariaDB keep row
+    triggers and their documented deadlocks, so they are not part of this
+    contract."""
     env = make_env(target, views=[vd for vd in VIEWS if vd.name in ("v_agg", "v_mm", "v_j")])
     ea, eb = _run_opposite_order_inserts(env)
     for e in (ea, eb):

@@ -188,7 +188,7 @@ class TestJinja2ProceduralTemplates(unittest.TestCase):
         self.assertIn("= __mv_init.", my8_pop[1])
         self.assertIn("VALUES(", m10_plan.initial_populate_sqls[1])
 
-    def test_trigger_templates_sqlite_pg_transition_and_mysql(self) -> None:
+    def test_trigger_templates_sqlite_pg_statement_and_mysql(self) -> None:
         pg_ts = ms.parse_table_schema(
             "CREATE TABLE items (id BIGINT PRIMARY KEY, cat TEXT, val INT)", dialect="postgres"
         )
@@ -197,30 +197,20 @@ class TestJinja2ProceduralTemplates(unittest.TestCase):
             dialect="postgres",
         )
 
-        # Row-level PG triggers
-        pg_row_plan = ms.IncrementalViewCompiler(pg_ts, pg_vs, dialect="postgres", pg_use_transition_tables=False).compile()
-        pg_row_sql = "\n".join(pg_row_plan.trigger_ddls)
-        self.assertIn("matview.skip_triggers", pg_row_sql)
-        self.assertIn("AFTER TRUNCATE ON", pg_row_sql)
-        self.assertIn("IF (TG_OP = 'DELETE') THEN", pg_row_sql)
-
-        # Transition-table vectorized vs loop PG triggers
-        pg_unfiltered_vs = ms.parse_view_definition(
-            "CREATE VIEW v AS SELECT cat, COUNT(*) AS cnt, SUM(val) AS s FROM items GROUP BY cat",
-            dialect="postgres",
-        )
-        pg_vec_plan = ms.IncrementalViewCompiler(
-            pg_ts, pg_unfiltered_vs, dialect="postgres", pg_use_transition_tables=True, pg_vectorize_transition_tables=True
-        ).compile()
-        pg_loop_plan = ms.IncrementalViewCompiler(
-            pg_ts, pg_unfiltered_vs, dialect="postgres", pg_use_transition_tables=True, pg_vectorize_transition_tables=False
-        ).compile()
-        vec_sql = "\n".join(pg_vec_plan.trigger_ddls)
-        loop_sql = "\n".join(pg_loop_plan.trigger_ddls)
-        self.assertIn("REFERENCING NEW TABLE AS __mv_new_rows", vec_sql)
-        self.assertNotIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", vec_sql)
-        self.assertIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", loop_sql)
-        self.assertIn("FOR OLD IN SELECT * FROM __mv_old_rows LOOP", loop_sql)
+        # PostgreSQL: statement-level transition-table triggers only
+        pg_plan = ms.IncrementalViewCompiler(pg_ts, pg_vs, dialect="postgres").compile()
+        pg_sql = "\n".join(pg_plan.trigger_ddls)
+        self.assertNotIn("matview.skip_triggers", pg_sql)
+        self.assertNotIn("FOR EACH ROW", pg_sql)
+        self.assertIn("AFTER TRUNCATE ON", pg_sql)
+        self.assertIn("REFERENCING NEW TABLE AS __mv_new_rows", pg_sql)
+        self.assertIn("REFERENCING OLD TABLE AS __mv_old_rows NEW TABLE AS __mv_new_rows", pg_sql)
+        self.assertNotIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", pg_sql)
+        self.assertIn("DO $mv_install$", pg_sql)
+        fn_ddls = [d for d in pg_plan.trigger_ddls if d.startswith("CREATE OR REPLACE FUNCTION") and "_trunc()" not in d]
+        self.assertEqual(len(fn_ddls), 3)
+        for fn_ddl in fn_ddls:
+            self.assertRegex(fn_ddl, r"IF NOT EXISTS \(SELECT 1 FROM __mv_(new|old)_rows\) THEN\s+RETURN NULL;")
 
         # MySQL row triggers
         my_ts = ms.parse_table_schema(

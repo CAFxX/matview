@@ -858,10 +858,7 @@ class _NativeBase:
     def test_caller_transaction_is_refused_and_left_intact(self) -> None:
         objects = self._maintenance_objects()
         self._write(f"INSERT INTO {self.table} VALUES (20, 'c', 7)")
-        modes = [{}]
-        if self.engine == Dialect.POSTGRES:
-            modes += [{"use_shadow_swap": True}, {"drop_triggers": True}]
-        for kwargs in modes:
+        for kwargs in [{}]:
             with self.subTest(**kwargs):
                 with self.assertRaises(TransactionOwnershipError):
                     with self.manager.bulk_changes(**kwargs):
@@ -953,7 +950,7 @@ class _NativeBase:
         self._assert_maintained_by_other_session(130)
 
     def test_committing_block_is_detected_and_recovered(self) -> None:
-        modes = [{}, {"drop_triggers": True}] if self.engine == Dialect.POSTGRES else [{}]
+        modes: List[Dict[str, Any]] = [{}]
         names = [r[0] for r in self._maintenance_objects()]
         for step, kwargs in enumerate(modes):
             with self.subTest(**kwargs):
@@ -978,97 +975,7 @@ class _NativeBase:
                         self.assertIn(cur.fetchone()[0], (None, 0))
                     self.conn.commit()
 
-    def test_concurrent_registration_cannot_leave_a_view_stale(self) -> None:
-        """Another session registers a view while a block is open. The new
-        view's triggers would be suspended by this session's bypass but it is
-        not in the refresh: registration must wait for the block (PostgreSQL:
-        catalog lock; MySQL/MariaDB: locking catalog read) or one side must
-        fail closed; every registered view ends exact."""
-        from test_avg_concurrent_maintenance import _session_id, _wait_until_lock_waiting
-
-        new_sql = f"SELECT bucket, COUNT(*) AS n FROM {self.table} WHERE amt >= 0 GROUP BY bucket"
-        other = self._connect()
-        monitor = self._connect(autocommit=self.engine == Dialect.POSTGRES)
-        other_sid = _session_id(self.engine, other)
-        bulk_sid = _session_id(self.engine, self.conn)
-        other_manager = MaterializedViewManager(
-            other, dialect=self.engine, object_prefix=self.prefix, ignore_limitations=True
-        )
-        done = threading.Event()
-        outcome: Dict[str, Any] = {}
-
-        def register() -> None:
-            try:
-                _quiet_register(other_manager, f"CREATE VIEW rv_concurrent AS {new_sql}")
-                outcome["register"] = "ok"
-            except BaseException as exc:  # reported below
-                outcome["register"] = exc
-            finally:
-                done.set()
-
-        thread = threading.Thread(target=register, daemon=True)
-        try:
-            with self.manager.bulk_changes():
-                thread.start()
-                _wait_until_lock_waiting(self.engine, monitor, other_sid, done, blocker_sid=bulk_sid)
-                self._write(f"INSERT INTO {self.table} VALUES (160, 'a', 4)")
-                self._write(f"INSERT INTO {self.table} VALUES (161, 'q', 4)")
-            outcome["bulk"] = "ok"
-        except BaseException as exc:
-            outcome["bulk"] = exc
-        thread.join(60)
-        self.assertFalse(thread.is_alive())
-        print(f"[concurrent registration] {outcome!r}", file=sys.stderr)
-        if self.engine == Dialect.POSTGRES:
-            # The catalog lock makes registration wait; nothing deadlocks.
-            self.assertEqual(outcome, {"register": "ok", "bulk": "ok"})
-        else:
-            # InnoDB may pick one side as a deadlock victim (1213); both
-            # failing, or any other error, is a bug.
-            failures = {k: v for k, v in outcome.items() if v != "ok"}
-            self.assertLessEqual(len(failures), 1, outcome)
-            for exc in failures.values():
-                self.assertIn(getattr(exc, "args", [None])[0], (1213,), repr(exc))
-        rows = [r[0] for r in self._rows()]
-        self.assertEqual(160 in rows, outcome["bulk"] == "ok")
-        self._assert_exact()
-        catalog = self.manager.get_catalog()
-        self.conn.commit()
-        if "rv_concurrent" in catalog:
-            self.assertEqual(
-                sorted(self._observed("SELECT * FROM rv_concurrent")), sorted(self._observed(new_sql))
-            )
-            self.assertEqual(self.manager.check_schema_drift()["rv_concurrent"], "ok")
-        else:
-            self.assertNotEqual(outcome["register"], "ok")
-
-    def test_failed_recovery_in_session_bypass_mode_names_the_stale_views(self) -> None:
-        """With the session bypass no trigger is dropped, so a failed recovery
-        leaves stale contents that the drift check cannot see: the error's
-        view_names is the record, and repair_view() fixes them."""
-        def failing_refresh(*_args: Any, **_kwargs: Any) -> None:
-            raise RuntimeError("injected recovery failure")
-
-        with self.assertRaises(BulkChangesRecoveryError) as ctx:
-            with self.manager.bulk_changes():
-                self._write(f"INSERT INTO {self.table} VALUES (190, 'a', 1)")
-                self.conn.commit()
-                self.manager._bulk_refresh = failing_refresh  # only the recovery refresh runs now
-        del self.manager._bulk_refresh
-        self.assertEqual(ctx.exception.view_names, ["bulk_totals"])
-        self.assertIn("cannot detect stale contents", str(ctx.exception))
-        self.assertNotEqual(
-            sorted(self._observed("SELECT bucket, n, total FROM bulk_totals")), sorted(self._observed(self._sql(LIVE_SQL)))
-        )
-        self.assertEqual(self.manager.check_schema_drift(), {"bulk_totals": "ok"})
-        self.conn.commit()
-        self.assertEqual(self.manager.repair_view("bulk_totals"), {"bulk_totals": "repaired"})
-        self._assert_exact()
-        self._assert_maintained_by_other_session(191)
-
     def _shape_modes(self) -> List[Dict[str, Any]]:
-        if self.engine == Dialect.POSTGRES:
-            return [{}, {"use_shadow_swap": True}, {"drop_triggers": True}]
         return [{}]
 
     def test_every_mode_is_exact_for_every_view_shape(self) -> None:
@@ -1107,7 +1014,9 @@ class _NativeBase:
     def test_refresh_waits_for_concurrent_maintained_writer(self) -> None:
         """An independent writer holds an uncommitted, trigger-maintained
         write; the bulk session must wait for it (positive lock-wait evidence)
-        and the result must be exact after both commit."""
+        and the result must be exact after both commit. MySQL/MariaDB: the
+        refresh waits. PostgreSQL (no refresh): the block's own statement-level
+        maintenance of the same group waits for the writer's group row."""
         from test_avg_concurrent_maintenance import _session_id, _wait_until_lock_waiting
 
         writer = self._connect()
@@ -1116,13 +1025,14 @@ class _NativeBase:
         writer_sid = _session_id(self.engine, writer)
         with writer.cursor() as cur:
             cur.execute(f"INSERT INTO {self.table} VALUES (60, 'a', 6)")
+        bulk_bucket = "a" if self.engine == Dialect.POSTGRES else "b"
         done = threading.Event()
         errors: List[BaseException] = []
 
         def run_bulk() -> None:
             try:
                 with self.manager.bulk_changes():
-                    self._write(f"INSERT INTO {self.table} VALUES (61, 'b', 7)")
+                    self._write(f"INSERT INTO {self.table} VALUES (61, '{bulk_bucket}', 7)")
             except BaseException as exc:  # reported below
                 errors.append(exc)
             finally:
@@ -1138,91 +1048,140 @@ class _NativeBase:
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertIn((60, "a", 6), self._rows())
-        self.assertIn((61, "b", 7), self._rows())
+        self.assertIn((61, bulk_bucket, 7), self._rows())
         self._assert_exact()
 
 
 class NativePostgresBulkChangesTests(_NativeBase, unittest.TestCase):
+    """PostgreSQL never suspends its statement-level maintenance: the block
+    only gets the transaction contract (shared tests above)."""
+
     engine = Dialect.POSTGRES
 
-    def test_refresh_recheck_rolls_back_when_views_changed(self) -> None:
-        """Defense in depth behind the catalog lock: with the lock disabled, a
-        view registered during the block must make the block roll back."""
-        new_sql = f"SELECT bucket, COUNT(*) AS n FROM {self.table} GROUP BY bucket"
-        other = self._connect()
-        other_manager = MaterializedViewManager(
-            other, dialect=self.engine, object_prefix=self.prefix, ignore_limitations=True
-        )
-        rows = self._rows()
-        with mock.patch.object(MaterializedViewManager, "_lock_catalog_for_change", lambda self: None):
-            with self.assertRaisesRegex(RuntimeError, "changed while the block ran"):
-                with self.manager.bulk_changes():
-                    _quiet_register(other_manager, f"CREATE VIEW rv_concurrent AS {new_sql}")
-                    self._write(f"INSERT INTO {self.table} VALUES (170, 'a', 4)")
-        self.assertFalse(self._in_transaction())
-        self.assertEqual(self._rows(), rows)
-        self._assert_exact()
-        self.assertEqual(sorted(self._observed("SELECT * FROM rv_concurrent")), sorted(self._observed(new_sql)))
-
-    def test_drop_triggers_and_shadow_swap_block_other_writers_and_are_exact(self) -> None:
-        from test_avg_concurrent_maintenance import _session_id, _wait_until_lock_waiting
-
-        for row_id, kwargs in ((70, {"drop_triggers": True}), (80, {"use_shadow_swap": True})):
+    def test_suspending_modes_are_refused_before_any_sql(self) -> None:
+        objects, rows = self._maintenance_objects(), self._rows()
+        for kwargs in ({"use_shadow_swap": True}, {"drop_triggers": True}):
             with self.subTest(**kwargs):
-                writer = self._connect()
-                monitor = self._connect(autocommit=True)
-                writer_sid = _session_id(self.engine, writer)
-                bulk_sid = _session_id(self.engine, self.conn)
-                done = threading.Event()
-                errors: List[BaseException] = []
-
-                def write() -> None:
-                    try:
-                        with writer.cursor() as cur:
-                            cur.execute(f"INSERT INTO {self.table} VALUES ({row_id + 1}, 'w', 9)")
-                        writer.commit()
-                    except BaseException as exc:
-                        errors.append(exc)
-                    finally:
-                        done.set()
-
-                with self.manager.bulk_changes(**kwargs):
-                    self._write(f"INSERT INTO {self.table} VALUES ({row_id}, 'a', 1)")
-                    if kwargs.get("drop_triggers"):
-                        # The dropped triggers are invisible to others until
-                        # commit: an independent writer must wait.
-                        thread = threading.Thread(target=write, daemon=True)
-                        thread.start()
-                        _wait_until_lock_waiting(self.engine, monitor, writer_sid, done, blocker_sid=bulk_sid)
-                if kwargs.get("drop_triggers"):
-                    thread.join(60)
-                    self.assertEqual(errors, [])
-                    self.assertIn((row_id + 1, "w", 9), self._rows())
+                with self.assertRaisesRegex(ValueError, "statement-level triggers maintain the views"):
+                    with self.manager.bulk_changes(**kwargs):
+                        self.fail("entered a refused PostgreSQL bulk mode")
                 self.assertFalse(self._in_transaction())
-                self.assertIn((row_id, "a", 1), self._rows())
-                self._assert_exact()
-                self._assert_maintained_by_other_session(row_id + 5)
+        self.assertEqual(self._rows(), rows)
+        self.assertEqual(self._maintenance_objects(), objects)
+        self._assert_exact()
 
-    def test_restoration_failure_is_raised_and_rolled_back(self) -> None:
-        for position in ("middle", "end"):
-            for kwargs in ({"drop_triggers": True}, {"use_shadow_swap": True}):
-                with self.subTest(position=position, **kwargs):
-                    rows = self._rows()
-                    names = [r[0] for r in self._maintenance_objects()]
-                    with self.assertRaises(Exception) as ctx:
-                        with _inject_failing_trigger_ddl(position):
-                            with self.manager.bulk_changes(**kwargs):
-                                self._write(f"INSERT INTO {self.table} VALUES (90, 'a', 1)")
-                    self.assertIn(INJECTED, str(ctx.exception))
-                    self.assertFalse(self._in_transaction())
-                    self.assertEqual(self._rows(), rows)
-                    self.assertEqual([r[0] for r in self._maintenance_objects()], names)
-                    self._assert_exact()
-                    self._assert_maintained_by_other_session(91)
+    def test_block_does_not_block_writers_of_other_groups(self) -> None:
+        """No catalog lock, no trigger DDL, no refresh: another session's
+        writer of another group commits while the block is open (it would wait
+        behind dropped triggers or a refresh), and the views are exact. A
+        registration in another session still waits, as any CREATE TRIGGER on
+        a table with an open writer does."""
+        other = self._connect()
+        with self.manager.bulk_changes(view_names=["bulk_totals"]):
+            self._write(f"INSERT INTO {self.table} VALUES (170, 'a', 4)")
+            with other.cursor() as cur:
+                cur.execute("SET LOCAL lock_timeout = '5s'")
+                cur.execute(f"INSERT INTO {self.table} VALUES (171, 'z', 5)")
+            other.commit()
+            self._write(f"INSERT INTO {self.table} VALUES (172, 'q', 6)")
+        self.assertFalse(self._in_transaction())
+        self.assertTrue({170, 171, 172} <= {r[0] for r in self._rows()})
+        self._assert_exact()
+
+    def test_unknown_view_name_is_refused(self) -> None:
+        with self.assertRaises(KeyError):
+            with self.manager.bulk_changes(view_names=["no_such_view"]):
+                self.fail("entered with an unknown view name")
+        self.assertFalse(self._in_transaction())
 
 
 class NativeMysqlBulkChangesTests(_NativeBase, unittest.TestCase):
     engine = Dialect.MYSQL
+
+    def test_concurrent_registration_cannot_leave_a_view_stale(self) -> None:
+        """Another session registers a view while a block is open. The new
+        view's triggers would be suspended by this session's bypass but it is
+        not in the refresh: registration must wait for the block (locking
+        catalog read) or one side must fail closed; every registered view
+        ends exact."""
+        from test_avg_concurrent_maintenance import _session_id, _wait_until_lock_waiting
+
+        new_sql = f"SELECT bucket, COUNT(*) AS n FROM {self.table} WHERE amt >= 0 GROUP BY bucket"
+        other = self._connect()
+        monitor = self._connect()
+        other_sid = _session_id(self.engine, other)
+        bulk_sid = _session_id(self.engine, self.conn)
+        other_manager = MaterializedViewManager(
+            other, dialect=self.engine, object_prefix=self.prefix, ignore_limitations=True
+        )
+        done = threading.Event()
+        outcome: Dict[str, Any] = {}
+
+        def register() -> None:
+            try:
+                _quiet_register(other_manager, f"CREATE VIEW rv_concurrent AS {new_sql}")
+                outcome["register"] = "ok"
+            except BaseException as exc:  # reported below
+                outcome["register"] = exc
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=register, daemon=True)
+        try:
+            with self.manager.bulk_changes():
+                thread.start()
+                _wait_until_lock_waiting(self.engine, monitor, other_sid, done, blocker_sid=bulk_sid)
+                self._write(f"INSERT INTO {self.table} VALUES (160, 'a', 4)")
+                self._write(f"INSERT INTO {self.table} VALUES (161, 'q', 4)")
+            outcome["bulk"] = "ok"
+        except BaseException as exc:
+            outcome["bulk"] = exc
+        thread.join(60)
+        self.assertFalse(thread.is_alive())
+        print(f"[concurrent registration] {outcome!r}", file=sys.stderr)
+        # InnoDB may pick one side as a deadlock victim (1213); both
+        # failing, or any other error, is a bug.
+        failures = {k: v for k, v in outcome.items() if v != "ok"}
+        self.assertLessEqual(len(failures), 1, outcome)
+        for exc in failures.values():
+            self.assertIn(getattr(exc, "args", [None])[0], (1213,), repr(exc))
+        rows = [r[0] for r in self._rows()]
+        self.assertEqual(160 in rows, outcome["bulk"] == "ok")
+        self._assert_exact()
+        catalog = self.manager.get_catalog()
+        self.conn.commit()
+        if "rv_concurrent" in catalog:
+            self.assertEqual(
+                sorted(self._observed("SELECT * FROM rv_concurrent")), sorted(self._observed(new_sql))
+            )
+            self.assertEqual(self.manager.check_schema_drift()["rv_concurrent"], "ok")
+        else:
+            self.assertNotEqual(outcome["register"], "ok")
+
+    def test_failed_recovery_in_session_bypass_mode_names_the_stale_views(self) -> None:
+        """With the session bypass no trigger is dropped, so a failed recovery
+        leaves stale contents that the drift check cannot see: the error's
+        view_names is the record, and repair_view() fixes them."""
+        def failing_refresh(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("injected recovery failure")
+
+        with self.assertRaises(BulkChangesRecoveryError) as ctx:
+            with self.manager.bulk_changes():
+                self._write(f"INSERT INTO {self.table} VALUES (190, 'a', 1)")
+                self.conn.commit()
+                self.manager._bulk_refresh = failing_refresh  # only the recovery refresh runs now
+        del self.manager._bulk_refresh
+        self.assertEqual(ctx.exception.view_names, ["bulk_totals"])
+        self.assertIn("cannot detect stale contents", str(ctx.exception))
+        self.assertNotEqual(
+            sorted(self._observed("SELECT bucket, n, total FROM bulk_totals")), sorted(self._observed(self._sql(LIVE_SQL)))
+        )
+        self.assertEqual(self.manager.check_schema_drift(), {"bulk_totals": "ok"})
+        self.conn.commit()
+        self.assertEqual(self.manager.repair_view("bulk_totals"), {"bulk_totals": "repaired"})
+        self._assert_exact()
+        self._assert_maintained_by_other_session(191)
+
 
     def test_ddl_modes_are_refused_before_any_sql(self) -> None:
         objects = self._maintenance_objects()

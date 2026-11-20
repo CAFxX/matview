@@ -406,8 +406,6 @@ class MaterializedViewManager:
         dialect: Optional[Dialect | str | EngineVersion] = None,
         ignore_limitations: bool = False,
         object_prefix: str = DEFAULT_OBJECT_PREFIX,
-        pg_use_transition_tables: bool = False,
-        pg_vectorize_transition_tables: bool = True,
         strict: bool = False,
         engine_version: Optional[EngineVersion | str] = None,
         skip_ensure_catalog: bool = False,
@@ -462,8 +460,6 @@ class MaterializedViewManager:
         self.subdialect: EngineSubdialect = self.engine_version.subdialect
         self.ignore_limitations = ignore_limitations
         self.object_prefix = object_prefix
-        self.pg_use_transition_tables = pg_use_transition_tables
-        self.pg_vectorize_transition_tables = pg_vectorize_transition_tables
         self.strict = strict
         self.pg_fillfactor = pg_fillfactor
         self.catalog_table = (
@@ -1718,8 +1714,6 @@ class MaterializedViewManager:
             schemas,
             v_spec,
             dialect=self.dialect,
-            pg_use_transition_tables=self.pg_use_transition_tables,
-            pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
             ignore_limitations=effective_ignore,
             object_prefix=self.object_prefix,
             strict=effective_strict,
@@ -1978,8 +1972,6 @@ class MaterializedViewManager:
                 schemas,
                 v_spec,
                 dialect=self.dialect,
-                pg_use_transition_tables=self.pg_use_transition_tables,
-                pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
                 ignore_limitations=effective_ignore,
                 object_prefix=self.object_prefix,
                 strict=effective_strict,
@@ -2050,7 +2042,27 @@ class MaterializedViewManager:
 
     _LIVE_TRIGGER_SQL = {
         Dialect.SQLITE: "SELECT name FROM sqlite_master WHERE type = 'trigger'",
-        Dialect.POSTGRES: "SELECT tgname FROM pg_catalog.pg_trigger WHERE NOT tgisinternal",
+        # A maintenance trigger counts as present only on a table that is
+        # visible through the search_path (the manager creates its objects
+        # unqualified; same-named triggers of other schemas do not count) and
+        # is not a partition, and only when every partition below it (all
+        # levels) has a trigger of the same name: statement-level triggers do
+        # not fire for direct writes to a partition that lacks them (for
+        # example one attached or created after registration).
+        Dialect.POSTGRES: (
+            "WITH RECURSIVE __mv_tree(root, relid) AS ("
+            " SELECT inhparent, inhrelid FROM pg_catalog.pg_inherits"
+            " UNION ALL"
+            " SELECT __mv_tree.root, i.inhrelid FROM pg_catalog.pg_inherits i"
+            " JOIN __mv_tree ON i.inhparent = __mv_tree.relid)"
+            " SELECT t.tgname FROM pg_catalog.pg_trigger t"
+            " JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid"
+            " WHERE NOT t.tgisinternal AND NOT c.relispartition"
+            " AND pg_catalog.pg_table_is_visible(c.oid)"
+            " AND NOT EXISTS (SELECT 1 FROM __mv_tree WHERE __mv_tree.root = t.tgrelid"
+            " AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t2"
+            " WHERE t2.tgrelid = __mv_tree.relid AND t2.tgname = t.tgname))"
+        ),
         Dialect.MYSQL: "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE()",
     }
 
@@ -2093,8 +2105,6 @@ class MaterializedViewManager:
                     schemas,
                     entry["view_sql"],
                     dialect=self.dialect,
-                    pg_use_transition_tables=self.pg_use_transition_tables,
-                    pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
                     ignore_limitations=True,
                     object_prefix=self.object_prefix,
                     engine_version=self.engine_version,
@@ -2186,7 +2196,6 @@ class MaterializedViewManager:
                 schemas,
                 entry["view_sql"],
                 dialect=self.dialect,
-                pg_use_transition_tables=self.pg_use_transition_tables,
                 ignore_limitations=True,
                 object_prefix=self.object_prefix,
                 engine_version=self.engine_version,
@@ -2303,28 +2312,7 @@ class MaterializedViewManager:
         shadow_aux_map: Dict[str, str],
     ) -> List[str]:
         sqls: List[str] = []
-        if self.dialect == Dialect.POSTGRES:
-            old_tbl = self._old_name(plan.backing_table_name)
-            sqls.append(build_drop_sql("TABLE", old_tbl, dialect=self.dialect))
-            for aux_t in plan.auxiliary_table_names:
-                sqls.append(build_drop_sql("TABLE", self._old_name(aux_t), dialect=self.dialect))
-
-            sqls.append(build_alter_rename_table_sql(plan.backing_table_name, old_tbl, dialect=self.dialect))
-            for aux_t in plan.auxiliary_table_names:
-                sqls.append(build_alter_rename_table_sql(aux_t, self._old_name(aux_t), dialect=self.dialect))
-
-            sqls.append(build_alter_rename_table_sql(shadow_tbl, plan.backing_table_name, dialect=self.dialect))
-            for aux_t, s_aux in shadow_aux_map.items():
-                sqls.append(build_alter_rename_table_sql(s_aux, aux_t, dialect=self.dialect))
-
-            if plan.reader_view_ddl:
-                sqls.append(self._make_replace_view_ddl(plan.reader_view_ddl))
-
-            sqls.append(build_drop_sql("TABLE", old_tbl, dialect=self.dialect))
-            for aux_t in plan.auxiliary_table_names:
-                sqls.append(build_drop_sql("TABLE", self._old_name(aux_t), dialect=self.dialect))
-
-        elif self.dialect == Dialect.MYSQL:
+        if self.dialect == Dialect.MYSQL:
             old_tbl = self._old_name(plan.backing_table_name)
             old_tables = [old_tbl]
             for aux_t in plan.auxiliary_table_names:
@@ -2422,12 +2410,8 @@ class MaterializedViewManager:
         # so the driver opens the transaction with the first statement.
 
     def _bulk_maintenance_ddl_drop(self, cur: Any, entry: Dict[str, Any]) -> None:
-        """Drop one view's maintenance triggers/functions (transactional DDL only)."""
-        if self.dialect == Dialect.POSTGRES:
-            for fn_name in entry["function_names"]:
-                if "fn_readonly_" not in fn_name:
-                    cur.execute(f"DROP FUNCTION IF EXISTS {fn_name}() CASCADE;")
-        elif self.dialect == Dialect.SQLITE:
+        """Drop one view's maintenance triggers (SQLite: transactional DDL)."""
+        if self.dialect == Dialect.SQLITE:
             for t_name in entry["trigger_names"]:
                 if "__ro_" not in t_name and not t_name.endswith("__readonly"):
                     cur.execute(f"DROP TRIGGER IF EXISTS {t_name};")
@@ -2439,8 +2423,6 @@ class MaterializedViewManager:
             schemas,
             entry["view_sql"],
             dialect=self.dialect,
-            pg_use_transition_tables=self.pg_use_transition_tables,
-            pg_vectorize_transition_tables=getattr(self, "pg_vectorize_transition_tables", True),
             ignore_limitations=True,
             object_prefix=self.object_prefix,
             engine_version=self.engine_version,
@@ -2585,8 +2567,21 @@ class MaterializedViewManager:
         use_shadow_swap: bool = False,
         drop_triggers: bool = False,
     ) -> Iterator[None]:
-        """Run a block of base-table DML without row-by-row maintenance, then
-        repopulate the affected materialized views, all in one transaction.
+        """Run a block of base-table DML in one manager-owned transaction.
+
+        PostgreSQL: maintenance is never suspended. The statement-level
+        triggers maintain every view once per statement during the block,
+        which is faster than suspending them and repopulating the views
+        (docs/design-bulk-maintenance.md) and has none of the repopulation's
+        races with concurrent writers. The block only gets the transaction
+        contract below. ``use_shadow_swap`` and ``drop_triggers`` (which would
+        suspend maintenance) are refused with ``ValueError`` before any SQL;
+        ``view_names`` is only checked for unknown names (``KeyError``).
+
+        SQLite, MySQL/MariaDB: row-by-row maintenance is suspended for the
+        block, then the affected views are repopulated, all in the same
+        transaction. This is a Python-only optimisation for large loads on the
+        manager's connection.
 
         Transaction ownership (as for the other lifecycle operations): the
         manager owns the transaction. A connection with an open transaction,
@@ -2598,39 +2593,30 @@ class MaterializedViewManager:
         exception propagates. Autocommit connections run in one explicit
         transaction (PostgreSQL autocommit is switched off for the duration and
         restored). The body must not commit or roll back the connection:
-        that is detected, the work after it is rolled back, maintenance is
-        restored and the views are refreshed in a new transaction, and
+        that is detected, the work after it is rolled back and
         ``BulkChangesTransactionError`` is raised (work the body committed
-        itself stays committed).
+        itself stays committed). On SQLite and MySQL/MariaDB maintenance is
+        then restored and the views are refreshed in a new transaction; on
+        PostgreSQL nothing was suspended, so nothing needs restoring.
 
-        How maintenance is suspended for the body (never globally outside a
-        transaction):
-        - PostgreSQL: ``SET LOCAL matview.skip_triggers`` (this transaction
-          only). With ``drop_triggers=True`` or for the shadow swap the
-          maintenance functions are dropped and re-created inside the
-          transaction; other writers to the base tables wait until it ends.
+        How maintenance is suspended for the body on SQLite and MySQL/MariaDB
+        (never globally outside a transaction):
         - MySQL/MariaDB: the session variable ``@__matview_skip_triggers``
           and DML only. ``use_shadow_swap`` and ``drop_triggers`` need DDL,
           which commits implicitly, and are refused with ``ValueError``
           before any SQL. The variable is cleared on every exit; if that
           fails the connection is closed (``BulkChangesConnectionError``).
+          The session bypass suspends the triggers of every registered view
+          on this connection, so ``view_names`` must name every registered
+          view (``ValueError`` otherwise).
         - SQLite: ``BEGIN IMMEDIATE`` (database-wide writer reservation),
           then the maintenance triggers are dropped and re-created inside the
           transaction.
 
-        The session bypass suspends the triggers of every registered view on
-        this connection, so on PostgreSQL (without ``drop_triggers``) and
-        MySQL/MariaDB ``view_names`` must name every registered view
-        (``ValueError`` otherwise); unknown names raise ``KeyError``.
-
-        Every target view is repopulated and its pk-range backfill watermark
-        is taken over in the same transaction (as ``repair_view`` does): a
-        running backfill stops at its next batch, an interrupted one is
-        recorded as complete. Concurrent writers: on PostgreSQL with the
-        default session bypass (``drop_triggers=False``), READ COMMITTED
-        repopulation does not lock base tables and is not exact while other
-        sessions commit writes to the base tables during the refresh; quiesce
-        them or use ``drop_triggers=True``, which makes them wait.
+        SQLite, MySQL/MariaDB: every target view is repopulated and its
+        pk-range backfill watermark is taken over in the same transaction (as
+        ``repair_view`` does): a running backfill stops at its next batch, an
+        interrupted one is recorded as complete.
 
         Failures are never swallowed: any error rolls the whole transaction
         back, which also restores the original maintenance objects. If the
@@ -2638,6 +2624,12 @@ class MaterializedViewManager:
         becomes unusable (``BulkChangesConnectionError``).
         """
         self._require_usable()
+        if self.dialect == Dialect.POSTGRES and (use_shadow_swap or drop_triggers):
+            raise ValueError(
+                "bulk_changes(use_shadow_swap=True / drop_triggers=True) is not supported on "
+                "PostgreSQL: its statement-level triggers maintain the views during the block "
+                "(once per statement), so there is no maintenance to suspend and no refresh."
+            )
         if self.dialect == Dialect.MYSQL and (use_shadow_swap or drop_triggers):
             raise ValueError(
                 "bulk_changes(use_shadow_swap=True / drop_triggers=True) is not supported on "
@@ -2646,7 +2638,9 @@ class MaterializedViewManager:
                 "sessions would write without maintenance. Use the default DML-only mode."
             )
         self._require_idle_connection("bulk_changes")
-        session_bypass = self.dialect in (Dialect.POSTGRES, Dialect.MYSQL) and not drop_triggers
+        # PostgreSQL keeps its statement-level maintenance for the block.
+        suspends = self.dialect != Dialect.POSTGRES
+        session_bypass = self.dialect == Dialect.MYSQL and not drop_triggers
 
         restore_autocommit: List[Any] = []
         if self.dialect == Dialect.POSTGRES:
@@ -2664,17 +2658,16 @@ class MaterializedViewManager:
             cur = self.conn.cursor()
             try:
                 self._begin_bulk_transaction(cur)
-                # The set of registered views must not change while the block
-                # runs (the session bypass also suspends a newly registered
-                # view's triggers, and the refresh would not repopulate it):
-                # PostgreSQL holds a catalog lock that every catalog-changing
-                # lifecycle operation also takes; MySQL/MariaDB reads the
+                # Where maintenance is suspended, the set of registered views
+                # must not change while the block runs (the session bypass
+                # also suspends a newly registered view's triggers, and the
+                # refresh would not repopulate it): MySQL/MariaDB reads the
                 # catalog with a locking read (which also opens no consistent
                 # snapshot: with MariaDB's innodb_snapshot_isolation the refresh
                 # would otherwise fail with error 1020 on backing rows a
                 # concurrent writer committed); SQLite holds the writer
-                # reservation. The refresh re-checks it.
-                self._lock_catalog_for_change()
+                # reservation. The refresh re-checks it. PostgreSQL suspends
+                # nothing, so it needs no catalog lock.
                 catalog = self._read_catalog(catalog_lock, required=True)
                 if view_names:
                     resolved = [self._resolve_catalog_name(n, catalog) for n in view_names]
@@ -2691,14 +2684,11 @@ class MaterializedViewManager:
                             f"bulk_changes(view_names=...) on {self.dialect.value}: the session "
                             f"trigger bypass also suspends maintenance of {left_out}, which would "
                             f"then be stale; include them in view_names (or pass none)"
-                            + (" or use drop_triggers=True" if self.dialect == Dialect.POSTGRES else "")
                         )
-                if self.dialect == Dialect.POSTGRES and session_bypass:
-                    cur.execute("SET LOCAL matview.skip_triggers = 'on';")
-                elif self.dialect == Dialect.MYSQL:
+                if self.dialect == Dialect.MYSQL:
                     mysql_flag_set = True
                     cur.execute("SET @__matview_skip_triggers = 1;")
-                if not session_bypass:
+                if suspends and not session_bypass:
                     for entry in targets:
                         self._bulk_maintenance_ddl_drop(cur, entry)
                 self._savepoint_create(cur, self._BULK_GUARD_SAVEPOINT)
@@ -2738,11 +2728,16 @@ class MaterializedViewManager:
                     body_ended_transaction = exc
             if body_ended_transaction is not None:
                 self._bulk_rollback("the bulk_changes() block ended the transaction")
+                if not suspends:
+                    raise BulkChangesTransactionError(
+                        "the bulk_changes() block committed or rolled back the manager's transaction "
+                        f"({body_ended_transaction!r}). Work after that point was rolled back; work it "
+                        "committed is kept (and was maintained: PostgreSQL maintenance is never suspended)"
+                    ) from body_ended_transaction
                 try:
                     # Always the plain refresh (never the caller's shadow-swap
                     # mode): the simplest path that restores maintenance.
                     self._begin_bulk_transaction(cur)
-                    self._lock_catalog_for_change()
                     self._bulk_require_unchanged_catalog(catalog, catalog_lock)
                     self._bulk_refresh(cur, targets, False, recreate_triggers=not session_bypass)
                     self._commit()
@@ -2771,10 +2766,9 @@ class MaterializedViewManager:
                 ) from body_ended_transaction
 
             try:
-                if self.dialect == Dialect.POSTGRES and session_bypass:
-                    cur.execute("SET LOCAL matview.skip_triggers = 'off';")
-                self._bulk_require_unchanged_catalog(catalog, catalog_lock)
-                self._bulk_refresh(cur, targets, use_shadow_swap, recreate_triggers=not session_bypass)
+                if suspends:
+                    self._bulk_require_unchanged_catalog(catalog, catalog_lock)
+                    self._bulk_refresh(cur, targets, use_shadow_swap, recreate_triggers=not session_bypass)
                 self._commit()
                 if dbapi_transaction_state(self.conn) is not False:
                     raise RuntimeError(
@@ -2915,7 +2909,6 @@ class MaterializedViewManager:
                 schemas,
                 v_spec,
                 dialect=self.dialect,
-                pg_use_transition_tables=self.pg_use_transition_tables,
                 ignore_limitations=effective_ignore,
                 object_prefix=self.object_prefix,
                 strict=effective_strict,
@@ -3254,8 +3247,6 @@ def generate_materialized_view(
     schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
     view_sql_or_spec: str | ViewSpec,
     dialect: Optional[Dialect | str | EngineVersion] = None,
-    pg_use_transition_tables: bool = False,
-    pg_vectorize_transition_tables: bool = True,
     ignore_limitations: bool = False,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
@@ -3324,8 +3315,6 @@ def generate_materialized_view(
         schemas=schemas,
         view_spec=view_spec,
         dialect=eff_dialect,
-        pg_use_transition_tables=pg_use_transition_tables,
-        pg_vectorize_transition_tables=pg_vectorize_transition_tables,
         ignore_limitations=ignore_limitations,
         object_prefix=object_prefix,
         incremental_backfill=incremental_backfill,
@@ -3342,8 +3331,6 @@ def generate_materialized_views(
     schema_sql_or_dict: str | Dict[str, TableSchema] | sqlite3.Connection | Any,
     view_sqls: Sequence[str | ViewSpec] | str | ViewSpec,
     dialect: Optional[Dialect | str | EngineVersion] = None,
-    pg_use_transition_tables: bool = False,
-    pg_vectorize_transition_tables: bool = True,
     ignore_limitations: bool = False,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
@@ -3383,8 +3370,6 @@ def generate_materialized_views(
             schemas=schemas,
             view_spec=vs,
             dialect=eff_dialect,
-            pg_use_transition_tables=pg_use_transition_tables,
-            pg_vectorize_transition_tables=pg_vectorize_transition_tables,
             ignore_limitations=ignore_limitations,
             object_prefix=object_prefix,
             incremental_backfill=incremental_backfill,

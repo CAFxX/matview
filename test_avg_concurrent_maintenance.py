@@ -62,7 +62,7 @@ _VIEW = (
 )
 
 
-def _plan_statements(dialect: Dialect, version: str, amt_type: str, *, tt: bool = False) -> Tuple[str, List[str]]:
+def _plan_statements(dialect: Dialect, version: str, amt_type: str) -> Tuple[str, List[str]]:
     schema = (
         f"CREATE TABLE t (id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, "
         f"amt {amt_type}, amt2 {amt_type});"
@@ -75,7 +75,6 @@ def _plan_statements(dialect: Dialect, version: str, amt_type: str, *, tt: bool 
             dialect=dialect,
             engine_version=version,
             ignore_limitations=True,
-            pg_use_transition_tables=tt,
             incremental_backfill=True,
         )
     stmts = list(plan.trigger_ddls)
@@ -125,17 +124,16 @@ class AvgMaintenanceShapeTests(unittest.TestCase):
 
     def test_exact_avg_is_derived_from_locked_row_without_base_reads(self) -> None:
         for dialect, version, amt_type in self.DERIVABLE:
-            for tt in ((False, True) if dialect == Dialect.POSTGRES else (False,)):
-                with self.subTest(dialect=dialect.value, version=version, type=amt_type, tt=tt):
-                    backing, stmts = _plan_statements(dialect, version, amt_type, tt=tt)
-                    for col in ("a", "a2"):
-                        rhs = _avg_assignments(stmts, col)
-                        self.assertTrue(rhs, f"no maintenance assignment for {col}")
-                        for expr in rhs:
-                            # A subquery here would read the base table through
-                            # a snapshot that predates the backing-row lock.
-                            self.assertNotRegex(expr, r"(?i)\(\s*SELECT\b", expr)
-                            self.assertIn(backing, expr)
+            with self.subTest(dialect=dialect.value, version=version, type=amt_type):
+                backing, stmts = _plan_statements(dialect, version, amt_type)
+                for col in ("a", "a2"):
+                    rhs = _avg_assignments(stmts, col)
+                    self.assertTrue(rhs, f"no maintenance assignment for {col}")
+                    for expr in rhs:
+                        # A subquery here would read the base table through
+                        # a snapshot that predates the backing-row lock.
+                        self.assertNotRegex(expr, r"(?i)\(\s*SELECT\b", expr)
+                        self.assertIn(backing, expr)
 
     def test_inexact_avg_types_keep_native_recompute(self) -> None:
         # Documented exclusion: these keep native recomputation (exact scale /
@@ -462,7 +460,7 @@ SEED = [(1, "G1", 10), (2, "G1", 21), (3, "G1", 33), (4, "G1", -4), (5, "G1", 5)
 
 
 class NativeAvgInterleavingTests(unittest.TestCase):
-    def _fixture(self, engine: Dialect, dsn: str, amt_type: str, tt: bool):
+    def _fixture(self, engine: Dialect, dsn: str, amt_type: str):
         suffix = uuid.uuid4().hex[:10]
         schema = f"mv_avgrace_{suffix}"
         table = f"avgrace_{suffix}"
@@ -478,7 +476,7 @@ class NativeAvgInterleavingTests(unittest.TestCase):
         )
         cur.executemany(f"INSERT INTO {table} (id, grp, amt) VALUES (%s, %s, %s)", SEED)
         conn.commit()
-        manager = MaterializedViewManager(conn, dialect=engine, pg_use_transition_tables=tt)
+        manager = MaterializedViewManager(conn, dialect=engine)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", EngineLimitationWarning)
             plan = manager.register_view(
@@ -502,10 +500,10 @@ class NativeAvgInterleavingTests(unittest.TestCase):
         self.assertEqual(actual, expected, f"{engine.value} {label}: materialized view != native view")
 
     def _run_interleaving(
-        self, engine: Dialect, dsn: str, amt_type: str, tt: bool, isolation: Optional[str],
+        self, engine: Dialect, dsn: str, amt_type: str, isolation: Optional[str],
         name: str, first: Op, second: Op,
     ) -> None:
-        conn, manager, plan, schema, table = self._fixture(engine, dsn, amt_type, tt)
+        conn, manager, plan, schema, table = self._fixture(engine, dsn, amt_type)
         s1 = _connect(engine, dsn)
         s2 = _connect(engine, dsn)
         monitor = _connect(engine, dsn)
@@ -545,7 +543,7 @@ class NativeAvgInterleavingTests(unittest.TestCase):
             self.assertFalse(th.is_alive(), "second session did not finish after the first committed")
             if errors:
                 raise errors[0]
-            self._assert_matches_native_view(engine, conn, plan, table, f"{amt_type} tt={tt} {isolation} {name}")
+            self._assert_matches_native_view(engine, conn, plan, table, f"{amt_type} {isolation} {name}")
         finally:
             for s in (s1, s2, monitor):
                 try:
@@ -555,50 +553,24 @@ class NativeAvgInterleavingTests(unittest.TestCase):
                     pass
             _cleanup(engine, conn, manager, plan, schema, table)
 
-    def _configs(self, engine: Dialect) -> List[Tuple[str, bool, Optional[str]]]:
+    def _configs(self, engine: Dialect) -> List[Tuple[str, Optional[str]]]:
         if engine == Dialect.POSTGRES:
-            # Default READ COMMITTED for row-level and transition-table triggers.
-            return [(t, tt, None) for t in ("BIGINT", "INTEGER", "SMALLINT") for tt in (False, True)]
+            # Default READ COMMITTED. NUMERIC/DOUBLE PRECISION AVG is
+            # recomputed natively, in a statement after the group lock (a
+            # fresh snapshot); it was stale before statement-level maintenance.
+            return [(t, None) for t in ("BIGINT", "INTEGER", "SMALLINT", "NUMERIC(12,3)", "DOUBLE PRECISION")]
         # Default REPEATABLE READ and READ COMMITTED.
-        return [(t, False, iso) for t in ("BIGINT", "DECIMAL(12,3)") for iso in (None, "READ COMMITTED")]
+        return [(t, iso) for t in ("BIGINT", "DECIMAL(12,3)") for iso in (None, "READ COMMITTED")]
 
     def test_native_avg_serialized_with_concurrent_group_writers(self) -> None:
         engines = _native_engines()
         if not engines:
             self.skipTest("POSTGRES_DSN / MYSQL_DSN not set; native engine test only")
         for engine, dsn in engines:
-            for amt_type, tt, iso in self._configs(engine):
+            for amt_type, iso in self._configs(engine):
                 for name, first, second in INTERLEAVINGS:
-                    with self.subTest(engine=engine.value, type=amt_type, tt=tt, isolation=iso, case=name):
-                        self._run_interleaving(engine, dsn, amt_type, tt, iso, name, first, second)
-
-    @unittest.expectedFailure
-    def test_native_postgres_recomputed_avg_known_race(self) -> None:
-        """KNOWN EXCLUSION (not fixed): AVG over PostgreSQL NUMERIC / DOUBLE
-        PRECISION keeps the native per-group recomputation subquery, whose
-        statement snapshot predates the backing-row lock, so the same
-        interleaving still stores a stale AVG. The same applies to every other
-        recomputed aggregate (VAR/STDDEV, MIN/MAX/BIT_AND/BIT_OR after a delete).
-        This must start passing (and lose expectedFailure) when fixed.
-
-        Only the specific stale-result mismatch counts as the expected
-        failure. Any other outcome (fixture error, no lock wait, timeout)
-        returns normally and is therefore reported as an unexpected success,
-        i.e. a failure, instead of being absorbed by expectedFailure."""
-        dsn = os.environ.get("POSTGRES_DSN")
-        if not dsn:
-            self.skipTest("POSTGRES_DSN not set; native-only known-defect probe")
-        name, first, second = INTERLEAVINGS[0]
-        try:
-            self._run_interleaving(Dialect.POSTGRES, dsn, "NUMERIC(12,3)", False, None, name, first, second)
-        except AssertionError as exc:
-            if "materialized view != native view" in str(exc):
-                raise
-            print(f"known-race probe did not reach the expected mismatch: {exc!r}")
-            return
-        except Exception as exc:
-            print(f"known-race probe errored instead of mismatching: {exc!r}")
-            return
+                    with self.subTest(engine=engine.value, type=amt_type, isolation=iso, case=name):
+                        self._run_interleaving(engine, dsn, amt_type, iso, name, first, second)
 
     def test_native_backfill_chunk_serialized_with_concurrent_writer(self) -> None:
         """A backfill chunk folding a group must not store an AVG that misses a
@@ -703,9 +675,8 @@ class NativeAvgExactnessTests(unittest.TestCase):
                 else ["TINYINT", "INT", "BIGINT", "BIGINT UNSIGNED", "DECIMAL(10,0)", "DECIMAL(30,7)", "DECIMAL(65,30)"]
             )
             for amt_type in types:
-                for tt in ((False, True) if engine == Dialect.POSTGRES else (False,)):
-                    with self.subTest(engine=engine.value, type=amt_type, tt=tt):
-                        self._run_exactness(engine, dsn, amt_type, tt)
+                with self.subTest(engine=engine.value, type=amt_type):
+                    self._run_exactness(engine, dsn, amt_type)
 
     @staticmethod
     def _values(amt_type: str) -> List[Any]:
@@ -728,7 +699,7 @@ class NativeAvgExactnessTests(unittest.TestCase):
         return [Decimal("1.000000000000000000000000000005"), Decimal("-0.000000000000000000000000000005"),
                 Decimal("2.5"), Decimal("33333333333333333333333333333.333333333333333333333333333333")]
 
-    def _run_exactness(self, engine: Dialect, dsn: str, amt_type: str, tt: bool) -> None:
+    def _run_exactness(self, engine: Dialect, dsn: str, amt_type: str) -> None:
         suffix = uuid.uuid4().hex[:10]
         schema = f"mv_avgx_{suffix}"
         table = f"avgx_{suffix}"
@@ -745,7 +716,7 @@ class NativeAvgExactnessTests(unittest.TestCase):
                 f"{engine_suffix}"
             )
             conn.commit()
-            manager = MaterializedViewManager(conn, dialect=engine, pg_use_transition_tables=tt)
+            manager = MaterializedViewManager(conn, dialect=engine)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", EngineLimitationWarning)
                 plan = manager.register_view(
@@ -764,7 +735,7 @@ class NativeAvgExactnessTests(unittest.TestCase):
                 cur.execute(f"SELECT grp, COUNT(*), COUNT(amt), AVG(amt) FROM {table} GROUP BY grp ORDER BY grp")
                 expected = [tuple(_exact(v) for v in r) for r in cur.fetchall()]
                 conn.commit()
-                self.assertEqual(actual, expected, f"{engine.value} {amt_type} tt={tt} {label}")
+                self.assertEqual(actual, expected, f"{engine.value} {amt_type} {label}")
 
             # Single-row group, growth one row at a time (insert path, then
             # conflict path), a NULL, removal back to one row, to all-NULL and

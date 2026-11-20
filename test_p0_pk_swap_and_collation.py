@@ -7,8 +7,9 @@ Finding #6: Row-Level Trigger PK Swap / Shift Data Loss Prevention
 - Verifies that the delete predicate in AFTER UPDATE triggers is gated by:
   `AND NOT EXISTS (SELECT 1 FROM <base_t> WHERE <base_pk = OLD.pk> AND (<where_clause>))`
 - Verifies edge cases with and without WHERE filtering, composite primary keys,
-  non-native PK projection views (`uses_native_pk = False`), and PostgreSQL
-  transition-table statement-level trigger ordering.
+  and non-native PK projection views (`uses_native_pk = False`). PostgreSQL
+  maintenance is statement-level (one signed delta per statement); its native
+  PK-permutation tests are in test_pg_statement_maintenance.py.
 
 Finding #7: MySQL/MariaDB __mv_pk Collation Safety & Case-Insensitive Collision Prevention
 - Verifies that MySQL backing tables use `VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`
@@ -45,36 +46,10 @@ from test_matview_sync import (
 class TestFinding6PkSwapAndShift(unittest.TestCase):
     """Exhaustive tests for Finding #6: PK swap, cycle, and shift safety."""
 
-    def test_postgres_row_level_trigger_sql_inspection(self) -> None:
-        """Verify PostgreSQL row-level trigger generates NOT EXISTS gate on OLD.pk."""
-        schema_sql = """
-        CREATE TABLE items (
-            id INT PRIMARY KEY,
-            name VARCHAR(50) NOT NULL,
-            val INT
-        );
-        """
-        view_sql = "CREATE VIEW items_mv AS SELECT id, name, val FROM items;"
-        plan = generate_materialized_view(
-            schema_sql,
-            view_sql,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=False,
-        )
-
-        trig_ddls = "\n\n".join(plan.trigger_ddls)
-        self.assertIn("NOT EXISTS", trig_ddls)
-        self.assertRegex(
-            trig_ddls,
-            r'DELETE FROM __matview_store_items_mv\s+WHERE __matview_store_items_mv\.id = OLD\.id\s+AND NOT EXISTS\s*\(\s*SELECT 1 FROM "?items"? WHERE "?items"?\.id = OLD\.id\)',
-        )
-        self.assertRegex(
-            trig_ddls,
-            r"TG_OP = 'DELETE'\s*\)\s*THEN\s*DELETE FROM __matview_store_items_mv\s+WHERE __matview_store_items_mv\.id = OLD\.id;",
-        )
-
-    def test_postgres_row_level_trigger_with_where_filter_sql_inspection(self) -> None:
-        """Verify PostgreSQL trigger gates NOT EXISTS with the view WHERE clause."""
+    def test_postgres_projection_maintenance_is_statement_level(self) -> None:
+        """PostgreSQL has no row-level maintenance: PK swaps, cycles and shifts
+        are one signed delta per statement (native behaviour is tested in
+        test_pg_statement_maintenance.py::test_primary_key_permutations)."""
         schema_sql = """
         CREATE TABLE items (
             id INT PRIMARY KEY,
@@ -82,77 +57,14 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
         );
         """
         view_sql = "CREATE VIEW active_items_mv AS SELECT id, status FROM items WHERE status = 'active';"
-        plan = generate_materialized_view(
-            schema_sql,
-            view_sql,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=False,
-        )
-
+        plan = generate_materialized_view(schema_sql, view_sql, dialect=Dialect.POSTGRES)
         trig_ddls = "\n\n".join(plan.trigger_ddls)
-        self.assertRegex(
-            trig_ddls,
-            r'NOT EXISTS\s*\(\s*SELECT 1 FROM "?items"? WHERE "?items"?\.id = OLD\.id\s+AND\s*\(("?items"?\.)?"?status"? = \'active\'\)\)',
-        )
-
-    def test_postgres_transition_table_loop_ordering(self) -> None:
-        """Verify fallback loop-based transition table triggers execute NEW loop before cleanup."""
-        schema_sql = """
-        CREATE TABLE items (
-            id INT PRIMARY KEY,
-            category VARCHAR(32) NOT NULL,
-            qty INT NOT NULL
-        );
-        """
-        view_sql = "CREATE VIEW cat_summary_mv AS SELECT category, SUM(qty) AS total_qty FROM items GROUP BY category;"
-        plan = generate_materialized_view(
-            schema_sql,
-            view_sql,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=False,
-        )
-
-        au_ddl = [ddl for ddl in plan.trigger_ddls if "_au()" in ddl][0]
-        pos_old = au_ddl.find("FOR OLD IN SELECT * FROM __mv_old_rows LOOP")
-        pos_new = au_ddl.find("FOR NEW IN SELECT * FROM __mv_new_rows LOOP")
-        pos_clean = au_ddl.find("DELETE FROM __matview_store_cat_summary_mv")
-
-        self.assertNotEqual(pos_old, -1)
-        self.assertNotEqual(pos_new, -1)
-        self.assertNotEqual(pos_clean, -1)
-        self.assertLess(pos_old, pos_new, "OLD loop must precede NEW loop")
-        self.assertLess(pos_new, pos_clean, "NEW loop must precede zero-count cleanup")
-
-    def test_postgres_transition_table_vectorized_ordering(self) -> None:
-        """Verify vectorized statement-level transition table triggers have no loops and run NEW before cleanup."""
-        schema_sql = """
-        CREATE TABLE items (
-            id INT PRIMARY KEY,
-            category VARCHAR(32) NOT NULL,
-            qty INT NOT NULL
-        );
-        """
-        view_sql = "CREATE VIEW cat_summary_mv AS SELECT category, SUM(qty) AS total_qty FROM items GROUP BY category;"
-        plan = generate_materialized_view(
-            schema_sql,
-            view_sql,
-            dialect=Dialect.POSTGRES,
-            pg_use_transition_tables=True,
-            pg_vectorize_transition_tables=True,
-        )
-
-        au_ddl = [ddl for ddl in plan.trigger_ddls if "_au()" in ddl][0]
-        self.assertNotIn("LOOP", au_ddl, "Vectorized trigger function must not contain row loops")
-        pos_old = au_ddl.find("__mv_old_rows")
-        pos_new = au_ddl.find("__mv_new_rows")
-        pos_clean = au_ddl.find("DELETE FROM __matview_store_cat_summary_mv")
-
-        self.assertNotEqual(pos_old, -1, "__mv_old_rows must be referenced in AU")
-        self.assertNotEqual(pos_new, -1, "__mv_new_rows must be referenced in AU")
-        self.assertNotEqual(pos_clean, -1, "zero-count cleanup must be present in AU")
-        self.assertLess(pos_old, pos_new, "OLD delta update must precede NEW delta upsert")
-        self.assertLess(pos_new, pos_clean, "NEW delta upsert must precede zero-count cleanup")
+        self.assertNotIn("FOR EACH ROW", trig_ddls)
+        self.assertNotIn("LOOP", trig_ddls.replace("END LOOP", "").replace("    LOOP\n", ""))
+        au_ddl = [ddl for ddl in plan.trigger_ddls if "_au()" in ddl and "FUNCTION" in ddl][0]
+        # A retracted key is deleted only if the same statement does not
+        # re-insert it (a PK swap keeps both rows).
+        self.assertRegex(au_ddl, r"(?s)DELETE FROM __matview_store_active_items_mv\s+WHERE .* IN \(SELECT .*__mv_old_rows.*\)\s+AND NOT .* IN \(SELECT .*__mv_new_rows")
 
     def test_sqlite_trigger_sql_inspection(self) -> None:
         """Verify SQLite trigger contains NOT EXISTS gate for PK swap protection."""

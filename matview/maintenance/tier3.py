@@ -129,6 +129,10 @@ class Tier3Mixin(MixinHost):
         trigger_ddls: List[str] = []
         trig_names: List[str] = []
         fn_names: List[str] = []
+        is_pg = self.dialect == Dialect.POSTGRES
+        # PostgreSQL: one per-view lock row serializes the full recompute;
+        # the DELETE/INSERT run after it (fresh READ COMMITTED snapshot).
+        pg_refresh = "\n".join([self._pg_view_lock_stmt(), *refresh_stmts]) if is_pg else None
         for ref_table in self.view.referenced_tables:
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
                 view_name=view_name,
@@ -137,7 +141,10 @@ class Tier3Mixin(MixinHost):
                 del_stmts=refresh_stmts,
                 upd_old_stmts=[],
                 upd_new_stmts=refresh_stmts,
-                trunc_stmts=refresh_stmts,
+                trunc_stmts=[self._pg_view_lock_stmt(), *refresh_stmts] if is_pg else refresh_stmts,
+                pg_ai_body=pg_refresh,
+                pg_ad_body=pg_refresh,
+                pg_au_body=pg_refresh,
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)
@@ -149,7 +156,8 @@ class Tier3Mixin(MixinHost):
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=[],
+            auxiliary_table_ddls=[self._pg_view_lock_ddl()] if is_pg else [],
+            auxiliary_table_names=[self._pg_view_lock_table()] if is_pg else [],
             index_ddls=index_ddls,
             initial_populate_sqls=[initial_populate_sql],
             trigger_ddls=trigger_ddls,
