@@ -231,7 +231,13 @@ class Tier1ZSetMixin(MixinHost):
 
         indexed_cols_lower = self._indexed_column_names_lower()
         for it in first_bs.select_items:
-            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.SQLITE:
+                # SQLite compound SELECT columns have no affinity; storing
+                # without affinity (BLOB) preserves exact storage classes across
+                # branches with differing affinities.
+                dt = "BLOB"
+            else:
+                dt = self._infer_expr_storage_type(it)
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
             col_defs_sql.append(f"{self._q(it.alias)} {dt}")
@@ -278,6 +284,7 @@ class Tier1ZSetMixin(MixinHost):
 
         q_uall_pk_cols = [self._q(c) for c in uall_pk_cols]
         q_user_columns = [self._q(c) for c in user_columns]
+        u_parts: List[str] = []
 
         if op_type == "UNION ALL":
             for b_idx, (_, bs) in enumerate(branches):
@@ -298,13 +305,19 @@ class Tier1ZSetMixin(MixinHost):
                         f"SELECT {pk_expr}, {', '.join(sel_exprs)}, 1 FROM {self._q(bs.base_table)}{w_sql};"
                     )
         elif op_type == "UNION":
-            u_parts: List[str] = []
+            u_parts = []
             for _, bs in branches:
                 sel_aliased = ", ".join(
                     f"{it.raw_expr} AS {self._q(col)}" for it, col in zip(bs.select_items, user_columns)
                 )
                 w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
-                u_parts.append(f"    SELECT {sel_aliased} FROM {self._q(bs.base_table)}{w_sql}")
+                b_alias = bs.joins[0].alias if bs.joins else bs.base_table
+                from_tbl = (
+                    f"{self._q(bs.base_table)} AS {self._q(b_alias)}"
+                    if b_alias.lower() != bs.base_table.lower()
+                    else self._q(bs.base_table)
+                )
+                u_parts.append(f"    SELECT {sel_aliased} FROM {from_tbl}{w_sql}")
             pk_u = self._canonical_group_pk_expr(user_columns)
             grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
             initial_populate_sqls.append(
@@ -322,8 +335,14 @@ class Tier1ZSetMixin(MixinHost):
                 b0 = "1" if b_idx == 0 else "0"
                 b1 = "1" if b_idx == 1 else "0"
                 w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
+                b_alias = bs.joins[0].alias if bs.joins else bs.base_table
+                from_tbl = (
+                    f"{self._q(bs.base_table)} AS {self._q(b_alias)}"
+                    if b_alias.lower() != bs.base_table.lower()
+                    else self._q(bs.base_table)
+                )
                 u_parts.append(
-                    f"    SELECT {sel_aliased}, {b0} AS __mv_b0, {b1} AS __mv_b1 FROM {self._q(bs.base_table)}{w_sql}"
+                    f"    SELECT {sel_aliased}, {b0} AS __mv_b0, {b1} AS __mv_b1 FROM {from_tbl}{w_sql}"
                 )
             pk_u = self._canonical_group_pk_expr(user_columns)
             grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
@@ -366,6 +385,7 @@ class Tier1ZSetMixin(MixinHost):
                     self._rewrite_branch_expr(it.raw_expr, ts, b_alias, "OLD")
                     for it in bs.select_items
                 ]
+                pk_old = ""
 
                 if op_type == "UNION ALL":
                     pk_names = [c.name for c in ts.columns.values() if c.primary_key]
@@ -468,11 +488,19 @@ class Tier1ZSetMixin(MixinHost):
                             f"    ON DUPLICATE KEY UPDATE __mv_row_count = {mv_table}.__mv_row_count + 1;"
                         )
                     else:
+                        if self.dialect == Dialect.SQLITE:
+                            rep_sets = ", ".join(
+                                f"{qc} = CASE WHEN {mv_table}.__mv_row_count <= 0 THEN excluded.{qc} ELSE {mv_table}.{qc} END"
+                                for qc in q_user_columns
+                            )
+                            conflict_set = f"{rep_sets}, __mv_row_count = {mv_table}.__mv_row_count + 1"
+                        else:
+                            conflict_set = f"__mv_row_count = {mv_table}.__mv_row_count + 1"
                         plus_s = (
                             f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                             f"    SELECT {pk_new}, {', '.join(new_vals)}, 1\n"
                             f"    WHERE {w_new}\n"
-                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET {conflict_set};"
                         )
                     minus_s = (
                         f"UPDATE {mv_table} SET __mv_row_count = {mv_table}.__mv_row_count - 1\n"
@@ -496,11 +524,23 @@ class Tier1ZSetMixin(MixinHost):
                             f"    ON DUPLICATE KEY UPDATE {cnt_col} = {mv_table}.{cnt_col} + 1;"
                         )
                     else:
+                        if self.dialect == Dialect.SQLITE and b_idx == 0:
+                            # Branch 0 defines the output representative for INTERSECT/EXCEPT.
+                            # Whenever branch 0 transitions from 0 -> 1 rows, adopt excluded values
+                            # so a prior branch-1 row (or departed branch-0 row) never leaves a
+                            # stale storage class.
+                            rep_sets = ", ".join(
+                                f"{qc} = CASE WHEN {mv_table}.__mv_cnt_0 <= 0 THEN excluded.{qc} ELSE {mv_table}.{qc} END"
+                                for qc in q_user_columns
+                            )
+                            conflict_set = f"{rep_sets}, {cnt_col} = {mv_table}.{cnt_col} + 1"
+                        else:
+                            conflict_set = f"{cnt_col} = {mv_table}.{cnt_col} + 1"
                         plus_s = (
                             f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
                             f"    SELECT {pk_new}, {', '.join(new_vals)}, {init_c0}, {init_c1}\n"
                             f"    WHERE {w_new}\n"
-                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET {cnt_col} = {mv_table}.{cnt_col} + 1;"
+                            f"    ON CONFLICT (__mv_pk) DO UPDATE SET {conflict_set};"
                         )
                     minus_s = (
                         f"UPDATE {mv_table} SET {cnt_col} = {mv_table}.{cnt_col} - 1\n"
@@ -511,11 +551,31 @@ class Tier1ZSetMixin(MixinHost):
                         f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {mv_table}.__mv_cnt_0 <= 0 AND {mv_table}.__mv_cnt_1 <= 0;"
                     )
 
+                refresh_stmts: List[str] = []
+                if self.dialect == Dialect.SQLITE and op_type in ("UNION", "INTERSECT", "EXCEPT"):
+                    surv_src = "\n    UNION ALL\n".join(u_parts) if op_type == "UNION" else u_parts[0]
+                    surv_cond = (
+                        f"{mv_table}.__mv_row_count > 0"
+                        if op_type == "UNION"
+                        else f"{mv_table}.__mv_cnt_0 > 0"
+                    )
+                    match_all_cols = " AND ".join(
+                        f"(__mv_u.{self._q(c)}) IS ({mv_table}.{self._q(c)})" for c in user_columns
+                    )
+                    for col, old_v in zip(user_columns, old_vals):
+                        q_col = self._q(col)
+                        refresh_stmts.append(
+                            f"UPDATE {mv_table}\n"
+                            f"    SET {q_col} = COALESCE((SELECT __mv_u.{q_col} FROM (\n{surv_src}\n    ) AS __mv_u WHERE {match_all_cols} LIMIT 1), {mv_table}.{q_col})\n"
+                            f"    WHERE ({w_old}) AND ({mv_table}.__mv_pk = ({pk_old})) AND {surv_cond} "
+                            f"AND typeof({old_v}) IN ('integer', 'real') AND typeof({mv_table}.{q_col}) = typeof({old_v});"
+                        )
+
                 ins_stmts.append(plus_s)
-                del_stmts.extend([minus_s, clean_s])
+                del_stmts.extend([minus_s, clean_s, *refresh_stmts])
                 upd_old_stmts.append(minus_s)
                 upd_new_stmts.append(plus_s)
-                cleanup_stmts.append(clean_s)
+                cleanup_stmts.extend([clean_s, *refresh_stmts])
 
             trunc_stmts = [f"DELETE FROM {mv_table};", *initial_populate_sqls]
 
@@ -718,7 +778,10 @@ class Tier1ZSetMixin(MixinHost):
             list(mv_pk_cols if uses_native_pk else ()) + list(extra_auto_cols)
         )
         for it in self.view.select_items:
-            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.SQLITE and self._lookup_col_def(it.raw_expr) is None:
+                dt = "BLOB"
+            else:
+                dt = self._infer_expr_storage_type(it)
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
             nn = " NOT NULL" if (uses_native_pk and it.alias.lower() in pk_col_set_lower) else ""

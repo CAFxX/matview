@@ -40,6 +40,7 @@ from ..sql_frontend import (
     _parse_single_agg_expr,
     _sanitize_ident,
     _split_top_level,
+    _sqlite_type_affinity,
     _tokenize_sql,
     _unquote_ident,
     _unwrap_outer_parens,
@@ -166,14 +167,17 @@ class Tier1JoinMixin(MixinHost):
             mv_col = self._group_col_alias(g_expr)
             if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
                 seen_hidden_grp.add(mv_col.lower())
-                c_def = self._lookup_col_def(self._qualify_join_expr(g_expr)) or self._lookup_col_def(g_expr)
-                if c_def:
-                    dt = self._normalize_dialect_type(c_def.data_type)
+                if self.dialect == Dialect.SQLITE:
+                    dt = "BLOB"
                 else:
-                    fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
-                    dt = self._infer_expr_storage_type(fake_it)
-                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
-                    dt = "VARCHAR(255)"
+                    c_def = self._lookup_col_def(self._qualify_join_expr(g_expr)) or self._lookup_col_def(g_expr)
+                    if c_def:
+                        dt = self._normalize_dialect_type(c_def.data_type)
+                    else:
+                        fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
+                        dt = self._infer_expr_storage_type(fake_it)
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                        dt = "VARCHAR(255)"
                 nn = " NOT NULL" if not has_nullable_grp else ""
                 col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
 
@@ -214,14 +218,17 @@ class Tier1JoinMixin(MixinHost):
 
         for item in work_items:
             if not item.is_aggregate:
-                c_def = self._lookup_col_def(self._qualify_join_expr(item.raw_expr)) or self._lookup_col_def(item.raw_expr)
-                dt = (
-                    self._normalize_dialect_type(c_def.data_type)
-                    if c_def
-                    else self._infer_expr_storage_type(item)
-                )
-                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
-                    dt = "VARCHAR(255)"
+                if self.dialect == Dialect.SQLITE:
+                    dt = "BLOB"
+                else:
+                    c_def = self._lookup_col_def(self._qualify_join_expr(item.raw_expr)) or self._lookup_col_def(item.raw_expr)
+                    dt = (
+                        self._normalize_dialect_type(c_def.data_type)
+                        if c_def
+                        else self._infer_expr_storage_type(item)
+                    )
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
+                        dt = "VARCHAR(255)"
                 nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
                 col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
             else:
@@ -743,7 +750,56 @@ class Tier1JoinMixin(MixinHost):
                 if grp_exprs
                 else None
             )
-            del_stmts = [minus_stmt] + ([del_zero_stmt] if del_zero_stmt else [])
+            refresh_grp_stmts: List[str] = []
+            if self.dialect == Dialect.SQLITE and grp_exprs:
+                seen_rcols: Set[str] = set()
+                for item in work_items:
+                    if item.is_aggregate:
+                        continue
+                    q_col = self._q(item.alias)
+                    if q_col in seen_rcols:
+                        continue
+                    seen_rcols.add(q_col)
+                    q_sel_e = self._qualify_join_expr(item.raw_expr)
+                    c_def = self._lookup_col_def(q_sel_e) or self._lookup_col_def(item.raw_expr)
+                    if c_def is not None:
+                        aff = _sqlite_type_affinity(c_def.data_type)
+                        if aff in ("TEXT", "REAL"):
+                            continue
+                        if aff in ("INTEGER", "NUMERIC"):
+                            val_guard = (
+                                f"__mv_delta.{q_col} = -9223372036854775808 "
+                                f"AND typeof({mv_table}.{q_col}) = typeof(__mv_delta.{q_col})"
+                            )
+                        else:
+                            val_guard = (
+                                f"typeof(__mv_delta.{q_col}) IN ('integer', 'real') "
+                                f"AND typeof({mv_table}.{q_col}) = typeof(__mv_delta.{q_col})"
+                            )
+                    else:
+                        val_guard = (
+                            f"typeof(__mv_delta.{q_col}) IN ('integer', 'real') "
+                            f"AND typeof({mv_table}.{q_col}) = typeof(__mv_delta.{q_col})"
+                        )
+                    sub_conds: List[str] = []
+                    if qual_where:
+                        sub_conds.append(f"({qual_where})")
+                    for g_raw, g_qual in zip(grp_exprs, qual_grp_exprs):
+                        mc = self._q(self._group_col_alias(g_raw))
+                        sub_conds.append(f"({g_qual}) IS ({mv_table}.{mc})")
+                    sub_w = f" WHERE {' AND '.join(sub_conds)}" if sub_conds else ""
+                    refresh_grp_stmts.append(
+                        f"UPDATE {mv_table}\n"
+                        f"    SET {q_col} = COALESCE((SELECT {q_sel_e} FROM {full_from_sql}{sub_w} LIMIT 1), {mv_table}.{q_col})\n"
+                        f"    WHERE EXISTS (\n"
+                        f"        SELECT 1 FROM (\n"
+                        f"            SELECT {aliased_delta_select}\n"
+                        f"            FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                        f"        ) AS __mv_delta\n"
+                        f"        WHERE {delta_pk_match} AND {val_guard}\n"
+                        f"    );"
+                    )
+            del_stmts = [minus_stmt] + ([del_zero_stmt] if del_zero_stmt else []) + refresh_grp_stmts
             trunc_stmts = [f"DELETE FROM {mv_table};"] + (
                 [initial_populate_sql] if not grp_exprs else []
             )
@@ -782,7 +838,7 @@ class Tier1JoinMixin(MixinHost):
                 del_stmts=del_stmts,
                 upd_old_stmts=[minus_stmt],
                 upd_new_stmts=[plus_stmt],
-                upd_cleanup_old_stmts=[del_zero_stmt] if del_zero_stmt else [],
+                upd_cleanup_old_stmts=([del_zero_stmt] if del_zero_stmt else []) + refresh_grp_stmts,
                 trunc_stmts=trunc_stmts,
                 pg_ai_body=pg_ai_body,
                 pg_ad_body=pg_ad_body,

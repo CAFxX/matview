@@ -63,21 +63,27 @@ class Tier3Mixin(MixinHost):
                     for c_def in t_schema.columns.values():
                         if c_def.name not in user_columns:
                             user_columns.append(c_def.name)
-                            dt = self._normalize_dialect_type(c_def.data_type)
+                            dt = "BLOB" if self.dialect == Dialect.SQLITE else self._normalize_dialect_type(c_def.data_type)
                             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
                                 dt = "VARCHAR(255)"
                             col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
             if not user_columns and self.primary_schema:
                 for c_def in self.primary_schema.columns.values():
                     user_columns.append(c_def.name)
-                    dt = self._normalize_dialect_type(c_def.data_type)
+                    dt = "BLOB" if self.dialect == Dialect.SQLITE else self._normalize_dialect_type(c_def.data_type)
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
                         dt = "VARCHAR(255)"
                     col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
         else:
             for item in self.view.select_items:
                 user_columns.append(item.alias)
-                col_type = self._infer_expr_storage_type(item)
+                if self.dialect == Dialect.SQLITE:
+                    # Tier 3 handles CTEs, compound set operations, ORDER BY,
+                    # and compound aggregate expressions where any declared
+                    # SQLite affinity could coerce runtime storage classes.
+                    col_type = "BLOB"
+                else:
+                    col_type = self._infer_expr_storage_type(item)
                 if self.dialect == Dialect.MYSQL and col_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
                     col_type = "VARCHAR(255)"
                 col_defs_sql.append(f"{self._q(item.alias)} {col_type}")

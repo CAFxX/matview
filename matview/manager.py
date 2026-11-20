@@ -69,7 +69,10 @@ from .sql_frontend import (
 #    holding non-INTEGER values; join/UNION ALL native recompute).
 # 3: SQLite UPDATE triggers also fire when only the storage class of a
 #    referenced column changes (INTEGER 3 -> REAL 3.0 in a BLOB column).
-MATVIEW_GENERATOR_VERSION = "3"
+# 4: SQLite no-affinity (BLOB) storage for MIN/MAX, group keys, DISTINCT aux
+#    values, set-ops, and computed expressions; canonicalized numeric __mv_pk
+#    keys and surviving group-key representative refresh.
+MATVIEW_GENERATOR_VERSION = "4"
 
 # How to repopulate a view whose pk-range backfill is incomplete.
 _REPAIR_GUIDANCE = (

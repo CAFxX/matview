@@ -48,7 +48,9 @@ class TestExprStorageTypeInference(unittest.TestCase):
         self.assertRegex(p_my.backing_table_ddl, r"eff_price DECIMAL\(12,\s*4\)")
 
         p_sq = generate_materialized_view(self.schemas, v_sql, dialect=Dialect.SQLITE)
-        self.assertIn("eff_price NUMERIC", p_sq.backing_table_ddl)
+        # SQLite computed expressions have no affinity in live views; storing
+        # without affinity (BLOB) prevents coercing REAL results to INTEGER/TEXT.
+        self.assertIn("eff_price BLOB", p_sq.backing_table_ddl)
         self.assertNotIn("eff_price BIGINT", p_sq.backing_table_ddl)
 
     def test_case_column_branches_infer_common_type_not_text(self) -> None:
@@ -72,6 +74,10 @@ class TestExprStorageTypeInference(unittest.TestCase):
                 self.assertIn("CHOSEN_INT INTEGER", ddl)
                 self.assertIn("CHOSEN_TAG TEXT", ddl)
                 self.assertIn("CHOSEN_REAL DOUBLE PRECISION", ddl)
+            elif dialect == Dialect.SQLITE:
+                self.assertIn("CHOSEN_INT BLOB", ddl)
+                self.assertIn("CHOSEN_TAG BLOB", ddl)
+                self.assertIn("CHOSEN_REAL BLOB", ddl)
             else:
                 self.assertIn("CHOSEN_INT BIGINT", ddl)
                 self.assertNotIn("CHOSEN_INT VARCHAR", ddl)

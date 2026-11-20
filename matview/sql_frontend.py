@@ -804,8 +804,35 @@ def _is_simple_column_expr(
     return isinstance(node, sqlglot_exp.Column) and not isinstance(node.this, sqlglot_exp.Star)
 
 
-def _extract_sqlite_raw_declared_types(stmt_sql: str) -> Dict[str, str]:
-    """Extract uppercased raw type keywords per column from a CREATE TABLE statement."""
+def _sqlite_type_affinity(declared_type: str) -> str:
+    """SQLite column affinity of a declared type (datatype3.html section 3.1).
+
+    The rules apply in order: "INT" -> INTEGER; "CHAR", "CLOB" or "TEXT" ->
+    TEXT; "BLOB", "ANY" (STRICT table), or no type -> BLOB; "REAL", "FLOA" or
+    "DOUB" -> REAL; otherwise NUMERIC. For example "POINT REAL" has INTEGER
+    affinity ("INT" in "POINT"), and "FLOATING POINT" has INTEGER affinity too.
+    """
+    t = (declared_type or "").upper()
+    if "INT" in t:
+        return "INTEGER"
+    if "CHAR" in t or "CLOB" in t or "TEXT" in t:
+        return "TEXT"
+    if "BLOB" in t or not t.strip() or t.strip() == "ANY":
+        return "BLOB"
+    if "REAL" in t or "FLOA" in t or "DOUB" in t:
+        return "REAL"
+    return "NUMERIC"
+
+
+def _extract_sqlite_raw_types_and_sanitized_ddl(stmt_sql: str) -> Tuple[Dict[str, str], str]:
+    """Extract raw SQLite declared types per column and a sqlglot-parseable DDL.
+
+    SQLite accepts arbitrary multi-word column type names (e.g. ``POINT REAL``,
+    ``FLOATING POINT``, ``UNSIGNED BIG INT``, ``ANY``) that sqlglot's parser
+    rejects. Returns ``(raw_types_by_col_lower, sanitized_ddl)`` where
+    ``sanitized_ddl`` replaces each column's declared type span with ``BLOB``
+    so sqlglot can parse constraints/PKs/FKs while callers restore the raw type.
+    """
     toks = _tokenize_sql(stmt_sql, read="sqlite")
     depth = 0
     lp_idx: Optional[int] = None
@@ -821,12 +848,14 @@ def _extract_sqlite_raw_declared_types(stmt_sql: str) -> Dict[str, str]:
                 rp_idx = idx
                 break
     if lp_idx is None or rp_idx is None or rp_idx <= lp_idx + 1:
-        return {}
+        return {}, stmt_sql
     constraint_starts = {
         "PRIMARY", "NOT", "NULL", "UNIQUE", "CHECK", "DEFAULT",
         "COLLATE", "REFERENCES", "GENERATED", "AS", "CONSTRAINT",
     }
+    table_constraint_starts = {"CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"}
     raw_types: Dict[str, str] = {}
+    type_spans: List[Tuple[int, int]] = []
     items: List[List[Any]] = []
     cur: List[Any] = []
     inner_depth = 0
@@ -846,20 +875,61 @@ def _extract_sqlite_raw_declared_types(stmt_sql: str) -> Dict[str, str]:
     for item_toks in items:
         if not item_toks:
             continue
-        first_up = item_toks[0].text.upper()
-        if first_up in ("CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"):
+        first_tok = item_toks[0]
+        first_up = first_tok.text.upper()
+        if first_tok.token_type != SQLGlotTokenType.IDENTIFIER and first_up in table_constraint_starts:
             continue
-        col_low = _unquote_ident(item_toks[0].text).lower()
-        t_parts: List[str] = []
-        d = 0
-        for tk in item_toks[1:]:
+        col_low = _unquote_ident(first_tok.text).lower()
+        t_toks: List[Any] = []
+        idx_t = 1
+        n_item = len(item_toks)
+        while idx_t < n_item:
+            tk = item_toks[idx_t]
             if tk.token_type == SQLGlotTokenType.L_PAREN:
+                # Include optional type parameter list like DECIMAL(12, 4) or VARCHAR(32)
+                if not t_toks:
+                    break
+                p_depth = 0
+                while idx_t < n_item:
+                    ptk = item_toks[idx_t]
+                    t_toks.append(ptk)
+                    if ptk.token_type == SQLGlotTokenType.L_PAREN:
+                        p_depth += 1
+                    elif ptk.token_type == SQLGlotTokenType.R_PAREN:
+                        p_depth -= 1
+                        if p_depth == 0:
+                            idx_t += 1
+                            break
+                    idx_t += 1
                 break
-            if d == 0 and tk.text.upper().split()[0] in constraint_starts:
+            if tk.token_type != SQLGlotTokenType.IDENTIFIER and tk.text.upper().split()[0] in constraint_starts:
                 break
-            t_parts.append(tk.text.upper())
-        raw_types[col_low] = " ".join(t_parts)
-    return raw_types
+            t_toks.append(tk)
+            idx_t += 1
+        if t_toks:
+            span_start = t_toks[0].start
+            span_end = t_toks[-1].end + 1
+            raw_types[col_low] = re.sub(r"\s+", " ", stmt_sql[span_start:span_end].strip())
+            type_spans.append((span_start, span_end))
+        else:
+            raw_types[col_low] = ""
+
+    if not type_spans:
+        return raw_types, stmt_sql
+    out_parts: List[str] = []
+    cursor = 0
+    for s_start, s_end in sorted(type_spans):
+        if s_start >= cursor:
+            out_parts.append(stmt_sql[cursor:s_start])
+            out_parts.append("BLOB")
+            cursor = s_end
+    out_parts.append(stmt_sql[cursor:])
+    return raw_types, "".join(out_parts)
+
+
+def _extract_sqlite_raw_declared_types(stmt_sql: str) -> Dict[str, str]:
+    """Extract raw SQLite declared types per column from a CREATE TABLE statement."""
+    return _extract_sqlite_raw_types_and_sanitized_ddl(stmt_sql)[0]
 
 
 def parse_table_index_def(
@@ -935,17 +1005,26 @@ def parse_table_schema(
             if not parsed_idx.table_name.startswith(("__matview_", "__mv_")):
                 pending_indexes.setdefault(parsed_idx.table_name.lower(), []).append(parsed_idx)
             continue
+        raw_col_types: Dict[str, str] = {}
+        used_sqlite_type_fallback = False
         try:
             stmt_ast = parse_sql_ast(raw_stmt_s, dialect=eff_dialect)
         except sqlglot.errors.SqlglotError:
-            continue
+            if eff_dialect == Dialect.SQLITE and re.match(
+                r"^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\b", raw_stmt_s, re.IGNORECASE
+            ):
+                raw_col_types, sanitized_sql = _extract_sqlite_raw_types_and_sanitized_ddl(raw_stmt_s)
+                try:
+                    stmt_ast = parse_sql_ast(sanitized_sql, dialect=eff_dialect)
+                    used_sqlite_type_fallback = True
+                except sqlglot.errors.SqlglotError:
+                    continue
+            else:
+                continue
         if not isinstance(stmt_ast, sqlglot_exp.Create) or (stmt_ast.kind or "").upper() != "TABLE":
             continue
-        raw_col_types = (
-            _extract_sqlite_raw_declared_types(raw_stmt_s)
-            if dialect == Dialect.SQLITE
-            else {}
-        )
+        if eff_dialect == Dialect.SQLITE and not raw_col_types:
+            raw_col_types, _ = _extract_sqlite_raw_types_and_sanitized_ddl(raw_stmt_s)
         schema_node = stmt_ast.this
         if not isinstance(schema_node, sqlglot_exp.Schema) or not isinstance(schema_node.this, sqlglot_exp.Table):
             continue
@@ -1044,12 +1123,27 @@ def parse_table_schema(
                 col_name = expr_item.name
                 if not col_name:
                     continue
-                if expr_item.kind is not None:
-                    data_type = expr_item.kind.sql() if sg_d == "sqlite" else expr_item.kind.sql(sg_d)
-                elif dialect == Dialect.SQLITE:
-                    # No declared type: BLOB affinity in SQLite. Declaring the
-                    # derived backing columns TEXT would convert numbers to text.
-                    data_type = "BLOB"
+                if eff_dialect == Dialect.SQLITE:
+                    raw_decl = raw_col_types.get(col_name.lower(), "").strip()
+                    parsed_dt = expr_item.kind.sql() if expr_item.kind is not None else ""
+                    if used_sqlite_type_fallback:
+                        data_type = raw_decl if raw_decl else "BLOB"
+                    elif raw_decl and (
+                        not parsed_dt
+                        or _sqlite_type_affinity(raw_decl) != _sqlite_type_affinity(parsed_dt)
+                    ):
+                        # Preserve the raw SQLite declared type whenever sqlglot's
+                        # canonicalization changes SQLite column affinity (e.g.
+                        # BLOB -> VARBINARY (NUMERIC) or STRING -> TEXT (TEXT)).
+                        data_type = raw_decl
+                    elif parsed_dt:
+                        data_type = parsed_dt
+                    else:
+                        # No declared type: BLOB affinity in SQLite. Declaring the
+                        # derived backing columns TEXT would convert numbers to text.
+                        data_type = "BLOB"
+                elif expr_item.kind is not None:
+                    data_type = expr_item.kind.sql(sg_d)
                 else:
                     data_type = "TEXT"
                 is_pk = any(

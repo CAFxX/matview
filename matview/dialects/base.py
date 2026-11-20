@@ -30,6 +30,7 @@ from ..sql_frontend import (
     _is_word_or_ident_token,
     _sanitize_ident,
     _split_top_level,
+    _sqlite_type_affinity,
     _tokenize_sql,
     _unquote_ident,
     _unwrap_outer_parens,
@@ -41,26 +42,6 @@ from ..sql_frontend import (
     tokenize_sql,
 )
 from .templates import render_procedural_sql
-
-
-def _sqlite_type_affinity(declared_type: str) -> str:
-    """SQLite column affinity of a declared type (datatype3.html section 3.1).
-
-    The rules apply in order: "INT" -> INTEGER; "CHAR", "CLOB" or "TEXT" ->
-    TEXT; "BLOB" or no type -> BLOB; "REAL", "FLOA" or "DOUB" -> REAL;
-    otherwise NUMERIC. For example "POINT REAL" has INTEGER affinity ("INT"
-    in "POINT"), and "FLOATING POINT" has INTEGER affinity too.
-    """
-    t = (declared_type or "").upper()
-    if "INT" in t:
-        return "INTEGER"
-    if "CHAR" in t or "CLOB" in t or "TEXT" in t:
-        return "TEXT"
-    if "BLOB" in t or not t.strip():
-        return "BLOB"
-    if "REAL" in t or "FLOA" in t or "DOUB" in t:
-        return "REAL"
-    return "NUMERIC"
 
 
 class DialectBaseMixin(MixinHost):
@@ -715,6 +696,8 @@ class DialectBaseMixin(MixinHost):
                     )
                     return self._sum_result_storage_type(sum_item)
                 if isinstance(inner, (sqlglot_exp.Min, sqlglot_exp.Max)):
+                    if self.dialect == Dialect.SQLITE:
+                        return "BLOB"
                     c_arg = self._lookup_col_def(inner.this.sql().strip() if isinstance(inner.this, sqlglot_exp.Expr) else None)
                     if c_arg:
                         return self._normalize_dialect_type(c_arg.data_type)
@@ -1056,6 +1039,11 @@ class DialectBaseMixin(MixinHost):
         if item.agg_func == AggFunc.SUM:
             return self._sum_result_storage_type(item)
         if item.agg_func in (AggFunc.MIN, AggFunc.MAX) and item.arg_expr:
+            if self.dialect == Dialect.SQLITE:
+                # SQLite MIN/MAX return the winning value with its exact
+                # runtime storage class; declaring any non-BLOB affinity would
+                # coerce values (e.g. REAL 4000.0 -> INTEGER 4000 or REAL -> TEXT).
+                return "BLOB"
             c_def = self._lookup_col_def(item.arg_expr)
             if c_def:
                 return self._normalize_dialect_type(c_def.data_type)
@@ -1064,7 +1052,28 @@ class DialectBaseMixin(MixinHost):
             )
             if arg_inferred:
                 return arg_inferred
+        if self.dialect == Dialect.SQLITE and item.agg_func is None:
+            # Compound aggregate expressions (e.g. COUNT(*) + 1, COALESCE(MAX(x), 0))
+            # have no affinity in SQLite live views; falling through to REAL would
+            # coerce integer results to REAL.
+            return "BLOB"
         return self._float_type()
+
+    @staticmethod
+    def _sqlite_canonical_pk_term(expr: str) -> str:
+        s = expr.strip()
+        if re.fullmatch(r"'(?:''|[^'])*'", s):
+            return f"quote({s})"
+        # SQLite GROUP BY / DISTINCT equate INTEGER and REAL when numerically
+        # equal (e.g. 1 and 1.0, 0 and -0.0, 2^53 and 2^53.0, -2^63 and -2^63.0),
+        # whereas quote(1) != quote(1.0). Canonicalize exact int64-valued REALs
+        # to INTEGER before quote().
+        e = f"({expr})"
+        return (
+            f"quote(CASE WHEN typeof({e}) = 'real' "
+            f"AND {e} >= -9223372036854775808.0 AND {e} < 9223372036854775808.0 "
+            f"AND CAST({e} AS INTEGER) = {e} THEN CAST({e} AS INTEGER) ELSE {e} END)"
+        )
 
     def _null_safe_eq(self, left_expr: str, right_expr: str, is_nullable: bool = True) -> str:
         if not is_nullable:
@@ -1103,7 +1112,7 @@ class DialectBaseMixin(MixinHost):
 
         cleaned_exprs = [_clean_pk_arg(e) for e in group_exprs]
         if self.dialect == Dialect.SQLITE:
-            return " || '|' || ".join(f"quote({e})" for e in cleaned_exprs)
+            return " || '|' || ".join(self._sqlite_canonical_pk_term(e) for e in cleaned_exprs)
         elif self.dialect == Dialect.POSTGRES:
             pg_parts = [
                 f"CAST({e} AS TEXT)" if e.strip().startswith("'") and e.strip().endswith("'") else e
@@ -1116,7 +1125,7 @@ class DialectBaseMixin(MixinHost):
                 for e in cleaned_exprs
             ]
             return f"CONCAT_WS('|', {', '.join(parts)}) COLLATE utf8mb4_bin"
-        return " || '|' || ".join(f"quote({e})" for e in cleaned_exprs)
+        return " || '|' || ".join(self._sqlite_canonical_pk_term(e) for e in cleaned_exprs)
 
     def _group_by_exprs_for_query(
         self, group_exprs: Sequence[str], include_canonical_pk: bool = True

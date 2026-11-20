@@ -454,23 +454,41 @@ class Tier2Mixin(MixinHost):
             else:
                 mv_c = f"__mv_grp_{idx_g}"
                 target_cols.append(mv_c)
-                c_def = self._lookup_col_def(g_expr)
-                dt = (
-                    self._normalize_dialect_type(c_def.data_type)
-                    if c_def
-                    else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
-                )
-                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
-                    dt = "VARCHAR(255)"
+                if self.dialect == Dialect.SQLITE:
+                    dt = "BLOB"
+                else:
+                    c_def = self._lookup_col_def(g_expr)
+                    dt = (
+                        self._normalize_dialect_type(c_def.data_type)
+                        if c_def
+                        else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
+                    )
+                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
+                        dt = "VARCHAR(255)"
                 hidden_grp_defs.append((mv_c, g_expr, dt))
             group_mv_cols.append((g_expr, mv_c))
 
         auto_grp_col_names = [mc for _, mc in group_mv_cols]
         indexed_cols_lower = self._indexed_column_names_lower(auto_grp_col_names)
+        grp_mv_cols_lower = {mc.lower() for _, mc in group_mv_cols}
 
         col_defs_sql: List[str] = []
         for it in self.view.select_items:
-            dt = self._infer_expr_storage_type(it)
+            if self.dialect == Dialect.SQLITE and (
+                (
+                    not it.is_aggregate
+                    and (
+                        it.alias.lower() in grp_mv_cols_lower
+                        or self.view.has_cte
+                        or self.view.has_compound_set_op
+                        or self._lookup_col_def(it.raw_expr) is None
+                    )
+                )
+                or (it.is_aggregate and it.agg_func is None)
+            ):
+                dt = "BLOB"
+            else:
+                dt = self._infer_expr_storage_type(it)
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
             col_defs_sql.append(f"{self._q(it.alias)} {dt}")
