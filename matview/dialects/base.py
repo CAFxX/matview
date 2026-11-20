@@ -1267,6 +1267,10 @@ class DialectBaseMixin(MixinHost):
         if agg_item is None or agg_item.agg_func is None:
             return None
         result = self._infer_expr_storage_type(agg_item)
+        if agg_item.agg_func in (AggFunc.MIN, AggFunc.MAX) and self.dialect == Dialect.MYSQL and result:
+            string_type = self._mysql_window_minmax_string_type(result)
+            if string_type is not None:
+                return string_type
         if (
             agg_item.agg_func in (AggFunc.MIN, AggFunc.MAX)
             and not (self.raw_view.has_cte or self.raw_view.has_subquery_in_from)
@@ -1443,7 +1447,7 @@ class DialectBaseMixin(MixinHost):
                 return "BLOB"
             c_def = self._lookup_col_def(item.arg_expr)
             if c_def:
-                return self._minmax_result_type(self._normalize_dialect_type(c_def.data_type))
+                return self._minmax_result_type(self._normalize_dialect_type(c_def.data_type), item.arg_expr)
             arg_inferred = self._infer_expr_storage_type(
                 SelectItem(raw_expr=item.arg_expr, alias=item.alias, is_aggregate=False)
             )
@@ -1460,7 +1464,7 @@ class DialectBaseMixin(MixinHost):
                 # MySQL's derived-table rule applies in _minmax_result_type.
                 return "BIGINT"
             if arg_inferred:
-                return self._minmax_result_type(arg_inferred)
+                return self._minmax_result_type(arg_inferred, item.arg_expr)
         if self.dialect == Dialect.SQLITE and item.agg_func is None:
             # Compound aggregate expressions (e.g. COUNT(*) + 1, COALESCE(MAX(x), 0))
             # have no affinity in SQLite live views; falling through to REAL would
@@ -1523,6 +1527,30 @@ class DialectBaseMixin(MixinHost):
             )
         return arg_type
 
+    @staticmethod
+    def _mysql_window_minmax_string_type(arg_type: str) -> Optional[str]:
+        """MySQL window MIN/MAX over CHAR(n), ENUM or SET returns VARCHAR
+        (measured on MySQL 8.4/9.7: type 253 with the argument's character
+        length; ENUM/SET with the longest member), while the grouped
+        aggregate keeps CHAR. Returns None for other types."""
+        u = arg_type.strip()
+        m = re.match(r"(?i)^(?:CHAR|CHARACTER|NCHAR)\s*\(\s*(\d+)\s*\)(.*)$", u)
+        if m:
+            return f"VARCHAR({int(m.group(1))}){m.group(2)}"
+        if re.match(r"(?i)^CHAR(?:ACTER)?\s*$", u):
+            return "VARCHAR(1)"
+        m = re.match(r"(?i)^(ENUM|SET)\s*\((.*)\)\s*$", u, re.S)
+        if m:
+            members = [x.replace("''", "'") for x in re.findall(r"'((?:''|[^'])*)'", m.group(2))]
+            if not members:
+                return None
+            if m.group(1).upper() == "ENUM":
+                width = max(len(x) for x in members)
+            else:
+                width = sum(len(x) for x in members) + len(members) - 1
+            return f"VARCHAR({max(width, 1)})"
+        return None
+
     def _mysql_derived_minmax_type(self, arg_type: str) -> str:
         """MySQL's MIN/MAX of an integer-like column read through a CTE or
         derived table: always sent as BIGINT (LONGLONG) on MySQL 8.4/9.7,
@@ -1539,7 +1567,51 @@ class DialectBaseMixin(MixinHost):
             return "BIGINT UNSIGNED"
         return arg_type
 
-    def _minmax_result_type(self, arg_type: str) -> str:
+    def _reads_recursive_cte(self, arg_expr: Optional[str]) -> bool:
+        """Whether a bare column argument is read from a recursive CTE.
+
+        MySQL 8.4/9.7 keep the column type for MIN/MAX over a recursive CTE's
+        column (TINYINT stays TINYINT), while a non-recursive CTE or derived
+        table sends BIGINT, even under the RECURSIVE keyword (measured
+        natively). The source is the column's qualifier, or the single FROM
+        source of the outer query when unqualified; a CTE is recursive when its
+        body references its own name.
+        """
+        if not arg_expr:
+            return False
+        m = re.fullmatch(r"\s*(?:`?(\w+)`?\.)?`?(\w+)`?\s*", arg_expr)
+        if m is None:
+            return False
+        try:
+            q = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return False
+        with_ = q.args.get("with") or q.args.get("with_")
+        if not isinstance(with_, sqlglot_exp.With) or not with_.args.get("recursive"):
+            return False
+        recursive = {
+            cte.alias_or_name.lower()
+            for cte in with_.expressions
+            if any(t.name.lower() == cte.alias_or_name.lower() for t in cte.this.find_all(sqlglot_exp.Table))
+        }
+        if not recursive:
+            return False
+        sources = {}
+        from_ = q.args.get("from") or q.args.get("from_")
+        tables = [from_.this] if from_ is not None else []
+        tables += [j.this for j in q.args.get("joins") or []]
+        for t in tables:
+            if isinstance(t, sqlglot_exp.Table):
+                sources[(t.alias_or_name or t.name).lower()] = t.name.lower()
+        if m.group(1):
+            src = sources.get(m.group(1).lower())
+        elif len(sources) == 1:
+            src = next(iter(sources.values()))
+        else:
+            return False
+        return src in recursive
+
+    def _minmax_result_type(self, arg_type: str, arg_expr: Optional[str] = None) -> str:
         """MIN/MAX result type for an argument type.
 
         PostgreSQL's MIN/MAX are declared over unmodified base types, so the
@@ -1548,7 +1620,9 @@ class DialectBaseMixin(MixinHost):
         text, char(5) -> bpchar, timestamp(0) -> timestamp. MySQL/MariaDB and
         SQLite keep the argument type.
         """
-        if self.raw_view.has_cte or self.raw_view.has_subquery_in_from:
+        if (self.raw_view.has_cte or self.raw_view.has_subquery_in_from) and not (
+            self.dialect == Dialect.MYSQL and self._reads_recursive_cte(arg_expr)
+        ):
             arg_type = self._mysql_derived_minmax_type(arg_type)
         if self.dialect != Dialect.POSTGRES:
             return arg_type
