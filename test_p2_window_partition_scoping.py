@@ -838,6 +838,14 @@ class TestTier2OuterJoinGroupScoping(unittest.TestCase):
                 dialect=ms.Dialect.MYSQL,
             )
 
+        # 9. MySQL: `||` under PIPES_AS_CONCAT must not be inferred as BOOLEAN/INTEGER
+        plan_my_pipe = _compile(
+            "CREATE VIEW mv_my_pipe AS SELECT o.ok || ':' || COALESCE(p.pg, 'none') AS tag, COUNT(*) AS cnt "
+            "FROM o LEFT JOIN p ON o.pid = p.id GROUP BY o.ok || ':' || COALESCE(p.pg, 'none');",
+            dialect=ms.Dialect.MYSQL,
+        )
+        self.assertIn("tag VARCHAR", plan_my_pipe.backing_table_ddl)
+
     def _run_native_outer_join_matrix(self, dsn: str, dialect: ms.Dialect) -> None:
         eng = sa.create_engine(_engine_url_for_dialect(dsn, dialect))
         is_pg = dialect == ms.Dialect.POSTGRES

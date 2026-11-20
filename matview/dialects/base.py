@@ -893,6 +893,10 @@ class DialectBaseMixin(MixinHost):
                 return "UNKNOWN"
             if kind == "Boolean":
                 return "BOOLEAN"
+            if kind == "Or" and self.dialect == Dialect.MYSQL and "||" in expr:
+                # Under MySQL/MariaDB PIPES_AS_CONCAT, `||` is string concatenation
+                # even though sqlglot parses it as logical Or.
+                return None
             if kind in (
                 "EQ",
                 "NEQ",
