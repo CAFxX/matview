@@ -519,7 +519,12 @@ class DialectEmitMixin(MixinHost):
             # maintenance (bulk stage 2); keep their existing comparison.
             return self._null_safe_eq(old, new, is_nullable=is_nullable)
         if self.dialect == Dialect.MYSQL:
-            return f"(CAST({old} AS BINARY) <=> CAST({new} AS BINARY))"
+            # CAST(... AS BINARY) prints a FLOAT with about 6 significant
+            # digits, so two different FLOAT values (0.8 and 0.8 * 1.0000001)
+            # print alike: also require the values themselves to be equal
+            # (measured natively, MySQL 9.7 / MariaDB 11.8: the UPDATE was
+            # skipped and the view kept the old value).
+            return f"(CAST({old} AS BINARY) <=> CAST({new} AS BINARY) AND {old} <=> {new})"
         # SQLite: IS compares with the column's collation (NOCASE, RTRIM), so
         # force BINARY. 3 IS 3.0 is true, but a column without affinity (BLOB
         # or no declared type) can change INTEGER 3 to REAL 3.0, which changes
