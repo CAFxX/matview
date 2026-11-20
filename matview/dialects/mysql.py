@@ -176,23 +176,26 @@ class MySQLDialectMixin(MixinHost):
         return issues
 
     def _mysql_untyped_minmax_uses(self) -> List[str]:
-        """MySQL MIN/MAX uses whose result type the planner cannot reproduce.
+        """MIN/MAX uses whose server-chosen result type the planner cannot reproduce.
 
-        MySQL types MIN/MAX of an integer-like argument narrower than BIGINT
-        (TINYINT/SMALLINT/MEDIUMINT/INT, UNSIGNED, YEAR, BIT, BOOL) differently
-        by context, and the difference is visible on the wire: as a whole
-        projected item (handled), as a window function over a CTE/derived
-        table, or nested in an expression (COALESCE(MAX(ti), 0) is BIGINT,
-        MAX(ti) OVER () + 1 is INT). Those contexts are refused rather than
-        guessed. MariaDB keeps argument types but loses UNSIGNED through
-        COALESCE/arithmetic over windowed MIN/MAX (out-of-range writes were
-        observed), so the same contexts are refused there. HAVING is not
-        projected and is allowed.
+        Measured natively (each argument type x context, through DML):
+        - MySQL 8.4/9.7: MIN/MAX of TINYINT/SMALLINT/MEDIUMINT (any sign),
+          YEAR, BIT or BOOL is typed by context, visibly on the wire, when it
+          is nested in a projected expression (COALESCE(MAX(ti), 0) is
+          BIGINT, MAX(ti) OVER () + 1 is INT) or is a window function over a
+          CTE/derived table. INT, INT UNSIGNED and BIGINT are exact there.
+        - MariaDB 10.11: grouped and derived-table uses are exact; a window
+          MIN/MAX nested in an expression is not for the narrow types above
+          and INT UNSIGNED (wrong values for UNSIGNED, YEAR, BIT).
+        Those uses are refused. A whole projected MIN/MAX and HAVING (not
+        projected) stay supported; an argument of unknown type is refused in
+        the refused contexts.
         """
         try:
             root = sqlglot.parse_one(self.raw_view.raw_select_sql, read="mysql")
         except sqlglot.errors.SqlglotError:
             return []
+        mariadb = self.subdialect == EngineSubdialect.MARIADB
         derived = self.raw_view.has_cte or self.raw_view.has_subquery_in_from
         top_items = list(root.expressions) if isinstance(root, sqlglot_exp.Select) else []
         having = root.args.get("having") if isinstance(root, sqlglot_exp.Select) else None
@@ -203,15 +206,22 @@ class MySQLDialectMixin(MixinHost):
                 continue
             col = self._lookup_source_col_def(arg.sql(dialect="mysql"))
             arg_type = (col.data_type if col is not None else (self._infer_ast_expr_storage_type(arg.sql(dialect="mysql")) or "")).upper()
+            unsigned = "UNSIGNED" in arg_type
             base = re.sub(r"\s*\(\d+\)", "", arg_type).replace(" UNSIGNED", "").replace(" ZEROFILL", "").strip()
-            narrow_int = base in (
-                "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "YEAR", "BOOL", "BOOLEAN"
-            ) or base.startswith("BIT") or (not base and col is None)
-            if not narrow_int:
+            narrow = base in ("TINYINT", "SMALLINT", "MEDIUMINT", "YEAR", "BOOL", "BOOLEAN") or base.startswith("BIT")
+            unknown = not base
+            if mariadb:
+                affected = narrow or unknown or (base in ("INT", "INTEGER") and unsigned)
+            else:
+                affected = narrow or unknown
+            if not affected:
                 continue
-            target = node.parent if isinstance(node.parent, sqlglot_exp.Window) else node
-            if isinstance(node.parent, sqlglot_exp.Window) and derived:
+            windowed = isinstance(node.parent, sqlglot_exp.Window)
+            target = node.parent if windowed and node.parent is not None else node
+            if windowed and derived and not mariadb:
                 issues.append(target.sql(dialect="mysql"))
+                continue
+            if mariadb and not windowed:
                 continue
             in_having = False
             cur = target.parent
@@ -237,9 +247,8 @@ class MySQLDialectMixin(MixinHost):
 
             raise UnsupportedMaterializedViewError(
                 f"View '{self.logical_view_name}' uses {', '.join(dict.fromkeys(issues))} on "
-                f"{self.subdialect.value}, whose result type the server derives by context (INT or BIGINT "
-                "on the wire, signedness) for integer arguments narrower than BIGINT; project MIN/MAX as "
-                "its own column, or CAST the argument to SIGNED."
+                f"{self.subdialect.value}, whose result type the server derives by context for this "
+                "argument type; project MIN/MAX as its own column, or CAST the argument to SIGNED."
             )
 
     def _enforce_mariadb_statistical_exactness(self, reader_view_ddl: str) -> None:
