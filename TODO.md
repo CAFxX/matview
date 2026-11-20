@@ -83,6 +83,37 @@ The following seven items are the in-database bulk-maintenance roadmap. Decision
   - Build a shared diagnostics framework with the two fixed lead phrases (`exact result required: falling back to strategy <X>`, `relaxed result allowed: using strategy <Y>`), exposed programmatically and in CLI text/JSON. Strategy names come from the shared enum/registry.
   - Add a capability matrix to the README: for each view shape and engine, the strategy used by default and with relaxation. Generate it from the registry.
   - Add a CI gate: every `UnsupportedMaterializedViewError` site has a test proving that no strategy can handle that shape.
+  - New strategies, ranked by value / (cost + risk). Research, measurements and per-engine applicability are in [docs/research-ivm-strategies.md](docs/research-ivm-strategies.md). There is one PR per lane. Each lane registers its strategy (shapes/engines, guarantee, cost class per engine, concurrency) and ships native exact differentials. Each lane adds at most +3 s per engine job to the per-change gate, and its stress/benchmark runs stay opt-in.
+    - [ ] **L1 Unrecognised aggregates fall back to group-scoped recompute.** On PostgreSQL 18, `JSON_AGG`, `JSON_OBJECT_AGG`, `percentile_cont/disc`, `mode()`, `ANY_VALUE` and `regr_*` fail registration with `UndefinedColumn` today (the reader view references base columns). Route any aggregate the frontend does not decompose to T2, or to T3 without GROUP BY. Check the same aggregates on MySQL/MariaDB/SQLite.
+    - [ ] **L2 MIN/MAX/BIT_AND/BIT_OR without O(group) deletes.**
+      - Recommend and use a `(group, arg)` index instead of `(group)`. Measured on an extreme delete: SQLite 2066 → 2.2 µs/row, PG 999 → 40 µs/row. On SQLite, `(group)` alone is slower than no index.
+      - For expression or join arguments, use the multiset aux table (the P2 "Optional Reference-Counted Auxiliary Tables" item, now a registry strategy) and per-bit counters.
+      - Fold `BIT_XOR` on PostgreSQL.
+    - [ ] **L3 Reader-side `ORDER BY` / `LIMIT` residual.**
+      - Any `ORDER BY`, even without `LIMIT`, sends a view to T3 today.
+      - Maintain the inner query with its own tier, and apply `ORDER BY [LIMIT k OFFSET m]` in the reader view over an index on the backing table.
+      - Cost class: writes cost the inner tier; reads cost O(log n + k). The registry needs a per-read cost dimension for this.
+    - [ ] **L4 Outer-join projection delta rules (LEFT/RIGHT, then FULL).**
+      - Null-padding rule: a padded row exists iff the key's match count is 0, and the pad insertion is idempotent so multi-row and statement-level firing is safe.
+      - Measured, T3 → delta per row: SQLite 273 ms → 27 µs, PG 806 → 0.8 ms, MySQL 2.5 s → 6.5 ms, MariaDB 51 s → 1.0 ms.
+      - Extends stage 6 (inner delta joins) and implements the P2 "Tier 1 Algebraic Maintenance for `LEFT OUTER JOIN`" item.
+    - [ ] **L5 Window suffix maintenance.**
+      - For backward-looking frames (ROW_NUMBER/RANK/DENSE_RANK/LAG, running `UNBOUNDED PRECEDING` and `ROWS n PRECEDING`), recompute only the rows from the changed position onwards.
+      - For running SUM/COUNT over integers/decimals and for ROW_NUMBER/RANK, apply invertible suffix deltas.
+      - Measured: appends are 190x–1900x faster on all four engines. At random positions the in-place deltas win on SQLite, MariaDB and PG but lose on MySQL (0.5x), so the planner chooses between delta and suffix/partition recompute by cost model.
+      - NTILE/PERCENT_RANK/CUME_DIST/LEAD and FOLLOWING frames keep the partition recompute.
+    - [ ] **L6 O(1) COUNT(DISTINCT) on PostgreSQL.**
+      - Apply refcount 0↔1 transitions from aggregated transition-table deltas instead of recounting the aux table. Measured: 500 → 46 µs/row with 5k distinct values per group.
+      - Then add refcounted DISTINCT aggregates over joins (T2 today).
+    - [ ] **L7 Semi-/anti-join counters.** For `EXISTS`/`IN`/`NOT EXISTS`/`NOT IN` (with a NULL counter for `NOT IN`), keep a per-key match count, so that a change to the subquery table no longer refreshes the whole view.
+    - [ ] **L8 `INTERSECT ALL` / `EXCEPT ALL` and mixed set operators** via the existing per-branch counters (`min(c0, c1)`, `max(c0 − c1, 0)` expanded in the reader). T3 today.
+    - [ ] **L9 `GROUPING SETS` / `ROLLUP` / `CUBE`** as a `UNION ALL` of GROUP BY branches plus a grouping id: PostgreSQL, and MySQL/MariaDB `WITH ROLLUP`. These fail with `ValueError` today.
+    - [ ] **L10 Relaxed class `float_sum_correctly_rounded`** (needs the registry and the `exact|relaxed` knob).
+      - Maintain an exact accumulator for float SUM/AVG and round once on read: `numeric` on PostgreSQL, 32-bit limbs on MySQL/MariaDB/SQLite, plus Inf/NaN counters.
+      - Measured on PG: O(1) and equal to `math.fsum`, whereas the live `SUM(float8)` differed from the correctly rounded sum in 4/5 adversarial groups. That is why this class is opt-in only.
+    - [ ] **L11 (low) Top-k threshold table** for `ORDER BY … LIMIT k` when the inner query cannot be stored (L3 covers the rest). Measured at k = 50 against an index-backed recompute: engine-dependent (PG 33x, MySQL 2.7x, SQLite even, MariaDB 0.4x).
+    - [ ] **L12 (low) `percentile_disc`/median cursor on PostgreSQL**: one O(log n) index step per change, along a `(v, pk)` order.
+    - [ ] **L13 (research) Recursive CTEs** via semi-naive insertion and DRed / backward-forward deletion. They stay T3 until a design proves bounded cost.
 
 - [ ] **Bulk maintenance stage 1: Native Bulk-Statement Differential and Benchmark Harness**:
   - Add a native suite that runs every multi-row statement kind on every engine/version and compares the reader with the live view after each statement. Statement kinds:
