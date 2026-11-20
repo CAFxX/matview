@@ -723,22 +723,49 @@ class NativeStatisticWrapperTests(unittest.TestCase):
                 with self.subTest(type=col_type):
                     self._run(engine, dsn, col_type)
 
+    # Views registered on one table at a time. MySQL keeps every parsed
+    # trigger of a table in memory and the per-table cost grows faster than
+    # linearly: all 112 wrapper views on one table took a MySQL 8.4 server
+    # from 1.4 GiB to over 6 GiB (CI runners have 7 GiB). Chunks keep the
+    # same views and DML steps on a fresh table each.
+    CHUNK = 16
+
     def _run(self, engine: Dialect, dsn: str, col_type: str) -> None:
         conn = _connect(engine, dsn)
         cur = conn.cursor()
         cur.execute("SELECT VERSION()")
         is_mariadb = "mariadb" in str(cur.fetchone()[0]).lower()
         conn.commit()
+        views = _wrapper_views("{t}")
+        all_pairs: List[str] = []
+        refused: List[str] = []
+        try:
+            for start in range(0, len(views), self.CHUNK):
+                pairs, chunk_refused = self._run_chunk(engine, conn, col_type, views[start:start + self.CHUNK])
+                all_pairs += pairs
+                refused += chunk_refused
+        finally:
+            conn.close()
+        if not is_mariadb or "DOUBLE" in col_type:
+            self.assertEqual(refused, [], "nothing may be refused here")
+        else:
+            # Only the plain top-level duplicates are reproducible; every
+            # HAVING use is refused.
+            self.assertEqual(sorted(all_pairs), sorted(f"{fn.lower()}_dup" for fn in _STAT_NAMES))
+
+    def _run_chunk(self, engine: Dialect, conn: Any, col_type: str, views: List[Tuple[str, str, bool]]) -> Tuple[List[str], List[str]]:
+        cur = conn.cursor()
         tag = uuid.uuid4().hex[:8]
         t = f"w_{tag}"
+        pairs, refused = [], []
         try:
             cur.execute(f"CREATE TABLE {t} (id INT PRIMARY KEY, g INT NOT NULL, x {col_type}) ENGINE=InnoDB")
             seed = _INT_SEED if "INT" in col_type else _SEED
             cur.executemany(f"INSERT INTO {t} (id, g, x) VALUES (%s, %s, %s)", seed)
             conn.commit()
             manager = MaterializedViewManager(conn, dialect=engine)
-            pairs, refused = [], []
-            for name, select, plain_dup in _wrapper_views(t):
+            for name, select_t, _plain_dup in views:
+                select = select_t.replace("{t}", t)
                 mv, live = f"mv_{name}_{tag}", f"lv_{name}_{tag}"
                 try:
                     with warnings.catch_warnings():
@@ -752,12 +779,6 @@ class NativeStatisticWrapperTests(unittest.TestCase):
                 cur.execute(f"CREATE VIEW {live} AS {select}")
                 conn.commit()
                 pairs.append((name, mv, live))
-            if not is_mariadb or "DOUBLE" in col_type:
-                self.assertEqual(refused, [], "nothing may be refused here")
-            else:
-                # Only the plain top-level duplicates are reproducible; every
-                # HAVING use is refused.
-                self.assertEqual(sorted(n for n, _, _ in pairs), sorted(f"{fn.lower()}_dup" for fn in _STAT_NAMES))
             checker = NativeStatisticalAggregateTests()
             for step, stmt in [("initial", None)] + list(_DML):
                 if stmt:
@@ -774,7 +795,7 @@ class NativeStatisticWrapperTests(unittest.TestCase):
             for name, kind in sorted(cur.fetchall(), key=lambda o: o[1] != "VIEW"):
                 cur.execute(f"DROP {'VIEW' if kind == 'VIEW' else 'TABLE'} IF EXISTS `{name}`")
             conn.commit()
-            conn.close()
+        return [n for n, _, _ in pairs], refused
 
 
 if __name__ == "__main__":

@@ -493,6 +493,7 @@ The existing differential-testing harness is useful, but its current headline co
   - MySQL/MariaDB `CAST(.. AS UNSIGNED)` columns of a CTE or derived table are stored as VARCHAR (values come back as strings) (pre-existing; same on master).
   - MariaDB `MAX(COALESCE(smallint_unsigned, 0))` reads back int where the view returns Decimal (pre-existing; same on master).
   - MySQL/MariaDB grouped `MIN`/`MAX` over ENUM/SET columns failed to register (DDL syntax error: ENUM without members); introspection now keeps the members, native grouped coverage is still missing.
+  - MySQL 8.4 server memory grows sharply with the number of maintained views on one table: 112 views on one table took a fresh server from 0.44 GiB to 7.1 GiB once DML fired their triggers (CI runners have 7 GiB; the CI MySQL 8.4 job lost its server with error 2013). The native wrapper test now registers 16 views per table (peak 0.6 GiB). Measure the per-table trigger cost on MySQL/MariaDB, document a supported views-per-table budget, and consider sharing one trigger per table/event across views.
   - `ABS(int)` is stored as DOUBLE on PostgreSQL and MariaDB: a group key `ABS(s)` reads back `1.0` where the view returns `1` (pre-existing; same on master).
   - MariaDB `smallint_unsigned + 1` is stored as BIGINT where the view returns INT (pre-existing; same on master).
   - MariaDB `CASE` over TINYINT/SMALLINT branches is stored as INT where the view returns SMALLINT (pre-existing; same on master).
