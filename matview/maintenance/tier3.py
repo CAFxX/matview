@@ -156,7 +156,7 @@ class Tier3Mixin(MixinHost):
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=[self._pg_view_lock_ddl()] if is_pg else [],
+            auxiliary_table_ddls=self._pg_view_lock_ddls() if is_pg else [],
             auxiliary_table_names=[self._pg_view_lock_table()] if is_pg else [],
             index_ddls=index_ddls,
             initial_populate_sqls=[initial_populate_sql],

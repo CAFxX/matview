@@ -160,6 +160,12 @@ def test_recompute_strategies_serialize_concurrent_writers(make_env, view: ViewD
     recompute from a snapshot that includes A (no duplicated or stale group)."""
     env = make_env(views=[view], seed=True)
     assert _strategy(env, view.name) in ("group_scoped_delta", "atomic_query_sync"), _strategy(env, view.name)
+    # Commit one write to the same groups first, so the lock rows already
+    # exist: a lock statement that does not lock an existing row (for example
+    # ON CONFLICT DO NOTHING) must make this test fail, not wait on an
+    # uncommitted unique-index entry instead.
+    env.execute("INSERT INTO t (id, g, v) VALUES (4999, 1, 0), (4998, 77, 0)")
+    env.commit()
     a, b, monitor = env.connect(), env.connect(), env.connect()
     sid_a, sid_b = _session_id(env, a), _session_id(env, b)
     a.cursor().execute("INSERT INTO t (id, g, v) VALUES (5001, 1, 1), (5002, 77, 2)")
@@ -270,6 +276,69 @@ def test_partition_attached_after_registration_is_reported_and_repaired(make_env
     env.check("direct writes to the repaired partition")
 
 
+def test_partition_detached_after_registration_is_reported_and_repaired(make_env) -> None:
+    """DETACH keeps the partition's rows in the view and leaves the
+    maintenance triggers on the detached table (they belong to the view's
+    functions): the drift check reports "triggers_orphaned", repair rebuilds
+    (drops them, re-installs on the current tree, repopulates), and writes to
+    the detached table no longer change the view."""
+    env = _subpartition_env(make_env)
+    env.execute("ALTER TABLE t DETACH PARTITION t_hi")
+    env.commit()
+    drift = env.manager.check_schema_drift()
+    env.commit()
+    assert {drift[vd.name] for vd in PART_VIEWS} == {"triggers_orphaned"}, str(drift)
+    with pytest.raises(ViewMismatch):
+        env.check("detached rows are still in the view (documented: report + repair)")
+    results = env.manager.repair_view()
+    env.commit()
+    assert {results[vd.name] for vd in PART_VIEWS} == {"rebuilt"}, results
+    assert set(env.manager.check_schema_drift().values()) == {"ok"}
+    env.commit()
+    env.check("after repair")
+    cur = env.conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM pg_trigger WHERE tgrelid = 't_hi'::regclass AND NOT tgisinternal")
+    assert cur.fetchone()[0] == 0
+    env.execute("INSERT INTO t_hi (id, g, v, w) VALUES (900, 5, 7, 1)")
+    env.execute("UPDATE t_hi SET v = v + 100")
+    env.execute("DELETE FROM t_hi WHERE id % 2 = 0")
+    env.commit()
+    env.check("writes to the detached table do not change the view")
+    env.execute("INSERT INTO t (id, g, v, w) VALUES (901, 1, 7, 1)")
+    env.commit()
+    env.check("writes to the remaining tree are maintained")
+
+
+def test_partition_created_or_dropped_after_registration(make_env) -> None:
+    """CREATE TABLE ... PARTITION OF behaves like ATTACH (reported missing,
+    repaired). DROP of a partition fires no trigger (DDL): the view keeps the
+    dropped rows until repair_view(), and no catalog or trigger residue is left."""
+    env = _subpartition_env(make_env)
+    env.execute("CREATE TABLE t_late PARTITION OF t FOR VALUES FROM (10) TO (20)")
+    env.commit()
+    drift = env.manager.check_schema_drift()
+    env.commit()
+    assert {drift[vd.name] for vd in PART_VIEWS} == {"triggers_missing"}, str(drift)
+    env.manager.repair_view()
+    env.commit()
+    env.execute("INSERT INTO t_late (id, g, v, w) VALUES (950, 12, 3, 1)")
+    env.commit()
+    env.check("direct write to the repaired new partition")
+    env.execute("DROP TABLE t_hi")
+    env.commit()
+    assert set(env.manager.check_schema_drift().values()) == {"ok"}
+    env.commit()
+    with pytest.raises(ViewMismatch):
+        env.check("rows of a dropped partition (documented: DROP is DDL, repair_view() fixes it)")
+    env.manager.repair_view()
+    env.commit()
+    env.check("after repair of a dropped partition")
+    cur = env.conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE '%%t_hi%%'")
+    assert cur.fetchone()[0] == 0
+    env.commit()
+
+
 @pytest.mark.parametrize("shape", ["view_over_partition", "inherits_parent", "inherits_child"])
 def test_sources_hidden_from_statement_triggers_are_refused(make_env, shape: str) -> None:
     schema = {
@@ -344,10 +413,12 @@ def test_single_row_cost_does_not_grow_with_view_size(make_env) -> None:
     MIN/MAX recompute through ``IS NOT DISTINCT FROM`` (nullable group key)
     scans the whole source table. Both views keep two rows per group at
     both sizes, so every UPDATE/DELETE below retracts a group extreme and
-    recomputes it. Measured server-side (DO loop, no client round trips); the
-    bound is a ratio between the sizes, so it does not depend on the
-    machine's speed."""
-    env = make_env(views=[VIEW_BY_NAME["v_agg"], VIEW_BY_NAME["v_mm"]], seed=False)
+    recomputes it. The group-scoped views (window RANK-like ROW_NUMBER,
+    STRING_AGG) recompute only the touched groups through index-usable key
+    predicates (a NULL-safe EXISTS would scan the table). Measured server-side
+    (DO loop, no client round trips); the bound is a ratio between the sizes,
+    so it does not depend on the machine's speed."""
+    env = make_env(views=[VIEW_BY_NAME["v_agg"], VIEW_BY_NAME["v_mm"], V_WIN, V_STRAGG], seed=False)
     costs = {}
     for groups in (1000, 50000):
         env.execute("DELETE FROM t")
@@ -414,3 +485,238 @@ def test_primary_key_permutations(make_env, name: str, sql: str) -> None:
     env.execute("DELETE FROM t WHERE id % 2 = 0")
     env.commit()
     env.check(f"{name} then delete of half the rows")
+
+
+# ---------------------------------------------------------------------------
+# Group-scoped views: per-group locks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("view", [V_WIN, V_STRAGG], ids=lambda v: v.name)
+def test_group_scoped_writers_of_disjoint_groups_neither_block_nor_deadlock(make_env, view: ViewDef) -> None:
+    """A updates a row of one group and keeps its transaction open; B updates
+    a row of another group: B must not wait for A (no whole-view lock).
+    Then A updates B's row: A waits for B's row lock only, B commits, A
+    commits; no deadlock, views exact."""
+    env = make_env(views=[view], seed=True)
+    a, b, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_b = _session_id(env, a), _session_id(env, b)
+    a.cursor().execute("UPDATE t SET v = v + 1 WHERE id = 10")  # g = 4
+    cur_b = b.cursor()
+    cur_b.execute("SET LOCAL lock_timeout = '10s'")
+    cur_b.execute("UPDATE t SET v = v + 1 WHERE id = 20")  # g = 2: completes while A is open
+    worker = _Worker(a, ["UPDATE t SET v = v + 2 WHERE id = 20"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_a, sid_b), worker.done, "A waits for B's source row")
+    finally:
+        b.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check("disjoint group writers")
+
+
+def test_group_scoped_same_group_writers_wait_and_stay_exact(make_env) -> None:
+    env = make_env(views=[V_WIN, V_STRAGG], seed=True)
+    a, b, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_b = _session_id(env, a), _session_id(env, b)
+    a.cursor().execute("UPDATE t SET v = v + 1 WHERE id = 10")  # g = 4
+    worker = _Worker(b, ["UPDATE t SET v = -v WHERE id = 16"]).start()  # g = 4
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "B waits for A's group lock")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check("same group writers")
+
+
+# ---------------------------------------------------------------------------
+# Aggregate recompute conditions and storage
+# ---------------------------------------------------------------------------
+
+# BIGINT argument: BIT_AND/BIT_OR(INT) results are stored as BIGINT (TODO.md,
+# pre-existing result-type divergence), which this test does not cover.
+V_BITS = ViewDef("v_bits", "SELECT g, BIT_AND(v) AS ba, BIT_OR(v) AS bo, COUNT(*) AS c FROM t GROUP BY g")
+
+
+def test_bit_and_bit_or_after_retracting_a_contributor(make_env) -> None:
+    """BIT_OR/BIT_AND are recomputed after a retraction of a non-NULL value:
+    deleting (or updating away) the only row that sets or clears a bit must
+    change the result."""
+    env = make_env(views=[V_BITS], seed=False)
+    env.execute("INSERT INTO t (id, g, v) VALUES (1, 1, 1), (2, 1, 3), (3, 1, 4), (4, 2, 7), (5, 2, 5), (6, 3, 6)")
+    env.commit()
+    for label, sql in [
+        ("delete the only row with bit 4", "DELETE FROM t WHERE id = 3"),
+        ("update away the only row without bit 2", "UPDATE t SET v = 7 WHERE id = 5"),
+        ("update one value to NULL", "UPDATE t SET v = NULL WHERE id = 4"),
+        ("delete the last non-NULL value", "DELETE FROM t WHERE id = 6"),
+    ]:
+        env.execute(sql)
+        env.commit()
+        env.check(label)
+
+
+COUNTED_VIEWS = [
+    ViewDef("v_un", "SELECT g FROM t WHERE w > 1 UNION SELECT g FROM t WHERE v > 0"),
+    ViewDef("v_in", "SELECT g FROM t WHERE w > 1 INTERSECT SELECT g FROM t WHERE v > 0"),
+    ViewDef("v_ex2", "SELECT g FROM t WHERE w > 1 EXCEPT SELECT g FROM t WHERE v > 50"),
+    VIEW_BY_NAME["v_ds"], VIEW_BY_NAME["v_agg"], VIEW_BY_NAME["v_j"],
+]
+
+
+def test_no_empty_rows_remain_in_backing_tables(make_env) -> None:
+    """Retractions delete rows whose counts reach zero: no backing row with
+    all counts <= 0 may remain (they are invisible to readers but leak
+    storage and slow every lookup)."""
+    env = make_env(views=COUNTED_VIEWS, seed=True)
+    for sql in ("UPDATE t SET g = (COALESCE(g, 0) + 1) % 4", "DELETE FROM t WHERE id % 3 = 0",
+                "UPDATE t SET w = 0, v = -1 WHERE id % 2 = 0", "DELETE FROM t WHERE g = 1"):
+        env.execute(sql)
+        env.commit()
+        env.check(sql)
+    cur = env.conn.cursor()
+    for vd in COUNTED_VIEWS:
+        store = env.plans[vd.name].backing_table_name
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s "
+                    "AND (column_name LIKE '__mv_cnt_%%' OR column_name IN ('__mv_row_count', 'c'))", (store,))
+        cols = [r[0] for r in cur.fetchall()]
+        assert cols, (vd.name, store)
+        cur.execute(f"SELECT COUNT(*) FROM {store} WHERE " + " AND ".join(f"{c} <= 0" for c in cols))
+        assert cur.fetchone()[0] == 0, (vd.name, cols)
+    env.commit()
+
+
+# ---------------------------------------------------------------------------
+# search_path of the writer
+# ---------------------------------------------------------------------------
+
+
+def test_writer_search_path_does_not_redirect_maintenance(make_env) -> None:
+    """The trigger functions run with the search_path of their creation
+    (SET search_path FROM CURRENT): a writer whose search_path puts another
+    schema with a table `t` first must not make the recomputes read it."""
+    env = make_env(views=[VIEW_BY_NAME["v_mm"], V_WIN, VIEW_BY_NAME["v_pj"]], seed=True)
+    evil = env.ns + "_evil"
+    cur = env.conn.cursor()
+    cur.execute(f'CREATE SCHEMA "{evil}"')
+    cur.execute(f'CREATE TABLE "{evil}".t (id INT PRIMARY KEY, g INT, v BIGINT, w INT, m NUMERIC(12,3))')
+    cur.execute(f'CREATE TABLE "{evil}".d (g INT PRIMARY KEY, name VARCHAR(20) NOT NULL)')
+    cur.execute(f'INSERT INTO "{evil}".t SELECT i, i % 6, -1000 - i, 1, 0 FROM generate_series(1, 60) i')
+    env.commit()
+    try:
+        w = env.connect()
+        wc = w.cursor()
+        wc.execute(f'SET search_path TO "{evil}", "{env.ns}"')
+        wc.execute(f'DELETE FROM "{env.ns}".t WHERE id IN (SELECT id FROM "{env.ns}".t WHERE v IS NOT NULL ORDER BY v LIMIT 5)')
+        wc.execute(f'UPDATE "{env.ns}".t SET v = v + 1 WHERE g = 2')
+        wc.execute(f'INSERT INTO "{env.ns}".t (id, g, v) VALUES (700, 3, 1)')
+        w.commit()
+        env.check("writer with a hostile search_path")
+    finally:
+        cur.execute(f'DROP SCHEMA "{evil}" CASCADE')
+        env.commit()
+
+
+# ---------------------------------------------------------------------------
+# Known limitation: writers of different sources of an algebraic join view
+# ---------------------------------------------------------------------------
+
+_JOIN_RACE = (
+    "Two READ COMMITTED transactions writing DIFFERENT sources of an algebraic join view each "
+    "join their delta with the other table's committed state and miss each other's change. "
+    "TODO.md 'Serialize Concurrent Writers of Different Sources of a PostgreSQL Join View'"
+)
+
+
+@pytest.mark.xfail(strict=True, raises=ViewMismatch, reason=_JOIN_RACE)
+def test_join_view_writers_of_different_sources_read_committed(make_env) -> None:
+    env = make_env(views=[VIEW_BY_NAME["v_j"]], seed=True)
+    a, b, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_b = _session_id(env, a), _session_id(env, b)
+    a.cursor().execute("INSERT INTO t (id, g, v) VALUES (3000, 1, 5)")
+    worker = _Worker(b, ["UPDATE d SET name = 'n2' WHERE g = 1"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "B waits for A's group lock")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check("concurrent writers of t and d")
+
+
+def test_join_view_writers_of_different_sources_repeatable_read_fail_closed(make_env) -> None:
+    env = make_env(views=[VIEW_BY_NAME["v_j"]], seed=True)
+    a, b = env.connect(), env.connect()
+    cb = b.cursor()
+    cb.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    cb.execute("SELECT COUNT(*) FROM t")
+    cb.fetchall()
+    a.cursor().execute("INSERT INTO t (id, g, v) VALUES (3000, 1, 5)")
+    a.commit()
+    with pytest.raises(Exception) as excinfo:
+        cb.execute("UPDATE d SET name = 'n2' WHERE g = 1")
+        b.commit()
+    b.rollback()
+    assert _pgcode(excinfo.value) == SERIALIZATION_FAILURE, repr(excinfo.value)
+    env.check("REPEATABLE READ writer of the other source")
+
+
+def test_whole_view_recompute_excludes_group_writers(make_env) -> None:
+    """A group-scoped view whose WHERE reads another table: writes to t
+    recompute their groups (holding the view lock row in SHARE mode), writes
+    to u recompute the whole view (holding it exclusively). The whole-view
+    writer must wait for the group writer and then see it."""
+    schema = list(PG_SCHEMA) + ["CREATE TABLE u (g INT PRIMARY KEY)"]
+    view = ViewDef("v_sub", "SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids FROM t "
+                            "WHERE g IN (SELECT g FROM u) GROUP BY g")
+    env = make_env(views=[], schema_sql=schema, seed=True)
+    env.execute("INSERT INTO u (g) VALUES (1), (2), (3)")
+    env.commit()
+    env.views = [view]
+    env.register(view)
+    assert _strategy(env, "v_sub") == "group_scoped_delta"
+    a, b, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_b = _session_id(env, a), _session_id(env, b)
+    a.cursor().execute("INSERT INTO t (id, g, v) VALUES (6001, 1, 1)")
+    worker = _Worker(b, ["INSERT INTO u (g) VALUES (4)"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "B waits for A's view lock")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check("whole-view recompute after a group writer")
+
+
+
+def test_group_scoped_single_row_cost_close_to_no_view(make_env) -> None:
+    """Group-scoped single-row maintenance against a no-view baseline on the
+    same table (100k rows, 10k groups, index on the group key): a table scan
+    per statement costs milliseconds, the per-group recompute tens to
+    hundreds of microseconds."""
+    env = make_env(views=[], seed=False)
+    env.execute("INSERT INTO t (id, g, v, w) SELECT i, i % 10000, i, i % 5 FROM generate_series(1, 100000) i")
+    env.commit()
+    env.execute("ANALYZE t")
+    env.commit()
+    stmts = ("INSERT INTO t (id, g, v) VALUES (1000000 + %1$s, mod(%1$s, 10000), 1)",
+             "UPDATE t SET v = v + 1 WHERE id = %1$s", "DELETE FROM t WHERE id = %1$s")
+    base = [_per_statement_us(env, sql, 500) for sql in stmts]
+    results = {}
+    for view in (V_WIN, V_STRAGG, ViewDef("v_rank", "SELECT id, g, RANK() OVER (PARTITION BY g ORDER BY v) AS r FROM t")):
+        env.views = [view]
+        env.register(view)
+        env.execute("ANALYZE")
+        env.commit()
+        results[view.name] = [_per_statement_us(env, sql, 500) for sql in stmts]
+        env.manager.drop_view(view.name)
+        env.commit()
+    print(f"group-scoped single-row us/stmt (ins, upd, del): none={base} {results}")
+    for name, costs in results.items():
+        for b, c in zip(base, costs):
+            assert c < 20 * b + 1000, (name, base, costs)

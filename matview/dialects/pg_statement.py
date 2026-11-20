@@ -18,8 +18,9 @@ The rules every body follows:
    rows) are upserted with one ``INSERT ... SELECT ... GROUP BY key ORDER BY
    key ON CONFLICT`` statement, so every writer locks them in the same key
    order. Rows keyed by a source primary key are already serialized by the
-   source rows' own locks. Strategies that recompute from the sources take a
-   per-view lock row first.
+   source rows' own locks. Group-scoped recomputes lock one lock-table row
+   per affected group key hash, in hash order (and the whole-view row in
+   SHARE mode); full recomputes lock the whole-view row exclusively.
 3. Lock, then recompute in a later statement. Native recomputations (MIN/MAX
    after a retraction of the extreme, BIT_AND/BIT_OR after a retraction,
    approximate or scale-dependent AVG, statistics, group-scoped and full
@@ -34,6 +35,9 @@ The rules every body follows:
    (direct partition writes fire only the partition's statement triggers). A
    source that is itself a partition or an inheritance child, or that has
    non-partition inheritance children, is refused at installation.
+6. The functions run with the search_path of their creation (``SET
+   search_path FROM CURRENT``): a writer's search_path cannot redirect the
+   recomputes to other tables.
 """
 
 from __future__ import annotations
@@ -812,20 +816,44 @@ class PgStatementMaintenanceMixin(MixinHost):
     def _pg_view_lock_ddl(self) -> str:
         return self._create_table_ddl(
             self._pg_view_lock_table(),
-            ["__mv_id INTEGER NOT NULL PRIMARY KEY", f"__mv_n {self._int_type()} NOT NULL DEFAULT 0"],
+            ["__mv_id BIGINT NOT NULL PRIMARY KEY", "__mv_n BIGINT NOT NULL DEFAULT 0"],
             is_backing_store=False,
         )
 
     def _pg_view_lock_stmt(self) -> str:
-        """Serializes every maintenance statement of this view (one row).
+        """Exclusive whole-view lock (row id 0) for full recomputes.
 
         READ COMMITTED: later statements of the function take a snapshot that
         includes every writer that held the row before. REPEATABLE READ and
         SERIALIZABLE: if another transaction changed the row after this
         transaction's snapshot, the upsert fails with a serialization error.
+        Group-scoped writers hold the same row in SHARE mode
+        (``_pg_view_shared_lock_stmts``), so they exclude full recomputes but
+        not each other.
         """
         lock_t = self._pg_view_lock_table()
         return (
-            f"INSERT INTO {lock_t} (__mv_id, __mv_n) VALUES (1, 1)\n"
+            f"INSERT INTO {lock_t} (__mv_id, __mv_n) VALUES (0, 1)\n"
             f"    ON CONFLICT (__mv_id) DO UPDATE SET __mv_n = {lock_t}.__mv_n + 1;"
         )
+
+    def _pg_view_shared_lock_stmts(self) -> List[str]:
+        """SHARE lock on the whole-view lock row (created if missing)."""
+        lock_t = self._pg_view_lock_table()
+        # The row normally exists (created with the table, see
+        # _pg_view_lock_ddls); a repopulation that emptied the table makes the
+        # first writer recreate it.
+        return [
+            f"PERFORM 1 FROM {lock_t} WHERE __mv_id = 0 FOR SHARE;\n"
+            f"    IF NOT FOUND THEN\n"
+            f"        INSERT INTO {lock_t} (__mv_id, __mv_n) VALUES (0, 0) ON CONFLICT (__mv_id) DO NOTHING;\n"
+            f"        PERFORM 1 FROM {lock_t} WHERE __mv_id = 0 FOR SHARE;\n"
+            f"    END IF;",
+        ]
+
+    def _pg_view_lock_ddls(self) -> List[str]:
+        """Lock table DDL plus its whole-view row (id 0)."""
+        return [
+            self._pg_view_lock_ddl(),
+            f"INSERT INTO {self._pg_view_lock_table()} (__mv_id, __mv_n) VALUES (0, 0) ON CONFLICT (__mv_id) DO NOTHING;",
+        ]
