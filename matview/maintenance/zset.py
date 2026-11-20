@@ -179,6 +179,63 @@ class Tier1ZSetMixin(MixinHost):
             i += 1
         return "".join(out)
 
+    def _table_pk_is_nonnull(self, pk_defs: Sequence[ColumnDef]) -> bool:
+        """Return True iff the table has a non-empty PK whose columns cannot be NULL."""
+        if not pk_defs:
+            return False
+        for c in pk_defs:
+            if c.not_null or self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+                continue
+            if (
+                self.dialect == Dialect.SQLITE
+                and len(pk_defs) == 1
+                and re.sub(r"\s+", " ", c.data_type.strip().upper()) == "INTEGER"
+            ):
+                continue
+            return False
+        return True
+
+    def _projection_row_pk_expr(self, exprs: Sequence[str]) -> str:
+        """Exact row-identity canonical key for bag projections and nullable-PK UNION ALL.
+
+        Unlike ``_canonical_group_pk_expr`` (which folds SQLite int64-valued REALs
+        like ``1.0`` onto ``INTEGER 1`` and normalizes PostgreSQL ``NUMERIC 1.0`` /
+        ``1.00`` and ``FLOAT8 0.0`` / ``-0.0`` for GROUP BY / DISTINCT / UNION
+        equivalence), projections preserve each row's exact representation so
+        distinct storage classes, decimal scales, and signed zeros stay distinct.
+        """
+        def _clean(e: str) -> str:
+            s = e.strip()
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", s):
+                return self._q(s)
+            m_dot = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$", s)
+            if m_dot:
+                return f"{m_dot.group(1)}.{self._q(m_dot.group(2))}"
+            return s
+
+        if self.dialect == Dialect.SQLITE:
+            terms = [
+                f"(typeof({s}) || ':' || length(quote({s})) || ':' || quote({s}))"
+                for s in (_clean(e) for e in exprs)
+            ]
+            return " || '|' || ".join(terms)
+        if self.dialect == Dialect.POSTGRES:
+            pg_terms: List[str] = []
+            for e in exprs:
+                s = _clean(e)
+                if s.upper() == "NULL":
+                    pg_terms.append("'N'")
+                elif s.startswith("'") and s.endswith("'"):
+                    cast_s = f"CAST({s} AS pg_catalog.text)"
+                    pg_terms.append(f"('V:' || pg_catalog.octet_length({cast_s}) || ':' || {cast_s})")
+                else:
+                    pg_terms.append(
+                        f"(CASE WHEN ({s}) IS NULL THEN 'N' "
+                        f"ELSE 'V:' || pg_catalog.octet_length(({s})::pg_catalog.text) || ':' || ({s})::pg_catalog.text END)"
+                    )
+            return f"ROW({', '.join(pg_terms)})::pg_catalog.text"
+        return self._canonical_group_pk_expr(exprs)
+
     def _resolve_setop_pk_info(
         self, branches: Optional[List[Tuple[str, ViewSpec]]] = None
     ) -> Tuple[bool, Tuple[str, ...], List[str], List[List[ColumnDef]]]:
@@ -196,14 +253,30 @@ class Tier1ZSetMixin(MixinHost):
         uall_pk_col_types: List[str] = []
         if op_type == "UNION ALL" and branch_pk_defs_list and branch_pk_defs_list[0]:
             k_pks = len(branch_pk_defs_list[0])
-            if all(len(pks) == k_pks for pks in branch_pk_defs_list):
-                use_native_uall_pk = True
-                uall_pk_cols = ("__mv_branch_id", *(f"__mv_pk_{i}" for i in range(k_pks)))
+            if (
+                all(len(pks) == k_pks for pks in branch_pk_defs_list)
+                and all(self._table_pk_is_nonnull(pks) for pks in branch_pk_defs_list)
+            ):
+                cand_types: List[str] = []
+                types_match = True
                 for i in range(k_pks):
                     dt_i = self._normalize_dialect_type(branch_pk_defs_list[0][i].data_type)
                     if self.dialect == Dialect.MYSQL and dt_i.upper() == "TEXT":
                         dt_i = "VARCHAR(255)"
-                    uall_pk_col_types.append(dt_i)
+                    for other_pks in branch_pk_defs_list[1:]:
+                        other_dt = self._normalize_dialect_type(other_pks[i].data_type)
+                        if self.dialect == Dialect.MYSQL and other_dt.upper() == "TEXT":
+                            other_dt = "VARCHAR(255)"
+                        if other_dt.upper() != dt_i.upper():
+                            types_match = False
+                            break
+                    if not types_match:
+                        break
+                    cand_types.append(dt_i)
+                if types_match:
+                    use_native_uall_pk = True
+                    uall_pk_cols = ("__mv_branch_id", *(f"__mv_pk_{i}" for i in range(k_pks)))
+                    uall_pk_col_types = cand_types
         return use_native_uall_pk, uall_pk_cols, uall_pk_col_types, branch_pk_defs_list
 
     def _compile_tier1_zset_setop(self) -> MaterializedViewPlan:
@@ -269,19 +342,30 @@ class Tier1ZSetMixin(MixinHost):
             auto_group_cols=(),
             has_pk_on_group_cols=False,
         )
+        any_nullable_branch_pk = op_type == "UNION ALL" and any(
+            not self._table_pk_is_nonnull(pks) for pks in branch_pk_defs_list
+        )
         reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
             self._build_readonly_view_and_triggers(
                 view_name,
                 mv_table,
                 user_columns,
                 extra_where_filter=extra_filter,
+                repeat_count_col="__mv_row_count" if any_nullable_branch_pk else None,
             )
         )
 
         initial_populate_sqls: List[str] = []
-        by_table_branches: Dict[str, List[Tuple[int, ViewSpec]]] = {}
+        by_table_branches_lower: Dict[str, Tuple[str, List[Tuple[int, ViewSpec]]]] = {}
         for b_idx, (_, bs) in enumerate(branches):
-            by_table_branches.setdefault(bs.base_table, []).append((b_idx, bs))
+            t_low = bs.base_table.lower()
+            if t_low not in by_table_branches_lower:
+                canon_name = self._schemas_lower[t_low].name if t_low in self._schemas_lower else bs.base_table
+                by_table_branches_lower[t_low] = (canon_name, [])
+            by_table_branches_lower[t_low][1].append((b_idx, bs))
+        by_table_branches: Dict[str, List[Tuple[int, ViewSpec]]] = {
+            canon_name: b_items for canon_name, b_items in by_table_branches_lower.values()
+        }
 
         q_uall_pk_cols = [self._q(c) for c in uall_pk_cols]
         q_user_columns = [self._q(c) for c in user_columns]
@@ -290,21 +374,49 @@ class Tier1ZSetMixin(MixinHost):
         if op_type == "UNION ALL":
             for b_idx, (_, bs) in enumerate(branches):
                 ts = self._schemas_lower[bs.base_table.lower()]
-                pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                pk_defs = [c for c in ts.columns.values() if c.primary_key]
+                pk_names = [c.name for c in pk_defs]
                 sel_exprs = [it.raw_expr for it in bs.select_items]
                 w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
-                q_pk_names = [self._q(c) for c in pk_names]
+                b_alias = bs.joins[0].alias if bs.joins else bs.base_table
+                is_aliased = b_alias.lower() != bs.base_table.lower()
+                from_tbl = (
+                    f"{self._q(bs.base_table)} AS {self._q(b_alias)}"
+                    if is_aliased
+                    else self._q(bs.base_table)
+                )
+                q_alias_prefix = f"{self._q(b_alias)}." if is_aliased else ""
+                q_pk_names = [f"{q_alias_prefix}{self._q(c)}" for c in pk_names]
                 if use_native_uall_pk:
                     initial_populate_sqls.append(
                         f"INSERT INTO {mv_table} ({', '.join(q_uall_pk_cols)}, {', '.join(q_user_columns)}, __mv_row_count)\n"
-                        f"SELECT {b_idx}, {', '.join(q_pk_names)}, {', '.join(sel_exprs)}, 1 FROM {self._q(bs.base_table)}{w_sql};"
+                        f"SELECT {b_idx}, {', '.join(q_pk_names)}, {', '.join(sel_exprs)}, 1 FROM {from_tbl}{w_sql};"
                     )
                 else:
-                    pk_expr = self._canonical_group_pk_expr([f"'B{b_idx}'", *pk_names])
-                    initial_populate_sqls.append(
-                        f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
-                        f"SELECT {pk_expr}, {', '.join(sel_exprs)}, 1 FROM {self._q(bs.base_table)}{w_sql};"
+                    branch_nonnull_pk = self._table_pk_is_nonnull(pk_defs)
+                    b_hash_cols = pk_names if branch_nonnull_pk else list(ts.columns.keys())
+                    pk_expr = self._projection_row_pk_expr(
+                        [f"'B{b_idx}'", *[f"{q_alias_prefix}{self._q(c)}" for c in b_hash_cols]]
                     )
+                    if branch_nonnull_pk:
+                        initial_populate_sqls.append(
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                            f"SELECT {pk_expr}, {', '.join(sel_exprs)}, 1 FROM {from_tbl}{w_sql};"
+                        )
+                    else:
+                        inner_cols = [
+                            f"{pk_expr} AS __mv_k0",
+                            *[f"{expr} AS __mv_c{j}" for j, expr in enumerate(sel_exprs)],
+                        ]
+                        outer_cols = ["__mv_p.__mv_k0", *[f"__mv_p.__mv_c{j}" for j in range(len(sel_exprs))]]
+                        initial_populate_sqls.append(
+                            f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                            f"SELECT {', '.join(outer_cols)}, COUNT(*)\n"
+                            f"FROM (\n"
+                            f"    SELECT {', '.join(inner_cols)} FROM {from_tbl}{w_sql}\n"
+                            f") AS __mv_p\n"
+                            f"GROUP BY {', '.join(outer_cols)};"
+                        )
         elif op_type == "UNION":
             u_parts = []
             for _, bs in branches:
@@ -389,7 +501,8 @@ class Tier1ZSetMixin(MixinHost):
                 pk_old = ""
 
                 if op_type == "UNION ALL":
-                    pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+                    pk_defs = [c for c in ts.columns.values() if c.primary_key]
+                    pk_names = [c.name for c in pk_defs]
                     if use_native_uall_pk:
                         new_pk_vals = [str(b_idx), *[f"NEW.{self._q(c)}" for c in pk_names]]
                         old_pk_match = f"{mv_table}.__mv_branch_id = {b_idx} AND " + " AND ".join(
@@ -436,8 +549,9 @@ class Tier1ZSetMixin(MixinHost):
                             f"    WHERE ({w_old}) AND ({old_pk_match}) AND {mv_table}.__mv_row_count <= 0;"
                         )
                     else:
-                        pk_new = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"NEW.{self._q(c)}" for c in pk_names]])
-                        pk_old = self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"OLD.{self._q(c)}" for c in pk_names]])
+                        b_hash_cols = pk_names if self._table_pk_is_nonnull(pk_defs) else list(ts.columns.keys())
+                        pk_new = self._projection_row_pk_expr([f"'B{b_idx}'", *[f"NEW.{self._q(c)}" for c in b_hash_cols]])
+                        pk_old = self._projection_row_pk_expr([f"'B{b_idx}'", *[f"OLD.{self._q(c)}" for c in b_hash_cols]])
                         if self.dialect == Dialect.MYSQL:
                             if self.engine_version.supports_mysql_row_alias_upsert:
                                 upd_set = ", ".join(f"{self._q(c)} = __mv_new.{self._q(c)}" for c in user_columns)
@@ -590,6 +704,15 @@ class Tier1ZSetMixin(MixinHost):
                 )
                 pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
 
+            uall_upd_keys: Optional[List[str]] = None
+            if op_type == "UNION ALL":
+                ts_pks = [c for c in ts.columns.values() if c.primary_key]
+                uall_upd_keys = (
+                    [c.name for c in ts_pks]
+                    if self._table_pk_is_nonnull(ts_pks)
+                    else list(ts.columns.keys())
+                )
+
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
                 view_name=view_name,
                 base_t=base_t,
@@ -599,6 +722,7 @@ class Tier1ZSetMixin(MixinHost):
                 upd_new_stmts=upd_new_stmts,
                 upd_cleanup_old_stmts=cleanup_stmts,
                 trunc_stmts=trunc_stmts,
+                update_key_columns=uall_upd_keys,
                 pg_ai_body=pg_ai_body,
                 pg_ad_body=pg_ad_body,
                 pg_au_body=pg_au_body,
@@ -660,12 +784,14 @@ class Tier1ZSetMixin(MixinHost):
             where = self._rewrite_branch_expr(bs.where_clause, ts, b_alias, rec) if bs.where_clause else None
             vals = [self._rewrite_branch_expr(it.raw_expr, ts, b_alias, rec) for it in bs.select_items]
             values = dict(zip(user_columns, vals))
-            pk_names = [c.name for c in ts.columns.values() if c.primary_key]
+            pk_defs = [c for c in ts.columns.values() if c.primary_key]
+            pk_names = [c.name for c in pk_defs]
             if op_type == "UNION ALL":
                 if use_native_uall_pk:
                     keys = [str(b_idx), *[f"{rec}.{self._q(c)}" for c in pk_names]]
                 else:
-                    keys = [self._canonical_group_pk_expr([f"'B{b_idx}'", *[f"{rec}.{self._q(c)}" for c in pk_names]])]
+                    b_hash_cols = pk_names if self._table_pk_is_nonnull(pk_defs) else list(ts.columns.keys())
+                    keys = [self._projection_row_pk_expr([f"'B{b_idx}'", *[f"{rec}.{self._q(c)}" for c in b_hash_cols]])]
                 contrib: Dict[str, str] = {}
             elif op_type == "UNION":
                 keys = [self._canonical_group_pk_expr(vals)]
@@ -708,19 +834,7 @@ class Tier1ZSetMixin(MixinHost):
         """
         assert self.primary_schema is not None
         pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
-        def _pk_col_nonnull(c: ColumnDef) -> bool:
-            if c.not_null or self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
-                return True
-            if self.dialect == Dialect.SQLITE:
-                # Only a single-column INTEGER PRIMARY KEY (rowid alias) is implicitly
-                # NOT NULL on SQLite; INT PRIMARY KEY and composite PKs allow NULL.
-                return (
-                    len(pk_defs) == 1
-                    and re.sub(r"\s+", " ", c.data_type.strip().upper()) == "INTEGER"
-                )
-            return False
-
-        can_native = bool(pk_defs) and all(_pk_col_nonnull(c) for c in pk_defs)
+        can_native = self._table_pk_is_nonnull(pk_defs)
         if not can_native:
             return ["__mv_pk"], [], False
 
@@ -821,31 +935,49 @@ class Tier1ZSetMixin(MixinHost):
             extra_auto_index_cols=extra_auto_cols,
         )
         reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
-            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+            self._build_readonly_view_and_triggers(
+                view_name,
+                mv_table,
+                user_columns,
+                repeat_count_col="__mv_row_count" if not uses_native_pk else None,
+            )
         )
 
         sel_exprs = [it.raw_expr for it in self.view.select_items]
         w_sql = f"\nWHERE {self.view.where_clause}" if self.view.where_clause else ""
         new_vals = [self._rewrite_expr_for_record(it.raw_expr, "NEW") for it in self.view.select_items]
+        base_alias = self.view.joins[0].alias if self.view.joins else base_t
+        is_base_aliased = base_alias.lower() != base_t.lower()
+        from_base_sql = (
+            f"{q_base_t} AS {self._q(base_alias)}"
+            if is_base_aliased
+            else q_base_t
+        )
+        q_base_prefix = f"{self._q(base_alias)}." if is_base_aliased else ""
 
         wm_pk_col: Optional[str] = None
-        int_pk_cols = [
-            c for c in self.primary_schema.columns.values()
-            if c.primary_key and "INT" in c.data_type.upper()
-        ]
-        if len(int_pk_cols) == 1:
-            wm_pk_col = int_pk_cols[0].name
-        elif self.dialect == Dialect.SQLITE and len(pk_names) <= 1:
-            wm_pk_col = pk_names[0] if pk_names else "rowid"
+        if uses_native_pk:
+            int_pk_cols = [
+                c for c in self.primary_schema.columns.values()
+                if c.primary_key and "INT" in c.data_type.upper()
+            ]
+            if len(int_pk_cols) == 1 and len(pk_names) == 1:
+                wm_pk_col = int_pk_cols[0].name
+        elif self.dialect == Dialect.SQLITE and len(pk_names) <= 1 and not is_base_aliased:
+            # Non-native single-column PK or keyless table on SQLite:
+            # use non-null 64-bit integer rowid so NULL-PK rows and TEXT PKs are
+            # never dropped or rejected during pk_range_fold backfill (composite
+            # PKs remain on offset_batch).
+            wm_pk_col = "rowid"
 
         if uses_native_pk:
             all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
             q_all_backing_cols = [self._q(c) for c in all_backing_cols]
-            all_select_exprs = [*sel_exprs, *[self._q(h[1]) for h in hidden_pk_defs]]
+            all_select_exprs = [*sel_exprs, *[f"{q_base_prefix}{self._q(h[1])}" for h in hidden_pk_defs]]
             all_new_vals = [*new_vals, *[f"NEW.{self._q(h[1])}" for h in hidden_pk_defs]]
             initial_populate_sql = (
                 f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
-                f"SELECT {', '.join(all_select_exprs)} FROM {q_base_t}{w_sql};"
+                f"SELECT {', '.join(all_select_exprs)} FROM {from_base_sql}{w_sql};"
             )
             if self.dialect == Dialect.MYSQL:
                 if self.engine_version.supports_mysql_row_alias_upsert:
@@ -939,24 +1071,28 @@ class Tier1ZSetMixin(MixinHost):
             pk_defs = [c for c in self.primary_schema.columns.values() if c.primary_key]
             has_nullable_pk = (not pk_defs) or any(not c.not_null for c in pk_defs)
             pk_hash_cols = all_base_cols if (has_nullable_pk and all_base_cols) else (pk_names or sel_exprs)
-            q_pk_hash_cols = [self._q(c) for c in pk_hash_cols] if (has_nullable_pk and all_base_cols) or pk_names else sel_exprs
-            pk_expr_base = self._canonical_group_pk_expr(q_pk_hash_cols)
+            q_pk_hash_cols = (
+                [f"{q_base_prefix}{self._q(c)}" for c in pk_hash_cols]
+                if (has_nullable_pk and all_base_cols) or pk_names
+                else sel_exprs
+            )
+            pk_expr_base = self._projection_row_pk_expr(q_pk_hash_cols)
             q_user_columns = [self._q(c) for c in user_columns]
-            w_pop = w_sql or "\nWHERE TRUE"
-            if self.dialect == Dialect.MYSQL:
-                initial_populate_sql = (
-                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
-                    f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_pop}\n"
-                    f"ON DUPLICATE KEY UPDATE __mv_row_count = {mv_table}.__mv_row_count + 1;"
-                )
-            else:
-                initial_populate_sql = (
-                    f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
-                    f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1 FROM {q_base_t}{w_pop}\n"
-                    f"ON CONFLICT (__mv_pk) DO UPDATE SET __mv_row_count = {mv_table}.__mv_row_count + 1;"
-                )
-            pk_new = self._canonical_group_pk_expr([f"NEW.{self._q(c)}" for c in pk_hash_cols])
-            pk_old = self._canonical_group_pk_expr([f"OLD.{self._q(c)}" for c in pk_hash_cols])
+            inner_pop_cols = [
+                f"{pk_expr_base} AS __mv_k0",
+                *[f"{expr} AS __mv_c{j}" for j, expr in enumerate(sel_exprs)],
+            ]
+            outer_pop_cols = ["__mv_p.__mv_k0", *[f"__mv_p.__mv_c{j}" for j in range(len(sel_exprs))]]
+            initial_populate_sql = (
+                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                f"SELECT {', '.join(outer_pop_cols)}, COUNT(*)\n"
+                f"FROM (\n"
+                f"    SELECT {', '.join(inner_pop_cols)} FROM {from_base_sql}{w_sql}\n"
+                f") AS __mv_p\n"
+                f"GROUP BY {', '.join(outer_pop_cols)};"
+            )
+            pk_new = self._projection_row_pk_expr([f"NEW.{self._q(c)}" for c in pk_hash_cols])
+            pk_old = self._projection_row_pk_expr([f"OLD.{self._q(c)}" for c in pk_hash_cols])
             if self.dialect == Dialect.MYSQL:
                 if self.engine_version.supports_mysql_row_alias_upsert:
                     upd_set = ", ".join(f"{self._q(c)} = __mv_new.{self._q(c)}" for c in user_columns)
@@ -989,36 +1125,37 @@ class Tier1ZSetMixin(MixinHost):
                     if self.view.where_clause
                     else f"({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
                 )
+                grouped_chunk_sel = (
+                    f"SELECT {', '.join(f'{oc} AS {tc}' for oc, tc in zip(outer_pop_cols, ['__mv_pk', *q_user_columns]))}, "
+                    f"COUNT(*) AS __mv_row_count\n"
+                    f"FROM (\n"
+                    f"SELECT {', '.join(inner_pop_cols)}\n"
+                    f"FROM {from_base_sql}\n"
+                    f"WHERE {chunk_w}\n"
+                    f") AS __mv_p\n"
+                    f"GROUP BY {', '.join(outer_pop_cols)}"
+                )
                 if self.dialect == Dialect.MYSQL:
                     if self.engine_version.supports_mysql_row_alias_upsert:
-                        aliased_chunk_sel = [
-                            f"{pk_expr_base} AS __mv_pk",
-                            *[f"{expr} AS {col}" for expr, col in zip(sel_exprs, q_user_columns)],
-                            "1 AS __mv_row_count",
-                        ]
                         chunk_upd = ", ".join(f"{c} = __mv_src.{c}" for c in q_user_columns)
                         chunk_upsert_sql = (
                             f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                             f"SELECT * FROM (\n"
-                            f"    SELECT {', '.join(aliased_chunk_sel)}\n"
-                            f"    FROM {q_base_t}\n"
-                            f"    WHERE {chunk_w}\n"
+                            f"{grouped_chunk_sel}\n"
                             f") AS __mv_src\n"
-                            f"ON DUPLICATE KEY UPDATE {chunk_upd}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            f"ON DUPLICATE KEY UPDATE {chunk_upd}, __mv_row_count = {mv_table}.__mv_row_count + __mv_src.__mv_row_count;"
                         )
                     else:
                         chunk_upsert_sql = (
                             f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
-                            f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1\nFROM {q_base_t}\n"
-                            f"WHERE {chunk_w}\n"
-                            f"ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                            f"{grouped_chunk_sel}\n"
+                            f"ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + VALUES(__mv_row_count);"
                         )
                 else:
                     chunk_upsert_sql = (
                         f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
-                        f"SELECT {pk_expr_base}, {', '.join(sel_exprs)}, 1\nFROM {q_base_t}\n"
-                        f"WHERE {chunk_w}\n"
-                        f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
+                        f"{grouped_chunk_sel}\n"
+                        f"ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + excluded.__mv_row_count;"
                     )
             else:
                 chunk_upsert_sql = None
@@ -1106,7 +1243,7 @@ class Tier1ZSetMixin(MixinHost):
                             from_sql=_pg_from,
                             sign=f"{rec}.{SIGN}",
                             where=pg_where,
-                            keys=[self._canonical_group_pk_expr([f"{rec}.{self._q(c)}" for c in pk_hash_cols])],  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
+                            keys=[self._projection_row_pk_expr([f"{rec}.{self._q(c)}" for c in pk_hash_cols])],  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
                             values=pg_values,
                         ),
                         {"__mv_row_count": "1"},
@@ -1116,6 +1253,7 @@ class Tier1ZSetMixin(MixinHost):
             pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
             trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
 
+        upd_key_cols = pk_names if uses_native_pk else pk_hash_cols  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
         trigger_ddls, trig_names, fn_names = self._emit_dialect_triggers_for_table(
             view_name=view_name,
             base_t=base_t,
@@ -1127,7 +1265,7 @@ class Tier1ZSetMixin(MixinHost):
             trunc_stmts=trunc_stmts,
             where_new=where_new,
             where_old=where_old,
-            update_key_columns=pk_names,
+            update_key_columns=upd_key_cols,
             pg_ai_body=pg_ai_body,
             pg_ad_body=pg_ad_body,
             pg_au_body=pg_au_body,
