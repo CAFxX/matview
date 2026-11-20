@@ -1108,6 +1108,7 @@ class Tier1ZSetMixin(MixinHost):
             trunc_stmts=[f"DELETE FROM {mv_table};"],
             where_new=where_new,
             where_old=where_old,
+            update_key_columns=pk_names,
             pg_ai_body=pg_ai_body,
             pg_ad_body=pg_ad_body,
             pg_au_body=pg_au_body,
