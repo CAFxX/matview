@@ -31,6 +31,7 @@ from matview_sync import (
     EngineLimitationError,
     EngineLimitationWarning,
     MaterializedViewManager,
+    UnsupportedMaterializedViewError,
     generate_materialized_view,
 )
 from test_native_statistical_aggregates import (
@@ -335,6 +336,30 @@ _INT_FAMILY = [
     "TINYINT", "TINYINT UNSIGNED", "SMALLINT", "SMALLINT UNSIGNED", "MEDIUMINT", "MEDIUMINT UNSIGNED",
     "INT", "INT UNSIGNED", "BIGINT", "BIGINT UNSIGNED", "YEAR", "BIT(8)", "BIT(16)", "BOOL", "TINYINT(1)",
 ]
+
+
+class MySQLBitWindowVersionGateTests(unittest.TestCase):
+    """Offline: window MIN/MAX over BIT is typed only for measured MySQL releases."""
+
+    SCHEMA = "CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, b BIT(8));"
+    VIEW = "CREATE VIEW v AS SELECT id, MAX(b) OVER (PARTITION BY g) AS r FROM t;"
+
+    def _col(self, engine: str) -> str:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", EngineLimitationWarning)
+            plan = generate_materialized_view(self.SCHEMA, self.VIEW, dialect=engine, ignore_limitations=True)
+        return next(l.strip().rstrip(",") for l in plan.backing_table_ddl.splitlines() if l.strip().startswith("r "))
+
+    def test_measured_releases_are_typed(self) -> None:
+        self.assertEqual(self._col("mysql:8.4.13"), "r INT UNSIGNED")
+        self.assertEqual(self._col("mysql:9.7.4"), "r BIT(8)")
+        self.assertEqual(self._col("mariadb:10.11"), "r BIT(8)")
+
+    def test_unmeasured_releases_are_refused(self) -> None:
+        for engine in ("mysql", "mysql:8.0.40", "mysql:9.1", "mysql:9.6.0", "mysql:9.8", "mysql:10.0"):
+            with self.subTest(engine=engine):
+                with self.assertRaises(UnsupportedMaterializedViewError):
+                    self._col(engine)
 
 
 class NativeMySQLIntegerMinMaxTests(unittest.TestCase):
