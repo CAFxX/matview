@@ -416,6 +416,7 @@ class DialectEmitMixin(MixinHost):
         trunc_stmts: Optional[List[str]] = None,
         where_new: Optional[str] = None,
         where_old: Optional[str] = None,
+        update_key_columns: Optional[Sequence[str]] = None,
         pg_ai_body: Optional[str] = None,
         pg_ad_body: Optional[str] = None,
         pg_au_body: Optional[str] = None,
@@ -430,6 +431,15 @@ class DialectEmitMixin(MixinHost):
         t_sync_name = self._bounded_ident(f"{p}trg_", stem, "_sync")
         q_base_t = self._q(base_t)
         ref_cols = self._referenced_columns_for_table(base_t)
+        # Projection backing rows are keyed by the source PK even when the
+        # public SELECT omits it. A PK-only UPDATE must therefore fire the
+        # maintenance trigger and must not be suppressed by SQLite's
+        # unchanged-column guard.
+        seen_ref_cols = {c.lower() for c in ref_cols}
+        for key_col in update_key_columns or ():
+            if key_col.lower() not in seen_ref_cols:
+                ref_cols.append(key_col)
+                seen_ref_cols.add(key_col.lower())
         upd_of_clause = (
             f" OF {', '.join(self._q(c) for c in ref_cols)}"
             if ref_cols and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES)
