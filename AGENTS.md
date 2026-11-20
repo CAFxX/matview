@@ -14,6 +14,20 @@ Every supported view shape must be checked against this oracle after initial pop
 
 Every discovered mismatch becomes a minimized, deterministic, permanent regression test. A test suite is not considered adequate merely because it passes: periodically inject representative faults (or use targeted mutation testing) and demonstrate that the differential tests fail. Never weaken, skip, normalize away, or broaden tolerances to make a discrepancy pass without first proving that the difference is permitted by the documented SQL/engine contract. Unsupported behavior must be rejected explicitly rather than silently returning a divergent result.
 
+## Product principles
+
+These refine, and never weaken, the semantic-equivalence invariant above.
+
+- **Maximal support.** Strive to support ALL views as well and as efficiently as possible within the user's constraints (exactness requirement, cost/latency budget, allowed staleness). Refusing a view (`UnsupportedMaterializedViewError`, limitation refusal) is the LAST resort: use it only when no strategy can maintain the view correctly within those constraints.
+- **Strategy ladder (open set).** Maintenance strategies are pluggable units in a strategy registry, not a closed list. Each declares (1) the view shapes/engines it can maintain, (2) the result guarantee it provides (exact, or which relaxed classes), (3) its cost class per engine (per row, per statement, per group, per table) and (4) its concurrency/race-safety properties. The planner selects the cheapest registered strategy, ordered by the cost model, whose guarantee satisfies the user's constraints; it refuses only when none qualifies. Initial entries (not the definition): algebraic delta, group/scope-scoped recompute, statement-level transition-table delta, and full refresh of the ORIGINAL query, unmodified (exact by construction, evaluated as a later read of the live view would be). Adding a strategy must not require changes to callers, diagnostics, the capability-matrix generator or the README table: all are derived from the registry. Every strategy ships with its own differential tests against the live view and a declared guarantee that those tests verify.
+- **Exact by default, relaxed by opt-in.** The default guarantee is MV == live view. Users may opt in, per code, to a weaker guarantee (like `-ffast-math`, e.g. float reassociation) to enable cheaper strategies. The global `ignore_limitations` never enables a weaker result guarantee.
+- **Diagnostics.** Announce every fallback or relaxed mode at registration, programmatically and in CLI text/JSON; never be silent. Use the fixed lead phrases `exact result required: falling back to strategy <X>` and `relaxed result allowed: using strategy <Y>`, followed by the reason, the cost class per engine and how to change it. Strategy names come from the shared enum/registry.
+- **Unreleased.** The project is unreleased: do no backwards-compatibility, upgrade or migration work.
+- **Type checking.** pyright `standard` (0 errors) gates CI. New mixins inherit `MixinHost`. Write suppressions as `# pyright: ignore[rule]  # reason`.
+- **Workspace hygiene.** Remove ephemeral artifacts (worktrees, scratch files, containers) as soon as they are unneeded; remove containers with `docker rm -fv`. Never touch shared resources.
+
+Roadmap: the "Strategy ladder: replace refusals with fallbacks" initiative in `TODO.md`.
+
 ## Testing standards
 
 - Design tests from the documented behavior and supported SQL/engine contract, not from the implementation's current code paths. Avoid tautological tests that reproduce the implementation's assumptions.
