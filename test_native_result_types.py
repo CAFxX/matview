@@ -30,6 +30,7 @@ from matview_sync import (
     Dialect,
     EngineLimitationError,
     EngineLimitationWarning,
+    MaintenanceFallbackWarning,
     MaintenanceStrategy,
     MaterializedViewManager,
     UnsupportedMaterializedViewError,
@@ -146,6 +147,17 @@ def _views(engine: Dialect, t: str) -> List[Tuple[str, str]]:
         ("case_char_varchar", f"SELECT id, CASE WHEN g = 1 THEN c ELSE v END AS r FROM {t}"),
         ("coalesce_char_varchar", f"SELECT id, COALESCE(c, v) AS r FROM {t}"),
     ]
+    views += [
+        # Window MIN/MAX over CHAR (MySQL returns VARCHAR, PostgreSQL bpchar).
+        ("win_max_char", f"SELECT id, MAX(c) OVER (PARTITION BY g) AS r FROM {t}"),
+        # MIN/MAX over a recursive CTE's SMALLINT column (MySQL keeps the type;
+        # a non-recursive CTE sends BIGINT, see cte_max_int).
+        ("recursive_cte_min_s", f"WITH RECURSIVE tr(id, s, depth) AS (SELECT id, s, 0 FROM {t} WHERE g = 1 "
+                                f"UNION ALL SELECT x.id, x.s, tr.depth + 1 FROM {t} x JOIN tr ON x.g = tr.id + 1 "
+                                f"WHERE tr.depth < 3) SELECT depth, MIN(s) AS r FROM tr GROUP BY depth"),
+    ]
+    if engine == Dialect.MYSQL:
+        views.append(("win_max_enum", f"SELECT id, MAX(e) OVER () AS r FROM {t}"))
     if engine == Dialect.POSTGRES:
         views.append(("min_char", f"SELECT g, MIN(c) AS r FROM {t} GROUP BY g"))
         views.append(("coalesce_char", f"SELECT id, COALESCE(c, 'q') AS r FROM {t}"))
@@ -231,6 +243,10 @@ class NativeResultTypeTests(unittest.TestCase):
             dp = " PRECISION" if engine == Dialect.POSTGRES else ""
             cur.execute(_TABLE.format(t=t, dp=dp) + (" ENGINE=InnoDB" if engine == Dialect.MYSQL else ""))
             cur.executemany(f"INSERT INTO {t} VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)", _SEED)
+            if engine == Dialect.MYSQL:
+                # ENUM (MySQL family only) for the window MIN/MAX string cases.
+                cur.execute(f"ALTER TABLE {t} ADD COLUMN e ENUM('a', 'bb') NULL")
+                cur.execute(f"UPDATE {t} SET e = IF(id % 2 = 1, 'a', 'bb')")
             conn.commit()
             manager = MaterializedViewManager(conn, dialect=engine)
             pairs = []
@@ -379,13 +395,47 @@ class ScalarSubqueryAggregateFallbackTests(unittest.TestCase):
                     self.assertNotEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
                     self.assertNotIn("__mv_elem", plan.reader_view_ddl or "")
 
-    def test_elementary_aggregate_over_subquery_aggregate_is_refused(self) -> None:
+    def test_fallback_is_announced(self) -> None:
         schema = _TABLE.format(t="t", dp=" PRECISION") + ";"
-        with self.assertRaises(UnsupportedMaterializedViewError):
-            generate_materialized_view(
-                schema, "CREATE VIEW v AS SELECT g, SUM(i + (SELECT MAX(i) FROM t)) AS s FROM t GROUP BY g;",
-                dialect="postgres:18", ignore_limitations=True,
-            )
+        view = _SUBQUERY_AGG_VIEWS[0].format(t="t")
+        for engine in ("sqlite", "postgres:18", "mysql:8.4", "mariadb:10.11"):
+            with self.subTest(engine=engine):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    plan = generate_materialized_view(
+                        schema.replace("DOUBLE PRECISION", "DOUBLE") if not engine.startswith("postgres") else schema,
+                        f"CREATE VIEW v AS {view};", dialect=engine, ignore_limitations=True,
+                    )
+                lead = f"exact result required: falling back to strategy {plan.strategy.value}: "
+                msgs = [str(w.message) for w in caught if issubclass(w.category, MaintenanceFallbackWarning)]
+                self.assertEqual(len(msgs), 1, msgs)
+                self.assertIn(lead, msgs[0])
+                self.assertEqual([d.code for d in plan.diagnostics.fallbacks], ["HAVING_SUBQUERY_AGGREGATE_FALLBACK"])
+                self.assertTrue(plan.diagnostics.fallbacks[0].message.startswith(lead))
+                self.assertIn("To change:", plan.diagnostics.fallbacks[0].message)
+                self.assertEqual("deadlock" in msgs[0], not engine.startswith(("sqlite", "postgres")))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generate_materialized_view(schema, "CREATE VIEW v AS SELECT g, COUNT(*) AS n FROM t GROUP BY g HAVING COUNT(*) > 1;",
+                                       dialect="postgres:18")
+        self.assertFalse([w for w in caught if issubclass(w.category, MaintenanceFallbackWarning)])
+
+    def test_projected_subquery_aggregates_stay_refused(self) -> None:
+        # Their result types are not derived (a fallback stored
+        # SUM(x) + (SELECT MAX(v) ..) as DOUBLE where engines return BIGINT/DECIMAL).
+        schema = _TABLE.format(t="t", dp=" PRECISION") + ";"
+        for engine in ("sqlite", "postgres:18", "mysql:8.4", "mariadb:10.11"):
+            for view in (
+                "SELECT g, SUM(i) + (SELECT MAX(b) FROM t) AS s FROM t GROUP BY g",
+                "SELECT g, COALESCE(MAX(i) + (SELECT SUM(b) FROM t), -1) AS s FROM t GROUP BY g",
+                "SELECT g, SUM(i + (SELECT MAX(i) FROM t)) AS s FROM t GROUP BY g",
+            ):
+                with self.subTest(engine=engine, view=view):
+                    with self.assertRaises(UnsupportedMaterializedViewError):
+                        generate_materialized_view(
+                            schema.replace("DOUBLE PRECISION", "DOUBLE") if not engine.startswith("postgres") else schema,
+                            f"CREATE VIEW v AS {view};", dialect=engine, ignore_limitations=True,
+                        )
 
     def test_matches_live_view_natively(self) -> None:
         engines = _native_engines()
