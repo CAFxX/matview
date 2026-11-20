@@ -1124,8 +1124,6 @@ def test_sum_of_integer_expression_result_type(make_env, request, target: Target
         ViewDef("ik_s", f"SELECT s, SUM({e}) AS a FROM ik GROUP BY s")))
 
 
-_E5 = ("SQLite MOD(x, y) returns REAL, but sqlglot parses it as the `%` operator (INTEGER), so the "
-       "backing column has INTEGER affinity. TODO.md 'Integer Expression Result Types Not Yet Derived Exactly'")
 _E6 = ("MySQL reports a GROUP BY expression over TINYINT/SMALLINT/MEDIUMINT arithmetic as INT (LONG) "
        "while a plain SELECT of it is BIGINT; the backing column is BIGINT. TODO.md "
        "'Integer Expression Result Types Not Yet Derived Exactly'")
@@ -1135,7 +1133,6 @@ _E7 = ("PostgreSQL integer +, -, * keep the operand type (int4 + int4 is int4, i
 # (product, view name, expression) -> reason. Applied at run time because the
 # product (MySQL or MariaDB) is read from the server.
 KNOWN_INT_EXPR_TYPE_DEFECTS: Dict[Tuple[str, str, str], str] = {
-    **{("sqlite", v, "MOD(i, 3)"): _E5 for v in ("ik_v", "ik_a")},
     **{("mysql", "ik_v", e): _E6 for e in ("s % 2", "ti % 2", "mi % 2", "s + s")},
     **{("postgres", v, e): _E7 for v in ("ik_v", "ik_a") for e in ("i + 1", "s + s", "i * 2")},
 }
