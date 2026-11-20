@@ -768,6 +768,31 @@ class PlannerMixin(MixinHost):
                 out_parts.append(expr_str[cursor:])
             return "".join(out_parts), True
 
+        # An aggregate inside a scalar subquery belongs to that subquery, not
+        # to the view's groups; the decomposition below would replace it with
+        # the outer group's stored value (wrong values, or "Subquery returns
+        # more than 1 row"). Refuse such projections and HAVING clauses.
+        def _aggregate_in_subquery(sql_text: str) -> bool:
+            try:
+                node = parse_sql_ast(sql_text, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                return False
+            for sub in node.find_all(sqlglot_exp.Subquery, sqlglot_exp.Select):
+                if sub is node:
+                    continue
+                if any(True for _ in sub.find_all(sqlglot_exp.AggFunc)):
+                    return True
+            return False
+
+        for text in [it.raw_expr for it in v.select_items if it.is_aggregate] + (
+            [v.having_clause] if v.having_clause else []
+        ):
+            if _aggregate_in_subquery(text):
+                raise UnsupportedMaterializedViewError(
+                    f"View '{self.logical_view_name}' uses an aggregate inside a scalar subquery in an "
+                    f"aggregated projection or HAVING ({text.strip()[:120]}), which is not maintained."
+                )
+
         all_ok = True
         for it in v.select_items:
             if not it.is_aggregate or it.agg_func is not None:
