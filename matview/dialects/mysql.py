@@ -175,6 +175,73 @@ class MySQLDialectMixin(MixinHost):
                     issues.append(f"HAVING reference to {col.name}")
         return issues
 
+    def _mysql_untyped_minmax_uses(self) -> List[str]:
+        """MySQL MIN/MAX uses whose result type the planner cannot reproduce.
+
+        MySQL types MIN/MAX of an integer-like argument narrower than BIGINT
+        (TINYINT/SMALLINT/MEDIUMINT/INT, UNSIGNED, YEAR, BIT, BOOL) differently
+        by context, and the difference is visible on the wire: as a whole
+        projected item (handled), as a window function over a CTE/derived
+        table, or nested in an expression (COALESCE(MAX(ti), 0) is BIGINT,
+        MAX(ti) OVER () + 1 is INT). Those contexts are refused rather than
+        guessed. MariaDB keeps argument types but loses UNSIGNED through
+        COALESCE/arithmetic over windowed MIN/MAX (out-of-range writes were
+        observed), so the same contexts are refused there. HAVING is not
+        projected and is allowed.
+        """
+        try:
+            root = sqlglot.parse_one(self.raw_view.raw_select_sql, read="mysql")
+        except sqlglot.errors.SqlglotError:
+            return []
+        derived = self.raw_view.has_cte or self.raw_view.has_subquery_in_from
+        top_items = list(root.expressions) if isinstance(root, sqlglot_exp.Select) else []
+        having = root.args.get("having") if isinstance(root, sqlglot_exp.Select) else None
+        issues: List[str] = []
+        for node in root.find_all(sqlglot_exp.Min, sqlglot_exp.Max):
+            arg = node.this
+            if arg is None:
+                continue
+            col = self._lookup_source_col_def(arg.sql(dialect="mysql"))
+            arg_type = (col.data_type if col is not None else (self._infer_ast_expr_storage_type(arg.sql(dialect="mysql")) or "")).upper()
+            base = re.sub(r"\s*\(\d+\)", "", arg_type).replace(" UNSIGNED", "").replace(" ZEROFILL", "").strip()
+            narrow_int = base in (
+                "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "YEAR", "BOOL", "BOOLEAN"
+            ) or base.startswith("BIT") or (not base and col is None)
+            if not narrow_int:
+                continue
+            target = node.parent if isinstance(node.parent, sqlglot_exp.Window) else node
+            if isinstance(node.parent, sqlglot_exp.Window) and derived:
+                issues.append(target.sql(dialect="mysql"))
+                continue
+            in_having = False
+            cur = target.parent
+            while cur is not None:
+                if cur is having:
+                    in_having = True
+                    break
+                cur = cur.parent
+            if in_having:
+                continue
+            whole_item = any(
+                item is target or (isinstance(item, sqlglot_exp.Alias) and item.this is target)
+                for item in top_items
+            )
+            if not whole_item and target.find_ancestor(sqlglot_exp.Select) is root:
+                issues.append(target.sql(dialect="mysql"))
+        return issues
+
+    def _enforce_mysql_minmax_typing(self) -> None:
+        issues = self._mysql_untyped_minmax_uses()
+        if issues:
+            from ..engines import UnsupportedMaterializedViewError
+
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}' uses {', '.join(dict.fromkeys(issues))} on "
+                f"{self.subdialect.value}, whose result type the server derives by context (INT or BIGINT "
+                "on the wire, signedness) for integer arguments narrower than BIGINT; project MIN/MAX as "
+                "its own column, or CAST the argument to SIGNED."
+            )
+
     def _enforce_mariadb_statistical_exactness(self, reader_view_ddl: str) -> None:
         if self.subdialect != EngineSubdialect.MARIADB:
             return
