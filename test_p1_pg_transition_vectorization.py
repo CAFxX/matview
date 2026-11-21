@@ -76,16 +76,21 @@ class TestPGStatementLevelDDL(unittest.TestCase):
         self.assertNotRegex(ddls, r"FOR\s+(NEW|OLD)\s+IN\s+SELECT")
         self.assertNotIn("skip_triggers", ddls)
         triggers = [d for d in plan.trigger_ddls if d.startswith("CREATE TRIGGER")]
-        events = sorted(re.search(r"AFTER (\w+)", t).group(1) for t in triggers)  # type: ignore[union-attr]
+        after_triggers = [t for t in triggers if re.search(r"\bAFTER\s+\w+", t)]
+        before_triggers = [t for t in triggers if re.search(r"\bBEFORE\s+INSERT\s+OR\s+UPDATE\s+OR\s+DELETE\s+OR\s+TRUNCATE\b", t)]
+        self.assertEqual(len(after_triggers) + len(before_triggers), len(triggers))
+        events = sorted(re.search(r"AFTER (\w+)", t).group(1) for t in after_triggers)  # type: ignore[union-attr]
         n_sources = len(plan.view_spec.referenced_tables)
         self.assertEqual(events, sorted(["DELETE", "INSERT", "TRUNCATE", "UPDATE"] * n_sources))
+        if before_triggers:
+            self.assertEqual(len(before_triggers), n_sources)
         for t in triggers:
             self.assertIn("FOR EACH STATEMENT", t)
-            if "TRUNCATE" not in t:
+            if t in after_triggers and "TRUNCATE" not in t:
                 self.assertIn("REFERENCING", t)
         self.assertEqual(sum(d.startswith("DO $mv_install$") for d in plan.trigger_ddls), n_sources)
         for suffix, fn in _functions(plan).items():
-            if suffix != "trunc":
+            if suffix not in ("trunc", "bs", "reconcile"):
                 table = "__mv_old_rows" if suffix == "ad" else "__mv_new_rows"
                 self.assertIn(f"IF NOT EXISTS (SELECT 1 FROM {table}) THEN\n        RETURN NULL;", fn)
 
@@ -190,14 +195,37 @@ class TestPGStatementLevelDDL(unittest.TestCase):
                 m = re.search(r"AS \$\$(.*)\$\$ LANGUAGE plpgsql", ddl, flags=re.S)
                 if not m:
                     continue
-                body = re.sub(r"(?s)^\s*BEGIN\s*(IF NOT EXISTS .*?END IF;)?", "", m.group(1))
-                body = re.sub(r"(?s)RETURN NULL;\s*END;\s*$", "", body)
+                body = m.group(1)
+                # Strip DECLARE block and Stage 3 PL/pgSQL control-flow scaffolding;
+                # parse every embedded SQL statement (including staging INSERTs and
+                # reconcile inclusion-exclusion upserts/deletes) as PostgreSQL.
+                m_begin = re.search(r"\bBEGIN\b", body)
+                if m_begin:
+                    body = body[m_begin.end() :]
+                # Extract any embedded Stage 3 staging INSERT statements before stripping
+                # PL/pgSQL bracket control flow, so staging DML is also parsed by sqlglot.
+                stage_blocks = re.findall(
+                    r"/\*\s*__MV_STAGE_START__\s*\*/(.*?)/\*\s*__MV_STAGE_END__\s*\*/",
+                    body,
+                    flags=re.S,
+                )
+                body = re.sub(r"/\*\s*__MV_BRACKET_START__\s*\*/.*?/\*\s*__MV_BRACKET_END__\s*\*/", "", body, flags=re.S)
+                body = "\n".join(stage_blocks) + "\n" + body
+                body = re.sub(r"(?s)IF NOT EXISTS .*?END IF;", "", body)
+                body = re.sub(r"(?s)IF NOT \(.*?END IF;", "", body)
+                body = re.sub(r"(?s)IF pg_catalog\.txid_current_if_assigned\(\) IS NULL THEN.*?END IF;", "", body)
+                body = re.sub(r"(?s)(?:RETURN(?:\s+NULL)?;\s*)?\bEND;\s*$", "", body)
                 for stmt in _split_top_level(body, ";"):
-                    if stmt.strip() and stmt.strip().upper() not in ("BEGIN",):
-                        try:
-                            sqlglot.parse(stmt, read="postgres")
-                        except Exception as exc:  # pragma: no cover - failure path
-                            self.fail(f"sqlglot cannot parse {stmt!r}: {exc}")
+                    st = stmt.strip()
+                    st_up = st.upper()
+                    if not st or st_up in ("BEGIN", "END", "ELSE", "END IF", "RETURN", "RETURN NULL"):
+                        continue
+                    if re.match(r"^(?:IF\b|ELSIF\b|PERFORM\b|__MV_\w+\s*:=)", st_up):
+                        continue
+                    try:
+                        sqlglot.parse(st, read="postgres")
+                    except Exception as exc:  # pragma: no cover - failure path
+                        self.fail(f"sqlglot cannot parse {st!r}: {exc}")
 
     def test_cli_rejects_removed_transition_table_flags(self) -> None:
         for flag in ("--pg-transition-tables", "--no-pg-vectorize-transition-tables"):

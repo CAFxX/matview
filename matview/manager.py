@@ -93,7 +93,7 @@ from .sql_frontend import (
 #     array unnest preserves composite elements, container nullness uses
 #     IS [NOT] DISTINCT FROM NULL for partially-/all-NULL composites, and
 #     registration probes refuse unsupported key types/collations up front.
-MATVIEW_GENERATOR_VERSION = "11"
+MATVIEW_GENERATOR_VERSION = "12"
 
 
 def _definition_digest(select_sql: str) -> str:
@@ -2228,7 +2228,7 @@ class MaterializedViewManager:
         return set(self._views_trigger_drift(catalog))
 
     _PG_CREATE_TRIGGER_RE = re.compile(
-        r'^CREATE TRIGGER (\S+)\s+AFTER \w+ ON ((?:"(?:""|[^"])+"(?:\."(?:""|[^"])+")?|\S+))',
+        r'^CREATE TRIGGER (\S+)\s+(?:AFTER\s+\w+|BEFORE\s+(?:INSERT|UPDATE|DELETE|TRUNCATE)(?:\s+OR\s+(?:INSERT|UPDATE|DELETE|TRUNCATE))*)\s+ON\s+((?:"(?:""|[^"])+"(?:\."(?:""|[^"])+")?|\S+))',
         flags=re.IGNORECASE | re.MULTILINE,
     )
 
@@ -3347,6 +3347,34 @@ class MaterializedViewManager:
                             )
                             and stmt not in matched_trig_ddls
                         ]
+                        # Also pull in helper functions invoked via PERFORM from matched trigger functions
+                        # (e.g., PostgreSQL Stage 3 multi-source reconcile functions).
+                        helper_fn_names: Set[str] = set()
+                        for stmt in fn_ddls:
+                            for pm in re.finditer(
+                                r"\bPERFORM\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                                stmt,
+                                re.IGNORECASE,
+                            ):
+                                cand = pm.group(1).lower()
+                                if cand not in needed_fn_names:
+                                    helper_fn_names.add(cand)
+                        if helper_fn_names:
+                            helper_ddls = [
+                                stmt
+                                for stmt in plan.trigger_ddls
+                                if any(
+                                    re.search(
+                                        rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:\"?{re.escape(fn)}\"?)\b",
+                                        stmt,
+                                        re.IGNORECASE,
+                                    )
+                                    for fn in helper_fn_names
+                                )
+                                and stmt not in matched_trig_ddls
+                                and stmt not in fn_ddls
+                            ]
+                            fn_ddls = helper_ddls + fn_ddls
                         view_repair_ddls = (
                             [plan.reader_view_ddl, *plan.readonly_trigger_ddls]
                             if not view_exists

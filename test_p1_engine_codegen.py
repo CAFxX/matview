@@ -1125,12 +1125,19 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
         )
         self.assertEqual(alg_plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
         lock_tbl = "__matview_lock_v_alg_j"
-        self.assertEqual(alg_plan.auxiliary_table_names, [lock_tbl])
+        self.assertEqual(
+            alg_plan.auxiliary_table_names,
+            [lock_tbl, "__matview_stg_v_alg_j__t", "__matview_stg_v_alg_j__d"],
+        )
         self.assertTrue(
             any(f"CREATE TABLE {lock_tbl}" in ddl for ddl in alg_plan.auxiliary_table_ddls),
             alg_plan.auxiliary_table_ddls,
         )
-        fn_ddls = [d for d in alg_plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_" in d]
+        fn_ddls = [
+            d
+            for d in alg_plan.trigger_ddls
+            if "CREATE OR REPLACE FUNCTION __matview_fn_sync_" in d and "_bs()" not in d
+        ]
         self.assertEqual(len(fn_ddls), 8)  # 2 sources x (ai, au, ad, trunc)
         for ddl in fn_ddls:
             lock_pos = ddl.find(f"INSERT INTO {lock_tbl} (__mv_id, __mv_n) VALUES (0, 1)")
@@ -1150,7 +1157,11 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
         self.assertEqual(t2_join_plan.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA)
         t2_lock_tbl = "__matview_lock_v_t2_lj"
         self.assertEqual(t2_join_plan.auxiliary_table_names, [t2_lock_tbl])
-        t2_fn_ddls = [d for d in t2_join_plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_" in d]
+        t2_fn_ddls = [
+            d
+            for d in t2_join_plan.trigger_ddls
+            if "CREATE OR REPLACE FUNCTION __matview_fn_sync_" in d and "_bs()" not in d
+        ]
         self.assertEqual(len(t2_fn_ddls), 8)
         for ddl in t2_fn_ddls:
             lock_pos = ddl.find(f"INSERT INTO {t2_lock_tbl} (__mv_id, __mv_n) VALUES (0, 1)")
@@ -1385,6 +1396,81 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
                 "CREATE VIEW v_ref_missing AS SELECT g, SUM(gx) AS s FROM gv GROUP BY g;",
                 dialect=Dialect.POSTGRES,
             )
+
+    def test_postgres_stage3_multi_source_inclusion_exclusion_codegen(self) -> None:
+        """Stage 3: PostgreSQL multi-source algebraic joins emit BEFORE/AFTER
+        bracket triggers, minimal-column staging tables, and exact inclusion-
+        exclusion reconcile functions (3 terms for 2 tables, 7 terms for 3 tables,
+        full-refresh overlap fallback for 5+ tables)."""
+        schemas = parse_table_schema(
+            "CREATE TABLE d (g INT PRIMARY KEY, name TEXT NOT NULL, unused_col BYTEA);"
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL, extra_unused TEXT);"
+            "CREATE TABLE u (uid INT PRIMARY KEY, tid INT NOT NULL, x INT NOT NULL);"
+            "CREATE TABLE p4 (p4id INT PRIMARY KEY, uid INT NOT NULL);"
+            "CREATE TABLE p5 (p5id INT PRIMARY KEY, p4id INT NOT NULL);",
+            dialect=Dialect.POSTGRES,
+        )
+
+        # 2-table join: 3 inclusion-exclusion terms (+Δt⋈d, +t⋈Δd, -(Δt⋈Δd))
+        p2 = generate_materialized_view(
+            schemas,
+            "CREATE VIEW v_s3_2 AS SELECT d.name, COUNT(*) AS c, SUM(t.v) AS s, MIN(t.v) AS mn "
+            "FROM t JOIN d ON t.g = d.g GROUP BY d.name;",
+            dialect=Dialect.POSTGRES,
+        )
+        reconcile_ddls = [d for d in p2.trigger_ddls if "__matview_fn_s3_" in d and "RETURNS VOID" in d]
+        self.assertEqual(len(reconcile_ddls), 1, p2.trigger_ddls)
+        rec2 = reconcile_ddls[0]
+        # Must include the negative pair correction -(t.__mv_s * d.__mv_s)
+        self.assertIn("-(t.__mv_s * d.__mv_s)", rec2)
+        self.assertIn("__matview_stg_v_s3_2__t", rec2)
+        self.assertIn("__matview_stg_v_s3_2__d", rec2)
+        # Unused columns must not be copied into staging tables.
+        stg_ddls = "\n".join(d for d in p2.auxiliary_table_ddls if "__matview_stg_" in d)
+        self.assertNotIn("unused_col", stg_ddls)
+        self.assertNotIn("extra_unused", stg_ddls)
+        # BEFORE bracket trigger must be installed on parent AND partitions.
+        before_trigs = [
+            d
+            for d in p2.trigger_ddls
+            if d.startswith("CREATE TRIGGER") and "BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON" in d
+        ]
+        self.assertEqual(len(before_trigs), 2)
+        install_blocks = [d for d in p2.trigger_ddls if d.startswith("DO $mv_install$")]
+        self.assertEqual(len(install_blocks), 2)
+        for blk in install_blocks:
+            self.assertIn("BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON %s", blk)
+
+        # 3-table join: 7 inclusion-exclusion terms including 3 negative pairs and 1 positive triple.
+        p3 = generate_materialized_view(
+            schemas,
+            "CREATE VIEW v_s3_3 AS SELECT d.name, COUNT(*) AS c, SUM(u.x) AS sx "
+            "FROM d JOIN t ON t.g = d.g JOIN u ON u.tid = t.id GROUP BY d.name;",
+            dialect=Dialect.POSTGRES,
+        )
+        rec3 = next(d for d in p3.trigger_ddls if "__matview_fn_s3_" in d and "RETURNS VOID" in d)
+        self.assertIn("-(d.__mv_s * t.__mv_s)", rec3)
+        self.assertIn("-(d.__mv_s * u.__mv_s)", rec3)
+        self.assertIn("-(t.__mv_s * u.__mv_s)", rec3)
+        self.assertIn("d.__mv_s * t.__mv_s * u.__mv_s", rec3)
+
+        # 5-table join: overlap falls back to locked full refresh without staging tables.
+        p5 = generate_materialized_view(
+            schemas,
+            "CREATE VIEW v_s3_5 AS SELECT d.name, COUNT(*) AS c "
+            "FROM d JOIN t ON t.g = d.g JOIN u ON u.tid = t.id "
+            "JOIN p4 ON p4.uid = u.uid JOIN p5 ON p5.p4id = p4.p4id GROUP BY d.name;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(p5.auxiliary_table_names, ["__matview_lock_v_s3_5"])
+        self.assertFalse(any("__matview_fn_s3_" in d for d in p5.trigger_ddls))
+        self.assertEqual(
+            sum(
+                d.startswith("CREATE TRIGGER") and "BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON" in d
+                for d in p5.trigger_ddls
+            ),
+            5,
+        )
 
 
 if __name__ == "__main__":

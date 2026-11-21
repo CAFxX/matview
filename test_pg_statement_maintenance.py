@@ -2478,3 +2478,558 @@ def test_pg18_virtual_generated_columns_all_strategies_and_drift(make_env, monke
     )
     assert cur.fetchall() == []
     env.conn.commit()
+
+
+def test_pg_stage3_multi_source_overlap_bracket_and_inclusion_exclusion(make_env) -> None:
+    """Stage 3: exact PostgreSQL maintenance when one query modifies several
+    sources of a join view via writable CTEs (2- and 3-source INSERT/UPDATE/
+    DELETE mixes), 2- and 3-level FK cascades (including 0-child cascades),
+    user BEFORE/AFTER ROW triggers, TRUNCATE CASCADE, partitioned sources,
+    SAVEPOINT rollback with an open bracket, sequential PL/pgSQL non-overlap
+    (verified with zero staging inserts), Tier 2 multi-source joins, special-
+    character view names, and concurrent READ COMMITTED / REPEATABLE READ
+    writers."""
+    import psycopg2
+    import psycopg2.extensions
+
+    schema = [
+        "CREATE TABLE s3_d (g INT PRIMARY KEY, name TEXT NOT NULL, x INT NOT NULL DEFAULT 0, unused_blob BYTEA)",
+        (
+            "CREATE TABLE s3_t ("
+            "id INT PRIMARY KEY, "
+            "g INT REFERENCES s3_d(g) ON UPDATE CASCADE ON DELETE CASCADE, "
+            "v INT, "
+            "w INT NOT NULL DEFAULT 0)"
+        ),
+        (
+            "CREATE TABLE s3_u ("
+            "uid INT PRIMARY KEY, "
+            "tid INT REFERENCES s3_t(id) ON UPDATE CASCADE ON DELETE CASCADE, "
+            "amt INT)"
+        ),
+        # Separate FK-free pair for phantom zero-net-group CTE tests (INSERT d + DELETE orphan t).
+        "CREATE TABLE s3_od (g INT PRIMARY KEY, name TEXT NOT NULL)",
+        "CREATE TABLE s3_ot (id INT PRIMARY KEY, g INT NOT NULL, v INT)",
+        # Partitioned child table joined to s3_d.
+        (
+            "CREATE TABLE s3_pt ("
+            "id INT NOT NULL, g INT NOT NULL, v INT NOT NULL, "
+            "PRIMARY KEY (g, id)) PARTITION BY LIST (g)"
+        ),
+        "CREATE TABLE s3_pt_1 PARTITION OF s3_pt FOR VALUES IN (1, 2, 10, 11, 12)",
+        "CREATE TABLE s3_pt_2 PARTITION OF s3_pt DEFAULT",
+    ]
+    views = [
+        # 2-table algebraic join with COUNT/SUM/AVG/MIN/MAX/BOOL_AND/BIT_XOR.
+        ViewDef(
+            "v_s3_2",
+            "SELECT d.name, COUNT(*) AS c, SUM(t.v) AS sv, AVG(t.v) AS av, "
+            "MIN(t.v) AS mn, MAX(t.v) AS mx, BOOL_AND(t.v > 0) AS all_pos, BIT_XOR(t.w) AS bx "
+            "FROM s3_t t JOIN s3_d d ON t.g = d.g GROUP BY d.name",
+        ),
+        # Global (ungrouped) 2-table algebraic join.
+        ViewDef(
+            "v_s3_glob",
+            "SELECT COUNT(*) AS c, SUM(t.v) AS sv, MIN(t.v) AS mn "
+            "FROM s3_t t JOIN s3_d d ON t.g = d.g",
+        ),
+        # 3-table algebraic join (exercises all 7 inclusion-exclusion terms including triple term).
+        ViewDef(
+            "v_s3_3",
+            "SELECT d.name, COUNT(*) AS c, SUM(u.amt) AS samt, MIN(u.amt) AS mn, MAX(u.amt) AS mx "
+            "FROM s3_d d JOIN s3_t t ON t.g = d.g JOIN s3_u u ON u.tid = t.id GROUP BY d.name",
+        ),
+        # Tier 2 multi-source LEFT JOIN, FULL OUTER JOIN, STRING_AGG, and cross-table GROUP BY.
+        ViewDef(
+            "v_s3_left",
+            "SELECT d.name, COUNT(t.id) AS c, SUM(t.v) AS sv "
+            "FROM s3_d d LEFT JOIN s3_t t ON t.g = d.g GROUP BY d.name",
+        ),
+        ViewDef(
+            "v_s3_str",
+            "SELECT (t.w + d.x) AS k, COUNT(*) AS c, STRING_AGG(d.name, ',' ORDER BY t.id) AS names "
+            "FROM s3_t t JOIN s3_d d ON t.g = d.g GROUP BY (t.w + d.x)",
+        ),
+        # FK-free phantom zero-net-group join.
+        ViewDef(
+            "v_s3_orphan",
+            "SELECT od.name, COUNT(*) AS c, SUM(ot.v) AS sv "
+            "FROM s3_ot ot JOIN s3_od od ON ot.g = od.g GROUP BY od.name",
+        ),
+        # Partitioned join view.
+        ViewDef(
+            "v_s3_part",
+            "SELECT d.name, COUNT(*) AS c, SUM(pt.v) AS sv "
+            "FROM s3_pt pt JOIN s3_d d ON pt.g = d.g GROUP BY d.name",
+        ),
+    ]
+    env = make_env(views=[], schema_sql=schema, seed=False)
+    cur = env.conn.cursor()
+    cur.execute("INSERT INTO s3_d (g, name, x) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)")
+    cur.execute(
+        "INSERT INTO s3_t (id, g, v, w) VALUES "
+        "(10, 1, 5, 1), (11, 1, 15, 2), (20, 2, -4, 3), (30, 3, 8, 4)"
+    )
+    cur.execute(
+        "INSERT INTO s3_u (uid, tid, amt) VALUES "
+        "(100, 10, 7), (101, 10, -2), (200, 20, 9), (300, 30, 11)"
+    )
+    cur.execute("INSERT INTO s3_od (g, name) VALUES (1, 'ok')")
+    cur.execute("INSERT INTO s3_ot (id, g, v) VALUES (1, 1, 10), (2, 99, 50)")
+    cur.execute("INSERT INTO s3_pt (id, g, v) VALUES (1, 1, 100), (2, 2, 200)")
+    env.conn.commit()
+    env.views = views
+    for vd in views:
+        env.register(vd)
+    # Also register a special-character view name join directly to verify GUC/OID/trigger quoting.
+    special_select = "SELECT d.name, COUNT(*) AS c, SUM(pt.v) AS sv FROM s3_pt pt JOIN s3_d d ON pt.g = d.g GROUP BY d.name"
+    env.manager.register_view(f'CREATE VIEW "my-stage3 join" AS {special_select};')
+    env.check("initial registration")
+
+    # 1. Sequential PL/pgSQL statements MUST NOT trigger overlap/staging.
+    stg_tables = [t for t in env.plans["v_s3_2"].auxiliary_table_names if "__matview_stg_" in t]
+    assert len(stg_tables) == 2, env.plans["v_s3_2"].auxiliary_table_names
+    cur.execute(
+        """
+        DO $$
+        BEGIN
+            UPDATE s3_d SET x = x + 1 WHERE g = 1;
+            UPDATE s3_t SET v = v + 2 WHERE id = 10;
+            UPDATE s3_u SET amt = amt + 3 WHERE uid = 100;
+        END $$;
+        """
+    )
+    cur.execute(
+        "SELECT relname, n_tup_ins FROM pg_stat_xact_user_tables WHERE relname = ANY(%s)",
+        (stg_tables,),
+    )
+    stg_ins = dict(cur.fetchall())
+    assert all(cnt == 0 for cnt in stg_ins.values()), f"sequential PL/pgSQL flagged overlap: {stg_ins}"
+    env.conn.commit()
+    env.check("after sequential PL/pgSQL statements")
+
+    # 2. 2-source writable CTEs: INSERT+INSERT, UPDATE+UPDATE, DELETE+DELETE,
+    #    mixed INSERT+UPDATE+DELETE, and phantom zero-net group (INSERT od + DELETE orphan ot).
+    cur.execute(
+        "WITH a AS (INSERT INTO s3_d (g, name, x) VALUES (4, 'd', 40), (5, 'a', 50) RETURNING g) "
+        "INSERT INTO s3_t (id, g, v, w) VALUES (40, 4, 25, 5), (41, 5, -9, 6)"
+    )
+    env.conn.commit()
+    env.check("2-source CTE INSERT+INSERT")
+
+    cur.execute(
+        "WITH a AS (UPDATE s3_d SET name = 'a_renamed', x = x + 5 WHERE g = 1 RETURNING g) "
+        "UPDATE s3_t SET v = v - 20, w = w + 10 WHERE g IN (SELECT g FROM a)"
+    )
+    env.conn.commit()
+    env.check("2-source CTE UPDATE+UPDATE (group key + extreme change)")
+
+    cur.execute(
+        "WITH a AS (INSERT INTO s3_od (g, name) VALUES (99, 'phantom') RETURNING g) "
+        "DELETE FROM s3_ot WHERE g IN (SELECT g FROM a)"
+    )
+    env.conn.commit()
+    env.check("2-source CTE phantom zero-net group")
+
+    # 3. 3-source writable CTEs (proving all 7 inclusion-exclusion terms including triple term!).
+    cur.execute(
+        "WITH a AS (INSERT INTO s3_d (g, name, x) VALUES (6, 'triple', 60) RETURNING g), "
+        "     b AS (INSERT INTO s3_t (id, g, v, w) VALUES (60, 6, 33, 7) RETURNING id) "
+        "INSERT INTO s3_u (uid, tid, amt) VALUES (600, 60, 100), (601, 60, -50)"
+    )
+    env.conn.commit()
+    env.check("3-source CTE INSERT+INSERT+INSERT")
+
+    cur.execute(
+        "WITH a AS (UPDATE s3_d SET name = 'triple2', x = 61 WHERE g = 6 RETURNING g), "
+        "     b AS (UPDATE s3_t SET v = v + 1, w = w + 1 WHERE g = 6 RETURNING id) "
+        "UPDATE s3_u SET amt = amt + 25 WHERE tid = 60"
+    )
+    env.conn.commit()
+    env.check("3-source CTE UPDATE+UPDATE+UPDATE")
+
+    cur.execute(
+        "WITH a AS (DELETE FROM s3_u WHERE uid = 600 RETURNING tid), "
+        "     b AS (UPDATE s3_t SET v = -100 WHERE id = 60 RETURNING g) "
+        "UPDATE s3_d SET name = 'triple3' WHERE g = 6"
+    )
+    env.conn.commit()
+    env.check("3-source CTE DELETE+UPDATE+UPDATE mix")
+
+    # 4. 2-level and 3-level FK cascades (multi-row ON UPDATE CASCADE, ON DELETE CASCADE,
+    #    and 0-child-row cascade where child transition table is empty!).
+    cur.execute("INSERT INTO s3_d (g, name, x) VALUES (77, 'childless', 0)")
+    env.conn.commit()
+    cur.execute("UPDATE s3_d SET g = 78, name = 'childless2' WHERE g = 77")
+    cur.execute("DELETE FROM s3_d WHERE g = 78")
+    env.conn.commit()
+    env.check("FK cascade with 0 matching child rows")
+
+    cur.execute("UPDATE s3_d SET g = g + 100 WHERE g IN (1, 2)")
+    env.conn.commit()
+    env.check("multi-row FK ON UPDATE CASCADE (d->t)")
+
+    cur.execute("DELETE FROM s3_d WHERE g IN (102, 6)")
+    env.conn.commit()
+    env.check("3-level FK ON DELETE CASCADE (d->t->u)")
+
+    # 5. Partitioned source in writable CTE + special-char view name + TRUNCATE CASCADE.
+    cur.execute(
+        "WITH a AS (INSERT INTO s3_d (g, name, x) VALUES (10, 'part_grp', 1) RETURNING g) "
+        "INSERT INTO s3_pt (id, g, v) VALUES (10, 10, 55), (11, 10, 45)"
+    )
+    env.conn.commit()
+    env.check("writable CTE into partitioned source")
+    cur.execute(
+        f'(SELECT * FROM "my-stage3 join" EXCEPT ALL SELECT * FROM ({special_select}) AS q) '
+        f'UNION ALL '
+        f'(SELECT * FROM ({special_select}) AS q EXCEPT ALL SELECT * FROM "my-stage3 join")'
+    )
+    assert cur.fetchall() == []
+    env.conn.commit()
+
+    # 6. SAVEPOINT + ROLLBACK TO SAVEPOINT mid-bracket (error after BEFORE/staging runs).
+    cur.execute("SAVEPOINT sp_s3")
+    with pytest.raises(psycopg2.Error):
+        cur.execute(
+            "WITH a AS (INSERT INTO s3_d (g, name, x) VALUES (88, 'rolled', 1) RETURNING g) "
+            "INSERT INTO s3_t (id, g, v, w) VALUES (10, 88, 1, 1)"  # duplicate PK id=10!
+        )
+    cur.execute("ROLLBACK TO SAVEPOINT sp_s3")
+    cur.execute("RELEASE SAVEPOINT sp_s3")
+    # Subsequent overlapping and non-overlapping writes in the SAME transaction must remain exact.
+    cur.execute(
+        "WITH a AS (INSERT INTO s3_d (g, name, x) VALUES (89, 'after_sp', 2) RETURNING g) "
+        "INSERT INTO s3_t (id, g, v, w) VALUES (890, 89, 12, 3)"
+    )
+    cur.execute("UPDATE s3_t SET v = v + 3 WHERE id = 890")
+    env.conn.commit()
+    env.check("after SAVEPOINT rollback mid-bracket + follow-up writes")
+
+    # Verify staging tables are completely empty after commit (zero leaked rows).
+    for st in stg_tables:
+        cur.execute(f"SELECT COUNT(*) FROM {st}")
+        assert cur.fetchone()[0] == 0, f"leaked staging rows in {st}"
+    env.conn.commit()
+
+    # 7. User BEFORE ROW and AFTER ROW triggers on s3_d writing s3_t (multiple rows).
+    cur.execute(
+        """
+        CREATE OR REPLACE FUNCTION s3_user_after_d() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.g >= 200 THEN
+                INSERT INTO s3_t (id, g, v, w) VALUES (NEW.g * 10, NEW.g, 17, 2)
+                ON CONFLICT (id) DO UPDATE SET v = s3_t.v + 5;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER s3_z_user_after_d AFTER INSERT OR UPDATE ON s3_d
+            FOR EACH ROW EXECUTE FUNCTION s3_user_after_d();
+        """
+    )
+    env.conn.commit()
+    cur.execute("INSERT INTO s3_d (g, name, x) VALUES (201, 'u1', 1), (202, 'u2', 2)")
+    cur.execute("UPDATE s3_d SET name = name || '_v2' WHERE g IN (201, 202)")
+    cur.execute("DROP TRIGGER s3_z_user_after_d ON s3_d; DROP FUNCTION s3_user_after_d();")
+    env.conn.commit()
+    env.check("multi-row user AFTER ROW trigger writing other join source")
+
+    # 8. Concurrent READ COMMITTED writer alongside writable CTEs + REPEATABLE READ 40001 check.
+    w1, w2 = env.connect(), env.connect()
+    try:
+        start_evt = threading.Event()
+        errs: List[Optional[BaseException]] = [None, None]
+
+        def _cte_worker() -> None:
+            start_evt.wait()
+            try:
+                c1 = w1.cursor()
+                for i in range(6):
+                    g = 500 + i
+                    c1.execute(
+                        f"WITH a AS (INSERT INTO s3_d (g, name, x) VALUES ({g}, 'conc_{i % 2}', {i}) RETURNING g) "
+                        f"INSERT INTO s3_t (id, g, v, w) VALUES ({g * 10}, {g}, {i + 1}, 1)"
+                    )
+                    w1.commit()
+            except BaseException as exc:
+                w1.rollback()
+                errs[0] = exc
+
+        def _single_worker() -> None:
+            start_evt.wait()
+            try:
+                c2 = w2.cursor()
+                for i in range(6):
+                    c2.execute("UPDATE s3_t SET v = v + 1 WHERE id = 10")
+                    w2.commit()
+            except BaseException as exc:
+                w2.rollback()
+                errs[1] = exc
+
+        t1 = threading.Thread(target=_cte_worker)
+        t2 = threading.Thread(target=_single_worker)
+        t1.start()
+        t2.start()
+        start_evt.set()
+        t1.join()
+        t2.join()
+        assert errs == [None, None], errs
+    finally:
+        w1.close()
+        w2.close()
+    env.check("concurrent READ COMMITTED writable CTE + single-table writer")
+
+    # REPEATABLE READ concurrent writable CTE must fail closed with 40001.
+    rr1, rr2 = env.connect(), env.connect()
+    try:
+        rr1.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ)
+        rr2.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ)
+        c1, c2 = rr1.cursor(), rr2.cursor()
+        c1.execute("SELECT COUNT(*) FROM s3_d")
+        c2.execute("SELECT COUNT(*) FROM s3_d")
+        c1.execute(
+            "WITH a AS (INSERT INTO s3_d (g, name, x) VALUES (901, 'rr', 1) RETURNING g) "
+            "INSERT INTO s3_t (id, g, v, w) VALUES (9010, 901, 5, 1)"
+        )
+        rr1.commit()
+        with pytest.raises(psycopg2.errors.SerializationFailure):
+            c2.execute(
+                "WITH a AS (INSERT INTO s3_d (g, name, x) VALUES (902, 'rr', 2) RETURNING g) "
+                "INSERT INTO s3_t (id, g, v, w) VALUES (9020, 902, 6, 1)"
+            )
+            rr2.commit()
+        rr2.rollback()
+    finally:
+        rr1.close()
+        rr2.close()
+    env.check("REPEATABLE READ concurrent writable CTE fail-closed 40001")
+
+    # 9. TRUNCATE s3_d CASCADE (truncates s3_d, s3_t, s3_u in one overlapping bracket).
+    cur.execute("TRUNCATE s3_d CASCADE")
+    env.conn.commit()
+    env.check("after TRUNCATE s3_d CASCADE")
+
+    # Drift check must stay ok across all Stage 3 triggers (including BEFORE triggers on partitions).
+    drift = env.manager.check_schema_drift()
+    assert all(status == "ok" for status in drift.values()), drift
+    env.conn.commit()
+
+    # 10. Adversarial drift detection for BEFORE bracket triggers (_bs) on parent and partition:
+    #     disabling or dropping _bs must be reported by check_schema_drift() and repaired cleanly.
+    bs_v2_d = next(t for t in env.plans["v_s3_2"].trigger_names if t.endswith("__s3_d_bs"))
+    cur.execute(f"ALTER TABLE s3_d DISABLE TRIGGER {bs_v2_d}")
+    env.conn.commit()
+    assert env.manager.check_schema_drift()["v_s3_2"] == "triggers_disabled"
+    env.manager.repair_view("v_s3_2")
+    assert env.manager.check_schema_drift()["v_s3_2"] == "ok"
+
+    bs_part = next(t for t in env.plans["v_s3_part"].trigger_names if t.endswith("__s3_pt_bs"))
+    cur.execute(f"DROP TRIGGER {bs_part} ON s3_pt_1")
+    env.conn.commit()
+    assert env.manager.check_schema_drift()["v_s3_part"] == "triggers_missing"
+    env.manager.repair_view("v_s3_part")
+    assert env.manager.check_schema_drift()["v_s3_part"] == "ok"
+    env.conn.commit()
+
+    # 11. Adversarial Stage 3 edge cases:
+    #     - Orphan row v -> NULL + parent INSERT with SUM (must store NULL, NOT 0)
+    #     - Consecutive overlapping brackets in ONE transaction (bseq=1 then bseq=2)
+    #     - PL/pgSQL EXCEPTION WHEN subtransaction rollback mid-bracket
+    #     - FULL OUTER JOIN, nullable group keys, WHERE/HAVING/BOOL_OR
+    #     - 4-table (15-term inclusion-exclusion) and 5-table (overlap full-refresh fallback) joins
+    #     - Tier 2 single-table view with 2nd-table subquery (uses_group_buckets=True)
+    #     - Rich staging column types (COLLATE "C", BPCHAR, VARCHAR(20), NUMERIC(10,2), INT[], ENUM, TIMESTAMPTZ)
+    #     - Multi-view concurrent s3_d writer alongside (s3_d, s3_t) writable CTE (AB-BA deadlock freedom)
+    #     - PG 18+ VIRTUAL generated column in a Stage 3 join source table
+    cur.execute("SHOW server_version_num")
+    pg_ver = int(cur.fetchone()[0])
+    env.conn.commit()
+
+    adv_schema = [
+        "CREATE TYPE s3_tag_enum AS ENUM ('lo', 'hi')",
+        (
+            "CREATE TABLE s3_a ("
+            'g INT PRIMARY KEY, name TEXT COLLATE "C", code BPCHAR, tag s3_tag_enum, '
+            "ts TIMESTAMPTZ, arr INT[], amt NUMERIC(10, 2))"
+        ),
+        (
+            "CREATE TABLE s3_b ("
+            "id INT PRIMARY KEY, g INT, v INT, flag BOOLEAN, "
+            + ("v_dbl INT GENERATED ALWAYS AS (v * 2) VIRTUAL" if pg_ver >= 180000 else "v_dbl INT GENERATED ALWAYS AS (v * 2) STORED")
+            + ")"
+        ),
+        "CREATE TABLE s3_c (cid INT PRIMARY KEY, bid INT, cv INT)",
+        "CREATE TABLE s3_e (eid INT PRIMARY KEY, cid INT, ev INT)",
+        "CREATE TABLE s3_f (fid INT PRIMARY KEY, eid INT, fv INT)",
+        "CREATE TABLE s3_sub (g INT PRIMARY KEY)",
+    ]
+    adv_views = [
+        # Nullable group key + COLLATE "C" + BPCHAR + ENUM + ARRAY + VIRTUAL col + SUM/BOOL_OR/HAVING/WHERE.
+        ViewDef(
+            "v_s3_rich",
+            "SELECT a.name, a.code, a.tag, a.arr, SUM(b.v) AS sv, SUM(b.v_dbl) AS sd, "
+            "BOOL_OR(b.flag) AS any_f, COUNT(*) AS c "
+            "FROM s3_b b JOIN s3_a a ON b.g = a.g "
+            "WHERE b.id > 0 GROUP BY a.name, a.code, a.tag, a.arr HAVING COUNT(*) > 0",
+        ),
+        # Single-table view sharing s3_a (to stress multi-view lock ordering with v_s3_rich).
+        ViewDef(
+            "v_s3_a_only",
+            "SELECT name, COUNT(*) AS c, SUM(amt) AS sa FROM s3_a GROUP BY name",
+        ),
+        # FULL OUTER JOIN (Tier 2 multi-source).
+        ViewDef(
+            "v_s3_full",
+            "SELECT COALESCE(a.name, 'none') AS nm, COUNT(a.g) AS ca, COUNT(b.id) AS cb, SUM(b.v) AS sv "
+            "FROM s3_a a FULL OUTER JOIN s3_b b ON a.g = b.g GROUP BY COALESCE(a.name, 'none')",
+        ),
+        # Tier 2 single-table view with 2nd-table subquery (uses_group_buckets=True).
+        ViewDef(
+            "v_s3_t2_sub",
+            "SELECT b.g, COUNT(*) AS c, SUM(b.v) AS sv FROM s3_b b "
+            "WHERE b.g IN (SELECT s.g FROM s3_sub s) GROUP BY b.g",
+        ),
+        # 4-table algebraic join (15 inclusion-exclusion terms).
+        ViewDef(
+            "v_s3_4",
+            "SELECT a.name, COUNT(*) AS c, SUM(e.ev) AS sev "
+            "FROM s3_a a JOIN s3_b b ON b.g = a.g JOIN s3_c c ON c.bid = b.id "
+            "JOIN s3_e e ON e.cid = c.cid GROUP BY a.name",
+        ),
+        # 5-table algebraic join (overlap full-refresh fallback).
+        ViewDef(
+            "v_s3_5",
+            "SELECT a.name, COUNT(*) AS c, SUM(f.fv) AS sfv "
+            "FROM s3_a a JOIN s3_b b ON b.g = a.g JOIN s3_c c ON c.bid = b.id "
+            "JOIN s3_e e ON e.cid = c.cid JOIN s3_f f ON f.eid = e.eid GROUP BY a.name",
+        ),
+    ]
+    adv_env = make_env(views=[], schema_sql=adv_schema, seed=False)
+    acur = adv_env.conn.cursor()
+    # Seed an orphan row in s3_b (g=1, v=10) with NO parent in s3_a yet.
+    acur.execute("INSERT INTO s3_b (id, g, v, flag) VALUES (10, 1, 10, TRUE)")
+    acur.execute("INSERT INTO s3_sub (g) VALUES (1)")
+    adv_env.conn.commit()
+    adv_env.views = adv_views
+    for vd in adv_views:
+        adv_env.register(vd)
+
+    def _check_adv(label: str) -> None:
+        for vd in adv_views:
+            acur.execute(f"SELECT * FROM {vd.name} LIMIT 0")
+            mv_oids = [d.type_code for d in acur.description]
+            cols = [d[0] for d in acur.description]
+            acur.execute(f"SELECT * FROM ({vd.select}) AS q LIMIT 0")
+            live_oids = [d.type_code for d in acur.description]
+            assert mv_oids == live_oids, f"{label}: {vd.name} OIDs {mv_oids} != {live_oids}"
+            sel_cols = ", ".join(cols)
+            acur.execute(
+                f"(SELECT {sel_cols} FROM {vd.name} EXCEPT ALL SELECT {sel_cols} FROM ({vd.select}) AS q) "
+                f"UNION ALL "
+                f"(SELECT {sel_cols} FROM ({vd.select}) AS q EXCEPT ALL SELECT {sel_cols} FROM {vd.name})"
+            )
+            diff = acur.fetchall()
+            assert diff == [], f"{label}: {vd.name} diff={diff}"
+        adv_env.conn.commit()
+
+    _check_adv("adv initial registration")
+
+    # Critical #2 regression: INSERT parent s3_a(g=1) + UPDATE orphan s3_b(v=10 -> NULL) in ONE CTE.
+    # Surviving group 'alpha' has 1 row with v=NULL, so SUM(b.v) MUST be NULL (not 0!).
+    acur.execute(
+        "WITH ins_a AS ("
+        "  INSERT INTO s3_a (g, name, code, tag, ts, arr, amt) "
+        "  VALUES (1, 'alpha', 'LONG_BPCHAR_VALUE', 'hi', '2026-01-01 00:00:00+00', ARRAY[1, 2], 12.34) "
+        "  RETURNING g"
+        ") UPDATE s3_b SET v = NULL WHERE id = 10"
+    )
+    adv_env.conn.commit()
+    _check_adv("orphan v->NULL + parent INSERT must yield SUM=NULL not 0")
+    acur.execute("SELECT sv, sd FROM v_s3_rich WHERE name = 'alpha'")
+    assert acur.fetchall() == [(None, None)]
+    adv_env.conn.commit()
+
+    # Consecutive overlapping brackets in ONE transaction (bseq=1 then bseq=2) +
+    # PL/pgSQL EXCEPTION WHEN subtransaction rollback mid-bracket!
+    acur.execute(
+        "WITH ins_a AS ("
+        "  INSERT INTO s3_a (g, name, code, tag, ts, arr, amt) "
+        "  VALUES (2, NULL, 'B2', 'lo', '2026-01-02 00:00:00+00', ARRAY[3], 5.00) RETURNING g"
+        "), ins_b AS ("
+        "  INSERT INTO s3_b (id, g, v, flag) VALUES (20, 2, 7, FALSE) RETURNING id"
+        "), ins_c AS ("
+        "  INSERT INTO s3_c (cid, bid, cv) VALUES (200, 20, 11) RETURNING cid"
+        "), ins_e AS ("
+        "  INSERT INTO s3_e (eid, cid, ev) VALUES (2000, 200, 13) RETURNING eid"
+        ") INSERT INTO s3_f (fid, eid, fv) VALUES (20000, 2000, 17)"
+    )
+    # Second overlapping bracket in the SAME transaction (bseq=2) + Tier 2 subquery table overlap!
+    acur.execute(
+        "WITH ins_sub AS (INSERT INTO s3_sub (g) VALUES (2) RETURNING g) "
+        "UPDATE s3_b SET v = 9 WHERE id = 20"
+    )
+    # PL/pgSQL EXCEPTION block catching a duplicate-key failure mid-bracket.
+    acur.execute(
+        """
+        DO $$
+        BEGIN
+            BEGIN
+                WITH ins_a AS (INSERT INTO s3_a (g, name, code, tag, ts, arr, amt)
+                               VALUES (3, 'rolled_exc', 'R', 'lo', now(), ARRAY[9], 1.00) RETURNING g)
+                INSERT INTO s3_b (id, g, v, flag) VALUES (20, 3, 99, TRUE);
+            EXCEPTION WHEN unique_violation THEN
+                NULL;
+            END;
+        END $$;
+        """
+    )
+    # 0-row multi-source UPDATE must not fail and must keep exactness.
+    acur.execute("WITH u AS (UPDATE s3_a SET amt = 0 WHERE g = -999) UPDATE s3_b SET v = 0 WHERE id = -999")
+    adv_env.conn.commit()
+    _check_adv("consecutive brackets + 4/5-table joins + Tier 2 subquery + EXCEPTION rollback + 0-row CTE")
+
+    # Multi-view deadlock freedom: concurrent writer updating s3_a (shared by v_s3_rich & v_s3_a_only)
+    # while another connection runs (s3_a, s3_b) writable CTEs.
+    mv1, mv2 = adv_env.connect(), adv_env.connect()
+    try:
+        go = threading.Event()
+        mv_errs: List[Optional[BaseException]] = [None, None]
+
+        def _mv_cte() -> None:
+            go.wait()
+            try:
+                c1 = mv1.cursor()
+                for k in range(10):
+                    c1.execute(
+                        "WITH ua AS (UPDATE s3_a SET amt = amt + 1 WHERE g = 1 RETURNING g) "
+                        "UPDATE s3_b SET v = COALESCE(v, 0) + 1 WHERE id = 10"
+                    )
+                    mv1.commit()
+            except BaseException as exc:
+                mv1.rollback()
+                mv_errs[0] = exc
+
+        def _mv_single_a() -> None:
+            go.wait()
+            try:
+                c2 = mv2.cursor()
+                for k in range(10):
+                    c2.execute("UPDATE s3_a SET amt = amt + 2 WHERE g = 1")
+                    mv2.commit()
+            except BaseException as exc:
+                mv2.rollback()
+                mv_errs[1] = exc
+
+        th1 = threading.Thread(target=_mv_cte)
+        th2 = threading.Thread(target=_mv_single_a)
+        th1.start()
+        th2.start()
+        go.set()
+        th1.join()
+        th2.join()
+        assert mv_errs == [None, None], f"multi-view deadlock/error: {mv_errs}"
+    finally:
+        mv1.close()
+        mv2.close()
+    _check_adv("multi-view concurrent shared-source s3_a writer + (s3_a, s3_b) writable CTE")

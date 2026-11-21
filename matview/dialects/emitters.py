@@ -578,6 +578,7 @@ class DialectEmitMixin(MixinHost):
         pg_ai_body: Optional[str] = None,
         pg_ad_body: Optional[str] = None,
         pg_au_body: Optional[str] = None,
+        pg_bracket: Optional[Any] = None,
         mysql_prelock: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         if self.dialect == Dialect.POSTGRES:
@@ -593,6 +594,7 @@ class DialectEmitMixin(MixinHost):
                 base_t,
                 {"INSERT": pg_ai_body, "UPDATE": pg_au_body, "DELETE": pg_ad_body},
                 trunc_body,
+                bracket=pg_bracket,
             )
 
         log_vname = self.logical_view_name

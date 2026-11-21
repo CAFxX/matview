@@ -168,10 +168,21 @@ class Tier2Mixin(MixinHost):
         if self.dialect != Dialect.POSTGRES or col_def is None:
             return sqlglot_exp.Null()
         dt = self._normalize_dialect_type(col_def.data_type).strip()
-        if not dt or dt.upper() in ("ARRAY", "USER-DEFINED"):
+        m_coll = re.search(
+            r"(\s+COLLATE\s+(?:(?:\"[^\"]+\"|\S+)\.)?(?:\"[^\"]+\"|\S+))\s*$",
+            dt,
+            re.IGNORECASE,
+        )
+        if m_coll:
+            base_dt = dt[: m_coll.start()].strip()
+            coll_tail = m_coll.group(1)
+        else:
+            base_dt = dt
+            coll_tail = ""
+        if not base_dt or base_dt.upper() in ("ARRAY", "USER-DEFINED"):
             return sqlglot_exp.Null() if allow_untyped_null else None
         try:
-            return parse_sql_ast(f"CAST(NULL AS {dt})", dialect=Dialect.POSTGRES)
+            return parse_sql_ast(f"CAST(NULL AS {base_dt}){coll_tail}", dialect=Dialect.POSTGRES)
         except sqlglot.errors.SqlglotError:
             return sqlglot_exp.Null() if allow_untyped_null else None
 
@@ -755,6 +766,7 @@ class Tier2Mixin(MixinHost):
         source_query_sql: str,
         group_col_types: Optional[Dict[str, str]] = None,
         uses_group_buckets: bool = False,
+        pg_bracket_source_bit: Optional[int] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         q_target_cols = [self._q(c) for c in target_cols]
         cols_csv = ", ".join(q_target_cols)
@@ -837,8 +849,11 @@ class Tier2Mixin(MixinHost):
         pg_ai_body: Optional[str] = None
         pg_ad_body: Optional[str] = None
         pg_au_body: Optional[str] = None
+        pg_bracket: Optional[Any] = None
         pg_trunc_stmts = full_refresh
         if self.dialect == Dialect.POSTGRES:
+            from ..dialects.pg_statement import PgStatementBracket
+
             pg_bodies = self._pg_group_scoped_bodies(
                 base_t, mv_table, cols_csv, src_cols_csv, group_mv_cols, source_query_sql,
                 can_push_down, full_refresh, group_col_types or {},
@@ -848,6 +863,13 @@ class Tier2Mixin(MixinHost):
             # TRUNCATE recomputes everything: lock all buckets when group-scoped
             # writers exist, otherwise only row 0.
             pg_trunc_stmts = [self._pg_view_lock_stmt(all_buckets=uses_group_buckets), *full_refresh]
+            if pg_bracket_source_bit is not None:
+                pg_bracket = PgStatementBracket(
+                    lock_table=self._pg_view_lock_table(),
+                    source_bit=pg_bracket_source_bit,
+                    overlap_refresh_sql="\n".join(pg_trunc_stmts),
+                    overlap_lock_sql=self._pg_view_lock_stmt(all_buckets=uses_group_buckets),
+                )
 
         return self._emit_dialect_triggers_for_table(
             view_name=view_name,
@@ -860,6 +882,7 @@ class Tier2Mixin(MixinHost):
             pg_ai_body=pg_ai_body,
             pg_ad_body=pg_ad_body,
             pg_au_body=pg_au_body,
+            pg_bracket=pg_bracket,
         )
 
 
@@ -1263,7 +1286,11 @@ class Tier2Mixin(MixinHost):
         trigger_ddls: List[str] = []
         trig_names: List[str] = []
         fn_names: List[str] = []
-        for ref_table in self.view.referenced_tables:
+        pg_multi_source = self.dialect == Dialect.POSTGRES and len(self.view.referenced_tables) >= 2
+        for ref_idx, ref_table in enumerate(self.view.referenced_tables):
+            src_bit: Optional[int] = None
+            if pg_multi_source:
+                src_bit = (1 << ref_idx) if ref_idx < 60 else ((1 << 60) | (1 << 61))
             t_ddls, t_ns, f_ns = self._build_tier2_triggers_for_table(
                 view_name=view_name,
                 mv_table=mv_table,
@@ -1273,6 +1300,7 @@ class Tier2Mixin(MixinHost):
                 source_query_sql=source_query_sql,
                 group_col_types=col_types_by_lower,
                 uses_group_buckets=uses_group_buckets,
+                pg_bracket_source_bit=src_bit,
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)

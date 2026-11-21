@@ -2451,7 +2451,7 @@ class TranspiledConnectionAdapter:
             s_up = s.upper().rstrip(";").strip()
 
         m_pg_fn = re.match(
-            r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\)\s+RETURNS\s+TRIGGER\s+AS\s+\$\$(.*)\$\$\s+LANGUAGE\s+plpgsql(?:\s+SET\s+search_path\s+FROM\s+CURRENT)?;?",
+            r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\)\s+RETURNS\s+(?:TRIGGER|VOID)\s+AS\s+\$\$(.*)\$\$\s+LANGUAGE\s+plpgsql(?:\s+SET\s+search_path\s+FROM\s+CURRENT)?;?",
             s,
             flags=re.I | re.S,
         )
@@ -2473,7 +2473,7 @@ class TranspiledConnectionAdapter:
             return [], 0
 
         if self.dialect == Dialect.POSTGRES and s_up.startswith("CREATE TRIGGER"):
-            if "AFTER TRUNCATE ON" in s_up:
+            if "AFTER TRUNCATE ON" in s_up or "BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON" in s_up:
                 return [], 0
             m_ro = re.match(
                 r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\s+INSTEAD\s+OF\s+INSERT\s+OR\s+UPDATE\s+OR\s+DELETE\s+ON\s+([A-Za-z0-9_]+)\s+FOR\s+EACH\s+ROW\s+EXECUTE\s+FUNCTION\s+([A-Za-z0-9_]+)\(\);?",
@@ -2505,6 +2505,14 @@ class TranspiledConnectionAdapter:
                     m_stmt_tr.group(4),
                 )
                 body = self._pg_functions.get(fn_name, "")
+                # Strip Stage 3 multi-source bracket prelude when transpiling
+                # PostgreSQL statement triggers onto SQLite (single-source only).
+                body = re.sub(
+                    r"/\*\s*__MV_BRACKET_START__\s*\*/.*?/\*\s*__MV_BRACKET_END__\s*\*/",
+                    "",
+                    body,
+                    flags=re.I | re.S,
+                )
                 # Statement-level bodies start with an early return on an
                 # empty transition table; a SQLite row trigger always has
                 # its one row.
