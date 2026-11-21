@@ -816,22 +816,7 @@ def _key_env(make_env, kind: str) -> Env:
                     schema_sql=[f"CREATE TABLE ck (id INT PRIMARY KEY, k {col_type}, g INT, v INT)"])
 
 
-try:
-    from psycopg2.errors import SyntaxError as _PgSyntaxError
-except ImportError:  # the module is skipped without POSTGRES_DSN
-    _PgSyntaxError = Exception  # type: ignore[misc,assignment]
-
-_ARRAY_KEY_TYPE = (
-    "An array-typed view column gets the invalid backing column type ARRAY (pre-existing): registration "
-    "fails. TODO.md 'Native Backing Column Types for Array Keys'"
-)
-
-
-@pytest.mark.parametrize("kind", [
-    pytest.param(k, marks=pytest.mark.xfail(strict=True, raises=_PgSyntaxError, reason=_ARRAY_KEY_TYPE))
-    if k == "numeric_array" else k
-    for k in KEY_TYPES
-])
+@pytest.mark.parametrize("kind", list(KEY_TYPES))
 def test_equal_keys_that_print_differently_form_one_group(make_env, kind: str) -> None:
     _, groups, other, _ = KEY_TYPES[kind]
     env = _key_env(make_env, kind)
@@ -1084,3 +1069,244 @@ def test_key_text_function_is_created_and_dropped_with_the_view(make_env) -> Non
     cur.execute(count, (key_fns[0].split("(")[0], env.ns))
     assert cur.fetchone()[0] == 0
     env.conn.commit()
+
+
+def test_native_postgres_array_backing_types_and_expressions(make_env, monkeypatch) -> None:
+    """PostgreSQL array-typed columns (built-in, parameterized, unbounded VARCHAR/BPCHAR,
+    TIMESTAMPTZ, BYTEA, JSONB, NUMRANGE, mixed-case ENUM, domain-over-array, array-of-domain,
+    2D arrays, partitioned tables, and array expressions) register cleanly with native backing
+    column types, preserve exact values and result OIDs across DML, and work via both
+    SQLAlchemy and raw DB-API introspection."""
+    import matview.connectivity as _conn_mod
+
+    env = make_env(
+        views=[],
+        seed=False,
+        schema_sql=[
+            'CREATE TYPE "MixedArrEnum" AS ENUM (\'alpha\', \'beta\')',
+            "CREATE DOMAIN pos_int_dom AS INTEGER CHECK (VALUE > 0)",
+            "CREATE DOMAIN int_arr_dom AS INTEGER[]",
+            """
+            CREATE TABLE arr_all (
+                id INT PRIMARY KEY,
+                g INT NOT NULL,
+                v INT NOT NULL,
+                a_int INT[],
+                a_int2d INT[][],
+                a_num NUMERIC[],
+                a_num_ps NUMERIC(10, 2)[],
+                a_txt TEXT[],
+                a_vc VARCHAR[],
+                a_vc20 VARCHAR(20)[],
+                a_c3 CHAR(3)[],
+                a_bp BPCHAR[],
+                a_ts TIMESTAMPTZ[],
+                a_bin BYTEA[],
+                a_jb JSONB[],
+                a_rng NUMRANGE[],
+                a_enum "MixedArrEnum"[],
+                a_dom_elem pos_int_dom[],
+                a_dom_arr int_arr_dom
+            )
+            """,
+            """
+            CREATE TABLE arr_part (
+                id INT NOT NULL,
+                g INT NOT NULL,
+                k NUMERIC[],
+                v INT NOT NULL,
+                PRIMARY KEY (g, id)
+            ) PARTITION BY LIST (g)
+            """,
+            "CREATE TABLE arr_part_1 PARTITION OF arr_part FOR VALUES IN (1)",
+            "CREATE TABLE arr_part_2 PARTITION OF arr_part FOR VALUES IN (2)",
+        ],
+    )
+    cur = env.conn.cursor()
+
+    # Verify both SQLAlchemy reflection and raw DB-API fallback produce exact native array DDL types
+    # (never bare "ARRAY" or "NULL", and preserving typmods, VARCHAR[] vs TEXT[], TIMESTAMPTZ[], and enums).
+    sa_schemas = env.manager.fetch_schema()
+    monkeypatch.setattr(_conn_mod, "_can_use_sqlalchemy_inspector", lambda _c: False)
+    raw_schemas = env.manager.fetch_schema()
+    monkeypatch.undo()
+
+    expected_reflected = {
+        "a_int": "integer[]",
+        "a_int2d": "integer[]",
+        "a_num": "numeric[]",
+        "a_num_ps": "numeric(10,2)[]",
+        "a_txt": "text[]",
+        "a_vc": "character varying[]",
+        "a_vc20": "character varying(20)[]",
+        "a_c3": "character(3)[]",
+        "a_bp": "bpchar[]",
+        "a_ts": "timestamp with time zone[]",
+        "a_bin": "bytea[]",
+        "a_jb": "jsonb[]",
+        "a_rng": "numrange[]",
+        "a_enum": '"MixedArrEnum"[]',
+        "a_dom_elem": "integer[]",
+        "a_dom_arr": "integer[]",
+    }
+    for label, sch_map in (("sqlalchemy", sa_schemas), ("dbapi_fallback", raw_schemas)):
+        cols = sch_map["arr_all"].columns
+        for cname, exp_dt in expected_reflected.items():
+            assert cols[cname].data_type == exp_dt, f"{label}: {cname} got {cols[cname].data_type!r}, expected {exp_dt!r}"
+        assert sch_map["arr_part"].columns["k"].data_type == "numeric[]", (
+            f"{label}: partitioned table array column got {sch_map['arr_part'].columns['k'].data_type!r}"
+        )
+
+    # Savepoint safety: an error inside _PG_NATIVE_ARRAY_TYPES_SQL inside an active
+    # transaction must roll back only its own savepoint and never abort the caller's tx.
+    cur.execute("SELECT 1")
+    monkeypatch.setattr(_conn_mod, "_PG_NATIVE_ARRAY_TYPES_SQL", "SELECT * FROM __nonexistent_pg_arr_probe__")
+    assert _conn_mod._pg_introspect_native_array_types(env.conn) == {}
+    cur.execute("SELECT 42")
+    assert cur.fetchone()[0] == 42
+    monkeypatch.undo()
+    env.conn.commit()
+
+    cur.execute(
+        """
+        INSERT INTO arr_all VALUES
+        (1, 1, 10, '{1,2}', '{{1,2},{3,4}}', '{1.0,NULL,2}', '{1.50,2.25}', '{"a","b"}',
+         '{"x"}', '{"short"}', '{"ab "}', '{"bp"}',
+         ARRAY['2026-01-01 00:00:00+00'::timestamptz],
+         ARRAY['\\x00ff'::bytea], ARRAY['{"a":1.0}'::jsonb], ARRAY['[1.0,2.50)'::numrange],
+         ARRAY['alpha'::"MixedArrEnum"], ARRAY[1,2]::pos_int_dom[], ARRAY[10,20]::int_arr_dom),
+        (2, 1, 20, '{1,2}', '{{1,2},{3,4}}', '{1,NULL,2.00}', '{1.5,2.25}', '{"a","b"}',
+         '{"x"}', '{"short"}', '{"ab "}', '{"bp"}',
+         ARRAY['2026-01-01 09:00:00+09'::timestamptz],
+         ARRAY['\\x00ff'::bytea], ARRAY['{"a":1}'::jsonb], ARRAY['[1,2.5)'::numrange],
+         ARRAY['alpha'::"MixedArrEnum"], ARRAY[1,2]::pos_int_dom[], ARRAY[10,20]::int_arr_dom),
+        (3, 2, 30, '{}', '{}', NULL, '{}', NULL,
+         '{}', '{}', '{}', '{}',
+         '{}', '{}', '{}', '{}',
+         '{}', '{}', '{}')
+        """
+    )
+    cur.execute(
+        "INSERT INTO arr_part VALUES (1, 1, '{1.0,2}', 10), (2, 2, '{1,2.00}', 25), (3, 1, NULL, 5)"
+    )
+    env.conn.commit()
+
+    views = [
+        ViewDef(
+            "v_arr_proj",
+            "SELECT id, a_int, a_int2d, a_num, a_num_ps, a_txt, a_vc, a_vc20, a_c3, a_bp, "
+            "a_ts, a_bin, a_jb, a_rng, a_enum, a_dom_elem, a_dom_arr FROM arr_all",
+        ),
+        ViewDef("v_arr_grp_types", "SELECT a_int, a_vc, a_bp, a_ts, a_jb, a_rng, a_enum, COUNT(*) AS n, SUM(v) AS s FROM arr_all GROUP BY a_int, a_vc, a_bp, a_ts, a_jb, a_rng, a_enum"),
+        ViewDef("v_arr_dom_grp", "SELECT a_dom_elem, a_dom_arr, COUNT(*) AS n, SUM(v) AS s FROM arr_all GROUP BY a_dom_elem, a_dom_arr"),
+        ViewDef(
+            "v_arr_expr",
+            "SELECT COALESCE(a_num, ARRAY[]::NUMERIC[]) AS k_co, "
+            "CASE WHEN g = 1 THEN a_num_ps ELSE a_num END AS k_case_num, "
+            "CASE WHEN g = 1 THEN a_vc ELSE ARRAY['x'] END AS k_case_txt, "
+            "CASE WHEN g = 1 THEN a_int ELSE a_num END AS k_case_wide, "
+            "COALESCE(ARRAY['x'], a_vc) AS k_co_lit, "
+            "a_txt COLLATE \"C\" AS k_coll, "
+            "a_num[1] AS first_num, a_num[1:2] AS slice_num, "
+            "a_int2d[1][1] AS elem_2d, a_int2d[1] AS elem_1d_of_2d, "
+            "a_vc[1] AS elem_vc, a_vc20[1] AS elem_vc20, a_c3[1] AS elem_c3, "
+            "ARRAY[g, v] AS made_arr, ARRAY[1, '2'] AS mix_arr, ARRAY[NULL] AS null_arr, "
+            "COUNT(*) AS n FROM arr_all "
+            "GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16",
+        ),
+        ViewDef(
+            "v_arr_minmax",
+            "SELECT g, MIN(a_num_ps) AS mn_num, MAX(a_vc20) AS mx_vc, "
+            "COALESCE(MIN(a_num_ps), ARRAY[]::NUMERIC[]) AS co_mn "
+            "FROM arr_all GROUP BY g",
+        ),
+        ViewDef("v_arr_part", "SELECT k, COUNT(*) AS n, SUM(v) AS s FROM arr_part GROUP BY k"),
+    ]
+    env.views = views
+    for vd in views:
+        env.register(vd)
+
+    def _norm_val(val):
+        if isinstance(val, memoryview):
+            return bytes(val)
+        if isinstance(val, list):
+            return [_norm_val(x) for x in val]
+        if isinstance(val, tuple):
+            return tuple(_norm_val(x) for x in val)
+        return val
+
+    def _assert_views_match_and_oids(label: str) -> None:
+        # Check exact result-type OIDs on every non-domain array column against the live SELECT.
+        domain_cols = {"a_dom_elem", "a_dom_arr"}
+        for vd in views:
+            cur.execute(f"SELECT * FROM {vd.name} LIMIT 0")
+            mv_desc = [(d.name, d.type_code) for d in cur.description]
+            cur.execute(f"SELECT * FROM ({vd.select}) AS q LIMIT 0")
+            live_desc = [(d.name, d.type_code) for d in cur.description]
+            for (mn, moid), (ln, loid) in zip(mv_desc, live_desc):
+                assert mn == ln
+                if mn not in domain_cols:
+                    assert moid == loid, f"{label}: {vd.name}.{mn} OID mismatch MV={moid} LIVE={loid}"
+            sel_cols = ", ".join(
+                f"{n}::integer[] AS {n}" if n == "a_dom_elem" else n
+                for n, _ in mv_desc
+            )
+            cur.execute(f"SELECT {sel_cols} FROM {vd.name}")
+            mv_rows = cur.fetchall()
+            cur.execute(f"SELECT {sel_cols} FROM ({vd.select}) AS q")
+            live_rows = cur.fetchall()
+            assert len(mv_rows) == len(live_rows), f"{label}: {vd.name} row count MV={len(mv_rows)} LIVE={len(live_rows)}"
+            if vd.name == "v_arr_proj":
+                # Projection rows must preserve exact per-row representation (including display scale).
+                mv_repr = sorted(repr(_norm_val(r)) for r in mv_rows)
+                live_repr = sorted(repr(_norm_val(r)) for r in live_rows)
+                assert mv_repr == live_repr, f"{label}: {vd.name}\n MV:   {mv_repr}\n LIVE: {live_repr}"
+            else:
+                # Grouped views must match LIVE with exact multiset equality under PostgreSQL's
+                # native equality (equal group keys like 1.0 vs 1 form one group; exact stored
+                # representative is arbitrary among equal members, just as in _check_key_groups).
+                cur.execute(
+                    f"(SELECT {sel_cols} FROM {vd.name} EXCEPT ALL SELECT {sel_cols} FROM ({vd.select}) AS q) "
+                    f"UNION ALL "
+                    f"(SELECT {sel_cols} FROM ({vd.select}) AS q EXCEPT ALL SELECT {sel_cols} FROM {vd.name})"
+                )
+                diff = cur.fetchall()
+                assert diff == [], f"{label}: {vd.name} symmetric diff={diff}\n MV:   {mv_rows}\n LIVE: {live_rows}"
+        env.conn.commit()
+
+    _assert_views_match_and_oids("initial")
+
+    # Mutate arrays across INSERT, UPDATE, and DELETE (including empty arrays and NULLs).
+    cur.execute(
+        """
+        INSERT INTO arr_all VALUES
+        (4, 2, 40, '{9,8}', '{{9,8}}', '{3.5}', '{3.50}', '{"z"}',
+         '{"y"}', '{"long"}', '{"cd "}', '{"bp2"}',
+         ARRAY['2026-06-01 00:00:00+00'::timestamptz],
+         ARRAY['\\xabcd'::bytea], ARRAY['{"b":2}'::jsonb], ARRAY['[2,4)'::numrange],
+         ARRAY['beta'::"MixedArrEnum"], ARRAY[5]::pos_int_dom[], ARRAY[50]::int_arr_dom)
+        """
+    )
+    cur.execute("UPDATE arr_all SET a_num = '{1.000,NULL,2.0}', v = 99 WHERE id = 3")
+    cur.execute("DELETE FROM arr_all WHERE id = 1")
+    cur.execute("INSERT INTO arr_part VALUES (4, 2, '{1.00,2.0}', 15)")
+    cur.execute("UPDATE arr_part SET k = '{}', v = 77 WHERE id = 3")
+    cur.execute("DELETE FROM arr_part WHERE id = 1")
+    env.conn.commit()
+
+    _assert_views_match_and_oids("after_dml")
+
+    # Verify secondary search_path schema visibility: a table in a secondary schema on
+    # search_path (not current_schema()) must also resolve native array types via pg_table_is_visible.
+    sec_sch = f"{env.ns}_sec"
+    cur.execute(f'CREATE SCHEMA "{sec_sch}"')
+    cur.execute(f'CREATE TABLE "{sec_sch}".sec_arr_t (id INT PRIMARY KEY, k NUMERIC(8, 2)[], v INT)')
+    cur.execute(f'SET search_path TO "{env.ns}", "{sec_sch}"')
+    env.conn.commit()
+    try:
+        arr_map = _conn_mod._pg_introspect_native_array_types(env.conn)
+        assert arr_map.get(("sec_arr_t", "k")) == "numeric(8,2)[]", arr_map
+    finally:
+        cur.execute(f'SET search_path TO "{env.ns}"')
+        cur.execute(f'DROP SCHEMA IF EXISTS "{sec_sch}" CASCADE')
+        env.conn.commit()
