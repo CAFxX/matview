@@ -2497,7 +2497,6 @@ class PlannerMixin(MixinHost):
             index_names=[n for sp in sub_plans for n in sp.index_names],
             user_indexes=first_plan.user_indexes,
             sub_plans=sub_plans,
-            strategy_diagnostics=[d for sp in sub_plans for d in sp.strategy_diagnostics],
             incremental_backfill=self.incremental_backfill,
             batch_size=self.batch_size,
             full_populate_sqls=[d for sp in sub_plans for d in sp.full_populate_sqls],
