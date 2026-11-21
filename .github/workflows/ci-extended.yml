@@ -233,6 +233,12 @@ jobs:
           MATVIEW_FUZZ_TARGET: "${{ matrix.label }}"
         run: python3 test_matview_sync.py --fuzz
 
+      - name: Timing-sensitive MySQL/MariaDB deadlock-rate test (extended lane only)
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+          MATVIEW_TIMING_TESTS: "1"
+        run: python3 -m pytest -q test_pgmy_exact_float_aggregates.py -k rarely_deadlock
+
       - name: Report failing seeds with replay commands
         if: always()
         run: |
