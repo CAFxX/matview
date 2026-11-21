@@ -77,7 +77,9 @@ GROUP_RECOMPUTE_COST = (
 )
 FULL_REFRESH_COST = (
     "every write re-runs the whole view query: O(table) once per statement on PostgreSQL, "
-    "once per changed row on SQLite, MySQL and MariaDB."
+    "once per changed row on SQLite, MySQL and MariaDB; all writers of the view's tables "
+    "serialize on the refresh, and concurrent MySQL/MariaDB writers can deadlock "
+    "(error 1213: retry the transaction)."
 )
 
 # Per-code opt-in that accepts a non-reproducible element order of string /
@@ -526,12 +528,23 @@ class ExactAggregateRoutingMixin(MixinHost):
             if c.name not in known
         ]
 
+    def _item_function_names(self, item: SelectItem) -> Set[str]:
+        node = self._item_ast(item.raw_expr)
+        if node is None:
+            return set()
+        sg_d = _sqlglot_dialect(self.dialect)
+        out: Set[str] = set()
+        for f in node.find_all(sqlglot_exp.Func):
+            if isinstance(f, sqlglot_exp.Anonymous):
+                out.add(str(f.name).upper())
+            else:
+                out.add(f.sql(dialect=sg_d).split("(", 1)[0].strip().upper())
+                out.add(str(f.key).upper())
+        return out
+
     def _has_unclassified_call(self, item: SelectItem) -> bool:
         names = {n for n, _ in self._unclassified_functions()}
-        if not names:
-            return False
-        node = self._item_ast(item.raw_expr)
-        return node is not None and any(str(a.name).upper() in names for a in node.find_all(sqlglot_exp.Anonymous))
+        return bool(names) and bool(self._item_function_names(item) & names)
 
     def _non_algebraic_aggregate_names(self) -> List[str]:
         """Names of the aggregate calls (select list and HAVING) that have no
@@ -679,7 +692,7 @@ class ExactAggregateRoutingMixin(MixinHost):
         if self.dialect == Dialect.SQLITE:
             return None
         if self._has_unclassified_call(item):
-            derived = self._routed_expr_storage_type(self._item_ast(item.raw_expr), allow_aggregate=False)
+            derived = self._routed_expr_storage_type(self._item_ast(item.raw_expr), allow_aggregate=True)
             if derived is None:
                 raise UnsupportedMaterializedViewError(
                     f"Cannot determine the native result type of {item.raw_expr!r} (column {item.alias!r}) "
@@ -712,7 +725,7 @@ class ExactAggregateRoutingMixin(MixinHost):
         if native_t is None:
             return None
         node = self._item_ast(item.raw_expr)
-        if node is None or node.find(sqlglot_exp.Anonymous) is None:
+        if node is None or (node.find(sqlglot_exp.Anonymous) is None and not self._has_unclassified_call(item)):
             return None
         # Verbatim: the server's own spelling is valid DDL (PostgreSQL
         # format_type, MySQL SHOW COLUMNS) and keeps modifiers such as UNSIGNED.
