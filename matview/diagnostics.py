@@ -1,50 +1,106 @@
-"""Typed diagnostics for maintenance fallbacks and relaxed (opt-in) modes.
+"""Structured diagnostics for maintenance-strategy decisions.
 
-Every fallback from the preferred exact maintenance strategy, and every
-opt-in mode that relaxes exactness, is announced with a fixed lead phrase so
-that users and tests can find it:
+A diagnostic tells the user which maintenance strategy a view got and why,
+whenever matview cannot use the fast exact algebraic maintenance:
 
-* ``exact result required: falling back to strategy <strategy>: ...`` for a
-  fallback that keeps results exact at a higher maintenance cost;
-* ``relaxed result allowed: using strategy <strategy>: ...`` for a mode the
-  caller enabled that gives up exactness.
+* exact result required (the default): ``exact result required: falling back
+  to strategy <X>`` -- matview keeps the result equal to the original view by
+  a more expensive strategy;
+* relaxed result allowed (an explicit per-code opt-in): ``relaxed result
+  allowed: using strategy <Y>`` -- matview uses a faster strategy whose result
+  may differ from the original view as documented.
 
-A diagnostic is emitted as a :class:`MaintenanceFallbackWarning` when a view
-is compiled and is kept in ``plan.diagnostics.fallbacks``.
+Strategy names are defined once here (``Strategy``) and used by the planner,
+the diagnostics, the CLI output, the README and the tests. The registry is
+open: new strategies and new diagnostic codes are added here.
 """
 
 from __future__ import annotations
 
+import logging
 import warnings
-from dataclasses import dataclass
-from typing import Any, Dict
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any, Dict, Iterable, Sequence, Tuple
 
-FALLBACK_LEAD = "exact result required: falling back to strategy"
+_LOG = logging.getLogger("matview")
+
+EXACT_LEAD = "exact result required: falling back to strategy"
 RELAXED_LEAD = "relaxed result allowed: using strategy"
 
 
-class MaintenanceFallbackWarning(UserWarning):
-    """Emitted when a view is maintained by a fallback or relaxed mode."""
+class Strategy(str, Enum):
+    """Human-readable maintenance strategy names (shared vocabulary)."""
+
+    FULL_REFRESH = "full refresh of the original query"
+    SCOPED_REFRESH = "scoped refresh of the affected groups"
+    ALGEBRAIC_DELTA = "algebraic delta (add/subtract)"
+    GROUP_SCOPED_RECOMPUTE = "group-scoped recompute"
+
+
+class DiagnosticSeverity(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+
+
+# Diagnostic codes (open registry).
+FLOAT_EXACT_REFRESH = "FLOAT_EXACT_REFRESH"
+FLOAT_RELAXED_MAINTENANCE = "FLOAT_RELAXED_MAINTENANCE"
 
 
 @dataclass(frozen=True)
 class Diagnostic:
+    """One diagnostic for one view.
+
+    ``columns`` and ``expressions`` name the output columns and aggregate
+    expressions that triggered it; ``strategy`` is the strategy in effect;
+    ``message`` starts with ``EXACT_LEAD`` or ``RELAXED_LEAD``."""
+
     code: str
-    severity: str  # "info" (exact fallback) or "warning" (relaxed exactness)
+    severity: DiagnosticSeverity
     view: str
+    strategy: Strategy
+    columns: Tuple[str, ...]
+    expressions: Tuple[str, ...]
     message: str
+    details: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"code": self.code, "severity": self.severity, "view": self.view, "message": self.message}
+        out = asdict(self)
+        out["severity"] = self.severity.value
+        out["strategy"] = self.strategy.value
+        out["columns"] = list(self.columns)
+        out["expressions"] = list(self.expressions)
+        return out
+
+    def __str__(self) -> str:
+        return f"[{self.code}] view {self.view}: {self.message}"
 
 
-def fallback_message(strategy: str, reason: str, cost: str, how_to_change: str) -> str:
-    return f"{FALLBACK_LEAD} {strategy}: {reason}. Cost: {cost}. To change: {how_to_change}."
+class MatviewDiagnosticWarning(UserWarning):
+    """Python warning carrying a ``Diagnostic`` (``warning.diagnostic``)."""
+
+    def __init__(self, diagnostic: Diagnostic) -> None:
+        super().__init__(str(diagnostic))
+        self.diagnostic = diagnostic
 
 
-def relaxed_message(strategy: str, reason: str, consequence: str, how_to_change: str) -> str:
-    return f"{RELAXED_LEAD} {strategy}: {reason}. Consequence: {consequence}. To change: {how_to_change}."
+def exact_fallback_message(strategy: Strategy, reason: str, cost: str, remedy: str) -> str:
+    return f"{EXACT_LEAD} {strategy.value}. Why: {reason} Cost: {cost} To change it: {remedy}"
 
 
-def emit(diagnostic: Diagnostic) -> None:
-    warnings.warn(f"[{diagnostic.code}] view '{diagnostic.view}': {diagnostic.message}", MaintenanceFallbackWarning, stacklevel=3)
+def relaxed_message(strategy: Strategy, contract: str, remedy: str) -> str:
+    return f"{RELAXED_LEAD} {strategy.value}. Contract: {contract} To return to exact: {remedy}"
+
+
+def emit(diagnostics: Iterable[Diagnostic], silence: Sequence[str] = (), stacklevel: int = 3) -> None:
+    """Emit each diagnostic as a MatviewDiagnosticWarning (and a WARNING
+    record on the ``matview`` logger) unless its code is in
+    ``silence`` (the per-code suppression for applications that already
+    decided; the global ``ignore_limitations`` never silences diagnostics)."""
+    silenced = set(silence or ())
+    for d in diagnostics:
+        if d.code not in silenced:
+            if _LOG.hasHandlers():  # no duplicate via logging's last-resort stderr handler
+                _LOG.warning("%s", d)
+            warnings.warn(MatviewDiagnosticWarning(d), stacklevel=stacklevel)

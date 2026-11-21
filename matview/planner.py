@@ -13,7 +13,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from ._host import MixinHost
-from .diagnostics import Diagnostic, emit as emit_diagnostic, fallback_message
+from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, emit as emit_diagnostics, exact_fallback_message
 from .engines import (
     AggFunc,
     Dialect,
@@ -67,6 +67,9 @@ from .sql_frontend import (
 )
 
 
+
+# Diagnostic code of the HAVING scalar-subquery-aggregate fallback.
+HAVING_SUBQUERY_AGGREGATE_FALLBACK = "HAVING_SUBQUERY_AGGREGATE_FALLBACK"
 
 def _has_subquery_aggregate(sql_text: str, dialect: Dialect) -> bool:
     """Whether an aggregate appears inside a (scalar) subquery of `sql_text`:
@@ -2094,7 +2097,6 @@ class PlannerMixin(MixinHost):
             triggers=list(raw_plan.trigger_names),
             indexes=list(raw_plan.index_names),
             reader_view=raw_plan.view_name,
-            fallbacks=self._fallback_diagnostics(raw_plan.strategy),
             details={
                 "dialect": self.dialect.value,
                 "engine_version": self.engine_version.label if self.engine_version else None,
@@ -2120,25 +2122,29 @@ class PlannerMixin(MixinHost):
             return ()
         cost = (
             "a write to a table the subquery reads recomputes every group of the view; other writes "
-            "recompute the touched groups"
+            "recompute the touched groups."
         )
         if self.dialect == Dialect.MYSQL:
-            cost += (
+            cost = cost[:-1] + (
                 "; concurrent writers to the subquery's table deadlock (error 1213) and roll back "
-                "(about 45% of writes with 4 concurrent writers, measured on MySQL 8.4 and MariaDB 10.11)"
+                "(about 45% of writes with 4 concurrent writers, measured on MySQL 8.4 and MariaDB 10.11)."
             )
         return (
             Diagnostic(
-                code="HAVING_SUBQUERY_AGGREGATE_FALLBACK",
-                severity="info",
+                code=HAVING_SUBQUERY_AGGREGATE_FALLBACK,
+                severity=DiagnosticSeverity.INFO,
                 view=self.logical_view_name,
-                message=fallback_message(
-                    strategy.value,
+                strategy=Strategy.GROUP_SCOPED_RECOMPUTE,
+                columns=(),
+                expressions=(having.strip(),),
+                message=exact_fallback_message(
+                    Strategy.GROUP_SCOPED_RECOMPUTE,
                     "HAVING compares with an aggregate inside a scalar subquery, which the algebraic "
-                    "decomposition cannot maintain",
+                    "decomposition cannot maintain.",
                     cost,
-                    "move the scalar-subquery condition out of HAVING (e.g. filter when reading the view)",
+                    "move the scalar-subquery condition out of HAVING (e.g. filter when reading the view).",
                 ),
+                details={"maintenance_strategy": strategy.value},
             ),
         )
 
@@ -2228,8 +2234,8 @@ class PlannerMixin(MixinHost):
             existing_base_indexes_used=used_existing,
             existing_base_indexes=existing_inv,
         )
-        for diagnostic in diagnostics.fallbacks:
-            emit_diagnostic(diagnostic)
+        strategy_diagnostics = list(self._fallback_diagnostics(raw_plan.strategy))
+        emit_diagnostics(strategy_diagnostics)
         return MaterializedViewPlan(
             dialect=raw_plan.dialect,
             strategy=raw_plan.strategy,
@@ -2261,6 +2267,7 @@ class PlannerMixin(MixinHost):
             diagnostics=diagnostics,
             recommended_base_indexes=rec_ddls,
             base_index_recommendations=rec_meta,
+            strategy_diagnostics=strategy_diagnostics,
         )
 
     def _compile_single_plan(self) -> MaterializedViewPlan:
@@ -2337,5 +2344,6 @@ class PlannerMixin(MixinHost):
             incremental_populate_sqls=[d for sp in sub_plans for d in sp.incremental_populate_sqls],
             engine_version=self.engine_version,
             diagnostics=first_plan.diagnostics,
+            strategy_diagnostics=[d for sp in sub_plans for d in sp.strategy_diagnostics],
         )
 

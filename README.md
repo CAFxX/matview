@@ -800,8 +800,8 @@ observe depends on the engine:
 - A view whose `HAVING` compares with an aggregate inside a scalar subquery
   (`HAVING COUNT(*) > (SELECT SUM(x) FROM t)`) is maintained by the
   group-scoped fallback, announced at registration with
-  `exact result required: falling back to strategy group_scoped_delta`
-  (a `MaintenanceFallbackWarning`, kept in `plan.diagnostics.fallbacks`). A
+  `exact result required: falling back to strategy group-scoped recompute`
+  (a `MatviewDiagnosticWarning`, kept in `plan.strategy_diagnostics`). A
   write to a table the subquery reads recomputes every group. On
   MySQL/MariaDB, concurrent writers to that table deadlock (error 1213) and
   roll back: about 45% of writes with 4 concurrent writers in our
