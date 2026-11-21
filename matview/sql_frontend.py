@@ -667,13 +667,18 @@ def _split_top_level(
         return [text.strip()] if text.strip() else []
     parts: List[str] = []
     depth = 0
+    bracket_depth = 0
     start = 0
     for tk in toks:
         if tk.token_type == SQLGlotTokenType.L_PAREN:
             depth += 1
         elif tk.token_type == SQLGlotTokenType.R_PAREN and depth > 0:
             depth -= 1
-        elif depth == 0:
+        elif tk.token_type == SQLGlotTokenType.L_BRACKET:
+            bracket_depth += 1
+        elif tk.token_type == SQLGlotTokenType.R_BRACKET and bracket_depth > 0:
+            bracket_depth -= 1
+        elif depth == 0 and bracket_depth == 0:
             is_match = False
             if sep == "," and tk.token_type == SQLGlotTokenType.COMMA:
                 is_match = True
@@ -702,13 +707,18 @@ def _find_top_level_token(
     """Finds the first top-level (depth == 0) `sqlglot` token matching `target_types`."""
     toks = _tokenize_sql(sql, read=_sqlglot_dialect(dialect))
     depth = 0
+    bracket_depth = 0
     target_set = set(target_types)
     for tk in toks:
         if tk.token_type == SQLGlotTokenType.L_PAREN:
             depth += 1
         elif tk.token_type == SQLGlotTokenType.R_PAREN and depth > 0:
             depth -= 1
-        elif depth == 0 and tk.token_type in target_set:
+        elif tk.token_type == SQLGlotTokenType.L_BRACKET:
+            bracket_depth += 1
+        elif tk.token_type == SQLGlotTokenType.R_BRACKET and bracket_depth > 0:
+            bracket_depth -= 1
+        elif depth == 0 and bracket_depth == 0 and tk.token_type in target_set:
             return tk
     return None
 

@@ -683,8 +683,22 @@ class DialectBaseMixin(MixinHost):
         return f"(1.0 * ({expr}) * ({expr}))"
 
     def _normalize_dialect_type(self, dt: str) -> str:
-        u = dt.strip().upper()
+        s = dt.strip()
+        u = s.upper()
         if self.dialect == Dialect.POSTGRES:
+            m_generic_arr = re.match(r"^ARRAY\s*<\s*(.+)\s*>$", s, flags=re.IGNORECASE)
+            if m_generic_arr:
+                inner = m_generic_arr.group(1).strip()
+                norm_inner = self._normalize_dialect_type(inner)
+                if inner.strip().upper() == "CHARACTER VARYING":
+                    norm_inner = "CHARACTER VARYING"
+                return f"{norm_inner}[]"
+            m_pg_arr = re.match(r"^(.*?)((?:\[\])+)$", s)
+            if m_pg_arr:
+                elem_raw, brackets = m_pg_arr.group(1).strip(), m_pg_arr.group(2)
+                if elem_raw.upper() in ("CHARACTER VARYING", "VARCHAR"):
+                    return f"{elem_raw}{brackets}"
+                return f"{self._normalize_dialect_type(elem_raw)}{brackets}"
             if u == "DOUBLE":
                 return "DOUBLE PRECISION"
             if u == "CHARACTER VARYING":
@@ -887,7 +901,71 @@ class DialectBaseMixin(MixinHost):
             "BOOL_AND", "BOOL_OR", "EVERY",
         }
 
+        def _pg_canonical_arr_elem(elem_raw: str) -> str:
+            elem_s = elem_raw.strip()
+            if '"' in elem_s:
+                return elem_s
+            elem_up = re.sub(r"\s+", " ", elem_s.upper())
+            elem_canon = {
+                "DECIMAL": "NUMERIC",
+                "DEC": "NUMERIC",
+                "INT": "INTEGER",
+                "INT4": "INTEGER",
+                "INT2": "SMALLINT",
+                "INT8": "BIGINT",
+                "FLOAT4": "REAL",
+                "FLOAT8": "DOUBLE PRECISION",
+                "BOOL": "BOOLEAN",
+                "CHARACTER VARYING": "VARCHAR",
+                "CHARACTER": "BPCHAR",
+                "TIMESTAMPTZ": "TIMESTAMP WITH TIME ZONE",
+                "TIMETZ": "TIME WITH TIME ZONE",
+            }.get(elem_up)
+            if elem_canon is not None:
+                return elem_canon
+            return elem_up
+
+        def _pg_strip_arr_elem_mod(elem: str) -> str:
+            if '"' in elem:
+                return elem
+            base = re.sub(r"\s*\([^)]*\)", "", elem).strip().upper()
+            return {
+                "DECIMAL": "NUMERIC",
+                "DEC": "NUMERIC",
+                "INT": "INTEGER",
+                "INT4": "INTEGER",
+                "INT2": "SMALLINT",
+                "INT8": "BIGINT",
+                "FLOAT4": "REAL",
+                "FLOAT8": "DOUBLE PRECISION",
+                "BOOL": "BOOLEAN",
+                "CHARACTER VARYING": "VARCHAR",
+                "CHARACTER": "BPCHAR",
+                "CHAR": "BPCHAR",
+                "NCHAR": "BPCHAR",
+                "TIMESTAMPTZ": "TIMESTAMP WITH TIME ZONE",
+                "TIMETZ": "TIME WITH TIME ZONE",
+            }.get(base, base)
+
         def canonical_type(data_type: str) -> Optional[str]:
+            if self.dialect == Dialect.POSTGRES:
+                stripped_dt = data_type.strip()
+                norm_dt = self._normalize_dialect_type(stripped_dt)
+                # Strip trailing COLLATE clause on array types before parsing brackets
+                no_coll = re.sub(
+                    r'\s+COLLATE\s+(?:"[^"]*"|\S+)\s*$',
+                    "",
+                    norm_dt.strip(),
+                    flags=re.IGNORECASE,
+                )
+                m_arr = re.match(r"^(.*?)((?:\[\])+)$", no_coll.strip())
+                if m_arr:
+                    elem_raw = m_arr.group(1).strip()
+                    # PostgreSQL array columns/values all share a single 1D
+                    # array type OID regardless of declared bracket count.
+                    return f"{_pg_canonical_arr_elem(elem_raw)}[]"
+                if stripped_dt.startswith('"'):
+                    return stripped_dt
             # Introspected MySQL/MariaDB string types carry their collation
             # ("CHAR(5) COLLATE UTF8MB4_UNICODE_CI" under a non-default
             # server collation): the clause does not change the family.
@@ -920,8 +998,27 @@ class DialectBaseMixin(MixinHost):
             if any(value not in ranks for value in known):
                 if all(value == known[0] for value in known):
                     return known[0]
-                if all(value in ("TEXT", "VARCHAR") for value in known):
+                if all(value in ("TEXT", "VARCHAR", "BPCHAR") for value in known):
+                    if all(value == "VARCHAR" for value in known):
+                        return "VARCHAR"
+                    if all(value == "BPCHAR" for value in known):
+                        return "BPCHAR"
                     return "TEXT"
+                if self.dialect == Dialect.POSTGRES and all(value.endswith("[]") for value in known):
+                    elems = [re.sub(r"(?:\[\])+$", "", v).strip() for v in known]
+                    if all(e == elems[0] for e in elems):
+                        return f"{elems[0]}[]"
+                    stripped = [_pg_strip_arr_elem_mod(e) for e in elems]
+                    if all(s in ranks for s in stripped):
+                        return f"{max(stripped, key=lambda v: ranks[v])}[]"
+                    if all(s in ("TEXT", "VARCHAR", "BPCHAR") for s in stripped):
+                        if all(s == "VARCHAR" for s in stripped):
+                            return "VARCHAR[]"
+                        if all(s == "BPCHAR" for s in stripped):
+                            return "BPCHAR[]"
+                        return "TEXT[]"
+                    if all(s == stripped[0] for s in stripped):
+                        return f"{stripped[0]}[]"
                 return None
             return max(known, key=lambda value: ranks[value])
 
@@ -929,7 +1026,7 @@ class DialectBaseMixin(MixinHost):
             if node is None:
                 return "UNKNOWN"
             kind = node.__class__.__name__
-            if kind == "Paren":
+            if kind in ("Paren", "Collate"):
                 return infer(node.this)
             if kind == "Null":
                 return "UNKNOWN"
@@ -996,7 +1093,55 @@ class DialectBaseMixin(MixinHost):
                 return canonical_type(win_t) if win_t else None
             if kind == "Cast":
                 target = node.args.get("to")
-                return canonical_type(target.sql()) if target is not None else None
+                if target is None:
+                    return None
+                target_sql = (
+                    target.sql(_sqlglot_dialect(self.dialect))
+                    if self.dialect == Dialect.POSTGRES
+                    else target.sql()
+                )
+                return canonical_type(target_sql)
+            if kind == "Array" and self.dialect == Dialect.POSTGRES:
+                ch_nodes = list(node.expressions or ())
+                if not ch_nodes:
+                    return None
+                elem_types = [infer(ch) for ch in ch_nodes]
+                if all(t == "UNKNOWN" for t in elem_types):
+                    return "TEXT[]"
+                # In PostgreSQL, bare string literals have type `unknown` and
+                # coerce to any explicitly typed element (e.g. ARRAY[1, '2'] -> INTEGER[]).
+                non_str_lit_types = [
+                    t
+                    for ch, t in zip(ch_nodes, elem_types)
+                    if not (isinstance(ch, sqlglot_exp.Literal) and ch.args.get("is_string"))
+                    and t is not None
+                    and t != "UNKNOWN"
+                ]
+                merged_elem = merge(non_str_lit_types) if non_str_lit_types else merge(elem_types)
+                if merged_elem is not None:
+                    return f"{merged_elem}[]"
+                return None
+            if kind == "Bracket" and self.dialect == Dialect.POSTGRES:
+                # Unwrap nested brackets (e.g. a_int2d[1][1] or a_int2d[1:2][1:2]):
+                # on PostgreSQL, any slice returns the array type; pure subscripts
+                # always return the scalar element type (preserving VARCHAR/BPCHAR
+                # OIDs rather than collapsing to TEXT).
+                has_slice = False
+                cur_n: Any = node
+                while cur_n is not None and cur_n.__class__.__name__ == "Bracket":
+                    if any(isinstance(e, sqlglot_exp.Slice) for e in (cur_n.expressions or ())):
+                        has_slice = True
+                    cur_n = cur_n.this
+                base_t = infer(cur_n)
+                if base_t is not None and base_t.endswith("[]"):
+                    if has_slice:
+                        return base_t
+                    elem_raw = re.sub(r"(?:\[\])+$", "", base_t).strip()
+                    stripped_elem = _pg_strip_arr_elem_mod(elem_raw)
+                    if stripped_elem in ("VARCHAR", "BPCHAR"):
+                        return stripped_elem
+                    return canonical_type(stripped_elem) or stripped_elem
+                return None
             if kind in ("Coalesce", "IfNull"):
                 vals = [infer(ch) for ch in node.iter_expressions()]
                 return merge(vals)
@@ -1626,7 +1771,42 @@ class DialectBaseMixin(MixinHost):
             arg_type = self._mysql_derived_minmax_type(arg_type)
         if self.dialect != Dialect.POSTGRES:
             return arg_type
-        u = re.sub(r"\s+", " ", arg_type.strip().upper())
+        s_raw = arg_type.strip()
+        m_arr = re.match(r"^(.*?)((?:\[\])+)$", s_raw)
+        if m_arr:
+            elem_raw, brackets = m_arr.group(1).strip(), m_arr.group(2)
+            if '"' in elem_raw:
+                return f"{elem_raw}{brackets}"
+            elem_u = re.sub(r"\s+", " ", elem_raw.upper())
+            elem_base = re.sub(r"\s*\([^)]*\)", "", elem_u).strip()
+            # PostgreSQL MIN/MAX(anyarray) is polymorphic over the array type
+            # and drops element typmods (e.g. VARCHAR(20)[] -> VARCHAR[],
+            # CHAR(3)[] -> BPCHAR[], NUMERIC(10,2)[] -> NUMERIC[]).
+            arr_map = {
+                "NUMERIC": "NUMERIC",
+                "DECIMAL": "NUMERIC",
+                "DEC": "NUMERIC",
+                "VARCHAR": "VARCHAR",
+                "CHARACTER VARYING": "VARCHAR",
+                "CHAR": "BPCHAR",
+                "CHARACTER": "BPCHAR",
+                "BPCHAR": "BPCHAR",
+                "NCHAR": "BPCHAR",
+                "TIMESTAMP": "TIMESTAMP",
+                "TIMESTAMP WITHOUT TIME ZONE": "TIMESTAMP",
+                "TIMESTAMPTZ": "TIMESTAMPTZ",
+                "TIMESTAMP WITH TIME ZONE": "TIMESTAMPTZ",
+                "TIME": "TIME",
+                "TIME WITHOUT TIME ZONE": "TIME",
+                "TIMETZ": "TIMETZ",
+                "TIME WITH TIME ZONE": "TIMETZ",
+            }
+            if elem_base in arr_map:
+                return f"{arr_map[elem_base]}{brackets}"
+            if elem_base.startswith("INTERVAL"):
+                return f"INTERVAL{brackets}"
+            return arg_type
+        u = re.sub(r"\s+", " ", s_raw.upper())
         base = re.sub(r"\s*\([^)]*\)", "", u).strip()
         if base in ("NUMERIC", "DECIMAL", "DEC"):
             return "NUMERIC"
@@ -1849,7 +2029,13 @@ class DialectBaseMixin(MixinHost):
                     elif tk.token_type == SQLGlotTokenType.IDENTIFIER:
                         if tk.start > cursor:
                             out.append(expr[cursor:tk.start])
-                        out.append(self._q(tk.text))
+                        out.append(
+                            quote_sql_identifier(
+                                tk.text,
+                                self.dialect,
+                                force=(self.dialect == Dialect.POSTGRES),
+                            )
+                        )
                         cursor = tk.end + 1
                         i += 1
                         continue

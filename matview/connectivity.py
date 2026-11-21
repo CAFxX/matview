@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
@@ -460,7 +461,12 @@ def _can_use_sqlalchemy_inspector(conn: Any) -> bool:
     return any(k in mod_cls for k in ("psycopg", "pymysql"))
 
 
-def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
+def _format_sa_column_type(
+    col_type: Any,
+    dialect: Dialect,
+    *,
+    _in_array: bool = False,
+) -> str:
     # A PostgreSQL domain (SQLAlchemy's postgresql.DOMAIN, possibly over
     # another domain) is stored and compared as its base type; its name is not
     # a type the backing table can be declared with. SQLAlchemy does not
@@ -470,6 +476,39 @@ def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
     while type(col_type).__name__ == "DOMAIN" and getattr(col_type, "data_type", None) is not None:
         col_type = col_type.data_type
         from_domain = True
+    if (
+        dialect == Dialect.POSTGRES
+        and type(col_type).__name__ == "ARRAY"
+        and getattr(col_type, "item_type", None) is not None
+    ):
+        item_t = col_type.item_type
+        arr_collation: Optional[str] = None
+        if getattr(item_t, "collation", None):
+            coll_s = str(item_t.collation)
+            arr_collation = None if coll_s.lower() == "default" else coll_s
+            item_t = copy.copy(item_t)
+            item_t.collation = None
+        elem_str = _format_sa_column_type(item_t, dialect, _in_array=True)
+        if elem_str.upper() == "NULL":
+            return "NULL"
+        dims = getattr(col_type, "dimensions", None)
+        n_dims = int(dims) if isinstance(dims, int) and dims > 0 else 1
+        arr_ddl = f"{elem_str}{'[]' * n_dims}"
+        if arr_collation:
+            quoted_coll = '"' + arr_collation.replace('"', '""') + '"'
+            arr_ddl = f"{arr_ddl} COLLATE {quoted_coll}"
+        return arr_ddl
+    if (
+        dialect == Dialect.POSTGRES
+        and type(col_type).__name__ in ("ENUM", "Enum")
+        and getattr(col_type, "name", None)
+    ):
+        enum_name = '"' + str(col_type.name).replace('"', '""') + '"'
+        enum_schema = getattr(col_type, "schema", None)
+        if enum_schema:
+            quoted_schema = '"' + str(enum_schema).replace('"', '""') + '"'
+            return f"{quoted_schema}.{enum_name}"
+        return enum_name
     precision = getattr(col_type, "precision", None)
     scale = getattr(col_type, "scale", None)
     raw_str = str(col_type).upper()
@@ -477,8 +516,11 @@ def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
         "NUMERIC" in raw_str or "DECIMAL" in raw_str
     ):
         raw_str = f"DECIMAL({int(precision)}, {int(scale)})"
-    elif from_domain and raw_str.startswith("VARCHAR"):
+    elif (from_domain or _in_array) and raw_str.startswith("VARCHAR") and not getattr(col_type, "length", None):
         raw_str = "VARCHAR"
+    elif _in_array and dialect == Dialect.POSTGRES and raw_str == "CHAR" and not getattr(col_type, "length", None):
+        # Unbounded CHAR[] in DDL means CHAR(1)[]; BPCHAR[] preserves unbounded char[].
+        raw_str = "BPCHAR"
     elif dialect == Dialect.POSTGRES and raw_str.startswith("VARCHAR") and not getattr(col_type, "length", None):
         raw_str = "TEXT"
     elif dialect == Dialect.POSTGRES and getattr(col_type, "timezone", False) and raw_str in ("TIMESTAMP", "TIME"):
@@ -497,6 +539,100 @@ def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
     if getattr(col_type, "unsigned", False) and "UNSIGNED" not in raw_str:
         raw_str = f"{raw_str} UNSIGNED"
     return raw_str
+
+
+_PG_NATIVE_ARRAY_TYPES_SQL = """
+WITH RECURSIVE unwrapped AS (
+    SELECT oid, oid AS base_oid, typtypmod AS base_mod, typtype, typbasetype, typcategory, typelem
+    FROM pg_catalog.pg_type
+    UNION ALL
+    SELECT u.oid, p.oid,
+           CASE WHEN u.base_mod <> -1 THEN u.base_mod ELSE p.typtypmod END,
+           p.typtype, p.typbasetype, p.typcategory, p.typelem
+    FROM unwrapped u
+    JOIN pg_catalog.pg_type p ON p.oid = u.typbasetype
+    WHERE u.typtype = 'd'
+)
+SELECT cl.relname,
+       a.attname,
+       CASE
+           WHEN u.typcategory = 'A' AND et.typtype = 'd'
+               THEN pg_catalog.format_type(
+                   ue.base_oid,
+                   CASE WHEN a.atttypmod <> -1 THEN a.atttypmod ELSE ue.base_mod END
+               ) || '[]'
+           WHEN t.typtype = 'd'
+               THEN pg_catalog.format_type(
+                   u.base_oid,
+                   CASE WHEN a.atttypmod <> -1 THEN a.atttypmod ELSE u.base_mod END
+               )
+           ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
+       END AS resolved_type
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class cl ON cl.oid = a.attrelid
+JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+JOIN unwrapped u ON u.oid = t.oid AND u.typtype <> 'd'
+LEFT JOIN pg_catalog.pg_type et ON et.oid = u.typelem AND u.typcategory = 'A'
+LEFT JOIN unwrapped ue ON ue.oid = et.oid AND ue.typtype <> 'd'
+WHERE pg_catalog.pg_table_is_visible(cl.oid)
+  AND cl.relkind IN ('r', 'p')
+  AND u.typcategory = 'A'
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+  AND cl.relname NOT LIKE '__matview_%'
+  AND cl.relname NOT LIKE '__mv_%'
+"""
+
+
+def _pg_introspect_native_array_types(conn_or_bind: Any) -> Dict[Tuple[str, str], str]:
+    """Return ``(table_lower, col_lower) -> native PostgreSQL array DDL type``
+    for array columns (including domain-over-array and array-of-domain columns)
+    of visible regular and partitioned tables via ``pg_catalog.format_type``.
+
+    Uses a SAVEPOINT when called inside an active transaction so an unexpected
+    catalog/permission error never aborts the caller's PostgreSQL transaction.
+    """
+    rows: List[Any] = []
+    try:
+        if isinstance(conn_or_bind, _SAEngine):
+            with conn_or_bind.connect() as sa_conn:
+                rows = list(sa_conn.exec_driver_sql(_PG_NATIVE_ARRAY_TYPES_SQL).fetchall() or ())
+        elif isinstance(conn_or_bind, _SAConnection):
+            if conn_or_bind.in_transaction():
+                with conn_or_bind.begin_nested():
+                    rows = list(conn_or_bind.exec_driver_sql(_PG_NATIVE_ARRAY_TYPES_SQL).fetchall() or ())
+            else:
+                rows = list(conn_or_bind.exec_driver_sql(_PG_NATIVE_ARRAY_TYPES_SQL).fetchall() or ())
+        elif hasattr(conn_or_bind, "cursor"):
+            cur = conn_or_bind.cursor()
+            used_sp = False
+            try:
+                if dbapi_transaction_state(conn_or_bind) is True:
+                    cur.execute("SAVEPOINT __mv_pg_arr_introspect")
+                    used_sp = True
+                cur.execute(_PG_NATIVE_ARRAY_TYPES_SQL)
+                rows = list(cur.fetchall() or ())
+                if used_sp:
+                    cur.execute("RELEASE SAVEPOINT __mv_pg_arr_introspect")
+            except Exception:
+                if used_sp:
+                    try:
+                        cur.execute("ROLLBACK TO SAVEPOINT __mv_pg_arr_introspect")
+                        cur.execute("RELEASE SAVEPOINT __mv_pg_arr_introspect")
+                    except Exception:
+                        pass
+                return {}
+            finally:
+                close_fn = getattr(cur, "close", None)
+                if callable(close_fn):
+                    close_fn()
+    except Exception:
+        return {}
+    out: Dict[Tuple[str, str], str] = {}
+    for r in rows:
+        if len(r) >= 3 and r[0] and r[1] and r[2]:
+            out[(str(r[0]).lower(), str(r[1]).lower())] = str(r[2])
+    return out
 
 
 def introspect_schemas_with_sqlalchemy(
@@ -551,6 +687,11 @@ def introspect_schemas_with_sqlalchemy(
             except Exception:
                 sqlite_ddl_schemas = {}
         sqlite_low = {k.lower(): v for k, v in sqlite_ddl_schemas.items()}
+        pg_array_types: Dict[Tuple[str, str], str] = (
+            _pg_introspect_native_array_types(bind_or_conn if isinstance(bind_or_conn, (_SAEngine, _SAConnection)) else raw_conn)
+            if eff_dialect == Dialect.POSTGRES
+            else {}
+        )
 
         schemas: Dict[str, TableSchema] = {}
         for t_name in insp.get_table_names():
@@ -572,7 +713,12 @@ def introspect_schemas_with_sqlalchemy(
             col_defs: Dict[str, ColumnDef] = {}
             for col in cols_info:
                 c_name = str(col["name"])
-                c_type = _format_sa_column_type(col.get("type", "TEXT"), eff_dialect)
+                native_arr = pg_array_types.get((t_name.lower(), c_name.lower()))
+                c_type = (
+                    native_arr
+                    if native_arr is not None
+                    else _format_sa_column_type(col.get("type", "TEXT"), eff_dialect)
+                )
                 is_pk = c_name.lower() in pk_cols_low
                 is_notnull = (not bool(col.get("nullable", True))) or is_pk
                 col_defs[c_name] = ColumnDef(
@@ -904,6 +1050,7 @@ def introspect_database_schemas(
             except Exception:
                 pass
 
+            pg_array_types = _pg_introspect_native_array_types(conn)
             cur.execute(
                 """
                 SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.character_maximum_length
@@ -930,11 +1077,15 @@ def introspect_database_schemas(
                     object_prefix and t_name.startswith(object_prefix)
                 ):
                     continue
-                dt_up = str(d_type).upper()
-                if dt_up in ("CHARACTER VARYING", "VARCHAR") and char_len:
-                    dt_up = f"VARCHAR({int(char_len)})"
-                elif dt_up == "CHARACTER VARYING":
-                    dt_up = "TEXT"
+                native_arr = pg_array_types.get((t_name.lower(), c_name.lower()))
+                if native_arr is not None:
+                    dt_up = native_arr
+                else:
+                    dt_up = str(d_type).upper()
+                    if dt_up in ("CHARACTER VARYING", "VARCHAR") and char_len:
+                        dt_up = f"VARCHAR({int(char_len)})"
+                    elif dt_up == "CHARACTER VARYING":
+                        dt_up = "TEXT"
                 is_pk = (t_name.lower(), c_name.lower()) in pk_pairs
                 grouped.setdefault(t_name, {})[c_name] = ColumnDef(
                     name=c_name,

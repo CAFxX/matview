@@ -183,6 +183,148 @@ class TestSqlAlchemyConnectivityAndIntrospection(unittest.TestCase):
             finally:
                 mgr.close()
 
+    def test_postgres_array_sa_type_formatting_and_codegen(self) -> None:
+        from sqlalchemy.dialects import postgresql as sa_pg
+        from sqlalchemy.types import Enum as SaEnum, NullType
+
+        from matview.connectivity import _format_sa_column_type
+
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(sa_pg.NUMERIC()), ms.Dialect.POSTGRES),
+            "NUMERIC[]",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(sa_pg.NUMERIC(10, 2)), ms.Dialect.POSTGRES),
+            "DECIMAL(10, 2)[]",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(sa_pg.INTEGER(), dimensions=2), ms.Dialect.POSTGRES),
+            "INTEGER[][]",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(sa_pg.VARCHAR()), ms.Dialect.POSTGRES),
+            "VARCHAR[]",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(sa_pg.CHAR()), ms.Dialect.POSTGRES),
+            "BPCHAR[]",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(sa_pg.TIMESTAMP(timezone=True)), ms.Dialect.POSTGRES),
+            "TIMESTAMP WITH TIME ZONE[]",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(sa_pg.TEXT(collation="C")), ms.Dialect.POSTGRES),
+            'TEXT[] COLLATE "C"',
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(sa_pg.TEXT(collation="default")), ms.Dialect.POSTGRES),
+            "TEXT[]",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(sa_pg.ENUM("a", "b", name="MixedEnum")), ms.Dialect.POSTGRES),
+            '"MixedEnum"[]',
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(SaEnum("a", "b", name="GenericEnum")), ms.Dialect.POSTGRES),
+            '"GenericEnum"[]',
+        )
+        self.assertEqual(
+            _format_sa_column_type(
+                sa_pg.ARRAY(sa_pg.ENUM("a", "b", name="my_enum", schema="custom_sch")),
+                ms.Dialect.POSTGRES,
+            ),
+            '"custom_sch"."my_enum"[]',
+        )
+        self.assertEqual(
+            _format_sa_column_type(
+                sa_pg.ARRAY(sa_pg.DOMAIN("pos_int", sa_pg.INTEGER())),
+                ms.Dialect.POSTGRES,
+            ),
+            "INTEGER[]",
+        )
+        self.assertEqual(
+            _format_sa_column_type(
+                sa_pg.DOMAIN("int_arr_dom", sa_pg.ARRAY(sa_pg.INTEGER())),
+                ms.Dialect.POSTGRES,
+            ),
+            "INTEGER[]",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.ARRAY(NullType()), ms.Dialect.POSTGRES),
+            "NULL",
+        )
+
+        # Offline DDL codegen preserves PostgreSQL array types per column for columns & expressions,
+        # without regressing SQLite/MySQL CAST inference.
+        schema = (
+            "CREATE TABLE arr_src ("
+            "id INT PRIMARY KEY, "
+            "k NUMERIC[], "
+            "k_ps NUMERIC(10, 2)[], "
+            "tags VARCHAR[], "
+            "c3 CHAR(3)[], "
+            "vals DOUBLE PRECISION[], "
+            "m2d INT[][], "
+            "v INT NOT NULL"
+            ");"
+        )
+        plan = ms.generate_materialized_view(
+            schema,
+            "CREATE VIEW v_arr_expr AS "
+            "SELECT k, tags, vals, COALESCE(k, ARRAY[]::NUMERIC[]) AS k_co, "
+            "CASE WHEN id > 0 THEN k_ps ELSE k END AS k_case, "
+            "k[1] AS first_k, k[1:2] AS slice_k, m2d[1][1] AS m_elem, "
+            "tags[1] AS tag_elem, c3[1] AS c3_elem, ARRAY[id, v] AS pair, "
+            "ARRAY[1, '2'] AS mix_a, ARRAY[NULL] AS null_a, "
+            "COUNT(*) AS n FROM arr_src "
+            "GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13;",
+            dialect=ms.Dialect.POSTGRES,
+        )
+        ddl = plan.backing_table_ddl
+        self.assertNotIn(" ARRAY ", ddl)
+        self.assertIn("k DECIMAL[]", ddl)
+        self.assertIn("tags VARCHAR[]", ddl)
+        self.assertIn("vals DOUBLE PRECISION[]", ddl)
+        self.assertIn("k_co NUMERIC[]", ddl)
+        self.assertIn("k_case NUMERIC[]", ddl)
+        self.assertIn("first_k NUMERIC", ddl)
+        self.assertIn("slice_k NUMERIC[]", ddl)
+        self.assertIn("m_elem INTEGER", ddl)
+        self.assertIn("tag_elem VARCHAR", ddl)
+        self.assertIn("c3_elem BPCHAR", ddl)
+        self.assertIn("pair INTEGER[]", ddl)
+        self.assertIn("mix_a INTEGER[]", ddl)
+        self.assertIn("null_a TEXT[]", ddl)
+
+        # Quoted PostgreSQL identifiers (collations like COLLATE "C", mixed-case enum casts)
+        # in GROUP BY expressions must keep their double quotes when rewritten.
+        coll_plan = ms.generate_materialized_view(
+            schema,
+            'CREATE VIEW v_arr_coll AS SELECT tags COLLATE "C" AS k_coll, COUNT(*) AS n '
+            'FROM arr_src GROUP BY tags COLLATE "C";',
+            dialect=ms.Dialect.POSTGRES,
+        )
+        self.assertIn("k_coll VARCHAR[]", coll_plan.backing_table_ddl)
+        self.assertIn('COLLATE "C"', coll_plan.initial_populate_sql)
+        self.assertNotIn("COLLATE C,", coll_plan.initial_populate_sql)
+        self.assertNotIn("COLLATE C;", coll_plan.initial_populate_sql)
+
+        # Ensure CAST handling on SQLite and MySQL did not regress.
+        sq_plan = ms.generate_materialized_view(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);",
+            "CREATE VIEW v_sq_cast AS SELECT id, CAST(x AS NUMERIC) AS c FROM t;",
+            dialect=ms.Dialect.SQLITE,
+        )
+        self.assertIn("c BLOB", sq_plan.backing_table_ddl)
+        my_plan = ms.generate_materialized_view(
+            "CREATE TABLE t (id INT PRIMARY KEY, x INT);",
+            "CREATE VIEW v_my_cast AS SELECT id, CAST(x AS UNSIGNED) AS c FROM t;",
+            dialect=ms.Dialect.MYSQL,
+            ignore_limitations=True,
+        )
+        self.assertNotIn("c BIGINT", my_plan.backing_table_ddl)
+
 
 if __name__ == "__main__":
     unittest.main()
