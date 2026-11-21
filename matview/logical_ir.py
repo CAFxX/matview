@@ -160,6 +160,21 @@ class ViewSpec:
     has_subquery_in_from: bool = False
     user_indexes: Tuple[ViewIndexSpec, ...] = ()
     additional_views: Tuple["ViewSpec", ...] = ()
+    # (UPPER function name, native result type or None) of user-defined
+    # aggregates classified through the engine catalog (matview.native_functions).
+    native_aggregates: Tuple[Tuple[str, Optional[str]], ...] = ()
+    # ("UPPER_NAME/arity", native result type) of scalar functions sqlglot
+    # does not model, from the same catalog lookup.
+    native_scalar_types: Tuple[Tuple[str, str], ...] = ()
+    # (lower-case output column, native result type) reported by the server
+    # for select items that call functions sqlglot does not model.
+    native_result_types: Tuple[Tuple[str, str], ...] = ()
+    # (UPPER function name, why) of calls the engine could not classify as
+    # aggregate or scalar (catalog unreadable / unavailable): the view is
+    # maintained by full refresh. ``functions_classified`` marks a spec the
+    # manager has run through the catalog lookup; offline specs are not.
+    unclassified_functions: Tuple[Tuple[str, str], ...] = ()
+    functions_classified: bool = False
 
 
 @dataclass(frozen=True)

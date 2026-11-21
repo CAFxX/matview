@@ -37,6 +37,7 @@ from .aggregate_semantics import (
 from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, exact_fallback_message
 from .engines import AggFunc, Dialect, MaintenanceStrategy, UnsupportedMaterializedViewError, _sqlglot_dialect
 from .logical_ir import SelectItem
+from .native_functions import unclassified_calls
 from .sql_frontend import parse_sql_ast
 
 # Diagnostic codes (matview.diagnostics registry is open).
@@ -45,6 +46,7 @@ UNRECOGNIZED_AGGREGATE_FULL_REFRESH = "UNRECOGNIZED_AGGREGATE_FULL_REFRESH"
 ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH = "ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"
 OPAQUE_AGGREGATE_FULL_REFRESH = "OPAQUE_AGGREGATE_FULL_REFRESH"
 GROUPING_SETS_FULL_REFRESH = "GROUPING_SETS_FULL_REFRESH"
+UNCLASSIFIED_FUNCTION_FULL_REFRESH = "UNCLASSIFIED_FUNCTION_FULL_REFRESH"
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,10 @@ class ExactAggregateRoutingMixin(MixinHost):
             return None
 
     # ------------------------------------------------------- classification
+    def _native_aggregate_names(self) -> frozenset[str]:
+        """User-defined aggregates classified through the engine catalog."""
+        return frozenset(n for n, _ in self.view.native_aggregates)
+
     def _view_has_grouping_sets(self) -> bool:
         q = self._exact_routing_select_ast()
         if q is None:
@@ -161,7 +167,9 @@ class ExactAggregateRoutingMixin(MixinHost):
             node = self._item_ast(raw)
             if node is None:
                 continue
-            for call in iter_unordered_order_sensitive_calls(node, self._order_keys_cover_every_primary_key):
+            for call in iter_unordered_order_sensitive_calls(
+                node, self._order_keys_cover_every_primary_key, self._native_aggregate_names()
+            ):
                 if self._is_float_policy_aggregate(call):
                     continue
                 out.append(call.sql(dialect=sg_d))
@@ -219,7 +227,7 @@ class ExactAggregateRoutingMixin(MixinHost):
         return any(
             isinstance(call, sqlglot_exp.WithinGroup)
             or call_name(call, sg_d) not in _ALGEBRAIC_AGGREGATE_NAMES | _RECOGNIZED_HOLISTIC_NAMES
-            for call in aggregate_calls(node)
+            for call in aggregate_calls(node, self._native_aggregate_names())
         )
 
     # -------------------------------------------------------------- routing
@@ -235,6 +243,23 @@ class ExactAggregateRoutingMixin(MixinHost):
                 "rewrite the view as a UNION ALL of plain GROUP BY queries, one per grouping level, "
                 "so that each level is maintained incrementally.",
                 (),
+            )
+        unclassified = self._unclassified_functions()
+        if unclassified:
+            names = sorted({n for n, _ in unclassified})
+            whys = sorted({w for _, w in unclassified})
+            return ExactRoutingFallback(
+                UNCLASSIFIED_FUNCTION_FULL_REFRESH,
+                Strategy.FULL_REFRESH,
+                f"function(s) {', '.join(names)} could not be classified as aggregate or scalar "
+                f"({'; '.join(whys)}); an aggregate and a scalar call give different results, and only "
+                f"re-running the original query is exact for both.",
+                FULL_REFRESH_COST,
+                "let the connection read the function catalog (MySQL: SELECT on "
+                "performance_schema.user_defined_functions; MariaDB: SELECT on mysql.func and "
+                "mysql.proc; SQLite: a driver/build with PRAGMA function_list), or register the view "
+                "through MaterializedViewManager on a connection instead of generating it offline.",
+                tuple(names),
             )
         if self.view.has_cte or self.view.has_compound_set_op or self.view.has_window_func:
             return None  # these shapes are full-refresh (or windowed) already
@@ -266,6 +291,27 @@ class ExactAggregateRoutingMixin(MixinHost):
             )
         return None
 
+    def _unclassified_functions(self) -> List[Tuple[str, str]]:
+        """(name, why) of function calls nobody classified as aggregate or
+        scalar: recorded by the manager's catalog lookup, or -- offline, with
+        no catalog to consult -- every call of a function that is neither
+        modelled by sqlglot nor a known built-in of the engine."""
+        if self.view.functions_classified:
+            return list(self.view.unclassified_functions)
+        known = {n for n, _ in self.view.native_aggregates}
+        return [
+            (c.name, "offline generation: no database connection to consult the catalog")
+            for c in unclassified_calls(self.view, self.dialect)
+            if c.name not in known
+        ]
+
+    def _has_unclassified_call(self, item: SelectItem) -> bool:
+        names = {n for n, _ in self._unclassified_functions()}
+        if not names:
+            return False
+        node = self._item_ast(item.raw_expr)
+        return node is not None and any(str(a.name).upper() in names for a in node.find_all(sqlglot_exp.Anonymous))
+
     def _non_algebraic_aggregate_names(self) -> List[str]:
         """Names of the aggregate calls (select list and HAVING) that have no
         algebraic delta rule."""
@@ -276,7 +322,7 @@ class ExactAggregateRoutingMixin(MixinHost):
         names = {
             name
             for raw in exprs
-            for call in aggregate_calls(self._item_ast(raw) or sqlglot_exp.Null())
+            for call in aggregate_calls(self._item_ast(raw) or sqlglot_exp.Null(), self._native_aggregate_names())
             for name in [call_name(call, sg_d)]
             if isinstance(call, sqlglot_exp.WithinGroup) or name not in _ALGEBRAIC_AGGREGATE_NAMES
         }
@@ -352,8 +398,23 @@ class ExactAggregateRoutingMixin(MixinHost):
         regular inference applies. Raises when the native result type cannot
         be determined on PostgreSQL/MySQL: storing it with a guessed type
         would change the view's result type."""
+        server_t = self._server_result_storage_type(item)
+        if server_t is not None:
+            return server_t
+        scalar_t = self._native_scalar_storage_type(item)
+        if scalar_t is not None:
+            return scalar_t
         if self.dialect == Dialect.SQLITE:
             return None
+        if self._has_unclassified_call(item):
+            derived = self._routed_expr_storage_type(self._item_ast(item.raw_expr), allow_aggregate=False)
+            if derived is None:
+                raise UnsupportedMaterializedViewError(
+                    f"Cannot determine the native result type of {item.raw_expr!r} (column {item.alias!r}) "
+                    f"on {self.dialect.value} without asking the server; storing it with a guessed type "
+                    f"would change the view's result. Wrap the expression in an explicit CAST(... AS <type>)."
+                )
+            return derived
         is_opaque = not item.is_aggregate and any(
             o.alias == item.alias and o.raw_expr == item.raw_expr for o in self._opaque_grouped_items()
         )
@@ -369,6 +430,36 @@ class ExactAggregateRoutingMixin(MixinHost):
                 f"result. Wrap the expression in an explicit CAST(... AS <type>)."
             )
         return resolved
+
+    def _server_result_storage_type(self, item: SelectItem) -> Optional[str]:
+        """The server-reported type of an item calling a function sqlglot does
+        not model (matview.native_functions.probe_result_types)."""
+        if self.dialect == Dialect.SQLITE or not self.view.native_result_types:
+            return None
+        native_t = dict(self.view.native_result_types).get(item.alias.lower())
+        if native_t is None:
+            return None
+        node = self._item_ast(item.raw_expr)
+        if node is None or node.find(sqlglot_exp.Anonymous) is None:
+            return None
+        # Verbatim: the server's own spelling is valid DDL (PostgreSQL
+        # format_type, MySQL SHOW COLUMNS) and keeps modifiers such as UNSIGNED.
+        return native_t.upper()
+
+    def _native_scalar_storage_type(self, item: SelectItem) -> Optional[str]:
+        """Native result type of a non-aggregate item that is one call of a
+        scalar function classified through the engine catalog."""
+        if item.is_aggregate or not self.view.native_scalar_types:
+            return None
+        node = self._item_ast(item.raw_expr)
+        while isinstance(node, sqlglot_exp.Paren):
+            node = node.this
+        if not isinstance(node, sqlglot_exp.Anonymous):
+            return None
+        native_t = dict(self.view.native_scalar_types).get(f"{str(node.name).upper()}/{len(node.expressions)}")
+        if native_t is None:
+            return None
+        return native_t if native_t == "BLOB" else self._normalize_dialect_type(native_t)
 
     def _routed_expr_storage_type(self, node: Optional[sqlglot_exp.Expr], *, allow_aggregate: bool) -> Optional[str]:
         """Native type of a routed select expression, or None when it is not
@@ -406,7 +497,7 @@ class ExactAggregateRoutingMixin(MixinHost):
             }
             return types.pop() if len(types) == 1 and None not in types else None
         if allow_aggregate:
-            calls = aggregate_calls(node)
+            calls = aggregate_calls(node, self._native_aggregate_names())
             if len(calls) == 1 and calls[0] is node:
                 return self._aggregate_call_storage_type(node)
         return None
@@ -436,6 +527,10 @@ class ExactAggregateRoutingMixin(MixinHost):
 
     def _aggregate_call_storage_type(self, call: sqlglot_exp.Expr) -> Optional[str]:
         name = call_name(call, _sqlglot_dialect(self.dialect))
+        native = dict(self.view.native_aggregates)
+        if isinstance(call, sqlglot_exp.Anonymous) and name in native:
+            native_t = native[name]
+            return self._normalize_dialect_type(native_t) if native_t else None
         raw_up = call.sql(dialect=_sqlglot_dialect(self.dialect)).upper()
         if " RETURNING " in f" {raw_up} ":
             return None

@@ -21,6 +21,13 @@ from sqlglot import exp as sqlglot_exp
 from sqlalchemy.engine import Connection as _SAConnection, Engine as _SAEngine
 
 from .compiler import IncrementalViewCompiler
+from .native_functions import (
+    apply_catalog_classification,
+    classify as classify_native_functions,
+    items_with_unmodelled_calls,
+    probe_result_types,
+    unclassified_calls,
+)
 from .connectivity import (
     connect_database_via_sqlalchemy,
     dbapi_connection_layers,
@@ -1809,7 +1816,8 @@ class MaterializedViewManager:
         strict: bool = False,
         watermark_catalog_table: Optional[str] = None,
     ) -> MaterializedViewPlan:
-        return generate_materialized_view(
+        view = self._classify_native_functions(schemas, view)
+        plan = generate_materialized_view(
             schemas,
             view,
             dialect=self.dialect,
@@ -1821,6 +1829,49 @@ class MaterializedViewManager:
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=getattr(self, "pg_fillfactor", 80),
         )
+        return plan
+
+    def _classify_native_functions(
+        self, schemas: Dict[str, TableSchema], view: Any
+    ) -> Any:
+        """Ask the engine catalog whether unmodelled function calls are
+        aggregates (see matview.native_functions); refuse when it cannot tell.
+        Calls on an engine without a readable catalog are recorded on the
+        spec (``unclassified_functions``) and force the exact full refresh."""
+        spec = view
+        if isinstance(view, str):
+            spec = parse_view_definition(view, known_tables={k.lower() for k in schemas}, dialect=self.dialect)
+        if not isinstance(spec, ViewSpec):
+            return view
+        if (
+            not spec.additional_views
+            and not unclassified_calls(spec, self.dialect)
+            and (self.dialect == Dialect.SQLITE or not items_with_unmodelled_calls(spec, self.dialect))
+        ):
+            return view
+        is_mariadb = self.subdialect == EngineSubdialect.MARIADB
+        spec = apply_catalog_classification(
+            spec,
+            self.dialect,
+            lambda calls: classify_native_functions(self.conn, self.dialect, is_mariadb, calls),
+        )
+        return self._with_server_result_types(spec)
+
+    def _with_server_result_types(self, spec: ViewSpec) -> ViewSpec:
+        """Attach the server-reported result types of select items that call
+        functions sqlglot does not model (their type cannot be derived from
+        the SQL text). PostgreSQL: a temporary view's pg_attribute types,
+        typmod included; MySQL/MariaDB: a temporary ``CREATE TABLE ... AS
+        SELECT ... LIMIT 0``. SQLite stores such columns without affinity."""
+        additional = tuple(self._with_server_result_types(a) for a in spec.additional_views)
+        if additional != spec.additional_views:
+            spec = replace(spec, additional_views=additional)
+        if self.dialect == Dialect.SQLITE or not items_with_unmodelled_calls(spec, self.dialect):
+            return spec
+        types = probe_result_types(self.conn, self.dialect, spec.raw_select_sql)
+        if not types:
+            return spec
+        return replace(spec, native_result_types=tuple(sorted(types.items())))
 
     def _stored_plan(self, schemas: Dict[str, TableSchema], entry: Dict[str, Any]) -> MaterializedViewPlan:
         """Recompile an installed view under exactly the limitation codes it
@@ -3524,6 +3575,11 @@ def generate_materialized_view(
             has_subquery_in_from=view_sql_or_spec.has_subquery_in_from,
             user_indexes=view_sql_or_spec.user_indexes + parsed_idxs,
             additional_views=view_sql_or_spec.additional_views,
+            native_aggregates=view_sql_or_spec.native_aggregates,
+            native_scalar_types=view_sql_or_spec.native_scalar_types,
+            native_result_types=view_sql_or_spec.native_result_types,
+            unclassified_functions=view_sql_or_spec.unclassified_functions,
+            functions_classified=view_sql_or_spec.functions_classified,
         )
     else:
         view_spec = view_sql_or_spec

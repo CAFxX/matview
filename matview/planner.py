@@ -497,6 +497,11 @@ class PlannerMixin(MixinHost):
             has_subquery_in_from=v.has_subquery_in_from,
             user_indexes=v.user_indexes,
             additional_views=v.additional_views,
+            native_aggregates=v.native_aggregates,
+            native_scalar_types=v.native_scalar_types,
+            native_result_types=v.native_result_types,
+            unclassified_functions=v.unclassified_functions,
+            functions_classified=v.functions_classified,
         )
 
     def _try_unwrap_simple_cte_or_derived_view(self, v: ViewSpec) -> ViewSpec:
@@ -710,6 +715,11 @@ class PlannerMixin(MixinHost):
             has_limit_or_order=False,
             has_subquery_in_from=False,
             user_indexes=v.user_indexes,
+            native_aggregates=v.native_aggregates,
+            native_scalar_types=v.native_scalar_types,
+            native_result_types=v.native_result_types,
+            unclassified_functions=v.unclassified_functions,
+            functions_classified=v.functions_classified,
         )
 
     def _decompose_compound_aggregates_and_having(
@@ -804,7 +814,9 @@ class PlannerMixin(MixinHost):
             if cursor < len(expr_str):
                 out_parts.append(expr_str[cursor:])
             rewritten = "".join(out_parts)
-            if _contains_aggregate_call(rewritten, dialect=self.dialect):
+            if _contains_aggregate_call(
+                rewritten, dialect=self.dialect, extra_names=frozenset(n for n, _ in self.view.native_aggregates)
+            ):
                 # An aggregate without an algebraic rule (JSON_AGG, mode(),
                 # percentile_cont, ...) is left in place: the expression is not
                 # decomposable and the view is maintained by recomputing it.
