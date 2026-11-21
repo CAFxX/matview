@@ -531,6 +531,27 @@ class DialectEmitMixin(MixinHost):
         return inc_stmts
 
 
+    @staticmethod
+    def _mariadb_row_key(t_schema: Any) -> Optional[Tuple[List[str], bool]]:
+        """Columns that identify one row of the table (for the MariaDB
+        ignored-update guard) and whether any of them is nullable: the
+        primary key, else a UNIQUE key on NOT NULL columns, else a nullable
+        UNIQUE key; None without any (no duplicate-key skip is possible)."""
+        pk = list(t_schema.effective_pk_columns())
+        if pk:
+            return pk, False
+        uniques = [
+            list(idx.columns) for idx in t_schema.indexes
+            if idx.unique and not idx.where_clause and idx.columns
+            and all(c in t_schema.columns for c in idx.columns)
+        ]
+        for cols in uniques:
+            if all(t_schema.columns[c].not_null for c in cols):
+                return cols, False
+        if uniques:
+            return uniques[0], True
+        return None
+
     def _identical_row_values_sql(self, old: str, new: str, is_nullable: bool) -> str:
         """True only when the OLD and NEW values are identical, not merely equal.
 
@@ -731,8 +752,51 @@ class DialectEmitMixin(MixinHost):
                 else (f"\n    {cleanup_block}" if cleanup_block else "")
             )
 
+            # MariaDB fires AFTER UPDATE for a row whose UPDATE IGNORE was
+            # skipped on a duplicate key (the row keeps its OLD values; MySQL
+            # does not fire). Apply the change only when the row is no longer
+            # in its OLD state: compared with OLD, which is read from storage,
+            # so the comparison is exact for every type.
+            # (Without the changed-column guard, the update maintenance
+            # recomputes from the table and is idempotent; no guard is added.)
+            # Only a table with a primary or unique key can skip a row on a
+            # duplicate key, and only such a key identifies the row: without
+            # one, an identical twin row would look "still OLD" and a real
+            # update would be skipped.
+            row_key = self._mariadb_row_key(t_schema) if t_schema is not None else None
+            if self.engine_version.is_mariadb and row_key is not None and ref_cols and changed_guard:
+                key_cols, nullable_key = row_key
+                cmp_cols = list(dict.fromkeys([*key_cols, *ref_cols]))
+                # Key lookup by equality; then identity, as in the changed
+                # guard (a case-only change under a case-insensitive
+                # collation is a change).
+                still_old = " AND ".join(
+                    [f"__mv_cur.{self._q(c)} <=> OLD.{self._q(c)}" for c in key_cols]
+                    + [self._identical_row_values_sql(f"__mv_cur.{self._q(c)}", f"OLD.{self._q(c)}", True)
+                       for c in cmp_cols]
+                )
+                # A locking read: a consistent (snapshot) read here would open
+                # the statement's read view before the maintenance statements
+                # lock the backing rows, and MariaDB's snapshot isolation
+                # (innodb_snapshot_isolation) then fails them with 1020 when a
+                # concurrent writer committed in between (CI, MariaDB 11.8/12.3:
+                # test_avg_concurrent_maintenance). The row is the one this
+                # statement just wrote and already holds locked; a trigger may
+                # not take FOR UPDATE on its own table (1442), LOCK IN SHARE
+                # MODE reads the latest version without a read view.
+                applied = f"NOT EXISTS (SELECT 1 FROM {q_base_t} AS __mv_cur WHERE {still_old} LOCK IN SHARE MODE)"
+                if nullable_key:
+                    # A NULL in a UNIQUE key is never a duplicate, so rows
+                    # with a NULL key part can be twins: apply those.
+                    applied = "(" + " OR ".join(f"OLD.{self._q(c)} IS NULL" for c in key_cols) + f" OR {applied})"
+            else:
+                applied = None
             upd_guard_open = f"IF ({changed_guard}) THEN\n    " if changed_guard else ""
             upd_guard_close = "\n    END IF;" if changed_guard else ""
+            # The ignored-row check nests inside the changed-row guard (it runs
+            # only for rows whose referenced values changed).
+            after_guard_open = upd_guard_open + (f"IF {applied} THEN\n    " if applied else "")
+            after_guard_close = ("\n    END IF;" if applied else "") + upd_guard_close
             upd_inner = (
                 f"{old_section}\n    {new_section}{clean_section}"
                 if old_section.strip()
@@ -758,7 +822,7 @@ class DialectEmitMixin(MixinHost):
                 trg_name=t_au_name,
                 event="UPDATE",
                 q_base_t=q_base_t,
-                body=f"{upd_guard_open}{upd_inner}{upd_guard_close}",
+                body=f"{after_guard_open}{upd_inner}{after_guard_close}",
             )
             t_names = [t_ai_name, t_ad_name, t_au_name]
             if not mysql_prelock:

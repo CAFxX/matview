@@ -654,6 +654,60 @@ def _mysql_replace(ctx: Ctx) -> None:
     ctx.commit_check("REPLACE")
 
 
+_KEY_SHAPES_SCHEMA = {"mysql": [
+    "CREATE TABLE nk (g INT, v INT) ENGINE=InnoDB",
+    "CREATE TABLE un (id INT NOT NULL UNIQUE, g INT, v INT) ENGINE=InnoDB",
+    "CREATE TABLE uq (u INT UNIQUE, g INT, v INT) ENGINE=InnoDB",
+    "CREATE TABLE cp (a INT, b INT, g INT, v INT, PRIMARY KEY (a, b)) ENGINE=InnoDB",
+]}
+
+
+@cell("mysql_update_ignore_key_shapes", AREA_A,
+      "UPDATE / UPDATE IGNORE on tables without a key and with identical duplicate rows, with only a UNIQUE NOT "
+      "NULL key, with only a nullable UNIQUE key (NULL twins) and with a composite primary key",
+      "the MariaDB ignored-update guard needs a key that identifies the row: a table without one cannot skip a "
+      "row on a duplicate key and gets no guard (an identical twin made a real update look skipped); rows with "
+      "a NULL in a nullable UNIQUE key are always applied. MariaDB limitation: wrong when the only key is a "
+      "nullable UNIQUE key and an IGNORE-skipped row has a NULL key (cell mariadb_update_ignore_null_unique_key)",
+      mysql=EXACT, mariadb=LIMITED)
+def _update_ignore_key_shapes(ctx: Ctx) -> None:
+    env = ctx.fresh(_KEY_SHAPES_SCHEMA,
+                    [ViewDef("v_nk", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nk GROUP BY g"),
+                     ViewDef("v_nkp", "SELECT g, v FROM nk WHERE v > 0"),
+                     ViewDef("v_un", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM un GROUP BY g"),
+                     ViewDef("v_uq", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM uq GROUP BY g"),
+                     ViewDef("v_cp", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM cp GROUP BY g")],
+                    ["INSERT INTO nk VALUES (1, 5), (1, 5), (2, 7)",
+                     "INSERT INTO un VALUES (1, 1, 5), (2, 1, 6), (3, 2, 7)",
+                     "INSERT INTO uq VALUES (NULL, 1, 5), (NULL, 1, 5), (10, 2, 7), (20, 3, 1)",
+                     "INSERT INTO cp VALUES (1, 1, 1, 5), (1, 2, 1, 6), (2, 1, 2, 7)"])
+    for sql in ["UPDATE nk SET v = 6 WHERE g = 1 LIMIT 1",
+                "UPDATE IGNORE nk SET v = v + 1 WHERE g = 2",
+                "UPDATE IGNORE un SET id = 1, v = 9 WHERE id = 2",
+                "UPDATE un SET v = v + 1 WHERE id = 3",
+                "UPDATE uq SET v = 6 WHERE u IS NULL LIMIT 1",
+                "UPDATE IGNORE uq SET u = 10, v = 0 WHERE u = 20",
+                "UPDATE IGNORE cp SET b = 1, v = 0 WHERE a = 1 AND b = 2",
+                "UPDATE cp SET v = v + 1 WHERE a = 2"]:
+        env.execute(sql)
+        ctx.check(sql + " (in transaction)", env, end_tx=False)
+    ctx.commit_check("UPDATE IGNORE across key shapes", env)
+
+
+@cell("mariadb_update_ignore_null_unique_key", AREA_A,
+      "UPDATE IGNORE skipping rows whose only key is a nullable UNIQUE key and whose key is NULL",
+      "rows with a NULL key can be identical twins, so the MariaDB ignored-update guard applies them and the "
+      "skipped update reaches the view (also with two nullable UNIQUE keys); MySQL fires no trigger for them",
+      todo="Exact Maintenance Under MariaDB UPDATE IGNORE (AFTER UPDATE Triggers Fire for Ignored Rows)",
+      mysql=EXACT, mariadb=WRONG)
+def _mariadb_null_unique(ctx: Ctx) -> None:
+    env = ctx.fresh({"mysql": ["CREATE TABLE nu (u INT UNIQUE, g INT, v INT) ENGINE=InnoDB"]},
+                    [ViewDef("v_nu", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nu GROUP BY g")],
+                    ["INSERT INTO nu VALUES (NULL, 1, 5), (NULL, 1, 5), (1, 1, 5), (2, 2, 7)"])
+    env.execute("UPDATE IGNORE nu SET u = 2, v = 9 WHERE u IS NULL")
+    ctx.commit_check("UPDATE IGNORE skipping NULL-key rows", env)
+
+
 @cell("mysql_insert_ignore_data_errors", AREA_A,
       "INSERT IGNORE / UPDATE IGNORE converting CHECK, range and duplicate-key errors to warnings",
       "twin", mysql=EXACT, mariadb=EXACT)
@@ -665,13 +719,20 @@ def _mysql_insert_ignore(ctx: Ctx) -> None:
 
 
 @cell("mysql_update_ignore_duplicate_key", AREA_A,
-      "UPDATE IGNORE whose rows hit a duplicate key on a UNIQUE column and are skipped",
-      "MariaDB fires the AFTER UPDATE trigger for a row whose update was ignored (reproduced without matview: "
-      "the trigger logs a change the table never had), so the view applies it; MySQL does not fire it",
-      todo="Exact Maintenance Under MariaDB UPDATE IGNORE (AFTER UPDATE Triggers Fire for Ignored Rows)",
-      mysql=EXACT, mariadb=WRONG)
+      "UPDATE IGNORE / INSERT IGNORE ... ON DUPLICATE KEY UPDATE whose row updates hit a duplicate key "
+      "(UNIQUE column or primary key) and are skipped, mixed with rows that succeed",
+      "twin; MariaDB fires the AFTER UPDATE trigger for a row whose update was skipped (reproduced without "
+      "matview; the row keeps its OLD values); its maintenance trigger now applies a change only when the row "
+      "is no longer in its OLD state. MySQL does not fire it",
+      mysql=EXACT, mariadb=EXACT)
 def _mysql_update_ignore_dup(ctx: Ctx) -> None:
     ctx.both("UPDATE IGNORE {t} SET u = 10, g = 4 WHERE id IN (2, 3)")
+    ctx.both("UPDATE IGNORE {t} SET u = u + 10, v = v + 1 ORDER BY id")  # some rows collide, others move
+    ctx.check("UPDATE IGNORE skipping duplicate keys", end_tx=False)
+    ctx.both("UPDATE IGNORE {t} SET id = id - 1, g = 3 WHERE id IN (2, 5, 9) ORDER BY id")  # PK collisions
+    ctx.both("UPDATE IGNORE {t} SET id = id + 1000 WHERE id IN (6, 7)")  # PK moves that succeed
+    ctx.both("INSERT IGNORE INTO {t} (id, g, v, w, u) VALUES (10, 1, 1, 1, NULL), (11, 1, 1, 1, NULL) "
+             "ON DUPLICATE KEY UPDATE u = 30, g = 2")
     ctx.commit_check("UPDATE IGNORE skipping duplicate keys")
 
 
@@ -1102,7 +1163,9 @@ def _sqlite_raise_fail(ctx: Ctx) -> None:
       "A newer user trigger whose writes reach the source only through other triggers: it inserts into a "
       "table whose trigger updates the source, or into a view whose INSTEAD OF trigger updates the source",
       "check_schema_drift() follows the trigger chain (bounded depth) and reports triggers_out_of_order; "
-      "repair_view() puts the maintenance triggers first. Writes hidden in application functions are not seen",
+      "repair_view() puts the maintenance triggers first. Writes hidden in application functions are not seen. "
+      "The check is conservative: a RAISE(FAIL/IGNORE) anywhere in the chain, even on an unrelated table, or a "
+      "chain deeper than 16 is reported too",
       sqlite=LIMITED)
 def _sqlite_indirect(ctx: Ctx) -> None:
     env = ctx.env
