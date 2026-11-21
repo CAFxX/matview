@@ -686,8 +686,32 @@ class DialectEmitMixin(MixinHost):
                 else (f"\n    {cleanup_block}" if cleanup_block else "")
             )
 
+            # MariaDB fires AFTER UPDATE for a row whose UPDATE IGNORE was
+            # skipped on a duplicate key (the row keeps its OLD values; MySQL
+            # does not fire). Apply the change only when the row is no longer
+            # in its OLD state: compared with OLD, which is read from storage,
+            # so the comparison is exact for every type.
+            # (Without the changed-column guard, the update maintenance
+            # recomputes from the table and is idempotent; no guard is added.)
+            if self.engine_version.is_mariadb and t_schema is not None and ref_cols and changed_guard:
+                key_cols = list(t_schema.effective_pk_columns()) or list(ref_cols)
+                cmp_cols = list(dict.fromkeys([*key_cols, *ref_cols]))
+                # Key lookup by equality; then identity, as in the changed
+                # guard (a case-only change under a case-insensitive
+                # collation is a change).
+                still_old = " AND ".join(
+                    [f"__mv_cur.{self._q(c)} <=> OLD.{self._q(c)}" for c in key_cols]
+                    + [self._identical_row_values_sql(f"__mv_cur.{self._q(c)}", f"OLD.{self._q(c)}", True)
+                       for c in cmp_cols]
+                )
+                applied = f"NOT EXISTS (SELECT 1 FROM {q_base_t} AS __mv_cur WHERE {still_old})"
+                after_guard: Optional[str] = f"({changed_guard}) AND {applied}"
+            else:
+                after_guard = changed_guard
             upd_guard_open = f"IF ({changed_guard}) THEN\n    " if changed_guard else ""
             upd_guard_close = "\n    END IF;" if changed_guard else ""
+            after_guard_open = f"IF ({after_guard}) THEN\n    " if after_guard else ""
+            after_guard_close = "\n    END IF;" if after_guard else ""
             upd_inner = (
                 f"{old_section}\n    {new_section}{clean_section}"
                 if old_section.strip()
@@ -713,7 +737,7 @@ class DialectEmitMixin(MixinHost):
                 trg_name=t_au_name,
                 event="UPDATE",
                 q_base_t=q_base_t,
-                body=f"{upd_guard_open}{upd_inner}{upd_guard_close}",
+                body=f"{after_guard_open}{upd_inner}{after_guard_close}",
             )
             t_names = [t_ai_name, t_ad_name, t_au_name]
             if not mysql_prelock:

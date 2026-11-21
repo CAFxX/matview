@@ -662,13 +662,20 @@ def _mysql_insert_ignore(ctx: Ctx) -> None:
 
 
 @cell("mysql_update_ignore_duplicate_key", AREA_A,
-      "UPDATE IGNORE whose rows hit a duplicate key on a UNIQUE column and are skipped",
-      "MariaDB fires the AFTER UPDATE trigger for a row whose update was ignored (reproduced without matview: "
-      "the trigger logs a change the table never had), so the view applies it; MySQL does not fire it",
-      todo="Exact Maintenance Under MariaDB UPDATE IGNORE (AFTER UPDATE Triggers Fire for Ignored Rows)",
-      mysql=EXACT, mariadb=WRONG)
+      "UPDATE IGNORE / INSERT IGNORE ... ON DUPLICATE KEY UPDATE whose row updates hit a duplicate key "
+      "(UNIQUE column or primary key) and are skipped, mixed with rows that succeed",
+      "twin; MariaDB fires the AFTER UPDATE trigger for a row whose update was skipped (reproduced without "
+      "matview; the row keeps its OLD values); its maintenance trigger now applies a change only when the row "
+      "is no longer in its OLD state. MySQL does not fire it",
+      mysql=EXACT, mariadb=EXACT)
 def _mysql_update_ignore_dup(ctx: Ctx) -> None:
     ctx.both("UPDATE IGNORE {t} SET u = 10, g = 4 WHERE id IN (2, 3)")
+    ctx.both("UPDATE IGNORE {t} SET u = u + 10, v = v + 1 ORDER BY id")  # some rows collide, others move
+    ctx.check("UPDATE IGNORE skipping duplicate keys", end_tx=False)
+    ctx.both("UPDATE IGNORE {t} SET id = id - 1, g = 3 WHERE id IN (2, 5, 9) ORDER BY id")  # PK collisions
+    ctx.both("UPDATE IGNORE {t} SET id = id + 1000 WHERE id IN (6, 7)")  # PK moves that succeed
+    ctx.both("INSERT IGNORE INTO {t} (id, g, v, w, u) VALUES (10, 1, 1, 1, NULL), (11, 1, 1, 1, NULL) "
+             "ON DUPLICATE KEY UPDATE u = 30, g = 2")
     ctx.commit_check("UPDATE IGNORE skipping duplicate keys")
 
 

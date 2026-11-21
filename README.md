@@ -391,7 +391,7 @@ cell is skipped there (verified on PostgreSQL 18 locally).
 | `sqlite_or_rollback` | INSERT OR ROLLBACK (the whole transaction is rolled back) | exact | n/a | n/a | n/a |  |
 | `mysql_replace` | REPLACE deleting PK- and UNIQUE-conflicting rows (VALUES and SELECT forms) | n/a | n/a | exact | exact | twin |
 | `mysql_insert_ignore_data_errors` | INSERT IGNORE / UPDATE IGNORE converting CHECK, range and duplicate-key errors to warnings | n/a | n/a | exact | exact | twin |
-| `mysql_update_ignore_duplicate_key` | UPDATE IGNORE whose rows hit a duplicate key on a UNIQUE column and are skipped | n/a | n/a | exact | **WRONG** | MariaDB fires the AFTER UPDATE trigger for a row whose update was ignored (reproduced without matview: the trigger logs a change the table never had), so the view applies it; MySQL does not fire it; TODO: Exact Maintenance Under MariaDB UPDATE IGNORE (AFTER UPDATE Triggers Fire for Ignored Rows) |
+| `mysql_update_ignore_duplicate_key` | UPDATE IGNORE / INSERT IGNORE ... ON DUPLICATE KEY UPDATE whose row updates hit a duplicate key (UNIQUE column or primary key) and are skipped, mixed with rows that succeed | n/a | n/a | exact | exact | twin; MariaDB fires the AFTER UPDATE trigger for a row whose update was skipped (reproduced without matview; the row keeps its OLD values); its maintenance trigger now applies a change only when the row is no longer in its OLD state. MySQL does not fire it |
 | `defaults_identity_upsert_gaps` | Column defaults, DEFAULT VALUES, identity/AUTO_INCREMENT keys and the id gaps upserts leave | exact | exact | exact | exact | twin incl. affected rows and lastval()/LAST_INSERT_ID()/last_insert_rowid() after each statement |
 | `update_delete_self_join` | UPDATE ... FROM / multi-table UPDATE and DELETE ... USING / multi-table DELETE joining the source to itself | exact | exact | exact | exact | twin |
 | `one_statement_both_join_sources` | One statement modifying both sources of a join view (multi-table UPDATE/DELETE; PostgreSQL writable CTE) | n/a | **WRONG** | exact | exact | PostgreSQL: the join aggregate counts the delta-delta term wrongly (statement triggers of the two tables each see the other table's final state); TODO: Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View |
@@ -437,7 +437,7 @@ cell is skipped there (verified on PostgreSQL 18 locally).
 | `two_phase_commit` | Two-phase commit: PREPARE TRANSACTION / COMMIT/ROLLBACK PREPARED; XA START ... XA COMMIT/ROLLBACK | n/a | exact | exact | exact | PostgreSQL needs max_prepared_transactions > 0 (the CI service runs with the default 0, so it is skipped there and was verified locally on 18) |
 | `statement_fails_midway` | An upsert failing on its third row (CHECK) inside a multi-statement transaction, then more statements | exact | exact | exact | exact | twin; PostgreSQL continues after ROLLBACK TO SAVEPOINT, the others after the statement-level rollback |
 
-Counts per product (exact, limited, refused, WRONG, n/a): sqlite 31/3/2/5/18; postgres 33/2/4/4/16; mysql 26/1/6/3/23; mariadb 27/1/6/4/21.
+Counts per product (exact, limited, refused, WRONG, n/a): sqlite 31/3/2/5/18; postgres 33/2/4/4/16; mysql 26/1/6/3/23; mariadb 28/1/6/3/21.
 <!-- END GENERATED: dml-matrix -->
 
 Not covered by the matrix: a real logical-replication subscription (its apply
