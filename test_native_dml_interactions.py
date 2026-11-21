@@ -1240,19 +1240,14 @@ def _generated_stored(ctx: Ctx) -> None:
 
 @cell("generated_virtual", AREA_B,
       "Views over a VIRTUAL generated column while its inputs change",
-      "PostgreSQL 18 (the first with VIRTUAL) rejects reading such a column from the statement triggers' "
-      "transition tables ('unexpected virtual generated column reference'): with a view reading it every write "
-      "of the source fails and is rolled back (UPDATEs fail even when no view reads it); registration does not "
-      "refuse",
-      todo="Support or Refuse PostgreSQL 18 VIRTUAL Generated Columns in Source Tables",
-      since={"postgres": (18, 0)}, sqlite=EXACT, postgres=REFUSED, mysql=EXACT, mariadb=EXACT)
+      "PostgreSQL 18+ fixed here: statement triggers project non-virtual transition columns explicitly and "
+      "compute VIRTUAL generated columns from their catalog generation expressions instead of reading them "
+      "from the transition tables",
+      since={"postgres": (18, 0)}, sqlite=EXACT, postgres=EXACT, mysql=EXACT, mariadb=EXACT)
 def _generated_virtual(ctx: Ctx) -> None:
     env = _gen_env(ctx, virtual=True)
     for sql in _GEN_DML:
-        if ctx.outcome == REFUSED:
-            ctx.fails(sql, env, match="virtual generated column")
-        else:
-            env.execute(sql)
+        env.execute(sql)
         ctx.check(sql + " (in transaction)", env, end_tx=False)
     ctx.commit_check("VIRTUAL generated column", env)
 

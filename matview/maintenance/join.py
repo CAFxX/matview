@@ -871,7 +871,7 @@ class Tier1JoinMixin(MixinHost):
                 pg_view_lock = self._pg_view_lock_stmt()
                 trunc_stmts = [pg_view_lock, f"DELETE FROM {mv_table};", initial_populate_sql]
                 pg_bodies = self._pg_aggregate_bodies(
-                    pg_spec, [_pg_join_source(j_alias)], pre_stmts=[pg_view_lock]
+                    pg_spec, [_pg_join_source(j_alias)], pre_stmts=[pg_view_lock], base_t=base_t
                 )
                 pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
 

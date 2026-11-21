@@ -26,8 +26,13 @@ class ColumnDef:
     not_null: bool = False
     primary_key: bool = False
     # A generated (computed) column changes without being named in an
-    # UPDATE's SET list. Set by DDL parsing (the SQLite introspection path).
+    # UPDATE's SET list. Set by DDL parsing and PostgreSQL catalog introspection.
     generated: bool = False
+    # PostgreSQL 18+ VIRTUAL generated column: cannot be read directly from
+    # statement-trigger transition tables, so triggers compute it from
+    # ``generation_expr`` over the non-virtual transition columns.
+    generated_virtual: bool = False
+    generation_expr: Optional[str] = None
     # True only for a SQLite single-column INTEGER PRIMARY KEY (without DESC or
     # WITHOUT ROWID), which is SQLite's guaranteed 64-bit signed-integer rowid alias.
     is_rowid_alias: bool = False

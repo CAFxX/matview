@@ -669,7 +669,7 @@ class Tier1UnionAllAggMixin(MixinHost):
                         self._requires_native_avg_recompute(it) or self._pgmy_native_recompute_item(it)
                     ),
                 )
-                pg_bodies.update(self._pg_aggregate_bodies(spec, pg_sources))
+                pg_bodies.update(self._pg_aggregate_bodies(spec, pg_sources, base_t=base_t))
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
                 view_name=view_name,
                 base_t=base_t,

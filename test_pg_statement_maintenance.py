@@ -2266,3 +2266,215 @@ def test_multi_bucket_opposite_order_batch_and_whole_view_no_deadlock(make_env) 
             f.result()
 
     env.check("multi-bucket opposite-order batch + whole-view stress")
+
+
+def test_pg18_virtual_generated_columns_all_strategies_and_drift(make_env, monkeypatch) -> None:
+    """PostgreSQL 18+ VIRTUAL generated columns (both explicit VIRTUAL and
+    default GENERATED ALWAYS AS (...)) work across every maintenance strategy
+    (unreferenced views, algebraic aggregates, Tier 2 STRING_AGG/window, joins
+    where the joined source has virtual columns, UNION ALL/UNION/DISTINCT,
+    filtered projections, partitioned tables), preserve exact values and OIDs
+    under both SQLAlchemy and raw DB-API introspection, and report schema drift
+    on ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION AS."""
+    import matview.connectivity as _conn_mod
+
+    probe_env = make_env(views=[], seed=False)
+    pcur = probe_env.conn.cursor()
+    pcur.execute("SHOW server_version_num")
+    ver_num = int(pcur.fetchone()[0])
+    probe_env.conn.commit()
+    if ver_num < 180000:
+        pytest.skip(f"VIRTUAL generated columns require PostgreSQL 18+ (running {ver_num})")
+
+    env = make_env(
+        views=[],
+        seed=False,
+        schema_sql=[
+            """
+            CREATE TABLE gv (
+                id INT PRIMARY KEY,
+                g INT,
+                "a b" INT,
+                x NUMERIC(10, 2),
+                v_default INT GENERATED ALWAYS AS ("a b" * 2 + 1),
+                v_num NUMERIC(12, 2) GENERATED ALWAYS AS (x * 1.5) VIRTUAL,
+                v_tag TEXT GENERATED ALWAYS AS (CASE WHEN "a b" > 0 THEN 'pos' ELSE 'nonpos' END) VIRTUAL,
+                v_stored INT GENERATED ALWAYS AS ("a b" + 10) STORED
+            )
+            """,
+            """
+            CREATE TABLE gv_dim (
+                g INT PRIMARY KEY,
+                raw_name TEXT,
+                label TEXT GENERATED ALWAYS AS (UPPER(raw_name) || '_v') VIRTUAL
+            )
+            """,
+            """
+            CREATE TABLE gv_part (
+                id INT NOT NULL,
+                g INT NOT NULL,
+                val INT,
+                doubled INT GENERATED ALWAYS AS (val * 2) VIRTUAL,
+                PRIMARY KEY (g, id)
+            ) PARTITION BY LIST (g)
+            """,
+            "CREATE TABLE gv_part_1 PARTITION OF gv_part FOR VALUES IN (1)",
+            "CREATE TABLE gv_part_2 PARTITION OF gv_part FOR VALUES IN (2)",
+        ],
+    )
+
+    # Verify both SQLAlchemy and raw DB-API introspection populate generated_virtual and generation_expr.
+    sa_schemas = env.manager.fetch_schema()
+    monkeypatch.setattr(_conn_mod, "_can_use_sqlalchemy_inspector", lambda _c: False)
+    raw_schemas = env.manager.fetch_schema()
+    monkeypatch.undo()
+    for label, sm in (("sqlalchemy", sa_schemas), ("dbapi_fallback", raw_schemas)):
+        gv_cols = sm["gv"].columns
+        assert gv_cols["v_default"].generated and gv_cols["v_default"].generated_virtual, label
+        assert gv_cols["v_default"].generation_expr is not None, label
+        assert gv_cols["v_num"].generated and gv_cols["v_num"].generated_virtual, label
+        assert gv_cols["v_tag"].generated and gv_cols["v_tag"].generated_virtual, label
+        assert gv_cols["v_stored"].generated and not gv_cols["v_stored"].generated_virtual, label
+        assert sm["gv_dim"].columns["label"].generated_virtual, label
+        assert sm["gv_part"].columns["doubled"].generated_virtual, label
+
+    views = [
+        # 1. View that does NOT reference any virtual column (previously crashed on every write!).
+        ViewDef("v_gv_unref", 'SELECT g, SUM("a b") AS s, COUNT(*) AS c FROM gv GROUP BY g'),
+        # 2. Algebraic aggregate grouping by and aggregating virtual columns.
+        ViewDef("v_gv_agg", "SELECT v_tag, SUM(v_default) AS sd, SUM(v_num) AS sn, COUNT(*) AS c FROM gv GROUP BY v_tag"),
+        # 3. Tier 2 STRING_AGG and window function over virtual columns.
+        ViewDef("v_gv_str", "SELECT g, STRING_AGG(CAST(v_default AS TEXT), ',' ORDER BY id) AS ds FROM gv GROUP BY g"),
+        ViewDef("v_gv_win", "SELECT id, v_tag, v_default, ROW_NUMBER() OVER (PARTITION BY v_tag ORDER BY v_default, id) AS rn FROM gv"),
+        # 4. Algebraic multi-table join where BOTH sources have virtual columns.
+        ViewDef(
+            "v_gv_join",
+            "SELECT d.label, SUM(gv.v_default) AS sd, COUNT(*) AS c "
+            "FROM gv JOIN gv_dim d ON gv.g = d.g GROUP BY d.label",
+        ),
+        # 5. UNION / DISTINCT / filtered Z-set projection over virtual columns.
+        ViewDef("v_gv_dst", "SELECT DISTINCT v_default, v_tag FROM gv"),
+        ViewDef("v_gv_proj", "SELECT id, v_default, v_num FROM gv WHERE v_default > 0"),
+        ViewDef(
+            "v_gv_uall",
+            "SELECT id, v_default AS val FROM gv WHERE g = 1 UNION ALL SELECT id, v_stored AS val FROM gv WHERE g = 2",
+        ),
+        # 6. Partitioned source table with virtual column.
+        ViewDef("v_gv_part", "SELECT g, SUM(doubled) AS s, COUNT(*) AS c FROM gv_part GROUP BY g"),
+    ]
+    env.views = views
+    for vd in views:
+        env.register(vd)
+
+    cur = env.conn.cursor()
+
+    def _assert_all_exact(label: str) -> None:
+        for vd in views:
+            cur.execute(f"SELECT * FROM {vd.name} LIMIT 0")
+            mv_oids = [d.type_code for d in cur.description]
+            cols = [d[0] for d in cur.description]
+            cur.execute(f"SELECT * FROM ({vd.select}) AS q LIMIT 0")
+            live_oids = [d.type_code for d in cur.description]
+            assert mv_oids == live_oids, f"{label}: {vd.name} OIDs {mv_oids} != {live_oids}"
+            sel_cols = ", ".join(cols)
+            cur.execute(
+                f"(SELECT {sel_cols} FROM {vd.name} EXCEPT ALL SELECT {sel_cols} FROM ({vd.select}) AS q) "
+                f"UNION ALL "
+                f"(SELECT {sel_cols} FROM ({vd.select}) AS q EXCEPT ALL SELECT {sel_cols} FROM {vd.name})"
+            )
+            diff = cur.fetchall()
+            assert diff == [], f"{label}: {vd.name} diff={diff}"
+        env.conn.commit()
+
+    cur.execute("INSERT INTO gv_dim (g, raw_name) VALUES (1, 'alpha'), (2, 'beta')")
+    cur.execute('INSERT INTO gv (id, g, "a b", x) VALUES (1, 1, 5, 10.00), (2, 1, -2, 3.33), (3, 2, 0, NULL), (4, 2, NULL, 4.50)')
+    cur.execute("INSERT INTO gv_part (id, g, val) VALUES (1, 1, 10), (2, 1, 20), (3, 2, -5)")
+    env.conn.commit()
+    _assert_all_exact("after inserts")
+
+    # UPDATE inputs of virtual columns (including ON CONFLICT DO UPDATE and direct partition write).
+    cur.execute('UPDATE gv SET "a b" = "a b" + 3, x = COALESCE(x, 0) + 1.25 WHERE id IN (1, 2, 3)')
+    cur.execute(
+        'INSERT INTO gv (id, g, "a b", x) VALUES (1, 2, -10, 7.00) '
+        'ON CONFLICT (id) DO UPDATE SET g = EXCLUDED.g, "a b" = EXCLUDED."a b", x = EXCLUDED.x'
+    )
+    cur.execute("UPDATE gv_dim SET raw_name = 'gamma' WHERE g = 1")
+    cur.execute("UPDATE gv_part_1 SET val = val + 7 WHERE id = 1")
+    env.conn.commit()
+    _assert_all_exact("after updates and upsert")
+
+    cur.execute("DELETE FROM gv WHERE id IN (2, 4)")
+    cur.execute("DELETE FROM gv_part WHERE id = 3")
+    env.conn.commit()
+    _assert_all_exact("after deletes")
+
+    cur.execute("TRUNCATE TABLE gv")
+    env.conn.commit()
+    _assert_all_exact("after truncate")
+
+    # ALTER COLUMN ... SET EXPRESSION AS must be detected as schema_changed and repaired cleanly.
+    cur.execute('INSERT INTO gv (id, g, "a b", x) VALUES (10, 1, 4, 2.00)')
+    env.conn.commit()
+    _assert_all_exact("before alter expression")
+
+    cur.execute('ALTER TABLE gv ALTER COLUMN v_default SET EXPRESSION AS ("a b" * 10)')
+    env.conn.commit()
+    drift = env.manager.check_schema_drift()
+    assert drift["v_gv_agg"] == "drifted", drift
+    for vn in ("v_gv_agg", "v_gv_str", "v_gv_win", "v_gv_join", "v_gv_dst", "v_gv_proj", "v_gv_uall"):
+        env.manager.repair_view(vn)
+    cur.execute('UPDATE gv SET "a b" = 6 WHERE id = 10')
+    env.conn.commit()
+    _assert_all_exact("after alter expression and repair")
+
+    # Adversarial keyword-named columns, multi-word casts, ARRAY/COLLATE virtual columns,
+    # coexisting ENUM column, dropped columns before/after virtual columns, and NULL virtual expression.
+    cur.execute("CREATE TYPE gv_status AS ENUM ('lo', 'hi')")
+    cur.execute(
+        """
+        CREATE TABLE gv_adv (
+            id INT PRIMARY KEY,
+            drop_before INT,
+            status gv_status,
+            "end" INT,
+            "null" INT,
+            "both" TEXT,
+            "precision" INT,
+            "varying" TEXT,
+            v_kw INT GENERATED ALWAYS AS (CASE WHEN "end" > 0 THEN "end" + "precision" ELSE COALESCE("null", 0) END) VIRTUAL,
+            v_cast DOUBLE PRECISION GENERATED ALWAYS AS (("end"::double precision) + 0.5) VIRTUAL,
+            v_sub TEXT GENERATED ALWAYS AS (SUBSTRING("varying"::character varying FROM 1 FOR 3)) VIRTUAL,
+            v_arr INT[] GENERATED ALWAYS AS (ARRAY["end", COALESCE("null", 0)]) VIRTUAL,
+            v_coll TEXT COLLATE "C" GENERATED ALWAYS AS (LOWER("both")) VIRTUAL,
+            v_null INT GENERATED ALWAYS AS (NULL) VIRTUAL,
+            drop_after INT
+        )
+        """
+    )
+    cur.execute("ALTER TABLE gv_adv DROP COLUMN drop_before, DROP COLUMN drop_after")
+    env.conn.commit()
+
+    # Register via raw DB-API fallback too to verify ENUM/ARRAY + COLLATE fidelity.
+    monkeypatch.setattr(_conn_mod, "_can_use_sqlalchemy_inspector", lambda _c: False)
+    vd_adv = ViewDef(
+        "v_gv_adv",
+        "SELECT status, v_coll, v_sub, v_arr, SUM(v_kw) AS sk, COUNT(v_cast) AS cc, COUNT(v_null) AS cn, COUNT(*) AS c "
+        "FROM gv_adv GROUP BY status, v_coll, v_sub, v_arr",
+    )
+    env.register(vd_adv)
+    monkeypatch.undo()
+
+    cur.execute(
+        'INSERT INTO gv_adv (id, status, "end", "null", "both", "precision", "varying") VALUES '
+        "(1, 'hi', 5, 1, 'AbC', 2, 'hello'), (2, 'lo', -1, 9, 'XYZ', 4, 'world')"
+    )
+    cur.execute('UPDATE gv_adv SET status = \'lo\', "end" = -3, "both" = \'ZzZ\', "varying" = \'abcdef\' WHERE id = 1')
+    cur.execute("DELETE FROM gv_adv WHERE id = 2")
+    env.conn.commit()
+    cur.execute(
+        f"(SELECT * FROM {vd_adv.name} EXCEPT ALL SELECT * FROM ({vd_adv.select}) AS q) "
+        f"UNION ALL "
+        f"(SELECT * FROM ({vd_adv.select}) AS q EXCEPT ALL SELECT * FROM {vd_adv.name})"
+    )
+    assert cur.fetchall() == []
+    env.conn.commit()

@@ -56,8 +56,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .._host import MixinHost
-from ..engines import AggFunc
-from ..logical_ir import SelectItem
+from ..engines import AggFunc, UnsupportedMaterializedViewError
+from ..logical_ir import SelectItem, TableSchema
 from .templates import render_procedural_sql
 
 SIGN = "__mv_s"
@@ -273,11 +273,230 @@ class PgStatementMaintenanceMixin(MixinHost):
     # ------------------------------------------------------------------
     # Shared SQL helpers
     # ------------------------------------------------------------------
-    @staticmethod
-    def _pg_projection_sql(event: str, sources: Sequence[PgDeltaSource], columns: Callable[[PgDeltaSource], List[str]]) -> str:
+    def _pg_rewrite_vgen_expr(self, expr: str, ts: TableSchema, record_prefix: str) -> str:
+        """Qualify bare/quoted non-virtual column references in a PostgreSQL
+        virtual generated column's expression with ``record_prefix``."""
+        import sqlglot.errors
+        from sqlglot import TokenType as SQLGlotTokenType, exp as sqlglot_exp
+        from ..engines import Dialect
+        from ..sql_frontend import _tokenize_sql, parse_sql_ast, quote_sql_identifier
+
+        non_vgen_by_exact = {c: c for c, cd in ts.columns.items() if not cd.generated_virtual}
+        non_vgen_by_lower = {c.lower(): c for c, cd in ts.columns.items() if not cd.generated_virtual}
+
+        # Primary path: sqlglot AST rewrite of unqualified Column nodes only.
+        # Avoids touching SQL keywords (CASE/END/FROM/FOR/NULL/TRUE/ARRAY),
+        # multi-word types (double precision, character varying, timestamp with
+        # time zone), EXTRACT/SUBSTRING/TRIM clauses, typed literals, and
+        # named function parameters. Fall back to the token scanner only if
+        # PG-specific syntax like OPERATOR(...) cannot round-trip cleanly.
+        if not re.search(r"\bOPERATOR\s*\(", expr, re.IGNORECASE):
+            try:
+                ast = parse_sql_ast(expr, dialect=Dialect.POSTGRES)
+                changed = False
+                for col_node in list(ast.find_all(sqlglot_exp.Column)):
+                    if col_node.table:
+                        continue
+                    ident = col_node.this
+                    if not isinstance(ident, sqlglot_exp.Identifier) or not ident.name:
+                        continue
+                    if ident.quoted:
+                        actual_c = non_vgen_by_exact.get(ident.name)
+                    else:
+                        actual_c = non_vgen_by_lower.get(ident.name.lower())
+                    if actual_c is None:
+                        continue
+                    col_node.set("table", sqlglot_exp.Identifier(this=record_prefix, quoted=False))
+                    col_node.set("this", sqlglot_exp.Identifier(this=actual_c, quoted=True))
+                    changed = True
+                if changed:
+                    return ast.sql(dialect="postgres")
+                return expr
+            except sqlglot.errors.SqlglotError:
+                pass
+
+        # Fallback token scanner (e.g. for PG OPERATOR(pg_catalog.+) syntax).
+        try:
+            toks = _tokenize_sql(expr, read="postgres")
+        except Exception:
+            return expr
+        _PG_TYPE_CONTINUATION = frozenset({
+            "precision", "varying", "with", "without", "time", "zone",
+            "year", "month", "day", "hour", "minute", "second", "to",
+            "character", "double", "bit", "timestamp", "interval",
+        })
+        out: List[str] = []
+        cursor = 0
+        n = len(toks)
+        in_dcolon_type = False
+        dcolon_paren_depth = 0
+        cast_as_depths: List[int] = []
+        paren_depth = 0
+        for i, tk in enumerate(toks):
+            tt = tk.token_type
+            if tt == SQLGlotTokenType.L_PAREN:
+                paren_depth += 1
+                if in_dcolon_type:
+                    dcolon_paren_depth += 1
+                continue
+            if tt == SQLGlotTokenType.R_PAREN:
+                if in_dcolon_type and dcolon_paren_depth > 0:
+                    dcolon_paren_depth -= 1
+                if cast_as_depths and paren_depth == cast_as_depths[-1]:
+                    cast_as_depths.pop()
+                paren_depth = max(0, paren_depth - 1)
+                continue
+            if tt == SQLGlotTokenType.DCOLON:
+                in_dcolon_type = True
+                dcolon_paren_depth = 0
+                continue
+            if tt == SQLGlotTokenType.ALIAS and i >= 2:
+                # Inside CAST(expr AS <type>): skip type tokens until matching ')'.
+                cast_as_depths.append(paren_depth)
+                continue
+            if in_dcolon_type:
+                if dcolon_paren_depth > 0 or tt in (SQLGlotTokenType.DOT, SQLGlotTokenType.L_BRACKET, SQLGlotTokenType.R_BRACKET):
+                    continue
+                if i > 0 and toks[i - 1].token_type in (SQLGlotTokenType.DCOLON, SQLGlotTokenType.DOT):
+                    continue
+                if tk.text and tk.text.lower() in _PG_TYPE_CONTINUATION:
+                    continue
+                in_dcolon_type = False
+            if cast_as_depths:
+                continue
+
+            is_quoted = tk.start < len(expr) and expr[tk.start] == '"'
+            if not is_quoted and tt != SQLGlotTokenType.VAR:
+                continue
+            if is_quoted and tt not in (SQLGlotTokenType.IDENTIFIER, SQLGlotTokenType.VAR):
+                continue
+            prev_tt = toks[i - 1].token_type if i > 0 else None
+            next_tt = toks[i + 1].token_type if i + 1 < n else None
+            if prev_tt in (SQLGlotTokenType.DOT, SQLGlotTokenType.COLLATE):
+                continue
+            if next_tt in (
+                SQLGlotTokenType.DOT,
+                SQLGlotTokenType.L_PAREN,
+                SQLGlotTokenType.STRING,
+                SQLGlotTokenType.FARROW,
+                SQLGlotTokenType.COLON_EQ,
+            ):
+                continue
+            if not is_quoted and next_tt == SQLGlotTokenType.L_BRACKET and tk.text.lower() == "array":
+                continue
+            if not is_quoted and prev_tt == SQLGlotTokenType.L_PAREN and next_tt == SQLGlotTokenType.FROM:
+                continue
+            actual_c = non_vgen_by_exact.get(tk.text) if is_quoted else non_vgen_by_lower.get(tk.text.lower())
+            if actual_c is None:
+                continue
+            if tk.start > cursor:
+                out.append(expr[cursor : tk.start])
+            out.append(f"{record_prefix}.{quote_sql_identifier(actual_c, dialect=Dialect.POSTGRES, force=True)}")
+            cursor = tk.end + 1
+        if cursor < len(expr):
+            out.append(expr[cursor:])
+        return "".join(out)
+
+    def _pg_signed_rows_sql(self, event: str, base_t: Optional[str] = None) -> str:
+        """Signed delta of one statement over ``base_t``'s transition tables.
+
+        For ordinary tables (no PostgreSQL 18 VIRTUAL generated columns) this
+        emits ``SELECT ±1 AS __mv_s, __mv_n.*``. When ``base_t`` has any
+        VIRTUAL generated column, PostgreSQL 18 forbids reading it from a
+        transition table (``unexpected virtual generated column reference``),
+        so we project every non-virtual column explicitly and compute each
+        virtual column from its generation expression over the transition row.
+        """
+        from sqlglot import exp as sqlglot_exp
+
+        from ..engines import Dialect
+        from ..sql_frontend import parse_sql_ast, quote_sql_identifier
+
+        ts = self._schemas_lower.get(base_t.lower()) if base_t else None
+        if ts is None or not any(c.generated_virtual for c in ts.columns.values()):
+            return signed_rows_sql(event)
+
+        raw_sql = self.view.raw_select_sql or ""
+        raw_sql_lower = raw_sql.lower()
+        uses_star = False
+        if raw_sql:
+            try:
+                parsed_view = parse_sql_ast(raw_sql, dialect=Dialect.POSTGRES)
+                uses_star = any(
+                    isinstance(star, sqlglot_exp.Star) and not isinstance(star.parent, sqlglot_exp.Count)
+                    for star in parsed_view.find_all(sqlglot_exp.Star)
+                )
+            except Exception:
+                uses_star = bool(
+                    re.search(
+                        r"\bselect\s+(?:distinct\s+)?(?:\*|\S+\.\*)|,\s*(?:\*|\S+\.\*)",
+                        raw_sql_lower,
+                    )
+                )
+
+        def _select_list(rec: str) -> str:
+            items: List[str] = []
+            for c_def in ts.columns.values():
+                q_c = quote_sql_identifier(c_def.name, dialect=Dialect.POSTGRES, force=True)
+                if not c_def.generated_virtual:
+                    items.append(f"{rec}.{q_c} AS {q_c}")
+                    continue
+                if c_def.generation_expr:
+                    rewritten = self._pg_rewrite_vgen_expr(c_def.generation_expr, ts, rec)
+                    dt_raw = (c_def.data_type or "").strip()
+                    m_coll = re.search(
+                        r"(\s+COLLATE\s+(?:(?:\"[^\"]+\"|\S+)\.)?(?:\"[^\"]+\"|\S+))\s*$",
+                        dt_raw,
+                        re.IGNORECASE,
+                    )
+                    if m_coll:
+                        base_dt = dt_raw[: m_coll.start()].strip()
+                        coll_tail = m_coll.group(1)
+                    else:
+                        base_dt = dt_raw
+                        coll_tail = ""
+                    if base_dt and base_dt.upper() not in ("NULL", "USER-DEFINED", "ARRAY"):
+                        items.append(f"CAST(({rewritten}) AS {base_dt}){coll_tail} AS {q_c}")
+                    else:
+                        items.append(f"({rewritten}){coll_tail} AS {q_c}")
+                else:
+                    # Check whether the view actually mentions this virtual column
+                    # (or uses SELECT * / tbl.*). Ignore COUNT(*) which does not read columns.
+                    col_re = re.compile(
+                        rf'(?<![A-Za-z0-9_$])"?{re.escape(c_def.name.lower())}"?(?![A-Za-z0-9_$])'
+                    )
+                    if uses_star or col_re.search(raw_sql_lower):
+                        raise UnsupportedMaterializedViewError(
+                            f"PostgreSQL virtual generated column {ts.name}.{c_def.name} cannot be read from "
+                            f"statement-trigger transition tables because its generation expression is unavailable."
+                        )
+            return ", ".join(items)
+
+        def _signed(sign: int, rec: str, tbl: str) -> str:
+            sel = _select_list(rec)
+            cols_sql = f"{sign} AS {SIGN}, {sel}" if sel else f"{sign} AS {SIGN}"
+            return f"SELECT {cols_sql} FROM {tbl} AS {rec}"
+
+        new = _signed(1, "__mv_n", PG_NEW_TABLE)
+        old = _signed(-1, "__mv_o", PG_OLD_TABLE)
+        if event == "INSERT":
+            return new
+        if event == "DELETE":
+            return old
+        if event == "UPDATE":
+            return f"{old}\n        UNION ALL\n        {new}"
+        raise ValueError(f"no transition tables for event {event!r}")
+
+    def _pg_projection_sql(
+        self,
+        event: str,
+        sources: Sequence[PgDeltaSource],
+        columns: Callable[[PgDeltaSource], List[str]],
+        base_t: Optional[str] = None,
+    ) -> str:
         """``(<branch> UNION ALL ...) AS __mv_p``: each source's signed rows,
         filtered by its predicate and projected to ``columns(source)``."""
-        signed = signed_rows_sql(event)
+        signed = self._pg_signed_rows_sql(event, base_t)
         parts: List[str] = []
         for src in sources:
             cols = [f"{src.sign} AS {SIGN}", *columns(src)]
@@ -358,10 +577,11 @@ class PgStatementMaintenanceMixin(MixinHost):
         spec: PgAggregateSpec,
         sources: Sequence[PgDeltaSource],
         pre_stmts: Sequence[str] = (),
+        base_t: Optional[str] = None,
     ) -> Dict[str, str]:
         """Set-based bodies for a backing table with one row per group."""
         return {
-            event: self._pg_aggregate_body(spec, sources, event, pre_stmts=pre_stmts)
+            event: self._pg_aggregate_body(spec, sources, event, pre_stmts=pre_stmts, base_t=base_t)
             for event in EVENTS
         }
 
@@ -371,6 +591,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         sources: Sequence[PgDeltaSource],
         event: str,
         pre_stmts: Sequence[str] = (),
+        base_t: Optional[str] = None,
     ) -> str:
         q = self._q
         mv = spec.mv_table
@@ -415,7 +636,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         for src in sources:
             if len(src.keys) != n_keys:
                 raise AssertionError("every delta source must provide one key per GROUP BY expression")
-        proj = self._pg_projection_sql(event, sources, _columns)
+        proj = self._pg_projection_sql(event, sources, _columns, base_t=base_t)
         keys = [f"__mv_p.__mv_k{i}" for i in range(n_keys)]
 
         # The backing primary key, as SQL over the projection.
@@ -742,6 +963,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         value_cols: Sequence[str],
         sources: Sequence[PgDeltaSource],
         count_col: Optional[str] = None,
+        base_t: Optional[str] = None,
     ) -> Dict[str, str]:
         """Bodies for a backing table with exactly one row per source row.
 
@@ -767,14 +989,14 @@ class PgStatementMaintenanceMixin(MixinHost):
         for event in EVENTS:
             stmts: List[str] = []
             if event_has_old(event):
-                old_keys = f"SELECT {k_sel} FROM {self._pg_projection_sql('DELETE', sources, _key_columns)}"
+                old_keys = f"SELECT {k_sel} FROM {self._pg_projection_sql('DELETE', sources, _key_columns, base_t=base_t)}"
                 cond = self._pg_key_match(mv_refs, old_keys)
                 if event == "UPDATE":
-                    new_keys = f"SELECT {k_sel} FROM {self._pg_projection_sql('INSERT', sources, _key_columns)}"
+                    new_keys = f"SELECT {k_sel} FROM {self._pg_projection_sql('INSERT', sources, _key_columns, base_t=base_t)}"
                     cond = f"{cond}\n    AND NOT {self._pg_key_match(mv_refs, new_keys)}"
                 stmts.append(f"DELETE FROM {mv_table}\n    WHERE {cond};")
             if event_has_new(event):
-                proj = self._pg_projection_sql("INSERT", sources, _row_columns)
+                proj = self._pg_projection_sql("INSERT", sources, _row_columns, base_t=base_t)
                 cols = q_keys + q_vals + ([q(count_col)] if count_col else [])
                 vals = [f"__mv_p.__mv_k{i}" for i in range(len(key_cols))] + [
                     f"__mv_p.__mv_c{j}" for j in range(len(value_cols))
@@ -804,6 +1026,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         count_cols: Sequence[str],
         sources: Sequence[Tuple[PgDeltaSource, Mapping[str, str]]],
         empty_condition: str,
+        base_t: Optional[str] = None,
     ) -> Dict[str, str]:
         """Bodies for a backing table with one row per distinct value tuple.
 
@@ -831,7 +1054,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         bodies: Dict[str, str] = {}
         s = f"__mv_p.{SIGN}"
         for event in EVENTS:
-            proj = self._pg_projection_sql(event, srcs, _columns)
+            proj = self._pg_projection_sql(event, srcs, _columns, base_t=base_t)
             group_cols = ["__mv_p.__mv_k0"] + [f"__mv_p.__mv_c{j}" for j in range(len(value_cols))]
             cnt_vals = [f"SUM({s} * __mv_p.__mv_n{j})" for j in range(len(count_cols))]
             sets = [f"{c} = {mv_table}.{c} + EXCLUDED.{c}" for c in q_cnts]

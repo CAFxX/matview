@@ -12,7 +12,6 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from .._host import MixinHost
-from ..dialects.pg_statement import signed_rows_sql as pg_signed_rows_sql
 from ..engines import (
     AggFunc,
     Dialect,
@@ -1055,7 +1054,7 @@ class Tier2Mixin(MixinHost):
         ]
 
         for event in ("INSERT", "UPDATE", "DELETE"):
-            got = self._pg_group_scope_keys(base_t, group_mv_cols, pg_signed_rows_sql(event))
+            got = self._pg_group_scope_keys(base_t, group_mv_cols, self._pg_signed_rows_sql(event, base_t))
             if got is None:
                 bodies[event] = refresh
                 continue
