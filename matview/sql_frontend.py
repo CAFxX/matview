@@ -1901,6 +1901,7 @@ def _parse_single_agg_expr(
 def _contains_aggregate_call(
     expr: str,
     dialect: Dialect = Dialect.SQLITE,
+    extra_names: frozenset[str] = frozenset(),
 ) -> bool:
     """Checks via `sqlglot.parse_one` whether `expr` contains an aggregate function call (excluding window functions and subqueries)."""
     try:
@@ -1935,7 +1936,13 @@ def _contains_aggregate_call(
         if _is_non_pg_catalog_qualified_fn(anon_node):
             continue
         name_up = anon_node.name.upper()
-        if name_up in _FN_TO_AGG_ENUM or name_up in _STATISTICAL_ALIAS_NAMES or name_up == "COUNT" or name_up in KNOWN_AGGREGATE_NAMES:
+        if (
+            name_up in _FN_TO_AGG_ENUM
+            or name_up in _STATISTICAL_ALIAS_NAMES
+            or name_up == "COUNT"
+            or name_up in KNOWN_AGGREGATE_NAMES
+            or name_up in extra_names
+        ):
             return True
     return False
 
