@@ -120,6 +120,9 @@ class DialectAwareParsingTests(unittest.TestCase):
             `id` INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
             `counter` MEDIUMINT UNSIGNED NOT NULL,
             `score` DOUBLE NOT NULL,
+            `ratio` FLOAT UNSIGNED NOT NULL,
+            `real_ratio` REAL NOT NULL,
+            `real_precision` REAL(10, 2) NOT NULL,
             `note` VARCHAR(255)
         );
         """
@@ -130,6 +133,27 @@ class DialectAwareParsingTests(unittest.TestCase):
         self.assertTrue(cols["id"].primary_key)
         self.assertIn("UNSIGNED", cols["id"].data_type.upper())
         self.assertIn("MEDIUMINT", cols["counter"].data_type.upper())
+        self.assertEqual(cols["ratio"].data_type.upper(), "FLOAT UNSIGNED")
+        self.assertEqual(cols["real_ratio"].data_type.upper(), "DOUBLE")
+        self.assertEqual(
+            cols["real_precision"].data_type.upper().replace(" ", ""), "DOUBLE(10,2)"
+        )
+
+    def test_mysql_real_uses_default_double_alias_without_fallback(self) -> None:
+        schema_sql = """
+        CREATE TABLE real_metrics (
+            id INT PRIMARY KEY,
+            value REAL NOT NULL,
+            precise_value REAL(10, 2) NOT NULL
+        );
+        """
+        schemas = parse_table_schema(schema_sql, dialect=Dialect.MYSQL)
+        self.assertIn("real_metrics", schemas)
+        cols = schemas["real_metrics"].columns
+        self.assertEqual(cols["value"].data_type.upper(), "DOUBLE")
+        self.assertEqual(
+            cols["precise_value"].data_type.upper().replace(" ", ""), "DOUBLE(10,2)"
+        )
 
     def test_mariadb_schema_parsing_via_engine_version(self) -> None:
         """Verify MariaDB engine version passes down cleanly without unknown dialect errors."""
