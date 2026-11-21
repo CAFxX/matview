@@ -21,6 +21,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlalchemy.engine import Connection as _SAConnection, Engine as _SAEngine
 
 from .compiler import IncrementalViewCompiler
+from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, emit as emit_diagnostics
 from .native_functions import apply_catalog_classification, classify as classify_native_functions, unclassified_calls
 from .connectivity import (
     connect_database_via_sqlalchemy,
@@ -413,6 +414,9 @@ def _manager_read_operation(fn: Callable[..., Any]) -> Callable[..., Any]:
                 self._rollback()
 
     return wrapper
+
+
+FUNCTION_CLASSIFICATION_FROM_TEXT = "FUNCTION_CLASSIFICATION_FROM_TEXT"
 
 
 class MaterializedViewManager:
@@ -2160,8 +2164,9 @@ class MaterializedViewManager:
         plain_views: Optional[Mapping[str, str]] = None,
         current_schema: Optional[str] = None,
     ) -> MaterializedViewPlan:
-        view = self._classify_native_functions(schemas, view)
-        return generate_materialized_view(
+        text_only: List[Tuple[str, Tuple[str, ...], str]] = []
+        view = self._classify_native_functions(schemas, view, text_only)
+        plan = generate_materialized_view(
             schemas,
             view,
             dialect=self.dialect,
@@ -2176,10 +2181,19 @@ class MaterializedViewManager:
             plain_views=plain_views,
             current_schema=current_schema,
         )
+        if text_only:
+            extra = self._text_only_classification_diagnostics(plan, text_only)
+            emit_diagnostics(extra)
+            plan.strategy_diagnostics.extend(extra)
+        return plan
 
-    def _classify_native_functions(self, schemas: Dict[str, TableSchema], view: Any) -> Any:
+    def _classify_native_functions(
+        self, schemas: Dict[str, TableSchema], view: Any, text_only: List[Tuple[str, Tuple[str, ...], str]]
+    ) -> Any:
         """Ask the engine catalog whether unmodelled function calls are
-        aggregates (see matview.native_functions); refuse when it cannot tell."""
+        aggregates (see matview.native_functions); refuse when it cannot tell.
+        Calls on an engine without a catalog to ask are appended to
+        ``text_only`` as (view, names, reason)."""
         spec = view
         if isinstance(view, str):
             spec = parse_view_definition(view, known_tables={k.lower() for k in schemas}, dialect=self.dialect)
@@ -2187,7 +2201,10 @@ class MaterializedViewManager:
             return view
         is_mariadb = self.subdialect == EngineSubdialect.MARIADB
         return apply_catalog_classification(
-            spec, self.dialect, lambda calls: classify_native_functions(self.conn, self.dialect, is_mariadb, calls)
+            spec,
+            self.dialect,
+            lambda calls: classify_native_functions(self.conn, self.dialect, is_mariadb, calls),
+            lambda vs, calls, why: text_only.append((vs.view_name, tuple(sorted({c.name for c in calls})), why)),
         )
 
     def _stored_plan(
@@ -2199,6 +2216,34 @@ class MaterializedViewManager:
         current_schema: Optional[str] = None,
         exclude_views: Sequence[str] = (),
     ) -> MaterializedViewPlan:
+    @staticmethod
+    def _text_only_classification_diagnostics(
+        plan: MaterializedViewPlan, text_only: Sequence[Tuple[str, Tuple[str, ...], str]]
+    ) -> List[Diagnostic]:
+        strategy = {
+            MaintenanceStrategy.ALGEBRAIC_DELTA: Strategy.ALGEBRAIC_DELTA,
+            MaintenanceStrategy.GROUP_SCOPED_DELTA: Strategy.GROUP_SCOPED_RECOMPUTE,
+        }.get(plan.strategy, Strategy.FULL_REFRESH)
+        return [
+            Diagnostic(
+                code=FUNCTION_CLASSIFICATION_FROM_TEXT,
+                severity=DiagnosticSeverity.WARNING,
+                view=view_name,
+                strategy=strategy,
+                columns=(),
+                expressions=names,
+                message=(
+                    f"function classification from the SQL text only: {', '.join(names)} could not be "
+                    f"looked up in the engine catalog ({why}), so a call without GROUP BY context is "
+                    f"maintained as a scalar function. If one of them is a user-defined aggregate the "
+                    f"view's rows can differ from the live view. To change it: use a SQLite build or "
+                    f"driver that supports PRAGMA function_list (SQLite 3.30+)."
+                ),
+            )
+            for view_name, names, why in text_only
+        ]
+
+    def _stored_plan(self, schemas: Dict[str, TableSchema], entry: Dict[str, Any]) -> MaterializedViewPlan:
         """Recompile an installed view under exactly the limitation codes it
         was installed with (plus the manager's accept_limitations); never a
         blanket override."""
