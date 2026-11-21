@@ -576,6 +576,11 @@ class ViewDiff:
                 lines.append(f"  Limitations ({len(self.diagnostics.engine_limitations)}):")
                 for lim in self.diagnostics.engine_limitations:
                     lines.append(f"    * [{lim['code']}] {lim['description']}")
+            perf_notes = list((self.diagnostics.details or {}).get("performance_notes") or ())
+            if perf_notes:
+                lines.append(f"  Performance Notes ({len(perf_notes)}):")
+                for note in perf_notes:
+                    lines.append(f"    * {note}")
 
         if self.status == "NOOP":
             lines.append("  Status: Up to date; no pending changes.")

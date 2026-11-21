@@ -1937,7 +1937,13 @@ class PlannerMixin(MixinHost):
                 reason = "native_order_sensitive_group_recompute"
             else:
                 reason = "holistic_minmax_delete_recompute"
+            minmax_needs = self._minmax_group_arg_index_needs(raw_plan, by_tbl, alias_map)
+            for t_n, cols in minmax_needs:
+                _record(t_n, cols, "minmax_extreme_recompute")
             for t_n, g_cols in by_tbl.items():
+                if any(t_n == m_t for m_t, _ in minmax_needs):
+                    # (group..., arg) also serves every group-key lookup.
+                    continue
                 _record(t_n, g_cols, reason)
 
         # 3. Window PARTITION BY columns (future Tier 2 window partition scoping / partitioning reads).
@@ -1974,6 +1980,59 @@ class PlannerMixin(MixinHost):
             )
 
         return needs
+
+    def _minmax_group_arg_index_needs(
+        self,
+        raw_plan: MaterializedViewPlan,
+        group_cols_by_table: Dict[str, List[str]],
+        alias_map: Dict[str, str],
+    ) -> List[Tuple[str, List[str]]]:
+        """`(table, group columns + argument)` indexes for single-table MIN/MAX.
+
+        Deleting or updating a group's current extreme recomputes
+        ``MIN/MAX(arg) ... WHERE <group key> = ...`` from the base table. An
+        index on the group columns followed by the argument turns that into
+        one index probe; an index on the group columns alone still reads the
+        whole group (native, 5 x 20k rows, per extreme delete: SQLite 2066 ->
+        2.2 us, PostgreSQL 999 -> 41, MySQL 14109 -> 165, MariaDB 12336 -> 136;
+        docs/research-ivm-strategies.md section 5). Only plain-column
+        arguments and plain-column group keys of the single base table
+        qualify; other shapes keep the group-key index.
+        """
+        v = self.view
+        if (
+            raw_plan.strategy != MaintenanceStrategy.ALGEBRAIC_DELTA
+            or self._alg_mode != "single"
+            or len(v.joins) != 1
+            or len(group_cols_by_table) != 1
+        ):
+            return []
+        (t_n, g_cols), = group_cols_by_table.items()
+        if len(g_cols) != len(v.group_by_cols):
+            return []
+        out: List[Tuple[str, List[str]]] = []
+        for it in self._working_select_items:
+            if not it.is_aggregate or it.agg_func not in (AggFunc.MIN, AggFunc.MAX) or not it.arg_expr:
+                continue
+            try:
+                a_ast = parse_sql_ast(it.arg_expr, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                continue
+            if not isinstance(a_ast, sqlglot_exp.Column):
+                continue
+            res = self._resolve_ast_col_to_table(a_ast, alias_map)
+            if res is None or res[0] != t_n:
+                continue
+            ts = self._schemas_lower.get(t_n.lower())
+            c_def = ts.columns.get(res[1]) if ts is not None else None
+            if self.dialect == Dialect.MYSQL and (
+                c_def is None or any(tk in c_def.data_type.upper() for tk in ("TEXT", "BLOB"))
+            ):
+                continue  # MySQL cannot index TEXT/BLOB without a prefix length
+            cols = list(g_cols) + ([res[1]] if res[1].lower() not in {c.lower() for c in g_cols} else [])
+            if cols not in [c for _, c in out]:
+                out.append((t_n, cols))
+        return out
 
     def _analyze_base_table_indexes(
         self,
@@ -2105,9 +2164,25 @@ class PlannerMixin(MixinHost):
                 "existing_base_indexes_used": list(existing_base_indexes_used),
                 "recommended_base_indexes": list(recommended_base_indexes),
                 "base_index_recommendations": list(base_index_recommendations),
-                "performance_notes": self._performance_notes(),
+                "performance_notes": self._performance_notes() + self._minmax_index_notes(base_index_recommendations),
             },
         )
+
+    @staticmethod
+    def _minmax_index_notes(base_index_recommendations: Sequence[Dict[str, Any]]) -> List[str]:
+        """What to do when a MIN/MAX extreme recompute has no (group, arg) index."""
+        notes: List[str] = []
+        for rec in base_index_recommendations:
+            if rec.get("reason") != "minmax_extreme_recompute":
+                continue
+            cols = ", ".join(rec.get("columns") or ())
+            notes.append(
+                f"minmax_extreme_recompute: deleting or updating the current MIN/MAX of a group "
+                f"recomputes it from {rec.get('table')}; without an index on ({cols}) that reads "
+                f"every row of the group (O(group rows)), with it it is one index probe "
+                f"(O(log n)). Create it with: {rec.get('ddl')}"
+            )
+        return notes
 
     def _pgmy_native_recompute_items_for_plan(self) -> bool:
         try:
