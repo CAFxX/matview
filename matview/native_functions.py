@@ -35,17 +35,22 @@ from sqlglot import exp as sqlglot_exp
 
 from .aggregate_semantics import KNOWN_AGGREGATE_NAMES
 from .engines import Dialect, UnsupportedMaterializedViewError, _sqlglot_dialect
-from .builtin_functions import MYSQL_BUILTIN_SCALAR_FUNCTIONS, SQLITE_BUILTIN_SCALAR_FUNCTIONS
+from .builtin_functions import (
+    MYSQL_BUILTIN_SCALAR_FUNCTIONS,
+    POSTGRES_BUILTIN_SCALAR_FUNCTIONS,
+    SQLITE_BUILTIN_SCALAR_FUNCTIONS,
+)
 from .logical_ir import SelectItem, ViewSpec
 from .sql_frontend import _FN_TO_AGG_ENUM, _STATISTICAL_ALIAS_NAMES
 
 AGGREGATE = "aggregate"
 SCALAR = "scalar"
 UNKNOWN = "unknown"
-# The engine offers no catalog to ask (a SQLite driver or build without
-# PRAGMA function_list): the call is classified from the SQL text, as offline
-# compilation does, and the registration announces it.
-TEXT_ONLY = "text_only"
+# The engine offers no catalog this connection can read (a SQLite driver or
+# build without PRAGMA function_list, a MySQL/MariaDB user without access to
+# the function catalogs): the call may be an aggregate or a scalar, so the
+# view is maintained by the always-exact full refresh of the original query.
+UNCLASSIFIABLE = "unclassifiable"
 
 _POLYMORPHIC_PG_TYPES = frozenset(
     {"anyelement", "anyarray", "anynonarray", "anyenum", "anyrange", "anymultirange",
@@ -112,7 +117,7 @@ def _builtin_scalars(dialect: Dialect) -> frozenset[str]:
         return MYSQL_BUILTIN_SCALAR_FUNCTIONS
     if dialect == Dialect.SQLITE:
         return SQLITE_BUILTIN_SCALAR_FUNCTIONS
-    return frozenset()  # PostgreSQL: pg_catalog is readable by every role
+    return POSTGRES_BUILTIN_SCALAR_FUNCTIONS
 
 
 def classify(conn: Any, dialect: Dialect, is_mariadb: bool, calls: Sequence[FunctionCall]) -> Dict[FunctionCall, FunctionClass]:
@@ -188,9 +193,9 @@ def _classify_sqlite(conn: Any, calls: Sequence[FunctionCall]) -> Dict[FunctionC
     try:
         rows = _rows(conn, "PRAGMA function_list")
     except Exception as e:  # compiled out (SQLITE_OMIT_INTROSPECTION_PRAGMAS) or a driver without it
-        return {c: FunctionClass(TEXT_ONLY, reason=f"PRAGMA function_list is unavailable ({e})") for c in calls}
+        return {c: FunctionClass(UNCLASSIFIABLE, reason=f"PRAGMA function_list is unavailable ({e})") for c in calls}
     if not rows:
-        return {c: FunctionClass(TEXT_ONLY, reason="PRAGMA function_list returned no functions") for c in calls}
+        return {c: FunctionClass(UNCLASSIFIABLE, reason="PRAGMA function_list returned no functions") for c in calls}
     out: Dict[FunctionCall, FunctionClass] = {}
     for call in calls:
         cands = [r for r in rows if str(r[0]).upper() == call.name and (int(r[4]) == call.arity or int(r[4]) < 0)]
@@ -262,7 +267,7 @@ def _classify_mysql(conn: Any, calls: Sequence[FunctionCall], is_mariadb: bool) 
             out[call] = FunctionClass(AGGREGATE if is_agg else SCALAR, str(ret).upper() if ret else None)
         elif unreadable:
             out[call] = FunctionClass(
-                TEXT_ONLY, reason="this connection cannot read " + " and ".join(unreadable)
+                UNCLASSIFIABLE, reason="this connection cannot read " + " and ".join(unreadable)
             )
         else:
             # Not a user-defined function: a built-in, and every built-in
@@ -296,24 +301,23 @@ def apply_catalog_classification(
     spec: ViewSpec,
     dialect: Dialect,
     classify_calls: Callable[[Sequence[FunctionCall]], Dict[FunctionCall, FunctionClass]],
-    on_text_only: Optional[Callable[[ViewSpec, Sequence[FunctionCall], str], None]] = None,
 ) -> ViewSpec:
     """Classify ``spec``'s unclassified calls and route its aggregates; raise
-    UnsupportedMaterializedViewError for a name the engine cannot classify.
-    Calls the engine has no catalog for (``TEXT_ONLY``) keep the text-based
-    classification and are reported through ``on_text_only``."""
-    additional = tuple(
-        apply_catalog_classification(a, dialect, classify_calls, on_text_only) for a in spec.additional_views
-    )
+    UnsupportedMaterializedViewError for a name the catalog does not know.
+    Calls the engine has no readable catalog for (``UNCLASSIFIABLE``) are
+    recorded in ``unclassified_functions``: the planner maintains the view by
+    full refresh (exact whatever the function is)."""
+    additional = tuple(apply_catalog_classification(a, dialect, classify_calls) for a in spec.additional_views)
     if additional != spec.additional_views:
         spec = replace(spec, additional_views=additional)
+    spec = replace(spec, functions_classified=True)
     calls = unclassified_calls(spec, dialect)
     if not calls:
         return spec
     classes = classify_calls(calls)
-    text_only = [c for c, k in classes.items() if k.kind == TEXT_ONLY]
-    if text_only and on_text_only is not None:
-        on_text_only(spec, text_only, classes[text_only[0]].reason)
+    unclassifiable = sorted({(c.name, k.reason) for c, k in classes.items() if k.kind == UNCLASSIFIABLE})
+    if unclassifiable:
+        spec = replace(spec, unclassified_functions=tuple(unclassifiable))
     kinds_by_name: Dict[str, Set[str]] = {}
     for c, k in classes.items():
         kinds_by_name.setdefault(c.name, set()).add(k.kind)
