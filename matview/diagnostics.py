@@ -37,6 +37,9 @@ class Strategy(str, Enum):
     SCOPED_REFRESH = "scoped refresh of the affected groups"
     ALGEBRAIC_DELTA = "algebraic delta (add/subtract)"
     GROUP_SCOPED_RECOMPUTE = "group-scoped recompute"
+    # Relaxed single-table float aggregates: plan.strategy algebraic_delta,
+    # the order-sensitive columns natively recomputed per group after the lock.
+    ALGEBRAIC_DELTA_NATIVE_RECOMPUTE = "algebraic delta with post-lock native group recompute"
 
 
 class DiagnosticSeverity(str, Enum):
@@ -79,7 +82,8 @@ class Diagnostic:
         return out
 
     def __str__(self) -> str:
-        return f"[{self.code}] view {self.view}: {self.message}"
+        # The lead phrase comes first; code and view follow.
+        return f"{self.message} [{self.code}; view {self.view}]"
 
 
 class MatviewDiagnosticWarning(UserWarning):

@@ -61,6 +61,7 @@ class MixinHost:
             sqlite_without_rowid: bool = True,
             accept_limitations: Sequence[str] = (),
             repair_fence_catalog_table: Optional[str] = None,
+            silence_diagnostics: Sequence[str] = (),
         ) -> None: ...
 
         # --- read-only accessors implemented by IncrementalViewCompiler (compiler.py) ---

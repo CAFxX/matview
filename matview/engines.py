@@ -662,7 +662,7 @@ class TransparencyLimitation:
 # ``--accept-limitation CODE``) overrides them; the global
 # ``ignore_limitations`` does not.
 PER_CODE_OPT_IN_LIMITATIONS = frozenset({
-    "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+    "FLOAT_REASSOCIATION_ALLOWED",
     # Element order of string/array/JSON aggregates without a total ORDER BY
     # (accepting it keeps the group-scoped recompute, announced as relaxed).
     "AGGREGATE_ORDER_NOT_REPRODUCIBLE",

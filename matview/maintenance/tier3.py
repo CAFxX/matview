@@ -234,8 +234,38 @@ class Tier3Mixin(MixinHost):
             is_backing_store=True,
         )
 
+        # MariaDB returns VAR/STDDEV over exact or FLOAT(M,D) arguments
+        # rounded to fixed decimals; the stored refresh value is the full
+        # double, so the reader rounds it the same way (as the incremental
+        # reader does; checked by _enforce_mariadb_statistical_exactness).
+        select_override: Optional[List[str]] = None
+        v = self.view
+        if self.subdialect == EngineSubdialect.MARIADB and not (
+            (len(v.select_items) == 1 and v.select_items[0].raw_expr.strip() == "*")
+            or v.has_cte or v.has_subquery_in_from or v.has_compound_set_op or v.has_window_func
+            or v.has_limit_or_order
+        ):
+            # Only a whole top-level statistic of a single plain query (the
+            # shape _enforce_mariadb_statistical_exactness accepts); anything
+            # else stays refused there.
+            exprs: List[str] = []
+            rounded = False
+            for item in self.view.select_items:
+                expr = self._q(item.alias)
+                if item.is_aggregate and item.agg_func in (
+                    AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP
+                ):
+                    scale = self._mariadb_statistical_result_scale(item)
+                    if 0 <= scale < self.MARIADB_NOT_FIXED_DEC:
+                        expr = f"ROUND({item.alias}, {scale}) AS {item.alias}"
+                        rounded = True
+                exprs.append(expr)
+            if rounded:
+                select_override = exprs
         reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
-            self._build_readonly_view_and_triggers(view_name, mv_table, user_columns)
+            self._build_readonly_view_and_triggers(
+                view_name, mv_table, user_columns, select_exprs_override=select_override
+            )
         )
 
         raw_query = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))

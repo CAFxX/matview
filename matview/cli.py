@@ -49,6 +49,15 @@ def _announce_recommendations(plan: Any, as_json: bool) -> None:
         for d in notes:
             print(f"NOTE {d}", file=sys.stderr)
 
+
+def _print_strategy_diagnostics(plan: Any) -> None:
+    """Strategy diagnostics on stdout, as SQL comments ahead of the script
+    (the Python warning goes to stderr as well)."""
+    for d in getattr(plan, "strategy_diagnostics", None) or []:
+        if d.severity != DiagnosticSeverity.NOTE:  # NOTEs are announced on stderr (_announce_recommendations)
+            print(f"-- {d}")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Compile SQL CREATE VIEW definition(s) into zero-dependency incremental materialized view SQL."
@@ -107,7 +116,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=[],
         metavar="CODE",
         help="Accept one limitation code explicitly (repeatable). Required for codes that "
-        "weaken the result contract, e.g. ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE "
+        "weaken the result contract, e.g. FLOAT_REASSOCIATION_ALLOWED "
         "(best-effort floating-point aggregates on PostgreSQL/MySQL/MariaDB) and "
         "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX; --ignore-limitations does not cover them.",
     )
@@ -353,6 +362,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     indexes=args.indexes,
                     strict=args.strict,
                 )
+                _print_strategy_diagnostics(plan)
                 _announce_recommendations(plan, args.json)
                 print(
                     plan.render_sql_script(
@@ -412,6 +422,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sqlite_without_rowid=not args.no_sqlite_without_rowid,
             engine_version=detected_ev,
         )
+        _print_strategy_diagnostics(plan)
         _announce_recommendations(plan, args.json)
         print(
             plan.render_sql_script(

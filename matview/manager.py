@@ -139,7 +139,9 @@ MATVIEW_GENERATOR_VERSION = "19"
 
 def _definition_digest(select_sql: str) -> str:
     """Digest of a view's SELECT (comments and whitespace normalized), used to
-    bind accepted limitation codes to the definition they were accepted for."""
+    bind accepted limitation codes to the definition they were accepted for.
+    A plain hash, not a MAC: it prevents accidental reuse of an acceptance for
+    another definition; anyone who can write the catalog can recompute it."""
     norm = re.sub(r"\s+", " ", _strip_sql_comments(select_sql or "")).strip().rstrip(";").strip()
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
@@ -611,7 +613,7 @@ class MaterializedViewManager:
       - Maintain a persistent metadata registry (`__matview_catalog`) of installed MVs
       - Safely create, diff, update, or drop materialized views (`register_view`, `sync_views`, `drop_view`)
       - Enforce transparency limitation checks unless `ignore_limitations=True`
-        (per-code limitations such as ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE
+        (per-code limitations such as FLOAT_REASSOCIATION_ALLOWED
         only with `accept_limitations=[code, ...]`, stored with each view)
       - Perform incremental (chunked/batched) initial backfills (`backfill_incrementally`)
       - Execute high-throughput multi-statement bulk changes (`bulk_changes`)
@@ -658,6 +660,7 @@ class MaterializedViewManager:
         sqlite_strict_backing: bool = False,
         sqlite_without_rowid: bool = True,
         accept_limitations: Optional[Sequence[str]] = None,
+        silence_diagnostics: Optional[Sequence[str]] = None,
     ) -> None:
         hint_d: Optional[Dialect] = None
         if isinstance(dialect, Dialect):
@@ -722,6 +725,8 @@ class MaterializedViewManager:
         self.accept_limitations: Tuple[str, ...] = tuple(
             sorted({str(c).strip() for c in (accept_limitations or ()) if str(c).strip()})
         )
+        # Diagnostic codes not emitted as warnings (still in plan.strategy_diagnostics).
+        self.silence_diagnostics: Tuple[str, ...] = tuple(silence_diagnostics or ())
         self.object_prefix = object_prefix
         self.strict = strict
         self.pg_fillfactor = pg_fillfactor
@@ -2383,6 +2388,7 @@ class MaterializedViewManager:
             dialect=self.dialect,
             ignore_limitations=ignore,
             accept_limitations=accept,
+            silence_diagnostics=getattr(self, "silence_diagnostics", ()),
             object_prefix=self.object_prefix,
             strict=strict,
             engine_version=self.engine_version,
@@ -2493,6 +2499,33 @@ class MaterializedViewManager:
 
     def _stored_accept(self, entry: Dict[str, Any]) -> Tuple[str, ...]:
         return tuple(sorted(set(entry.get("accepted_limitations") or ()) | set(self.accept_limitations)))
+
+    @_manager_read_operation
+    def get_diagnostics(self, view_name: Optional[str] = None) -> Dict[str, List[Any]]:
+        """Strategy diagnostics (matview.diagnostics.Diagnostic) of installed
+        views, reconstructed from their stored definitions and accepted
+        limitation codes: ``{view_name: [Diagnostic, ...]}``. Not emitted as
+        warnings. A view that no longer compiles maps to an empty list
+        (see check_schema_drift)."""
+        import warnings as _warnings
+
+        schemas = self.fetch_schema()
+        catalog = self.get_catalog()
+        names = [self._resolve_catalog_name(view_name, catalog)] if view_name else list(catalog)
+        out: Dict[str, List[Any]] = {}
+        for name in names:
+            entry = catalog.get(name)
+            if entry is None:
+                raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
+            try:
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore")
+                    plan = self._stored_plan(schemas, entry)
+            except Exception:
+                out[name] = []
+                continue
+            out[name] = list(plan.strategy_diagnostics)
+        return out
 
     def _register_single_view_spec(
         self,
@@ -2808,6 +2841,7 @@ class MaterializedViewManager:
             index_names=[n for sp in sub_plans for n in sp.index_names],
             user_indexes=p0.user_indexes,
             sub_plans=sub_plans,
+            strategy_diagnostics=[d for sp in sub_plans for d in sp.strategy_diagnostics],
         )
 
     @_manager_owned_operation("sync_views")
@@ -5360,6 +5394,7 @@ def generate_materialized_view(
     dialect: Optional[Dialect | str | EngineVersion] = None,
     ignore_limitations: bool = False,
     accept_limitations: Sequence[str] = (),
+    silence_diagnostics: Sequence[str] = (),
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     incremental_backfill: bool = False,
@@ -5454,6 +5489,7 @@ def generate_materialized_view(
         dialect=eff_dialect,
         ignore_limitations=ignore_limitations,
         accept_limitations=accept_limitations,
+        silence_diagnostics=silence_diagnostics,
         object_prefix=object_prefix,
         incremental_backfill=incremental_backfill,
         batch_size=batch_size,
@@ -5474,6 +5510,7 @@ def generate_materialized_views(
     dialect: Optional[Dialect | str | EngineVersion] = None,
     ignore_limitations: bool = False,
     accept_limitations: Sequence[str] = (),
+    silence_diagnostics: Sequence[str] = (),
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     incremental_backfill: bool = False,
@@ -5533,6 +5570,7 @@ def generate_materialized_views(
             dialect=eff_dialect,
             ignore_limitations=ignore_limitations,
             accept_limitations=accept_limitations,
+            silence_diagnostics=silence_diagnostics,
             object_prefix=object_prefix,
             incremental_backfill=incremental_backfill,
             batch_size=batch_size,
@@ -5558,6 +5596,7 @@ def install_materialized_view_sqlite(
     on_progress: Optional[Callable[[int, int], None]] = None,
     ignore_limitations: bool = False,
     accept_limitations: Sequence[str] = (),
+    silence_diagnostics: Sequence[str] = (),
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     strict: bool = False,
@@ -5568,6 +5607,7 @@ def install_materialized_view_sqlite(
         dialect=Dialect.SQLITE,
         ignore_limitations=ignore_limitations,
         accept_limitations=accept_limitations,
+        silence_diagnostics=silence_diagnostics,
         object_prefix=object_prefix,
         strict=strict,
     )
