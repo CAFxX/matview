@@ -2890,7 +2890,17 @@ class MaterializedViewManager:
                             f"then be stale; include them in view_names (or pass none)"
                         )
                 if self.dialect == Dialect.MYSQL:
+                    # The flag alone does nothing: the triggers skip only while
+                    # this session also holds its per-connection named lock,
+                    # which bulk_changes() takes here and releases below (and
+                    # the server releases when the connection ends). A session
+                    # that merely sets the variable (stale pooled connection,
+                    # copied code) is still maintained.
                     mysql_flag_set = True
+                    cur.execute("SELECT GET_LOCK(CONCAT('__matview_bypass:', CONNECTION_ID()), 0);")
+                    got = cur.fetchone()
+                    if not got or got[0] != 1:
+                        raise RuntimeError("bulk_changes(): could not take the session trigger-bypass lock")
                     cur.execute("SET @__matview_skip_triggers = 1;")
                 if suspends and not session_bypass:
                     for entry in targets:
@@ -2916,6 +2926,7 @@ class MaterializedViewManager:
                 # it cannot be cleared, closing the connection rolls back.
                 try:
                     cur.execute("SET @__matview_skip_triggers = 0;")
+                    cur.execute("DO RELEASE_LOCK(CONCAT('__matview_bypass:', CONNECTION_ID()));")
                 except Exception as reset_exc:
                     raise self._invalidate_connection(
                         f"the session trigger-bypass flag could not be cleared ({reset_exc!r})"
@@ -3000,6 +3011,7 @@ class MaterializedViewManager:
                     try:
                         with self._cursor() as reset_cur:
                             reset_cur.execute("SET @__matview_skip_triggers = 0;")
+                            reset_cur.execute("DO RELEASE_LOCK(CONCAT('__matview_bypass:', CONNECTION_ID()));")
                     except Exception as reset_exc:
                         raise self._invalidate_connection(
                             f"the session trigger-bypass flag could not be cleared ({reset_exc!r})"

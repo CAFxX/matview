@@ -2490,7 +2490,8 @@ class TranspiledConnectionAdapter:
                     m_tr.group(4).strip(),
                 )
                 m_skip_wrap = re.match(
-                    r"^IF\s+COALESCE\(@__matview_skip_triggers,\s*0\)\s*=\s*0\s+THEN\s*(.*)\s*END\s+IF;$",
+                    r"^IF\s+NOT\s+\(COALESCE\(@__matview_skip_triggers,\s*0\)\s*<>\s*0\s+AND\s+IS_USED_LOCK\("
+                    r"CONCAT\('__matview_bypass:',\s*CONNECTION_ID\(\)\)\)\s*<=>\s*CONNECTION_ID\(\)\)\s+THEN\s*(.*)\s*END\s+IF;$",
                     body,
                     flags=re.I | re.S,
                 )
