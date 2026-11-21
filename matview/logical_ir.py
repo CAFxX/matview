@@ -180,6 +180,12 @@ class ViewSpec:
     # (lower-case output column, native result type) reported by the server
     # for select items that call functions sqlglot does not model.
     native_result_types: Tuple[Tuple[str, str], ...] = ()
+    # (UPPER function name, why) of calls the engine could not classify as
+    # aggregate or scalar (catalog unreadable / unavailable): the view is
+    # maintained by full refresh. ``functions_classified`` marks a spec the
+    # manager has run through the catalog lookup; offline specs are not.
+    unclassified_functions: Tuple[Tuple[str, str], ...] = ()
+    functions_classified: bool = False
 
 
 @dataclass(frozen=True)

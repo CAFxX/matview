@@ -40,6 +40,7 @@ from .aggregate_semantics import (
 from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, exact_fallback_message, relaxed_message
 from .engines import AggFunc, Dialect, MaintenanceStrategy, UnsupportedMaterializedViewError, _sqlglot_dialect
 from .logical_ir import SelectItem
+from .native_functions import unclassified_calls
 from .sql_frontend import parse_sql_ast
 
 # Diagnostic codes (matview.diagnostics registry is open).
@@ -48,6 +49,7 @@ UNRECOGNIZED_AGGREGATE_FULL_REFRESH = "UNRECOGNIZED_AGGREGATE_FULL_REFRESH"
 ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH = "ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"
 OPAQUE_AGGREGATE_FULL_REFRESH = "OPAQUE_AGGREGATE_FULL_REFRESH"
 GROUPING_SETS_FULL_REFRESH = "GROUPING_SETS_FULL_REFRESH"
+UNCLASSIFIED_FUNCTION_FULL_REFRESH = "UNCLASSIFIED_FUNCTION_FULL_REFRESH"
 
 
 @dataclass(frozen=True)
@@ -360,6 +362,25 @@ class ExactAggregateRoutingMixin(MixinHost):
             )
         if self.view.has_cte or self.view.has_compound_set_op:
             return None  # these shapes are full-refresh already
+        unclassified = self._unclassified_functions()
+        if unclassified:
+            names = sorted({n for n, _ in unclassified})
+            whys = sorted({w for _, w in unclassified})
+            return ExactRoutingFallback(
+                UNCLASSIFIED_FUNCTION_FULL_REFRESH,
+                Strategy.FULL_REFRESH,
+                f"function(s) {', '.join(names)} could not be classified as aggregate or scalar "
+                f"({'; '.join(whys)}); an aggregate and a scalar call give different results, and only "
+                f"re-running the original query is exact for both.",
+                FULL_REFRESH_COST,
+                "let the connection read the function catalog (MySQL: SELECT on "
+                "performance_schema.user_defined_functions; MariaDB: SELECT on mysql.func and "
+                "mysql.proc; SQLite: a driver/build with PRAGMA function_list), or register the view "
+                "through MaterializedViewManager on a connection instead of generating it offline.",
+                tuple(names),
+            )
+        if self.view.has_cte or self.view.has_compound_set_op or self.view.has_window_func:
+            return None  # these shapes are full-refresh (or windowed) already
         unordered = self._unordered_order_sensitive_aggregates()
         if unordered:
             return ExactRoutingFallback(
@@ -391,6 +412,27 @@ class ExactAggregateRoutingMixin(MixinHost):
                 tuple(it.raw_expr for it in opaque),
             )
         return None
+
+    def _unclassified_functions(self) -> List[Tuple[str, str]]:
+        """(name, why) of function calls nobody classified as aggregate or
+        scalar: recorded by the manager's catalog lookup, or -- offline, with
+        no catalog to consult -- every call of a function that is neither
+        modelled by sqlglot nor a known built-in of the engine."""
+        if self.view.functions_classified:
+            return list(self.view.unclassified_functions)
+        known = {n for n, _ in self.view.native_aggregates}
+        return [
+            (c.name, "offline generation: no database connection to consult the catalog")
+            for c in unclassified_calls(self.view, self.dialect)
+            if c.name not in known
+        ]
+
+    def _has_unclassified_call(self, item: SelectItem) -> bool:
+        names = {n for n, _ in self._unclassified_functions()}
+        if not names:
+            return False
+        node = self._item_ast(item.raw_expr)
+        return node is not None and any(str(a.name).upper() in names for a in node.find_all(sqlglot_exp.Anonymous))
 
     def _non_algebraic_aggregate_names(self) -> List[str]:
         """Names of the aggregate calls (select list and HAVING) that have no
@@ -517,6 +559,15 @@ class ExactAggregateRoutingMixin(MixinHost):
             return scalar_t
         if self.dialect == Dialect.SQLITE:
             return None
+        if self._has_unclassified_call(item):
+            derived = self._routed_expr_storage_type(self._item_ast(item.raw_expr), allow_aggregate=False)
+            if derived is None:
+                raise UnsupportedMaterializedViewError(
+                    f"Cannot determine the native result type of {item.raw_expr!r} (column {item.alias!r}) "
+                    f"on {self.dialect.value} without asking the server; storing it with a guessed type "
+                    f"would change the view's result. Wrap the expression in an explicit CAST(... AS <type>)."
+                )
+            return derived
         is_opaque = not item.is_aggregate and any(
             o.alias == item.alias and o.raw_expr == item.raw_expr for o in self._opaque_grouped_items()
         )
