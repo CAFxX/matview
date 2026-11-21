@@ -160,6 +160,12 @@ class ViewSpec:
     has_subquery_in_from: bool = False
     user_indexes: Tuple[ViewIndexSpec, ...] = ()
     additional_views: Tuple["ViewSpec", ...] = ()
+    # (UPPER function name, native result type or None) of user-defined
+    # aggregates classified through the engine catalog (matview.native_functions).
+    native_aggregates: Tuple[Tuple[str, Optional[str]], ...] = ()
+    # ("UPPER_NAME/arity", native result type) of scalar functions sqlglot
+    # does not model, from the same catalog lookup.
+    native_scalar_types: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
