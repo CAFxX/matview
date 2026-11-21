@@ -2267,7 +2267,7 @@ class Tier1SingleMixin(MixinHost):
             elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
                 insert_vals.append(f"(CASE WHEN ({val_e}) IS NOT NULL THEN 1 ELSE 0 END)")
             elif self._sqlite_union_native_sum(item):
-                insert_vals.append(self._build_recompute_subquery_raw(item, record_prefix))
+                insert_vals.append(self._build_recompute_subquery_raw(item, record_prefix, processed_only=True))
             elif (
                 self._sqlite_exact_sum_enabled()
                 and item.is_distinct
@@ -2342,7 +2342,7 @@ class Tier1SingleMixin(MixinHost):
                 )
             elif self._sqlite_union_native_sum(item):
                 update_assignments.append(
-                    f"{col_alias} = {self._build_recompute_subquery_raw(item, record_prefix)}"
+                    f"{col_alias} = {self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)}"
                 )
             elif item.agg_func == AggFunc.SUM:
                 new_sum = _plus_sum_expr(item, col_alias)
@@ -2365,7 +2365,7 @@ class Tier1SingleMixin(MixinHost):
                 update_assignments.append(f"{col_alias} = {folded}")
             elif item.agg_func == AggFunc.AVG:
                 if self._requires_native_avg_recompute(item):
-                    recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                    recomputed = self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)
                     update_assignments.append(f"{col_alias} = {recomputed}")
                 elif self._sqlite_exact_sum_enabled() and item.is_distinct:
                     recomputed = self._build_native_group_recompute(
@@ -2393,7 +2393,7 @@ class Tier1SingleMixin(MixinHost):
                 # operation order and is not bit-identical for approximate
                 # inputs. Re-evaluate the affected group with the same native
                 # aggregate so the materialized result matches the live view.
-                recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                recomputed = self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)
                 update_assignments.append(f"{col_alias} = {recomputed}")
             elif item.agg_func == AggFunc.MIN:
                 update_assignments.append(
@@ -2454,7 +2454,7 @@ class Tier1SingleMixin(MixinHost):
                     f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
                 )
             else:
-                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                recomp = self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)
                 update_assignments.append(f"{col_alias} = {recomp}")
 
         q_row_count_col = self._q(row_count_col)
@@ -2707,7 +2707,7 @@ class Tier1SingleMixin(MixinHost):
                 )
             elif self._sqlite_union_native_sum(item):
                 update_assignments.append(
-                    f"{col_alias} = {self._build_recompute_subquery_raw(item, record_prefix)}"
+                    f"{col_alias} = {self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)}"
                 )
             elif item.agg_func == AggFunc.SUM:
                 cnt_col = self._q(col_nonnull_count_map[ekey])
@@ -2732,7 +2732,7 @@ class Tier1SingleMixin(MixinHost):
                 update_assignments.append(f"{col_alias} = {folded}")
             elif item.agg_func == AggFunc.AVG:
                 if self._requires_native_avg_recompute(item):
-                    recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                    recomputed = self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)
                     update_assignments.append(f"{col_alias} = {recomputed}")
                 elif self._sqlite_exact_sum_enabled() and item.is_distinct:
                     recomputed = self._build_native_group_recompute(
@@ -2755,22 +2755,22 @@ class Tier1SingleMixin(MixinHost):
                 AggFunc.STDDEV_POP,
                 AggFunc.STDDEV_SAMP,
             ):
-                recomputed = self._build_recompute_subquery_raw(item, record_prefix)
+                recomputed = self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)
                 update_assignments.append(f"{col_alias} = {recomputed}")
             elif item.agg_func == AggFunc.MIN:
-                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                recomp = self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)
                 update_assignments.append(
                     f"{col_alias} = CASE WHEN ({val_e}) IS NOT NULL AND {mv_table}.{col_alias} >= ({val_e}) "
                     f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
                 )
             elif item.agg_func == AggFunc.MAX:
-                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                recomp = self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)
                 update_assignments.append(
                     f"{col_alias} = CASE WHEN ({val_e}) IS NOT NULL AND {mv_table}.{col_alias} <= ({val_e}) "
                     f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
                 )
             elif item.agg_func in (AggFunc.BIT_AND, AggFunc.BIT_OR):
-                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                recomp = self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)
                 update_assignments.append(
                     f"{col_alias} = CASE WHEN ({val_e}) IS NOT NULL "
                     f"THEN {recomp} ELSE {mv_table}.{col_alias} END"
@@ -2806,7 +2806,7 @@ class Tier1SingleMixin(MixinHost):
                     f"WHEN {new_tcnt} > 0 THEN {t_lit} ELSE {f_lit} END"
                 )
             else:
-                recomp = self._build_recompute_subquery_raw(item, record_prefix)
+                recomp = self._build_recompute_subquery_raw(item, record_prefix, processed_only=True)
                 update_assignments.append(f"{col_alias} = {recomp}")
 
         q_row_count_col = self._q(row_count_col)
