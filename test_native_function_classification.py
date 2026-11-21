@@ -157,6 +157,52 @@ class SqliteTests(unittest.TestCase):
                 conn.close()
 
 
+class _NoFunctionListCursor(sqlite3.Cursor):
+    def execute(self, sql: str, *args: Any) -> "sqlite3.Cursor":  # pyright: ignore[reportIncompatibleMethodOverride]  # test double
+        if "function_list" in sql.lower():
+            raise sqlite3.OperationalError("unknown pragma (simulated driver without PRAGMA function_list)")
+        return super().execute(sql, *args)
+
+
+class _NoFunctionListConnection(sqlite3.Connection):
+    """A SQLite connection whose driver/build offers no PRAGMA function_list."""
+
+    def cursor(self, factory: Any = None) -> sqlite3.Cursor:  # pyright: ignore[reportIncompatibleMethodOverride]  # test double
+        return super().cursor(factory or _NoFunctionListCursor)
+
+
+class SqliteWithoutFunctionListTests(unittest.TestCase):
+    """Without a catalog to ask, classification falls back to the SQL text
+    (the previous behaviour, as offline compilation does) and is announced
+    with FUNCTION_CLASSIFICATION_FROM_TEXT instead of refusing the view."""
+
+    def test_falls_back_to_text_classification_and_announces_it(self) -> None:
+        from matview.diagnostics import MatviewDiagnosticWarning
+
+        with tempfile.TemporaryDirectory() as d:
+            conn = sqlite3.connect(os.path.join(d, "db.sqlite"), factory=_NoFunctionListConnection)
+            try:
+                conn.create_function("py_twice", 1, lambda x: None if x is None else 2 * x)
+                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
+                conn.execute("INSERT INTO t VALUES (1, 1, 1), (2, 1, 2), (3, 2, NULL)")
+                conn.commit()
+                mgr = MaterializedViewManager(conn)
+                sql = "SELECT id, py_twice(v) AS a FROM t"
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    plan = mgr.register_view(f"CREATE VIEW v_scalar AS {sql}")
+                codes = [d.code for d in plan.strategy_diagnostics]
+                self.assertIn("FUNCTION_CLASSIFICATION_FROM_TEXT", codes)
+                warned = [w.message.diagnostic.code for w in caught if isinstance(w.message, MatviewDiagnosticWarning)]
+                self.assertIn("FUNCTION_CLASSIFICATION_FROM_TEXT", warned)
+                self.assertEqual(plan.strategy, T1)
+                conn.execute("UPDATE t SET v = 5 WHERE id = 3")
+                conn.commit()
+                self.assertEqual(sorted(conn.execute("SELECT * FROM v_scalar").fetchall()), sorted(conn.execute(sql).fetchall()))
+            finally:
+                conn.close()
+
+
 @unittest.skipUnless(os.environ.get("POSTGRES_DSN"), "POSTGRES_DSN not set")
 class PostgresTests(unittest.TestCase):
     def setUp(self) -> None:

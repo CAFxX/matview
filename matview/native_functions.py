@@ -40,6 +40,10 @@ from .sql_frontend import _FN_TO_AGG_ENUM, _STATISTICAL_ALIAS_NAMES
 AGGREGATE = "aggregate"
 SCALAR = "scalar"
 UNKNOWN = "unknown"
+# The engine offers no catalog to ask (a SQLite driver or build without
+# PRAGMA function_list): the call is classified from the SQL text, as offline
+# compilation does, and the registration announces it.
+TEXT_ONLY = "text_only"
 
 _POLYMORPHIC_PG_TYPES = frozenset(
     {"anyelement", "anyarray", "anynonarray", "anyenum", "anyrange", "anymultirange",
@@ -148,9 +152,9 @@ def _classify_sqlite(conn: Any, calls: Sequence[FunctionCall]) -> Dict[FunctionC
     try:
         rows = _rows(conn, "PRAGMA function_list")
     except Exception as e:  # compiled out (SQLITE_OMIT_INTROSPECTION_PRAGMAS) or a driver without it
-        return {c: FunctionClass(UNKNOWN, reason=f"PRAGMA function_list is unavailable ({e})") for c in calls}
+        return {c: FunctionClass(TEXT_ONLY, reason=f"PRAGMA function_list is unavailable ({e})") for c in calls}
     if not rows:
-        return {c: FunctionClass(UNKNOWN, reason="PRAGMA function_list returned no functions") for c in calls}
+        return {c: FunctionClass(TEXT_ONLY, reason="PRAGMA function_list returned no functions") for c in calls}
     out: Dict[FunctionCall, FunctionClass] = {}
     for call in calls:
         cands = [r for r in rows if str(r[0]).upper() == call.name and (int(r[4]) == call.arity or int(r[4]) < 0)]
@@ -247,16 +251,24 @@ def apply_catalog_classification(
     spec: ViewSpec,
     dialect: Dialect,
     classify_calls: Callable[[Sequence[FunctionCall]], Dict[FunctionCall, FunctionClass]],
+    on_text_only: Optional[Callable[[ViewSpec, Sequence[FunctionCall], str], None]] = None,
 ) -> ViewSpec:
     """Classify ``spec``'s unclassified calls and route its aggregates; raise
-    UnsupportedMaterializedViewError for a name the engine cannot classify."""
-    additional = tuple(apply_catalog_classification(a, dialect, classify_calls) for a in spec.additional_views)
+    UnsupportedMaterializedViewError for a name the engine cannot classify.
+    Calls the engine has no catalog for (``TEXT_ONLY``) keep the text-based
+    classification and are reported through ``on_text_only``."""
+    additional = tuple(
+        apply_catalog_classification(a, dialect, classify_calls, on_text_only) for a in spec.additional_views
+    )
     if additional != spec.additional_views:
         spec = replace(spec, additional_views=additional)
     calls = unclassified_calls(spec, dialect)
     if not calls:
         return spec
     classes = classify_calls(calls)
+    text_only = [c for c, k in classes.items() if k.kind == TEXT_ONLY]
+    if text_only and on_text_only is not None:
+        on_text_only(spec, text_only, classes[text_only[0]].reason)
     unknown = [(c, k) for c, k in classes.items() if k.kind == UNKNOWN]
     if unknown:
         listed = "; ".join(f"{c.name}/{c.arity}: {k.reason}" for c, k in unknown)
