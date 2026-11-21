@@ -551,6 +551,8 @@ class PlannerMixin(MixinHost):
             additional_views=v.additional_views,
             original_select_sql=v.original_select_sql,
             referenced_plain_views=v.referenced_plain_views,
+            native_aggregates=v.native_aggregates,
+            native_scalar_types=v.native_scalar_types,
         )
 
     def _try_unwrap_simple_cte_or_derived_view(self, v: ViewSpec, _depth: int = 0) -> ViewSpec:
@@ -880,6 +882,8 @@ class PlannerMixin(MixinHost):
             user_indexes=v.user_indexes,
             original_select_sql=v.original_select_sql,
             referenced_plain_views=v.referenced_plain_views,
+            native_aggregates=v.native_aggregates,
+            native_scalar_types=v.native_scalar_types,
         )
 
     def _decompose_compound_aggregates_and_having(
@@ -985,7 +989,9 @@ class PlannerMixin(MixinHost):
             if cursor < len(expr_str):
                 out_parts.append(expr_str[cursor:])
             rewritten = "".join(out_parts)
-            if _contains_aggregate_call(rewritten, dialect=self.dialect):
+            if _contains_aggregate_call(
+                rewritten, dialect=self.dialect, extra_names=frozenset(n for n, _ in self.view.native_aggregates)
+            ):
                 # An aggregate without an algebraic rule (JSON_AGG, mode(),
                 # percentile_cont, ...) is left in place: the expression is not
                 # decomposable and the view is maintained by recomputing it.
