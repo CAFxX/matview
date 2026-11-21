@@ -500,6 +500,8 @@ class PlannerMixin(MixinHost):
             native_aggregates=v.native_aggregates,
             native_scalar_types=v.native_scalar_types,
             native_result_types=v.native_result_types,
+            unclassified_functions=v.unclassified_functions,
+            functions_classified=v.functions_classified,
         )
 
     def _try_unwrap_simple_cte_or_derived_view(self, v: ViewSpec) -> ViewSpec:
@@ -716,6 +718,8 @@ class PlannerMixin(MixinHost):
             native_aggregates=v.native_aggregates,
             native_scalar_types=v.native_scalar_types,
             native_result_types=v.native_result_types,
+            unclassified_functions=v.unclassified_functions,
+            functions_classified=v.functions_classified,
         )
 
     def _decompose_compound_aggregates_and_having(
