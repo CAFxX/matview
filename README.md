@@ -345,9 +345,15 @@ view as `invalid`.
 Some trigger-bypassing operations are not detected and not refused: `INSERT OR
 REPLACE`/`REPLACE` on a SQLite connection that was not configured with
 [`configure_sqlite_connection()`](#sqlite-writer-connections), and other engine
-features that skip triggers, and the session flag `bulk_changes()` uses
-on MySQL/MariaDB (`@__matview_skip_triggers`), which any session can set (see
+features that skip triggers (see
 [Close Unsafe DML Paths That Bypass Trigger-Based Maintenance](TODO.md)). The
+session flag `bulk_changes()` uses on MySQL/MariaDB (`@__matview_skip_triggers`)
+suspends maintenance only while the session also holds the per-connection
+named lock `__matview_bypass:<connection id>` that `bulk_changes()` takes for
+its block; a session that only sets the flag is maintained. This guards
+against accidental bypass (a stale flag on a pooled connection, copied code);
+it is not a security boundary or access control: any session that takes that
+lock as well bypasses maintenance. The
 tested per-engine list is in
 [DML and trigger interaction support](#dml-and-trigger-interaction-support).
 
@@ -438,7 +444,7 @@ cell is skipped there (verified on PostgreSQL 18 locally).
 | `mariadb_system_versioning` | System-versioned (temporal) source table: UPDATE/DELETE create history rows; DELETE HISTORY | n/a | n/a | n/a | exact | the view and its oracle read the current rows |
 | `pg_disable_trigger` | ALTER TABLE ... DISABLE TRIGGER USER/ALL on a source (as pg_restore --disable-triggers does) | n/a | limited | n/a | n/a | writes are not maintained while disabled; check_schema_drift() reports triggers_disabled (added here; it reported ok) and repair_view() rebuilds the views with enabled triggers |
 | `pg_session_replication_role` | Writes under session_replication_role = replica (logical-replication apply workers, some restore tools) | n/a | **WRONG** | n/a | n/a | ENABLE (origin) triggers do not fire; not detectable afterwards. A real subscription was not exercised: apply workers use this setting; TODO: Detect PostgreSQL Maintenance Triggers Disabled by `session_replication_role = replica` or `ALTER TABLE ... DISABLE TRIGGER` |
-| `mysql_session_skip_flag` | An application session setting @__matview_skip_triggers (the bulk_changes() bypass flag) | n/a | n/a | **WRONG** | **WRONG** | any session can set it and its writes are silently not maintained (documented); TODO: Close Unsafe DML Paths That Bypass Trigger-Based Maintenance |
+| `mysql_session_skip_flag` | An application session setting @__matview_skip_triggers (the bulk_changes() bypass flag) | n/a | n/a | exact | exact | the triggers skip maintenance only while the session also holds the per-connection named lock '__matview_bypass:<connection id>' that bulk_changes() takes for its block, so the flag alone (a stale pooled connection, copied code) is ignored; deliberately taking that lock remains a privileged escape hatch |
 | `ddl_add_unused_column` | Out-of-band ALTER TABLE ADD COLUMN on a source (column unused by the view) | exact | exact | exact | exact | maintenance continues exactly; check_schema_drift() reports drifted (the signature covers every column) |
 | `ddl_drop_used_column` | Out-of-band ALTER TABLE DROP COLUMN of a column the view uses | refused | refused | refused | refused | SQLite refuses the DDL (a trigger references the column); PostgreSQL/MySQL/MariaDB accept it, then every INSERT/UPDATE of the source fails in the maintenance trigger and check_schema_drift() reports invalid |
 | `ddl_rename_used_column` | Out-of-band ALTER TABLE RENAME COLUMN of a column the view uses | limited | refused | refused | refused | SQLite rewrites the trigger bodies, so maintenance continues on the renamed column while the registered definition no longer compiles (check_schema_drift() reports invalid); PostgreSQL/MySQL/MariaDB maintenance fails on every write, so writes fail closed |

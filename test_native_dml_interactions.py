@@ -1661,15 +1661,27 @@ def _pg_replica(ctx: Ctx) -> None:
 
 @cell("mysql_session_skip_flag", AREA_B,
       "An application session setting @__matview_skip_triggers (the bulk_changes() bypass flag)",
-      "any session can set it and its writes are silently not maintained (documented)",
-      todo="Close Unsafe DML Paths That Bypass Trigger-Based Maintenance", mysql=WRONG, mariadb=WRONG)
+      "the triggers skip maintenance only while the session also holds the per-connection named lock "
+      "'__matview_bypass:<connection id>' that bulk_changes() takes for its block, so the flag alone (a stale "
+      "pooled connection, copied code) is ignored; deliberately taking that lock remains a privileged escape "
+      "hatch", mysql=EXACT, mariadb=EXACT)
 def _mysql_skip(ctx: Ctx) -> None:
     env = ctx.env
     w = ctx.other_conn()
     env.execute("SET @__matview_skip_triggers = 1", w)
     env.execute("INSERT INTO t (id, g, v, w, u) VALUES (770, 1, 5, 1, NULL)", w)
+    env.execute("UPDATE t SET v = v + 1 WHERE id % 3 = 0", w)
     w.commit()
     ctx.check("write with the session bypass flag")
+    # bulk_changes() itself still suspends maintenance and refreshes.
+    with env.manager.bulk_changes():
+        env.execute("INSERT INTO t (id, g, v, w, u) VALUES (771, 2, 7, 1, NULL)")
+    ctx.check("after bulk_changes()")
+    env.execute("SET @__matview_skip_triggers = 1")  # the lock was released with the block
+    env.execute("DELETE FROM t WHERE id = 771")
+    env.commit()
+    ctx.check("flag left set after bulk_changes()")
+    env.execute("SET @__matview_skip_triggers = 0")
 
 
 # The four out-of-band DDL cells share one environment (one source table and
