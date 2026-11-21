@@ -988,7 +988,14 @@ def _mysql_default_mode_declared_type(raw_decl: str) -> str:
     mode must declare FLOAT explicitly or use live schema introspection.
     """
     normalized = re.sub(r"\s+", " ", raw_decl.strip())
-    return re.sub(r"^REAL(?=\s|\(|$)", "DOUBLE", normalized, count=1, flags=re.IGNORECASE)
+    return re.sub(
+        r"^REAL(?=\s|\(|$)",
+        "DOUBLE",
+        normalized,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
 
 def _extract_sqlite_raw_declared_types(stmt_sql: str) -> Dict[str, str]:
     """Extract raw SQLite declared types per column from a CREATE TABLE statement."""
