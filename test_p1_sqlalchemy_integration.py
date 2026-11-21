@@ -325,6 +325,201 @@ class TestSqlAlchemyConnectivityAndIntrospection(unittest.TestCase):
         )
         self.assertNotIn("c BIGINT", my_plan.backing_table_ddl)
 
+        # PostgreSQL BIT(n) / BIT VARYING SQLAlchemy formatting and BIT_AND/BIT_OR codegen.
+        self.assertEqual(_format_sa_column_type(sa_pg.BIT(length=4), ms.Dialect.POSTGRES), "BIT(4)")
+        self.assertEqual(_format_sa_column_type(sa_pg.BIT(varying=True), ms.Dialect.POSTGRES), "BIT VARYING")
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.BIT(length=8, varying=True), ms.Dialect.POSTGRES),
+            "BIT VARYING(8)",
+        )
+        bit_plan = ms.generate_materialized_view(
+            "CREATE TABLE tb (id INT PRIMARY KEY, g INT, s SMALLINT, ss SMALLSERIAL, "
+            "s2 SERIAL2, i INT, s4 SERIAL4, b BIGINT, bf BIT(4), vb VARBIT);",
+            "CREATE VIEW v_bit AS SELECT g, BIT_AND(s) AS ba_s, BIT_OR(ss) AS bo_ss, "
+            "BIT_AND(s2) AS ba_s2, BIT_AND(i) AS ba_i, BIT_OR(s4) AS bo_s4, BIT_OR(b) AS bo_b, "
+            "BIT_AND(bf) AS ba_bf, BIT_OR(vb) AS bo_vb, "
+            "BIT_AND(COALESCE(bf, B'1111')) AS ba_co_bf, "
+            "BIT_AND(bf & B'1111') AS ba_expr_bf "
+            "FROM tb GROUP BY g;",
+            dialect=ms.Dialect.POSTGRES,
+        )
+        b_ddl = bit_plan.backing_table_ddl
+        self.assertIn("ba_s SMALLINT", b_ddl)
+        self.assertIn("bo_ss SMALLINT", b_ddl)
+        self.assertIn("ba_s2 SMALLINT", b_ddl)
+        self.assertIn("ba_i INTEGER", b_ddl)
+        self.assertIn("bo_s4 INTEGER", b_ddl)
+        self.assertIn("bo_b BIGINT", b_ddl)
+        self.assertIn("ba_bf BIT(4)", b_ddl)
+        self.assertIn("bo_vb BIT VARYING", b_ddl)
+        self.assertIn("ba_co_bf BIT(4)", b_ddl)
+        self.assertIn("ba_expr_bf BIT(4)", b_ddl)
+
+    def test_native_special_char_view_names_and_pg_bit_aggregates(self) -> None:
+        pg_dsn = os.environ.get("POSTGRES_DSN", "").strip()
+        my_dsn = os.environ.get("MYSQL_DSN", "").strip()
+        if not pg_dsn and not my_dsn:
+            self.skipTest("Neither POSTGRES_DSN nor MYSQL_DSN is set")
+
+        if pg_dsn:
+            import psycopg2
+            from unittest import mock
+
+            import matview.connectivity as _conn_mod
+
+            conn = psycopg2.connect(pg_dsn)
+            cur = conn.cursor()
+            ns = f"__mv_vname_pg_{os.getpid()}"
+            try:
+                cur.execute(f'DROP SCHEMA IF EXISTS "{ns}" CASCADE; CREATE SCHEMA "{ns}"; SET search_path TO "{ns}";')
+                cur.execute(
+                    'CREATE TABLE "order items" ('
+                    "id INT PRIMARY KEY, g INT, v INT, s SMALLINT, b BIGINT, bf BIT(4), vb VARBIT)"
+                )
+                cur.execute(
+                    'INSERT INTO "order items" VALUES '
+                    "(1, 1, 10, 7, 31, B'1010', B'110'), "
+                    "(2, 1, 20, 3, 14, B'1100', B'101'), "
+                    "(3, 2, 5, 5, 9, B'0110', B'011')"
+                )
+                conn.commit()
+                mgr = ms.MaterializedViewManager(conn, dialect=ms.Dialect.POSTGRES)
+
+                # Verify both SQLAlchemy reflection and raw DB-API fallback preserve BIT(4) width.
+                sa_sc = mgr.fetch_schema()
+                self.assertEqual(sa_sc["order items"].columns["bf"].data_type, "BIT(4)")
+                self.assertEqual(sa_sc["order items"].columns["vb"].data_type, "BIT VARYING")
+                with mock.patch.object(_conn_mod, "_can_use_sqlalchemy_inspector", lambda _c: False):
+                    raw_sc = mgr.fetch_schema()
+                self.assertEqual(raw_sc["order items"].columns["bf"].data_type, "BIT(4)")
+                self.assertEqual(raw_sc["order items"].columns["vb"].data_type, "BIT VARYING")
+
+                pg_names = [
+                    "sales summary",
+                    "sales_summary",
+                    "Sales Summary",
+                    "SalesSummary",
+                    "sales-summary",
+                    "user's view",
+                    'a "b" c',
+                    "my.view",
+                    "---",
+                ]
+                for vn in pg_names:
+                    qv = '"' + vn.replace('"', '""') + '"'
+                    mgr.register_view(
+                        f'CREATE VIEW {qv} AS SELECT g, SUM(v) AS s, COUNT(*) AS c FROM "order items" GROUP BY g'
+                    )
+                sel_bit = (
+                    "SELECT g, BIT_AND(s) AS ba_s, BIT_OR(s) AS bo_s, BIT_XOR(s) AS bx_s, "
+                    "BIT_AND(v) AS ba_i, BIT_OR(v) AS bo_i, BIT_XOR(v) AS bx_i, "
+                    "BIT_AND(b) AS ba_b, BIT_OR(b) AS bo_b, BIT_XOR(b) AS bx_b, "
+                    "BIT_AND(bf) AS ba_bf, BIT_OR(bf) AS bo_bf, BIT_XOR(bf) AS bx_bf, "
+                    "BIT_AND(COALESCE(bf, B'1111')) AS ba_co_bf, "
+                    "BIT_AND(bf & B'1111') AS ba_expr_bf, "
+                    'BIT_AND(vb) AS ba_vb FROM "order items" GROUP BY g'
+                )
+                mgr.register_view(f'CREATE VIEW "bit summary" AS {sel_bit}')
+
+                cur.execute('INSERT INTO "order items" VALUES (4, 2, 15, 1, 7, B\'0101\', B\'001\')')
+                cur.execute('UPDATE "order items" SET v = 30, bf = B\'1110\' WHERE id = 1')
+                cur.execute('DELETE FROM "order items" WHERE id = 3')
+                conn.commit()
+
+                cur.execute('SELECT g, SUM(v), COUNT(*) FROM "order items" GROUP BY g ORDER BY g')
+                expected = cur.fetchall()
+                conn.commit()
+
+                for vn in pg_names:
+                    qv = vn if vn == "SalesSummary" else '"' + vn.replace('"', '""') + '"'
+                    cur.execute(f"SELECT g, s, c FROM {qv} ORDER BY g")
+                    self.assertEqual(cur.fetchall(), expected, vn)
+                    conn.commit()
+                    with self.assertRaises(Exception):
+                        cur.execute(f"DELETE FROM {qv}")
+                    conn.rollback()
+                    self.assertEqual(mgr.check_schema_drift()[vn], "ok", vn)
+                    mgr.repair_view(vn)
+                    self.assertTrue(mgr.drop_view(vn))
+
+                cur.execute('SELECT * FROM "bit summary" ORDER BY g')
+                mv_bit = cur.fetchall()
+                mv_oids = {d.name: d.type_code for d in cur.description}
+                cur.execute(f"SELECT * FROM ({sel_bit}) AS q ORDER BY g")
+                live_bit = cur.fetchall()
+                live_oids = {d.name: d.type_code for d in cur.description}
+                conn.commit()
+                self.assertEqual(mv_bit, live_bit)
+                for col in (
+                    "ba_s", "bo_s", "bx_s",
+                    "ba_i", "bo_i", "bx_i",
+                    "ba_b", "bo_b", "bx_b",
+                    "ba_bf", "bo_bf", "bx_bf",
+                    "ba_co_bf", "ba_expr_bf",
+                ):
+                    self.assertEqual(mv_oids[col], live_oids[col], (col, mv_oids[col], live_oids[col]))
+                self.assertEqual(mv_oids["ba_vb"], 1562)
+                self.assertTrue(mgr.drop_view("bit summary"))
+            finally:
+                try:
+                    conn.rollback()
+                    cur.execute(f'DROP SCHEMA IF EXISTS "{ns}" CASCADE')
+                    conn.commit()
+                finally:
+                    cur.close()
+                    conn.close()
+
+        if my_dsn:
+            mgr = ms.MaterializedViewManager(my_dsn)
+            t_name = f"order items {os.getpid()}"
+            my_names = [
+                f"sales summary {os.getpid()}",
+                f"sales-summary-{os.getpid()}",
+                f"user's view {os.getpid()}",
+            ]
+            try:
+                for vn in my_names:
+                    mgr.drop_view(vn)
+                with mgr._cursor() as cur:
+                    cur.execute(f"DROP TABLE IF EXISTS `{t_name}`")
+                    cur.execute(f"CREATE TABLE `{t_name}` (id INT PRIMARY KEY, g INT, v INT)")
+                    cur.execute(f"INSERT INTO `{t_name}` VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5)")
+                    mgr._commit()
+                for vn in my_names:
+                    mgr.register_view(
+                        f"CREATE VIEW `{vn}` AS SELECT g, SUM(v) AS s, COUNT(*) AS c FROM `{t_name}` GROUP BY g",
+                        ignore_limitations=True,
+                    )
+                with mgr._cursor() as cur:
+                    cur.execute(f"INSERT INTO `{t_name}` VALUES (4, 2, 15)")
+                    cur.execute(f"UPDATE `{t_name}` SET v = 30 WHERE id = 1")
+                    cur.execute(f"DELETE FROM `{t_name}` WHERE id = 3")
+                    mgr._commit()
+                    cur.execute(f"SELECT g, SUM(v), COUNT(*) FROM `{t_name}` GROUP BY g ORDER BY g")
+                    expected = cur.fetchall()
+                    mgr._rollback()
+                for vn in my_names:
+                    with mgr._cursor() as cur:
+                        cur.execute(f"SELECT g, s, c FROM `{vn}` ORDER BY g")
+                        self.assertEqual(cur.fetchall(), expected, vn)
+                        mgr._rollback()
+                    self.assertEqual(mgr.check_schema_drift()[vn], "ok", vn)
+                    mgr.repair_view(vn)
+                    self.assertTrue(mgr.drop_view(vn))
+            finally:
+                try:
+                    mgr._rollback()
+                    for vn in my_names:
+                        try:
+                            mgr.drop_view(vn)
+                        except Exception:
+                            pass
+                    with mgr._cursor() as cur:
+                        cur.execute(f"DROP TABLE IF EXISTS `{t_name}`")
+                        mgr._commit()
+                finally:
+                    mgr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

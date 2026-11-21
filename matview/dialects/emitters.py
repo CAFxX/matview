@@ -56,7 +56,7 @@ class DialectEmitMixin(MixinHost):
         log_vname = self.logical_view_name
         p = self.object_prefix if self.object_prefix else "__matview_"
         sg_d = _sqlglot_dialect(self.dialect)
-        q_db_view = _ast_table_expr(db_view, self.dialect).sql(dialect=sg_d)
+        q_db_view = _ast_table_expr(db_view, self.dialect, allow_qualified=False).sql(dialect=sg_d)
         user_cols_lower = {c.lower() for c in user_columns}
         proj_exprs = (
             [self._q(ex) if ex.lower() in user_cols_lower else ex for ex in select_exprs_override]
@@ -139,6 +139,7 @@ class DialectEmitMixin(MixinHost):
                 where_sql=where_cond,
                 dialect=self.dialect,
                 algorithm="TEMPTABLE",
+                allow_qualified_view=False,
             )
             return reader_view_ddl, [], [], []
         else:
@@ -148,6 +149,7 @@ class DialectEmitMixin(MixinHost):
                 proj_exprs,
                 where_sql=extra_where_filter,
                 dialect=self.dialect,
+                allow_qualified_view=False,
             )
 
         if self.dialect == Dialect.SQLITE:
@@ -162,7 +164,7 @@ class DialectEmitMixin(MixinHost):
                         trg_name=self._q(t_name),
                         op=op,
                         db_view=q_db_view,
-                        raw_db_view=db_view,
+                        raw_db_view=db_view.replace("'", "''"),
                     )
                 )
             return reader_view_ddl, ro_trigs, ro_names, []

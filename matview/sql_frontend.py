@@ -337,10 +337,22 @@ def tokenize_sql(
     return tokens
 
 
+def _strip_outer_ident_quotes(s: str) -> str:
+    """Strips a single pair of outer SQL identifier quotes without splitting on dots."""
+    if s.startswith('"') and s.endswith('"') and len(s) >= 2:
+        return s[1:-1].replace('""', '"')
+    if s.startswith("`") and s.endswith("`") and len(s) >= 2:
+        return s[1:-1].replace("``", "`")
+    if s.startswith("[") and s.endswith("]") and len(s) >= 2:
+        return s[1:-1]
+    return s
+
+
 def quote_sql_identifier(
     ident: str,
     dialect: Dialect = Dialect.SQLITE,
     force: bool = False,
+    allow_qualified: bool = True,
 ) -> str:
     """
     Quotes a SQL identifier via `sqlglot.exp.to_identifier` using dialect-appropriate
@@ -351,7 +363,7 @@ def quote_sql_identifier(
     s = ident.strip()
     if not s:
         return s
-    raw = _unquote_ident(s)
+    raw = _unquote_ident(s, dialect=dialect) if allow_qualified else _strip_outer_ident_quotes(s)
     needs_q = (
         force
         or raw.upper() in _SQL_RESERVED_KEYWORDS
@@ -393,20 +405,36 @@ def _ast_needs_quotes(raw_ident: str, original_ident: str) -> bool:
     )
 
 
-def _ast_ident_expr(ident: str, dialect: Dialect = Dialect.SQLITE) -> sqlglot_exp.Identifier:
+def _ast_ident_expr(
+    ident: str,
+    dialect: Dialect = Dialect.SQLITE,
+    *,
+    allow_qualified: bool = True,
+) -> sqlglot_exp.Identifier:
     """Builds a `sqlglot.exp.Identifier` preserving dialect quoting requirements."""
-    raw = _unquote_ident(ident.strip(), dialect=dialect)
-    return sqlglot_exp.to_identifier(raw, quoted=_ast_needs_quotes(raw, ident))
+    s = ident.strip()
+    raw = _unquote_ident(s, dialect=dialect) if allow_qualified else _strip_outer_ident_quotes(s)
+    return sqlglot_exp.to_identifier(raw, quoted=_ast_needs_quotes(raw, s))
 
 
-def _ast_table_expr(name: str, dialect: Dialect = Dialect.SQLITE) -> sqlglot_exp.Table:
+def _ast_table_expr(
+    name: str,
+    dialect: Dialect = Dialect.SQLITE,
+    *,
+    allow_qualified: bool = True,
+) -> sqlglot_exp.Table:
     """Builds a `sqlglot.exp.Table`, handling optional `schema.table` qualification."""
-    parts = _split_top_level(name.strip(), ".")
-    if len(parts) == 2:
-        db_ident = _ast_ident_expr(parts[0], dialect)
-        tbl_ident = _ast_ident_expr(parts[1], dialect)
-        return sqlglot_exp.Table(this=tbl_ident, db=db_ident)
-    return sqlglot_exp.Table(this=_ast_ident_expr(name, dialect))
+    s = name.strip()
+    if allow_qualified and "." in s:
+        try:
+            parts = _split_top_level(s, ".", dialect=dialect)
+        except sqlglot.errors.SqlglotError:
+            parts = [s]
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            db_ident = _ast_ident_expr(parts[0], dialect)
+            tbl_ident = _ast_ident_expr(parts[1], dialect)
+            return sqlglot_exp.Table(this=tbl_ident, db=db_ident)
+    return sqlglot_exp.Table(this=_ast_ident_expr(s, dialect, allow_qualified=allow_qualified))
 
 
 def build_drop_sql(
@@ -416,10 +444,11 @@ def build_drop_sql(
     if_exists: bool = True,
     cascade: bool = False,
     on_table: Optional[str] = None,
+    allow_qualified: bool = True,
 ) -> str:
     """Constructs a dialect-appropriate DROP statement via `sqlglot.exp.Drop`."""
     name_seq = [names] if isinstance(names, str) else list(names)
-    tables = [_ast_table_expr(n, dialect) for n in name_seq]
+    tables = [_ast_table_expr(n, dialect, allow_qualified=allow_qualified) for n in name_seq]
     cluster = (
         sqlglot_exp.OnProperty(this=_ast_table_expr(on_table, dialect))
         if on_table
@@ -512,6 +541,7 @@ def build_create_view_sql(
     dialect: Dialect = Dialect.SQLITE,
     replace: bool = False,
     algorithm: Optional[str] = None,
+    allow_qualified_view: bool = True,
 ) -> str:
     """Builds a `CREATE [OR REPLACE] [ALGORITHM=...] VIEW` statement via `sqlglot.exp.Create`."""
     sg_dialect = _sqlglot_dialect(dialect)
@@ -525,7 +555,7 @@ def build_create_view_sql(
             expressions=[sqlglot_exp.AlgorithmProperty(this=sqlglot_exp.Var(this=algorithm.strip().upper()))]
         )
     node = sqlglot_exp.Create(
-        this=_ast_table_expr(view_name, dialect),
+        this=_ast_table_expr(view_name, dialect, allow_qualified=allow_qualified_view),
         kind="VIEW",
         replace=replace,
         expression=query,
@@ -638,8 +668,12 @@ def _unquote_ident(
         or (s.startswith("`") and s.endswith("`") and "`." not in s)
         or (s.startswith("[") and s.endswith("]") and "]." not in s)
     ):
-        parts = _split_top_level(s, ".", dialect=dialect)
-        s = parts[-1].strip()
+        try:
+            parts = _split_top_level(s, ".", dialect=dialect)
+            if len(parts) > 1:
+                s = parts[-1].strip()
+        except sqlglot.errors.SqlglotError:
+            pass
     if s.startswith('"') and s.endswith('"') and len(s) >= 2:
         return s[1:-1].replace('""', '"')
     if s.startswith("`") and s.endswith("`") and len(s) >= 2:
@@ -1021,7 +1055,13 @@ def parse_table_schema(
         try:
             stmt_ast = parse_sql_ast(raw_stmt_s, dialect=eff_dialect)
         except sqlglot.errors.SqlglotError:
-            if eff_dialect == Dialect.SQLITE and re.match(
+            if eff_dialect == Dialect.POSTGRES and re.search(r"\bBIT\s+VARYING\b", raw_stmt_s, re.IGNORECASE):
+                pg_norm_sql = re.sub(r"\bBIT\s+VARYING\b", "VARBIT", raw_stmt_s, flags=re.IGNORECASE)
+                try:
+                    stmt_ast = parse_sql_ast(pg_norm_sql, dialect=eff_dialect)
+                except sqlglot.errors.SqlglotError:
+                    continue
+            elif eff_dialect == Dialect.SQLITE and re.match(
                 r"^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\b", raw_stmt_s, re.IGNORECASE
             ):
                 raw_col_types, sanitized_sql = _extract_sqlite_raw_types_and_sanitized_ddl(raw_stmt_s)
@@ -2398,32 +2438,45 @@ def parse_view_definition(
 def _extract_created_object(stmt: str) -> Optional[Tuple[str, str]]:
     """Extracts object type ('trigger', 'view', 'table') and name created by a DDL statement."""
     cleaned = _strip_sql_comments(stmt).strip()
+    ident_pat = r'(?:"(?:""|[^"])+"|`(?:``|[^`])+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*)'
+    qual_pat = rf"({ident_pat}(?:\.{ident_pat})?)"
+
+    def _extract_leaf(raw_qual: str) -> str:
+        # Take the unqualified object name when schema-qualified, preserving dots
+        # inside a quoted identifier such as `"my.view"`.
+        parts = re.findall(ident_pat, raw_qual)
+        leaf = parts[-1] if parts else raw_qual
+        if leaf.startswith('"') and leaf.endswith('"') and len(leaf) >= 2:
+            return leaf[1:-1].replace('""', '"')
+        if leaf.startswith("`") and leaf.endswith("`") and len(leaf) >= 2:
+            return leaf[1:-1].replace("``", "`")
+        if leaf.startswith("[") and leaf.endswith("]") and len(leaf) >= 2:
+            return leaf[1:-1]
+        return leaf
+
     m_trig = re.match(
-        r"^CREATE(?:\s+OR\s+REPLACE)?(?:\s+DEFINER\s*=\s*\S+)?\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.\"`]+)",
+        rf"^CREATE(?:\s+OR\s+REPLACE)?(?:\s+DEFINER\s*=\s*\S+)?\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?{qual_pat}",
         cleaned,
         re.IGNORECASE,
     )
     if m_trig:
-        name = m_trig.group(1).strip('"`').split(".")[-1].strip('"`')
-        return ("trigger", name)
+        return ("trigger", _extract_leaf(m_trig.group(1)))
 
     m_view = re.match(
-        r"^CREATE(?:\s+OR\s+REPLACE)?(?:\s+ALGORITHM\s*=\s*\w+)?(?:\s+DEFINER\s*=\s*\S+)?\s+VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.\"`]+)",
+        rf"^CREATE(?:\s+OR\s+REPLACE)?(?:\s+ALGORITHM\s*=\s*\w+)?(?:\s+DEFINER\s*=\s*\S+)?\s+VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?{qual_pat}",
         cleaned,
         re.IGNORECASE,
     )
     if m_view:
-        name = m_view.group(1).strip('"`').split(".")[-1].strip('"`')
-        return ("view", name)
+        return ("view", _extract_leaf(m_view.group(1)))
 
     m_tbl = re.match(
-        r"^CREATE(?:\s+TEMPORARY)?\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.\"`]+)",
+        rf"^CREATE(?:\s+TEMPORARY)?\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{qual_pat}",
         cleaned,
         re.IGNORECASE,
     )
     if m_tbl:
-        name = m_tbl.group(1).strip('"`').split(".")[-1].strip('"`')
-        return ("table", name)
+        return ("table", _extract_leaf(m_tbl.group(1)))
 
     return None
 

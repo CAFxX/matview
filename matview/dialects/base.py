@@ -48,12 +48,24 @@ from .templates import render_procedural_sql
 
 class DialectBaseMixin(MixinHost):
     def _bounded_ident(self, prefix: str, stem: str, suffix: str = "", max_len: int = 62) -> str:
-        full = f"{prefix}{stem}{suffix}"
-        if len(full) <= max_len:
+        needs_sanitize = not bool(re.fullmatch(r"[A-Za-z0-9_]+", stem))
+        safe_stem = re.sub(r"[^A-Za-z0-9_]+", "_", stem).strip("_").lower() if needs_sanitize else stem
+        if needs_sanitize and not safe_stem:
+            safe_stem = "v"
+        full = f"{prefix}{safe_stem}{suffix}"
+        if not needs_sanitize and len(full) <= max_len:
             return full
+        # Hash the raw `stem` so sanitized identifiers (e.g. "sales summary" vs
+        # "sales_summary" vs "Sales Summary") and truncated names never collide.
         h = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:8]
-        avail = max(4, max_len - len(prefix) - len(suffix) - 9)
-        return f"{prefix}{stem[:avail]}_{h}{suffix}"
+        avail = max_len - len(prefix) - len(suffix) - 9
+        if avail >= 1:
+            return f"{prefix}{safe_stem[:avail]}_{h}{suffix}"
+        if len(prefix) + 8 + len(suffix) <= max_len:
+            return f"{prefix}{h}{suffix}"
+        full_h = hashlib.sha1(f"{prefix}{stem}{suffix}".encode("utf-8")).hexdigest()[:8]
+        p_avail = max(1, max_len - len(suffix) - 9)
+        return f"{prefix[:p_avail]}_{full_h}{suffix}"[:max_len]
 
     def _backing_table_name(self) -> str:
         p = self.object_prefix if self.object_prefix else "__matview_"
@@ -966,16 +978,23 @@ class DialectBaseMixin(MixinHost):
                     return f"{_pg_canonical_arr_elem(elem_raw)}[]"
                 if stripped_dt.startswith('"'):
                     return stripped_dt
+                dt_up = re.sub(r"\s+", " ", stripped_dt.upper())
+                if dt_up == "BIT" or re.match(r"^BIT\s*\(\s*\d+\s*\)$", dt_up):
+                    return re.sub(r"\s+", "", dt_up)
+                if dt_up in ("VARBIT", "BIT VARYING") or re.match(
+                    r"^(?:VARBIT|BIT VARYING)\s*\(\s*\d+\s*\)$", dt_up
+                ):
+                    return "BIT VARYING"
             # Introspected MySQL/MariaDB string types carry their collation
             # ("CHAR(5) COLLATE UTF8MB4_UNICODE_CI" under a non-default
             # server collation): the clause does not change the family.
             bare = re.sub(r"\s+(?:COLLATE|CHARACTER\s+SET|CHARSET)\s+\S+", "", data_type.upper())
             upper = re.sub(r"\s*\(.*\)\s*$", "", bare).strip()
-            if upper in ("SMALLINT", "INT2"):
+            if upper in ("SMALLINT", "INT2", "SMALLSERIAL", "SERIAL2"):
                 return "SMALLINT"
-            if upper in ("INTEGER", "INT", "INT4", "MEDIUMINT", "TINYINT"):
+            if upper in ("INTEGER", "INT", "INT4", "MEDIUMINT", "TINYINT", "SERIAL", "SERIAL4"):
                 return "INTEGER"
-            if upper in ("BIGINT", "INT8", "BIGINT UNSIGNED", "INT UNSIGNED"):
+            if upper in ("BIGINT", "INT8", "BIGINT UNSIGNED", "INT UNSIGNED", "BIGSERIAL", "SERIAL8"):
                 return "BIGINT"
             if upper in ("NUMERIC", "DECIMAL", "DEC", "FIXED"):
                 return "NUMERIC"
@@ -1019,6 +1038,10 @@ class DialectBaseMixin(MixinHost):
                         return "TEXT[]"
                     if all(s == stripped[0] for s in stripped):
                         return f"{stripped[0]}[]"
+                if self.dialect == Dialect.POSTGRES and all(
+                    v == "BIT" or v == "BIT VARYING" or v.startswith("BIT(") for v in known
+                ):
+                    return "BIT VARYING"
                 return None
             return max(known, key=lambda value: ranks[value])
 
@@ -1167,6 +1190,14 @@ class DialectBaseMixin(MixinHost):
                         return None
                     branches.append(inferred)
                 return merge(branches)
+            if kind == "BitString" and self.dialect == Dialect.POSTGRES:
+                bits = str(node.this or "")
+                return f"BIT({len(bits)})" if bits else "BIT VARYING"
+            if kind in ("BitwiseAnd", "BitwiseOr", "BitwiseXor") and self.dialect == Dialect.POSTGRES:
+                left, right = infer(node.this), infer(node.expression)
+                if left is None or right is None:
+                    return None
+                return merge((left, right))
             if kind in ("Add", "Sub", "Mul", "Div", "Mod", "IntDiv"):
                 left, right = infer(node.this), infer(node.expression)
                 if left is None or right is None:
@@ -1551,10 +1582,14 @@ class DialectBaseMixin(MixinHost):
                 arg_t = (
                     c_def.data_type if c_def else (self._infer_ast_expr_storage_type(item.arg_expr) or "")
                 ).strip().upper()
-                if arg_t in ("SMALLINT", "INT2"):
+                if arg_t in ("SMALLINT", "INT2", "SMALLSERIAL", "SERIAL2"):
                     return "SMALLINT"
-                if arg_t in ("INTEGER", "INT", "INT4", "SERIAL"):
+                if arg_t in ("INTEGER", "INT", "INT4", "SERIAL", "SERIAL4"):
                     return "INTEGER"
+                if arg_t == "BIT" or re.match(r"^BIT\s*\(\s*\d+\s*\)$", arg_t):
+                    return arg_t
+                if arg_t in ("VARBIT", "BIT VARYING") or re.match(r"^(?:VARBIT|BIT\s+VARYING)\s*\(\s*\d+\s*\)$", arg_t):
+                    return "BIT VARYING"
             return "BIGINT UNSIGNED" if self.dialect == Dialect.MYSQL else self._int_type()
         if item.agg_func in (
             AggFunc.COUNT_STAR,

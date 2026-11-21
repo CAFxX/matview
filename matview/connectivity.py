@@ -526,6 +526,14 @@ def _format_sa_column_type(
     elif dialect == Dialect.POSTGRES and getattr(col_type, "timezone", False) and raw_str in ("TIMESTAMP", "TIME"):
         # SQLAlchemy prints TIMESTAMP(timezone=True) as plain TIMESTAMP.
         raw_str = f"{raw_str} WITH TIME ZONE"
+    elif dialect == Dialect.POSTGRES and raw_str == "BIT":
+        # SQLAlchemy's PostgreSQL BIT prints as bare "BIT" without its width or
+        # VARYING modifier; bare BIT in DDL means BIT(1).
+        bit_len = getattr(col_type, "length", None)
+        if getattr(col_type, "varying", False):
+            raw_str = f"BIT VARYING({int(bit_len)})" if bit_len is not None else "BIT VARYING"
+        elif bit_len is not None:
+            raw_str = f"BIT({int(bit_len)})"
     elif dialect == Dialect.MYSQL and raw_str == "BIT" and getattr(col_type, "length", None):
         # SQLAlchemy's MySQL BIT prints without its width; the width decides
         # MySQL's MIN/MAX result types (BIT(1..9) vs BIT(10..64)).
@@ -1086,6 +1094,10 @@ def introspect_database_schemas(
                         dt_up = f"VARCHAR({int(char_len)})"
                     elif dt_up == "CHARACTER VARYING":
                         dt_up = "TEXT"
+                    elif dt_up == "BIT" and char_len:
+                        dt_up = f"BIT({int(char_len)})"
+                    elif dt_up == "BIT VARYING" and char_len:
+                        dt_up = f"BIT VARYING({int(char_len)})"
                 is_pk = (t_name.lower(), c_name.lower()) in pk_pairs
                 grouped.setdefault(t_name, {})[c_name] = ColumnDef(
                     name=c_name,
