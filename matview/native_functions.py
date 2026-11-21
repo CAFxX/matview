@@ -25,6 +25,7 @@ consult a catalog and keeps the text-based classification.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -35,11 +36,7 @@ from sqlglot import exp as sqlglot_exp
 
 from .aggregate_semantics import KNOWN_AGGREGATE_NAMES
 from .engines import Dialect, UnsupportedMaterializedViewError, _sqlglot_dialect
-from .builtin_functions import (
-    MYSQL_BUILTIN_SCALAR_FUNCTIONS,
-    POSTGRES_BUILTIN_SCALAR_FUNCTIONS,
-    SQLITE_BUILTIN_SCALAR_FUNCTIONS,
-)
+from .builtin_functions import MYSQL_BUILTIN_SCALAR_FUNCTIONS
 from .logical_ir import SelectItem, ViewSpec
 from .sql_frontend import _FN_TO_AGG_ENUM, _STATISTICAL_ALIAS_NAMES
 
@@ -103,21 +100,18 @@ def unclassified_calls(spec: ViewSpec, dialect: Dialect) -> List[FunctionCall]:
             )
             if not name or name in KNOWN_AGGREGATE_NAMES or name in _FN_TO_AGG_ENUM or name in _STATISTICAL_ALIAS_NAMES or name == "COUNT":
                 continue
-            if schema is None and name in _builtin_scalars(dialect):
-                continue  # an unqualified built-in scalar: no catalog lookup needed
+            if schema is None and dialect == Dialect.MYSQL and name in MYSQL_BUILTIN_SCALAR_FUNCTIONS:
+                # MySQL/MariaDB resolve an unqualified built-in name before any
+                # stored or loadable function (verified natively on 8.4 and
+                # 11.8: a stored crc32() is reachable only qualified), so the
+                # name cannot be shadowed: no catalog lookup needed. PostgreSQL
+                # and SQLite let user functions shadow built-ins: always ask.
+                continue
             key = (schema or "", name, len(anon.expressions))
             if key not in seen:
                 seen.add(key)
                 out.append(FunctionCall(name=name, arity=len(anon.expressions), schema=schema))
     return out
-
-
-def _builtin_scalars(dialect: Dialect) -> frozenset[str]:
-    if dialect == Dialect.MYSQL:
-        return MYSQL_BUILTIN_SCALAR_FUNCTIONS
-    if dialect == Dialect.SQLITE:
-        return SQLITE_BUILTIN_SCALAR_FUNCTIONS
-    return POSTGRES_BUILTIN_SCALAR_FUNCTIONS
 
 
 def classify(conn: Any, dialect: Dialect, is_mariadb: bool, calls: Sequence[FunctionCall]) -> Dict[FunctionCall, FunctionClass]:
@@ -181,7 +175,10 @@ def _classify_postgres(conn: Any, calls: Sequence[FunctionCall]) -> Dict[Functio
             rt = types.pop() if len(types) == 1 else None
             out[call] = FunctionClass(AGGREGATE, None if rt is None or rt in _POLYMORPHIC_PG_TYPES else rt)
         elif "a" in kinds:
-            out[call] = FunctionClass(UNKNOWN, reason="overloads of that arity are both aggregates and functions")
+            # Which overload wins depends on argument types (e.g. a user
+            # md5(int) aggregate next to pg_catalog.md5(text)); either may be
+            # called, so only the full refresh is exact.
+            out[call] = FunctionClass(UNCLASSIFIABLE, reason="overloads of that arity are both aggregates and functions")
         else:
             types = {r[4] for r in cands if not r[5]}
             rt = types.pop() if len(types) == 1 and len(cands) == 1 else None
@@ -202,11 +199,14 @@ def _classify_sqlite(conn: Any, calls: Sequence[FunctionCall]) -> Dict[FunctionC
         exact = [r for r in cands if int(r[4]) == call.arity]
         if exact:
             cands = exact  # SQLite prefers the exact-arity registration
+        user = [r for r in cands if int(r[1]) == 0]
+        if user:
+            cands = user  # an application-defined function overrides the built-in
         kinds = {"aggregate" if str(r[2]) in ("a", "w") else "scalar" for r in cands}
         if not cands:
             out[call] = FunctionClass(UNKNOWN, reason="no function of that name and arity in PRAGMA function_list")
         elif len(kinds) > 1:
-            out[call] = FunctionClass(UNKNOWN, reason="registered both as an aggregate and as a scalar function")
+            out[call] = FunctionClass(UNCLASSIFIABLE, reason="registered both as an aggregate and as a scalar function")
         else:
             # A scalar result keeps its own storage class only in a column
             # without affinity (TEXT affinity would turn 3 into '3').
@@ -315,15 +315,17 @@ def apply_catalog_classification(
     if not calls:
         return spec
     classes = classify_calls(calls)
-    unclassifiable = sorted({(c.name, k.reason) for c, k in classes.items() if k.kind == UNCLASSIFIABLE})
-    if unclassifiable:
-        spec = replace(spec, unclassified_functions=tuple(unclassifiable))
     kinds_by_name: Dict[str, Set[str]] = {}
     for c, k in classes.items():
         kinds_by_name.setdefault(c.name, set()).add(k.kind)
     for c, k in list(classes.items()):
         if AGGREGATE in kinds_by_name[c.name] and kinds_by_name[c.name] - {AGGREGATE}:
-            classes[c] = FunctionClass(UNKNOWN, reason="calls of that name resolve to both an aggregate and another function")
+            classes[c] = FunctionClass(UNCLASSIFIABLE, reason="calls of that name resolve to both an aggregate and another function")
+    unclassifiable = sorted({(c.name, k.reason) for c, k in classes.items() if k.kind == UNCLASSIFIABLE})
+    if unclassifiable:
+        merged_u = dict(spec.unclassified_functions)
+        merged_u.update(dict(unclassifiable))
+        spec = replace(spec, unclassified_functions=tuple(sorted(merged_u.items())))
     unknown = [(c, k) for c, k in classes.items() if k.kind == UNKNOWN]
     if unknown:
         listed = "; ".join(f"{c.name}/{c.arity}: {k.reason}" for c, k in unknown)
@@ -462,3 +464,58 @@ def _mysql_type_from_metadata(desc: Sequence[Any], field: Any) -> Optional[str]:
             return None
         return f"VARCHAR({length})" if length <= 4096 else "LONGTEXT"
     return None
+
+
+def _modelled_function_names(spec: ViewSpec, dialect: Dialect) -> Set[str]:
+    """Names of the functions sqlglot models (Func nodes other than
+    Anonymous) in the select list and HAVING, as the dialect spells them."""
+    exprs = [it.raw_expr for it in spec.select_items]
+    if spec.having_clause:
+        exprs.append(spec.having_clause)
+    sg_d = _sqlglot_dialect(dialect)
+    out: Set[str] = set()
+    for raw in exprs:
+        node = _parse(raw, dialect)
+        if node is None:
+            continue
+        for f in node.find_all(sqlglot_exp.Func):
+            if isinstance(f, sqlglot_exp.Anonymous):
+                continue
+            head = f.sql(dialect=sg_d).split("(", 1)[0].strip().upper()
+            if head and re.fullmatch(r"[A-Z_][A-Z0-9_]*", head):
+                out.add(head)
+            key = getattr(f, "key", "")
+            if key:
+                out.add(str(key).upper())
+    return out
+
+
+def overridden_modelled_functions(conn: Any, spec: ViewSpec, dialect: Dialect) -> List[Tuple[str, str]]:
+    """Built-in functions that sqlglot models (min, max, abs, lower, md5, ...)
+    for which the engine also has a user-defined function of the same name
+    that an unqualified call can reach: the algebraic rules assume the
+    built-in, so the view needs the full refresh. PostgreSQL: visible
+    functions outside pg_catalog (overloads are chosen by argument type);
+    SQLite: application-defined functions (PRAGMA function_list lists both).
+    MySQL/MariaDB built-ins cannot be shadowed by unqualified calls."""
+    names = _modelled_function_names(spec, dialect)
+    if not names or dialect == Dialect.MYSQL:
+        return []
+    try:
+        if dialect == Dialect.POSTGRES:
+            rows = _rows(
+                conn,
+                "SELECT DISTINCT upper(p.proname) FROM pg_catalog.pg_proc p "
+                "JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE upper(p.proname) = ANY(%s) AND n.nspname <> 'pg_catalog' "
+                "AND pg_catalog.pg_function_is_visible(p.oid)",
+                (sorted(names),),
+            )
+            overridden = {str(r[0]) for r in rows}
+        else:
+            rows = _rows(conn, "PRAGMA function_list")
+            builtin = {str(r[0]).upper() for r in rows if int(r[1]) == 1}
+            overridden = {str(r[0]).upper() for r in rows if int(r[1]) == 0} & builtin & names
+    except Exception:
+        return []  # no readable catalog: unmodelled calls are unclassifiable anyway
+    return [(n, "a user-defined function of that name can shadow the built-in") for n in sorted(overridden)]
