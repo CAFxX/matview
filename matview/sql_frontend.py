@@ -1031,6 +1031,114 @@ def parse_table_index_def(
     )
 
 
+def _find_pg_balanced_paren_span(sql: str, start_idx: int) -> Tuple[int, int]:
+    """Return ``(open_idx, close_idx)`` of the first balanced ``(...)`` block
+    starting at or after ``start_idx``, skipping single/double-quoted strings
+    (including ``E'...'`` escapes) and ``$tag$...$tag$`` dollar-quoted strings."""
+    n = len(sql)
+    i = start_idx
+    open_idx = -1
+    depth = 0
+    in_sq = False
+    sq_escape = False
+    in_dq = False
+    dollar_tag: Optional[str] = None
+    while i < n:
+        ch = sql[i]
+        if dollar_tag is not None:
+            if sql.startswith(dollar_tag, i):
+                i += len(dollar_tag)
+                dollar_tag = None
+                continue
+            i += 1
+            continue
+        if in_sq:
+            if sq_escape and ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == "'":
+                if i + 1 < n and sql[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = False
+                sq_escape = False
+            i += 1
+            continue
+        if in_dq:
+            if ch == '"':
+                if i + 1 < n and sql[i + 1] == '"':
+                    i += 2
+                    continue
+                in_dq = False
+            i += 1
+            continue
+        if ch == "$":
+            m_tag = re.match(r"\$[A-Za-z_0-9]*\$", sql[i:])
+            if m_tag:
+                dollar_tag = m_tag.group(0)
+                i += len(dollar_tag)
+                continue
+        if ch == "'":
+            in_sq = True
+            sq_escape = i > 0 and sql[i - 1] in ("e", "E") and (i < 2 or not (sql[i - 2].isalnum() or sql[i - 2] == "_"))
+            i += 1
+            continue
+        if ch == '"':
+            in_dq = True
+            i += 1
+            continue
+        if ch == "(":
+            if depth == 0:
+                open_idx = i
+            depth += 1
+        elif ch == ")" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                return open_idx, i
+        i += 1
+    return -1, -1
+
+
+def _normalize_pg_virtual_generated_ddl(raw_stmt: str) -> Tuple[str, Set[str]]:
+    """Rewrite PostgreSQL 18 ``GENERATED ALWAYS AS (<expr>) [VIRTUAL]`` column
+    clauses to ``STORED`` for sqlglot parsing while returning the lowercased
+    names of columns that are ``VIRTUAL`` (explicitly or by PG 18 default)."""
+    lp, rp = _find_pg_balanced_paren_span(raw_stmt, 0)
+    if lp < 0 or rp <= lp:
+        return raw_stmt, set()
+    body = raw_stmt[lp + 1 : rp]
+    parts = _split_top_level(body, ",", dialect=Dialect.POSTGRES)
+    virtual_cols: Set[str] = set()
+    new_parts: List[str] = []
+    gen_re = re.compile(r"\bGENERATED\s+ALWAYS\s+AS\s*\(", re.IGNORECASE)
+    for part in parts:
+        m = gen_re.search(part)
+        if not m:
+            new_parts.append(part)
+            continue
+        _, close_idx = _find_pg_balanced_paren_span(part, m.end() - 1)
+        if close_idx < 0:
+            new_parts.append(part)
+            continue
+        tail = part[close_idx + 1 :]
+        if re.match(r"^\s*STORED\b", tail, re.IGNORECASE):
+            new_parts.append(part)
+            continue
+        # Extract leading column name (quoted or bare) to mark as virtual.
+        p_strip = part.lstrip()
+        m_col = re.match(r'^"((?:[^"]|"")+)"|^([A-Za-z_][A-Za-z0-9_$]*)', p_strip)
+        if m_col:
+            c_name = m_col.group(1).replace('""', '"') if m_col.group(1) is not None else m_col.group(2)
+            virtual_cols.add(c_name.lower())
+        m_virt = re.match(r"^(\s*)VIRTUAL\b", tail, re.IGNORECASE)
+        if m_virt:
+            new_tail = m_virt.group(1) + "STORED" + tail[m_virt.end() :]
+        else:
+            new_tail = " STORED" + tail
+        new_parts.append(part[: close_idx + 1] + new_tail)
+    return raw_stmt[: lp + 1] + ",".join(new_parts) + raw_stmt[rp:], virtual_cols
+
+
 def parse_table_schema(
     schema_sql: str,
     dialect: Dialect = Dialect.SQLITE,
@@ -1052,11 +1160,17 @@ def parse_table_schema(
             continue
         raw_col_types: Dict[str, str] = {}
         used_sqlite_type_fallback = False
+        pg_virtual_cols_lower: Set[str] = set()
+        parse_input_s = raw_stmt_s
+        if eff_dialect == Dialect.POSTGRES and re.search(
+            r"\bGENERATED\s+ALWAYS\s+AS\s*\(", raw_stmt_s, re.IGNORECASE
+        ):
+            parse_input_s, pg_virtual_cols_lower = _normalize_pg_virtual_generated_ddl(raw_stmt_s)
         try:
-            stmt_ast = parse_sql_ast(raw_stmt_s, dialect=eff_dialect)
+            stmt_ast = parse_sql_ast(parse_input_s, dialect=eff_dialect)
         except sqlglot.errors.SqlglotError:
-            if eff_dialect == Dialect.POSTGRES and re.search(r"\bBIT\s+VARYING\b", raw_stmt_s, re.IGNORECASE):
-                pg_norm_sql = re.sub(r"\bBIT\s+VARYING\b", "VARBIT", raw_stmt_s, flags=re.IGNORECASE)
+            if eff_dialect == Dialect.POSTGRES and re.search(r"\bBIT\s+VARYING\b", parse_input_s, re.IGNORECASE):
+                pg_norm_sql = re.sub(r"\bBIT\s+VARYING\b", "VARBIT", parse_input_s, flags=re.IGNORECASE)
                 try:
                     stmt_ast = parse_sql_ast(pg_norm_sql, dialect=eff_dialect)
                 except sqlglot.errors.SqlglotError:
@@ -1166,6 +1280,7 @@ def parse_table_schema(
             strict = bool(re.search(r"\bSTRICT\b", tail_opts, re.IGNORECASE))
         col_items: List[Tuple[str, str, bool, bool, bool]] = []
         generated_cols_lower: Set[str] = set()
+        generation_exprs_lower: Dict[str, str] = {}
         all_pk_cols_lower: Set[str] = set(table_pk_cols)
         ordered_pk_cols: List[str] = list(table_pk_cols_order)
         for expr_item in schema_node.expressions:
@@ -1229,11 +1344,11 @@ def parse_table_schema(
                     and not c.kind.args.get("allow_null")
                     for c in expr_item.constraints
                 )
-                if any(
-                    isinstance(c.kind, sqlglot_exp.ComputedColumnConstraint)
-                    for c in expr_item.constraints
-                ):
-                    generated_cols_lower.add(col_name.lower())
+                for c in expr_item.constraints:
+                    if isinstance(c.kind, sqlglot_exp.ComputedColumnConstraint):
+                        generated_cols_lower.add(col_name.lower())
+                        if c.kind.this is not None:
+                            generation_exprs_lower[col_name.lower()] = c.kind.this.sql(dialect=sg_d)
                 if is_pk and col_name.lower() not in all_pk_cols_lower:
                     all_pk_cols_lower.add(col_name.lower())
                     ordered_pk_cols.append(col_name)
@@ -1268,6 +1383,8 @@ def parse_table_schema(
                 not_null=not_null,
                 primary_key=eff_pk,
                 generated=col_name.lower() in generated_cols_lower,
+                generated_virtual=col_name.lower() in pg_virtual_cols_lower,
+                generation_expr=generation_exprs_lower.get(col_name.lower()),
                 is_rowid_alias=is_rowid_alias,
             )
 

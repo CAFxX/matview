@@ -1006,8 +1006,9 @@ class MaterializedViewManager:
             ts = low_map.get(ref_t.lower())
             if ts:
                 for c_name, c_def in sorted(ts.columns.items()):
+                    vgen_sig = f":vgen:{c_def.generation_expr or ''}" if c_def.generated_virtual else ""
                     h.update(
-                        f"{ts.name}.{c_name}:{c_def.data_type}:{c_def.not_null}:{c_def.primary_key}".encode("utf-8")
+                        f"{ts.name}.{c_name}:{c_def.data_type}:{c_def.not_null}:{c_def.primary_key}{vgen_sig}".encode("utf-8")
                     )
         return h.hexdigest()
 

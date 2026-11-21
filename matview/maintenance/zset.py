@@ -804,19 +804,35 @@ class Tier1ZSetMixin(MixinHost):
                 contrib,
             ))
 
+        setop_base_t = b_list[0][1].base_table if b_list else None
         if op_type == "UNION ALL":
             key_cols = list(uall_pk_cols) if use_native_uall_pk else ["__mv_pk"]
             return self._pg_keyed_rows_bodies(
-                mv_table, key_cols, list(user_columns), [src for src, _ in sources], count_col="__mv_row_count"
+                mv_table,
+                key_cols,
+                list(user_columns),
+                [src for src, _ in sources],
+                count_col="__mv_row_count",
+                base_t=setop_base_t,
             )
         if op_type == "UNION":
             return self._pg_counted_rows_bodies(
-                mv_table, "__mv_pk", user_columns, ["__mv_row_count"], sources,
+                mv_table,
+                "__mv_pk",
+                user_columns,
+                ["__mv_row_count"],
+                sources,
                 f"{mv_table}.__mv_row_count <= 0",
+                base_t=setop_base_t,
             )
         return self._pg_counted_rows_bodies(
-            mv_table, "__mv_pk", user_columns, ["__mv_cnt_0", "__mv_cnt_1"], sources,
+            mv_table,
+            "__mv_pk",
+            user_columns,
+            ["__mv_cnt_0", "__mv_cnt_1"],
+            sources,
             f"{mv_table}.__mv_cnt_0 <= 0 AND {mv_table}.__mv_cnt_1 <= 0",
+            base_t=setop_base_t,
         )
 
     def _compile_tier1_zset_distinct(self) -> MaterializedViewPlan:
@@ -1229,6 +1245,7 @@ class Tier1ZSetMixin(MixinHost):
                         keys=[f"{rec}.{self._q(src_c)}" for src_c in pk_names],
                         values=pg_values,
                     )],
+                    base_t=self.view.base_table,
                 )
             else:
                 pg_bodies = self._pg_counted_rows_bodies(
@@ -1247,6 +1264,7 @@ class Tier1ZSetMixin(MixinHost):
                         {"__mv_row_count": "1"},
                     )],
                     f"{mv_table}.__mv_row_count <= 0",
+                    base_t=self.view.base_table,
                 )
             pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
             trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]

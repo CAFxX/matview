@@ -584,7 +584,7 @@ LEFT JOIN pg_catalog.pg_type et ON et.oid = u.typelem AND u.typcategory = 'A'
 LEFT JOIN unwrapped ue ON ue.oid = et.oid AND ue.typtype <> 'd'
 WHERE pg_catalog.pg_table_is_visible(cl.oid)
   AND cl.relkind IN ('r', 'p')
-  AND (u.typcategory = 'A' OR u.typtype IN ('c', 'r', 'm'))
+  AND (u.typcategory = 'A' OR u.typtype IN ('c', 'r', 'm', 'e'))
   AND a.attnum > 0
   AND NOT a.attisdropped
   AND cl.relname NOT LIKE '__matview_%'
@@ -641,6 +641,108 @@ def _pg_introspect_native_array_types(conn_or_bind: Any) -> Dict[Tuple[str, str]
     for r in rows:
         if len(r) >= 3 and r[0] and r[1] and r[2]:
             out[(str(r[0]).lower(), str(r[1]).lower())] = str(r[2])
+    return out
+
+
+_PG_GENERATED_COLUMNS_SQL = """
+WITH RECURSIVE unwrapped AS (
+    SELECT oid, oid AS base_oid, typtypmod AS base_mod, typtype, typbasetype, typcollation
+    FROM pg_catalog.pg_type
+    UNION ALL
+    SELECT u.oid, p.oid,
+           CASE WHEN u.base_mod <> -1 THEN u.base_mod ELSE p.typtypmod END,
+           p.typtype, p.typbasetype, p.typcollation
+    FROM unwrapped u
+    JOIN pg_catalog.pg_type p ON p.oid = u.typbasetype
+    WHERE u.typtype = 'd'
+)
+SELECT cl.relname,
+       a.attname,
+       a.attgenerated,
+       pg_catalog.pg_get_expr(ad.adbin, ad.adrelid),
+       CASE
+           WHEN t.typtype = 'd'
+               THEN pg_catalog.format_type(
+                   u.base_oid,
+                   CASE WHEN a.atttypmod <> -1 THEN a.atttypmod ELSE u.base_mod END
+               )
+           ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
+       END || CASE
+           WHEN a.attcollation <> 0 AND a.attcollation <> t.typcollation
+               THEN ' COLLATE ' || pg_catalog.quote_ident(cn.nspname) || '.' || pg_catalog.quote_ident(co.collname)
+           ELSE ''
+       END AS resolved_type
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class cl ON cl.oid = a.attrelid
+JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+JOIN unwrapped u ON u.oid = t.oid AND u.typtype <> 'd'
+LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
+LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace
+WHERE pg_catalog.pg_table_is_visible(cl.oid)
+  AND cl.relkind IN ('r', 'p')
+  AND a.attgenerated IN ('v', 's')
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+  AND cl.relname NOT LIKE '__matview_%'
+  AND cl.relname NOT LIKE '__mv_%'
+"""
+
+
+def _pg_introspect_generated_columns(
+    conn_or_bind: Any,
+) -> Dict[Tuple[str, str], Tuple[str, Optional[str], Optional[str]]]:
+    """Return ``(table_lower, col_lower) -> (attgenerated, generation_expr, resolved_type)``
+    for PostgreSQL generated columns (``'v'`` virtual on PG 18+, ``'s'`` stored
+    on PG 12+) of visible regular and partitioned tables.
+
+    ``resolved_type`` uses ``pg_catalog.format_type`` (unwrapping domains and
+    preserving exact-case explicit collations) so virtual column casts and
+    backing DDL never receive ``USER-DEFINED`` or uppercased collation names.
+    """
+    rows: List[Any] = []
+    try:
+        if isinstance(conn_or_bind, _SAEngine):
+            with conn_or_bind.connect() as sa_conn:
+                rows = list(sa_conn.exec_driver_sql(_PG_GENERATED_COLUMNS_SQL).fetchall() or ())
+        elif isinstance(conn_or_bind, _SAConnection):
+            if conn_or_bind.in_transaction():
+                with conn_or_bind.begin_nested():
+                    rows = list(conn_or_bind.exec_driver_sql(_PG_GENERATED_COLUMNS_SQL).fetchall() or ())
+            else:
+                rows = list(conn_or_bind.exec_driver_sql(_PG_GENERATED_COLUMNS_SQL).fetchall() or ())
+        elif hasattr(conn_or_bind, "cursor"):
+            cur = conn_or_bind.cursor()
+            used_sp = False
+            try:
+                if dbapi_transaction_state(conn_or_bind) is True:
+                    cur.execute("SAVEPOINT __mv_pg_gen_introspect")
+                    used_sp = True
+                cur.execute(_PG_GENERATED_COLUMNS_SQL)
+                rows = list(cur.fetchall() or ())
+                if used_sp:
+                    cur.execute("RELEASE SAVEPOINT __mv_pg_gen_introspect")
+            except Exception:
+                if used_sp:
+                    try:
+                        cur.execute("ROLLBACK TO SAVEPOINT __mv_pg_gen_introspect")
+                        cur.execute("RELEASE SAVEPOINT __mv_pg_gen_introspect")
+                    except Exception:
+                        pass
+                return {}
+            finally:
+                close_fn = getattr(cur, "close", None)
+                if callable(close_fn):
+                    close_fn()
+    except Exception:
+        return {}
+    out: Dict[Tuple[str, str], Tuple[str, Optional[str], Optional[str]]] = {}
+    for r in rows:
+        if len(r) >= 4 and r[0] and r[1] and r[2]:
+            kind = str(r[2]).strip().lower()
+            expr = str(r[3]) if r[3] is not None else None
+            resolved_dt = str(r[4]) if len(r) >= 5 and r[4] else None
+            out[(str(r[0]).lower(), str(r[1]).lower())] = (kind, expr, resolved_dt)
     return out
 
 
@@ -701,6 +803,11 @@ def introspect_schemas_with_sqlalchemy(
             if eff_dialect == Dialect.POSTGRES
             else {}
         )
+        pg_gen_cols: Dict[Tuple[str, str], Tuple[str, Optional[str], Optional[str]]] = (
+            _pg_introspect_generated_columns(bind_or_conn if isinstance(bind_or_conn, (_SAEngine, _SAConnection)) else raw_conn)
+            if eff_dialect == Dialect.POSTGRES
+            else {}
+        )
 
         schemas: Dict[str, TableSchema] = {}
         for t_name in insp.get_table_names():
@@ -730,11 +837,17 @@ def introspect_schemas_with_sqlalchemy(
                 )
                 is_pk = c_name.lower() in pk_cols_low
                 is_notnull = (not bool(col.get("nullable", True))) or is_pk
+                gen_info = pg_gen_cols.get((t_name.lower(), c_name.lower()))
+                if gen_info is not None and gen_info[2]:
+                    c_type = gen_info[2]
                 col_defs[c_name] = ColumnDef(
                     name=c_name,
                     data_type=c_type,
                     not_null=is_notnull,
                     primary_key=is_pk,
+                    generated=gen_info is not None,
+                    generated_virtual=(gen_info is not None and gen_info[0] == "v"),
+                    generation_expr=(gen_info[1] if gen_info is not None else None),
                 )
 
             fk_actions: List[str] = []
@@ -1060,6 +1173,7 @@ def introspect_database_schemas(
                 pass
 
             pg_array_types = _pg_introspect_native_array_types(conn)
+            pg_gen_cols = _pg_introspect_generated_columns(conn)
             cur.execute(
                 """
                 SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.character_maximum_length
@@ -1100,11 +1214,17 @@ def introspect_database_schemas(
                     elif dt_up == "BIT VARYING" and char_len:
                         dt_up = f"BIT VARYING({int(char_len)})"
                 is_pk = (t_name.lower(), c_name.lower()) in pk_pairs
+                gen_info = pg_gen_cols.get((t_name.lower(), c_name.lower()))
+                if gen_info is not None and gen_info[2]:
+                    dt_up = gen_info[2]
                 grouped.setdefault(t_name, {})[c_name] = ColumnDef(
                     name=c_name,
                     data_type=dt_up,
                     not_null=(str(is_null).upper() == "NO") or is_pk,
                     primary_key=is_pk,
+                    generated=gen_info is not None,
+                    generated_virtual=(gen_info is not None and gen_info[0] == "v"),
+                    generation_expr=(gen_info[1] if gen_info is not None else None),
                 )
             for t_name, cols in grouped.items():
                 schemas[t_name] = TableSchema(

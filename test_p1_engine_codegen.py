@@ -1302,6 +1302,90 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             t2_p2 = next(t for t in p2.trigger_names if t.endswith("_au") and tbl2.lower() in next(d for d in p2.trigger_ddls if f"CREATE TRIGGER {t} " in d).lower())
             self.assertEqual(t1_p1.lower() < t1_p2.lower(), t2_p1.lower() < t2_p2.lower(), (t1_p1, t1_p2, t2_p1, t2_p2))
 
+    def test_postgres_18_virtual_generated_columns_parsing_codegen_and_fail_closed(self) -> None:
+        from matview.engines import UnsupportedMaterializedViewError
+        from matview.logical_ir import ColumnDef, TableSchema
+
+        ddl = (
+            'CREATE TABLE gv ('
+            '  id INT PRIMARY KEY,'
+            '  "a b" INT,'
+            '  x NUMERIC(10, 2),'
+            '  bv BIT VARYING(8),'
+            '  v_explicit INT GENERATED ALWAYS AS ("a b" * 2 + 1) VIRTUAL,'
+            '  v_default NUMERIC(12, 2) GENERATED ALWAYS AS (x * 1.5),'
+            '  v_stored INT GENERATED ALWAYS AS ("a b" + 10) STORED'
+            ');'
+        )
+        schemas = parse_table_schema(ddl, dialect=Dialect.POSTGRES)
+        self.assertIn("gv", schemas)
+        cols = schemas["gv"].columns
+        self.assertTrue(cols["v_explicit"].generated and cols["v_explicit"].generated_virtual)
+        self.assertIn('"a b"', cols["v_explicit"].generation_expr or "")
+        self.assertTrue(cols["v_default"].generated and cols["v_default"].generated_virtual)
+        self.assertIn("1.5", cols["v_default"].generation_expr or "")
+        self.assertTrue(cols["v_stored"].generated and not cols["v_stored"].generated_virtual)
+
+        # Trigger functions must NOT expand __mv_n.* / __mv_o.*, and must compute
+        # virtual columns via CAST over non-virtual transition columns.
+        plan = generate_materialized_view(
+            schemas,
+            "CREATE VIEW v_gv AS SELECT v_explicit, SUM(v_default) AS s, COUNT(*) AS c FROM gv GROUP BY v_explicit;",
+            dialect=Dialect.POSTGRES,
+        )
+        fn_ddls = [d for d in plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_" in d and "_trunc" not in d]
+        self.assertEqual(len(fn_ddls), 3)
+        for fn in fn_ddls:
+            self.assertNotIn("__mv_n.*", fn)
+            self.assertNotIn("__mv_o.*", fn)
+            self.assertIn('AS "v_explicit"', fn)
+            self.assertIn('AS "v_default"', fn)
+
+        # Standalone PG 18 default-virtual DDL (no VIRTUAL keyword, no BIT VARYING)
+        # and partitioned DDL with trailing PARTITION BY LIST (g) must also parse as virtual.
+        default_only = parse_table_schema(
+            "CREATE TABLE gv_def (id INT PRIMARY KEY, a INT, v INT GENERATED ALWAYS AS (a * 2));"
+            "CREATE TABLE gv_p (id INT NOT NULL, g INT NOT NULL, a INT, "
+            "v INT GENERATED ALWAYS AS (a + 1) VIRTUAL, PRIMARY KEY (g, id)) PARTITION BY LIST (g);",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertTrue(default_only["gv_def"].columns["v"].generated_virtual)
+        self.assertEqual(default_only["gv_def"].columns["v"].generation_expr, "a * 2")
+        self.assertTrue(default_only["gv_p"].columns["v"].generated_virtual)
+        self.assertEqual(default_only["gv_p"].columns["v"].generation_expr, "a + 1")
+
+        # Missing generation_expr: unreferenced virtual column (including COUNT(*)) is
+        # safely omitted; referenced virtual column fails closed at compile time.
+        no_expr_schemas = {
+            "gv": TableSchema(
+                name="gv",
+                columns={
+                    "id": ColumnDef("id", "INTEGER", not_null=True, primary_key=True),
+                    "g": ColumnDef("g", "INTEGER"),
+                    "v": ColumnDef("v", "INTEGER"),
+                    "gx": ColumnDef("gx", "INTEGER", generated=True, generated_virtual=True, generation_expr=None),
+                },
+                pk_columns=("id",),
+            )
+        }
+        for v_sql in (
+            "CREATE VIEW v_unref AS SELECT g, SUM(v) AS s FROM gv GROUP BY g;",
+            "CREATE VIEW v_cnt_only AS SELECT COUNT(*) AS c FROM gv;",
+        ):
+            plan_unref = generate_materialized_view(no_expr_schemas, v_sql, dialect=Dialect.POSTGRES)
+            for fn in plan_unref.trigger_ddls:
+                if "CREATE OR REPLACE FUNCTION __matview_fn_sync_" in fn and "_trunc" not in fn:
+                    self.assertNotIn("__mv_n.*", fn)
+                    self.assertNotIn("__mv_o.*", fn)
+                    self.assertNotIn("gx", fn)
+
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            generate_materialized_view(
+                no_expr_schemas,
+                "CREATE VIEW v_ref_missing AS SELECT g, SUM(gx) AS s FROM gv GROUP BY g;",
+                dialect=Dialect.POSTGRES,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2830,7 +2830,7 @@ class Tier1SingleMixin(MixinHost):
                 self._requires_native_avg_recompute(it) or self._pgmy_native_recompute_item(it)
             ),
         )
-        return self._pg_aggregate_bodies(spec, [source])
+        return self._pg_aggregate_bodies(spec, [source], base_t=self.view.base_table)
 
     def _build_tier1_triggers(
         self,
