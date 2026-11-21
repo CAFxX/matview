@@ -123,6 +123,8 @@ TYPE_CLASSES: List[Tuple[str, str, bool]] = [
     ("postgres", "TEXT", False), ("postgres", "VARCHAR", False), ("postgres", "VARCHAR(1000)", False),
     ("postgres", "BYTEA", False), ("postgres", "JSONB", False), ("postgres", "NUMERIC", False),
     ("postgres", "INTEGER[]", False),
+    # PostgreSQL: the group columns count towards the 2704-byte row too.
+    ("postgres6", "VARCHAR(100)", False),
     ("mysql", "INT", True), ("mysql", "BIGINT UNSIGNED", True), ("mysql", "DECIMAL(65, 30)", True),
     ("mysql", "DOUBLE", True), ("mysql", "DATE", True), ("mysql", "DATETIME(6)", True),
     ("mysql", "TIMESTAMP", True), ("mysql", "VARBINARY(255)", True),
@@ -135,6 +137,12 @@ TYPE_CLASSES: List[Tuple[str, str, bool]] = [
 class ArgumentTypeClassTests(unittest.TestCase):
     def test_type_classes(self) -> None:
         for dialect, typ, recommended in TYPE_CLASSES:
+            if dialect == "postgres6":  # six VARCHAR(100) group columns
+                keys = [f"k{i}" for i in range(6)]
+                schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, " + ", ".join(f"{k} VARCHAR(100)" for k in keys) + f", a {typ});"
+                plan = _plan("postgres", schema, f"SELECT {', '.join(keys)}, MAX(a) AS m FROM t GROUP BY {', '.join(keys)}")
+                self.assertEqual(_rec_cols(plan), [tuple(keys)], typ)
+                continue
             schema = f"CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, a {typ});"
             plan = _plan(dialect, schema, "SELECT g, MAX(a) AS m FROM t GROUP BY g")
             recs = _rec_cols(plan)
@@ -215,6 +223,24 @@ def _apply_index_changes(eng: "_Engine", add: Sequence[str] = (), drop: Sequence
         eng.run(f"DROP INDEX {n}")
     for ddl in add:
         eng.run(ddl)
+
+
+def _check_wide_group_key_index(test: unittest.TestCase, conn: Any) -> None:
+    """PostgreSQL: five VARCHAR(100) group columns plus a VARCHAR(100)
+    argument fit the btree row limit with 4-byte characters (recommended,
+    created, maximum-size row written); a sixth group column does not
+    (offline: not recommended)."""
+    keys = [f"k{i}" for i in range(5)]
+    col_sql = "id INTEGER PRIMARY KEY, " + ", ".join(f"{k} VARCHAR(100)" for k in keys) + ", a VARCHAR(100)"
+    plan = _plan("postgres", f"CREATE TABLE mmwide ({col_sql});", f"SELECT {', '.join(keys)}, MAX(a) AS m FROM mmwide GROUP BY {', '.join(keys)}")
+    test.assertEqual(_rec_cols(plan), [tuple(keys) + ("a",)])
+    cur = conn.cursor()
+    cur.execute(f"CREATE TABLE mmwide ({col_sql})")
+    for ddl in plan.recommended_base_indexes:
+        cur.execute(ddl)
+    wide = "\U0001F600" * 100
+    cur.execute("INSERT INTO mmwide VALUES (%s" + ", %s" * 6 + ")", [1] + [wide] * 6)
+    conn.commit()
 
 
 # ---------------------------------------------------------------- native
@@ -388,6 +414,7 @@ class PostgresNativeTests(unittest.TestCase):
             eng = _Engine("postgres", conn, "mmt")
             _scenario(self, eng, mgr.register_view)
             _check_recommended_indexes_accept_max_values(self, "postgres", conn, "mmtypes")
+            _check_wide_group_key_index(self, conn)
         finally:
             conn.rollback()
             cur = conn.cursor()

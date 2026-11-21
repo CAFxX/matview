@@ -2481,6 +2481,34 @@ _PG_SAFE_INDEX_TYPE = re.compile(
     r"TIMESTAMP(?:\(\d+\))?(?: WITH(?:OUT)? TIME ZONE)?|TIMESTAMPTZ|INTERVAL(?:\(\d+\))?|"
     r"UUID|MONEY|INET|CIDR|MACADDR|MACADDR8|OID)"
 )
+_PG_KEY_LIMIT_BYTES = 2600  # 2704-byte btree tuple limit minus header/alignment margin
+
+
+def _pg_key_bytes(data_type: str) -> Optional[int]:
+    """Upper bound of a PostgreSQL btree key column in bytes, or None when the
+    type's values are unbounded or long (TEXT, BYTEA, JSONB, arrays, ...).
+    Character types count 4 bytes per character (UTF-8) plus the varlena
+    header; NUMERIC(p) counts its digit groups."""
+    t = re.sub(r"\s+", " ", data_type.strip().upper())
+    if not t:
+        return None
+    if _PG_SAFE_INDEX_TYPE.fullmatch(t):
+        if re.match(r"(?:SMALLINT|INT2|SMALLSERIAL|BOOL)", t):
+            return 2
+        if re.match(r"(?:INTERVAL|UUID|MACADDR8)", t):
+            return 16
+        if re.match(r"(?:INET|CIDR)", t):
+            return 24
+        return 8
+    m = re.fullmatch(r"(?:NUMERIC|DECIMAL)\s*\(\s*(\d+)(?:\s*,\s*-?\d+)?\s*\)", t)
+    if m and int(m.group(1)) <= 300:
+        return (int(m.group(1)) + 3) // 4 * 2 + 8
+    m = re.fullmatch(r"(?:CHARACTER VARYING|VARCHAR|CHARACTER|CHAR|BPCHAR)\s*\(\s*(\d+)\s*\)", t)
+    if m and int(m.group(1)) <= 100:
+        return int(m.group(1)) * 4 + 4
+    return None
+
+
 _MYSQL_INT_BYTES = {"TINYINT": 1, "SMALLINT": 2, "MEDIUMINT": 3, "INT": 4, "INTEGER": 4, "BIGINT": 8}
 _MYSQL_KEY_LIMIT_BYTES = 3072  # InnoDB DYNAMIC/COMPRESSED row formats
 
@@ -2529,18 +2557,26 @@ def _minmax_index_type_blocker(dialect: Dialect, arg_type: str, group_types: Seq
     if dialect == Dialect.SQLITE:
         return None
     if dialect == Dialect.POSTGRES:
-        if _PG_SAFE_INDEX_TYPE.fullmatch(t):
-            return None
-        m = re.fullmatch(r"(?:NUMERIC|DECIMAL)\s*\(\s*(\d+)(?:\s*,\s*-?\d+)?\s*\)", t)
-        if m and int(m.group(1)) <= 300:
-            return None
-        m = re.fullmatch(r"(?:CHARACTER VARYING|VARCHAR|CHARACTER|CHAR|BPCHAR)\s*\(\s*(\d+)\s*\)", t)
-        if m and int(m.group(1)) <= 100:
-            return None
-        return (
-            f"values of type {arg_type} can exceed PostgreSQL's 2704-byte btree row limit, so writing a "
-            f"long value after creating the index would fail"
-        )
+        if _pg_key_bytes(arg_type) is None:
+            return (
+                f"values of type {arg_type} can exceed PostgreSQL's 2704-byte btree row limit, so writing a "
+                f"long value after creating the index would fail"
+            )
+        total = 0
+        for ty in [arg_type, *group_types]:
+            b = _pg_key_bytes(ty)
+            if b is None:
+                return (
+                    f"group key values of type {ty or 'unknown'} can make the index row exceed PostgreSQL's "
+                    f"2704-byte btree limit"
+                )
+            total += b
+        if total > _PG_KEY_LIMIT_BYTES:
+            return (
+                f"an index row would take up to {total} bytes, more than PostgreSQL's btree limit "
+                f"(2704 bytes including the row header)"
+            )
+        return None
     if re.match(r"(?:CHAR|VARCHAR|CHARACTER|NCHAR|NVARCHAR|TINYTEXT|TEXT|MEDIUMTEXT|LONGTEXT|ENUM|SET|JSON)\b", t):
         return (
             f"{arg_type} values compare under the column's collation (case- and trailing-space-insensitive "
