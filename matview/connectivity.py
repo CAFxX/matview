@@ -563,18 +563,26 @@ WITH RECURSIVE unwrapped AS (
 )
 SELECT cl.relname,
        a.attname,
-       CASE
+       (CASE
            WHEN u.typcategory = 'A' AND et.typtype = 'd'
                THEN pg_catalog.format_type(
                    ue.base_oid,
                    CASE WHEN a.atttypmod <> -1 THEN a.atttypmod ELSE ue.base_mod END
                ) || '[]'
+           WHEN u.base_oid = 'pg_catalog.bpchar'::pg_catalog.regtype
+                AND a.atttypmod = -1 AND u.base_mod = -1
+               THEN 'bpchar'
            WHEN t.typtype = 'd'
                THEN pg_catalog.format_type(
                    u.base_oid,
                    CASE WHEN a.atttypmod <> -1 THEN a.atttypmod ELSE u.base_mod END
                )
            ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
+       END)
+       || CASE
+           WHEN co.oid IS NOT NULL
+               THEN ' COLLATE ' || pg_catalog.quote_ident(cn.nspname) || '.' || pg_catalog.quote_ident(co.collname)
+           ELSE ''
        END AS resolved_type
 FROM pg_catalog.pg_attribute a
 JOIN pg_catalog.pg_class cl ON cl.oid = a.attrelid
@@ -582,9 +590,17 @@ JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
 JOIN unwrapped u ON u.oid = t.oid AND u.typtype <> 'd'
 LEFT JOIN pg_catalog.pg_type et ON et.oid = u.typelem AND u.typcategory = 'A'
 LEFT JOIN unwrapped ue ON ue.oid = et.oid AND ue.typtype <> 'd'
+LEFT JOIN pg_catalog.pg_collation co
+       ON co.oid = a.attcollation AND a.attcollation <> 0 AND a.attcollation <> t.typcollation
+LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace
 WHERE pg_catalog.pg_table_is_visible(cl.oid)
   AND cl.relkind IN ('r', 'p')
-  AND (u.typcategory = 'A' OR u.typtype IN ('c', 'r', 'm', 'e'))
+  AND (
+      u.typcategory = 'A'
+      OR u.typtype IN ('c', 'r', 'm', 'e')
+      OR co.oid IS NOT NULL
+      OR (u.base_oid = 'pg_catalog.bpchar'::pg_catalog.regtype AND a.atttypmod = -1 AND u.base_mod = -1)
+  )
   AND a.attnum > 0
   AND NOT a.attisdropped
   AND cl.relname NOT LIKE '__matview_%'

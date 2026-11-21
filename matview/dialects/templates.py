@@ -181,6 +181,118 @@ $$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
     "pg_truncate_trigger": """CREATE TRIGGER {{ trg_name }}
 AFTER TRUNCATE ON {{ q_base_t }}
 FOR EACH STATEMENT EXECUTE FUNCTION {{ fn_name }}();""",
+    "pg_before_bracket_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+RETURNS TRIGGER AS $$
+DECLARE
+    __mv_guc pg_catalog.text := 'matview.s3_' || {{ lock_reg }}::pg_catalog.regclass::pg_catalog.oid::pg_catalog.text;
+    __mv_raw pg_catalog.text := COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0');
+    __mv_d INT := pg_catalog.split_part(__mv_raw, ':', 1)::int;
+    __mv_m BIGINT := pg_catalog.split_part(__mv_raw, ':', 2)::bigint;
+    __mv_bseq INT := pg_catalog.split_part(__mv_raw, ':', 3)::int;
+    __mv_tr INT := pg_catalog.split_part(__mv_raw, ':', 4)::int;
+BEGIN
+    IF __mv_d = 0 THEN
+        __mv_bseq := __mv_bseq + 1;
+        __mv_m := {{ src_bit }}::bigint;
+        __mv_tr := CASE WHEN TG_OP = 'TRUNCATE' THEN 1 ELSE 0 END;
+    ELSE
+        __mv_m := __mv_m | {{ src_bit }}::bigint;
+        IF TG_OP = 'TRUNCATE' THEN
+            __mv_tr := 1;
+        END IF;
+    END IF;
+    __mv_d := __mv_d + 1;
+    PERFORM pg_catalog.set_config(__mv_guc, __mv_d::pg_catalog.text || ':' || __mv_m::pg_catalog.text || ':' || __mv_bseq::pg_catalog.text || ':' || __mv_tr::pg_catalog.text, true);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
+    "pg_before_bracket_trigger": """CREATE TRIGGER {{ trg_name }}
+BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON {{ q_base_t }}
+FOR EACH STATEMENT EXECUTE FUNCTION {{ fn_name }}();""",
+    "pg_bracketed_statement_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+RETURNS TRIGGER AS $$
+DECLARE
+    __mv_guc pg_catalog.text := 'matview.s3_' || {{ lock_reg }}::pg_catalog.regclass::pg_catalog.oid::pg_catalog.text;
+    __mv_raw pg_catalog.text := COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0');
+    __mv_d INT := pg_catalog.split_part(__mv_raw, ':', 1)::int;
+    __mv_m BIGINT := pg_catalog.split_part(__mv_raw, ':', 2)::bigint;
+    __mv_bseq INT := pg_catalog.split_part(__mv_raw, ':', 3)::int;
+    __mv_tr INT := pg_catalog.split_part(__mv_raw, ':', 4)::int;
+    __mv_nd INT := GREATEST(__mv_d - 1, 0);
+    __mv_overlap BOOLEAN := (__mv_m & (__mv_m - 1)) <> 0;
+BEGIN
+    /* __MV_BRACKET_START__ */
+    IF __mv_nd = 0 THEN
+        PERFORM pg_catalog.set_config(__mv_guc, '0:0:' || __mv_bseq::pg_catalog.text || ':0', true);
+    ELSE
+        PERFORM pg_catalog.set_config(__mv_guc, __mv_nd::pg_catalog.text || ':' || __mv_m::pg_catalog.text || ':' || __mv_bseq::pg_catalog.text || ':' || __mv_tr::pg_catalog.text, true);
+    END IF;
+    IF __mv_overlap OR __mv_tr <> 0 THEN
+        IF __mv_tr = 0 AND EXISTS (SELECT 1 FROM {{ guard_table }}) THEN
+{% if overlap_lock_sql %}
+            {{ overlap_lock_sql }}
+{% endif %}
+{% if stage_sql %}
+            /* __MV_STAGE_START__ */
+            {{ stage_sql }}
+            /* __MV_STAGE_END__ */
+{% endif %}
+        END IF;
+        IF __mv_nd = 0 THEN
+            IF __mv_tr <> 0 THEN
+                {{ trunc_refresh_sql }}
+            ELSE
+                {{ overlap_close_sql }}
+            END IF;
+        END IF;
+        RETURN NULL;
+    END IF;
+    /* __MV_BRACKET_END__ */
+    IF NOT EXISTS (SELECT 1 FROM {{ guard_table }}) THEN
+        RETURN NULL;
+    END IF;
+    {{ body_sql }}
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
+    "pg_bracketed_truncate_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+RETURNS TRIGGER AS $$
+DECLARE
+    __mv_guc pg_catalog.text := 'matview.s3_' || {{ lock_reg }}::pg_catalog.regclass::pg_catalog.oid::pg_catalog.text;
+    __mv_raw pg_catalog.text := COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0');
+    __mv_d INT := pg_catalog.split_part(__mv_raw, ':', 1)::int;
+    __mv_m BIGINT := pg_catalog.split_part(__mv_raw, ':', 2)::bigint;
+    __mv_bseq INT := pg_catalog.split_part(__mv_raw, ':', 3)::int;
+    __mv_nd INT := GREATEST(__mv_d - 1, 0);
+BEGIN
+    IF __mv_nd = 0 THEN
+        PERFORM pg_catalog.set_config(__mv_guc, '0:0:' || __mv_bseq::pg_catalog.text || ':0', true);
+        {{ trunc_refresh_sql }}
+    ELSE
+        PERFORM pg_catalog.set_config(__mv_guc, __mv_nd::pg_catalog.text || ':' || __mv_m::pg_catalog.text || ':' || __mv_bseq::pg_catalog.text || ':1', true);
+{% if overlap_lock_sql %}
+        {{ overlap_lock_sql }}
+{% endif %}
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
+    "pg_reconcile_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
+RETURNS VOID AS $$
+DECLARE
+    __mv_guc pg_catalog.text := 'matview.s3_' || {{ lock_reg }}::pg_catalog.regclass::pg_catalog.oid::pg_catalog.text;
+    __mv_bseq INT := pg_catalog.split_part(COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0'), ':', 3)::int;
+BEGIN
+    IF pg_catalog.txid_current_if_assigned() IS NULL THEN
+        RETURN;
+    END IF;
+    IF NOT ({{ any_staged_cond }}) THEN
+        RETURN;
+    END IF;
+    {{ reconcile_body_sql }}
+    {{ cleanup_sql }}
+END;
+$$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
     "pg_statement_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
 RETURNS TRIGGER AS $$
 BEGIN

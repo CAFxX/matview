@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -11,7 +12,13 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from .._host import MixinHost
-from ..dialects.pg_statement import SIGN, PgAggregateSpec, PgDeltaSource
+from ..dialects.pg_statement import (
+    EVENTS as PG_EVENTS,
+    SIGN,
+    PgAggregateSpec,
+    PgDeltaSource,
+    PgStatementBracket,
+)
 from ..engines import (
     AggFunc,
     Dialect,
@@ -753,8 +760,211 @@ class Tier1JoinMixin(MixinHost):
         trigger_ddls: List[str] = []
         trig_names: List[str] = []
         fn_names: List[str] = []
+        is_pg = self.dialect == Dialect.POSTGRES
+        aux_table_ddls: List[str] = self._pg_view_lock_ddls() if is_pg else []
+        aux_table_names: List[str] = [self._pg_view_lock_table()] if is_pg else []
 
-        for j in self.view.joins:
+        # PostgreSQL Stage 3: multi-source overlap bracket + inclusion-exclusion
+        # reconciliation so writable CTEs, FK cascades, and user triggers modifying
+        # several sources of an algebraic join in one statement remain exact.
+        pg_brackets_by_idx: Dict[int, PgStatementBracket] = {}
+        if is_pg and len(self.view.joins) >= 2:
+            pg_view_lock = self._pg_view_lock_stmt()
+            pg_lock_tbl = self._pg_view_lock_table()
+            pg_full_refresh_sql = "\n".join(
+                [pg_view_lock, f"DELETE FROM {mv_table};", initial_populate_sql]
+            )
+            if len(self.view.joins) <= 4:
+                # Determine which columns of each source are referenced by the join view.
+                needed_by_alias: Dict[str, List[str]] = {j.alias.lower(): [] for j in self.view.joins}
+                seen_col_by_alias: Dict[str, Set[str]] = {j.alias.lower(): set() for j in self.view.joins}
+                fallback_all_cols = False
+                exprs_to_scan: List[str] = []
+                for jj in self.view.joins:
+                    if jj.on_condition:
+                        exprs_to_scan.append(self._qualify_join_expr(jj.on_condition))
+                if qual_where:
+                    exprs_to_scan.append(qual_where)
+                exprs_to_scan.extend(qual_grp_exprs)
+                for it in work_items:
+                    if it.is_aggregate:
+                        exprs_to_scan.append(
+                            self._qualify_join_expr(self._effective_agg_value_expr(it, record_prefix=None))
+                        )
+                    else:
+                        exprs_to_scan.append(self._qualify_join_expr(it.raw_expr))
+                if self.view.having_clause:
+                    exprs_to_scan.append(self._qualify_join_expr(self.view.having_clause))
+                for ex in exprs_to_scan:
+                    try:
+                        toks = _tokenize_sql(ex, read=_sqlglot_dialect(self.dialect))
+                    except Exception:
+                        fallback_all_cols = True
+                        break
+                    ti = 0
+                    tn = len(toks)
+                    while ti < tn:
+                        if (
+                            _is_word_or_ident_token(toks[ti])
+                            and ti + 2 < tn
+                            and toks[ti + 1].token_type == SQLGlotTokenType.DOT
+                            and _is_word_or_ident_token(toks[ti + 2])
+                        ):
+                            al_low = toks[ti].text.lower()
+                            col_txt = toks[ti + 2].text
+                            if al_low in seen_col_by_alias:
+                                if col_txt.lower() not in seen_col_by_alias[al_low]:
+                                    seen_col_by_alias[al_low].add(col_txt.lower())
+                                    needed_by_alias[al_low].append(col_txt)
+                                ti += 3
+                                continue
+                        ti += 1
+
+                stg_table_by_idx: Dict[int, str] = {}
+                staged_cols_by_idx: Dict[int, List[str]] = {}
+                for idx, jj in enumerate(self.view.joins):
+                    ts = self._schemas_lower.get(jj.table_name.lower())
+                    if ts is None:
+                        cols_for_stg: List[str] = []
+                    elif fallback_all_cols:
+                        cols_for_stg = list(ts.columns.keys())
+                    else:
+                        cols_by_low = {c.lower(): c for c in ts.columns}
+                        cols_for_stg = [
+                            cols_by_low[c.lower()]
+                            for c in needed_by_alias[jj.alias.lower()]
+                            if c.lower() in cols_by_low
+                        ]
+                    stg_tbl, stg_ddl, stg_idx, stg_idx_ddl = self._pg_join_stage_table_ddls(
+                        jj.table_name, cols_for_stg
+                    )
+                    stg_table_by_idx[idx] = stg_tbl
+                    staged_cols_by_idx[idx] = cols_for_stg
+                    aux_table_ddls.append(stg_ddl)
+                    aux_table_names.append(stg_tbl)
+                    index_ddls.append(stg_idx_ddl)
+                    index_names.append(stg_idx)
+
+                # Build all 2^m - 1 non-empty inclusion-exclusion delta sources:
+                # Δ(R_1 ⋈ ... ⋈ R_m) = Σ_{∅ ≠ T ⊆ {1..m}} (-1)^(|T|-1) (∏_{i∈T} ΔR_i) ⋈ (∏_{i∉T} R_i)
+                ie_sources: List[PgDeltaSource] = []
+                n_joins = len(self.view.joins)
+                for subset_size in range(1, n_joins + 1):
+                    parity = 1 if (subset_size % 2 == 1) else -1
+                    for subset in itertools.combinations(range(n_joins), subset_size):
+                        subset_set = set(subset)
+                        sign_factors = [f"{self._q(self.view.joins[i].alias)}.{SIGN}" for i in subset]
+                        sign_expr = (
+                            " * ".join(sign_factors)
+                            if parity == 1
+                            else f"-({' * '.join(sign_factors)})"
+                        )
+
+                        def _make_ie_from(sub_s: Set[int]) -> Any:
+                            def _from(_signed: str) -> str:
+                                parts: List[str] = []
+                                for j_idx, jj in enumerate(self.view.joins):
+                                    if j_idx in sub_s:
+                                        st = stg_table_by_idx[j_idx]
+                                        tbl_sql = (
+                                            f"(SELECT * FROM {st} "
+                                            f"WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_bseq) "
+                                            f"AS {self._q(jj.alias)}"
+                                        )
+                                    else:
+                                        tbl_sql = f"{self._q(jj.table_name)} AS {self._q(jj.alias)}"
+                                    if j_idx == 0:
+                                        parts.append(tbl_sql)
+                                    else:
+                                        on_sql = (
+                                            f" ON {self._qualify_join_expr(jj.on_condition)}"
+                                            if jj.on_condition
+                                            else ""
+                                        )
+                                        parts.append(f"{jj.join_type} {tbl_sql}{on_sql}")
+                                return "\n        ".join(parts)
+
+                            return _from
+
+                        ie_sources.append(
+                            PgDeltaSource(
+                                from_sql=_make_ie_from(subset_set),
+                                sign=sign_expr,
+                                where=qual_where,
+                                keys=qual_grp_exprs,
+                                values={
+                                    _expr_key(it): self._qualify_join_expr(
+                                        self._effective_agg_value_expr(it, record_prefix=None)
+                                    )
+                                    for it in work_items
+                                    if it.is_aggregate
+                                },
+                                extras={
+                                    it.alias.lower(): self._qualify_join_expr(it.raw_expr)
+                                    for it in work_items
+                                    if not it.is_aggregate and it.alias.lower() not in pg_group_aliases
+                                },
+                            )
+                        )
+
+                reconcile_body_sql = self._pg_aggregate_body(
+                    pg_spec,
+                    ie_sources,
+                    "UPDATE",
+                    pre_stmts=[pg_view_lock],
+                    force_recompute_extremes=True,
+                )
+                reconcile_fn = self._pg_reconcile_fn_name()
+                all_stg_tables = [stg_table_by_idx[i] for i in range(n_joins)]
+                reconcile_ddl = self._pg_reconcile_fn_ddl(
+                    reconcile_fn, pg_lock_tbl, all_stg_tables, reconcile_body_sql
+                )
+                trigger_ddls.append(reconcile_ddl)
+                fn_names.append(reconcile_fn)
+
+                trunc_cleanup_sql = "\n".join(
+                    f"DELETE FROM {st} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_bseq;"
+                    for st in all_stg_tables
+                )
+                for idx, jj in enumerate(self.view.joins):
+                    st = stg_table_by_idx[idx]
+                    q_cols = [self._q(c) for c in staged_cols_by_idx[idx]]
+                    ins_cols = ["__mv_tx", "__mv_seq", SIGN, *q_cols]
+                    sel_cols = [
+                        "pg_catalog.txid_current()",
+                        "__mv_bseq",
+                        f"__mv_src.{SIGN}",
+                        *[f"__mv_src.{c}" for c in q_cols],
+                    ]
+                    stage_sqls = {
+                        ev: (
+                            f"INSERT INTO {st} ({', '.join(ins_cols)})\n"
+                            f"            SELECT {', '.join(sel_cols)}\n"
+                            f"            FROM (\n"
+                            f"            {self._pg_signed_rows_sql(ev, jj.table_name)}\n"
+                            f"            ) AS __mv_src;"
+                        )
+                        for ev in PG_EVENTS
+                    }
+                    pg_brackets_by_idx[idx] = PgStatementBracket(
+                        lock_table=pg_lock_tbl,
+                        source_bit=1 << idx,
+                        reconcile_fn=reconcile_fn,
+                        stage_sqls=stage_sqls,
+                        trunc_cleanup_sql=trunc_cleanup_sql,
+                        overlap_lock_sql=pg_view_lock,
+                    )
+            else:
+                for idx in range(len(self.view.joins)):
+                    src_bit = (1 << idx) if idx < 60 else ((1 << 60) | (1 << 61))
+                    pg_brackets_by_idx[idx] = PgStatementBracket(
+                        lock_table=pg_lock_tbl,
+                        source_bit=src_bit,
+                        overlap_refresh_sql=pg_full_refresh_sql,
+                        overlap_lock_sql=pg_view_lock,
+                    )
+
+        for j_idx, j in enumerate(self.view.joins):
             base_t = j.table_name
             j_alias = j.alias
             from_new = _build_join_from_clause(replace_alias=j_alias, rec_prefix="NEW")
@@ -887,20 +1097,20 @@ class Tier1JoinMixin(MixinHost):
                 pg_ai_body=pg_ai_body,
                 pg_ad_body=pg_ad_body,
                 pg_au_body=pg_au_body,
+                pg_bracket=pg_brackets_by_idx.get(j_idx),
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)
             fn_names.extend(f_ns)
 
-        is_pg = self.dialect == Dialect.POSTGRES
         return MaterializedViewPlan(
             dialect=self.dialect,
             strategy=self.strategy,
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=self._pg_view_lock_ddls() if is_pg else [],
-            auxiliary_table_names=[self._pg_view_lock_table()] if is_pg else [],
+            auxiliary_table_ddls=aux_table_ddls,
+            auxiliary_table_names=aux_table_names,
             index_ddls=index_ddls,
             initial_populate_sqls=[initial_populate_sql],
             trigger_ddls=trigger_ddls,

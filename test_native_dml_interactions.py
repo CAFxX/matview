@@ -738,10 +738,9 @@ def _self_join_dml(ctx: Ctx) -> None:
 
 @cell("one_statement_both_join_sources", AREA_A,
       "One statement modifying both sources of a join view (multi-table UPDATE/DELETE; PostgreSQL writable CTE)",
-      "PostgreSQL: the join aggregate counts the delta-delta term wrongly (statement triggers of the two "
-      "tables each see the other table's final state)",
-      todo="Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View",
-      postgres=WRONG, mysql=EXACT, mariadb=EXACT)
+      "PostgreSQL: BEFORE/AFTER statement bracket detects multi-source overlap and reconciles once via "
+      "inclusion-exclusion over staged deltas (Stage 3)",
+      postgres=EXACT, mysql=EXACT, mariadb=EXACT)
 def _both_join_sources(ctx: Ctx) -> None:
     env = ctx.env
     if ctx.family == "postgres":
@@ -1088,11 +1087,11 @@ def _other_source_rows() -> str:
 
 @cell("user_trigger_writes_other_source_first", AREA_B,
       "User trigger on one join source that writes the other source, firing BEFORE the maintenance trigger",
-      "PostgreSQL row trigger (row triggers fire before statement triggers); SQLite trigger created after "
-      "registration (SQLite fires the newest trigger first); MySQL/MariaDB PRECEDES. The join aggregate counts "
-      "the new pair twice where it is maintained algebraically",
+      "PostgreSQL: row/statement trigger modifying the other join source runs inside the Stage 3 statement bracket "
+      "and reconciles via inclusion-exclusion; SQLite (newest trigger first) and MySQL/MariaDB (PRECEDES) still "
+      "count the new pair twice where maintained algebraically",
       todo=TRIGGER_ORDER_TODO,
-      sqlite=WRONG, postgres=WRONG, mysql=WRONG, mariadb=WRONG)
+      sqlite=WRONG, postgres=EXACT, mysql=WRONG, mariadb=WRONG)
 def _other_source_first(ctx: Ctx) -> None:
     env = ctx.env
     if ctx.family == "postgres":
@@ -1321,10 +1320,10 @@ _FK_JOIN_SCHEMA = {
 
 @cell("fk_action_into_both_join_sources", AREA_B,
       "An FK action (ON UPDATE CASCADE / ON DELETE SET NULL of the join key) modifying both sources of a join view",
-      "PostgreSQL: the cascaded change runs as a separate statement whose triggers see the other source's final "
-      "state; SQLite runs the cascade before the parent row's maintenance trigger; MySQL/MariaDB refuse as in "
-      "fk_referential_actions",
-      todo=TRIGGER_ORDER_TODO, sqlite=WRONG, postgres=WRONG)
+      "PostgreSQL: Stage 3 statement bracket stages both parent and cascaded child deltas and reconciles once "
+      "via inclusion-exclusion; SQLite runs the cascade before the parent row's maintenance trigger; MySQL/MariaDB "
+      "refuse as in fk_referential_actions",
+      todo=TRIGGER_ORDER_TODO, sqlite=WRONG, postgres=EXACT)
 def _fk_join(ctx: Ctx) -> None:
     rows = [r for r in _base_rows() if r[1] is not None]
     env = ctx.fresh(_FK_JOIN_SCHEMA, [V_J, V_PJ, V_AGG],

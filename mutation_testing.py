@@ -222,6 +222,16 @@ MUTANTS = (
             "test_backfill_unreferenced_rowid_update_on_text_pk_table"
         ),
     ),
+    Mutant(
+        name="pg-stage3-join-omits-inclusion-exclusion-correction",
+        source_path="matview/maintenance/join.py",
+        original="                for subset_size in range(1, n_joins + 1):",
+        replacement="                for subset_size in range(1, 2):",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_stage3_multi_source_inclusion_exclusion_codegen"
+        ),
+    ),
 )
 
 

@@ -152,6 +152,29 @@ class PgAggregateSpec:
     native_recompute: Callable[[SelectItem], bool]
 
 
+@dataclass(frozen=True)
+class PgStatementBracket:
+    """Multi-source statement-overlap bracket for PostgreSQL join views (Stage 3).
+
+    Pairs one ``BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE`` statement trigger
+    with the ``AFTER`` statement triggers on every source table of a multi-source
+    view. Single-source statements observe a single source bit in the transaction-
+    local bracket GUC and run the unchanged fast path with zero staging overhead.
+    When one query, writable CTE, FK cascade, or user trigger mutates two or more
+    sources inside one open bracket, intermediate firings stage their signed
+    deltas (or defer) and the closing trigger reconciles once against the final
+    state of all sources.
+    """
+
+    lock_table: str
+    source_bit: int
+    reconcile_fn: Optional[str] = None
+    stage_sqls: Mapping[str, str] = field(default_factory=dict)
+    overlap_refresh_sql: str = ""
+    trunc_cleanup_sql: str = ""
+    overlap_lock_sql: str = ""
+
+
 _FOLDED_AGGS = (
     AggFunc.COUNT_STAR,
     AggFunc.COUNT_COL,
@@ -178,6 +201,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         base_t: str,
         bodies: Mapping[str, str],
         trunc_body: str,
+        bracket: Optional[PgStatementBracket] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         """Functions and statement triggers for one (view, source table) pair.
 
@@ -211,19 +235,70 @@ class PgStatementMaintenanceMixin(MixinHost):
         ddls: List[str] = []
         trig_names: List[str] = []
         fn_names: List[str] = []
-        # (trigger name, event clause, referencing clause or None, function)
-        installs: List[Tuple[str, str, Optional[str], str]] = []
+        # (trigger name, timing, event clause, referencing clause or None, function)
+        installs: List[Tuple[str, str, str, Optional[str], str]] = []
+
+        lock_reg: Optional[str] = None
+        trunc_refresh_sql = trunc_body.strip()
+        overlap_close_sql = ""
+        if bracket is not None:
+            lock_reg = "'" + bracket.lock_table.replace("'", "''") + "'"
+            if bracket.trunc_cleanup_sql.strip():
+                trunc_refresh_sql = f"{bracket.trunc_cleanup_sql.strip()}\n        {trunc_body.strip()}"
+            overlap_close_sql = (
+                f"PERFORM {bracket.reconcile_fn}();"
+                if bracket.reconcile_fn
+                else (bracket.overlap_refresh_sql.strip() or trunc_body.strip())
+            )
+            fn_before = self._bounded_ident(f"{p}fn_sync_", stem, "_bs")
+            trg_before = self._bounded_ident(trg_prefix, stem, "_bs")
+            ddls.append(
+                render_procedural_sql(
+                    "pg_before_bracket_function",
+                    fn_name=fn_before,
+                    lock_reg=lock_reg,
+                    src_bit=bracket.source_bit,
+                )
+            )
+            ddls.append(
+                render_procedural_sql(
+                    "pg_before_bracket_trigger",
+                    trg_name=trg_before,
+                    q_base_t=q_base_t,
+                    fn_name=fn_before,
+                )
+            )
+            installs.append((trg_before, "BEFORE", "INSERT OR UPDATE OR DELETE OR TRUNCATE", None, fn_before))
+            trig_names.append(trg_before)
+            fn_names.append(fn_before)
+
         for event in EVENTS:
             fn = self._bounded_ident(f"{p}fn_sync_", stem, suffix[event])
             trg = self._bounded_ident(trg_prefix, stem, suffix[event])
-            ddls.append(
-                render_procedural_sql(
-                    "pg_statement_function",
-                    fn_name=fn,
-                    guard_table=guard_table[event],
-                    body_sql=bodies[event].strip(),
+            if bracket is not None:
+                assert lock_reg is not None
+                ddls.append(
+                    render_procedural_sql(
+                        "pg_bracketed_statement_function",
+                        fn_name=fn,
+                        lock_reg=lock_reg,
+                        guard_table=guard_table[event],
+                        overlap_lock_sql=bracket.overlap_lock_sql.strip(),
+                        stage_sql=bracket.stage_sqls.get(event, "").strip(),
+                        trunc_refresh_sql=trunc_refresh_sql,
+                        overlap_close_sql=overlap_close_sql,
+                        body_sql=bodies[event].strip(),
+                    )
                 )
-            )
+            else:
+                ddls.append(
+                    render_procedural_sql(
+                        "pg_statement_function",
+                        fn_name=fn,
+                        guard_table=guard_table[event],
+                        body_sql=bodies[event].strip(),
+                    )
+                )
             ddls.append(
                 render_procedural_sql(
                     "pg_statement_trigger",
@@ -234,15 +309,27 @@ class PgStatementMaintenanceMixin(MixinHost):
                     fn_name=fn,
                 )
             )
-            installs.append((trg, event, referencing[event], fn))
+            installs.append((trg, "AFTER", event, referencing[event], fn))
             trig_names.append(trg)
             fn_names.append(fn)
 
         fn_trunc = self._bounded_ident(f"{p}fn_sync_", stem, "_trunc")
         trg_trunc = self._bounded_ident(trg_prefix, stem, "_trunc")
-        ddls.append(render_procedural_sql("pg_truncate_function", fn_name=fn_trunc, trunc_block=trunc_body.strip()))
+        if bracket is not None:
+            assert lock_reg is not None
+            ddls.append(
+                render_procedural_sql(
+                    "pg_bracketed_truncate_function",
+                    fn_name=fn_trunc,
+                    lock_reg=lock_reg,
+                    overlap_lock_sql=bracket.overlap_lock_sql.strip(),
+                    trunc_refresh_sql=trunc_refresh_sql,
+                )
+            )
+        else:
+            ddls.append(render_procedural_sql("pg_truncate_function", fn_name=fn_trunc, trunc_block=trunc_body.strip()))
         ddls.append(render_procedural_sql("pg_truncate_trigger", trg_name=trg_trunc, q_base_t=q_base_t, fn_name=fn_trunc))
-        installs.append((trg_trunc, "TRUNCATE", None, fn_trunc))
+        installs.append((trg_trunc, "AFTER", "TRUNCATE", None, fn_trunc))
         trig_names.append(trg_trunc)
         fn_names.append(fn_trunc)
 
@@ -250,16 +337,16 @@ class PgStatementMaintenanceMixin(MixinHost):
         return ddls, trig_names, fn_names
 
     def _pg_partition_install_block(
-        self, base_t: str, installs: Sequence[Tuple[str, str, Optional[str], str]]
+        self, base_t: str, installs: Sequence[Tuple[str, str, str, Optional[str], str]]
     ) -> str:
         """``DO`` block: refuse inheritance shapes statement triggers cannot see,
         then create every trigger on each partition (all levels) of ``base_t``."""
         reg = "'" + self._q(base_t).replace("'", "''") + "'"
         creates: List[str] = []
-        for trg, event, referencing, fn in installs:
+        for trg, timing, event, referencing, fn in installs:
             ref_sql = f" REFERENCING {referencing}" if referencing else ""
             stmt = (
-                f"CREATE TRIGGER {trg} AFTER {event} ON %s{ref_sql} "
+                f"CREATE TRIGGER {trg} {timing} {event} ON %s{ref_sql} "
                 f"FOR EACH STATEMENT EXECUTE FUNCTION {fn}()"
             )
             creates.append(f"        EXECUTE format('{stmt}', __mv_child);")
@@ -268,6 +355,88 @@ class PgStatementMaintenanceMixin(MixinHost):
             reg=reg,
             table_label=base_t.replace("'", "''"),
             creates="\n".join(creates),
+        )
+
+    def _pg_join_stage_table(self, base_t: str) -> str:
+        """Per-(view, source) staging table name for Stage 3 multi-source overlap deltas."""
+        p = self.object_prefix if self.object_prefix else "__matview_"
+        return self._bounded_ident(f"{p}stg_", f"{self.logical_view_name}__{base_t}")
+
+    def _pg_join_stage_table_ddls(
+        self, base_t: str, col_names: Sequence[str]
+    ) -> Tuple[str, str, str, str]:
+        """Return ``(stage_table, create_table_ddl, index_name, create_index_ddl)``."""
+        p = self.object_prefix if self.object_prefix else "__matview_"
+        stg_tbl = self._pg_join_stage_table(base_t)
+        idx_name = self._bounded_ident(f"{p}idx_stg_", f"{self.logical_view_name}__{base_t}")
+        ts = self._schemas_lower.get(base_t.lower())
+        col_defs = [
+            "__mv_tx BIGINT NOT NULL",
+            "__mv_seq INTEGER NOT NULL",
+            f"{SIGN} SMALLINT NOT NULL",
+        ]
+        if ts is not None:
+            cols_by_lower = {c.lower(): c_def for c, c_def in ts.columns.items()}
+            for cn in col_names:
+                c_def = cols_by_lower.get(cn.lower())
+                if c_def is None:
+                    continue
+                raw_dt = (c_def.data_type or "TEXT").strip()
+                m_coll = re.search(
+                    r"(\s+COLLATE\s+(?:(?:\"[^\"]+\"|\S+)\.)?(?:\"[^\"]+\"|\S+))\s*$",
+                    raw_dt,
+                    re.IGNORECASE,
+                )
+                if m_coll:
+                    base_dt = raw_dt[: m_coll.start()].strip()
+                    coll_tail = m_coll.group(1)
+                else:
+                    base_dt = raw_dt
+                    coll_tail = ""
+                dt_up = base_dt.upper()
+                if dt_up in ("CHARACTER VARYING", "VARCHAR"):
+                    ddl_dt = f"TEXT{coll_tail}"
+                elif dt_up in ("CHAR", "CHARACTER"):
+                    # Unbounded CHAR means CHAR(1) in PostgreSQL DDL; BPCHAR keeps full length.
+                    ddl_dt = f"BPCHAR{coll_tail}"
+                else:
+                    ddl_dt = f"{self._normalize_dialect_type(base_dt)}{coll_tail}"
+                col_defs.append(f"{self._q(c_def.name)} {ddl_dt}")
+        create_tbl = (
+            f"CREATE TABLE {stg_tbl} (\n    "
+            + ",\n    ".join(col_defs)
+            + "\n);"
+        )
+        create_idx = f"CREATE INDEX {idx_name} ON {stg_tbl} (__mv_tx, __mv_seq);"
+        return stg_tbl, create_tbl, idx_name, create_idx
+
+    def _pg_reconcile_fn_name(self) -> str:
+        p = self.object_prefix if self.object_prefix else "__matview_"
+        return self._bounded_ident(f"{p}fn_s3_", self.logical_view_name, "_reconcile")
+
+    def _pg_reconcile_fn_ddl(
+        self,
+        fn_name: str,
+        lock_table: str,
+        stage_tables: Sequence[str],
+        reconcile_body_sql: str,
+    ) -> str:
+        lock_reg = "'" + lock_table.replace("'", "''") + "'"
+        any_staged = " OR ".join(
+            f"EXISTS (SELECT 1 FROM {st} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_bseq)"
+            for st in stage_tables
+        )
+        cleanup = "\n    ".join(
+            f"DELETE FROM {st} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_bseq;"
+            for st in stage_tables
+        )
+        return render_procedural_sql(
+            "pg_reconcile_function",
+            fn_name=fn_name,
+            lock_reg=lock_reg,
+            any_staged_cond=any_staged,
+            reconcile_body_sql=reconcile_body_sql.strip(),
+            cleanup_sql=cleanup,
         )
 
     # ------------------------------------------------------------------
@@ -578,10 +747,18 @@ class PgStatementMaintenanceMixin(MixinHost):
         sources: Sequence[PgDeltaSource],
         pre_stmts: Sequence[str] = (),
         base_t: Optional[str] = None,
+        force_recompute_extremes: bool = False,
     ) -> Dict[str, str]:
         """Set-based bodies for a backing table with one row per group."""
         return {
-            event: self._pg_aggregate_body(spec, sources, event, pre_stmts=pre_stmts, base_t=base_t)
+            event: self._pg_aggregate_body(
+                spec,
+                sources,
+                event,
+                pre_stmts=pre_stmts,
+                base_t=base_t,
+                force_recompute_extremes=force_recompute_extremes,
+            )
             for event in EVENTS
         }
 
@@ -592,6 +769,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         event: str,
         pre_stmts: Sequence[str] = (),
         base_t: Optional[str] = None,
+        force_recompute_extremes: bool = False,
     ) -> str:
         q = self._q
         mv = spec.mv_table
@@ -718,7 +896,12 @@ class PgStatementMaintenanceMixin(MixinHost):
                 distinct_items.append(it)
                 ins = {AggFunc.COUNT_COL: "0", AggFunc.TOTAL: "0.0"}.get(fn, "NULL") if fn else "NULL"
                 add(it.alias, ins, f"{mv}.{col}")
-            elif it.is_distinct or spec.native_recompute(it) or fn not in _FOLDED_AGGS:
+            elif (
+                it.is_distinct
+                or spec.native_recompute(it)
+                or fn not in _FOLDED_AGGS
+                or (force_recompute_extremes and fn in (AggFunc.MIN, AggFunc.MAX, AggFunc.BIT_AND, AggFunc.BIT_OR))
+            ):
                 always_recompute.append(it)
                 # Placeholder until the recompute statement; TOTAL is NOT NULL.
                 add(it.alias, "0.0" if fn == AggFunc.TOTAL else "NULL", f"{mv}.{col}")
@@ -904,12 +1087,53 @@ class PgStatementMaintenanceMixin(MixinHost):
                     f"    WHERE {self._pg_key_match(mv_pk_refs, f'SELECT {pk_select} FROM {proj} WHERE ' + ' OR '.join(touched))};"
                 )
 
-        if grp_exprs and has_old:
+        if grp_exprs and (has_old or force_recompute_extremes):
+            del_filter = "" if force_recompute_extremes else f" WHERE {s} < 0"
             stmts.append(
                 f"DELETE FROM {mv}\n"
-                f"    WHERE {self._pg_key_match(mv_pk_refs, f'SELECT {pk_select} FROM {proj} WHERE {s} < 0')}\n"
+                f"    WHERE {self._pg_key_match(mv_pk_refs, f'SELECT {pk_select} FROM {proj}{del_filter}')}\n"
                 f"    AND {mv}.{q_rc} <= 0;"
             )
+
+        if force_recompute_extremes:
+            # In multi-source inclusion-exclusion, a newly inserted group whose
+            # non-NULL values net out to count 0 (e.g., an orphan row whose value
+            # changed to NULL in the same statement its parent was inserted) has
+            # COUNT(val) > 0 in the projection, so INSERT's sum_delta evaluates
+            # to 0 instead of NULL. Reset any surviving SUM / hidden-sum column
+            # whose non-NULL count is 0 back to NULL.
+            zero_sum_pairs: List[Tuple[str, str]] = []
+            seen_zsum: set = set()
+            for it in items:
+                if (
+                    it.is_aggregate
+                    and it.agg_func == AggFunc.SUM
+                    and not it.is_distinct
+                    and not spec.native_recompute(it)
+                ):
+                    nn = spec.nonnull_map.get(spec.value_key(it))
+                    if nn is not None and q(it.alias) not in seen_zsum:
+                        seen_zsum.add(q(it.alias))
+                        zero_sum_pairs.append((q(it.alias), q(nn)))
+            for vk, sm in spec.sum_map.items():
+                if vk not in spec.distinct_aux and q(sm) not in seen_zsum:
+                    nn = spec.nonnull_map.get(vk)
+                    if nn is not None:
+                        seen_zsum.add(q(sm))
+                        zero_sum_pairs.append((q(sm), q(nn)))
+            if zero_sum_pairs:
+                z_sets = [
+                    f"{sc} = CASE WHEN {mv}.{nc} = 0 THEN NULL ELSE {mv}.{sc} END"
+                    for sc, nc in zero_sum_pairs
+                ]
+                z_cond = " OR ".join(
+                    f"({mv}.{nc} = 0 AND {mv}.{sc} IS NOT NULL)" for sc, nc in zero_sum_pairs
+                )
+                stmts.append(
+                    f"UPDATE {mv} SET\n        {sep.join(z_sets)}\n"
+                    f"    WHERE {self._pg_key_match(mv_pk_refs, f'SELECT {pk_select} FROM {proj}')}\n"
+                    f"    AND ({z_cond});"
+                )
 
         # Native recomputations, after the lock statement.
         rec_assigns: List[str] = []
