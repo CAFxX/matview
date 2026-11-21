@@ -93,6 +93,9 @@ class Cell:
     note: str
     since: Tuple[Tuple[str, Tuple[int, int]], ...]
     todo: str  # TODO.md item title (required for SILENTLY-WRONG)
+    # Products whose outcome was verified only outside CI (the PR-gate server
+    # lacks a setting the cell needs; the test skips there).
+    local_only: Tuple[str, ...] = ()
 
     def outcome(self, product: str) -> str:
         return dict(self.outcomes).get(product, NA)
@@ -109,13 +112,13 @@ AREA_C = "C. Transactions"
 
 
 def cell(cid: str, area: str, what: str, note: str = "", since: Optional[Dict[str, Tuple[int, int]]] = None,
-         todo: str = "", **outcomes: str) -> Callable[[Callable[["Ctx"], None]], Callable[["Ctx"], None]]:
+         todo: str = "", local_only: Tuple[str, ...] = (), **outcomes: str) -> Callable[[Callable[["Ctx"], None]], Callable[["Ctx"], None]]:
     for p, o in outcomes.items():
         assert p in PRODUCTS and o in OUTCOMES, (cid, p, o)
 
     def deco(fn: Callable[["Ctx"], None]) -> Callable[["Ctx"], None]:
         CELLS.append(Cell(cid, area, what, tuple(outcomes.items()), fn, note,
-                          tuple((since or {}).items()), todo))
+                          tuple((since or {}).items()), todo, tuple(local_only)))
         return fn
 
     return deco
@@ -1254,19 +1257,32 @@ def _generated_virtual(ctx: Ctx) -> None:
 
 
 @cell("pg_domains", AREA_B,
-      "Source columns of domain types: grouped by, aggregated, projected (incl. a domain CHECK violation)",
-      "fixed here: registration failed (backing column declared as type DOMAIN) and a domain group key was "
-      "refused by the canonical group-key function", postgres=EXACT)
+      "Source columns of domain types over BIGINT, VARCHAR(n), TEXT, TEXT with CHECK, TEXT COLLATE \"C\" and CHAR(n): "
+      "grouped by, "
+      "aggregated, projected (incl. domain CHECK violations)",
+      "registration used to fail (backing column declared as type DOMAIN; for a domain over TEXT or CHAR(n) "
+      "the reflected collation \"default\" and the lost CHAR length) and a domain group key was refused by the "
+      "canonical group-key function; a domain over an array type still fails (array backing types)",
+      postgres=EXACT)
 def _pg_domains(ctx: Ctx) -> None:
     env = ctx.fresh({"postgres": ["CREATE DOMAIN au_pos AS BIGINT CHECK (VALUE > 0)",
                                   "CREATE DOMAIN au_label AS VARCHAR(10)",
-                                  "CREATE TABLE dm (id INT PRIMARY KEY, g au_label, v au_pos)"]},
+                                  "CREATE DOMAIN au_txt AS TEXT",
+                                  "CREATE DOMAIN au_code AS TEXT CHECK (VALUE <> '')",
+                                  "CREATE DOMAIN au_ch3 AS CHAR(3)",
+                                  "CREATE DOMAIN au_cc AS TEXT COLLATE \"C\"",
+                                  "CREATE TABLE dm (id INT PRIMARY KEY, g au_label, v au_pos, t au_txt, k au_code, "
+                                  "c au_ch3, cc au_cc)"]},
                     [ViewDef("v_dm", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM dm GROUP BY g"),
-                     ViewDef("v_dmp", "SELECT id, g, v FROM dm WHERE v > 3")],
-                    ["INSERT INTO dm VALUES " + _values([(i, f"l{i % 3}", i) for i in range(1, 13)])])
-    env.execute("INSERT INTO dm VALUES (100, 'l9', 5), (101, NULL, 1)")
-    env.execute("UPDATE dm SET g = 'l1', v = v + 2 WHERE id % 2 = 0")
+                     ViewDef("v_dmp", "SELECT id, g, v, t FROM dm WHERE v > 3"),
+                     ViewDef("v_dmt", "SELECT t, k, cc, COUNT(*) AS n FROM dm GROUP BY t, k, cc"),
+                     ViewDef("v_dmc", "SELECT c, MAX(v) AS hi, COUNT(*) AS n FROM dm GROUP BY c")],
+                    ["INSERT INTO dm VALUES " + _values(
+                        [(i, f"l{i % 3}", i, f"t{i % 2}", f"k{i % 4}", f"c{i % 3}", "Ab"[i % 2]) for i in range(1, 13)])])
+    env.execute("INSERT INTO dm VALUES (100, 'l9', 5, 'tz', 'kz', 'abc', 'a'), (101, NULL, 1, NULL, NULL, NULL, NULL)")
+    env.execute("UPDATE dm SET g = 'l1', v = v + 2, t = 'tz', c = 'xy' WHERE id % 2 = 0")
     ctx.fails("UPDATE dm SET v = v - 7", env)
+    ctx.fails("UPDATE dm SET k = '' WHERE id = 3", env)
     ctx.commit_check("domains", env)
 
 
@@ -1442,11 +1458,11 @@ def _system_versioning(ctx: Ctx) -> None:
       "reported ok) and repair_view() rebuilds the views with enabled triggers",
       postgres=LIMITED)
 def _pg_disable(ctx: Ctx) -> None:
-    env = ctx.env
-    other = ctx.other_conn()
+    # Own small environment: the repair rebuilds every view it reports.
+    env = ctx.fresh(BASE_SCHEMA, [V_AGG, V_PR], _base_seed())
+    other = env.connect()
     env.execute("ALTER TABLE t DISABLE TRIGGER USER", other)
     other.commit()
-    ctx.cleanup("ALTER TABLE t ENABLE TRIGGER USER")
     env.execute("INSERT INTO t (id, g, v, w, u) VALUES (750, 1, 5, 1, NULL)")
     env.commit()
     drift = env.manager.check_schema_drift()
@@ -1455,10 +1471,10 @@ def _pg_disable(ctx: Ctx) -> None:
         assert drift == {vd.name: "triggers_disabled" for vd in env.views}, drift
         env.manager.repair_view()
         env.commit()
-        ctx.check("after repair_view()")
+        ctx.check("after repair_view()", env)
         return
     try:
-        ctx.check("writes with the maintenance triggers disabled")
+        ctx.check("writes with the maintenance triggers disabled", env)
     except ViewMismatch as exc:
         raise ViewMismatch(f"{exc}\n  check_schema_drift() = {drift}") from None
 
@@ -1491,53 +1507,73 @@ def _mysql_skip(ctx: Ctx) -> None:
     ctx.check("write with the session bypass flag")
 
 
-_X_SCHEMA = {
-    "postgres": ["CREATE TABLE x (id INT PRIMARY KEY, g INT, v BIGINT)"],
-    "mysql": ["CREATE TABLE x (id INT PRIMARY KEY, g INT, v BIGINT) ENGINE=InnoDB"],
-    "sqlite": ["CREATE TABLE x (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)"],
-}
-_X_VIEWS = [ViewDef("v_x", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM x GROUP BY g"),
-            ViewDef("v_xp", "SELECT id, v FROM x WHERE g = 1")]
-_X_SEED = ["INSERT INTO x (id, g, v) VALUES " + _values([(i, i % 3, i * 3 - 11) for i in range(1, 13)])]
+# The four out-of-band DDL cells share one environment (one source table and
+# one view each), so each cell pays no environment setup of its own.
+_DDL_TABLES = ("xa", "xd", "xr", "xc")
+_DDL_COLS = {"postgres": "id INT PRIMARY KEY, g INT, v BIGINT",
+             "mysql": "id INT PRIMARY KEY, g INT, v BIGINT",
+             "sqlite": "id INTEGER PRIMARY KEY, g INTEGER, v INTEGER"}
 
 
-def _drift_not_ok_then_repair(ctx: Ctx, env: Env, label: str) -> None:
-    """The documented recovery: the drift check reports every affected view
-    and repair_view() (on MySQL/MariaDB, which refuse a non-atomic rebuild:
-    drop_view() + register_view()) restores exactness."""
-    from matview import UnsafeReplacementError
+def _ddl_table_sql(family: str, table: str) -> str:
+    return f"CREATE TABLE {table} ({_DDL_COLS[family]})" + (" ENGINE=InnoDB" if family == "mysql" else "")
 
+
+def _ddl_view(table: str) -> ViewDef:
+    return ViewDef(f"v_{table}", f"SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {table} GROUP BY g")
+
+
+_DDL_ENVS: Dict[str, DEnv] = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _close_ddl_envs():
+    yield
+    while _DDL_ENVS:
+        _DDL_ENVS.popitem()[1].close()
+
+
+def _ddl_env(ctx: Ctx, table: str) -> DEnv:
+    env = _DDL_ENVS.get(ctx.target.id)
+    if env is None:
+        env = DEnv(ctx.target, [_ddl_view(t) for t in _DDL_TABLES],
+                   [_ddl_table_sql(ctx.family, t) for t in _DDL_TABLES],
+                   [f"INSERT INTO {t} (id, g, v) VALUES " + _values([(i, i % 3, i * 3 - 11) for i in range(1, 13)])
+                    for t in _DDL_TABLES])
+        _DDL_ENVS[ctx.target.id] = env
+    return env
+
+
+def _ddl_check(env: DEnv, table: str, label: str, select: Optional[str] = None) -> None:
+    vd = _ddl_view(table)
+    saved = env.views
+    env.views = [ViewDef(vd.name, select or vd.select)]
+    try:
+        env.check(label)
+    finally:
+        env.views = saved
+
+
+def _ddl_drift(env: DEnv, table: str) -> str:
     drift = env.manager.check_schema_drift()
     env.commit()
-    assert drift and all(s != "ok" for s in drift.values()), f"{label}: check_schema_drift() = {drift}"
-    if ctx.family == "mysql":
-        with pytest.raises(UnsafeReplacementError):
-            env.manager.repair_view()
-        env.rollback()
-        for vd in env.views:
-            env.manager.drop_view(vd.name)
-            env.register(vd)
-    else:
-        env.manager.repair_view()
-    env.commit()
-    ctx.check(f"{label} after repair", env)
+    return drift[_ddl_view(table).name]
 
 
 @cell("ddl_add_unused_column", AREA_B, "Out-of-band ALTER TABLE ADD COLUMN on a source (column unused by the view)",
       "maintenance continues exactly; check_schema_drift() reports drifted (the signature covers every column)",
       sqlite=EXACT, postgres=EXACT, mysql=EXACT, mariadb=EXACT)
 def _ddl_add(ctx: Ctx) -> None:
-    env = ctx.fresh(_X_SCHEMA, _X_VIEWS, _X_SEED)
+    env = _ddl_env(ctx, "xa")
     other = env.connect()
-    env.execute("ALTER TABLE x ADD COLUMN extra INT", other)
+    env.execute("ALTER TABLE xa ADD COLUMN extra INT", other)
     other.commit()
-    env.execute("INSERT INTO x (id, g, v, extra) VALUES (100, 1, 4, 9), (101, 2, 5, NULL)")
-    env.execute("UPDATE x SET v = v + 1, extra = 1 WHERE id % 2 = 0")
-    env.execute("DELETE FROM x WHERE id % 5 = 0")
-    ctx.commit_check("after ADD COLUMN", env)
-    drift = env.manager.check_schema_drift()
+    env.execute("INSERT INTO xa (id, g, v, extra) VALUES (100, 1, 4, 9), (101, 2, 5, NULL)")
+    env.execute("UPDATE xa SET v = v + 1, extra = 1 WHERE id % 2 = 0")
+    env.execute("DELETE FROM xa WHERE id % 5 = 0")
     env.commit()
-    assert set(drift.values()) == {"drifted"}, drift
+    _ddl_check(env, "xa", "after ADD COLUMN")
+    assert _ddl_drift(env, "xa") == "drifted"
 
 
 @cell("ddl_drop_used_column", AREA_B, "Out-of-band ALTER TABLE DROP COLUMN of a column the view uses",
@@ -1545,22 +1581,21 @@ def _ddl_add(ctx: Ctx) -> None:
       "INSERT/UPDATE of the source fails in the maintenance trigger and check_schema_drift() reports invalid",
       sqlite=REFUSED, postgres=REFUSED, mysql=REFUSED, mariadb=REFUSED)
 def _ddl_drop(ctx: Ctx) -> None:
-    env = ctx.fresh(_X_SCHEMA, _X_VIEWS, _X_SEED)
+    env = _ddl_env(ctx, "xd")
     other = env.connect()
     if ctx.family == "sqlite":
-        ctx.fails("ALTER TABLE x DROP COLUMN v", env, conn=other)
+        ctx.fails("ALTER TABLE xd DROP COLUMN v", env, conn=other)
         other.rollback()
-        env.execute("INSERT INTO x (id, g, v) VALUES (100, 1, 4)")
-        ctx.commit_check("after the refused DROP COLUMN", env)
+        env.execute("INSERT INTO xd (id, g, v) VALUES (100, 1, 4)")
+        env.commit()
+        _ddl_check(env, "xd", "after the refused DROP COLUMN")
         return
-    env.execute("ALTER TABLE x DROP COLUMN v", other)
+    env.execute("ALTER TABLE xd DROP COLUMN v", other)
     other.commit()
-    ctx.fails("INSERT INTO x (id, g) VALUES (100, 1)", env)
-    ctx.fails("UPDATE x SET g = 2 WHERE id = 1", env)
+    ctx.fails("INSERT INTO xd (id, g) VALUES (100, 1)", env)
+    ctx.fails("UPDATE xd SET g = 2 WHERE id = 1", env)
     env.rollback()
-    drift = env.manager.check_schema_drift()
-    env.commit()
-    assert set(drift.values()) == {"invalid"}, drift
+    assert _ddl_drift(env, "xd") == "invalid"
 
 
 @cell("ddl_rename_used_column", AREA_B, "Out-of-band ALTER TABLE RENAME COLUMN of a column the view uses",
@@ -1569,41 +1604,50 @@ def _ddl_drop(ctx: Ctx) -> None:
       "maintenance fails on every write, so writes fail closed",
       sqlite=LIMITED, postgres=REFUSED, mysql=REFUSED, mariadb=REFUSED)
 def _ddl_rename(ctx: Ctx) -> None:
-    env = ctx.fresh(_X_SCHEMA, _X_VIEWS, _X_SEED)
+    env = _ddl_env(ctx, "xr")
     other = env.connect()
-    env.execute("ALTER TABLE x RENAME COLUMN v TO v2", other)
+    env.execute("ALTER TABLE xr RENAME COLUMN v TO v2", other)
     other.commit()
     if ctx.family == "sqlite":
-        env.execute("INSERT INTO x (id, g, v2) VALUES (100, 1, 4), (101, 2, 5)")
-        env.execute("UPDATE x SET v2 = v2 + 1 WHERE id % 2 = 0")
+        env.execute("INSERT INTO xr (id, g, v2) VALUES (100, 1, 4), (101, 2, 5)")
+        env.execute("UPDATE xr SET v2 = v2 + 1 WHERE id % 2 = 0")
         env.commit()
-        renamed = [ViewDef(vd.name, vd.select.replace("v)", "v2)").replace(", v FROM", ", v2 AS v FROM")) for vd in _X_VIEWS]
-        env.views = renamed
-        ctx.check("maintenance on the renamed column", env)
-        drift = env.manager.check_schema_drift()
-        env.commit()
-        assert set(drift.values()) == {"invalid"}, drift
+        _ddl_check(env, "xr", "maintenance on the renamed column",
+                   select="SELECT g, SUM(v2) AS s, COUNT(*) AS c FROM xr GROUP BY g")
+        assert _ddl_drift(env, "xr") == "invalid"
         return
-    ctx.fails("INSERT INTO x (id, g, v2) VALUES (100, 1, 4)", env)
-    ctx.fails("UPDATE x SET v2 = v2 + 1 WHERE id = 1", env)
+    ctx.fails("INSERT INTO xr (id, g, v2) VALUES (100, 1, 4)", env)
+    ctx.fails("UPDATE xr SET v2 = v2 + 1 WHERE id = 1", env)
     env.rollback()
-    drift = env.manager.check_schema_drift()
-    env.commit()
-    assert drift and all(s != "ok" for s in drift.values()), drift
+    assert _ddl_drift(env, "xr") != "ok"
 
 
 @cell("ddl_drop_recreate_source", AREA_B, "Out-of-band DROP TABLE and re-CREATE of a source, then writes",
       "the new table has no maintenance triggers, so the view is stale; check_schema_drift() reports it and "
-      "repair_view() restores exactness",
+      "repair_view() (MySQL/MariaDB: drop_view() + register_view(), they refuse a non-atomic rebuild) restores "
+      "exactness",
       sqlite=LIMITED, postgres=LIMITED, mysql=LIMITED, mariadb=LIMITED)
 def _ddl_recreate(ctx: Ctx) -> None:
-    env = ctx.fresh(_X_SCHEMA, _X_VIEWS, _X_SEED)
+    from matview import UnsafeReplacementError
+
+    env = _ddl_env(ctx, "xc")
     other = env.connect()
-    env.execute("DROP TABLE x", other)
-    env.execute(_X_SCHEMA[ctx.family][0], other)
-    env.execute("INSERT INTO x (id, g, v) VALUES (1, 1, 1), (2, 1, 2), (50, 2, 3)", other)
+    env.execute("DROP TABLE xc", other)
+    env.execute(_ddl_table_sql(ctx.family, "xc"), other)
+    env.execute("INSERT INTO xc (id, g, v) VALUES (1, 1, 1), (2, 1, 2), (50, 2, 3)", other)
     other.commit()
-    _drift_not_ok_then_repair(ctx, env, "DROP + CREATE of the source")
+    assert _ddl_drift(env, "xc") != "ok"
+    vd = _ddl_view("xc")
+    if ctx.family == "mysql":
+        with pytest.raises(UnsafeReplacementError):
+            env.manager.repair_view(vd.name)
+        env.rollback()
+        env.manager.drop_view(vd.name)
+        env.register(vd)
+    else:
+        env.manager.repair_view(vd.name)
+    env.commit()
+    _ddl_check(env, "xc", "DROP + CREATE of the source after repair")
 
 
 # ---------------------------------------------------------------------------
@@ -1711,8 +1755,9 @@ def _autocommit(ctx: Ctx) -> None:
 
 @cell("two_phase_commit", AREA_C,
       "Two-phase commit: PREPARE TRANSACTION / COMMIT|ROLLBACK PREPARED; XA START ... XA COMMIT|ROLLBACK",
-      "PostgreSQL needs max_prepared_transactions > 0 (the CI service runs with the default 0, so it is skipped "
-      "there and was verified locally on 18)", sqlite=NA, postgres=EXACT, mysql=EXACT, mariadb=EXACT)
+      "PostgreSQL needs max_prepared_transactions > 0; the CI service runs with the default 0, so the cell is "
+      "skipped there (verified locally on 18)", local_only=("postgres",),
+      sqlite=NA, postgres=EXACT, mysql=EXACT, mariadb=EXACT)
 def _two_phase(ctx: Ctx) -> None:
     env = ctx.env
     w = ctx.other_conn()
@@ -1834,6 +1879,8 @@ def render_matrix() -> str:
             need = c.min_version(p)
             if need is not None and c.outcome(p) != NA:
                 o += f" ({need[0]}.{need[1]}+)" if p in ("sqlite", "mariadb") else f" ({need[0]}+)"
+            if p in c.local_only:
+                o += " (verified locally, not in CI)"
             outs.append(o)
         note = c.note.replace("|", "/")
         if c.todo:
