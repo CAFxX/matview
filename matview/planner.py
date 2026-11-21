@@ -2443,9 +2443,10 @@ class PlannerMixin(MixinHost):
 
     def _fallback_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
         """Announced fallbacks of this plan (see matview.diagnostics)."""
+        routed = self._exact_routing_diagnostics(strategy)
         having = self.view.having_clause
         if not having or strategy == MaintenanceStrategy.ALGEBRAIC_DELTA or not _has_subquery_aggregate(having, self.dialect):
-            return ()
+            return routed
         cost = (
             "a write to a table the subquery reads recomputes every group of the view; other writes "
             "recompute the touched groups."
@@ -2455,7 +2456,7 @@ class PlannerMixin(MixinHost):
                 "; concurrent writers to the subquery's table deadlock (error 1213) and roll back "
                 "(about 45% of writes with 4 concurrent writers, measured on MySQL 8.4 and MariaDB 10.11)."
             )
-        return (
+        return routed + (
             Diagnostic(
                 code=HAVING_SUBQUERY_AGGREGATE_FALLBACK,
                 severity=DiagnosticSeverity.INFO,

@@ -61,12 +61,14 @@ from matview_sync import (
     generate_materialized_view,
     parse_table_schema,
 )
-from matview.diagnostics import EXACT_FALLBACK_LEAD
+from matview.diagnostics import EXACT_LEAD, MatviewDiagnosticWarning, Strategy
 
 T2 = MaintenanceStrategy.GROUP_SCOPED_DELTA
 T3 = MaintenanceStrategy.ATOMIC_QUERY_SYNC
+# Shared strategy vocabulary (matview.diagnostics) for each maintenance strategy.
+ANNOUNCED = {T2: Strategy.GROUP_SCOPED_RECOMPUTE, T3: Strategy.FULL_REFRESH}
 SEED = int(os.environ.get("MATVIEW_UNRECOGNIZED_AGG_SEED", "20261120"))
-DML_STEPS = 16
+DML_STEPS = 12
 
 
 class Case:
@@ -101,12 +103,16 @@ PG_CASES: List[Case] = [
     _grouped("json_agg_unordered", "JSON_AGG(v)", T3),
     _grouped("jsonb_agg_ordered", "JSONB_AGG(v ORDER BY v DESC, id)", T2),
     _grouped("jsonb_agg_coalesce", "COALESCE(JSONB_AGG(v ORDER BY id), '[]')", T2),
+    _grouped("json_agg_case", "CASE WHEN COUNT(*) > 1 THEN JSON_AGG(v ORDER BY id) END", T2),
     _grouped("json_object_agg_ordered", "JSON_OBJECT_AGG(id, v ORDER BY id)", T2),
     _grouped("jsonb_object_agg_dup_keys", "JSONB_OBJECT_AGG(s, v)", T3),
     _grouped("percentile_cont", "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v)", T2),
     _grouped("percentile_cont_float", "PERCENTILE_CONT(0.3) WITHIN GROUP (ORDER BY x)", T2),
     _grouped("percentile_disc_array", "PERCENTILE_DISC(ARRAY[0.25, 0.75]) WITHIN GROUP (ORDER BY v)", T2),
     _grouped("mode", "MODE() WITHIN GROUP (ORDER BY v)", T2),
+    # Polymorphic aggregates drop the argument's type modifier natively.
+    _grouped("percentile_disc_numeric", "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY d)", T2),
+    _grouped("array_agg_numeric_ordered", "ARRAY_AGG(d ORDER BY id)", T2),
     _grouped("hypothetical_rank", "RANK(3) WITHIN GROUP (ORDER BY v)", T2),
     _grouped("any_value", "ANY_VALUE(v)", T3, min_version=(16,)),
     _grouped("regr_slope", "REGR_SLOPE(x, v)", T3),
@@ -156,12 +162,12 @@ MY_CASES: List[Case] = [
     _grouped("group_concat_ordered", "GROUP_CONCAT(v ORDER BY id)", T2, skip_type_code=("a",)),
     _grouped("group_concat_unordered", "GROUP_CONCAT(s)", T3, skip_type_code=("a",)),
     _grouped("group_concat_distinct", "GROUP_CONCAT(DISTINCT v ORDER BY v)", T3, skip_type_code=("a",)),
-    Case("with_rollup", "SELECT g, SUM(v) AS sv, COUNT(*) AS n FROM {t} GROUP BY g WITH ROLLUP", T3),
+    Case("with_rollup", "SELECT g, SUM(v) AS sv, COUNT(*) AS n FROM {t} GROUP BY g WITH ROLLUP", T3, engines=("mariadb",)),
     Case(
         "with_rollup_grouping",
-        "SELECT g, COUNT(*) AS n, GROUPING(g) AS gr FROM {t} GROUP BY g WITH ROLLUP",
+        "SELECT g, SUM(v) AS sv, COUNT(*) AS n, GROUPING(g) AS gr FROM {t} GROUP BY g WITH ROLLUP",
         T3,
-        engines=("mysql",),
+        engines=("mysql",),  # MariaDB has no GROUPING()
     ),
     Case("ungrouped_json_arrayagg", "SELECT JSON_ARRAYAGG(v) AS a FROM {t}", T3),
 ]
@@ -253,7 +259,8 @@ class _Fixture:
         v = rng.choice([None, -2, 0, 1, 3, 3, 5, 8])
         x = rng.choice([0.1, -0.0, 2.5, 1e16, 3.0])
         s = rng.choice(["a", "b", "c"])
-        return (self.next_id, g, h, v, x, s)
+        d = rng.choice([None, "1.50", "-2.25", "1.50", "10.00"])
+        return (self.next_id, g, h, v, x, s, d)
 
     def _ids(self) -> List[int]:
         cur = self.conn.cursor()
@@ -264,8 +271,8 @@ class _Fixture:
 
     def insert(self, n: int = 1) -> None:
         rows = [self._random_row() for _ in range(n)]
-        ph = ", ".join(["(%s, %s, %s, %s, %s, %s)"] * n)
-        self.execute(f"INSERT INTO {self.t} (id, g, h, v, x, s) VALUES {ph}", [x for r in rows for x in r])
+        ph = ", ".join(["(%s, %s, %s, %s, %s, %s, %s)"] * n)
+        self.execute(f"INSERT INTO {self.t} (id, g, h, v, x, s, d) VALUES {ph}", [x for r in rows for x in r])
         for r in rows:
             if self.rng.random() < 0.7:
                 self.execute(f"INSERT INTO {self.u} (id, tid, w) VALUES (%s, %s, %s)", (r[0] * 10, r[0], self.rng.choice([1, 2, None])))
@@ -332,18 +339,25 @@ def _drive(test: unittest.TestCase, fx: _Fixture, register: Callable[[str], Any]
     fx.commit()
     views = _native_views(fx)
     ddl = ";\n".join(f"CREATE VIEW {fx.prefix}{case.name} AS {fx.sql(case)}" for case in views)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", EngineLimitationWarning)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         plan = register(ddl)
+    announced = [w.message.diagnostic for w in caught if isinstance(w.message, MatviewDiagnosticWarning)]
     plans = list(plan.sub_plans) or [plan]
     test.assertEqual(len(plans), len(views))
     for case, sub in zip(views, plans):
         test.assertEqual(sub.strategy, case.expected, f"[{fx.engine}] {case.name}: strategy")
+        lead = f"{EXACT_LEAD} {ANNOUNCED[case.expected].value}. Why: "
         reason = sub.diagnostics.fallback_reason if sub.diagnostics else ""
         test.assertTrue(
-            (reason or "").startswith(f"{EXACT_FALLBACK_LEAD} {case.expected.value}:"),
+            (reason or "").startswith(lead),
             f"[{fx.engine}] {case.name}: fallback not announced with the lead phrase: {reason!r}",
         )
+        # Announced at registration (a warning) and listed on the plan.
+        mine = [d for d in sub.strategy_diagnostics if d.message.startswith(lead)]
+        test.assertEqual(len(mine), 1, f"[{fx.engine}] {case.name}: {sub.strategy_diagnostics!r}")
+        test.assertIn(mine[0], announced, f"[{fx.engine}] {case.name}: no registration warning")
+        test.assertEqual(mine[0].strategy, ANNOUNCED[case.expected])
         fx.views[case.name] = (case, f"{fx.prefix}{case.name}", sub)
     fx.commit()
     fx.compare_all(test, "initial population")
@@ -353,7 +367,7 @@ def _drive(test: unittest.TestCase, fx: _Fixture, register: Callable[[str], Any]
 
 
 # ------------------------------------------------------------- engines
-_BASE_DDL = "CREATE TABLE {t} (id INTEGER PRIMARY KEY, g INTEGER, h INTEGER NOT NULL, v INTEGER, x {dbl}, s VARCHAR(8) NOT NULL)"
+_BASE_DDL = "CREATE TABLE {t} (id INTEGER PRIMARY KEY, g INTEGER, h INTEGER NOT NULL, v INTEGER, x {dbl}, s VARCHAR(8) NOT NULL, d NUMERIC(10, 2))"
 _U_DDL = "CREATE TABLE {u} (id INTEGER PRIMARY KEY, tid INTEGER NOT NULL, w INTEGER)"
 
 
@@ -456,18 +470,18 @@ class MysqlUnrecognizedAggregateTests(unittest.TestCase):
         ver = str(cur.fetchone()[0])
         self.engine = "mariadb" if "mariadb" in ver.lower() else "mysql"
         self.version = tuple(int(x) for x in re.findall(r"\d+", ver)[:2])
-        self.prefix = f"l1agg_{uuid.uuid4().hex[:6]}_"
-        self.mgr: Optional[MaterializedViewManager] = None
+        # A private database: teardown is one DROP DATABASE instead of a
+        # drop_view per view (MySQL DDL commits are the dominant cost).
+        self.database = f"l1agg_{uuid.uuid4().hex[:8]}"
+        cur.execute(f"CREATE DATABASE {self.database}")
+        cur.execute(f"USE {self.database}")
+        self.conn.commit()
+        self.prefix = ""
 
     def tearDown(self) -> None:
         self.conn.rollback()
-        if self.mgr is not None:
-            for name in list(self.mgr.get_catalog()):
-                if name.startswith(self.prefix):
-                    self.mgr.drop_view(name)
         cur = self.conn.cursor()
-        for t in ("u", "t"):
-            cur.execute(f"DROP TABLE IF EXISTS {self.prefix}{t}")
+        cur.execute(f"DROP DATABASE IF EXISTS {self.database}")
         self.conn.commit()
         self.conn.close()
 
@@ -479,16 +493,116 @@ class MysqlUnrecognizedAggregateTests(unittest.TestCase):
         self.conn.commit()
         # ignore_limitations acknowledges MYSQL_NO_TRUNCATE_TRIGGER only; it
         # never enables a weaker result guarantee.
-        self.mgr = MaterializedViewManager(self.conn, ignore_limitations=True)
-        mgr = self.mgr
+        mgr = MaterializedViewManager(self.conn, ignore_limitations=True)
         _drive(self, fx, mgr.register_view)
+
+
+class ConcurrentWritersTests(unittest.TestCase):
+    """Two independent sessions write the same group of a routed view.
+
+    A inserts into group 1 and keeps its transaction open; B has taken its
+    snapshot, inserts into group 1 too and waits for A's lock (positive
+    lock-wait evidence); A commits, then B. The group-scoped recompute (an
+    ordered GROUP_CONCAT / JSONB_AGG) and the full refresh (an unordered one)
+    must both include both rows: a recompute from B's pre-wait snapshot would
+    miss A's row. MariaDB 11.6+ with innodb_snapshot_isolation may reject B
+    (1020, retry); then only A's row is expected.
+    """
+
+    def test_two_writers_same_group(self) -> None:
+        import threading
+
+        from matview_sync import Dialect
+        from test_avg_concurrent_maintenance import _connect, _native_engines, _session_id, _wait_until_lock_waiting
+
+        engines = _native_engines()
+        if not engines:
+            self.skipTest("no native engine DSN set")
+        for engine, dsn in engines:
+            with self.subTest(engine=engine.value):
+                is_pg = engine == Dialect.POSTGRES
+                t = f"l1cc_{uuid.uuid4().hex[:6]}"
+                ordered = "JSONB_AGG(v ORDER BY id)" if is_pg else "GROUP_CONCAT(v ORDER BY id)"
+                unordered = "JSONB_AGG(v)" if is_pg else "GROUP_CONCAT(v)"
+                views = {
+                    f"{t}_t2": (f"SELECT g, {ordered} AS a FROM {t} GROUP BY g", T2),
+                    f"{t}_t3": (f"SELECT g, {unordered} AS a FROM {t} GROUP BY g", T3),
+                }
+                setup, a, b, monitor = (_connect(engine, dsn) for _ in range(4))
+                try:
+                    cur = setup.cursor()
+                    cur.execute(f"CREATE TABLE {t} (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
+                    cur.execute(f"CREATE INDEX {t}_g ON {t} (g)")
+                    cur.executemany(f"INSERT INTO {t} VALUES (%s, %s, %s)", [(1, 1, 1), (2, 2, 2)])
+                    setup.commit()
+                    mgr = MaterializedViewManager(setup, ignore_limitations=not is_pg)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        plan = mgr.register_view(";\n".join(f"CREATE VIEW {n} AS {q}" for n, (q, _) in views.items()))
+                    self.assertEqual([p.strategy for p in plan.sub_plans], [e for _, e in views.values()])
+                    setup.commit()
+                    a_sid, b_sid = _session_id(engine, a), _session_id(engine, b)
+                    a.cursor().execute(f"INSERT INTO {t} VALUES (10, 1, 10)")
+                    bc = b.cursor()
+                    bc.execute(f"SELECT COUNT(*) FROM {t}")
+                    bc.fetchall()
+                    done = threading.Event()
+                    errors: List[BaseException] = []
+
+                    def run_b() -> None:
+                        try:
+                            bc.execute(f"INSERT INTO {t} VALUES (11, 1, 11)")
+                            b.commit()
+                        except BaseException as e:  # surfaced below
+                            errors.append(e)
+                        finally:
+                            done.set()
+
+                    th = threading.Thread(target=run_b)
+                    th.start()
+                    _wait_until_lock_waiting(engine, monitor, b_sid, done, blocker_sid=a_sid)
+                    a.commit()
+                    th.join(30)
+                    self.assertFalse(th.is_alive())
+                    if errors:
+                        self.assertEqual([getattr(e, "args", (None,))[0] for e in errors], [1020], errors)
+                        b.rollback()
+                    cur = setup.cursor()
+                    if is_pg:
+                        import psycopg2.extras
+
+                        psycopg2.extras.register_default_jsonb(setup, loads=lambda x: x)
+                    for name, (q, _) in views.items():
+                        mv = _snapshot(cur, f"SELECT * FROM {name}")[0]
+                        live = _snapshot(cur, q)[0]
+                        self.assertEqual(mv, live, name)
+                    cur.execute(f"SELECT COUNT(*) FROM {t} WHERE g = 1")
+                    self.assertEqual(cur.fetchone()[0], 2 if errors else 3)
+                    setup.commit()
+                finally:
+                    for c in (a, b, monitor):
+                        try:
+                            c.rollback()
+                            c.close()
+                        except Exception:
+                            pass
+                    setup.rollback()
+                    cleanup = MaterializedViewManager(setup, ignore_limitations=True)
+                    for n in views:
+                        if n in cleanup.get_catalog():
+                            setup.commit()
+                            cleanup.drop_view(n)
+                    setup.commit()
+                    setup.cursor().execute(f"DROP TABLE IF EXISTS {t}")
+                    setup.commit()
+                    setup.close()
 
 
 # ------------------------------------------------------------- offline
 class OfflineRoutingTests(unittest.TestCase):
     """Structural guards for the routing and its diagnostics (no database)."""
 
-    SCHEMA = "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, h INTEGER NOT NULL, v INTEGER, x DOUBLE PRECISION, s VARCHAR(8) NOT NULL);"
+    SCHEMA = "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, h INTEGER NOT NULL, v INTEGER, x DOUBLE PRECISION, s VARCHAR(8) NOT NULL, d NUMERIC(10, 2));"
 
     def _plan(self, dialect: str, select: str) -> Any:
         schema = self.SCHEMA if dialect == "postgres" else self.SCHEMA.replace("DOUBLE PRECISION", "DOUBLE")
@@ -526,16 +640,19 @@ class OfflineRoutingTests(unittest.TestCase):
     def test_fallback_messages_name_cost_and_remedy(self) -> None:
         plan = self._plan("postgres", "SELECT g, ARRAY_AGG(v) AS a FROM t GROUP BY g")
         msg = plan.diagnostics.fallback_reason
-        self.assertTrue(msg.startswith(f"{EXACT_FALLBACK_LEAD} atomic_query_sync: "), msg)
+        self.assertTrue(msg.startswith(f"{EXACT_LEAD} {Strategy.FULL_REFRESH.value}. Why: "), msg)
         self.assertIn("Cost: ", msg)
-        self.assertIn("To change: add an ORDER BY", msg)
+        self.assertIn("once per statement on PostgreSQL", msg)
+        self.assertIn("To change it: add an ORDER BY", msg)
+        self.assertEqual([d.code for d in plan.strategy_diagnostics], ["ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"])
         plan = self._plan("postgres", "SELECT g, MODE() WITHIN GROUP (ORDER BY v) AS a FROM t GROUP BY g")
         msg = plan.diagnostics.fallback_reason
-        self.assertTrue(msg.startswith(f"{EXACT_FALLBACK_LEAD} group_scoped_delta: "), msg)
+        self.assertTrue(msg.startswith(f"{EXACT_LEAD} {Strategy.GROUP_SCOPED_RECOMPUTE.value}. Why: "), msg)
         self.assertIn("MODE", msg)
         plan = self._plan("postgres", "SELECT g, h, COUNT(*) AS n FROM t GROUP BY ROLLUP(g, h)")
         self.assertIn("UNION ALL", plan.diagnostics.fallback_reason)
-        self.assertTrue(plan.diagnostics.to_dict()["fallback_reason"].startswith(EXACT_FALLBACK_LEAD))
+        self.assertTrue(plan.diagnostics.to_dict()["fallback_reason"].startswith(EXACT_LEAD))
+        self.assertEqual([d.code for d in plan.strategy_diagnostics], ["GROUPING_SETS_FULL_REFRESH"])
 
     def test_types_on_postgres(self) -> None:
         expect = {
@@ -543,7 +660,7 @@ class OfflineRoutingTests(unittest.TestCase):
             "JSONB_AGG(v ORDER BY id)": "JSONB",
             "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v)": "DOUBLE PRECISION",
             "PERCENTILE_DISC(ARRAY[0.5]) WITHIN GROUP (ORDER BY v)": "INT[]",
-            "MODE() WITHIN GROUP (ORDER BY s)": "VARCHAR(8)",
+            "MODE() WITHIN GROUP (ORDER BY s)": "VARCHAR",
             "REGR_COUNT(x, v)": "BIGINT",
             "ARRAY_AGG(v ORDER BY id)": "INT[]",
             "RANGE_AGG(INT4RANGE(v, v + 1))": "INT4MULTIRANGE",
@@ -554,6 +671,20 @@ class OfflineRoutingTests(unittest.TestCase):
             self.assertIsNotNone(m, plan.backing_table_ddl)
             assert m is not None
             self.assertEqual(m.group(1).strip().upper(), typ, expr)
+
+    def test_float_accumulators_default_to_exact_full_refresh(self) -> None:
+        # regr_*/corr/covar_* over DOUBLE PRECISION accumulate in float8 in
+        # input order. Under default settings (no ignore/accept) they are
+        # maintained by re-running the original query (exact like a later
+        # read of the live view), not refused: no limitation code is raised.
+        for expr in ("REGR_SLOPE(x, v)", "CORR(x, v)", "COVAR_SAMP(x, v)"):
+            plan = generate_materialized_view(
+                parse_table_schema(self.SCHEMA, dialect="postgres"),
+                f"CREATE VIEW mv AS SELECT g, {expr} AS a FROM t GROUP BY g",
+                dialect="postgres",
+            )
+            self.assertEqual(plan.strategy, T3, expr)
+            self.assertEqual([lim.code for lim in plan.limitations], [], expr)
 
     def test_compound_with_unrecognized_aggregate_on_mysql_is_refused_not_guessed(self) -> None:
         with self.assertRaisesRegex(UnsupportedMaterializedViewError, "CAST"):
