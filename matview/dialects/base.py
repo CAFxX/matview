@@ -1046,6 +1046,20 @@ class DialectBaseMixin(MixinHost):
                 if merged == "REAL":
                     return "DOUBLE PRECISION"
                 return merged
+            if kind in ("Subquery", "Select") and self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+                # A scalar subquery has the type of its single projection
+                # (stored as TEXT it returned '0.3' where the view returns 0.3).
+                inner = node.this if kind == "Subquery" else node
+                if isinstance(inner, sqlglot_exp.Select) and len(inner.expressions) == 1:
+                    e = inner.expressions[0]
+                    if isinstance(e, sqlglot_exp.Alias):
+                        e = e.this
+                    if isinstance(e, (sqlglot_exp.Sum, sqlglot_exp.Avg, sqlglot_exp.Count)):
+                        return infer(sqlglot_exp.Window(this=e.copy()))
+                    if isinstance(e, (sqlglot_exp.Min, sqlglot_exp.Max)):
+                        return infer(e.this)
+                    return infer(e)
+                return None
             if kind == "Window" and self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
                 # Window SUM/AVG/COUNT keep the engine's native result type
                 # (stored as DOUBLE they lost the exact NUMERIC/DECIMAL value:

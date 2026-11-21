@@ -55,6 +55,7 @@ class MixinHost:
             watermark_catalog_table: Optional[str] = None,
             pg_fillfactor: Optional[int] = 80,
             accept_limitations: Sequence[str] = (),
+            silence_diagnostics: Sequence[str] = (),
         ) -> None: ...
 
         # --- read-only accessors implemented by IncrementalViewCompiler (compiler.py) ---

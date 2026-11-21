@@ -63,6 +63,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
         watermark_catalog_table: Optional[str] = None,
         pg_fillfactor: Optional[int] = 80,
         accept_limitations: Sequence[str] = (),
+        silence_diagnostics: Sequence[str] = (),
     ) -> None:
         self._context: CompilationContext = self._build_compilation_context(
             schemas=schemas,
@@ -77,6 +78,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=pg_fillfactor,
             accept_limitations=accept_limitations,
+            silence_diagnostics=silence_diagnostics,
         )
 
     @classmethod
@@ -94,6 +96,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
         watermark_catalog_table: Optional[str] = None,
         pg_fillfactor: Optional[int] = 80,
         accept_limitations: Sequence[str] = (),
+        silence_diagnostics: Sequence[str] = (),
     ) -> CompilationContext:
         schemas_ro = MappingProxyType(dict(schemas))
         schemas_lower_ro = MappingProxyType({k.lower(): v for k, v in schemas_ro.items()})
@@ -154,6 +157,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
             alg_mode="single",
             ir=base_ir,
             accepted_limitations=tuple(sorted({str(c).strip() for c in (accept_limitations or ()) if str(c).strip()})),
+            silence_diagnostics=tuple(sorted({str(c).strip() for c in (silence_diagnostics or ()) if str(c).strip()})),
         )
         stage1 = cls._from_context(stage_ctx)
 
@@ -210,6 +214,12 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
         stage5._validate_schema_and_view()
 
         strategy, alg_mode = stage5._select_strategy_and_mode()
+        strategy_diags = tuple(stage5._float_strategy_diagnostics(strategy, alg_mode))
+        if strategy_diags:
+            from .diagnostics import emit as _emit_diagnostics
+
+            _emit_diagnostics(strategy_diags, stage5.context.silence_diagnostics, stacklevel=4)
+            stage5 = stage5._with_context(stage5.context.with_updates(strategy_diagnostics=strategy_diags))
         if strict and strategy != MaintenanceStrategy.ALGEBRAIC_DELTA:
             raise StrictCompilationError(
                 f"View '{logical_view_name}' cannot be compiled with Tier 1 ALGEBRAIC_DELTA "

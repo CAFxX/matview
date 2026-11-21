@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import sys
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from .connectivity import detect_engine_version, introspect_database_schemas
 from .engines import (
@@ -33,6 +33,13 @@ from .sql_frontend import parse_table_schema
 # limitation or compilation error).
 EXIT_UNSAFE_REPLACEMENT = 3  # a published view cannot be replaced atomically here
 EXIT_TRANSACTION_OWNERSHIP = 4  # the connection's transaction state cannot be owned
+
+
+def _print_strategy_diagnostics(plan: Any) -> None:
+    """Strategy diagnostics on stdout, as SQL comments ahead of the script
+    (the Python warning goes to stderr as well)."""
+    for d in getattr(plan, "strategy_diagnostics", None) or []:
+        print(f"-- {d}")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -93,7 +100,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=[],
         metavar="CODE",
         help="Accept one limitation code explicitly (repeatable). Required for codes that "
-        "weaken the result contract, e.g. ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE "
+        "weaken the result contract, e.g. FLOAT_REASSOCIATION_ALLOWED "
         "(best-effort floating-point aggregates on PostgreSQL/MySQL/MariaDB) and "
         "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX; --ignore-limitations does not cover them.",
     )
@@ -318,6 +325,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     indexes=args.indexes,
                     strict=args.strict,
                 )
+                _print_strategy_diagnostics(plan)
                 print(
                     plan.render_sql_script(
                         include_populate=not args.no_populate,
@@ -374,6 +382,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             strict=args.strict,
             engine_version=detected_ev,
         )
+        _print_strategy_diagnostics(plan)
         print(
             plan.render_sql_script(
                 include_populate=not args.no_populate,
