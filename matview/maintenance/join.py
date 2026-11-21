@@ -862,8 +862,17 @@ class Tier1JoinMixin(MixinHost):
             pg_au_body: Optional[str] = None
 
             if self.dialect == Dialect.POSTGRES:
-                trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
-                pg_bodies = self._pg_aggregate_bodies(pg_spec, [_pg_join_source(j_alias)])
+                # Serialize concurrent writers across different join sources via the
+                # per-view lock row before joining the transition delta against the
+                # other sources' tables. Under READ COMMITTED, the join statement runs
+                # next with a fresh snapshot that includes every committed writer of
+                # the other sources; under REPEATABLE READ / SERIALIZABLE, a concurrent
+                # write to any source fails closed with 40001 on the lock row.
+                pg_view_lock = self._pg_view_lock_stmt()
+                trunc_stmts = [pg_view_lock, f"DELETE FROM {mv_table};", initial_populate_sql]
+                pg_bodies = self._pg_aggregate_bodies(
+                    pg_spec, [_pg_join_source(j_alias)], pre_stmts=[pg_view_lock]
+                )
                 pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
 
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
@@ -883,13 +892,15 @@ class Tier1JoinMixin(MixinHost):
             trig_names.extend(t_ns)
             fn_names.extend(f_ns)
 
+        is_pg = self.dialect == Dialect.POSTGRES
         return MaterializedViewPlan(
             dialect=self.dialect,
             strategy=self.strategy,
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=[],
+            auxiliary_table_ddls=self._pg_view_lock_ddls() if is_pg else [],
+            auxiliary_table_names=[self._pg_view_lock_table()] if is_pg else [],
             index_ddls=index_ddls,
             initial_populate_sqls=[initial_populate_sql],
             trigger_ddls=trigger_ddls,

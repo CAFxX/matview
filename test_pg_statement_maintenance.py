@@ -627,38 +627,385 @@ def test_writer_search_path_does_not_redirect_maintenance(make_env) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Known limitation: writers of different sources of an algebraic join view
+# Concurrent writers of different sources of a PostgreSQL join view
 # ---------------------------------------------------------------------------
 
-_JOIN_RACE = (
-    "Two READ COMMITTED transactions writing DIFFERENT sources of an algebraic join view each "
-    "join their delta with the other table's committed state and miss each other's change. "
-    "TODO.md 'Serialize Concurrent Writers of Different Sources of a PostgreSQL Join View'"
-)
 
-
-@pytest.mark.xfail(strict=True, raises=ViewMismatch, reason=_JOIN_RACE)
 def test_join_view_writers_of_different_sources_read_committed(make_env) -> None:
+    """READ COMMITTED: concurrent writers of different sources of an algebraic
+    join view serialize on the view's lock row before joining their delta with
+    the other source, so the second writer's join takes a fresh snapshot that
+    includes the first writer's commit."""
     env = make_env(views=[VIEW_BY_NAME["v_j"]], seed=True)
     a, b, monitor = env.connect(), env.connect(), env.connect()
     sid_a, sid_b = _session_id(env, a), _session_id(env, b)
     a.cursor().execute("INSERT INTO t (id, g, v) VALUES (3000, 1, 5)")
     worker = _Worker(b, ["UPDATE d SET name = 'n2' WHERE g = 1"]).start()
     try:
-        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "B waits for A's group lock")
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "B waits for A's view lock")
     finally:
         a.commit()
         worker.join()
     if worker.error is not None:
         raise worker.error
-    env.check("concurrent writers of t and d")
+    env.check("concurrent writers of t and d (t first)")
+
+    # Reverse direction: d writes first, t inserts into the renamed join key concurrently.
+    a.cursor().execute("UPDATE d SET name = 'n3' WHERE g = 1")
+    worker = _Worker(b, ["INSERT INTO t (id, g, v) VALUES (3001, 1, 7)"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "B waits for A's view lock (d first)")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check("concurrent writers of d and t (d first)")
 
 
-def test_join_view_writers_of_different_sources_repeatable_read_fail_closed(make_env) -> None:
+def test_join_view_empty_join_race_and_truncate_read_committed(make_env) -> None:
+    """READ COMMITTED: each algebraic join shape tested in isolation (no
+    multi-view trigger masking): empty-join race, join-key UPDATE + DELETE/INSERT
+    races, MIN/AVG recompute join, 3-table join with disjoint join keys,
+    concurrent TRUNCATE + INSERT, and lock-table drop lifecycle."""
+    # 1. Standalone v_j: empty-join race, concurrent join-key UPDATE, DELETE + INSERT,
+    #    and lock-table lifecycle.
     env = make_env(views=[VIEW_BY_NAME["v_j"]], seed=True)
+    assert _strategy(env, "v_j") == "algebraic_delta"
+    a, b, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_b = _session_id(env, a), _session_id(env, b)
+
+    a.cursor().execute("INSERT INTO t (id, g, v, m) VALUES (9901, 99, 13, 1.250)")
+    worker = _Worker(b, ["INSERT INTO d (g, name) VALUES (99, 'n99')"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "empty-join B waits for A")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check("empty-join race (v_j alone)")
+
+    # Concurrent join-key UPDATE on t + rename on d.
+    a.cursor().execute("UPDATE t SET g = 2 WHERE id = 9901")
+    worker = _Worker(b, ["UPDATE d SET name = 'n2_upd' WHERE g = 2"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "join-key UPDATE B waits for A")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check("concurrent join-key UPDATE on t and rename on d")
+
+    # Concurrent DELETE on d + INSERT into t for the deleted join key.
+    a.cursor().execute("DELETE FROM d WHERE g = 99")
+    worker = _Worker(b, ["INSERT INTO t (id, g, v, m) VALUES (9904, 99, 5, 1.000)"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "DELETE+INSERT B waits for A")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check("concurrent DELETE on d and INSERT into t")
+
+    lock_tbl = env.plans["v_j"].auxiliary_table_names[0]
+    cur = env.conn.cursor()
+    cur.execute("SELECT to_regclass(%s)", (f'"{env.ns}"."{lock_tbl}"',))
+    assert cur.fetchone()[0] is not None
+    env.conn.commit()
+    env.manager.drop_view("v_j")
+    env.views = []
+    cur.execute("SELECT to_regclass(%s)", (f'"{env.ns}"."{lock_tbl}"',))
+    assert cur.fetchone()[0] is None
+    env.conn.commit()
+
+    # 2. Standalone algebraic join with MIN/AVG recompute (no other view on t/d).
+    v_j_rec = ViewDef(
+        "v_j_rec",
+        "SELECT d.name, MIN(t.v) AS mn, AVG(t.m) AS av, SUM(t.v) AS s, COUNT(*) AS c "
+        "FROM t JOIN d ON t.g = d.g GROUP BY d.name",
+    )
+    env_rec = make_env(views=[v_j_rec], seed=True)
+    assert _strategy(env_rec, "v_j_rec") == "algebraic_delta"
+    ar, br, mon_r = env_rec.connect(), env_rec.connect(), env_rec.connect()
+    sid_ar, sid_br = _session_id(env_rec, ar), _session_id(env_rec, br)
+    ar.cursor().execute("DELETE FROM t WHERE g = 1 AND v = (SELECT MIN(v) FROM t WHERE g = 1)")
+    worker = _Worker(br, ["UPDATE d SET name = 'n2' WHERE g = 1"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env_rec, mon_r, sid_br, sid_ar), worker.done, "recompute B waits for A")
+    finally:
+        ar.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env_rec.check("standalone algebraic join MIN/AVG recompute + concurrent d update")
+
+    # 3. Standalone 3-table join (disjoint join keys) + concurrent TRUNCATE.
+    schema3 = list(PG_SCHEMA) + [
+        "CREATE TABLE e (name VARCHAR(20) PRIMARY KEY, tag VARCHAR(20) NOT NULL)",
+    ]
+    v_j3 = ViewDef(
+        "v_j3",
+        "SELECT e.tag, SUM(t.v) AS s, COUNT(*) AS c "
+        "FROM t JOIN d ON t.g = d.g JOIN e ON d.name = e.name GROUP BY e.tag",
+    )
+    env3 = make_env(views=[], schema_sql=schema3, seed=True)
+    env3.execute("INSERT INTO e (name, tag) VALUES ('n0', 't0'), ('n1', 't1'), ('n2', 't2')")
+    env3.execute("INSERT INTO d (g, name) VALUES (99, 'n99')")
+    env3.commit()
+    env3.views = [v_j3]
+    env3.register(v_j3)
+    assert _strategy(env3, "v_j3") == "algebraic_delta"
+    a3, b3, mon3 = env3.connect(), env3.connect(), env3.connect()
+    sid_a3, sid_b3 = _session_id(env3, a3), _session_id(env3, b3)
+
+    a3.cursor().execute("INSERT INTO t (id, g, v, m) VALUES (9902, 99, 17, 2.750)")
+    worker = _Worker(b3, ["INSERT INTO e (name, tag) VALUES ('n99', 't99')"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env3, mon3, sid_b3, sid_a3), worker.done, "3-table B waits for A")
+    finally:
+        a3.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env3.check("standalone 3-table join concurrent writers of t and e")
+
+    a3.cursor().execute("INSERT INTO t (id, g, v, m) VALUES (9903, 2, 11, 3.000)")
+    worker = _Worker(b3, ["TRUNCATE e"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env3, mon3, sid_b3, sid_a3), worker.done, "TRUNCATE waits for A's view lock")
+    finally:
+        a3.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env3.check("standalone 3-table join concurrent INSERT into t and TRUNCATE e")
+
+
+@pytest.mark.parametrize(
+    "vd",
+    [
+        ViewDef(
+            "v_lj",
+            "SELECT d.name, SUM(t.v) AS s, COUNT(t.v) AS c FROM d LEFT JOIN t ON t.g = d.g GROUP BY d.name",
+        ),
+        ViewDef(
+            "v_j_str",
+            "SELECT d.name, STRING_AGG(CAST(t.id AS TEXT), ',' ORDER BY t.id) AS ids "
+            "FROM t INNER JOIN d ON t.g = d.g GROUP BY d.name",
+        ),
+        ViewDef(
+            "v_fj",
+            "SELECT COALESCE(d.name, '__unmatched__') AS grp, COUNT(t.id) AS c, SUM(t.v) AS s "
+            "FROM d FULL OUTER JOIN t ON t.g = d.g GROUP BY COALESCE(d.name, '__unmatched__')",
+        ),
+    ],
+    ids=lambda v: v.name,
+)
+def test_group_scoped_join_writers_of_different_sources(make_env, vd: ViewDef) -> None:
+    """Each group-scoped (Tier 2) join view tested in isolation (no cross-view
+    trigger masking): LEFT JOIN, INNER JOIN STRING_AGG, and FULL OUTER JOIN
+    serialize concurrent writers across sources before computing affected keys."""
+    env = make_env(views=[vd], seed=True)
+    assert _strategy(env, vd.name) == "group_scoped_delta", (vd.name, _strategy(env, vd.name))
+
+    a, b, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_b = _session_id(env, a), _session_id(env, b)
+
+    # 1. Empty-join race (d then t): A inserts d(99, 'n99'), B concurrently inserts t(9900, 99, 42).
+    a.cursor().execute("INSERT INTO d (g, name) VALUES (99, 'n99')")
+    worker = _Worker(b, ["INSERT INTO t (id, g, v) VALUES (9900, 99, 42)"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, f"{vd.name} d->t B waits for A")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check(f"{vd.name} empty-join race (d then t)")
+
+    # 2. Reverse empty-join race (t then d): A inserts t(9905, 101, 19), B concurrently inserts d(101, 'n101').
+    a.cursor().execute("INSERT INTO t (id, g, v) VALUES (9905, 101, 19)")
+    worker = _Worker(b, ["INSERT INTO d (g, name) VALUES (101, 'n101')"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, f"{vd.name} t->d B waits for A")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check(f"{vd.name} empty-join race (t then d)")
+
+    # 3. Rename race: A updates d.name while B inserts into t on the same join key.
+    a.cursor().execute("UPDATE d SET name = 'n99_renamed' WHERE g = 99")
+    worker = _Worker(b, ["INSERT INTO t (id, g, v) VALUES (9901, 99, 8)"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, f"{vd.name} rename B waits for A")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check(f"{vd.name} rename race")
+
+    # 4. REPEATABLE READ: concurrent writer of the other source fails closed with 40001.
+    cb = b.cursor()
+    cb.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    cb.execute("SELECT COUNT(*) FROM d")
+    cb.fetchall()
+    a.cursor().execute("INSERT INTO d (g, name) VALUES (100, 'n100')")
+    a.commit()
+    with pytest.raises(Exception) as excinfo:
+        cb.execute("INSERT INTO t (id, g, v) VALUES (9902, 100, 5)")
+        b.commit()
+    b.rollback()
+    assert _pgcode(excinfo.value) == SERIALIZATION_FAILURE, repr(excinfo.value)
+    env.check(f"{vd.name} REPEATABLE READ fail closed")
+
+
+def test_multi_view_join_trigger_order_does_not_deadlock(make_env) -> None:
+    """Multiple join views sharing two sources must acquire their per-view lock
+    rows in the same order regardless of which source table is written, even
+    when view names sit on an underscore/digit boundary ('v' vs 'v_' on
+    '0_orders' vs 'dim') or share a long truncated prefix."""
+    schema = [
+        'CREATE TABLE "0_orders" (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL)',
+        "CREATE TABLE dim (g INT PRIMARY KEY, name VARCHAR(20) NOT NULL)",
+    ]
+    views = [
+        ViewDef("v", 'SELECT dim.name, COUNT(*) AS c FROM "0_orders" JOIN dim ON "0_orders".g = dim.g GROUP BY dim.name'),
+        ViewDef("v_", 'SELECT dim.name, SUM("0_orders".v) AS s FROM "0_orders" JOIN dim ON "0_orders".g = dim.g GROUP BY dim.name'),
+        ViewDef(
+            "very_long_shared_prefix_for_join_view_alpha_one",
+            'SELECT dim.name, COUNT(*) AS c FROM "0_orders" JOIN dim ON "0_orders".g = dim.g GROUP BY dim.name',
+        ),
+        ViewDef(
+            "very_long_shared_prefix_for_join_view_alpha_two",
+            'SELECT dim.name, SUM("0_orders".v) AS s FROM "0_orders" JOIN dim ON "0_orders".g = dim.g GROUP BY dim.name',
+        ),
+    ]
+    env = make_env(views=[], schema_sql=schema, seed=False)
+    env.execute("INSERT INTO dim VALUES (1, 'n1'), (2, 'n2')")
+    env.execute('INSERT INTO "0_orders" VALUES (1, 1, 10), (2, 2, 20)')
+    env.commit()
+    env.views = views
+    for vd in views:
+        env.register(vd)
+
+    # Verify PostgreSQL's own pg_trigger.tgname firing order is identical on both sources.
+    trig_to_view = {t.lower(): vd.name for vd in views for t in env.plans[vd.name].trigger_names}
+    cur = env.conn.cursor()
+    cur.execute(
+        "SELECT t.tgname FROM pg_trigger t "
+        "WHERE t.tgrelid = '\"0_orders\"'::regclass AND NOT t.tgisinternal AND t.tgname LIKE '%%_ai' "
+        "ORDER BY t.tgname"
+    )
+    ord_orders = [trig_to_view[r[0].lower()] for r in cur.fetchall()]
+    cur.execute(
+        "SELECT t.tgname FROM pg_trigger t "
+        "WHERE t.tgrelid = 'dim'::regclass AND NOT t.tgisinternal AND t.tgname LIKE '%%_au' "
+        "ORDER BY t.tgname"
+    )
+    ord_dim = [trig_to_view[r[0].lower()] for r in cur.fetchall()]
+    assert len(ord_orders) == 4 and ord_orders == ord_dim, (ord_orders, ord_dim)
+    env.conn.commit()
+
+    # Run concurrent opposite-source writers repeatedly; consistent lock order
+    # means zero deadlocks (40P01) and exact results across all 4 views.
+    a, b = env.connect(), env.connect()
+    for step in range(8):
+        start_evt = threading.Event()
+        errs: List[Optional[BaseException]] = [None, None]
+
+        def run_a(idx: int = step) -> None:
+            start_evt.wait()
+            try:
+                a.cursor().execute(f'INSERT INTO "0_orders" VALUES ({100 + idx}, 1, {idx + 1})')
+                a.commit()
+            except BaseException as exc:
+                a.rollback()
+                errs[0] = exc
+
+        def run_b(idx: int = step) -> None:
+            start_evt.wait()
+            try:
+                b.cursor().execute(f"UPDATE dim SET name = 'n1_{idx}' WHERE g = 1")
+                b.commit()
+            except BaseException as exc:
+                b.rollback()
+                errs[1] = exc
+
+        ta = threading.Thread(target=run_a, daemon=True)
+        tb = threading.Thread(target=run_b, daemon=True)
+        ta.start()
+        tb.start()
+        start_evt.set()
+        ta.join(30)
+        tb.join(30)
+        assert errs == [None, None], f"step {step} failed (possible deadlock): {errs!r}"
+    env.check("multi-view concurrent opposite-source writers")
+
+
+def test_repair_view_reseeds_lock_row_for_repeatable_read(make_env) -> None:
+    """repair_view() deletes auxiliary tables; it must re-seed row (0, 0) in
+    __matview_lock_<v> so REPEATABLE READ writers of subquery-filtered Tier 2
+    views (FOR SHARE on row 0) still fail closed with 40001 after a repair,
+    and algebraic join views remain serialized after a repair."""
+    schema = list(PG_SCHEMA) + ["CREATE TABLE u (g INT PRIMARY KEY)"]
+    v_sub = ViewDef(
+        "v_sub",
+        "SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids FROM t "
+        "WHERE g IN (SELECT g FROM u) GROUP BY g",
+    )
+    env = make_env(views=[], schema_sql=schema, seed=True)
+    env.execute("INSERT INTO u (g) VALUES (1), (2), (3)")
+    env.commit()
+    env.views = [VIEW_BY_NAME["v_j"], v_sub]
+    for vd in env.views:
+        env.register(vd)
+
+    # Damage both backing tables and repair them.
+    for vd in env.views:
+        env.execute(f"DELETE FROM {env.plans[vd.name].backing_table_name}")
+    env.commit()
+    for vd in env.views:
+        env.manager.repair_view(vd.name)
+    env.commit()
+
+    # Verify (0, 0) seed row was restored in both lock tables.
+    cur = env.conn.cursor()
+    for vd in env.views:
+        lock_t = env.plans[vd.name].auxiliary_table_names[0]
+        cur.execute(f"SELECT COUNT(*) FROM {lock_t} WHERE __mv_id = 0")
+        assert cur.fetchone()[0] == 1, (vd.name, lock_t)
+    env.conn.commit()
+
+    # Under REPEATABLE READ after repair_view(): B takes snapshot, A updates u
+    # (exclusive lock on row 0) and commits, B writes t (FOR SHARE on row 0) ->
+    # must fail closed with 40001 rather than seeing an empty lock table.
     a, b = env.connect(), env.connect()
     cb = b.cursor()
     cb.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    cb.execute("SELECT COUNT(*) FROM t")
+    cb.fetchall()
+    a.cursor().execute("INSERT INTO u (g) VALUES (4)")
+    a.commit()
+    with pytest.raises(Exception) as excinfo:
+        cb.execute("INSERT INTO t (id, g, v) VALUES (8801, 4, 10)")
+        b.commit()
+    b.rollback()
+    assert _pgcode(excinfo.value) == SERIALIZATION_FAILURE, repr(excinfo.value)
+    env.check("post-repair REPEATABLE READ fail closed on v_sub and v_j")
+
+
+@pytest.mark.parametrize("isolation", ["REPEATABLE READ", "SERIALIZABLE"])
+def test_join_view_writers_of_different_sources_repeatable_read_fail_closed(make_env, isolation: str) -> None:
+    env = make_env(views=[VIEW_BY_NAME["v_j"]], seed=True)
+    a, b = env.connect(), env.connect()
+    cb = b.cursor()
+    cb.execute(f"BEGIN ISOLATION LEVEL {isolation}")
     cb.execute("SELECT COUNT(*) FROM t")
     cb.fetchall()
     a.cursor().execute("INSERT INTO t (id, g, v) VALUES (3000, 1, 5)")
@@ -668,7 +1015,21 @@ def test_join_view_writers_of_different_sources_repeatable_read_fail_closed(make
         b.commit()
     b.rollback()
     assert _pgcode(excinfo.value) == SERIALIZATION_FAILURE, repr(excinfo.value)
-    env.check("REPEATABLE READ writer of the other source")
+    env.check(f"{isolation} writer of the other source")
+
+    # Also fail closed on the empty-join case (neither t nor d initially had g=99,
+    # so A's insert produces an empty Δt ⋈ d and only touches the view lock row).
+    cb.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+    cb.execute("SELECT COUNT(*) FROM t")
+    cb.fetchall()
+    a.cursor().execute("INSERT INTO t (id, g, v) VALUES (3009, 99, 5)")
+    a.commit()
+    with pytest.raises(Exception) as excinfo:
+        cb.execute("INSERT INTO d (g, name) VALUES (99, 'n99')")
+        b.commit()
+    b.rollback()
+    assert _pgcode(excinfo.value) == SERIALIZATION_FAILURE, repr(excinfo.value)
+    env.check(f"{isolation} empty-join writer of the other source")
 
 
 def test_whole_view_recompute_excludes_group_writers(make_env) -> None:

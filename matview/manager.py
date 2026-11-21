@@ -84,7 +84,7 @@ from .sql_frontend import (
 # 8: Watermark-gated backfill UPDATE triggers always track the watermark/backfill
 #    range key (including unreferenced integer PKs and unshadowed SQLite rowid
 #    aliases) and strictly validate integer PK / WITHOUT ROWID eligibility.
-MATVIEW_GENERATOR_VERSION = "8"
+MATVIEW_GENERATOR_VERSION = "9"
 
 
 def _definition_digest(select_sql: str) -> str:
@@ -2474,6 +2474,9 @@ class MaterializedViewManager:
                     )
                     for aux_t in plan.auxiliary_table_names:
                         cur.execute(f"DELETE FROM {aux_t};")
+                    for aux_ddl in plan.auxiliary_table_ddls:
+                        if aux_ddl.lstrip().upper().startswith("INSERT "):
+                            cur.execute(aux_ddl)
                     cur.execute(f"DELETE FROM {plan.backing_table_name};")
                     for stmt in plan.get_populate_statements(incremental_backfill=False):
                         cur.execute(stmt)
@@ -2679,6 +2682,9 @@ class MaterializedViewManager:
             else:
                 for aux_t in plan.auxiliary_table_names:
                     cur.execute(f"DELETE FROM {aux_t};")
+                for aux_ddl in plan.auxiliary_table_ddls:
+                    if aux_ddl.lstrip().upper().startswith("INSERT "):
+                        cur.execute(aux_ddl)
                 cur.execute(f"DELETE FROM {plan.backing_table_name};")
                 for stmt in plan.get_populate_statements(incremental_backfill=False):
                     cur.execute(stmt)
