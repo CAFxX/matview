@@ -18,6 +18,7 @@ from matview_sync import (
     Dialect,
     EngineVersion,
     IncrementalViewCompiler,
+    MaintenanceStrategy,
     MaterializedViewManager,
     TableSchema,
     generate_materialized_view,
@@ -1101,6 +1102,110 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
                 pass
             cur.close()
             conn.close()
+
+
+    def test_postgres_join_views_emit_pre_join_view_lock(self) -> None:
+        """PostgreSQL algebraic and group-scoped multi-source join views must create
+        their per-view lock table and acquire the exclusive view lock row (__mv_id = 0)
+        in a separate statement BEFORE joining their transition delta with other sources,
+        while single-FROM-item group-scoped views retain per-group locking, and trigger
+        names keep a table-independent firing order across sources."""
+        schemas = parse_table_schema(
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL);"
+            "CREATE TABLE d (g INT PRIMARY KEY, name TEXT NOT NULL);",
+            dialect=Dialect.POSTGRES,
+        )
+
+        # 1. Algebraic join view (Tier 1B)
+        alg_plan = generate_materialized_view(
+            schemas,
+            "CREATE VIEW v_alg_j AS SELECT d.name, SUM(t.v) AS s, COUNT(*) AS c "
+            "FROM t JOIN d ON t.g = d.g GROUP BY d.name;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(alg_plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+        lock_tbl = "__matview_lock_v_alg_j"
+        self.assertEqual(alg_plan.auxiliary_table_names, [lock_tbl])
+        self.assertTrue(
+            any(f"CREATE TABLE {lock_tbl}" in ddl for ddl in alg_plan.auxiliary_table_ddls),
+            alg_plan.auxiliary_table_ddls,
+        )
+        fn_ddls = [d for d in alg_plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_" in d]
+        self.assertEqual(len(fn_ddls), 8)  # 2 sources x (ai, au, ad, trunc)
+        for ddl in fn_ddls:
+            lock_pos = ddl.find(f"INSERT INTO {lock_tbl} (__mv_id, __mv_n) VALUES (0, 1)")
+            self.assertNotEqual(lock_pos, -1, f"missing pre-join view lock in:\n{ddl}")
+            store_pos = ddl.find(alg_plan.backing_table_name)
+            self.assertNotEqual(store_pos, -1, ddl)
+            self.assertLess(lock_pos, store_pos, f"view lock must precede backing-store access:\n{ddl}")
+
+        # 2. Group-scoped multi-source join view (Tier 2): exclusive view lock before kset,
+        #    NOT FOR SHARE + pre-lock hash, while keeping scoped DELETE/INSERT.
+        t2_join_plan = generate_materialized_view(
+            schemas,
+            "CREATE VIEW v_t2_lj AS SELECT d.name, SUM(t.v) AS s, COUNT(t.v) AS c "
+            "FROM d LEFT JOIN t ON t.g = d.g GROUP BY d.name;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(t2_join_plan.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA)
+        t2_lock_tbl = "__matview_lock_v_t2_lj"
+        self.assertEqual(t2_join_plan.auxiliary_table_names, [t2_lock_tbl])
+        t2_fn_ddls = [d for d in t2_join_plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_" in d]
+        self.assertEqual(len(t2_fn_ddls), 8)
+        for ddl in t2_fn_ddls:
+            lock_pos = ddl.find(f"INSERT INTO {t2_lock_tbl} (__mv_id, __mv_n) VALUES (0, 1)")
+            self.assertNotEqual(lock_pos, -1, ddl)
+            self.assertNotIn("FOR SHARE", ddl)
+            del_pos = ddl.find(f"DELETE FROM {t2_join_plan.backing_table_name}")
+            self.assertLess(lock_pos, del_pos, ddl)
+
+        # 3. Single-table group-scoped view must still use FOR SHARE + per-group locks.
+        t2_single_plan = generate_materialized_view(
+            schemas,
+            "CREATE VIEW v_t2_single AS SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids "
+            "FROM t GROUP BY g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(t2_single_plan.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA)
+        single_ai = next(
+            d for d in t2_single_plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_v_t2_single__t_ai" in d
+        )
+        self.assertIn("FOR SHARE", single_ai)
+        self.assertIn("hashtextextended", single_ai)
+
+        # 4. Trigger firing order between any two views must be identical across every
+        #    source table (including underscore/case boundaries and long shared prefixes).
+        case_schemas = parse_table_schema(
+            'CREATE TABLE "Orders" (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL);'
+            "CREATE TABLE dim (g INT PRIMARY KEY, name TEXT NOT NULL);",
+            dialect=Dialect.POSTGRES,
+        )
+        pairs = [
+            (
+                case_schemas,
+                "Orders",
+                "dim",
+                'CREATE VIEW v AS SELECT dim.name, COUNT(*) AS c FROM "Orders" JOIN dim ON "Orders".g = dim.g GROUP BY dim.name;',
+                'CREATE VIEW v_ AS SELECT dim.name, SUM("Orders".v) AS s FROM "Orders" JOIN dim ON "Orders".g = dim.g GROUP BY dim.name;',
+            ),
+            (
+                schemas,
+                "t",
+                "d",
+                "CREATE VIEW very_long_shared_prefix_for_join_view_alpha_one AS "
+                "SELECT d.name, COUNT(*) AS c FROM t JOIN d ON t.g = d.g GROUP BY d.name;",
+                "CREATE VIEW very_long_shared_prefix_for_join_view_alpha_two AS "
+                "SELECT d.name, SUM(t.v) AS s FROM t JOIN d ON t.g = d.g GROUP BY d.name;",
+            ),
+        ]
+        for sc, tbl1, tbl2, sql1, sql2 in pairs:
+            p1 = generate_materialized_view(sc, sql1, dialect=Dialect.POSTGRES)
+            p2 = generate_materialized_view(sc, sql2, dialect=Dialect.POSTGRES)
+            t1_p1 = next(t for t in p1.trigger_names if t.endswith("_ai") and tbl1.lower() in next(d for d in p1.trigger_ddls if f"CREATE TRIGGER {t} " in d).lower())
+            t1_p2 = next(t for t in p2.trigger_names if t.endswith("_ai") and tbl1.lower() in next(d for d in p2.trigger_ddls if f"CREATE TRIGGER {t} " in d).lower())
+            t2_p1 = next(t for t in p1.trigger_names if t.endswith("_au") and tbl2.lower() in next(d for d in p1.trigger_ddls if f"CREATE TRIGGER {t} " in d).lower())
+            t2_p2 = next(t for t in p2.trigger_names if t.endswith("_au") and tbl2.lower() in next(d for d in p2.trigger_ddls if f"CREATE TRIGGER {t} " in d).lower())
+            self.assertEqual(t1_p1.lower() < t1_p2.lower(), t2_p1.lower() < t2_p2.lower(), (t1_p1, t1_p2, t2_p1, t2_p2))
 
 
 if __name__ == "__main__":

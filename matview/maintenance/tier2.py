@@ -1060,16 +1060,24 @@ class Tier2Mixin(MixinHost):
             sel = ", ".join(f"{k} AS __mv_k{i}" for i, k in enumerate(keys))
             kset = f"(SELECT DISTINCT {sel} FROM {from_sql}) AS __mv_kset"
             kcols = [f"__mv_kset.__mv_k{i}" for i in range(n)]
-            canon = self._canonical_group_pk_expr(kcols)
             no_null = " AND ".join(f"{k} IS NOT NULL" for k in kcols)
             any_null = " OR ".join(f"{k} IS NULL" for k in kcols)
-            stmts = [
-                *self._pg_view_shared_lock_stmts(),
-                f"INSERT INTO {lock_t} (__mv_id, __mv_n)\n"
-                f"    SELECT DISTINCT {self._pg_group_lock_id_sql(canon)}, 1 FROM {kset}\n"
-                f"    ORDER BY 1\n"
-                f"    ON CONFLICT (__mv_id) DO UPDATE SET __mv_n = {lock_t}.__mv_n + 1;"
-            ]
+            if len(self.view.joins) > 1:
+                # Multi-source join view: acquire the per-view lock row exclusively
+                # before evaluating kset against other sources, so concurrent writers
+                # to different sources serialize and never compute an empty/stale kset
+                # before the other source commits (while still keeping DELETE/INSERT
+                # scoped to the affected groups in kset).
+                stmts = [self._pg_view_lock_stmt()]
+            else:
+                canon = self._canonical_group_pk_expr(kcols)
+                stmts = [
+                    *self._pg_view_shared_lock_stmts(),
+                    f"INSERT INTO {lock_t} (__mv_id, __mv_n)\n"
+                    f"    SELECT DISTINCT {self._pg_group_lock_id_sql(canon)}, 1 FROM {kset}\n"
+                    f"    ORDER BY 1\n"
+                    f"    ON CONFLICT (__mv_id) DO UPDATE SET __mv_n = {lock_t}.__mv_n + 1;"
+                ]
 
             def _match_nonnull(lhs: List[str]) -> str:
                 conds = [

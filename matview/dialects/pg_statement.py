@@ -18,9 +18,13 @@ The rules every body follows:
    rows) are upserted with one ``INSERT ... SELECT ... GROUP BY key ORDER BY
    key ON CONFLICT`` statement, so every writer locks them in the same key
    order. Rows keyed by a source primary key are already serialized by the
-   source rows' own locks. Group-scoped recomputes lock one lock-table row
-   per affected group key hash, in hash order (and the whole-view row in
-   SHARE mode); full recomputes lock the whole-view row exclusively.
+   source rows' own locks. Single-source group-scoped recomputes lock one
+   lock-table row per affected group key hash, in hash order (and the
+   whole-view row in SHARE mode); full recomputes and multi-source join views
+   (algebraic and group-scoped) lock the whole-view row exclusively before
+   joining their delta against other sources, so every later statement takes a
+   fresh READ COMMITTED snapshot (and REPEATABLE READ / SERIALIZABLE fail
+   closed with 40001 on any concurrent write to another source).
 3. Lock, then recompute in a later statement. Native recomputations (MIN/MAX
    after a retraction of the extreme, BIT_AND/BIT_OR after a retraction,
    approximate or scale-dependent AVG, statistics, group-scoped and full
@@ -42,6 +46,7 @@ The rules every body follows:
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import re
 from dataclasses import dataclass, field
@@ -175,6 +180,13 @@ class PgStatementMaintenanceMixin(MixinHost):
             )
         p = self.object_prefix if self.object_prefix else "__matview_"
         stem = f"{self.logical_view_name}__{base_t}"
+        # PostgreSQL fires AFTER triggers in alphabetical tgname order. Prefix
+        # trigger names with a fixed-width lowercase hash of the view name alone
+        # so any two views fire in the exact same order on every source table
+        # (even for long shared prefixes or underscore/case boundary names),
+        # preventing multi-view AB-BA lock-order deadlocks across sources.
+        view_order_key = hashlib.sha1(self.logical_view_name.encode("utf-8")).hexdigest()[:12]
+        trg_prefix = f"{p}trg_{view_order_key}_"
         q_base_t = self._q(base_t)
         suffix = {"INSERT": "_ai", "UPDATE": "_au", "DELETE": "_ad"}
         referencing = {
@@ -191,7 +203,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         installs: List[Tuple[str, str, Optional[str], str]] = []
         for event in EVENTS:
             fn = self._bounded_ident(f"{p}fn_sync_", stem, suffix[event])
-            trg = self._bounded_ident(f"{p}trg_", stem, suffix[event])
+            trg = self._bounded_ident(trg_prefix, stem, suffix[event])
             ddls.append(
                 render_procedural_sql(
                     "pg_statement_function",
@@ -215,7 +227,7 @@ class PgStatementMaintenanceMixin(MixinHost):
             fn_names.append(fn)
 
         fn_trunc = self._bounded_ident(f"{p}fn_sync_", stem, "_trunc")
-        trg_trunc = self._bounded_ident(f"{p}trg_", stem, "_trunc")
+        trg_trunc = self._bounded_ident(trg_prefix, stem, "_trunc")
         ddls.append(render_procedural_sql("pg_truncate_function", fn_name=fn_trunc, trunc_block=trunc_body.strip()))
         ddls.append(render_procedural_sql("pg_truncate_trigger", trg_name=trg_trunc, q_base_t=q_base_t, fn_name=fn_trunc))
         installs.append((trg_trunc, "TRUNCATE", None, fn_trunc))
@@ -321,13 +333,23 @@ class PgStatementMaintenanceMixin(MixinHost):
     # Grouped / global aggregates (single table, join, UNION ALL branches)
     # ------------------------------------------------------------------
     def _pg_aggregate_bodies(
-        self, spec: PgAggregateSpec, sources: Sequence[PgDeltaSource]
+        self,
+        spec: PgAggregateSpec,
+        sources: Sequence[PgDeltaSource],
+        pre_stmts: Sequence[str] = (),
     ) -> Dict[str, str]:
         """Set-based bodies for a backing table with one row per group."""
-        return {event: self._pg_aggregate_body(spec, sources, event) for event in EVENTS}
+        return {
+            event: self._pg_aggregate_body(spec, sources, event, pre_stmts=pre_stmts)
+            for event in EVENTS
+        }
 
     def _pg_aggregate_body(
-        self, spec: PgAggregateSpec, sources: Sequence[PgDeltaSource], event: str
+        self,
+        spec: PgAggregateSpec,
+        sources: Sequence[PgDeltaSource],
+        event: str,
+        pre_stmts: Sequence[str] = (),
     ) -> str:
         q = self._q
         mv = spec.mv_table
@@ -563,7 +585,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         q_rc = q(spec.row_count_col)
         add(spec.row_count_col, f"SUM({s})", f"{mv}.{q_rc} + EXCLUDED.{q_rc}")
 
-        stmts: List[str] = []
+        stmts: List[str] = list(pre_stmts)
         sep = ",\n        "
         stmts.append(
             f"INSERT INTO {mv} ({', '.join(ins_cols)})\n"
