@@ -897,6 +897,7 @@ def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     s = re.sub(r"::\s*NUMERIC\b", " * 1.0", s, flags=re.IGNORECASE)
     s = re.sub(r"::\s*(?:TEXT|BIGINT|DOUBLE\s+PRECISION|INTEGER|BOOLEAN)\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\bIS\s+NOT\s+DISTINCT\s+FROM\b", "IS", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bIS\s+DISTINCT\s+FROM\b", "IS NOT", s, flags=re.IGNORECASE)
     s = re.sub(r"\bDOUBLE\s+PRECISION\b", "REAL", s, flags=re.IGNORECASE)
     s = re.sub(r"\bBOOLEAN\b", "INTEGER", s, flags=re.IGNORECASE)
     s = re.sub(r"\bTRUE\b", "1", s, flags=re.IGNORECASE)

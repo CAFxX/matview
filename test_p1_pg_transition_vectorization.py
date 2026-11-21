@@ -108,7 +108,10 @@ class TestPGStatementLevelDDL(unittest.TestCase):
         # MIN recompute: its own UPDATE statement after the upsert, only for
         # groups whose retracted value reaches the stored minimum.
         self.assertNotIn("SELECT MIN(", upsert)
-        self.assertRegex(rest, r"(?s)UPDATE __matview_store_v SET\s+lo = CASE WHEN \(__mv_r\.__mv_r0 IS NOT NULL")
+        self.assertRegex(
+            rest,
+            r"(?s)UPDATE __matview_store_v SET\s+lo = CASE WHEN \(__mv_r\.__mv_r0 IS DISTINCT FROM NULL",
+        )
         # Insert-only statements never retract: no delete, no recompute.
         ai = _body(fns["ai"])
         self.assertNotIn("DELETE FROM", ai)

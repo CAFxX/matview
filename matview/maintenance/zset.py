@@ -230,7 +230,7 @@ class Tier1ZSetMixin(MixinHost):
                     pg_terms.append(f"('V:' || pg_catalog.octet_length({cast_s}) || ':' || {cast_s})")
                 else:
                     pg_terms.append(
-                        f"(CASE WHEN ({s}) IS NULL THEN 'N' "
+                        f"(CASE WHEN ({s}) IS NOT DISTINCT FROM NULL THEN 'N' "
                         f"ELSE 'V:' || pg_catalog.octet_length(({s})::pg_catalog.text) || ':' || ({s})::pg_catalog.text END)"
                     )
             return f"ROW({', '.join(pg_terms)})::pg_catalog.text"

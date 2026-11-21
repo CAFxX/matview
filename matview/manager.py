@@ -89,7 +89,11 @@ from .sql_frontend import (
 # 10: PostgreSQL group-scoped lock tables use bounded hash buckets (1..1024)
 #     with fillfactor = 50 and full-bucket whole-view locks instead of FOR SHARE
 #     on row 0 (eliminating unbounded lock-row growth and MultiXactId churn).
-MATVIEW_GENERATOR_VERSION = "10"
+# 11: PostgreSQL canonical keys support composites and multiranges, targetlist
+#     array unnest preserves composite elements, container nullness uses
+#     IS [NOT] DISTINCT FROM NULL for partially-/all-NULL composites, and
+#     registration probes refuse unsupported key types/collations up front.
+MATVIEW_GENERATOR_VERSION = "11"
 
 
 def _definition_digest(select_sql: str) -> str:

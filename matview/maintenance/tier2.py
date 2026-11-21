@@ -1064,8 +1064,8 @@ class Tier2Mixin(MixinHost):
             sel = ", ".join(f"{k} AS __mv_k{i}" for i, k in enumerate(keys))
             kset = f"(SELECT DISTINCT {sel} FROM {from_sql}) AS __mv_kset"
             kcols = [f"__mv_kset.__mv_k{i}" for i in range(n)]
-            no_null = " AND ".join(f"{k} IS NOT NULL" for k in kcols)
-            any_null = " OR ".join(f"{k} IS NULL" for k in kcols)
+            no_null = " AND ".join(f"{k} IS DISTINCT FROM NULL" for k in kcols)
+            any_null = " OR ".join(f"{k} IS NOT DISTINCT FROM NULL" for k in kcols)
             if len(self.view.joins) > 1:
                 # Multi-source join view: acquire the per-view lock row exclusively
                 # before evaluating kset against other sources, so concurrent writers
@@ -1097,7 +1097,8 @@ class Tier2Mixin(MixinHost):
 
             def _match_null(lhs: List[str]) -> str:
                 eq = " AND ".join(
-                    f"({l} = {k} OR ({l} IS NULL AND {k} IS NULL))" for l, k in zip(lhs, kcols)
+                    f"({l} = {k} OR ({l} IS NOT DISTINCT FROM NULL AND {k} IS NOT DISTINCT FROM NULL))"
+                    for l, k in zip(lhs, kcols)
                 )
                 return (
                     f"EXISTS (SELECT 1 FROM {kset} WHERE {any_null})\n"

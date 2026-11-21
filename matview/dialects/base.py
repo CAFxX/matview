@@ -976,7 +976,7 @@ class DialectBaseMixin(MixinHost):
                     # PostgreSQL array columns/values all share a single 1D
                     # array type OID regardless of declared bracket count.
                     return f"{_pg_canonical_arr_elem(elem_raw)}[]"
-                if stripped_dt.startswith('"'):
+                if '"' in stripped_dt:
                     return stripped_dt
                 dt_up = re.sub(r"\s+", " ", stripped_dt.upper())
                 if dt_up == "BIT" or re.match(r"^BIT\s*\(\s*\d+\s*\)$", dt_up):
