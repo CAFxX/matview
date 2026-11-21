@@ -2711,6 +2711,23 @@ class TranspiledConnectionAdapter:
                     flags=re.I,
                 )
                 main_pks = self._table_pks.get(m_target.group(1).lower(), ["__mv_pk"]) if m_target else ["__mv_pk"]
+                # MariaDB ignored-update guard (a nested IF with a locking
+                # read of the source row): the emulation has no UPDATE IGNORE
+                # trigger quirk and SQLite no locking reads, so drop the guard
+                # and its END IF (the one closing just before the outer guard's).
+                m_ign = re.search(
+                    r"IF\s+[^\n]*?NOT\s+EXISTS\s*\(SELECT\s+1\s+FROM\s+\S+\s+AS\s+__mv_cur\s+WHERE\s+[^\n]*?"
+                    r"LOCK\s+IN\s+SHARE\s+MODE\)\)?\s+THEN\s*",
+                    body,
+                    flags=re.I,
+                )
+                if m_ign:
+                    tail = body[m_ign.end():]
+                    ends = [m.start() for m in re.finditer(r"END\s+IF;", tail, flags=re.I)]
+                    if len(ends) >= 2:
+                        cut = ends[-2]
+                        tail = tail[:cut] + re.sub(r"^END\s+IF;", "", tail[cut:], count=1, flags=re.I)
+                    body = body[:m_ign.start()] + tail
                 b_clean = self._convert_mysql_dml_to_sqlite(body, main_pks)
                 when_cl = ""
                 m_outer = re.match(

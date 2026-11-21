@@ -251,6 +251,35 @@ The following seven items are the in-database bulk-maintenance roadmap. Decision
 - [ ] **PostgreSQL MIN/MAX(VARCHAR) Result Type and NUMERIC Group Representative** (found in the #259 review; re-verify on current master):
   - `MIN`/`MAX` over a `VARCHAR` column (also via a domain) were stored as `VARCHAR` (type 1043) while the native result type is `TEXT` (25).
   - A `NUMERIC` group key whose group holds equal values of different scale (1.0 and 1.00): after an `UPDATE` the stored representative can differ from the one the live `GROUP BY` returns (also with a domain over `NUMERIC`).
+  - Progress: on MariaDB (as detected by the manager) the maintenance `AFTER UPDATE` trigger now applies a change only when the row is no longer in its OLD state on its key and referenced columns (compared with `OLD`, read from storage, so exact for every type; `TIMESTAMP(3)` showed that comparing with `NEW` is not); the cell, extended to primary-key collisions, mixed statements and `INSERT IGNORE ... ON DUPLICATE KEY UPDATE`, is exact. The guard is generated only for tables with a primary key or a UNIQUE key (without one no row can be skipped on a duplicate key, and an identical twin row would make a real update look skipped: review finding, cell `mysql_update_ignore_key_shapes`). Remaining: SQL generated for the generic `mysql` dialect (CLI without a MariaDB version) has no guard; on a table whose only key is a nullable UNIQUE key, a skipped update of a row whose key is NULL is still applied (such rows can have identical twins, so they are always applied); the upstream report is not filed.
+- [ ] **Support or Refuse PostgreSQL 18 VIRTUAL Generated Columns in Source Tables**:
+  - Fails closed but breaks the application: PostgreSQL 18 raises "unexpected virtual generated column reference" when the statement-trigger functions read a VIRTUAL generated column from a transition table (`SELECT ... __mv_n.*` or a referenced column). Registration succeeds, then every `UPDATE` of the source fails, and every write fails when a view reads the column (cell `generated_virtual`). Read only the needed non-virtual columns from the transition tables and compute virtual columns from their expressions (or join back to the table by key), or refuse at registration with an `EngineLimitationError` code. STORED generated columns are exact on every engine (cell `generated_stored`).
+- [ ] **PostgreSQL Result Types and Names Found by the Stage 2 Review** (all pre-existing on master):
+  - `BIT_AND`/`BIT_OR` over `INT` are stored as `BIGINT` but the native result is `INTEGER`.
+  - `VARIANCE`/`STDDEV` differ from the native result from the initial population on (see "Preserve Dialect-Native Statistical Aggregate Alias Semantics").
+  - A domain over an array type fails registration (42601, the array backing-type problem of "Native Backing Column Types for Array Keys"); other domains are reflected as their base type (cell `pg_domains` in `test_native_dml_interactions.py`).
+  - `MIN`/`MAX` over a `VARCHAR` column (also via a domain) are stored as `VARCHAR` (type 1043) but the native result type is `TEXT` (25).
+  - A `NUMERIC` group key whose group holds equal values of different scale (1.0 and 1.00): after an `UPDATE` the stored representative can differ from the one the live `GROUP BY` returns (same with a domain over `NUMERIC`). The oracle compares scale, so this is visible; the PostgreSQL contract for which representative a group shows needs deciding (canonical, or the native first-seen value).
+  - A view name containing a space produces invalid backing-table DDL.
+  - FK `ON DELETE CASCADE` into both join sides: stage 3.
+- [ ] **Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View**:
+  - Writable CTEs and FK cascades into two sources of an algebraic join view currently get `Δt ⋈ Δd` wrong, with both row triggers and transition tables (PG 15/18).
+  - Detect the overlap exactly: a `BEFORE`/`AFTER STATEMENT` bracket counter per view, kept in a transaction-local setting. Overlapping firings store their signed deltas, and the last one applies `−(Δt ⋈ Δd)`. Three or more co-modified sources use inclusion–exclusion or fail closed.
+  - First verify the bracket firing order natively on every supported PostgreSQL version and statement kind.
+  - Tests:
+    - 2- and 3-source CTEs with insert, update and delete mixes;
+    - FK cascades into both sides;
+    - savepoint rollback with an open bracket;
+    - sequential PL/pgSQL statements, which must not be flagged;
+    - a mutation check that drops the correction.
+- [ ] **Bulk maintenance stage 4: Lean Row-Trigger Bodies on SQLite, MySQL and MariaDB**:
+  - Every per-row body must be O(1) indexed statements:
+    - restrict empty-group deletes to the row's key (join views emit an unrestricted `DELETE ... WHERE n <= 0` per row today);
+    - remove single-row derived tables with `GROUP BY`;
+    - compute derived columns such as AVG in the reader view instead of storing them;
+    - minimise statements per row.
+  - Measured headroom: the SQLite generated agg body costs 1.5–2x a hand-minimised exact body.
+  - Tests: the stage 1 differential, plus per-row cost budgets relative to the measured trigger floor and to the hand-minimised bodies. Measured: the floor is SQLite 0.3–0.4 µs and MySQL/MariaDB 0–3 µs per row; the generated MariaDB 12.3 agg body costs 66 µs per row against 10 µs lean.
 - [ ] **Bulk maintenance stage 5: Per-Row Cost Classes and Explicit Refusal of Super-Linear Row Maintenance**:
   - Classify every row-trigger body as O(1), O(log n) with a named supporting index, O(group) or O(table).
   - On SQLite/MySQL/MariaDB, refuse O(group) and O(table) plans by default with an explicit limitation code that names the cost and the missing index. Measured costs of such plans:
