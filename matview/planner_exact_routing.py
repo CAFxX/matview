@@ -358,6 +358,9 @@ class ExactAggregateRoutingMixin(MixinHost):
         regular inference applies. Raises when the native result type cannot
         be determined on PostgreSQL/MySQL: storing it with a guessed type
         would change the view's result type."""
+        server_t = self._server_result_storage_type(item)
+        if server_t is not None:
+            return server_t
         scalar_t = self._native_scalar_storage_type(item)
         if scalar_t is not None:
             return scalar_t
@@ -378,6 +381,21 @@ class ExactAggregateRoutingMixin(MixinHost):
                 f"result. Wrap the expression in an explicit CAST(... AS <type>)."
             )
         return resolved
+
+    def _server_result_storage_type(self, item: SelectItem) -> Optional[str]:
+        """The server-reported type of an item calling a function sqlglot does
+        not model (matview.native_functions.probe_result_types)."""
+        if self.dialect == Dialect.SQLITE or not self.view.native_result_types:
+            return None
+        native_t = dict(self.view.native_result_types).get(item.alias.lower())
+        if native_t is None:
+            return None
+        node = self._item_ast(item.raw_expr)
+        if node is None or node.find(sqlglot_exp.Anonymous) is None:
+            return None
+        # Verbatim: the server's own spelling is valid DDL (PostgreSQL
+        # format_type, MySQL SHOW COLUMNS) and keeps modifiers such as UNSIGNED.
+        return native_t.upper()
 
     def _native_scalar_storage_type(self, item: SelectItem) -> Optional[str]:
         """Native result type of a non-aggregate item that is one call of a

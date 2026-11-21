@@ -21,8 +21,14 @@ from sqlglot import exp as sqlglot_exp
 from sqlalchemy.engine import Connection as _SAConnection, Engine as _SAEngine
 
 from .compiler import IncrementalViewCompiler
-from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, emit as emit_diagnostics
-from .native_functions import apply_catalog_classification, classify as classify_native_functions, unclassified_calls
+from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, emit as emit_diagnostics, exact_fallback_message
+from .native_functions import (
+    apply_catalog_classification,
+    classify as classify_native_functions,
+    items_with_unmodelled_calls,
+    probe_result_types,
+    unclassified_calls,
+)
 from .connectivity import (
     connect_database_via_sqlalchemy,
     dbapi_connection_layers,
@@ -1829,7 +1835,7 @@ class MaterializedViewManager:
             pg_fillfactor=getattr(self, "pg_fillfactor", 80),
         )
         if text_only:
-            extra = self._text_only_classification_diagnostics(plan, text_only)
+            extra = self._text_only_classification_diagnostics(plan, text_only, self.dialect)
             emit_diagnostics(extra)
             plan.strategy_diagnostics.extend(extra)
         return plan
@@ -1844,20 +1850,51 @@ class MaterializedViewManager:
         spec = view
         if isinstance(view, str):
             spec = parse_view_definition(view, known_tables={k.lower() for k in schemas}, dialect=self.dialect)
-        if not isinstance(spec, ViewSpec) or not unclassified_calls(spec, self.dialect) and not spec.additional_views:
+        if not isinstance(spec, ViewSpec):
+            return view
+        if (
+            not spec.additional_views
+            and not unclassified_calls(spec, self.dialect)
+            and (self.dialect == Dialect.SQLITE or not items_with_unmodelled_calls(spec, self.dialect))
+        ):
             return view
         is_mariadb = self.subdialect == EngineSubdialect.MARIADB
-        return apply_catalog_classification(
+        spec = apply_catalog_classification(
             spec,
             self.dialect,
             lambda calls: classify_native_functions(self.conn, self.dialect, is_mariadb, calls),
             lambda vs, calls, why: text_only.append((vs.view_name, tuple(sorted({c.name for c in calls})), why)),
         )
+        return self._with_server_result_types(spec)
+
+    def _with_server_result_types(self, spec: ViewSpec) -> ViewSpec:
+        """Attach the server-reported result types of select items that call
+        functions sqlglot does not model (their type cannot be derived from
+        the SQL text). PostgreSQL: a temporary view's pg_attribute types,
+        typmod included; MySQL/MariaDB: a temporary ``CREATE TABLE ... AS
+        SELECT ... LIMIT 0``. SQLite stores such columns without affinity."""
+        additional = tuple(self._with_server_result_types(a) for a in spec.additional_views)
+        if additional != spec.additional_views:
+            spec = replace(spec, additional_views=additional)
+        if self.dialect == Dialect.SQLITE or not items_with_unmodelled_calls(spec, self.dialect):
+            return spec
+        types = probe_result_types(self.conn, self.dialect, spec.raw_select_sql)
+        if not types:
+            return spec
+        return replace(spec, native_result_types=tuple(sorted(types.items())))
 
     @staticmethod
     def _text_only_classification_diagnostics(
-        plan: MaterializedViewPlan, text_only: Sequence[Tuple[str, Tuple[str, ...], str]]
+        plan: MaterializedViewPlan,
+        text_only: Sequence[Tuple[str, Tuple[str, ...], str]],
+        dialect: Dialect = Dialect.SQLITE,
     ) -> List[Diagnostic]:
+        remedy = (
+            "use a SQLite build or driver that supports PRAGMA function_list (SQLite 3.30+)."
+            if dialect == Dialect.SQLITE
+            else "grant this user SELECT on the function catalogs named above (MySQL: "
+            "performance_schema.user_defined_functions; MariaDB: mysql.func and mysql.proc)."
+        )
         strategy = {
             MaintenanceStrategy.ALGEBRAIC_DELTA: Strategy.ALGEBRAIC_DELTA,
             MaintenanceStrategy.GROUP_SCOPED_DELTA: Strategy.GROUP_SCOPED_RECOMPUTE,
@@ -1870,12 +1907,13 @@ class MaterializedViewManager:
                 strategy=strategy,
                 columns=(),
                 expressions=names,
-                message=(
-                    f"function classification from the SQL text only: {', '.join(names)} could not be "
-                    f"looked up in the engine catalog ({why}), so a call without GROUP BY context is "
-                    f"maintained as a scalar function. If one of them is a user-defined aggregate the "
-                    f"view's rows can differ from the live view. To change it: use a SQLite build or "
-                    f"driver that supports PRAGMA function_list (SQLite 3.30+)."
+                message=exact_fallback_message(
+                    strategy,
+                    f"{', '.join(names)} could not be looked up in the engine catalog ({why}), so they are "
+                    f"classified from the SQL text: a call without GROUP BY context is maintained as a scalar "
+                    f"function; if one is a user-defined aggregate, the view's rows can differ from the live view.",
+                    "the selected strategy's.",
+                    remedy,
                 ),
             )
             for view_name, names, why in text_only
@@ -3585,6 +3623,7 @@ def generate_materialized_view(
             additional_views=view_sql_or_spec.additional_views,
             native_aggregates=view_sql_or_spec.native_aggregates,
             native_scalar_types=view_sql_or_spec.native_scalar_types,
+            native_result_types=view_sql_or_spec.native_result_types,
         )
     else:
         view_spec = view_sql_or_spec
