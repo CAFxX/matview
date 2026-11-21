@@ -262,8 +262,9 @@ class MySQLDialectMixin(MixinHost):
                 f"View '{self.logical_view_name}' uses {', '.join(dict.fromkeys(issues))} on MariaDB, "
                 "whose result the materialized view cannot reproduce exactly: MariaDB fixes the "
                 "decimals of VAR/STDDEV over exact or FLOAT(M,D) arguments and rounds results to them, "
-                "and accumulates window VAR/STDDEV in row order. Project such a statistic as its own "
-                "top-level column of a single-query view, or CAST its argument to DOUBLE."
+                "and accumulates window VAR/STDDEV in row order. CAST its argument to DOUBLE (kept exact "
+                "by the full refresh), or, under the FLOAT_REASSOCIATION_ALLOWED opt-in, project "
+                "the statistic of an exact argument as its own top-level column of a single-query view."
             )
 
 

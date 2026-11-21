@@ -568,6 +568,16 @@ def _format_sa_column_type(
             raw_str = f"BIT VARYING({int(bit_len)})" if bit_len is not None else "BIT VARYING"
         elif bit_len is not None:
             raw_str = f"BIT({int(bit_len)})"
+    elif (
+        dialect == Dialect.MYSQL
+        and raw_str in ("FLOAT", "DOUBLE", "REAL")
+        and precision is not None
+        and scale is not None
+    ):
+        # SQLAlchemy prints MySQL FLOAT(M,D)/DOUBLE(M,D) without (M,D); the
+        # fixed decimals change MariaDB's VAR/STDDEV result rounding and the
+        # column's result metadata, as the information_schema path keeps.
+        raw_str = f"{raw_str}({int(precision)},{int(scale)})"
     elif dialect == Dialect.MYSQL and raw_str == "BIT" and getattr(col_type, "length", None):
         # SQLAlchemy's MySQL BIT prints without its width; the width decides
         # MySQL's MIN/MAX result types (BIT(1..9) vs BIT(10..64)).

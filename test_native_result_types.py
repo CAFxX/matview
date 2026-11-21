@@ -46,6 +46,18 @@ from test_native_statistical_aggregates import (
     _native_engines,
 )
 
+
+def _assert_exact_float_refresh(test: unittest.TestCase, schema: str, select: str, dialect: str, **kw: Any) -> None:
+    """A floating-point order-sensitive aggregate (never misclassified as
+    exact) is maintained by default by the exact full refresh of the
+    original query, announced by a FLOAT_EXACT_REFRESH diagnostic."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", MatviewDiagnosticWarning)
+        warnings.simplefilter("ignore", EngineLimitationWarning)
+        plan = generate_materialized_view(schema, f"CREATE VIEW v AS {select};", dialect=dialect, **kw)
+    test.assertEqual(plan.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC, select)
+    test.assertIn("FLOAT_EXACT_REFRESH", [d.code for d in plan.strategy_diagnostics], select)
+
 _TABLE = (
     "CREATE TABLE {t} (id INT PRIMARY KEY, g INT NOT NULL, i INT, s SMALLINT, b BIGINT, "
     "d DECIMAL(12,3), f DOUBLE{dp}, v VARCHAR(16), c CHAR(3))"
@@ -261,7 +273,7 @@ class PostgresPlannedResultTypeTests(unittest.TestCase):
                 self.assertEqual(m.group(1).strip(), expected_type)
 
         # Bare FLOAT4, f4 + f4, and NULLIF(f4, f8) keep REAL under opt-in;
-        # NULLIF(i, f4), NULLIF(i, f8), and FLOOR/CEIL/ROUND/TRUNC/SIGN(int) are DOUBLE PRECISION and refused by default.
+        # NULLIF(i, f4), NULLIF(i, f8), and FLOOR/CEIL/ROUND/TRUNC/SIGN(int) are DOUBLE PRECISION and maintained by the exact full refresh by default.
         for opt_select, opt_type in (
             ("SELECT g, SUM(f4) AS r FROM ik GROUP BY g", "REAL"),
             ("SELECT g, SUM(f4 + f4) AS r FROM ik GROUP BY g", "REAL"),
@@ -270,8 +282,7 @@ class PostgresPlannedResultTypeTests(unittest.TestCase):
             ("SELECT g, SUM(FLOOR(i)) AS r FROM ik GROUP BY g", "DOUBLE PRECISION"),
         ):
             with self.subTest(dialect="postgres_float", select=opt_select):
-                with self.assertRaises(EngineLimitationError):
-                    generate_materialized_view(pg_schema, f"CREATE VIEW v AS {opt_select};", dialect="postgres:18")
+                _assert_exact_float_refresh(self, pg_schema, opt_select, "postgres:18")
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", EngineLimitationWarning)
                     plan_fl = generate_materialized_view(
@@ -289,8 +300,7 @@ class PostgresPlannedResultTypeTests(unittest.TestCase):
             "SELECT g, SUM(SIGN(i)) AS r FROM ik GROUP BY g",
         ):
             with self.subTest(dialect="postgres_refused", select=pg_refused):
-                with self.assertRaises(EngineLimitationError):
-                    generate_materialized_view(pg_schema, f"CREATE VIEW v AS {pg_refused};", dialect="postgres:18")
+                _assert_exact_float_refresh(self, pg_schema, pg_refused, "postgres:18")
 
         mysql_schema = (
             "CREATE TABLE ik (id INT PRIMARY KEY, g INT, i INT, s SMALLINT, b BIGINT, "
@@ -347,7 +357,7 @@ class PostgresPlannedResultTypeTests(unittest.TestCase):
         self.assertIn(") AS r", avg_unindexed.reader_view_ddl)
         self.assertIn("DECIMAL(14, 4)", avg_indexed.backing_table_ddl)
 
-        # Float branch inside CASE/IF and DOUBLE UNSIGNED must fail closed (never misclassified as exact).
+        # Float branch inside CASE/IF and DOUBLE UNSIGNED must be classified as approximate (never misclassified as exact): exact full refresh by default.
         for approx_select in (
             "SELECT g, SUM(CASE WHEN i > 0 THEN f ELSE NULL END) AS r FROM ik GROUP BY g",
             "SELECT g, SUM(IF(i > 0, f, 0)) AS r FROM ik GROUP BY g",
@@ -356,13 +366,9 @@ class PostgresPlannedResultTypeTests(unittest.TestCase):
             "SELECT g, AVG(du) AS r FROM ik GROUP BY g",
         ):
             with self.subTest(dialect="mysql_refused", select=approx_select):
-                with self.assertRaises(EngineLimitationError):
-                    generate_materialized_view(
-                        mysql_schema,
-                        f"CREATE VIEW v AS {approx_select};",
-                        dialect="mysql:8.4",
-                        ignore_limitations=True,
-                    )
+                _assert_exact_float_refresh(
+                    self, mysql_schema, approx_select, "mysql:8.4", ignore_limitations=True
+                )
 
 
 class MySQLPlannedResultTypeTests(unittest.TestCase):

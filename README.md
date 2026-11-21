@@ -1424,7 +1424,13 @@ views, each key value is mapped to a canonical text by a per-view function
   use on PostgreSQL), and that can change the live result itself. A scoped
   refresh (only the affected groups) is not used: restricting the query to a
   group can change its plan and row order (measured), and no shape has been
-  proven equivalent yet. Cost, stated in a registration diagnostic:
+  proven equivalent yet.
+  MariaDB exclusion (refused, not bypassable): `VAR_*`/`STDDEV_*` over an
+  exact argument (integer/`DECIMAL`) or a `FLOAT(M,D)`/`DOUBLE(M,D)`
+  column, alone or wrapped (for example `COALESCE(STDDEV_POP(x), 0)`):
+  MariaDB rounds such results to fixed decimals that a stored `DOUBLE` does
+  not reproduce. Remedy: `CAST(x AS DOUBLE)` (then refreshed exactly).
+  Cost, stated in a registration diagnostic:
 
   | Engine | Full refresh cost | Concurrency |
   | --- | --- | --- |

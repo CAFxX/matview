@@ -461,7 +461,7 @@ class PlannerMixin(MixinHost):
                 dialect=self.dialect,
                 affected_object=self.logical_view_name,
                 description=(
-                    f"Relaxed result allowed for {listed}: maintained incrementally (race-free native "
+                    f"Relaxed result allowed for {listed}: maintained incrementally on a BEST-EFFORT basis (race-free native "
                     f"recompute in {order} where available); the floating-point result may differ from "
                     f"the original view in the last digits, because the original view accumulates in its "
                     f"plan's row order."

@@ -1474,6 +1474,112 @@ class NativeDefaultExactRefresh(_ExactCase):
                     fx.close()
 
 
+class NativeMysqlStatisticsDefault(_ExactCase):
+    """Default mode, natively, VAR/STDDEV on MySQL/MariaDB over every argument
+    family: DOUBLE, FLOAT(M,D), DOUBLE(M,D), DECIMAL(12,5), DECIMAL(40,30),
+    INT; grouped by a nullable key and global; NULL values and empty groups.
+
+    MariaDB rounds VAR/STDDEV over exact or FLOAT(M,D)/DOUBLE(M,D) arguments
+    to fixed decimals that a stored double cannot reproduce (measured: live
+    7-8 decimals; DECIMAL(40,30) 1 ulp; global DECIMAL(12,5) tens of ulps
+    after ROUND), so those views (and wrappers such as COALESCE) are refused,
+    with or without the relaxed opt-in for wrappers; DOUBLE arguments and the
+    documented remedy CAST(arg AS DOUBLE) refresh and equal the live view
+    exactly. MySQL computes all of them in double precision: every shape
+    refreshes and is exact. FLOAT(M,D) is declared on the live table, so the
+    view's schema comes from live introspection (which must keep (M,D))."""
+
+    _ARGS = ("d", "fm", "dm", "n5", "n30", "k")
+    _FIXED = ("fm", "dm", "n5", "n30", "k")
+
+    def _mysql(self) -> str:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("set MYSQL_DSN")
+        return dsn
+
+    def _shapes(self, t: str) -> List[Tuple[str, str]]:
+        fns = ("VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP")
+        out: List[Tuple[str, str]] = []
+        for c in self._ARGS:
+            cols = ", ".join(f"{fn}({c}) AS {fn.lower()}_{c}" for fn in fns)
+            out.append((c, f"SELECT g, COUNT(*) AS n, {cols} FROM {t} GROUP BY g"))
+            out.append((c, f"SELECT {cols} FROM {t}"))
+        out.append(("fm", f"SELECT g, COALESCE(STDDEV_POP(fm), 0) AS s FROM {t} GROUP BY g"))
+        out.append(("cast", f"SELECT g, VAR_SAMP(CAST(fm AS DOUBLE)) AS v, "
+                            f"STDDEV_POP(CAST(n5 AS DOUBLE)) AS s FROM {t} GROUP BY g"))
+        return out
+
+    def test_statistics_refresh_exact_or_refused(self) -> None:
+        dsn = self._mysql()
+        fx = _Fixture(Dialect.MYSQL, dsn)
+        try:
+            cur = fx.conn.cursor()
+            cur.execute("SELECT VERSION()")
+            mariadb = "mariadb" in str(cur.fetchone()[0]).lower()
+            fx.conn.commit()
+            t = fx.table(
+                "st",
+                "id BIGINT PRIMARY KEY, g INT, d DOUBLE, fm FLOAT(7,3), dm DOUBLE(12,4), "
+                "n5 DECIMAL(12,5), n30 DECIMAL(40,30), k INT",
+            )
+            accepted: List[Tuple[Any, str]] = []
+            for arg, sel in self._shapes(t):
+                refused = mariadb and arg in self._FIXED
+                with self.subTest(shape=sel[:60]):
+                    if refused:
+                        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "on MariaDB"):
+                            fx.register(sel, relaxed=False)
+                        fx.conn.rollback()
+                        if sel.startswith(f"SELECT g, COALESCE"):
+                            # A wrapper is refused under the relaxed opt-in too.
+                            with self.assertRaisesRegex(UnsupportedMaterializedViewError, "on MariaDB"):
+                                fx.register(sel, relaxed=True)
+                            fx.conn.rollback()
+                        continue
+                    plan = fx.register(sel, relaxed=False)
+                    self.assertEqual(plan.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
+                    accepted.append((plan, sel))
+            self.assertTrue(accepted)
+            rng = random.Random(255)
+            vals = (None, 0, 1, -1, 1.5, 2.25, 123.456, 1e-3, 999.5, 7)
+            ids: List[int] = []
+            for step in range(40):
+                op = rng.random()
+                if op < 0.55 or not ids:
+                    i = 1 + len(ids) + step * 7
+                    ids.append(i)
+                    v = [rng.choice(vals) for _ in range(5)]
+                    cur.execute(
+                        f"INSERT INTO {t} VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (i, rng.choice((1, 2, 3, None)), v[0], v[1], v[2], v[3], v[4],
+                         None if v[0] is None else rng.randrange(-3, 5)),
+                    )
+                elif op < 0.8:
+                    cur.execute(
+                        f"UPDATE {t} SET n5 = %s, fm = %s, d = %s, g = %s WHERE id = %s",
+                        (rng.choice(vals), rng.choice(vals), rng.choice(vals),
+                         rng.choice((1, 2, 3, 4)), rng.choice(ids)),
+                    )
+                else:
+                    cur.execute(f"DELETE FROM {t} WHERE id = %s", (ids.pop(rng.randrange(len(ids))),))
+                fx.conn.commit()
+                for plan, sel in accepted:
+                    cur.execute(f"SELECT * FROM {plan.view_name}")
+                    mv = _rows(cur.fetchall())
+                    cur.execute(sel)
+                    live = _rows(cur.fetchall())
+                    fx.conn.commit()
+                    self.assertEqual(mv, live, f"step {step}: {sel}")
+            # Empty table: global statistics are NULL, groups disappear.
+            cur.execute(f"DELETE FROM {t}")
+            fx.conn.commit()
+            for plan, sel in accepted:
+                self.assertViewExact(fx.conn, plan, sel, f"empty: {sel}")
+        finally:
+            fx.close()
+
+
 class NativeWindowExactTypes(_ExactCase):
     """Window SUM/AVG/COUNT of exact arguments keep the engine's result type
     (NUMERIC / DECIMAL), so they are compared exactly with no budget (stored
