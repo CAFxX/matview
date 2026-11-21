@@ -382,8 +382,8 @@ class Env:
 
     def register(
         self, vd: ViewDef, ignore_limitations: Optional[bool] = None,
-        accept_limitations: Optional[Sequence[str]] = None,
-    ) -> None:
+        accept_limitations: Optional[Sequence[str]] = None, populate: bool = True,
+    ) -> Any:
         # MySQL/MariaDB registration requires acknowledging the documented
         # MYSQL_NO_TRUNCATE_TRIGGER limitation; that is asserted, not silenced.
         # Floating-point order-sensitive aggregates need an explicit per-code
@@ -393,7 +393,7 @@ class Env:
             warnings.simplefilter("always")
             plan = self.manager.register_view(
                 f"CREATE VIEW {vd.name} AS {vd.select};", ignore_limitations=ignore,
-                accept_limitations=accept_limitations,
+                accept_limitations=accept_limitations, populate=populate,
             )
         self.conn.commit()
         codes = sorted({lim.code for lim in plan.limitations})
@@ -408,6 +408,7 @@ class Env:
                 for w in caught
             ), [str(w.message) for w in caught]
         self.plans[vd.name] = plan
+        return plan
 
     # -- execution -----------------------------------------------------------
     def execute(self, sql: str, conn: Any = None) -> int:
@@ -984,6 +985,54 @@ def test_avg_decimal_new_group_scale(make_env, target: Target) -> None:
 
 _E2 = ("A single-table projection without its source primary key must still maintain hidden-key "
        "identity across primary-key-only updates. TODO.md 'Track Source-Key Changes in Projection Views Without the Key Column'")
+
+
+BACKFILL_SCHEMA = {
+    "postgres": ["CREATE TABLE bt (id INT PRIMARY KEY, g INT NOT NULL, x NUMERIC(12,3))"],
+    "mysql": ["CREATE TABLE bt (id INT PRIMARY KEY, g INT NOT NULL, x DECIMAL(12,3)) ENGINE=InnoDB"],
+    "sqlite": ["CREATE TABLE bt (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, x INTEGER)"],
+}
+
+
+@pytest.mark.parametrize("target", _params())
+def test_recompute_during_backfill_ignores_rows_not_yet_folded(make_env, target: Target) -> None:
+    """While a pk-range backfill is active the triggers skip source rows in
+    the unfolded window, which the backfill folds later. A native recompute
+    by a trigger (AVG, MIN/MAX after a retraction) must skip them too:
+    otherwise it stores a value that includes such a row, and when the row
+    is deleted before its chunk runs (the trigger skips that delete), no
+    chunk touches the group again and the stale value stays (CI failure of
+    test_pgmy_exact_float_aggregates.py::NativeConcurrentWriters on PG 15).
+
+    Deterministic: the writes run on an independent connection between two
+    committed backfill batches (from the progress callback)."""
+    env = make_env(target, views=[], seed=False, schema_sql=BACKFILL_SCHEMA[target.family])
+    # Group 1: ids 1..10 (first chunk) and id 25 (third chunk, the smallest
+    # value); group 2 fills the second and third chunks.
+    rows = [(i, 1, 10 + i) for i in range(1, 11)] + [(i, 2, i) for i in range(11, 25)] + [(25, 1, -50)]
+    env.execute("INSERT INTO bt (id, g, x) VALUES " + ", ".join(f"({i}, {g}, {x})" for i, g, x in rows))
+    env.commit()
+    vd = ViewDef("v_bt", "SELECT g, COUNT(*) AS n, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx FROM bt GROUP BY g")
+    env.views = [vd]
+    plan = env.register(vd, populate=False)
+    writer = env.connect()
+    done: List[int] = []
+
+    def on_progress(batch: int, _rows: int) -> None:
+        if batch != 1:
+            return
+        # Folded: ids 1..10; unfolded window: 11..25.
+        for sql in ("INSERT INTO bt (id, g, x) VALUES (1000, 1, 7)",  # AVG of group 1 recomputed
+                    "DELETE FROM bt WHERE id = 10",  # group 1's MAX retracted: recomputed
+                    "DELETE FROM bt WHERE id = 1",  # group 1's MIN retracted: recomputed
+                    "DELETE FROM bt WHERE id = 25"):  # in the window: skipped by the trigger
+            env.execute(sql, conn=writer)
+            env.commit(conn=writer)
+        done.append(batch)
+
+    env.manager.backfill_incrementally(plan, batch_size=10, on_progress=on_progress, snapshot_isolation=False)
+    assert done == [1]
+    env.check("backfill after writes that recomputed a group with unfolded rows")
 
 
 @pytest.mark.parametrize("target", _params())
