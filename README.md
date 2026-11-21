@@ -726,6 +726,13 @@ protocol at all: run it with writes to the source tables stopped.
   fires before the maintenance trigger, because SQLite fires the newest trigger
   first) or `triggers_orphaned` when maintenance triggers are gone, disabled,
   preceded or on a detached partition (`repair_view()` rebuilds them).
+  PostgreSQL and MySQL/MariaDB also report `triggers_out_of_order` for a
+  multi-source view when a user trigger on one source fires before the
+  maintenance trigger and writes another source; there `repair_view()` only
+  repopulates and does not reorder triggers: on MySQL/MariaDB re-register the
+  view (`drop_view()` then `register_view()`, which places its triggers
+  first), on PostgreSQL rewrite the user trigger as a statement-level trigger
+  named after the maintenance triggers.
   `diff_views()` / `matview diff` shows what a registration would change.
 - `repair_view(name=None)` (`--repair`) repopulates (or rebuilds after drift)
   each view in its own transaction; there is no all-view atomicity (see

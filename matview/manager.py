@@ -1911,7 +1911,7 @@ class MaterializedViewManager:
                         created_objects.append(obj)
                 for stmt in plan.trigger_ddls:
                     obj = _extract_created_object(stmt)
-                    cur.execute(stmt)
+                    cur.execute(self._mysql_maintenance_trigger_first(cur, stmt, plan.trigger_names))
                     if obj:
                         created_objects.append(obj)
 
@@ -2234,7 +2234,19 @@ class MaterializedViewManager:
         if not catalog:
             return {}
         if self.dialect == Dialect.POSTGRES:
-            return self._pg_trigger_drift(catalog)
+            out_pg = self._pg_trigger_drift(catalog)
+            for v, st in self._join_source_order_drift(catalog).items():
+                out_pg.setdefault(v, st)
+            return out_pg
+        if self.dialect == Dialect.MYSQL:
+            order_drift = self._join_source_order_drift(catalog)
+            presence = self._views_trigger_presence_drift(catalog)
+            for v, st in order_drift.items():
+                presence.setdefault(v, st)
+            return presence
+        return self._views_trigger_presence_drift(catalog)
+
+    def _views_trigger_presence_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
         sql = self._LIVE_TRIGGER_SQL.get(self.dialect)
         if sql is None:
             return {}
@@ -2356,6 +2368,129 @@ class MaterializedViewManager:
                 m_rowid, m_tbl, m_event = info
                 if any(r > m_rowid and tbl == m_tbl and ev == m_event for r, tbl, ev in risky):
                     out[name] = "triggers_out_of_order"
+                    break
+        return out
+
+    _MYSQL_AFTER_TRIGGER_RE = re.compile(
+        r"^\s*CREATE\s+TRIGGER\s+(\S+)\s+AFTER\s+(INSERT|UPDATE|DELETE)\s+ON\s+(\S+)\s+FOR\s+EACH\s+ROW\b",
+        flags=re.IGNORECASE,
+    )
+
+    def _mysql_maintenance_trigger_first(self, cur: Any, stmt: str, own_names: Sequence[str]) -> str:
+        """MySQL/MariaDB fire the triggers of one table, event and timing in
+        ``ACTION_ORDER`` (creation order unless ``FOLLOWS``/``PRECEDES``).
+        A maintenance ``AFTER`` trigger must run before any existing user
+        trigger: one that writes another source of a join view first makes
+        the view count that change twice. Place it before the first existing
+        trigger with ``PRECEDES`` (user triggers created later run after it
+        unless they ask to precede it, which the drift check reports)."""
+        if self.dialect != Dialect.MYSQL:
+            return stmt
+        m = self._MYSQL_AFTER_TRIGGER_RE.match(stmt)
+        if not m:
+            return stmt
+        table = m.group(3).strip("`")
+        own = {str(n).lower() for n in own_names}
+        self._execute_param(
+            cur,
+            "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE() "
+            "AND event_object_table = ? AND event_manipulation = ? AND action_timing = 'AFTER' "
+            "ORDER BY action_order",
+            (table, m.group(2).upper()),
+        )
+        first = next((str(r[0]) for r in cur.fetchall() or [] if str(r[0]).lower() not in own), None)
+        if first is None:
+            return stmt
+        q = "`" + first.replace("`", "``") + "`"
+        return stmt[: m.end()] + f" PRECEDES {q}" + stmt[m.end():]
+
+    # A write to a table in a procedural body (PL/pgSQL, MySQL trigger body).
+    _BODY_WRITE_RE = re.compile(
+        r"\b(?:INSERT(?:\s+(?:IGNORE|OR\s+\w+))?\s+INTO|REPLACE\s+INTO|MERGE\s+INTO|"
+        r"UPDATE(?:\s+(?:IGNORE|OR\s+\w+))?|DELETE\s+FROM)\s+"
+        r"(?:[\"`]?\w+[\"`]?\s*\.\s*)?[\"`]?(\w+)",
+        flags=re.IGNORECASE,
+    )
+
+    def _join_source_order_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+        """``{view: "triggers_out_of_order"}`` (PostgreSQL, MySQL/MariaDB): a
+        user trigger on a source of a multi-source view fires before the
+        view's maintenance trigger for the same event and writes another
+        source of that view. That source's maintenance then joins its change
+        with the not-yet-maintained row, and the first source's maintenance
+        joins the row with the change again: the pair is counted twice.
+
+        PostgreSQL: every row-level ``AFTER`` trigger fires before the
+        statement-level maintenance triggers, and statement-level triggers
+        fire in name order; ``repair_view()`` cannot change that (rewrite the
+        user trigger as a statement-level trigger named after the
+        maintenance triggers). MySQL/MariaDB: ``ACTION_ORDER``; registration
+        places maintenance triggers first, so only a later ``PRECEDES`` is
+        reported (re-register the view to fix). Only direct writes in the
+        trigger body are seen, not writes in functions or procedures it
+        calls.
+        """
+        with self._cursor() as cur:
+            if self.dialect == Dialect.POSTGRES:
+                rows = self._catalog_select(
+                    cur,
+                    "SELECT tg.tgname, tg.tgrelid::bigint, c.relname, tg.tgtype::int, p.prosrc, tg.tgenabled "
+                    "FROM pg_catalog.pg_trigger tg JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid "
+                    "JOIN pg_catalog.pg_proc p ON p.oid = tg.tgfoid WHERE NOT tg.tgisinternal",
+                )
+            elif self.dialect == Dialect.MYSQL:
+                rows = self._catalog_select(
+                    cur,
+                    "SELECT trigger_name, event_object_table, event_object_table, event_manipulation, "
+                    "action_timing, action_order, action_statement FROM information_schema.triggers "
+                    "WHERE trigger_schema = DATABASE()",
+                )
+            else:
+                return {}
+        if not rows:
+            return {}
+        # (name, table key, table name, event bits, firing-order key, body, AFTER and enabled, row-level);
+        # PostgreSQL trigger names repeat across tables (partitions).
+        trigs: List[Tuple[str, Any, str, int, Any, str, bool, bool]] = []
+        ev_bit = {"INSERT": 4, "DELETE": 8, "UPDATE": 16}
+        for r in rows:
+            if self.dialect == Dialect.POSTGRES:
+                name, rel, relname, tgtype, body, enabled = r
+                tgtype = int(tgtype)
+                after = not (tgtype & 2) and not (tgtype & 64) and str(enabled) in ("O", "A")
+                is_row = bool(tgtype & 1)
+                trigs.append((str(name), int(rel), str(relname).lower(), tgtype & 28, str(name).encode("utf-8"),
+                              str(body or ""), after, is_row))
+            else:
+                name, tbl, _, event, timing, order, body = r
+                trigs.append((str(name), str(tbl).lower(), str(tbl).lower(), ev_bit.get(str(event).upper(), 0),
+                              int(order or 0), str(body or ""), str(timing).upper() == "AFTER", True))
+        maint_names = {str(t).lower() for e in catalog.values() for t in e.get("trigger_names") or []}
+        out: Dict[str, str] = {}
+        for vname, entry in catalog.items():
+            own = {str(t).lower() for t in entry.get("trigger_names") or []}
+            mine = [tr[1:] for tr in trigs if tr[0].lower() in own and tr[6]]
+            sources = {m[1] for m in mine}
+            if len(sources) < 2:
+                continue
+            for n, tkey, tname, evs, order, body, after, is_row in trigs:
+                if n.lower() in maint_names or not after:
+                    continue
+                others = sources - {tname}
+                writes = {m.group(1).lower() for m in self._BODY_WRITE_RE.finditer(body)}
+                if not (writes & others):
+                    continue
+                for m_tkey, _, m_evs, m_order, _, _, m_is_row in mine:
+                    if m_tkey != tkey or not (m_evs & evs):
+                        continue
+                    if self.dialect == Dialect.POSTGRES:
+                        first = is_row and not m_is_row or (is_row == m_is_row and order < m_order)
+                    else:
+                        first = order < m_order
+                    if first:
+                        out[vname] = "triggers_out_of_order"
+                        break
+                if vname in out:
                     break
         return out
 
