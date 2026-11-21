@@ -493,7 +493,10 @@ Support levels used here:
 - Transpiled: in `test_matview_sync.py`, the PostgreSQL and MySQL code paths are
   also exercised against SQLite through `TranspiledConnectionAdapter` (sqlglot
   transpilation). These are auxiliary checks, not evidence of native engine
-  semantics.
+  semantics. The adapter also stubs the MySQL session-bypass lock
+  (`GET_LOCK`/`RELEASE_LOCK`) and the trigger-order (`ACTION_ORDER`) lookup,
+  so offline runs prove nothing about them; the native cells of
+  `test_native_dml_interactions.py` cover them.
 - Best-effort: SQLite3 Multiple Ciphers and sqlean run the main suite nightly as
   SQLite builds; cipher and extension functionality is not tested. The sqlean
   lane is allowed to fail: sqlean's own `VAR_*`/`STDDEV_*` functions differ

@@ -2328,6 +2328,11 @@ class TranspiledConnectionAdapter:
                 self._skip_triggers = 1 if ("'ON'" in s_up or "= 1" in s_up or "=1" in s_up) else 0
             return [], 0
 
+        if "INFORMATION_SCHEMA.TRIGGERS" in s_up and "ORDER BY ACTION_ORDER" in s_up:
+            # Registration's "existing triggers of this table and event"
+            # lookup (PRECEDES placement): the emulation keeps no trigger
+            # order, so report none.
+            return [], 0
         if "INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS" in s_up:
             schemas = introspect_sqlite_schemas(self._sq_conn)
             rows = []
