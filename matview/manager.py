@@ -21,6 +21,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlalchemy.engine import Connection as _SAConnection, Engine as _SAEngine
 
 from .compiler import IncrementalViewCompiler
+from .native_functions import apply_catalog_classification, classify as classify_native_functions, unclassified_calls
 from .connectivity import (
     connect_database_via_sqlalchemy,
     dbapi_connection_layers,
@@ -2172,6 +2173,7 @@ class MaterializedViewManager:
         plain_views: Optional[Mapping[str, str]] = None,
         current_schema: Optional[str] = None,
     ) -> MaterializedViewPlan:
+        view = self._classify_native_functions(schemas, view)
         return generate_materialized_view(
             schemas,
             view,
@@ -2186,6 +2188,19 @@ class MaterializedViewManager:
             repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
             plain_views=plain_views,
             current_schema=current_schema,
+        )
+
+    def _classify_native_functions(self, schemas: Dict[str, TableSchema], view: Any) -> Any:
+        """Ask the engine catalog whether unmodelled function calls are
+        aggregates (see matview.native_functions); refuse when it cannot tell."""
+        spec = view
+        if isinstance(view, str):
+            spec = parse_view_definition(view, known_tables={k.lower() for k in schemas}, dialect=self.dialect)
+        if not isinstance(spec, ViewSpec) or not unclassified_calls(spec, self.dialect) and not spec.additional_views:
+            return view
+        is_mariadb = self.subdialect == EngineSubdialect.MARIADB
+        return apply_catalog_classification(
+            spec, self.dialect, lambda calls: classify_native_functions(self.conn, self.dialect, is_mariadb, calls)
         )
 
     def _stored_plan(
@@ -4989,6 +5004,8 @@ def generate_materialized_view(
             additional_views=view_sql_or_spec.additional_views,
             original_select_sql=view_sql_or_spec.original_select_sql,
             referenced_plain_views=view_sql_or_spec.referenced_plain_views,
+            native_aggregates=view_sql_or_spec.native_aggregates,
+            native_scalar_types=view_sql_or_spec.native_scalar_types,
         )
     else:
         view_spec = view_sql_or_spec

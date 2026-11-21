@@ -557,11 +557,14 @@ class PostgresUnrecognizedAggregateTests(unittest.TestCase):
     def test_unknown_result_type_is_refused_with_cast_remedy(self) -> None:
         cur = self.conn.cursor()
         cur.execute(_BASE_DDL.format(t="t", dbl="DOUBLE PRECISION"))
-        cur.execute("CREATE AGGREGATE isum(integer) (SFUNC = int4pl, STYPE = integer)")
+        # A polymorphic user-defined aggregate: the catalog result type is
+        # anyelement, so the native type of the call is not known statically.
+        cur.execute("CREATE FUNCTION first_sf(anyelement, anyelement) RETURNS anyelement LANGUAGE sql IMMUTABLE AS 'SELECT COALESCE($1, $2)'")
+        cur.execute("CREATE AGGREGATE afirst(anyelement) (SFUNC = first_sf, STYPE = anyelement)")
         self.conn.commit()
         mgr = MaterializedViewManager(self.conn)
         with self.assertRaisesRegex(UnsupportedMaterializedViewError, r"CAST\(\.\.\. AS <type>\)"):
-            mgr.register_view("CREATE VIEW isum_v AS SELECT g, isum(v) AS a FROM t GROUP BY g")
+            mgr.register_view("CREATE VIEW isum_v AS SELECT g, afirst(v) AS a FROM t GROUP BY g")
         self.conn.rollback()
         cur = self.conn.cursor()
         cur.execute("SELECT count(*) FROM pg_class WHERE relname = 'isum_v' AND relnamespace = %s::regnamespace", (self.schema,))

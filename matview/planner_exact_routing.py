@@ -138,6 +138,10 @@ class ExactAggregateRoutingMixin(MixinHost):
             return None
 
     # ------------------------------------------------------- classification
+    def _native_aggregate_names(self) -> frozenset[str]:
+        """User-defined aggregates classified through the engine catalog."""
+        return frozenset(n for n, _ in self.view.native_aggregates)
+
     def _view_has_grouping_sets(self) -> bool:
         q = self._exact_routing_select_ast()
         if q is None:
@@ -326,7 +330,9 @@ class ExactAggregateRoutingMixin(MixinHost):
             node = self._item_ast(raw)
             if node is None:
                 continue
-            for call in iter_unordered_order_sensitive_calls(node, self._order_keys_cover_every_primary_key):
+            for call in iter_unordered_order_sensitive_calls(
+                node, self._order_keys_cover_every_primary_key, self._native_aggregate_names()
+            ):
                 if self._is_float_policy_aggregate(call):
                     continue
                 name = call_name(call, sg_d)
@@ -434,7 +440,7 @@ class ExactAggregateRoutingMixin(MixinHost):
         return any(
             isinstance(call, sqlglot_exp.WithinGroup)
             or call_name(call, sg_d) not in _ALGEBRAIC_AGGREGATE_NAMES | _RECOGNIZED_HOLISTIC_NAMES
-            for call in aggregate_calls(node)
+            for call in aggregate_calls(node, self._native_aggregate_names())
         )
 
     # -------------------------------------------------------------- routing
@@ -495,7 +501,7 @@ class ExactAggregateRoutingMixin(MixinHost):
         names = {
             name
             for raw in exprs
-            for call in aggregate_calls(self._item_ast(raw) or sqlglot_exp.Null())
+            for call in aggregate_calls(self._item_ast(raw) or sqlglot_exp.Null(), self._native_aggregate_names())
             for name in [call_name(call, sg_d)]
             if isinstance(call, sqlglot_exp.WithinGroup) or name not in _ALGEBRAIC_AGGREGATE_NAMES
         }
@@ -622,6 +628,9 @@ class ExactAggregateRoutingMixin(MixinHost):
         regular inference applies. Raises when the native result type cannot
         be determined on PostgreSQL/MySQL: storing it with a guessed type
         would change the view's result type."""
+        scalar_t = self._native_scalar_storage_type(item)
+        if scalar_t is not None:
+            return scalar_t
         if self.dialect == Dialect.SQLITE:
             return None
         is_opaque = not item.is_aggregate and any(
@@ -639,6 +648,21 @@ class ExactAggregateRoutingMixin(MixinHost):
                 f"result. Wrap the expression in an explicit CAST(... AS <type>)."
             )
         return resolved
+
+    def _native_scalar_storage_type(self, item: SelectItem) -> Optional[str]:
+        """Native result type of a non-aggregate item that is one call of a
+        scalar function classified through the engine catalog."""
+        if item.is_aggregate or not self.view.native_scalar_types:
+            return None
+        node = self._item_ast(item.raw_expr)
+        while isinstance(node, sqlglot_exp.Paren):
+            node = node.this
+        if not isinstance(node, sqlglot_exp.Anonymous):
+            return None
+        native_t = dict(self.view.native_scalar_types).get(f"{str(node.name).upper()}/{len(node.expressions)}")
+        if native_t is None:
+            return None
+        return native_t if native_t == "BLOB" else self._normalize_dialect_type(native_t)
 
     def _routed_expr_storage_type(self, node: Optional[sqlglot_exp.Expr], *, allow_aggregate: bool) -> Optional[str]:
         """Native type of a routed select expression, or None when it is not
@@ -677,7 +701,7 @@ class ExactAggregateRoutingMixin(MixinHost):
             }
             return types.pop() if len(types) == 1 and None not in types else None
         if allow_aggregate:
-            calls = aggregate_calls(node)
+            calls = aggregate_calls(node, self._native_aggregate_names())
             if len(calls) == 1 and calls[0] is node:
                 return self._aggregate_call_storage_type(node)
         return None
@@ -710,6 +734,10 @@ class ExactAggregateRoutingMixin(MixinHost):
 
     def _aggregate_call_storage_type(self, call: sqlglot_exp.Expr) -> Optional[str]:
         name = call_name(call, _sqlglot_dialect(self.dialect))
+        native = dict(self.view.native_aggregates)
+        if isinstance(call, sqlglot_exp.Anonymous) and name in native:
+            native_t = native[name]
+            return self._normalize_dialect_type(native_t) if native_t else None
         raw_up = call.sql(dialect=_sqlglot_dialect(self.dialect)).upper()
         if " RETURNING " in f" {raw_up} ":
             return None
