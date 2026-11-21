@@ -2078,6 +2078,9 @@ class DialectBaseMixin(MixinHost):
         return result
 
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
+        routed_type = self._exact_routing_storage_type(item)
+        if routed_type is not None:
+            return routed_type
         if not item.is_aggregate:
             c_def = self._lookup_col_def(item.raw_expr)
             if c_def:
