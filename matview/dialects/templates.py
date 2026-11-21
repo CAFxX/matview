@@ -346,7 +346,8 @@ $mv_install$;""",
 {{ timing | default('AFTER') }} {{ event }} ON {{ q_base_t }}
 FOR EACH ROW
 BEGIN
-    IF COALESCE(@__matview_skip_triggers, 0) = 0 THEN
+    IF NOT (COALESCE(@__matview_skip_triggers, 0) <> 0
+            AND IS_USED_LOCK(CONCAT('__matview_bypass:', CONNECTION_ID())) <=> CONNECTION_ID()) THEN
     {{ body }}
     END IF;
 END;""",
