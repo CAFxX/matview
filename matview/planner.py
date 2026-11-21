@@ -239,57 +239,134 @@ class PlannerMixin(MixinHost):
             arg = fn.this
             if isinstance(arg, sqlglot_exp.Distinct):
                 arg = arg.expressions[0] if arg.expressions else None
-            arg_sql = arg.sql(dialect=sg) if arg is not None else ""
+            if arg is None:
+                arg_sql = ""
+            elif isinstance(arg, str):
+                arg_sql = arg
+            else:
+                arg_sql = arg.sql(dialect=sg)
             if self._exact_numeric_precision_scale(arg_sql) is None or fname not in ("SUM", "AVG"):
                 out.append(w.sql(dialect=sg))
         return out
 
+    FLOAT_RELAXED_CODE = "FLOAT_REASSOCIATION_ALLOWED"
+
+    def _order_sensitive_float_items(self) -> List[Tuple[str, str]]:
+        """(column, expression) of every aggregate whose PostgreSQL/MySQL/
+        MariaDB result depends on the order the plan reads the rows: SUM/AVG/
+        TOTAL over approximate (or not provably exact) arguments and VAR/
+        STDDEV in DOUBLE (MySQL/MariaDB every type), plain or window."""
+        if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL):
+            return []
+        items = getattr(self, "_working_select_items", None) or self.view.select_items
+        out: List[Tuple[str, str]] = [
+            (it.alias, it.raw_expr) for it in items
+            if it.is_aggregate and self._is_order_sensitive_aggregate(it)
+        ]
+        out += [("", e) for e in self._nested_order_sensitive_exprs() if all(e != x for _, x in out)]
+        windows = self._window_order_sensitive_exprs()
+        if windows:
+            norm = lambda t: re.sub(r"\s+", "", t).lower()  # noqa: E731
+            matched = set()
+            for it in self.view.select_items:
+                for w in windows:
+                    if norm(w) in norm(it.raw_expr) or norm(it.raw_expr) in norm(w):
+                        out.append((it.alias, it.raw_expr))
+                        matched.add(w)
+            out += [("", w) for w in windows if w not in matched]
+        return list(dict.fromkeys(out))
+
+    _ORDER_SENSITIVE_FN_NAMES = frozenset({
+        "SUM", "AVG", "TOTAL", "VARIANCE", "VARIANCE_POP", "VAR_POP", "VAR_SAMP", "STDDEV",
+        "STDDEV_POP", "STDDEV_SAMP", "STD",
+    })
+    _STAT_FN_NAMES = frozenset({"VARIANCE", "VARIANCE_POP", "VAR_POP", "VAR_SAMP", "STDDEV", "STDDEV_POP",
+                                "STDDEV_SAMP", "STD"})
+
+    def _nested_order_sensitive_exprs(self) -> List[str]:
+        """Order-sensitive float aggregates anywhere in the query outside the
+        top-level projection: CTEs, derived tables, scalar subqueries,
+        subqueries in WHERE/HAVING, set-operation branches. Arguments whose
+        type cannot be proven exact count as approximate."""
+        try:
+            root = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return []
+        sg = _sqlglot_dialect(self.dialect)
+        top = root if isinstance(root, sqlglot_exp.Select) else None
+        top_exprs = {id(e) for e in (top.expressions if top is not None else [])}
+        out: List[str] = []
+        for node in root.walk():
+            if not isinstance(node, sqlglot_exp.Func) or isinstance(node.parent, sqlglot_exp.Window):
+                continue
+            names = {node.sql_name().upper(), str(getattr(node, "name", "") or "").upper()}
+            if not names & self._ORDER_SENSITIVE_FN_NAMES:
+                continue
+            # Top-level projections are handled through the working items.
+            anc, nested = node.parent, False
+            while anc is not None:
+                if isinstance(anc, sqlglot_exp.Select) and anc is not top:
+                    nested = True
+                    break
+                if id(anc) in top_exprs:
+                    break
+                anc = anc.parent
+            if top is not None and not nested and anc is not None and id(anc) in top_exprs:
+                continue
+            if top is not None and not nested:
+                # Outside any nested SELECT and outside the projection: e.g.
+                # HAVING of the top-level query; treat like a nested use.
+                pass
+            arg = node.this
+            if isinstance(arg, sqlglot_exp.Distinct):
+                arg = arg.expressions[0] if arg.expressions else None
+            if arg is None:
+                arg_sql = ""
+            elif isinstance(arg, str):
+                arg_sql = arg
+            else:
+                arg_sql = arg.sql(dialect=sg)
+            is_stat = bool(names & self._STAT_FN_NAMES)
+            exact = bool(arg_sql) and self._exact_numeric_precision_scale(arg_sql) is not None
+            if (is_stat and self.dialect == Dialect.MYSQL) or not exact:
+                out.append(node.sql(dialect=sg))
+        return list(dict.fromkeys(out))
+
+    def _float_relaxed_requested(self) -> bool:
+        return self.FLOAT_RELAXED_CODE in set(self.accepted_limitations)
+
+    def _float_refresh_required(self) -> bool:
+        """Default (exact) mode: a view with an order-sensitive float
+        aggregate is maintained by a full refresh of its original query."""
+        return bool(self._order_sensitive_float_items()) and not self._float_relaxed_requested()
+
     def _order_sensitive_shape_limitations(
         self, strategy: MaintenanceStrategy, alg_mode: str
     ) -> List[TransparencyLimitation]:
-        """PostgreSQL/MySQL/MariaDB refuse floating-point order-sensitive
-        aggregates by default, whatever the shape.
+        """Limitations of the RELAXED mode for floating-point order-sensitive
+        aggregates on PostgreSQL/MySQL/MariaDB.
 
-        SUM/AVG over approximate (or not provably exact) arguments accumulate
-        in binary floating point in the order the engine reads the rows, and
-        VAR/STDDEV use the engine's streaming algorithm (MySQL/MariaDB in
-        DOUBLE for every argument type). That order is chosen by the plan of
-        the original view and is not a function of the data: an index or range
-        scan for a WHERE clause, sort-based grouping, parallel aggregation and
-        the join order all change it (measured natively: PostgreSQL ungrouped
-        `SUM(x) WHERE y < 10` with an index on y and MySQL 8.4 / MariaDB 10.11
-        grouped views with an index on the WHERE column: original view 1.5,
-        any fixed recompute order 2.0; PostgreSQL parallel aggregation makes
-        the original view itself nondeterministic). No maintained value can
-        equal the original view under every plan, so these views are only
-        installed with an explicit per-code opt-in (``accept_limitations``),
-        which gives best-effort maintenance: race-free, and equal to the
-        original view when it evaluates in the recompute's order.
-        """
-        if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL):
+        By default such a view is exact: it is maintained by a full refresh of
+        its original query (see _float_refresh_required and
+        _float_strategy_diagnostics), and no limitation applies. Only with the
+        explicit per-code opt-in FLOAT_REASSOCIATION_ALLOWED does the planner
+        use incremental maintenance whose float result may differ from the
+        original view in the last digits (the original view accumulates in
+        its plan's row order); shapes whose incremental maintenance is not
+        the race-free post-lock recompute also need
+        ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE."""
+        items = self._order_sensitive_float_items()
+        if not items or not self._float_relaxed_requested():
             return []
-        items = [
-            it.raw_expr for it in self._working_select_items
-            if it.is_aggregate and self._is_order_sensitive_aggregate(it)
-        ]
-        items += self._window_order_sensitive_exprs()
-        if not items:
+        if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC:
+            # This shape is maintained by a full refresh in every mode: exact.
             return []
-        order = (
-            "sequential-scan (ctid) order" if self.dialect == Dialect.POSTGRES
-            else "primary-key order"
-        )
-        listed = ", ".join(dict.fromkeys(items))
+        listed = ", ".join(dict.fromkeys(e for _, e in items))
         lims: List[TransparencyLimitation] = []
         recomputed = strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and (
             alg_mode == "single" or (alg_mode == "union_all_agg" and self.dialect == Dialect.POSTGRES)
         )
         if not recomputed:
-            # Only single-table algebraic views (and PostgreSQL UNION ALL
-            # aggregates) recompute the order-sensitive aggregate race-free
-            # after locking; join folds, MySQL/MariaDB UNION ALL folds and
-            # group-scoped / atomic re-evaluation (joins, window functions)
-            # are neither drift-free nor verified race-free.
             lims.append(
                 TransparencyLimitation(
                     code="ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE",
@@ -297,40 +374,108 @@ class PlannerMixin(MixinHost):
                     dialect=self.dialect,
                     affected_object=self.logical_view_name,
                     description=(
-                        f"Aggregate(s) {listed} in a {strategy.value}/{alg_mode} view are maintained by "
-                        f"folding deltas or by re-evaluating the group without the lock-then-recompute "
-                        f"protocol of single-table views: rounding can accumulate across writes and "
-                        f"concurrent writers are not verified to be serialized. With accept_limitations=['ORDER_SENSITIVE_AGGREGATE_"
-                        f"NO_RACE_FREE_RECOMPUTE'] values can drift from the original view until "
-                        f"repair_view()."
+                        f"Relaxed mode: aggregate(s) {listed} in a {strategy.value}/{alg_mode} view are "
+                        f"maintained by folding deltas or by re-evaluating the group without the "
+                        f"lock-then-recompute protocol of single-table views: rounding can accumulate "
+                        f"across writes (not only in the last digits) and concurrent writers are not "
+                        f"verified to be serialized, until repair_view()."
                     ),
                     mitigation=(
-                        "Aggregate an exact type (integer/DECIMAL/NUMERIC), materialize the aggregate over "
-                        "a single table, or accept the code explicitly."
+                        "Use the default (exact full refresh), aggregate an exact type, or accept the code "
+                        "explicitly."
                     ),
                 )
             )
+        order = "sequential-scan (ctid) order" if self.dialect == Dialect.POSTGRES else "primary-key order"
         return lims + [
             TransparencyLimitation(
-                code="ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+                code=self.FLOAT_RELAXED_CODE,
                 severity=LimitationSeverity.BLOCKER,
                 dialect=self.dialect,
                 affected_object=self.logical_view_name,
                 description=(
-                    f"Aggregate(s) {listed} accumulate in floating point in the order the original "
-                    f"view's plan reads the rows (index and range scans, sort-based grouping, "
-                    f"parallel aggregation, join order), so no maintained value equals the original "
-                    f"view under every plan. With accept_limitations=['ORDER_SENSITIVE_AGGREGATE_"
-                    f"NOT_REPRODUCIBLE'] the view is maintained on a BEST-EFFORT basis: race-free "
-                    f"native recompute in {order}, equal to the original view only when it "
-                    f"evaluates in that order."
+                    f"Relaxed result allowed for {listed}: maintained incrementally (race-free native "
+                    f"recompute in {order} where available); the floating-point result may differ from "
+                    f"the original view in the last digits, because the original view accumulates in its "
+                    f"plan's row order."
                 ),
-                mitigation=(
-                    "Aggregate an exact type (integer/DECIMAL/NUMERIC), or accept the code explicitly "
-                    "(accept_limitations / --accept-limitation)."
-                ),
+                mitigation="Remove FLOAT_REASSOCIATION_ALLOWED to get the exact default (full refresh).",
             )
         ]
+
+    def _float_strategy_diagnostics(self, strategy: MaintenanceStrategy, alg_mode: str) -> List[Any]:
+        """Diagnostics for floating-point order-sensitive aggregates (see
+        matview.diagnostics): which strategy is in effect, why, its cost and
+        how to change it."""
+        from .diagnostics import (
+            FLOAT_EXACT_REFRESH,
+            FLOAT_RELAXED_MAINTENANCE,
+            Diagnostic,
+            DiagnosticSeverity,
+            Strategy,
+            exact_fallback_message,
+            relaxed_message,
+        )
+
+        items = self._order_sensitive_float_items()
+        if not items:
+            return []
+        cols = tuple(c for c, _ in items if c)
+        exprs = tuple(dict.fromkeys(e for _, e in items))
+        reason = (
+            f"{', '.join(exprs)} accumulate(s) in floating point, and floating-point addition is not "
+            f"associative: adding and subtracting deltas (or recomputing in another row order) can "
+            f"differ from the original view (1e16 + 1.5 - 1e16 gives 2.0, the view returns 1.5)."
+        )
+        if self.dialect == Dialect.POSTGRES:
+            cost = (
+                "on PostgreSQL, O(rows in the view's source tables) per writing statement "
+                "(statement-level triggers re-run the whole view query once per INSERT/UPDATE/DELETE "
+                "statement); the refresh locks the whole view, so all writers of the view serialize "
+                "(writers of different groups wait for each other) and under REPEATABLE READ a "
+                "concurrent second writer fails with a serialization error (40001)."
+            )
+        else:
+            cost = (
+                f"on {'MariaDB' if self.subdialect == EngineSubdialect.MARIADB else 'MySQL'}, O(rows in "
+                f"the view's source tables) per written ROW (row triggers re-run the whole view query "
+                f"for every inserted, updated or deleted row); the refresh locks every row of the view, "
+                f"so all writers of the view serialize and concurrent writers deadlock often (error "
+                f"1213, retryable; measured with 4 single-write writers: MySQL 8.4 285/600 "
+                f"transactions, MariaDB 138/600)."
+            )
+        if self._float_relaxed_requested() and strategy != MaintenanceStrategy.ATOMIC_QUERY_SYNC:
+            if strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and alg_mode in ("single", "union_all_agg"):
+                strat = Strategy.ALGEBRAIC_DELTA_NATIVE_RECOMPUTE
+            elif strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA:
+                strat = Strategy.GROUP_SCOPED_RECOMPUTE
+            else:
+                strat = Strategy.ALGEBRAIC_DELTA
+            msg = relaxed_message(
+                strat,
+                "the floating-point result may differ from the live view in the last digits (it is "
+                "accumulated in another row order than the original view's plan).",
+                "remove FLOAT_REASSOCIATION_ALLOWED from accept_limitations / --accept-limitation.",
+            )
+            return [Diagnostic(
+                code=FLOAT_RELAXED_MAINTENANCE, severity=DiagnosticSeverity.WARNING,
+                view=self.logical_view_name, strategy=strat, columns=cols, expressions=exprs, message=msg,
+                details={"dialect": self.dialect.value},
+            )]
+        msg = exact_fallback_message(
+            Strategy.FULL_REFRESH,
+            reason,
+            cost,
+            "store the values as DECIMAL/NUMERIC or integers (exact, fast incremental maintenance), or "
+            "accept a relaxed result with accept_limitations=['FLOAT_REASSOCIATION_ALLOWED'] / "
+            "--accept-limitation FLOAT_REASSOCIATION_ALLOWED (fast incremental maintenance, may differ "
+            "from the live view in the last digits).",
+        )
+        return [Diagnostic(
+            code=FLOAT_EXACT_REFRESH, severity=DiagnosticSeverity.WARNING,
+            view=self.logical_view_name, strategy=Strategy.FULL_REFRESH, columns=cols, expressions=exprs,
+            message=msg, details={"dialect": self.dialect.value, "cost": cost},
+        )]
 
     def _mysql_group_index_limitations(
         self, strategy: MaintenanceStrategy, alg_mode: str
@@ -1266,6 +1411,15 @@ class PlannerMixin(MixinHost):
         return self._effective_group_by_exprs
 
     def _select_strategy_and_mode(self) -> Tuple[MaintenanceStrategy, str]:
+        if self._float_refresh_required():
+            # Exact default for floating-point order-sensitive aggregates:
+            # re-run the view's own query (full refresh). A scoped refresh is
+            # only equivalent when restricting the query to the affected
+            # groups provably cannot change the row order of the remaining
+            # rows; no shape is proven yet (a WHERE + index plan restricted
+            # to one group reorders rows: measured 1.5 vs 2.0), so every
+            # shape uses the full refresh.
+            return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
         win_part_keys = self._extract_window_partition_keys()
         if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_upsert:
             v = self.view
@@ -2291,7 +2445,11 @@ class PlannerMixin(MixinHost):
         if self.dialect == Dialect.MYSQL:
             self._enforce_mariadb_statistical_exactness(raw.reader_view_ddl or "")
             self._enforce_mysql_minmax_typing()
-        return self._finalize_plan_backfill(raw)
+        plan = self._finalize_plan_backfill(raw)
+        diags = list(getattr(getattr(self, "_context", None), "strategy_diagnostics", ()) or ())
+        if diags:
+            plan = replace(plan, strategy_diagnostics=[*plan.strategy_diagnostics, *diags])
+        return plan
 
     def compile(self) -> MaterializedViewPlan:
         first_plan = self._compile_single_plan()
@@ -2306,6 +2464,7 @@ class PlannerMixin(MixinHost):
                 dialect=self.dialect,
                 ignore_limitations=self.ignore_limitations,
                 accept_limitations=self.accepted_limitations,
+                silence_diagnostics=getattr(getattr(self, "_context", None), "silence_diagnostics", ()),
                 object_prefix=self.object_prefix,
                 incremental_backfill=self.incremental_backfill,
                 batch_size=self.batch_size,

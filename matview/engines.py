@@ -522,7 +522,7 @@ class TransparencyLimitation:
 # ``--accept-limitation CODE``) overrides them; the global
 # ``ignore_limitations`` does not.
 PER_CODE_OPT_IN_LIMITATIONS = frozenset({
-    "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+    "FLOAT_REASSOCIATION_ALLOWED",
     "ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE",
     "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
 })
