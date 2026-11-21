@@ -192,5 +192,117 @@ class TestSqlglotExpBuilders(unittest.TestCase):
             conn.close()
 
 
+    def test_special_char_view_names_and_extract_created_object(self) -> None:
+        import re
+
+        from matview.sql_frontend import _extract_created_object
+
+        # _extract_created_object must handle quoted names with spaces, single quotes,
+        # dots, and escaped quote delimiters.
+        self.assertEqual(_extract_created_object('CREATE VIEW "sales summary" AS SELECT 1;'), ("view", "sales summary"))
+        self.assertEqual(_extract_created_object('CREATE VIEW "user\'s view" AS SELECT 1;'), ("view", "user's view"))
+        self.assertEqual(_extract_created_object('CREATE VIEW "a ""b"" c" AS SELECT 1;'), ("view", 'a "b" c'))
+        self.assertEqual(_extract_created_object('CREATE VIEW "my.view" AS SELECT 1;'), ("view", "my.view"))
+        self.assertEqual(_extract_created_object('CREATE VIEW "public"."my.view" AS SELECT 1;'), ("view", "my.view"))
+        self.assertEqual(_extract_created_object("CREATE VIEW `sales summary` AS SELECT 1;"), ("view", "sales summary"))
+        self.assertEqual(_extract_created_object("CREATE TABLE `order items` (id INT);"), ("table", "order items"))
+        self.assertEqual(_extract_created_object('CREATE TRIGGER "trg 1" AFTER INSERT ON t;'), ("trigger", "trg 1"))
+
+        # Across all three dialects, special-character view names (and base table names)
+        # must produce valid unquoted internal identifiers without collisions.
+        for dial in (Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL):
+            q = "`" if dial == Dialect.MYSQL else '"'
+            sc = parse_table_schema(
+                f"CREATE TABLE {q}order items{q} (id INT PRIMARY KEY, g INT, v INT);",
+                dialect=dial,
+            )
+            seen_stores = set()
+            vnames = ["sales summary", "sales_summary", "Sales Summary", "sales-summary", "user's view", "my.view", "---"]
+            for vn in vnames:
+                qvn = f"{q}{vn.replace(q, q + q)}{q}"
+                plan = generate_materialized_view(
+                    sc,
+                    f"CREATE VIEW {qvn} AS SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {q}order items{q} GROUP BY g;",
+                    dialect=dial,
+                    ignore_limitations=True,
+                )
+                self.assertRegex(plan.backing_table_name, r"^[A-Za-z_][A-Za-z0-9_]*$", (dial, vn))
+                self.assertLessEqual(len(plan.backing_table_name), 62)
+                self.assertNotIn(plan.backing_table_name, seen_stores, (dial, vn))
+                seen_stores.add(plan.backing_table_name)
+                for obj_name in (*plan.trigger_names, *plan.index_names, *plan.auxiliary_table_names):
+                    self.assertRegex(obj_name, r"^[A-Za-z_][A-Za-z0-9_]*$", (dial, vn, obj_name))
+                    self.assertLessEqual(len(obj_name), 62)
+                expected_ref = vn if vn == "sales_summary" else qvn
+                self.assertIn(expected_ref, plan.reader_view_ddl)
+                self.assertTrue(any(expected_ref in stmt for stmt in plan.drop_statements()), (dial, vn, plan.drop_statements()))
+
+        # Trailing-newline bypass and long custom prefix cap in _bounded_ident.
+        long_prefix_plan = generate_materialized_view(
+            parse_table_schema("CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT);", dialect=Dialect.POSTGRES),
+            'CREATE VIEW "sales\n" AS SELECT g, SUM(v) AS s FROM t GROUP BY g;',
+            dialect=Dialect.POSTGRES,
+            object_prefix="x_" * 20,
+        )
+        self.assertRegex(long_prefix_plan.backing_table_name, r"^[A-Za-z_][A-Za-z0-9_]*$")
+        self.assertLessEqual(len(long_prefix_plan.backing_table_name), 62)
+        for obj_name in (*long_prefix_plan.trigger_names, *long_prefix_plan.index_names):
+            self.assertRegex(obj_name, r"^[A-Za-z_][A-Za-z0-9_]*$")
+            self.assertLessEqual(len(obj_name), 62)
+
+        # PostgreSQL BIT VARYING / BIT VARYING(n) DDL must parse cleanly in parse_table_schema.
+        bit_schemas = parse_table_schema(
+            "CREATE TABLE tb (id INT PRIMARY KEY, g INT, b4 BIT(4), bv BIT VARYING, bv8 BIT VARYING(8));",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertIn("tb", bit_schemas)
+        self.assertIn("bv", bit_schemas["tb"].columns)
+        self.assertIn("bv8", bit_schemas["tb"].columns)
+
+        # Live SQLite end-to-end lifecycle across all adversarial view names on a spaced base table,
+        # including diff_views(prune_removed=True) quoted DROP generation.
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute('CREATE TABLE "order items" (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER);')
+            conn.execute('INSERT INTO "order items" VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5);')
+            conn.commit()
+            mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+            sq_names = ["sales summary", "sales_summary", "sales-summary", "user's view", 'a "b" c', "my.view", "---"]
+            for vn in sq_names:
+                qvn = '"' + vn.replace('"', '""') + '"'
+                mgr.register_view(
+                    f'CREATE VIEW {qvn} AS SELECT g, SUM(v) AS s, COUNT(*) AS c FROM "order items" GROUP BY g;'
+                )
+            conn.execute('INSERT INTO "order items" VALUES (4, 2, 15);')
+            conn.execute('UPDATE "order items" SET v = 30 WHERE id = 1;')
+            conn.execute('DELETE FROM "order items" WHERE id = 3;')
+            conn.commit()
+            expected = conn.execute(
+                'SELECT g, SUM(v), COUNT(*) FROM "order items" GROUP BY g ORDER BY g;'
+            ).fetchall()
+            prune_report = mgr.diff_views(
+                ['CREATE VIEW sales_summary AS SELECT g, SUM(v) AS s, COUNT(*) AS c FROM "order items" GROUP BY g;'],
+                prune_removed=True,
+            )
+            for vn in sq_names:
+                qvn = '"' + vn.replace('"', '""') + '"'
+                if vn != "sales_summary":
+                    self.assertIn(vn, prune_report)
+                    self.assertTrue(
+                        any(f"DROP VIEW IF EXISTS {qvn};" == d for d in prune_report[vn].pending_ddls),
+                        (vn, prune_report[vn].pending_ddls),
+                    )
+                got = conn.execute(f"SELECT g, s, c FROM {qvn} ORDER BY g;").fetchall()
+                self.assertEqual(got, expected, vn)
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(f"DELETE FROM {qvn};")
+                conn.rollback()
+                self.assertEqual(mgr.check_schema_drift()[vn], "ok")
+                mgr.repair_view(vn)
+                self.assertTrue(mgr.drop_view(vn))
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -99,7 +99,8 @@ def _stored_select_sql(view_sql: str) -> str:
     ``_serialize_view_sql_with_indexes``: ``CREATE VIEW n AS <select>;``
     followed by optional ``CREATE INDEX`` lines)."""
     first = re.split(r";\s*\n\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b", view_sql or "", maxsplit=1, flags=re.IGNORECASE)[0]
-    m = re.match(r"\s*CREATE\s+VIEW\s+\S+\s+AS\s+(.*)$", first, flags=re.IGNORECASE | re.DOTALL)
+    ident_pat = r'(?:"(?:""|[^"])+"|`(?:``|[^`])+`|\[[^\]]+\]|\S+)'
+    m = re.match(rf"\s*CREATE\s+VIEW\s+{ident_pat}\s+AS\s+(.*)$", first, flags=re.IGNORECASE | re.DOTALL)
     return m.group(1) if m else first
 
 # How to repopulate a view whose pk-range backfill is incomplete.
@@ -1003,14 +1004,15 @@ class MaterializedViewManager:
 
     @staticmethod
     def _serialize_view_sql_with_indexes(plan: MaterializedViewPlan, raw_view_sql: Optional[str] = None) -> str:
-        parts = [f"CREATE VIEW {plan.logical_view_name} AS {plan.view_spec.raw_select_sql.strip().rstrip(';')};"]
+        q_vname = quote_sql_identifier(plan.logical_view_name, plan.dialect, allow_qualified=False)
+        parts = [f"CREATE VIEW {q_vname} AS {plan.view_spec.raw_select_sql.strip().rstrip(';')};"]
         for idx_spec in plan.user_indexes:
             u_kw = "UNIQUE " if idx_spec.unique else ""
-            n_str = f"{idx_spec.name} " if idx_spec.name else ""
+            n_str = f"{quote_sql_identifier(idx_spec.name, plan.dialect, allow_qualified=False)} " if idx_spec.name else ""
             using_str = f" USING {idx_spec.using_method}" if idx_spec.using_method else ""
             w_str = f" WHERE {idx_spec.where_clause}" if idx_spec.where_clause else ""
             parts.append(
-                f"CREATE {u_kw}INDEX {n_str}ON {plan.logical_view_name}{using_str} "
+                f"CREATE {u_kw}INDEX {n_str}ON {q_vname}{using_str} "
                 f"({', '.join(idx_spec.columns)}){w_str};"
             )
         return "\n".join(parts)
@@ -1036,9 +1038,15 @@ class MaterializedViewManager:
                     else view_name
                 )
                 db_v = f"{self.object_prefix}{raw_logical}"
-                cur.execute(build_drop_sql("VIEW", db_v, dialect=self.dialect))
-                cur.execute(build_drop_sql("VIEW", raw_logical, dialect=self.dialect))
-                cur.execute(build_drop_sql("TABLE", f"{self.object_prefix}store_{raw_logical}", dialect=self.dialect))
+                cur.execute(build_drop_sql("VIEW", db_v, dialect=self.dialect, allow_qualified=False))
+                cur.execute(build_drop_sql("VIEW", raw_logical, dialect=self.dialect, allow_qualified=False))
+                cur.execute(build_drop_sql("TABLE", f"{self.object_prefix}store_{raw_logical}", dialect=self.dialect, allow_qualified=False))
+                if not re.fullmatch(r"[A-Za-z0-9_]+", raw_logical):
+                    p = self.object_prefix if self.object_prefix else "__matview_"
+                    safe = re.sub(r"[^A-Za-z0-9_]+", "_", raw_logical).strip("_").lower() or "v"
+                    h = hashlib.sha1(raw_logical.encode("utf-8")).hexdigest()[:8]
+                    avail = max(1, 62 - len(f"{p}store_") - 9)
+                    cur.execute(build_drop_sql("TABLE", f"{p}store_{safe[:avail]}_{h}", dialect=self.dialect, allow_qualified=False))
                 self._commit()
                 return False
 
@@ -1060,7 +1068,7 @@ class MaterializedViewManager:
                 cur.execute(build_drop_sql("TRIGGER", t_name, dialect=self.dialect))
         for fn_name in entry["function_names"]:
             cur.execute(f"DROP FUNCTION IF EXISTS {fn_name if '(' in fn_name else fn_name + '()'} CASCADE;")
-        cur.execute(build_drop_sql("VIEW", resolved_name, dialect=self.dialect))
+        cur.execute(build_drop_sql("VIEW", resolved_name, dialect=self.dialect, allow_qualified=False))
         cur.execute(build_drop_sql("TABLE", entry["backing_table"], dialect=self.dialect))
         for aux_t in entry["aux_tables"]:
             cur.execute(build_drop_sql("TABLE", aux_t, dialect=self.dialect))
@@ -1990,11 +1998,11 @@ class MaterializedViewManager:
                     for kind, name in reversed(created_objects):
                         try:
                             if kind == "trigger":
-                                cur.execute(f"DROP TRIGGER IF EXISTS {name};")
+                                cur.execute(build_drop_sql("TRIGGER", name, dialect=self.dialect, allow_qualified=False))
                             elif kind == "view":
-                                cur.execute(f"DROP VIEW IF EXISTS {name};")
+                                cur.execute(build_drop_sql("VIEW", name, dialect=self.dialect, allow_qualified=False))
                             elif kind == "table":
-                                cur.execute(f"DROP TABLE IF EXISTS {name};")
+                                cur.execute(build_drop_sql("TABLE", name, dialect=self.dialect, allow_qualified=False))
                         except Exception:
                             pass
                     self._commit()
@@ -2210,7 +2218,8 @@ class MaterializedViewManager:
         return set(self._views_trigger_drift(catalog))
 
     _PG_CREATE_TRIGGER_RE = re.compile(
-        r"^CREATE TRIGGER (\S+)\s+AFTER \w+ ON (\S+)", flags=re.IGNORECASE | re.MULTILINE
+        r'^CREATE TRIGGER (\S+)\s+AFTER \w+ ON ((?:"(?:""|[^"])+"(?:\."(?:""|[^"])+")?|\S+))',
+        flags=re.IGNORECASE | re.MULTILINE,
     )
 
     def _views_trigger_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
@@ -2262,18 +2271,18 @@ class MaterializedViewManager:
                         f" UNION ALL SELECT i.inhrelid FROM pg_catalog.pg_inherits i"
                         f" JOIN __mv_tree ON i.inhparent = __mv_tree.relid),"
                         f" __mv_fn AS (SELECT t.tgfoid FROM pg_catalog.pg_trigger t"
-                        f" WHERE t.tgrelid = pg_catalog.to_regclass({lit_t})::oid AND t.tgname = {lit_n})"
+                        f" WHERE t.tgrelid = pg_catalog.to_regclass({lit_t})::oid AND lower(t.tgname) = lower({lit_n}))"
                         f" SELECT"
                         f" (SELECT count(*) FROM __mv_tree WHERE __mv_tree.relid IS NULL OR NOT EXISTS ("
                         f"  SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = __mv_tree.relid"
-                        f"  AND t.tgname = {lit_n})),"
+                        f"  AND lower(t.tgname) = lower({lit_n}))),"
                         f" (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgfoid IN (SELECT tgfoid FROM __mv_fn)"
                         f"  AND t.tgrelid NOT IN (SELECT relid FROM __mv_tree WHERE relid IS NOT NULL)),"
                         # ALTER TABLE ... DISABLE TRIGGER ('D') or ENABLE REPLICA
                         # TRIGGER ('R'): the trigger does not fire for ordinary
                         # sessions, so their writes are not maintained.
                         f" (SELECT count(*) FROM pg_catalog.pg_trigger t JOIN __mv_tree ON t.tgrelid = __mv_tree.relid"
-                        f"  WHERE t.tgname = {lit_n} AND t.tgenabled NOT IN ('O', 'A'))",
+                        f"  WHERE lower(t.tgname) = lower({lit_n}) AND t.tgenabled NOT IN ('O', 'A'))",
                     )
                     if rows is None:
                         continue
@@ -2289,11 +2298,11 @@ class MaterializedViewManager:
                     # Read-only/other triggers recorded by name only.
                     names = [t for t in entry.get("trigger_names") or [] if t not in ddls]
                     if names:
-                        lits = ", ".join("'" + t.replace("'", "''") + "'" for t in names)
+                        lits = ", ".join("'" + t.lower().replace("'", "''") + "'" for t in names)
                         rows = self._catalog_select(
-                            cur, f"SELECT count(DISTINCT tgname) FROM pg_catalog.pg_trigger WHERE tgname IN ({lits})"
+                            cur, f"SELECT count(DISTINCT lower(tgname)) FROM pg_catalog.pg_trigger WHERE lower(tgname) IN ({lits})"
                         )
-                        if rows is not None and int(rows[0][0]) < len(set(names)):
+                        if rows is not None and int(rows[0][0]) < len({n.lower() for n in names}):
                             status = "triggers_missing"
                 if status:
                     out[name] = status
@@ -2554,7 +2563,7 @@ class MaterializedViewManager:
             sqls.append(build_drop_sql("TABLE", old_tables, dialect=self.dialect))
 
         else:  # SQLite and generic fallback
-            sqls.append(build_drop_sql("VIEW", plan.view_name, dialect=self.dialect))
+            sqls.append(build_drop_sql("VIEW", plan.view_name, dialect=self.dialect, allow_qualified=False))
             sqls.append(build_drop_sql("TABLE", plan.backing_table_name, dialect=self.dialect))
             sqls.append(build_alter_rename_table_sql(shadow_tbl, plan.backing_table_name, dialect=self.dialect))
             for aux_t, s_aux in shadow_aux_map.items():
@@ -3117,6 +3126,7 @@ class MaterializedViewManager:
             specs_input,
             known_tables={k.lower() for k in schemas},
             indexes=indexes,
+            dialect=self.dialect,
         )
 
         for v_spec in all_specs:
@@ -3356,14 +3366,14 @@ class MaterializedViewManager:
                     drop_ddls: List[str] = []
                     if self.dialect != Dialect.POSTGRES:
                         for t_name in cat_entry.get("trigger_names", []):
-                            drop_ddls.append(f"DROP TRIGGER IF EXISTS {t_name};")
+                            drop_ddls.append(build_drop_sql("TRIGGER", t_name, dialect=self.dialect, allow_qualified=False))
                     for fn_name in cat_entry.get("function_names", []):
                         drop_ddls.append(f"DROP FUNCTION IF EXISTS {fn_name if '(' in fn_name else fn_name + '()'} CASCADE;")
-                    drop_ddls.append(f"DROP VIEW IF EXISTS {cat_name};")
+                    drop_ddls.append(build_drop_sql("VIEW", cat_name, dialect=self.dialect, allow_qualified=False))
                     if cat_entry.get("backing_table"):
-                        drop_ddls.append(f"DROP TABLE IF EXISTS {cat_entry['backing_table']};")
+                        drop_ddls.append(build_drop_sql("TABLE", cat_entry["backing_table"], dialect=self.dialect, allow_qualified=False))
                     for aux_t in cat_entry.get("aux_tables", []):
-                        drop_ddls.append(f"DROP TABLE IF EXISTS {aux_t};")
+                        drop_ddls.append(build_drop_sql("TABLE", aux_t, dialect=self.dialect, allow_qualified=False))
 
                     pending_changes = {
                         "backing_table": {
