@@ -1090,9 +1090,12 @@ def _other_source_rows() -> str:
       "User trigger on one join source that writes the other source, firing BEFORE the maintenance trigger",
       "PostgreSQL row trigger (row triggers fire before statement triggers); SQLite trigger created after "
       "registration (SQLite fires the newest trigger first); MySQL/MariaDB PRECEDES. The join aggregate counts "
-      "the new pair twice where it is maintained algebraically",
+      "the new pair twice where it is maintained algebraically. PostgreSQL and MySQL/MariaDB: "
+      "check_schema_drift() reports triggers_out_of_order for the join views before any write; MySQL/MariaDB: "
+      "re-registering the views puts their triggers first (exact); PostgreSQL row triggers always fire before "
+      "the statement-level maintenance, so it stays wrong until the user trigger is rewritten",
       todo=TRIGGER_ORDER_TODO,
-      sqlite=WRONG, postgres=WRONG, mysql=WRONG, mariadb=WRONG)
+      sqlite=WRONG, postgres=WRONG, mysql=LIMITED, mariadb=LIMITED)
 def _other_source_first(ctx: Ctx) -> None:
     env = ctx.env
     if ctx.family == "postgres":
@@ -1110,8 +1113,37 @@ def _other_source_first(ctx: Ctx) -> None:
         ctx.cleanup("DROP TRIGGER IF EXISTS au_dim")
         env.commit()
     ctx.cleanup("DELETE FROM d WHERE g >= 50")
+    if ctx.family in ("postgres", "mysql"):
+        joins = {vd.name for vd in env.views if vd.join}
+        drift = env.manager.check_schema_drift()
+        env.commit()
+        assert drift == {vd.name: ("triggers_out_of_order" if vd.name in joins else "ok") for vd in env.views}, drift
+    if ctx.family == "mysql":
+        for vd in env.views:
+            if vd.join:
+                env.manager.drop_view(vd.name)
+                env.register(vd)
+        assert set(env.manager.check_schema_drift().values()) == {"ok"}
+        env.commit()
     env.execute(f"INSERT INTO t (id, g, v, w, u) VALUES {_other_source_rows()}")
     ctx.commit_check("trigger writing the other join source first")
+
+
+@cell("mysql_preexisting_user_trigger_writes_other_source", AREA_B,
+      "A user trigger on one join source that writes the other source, created before the view was registered",
+      "MySQL/MariaDB fire triggers in creation order, so before this fix the older user trigger fired first and "
+      "the join aggregate counted the pair twice; registration now places the maintenance triggers first "
+      "(PRECEDES). SQLite fires older triggers last (user_trigger_writes_other_source_last)",
+      mysql=EXACT, mariadb=EXACT)
+def _mysql_preexisting_other_source(ctx: Ctx) -> None:
+    schema = BASE_SCHEMA["mysql"] + [
+        "CREATE TRIGGER au_dim AFTER INSERT ON t FOR EACH ROW "
+        "BEGIN IF NEW.g >= 50 THEN INSERT IGNORE INTO d (g, name) VALUES (NEW.g, 'nz'); END IF; END"]
+    env = ctx.fresh({"mysql": schema}, [V_J, V_PJ], _base_seed())
+    assert set(env.manager.check_schema_drift().values()) == {"ok"}
+    env.commit()
+    env.execute(f"INSERT INTO t (id, g, v, w, u) VALUES {_other_source_rows()}")
+    ctx.commit_check("pre-existing trigger writing the other join source", env)
 
 
 @cell("user_trigger_writes_other_source_last", AREA_B,
