@@ -110,6 +110,84 @@ class OfflineRecommendationTests(unittest.TestCase):
         self.assertNotIn(("g", "x"), _rec_cols(plan))
 
 
+# Argument type classes: (dialect, type, recommended?). PostgreSQL btree rows
+# are limited to 2704 bytes (later writes of long values would fail);
+# MySQL/MariaDB character arguments compare under a collation and keys are
+# limited to 3072 bytes.
+TYPE_CLASSES: List[Tuple[str, str, bool]] = [
+    ("postgres", "INTEGER", True), ("postgres", "BIGINT", True), ("postgres", "SMALLINT", True),
+    ("postgres", "DOUBLE PRECISION", True), ("postgres", "NUMERIC(38, 10)", True), ("postgres", "DATE", True),
+    ("postgres", "TIMESTAMP", True), ("postgres", "TIMESTAMPTZ", True), ("postgres", "UUID", True),
+    ("postgres", "VARCHAR(100)", True), ("postgres", "CHAR(10)", True), ("postgres", "BOOLEAN", True),
+    ("postgres", "INTERVAL", True),
+    ("postgres", "TEXT", False), ("postgres", "VARCHAR", False), ("postgres", "VARCHAR(1000)", False),
+    ("postgres", "BYTEA", False), ("postgres", "JSONB", False), ("postgres", "NUMERIC", False),
+    ("postgres", "INTEGER[]", False),
+    ("mysql", "INT", True), ("mysql", "BIGINT UNSIGNED", True), ("mysql", "DECIMAL(65, 30)", True),
+    ("mysql", "DOUBLE", True), ("mysql", "DATE", True), ("mysql", "DATETIME(6)", True),
+    ("mysql", "TIMESTAMP", True), ("mysql", "VARBINARY(255)", True),
+    ("mysql", "VARCHAR(10)", False), ("mysql", "VARCHAR(1000)", False), ("mysql", "TEXT", False),
+    ("mysql", "JSON", False), ("mysql", "BLOB", False), ("mysql", "VARBINARY(3100)", False),
+    ("sqlite", "TEXT", True), ("sqlite", "BLOB", True),
+]
+
+
+class ArgumentTypeClassTests(unittest.TestCase):
+    def test_type_classes(self) -> None:
+        for dialect, typ, recommended in TYPE_CLASSES:
+            schema = f"CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, a {typ});"
+            plan = _plan(dialect, schema, "SELECT g, MAX(a) AS m FROM t GROUP BY g")
+            recs = _rec_cols(plan)
+            notes = [n for n in plan.diagnostics.details["performance_notes"] if n.startswith("minmax_extreme_recompute")]
+            if recommended:
+                self.assertEqual(recs, [("g", "a")], f"{dialect} {typ}")
+            else:
+                self.assertEqual(recs, [("g",)], f"{dialect} {typ}")
+                self.assertTrue(any("no (g, a) index is recommended" in n for n in notes), f"{dialect} {typ}: {notes}")
+
+    def test_mysql_long_group_key_does_not_get_an_uncreatable_index(self) -> None:
+        plan = _plan("mysql", "CREATE TABLE t (id INTEGER PRIMARY KEY, g VARCHAR(800), a INT);", "SELECT g, MIN(a) AS m FROM t GROUP BY g")
+        self.assertNotIn(("g", "a"), _rec_cols(plan))
+
+
+def _max_values(dialect: str) -> List[Tuple[str, str, Any]]:
+    """(column, type, maximum-size value) for every recommended type class."""
+    if dialect == "postgres":
+        return [
+            ("c_num", "NUMERIC(38, 10)", "9999999999999999999999999999.9999999999"),
+            ("c_vc", "VARCHAR(100)", "\U0001F600" * 100),
+            ("c_ch", "CHAR(10)", "\U0001F600" * 10),
+            ("c_big", "BIGINT", 9223372036854775807),
+            ("c_ts", "TIMESTAMPTZ", "294276-12-31 23:59:59+00"),
+            ("c_iv", "INTERVAL", "178000000 years"),
+            ("c_uuid", "UUID", "ffffffff-ffff-ffff-ffff-ffffffffffff"),
+        ]
+    return [
+        ("c_num", "DECIMAL(65, 30)", "99999999999999999999999999999999999.999999999999999999999999999999"),
+        ("c_vb", "VARBINARY(255)", b"\xff" * 255),
+        ("c_big", "BIGINT UNSIGNED", 18446744073709551615),
+        ("c_dt", "DATETIME(6)", "9999-12-31 23:59:59.999999"),
+    ]
+
+
+def _check_recommended_indexes_accept_max_values(test: unittest.TestCase, dialect: str, conn: Any, table: str) -> None:
+    """Every recommended index can be created, and a maximum-size value of
+    the declared type can be written (and its extreme deleted) afterwards."""
+    cols = _max_values(dialect)
+    cur = conn.cursor()
+    cur.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, g INTEGER, " + ", ".join(f"{c} {t}" for c, t, _ in cols) + ")")
+    conn.commit()
+    schema = f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, g INTEGER, " + ", ".join(f"{c} {t}" for c, t, _ in cols) + ");"
+    plan = _plan(dialect, schema, f"SELECT g, " + ", ".join(f"MAX({c}) AS m_{c}" for c, _, _ in cols) + f" FROM {table} GROUP BY g")
+    test.assertEqual(sorted(_rec_cols(plan)), sorted(("g", c) for c, _, _ in cols), dialect)
+    for ddl in plan.recommended_base_indexes:
+        cur.execute(ddl)
+    ph = ", ".join(["%s"] * (len(cols) + 2))
+    cur.execute(f"INSERT INTO {table} VALUES ({ph})", [1, 1, *[v for _, _, v in cols]])
+    cur.execute(f"DELETE FROM {table} WHERE id = 1")
+    conn.commit()
+
+
 # ---------------------------------------------------------------- native
 class _Engine:
     """Driver differences: placeholder, row-read counter, index DDL."""
@@ -282,6 +360,7 @@ class PostgresNativeTests(unittest.TestCase):
             mgr = MaterializedViewManager(conn)
             eng = _Engine("postgres", conn, "mmt")
             _scenario(self, eng, mgr.register_view, lambda ix: eng.run(f"DROP INDEX {ix}"))
+            _check_recommended_indexes_accept_max_values(self, "postgres", conn, "mmtypes")
         finally:
             conn.rollback()
             cur = conn.cursor()
@@ -302,22 +381,23 @@ class MysqlNativeTests(unittest.TestCase):
             host=p.hostname or "127.0.0.1", port=p.port or 3306, user=p.username or "root",
             password=p.password or "", database=p.path.lstrip("/") or None, autocommit=False,
         )
-        table = f"l2mm_{uuid.uuid4().hex[:6]}"
-        mgr: Optional[MaterializedViewManager] = None
+        table = "mmt"
+        database = f"l2mm_{uuid.uuid4().hex[:8]}"  # private: teardown is one DROP DATABASE
         try:
-            conn.cursor().execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, g INTEGER, h INTEGER NOT NULL, v INTEGER, w INTEGER)")
+            cur = conn.cursor()
+            cur.execute(f"CREATE DATABASE {database}")
+            cur.execute(f"USE {database}")
+            cur.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, g INTEGER, h INTEGER NOT NULL, v INTEGER, w INTEGER)")
             conn.commit()
             # ignore_limitations acknowledges MYSQL_NO_TRUNCATE_TRIGGER only.
             mgr = MaterializedViewManager(conn, ignore_limitations=True)
             eng = _Engine("mysql", conn, table)
             _scenario(self, eng, mgr.register_view, lambda ix: eng.run(f"DROP INDEX {ix} ON {table}"))
+            conn.commit()
+            _check_recommended_indexes_accept_max_values(self, "mysql", conn, f"{table}_types")
         finally:
             conn.rollback()
-            if mgr is not None:
-                for name in list(mgr.get_catalog()):
-                    if name.startswith(table):
-                        mgr.drop_view(name)
-            conn.cursor().execute(f"DROP TABLE IF EXISTS {table}")
+            conn.cursor().execute(f"DROP DATABASE IF EXISTS {database}")
             conn.commit()
             conn.close()
 
