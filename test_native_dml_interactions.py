@@ -1544,8 +1544,10 @@ _FK_LATE_SCHEMA = {
 
 @cell("fk_cascade_added_after_registration", AREA_B,
       "A cascading FK added to a source table after the view was registered (out-of-band ALTER TABLE)",
-      "MySQL/MariaDB: the cascaded deletes fire no triggers and check_schema_drift() still reports ok "
-      "(the registration-time refusal is never re-evaluated); SQLite cannot add an FK to an existing table",
+      "MySQL/MariaDB: the cascaded deletes fire no triggers, so the view diverges; check_schema_drift() reports "
+      "invalid from the moment the FK exists (the view no longer compiles under its accepted limitation codes: "
+      "MYSQL_FK_CASCADE_NO_TRIGGER is new), but nothing stops the writes. SQLite cannot add an FK to an "
+      "existing table",
       todo="Make Schema Introspection and Drift Signatures Semantically Complete and Fail-Closed",
       postgres=EXACT, mysql=WRONG, mariadb=WRONG)
 def _fk_late(ctx: Ctx) -> None:
@@ -1555,9 +1557,10 @@ def _fk_late(ctx: Ctx) -> None:
     other = env.connect()
     env.execute("ALTER TABLE c ADD CONSTRAINT au_fk FOREIGN KEY (pid) REFERENCES p (pid) ON DELETE CASCADE", other)
     other.commit()
-    env.execute("DELETE FROM p WHERE pid = 2")
-    env.commit()
     drift = env.manager.check_schema_drift()
+    env.commit()
+    assert drift == {"v_late": "invalid" if ctx.family == "mysql" else "ok"}, drift
+    env.execute("DELETE FROM p WHERE pid = 2")
     env.commit()
     try:
         ctx.check("cascade through an FK added after registration", env)
