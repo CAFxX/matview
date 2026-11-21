@@ -30,7 +30,7 @@ from matview_sync import (
     Dialect,
     EngineLimitationError,
     EngineLimitationWarning,
-    MaintenanceFallbackWarning,
+    MatviewDiagnosticWarning,
     MaintenanceStrategy,
     MaterializedViewManager,
     UnsupportedMaterializedViewError,
@@ -407,19 +407,19 @@ class ScalarSubqueryAggregateFallbackTests(unittest.TestCase):
                         schema.replace("DOUBLE PRECISION", "DOUBLE") if not engine.startswith("postgres") else schema,
                         f"CREATE VIEW v AS {view};", dialect=engine, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN,
                     )
-                lead = f"exact result required: falling back to strategy {plan.strategy.value}: "
-                msgs = [str(w.message) for w in caught if issubclass(w.category, MaintenanceFallbackWarning)]
+                lead = "exact result required: falling back to strategy group-scoped recompute. "
+                msgs = [str(w.message) for w in caught if issubclass(w.category, MatviewDiagnosticWarning)]
                 self.assertEqual(len(msgs), 1, msgs)
                 self.assertIn(lead, msgs[0])
-                self.assertEqual([d.code for d in plan.diagnostics.fallbacks], ["HAVING_SUBQUERY_AGGREGATE_FALLBACK"])
-                self.assertTrue(plan.diagnostics.fallbacks[0].message.startswith(lead))
-                self.assertIn("To change:", plan.diagnostics.fallbacks[0].message)
+                self.assertEqual([d.code for d in plan.strategy_diagnostics], ["HAVING_SUBQUERY_AGGREGATE_FALLBACK"])
+                self.assertTrue(plan.strategy_diagnostics[0].message.startswith(lead))
+                self.assertIn("To change it:", plan.strategy_diagnostics[0].message)
                 self.assertEqual("deadlock" in msgs[0], not engine.startswith(("sqlite", "postgres")))
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             generate_materialized_view(schema, "CREATE VIEW v AS SELECT g, COUNT(*) AS n FROM t GROUP BY g HAVING COUNT(*) > 1;",
                                        dialect="postgres:18")
-        self.assertFalse([w for w in caught if issubclass(w.category, MaintenanceFallbackWarning)])
+        self.assertFalse([w for w in caught if issubclass(w.category, MatviewDiagnosticWarning)])
 
     def test_projected_subquery_aggregates_stay_refused(self) -> None:
         # Their result types are not derived (a fallback stored

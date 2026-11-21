@@ -14,7 +14,7 @@ from .connectivity import (
     render_parameterized_sql,
     unwrap_dbapi_connection,
 )
-from .diagnostics import Diagnostic, MaintenanceFallbackWarning
+from .diagnostics import Diagnostic, MatviewDiagnosticWarning
 from .dialects import PROCEDURAL_SQL_TEMPLATES, render_procedural_sql
 from .engines import (
     AggFunc,
@@ -100,7 +100,7 @@ __all__ = [
     "PER_CODE_OPT_IN_LIMITATIONS",
     "EngineLimitationWarning",
     "Diagnostic",
-    "MaintenanceFallbackWarning",
+    "MatviewDiagnosticWarning",
     "StrictCompilationError",
     "UnsupportedMaterializedViewError",
     "BackfillInterruptedError",

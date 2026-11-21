@@ -179,8 +179,6 @@ class PlanDiagnostics:
     indexes: List[str] = field(default_factory=list)
     reader_view: Optional[str] = None
     details: Dict[str, Any] = field(default_factory=dict)
-    # Announced fallbacks / relaxed modes (matview.diagnostics.Diagnostic).
-    fallbacks: Tuple[Any, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -197,7 +195,6 @@ class PlanDiagnostics:
             "indexes": list(self.indexes),
             "reader_view": self.reader_view,
             "details": dict(self.details),
-            "fallbacks": [d.to_dict() for d in self.fallbacks],
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -254,6 +251,9 @@ class MaterializedViewPlan:
     diagnostics: Optional[PlanDiagnostics] = None
     recommended_base_indexes: List[str] = field(default_factory=list)
     base_index_recommendations: List[Dict[str, Any]] = field(default_factory=list)
+    # matview.diagnostics.Diagnostic objects: the maintenance strategy chosen
+    # where the fast exact algebraic maintenance does not apply.
+    strategy_diagnostics: List[Any] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.diagnostics is None:
