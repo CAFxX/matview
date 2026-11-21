@@ -25,6 +25,7 @@ consult a catalog and keeps the text-based classification.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -34,6 +35,7 @@ from sqlglot import exp as sqlglot_exp
 
 from .aggregate_semantics import KNOWN_AGGREGATE_NAMES
 from .engines import Dialect, UnsupportedMaterializedViewError, _sqlglot_dialect
+from .builtin_functions import MYSQL_BUILTIN_SCALAR_FUNCTIONS, SQLITE_BUILTIN_SCALAR_FUNCTIONS
 from .logical_ir import SelectItem, ViewSpec
 from .sql_frontend import _FN_TO_AGG_ENUM, _STATISTICAL_ALIAS_NAMES
 
@@ -56,6 +58,7 @@ _POLYMORPHIC_PG_TYPES = frozenset(
 class FunctionCall:
     name: str  # upper case
     arity: int
+    schema: Optional[str] = None  # qualifier as written (PostgreSQL schema, MySQL database)
 
 
 @dataclass(frozen=True)
@@ -78,7 +81,7 @@ def unclassified_calls(spec: ViewSpec, dialect: Dialect) -> List[FunctionCall]:
     exprs = [it.raw_expr for it in spec.select_items]
     if spec.having_clause:
         exprs.append(spec.having_clause)
-    seen: Set[Tuple[str, int]] = set()
+    seen: Set[Tuple[str, str, int]] = set()
     out: List[FunctionCall] = []
     for raw in exprs:
         node = _parse(raw, dialect)
@@ -88,13 +91,28 @@ def unclassified_calls(spec: ViewSpec, dialect: Dialect) -> List[FunctionCall]:
             if anon.find_ancestor(sqlglot_exp.Window) is not None:
                 continue
             name = str(anon.name).upper()
+            parent = anon.parent
+            schema = (
+                str(parent.this.name) if isinstance(parent, sqlglot_exp.Dot) and parent.expression is anon
+                and isinstance(parent.this, (sqlglot_exp.Identifier, sqlglot_exp.Column)) else None
+            )
             if not name or name in KNOWN_AGGREGATE_NAMES or name in _FN_TO_AGG_ENUM or name in _STATISTICAL_ALIAS_NAMES or name == "COUNT":
                 continue
-            key = (name, len(anon.expressions))
+            if schema is None and name in _builtin_scalars(dialect):
+                continue  # an unqualified built-in scalar: no catalog lookup needed
+            key = (schema or "", name, len(anon.expressions))
             if key not in seen:
                 seen.add(key)
-                out.append(FunctionCall(name=name, arity=len(anon.expressions)))
+                out.append(FunctionCall(name=name, arity=len(anon.expressions), schema=schema))
     return out
+
+
+def _builtin_scalars(dialect: Dialect) -> frozenset[str]:
+    if dialect == Dialect.MYSQL:
+        return MYSQL_BUILTIN_SCALAR_FUNCTIONS
+    if dialect == Dialect.SQLITE:
+        return SQLITE_BUILTIN_SCALAR_FUNCTIONS
+    return frozenset()  # PostgreSQL: pg_catalog is readable by every role
 
 
 def classify(conn: Any, dialect: Dialect, is_mariadb: bool, calls: Sequence[FunctionCall]) -> Dict[FunctionCall, FunctionClass]:
@@ -121,20 +139,38 @@ def _rows(conn: Any, sql: str, params: Sequence[Any] = ()) -> List[Tuple[Any, ..
 
 def _classify_postgres(conn: Any, calls: Sequence[FunctionCall]) -> Dict[FunctionCall, FunctionClass]:
     names = sorted({c.name for c in calls})
+    # Candidates as PostgreSQL resolves them: a qualified call looks only in
+    # its schema, an unqualified one only at visible functions; a call
+    # matches when its argument count is between the required and the
+    # declared parameters (DEFAULT values) or reaches a VARIADIC parameter.
     rows = _rows(
         conn,
         "SELECT upper(p.proname), p.prokind, p.pronargs, p.provariadic <> 0, "
-        "pg_catalog.format_type(p.prorettype, NULL), p.proretset "
-        "FROM pg_catalog.pg_proc p WHERE upper(p.proname) = ANY(%s) "
-        "AND pg_catalog.pg_function_is_visible(p.oid)",
+        "pg_catalog.format_type(p.prorettype, NULL), p.proretset, p.pronargdefaults, n.nspname, "
+        "pg_catalog.pg_function_is_visible(p.oid) "
+        "FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace "
+        "WHERE upper(p.proname) = ANY(%s)",
         (names,),
     )
+
+    def _matches(r: Tuple[Any, ...], call: FunctionCall) -> bool:
+        if r[0] != call.name:
+            return False
+        if call.schema is not None:
+            if r[7] != call.schema and r[7].lower() != call.schema.lower():
+                return False
+        elif not r[8]:
+            return False
+        required = r[2] - r[6]
+        return required <= call.arity <= r[2] or (bool(r[3]) and call.arity >= r[2] - 1)
+
     out: Dict[FunctionCall, FunctionClass] = {}
     for call in calls:
-        cands = [r for r in rows if r[0] == call.name and (r[2] == call.arity or (r[3] and call.arity >= r[2] - 1))]
+        cands = [r for r in rows if _matches(r, call)]
         kinds = {r[1] for r in cands}
         if not cands:
-            out[call] = FunctionClass(UNKNOWN, reason="no visible function of that name and arity in pg_proc")
+            where = f"schema {call.schema}" if call.schema else "the search_path"
+            out[call] = FunctionClass(UNKNOWN, reason=f"no function of that name and arity in {where} (pg_proc)")
         elif kinds == {"a"}:
             types = {r[4] for r in cands}
             rt = types.pop() if len(types) == 1 else None
@@ -185,11 +221,13 @@ def _classify_mysql(conn: Any, calls: Sequence[FunctionCall], is_mariadb: bool) 
             unreadable.append(label)
             return []
 
+    # Stored functions: the database of a qualified call, else the current one.
     if is_mariadb:
         udfs = _try("mysql.func", f"SELECT UPPER(name), type, ret FROM mysql.func WHERE UPPER(name) IN ({ph})")
         stored = _try(
             "mysql.proc",
-            f"SELECT UPPER(name), aggregate, returns FROM mysql.proc WHERE db = DATABASE() AND type = 'FUNCTION' AND UPPER(name) IN ({ph})",
+            f"SELECT UPPER(name), aggregate, returns, db, db = DATABASE() FROM mysql.proc "
+            f"WHERE type = 'FUNCTION' AND UPPER(name) IN ({ph})",
         )
     else:
         udfs = _try(
@@ -198,13 +236,18 @@ def _classify_mysql(conn: Any, calls: Sequence[FunctionCall], is_mariadb: bool) 
         )
         stored = _try(
             "information_schema.ROUTINES",
-            f"SELECT UPPER(ROUTINE_NAME), 'NONE', DTD_IDENTIFIER FROM information_schema.ROUTINES "
-            f"WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = 'FUNCTION' AND UPPER(ROUTINE_NAME) IN ({ph})",
+            f"SELECT UPPER(ROUTINE_NAME), 'NONE', DTD_IDENTIFIER, ROUTINE_SCHEMA, ROUTINE_SCHEMA = DATABASE() "
+            f"FROM information_schema.ROUTINES WHERE ROUTINE_TYPE = 'FUNCTION' AND UPPER(ROUTINE_NAME) IN ({ph})",
         )
+
+    def _db_match(r: Tuple[Any, ...], call: FunctionCall) -> bool:
+        db = r[3].decode() if isinstance(r[3], (bytes, bytearray)) else str(r[3])
+        return db.lower() == call.schema.lower() if call.schema is not None else bool(r[4])
+
     out: Dict[FunctionCall, FunctionClass] = {}
     for call in calls:
-        u = [r for r in udfs if r[0] == call.name]
-        s = [r for r in stored if r[0] == call.name]
+        u = [r for r in udfs if r[0] == call.name] if call.schema is None else []
+        s = [r for r in stored if r[0] == call.name and _db_match(r, call)]
         if u:
             is_agg = str(u[0][1]).lower() == "aggregate"
             out[call] = FunctionClass(AGGREGATE if is_agg else SCALAR)
@@ -218,7 +261,9 @@ def _classify_mysql(conn: Any, calls: Sequence[FunctionCall], is_mariadb: bool) 
                 ret = bytes(ret).decode("utf-8", "replace")
             out[call] = FunctionClass(AGGREGATE if is_agg else SCALAR, str(ret).upper() if ret else None)
         elif unreadable:
-            out[call] = FunctionClass(UNKNOWN, reason="cannot read " + " and ".join(unreadable))
+            out[call] = FunctionClass(
+                TEXT_ONLY, reason="this connection cannot read " + " and ".join(unreadable)
+            )
         else:
             # Not a user-defined function: a built-in, and every built-in
             # aggregate of MySQL/MariaDB is modelled (KNOWN_AGGREGATE_NAMES).
@@ -269,6 +314,12 @@ def apply_catalog_classification(
     text_only = [c for c, k in classes.items() if k.kind == TEXT_ONLY]
     if text_only and on_text_only is not None:
         on_text_only(spec, text_only, classes[text_only[0]].reason)
+    kinds_by_name: Dict[str, Set[str]] = {}
+    for c, k in classes.items():
+        kinds_by_name.setdefault(c.name, set()).add(k.kind)
+    for c, k in list(classes.items()):
+        if AGGREGATE in kinds_by_name[c.name] and kinds_by_name[c.name] - {AGGREGATE}:
+            classes[c] = FunctionClass(UNKNOWN, reason="calls of that name resolve to both an aggregate and another function")
     unknown = [(c, k) for c, k in classes.items() if k.kind == UNKNOWN]
     if unknown:
         listed = "; ".join(f"{c.name}/{c.arity}: {k.reason}" for c, k in unknown)
@@ -296,3 +347,114 @@ def apply_catalog_classification(
 
 def native_aggregate_names(spec: ViewSpec) -> frozenset[str]:
     return frozenset(n for n, _ in spec.native_aggregates)
+
+
+def items_with_unmodelled_calls(spec: ViewSpec, dialect: Dialect) -> List[SelectItem]:
+    """Select items calling a function sqlglot does not model (windows included)."""
+    out: List[SelectItem] = []
+    for it in spec.select_items:
+        node = _parse(it.raw_expr, dialect)
+        if node is not None and node.find(sqlglot_exp.Anonymous) is not None:
+            out.append(it)
+    return out
+
+
+def probe_result_types(conn: Any, dialect: Dialect, select_sql: str) -> Dict[str, str]:
+    """Output column -> native type of ``select_sql``, asked from the server
+    without reading data; {} when the probe fails (the caller keeps the
+    static inference). The probe leaves no object behind."""
+    name = f"__matview_probe_{uuid.uuid4().hex[:12]}"
+    body = select_sql.strip().rstrip(";")
+    try:
+        if dialect == Dialect.POSTGRES:
+            savepoint = not getattr(conn, "autocommit", False)
+            cur = conn.cursor()
+            try:
+                if savepoint:
+                    cur.execute(f"SAVEPOINT {name}")
+                try:
+                    cur.execute(f"CREATE TEMPORARY VIEW {name} AS {body}")
+                    cur.execute(
+                        "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) FROM pg_catalog.pg_attribute a "
+                        "WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                        (f"pg_temp.{name}",),
+                    )
+                    rows = list(cur.fetchall())
+                    cur.execute(f"DROP VIEW pg_temp.{name}")
+                except Exception:
+                    if savepoint:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT {name}")
+                    raise
+                finally:
+                    if savepoint:
+                        cur.execute(f"RELEASE SAVEPOINT {name}")
+            finally:
+                cur.close()
+            return {str(r[0]).lower(): str(r[1]) for r in rows}
+        # MySQL/MariaDB: the result-set metadata of the query itself (a
+        # CREATE TABLE ... AS SELECT widens INT results to BIGINT, so its
+        # column types differ from what the live view returns).
+        cur = conn.cursor()
+        try:
+            cur.execute(f"SELECT * FROM ({body}) AS __mv_probe_q LIMIT 0")
+            desc = list(cur.description or ())
+            fields = list(getattr(getattr(cur, "_result", None), "fields", None) or ())
+            cur.fetchall()
+        finally:
+            cur.close()
+        out: Dict[str, str] = {}
+        for i, d in enumerate(desc):
+            f = fields[i] if i < len(fields) else None
+            typ = _mysql_type_from_metadata(d, f)
+            if typ is not None:
+                out[str(d[0]).lower()] = typ
+        return out
+    except Exception:
+        return {}
+
+
+_MYSQL_UNSIGNED_FLAG = 32
+_MYSQL_BINARY_CHARSET = 63
+_MYSQL_INT_CODES = {1: "TINYINT", 2: "SMALLINT", 9: "MEDIUMINT", 3: "INT", 8: "BIGINT"}
+
+
+def _mysql_type_from_metadata(desc: Sequence[Any], field: Any) -> Optional[str]:
+    """DDL type reproducing a MySQL/MariaDB result column's protocol type, or
+    None when not modelled (the static inference then applies)."""
+    code = desc[1]
+    unsigned = bool(field is not None and int(getattr(field, "flags", 0)) & _MYSQL_UNSIGNED_FLAG)
+    if code in _MYSQL_INT_CODES:
+        return _MYSQL_INT_CODES[code] + (" UNSIGNED" if unsigned else "")
+    if code == 4:
+        return "FLOAT"
+    if code == 5:
+        return "DOUBLE"
+    if code in (0, 246):  # DECIMAL / NEWDECIMAL: precision and scale from the metadata
+        precision, scale = desc[4], desc[5]
+        if precision is None or scale is None:
+            return None
+        digits = max(int(precision) - (1 if int(scale) > 0 else 0) - (0 if unsigned else 1), 1)
+        return f"DECIMAL({min(max(digits, int(scale)), 65)}, {int(scale)})"
+    if code == 10:
+        return "DATE"
+    if code in (7, 12):
+        fsp = int(desc[5] or 0)
+        base = "TIMESTAMP" if code == 7 else "DATETIME"
+        return f"{base}({fsp})" if 0 < fsp <= 6 else base
+    if code == 11:
+        return "TIME"
+    if code == 13:
+        return "YEAR"
+    if code == 245:
+        return "JSON"
+    if code in (15, 253, 254):  # VARCHAR / VAR_STRING / STRING
+        charsetnr = int(getattr(field, "charsetnr", 0) or 0) if field is not None else 0
+        length = int(desc[3] or 0)
+        if charsetnr == _MYSQL_BINARY_CHARSET:
+            return f"VARBINARY({max(length, 1)})"
+        # The metadata length is in bytes; using it as the character count
+        # over-allocates but never truncates, whatever the character set.
+        if not length:
+            return None
+        return f"VARCHAR({length})" if length <= 4096 else "LONGTEXT"
+    return None

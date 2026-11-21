@@ -177,6 +177,9 @@ class ViewSpec:
     # ("UPPER_NAME/arity", native result type) of scalar functions sqlglot
     # does not model, from the same catalog lookup.
     native_scalar_types: Tuple[Tuple[str, str], ...] = ()
+    # (lower-case output column, native result type) reported by the server
+    # for select items that call functions sqlglot does not model.
+    native_result_types: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
