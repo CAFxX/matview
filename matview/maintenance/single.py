@@ -194,16 +194,28 @@ class Tier1SingleMixin(MixinHost):
     def _sqlite_is_approx_value_sql(val_e: str) -> str:
         return f"(CASE WHEN ({val_e}) IS NOT NULL AND typeof({val_e}) <> 'integer' THEN 1 ELSE 0 END)"
 
+    _HOLISTIC_AGG_FUNCS: frozenset[AggFunc] = frozenset(
+        {
+            AggFunc.GROUP_CONCAT,
+            AggFunc.STRING_AGG,
+            AggFunc.JSON_GROUP_ARRAY,
+            AggFunc.JSON_GROUP_OBJECT,
+            AggFunc.ARRAY_AGG,
+        }
+    )
+
+    def _has_holistic_or_distinct_aggs(self) -> bool:
+        return any(
+            it.is_aggregate and (it.is_distinct or it.agg_func in self._HOLISTIC_AGG_FUNCS)
+            for it in self._working_select_items
+        )
+
     def _watermark_pk_column(self) -> Optional[str]:
         if not (self.watermark_catalog_table and self._alg_mode in ("single", "distinct")):
             return None
-        wm_pk_col: Optional[str] = "rowid" if self.dialect == Dialect.SQLITE else None
-        if self.primary_schema:
-            for c_def in self.primary_schema.columns.values():
-                if c_def.primary_key and "INT" in c_def.data_type.upper():
-                    wm_pk_col = c_def.name
-                    break
-        return wm_pk_col
+        if self._has_holistic_or_distinct_aggs():
+            return None
+        return self._resolve_pk_range_column(allow_sqlite_rowid=True)
 
     def _build_native_group_recompute(
         self,
@@ -234,10 +246,11 @@ class Tier1SingleMixin(MixinHost):
             conds.append(f"({rows_filter})")
         wm_pk = self._watermark_pk_column() if processed_only else None
         if wm_pk:
-            q_pk = "rowid" if wm_pk == "rowid" else self._q(wm_pk)
+            q_pk = self._quote_pk_range_col(wm_pk)
+            view_lit = self.db_view_name.replace("'", "''")
             conds.append(
                 f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
-                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
                 f"AND {q_base_t}.{q_pk} > backfill_cursor_pk AND {q_base_t}.{q_pk} <= backfill_max_pk)"
             )
         where_part = f" WHERE {' AND '.join(conds)}" if conds else ""
@@ -609,9 +622,10 @@ class Tier1SingleMixin(MixinHost):
             params = "(SELECT CAST(%s AS SIGNED) AS lo, CAST(%s AS SIGNED) AS hi) AS __mv_p"
         folded = f"{q_base_t}.{q_pk} <= __mv_p.hi"
         if self.watermark_catalog_table:
+            view_lit = self.db_view_name.replace("'", "''")
             folded += (
                 f" OR NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
-                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
                 f"AND {q_base_t}.{q_pk} <= backfill_max_pk)"
             )
         touched = self._build_native_group_recompute(
@@ -741,12 +755,13 @@ class Tier1SingleMixin(MixinHost):
         chunk's upper bound. Rows above the claimed backfill range are folded
         by the triggers (see the trigger watermark guard)."""
         q_base_t = self._q(self.view.base_table)
-        q_pk = "rowid" if pk_col == "rowid" else self._q(pk_col)
+        q_pk = self._quote_pk_range_col(pk_col)
         cond = f"{q_base_t}.{q_pk} <= ?2"
         if self.watermark_catalog_table:
+            view_lit = self.db_view_name.replace("'", "''")
             cond += (
                 f" OR NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
-                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
                 f"AND {q_base_t}.{q_pk} <= backfill_max_pk)"
             )
         return cond
@@ -1317,30 +1332,12 @@ class Tier1SingleMixin(MixinHost):
         )
         stmts.append(main_backfill_sql)
 
-        holistic_funcs = {
-            AggFunc.GROUP_CONCAT,
-            AggFunc.STRING_AGG,
-            AggFunc.JSON_GROUP_ARRAY,
-            AggFunc.JSON_GROUP_OBJECT,
-            AggFunc.ARRAY_AGG,
-        }
-        has_holistic_or_distinct = bool(distinct_aux_tables) or any(
-            it.is_aggregate and it.agg_func in holistic_funcs for it in work_items
-        )
+        has_holistic_or_distinct = bool(distinct_aux_tables) or self._has_holistic_or_distinct_aggs()
 
-        has_int_pk = bool(
-            self.primary_schema
-            and any(c.primary_key and "INT" in c.data_type.upper() for c in self.primary_schema.columns.values())
-        )
-        if not has_holistic_or_distinct and (self.dialect == Dialect.SQLITE or has_int_pk):
-            pk_col = "rowid"
-            if self.primary_schema:
-                for c_def in self.primary_schema.columns.values():
-                    if c_def.primary_key and "INT" in c_def.data_type.upper():
-                        pk_col = c_def.name
-                        break
+        pk_col = None if has_holistic_or_distinct else self._resolve_pk_range_column(allow_sqlite_rowid=True)
+        if pk_col is not None:
             ph = "?" if self.dialect == Dialect.SQLITE else "%s"
-            q_pk_col = "rowid" if pk_col == "rowid" else self._q(pk_col)
+            q_pk_col = self._quote_pk_range_col(pk_col)
             chunk_where = (
                 f"({self.view.where_clause}) AND ({q_pk_col} > {ph} AND {q_pk_col} <= {ph})"
                 if self.view.where_clause
@@ -2798,7 +2795,8 @@ class Tier1SingleMixin(MixinHost):
             if not it.is_aggregate and it.alias.lower() not in group_aliases
         }
         where = self._rewrite_expr_for_record(self.view.where_clause, rec) if self.view.where_clause else None
-        wm = self._pg_watermark_predicate(rec) if self._alg_mode in ("single", "distinct") else None
+        wm_pk_col = self._watermark_pk_column()
+        wm = self._pg_watermark_predicate(rec, wm_pk_col) if wm_pk_col else None
         if wm:
             where = f"({where}) AND ({wm})" if where else wm
         source = PgDeltaSource(
@@ -2916,27 +2914,22 @@ class Tier1SingleMixin(MixinHost):
             if self.view.where_clause
             else None
         )
-        if self.watermark_catalog_table and self._alg_mode in ("single", "distinct"):
-            wm_pk_col: Optional[str] = "rowid" if self.dialect == Dialect.SQLITE else None
-            if self.primary_schema:
-                for c_def in self.primary_schema.columns.values():
-                    if c_def.primary_key and "INT" in c_def.data_type.upper():
-                        wm_pk_col = c_def.name
-                        break
-            if wm_pk_col:
-                q_pk = self._q(wm_pk_col)
-                wm_new = (
-                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
-                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
-                    f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"
-                )
-                wm_old = (
-                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
-                    f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
-                    f"AND OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"
-                )
-                where_new = f"({where_new}) AND ({wm_new})" if where_new else wm_new
-                where_old = f"({where_old}) AND ({wm_old})" if where_old else wm_old
+        wm_pk_col = self._watermark_pk_column()
+        if wm_pk_col:
+            q_pk = self._quote_pk_range_col(wm_pk_col)
+            view_lit = self.db_view_name.replace("'", "''")
+            wm_new = (
+                f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
+                f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"
+            )
+            wm_old = (
+                f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
+                f"AND OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"
+            )
+            where_new = f"({where_new}) AND ({wm_new})" if where_new else wm_new
+            where_old = f"({where_old}) AND ({wm_old})" if where_old else wm_old
 
         trunc_stmts = [
             f"DELETE FROM {aux_tbl};" for aux_tbl, _, _ in distinct_aux_tables.values()
@@ -2977,6 +2970,7 @@ class Tier1SingleMixin(MixinHost):
             trunc_stmts=trunc_stmts,
             where_new=where_new,
             where_old=where_old,
+            update_key_columns=[wm_pk_col] if wm_pk_col else None,
             pg_ai_body=pg_ai_body,
             pg_ad_body=pg_ad_body,
             pg_au_body=pg_au_body,

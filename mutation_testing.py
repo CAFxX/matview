@@ -182,6 +182,46 @@ MUTANTS = (
             "test_projection_watermark_deletes_exact_inclusive_cursor_row"
         ),
     ),
+    Mutant(
+        name="single-backfill-trigger-omits-unreferenced-pk-update-key",
+        source_path="matview/maintenance/single.py",
+        original="            update_key_columns=[wm_pk_col] if wm_pk_col else None,",
+        replacement="            update_key_columns=None,",
+        target_test=(
+            "test_p0_backfill_watermark_safety.BackfillWatermarkSafetyTests."
+            "test_backfill_unreferenced_pk_update_across_watermark_boundaries"
+        ),
+    ),
+    Mutant(
+        name="zset-backfill-trigger-omits-watermark-rowid-key",
+        source_path="matview/maintenance/zset.py",
+        original=(
+            "        if (\n"
+            "            self.watermark_catalog_table\n"
+            "            and wm_pk_col\n"
+            "            and wm_pk_col.lower() not in {c.lower() for c in upd_key_cols}\n"
+            "        ):\n"
+            "            upd_key_cols.append(wm_pk_col)"
+        ),
+        replacement="        pass",
+        target_test=(
+            "test_p0_backfill_watermark_safety.BackfillWatermarkSafetyTests."
+            "test_backfill_unreferenced_rowid_update_on_text_pk_table"
+        ),
+    ),
+    Mutant(
+        name="emitters-sqlite-implicit-rowid-omits-unchanged-guard",
+        source_path="matview/dialects/emitters.py",
+        original=(
+            "            for rowid_alias in implicit_rowid_aliases:\n"
+            "                unchanged_conds.append(f\"OLD.{rowid_alias} = NEW.{rowid_alias}\")"
+        ),
+        replacement="            pass",
+        target_test=(
+            "test_p0_backfill_watermark_safety.BackfillWatermarkSafetyTests."
+            "test_backfill_unreferenced_rowid_update_on_text_pk_table"
+        ),
+    ),
 )
 
 

@@ -821,6 +821,287 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             cur.close()
             conn.close()
 
+    def test_native_mysql_backfill_unreferenced_pk_update(self) -> None:
+        """Native MySQL/MariaDB: mid-backfill UPDATE changing an unreferenced integer
+        PK across watermark boundaries on an independent connection stays exact for
+        SUM-only grouped views, native-PK projections, and aliased incremental populate."""
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; skipping live MySQL/MariaDB unreferenced PK backfill test")
+        import threading
+        from urllib.parse import urlparse
+        import pymysql
+
+        parsed = urlparse(dsn)
+
+        def _connect():
+            return pymysql.connect(
+                host=parsed.hostname or "127.0.0.1",
+                port=parsed.port or 3306,
+                user=parsed.username or "root",
+                password=parsed.password or "",
+                database=parsed.path.lstrip("/"),
+                autocommit=False,
+            )
+
+        conn = _connect()
+        base_tbl = "t_cg_my_unref_pk"
+        mv_agg = "v_cg_my_unref_agg"
+        mv_proj = "v_cg_my_unref_proj"
+        mv_alias = "v_cg_my_unref_alias"
+        mgr = MaterializedViewManager(conn, dialect=Dialect.MYSQL, ignore_limitations=True)
+        cur = conn.cursor()
+        try:
+            for vn in (mv_agg, mv_proj, mv_alias):
+                try:
+                    mgr.drop_view(vn)
+                except Exception:
+                    pass
+                cur.execute(f"DROP VIEW IF EXISTS {vn};")
+                cur.execute(f"DROP TABLE IF EXISTS {mgr.object_prefix}store_{vn};")
+            cur.execute(f"DROP TABLE IF EXISTS {base_tbl};")
+            cur.execute(
+                f"CREATE TABLE {base_tbl} (id INT PRIMARY KEY, grp VARCHAR(32) NOT NULL, val INT NOT NULL, note VARCHAR(32));"
+            )
+            cur.executemany(
+                f"INSERT INTO {base_tbl} VALUES (%s, %s, %s, %s);",
+                [(i, f"g{i % 3}", i * 10, f"n{i}") for i in range(1, 11)],
+            )
+            conn.commit()
+
+            agg_sql = f"SELECT grp, SUM(val) AS s FROM {base_tbl} GROUP BY grp"
+            proj_sql = f"SELECT val FROM {base_tbl}"
+            p_agg = mgr.register_view(f"CREATE VIEW {mv_agg} AS {agg_sql};", populate=False)
+            p_proj = mgr.register_view(f"CREATE VIEW {mv_proj} AS {proj_sql};", populate=False)
+
+            def _run_with_moves(plan, moves: tuple[str, ...]) -> None:
+                worker_errors: list[BaseException] = []
+
+                def on_progress(batch_idx: int, _rows_done: int) -> None:
+                    if batch_idx != 1:
+                        return
+                    done = threading.Event()
+
+                    def worker() -> None:
+                        try:
+                            c2 = _connect()
+                            try:
+                                cur2 = c2.cursor()
+                                for st in moves:
+                                    cur2.execute(st)
+                                c2.commit()
+                                cur2.close()
+                            finally:
+                                c2.close()
+                        except BaseException as exc:
+                            worker_errors.append(exc)
+                        finally:
+                            done.set()
+
+                    th = threading.Thread(target=worker, daemon=True)
+                    th.start()
+                    self.assertTrue(done.wait(timeout=15), "MySQL worker timed out")
+                    th.join(timeout=1)
+                    if worker_errors:
+                        raise worker_errors[0]
+
+                batches = mgr.backfill_incrementally(
+                    plan, batch_size=3, on_progress=on_progress, snapshot_isolation=False
+                )
+                self.assertGreaterEqual(batches, 2)
+
+            _run_with_moves(
+                p_agg,
+                (
+                    f"UPDATE {base_tbl} SET note = 'x' WHERE id = 3;",
+                    f"UPDATE {base_tbl} SET id = 100 WHERE id = 8;",
+                    f"UPDATE {base_tbl} SET id = 0 WHERE id = 7;",
+                    f"UPDATE {base_tbl} SET id = 7 WHERE id = 2;",
+                ),
+            )
+            _run_with_moves(
+                p_proj,
+                (
+                    f"UPDATE {base_tbl} SET id = 105 WHERE id = 9;",
+                    f"UPDATE {base_tbl} SET id = 9 WHERE id = 1;",
+                ),
+            )
+
+            # Aliased projection incremental populate procedure executes cleanly
+            p_alias = mgr.register_view(
+                f"CREATE VIEW {mv_alias} AS SELECT s.val FROM {base_tbl} AS s WHERE s.val >= 20;",
+                populate=False,
+            )
+            for stmt in p_alias.get_populate_statements(incremental_backfill=True):
+                cur.execute(stmt)
+            conn.commit()
+
+            cur.execute(f"SELECT grp, s FROM {mv_agg} ORDER BY grp;")
+            got_agg = cur.fetchall()
+            cur.execute(f"{agg_sql} ORDER BY grp;")
+            self.assertEqual(got_agg, cur.fetchall())
+
+            cur.execute(f"SELECT val FROM {mv_proj} ORDER BY val;")
+            got_proj = cur.fetchall()
+            cur.execute(f"{proj_sql} ORDER BY val;")
+            self.assertEqual(got_proj, cur.fetchall())
+
+            cur.execute(f"SELECT val FROM {mv_alias} ORDER BY val;")
+            got_alias = cur.fetchall()
+            cur.execute(f"SELECT s.val FROM {base_tbl} AS s WHERE s.val >= 20 ORDER BY s.val;")
+            self.assertEqual(got_alias, cur.fetchall())
+        finally:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            for vn in (mv_agg, mv_proj, mv_alias):
+                try:
+                    mgr.drop_view(vn)
+                except Exception:
+                    pass
+            try:
+                cur.execute(f"DROP TABLE IF EXISTS {base_tbl};")
+                conn.commit()
+            except Exception:
+                pass
+            cur.close()
+            conn.close()
+
+    def test_native_postgres_backfill_unreferenced_pk_update(self) -> None:
+        """Native PostgreSQL: mid-backfill UPDATE changing an unreferenced integer PK
+        across watermark boundaries on an independent connection stays exact for
+        SUM-only grouped views, native-PK projections, and aliased incremental populate."""
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN is not set; skipping live PostgreSQL unreferenced PK backfill test")
+        import threading
+        import psycopg2
+
+        conn = psycopg2.connect(dsn)
+        base_tbl = "t_cg_pg_unref_pk"
+        mv_agg = "v_cg_pg_unref_agg"
+        mv_proj = "v_cg_pg_unref_proj"
+        mv_alias = "v_cg_pg_unref_alias"
+        mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
+        cur = conn.cursor()
+        try:
+            for vn in (mv_agg, mv_proj, mv_alias):
+                try:
+                    mgr.drop_view(vn)
+                except Exception:
+                    pass
+                cur.execute(f"DROP VIEW IF EXISTS {vn} CASCADE;")
+                cur.execute(f"DROP TABLE IF EXISTS {mgr.object_prefix}store_{vn} CASCADE;")
+            cur.execute(f"DROP TABLE IF EXISTS {base_tbl} CASCADE;")
+            cur.execute(
+                f"CREATE TABLE {base_tbl} (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL, note TEXT);"
+            )
+            cur.executemany(
+                f"INSERT INTO {base_tbl} VALUES (%s, %s, %s, %s);",
+                [(i, f"g{i % 3}", i * 10, f"n{i}") for i in range(1, 11)],
+            )
+            conn.commit()
+
+            agg_sql = f"SELECT grp, SUM(val) AS s FROM {base_tbl} GROUP BY grp"
+            proj_sql = f"SELECT val FROM {base_tbl}"
+            p_agg = mgr.register_view(f"CREATE VIEW {mv_agg} AS {agg_sql};", populate=False)
+            p_proj = mgr.register_view(f"CREATE VIEW {mv_proj} AS {proj_sql};", populate=False)
+
+            def _run_with_moves(plan, moves: tuple[str, ...]) -> None:
+                worker_errors: list[BaseException] = []
+
+                def on_progress(batch_idx: int, _rows_done: int) -> None:
+                    if batch_idx != 1:
+                        return
+                    done = threading.Event()
+
+                    def worker() -> None:
+                        try:
+                            c2 = psycopg2.connect(dsn)
+                            try:
+                                cur2 = c2.cursor()
+                                for st in moves:
+                                    cur2.execute(st)
+                                c2.commit()
+                                cur2.close()
+                            finally:
+                                c2.close()
+                        except BaseException as exc:
+                            worker_errors.append(exc)
+                        finally:
+                            done.set()
+
+                    th = threading.Thread(target=worker, daemon=True)
+                    th.start()
+                    self.assertTrue(done.wait(timeout=15), "PostgreSQL worker timed out")
+                    th.join(timeout=1)
+                    if worker_errors:
+                        raise worker_errors[0]
+
+                batches = mgr.backfill_incrementally(
+                    plan, batch_size=3, on_progress=on_progress, snapshot_isolation=False
+                )
+                self.assertGreaterEqual(batches, 2)
+
+            _run_with_moves(
+                p_agg,
+                (
+                    f"UPDATE {base_tbl} SET note = 'x' WHERE id = 3;",
+                    f"UPDATE {base_tbl} SET id = 100 WHERE id = 8;",
+                    f"UPDATE {base_tbl} SET id = 0 WHERE id = 7;",
+                    f"UPDATE {base_tbl} SET id = 7 WHERE id = 2;",
+                ),
+            )
+            _run_with_moves(
+                p_proj,
+                (
+                    f"UPDATE {base_tbl} SET id = 105 WHERE id = 9;",
+                    f"UPDATE {base_tbl} SET id = 9 WHERE id = 1;",
+                ),
+            )
+
+            # Aliased projection incremental populate DO block executes cleanly
+            p_alias = mgr.register_view(
+                f"CREATE VIEW {mv_alias} AS SELECT s.val FROM {base_tbl} AS s WHERE s.val >= 20;",
+                populate=False,
+            )
+            for stmt in p_alias.get_populate_statements(incremental_backfill=True):
+                cur.execute(stmt)
+            conn.commit()
+
+            cur.execute(f"SELECT grp, s FROM {mv_agg} ORDER BY grp;")
+            got_agg = cur.fetchall()
+            cur.execute(f"{agg_sql} ORDER BY grp;")
+            self.assertEqual(got_agg, cur.fetchall())
+
+            cur.execute(f"SELECT val FROM {mv_proj} ORDER BY val;")
+            got_proj = cur.fetchall()
+            cur.execute(f"{proj_sql} ORDER BY val;")
+            self.assertEqual(got_proj, cur.fetchall())
+
+            cur.execute(f"SELECT val FROM {mv_alias} ORDER BY val;")
+            got_alias = cur.fetchall()
+            cur.execute(f"SELECT s.val FROM {base_tbl} AS s WHERE s.val >= 20 ORDER BY s.val;")
+            self.assertEqual(got_alias, cur.fetchall())
+        finally:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            for vn in (mv_agg, mv_proj, mv_alias):
+                try:
+                    mgr.drop_view(vn)
+                except Exception:
+                    pass
+            try:
+                cur.execute(f"DROP TABLE IF EXISTS {base_tbl} CASCADE;")
+                conn.commit()
+            except Exception:
+                pass
+            cur.close()
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

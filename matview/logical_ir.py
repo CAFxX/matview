@@ -28,6 +28,9 @@ class ColumnDef:
     # A generated (computed) column changes without being named in an
     # UPDATE's SET list. Set by DDL parsing (the SQLite introspection path).
     generated: bool = False
+    # True only for a SQLite single-column INTEGER PRIMARY KEY (without DESC or
+    # WITHOUT ROWID), which is SQLite's guaranteed 64-bit signed-integer rowid alias.
+    is_rowid_alias: bool = False
 
 
 def _normalize_index_column_key(col_spec: str) -> str:
@@ -66,6 +69,8 @@ class TableSchema:
     has_on_conflict_replace: bool = False
     indexes: Tuple[TableIndexDef, ...] = ()
     pk_columns: Tuple[str, ...] = ()
+    without_rowid: bool = False
+    strict: bool = False
 
     def effective_pk_columns(self) -> Tuple[str, ...]:
         if self.pk_columns:
