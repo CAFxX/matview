@@ -175,17 +175,46 @@ def _check_recommended_indexes_accept_max_values(test: unittest.TestCase, dialec
     the declared type can be written (and its extreme deleted) afterwards."""
     cols = _max_values(dialect)
     cur = conn.cursor()
-    cur.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, g INTEGER, " + ", ".join(f"{c} {t}" for c, t, _ in cols) + ")")
-    conn.commit()
-    schema = f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, g INTEGER, " + ", ".join(f"{c} {t}" for c, t, _ in cols) + ");"
-    plan = _plan(dialect, schema, f"SELECT g, " + ", ".join(f"MAX({c}) AS m_{c}" for c, _, _ in cols) + f" FROM {table} GROUP BY g")
+    col_sql = "id INTEGER PRIMARY KEY, g INTEGER, " + ", ".join(f"{c} {t}" for c, t, _ in cols)
+    plan = _plan(dialect, f"CREATE TABLE {table} ({col_sql});", f"SELECT g, " + ", ".join(f"MAX({c}) AS m_{c}" for c, _, _ in cols) + f" FROM {table} GROUP BY g")
     test.assertEqual(sorted(_rec_cols(plan)), sorted(("g", c) for c, _, _ in cols), dialect)
-    for ddl in plan.recommended_base_indexes:
-        cur.execute(ddl)
+    if dialect == "mysql":
+        # The recommended key parts, created with the table (one DDL statement).
+        inline = "".join(f", INDEX {n} {c}" for n, c in _index_parts(plan.recommended_base_indexes))
+        cur.execute(f"CREATE TABLE {table} ({col_sql}{inline})")
+    else:
+        cur.execute(f"CREATE TABLE {table} ({col_sql})")
+        for ddl in plan.recommended_base_indexes:
+            cur.execute(ddl)
     ph = ", ".join(["%s"] * (len(cols) + 2))
     cur.execute(f"INSERT INTO {table} VALUES ({ph})", [1, 1, *[v for _, _, v in cols]])
     cur.execute(f"DELETE FROM {table} WHERE id = 1")
     conn.commit()
+
+
+def _index_parts(ddls: Sequence[str]) -> List[Tuple[str, str]]:
+    """(name, column list) of ``CREATE INDEX name ON table (cols);`` statements."""
+    out = []
+    for ddl in ddls:
+        m = re.match(r"\s*CREATE INDEX (\S+) ON \S+ (\(.*\))\s*;?\s*$", ddl)
+        assert m, ddl
+        out.append((m.group(1), m.group(2)))
+    return out
+
+
+def _apply_index_changes(eng: "_Engine", add: Sequence[str] = (), drop: Sequence[str] = ()) -> None:
+    """Run recommended CREATE INDEX statements and drop indexes. MySQL/MariaDB:
+    one ALTER TABLE (each DDL statement commits and costs ~70 ms)."""
+    if not add and not drop:
+        return
+    if eng.name == "mysql":
+        parts = [f"DROP INDEX {n}" for n in drop] + [f"ADD INDEX {n} {cols}" for n, cols in _index_parts(add)]
+        eng.run(f"ALTER TABLE {eng.table} " + ", ".join(parts))
+        return
+    for n in drop:
+        eng.run(f"DROP INDEX {n}")
+    for ddl in add:
+        eng.run(ddl)
 
 
 # ---------------------------------------------------------------- native
@@ -240,7 +269,7 @@ def _canon(v: Any) -> Tuple[str, str]:
     return ("float", v.hex()) if isinstance(v, float) else (type(v).__name__, repr(v))
 
 
-def _scenario(test: unittest.TestCase, eng: _Engine, register: Callable[[str], Any], drop_index: Callable[[str], None]) -> None:
+def _scenario(test: unittest.TestCase, eng: _Engine, register: Callable[[str], Any]) -> None:
     t = eng.table
     rows: List[Tuple[Any, ...]] = []
     rid = 0
@@ -257,8 +286,9 @@ def _scenario(test: unittest.TestCase, eng: _Engine, register: Callable[[str], A
     cur.executemany(eng.ph(f"INSERT INTO {t} (id, g, h, v, w) VALUES (%s, %s, %s, %s, %s)"), rows)
     eng.conn.commit()
     views = {
-        "mm1": f"SELECT g, MIN(v) AS mn, MAX(v) AS mx, COUNT(v) AS c, COUNT(*) AS n FROM {t} GROUP BY g",
-        "mm2": f"SELECT g, h, MAX(w) AS mw, MIN(w) AS lw FROM {t} GROUP BY g, h",
+        # One view (each registration costs several DDL commits on MySQL):
+        # a two-column group key, two MIN/MAX arguments, a NULL group key.
+        "mm1": f"SELECT g, h, MIN(v) AS mn, MAX(v) AS mx, COUNT(v) AS c, COUNT(*) AS n, MAX(w) AS mw, MIN(w) AS lw FROM {t} GROUP BY g, h",
     }
     plans = {}
     for name, sql in views.items():
@@ -266,10 +296,10 @@ def _scenario(test: unittest.TestCase, eng: _Engine, register: Callable[[str], A
             warnings.simplefilter("ignore", EngineLimitationWarning)
             plans[name] = register(f"CREATE VIEW {t}_{name} AS {sql}")
     p1 = plans["mm1"]
-    test.assertEqual(_rec_cols(p1), [("g", "v")], eng.name)
+    test.assertEqual(_rec_cols(p1), [("g", "h", "v"), ("g", "h", "w")], eng.name)
     test.assertTrue(any(n.startswith("minmax_extreme_recompute") for n in p1.diagnostics.details["performance_notes"]))
-    for ddl in {d for p in plans.values() for d in p.recommended_base_indexes}:
-        eng.run(ddl)
+    recommended = sorted({d for p in plans.values() for d in p.recommended_base_indexes})
+    _apply_index_changes(eng, add=recommended)
     if eng.name == "postgres":
         eng.run(f"ANALYZE {t}")
     eng.conn.commit()
@@ -313,10 +343,7 @@ def _scenario(test: unittest.TestCase, eng: _Engine, register: Callable[[str], A
     compare("rolled-back extreme delete")
     # Sensitivity of the cost counter: with the group-key index only, the
     # same extreme delete reads the whole group.
-    for p in plans.values():
-        for ddl in p.recommended_base_indexes:
-            drop_index(re.search(r"CREATE INDEX (\S+)", ddl).group(1))  # type: ignore[union-attr]
-    eng.run(f"CREATE INDEX {t}_gonly ON {t} (g)")
+    _apply_index_changes(eng, add=[f"CREATE INDEX {t}_gonly ON {t} (g);"], drop=[n for n, _ in _index_parts(recommended)])
     if eng.name == "postgres":
         eng.run(f"ANALYZE {t}")
     eng.conn.commit()
@@ -339,7 +366,7 @@ class SqliteNativeTests(unittest.TestCase):
                 conn.commit()
                 mgr = MaterializedViewManager(conn)
                 eng = _Engine("sqlite", conn, "mmt")
-                _scenario(self, eng, mgr.register_view, lambda ix: eng.run(f"DROP INDEX {ix}"))
+                _scenario(self, eng, mgr.register_view)
             finally:
                 conn.close()
 
@@ -359,7 +386,7 @@ class PostgresNativeTests(unittest.TestCase):
             conn.commit()
             mgr = MaterializedViewManager(conn)
             eng = _Engine("postgres", conn, "mmt")
-            _scenario(self, eng, mgr.register_view, lambda ix: eng.run(f"DROP INDEX {ix}"))
+            _scenario(self, eng, mgr.register_view)
             _check_recommended_indexes_accept_max_values(self, "postgres", conn, "mmtypes")
         finally:
             conn.rollback()
@@ -376,29 +403,24 @@ class MysqlNativeTests(unittest.TestCase):
 
         import pymysql
 
-        p = urlparse(os.environ["MYSQL_DSN"])
+        p = urlparse(_mysql_private_dsn())
         conn = pymysql.connect(
             host=p.hostname or "127.0.0.1", port=p.port or 3306, user=p.username or "root",
             password=p.password or "", database=p.path.lstrip("/") or None, autocommit=False,
         )
         table = "mmt"
-        database = f"l2mm_{uuid.uuid4().hex[:8]}"  # private: teardown is one DROP DATABASE
         try:
             cur = conn.cursor()
-            cur.execute(f"CREATE DATABASE {database}")
-            cur.execute(f"USE {database}")
             cur.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, g INTEGER, h INTEGER NOT NULL, v INTEGER, w INTEGER)")
             conn.commit()
             # ignore_limitations acknowledges MYSQL_NO_TRUNCATE_TRIGGER only.
             mgr = MaterializedViewManager(conn, ignore_limitations=True)
             eng = _Engine("mysql", conn, table)
-            _scenario(self, eng, mgr.register_view, lambda ix: eng.run(f"DROP INDEX {ix} ON {table}"))
+            _scenario(self, eng, mgr.register_view)
             conn.commit()
             _check_recommended_indexes_accept_max_values(self, "mysql", conn, f"{table}_types")
         finally:
             conn.rollback()
-            conn.cursor().execute(f"DROP DATABASE IF EXISTS {database}")
-            conn.commit()
             conn.close()
 
 
@@ -426,6 +448,8 @@ class ConcurrentExtremeDeleteTests(unittest.TestCase):
             self.skipTest("no native engine DSN set")
         for engine, dsn in engines:
             with self.subTest(engine=engine.value):
+                if engine != Dialect.POSTGRES:
+                    dsn = _mysql_private_dsn()
                 self._run(engine, dsn, Dialect, threading, _connect, _session_id, _wait_until_lock_waiting)
 
     def _run(self, engine: Any, dsn: str, Dialect: Any, threading: Any, _connect: Any, _session_id: Any, _wait: Any) -> None:
@@ -438,9 +462,12 @@ class ConcurrentExtremeDeleteTests(unittest.TestCase):
         mgr: Optional[MaterializedViewManager] = None
         try:
             cur = setup.cursor()
-            cur.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
+            if is_pg:
+                cur.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
+                cur.execute(f"CREATE INDEX {table}_gv ON {table} (g, v)")
+            else:  # one DDL statement
+                cur.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, INDEX {table}_gv (g, v))")
             cur.executemany(f"INSERT INTO {table} VALUES (%s, %s, %s)", [(i, 1, i) for i in range(1, 41)] + [(100, 2, 7)])
-            cur.execute(f"CREATE INDEX {table}_gv ON {table} (g, v)")
             setup.commit()
             mgr = MaterializedViewManager(setup, ignore_limitations=not is_pg)
             mgr.register_view(f"CREATE VIEW {table}_v AS SELECT g, MIN(v) AS mn, MAX(v) AS mx, COUNT(*) AS n FROM {table} GROUP BY g")
@@ -503,14 +530,55 @@ class ConcurrentExtremeDeleteTests(unittest.TestCase):
                 except Exception:
                     pass
             setup.rollback()
-            if mgr is not None:
-                try:
-                    mgr.drop_view(f"{table}_v")
-                except Exception:
-                    pass
-            setup.cursor().execute(f"DROP TABLE IF EXISTS {table}")
-            setup.commit()
+            if is_pg:  # MySQL/MariaDB: the module's private database is dropped once
+                if mgr is not None:
+                    try:
+                        mgr.drop_view(f"{table}_v")
+                    except Exception:
+                        pass
+                setup.cursor().execute(f"DROP TABLE IF EXISTS {table}")
+                setup.commit()
             setup.close()
+
+
+# MySQL/MariaDB: one private database for the whole module (each DDL commit
+# costs ~70 ms; teardown is a single DROP DATABASE).
+_MYSQL_PRIVATE_DB: Optional[str] = None
+
+
+def _mysql_admin() -> Any:
+    from urllib.parse import urlparse
+
+    import pymysql
+
+    p = urlparse(os.environ["MYSQL_DSN"])
+    return pymysql.connect(
+        host=p.hostname or "127.0.0.1", port=p.port or 3306, user=p.username or "root",
+        password=p.password or "", autocommit=True,
+    )
+
+
+def _mysql_private_dsn() -> str:
+    global _MYSQL_PRIVATE_DB
+    from urllib.parse import urlparse, urlunparse
+
+    if _MYSQL_PRIVATE_DB is None:
+        _MYSQL_PRIVATE_DB = f"l2mm_{uuid.uuid4().hex[:8]}"
+        admin = _mysql_admin()
+        try:
+            admin.cursor().execute(f"CREATE DATABASE {_MYSQL_PRIVATE_DB}")
+        finally:
+            admin.close()
+    return urlunparse(urlparse(os.environ["MYSQL_DSN"])._replace(path=f"/{_MYSQL_PRIVATE_DB}"))
+
+
+def tearDownModule() -> None:
+    if _MYSQL_PRIVATE_DB is not None:
+        admin = _mysql_admin()
+        try:
+            admin.cursor().execute(f"DROP DATABASE IF EXISTS {_MYSQL_PRIVATE_DB}")
+        finally:
+            admin.close()
 
 
 if __name__ == "__main__":
