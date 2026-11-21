@@ -183,7 +183,9 @@ The following seven items are the in-database bulk-maintenance roadmap. Decision
 - [ ] **PostgreSQL Result Types and Names Found by the Stage 2 Review** (all pre-existing on master):
   - `BIT_AND`/`BIT_OR` over `INT` are stored as `BIGINT` but the native result is `INTEGER`.
   - `VARIANCE`/`STDDEV` differ from the native result from the initial population on (see "Preserve Dialect-Native Statistical Aggregate Alias Semantics").
-  - A domain-typed source column fails registration (`type "domain" does not exist`).
+  - A domain over an array type fails registration (42601, the array backing-type problem of "Native Backing Column Types for Array Keys"); other domains are reflected as their base type (cell `pg_domains` in `test_native_dml_interactions.py`).
+  - `MIN`/`MAX` over a `VARCHAR` column (also via a domain) are stored as `VARCHAR` (type 1043) but the native result type is `TEXT` (25).
+  - A `NUMERIC` group key whose group holds equal values of different scale (1.0 and 1.00): after an `UPDATE` the stored representative can differ from the one the live `GROUP BY` returns (same with a domain over `NUMERIC`). The oracle compares scale, so this is visible; the PostgreSQL contract for which representative a group shows needs deciding (canonical, or the native first-seen value).
   - A view name containing a space produces invalid backing-table DDL.
   - FK `ON DELETE CASCADE` into both join sides: stage 3.
 - [ ] **Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View**:
