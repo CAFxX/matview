@@ -441,7 +441,7 @@ cell is skipped there (verified on PostgreSQL 18 locally).
 | `user_after_trigger_writes_same_table` | User AFTER row trigger that updates the same row and inserts/deletes other rows of the source | exact | exact | n/a | n/a | SQLite: Stage 4's same-group in-place UPDATE trigger avoids transiently deleting the group when a newer user AFTER INSERT trigger updates a non-group column on an existing group (still wrong if the user trigger changes a group key or updates an aggregated column of a brand-new group before INSERT maintenance runs — same-row updates before outer AFTER STATEMENT also affect PostgreSQL). MySQL/MariaDB forbid a trigger writing its own table (error 1442) |
 | `sqlite_recursive_user_trigger` | A user trigger that re-fires itself (unguarded self-UPDATE) | limited | n/a | n/a | n/a | configure_sqlite_connection() turns recursive_triggers ON, so such a trigger recurses until SQLite's depth limit and the statement fails (it ran once with the SQLite default); the view stays exact either way; PostgreSQL user triggers recurse regardless (guard with pg_trigger_depth()) |
 | `user_trigger_raises` | A user trigger raising an error mid-statement (RAISE EXCEPTION / SIGNAL / RAISE(ABORT/FAIL/ROLLBACK)) | exact | exact | exact | exact | rollback atomicity of the statement (SQLite FAIL keeps the earlier rows, ROLLBACK ends the transaction) |
-| `sqlite_user_trigger_raise_fail` | A user AFTER trigger created after registration raising RAISE(FAIL) on the second row of a statement | **WRONG** | n/a | n/a | n/a | FAIL keeps the rows already written, including the failing row itself, but the newer user trigger ran first and the failing row's maintenance trigger never runs; TODO: Exact Maintenance When a User Trigger or FK Action Runs Before the Maintenance Trigger |
+| `sqlite_user_trigger_raise_fail` | A user AFTER trigger created after registration raising RAISE(FAIL) on the second row of a statement | limited | n/a | n/a | n/a | FAIL keeps the rows already written, including the failing row itself; while the newer user trigger fires first the failing row's maintenance never runs. check_schema_drift() reports triggers_out_of_order (also for RAISE(IGNORE)) and repair_view() puts the maintenance triggers first |
 | `sqlite_user_triggers_older_than_views` | The same self-writing and RAISE(FAIL) user triggers created before the views were registered | exact | n/a | n/a | n/a | SQLite then fires them after the maintenance triggers |
 | `pg_statement_trigger_ordering` | User statement-level AFTER triggers ordered before and after the maintenance triggers (by name) that write the source again | n/a | exact | n/a | n/a |  |
 | `user_trigger_writes_other_source_first` | User trigger on one join source that writes the other source, firing BEFORE the maintenance trigger | **WRONG** | exact | **WRONG** | **WRONG** | PostgreSQL: row/statement trigger modifying the other join source runs inside the Stage 3 statement bracket and reconciles via inclusion-exclusion; SQLite (newest trigger first) and MySQL/MariaDB (PRECEDES) still count the new pair twice where maintained algebraically; TODO: Exact Maintenance When a User Trigger or FK Action Runs Before the Maintenance Trigger |
@@ -742,8 +742,11 @@ protocol at all: run it with writes to the source tables stopped.
 - `check_schema_drift()` (`--check-drift`) compares each registered view with
   the live schema: `ok`, `drifted`, `invalid`, `backfill_incomplete`, or
   `triggers_missing`, `triggers_disabled` (PostgreSQL `ALTER TABLE ... DISABLE
-  TRIGGER`) or `triggers_orphaned` when maintenance triggers are gone,
-  disabled or on a detached partition (`repair_view()` rebuilds them).
+  TRIGGER`), `triggers_out_of_order` (SQLite: a user trigger created after
+  registration that writes a source table or uses `RAISE(FAIL)`/`RAISE(IGNORE)`
+  fires before the maintenance trigger, because SQLite fires the newest trigger
+  first) or `triggers_orphaned` when maintenance triggers are gone, disabled,
+  preceded or on a detached partition (`repair_view()` rebuilds them).
   `diff_views()` / `matview diff` shows what a registration would change.
 - `repair_view(name=None)` (`--repair`) repopulates (or rebuilds after drift)
   each view in its own transaction; there is no all-view atomicity (see

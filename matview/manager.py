@@ -2391,9 +2391,11 @@ class MaterializedViewManager:
         Declaratively synchronizes a collection of materialized view definitions against
         the connected database (supporting multi-view SQL files/strings as well).
         Returns a status map `{view_name: "created" | "updated" | "unchanged" |
-        "backfill_incomplete" | "triggers_missing" | "triggers_disabled" | "triggers_orphaned" | "dropped"}`
+        "backfill_incomplete" | "triggers_missing" | "triggers_disabled" | "triggers_out_of_order" |
+        "triggers_orphaned" | "dropped"}`
         ("triggers_missing": maintenance triggers of an unchanged view are gone; "triggers_disabled": a
-        PostgreSQL maintenance trigger is disabled; "triggers_orphaned": a PostgreSQL
+        PostgreSQL maintenance trigger is disabled; "triggers_out_of_order": a newer SQLite user trigger
+        that writes a source table fires before the maintenance trigger; "triggers_orphaned": a PostgreSQL
         maintenance trigger is on a DETACHed partition; repair both with `repair_view()`); "backfill_incomplete" means the definition
         is current but a pk-range backfill is running elsewhere or was interrupted
         (repair with `repair_view()`). ``accept_limitations`` behaves as in
@@ -2507,7 +2509,7 @@ class MaterializedViewManager:
     )
 
     def _views_trigger_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
-        """``{view: "triggers_missing" | "triggers_disabled" | "triggers_orphaned"}``
+        """``{view: "triggers_missing" | "triggers_disabled" | "triggers_out_of_order" | "triggers_orphaned"}``
         for views whose maintenance triggers drifted.
 
         "triggers_missing": a recorded trigger does not exist (PostgreSQL: on
@@ -2534,10 +2536,121 @@ class MaterializedViewManager:
         if rows is None:
             return {}
         live = {str(r[0]).lower() for r in rows if r[0]}
-        return {
+        out = {
             name: "triggers_missing" for name, entry in catalog.items()
             if any(str(t).lower() not in live for t in entry.get("trigger_names") or [])
         }
+        if self.dialect == Dialect.SQLITE:
+            for name, status in self._sqlite_trigger_order_drift(catalog).items():
+                out.setdefault(name, status)
+        return out
+
+    # Header of a SQLite trigger up to its body: timing (BEFORE when omitted)
+    # and event.
+    _SQLITE_TRIGGER_EVENT_RE = re.compile(
+        r"\b(?:(BEFORE|AFTER|INSTEAD\s+OF)\s+)?(INSERT|UPDATE|DELETE)\b(?:\s+OF\b.*?)?\s+ON\s",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    _SQLITE_TRIGGER_WRITE_RE = re.compile(
+        r"\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE(?:\s+OR\s+\w+)?|DELETE\s+FROM)\s+"
+        r"(?:(?:main|\"main\")\s*\.\s*)?[\"`\[]?([^\s\"`\]\(.;]+)",
+        flags=re.IGNORECASE,
+    )
+    _SQLITE_RAISE_SKIP_RE = re.compile(r"\bRAISE\s*\(\s*(?:FAIL|IGNORE)\b", flags=re.IGNORECASE)
+
+    def _sqlite_trigger_order_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+        """``{view: "triggers_out_of_order"}``: a user ``AFTER`` trigger on a
+        source table fires before the view's maintenance trigger for the same
+        event and can break it.
+
+        SQLite fires the triggers of one table and timing in descending
+        ``sqlite_master`` rowid order (the most recently created first; the
+        order survives reconnects and ``VACUUM``), so a user trigger created
+        after registration runs first. It is reported when its body writes a
+        table that has maintenance triggers (the view then sees changes out
+        of order, e.g. an update of a row whose insert it has not seen yet,
+        or the other join source before the delta it pairs with) or uses
+        ``RAISE(FAIL)`` / ``RAISE(IGNORE)`` (the row is kept but the later
+        maintenance trigger never runs), also through a chain of other
+        triggers it sets off (a write to another table or to a view whose
+        INSTEAD OF trigger writes a source; bounded depth). ``repair_view()``
+        recreates the maintenance triggers, which makes them the newest.
+        TEMP triggers (connection-local) and writes the SQL text does not
+        show (application functions) are not seen.
+        """
+        with self._cursor() as cur:
+            rows = self._catalog_select(cur, "SELECT rowid, name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        if not rows:
+            return {}
+        maint_names = {
+            str(t).lower() for entry in catalog.values() for t in entry.get("trigger_names") or []
+        }
+
+        def head_and_body(sql: str) -> Tuple[Optional[Tuple[str, str]], str]:
+            m_begin = re.search(r"\bBEGIN\b", sql, flags=re.IGNORECASE)
+            head = sql[: m_begin.start()] if m_begin else sql
+            body = sql[m_begin.end():] if m_begin else ""
+            m_ev = self._SQLITE_TRIGGER_EVENT_RE.search(head)
+            if not m_ev:
+                return None, body
+            timing = re.sub(r"\s+", " ", (m_ev.group(1) or "BEFORE").upper())
+            return (timing, m_ev.group(2).upper()), body
+
+        maint: Dict[str, Tuple[int, str, str]] = {}  # name -> (rowid, table, event)
+        user: List[Tuple[int, str, str, str]] = []  # (rowid, table, event, body)
+        # Non-maintenance triggers (any timing, also INSTEAD OF on views) by
+        # the table or view they are on: (written objects, uses RAISE(FAIL/IGNORE)).
+        effects_on: Dict[str, List[Tuple[Set[str], bool]]] = {}
+        for rowid, t_name, tbl, sql in rows:
+            kind, body = head_and_body(str(sql or ""))
+            if kind is None:
+                continue
+            timing, event = kind
+            if str(t_name).lower() in maint_names:
+                maint[str(t_name).lower()] = (int(rowid), str(tbl).lower(), event)
+                continue
+            writes = {m.group(1).lower() for m in self._SQLITE_TRIGGER_WRITE_RE.finditer(body)}
+            effects_on.setdefault(str(tbl).lower(), []).append(
+                (writes, bool(self._SQLITE_RAISE_SKIP_RE.search(body))))
+            if timing == "AFTER":
+                user.append((int(rowid), str(tbl).lower(), event, body))
+        source_tables = {tbl for _, tbl, _ in maint.values()}
+
+        def reaches_source(body: str) -> bool:
+            """The trigger body, or a trigger chain it starts (a write to
+            another table or to a view whose INSTEAD OF trigger writes on),
+            writes a source table or raises FAIL/IGNORE. Bounded depth."""
+            if self._SQLITE_RAISE_SKIP_RE.search(body):
+                return True
+            frontier = {m.group(1).lower() for m in self._SQLITE_TRIGGER_WRITE_RE.finditer(body)}
+            seen: Set[str] = set()
+            for _ in range(16):
+                if frontier & source_tables:
+                    return True
+                seen |= frontier
+                nxt: Set[str] = set()
+                for obj in frontier:
+                    for writes, raises in effects_on.get(obj, ()):
+                        if raises:
+                            return True
+                        nxt |= writes
+                frontier = nxt - seen
+                if not frontier:
+                    return False
+            return True  # deeper than the bound: report rather than miss
+
+        risky = [(rowid, tbl, event) for rowid, tbl, event, body in user if reaches_source(body)]
+        out: Dict[str, str] = {}
+        for name, entry in catalog.items():
+            for t in entry.get("trigger_names") or []:
+                info = maint.get(str(t).lower())
+                if info is None:
+                    continue
+                m_rowid, m_tbl, m_event = info
+                if any(r > m_rowid and tbl == m_tbl and ev == m_event for r, tbl, ev in risky):
+                    out[name] = "triggers_out_of_order"
+                    break
+        return out
 
     def _pg_trigger_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
         out: Dict[str, str] = {}
@@ -2598,14 +2711,17 @@ class MaterializedViewManager:
         Inspects all registered views in `__matview_catalog` against the current live base
         table schemas and returns `{view_name: "ok" | "drifted" | "invalid" |
         "backfill_incomplete" | "triggers_missing" | "triggers_disabled" |
-        "triggers_orphaned"}`;
+        "triggers_out_of_order" | "triggers_orphaned"}`;
         "backfill_incomplete" (definition current, but a pk-range backfill is
         running elsewhere or was interrupted) is never "ok"; "triggers_missing"
         means maintenance triggers recorded for the view do not exist, also on a
         PostgreSQL partition attached or created later (writes are not
         maintained); "triggers_disabled" means a PostgreSQL maintenance trigger
         was disabled (`ALTER TABLE ... DISABLE TRIGGER`, as `pg_restore
-        --disable-triggers` does; writes are not maintained); "triggers_orphaned" means a PostgreSQL maintenance trigger
+        --disable-triggers` does; writes are not maintained); "triggers_out_of_order"
+        means a SQLite user trigger created after registration fires before a
+        maintenance trigger and writes a source table or uses RAISE(FAIL/IGNORE)
+        (see `_sqlite_trigger_order_drift`); "triggers_orphaned" means a PostgreSQL maintenance trigger
         is on a table outside the source's partition tree, e.g. a DETACHed
         partition (its writes still change the view, and its rows are still in
         the view). Repair both with `repair_view()`, which rebuilds the view.
