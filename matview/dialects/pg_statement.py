@@ -18,13 +18,16 @@ The rules every body follows:
    rows) are upserted with one ``INSERT ... SELECT ... GROUP BY key ORDER BY
    key ON CONFLICT`` statement, so every writer locks them in the same key
    order. Rows keyed by a source primary key are already serialized by the
-   source rows' own locks. Single-source group-scoped recomputes lock one
-   lock-table row per affected group key hash, in hash order (and the
-   whole-view row in SHARE mode); full recomputes and multi-source join views
-   (algebraic and group-scoped) lock the whole-view row exclusively before
-   joining their delta against other sources, so every later statement takes a
-   fresh READ COMMITTED snapshot (and REPEATABLE READ / SERIALIZABLE fail
-   closed with 40001 on any concurrent write to another source).
+   source rows' own locks. Single-source group-scoped recomputes lock bounded
+   hash-bucket rows (ids ``1..PG_GROUP_LOCK_BUCKETS``) in bucket-id order, with
+   no shared lock on row 0 (avoiding MultiXactId churn); whole-view recomputes
+   on such views lock all rows ``0..PG_GROUP_LOCK_BUCKETS`` in ascending id
+   order so both directions exclude each other symmetrically without deadlocks.
+   Full recomputes and multi-source join views (algebraic and group-scoped)
+   lock row 0 exclusively before joining their delta against other sources, so
+   every later statement takes a fresh READ COMMITTED snapshot (and REPEATABLE
+   READ / SERIALIZABLE fail closed with 40001 on any concurrent write to
+   another source).
 3. Lock, then recompute in a later statement. Native recomputations (MIN/MAX
    after a retraction of the extreme, BIT_AND/BIT_OR after a retraction,
    approximate or scale-dependent AVG, statistics, group-scoped and full
@@ -65,6 +68,15 @@ PG_OLD_TABLE = "__mv_old_rows"
 
 EVENTS: Tuple[str, ...] = ("INSERT", "UPDATE", "DELETE")
 """Statement events with transition tables (TRUNCATE has none)."""
+
+PG_GROUP_LOCK_BUCKETS = 1024
+"""Fixed number of hash buckets (ids ``1..PG_GROUP_LOCK_BUCKETS``) in a
+group-scoped view's PostgreSQL lock table. Must be a power of two so bucket
+ids are computed with a single bitmask."""
+
+PG_LOCK_TABLE_FILLFACTOR = 50
+"""Heap fillfactor for PostgreSQL lock tables so repeated counter increments
+stay HOT updates with opportunistic in-page pruning."""
 
 
 def event_has_new(event: str) -> bool:
@@ -836,58 +848,67 @@ class PgStatementMaintenanceMixin(MixinHost):
         return self._bounded_ident(f"{p}lock_", self.logical_view_name)
 
     def _pg_view_lock_ddl(self) -> str:
-        return self._create_table_ddl(
-            self._pg_view_lock_table(),
-            ["__mv_id BIGINT NOT NULL PRIMARY KEY", "__mv_n BIGINT NOT NULL DEFAULT 0"],
-            is_backing_store=False,
+        return (
+            f"CREATE TABLE {self._pg_view_lock_table()} (\n"
+            f"    __mv_id BIGINT NOT NULL PRIMARY KEY,\n"
+            f"    __mv_n BIGINT NOT NULL DEFAULT 0\n"
+            f") WITH (fillfactor = {PG_LOCK_TABLE_FILLFACTOR});"
         )
 
-    def _pg_view_lock_stmt(self) -> str:
-        """Exclusive whole-view lock (row id 0) for full recomputes.
+    def _pg_view_lock_stmt(self, all_buckets: bool = False) -> str:
+        """Exclusive whole-view lock for full recomputes and multi-source joins.
 
         READ COMMITTED: later statements of the function take a snapshot that
-        includes every writer that held the row before. REPEATABLE READ and
-        SERIALIZABLE: if another transaction changed the row after this
+        includes every writer that held the lock before. REPEATABLE READ and
+        SERIALIZABLE: if another transaction updated a locked row after this
         transaction's snapshot, the upsert fails with a serialization error.
-        Group-scoped writers hold the same row in SHARE mode
-        (``_pg_view_shared_lock_stmts``), so they exclude full recomputes but
-        not each other.
+
+        When ``all_buckets`` is True (whole-view recomputes on a group-scoped
+        view, such as ``TRUNCATE`` or writes to a subquery-referenced table),
+        upserts every row ``0..PG_GROUP_LOCK_BUCKETS`` in strictly ascending
+        ``__mv_id`` order. Because group-scoped writers lock ascending subsets
+        of ``1..PG_GROUP_LOCK_BUCKETS`` without taking ``FOR SHARE`` on row 0,
+        whole-view recomputes and group-scoped writers exclude each other
+        symmetrically (under READ COMMITTED, REPEATABLE READ, and SERIALIZABLE)
+        with zero MultiXactId allocations.
         """
         lock_t = self._pg_view_lock_table()
+        if all_buckets:
+            return (
+                f"INSERT INTO {lock_t} (__mv_id, __mv_n)\n"
+                f"    SELECT __mv_g, 1 FROM generate_series(0, {PG_GROUP_LOCK_BUCKETS}) AS __mv_g\n"
+                f"    ORDER BY 1\n"
+                f"    ON CONFLICT (__mv_id) DO UPDATE SET __mv_n = {lock_t}.__mv_n + 1;"
+            )
         return (
             f"INSERT INTO {lock_t} (__mv_id, __mv_n) VALUES (0, 1)\n"
             f"    ON CONFLICT (__mv_id) DO UPDATE SET __mv_n = {lock_t}.__mv_n + 1;"
         )
 
-    def _pg_view_shared_lock_stmts(self) -> List[str]:
-        """SHARE lock on the whole-view lock row (created if missing)."""
+    def _pg_view_lock_ddls(self, with_group_buckets: bool = False) -> List[str]:
+        """Lock table DDL plus its pre-seeded row(s) (id 0, and 1..B for group-scoped views)."""
         lock_t = self._pg_view_lock_table()
-        # The row normally exists (created with the table, see
-        # _pg_view_lock_ddls); a repopulation that emptied the table makes the
-        # first writer recreate it.
-        return [
-            f"PERFORM 1 FROM {lock_t} WHERE __mv_id = 0 FOR SHARE;\n"
-            f"    IF NOT FOUND THEN\n"
-            f"        INSERT INTO {lock_t} (__mv_id, __mv_n) VALUES (0, 0) ON CONFLICT (__mv_id) DO NOTHING;\n"
-            f"        PERFORM 1 FROM {lock_t} WHERE __mv_id = 0 FOR SHARE;\n"
-            f"    END IF;",
-        ]
-
-    def _pg_view_lock_ddls(self) -> List[str]:
-        """Lock table DDL plus its whole-view row (id 0)."""
-        return [
-            self._pg_view_lock_ddl(),
-            f"INSERT INTO {self._pg_view_lock_table()} (__mv_id, __mv_n) VALUES (0, 0) ON CONFLICT (__mv_id) DO NOTHING;",
-        ]
+        if with_group_buckets:
+            seed = (
+                f"INSERT INTO {lock_t} (__mv_id, __mv_n) "
+                f"SELECT __mv_g, 0 FROM generate_series(0, {PG_GROUP_LOCK_BUCKETS}) AS __mv_g "
+                f"ON CONFLICT (__mv_id) DO NOTHING;"
+            )
+        else:
+            seed = f"INSERT INTO {lock_t} (__mv_id, __mv_n) VALUES (0, 0) ON CONFLICT (__mv_id) DO NOTHING;"
+        return [self._pg_view_lock_ddl(), seed]
 
     def _pg_group_lock_id_sql(self, canonical_key: str) -> str:
-        """Lock-table row id of a group (never 0, the whole-view row).
+        """Bounded lock-table bucket id of a group (``1..PG_GROUP_LOCK_BUCKETS``, never 0).
 
-        Equal groups get equal ids because ``canonical_key`` is the canonical
-        text (``_pg_key_text_fn``); unequal groups whose hashes collide share a
-        row, which only makes their writers wait for each other.
+        Equal groups get equal bucket ids because ``canonical_key`` is the
+        canonical text (``_pg_key_text_fn``); unequal groups whose hashes map
+        to the same bucket share a row, which only makes their writers wait
+        for each other while bounding the lock table at
+        ``<= PG_GROUP_LOCK_BUCKETS + 1`` rows forever.
         """
-        return f"hashtextextended({canonical_key}, 0) | 1"
+        mask = PG_GROUP_LOCK_BUCKETS - 1
+        return f"((hashtextextended({canonical_key}, 0) & {mask}) + 1)"
 
     # ------------------------------------------------------------------
     # Canonical group identity

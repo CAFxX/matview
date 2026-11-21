@@ -949,10 +949,11 @@ def test_multi_view_join_trigger_order_does_not_deadlock(make_env) -> None:
 
 
 def test_repair_view_reseeds_lock_row_for_repeatable_read(make_env) -> None:
-    """repair_view() deletes auxiliary tables; it must re-seed row (0, 0) in
+    """repair_view() deletes auxiliary tables; it must re-seed the lock rows
+    (0, and 1..PG_GROUP_LOCK_BUCKETS for group-scoped views) in
     __matview_lock_<v> so REPEATABLE READ writers of subquery-filtered Tier 2
-    views (FOR SHARE on row 0) still fail closed with 40001 after a repair,
-    and algebraic join views remain serialized after a repair."""
+    views still fail closed with 40001 after a repair, and algebraic join views
+    remain serialized after a repair."""
     schema = list(PG_SCHEMA) + ["CREATE TABLE u (g INT PRIMARY KEY)"]
     v_sub = ViewDef(
         "v_sub",
@@ -983,8 +984,9 @@ def test_repair_view_reseeds_lock_row_for_repeatable_read(make_env) -> None:
     env.conn.commit()
 
     # Under REPEATABLE READ after repair_view(): B takes snapshot, A updates u
-    # (exclusive lock on row 0) and commits, B writes t (FOR SHARE on row 0) ->
-    # must fail closed with 40001 rather than seeing an empty lock table.
+    # (locks all buckets 0..PG_GROUP_LOCK_BUCKETS) and commits, B writes t
+    # (updates its bucket row) -> must fail closed with 40001 rather than
+    # seeing an empty lock table.
     a, b = env.connect(), env.connect()
     cb = b.cursor()
     cb.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
@@ -1034,9 +1036,9 @@ def test_join_view_writers_of_different_sources_repeatable_read_fail_closed(make
 
 def test_whole_view_recompute_excludes_group_writers(make_env) -> None:
     """A group-scoped view whose WHERE reads another table: writes to t
-    recompute their groups (holding the view lock row in SHARE mode), writes
-    to u recompute the whole view (holding it exclusively). The whole-view
-    writer must wait for the group writer and then see it."""
+    recompute their groups (locking bounded group buckets), writes to u
+    recompute the whole view (locking all buckets 0..PG_GROUP_LOCK_BUCKETS).
+    The whole-view writer must wait for the group writer and then see it."""
     schema = list(PG_SCHEMA) + ["CREATE TABLE u (g INT PRIMARY KEY)"]
     view = ViewDef("v_sub", "SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids FROM t "
                             "WHERE g IN (SELECT g FROM u) GROUP BY g")
@@ -1671,3 +1673,273 @@ def test_native_postgres_array_backing_types_and_expressions(make_env, monkeypat
         cur.execute(f'SET search_path TO "{env.ns}"')
         cur.execute(f'DROP SCHEMA IF EXISTS "{sec_sch}" CASCADE')
         env.conn.commit()
+
+
+def test_group_lock_table_stays_bounded_hot_and_zero_multixacts(make_env) -> None:
+    """Group-scoped lock table stays bounded at PG_GROUP_LOCK_BUCKETS + 1 rows
+    even after thousands of distinct (including transient/deleted) groups are
+    written concurrently across independent connections, uses HOT updates, and
+    allocates zero MultiXactIds."""
+    import concurrent.futures
+    from matview.dialects.pg_statement import PG_GROUP_LOCK_BUCKETS
+
+    env = make_env(views=[V_STRAGG], seed=False)
+    env.execute("CREATE INDEX idx_t_g ON t (g)")
+    env.commit()
+    lock_tbl = "__matview_lock_v_stragg"
+
+    stat_conn = env.connect()
+    stat_conn.autocommit = True
+    scur = stat_conn.cursor()
+    scur.execute("SELECT current_setting('is_superuser')")
+    is_super = scur.fetchone()[0] == "on"
+    scur.execute(
+        "SELECT COALESCE(n_tup_upd, 0), COALESCE(n_tup_hot_upd, 0) FROM pg_stat_user_tables "
+        "WHERE schemaname = %s AND relname = %s",
+        (env.ns, lock_tbl),
+    )
+    row_before = scur.fetchone()
+    upd_before, hot_before = (row_before[0], row_before[1]) if row_before else (0, 0)
+    if is_super:
+        scur.execute("CHECKPOINT")
+        scur.execute("SELECT next_multixact_id::text::bigint FROM pg_control_checkpoint()")
+        mx_before = scur.fetchone()[0]
+    else:
+        mx_before = None
+
+    n_threads = 4
+    groups_per_thread = 750  # 3,000 distinct groups (half deleted after insert -> 4,500 lock updates)
+    expected_updates = n_threads * (groups_per_thread + (groups_per_thread + 1) // 2)
+
+    def _writer(tid: int) -> None:
+        conn = env.connect()
+        try:
+            cur = conn.cursor()
+            base = tid * groups_per_thread + 1
+            for i in range(groups_per_thread):
+                rid = base + i
+                cur.execute("INSERT INTO t (id, g, v) VALUES (%s, %s, %s)", (rid, rid, i))
+                conn.commit()
+                if i % 2 == 0:
+                    cur.execute("DELETE FROM t WHERE id = %s", (rid,))
+                    conn.commit()
+            # Force this worker backend to flush its pg_stat_user_tables counters immediately.
+            cur.execute("SELECT pg_stat_force_next_flush()")
+            conn.commit()
+        finally:
+            conn.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
+        futs = [ex.submit(_writer, t) for t in range(n_threads)]
+        for f in futs:
+            f.result()
+
+    # Exact MV equivalence after 3,000 concurrent groups + 1,500 transient group deletions.
+    env.check("bounded group lock table concurrent transient groups")
+
+    # Lock table row count and id bounds: strictly 0..PG_GROUP_LOCK_BUCKETS.
+    scur.execute(f"SELECT COUNT(*), MIN(__mv_id), MAX(__mv_id) FROM {env.ns}.{lock_tbl}")
+    row_cnt, min_id, max_id = scur.fetchone()
+    assert row_cnt == PG_GROUP_LOCK_BUCKETS + 1, (row_cnt, min_id, max_id)
+    assert min_id == 0 and max_id == PG_GROUP_LOCK_BUCKETS, (min_id, max_id)
+
+    # Verify negative hashtextextended results still map strictly into 1..PG_GROUP_LOCK_BUCKETS.
+    scur.execute(
+        f"SELECT MIN(((h & {PG_GROUP_LOCK_BUCKETS - 1}) + 1)), "
+        f"       MAX(((h & {PG_GROUP_LOCK_BUCKETS - 1}) + 1)), "
+        f"       COUNT(*) FILTER (WHERE h < 0) "
+        f"FROM (SELECT hashtextextended('g_' || i, 0) AS h FROM generate_series(1, 2000) i) s"
+    )
+    b_min, b_max, neg_cnt = scur.fetchone()
+    assert neg_cnt > 0 and b_min >= 1 and b_max <= PG_GROUP_LOCK_BUCKETS, (b_min, b_max, neg_cnt)
+
+    # Verify bounded heap size (<= 512 KiB even under brief xmin pinning), HOT updates,
+    # and zero MultiXactId allocations.
+    scur.execute(f"SELECT pg_relation_size('{env.ns}.{lock_tbl}')")
+    heap_bytes = scur.fetchone()[0]
+    assert heap_bytes <= 512 * 1024, f"lock table heap grew unexpectedly: {heap_bytes} bytes"
+
+    deadline = time.monotonic() + 5.0
+    upd_delta, hot_delta = 0, 0
+    while True:
+        scur.execute(
+            "SELECT COALESCE(n_tup_upd, 0), COALESCE(n_tup_hot_upd, 0) FROM pg_stat_user_tables "
+            "WHERE schemaname = %s AND relname = %s",
+            (env.ns, lock_tbl),
+        )
+        r_after = scur.fetchone()
+        if r_after is not None:
+            upd_delta = r_after[0] - upd_before
+            hot_delta = r_after[1] - hot_before
+            if upd_delta >= expected_updates:
+                break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    assert upd_delta == expected_updates, f"expected {expected_updates} lock-table updates, saw {upd_delta}"
+    assert hot_delta >= int(upd_delta * 0.98), f"expected HOT updates on lock table: {hot_delta}/{upd_delta}"
+
+    if is_super:
+        scur.execute("CHECKPOINT")
+        scur.execute("SELECT next_multixact_id::text::bigint FROM pg_control_checkpoint()")
+        mx_after = scur.fetchone()[0]
+        assert mx_after == mx_before, f"group-scoped writers allocated MultiXactIds: {mx_after - mx_before}"
+    stat_conn.close()
+
+
+@pytest.mark.parametrize("isolation", ["REPEATABLE READ", "SERIALIZABLE"])
+def test_whole_view_recompute_and_group_writer_symmetric_exclusion(make_env, isolation: str) -> None:
+    """Whole-view recomputes (writes to subquery table u or TRUNCATE t) and
+    group-scoped writes to t exclude each other symmetrically in BOTH directions:
+    under READ COMMITTED (reverse order: whole-view holds lock, group writer
+    waits) and under REPEATABLE READ / SERIALIZABLE (both u-then-t and t-then-u
+    plus TRUNCATE-then-t fail closed with 40001, including after repair_view())."""
+    from matview.dialects.pg_statement import PG_GROUP_LOCK_BUCKETS
+
+    schema = list(PG_SCHEMA) + ["CREATE TABLE u (g INT PRIMARY KEY)"]
+    view = ViewDef(
+        "v_sub",
+        "SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids FROM t "
+        "WHERE g IN (SELECT g FROM u) GROUP BY g",
+    )
+    env = make_env(views=[], schema_sql=schema, seed=True)
+    env.execute("INSERT INTO u (g) VALUES (1), (2), (3)")
+    env.commit()
+    env.views = [view]
+    env.register(view)
+    assert _strategy(env, "v_sub") == "group_scoped_delta"
+
+    # 1. Reverse READ COMMITTED direction: whole-view writer holds all buckets,
+    #    group-scoped writer on t must wait and then see the committed u row.
+    a, b, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_b = _session_id(env, a), _session_id(env, b)
+    a.cursor().execute("INSERT INTO u (g) VALUES (4)")
+    worker = _Worker(b, ["INSERT INTO t (id, g, v) VALUES (6101, 4, 1)"]).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "group writer waits for whole-view lock")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    env.check("group writer after whole-view recompute")
+
+    # 2. Reverse REPEATABLE READ/SERIALIZABLE direction: B takes snapshot, A writes t
+    #    (updates one bucket) and commits, B writes u (locks all buckets 0..B) -> 40001.
+    b_iso = env.connect()
+    cb = b_iso.cursor()
+    cb.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+    cb.execute("SELECT COUNT(*) FROM t")
+    cb.fetchall()
+    a.cursor().execute("INSERT INTO t (id, g, v) VALUES (6102, 1, 2)")
+    a.commit()
+    with pytest.raises(Exception) as excinfo:
+        cb.execute("INSERT INTO u (g) VALUES (5)")
+        b_iso.commit()
+    b_iso.rollback()
+    assert _pgcode(excinfo.value) == SERIALIZATION_FAILURE, repr(excinfo.value)
+
+    # 3. Forward REPEATABLE READ/SERIALIZABLE direction with TRUNCATE: B takes snapshot
+    #    (without locking table t, since TRUNCATE needs ACCESS EXCLUSIVE on t),
+    #    A truncates t (locks all buckets 0..B) and commits, B inserts into t -> 40001.
+    cb.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+    cb.execute("SELECT COUNT(*) FROM u")
+    cb.fetchall()
+    a.cursor().execute("TRUNCATE TABLE t")
+    a.commit()
+    with pytest.raises(Exception) as excinfo2:
+        cb.execute("INSERT INTO t (id, g, v) VALUES (6103, 2, 3)")
+        b_iso.commit()
+    b_iso.rollback()
+    assert _pgcode(excinfo2.value) == SERIALIZATION_FAILURE, repr(excinfo2.value)
+
+    # 3b. Reverse REPEATABLE READ/SERIALIZABLE direction with TRUNCATE: B takes snapshot
+    #     (without locking t), A inserts into t (updates one bucket) and commits,
+    #     B truncates t (locks all buckets 0..B) -> 40001.
+    cb.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+    cb.execute("SELECT COUNT(*) FROM u")
+    cb.fetchall()
+    a.cursor().execute("INSERT INTO t (id, g, v) VALUES (6105, 3, 5)")
+    a.commit()
+    with pytest.raises(Exception) as excinfo2b:
+        cb.execute("TRUNCATE TABLE t")
+        b_iso.commit()
+    b_iso.rollback()
+    assert _pgcode(excinfo2b.value) == SERIALIZATION_FAILURE, repr(excinfo2b.value)
+
+    # 4. After repair_view(), all PG_GROUP_LOCK_BUCKETS + 1 rows are re-seeded and
+    #    reverse REPEATABLE READ/SERIALIZABLE direction still fails closed with 40001.
+    env.manager.repair_view("v_sub")
+    cur = env.conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM __matview_lock_v_sub")
+    assert cur.fetchone()[0] == PG_GROUP_LOCK_BUCKETS + 1
+    env.conn.commit()
+
+    cb.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+    cb.execute("SELECT COUNT(*) FROM t")
+    cb.fetchall()
+    a.cursor().execute("INSERT INTO t (id, g, v) VALUES (6104, 1, 4)")
+    a.commit()
+    with pytest.raises(Exception) as excinfo3:
+        cb.execute("INSERT INTO u (g) VALUES (6)")
+        b_iso.commit()
+    b_iso.rollback()
+    assert _pgcode(excinfo3.value) == SERIALIZATION_FAILURE, repr(excinfo3.value)
+    b_iso.close()
+    a.close()
+    b.close()
+    monitor.close()
+    env.check(f"symmetric exclusion ({isolation})")
+
+
+def test_multi_bucket_opposite_order_batch_and_whole_view_no_deadlock(make_env) -> None:
+    """Concurrent multi-row statements touching many buckets in opposite orders
+    plus concurrent whole-view recomputes (writes to subquery table u) never
+    deadlock and stay exact."""
+    import concurrent.futures
+
+    schema = list(PG_SCHEMA) + ["CREATE TABLE u (g INT PRIMARY KEY)"]
+    view = ViewDef(
+        "v_sub_batch",
+        "SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids FROM t "
+        "WHERE g IN (SELECT g FROM u) GROUP BY g",
+    )
+    env = make_env(views=[], schema_sql=schema, seed=False)
+    env.execute("INSERT INTO u (g) SELECT g FROM generate_series(1, 60) g")
+    env.commit()
+    env.views = [view]
+    env.register(view)
+
+    def _batch_writer(direction: int) -> None:
+        conn = env.connect()
+        try:
+            cur = conn.cursor()
+            gs = list(range(1, 61)) if direction > 0 else list(range(60, 0, -1))
+            for r in range(15):
+                base = (10000 if direction > 0 else 20000) + r * 100
+                vals = ", ".join(f"({base + idx}, {g}, {r})" for idx, g in enumerate(gs))
+                cur.execute(f"INSERT INTO t (id, g, v) VALUES {vals}")
+                conn.commit()
+        finally:
+            conn.close()
+
+    def _whole_view_writer() -> None:
+        conn = env.connect()
+        try:
+            cur = conn.cursor()
+            for r in range(10):
+                cur.execute("INSERT INTO u (g) VALUES (%s)", (100 + r,))
+                conn.commit()
+        finally:
+            conn.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futs = [
+            ex.submit(_batch_writer, 1),
+            ex.submit(_batch_writer, -1),
+            ex.submit(_whole_view_writer),
+        ]
+        for f in futs:
+            f.result()
+
+    env.check("multi-bucket opposite-order batch + whole-view stress")

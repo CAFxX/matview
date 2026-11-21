@@ -101,7 +101,7 @@ class Tier2Mixin(MixinHost):
                 ast = parse_sql_ast(clause, dialect=self.dialect)
             except sqlglot.errors.SqlglotError:
                 return all_tables
-            for subq in ast.find_all(sqlglot_exp.Select):
+            for subq in ast.find_all(sqlglot_exp.Select, sqlglot_exp.Subquery):
                 for tbl in subq.find_all(sqlglot_exp.Table):
                     if tbl.name:
                         subq_tables.add(tbl.name.lower())
@@ -755,6 +755,7 @@ class Tier2Mixin(MixinHost):
         group_mv_cols: List[Tuple[str, str]],
         source_query_sql: str,
         group_col_types: Optional[Dict[str, str]] = None,
+        uses_group_buckets: bool = False,
     ) -> Tuple[List[str], List[str], List[str]]:
         q_target_cols = [self._q(c) for c in target_cols]
         cols_csv = ", ".join(q_target_cols)
@@ -842,10 +843,12 @@ class Tier2Mixin(MixinHost):
             pg_bodies = self._pg_group_scoped_bodies(
                 base_t, mv_table, cols_csv, src_cols_csv, group_mv_cols, source_query_sql,
                 can_push_down, full_refresh, group_col_types or {},
+                uses_group_buckets=uses_group_buckets,
             )
             pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
-            # TRUNCATE recomputes everything: the whole-view lock key.
-            pg_trunc_stmts = [self._pg_view_lock_stmt(), *full_refresh]
+            # TRUNCATE recomputes everything: lock all buckets when group-scoped
+            # writers exist, otherwise only row 0.
+            pg_trunc_stmts = [self._pg_view_lock_stmt(all_buckets=uses_group_buckets), *full_refresh]
 
         return self._emit_dialect_triggers_for_table(
             view_name=view_name,
@@ -1007,18 +1010,19 @@ class Tier2Mixin(MixinHost):
         can_push_down: bool,
         full_refresh: List[str],
         group_col_types: Optional[Dict[str, str]] = None,
+        uses_group_buckets: bool = False,
     ) -> Dict[str, str]:
         """PostgreSQL statement-level bodies for group-scoped recompute.
 
-        1. Take the view-wide lock row (id 0) in SHARE mode, so a whole-view
-           recompute (UPDATE of that row, e.g. TRUNCATE or a source whose
-           affected groups cannot be derived) excludes group writers, then
-           lock the affected groups only, in key order: one row per group key
-           hash (odd ids) in the view's lock table, upserted in hash order (READ
-           COMMITTED: later statements see every committed writer of those
-           groups; REPEATABLE READ/SERIALIZABLE: a concurrent change of the
-           group fails with a serialization error). Writers of other groups
-           neither wait nor deadlock on it.
+        1. Single-source group-scoped writers lock only the bounded hash
+           buckets (``1..PG_GROUP_LOCK_BUCKETS``) of their affected groups in
+           ascending bucket-id order, with no ``FOR SHARE`` lock on row 0
+           (eliminating MultiXactId allocations and bounding the lock table at
+           ``PG_GROUP_LOCK_BUCKETS + 1`` rows). Whole-view recomputes on such a
+           view (``TRUNCATE`` or a source whose affected groups cannot be
+           derived) lock all rows ``0..PG_GROUP_LOCK_BUCKETS`` in ascending
+           order, symmetrically excluding group writers under READ COMMITTED,
+           REPEATABLE READ, and SERIALIZABLE.
         2. Delete and re-insert the affected groups in later statements,
            matching keys with index-usable predicates: ``col = ANY(ARRAY(...))``
            for scalar keys without NULLs (``IN (SELECT ...)`` for array /
@@ -1027,7 +1031,7 @@ class Tier2Mixin(MixinHost):
            work when there is none.
         """
         bodies: Dict[str, str] = {}
-        refresh = "\n".join([self._pg_view_lock_stmt(), *full_refresh])
+        refresh = "\n".join([self._pg_view_lock_stmt(all_buckets=uses_group_buckets), *full_refresh])
         lock_t = self._pg_view_lock_table()
         col_types_map = group_col_types or {}
         src_lhs_push: Optional[List[str]] = None
@@ -1072,7 +1076,6 @@ class Tier2Mixin(MixinHost):
             else:
                 canon = self._canonical_group_pk_expr(kcols)
                 stmts = [
-                    *self._pg_view_shared_lock_stmts(),
                     f"INSERT INTO {lock_t} (__mv_id, __mv_n)\n"
                     f"    SELECT DISTINCT {self._pg_group_lock_id_sql(canon)}, 1 FROM {kset}\n"
                     f"    ORDER BY 1\n"
@@ -1250,6 +1253,13 @@ class Tier2Mixin(MixinHost):
             ),
         )
 
+        uses_group_buckets = (
+            self.dialect == Dialect.POSTGRES
+            and len(self.view.joins) <= 1
+            and bool(group_mv_cols)
+            and self.view.base_table.lower() not in self._tier2_subquery_tables()
+        )
+
         trigger_ddls: List[str] = []
         trig_names: List[str] = []
         fn_names: List[str] = []
@@ -1262,6 +1272,7 @@ class Tier2Mixin(MixinHost):
                 group_mv_cols=group_mv_cols,
                 source_query_sql=source_query_sql,
                 group_col_types=col_types_by_lower,
+                uses_group_buckets=uses_group_buckets,
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)
@@ -1273,7 +1284,11 @@ class Tier2Mixin(MixinHost):
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=self._pg_view_lock_ddls() if self.dialect == Dialect.POSTGRES else [],
+            auxiliary_table_ddls=(
+                self._pg_view_lock_ddls(with_group_buckets=uses_group_buckets)
+                if self.dialect == Dialect.POSTGRES
+                else []
+            ),
             auxiliary_table_names=[self._pg_view_lock_table()] if self.dialect == Dialect.POSTGRES else [],
             index_ddls=index_ddls,
             initial_populate_sqls=[initial_populate_sql],

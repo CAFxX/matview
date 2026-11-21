@@ -84,7 +84,12 @@ from .sql_frontend import (
 # 8: Watermark-gated backfill UPDATE triggers always track the watermark/backfill
 #    range key (including unreferenced integer PKs and unshadowed SQLite rowid
 #    aliases) and strictly validate integer PK / WITHOUT ROWID eligibility.
-MATVIEW_GENERATOR_VERSION = "9"
+# 9: PostgreSQL join views serialize concurrent writers across sources via the
+#    per-view lock table and fixed-width view-hash trigger prefixes.
+# 10: PostgreSQL group-scoped lock tables use bounded hash buckets (1..1024)
+#     with fillfactor = 50 and full-bucket whole-view locks instead of FOR SHARE
+#     on row 0 (eliminating unbounded lock-row growth and MultiXactId churn).
+MATVIEW_GENERATOR_VERSION = "10"
 
 
 def _definition_digest(select_sql: str) -> str:
