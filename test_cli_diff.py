@@ -656,7 +656,7 @@ class TestCLICompileLimitationContract(unittest.TestCase):
             ("mariadb:10.11", "CREATE VIEW v AS SELECT grp, VAR_SAMP(val) * 2 AS v2 FROM t GROUP BY grp;",
              (["--ignore-limitations"],
               # Past the order-sensitivity opt-in too: MariaDB's own refusal must hold.
-              ["--ignore-limitations", "--accept-limitation", "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+              ["--ignore-limitations", "--accept-limitation", "FLOAT_REASSOCIATION_ALLOWED",
                "--accept-limitation", "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX"])),
         ):
             for extra in extras:
