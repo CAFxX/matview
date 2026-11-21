@@ -1257,7 +1257,10 @@ class Tier1SingleMixin(MixinHost):
             w_parts: List[str] = []
             if self.view.where_clause:
                 w_parts.append(f"({self.view.where_clause})")
-            w_parts.append(f"({eff}) IS NOT NULL")
+            if self.dialect == Dialect.POSTGRES:
+                w_parts.append(f"({eff}) IS DISTINCT FROM NULL")
+            else:
+                w_parts.append(f"({eff}) IS NOT NULL")
             where_sql = f"\nWHERE {' AND '.join(w_parts)}"
             group_sql = f"\nGROUP BY {', '.join(dist_grp)}"
             stmts.append(

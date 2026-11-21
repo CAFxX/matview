@@ -1127,6 +1127,22 @@ KEY_TYPES = {
                       "(SELECT array_agg(trim_scale(x) ORDER BY o) FROM unnest({k}) WITH ORDINALITY u(x, o))::text"),
     "numrange": ("NUMRANGE", [["'[1.0,2.50)'", "'[1,2.5)'"]], "'[1,3)'",
                  "numrange(trim_scale(lower({k})), trim_scale(upper({k})))::text"),
+    "nummultirange": (
+        "NUMMULTIRANGE",
+        [["'{[1.0,2.50),[4.00,5)}'::nummultirange", "'{[1,2.5),[4,5.0)}'::nummultirange"], ["'{}'::nummultirange"]],
+        "'{[1,3)}'::nummultirange",
+        "(SELECT COALESCE(array_agg(numrange(trim_scale(lower(r)), trim_scale(upper(r)), "
+        "(CASE WHEN lower_inc(r) THEN '[' ELSE '(' END) || (CASE WHEN upper_inc(r) THEN ']' ELSE ')' END)) ORDER BY o), '{{}}') "
+        "FROM unnest({k}) WITH ORDINALITY u(r, o))::text",
+    ),
+    "tstzmultirange": (
+        "TSTZMULTIRANGE",
+        [["'{[2026-01-01 00:00:00+00,2026-01-01 02:00:00+00)}'::tstzmultirange",
+          "'{[2026-01-01 09:00:00+09,2026-01-01 11:00:00+09)}'::tstzmultirange"]],
+        "'{[2026-01-02 00:00:00+00,2026-01-02 01:00:00+00)}'::tstzmultirange",
+        "(SELECT COALESCE(array_agg((lower(r) AT TIME ZONE 'UTC')::text || '..' || (upper(r) AT TIME ZONE 'UTC')::text ORDER BY o), '{{}}') "
+        "FROM unnest({k}) WITH ORDINALITY u(r, o))::text",
+    ),
 }
 
 # Session settings that change how values print; writes alternate between them.
@@ -1243,7 +1259,7 @@ def test_timestamptz_key_value_independent_of_session_timezone(make_env) -> None
 
 
 @pytest.mark.parametrize("kind,view", [("numeric", "ck_str"), ("numeric", "ck_agg"), ("float8", "ck_str"),
-                                       ("interval", "ck_str")])
+                                       ("interval", "ck_str"), ("nummultirange", "ck_str"), ("nummultirange", "ck_agg")])
 def test_concurrent_writers_of_equal_keys_that_print_differently(make_env, kind: str, view: str) -> None:
     """READ COMMITTED: A inserts one spelling of a key and stays open; B
     inserts another spelling of the same key from a session with other print
@@ -1310,21 +1326,328 @@ def test_nondeterministic_collation_keys_are_refused_at_registration(make_env) -
 
 
 def test_unsupported_key_type_fails_closed(make_env) -> None:
-    """A multirange-typed nullable group key has no canonical text (yet): the
-    write fails with 0A000 instead of possibly splitting a group."""
+    """Unsupported grouping key types (such as anonymous ``record`` via
+    ``GROUP BY ROW(...)``) and composite/domain/array keys containing a
+    nondeterministic collation are refused at registration time (0A000) even
+    when the source table is empty."""
     env = make_env(views=[], seed=False, schema_sql=[
-        "CREATE TABLE cp (id INT PRIMARY KEY, p NUMMULTIRANGE, v INT)",
+        "CREATE TABLE cp (id INT PRIMARY KEY, a INT, v INT)",
     ])
-    vd = ViewDef("vp", "SELECT p, COUNT(*) AS n FROM cp GROUP BY p")
-    env.views = [vd]
-    env.register(vd)
-    with pytest.raises(Exception) as excinfo:
-        env.execute("INSERT INTO cp VALUES (1, '{[1.0,2)}', 1)")
-        env.commit()
+    # 1. Anonymous `record` grouping key (including positional GROUP BY 1 and
+    #    SELECT DISTINCT): refused at registration, not at first write.
+    rec_views = [
+        ViewDef("v_rec_grp", "SELECT COUNT(*) AS n, SUM(v) AS s FROM cp GROUP BY ROW(a, v)"),
+        ViewDef("v_rec_pos", "SELECT ROW(a, v) AS r, COUNT(*) AS n FROM cp GROUP BY 1"),
+        ViewDef("v_rec_dst", "SELECT DISTINCT ROW(a, v) AS r FROM cp"),
+        ViewDef("v_rec_win", "SELECT id, ROW_NUMBER() OVER (PARTITION BY ROW(a, v) ORDER BY id) AS rn FROM cp"),
+    ]
+    for vd in rec_views:
+        with pytest.raises(Exception) as excinfo:
+            env.register(vd)
+        env.conn.rollback()
+        assert _pgcode(excinfo.value) == "0A000", (vd.name, repr(excinfo.value))
+        assert "record" in str(excinfo.value).lower(), (vd.name, str(excinfo.value))
+
+    # 2. Composite / nested composite / domain / array / custom range containing
+    #    a nondeterministic collation (including output-alias shadowing): refused
+    #    at registration with 0A000.
+    cur = env.conn.cursor()
+    try:
+        cur.execute(
+            "CREATE COLLATION mv_test_ci_comp (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+        )
+        env.conn.commit()
+    except Exception as exc:
+        env.conn.rollback()
+        pytest.skip(f"ICU nondeterministic collation unavailable: {exc}")
+
+    cur.execute("CREATE TYPE ci_leaf AS (n INT, s TEXT COLLATE mv_test_ci_comp)")
+    cur.execute("CREATE TYPE ci_outer AS (id INT, leaf ci_leaf)")
+    cur.execute("CREATE DOMAIN ci_dom AS ci_leaf")
+    cur.execute("CREATE TYPE ci_range AS RANGE (subtype = text, collation = mv_test_ci_comp)")
+    cur.execute(
+        "CREATE TABLE tc_comp (id INT PRIMARY KEY, c1 ci_leaf, c2 ci_outer, c3 ci_dom, "
+        "c4 ci_leaf[], c5 ci_range, c6 ci_multirange, ok INT, v INT)"
+    )
+    env.conn.commit()
+
+    for col in ("c1", "c2", "c3", "c4", "c5", "c6"):
+        vd = ViewDef(f"v_ci_{col}", f"SELECT {col}, COUNT(*) AS n FROM tc_comp GROUP BY {col}")
+        with pytest.raises(Exception) as excinfo:
+            env.register(vd)
+        env.conn.rollback()
+        assert _pgcode(excinfo.value) == "0A000", (col, repr(excinfo.value))
+        assert "mv_test_ci_comp" in str(excinfo.value), (col, str(excinfo.value))
+
+    # Output alias `'ok' AS c1` does NOT shadow base column `tc_comp.c1` in PostgreSQL GROUP BY.
+    vd_shadow = ViewDef("v_ci_shadow", "SELECT 'ok'::TEXT AS c1, COUNT(*) AS n FROM tc_comp GROUP BY c1")
+    with pytest.raises(Exception) as excinfo_sh:
+        env.register(vd_shadow)
     env.conn.rollback()
-    assert _pgcode(excinfo.value) == "0A000", repr(excinfo.value)
-    assert "nummultirange" in str(excinfo.value), str(excinfo.value)
-    env.check("after the refused write")
+    assert _pgcode(excinfo_sh.value) == "0A000", repr(excinfo_sh.value)
+    assert "mv_test_ci_comp" in str(excinfo_sh.value), str(excinfo_sh.value)
+
+
+def test_composite_and_multirange_canonical_keys(make_env, monkeypatch) -> None:
+    """Field-wise composite canonicalization and range-wise multirange
+    canonicalization (including nested/quoted/empty/dropped-attribute
+    composites, NULL vs ROW(NULL,...), domains over composites, 1D/2D arrays
+    of composites, custom float multiranges, concurrent writers, and native
+    type/OID preservation via both SQLAlchemy and raw DB-API introspection)."""
+    import matview.connectivity as _conn_mod
+
+    env = make_env(
+        views=[],
+        seed=False,
+        schema_sql=[
+            'CREATE TYPE comp_pair AS (a NUMERIC, b FLOAT8, "c d" TEXT)',
+            'CREATE TYPE "MixedComp" AS (x INT, y comp_pair)',
+            "CREATE TYPE empty_comp AS ()",
+            "CREATE TYPE dropped_comp AS (keep_a NUMERIC, drop_me TEXT, keep_b FLOAT8)",
+            "ALTER TYPE dropped_comp DROP ATTRIBUTE drop_me",
+            "CREATE DOMAIN comp_dom AS comp_pair",
+            "CREATE TYPE floatrange AS RANGE (subtype = float8)",
+            "CREATE TYPE comp_with_mr AS (tag TEXT, mr NUMMULTIRANGE)",
+            """
+            CREATE TABLE cm (
+                id INT PRIMARY KEY,
+                k_comp comp_pair,
+                k_mcomp "MixedComp",
+                k_empty empty_comp,
+                k_drop dropped_comp,
+                k_dom comp_dom,
+                k_dom_arr comp_dom[],
+                k_arr comp_pair[],
+                k_arr2d comp_pair[][],
+                k_fmr floatmultirange,
+                k_cmr comp_with_mr,
+                v INT
+            )
+            """,
+        ],
+    )
+
+    # 1. Verify both SQLAlchemy and raw DB-API introspection preserve native
+    #    composite, domain-over-composite, and custom multirange DDL types.
+    sa_schemas = env.manager.fetch_schema()
+    monkeypatch.setattr(_conn_mod, "_can_use_sqlalchemy_inspector", lambda _c: False)
+    raw_schemas = env.manager.fetch_schema()
+    monkeypatch.undo()
+    expected_types = {
+        "k_comp": "comp_pair",
+        "k_mcomp": '"MixedComp"',
+        "k_empty": "empty_comp",
+        "k_drop": "dropped_comp",
+        "k_dom": "comp_pair",
+        "k_dom_arr": "comp_pair[]",
+        "k_arr": "comp_pair[]",
+        "k_arr2d": "comp_pair[]",
+        "k_fmr": "floatmultirange",
+        "k_cmr": "comp_with_mr",
+    }
+    for label, sch_map in (("sqlalchemy", sa_schemas), ("dbapi_fallback", raw_schemas)):
+        cols = sch_map["cm"].columns
+        for cname, exp_dt in expected_types.items():
+            assert cols[cname].data_type == exp_dt, f"{label}: {cname} got {cols[cname].data_type!r}, expected {exp_dt!r}"
+
+    views = [
+        ViewDef("v_comp_agg", "SELECT k_comp, COUNT(*) AS n, SUM(v) AS s FROM cm GROUP BY k_comp"),
+        ViewDef("v_comp_str", "SELECT k_comp, STRING_AGG(CAST(v AS TEXT), ',' ORDER BY v) AS vs FROM cm GROUP BY k_comp"),
+        ViewDef("v_comp_minmax", "SELECT k_comp, MIN(v) AS lo, MAX(v) AS hi, AVG(v) AS av FROM cm GROUP BY k_comp"),
+        ViewDef(
+            "v_comp_cnt",
+            "SELECT (v % 2) AS parity, COUNT(k_comp) AS c_all, COUNT(DISTINCT k_comp) AS c_dist, "
+            "COUNT(k_fmr) AS c_fmr, COUNT(DISTINCT k_fmr) AS c_fmr_dist FROM cm GROUP BY (v % 2)",
+        ),
+        ViewDef("v_comp_proj", "SELECT k_comp, v FROM cm UNION ALL SELECT k_comp, v + 1000 FROM cm"),
+        ViewDef("v_mcomp", "SELECT k_mcomp, COUNT(*) AS n, SUM(v) AS s FROM cm GROUP BY k_mcomp"),
+        ViewDef("v_empty", "SELECT k_empty, COUNT(*) AS n, SUM(v) AS s FROM cm GROUP BY k_empty"),
+        ViewDef("v_drop", "SELECT k_drop, COUNT(*) AS n, SUM(v) AS s FROM cm GROUP BY k_drop"),
+        ViewDef("v_dom", "SELECT k_dom, COUNT(*) AS n, SUM(v) AS s FROM cm GROUP BY k_dom"),
+        ViewDef("v_dom_arr", "SELECT k_dom_arr, COUNT(*) AS n, SUM(v) AS s FROM cm GROUP BY k_dom_arr"),
+        ViewDef("v_arr", "SELECT k_arr, COUNT(*) AS n, SUM(v) AS s FROM cm GROUP BY k_arr"),
+        ViewDef("v_arr2d", "SELECT k_arr2d, COUNT(*) AS n, SUM(v) AS s FROM cm GROUP BY k_arr2d"),
+        ViewDef("v_fmr", "SELECT k_fmr, COUNT(*) AS n, SUM(v) AS s FROM cm GROUP BY k_fmr"),
+        ViewDef("v_cmr", "SELECT k_cmr, COUNT(*) AS n, SUM(v) AS s FROM cm GROUP BY k_cmr"),
+        ViewDef("v_comp_dst", "SELECT DISTINCT k_comp FROM cm"),
+    ]
+    env.views = views
+    for vd in views:
+        env.register(vd)
+
+    cur = env.conn.cursor()
+
+    def _assert_all_exact(label: str) -> None:
+        for vd in views:
+            if vd.name != "v_comp_proj":
+                cur.execute(f"SELECT COUNT(*) FROM {env.plans[vd.name].backing_table_name}")
+                stored = cur.fetchone()[0]
+                cur.execute(f"SELECT COUNT(*) FROM ({vd.select}) AS q")
+                live_cnt = cur.fetchone()[0]
+                assert stored == live_cnt, f"{label}: {vd.name} stored={stored} live={live_cnt}"
+            cur.execute(f"SELECT * FROM {vd.name} LIMIT 0")
+            mv_oids = [d.type_code for d in cur.description]
+            cols = [d[0] for d in cur.description]
+            cur.execute(f"SELECT * FROM ({vd.select}) AS q LIMIT 0")
+            live_oids = [d.type_code for d in cur.description]
+            # Domain columns intentionally unwrap to their base type in backing tables.
+            if vd.name not in ("v_dom", "v_dom_arr"):
+                assert mv_oids == live_oids, f"{label}: {vd.name} OIDs {mv_oids} != {live_oids}"
+            sel_cols = ", ".join(cols)
+            cur.execute(
+                f"(SELECT {sel_cols} FROM {vd.name} EXCEPT ALL SELECT {sel_cols} FROM ({vd.select}) AS q) "
+                f"UNION ALL "
+                f"(SELECT {sel_cols} FROM ({vd.select}) AS q EXCEPT ALL SELECT {sel_cols} FROM {vd.name})"
+            )
+            diff = cur.fetchall()
+            assert diff == [], f"{label}: {vd.name} diff={diff}"
+        env.conn.commit()
+
+    # Insert equal spellings across SESSION_PROFILES plus adversarial distinct values:
+    # - ROW(1.0, -0.0, 'hi') == ROW(1.00, 0.0, 'hi') -> MUST merge into 1 group
+    # - ROW(1.0, NULL, 'hi') == ROW(1.00, NULL, 'hi') -> partially-NULL composite
+    #   (both IS NULL and IS NOT NULL are FALSE in PG; must NOT be dropped in Tier 2,
+    #    MIN/MAX/AVG recomputes, COUNT(k_comp), COUNT(DISTINCT k_comp), or Z-set PKs!)
+    # - NULL::comp_pair vs ROW(NULL, NULL, NULL)::comp_pair -> MUST stay 2 distinct groups
+    # - ARRAY[ROW(1.0, 2.0, 'hi')] vs ARRAY[ROW(1.0, 2.0, 'DIFF')] -> MUST stay 2 distinct groups
+    # - floatmultirange '{[-0.0, 1.0)}' == '{[0.0, 1.0)}' and '{}' empty multirange
+    for s in SESSION_PROFILES[0]:
+        cur.execute(s)
+    cur.execute("""
+        INSERT INTO cm VALUES
+        (1, ROW(1.0, -0.0, 'hi')::comp_pair, ROW(7, ROW(1.0, -0.0, NULL)::comp_pair)::"MixedComp",
+            ROW()::empty_comp, ROW(2.50, -0.0)::dropped_comp, ROW(1.0, -0.0, 'd')::comp_dom,
+            ARRAY[ROW(1.0, -0.0, 'd')::comp_dom, NULL],
+            ARRAY[ROW(1.0, -0.0, 'hi')::comp_pair, NULL],
+            ARRAY[ARRAY[ROW(1.0, -0.0, 'a')::comp_pair, NULL], ARRAY[ROW(2.0, 3.0, 'b')::comp_pair, ROW(NULL, NULL, NULL)::comp_pair]],
+            '{[-0.0,1.0)}'::floatmultirange, ROW('t', '{[1.0,2.50)}'::nummultirange)::comp_with_mr, 10),
+        (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 20),
+        (3, ROW(NULL, NULL, NULL)::comp_pair, ROW(NULL, NULL)::"MixedComp",
+            ROW()::empty_comp, ROW(NULL, NULL)::dropped_comp, ROW(NULL, NULL, NULL)::comp_dom,
+            ARRAY[ROW(1.0, -0.0, 'DIFF')::comp_dom, NULL],
+            ARRAY[ROW(1.0, -0.0, 'DIFF')::comp_pair, NULL],
+            ARRAY[ARRAY[ROW(1.0, -0.0, 'DIFF')::comp_pair, NULL], ARRAY[ROW(2.0, 3.0, 'b')::comp_pair, ROW(NULL, NULL, NULL)::comp_pair]],
+            '{}'::floatmultirange, ROW('t', '{}'::nummultirange)::comp_with_mr, 31),
+        (5, ROW(1.0, NULL, 'hi')::comp_pair, ROW(8, ROW(1.0, NULL, 'hi')::comp_pair)::"MixedComp",
+            ROW()::empty_comp, ROW(2.50, NULL)::dropped_comp, ROW(1.0, NULL, 'd')::comp_dom,
+            ARRAY[ROW(1.0, NULL, 'd')::comp_dom],
+            ARRAY[ROW(1.0, NULL, 'hi')::comp_pair],
+            ARRAY[ARRAY[ROW(1.0, NULL, 'a')::comp_pair]],
+            '{[2.0,3.0)}'::floatmultirange, ROW('p', '{[1.0,2.50)}'::nummultirange)::comp_with_mr, 51)
+    """)
+    env.conn.commit()
+    _assert_all_exact("after initial insert")
+
+    for s in SESSION_PROFILES[1]:
+        cur.execute(s)
+    cur.execute("""
+        INSERT INTO cm VALUES
+        (4, ROW(1.00, 0.0, 'hi')::comp_pair, ROW(7, ROW(1, 0.0, NULL)::comp_pair)::"MixedComp",
+            ROW()::empty_comp, ROW(2.5, 0.0)::dropped_comp, ROW(1, 0.0, 'd')::comp_dom,
+            ARRAY[ROW(1, 0.0, 'd')::comp_dom, NULL],
+            ARRAY[ROW(1, 0.0, 'hi')::comp_pair, NULL],
+            ARRAY[ARRAY[ROW(1, 0.0, 'a')::comp_pair, NULL], ARRAY[ROW(2, 3.0, 'b')::comp_pair, ROW(NULL, NULL, NULL)::comp_pair]],
+            '{[0.0,1.0)}'::floatmultirange, ROW('t', '{[1,2.5)}'::nummultirange)::comp_with_mr, 40),
+        (6, ROW(1.00, NULL, 'hi')::comp_pair, ROW(8, ROW(1, NULL, 'hi')::comp_pair)::"MixedComp",
+            ROW()::empty_comp, ROW(2.5, NULL)::dropped_comp, ROW(1, NULL, 'd')::comp_dom,
+            ARRAY[ROW(1, NULL, 'd')::comp_dom],
+            ARRAY[ROW(1, NULL, 'hi')::comp_pair],
+            ARRAY[ARRAY[ROW(1, NULL, 'a')::comp_pair]],
+            '{[2.0,3.0)}'::floatmultirange, ROW('p', '{[1,2.5)}'::nummultirange)::comp_with_mr, 61)
+    """)
+    env.conn.commit()
+    _assert_all_exact("after equal-spelling merge (including partially-NULL composite)")
+
+    # Verify NULL vs ROW(NULL,NULL,NULL) vs ROW(1,NULL,'hi') vs ROW(1,0,'hi') = 4 distinct groups!
+    cur.execute("SELECT COUNT(*) FROM v_comp_agg")
+    assert cur.fetchone()[0] == 4
+    cur.execute("SELECT COUNT(*) FROM v_comp_str")
+    assert cur.fetchone()[0] == 4
+    cur.execute("SELECT COUNT(*) FROM v_comp_minmax")
+    assert cur.fetchone()[0] == 4
+    # Verify composite arrays differing only in field 3 stayed distinct (4 groups: hi, DIFF, partial-null, NULL).
+    cur.execute("SELECT COUNT(*) FROM v_arr")
+    assert cur.fetchone()[0] == 4
+    cur.execute("SELECT COUNT(*) FROM v_arr2d")
+    assert cur.fetchone()[0] == 4
+    cur.execute("SELECT COUNT(*) FROM v_dom_arr")
+    assert cur.fetchone()[0] == 4
+    env.conn.commit()
+
+    # Verify _pg_key_text_fn works even when called under a hostile search_path (SET search_path FROM CURRENT).
+    key_fn = next(f.split("(")[0] for f in env.plans["v_comp_agg"].function_names if f.startswith("__matview_key_"))
+    cur.execute("SET search_path TO pg_catalog")
+    cur.execute(
+        f'SELECT "{env.ns}".{key_fn}(ROW(1.0, -0.0, \'hi\')::"{env.ns}".comp_pair) '
+        f'     = "{env.ns}".{key_fn}(ROW(1, 0.0, \'hi\')::"{env.ns}".comp_pair)'
+    )
+    assert cur.fetchone()[0] is True
+    cur.execute(f'SET search_path TO "{env.ns}"')
+    env.conn.commit()
+
+    # Concurrent writers inserting different spellings of the same composite key must serialize on one lock.
+    a, b, monitor = env.connect(), env.connect(), env.connect()
+    sid_a, sid_b = _session_id(env, a), _session_id(env, b)
+    a.cursor().execute("INSERT INTO cm (id, k_comp, v) VALUES (10, ROW(1.000, -0.0, 'hi')::comp_pair, 100)")
+    worker = _Worker(
+        b, ["INSERT INTO cm (id, k_comp, v) VALUES (11, ROW(1, 0.0, 'hi')::comp_pair, 110)"]
+    ).start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_b, sid_a), worker.done, "B waits on composite group lock")
+    finally:
+        a.commit()
+        worker.join()
+    if worker.error is not None:
+        raise worker.error
+    a.close()
+    b.close()
+    monitor.close()
+    _assert_all_exact("after concurrent composite writers")
+
+    # UPDATE and DELETE retractions including retracting MIN/MAX extremes on partially-NULL & all-NULL composites.
+    cur.execute("DELETE FROM cm WHERE id = 5")  # retracts MIN(v)=51 from partially-NULL group ROW(1,NULL,'hi')
+    cur.execute("UPDATE cm SET k_comp = ROW(1, 0.0, 'hi')::comp_pair, v = v + 1 WHERE id = 3")
+    cur.execute("DELETE FROM cm WHERE id IN (1, 2, 4, 10, 11)")
+    env.conn.commit()
+    _assert_all_exact("after extreme retraction, update, and delete")
+
+    cur.execute("DELETE FROM cm")
+    env.conn.commit()
+    _assert_all_exact("after delete all")
+
+    # Verify non-default array lower bounds ('[2:3]={1,2}' vs '{1,2}') remain distinct,
+    # and schema-qualified quoted composite types preserve quoting in COALESCE().
+    sec_sch = f"{env.ns}_comp_sec"
+    cur.execute(f'CREATE SCHEMA "{sec_sch}"')
+    cur.execute(f'CREATE TYPE "{sec_sch}"."SecMixedComp" AS (a NUMERIC, b TEXT)')
+    cur.execute(
+        f'CREATE TABLE cm_extra (id INT PRIMARY KEY, ka INT[], kc1 "{sec_sch}"."SecMixedComp", kc2 "{sec_sch}"."SecMixedComp", v INT)'
+    )
+    env.conn.commit()
+    try:
+        vd_lb = ViewDef("v_arr_bounds", "SELECT ka, COUNT(*) AS n FROM cm_extra GROUP BY ka")
+        vd_sc = ViewDef("v_sec_coal", "SELECT COALESCE(kc1, kc2) AS k, COUNT(*) AS n FROM cm_extra GROUP BY COALESCE(kc1, kc2)")
+        env.register(vd_lb)
+        env.register(vd_sc)
+        cur.execute(
+            f"""
+            INSERT INTO cm_extra VALUES
+            (1, '{{1,2}}'::int[], ROW(1.0, 'x')::"{sec_sch}"."SecMixedComp", NULL, 1),
+            (2, '[2:3]={{1,2}}'::int[], NULL, ROW(1.00, 'x')::"{sec_sch}"."SecMixedComp", 2)
+            """
+        )
+        env.conn.commit()
+        cur.execute("SELECT COUNT(*) FROM v_arr_bounds")
+        assert cur.fetchone()[0] == 2  # '[2:3]={1,2}' != '{1,2}' in PostgreSQL!
+        cur.execute("SELECT COUNT(*) FROM v_sec_coal")
+        assert cur.fetchone()[0] == 1  # ROW(1.0,'x') == ROW(1.00,'x') merged cleanly!
+        env.conn.commit()
+        env.manager.drop_view("v_arr_bounds")
+        env.manager.drop_view("v_sec_coal")
+    finally:
+        cur.execute("DROP TABLE IF EXISTS cm_extra")
+        cur.execute(f'DROP SCHEMA IF EXISTS "{sec_sch}" CASCADE')
+        env.conn.commit()
 
 
 # ---------------------------------------------------------------------------

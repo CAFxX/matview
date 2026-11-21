@@ -325,11 +325,20 @@ class PgStatementMaintenanceMixin(MixinHost):
         if not nullable_keys:
             return build([])
         if len(nullable_keys) > 3:
-            return build([f"({l} = {r} OR ({l} IS NULL AND {r} IS NULL))" for l, r in nullable_keys])
+            return build([
+                f"({l} = {r} OR ({l} IS NOT DISTINCT FROM NULL AND {r} IS NOT DISTINCT FROM NULL))"
+                for l, r in nullable_keys
+            ])
         branches: List[Tuple[str, str]] = []
         for mask in itertools.product((False, True), repeat=len(nullable_keys)):
-            when = " AND ".join(f"{r} IS NULL" if is_null else f"{r} IS NOT NULL" for (_l, r), is_null in zip(nullable_keys, mask))
-            conds = [f"{l} IS NULL" if is_null else f"{l} = {r}" for (l, r), is_null in zip(nullable_keys, mask)]
+            when = " AND ".join(
+                f"{r} IS NOT DISTINCT FROM NULL" if is_null else f"{r} IS DISTINCT FROM NULL"
+                for (_l, r), is_null in zip(nullable_keys, mask)
+            )
+            conds = [
+                f"{l} IS NOT DISTINCT FROM NULL" if is_null else f"{l} = {r}"
+                for (l, r), is_null in zip(nullable_keys, mask)
+            ]
             branches.append((when, build(conds)))
         last = branches.pop()[1]
         return "(CASE " + " ".join(f"WHEN {w} THEN {b}" for w, b in branches) + f" ELSE {last} END)"
@@ -426,7 +435,7 @@ class PgStatementMaintenanceMixin(MixinHost):
             return f"__mv_p.{slot_of[vk]}"
 
         def cnt_delta(val: str) -> str:
-            return f"SUM(CASE WHEN ({val}) IS NOT NULL THEN {s} ELSE 0 END)"
+            return f"SUM(CASE WHEN ({val}) IS DISTINCT FROM NULL THEN {s} ELSE 0 END)"
 
         def sum_delta(val: str) -> str:
             # Positive and negative parts are summed separately: multiplying
@@ -531,8 +540,8 @@ class PgStatementMaintenanceMixin(MixinHost):
                 add(
                     it.alias,
                     f"{agg}(CASE WHEN {s} > 0 THEN {val} END)",
-                    f"CASE WHEN EXCLUDED.{col} IS NULL THEN {mv}.{col} "
-                    f"WHEN {mv}.{col} IS NULL OR EXCLUDED.{col} {op} {mv}.{col} THEN EXCLUDED.{col} "
+                    f"CASE WHEN EXCLUDED.{col} IS NOT DISTINCT FROM NULL THEN {mv}.{col} "
+                    f"WHEN {mv}.{col} IS NOT DISTINCT FROM NULL OR EXCLUDED.{col} {op} {mv}.{col} THEN EXCLUDED.{col} "
                     f"ELSE {mv}.{col} END",
                 )
                 minmax_recompute.append(it)
@@ -629,7 +638,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                     f"INSERT INTO {aux_tbl} ({', '.join(q_aux_keys)}, __val, __ref_cnt)\n"
                     f"    SELECT {', '.join(aux_pk_exprs)}, {val}, SUM({s})\n"
                     f"    FROM {proj}\n"
-                    f"    WHERE {val} IS NOT NULL\n"
+                    f"    WHERE {val} IS DISTINCT FROM NULL\n"
                     f"    GROUP BY {', '.join(aux_pk_exprs)}, {val}\n"
                     f"    ORDER BY {', '.join(aux_pk_exprs)}, {val}\n"
                     f"    ON CONFLICT ({', '.join(q_aux_keys)}, __val) DO UPDATE SET\n"
@@ -639,10 +648,10 @@ class PgStatementMaintenanceMixin(MixinHost):
                     aux_refs = [f"{aux_tbl}.{c}" for c in q_aux_keys] + [f"{aux_tbl}.__val"]
                     stmts.append(
                         f"DELETE FROM {aux_tbl}\n"
-                        f"    WHERE {self._pg_key_match(aux_refs, f'SELECT {chr(44).join(aux_pk_exprs)}, {val} FROM {proj} WHERE {s} < 0 AND {val} IS NOT NULL')}\n"
+                        f"    WHERE {self._pg_key_match(aux_refs, f'SELECT {chr(44).join(aux_pk_exprs)}, {val} FROM {proj} WHERE {s} < 0 AND {val} IS DISTINCT FROM NULL')}\n"
                         f"    AND {aux_tbl}.__ref_cnt <= 0;"
                     )
-                touched.append(f"{val} IS NOT NULL")
+                touched.append(f"{val} IS DISTINCT FROM NULL")
             match_aux = " AND ".join(f"__mv_a.{c} = {mv}.{c}" for c in q_aux_keys)
             assigns: List[str] = []
             for it in distinct_items:
@@ -696,7 +705,10 @@ class PgStatementMaintenanceMixin(MixinHost):
                 agg, op = ("MIN", "<=") if it.agg_func == AggFunc.MIN else ("MAX", ">=")
                 rcol = f"__mv_r{i}"
                 rec_cols.append(f"{agg}(CASE WHEN {s} < 0 THEN {val} END) AS {rcol}")
-                cond = f"(__mv_r.{rcol} IS NOT NULL AND ({mv}.{col} IS NULL OR __mv_r.{rcol} {op} {mv}.{col}))"
+                cond = (
+                    f"(__mv_r.{rcol} IS DISTINCT FROM NULL AND "
+                    f"({mv}.{col} IS NOT DISTINCT FROM NULL OR __mv_r.{rcol} {op} {mv}.{col}))"
+                )
                 rec_assigns.append(f"{col} = CASE WHEN {cond} THEN {spec.recompute(it)} ELSE {mv}.{col} END")
                 rec_conds.append(cond)
             for i, it in enumerate(bitwise_recompute):
@@ -935,11 +947,14 @@ class PgStatementMaintenanceMixin(MixinHost):
         (both zeros, every NaN, otherwise the exact binary value), date,
         timestamp, timestamptz (UTC), interval (its comparison span in
         microseconds), bytea (hex), citext (lowercase), jsonb (numbers
-        normalized, keys sorted), arrays and ranges (recursively). Types whose
-        text output is canonical are returned as text. Composite, record and
-        multirange values raise ``feature_not_supported``. A domain value is
-        canonicalized as its base type (dynamic SQL, only on that path). Text under a
-        nondeterministic collation is refused at registration
+        normalized, keys sorted), arrays, ranges, multiranges, and named
+        composites (recursively). Types whose text output is canonical are
+        returned as text. Anonymous ``record`` and other unsupported pseudo-
+        types raise ``feature_not_supported`` (and are refused at registration
+        by ``_pg_collation_guard_ddl``). A domain value is canonicalized as its
+        base type (dynamic SQL, only on that path). Text under a
+        nondeterministic collation (including inside domains, ranges,
+        multiranges, arrays, or composite fields) is refused at registration
         (``_pg_collation_guard_ddl``).
 
         PL/pgSQL plans each statement only when it first runs, per argument
@@ -957,12 +972,13 @@ class PgStatementMaintenanceMixin(MixinHost):
         ivl = "v::pg_catalog.interval"
         return (
             f"CREATE OR REPLACE FUNCTION {fn}(v anyelement) RETURNS text\n"
-            "LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $mv_key$\n"
+            "LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE SET search_path FROM CURRENT AS $mv_key$\n"
             "DECLARE\n"
             "  t pg_catalog.regtype := pg_catalog.pg_typeof(v);\n"
             "  s pg_catalog.text;\n"
             "  f pg_catalog.float8;\n"
             "  ty record;\n"
+            "  comp_vals pg_catalog.text;\n"
             "BEGIN\n"
             f"  IF t IN ({text_list}) THEN\n"
             "    RETURN v::pg_catalog.text;\n"
@@ -1025,7 +1041,7 @@ class PgStatementMaintenanceMixin(MixinHost):
             "    END IF;\n"
             "    RETURN v::pg_catalog.text;\n"
             "  END IF;\n"
-            "  SELECT typ.typname, typ.typtype, typ.typcategory, typ.typbasetype, typ.typtypmod INTO ty\n"
+            "  SELECT typ.typname, typ.typtype, typ.typcategory, typ.typbasetype, typ.typtypmod, typ.typrelid INTO ty\n"
             "    FROM pg_catalog.pg_type AS typ WHERE typ.oid = t;\n"
             "  IF ty.typtype = 'd' THEN\n"
             "    -- A domain value groups like its base type (domains share its equality).\n"
@@ -1035,9 +1051,13 @@ class PgStatementMaintenanceMixin(MixinHost):
             "    RETURN s;\n"
             "  END IF;\n"
             "  IF ty.typcategory = 'A' THEN\n"
+            "    -- Unnest in the SELECT list (not FROM) so composite array elements\n"
+            "    -- stay intact instead of being expanded into individual fields.\n"
             "    SELECT COALESCE(pg_catalog.array_dims(v), '') || '{' || COALESCE(pg_catalog.string_agg(\n"
             "             CASE WHEN u.c IS NULL THEN 'N' ELSE pg_catalog.length(u.c) || ':' || u.c END, ',' ORDER BY u.o), '') || '}'\n"
-            f"      INTO s FROM (SELECT {fn}(x.e) AS c, x.o FROM pg_catalog.unnest(v) WITH ORDINALITY AS x(e, o)) AS u;\n"
+            f"      INTO s FROM (SELECT {fn}(x.e) AS c, x.o FROM (\n"
+            "        SELECT pg_catalog.unnest(v) AS e, pg_catalog.generate_series(1, pg_catalog.cardinality(v)) AS o\n"
+            "      ) AS x) AS u;\n"
             "    RETURN s;\n"
             "  ELSIF ty.typtype = 'r' THEN\n"
             "    IF pg_catalog.isempty(v) THEN\n"
@@ -1047,6 +1067,26 @@ class PgStatementMaintenanceMixin(MixinHost):
             "    s := (CASE WHEN pg_catalog.lower_inc(v) THEN '[' ELSE '(' END) || COALESCE(pg_catalog.length(s) || ':' || s, '') || ',';\n"
             f"    RETURN s || COALESCE(pg_catalog.length({fn}(pg_catalog.upper(v))) || ':' || {fn}(pg_catalog.upper(v)), '')\n"
             "           || (CASE WHEN pg_catalog.upper_inc(v) THEN ']' ELSE ')' END);\n"
+            "  ELSIF ty.typtype = 'm' THEN\n"
+            "    SELECT '{' || COALESCE(pg_catalog.string_agg(\n"
+            "             pg_catalog.length(u.c) || ':' || u.c, ',' ORDER BY u.o), '') || '}'\n"
+            f"      INTO s FROM (SELECT {fn}(x.e) AS c, x.o FROM pg_catalog.unnest(v) WITH ORDINALITY AS x(e, o)) AS u;\n"
+            "    RETURN s;\n"
+            "  ELSIF ty.typtype = 'c' AND ty.typrelid <> 0 THEN\n"
+            "    SELECT pg_catalog.string_agg(\n"
+            f"             pg_catalog.format('(%s, %s(($1).%I))', a.attnum, '{fn}', a.attname),\n"
+            "             ', ' ORDER BY a.attnum)\n"
+            "      INTO comp_vals\n"
+            "      FROM pg_catalog.pg_attribute AS a\n"
+            "      WHERE a.attrelid = ty.typrelid AND a.attnum > 0 AND NOT a.attisdropped;\n"
+            "    IF comp_vals IS NULL THEN\n"
+            "      RETURN '()';\n"
+            "    END IF;\n"
+            "    EXECUTE 'SELECT ''('' || pg_catalog.string_agg('\n"
+            "         || 'CASE WHEN f.c IS NULL THEN ''N'' ELSE pg_catalog.length(f.c) || '':'' || f.c END, '','' ORDER BY f.o'\n"
+            "         || ') || '')'' FROM (VALUES ' || comp_vals || ') AS f(o, c)'\n"
+            "      INTO s USING v;\n"
+            "    RETURN s;\n"
             "  ELSIF ty.typname = 'citext' THEN\n"
             "    RETURN pg_catalog.lower(v::pg_catalog.text);\n"
             "  ELSIF ty.typtype IN ('b', 'e') THEN\n"
@@ -1058,18 +1098,110 @@ class PgStatementMaintenanceMixin(MixinHost):
             "$mv_key$;"
         )
 
-    def _pg_collation_guard_ddl(self) -> Optional[str]:
-        """Refuse (0A000) a view whose groups could compare under a
-        nondeterministic collation.
+    def _pg_probe_key_exprs(self) -> Tuple[Optional[str], List[str]]:
+        """Return ``(from_clause, key_exprs)`` for registration-time probing of
+        GROUP BY and window PARTITION BY expression types, or ``(None, [])``
+        when the view's FROM clause cannot be probed directly (CTEs, set ops,
+        or FROM subqueries)."""
+        if self.view.has_cte or self.view.has_compound_set_op or self.view.has_subquery_in_from:
+            return None, []
+        if self.view.joins:
+            parts: List[str] = []
+            for idx, j in enumerate(self.view.joins):
+                q_t = self._q(j.table_name)
+                alias_part = (
+                    f" AS {self._q(j.alias)}"
+                    if j.alias and j.alias.lower() != j.table_name.lower()
+                    else ""
+                )
+                if idx == 0:
+                    parts.append(f"{q_t}{alias_part}")
+                else:
+                    on_part = f" ON {j.on_condition}" if j.on_condition else ""
+                    parts.append(f"{j.join_type} {q_t}{alias_part}{on_part}")
+            from_clause = " ".join(parts)
+        elif self.view.base_table:
+            from_clause = self._q(self.view.base_table)
+        else:
+            return None, []
 
-        Under such a collation (PostgreSQL 12+) distinct strings compare equal
-        ('A' = 'a' under a case-insensitive ICU collation): ``GROUP BY`` merges
-        them, so no canonical text or index on the stored value identifies the
-        group. Returns None when the view neither groups, deduplicates nor
-        takes MIN/MAX. Otherwise the block checks, at registration, every
-        column of a source table that the view text mentions and every
-        collation it names after ``COLLATE``; it can refuse a view whose
-        mention is not a key (a conservative refusal, never a silent one).
+        base_cols_lower: set[str] = set()
+        for ref_t in self.view.referenced_tables:
+            ts = self._schemas_lower.get(ref_t.lower())
+            if ts is not None:
+                base_cols_lower.update(c.lower() for c in ts.columns)
+
+        alias_to_expr: Dict[str, str] = {}
+        for it in self.view.select_items:
+            if it.alias and it.raw_expr and not it.is_aggregate:
+                alias_to_expr[it.alias.lower()] = it.raw_expr
+
+        exprs: List[str] = []
+        seen: set[str] = set()
+        for g in self.view.group_by_cols:
+            gs = g.strip()
+            if not gs:
+                continue
+            if gs.isdigit():
+                pos = int(gs)
+                if 1 <= pos <= len(self.view.select_items):
+                    it = self.view.select_items[pos - 1]
+                    if it.raw_expr and not it.is_aggregate:
+                        resolved = it.raw_expr.strip()
+                    else:
+                        continue
+                else:
+                    continue
+            else:
+                # PostgreSQL binds bare GROUP BY identifiers to input columns
+                # before output aliases; only substitute an alias when no
+                # referenced table has a column of that name.
+                bare_ident = gs.strip('"').lower()
+                if bare_ident in base_cols_lower:
+                    resolved = gs
+                else:
+                    resolved = alias_to_expr.get(bare_ident, gs)
+            if resolved and resolved not in seen:
+                seen.add(resolved)
+                exprs.append(resolved)
+        if self.view.has_top_level_distinct and not self.view.group_by_cols:
+            for it in self.view.select_items:
+                if it.raw_expr and not it.is_aggregate:
+                    rs = it.raw_expr.strip()
+                    if rs and rs not in seen:
+                        seen.add(rs)
+                        exprs.append(rs)
+        if self.view.has_window_func:
+            from ..sql_frontend import parse_sql_ast
+            import sqlglot.errors
+            from sqlglot import exp as sqlglot_exp
+
+            for it in self.view.select_items:
+                if not it.raw_expr:
+                    continue
+                try:
+                    ast = parse_sql_ast(it.raw_expr, dialect=self.dialect)
+                except sqlglot.errors.SqlglotError:
+                    continue
+                for win in ast.find_all(sqlglot_exp.Window):
+                    for pe in (win.args.get("partition_by") or ()):
+                        ps = pe.sql(dialect="postgres").strip()
+                        if ps and ps not in seen:
+                            seen.add(ps)
+                            exprs.append(ps)
+        return from_clause, exprs
+
+    def _pg_collation_guard_ddl(self) -> Optional[str]:
+        """Refuse (0A000) at registration any view whose keys use a
+        nondeterministic collation (including inside domains, ranges,
+        multiranges, arrays, or composite fields) or an unsupported key type
+        (such as anonymous ``record``).
+
+        Under a nondeterministic collation (PostgreSQL 12+) distinct strings
+        compare equal ('A' = 'a' under a case-insensitive ICU collation):
+        ``GROUP BY`` merges them, so no canonical text or index on the stored
+        value identifies the group. Returns None when the view neither groups,
+        deduplicates nor takes MIN/MAX.
         """
         sql = self.view.raw_select_sql
         if not re.search(r"\b(?:GROUP|DISTINCT|UNION|INTERSECT|EXCEPT|PARTITION|MIN|MAX)\b", sql, re.IGNORECASE):
@@ -1081,19 +1213,105 @@ class PgStatementMaintenanceMixin(MixinHost):
         while tag in sql:
             tag = tag[:-1] + "x$"
         table_list = ", ".join("'" + self._q(t).replace("'", "''") + "'" for t in tables)
+
+        probe_from, probe_exprs = self._pg_probe_key_exprs()
+        probe_block = ""
+        if probe_from and probe_exprs:
+            def _lit(val: str) -> str:
+                return "'" + val.replace("'", "''") + "'"
+
+            expr_arr = ", ".join(_lit(e) for e in probe_exprs)
+            probe_block = (
+                f"  FOREACH probe_expr IN ARRAY ARRAY[{expr_arr}]::pg_catalog.text[] LOOP\n"
+                "    k_oid := NULL;\n"
+                "    BEGIN\n"
+                "      EXECUTE pg_catalog.format(\n"
+                "        'SELECT pg_catalog.pg_typeof(q.__mv_k)::pg_catalog.oid '\n"
+                "        'FROM (SELECT 1) AS __mv_one '\n"
+                "        'LEFT JOIN (SELECT (%s) AS __mv_k FROM %s WHERE false) AS q ON true',\n"
+                f"        probe_expr, {_lit(probe_from)}\n"
+                "      ) INTO k_oid;\n"
+                "    EXCEPTION WHEN undefined_column OR undefined_table OR undefined_function THEN\n"
+                "      k_oid := NULL;\n"
+                "    END;\n"
+                "    IF k_oid IS NOT NULL THEN\n"
+                "      type_walk_sql :=\n"
+                "        'WITH RECURSIVE kt(type_oid, coll_oid, depth) AS ('\n"
+                "        ' SELECT $1, 0::pg_catalog.oid, 0'\n"
+                "        ' UNION ALL'\n"
+                "        ' SELECT nxt.type_oid, nxt.coll_oid, kt.depth + 1'\n"
+                "        ' FROM kt JOIN pg_catalog.pg_type t ON t.oid = kt.type_oid'\n"
+                "        ' CROSS JOIN LATERAL ('\n"
+                "        '   SELECT t.typbasetype AS type_oid, CASE WHEN t.typcollation <> 0 THEN t.typcollation ELSE kt.coll_oid END AS coll_oid WHERE t.typtype = ''d'''\n"
+                "        '   UNION ALL SELECT t.typelem, 0::pg_catalog.oid WHERE t.typcategory = ''A'' AND t.typelem <> 0'\n"
+                "        '   UNION ALL SELECT rg.rngsubtype, rg.rngcollation FROM pg_catalog.pg_range rg WHERE t.typtype = ''r'' AND rg.rngtypid = t.oid'\n"
+                "        || CASE WHEN ver_num >= 140000 THEN\n"
+                "           '   UNION ALL SELECT rg.rngtypid, 0::pg_catalog.oid FROM pg_catalog.pg_range rg WHERE t.typtype = ''m'' AND rg.rngmultitypid = t.oid'\n"
+                "           ELSE '' END\n"
+                "        || '   UNION ALL SELECT fa.atttypid, fa.attcollation FROM pg_catalog.pg_attribute fa WHERE t.typtype = ''c'' AND t.typrelid <> 0 AND fa.attrelid = t.typrelid AND fa.attnum > 0 AND NOT fa.attisdropped'\n"
+                "        ' ) AS nxt WHERE kt.depth < 16'\n"
+                "        ') ';\n"
+                "      EXECUTE type_walk_sql\n"
+                "        || 'SELECT t.oid FROM kt JOIN pg_catalog.pg_type t ON t.oid = kt.type_oid '\n"
+                "        || 'WHERE t.typtype NOT IN (''b'', ''e'', ''d'', ''r'', ''m'', ''c'') '\n"
+                "        || '   OR (t.typtype = ''c'' AND t.typrelid = 0) LIMIT 1'\n"
+                "        INTO bad_oid USING k_oid;\n"
+                "      IF bad_oid IS NOT NULL THEN\n"
+                "        RAISE EXCEPTION 'matview: a grouping key of type % is not supported', pg_catalog.format_type(bad_oid, NULL)\n"
+                "          USING ERRCODE = 'feature_not_supported';\n"
+                "      END IF;\n"
+                "      IF ver_num >= 120000 THEN\n"
+                "        EXECUTE type_walk_sql\n"
+                "          || 'SELECT c.collname::pg_catalog.text FROM kt JOIN pg_catalog.pg_collation c ON c.oid = kt.coll_oid '\n"
+                "          || 'WHERE NOT c.collisdeterministic LIMIT 1'\n"
+                "          INTO bad_coll USING k_oid;\n"
+                "        IF bad_coll IS NOT NULL THEN\n"
+                "          RAISE EXCEPTION 'matview: % uses the nondeterministic collation %, which is not supported for grouping, DISTINCT, set operations, window partitions or MIN/MAX',\n"
+                "            probe_expr, pg_catalog.quote_ident(bad_coll)\n"
+                "            USING ERRCODE = 'feature_not_supported';\n"
+                "        END IF;\n"
+                "      END IF;\n"
+                "    END IF;\n"
+                "  END LOOP;\n"
+            )
+
         return (
             "DO $mv_coll$\n"
             "DECLARE\n"
             f"  q pg_catalog.text := {tag}{sql}{tag};\n"
+            "  ver_num pg_catalog.int4 := pg_catalog.current_setting('server_version_num')::pg_catalog.int4;\n"
             "  r record;\n"
+            "  probe_expr pg_catalog.text;\n"
+            "  type_walk_sql pg_catalog.text;\n"
+            "  k_oid pg_catalog.oid;\n"
+            "  bad_oid pg_catalog.oid;\n"
+            "  bad_coll pg_catalog.text;\n"
             "BEGIN\n"
-            "  IF pg_catalog.current_setting('server_version_num')::pg_catalog.int4 < 120000 THEN\n"
+            f"{probe_block}"
+            "  IF ver_num < 120000 THEN\n"
             "    RETURN;\n"
             "  END IF;\n"
             "  FOR r IN EXECUTE\n"
-            "      'SELECT a.attrelid::pg_catalog.regclass::pg_catalog.text AS rel, a.attname::pg_catalog.text AS what, c.collname::pg_catalog.text AS coll'\n"
-            "      ' FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation'\n"
-            "      ' WHERE a.attrelid = ANY ($1) AND a.attnum > 0 AND NOT a.attisdropped AND NOT c.collisdeterministic'\n"
+            "      'WITH RECURSIVE col_types(rel, what, type_oid, coll_oid, depth) AS ('\n"
+            "      ' SELECT a.attrelid::pg_catalog.regclass::pg_catalog.text, a.attname::pg_catalog.text, a.atttypid, a.attcollation, 0'\n"
+            "      ' FROM pg_catalog.pg_attribute a'\n"
+            "      ' WHERE a.attrelid = ANY ($1) AND a.attnum > 0 AND NOT a.attisdropped'\n"
+            "      ' UNION ALL'\n"
+            "      ' SELECT ct.rel, ct.what, nxt.type_oid, nxt.coll_oid, ct.depth + 1'\n"
+            "      ' FROM col_types ct JOIN pg_catalog.pg_type t ON t.oid = ct.type_oid'\n"
+            "      ' CROSS JOIN LATERAL ('\n"
+            "      '   SELECT t.typbasetype AS type_oid, CASE WHEN t.typcollation <> 0 THEN t.typcollation ELSE ct.coll_oid END AS coll_oid WHERE t.typtype = ''d'''\n"
+            "      '   UNION ALL SELECT t.typelem, 0::pg_catalog.oid WHERE t.typcategory = ''A'' AND t.typelem <> 0'\n"
+            "      '   UNION ALL SELECT rg.rngsubtype, rg.rngcollation FROM pg_catalog.pg_range rg WHERE t.typtype = ''r'' AND rg.rngtypid = t.oid'\n"
+            "      || CASE WHEN ver_num >= 140000 THEN\n"
+            "         '   UNION ALL SELECT rg.rngtypid, 0::pg_catalog.oid FROM pg_catalog.pg_range rg WHERE t.typtype = ''m'' AND rg.rngmultitypid = t.oid'\n"
+            "         ELSE '' END\n"
+            "      || '   UNION ALL SELECT fa.atttypid, fa.attcollation FROM pg_catalog.pg_attribute fa WHERE t.typtype = ''c'' AND t.typrelid <> 0 AND fa.attrelid = t.typrelid AND fa.attnum > 0 AND NOT fa.attisdropped'\n"
+            "      ' ) AS nxt WHERE ct.depth < 16'\n"
+            "      ') '\n"
+            "      'SELECT DISTINCT ct.rel, ct.what, c.collname::pg_catalog.text AS coll'\n"
+            "      ' FROM col_types ct JOIN pg_catalog.pg_collation c ON c.oid = ct.coll_oid'\n"
+            "      ' WHERE NOT c.collisdeterministic'\n"
             "      ' UNION ALL SELECT NULL, NULL, c.collname::pg_catalog.text FROM pg_catalog.pg_collation c'\n"
             "      ' WHERE NOT c.collisdeterministic'\n"
             f"      USING ARRAY[{table_list}]::pg_catalog.regclass[]\n"

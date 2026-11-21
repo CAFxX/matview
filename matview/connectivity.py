@@ -584,7 +584,7 @@ LEFT JOIN pg_catalog.pg_type et ON et.oid = u.typelem AND u.typcategory = 'A'
 LEFT JOIN unwrapped ue ON ue.oid = et.oid AND ue.typtype <> 'd'
 WHERE pg_catalog.pg_table_is_visible(cl.oid)
   AND cl.relkind IN ('r', 'p')
-  AND u.typcategory = 'A'
+  AND (u.typcategory = 'A' OR u.typtype IN ('c', 'r', 'm'))
   AND a.attnum > 0
   AND NOT a.attisdropped
   AND cl.relname NOT LIKE '__matview_%'
@@ -593,9 +593,10 @@ WHERE pg_catalog.pg_table_is_visible(cl.oid)
 
 
 def _pg_introspect_native_array_types(conn_or_bind: Any) -> Dict[Tuple[str, str], str]:
-    """Return ``(table_lower, col_lower) -> native PostgreSQL array DDL type``
-    for array columns (including domain-over-array and array-of-domain columns)
-    of visible regular and partitioned tables via ``pg_catalog.format_type``.
+    """Return ``(table_lower, col_lower) -> native PostgreSQL DDL type`` for
+    array, composite, range, and multirange columns (including domains over
+    them and arrays of domains) of visible regular and partitioned tables via
+    ``pg_catalog.format_type``.
 
     Uses a SAVEPOINT when called inside an active transaction so an unexpected
     catalog/permission error never aborts the caller's PostgreSQL transaction.
