@@ -76,7 +76,19 @@ the group (measured per extreme delete, net of the bare DELETE: SQLite 1967 ->
 3 us with `(g)` vs `(g, v)`, PostgreSQL 1072 -> 519, MySQL 8.4 17060 -> ~0,
 MariaDB 11.8 7765 -> 311). Without it the plan diagnostics (and `diff` text)
 carry a `minmax_extreme_recompute` performance note with the `CREATE INDEX`
-statement. Expression and join arguments keep the group-key index.
+statement. Expression and join arguments keep the group-key index. No
+`(group, arg)` index is recommended (the note says why) where creating or
+keeping it could fail or change results: on PostgreSQL for argument types whose
+values can exceed the 2704-byte btree row limit (`TEXT`, unbounded or long
+`VARCHAR`, `BYTEA`, `JSONB`, unconstrained `NUMERIC`, arrays); on MySQL/MariaDB
+for character arguments (they compare under a collation) and for keys longer
+than InnoDB's 3072 bytes.
+
+Known limitation: `MIN`/`MAX` of text values that compare equal under the
+column's collation but differ (`'a'` and `'a '` under a PAD SPACE collation,
+`'b'` and `'B'` under a case-insensitive one) may return a different one of
+those values than the live query, whose choice depends on its plan (adding an
+index can change it).
 
 ## Installation
 

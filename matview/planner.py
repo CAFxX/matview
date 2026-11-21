@@ -1993,11 +1993,13 @@ class PlannerMixin(MixinHost):
         ``MIN/MAX(arg) ... WHERE <group key> = ...`` from the base table. An
         index on the group columns followed by the argument turns that into
         one index probe; an index on the group columns alone still reads the
-        whole group (native, 5 x 20k rows, per extreme delete: SQLite 2066 ->
-        2.2 us, PostgreSQL 999 -> 41, MySQL 14109 -> 165, MariaDB 12336 -> 136;
-        docs/research-ivm-strategies.md section 5). Only plain-column
-        arguments and plain-column group keys of the single base table
-        qualify; other shapes keep the group-key index.
+        whole group (lane measurement, 40k rows, 100 extreme deletes in one
+        transaction, net of the bare DELETE, (g) vs (g, v): SQLite 1967 -> 3
+        us, PostgreSQL 18 1072 -> 519, MySQL 8.4 17060 -> ~0, MariaDB 11.8
+        7765 -> 311). Only plain-column arguments and plain-column group keys
+        of the single base table qualify, and only argument types whose index
+        is safe to create and to keep writing to (``_minmax_index_arg_blocker``);
+        other shapes keep the group-key index.
         """
         v = self.view
         if (
@@ -2023,16 +2025,28 @@ class PlannerMixin(MixinHost):
             res = self._resolve_ast_col_to_table(a_ast, alias_map)
             if res is None or res[0] != t_n:
                 continue
-            ts = self._schemas_lower.get(t_n.lower())
-            c_def = ts.columns.get(res[1]) if ts is not None else None
-            if self.dialect == Dialect.MYSQL and (
-                c_def is None or any(tk in c_def.data_type.upper() for tk in ("TEXT", "BLOB"))
-            ):
-                continue  # MySQL cannot index TEXT/BLOB without a prefix length
+            if self._minmax_index_arg_blocker(t_n, g_cols, res[1]) is not None:
+                continue
             cols = list(g_cols) + ([res[1]] if res[1].lower() not in {c.lower() for c in g_cols} else [])
             if cols not in [c for _, c in out]:
                 out.append((t_n, cols))
         return out
+
+    def _minmax_index_arg_blocker(self, table: str, group_cols: Sequence[str], arg_col: str) -> Optional[str]:
+        """Why no ``(group..., arg)`` index is recommended for this argument,
+        or None when it is safe to create and to keep writing to."""
+        ts = self._schemas_lower.get(table.lower())
+        if ts is None:
+            return "the column types are unknown"
+        defs = {k.lower(): v for k, v in ts.columns.items()}
+        arg_def = defs.get(arg_col.lower())
+        if arg_def is None:
+            return "the column type is unknown"
+        return _minmax_index_type_blocker(
+            self.dialect,
+            arg_def.data_type,
+            [defs[g.lower()].data_type if g.lower() in defs else "" for g in group_cols],
+        )
 
     def _analyze_base_table_indexes(
         self,
@@ -2164,9 +2178,46 @@ class PlannerMixin(MixinHost):
                 "existing_base_indexes_used": list(existing_base_indexes_used),
                 "recommended_base_indexes": list(recommended_base_indexes),
                 "base_index_recommendations": list(base_index_recommendations),
-                "performance_notes": self._performance_notes() + self._minmax_index_notes(base_index_recommendations),
+                "performance_notes": self._performance_notes() + self._minmax_index_notes(base_index_recommendations) + self._minmax_unindexable_notes(),
             },
         )
+
+    def _minmax_unindexable_notes(self) -> List[str]:
+        """MIN/MAX arguments for which no (group, arg) index is recommended."""
+        v = self.view
+        if self._alg_mode != "single" or len(v.joins) != 1 or not v.group_by_cols:
+            return []
+        alias_map = self._alias_to_table_map()
+        g_cols: List[str] = []
+        for g in v.group_by_cols:
+            try:
+                g_ast = parse_sql_ast(g, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                return []
+            res_g = self._resolve_ast_col_to_table(g_ast, alias_map) if isinstance(g_ast, sqlglot_exp.Column) else None
+            if res_g is None:
+                return []
+            g_cols.append(res_g[1])
+        notes: List[str] = []
+        for it in self._working_select_items:
+            if not it.is_aggregate or it.agg_func not in (AggFunc.MIN, AggFunc.MAX) or not it.arg_expr:
+                continue
+            try:
+                a_ast = parse_sql_ast(it.arg_expr, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                continue
+            res = self._resolve_ast_col_to_table(a_ast, alias_map) if isinstance(a_ast, sqlglot_exp.Column) else None
+            if res is None:
+                continue
+            why = self._minmax_index_arg_blocker(res[0], g_cols, res[1])
+            if why is not None:
+                notes.append(
+                    f"minmax_extreme_recompute: no ({', '.join(g_cols + [res[1]])}) index is recommended for "
+                    f"{it.raw_expr}: {why}. Deleting or updating a group's current extreme reads every row of "
+                    f"the group (O(group rows)) through the group-key index; keep the group small, or "
+                    f"maintain the extreme in an indexable column of the table."
+                )
+        return notes
 
     @staticmethod
     def _minmax_index_notes(base_index_recommendations: Sequence[Dict[str, Any]]) -> List[str]:
@@ -2422,3 +2473,87 @@ class PlannerMixin(MixinHost):
             strategy_diagnostics=[d for sp in sub_plans for d in sp.strategy_diagnostics],
         )
 
+
+_PG_SAFE_INDEX_TYPE = re.compile(
+    r"(?:SMALLINT|INT2|INTEGER|INT|INT4|BIGINT|INT8|SMALLSERIAL|SERIAL|BIGSERIAL|SERIAL4|SERIAL8|"
+    r"REAL|FLOAT4|DOUBLE PRECISION|FLOAT8|FLOAT(?:\(\d+\))?|BOOLEAN|BOOL|DATE|"
+    r"TIME(?:\(\d+\))?(?: WITH(?:OUT)? TIME ZONE)?|TIMETZ|"
+    r"TIMESTAMP(?:\(\d+\))?(?: WITH(?:OUT)? TIME ZONE)?|TIMESTAMPTZ|INTERVAL(?:\(\d+\))?|"
+    r"UUID|MONEY|INET|CIDR|MACADDR|MACADDR8|OID)"
+)
+_MYSQL_INT_BYTES = {"TINYINT": 1, "SMALLINT": 2, "MEDIUMINT": 3, "INT": 4, "INTEGER": 4, "BIGINT": 8}
+_MYSQL_KEY_LIMIT_BYTES = 3072  # InnoDB DYNAMIC/COMPRESSED row formats
+
+
+def _mysql_key_bytes(data_type: str) -> Optional[int]:
+    """Upper bound of a column's InnoDB key part in bytes (utf8mb4 assumed for
+    character columns: 4 bytes per character), or None when not modelled."""
+    t = data_type.strip().upper()
+    base = re.sub(r"\s+(?:UNSIGNED|SIGNED|ZEROFILL)\b", "", t).strip()
+    m = re.fullmatch(r"([A-Z ]+?)\s*(?:\((\d+)(?:\s*,\s*(\d+))?\))?", base)
+    if not m:
+        return None
+    name, n = m.group(1).strip(), int(m.group(2)) if m.group(2) else None
+    if name in _MYSQL_INT_BYTES:
+        return _MYSQL_INT_BYTES[name]
+    if name in ("DECIMAL", "NUMERIC", "DEC", "FIXED"):
+        return ((n or 10) + 1) // 2 + 1
+    if name in ("FLOAT", "DOUBLE", "DOUBLE PRECISION", "REAL"):
+        return 8
+    if name in ("DATE", "YEAR", "TIME", "DATETIME", "TIMESTAMP", "BOOL", "BOOLEAN", "BIT"):
+        return 8
+    if name in ("CHAR", "VARCHAR", "CHARACTER", "CHARACTER VARYING", "NCHAR", "NVARCHAR"):
+        return (n if n is not None else 1) * 4 + 2
+    if name in ("BINARY", "VARBINARY"):
+        return (n if n is not None else 1) + 2
+    return None
+
+
+def _minmax_index_type_blocker(dialect: Dialect, arg_type: str, group_types: Sequence[str]) -> Optional[str]:
+    """Why a ``(group..., arg)`` btree is not recommended for these types.
+
+    * PostgreSQL: a btree row is limited to 2704 bytes; an index on a column
+      whose values can be longer (TEXT, unbounded or long VARCHAR, BYTEA,
+      JSONB, unconstrained NUMERIC, arrays, ...) makes later writes of long
+      values fail. Only fixed-size types, NUMERIC(p <= 300) and
+      CHAR/VARCHAR(n <= 100) qualify.
+    * MySQL/MariaDB: character arguments compare under their collation
+      (case- and, for PAD SPACE collations, trailing-space-insensitive by
+      default), so an index changes which of several equal-comparing values
+      the live query returns; and every key must fit InnoDB's 3072 bytes.
+      Numeric, temporal and BINARY/VARBINARY arguments qualify within that
+      limit.
+    * SQLite: no row-size limit; every type qualifies.
+    """
+    t = re.sub(r"\s+", " ", arg_type.strip().upper())
+    if dialect == Dialect.SQLITE:
+        return None
+    if dialect == Dialect.POSTGRES:
+        if _PG_SAFE_INDEX_TYPE.fullmatch(t):
+            return None
+        m = re.fullmatch(r"(?:NUMERIC|DECIMAL)\s*\(\s*(\d+)(?:\s*,\s*-?\d+)?\s*\)", t)
+        if m and int(m.group(1)) <= 300:
+            return None
+        m = re.fullmatch(r"(?:CHARACTER VARYING|VARCHAR|CHARACTER|CHAR|BPCHAR)\s*\(\s*(\d+)\s*\)", t)
+        if m and int(m.group(1)) <= 100:
+            return None
+        return (
+            f"values of type {arg_type} can exceed PostgreSQL's 2704-byte btree row limit, so writing a "
+            f"long value after creating the index would fail"
+        )
+    if re.match(r"(?:CHAR|VARCHAR|CHARACTER|NCHAR|NVARCHAR|TINYTEXT|TEXT|MEDIUMTEXT|LONGTEXT|ENUM|SET|JSON)\b", t):
+        return (
+            f"{arg_type} values compare under the column's collation (case- and trailing-space-insensitive "
+            f"by default), so an index would change which of several equal values the live query returns"
+        )
+    if re.match(r"(?:TINYBLOB|BLOB|MEDIUMBLOB|LONGBLOB|GEOMETRY|POINT)\b", t):
+        return f"{arg_type} columns cannot be indexed without a prefix length"
+    total = 0
+    for ty in [arg_type, *group_types]:
+        b = _mysql_key_bytes(ty)
+        if b is None:
+            return f"the key length of type {ty or 'unknown'} is not modelled"
+        total += b
+    if total > _MYSQL_KEY_LIMIT_BYTES:
+        return f"the key would take up to {total} bytes, more than InnoDB's {_MYSQL_KEY_LIMIT_BYTES}-byte limit"
+    return None
