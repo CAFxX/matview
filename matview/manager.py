@@ -26,6 +26,7 @@ from .native_functions import (
     classify as classify_native_functions,
     items_with_unmodelled_calls,
     probe_result_types,
+    overridden_modelled_functions,
     unclassified_calls,
 )
 from .connectivity import (
@@ -2196,12 +2197,16 @@ class MaterializedViewManager:
             spec = parse_view_definition(view, known_tables={k.lower() for k in schemas}, dialect=self.dialect)
         if not isinstance(spec, ViewSpec):
             return view
+        if self.dialect != Dialect.MYSQL:
+            overridden = overridden_modelled_functions(self.conn, spec, self.dialect)
+            if overridden:
+                spec = replace(spec, unclassified_functions=tuple(overridden), functions_classified=True)
         if (
             not spec.additional_views
             and not unclassified_calls(spec, self.dialect)
             and (self.dialect == Dialect.SQLITE or not items_with_unmodelled_calls(spec, self.dialect))
         ):
-            return view
+            return self._with_server_result_types(spec) if spec.unclassified_functions else view
         is_mariadb = self.subdialect == EngineSubdialect.MARIADB
         spec = apply_catalog_classification(
             spec,
@@ -2219,7 +2224,7 @@ class MaterializedViewManager:
         additional = tuple(self._with_server_result_types(a) for a in spec.additional_views)
         if additional != spec.additional_views:
             spec = replace(spec, additional_views=additional)
-        if self.dialect == Dialect.SQLITE or not items_with_unmodelled_calls(spec, self.dialect):
+        if self.dialect == Dialect.SQLITE or not (items_with_unmodelled_calls(spec, self.dialect) or spec.unclassified_functions):
             return spec
         types = probe_result_types(self.conn, self.dialect, spec.raw_select_sql)
         if not types:

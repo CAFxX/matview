@@ -157,6 +157,44 @@ class SqliteTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_application_overrides_of_built_ins(self) -> None:
+        # create_aggregate/create_function reusing a built-in name override
+        # it (PRAGMA function_list lists both): never maintained as the
+        # built-in. hex() becomes an aggregate (unmodelled name: catalog says
+        # aggregate); lower/abs/max are modelled by sqlglot, so the override
+        # forces the exact full refresh.
+        with tempfile.TemporaryDirectory() as d:
+            conn = self._conn(d)
+
+            class Total:
+                def __init__(self) -> None:
+                    self.total = 0
+
+                def step(self, value: Any) -> None:
+                    self.total += value or 0
+
+                def finalize(self) -> int:
+                    return self.total
+
+            conn.create_aggregate("hex", 1, Total)  # pyright: ignore[reportArgumentType]  # sqlite3 aggregate protocol
+            conn.create_aggregate("max", 1, Total)  # pyright: ignore[reportArgumentType]  # sqlite3 aggregate protocol
+            conn.create_function("lower", 1, lambda x: None if x is None else -x)
+            conn.create_function("abs", 1, lambda x: 7)
+            try:
+                mgr = MaterializedViewManager(conn)
+                _drive(
+                    self, "sqlite", conn, mgr.register_view,
+                    [
+                        ("o_hex", "SELECT hex(v) AS a FROM t", T3),
+                        ("o_max", "SELECT g, max(v) AS m FROM t GROUP BY g", T3),
+                        ("o_lower", "SELECT id, lower(v) AS a FROM t", T3),
+                        ("o_abs", "SELECT id, abs(v) AS a FROM t", T3),
+                    ],
+                    ph="?",
+                )
+            finally:
+                conn.close()
+
     def test_unclassifiable_name_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             conn = self._conn(d)
@@ -245,6 +283,13 @@ class PostgresTests(unittest.TestCase):
         cur.execute(f'CREATE AGGREGATE "{self.hid}".hsum(integer) (SFUNC = int4pl, STYPE = integer)')
         cur.execute(f'CREATE AGGREGATE "{self.hid}".shadowed(integer) (SFUNC = int4pl, STYPE = integer)')
         cur.execute("CREATE FUNCTION shadowed(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1'")
+        # User functions reusing pg_catalog names: md5(int) is an aggregate
+        # (pg_catalog.md5 takes text/bytea) and lower(int) a scalar. Which
+        # overload a call reaches depends on argument types, so a name mixing
+        # aggregates and functions, or a modelled built-in a user function can
+        # shadow, gets the exact full refresh.
+        cur.execute("CREATE AGGREGATE md5(integer) (SFUNC = int4pl, STYPE = integer)")
+        cur.execute("CREATE FUNCTION lower(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 * 10'")
         self.conn.commit()
 
     def tearDown(self) -> None:
@@ -275,20 +320,11 @@ class PostgresTests(unittest.TestCase):
                 ("v_cte", "WITH x AS (SELECT * FROM t) SELECT isum(v) AS a FROM x", T3),
                 ("v_filter", "SELECT g, isum(v) FILTER (WHERE v > 1) AS a FROM t GROUP BY g", T3),
                 ("v_compound", "SELECT g, COALESCE(isum(v), 0) + 1 AS a FROM t GROUP BY g", T3),
+                ("v_md5_ungrouped", "SELECT md5(v) AS a FROM t", T3),
+                ("v_md5_key", "SELECT g, md5(g) AS a, COUNT(*) AS n FROM t GROUP BY g", T3),
+                ("v_lower_user", "SELECT id, lower(v) AS a FROM t", T3),
             ],
         )
-
-    def test_ambiguous_overload_is_refused(self) -> None:
-        cur = self.conn.cursor()
-        cur.execute("CREATE FUNCTION isum(bigint) RETURNS bigint LANGUAGE sql IMMUTABLE AS 'SELECT $1'")
-        self.conn.commit()
-        mgr = MaterializedViewManager(self.conn)
-        with self.assertRaisesRegex(UnsupportedMaterializedViewError, r"ISUM/1: overloads of that arity are both aggregates and functions"):
-            mgr.register_view("CREATE VIEW v_amb AS SELECT isum(v) AS a FROM t")
-        self.conn.rollback()
-        cur = self.conn.cursor()
-        cur.execute("SELECT count(*) FROM pg_class WHERE relname LIKE %s AND relnamespace = %s::regnamespace", ("%v_amb%", self.schema))
-        self.assertEqual(cur.fetchone()[0], 0)
 
 
 @unittest.skipUnless(os.environ.get("MYSQL_DSN"), "MYSQL_DSN not set")
@@ -311,6 +347,10 @@ class MysqlTests(unittest.TestCase):
         cur.execute(f"USE {self.database}")
         cur.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
         cur.execute("CREATE FUNCTION iadd(a INT, b INT) RETURNS INT DETERMINISTIC RETURN a + b")
+        # A stored function with a built-in's name: unqualified calls still
+        # resolve to the built-in (MySQL/MariaDB precedence), so CRC32 needs
+        # no lookup; the comparison with the live view checks it natively.
+        cur.execute("CREATE FUNCTION crc32(x INT) RETURNS INT DETERMINISTIC RETURN 42")
         if self.mariadb:
             cur.execute(
                 "CREATE AGGREGATE FUNCTION isum(x INT) RETURNS INT BEGIN "
@@ -322,16 +362,19 @@ class MysqlTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.rollback()
         cur = self.conn.cursor()
+        cur.execute(f"DROP USER IF EXISTS '{self.database}'@'%'")
+        if getattr(self, "trust_before", None) is not None:
+            cur.execute(f"SET GLOBAL log_bin_trust_function_creators = {int(self.trust_before)}")
         cur.execute(f"DROP DATABASE IF EXISTS {self.database}")
         self.conn.commit()
         self.conn.close()
 
     def test_catalog_classified_functions(self) -> None:
         views = [
-            ("v_scalar", "SELECT id, iadd(v, id) AS a FROM t", T1),
-            # A built-in sqlglot does not model: no lookup; server-reported type.
-            ("v_builtin", "SELECT id, CRC32(v) AS a FROM t", T1),
-            (f"v_qualified", f"SELECT id, {self.database}.iadd(v, 1) AS a FROM t", T1),
+            # One view (each MySQL registration costs several DDL commits): a
+            # stored scalar, the same function qualified by its database, and
+            # a built-in sqlglot does not model (no lookup; server type).
+            ("v_scalars", f"SELECT id, iadd(v, id) AS a, {self.database}.iadd(v, 1) AS b, CRC32(v) AS c FROM t", T1),
         ]
         if self.mariadb:  # MariaDB stored aggregate functions (CREATE AGGREGATE FUNCTION)
             views += [
@@ -341,78 +384,57 @@ class MysqlTests(unittest.TestCase):
         # ignore_limitations acknowledges MYSQL_NO_TRUNCATE_TRIGGER only.
         mgr = MaterializedViewManager(self.conn, ignore_limitations=True)
         _drive(self, "mariadb" if self.mariadb else "mysql", self.conn, mgr.register_view, views)
+        self._restricted_user()
 
-
-@unittest.skipUnless(os.environ.get("MYSQL_DSN"), "MYSQL_DSN not set")
-class MysqlRestrictedUserTests(unittest.TestCase):
-    """A user with only GRANT ALL ON <db>.* cannot read the server-wide
-    function catalogs (MySQL performance_schema.user_defined_functions,
-    MariaDB mysql.func / mysql.proc): built-ins need no lookup, stored
-    functions visible in information_schema.ROUTINES are classified there,
-    and the rest falls back to the SQL text with an announcement -- never a
-    refusal."""
-
-    def test_restricted_user(self) -> None:
+    def _restricted_user(self) -> None:
+        """A user with only GRANT ALL ON <db>.* cannot read the server-wide
+        function catalogs (MySQL performance_schema.user_defined_functions,
+        MariaDB mysql.func / mysql.proc): built-ins need no lookup, stored
+        functions in information_schema.ROUTINES (MySQL) are classified, and
+        the rest gets the exact full refresh, announced."""
         from urllib.parse import urlparse
 
         import pymysql
 
+        cur = self.conn.cursor()
+        user = self.database
+        # Without SUPER, creating triggers with binary logging on needs
+        # log_bin_trust_function_creators (MySQL 8.4 default: binlog on).
+        cur.execute("SELECT @@GLOBAL.log_bin_trust_function_creators")
+        self.trust_before = cur.fetchone()[0]
+        cur.execute("SET GLOBAL log_bin_trust_function_creators = 1")
+        cur.execute(f"CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'")
+        cur.execute(f"GRANT ALL ON {self.database}.* TO '{user}'@'%'")
+        self.conn.commit()
         p = urlparse(os.environ["MYSQL_DSN"])
-        root = pymysql.connect(host=p.hostname or "127.0.0.1", port=p.port or 3306, user=p.username or "root",
-                               password=p.password or "", autocommit=True)
-        db = f"l3r_{uuid.uuid4().hex[:8]}"
-        user = db
-        rc = root.cursor()
-        rc.execute("SELECT VERSION()")
-        mariadb = "mariadb" in str(rc.fetchone()[0]).lower()
+        conn = pymysql.connect(host=p.hostname or "127.0.0.1", port=p.port or 3306, user=user, password="pw",
+                               database=self.database, autocommit=False)
         try:
-            # Without SUPER, creating triggers with binary logging on needs
-            # log_bin_trust_function_creators (MySQL 8.4 default: binlog on).
-            rc.execute("SELECT @@GLOBAL.log_bin_trust_function_creators")
-            trust_before = rc.fetchone()[0]
-            rc.execute("SET GLOBAL log_bin_trust_function_creators = 1")
-            rc.execute(f"CREATE DATABASE {db}")
-            rc.execute(f"CREATE TABLE {db}.t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
-            rc.execute(f"CREATE FUNCTION {db}.iadd(a INT, b INT) RETURNS INT DETERMINISTIC RETURN a + b")
-            rc.execute(f"CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'")
-            rc.execute(f"GRANT ALL ON {db}.* TO '{user}'@'%'")
-            conn = pymysql.connect(host=p.hostname or "127.0.0.1", port=p.port or 3306, user=user, password="pw",
-                                   database=db, autocommit=False)
-            try:
-                mgr = MaterializedViewManager(conn, ignore_limitations=True)
-                with warnings.catch_warnings(record=True):
-                    warnings.simplefilter("always")
-                    plan = mgr.register_view(
-                        "CREATE VIEW v_builtin AS SELECT id, CRC32(v) AS a FROM t;\n"
-                        "CREATE VIEW v_stored AS SELECT id, iadd(v, 1) AS a FROM t"
-                    )
-                subs = list(plan.sub_plans)
-                # CRC32: a built-in, no lookup. iadd: MySQL lists the user's
-                # own routines in information_schema.ROUTINES (scalar); MariaDB
-                # keeps them in mysql.proc, which this user cannot read, so the
-                # view gets the exact full refresh, announced.
-                self.assertEqual([sp.strategy for sp in subs], [T1, T3 if mariadb else T1])
-                self.assertFalse([d for d in subs[0].strategy_diagnostics if d.code == "UNCLASSIFIED_FUNCTION_FULL_REFRESH"])
-                mine = [d for d in subs[1].strategy_diagnostics if d.code == "UNCLASSIFIED_FUNCTION_FULL_REFRESH"]
-                self.assertEqual(len(mine), 1 if mariadb else 0, subs[1].strategy_diagnostics)
-                if mine:
-                    self.assertTrue(mine[0].message.startswith("exact result required: falling back to strategy full refresh"))
-                    self.assertIn("mysql.proc", mine[0].message)
-                cur = conn.cursor()
-                cur.execute("INSERT INTO t VALUES (1, 1, 5), (2, 2, NULL)")
-                conn.commit()
-                for name, sql in (("v_builtin", "SELECT id, CRC32(v) AS a FROM t"), ("v_stored", "SELECT id, iadd(v, 1) AS a FROM t")):
-                    mv, mv_t = _snap(cur, f"SELECT * FROM {name}")
-                    live, live_t = _snap(cur, sql)
-                    self.assertEqual((mv, mv_t), (live, live_t), name)
-                conn.commit()
-            finally:
-                conn.close()
+            mgr = MaterializedViewManager(conn, ignore_limitations=True)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                plan = mgr.register_view("CREATE VIEW r_mixed AS SELECT id, CRC32(v) AS a, iadd(v, 1) AS b FROM t")
+            # CRC32: built-in, no lookup. iadd: MySQL lists the user's own
+            # routines in information_schema.ROUTINES (scalar); MariaDB keeps
+            # them in mysql.proc, which this user cannot read, so the view gets
+            # the exact full refresh, announced, naming only IADD.
+            self.assertEqual(plan.strategy, T3 if self.mariadb else T1)
+            mine = [d for d in plan.strategy_diagnostics if d.code == "UNCLASSIFIED_FUNCTION_FULL_REFRESH"]
+            self.assertEqual(len(mine), 1 if self.mariadb else 0, plan.strategy_diagnostics)
+            if mine:
+                self.assertTrue(mine[0].message.startswith("exact result required: falling back to strategy full refresh"))
+                self.assertIn("mysql.proc", mine[0].message)
+                self.assertEqual(mine[0].expressions, ("IADD",))
+            c = conn.cursor()
+            c.execute("INSERT INTO t VALUES (100, 1, 5), (101, 2, NULL)")
+            conn.commit()
+            for name, sql in (("r_mixed", "SELECT id, CRC32(v) AS a, iadd(v, 1) AS b FROM t"),):
+                mv, mv_t = _snap(c, f"SELECT * FROM {name}")
+                live, live_t = _snap(c, sql)
+                self.assertEqual((mv, mv_t), (live, live_t), name)
+            conn.commit()
         finally:
-            rc.execute(f"SET GLOBAL log_bin_trust_function_creators = {int(trust_before)}" if "trust_before" in locals() else "SELECT 1")
-            rc.execute(f"DROP USER IF EXISTS '{user}'@'%'")
-            rc.execute(f"DROP DATABASE IF EXISTS {db}")
-            root.close()
+            conn.close()
 
 
 class OfflineTests(unittest.TestCase):
