@@ -69,6 +69,14 @@ Some tier-1 aggregates still read the source table for the affected group:
 `MIN`/`MAX`/`BIT_AND`/`BIT_OR` when a value is removed, and on SQLite
 `SUM`/`TOTAL`/`AVG` over non-integer values (see
 [Floating-point aggregates](#floating-point-aggregates)).
+For `MIN(col)`/`MAX(col)` over a plain column of a single-table view grouped by
+plain columns, `recommended_base_indexes` names `(group columns..., col)`: with
+it, removing a group's current extreme is one index probe instead of a scan of
+the group (measured per extreme delete, net of the bare DELETE: SQLite 1967 ->
+3 us with `(g)` vs `(g, v)`, PostgreSQL 1072 -> 519, MySQL 8.4 17060 -> ~0,
+MariaDB 11.8 7765 -> 311). Without it the plan diagnostics (and `diff` text)
+carry a `minmax_extreme_recompute` performance note with the `CREATE INDEX`
+statement. Expression and join arguments keep the group-key index.
 
 ## Installation
 
@@ -198,6 +206,8 @@ python3 matview_sync.py diff --db app.db --view views.sql
 [NOOP] customer_sales
   Strategy: algebraic_delta (Tier 1 (single))
   Selection Reason: Tier 1 algebraic delta maintenance: single-table O(1) incremental aggregates.
+  Performance Notes (1):
+    * sqlite_sum_total_avg_native_recompute_on_real: a group holding any non-INTEGER value (any value of a REAL-affinity column) is recomputed from the base table on every write (O(group rows) with a group-key index, O(table) without); integer-only groups keep the O(1) exact fold.
   Status: Up to date; no pending changes.
 
 ------------------------------------------------------------------------------
