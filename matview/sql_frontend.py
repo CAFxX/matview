@@ -25,6 +25,7 @@ from .engines import (
     _sqlglot_dialect,
     parse_engine_version,
 )
+from .aggregate_semantics import KNOWN_AGGREGATE_NAMES
 from .logical_ir import (
     ColumnDef,
     JoinSpec,
@@ -1613,7 +1614,7 @@ def _contains_aggregate_call(
         return True
     for anon_node in ast_node.find_all(sqlglot_exp.Anonymous):
         name_up = anon_node.name.upper()
-        if name_up in _FN_TO_AGG_ENUM or name_up in _STATISTICAL_ALIAS_NAMES or name_up == "COUNT":
+        if name_up in _FN_TO_AGG_ENUM or name_up in _STATISTICAL_ALIAS_NAMES or name_up == "COUNT" or name_up in KNOWN_AGGREGATE_NAMES:
             return True
     return False
 

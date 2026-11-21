@@ -803,7 +803,13 @@ class PlannerMixin(MixinHost):
                 idx += 1
             if cursor < len(expr_str):
                 out_parts.append(expr_str[cursor:])
-            return "".join(out_parts), True
+            rewritten = "".join(out_parts)
+            if _contains_aggregate_call(rewritten, dialect=self.dialect):
+                # An aggregate without an algebraic rule (JSON_AGG, mode(),
+                # percentile_cont, ...) is left in place: the expression is not
+                # decomposable and the view is maintained by recomputing it.
+                return expr_str, False
+            return rewritten, True
 
         # An aggregate inside a scalar subquery belongs to that subquery, not
         # to the view's groups; the decomposition below would replace it with
@@ -1266,6 +1272,8 @@ class PlannerMixin(MixinHost):
         return self._effective_group_by_exprs
 
     def _select_strategy_and_mode(self) -> Tuple[MaintenanceStrategy, str]:
+        if self._exact_full_refresh_fallback() is not None:
+            return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
         win_part_keys = self._extract_window_partition_keys()
         if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_upsert:
             v = self.view
@@ -1355,6 +1363,7 @@ class PlannerMixin(MixinHost):
                             )
                         if (
                             has_any_agg
+                            and not self._view_has_grouping_sets()
                             and item.source_col.lower() not in grp_cols_lower
                             and item.raw_expr.strip().lower() not in grp_exprs_lower
                         ):
@@ -1793,6 +1802,9 @@ class PlannerMixin(MixinHost):
                 "Window functions require recomputing sibling rows within the affected PARTITION BY partition rather than single-row O(1) deltas.",
             )
         sel = "Tier 2 group-scoped delta maintenance: recomputes only the affected GROUP BY groups."
+        unrecognized = self._unrecognized_aggregate_group_fallback()
+        if unrecognized is not None:
+            return (sel, unrecognized.message())
         if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_upsert:
             return (sel, "SQLite version lacks UPSERT (INSERT ... ON CONFLICT) required for Tier 1 algebraic delta maintenance.")
 
@@ -1821,6 +1833,13 @@ class PlannerMixin(MixinHost):
 
     def _diagnose_tier3_fallback(self) -> Tuple[str, str]:
         sel = "Tier 3 atomic query sync: full atomic refresh executed on base-table mutations."
+        exact_fb = self._exact_full_refresh_fallback()
+        if exact_fb is not None:
+            return (sel, exact_fb.message())
+        if not self.view.group_by_cols and not self.view.has_window_func:
+            no_rule = self._unrecognized_aggregate_full_refresh_fallback()
+            if no_rule is not None:
+                return (sel, no_rule.message())
         if self.view.has_window_func:
             return (sel, "Window function (e.g. ROW_NUMBER, RANK, LAG, LEAD) requires universal atomic refresh.")
         if self.view.has_cte:
@@ -2117,9 +2136,10 @@ class PlannerMixin(MixinHost):
 
     def _fallback_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
         """Announced fallbacks of this plan (see matview.diagnostics)."""
+        routed = self._exact_routing_diagnostics(strategy)
         having = self.view.having_clause
         if not having or strategy == MaintenanceStrategy.ALGEBRAIC_DELTA or not _has_subquery_aggregate(having, self.dialect):
-            return ()
+            return routed
         cost = (
             "a write to a table the subquery reads recomputes every group of the view; other writes "
             "recompute the touched groups."
@@ -2129,7 +2149,7 @@ class PlannerMixin(MixinHost):
                 "; concurrent writers to the subquery's table deadlock (error 1213) and roll back "
                 "(about 45% of writes with 4 concurrent writers, measured on MySQL 8.4 and MariaDB 10.11)."
             )
-        return (
+        return routed + (
             Diagnostic(
                 code=HAVING_SUBQUERY_AGGREGATE_FALLBACK,
                 severity=DiagnosticSeverity.INFO,
