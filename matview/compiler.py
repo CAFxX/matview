@@ -27,10 +27,11 @@ from .logical_ir import (
 )
 from .maintenance import MaintenanceMixin
 from .planner import PlannerMixin
+from .planner_exact_routing import ExactAggregateRoutingMixin
 from .sql_frontend import resolve_statistical_aggregate_aliases
 
 
-class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
+class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, MaintenanceMixin, DialectMixin):
     """
     Compiles a `ViewSpec` + table schemas + target `EngineVersion` into a
     `MaterializedViewPlan` via an immutable `CompilationContext` / `LogicalIR`.
