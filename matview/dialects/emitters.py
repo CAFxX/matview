@@ -188,6 +188,8 @@ class DialectEmitMixin(MixinHost):
         # Case 1: PK / rowid range folding (`pk_range_fold`)
         if spec.mode == "pk_range_fold" and spec.pk_column and spec.chunk_sql_templates:
             base_t = raw_plan.view_spec.base_table
+            base_alias = raw_plan.view_spec.joins[0].alias if raw_plan.view_spec.joins else base_t
+            is_base_aliased = base_alias.lower() != base_t.lower()
             pk_col = spec.pk_column
             tmpl = spec.chunk_sql_templates[0].strip().rstrip(";")
             ph = "?" if self.dialect == Dialect.SQLITE else "%s"
@@ -197,7 +199,15 @@ class DialectEmitMixin(MixinHost):
                 and not raw_plan.view_spec.has_top_level_distinct
             )
             q_base_t = self._q(base_t)
-            q_pk_col = self._q(pk_col)
+            q_pk_col = self._quote_pk_range_col(pk_col)
+            q_table_ref = self._q(base_alias) if is_base_aliased else q_base_t
+            q_cond_pk = f"{q_table_ref}.{q_pk_col}" if is_base_aliased else q_pk_col
+            from_join_target = f"{q_base_t} AS {self._q(base_alias)}" if is_base_aliased else q_base_t
+            from_base_pat = (
+                rf"\nFROM\s+{re.escape(q_base_t)}(?:\s+AS\s+{re.escape(self._q(base_alias))})?\b"
+                if is_base_aliased
+                else rf"\nFROM\s+{re.escape(q_base_t)}\b"
+            )
 
             def _bound_follow_up_templates() -> List[str]:
                 # Follow-up chunk statements (PostgreSQL/MySQL native
@@ -227,15 +237,20 @@ class DialectEmitMixin(MixinHost):
                 return out
 
             if self.dialect == Dialect.SQLITE:
-                # Replace `(pk_col > ? AND pk_col <= ?)` with recursive CTE batch join
-                cond_pat = f"({q_pk_col} > {ph} AND {q_pk_col} <= {ph})"
+                # Replace `(pk_col > ? AND pk_col <= ?)` (or aliased `s.pk_col`) with recursive CTE batch join
+                cond_pat = f"({q_cond_pk} > {ph} AND {q_cond_pk} <= {ph})"
                 joined_tmpl = tmpl.replace(
                     cond_pat,
-                    f"({q_base_t}.{q_pk_col} > __mv_b.lo AND {q_base_t}.{q_pk_col} <= __mv_b.hi)",
+                    f"({q_table_ref}.{q_pk_col} > __mv_b.lo AND {q_table_ref}.{q_pk_col} <= __mv_b.hi)",
                 )
+                if joined_tmpl == tmpl and q_cond_pk != q_pk_col:
+                    joined_tmpl = tmpl.replace(
+                        f"({q_pk_col} > {ph} AND {q_pk_col} <= {ph})",
+                        f"({q_table_ref}.{q_pk_col} > __mv_b.lo AND {q_table_ref}.{q_pk_col} <= __mv_b.hi)",
+                    )
                 joined_tmpl = re.sub(
-                    rf"\nFROM\s+{re.escape(q_base_t)}\b",
-                    f"\nFROM __mv_batches AS __mv_b JOIN {q_base_t} ON ({q_base_t}.{q_pk_col} > __mv_b.lo AND {q_base_t}.{q_pk_col} <= __mv_b.hi)",
+                    from_base_pat,
+                    f"\nFROM __mv_batches AS __mv_b JOIN {from_join_target} ON ({q_table_ref}.{q_pk_col} > __mv_b.lo AND {q_table_ref}.{q_pk_col} <= __mv_b.hi)",
                     joined_tmpl,
                     count=1,
                     flags=re.IGNORECASE,
@@ -252,9 +267,14 @@ class DialectEmitMixin(MixinHost):
 
             elif self.dialect == Dialect.POSTGRES:
                 pg_chunk = tmpl.replace(
-                    f"({q_pk_col} > %s AND {q_pk_col} <= %s)",
-                    f"({q_pk_col} > __mv_cur_pk AND {q_pk_col} <= __mv_top_pk)",
+                    f"({q_cond_pk} > %s AND {q_cond_pk} <= %s)",
+                    f"({q_cond_pk} > __mv_cur_pk AND {q_cond_pk} <= __mv_top_pk)",
                 )
+                if pg_chunk == tmpl and q_cond_pk != q_pk_col:
+                    pg_chunk = tmpl.replace(
+                        f"({q_pk_col} > %s AND {q_pk_col} <= %s)",
+                        f"({q_pk_col} > __mv_cur_pk AND {q_pk_col} <= __mv_top_pk)",
+                    )
                 if is_global_agg:
                     pg_chunk = re.sub(
                         r"\nON CONFLICT\b",
@@ -282,9 +302,14 @@ class DialectEmitMixin(MixinHost):
 
             elif self.dialect == Dialect.MYSQL:
                 my_chunk = tmpl.replace(
-                    f"({q_pk_col} > %s AND {q_pk_col} <= %s)",
-                    f"({q_pk_col} > __mv_cur_pk AND {q_pk_col} <= __mv_top_pk)",
+                    f"({q_cond_pk} > %s AND {q_cond_pk} <= %s)",
+                    f"({q_cond_pk} > __mv_cur_pk AND {q_cond_pk} <= __mv_top_pk)",
                 )
+                if my_chunk == tmpl and q_cond_pk != q_pk_col:
+                    my_chunk = tmpl.replace(
+                        f"({q_pk_col} > %s AND {q_pk_col} <= %s)",
+                        f"({q_pk_col} > __mv_cur_pk AND {q_pk_col} <= __mv_top_pk)",
+                    )
                 if is_global_agg:
                     if "\n) AS __mv_src\nON DUPLICATE KEY UPDATE" in my_chunk:
                         my_chunk = my_chunk.replace(
@@ -576,36 +601,56 @@ class DialectEmitMixin(MixinHost):
         t_au_name = self._bounded_ident(f"{p}trg_", stem, "_au")
         q_base_t = self._q(base_t)
         ref_cols = self._referenced_columns_for_table(base_t)
-        # Projection backing rows are keyed by the source PK even when the
-        # public SELECT omits it. A PK-only UPDATE must therefore fire the
-        # maintenance trigger and must not be suppressed by the dialect's
-        # unchanged-column guard (SQLite and MySQL/MariaDB).
+        t_schema = self._schemas_lower.get(base_t.lower())
+        schema_cols_by_lower = (
+            {c.lower(): c_def for c, c_def in t_schema.columns.items()}
+            if t_schema
+            else {}
+        )
+        # Projection backing rows (and watermark-gated backfill triggers) depend
+        # on key columns even when the public SELECT omits them. A key-only UPDATE
+        # must therefore fire the maintenance trigger and must not be suppressed
+        # by the dialect's unchanged-column guard (SQLite and MySQL/MariaDB).
+        implicit_rowid_aliases: List[str] = []
         seen_ref_cols = {c.lower() for c in ref_cols}
         for key_col in update_key_columns or ():
-            if key_col.lower() not in seen_ref_cols:
-                ref_cols.append(key_col)
-                seen_ref_cols.add(key_col.lower())
-        t_schema = self._schemas_lower.get(base_t.lower())
+            k_low = key_col.lower()
+            if k_low not in seen_ref_cols:
+                if (
+                    self.dialect == Dialect.SQLITE
+                    and k_low in ("rowid", "_rowid_", "oid")
+                    and k_low not in schema_cols_by_lower
+                ):
+                    # SQLite forbids `AFTER UPDATE OF rowid` (or `_rowid_`/`oid`)
+                    # when it is an implicit pseudo-column; omit the OF list and
+                    # guard via `OLD.<alias> = NEW.<alias>` in the WHEN clause.
+                    if k_low not in implicit_rowid_aliases:
+                        implicit_rowid_aliases.append(k_low)
+                else:
+                    ref_cols.append(key_col)
+                    seen_ref_cols.add(k_low)
         # SQLite fires "AFTER UPDATE OF cols" only when a listed column is in
         # the SET list; a referenced generated column changes when the columns
         # it is computed from do, so it disables the column filter (the WHEN
         # guard below still skips rows whose referenced values are unchanged).
         refs_generated = t_schema is not None and any(
-            (cd := t_schema.columns.get(c)) is not None and cd.generated for c in ref_cols
+            (cd := schema_cols_by_lower.get(c.lower())) is not None and cd.generated for c in ref_cols
         )
         upd_of_clause = (
             f" OF {', '.join(self._q(c) for c in ref_cols)}"
-            if ref_cols and self.dialect == Dialect.SQLITE and not refs_generated
+            if ref_cols and self.dialect == Dialect.SQLITE and not refs_generated and not implicit_rowid_aliases
             else ""
         )
 
         unchanged_conds: List[str] = []
         if t_schema and ref_cols:
             for c_name in ref_cols:
-                c_def = t_schema.columns.get(c_name)
+                c_def = schema_cols_by_lower.get(c_name.lower())
                 is_null = not (c_def.not_null if c_def else False)
                 qc = self._q(c_name)
                 unchanged_conds.append(self._identical_row_values_sql(f"OLD.{qc}", f"NEW.{qc}", is_null))
+            for rowid_alias in implicit_rowid_aliases:
+                unchanged_conds.append(f"OLD.{rowid_alias} = NEW.{rowid_alias}")
         changed_guard = f"NOT ({' AND '.join(unchanged_conds)})" if unchanged_conds else None
         if (
             self.dialect == Dialect.POSTGRES

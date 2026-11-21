@@ -19,16 +19,21 @@ Verifies:
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import tempfile
 import threading
 import unittest
+import warnings
 
+from matview.manager import MATVIEW_GENERATOR_VERSION
 from matview_sync import (
     BackfillInterruptedError,
     Dialect,
+    EngineLimitationWarning,
     MaterializedViewManager,
     UnsupportedMaterializedViewError,
+    generate_materialized_view,
 )
 from test_matview_sync import _register_sqlite_compat_udfs
 
@@ -448,6 +453,676 @@ class BackfillWatermarkSafetyTests(unittest.TestCase):
             ),
             where_clause="amt >= 20 OR note = 'keep_extra'",
         )
+
+    def test_backfill_unreferenced_pk_update_across_watermark_boundaries(self) -> None:
+        """Updating an unreferenced integer PK across the active backfill watermark
+        range (unbackfilled -> above max_pk, unbackfilled -> <= cursor, <= cursor
+        -> unbackfilled, <= cursor -> above max_pk) must fire the UPDATE trigger
+        and stay exact across grouped, global, filtered, DISTINCT, and native-PK
+        projection views whose SELECT lists do NOT reference `*` or the PK column."""
+        cases = (
+            (
+                "agg_grp_src",
+                "v_agg_grp",
+                "SELECT grp, SUM(val) AS s FROM agg_grp_src GROUP BY grp",
+                "ORDER BY grp",
+                [(i, f"g{i % 3}", i * 10, f"n{i}") for i in range(1, 11)],
+            ),
+            (
+                "agg_glob_src",
+                "v_agg_glob",
+                "SELECT SUM(val) AS s FROM agg_glob_src",
+                "",
+                [(i, f"g{i % 3}", i * 10, f"n{i}") for i in range(1, 11)],
+            ),
+            (
+                "agg_filt_src",
+                "v_agg_filt",
+                "SELECT grp, SUM(val) AS s FROM agg_filt_src WHERE val >= 20 GROUP BY grp",
+                "ORDER BY grp",
+                [(i, f"g{i % 3}", i * 10, f"n{i}") for i in range(1, 11)],
+            ),
+            (
+                "dist_src",
+                "v_dist_unref_pk",
+                "SELECT DISTINCT grp FROM dist_src",
+                "ORDER BY grp",
+                [(i, f"g{i:02d}", i * 10, f"n{i}") for i in range(1, 11)],
+            ),
+            (
+                "proj_unref_src",
+                "v_proj_unref_pk",
+                "SELECT grp, val FROM proj_unref_src",
+                "ORDER BY grp, val",
+                [(i, f"g{i:02d}", i * 10, f"n{i}") for i in range(1, 11)],
+            ),
+        )
+        for tbl, vname, select_sql, order_sql, rows in cases:
+            with self.subTest(view=vname):
+                self.conn.execute(
+                    f"CREATE TABLE {tbl} (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL, note TEXT);"
+                )
+                self.conn.executemany(f"INSERT INTO {tbl} VALUES (?, ?, ?, ?);", rows)
+                self.conn.commit()
+
+                manager = MaterializedViewManager(self.conn)
+                plan = manager.register_view(f"CREATE VIEW {vname} AS {select_sql};", populate=False)
+                worker_errors: list[BaseException] = []
+
+                def on_progress(batch_idx: int, _rows_done: int) -> None:
+                    if batch_idx != 1:
+                        return
+                    done = threading.Event()
+
+                    def worker() -> None:
+                        try:
+                            second = sqlite3.connect(self.db_path, timeout=10)
+                            try:
+                                second.execute("PRAGMA busy_timeout=10000;")
+                                _register_sqlite_compat_udfs(second)
+                                # Non-PK unreferenced update should remain harmless
+                                second.execute(f"UPDATE {tbl} SET note = 'touched' WHERE id = 3;")
+                                # 1. Unbackfilled (id=8 in (3,10]) -> above max_pk (100): must fold NEW
+                                second.execute(f"UPDATE {tbl} SET id = 100 WHERE id = 8;")
+                                # 2. Unbackfilled (id=7 in (3,10]) -> <= cursor (0): must fold NEW
+                                second.execute(f"UPDATE {tbl} SET id = 0 WHERE id = 7;")
+                                # 3. Already backfilled (id=2 <= 3) -> unbackfilled (id=7 in (3,10]): must retract OLD
+                                second.execute(f"UPDATE {tbl} SET id = 7 WHERE id = 2;")
+                                # 4. Already backfilled (id=1 <= 3) -> above max_pk (101): retract OLD + fold NEW
+                                second.execute(f"UPDATE {tbl} SET id = 101 WHERE id = 1;")
+                                second.commit()
+                            finally:
+                                second.close()
+                        except BaseException as exc:
+                            worker_errors.append(exc)
+                        finally:
+                            done.set()
+
+                    t = threading.Thread(target=worker, daemon=True)
+                    t.start()
+                    self.assertTrue(done.wait(timeout=10), "worker timed out")
+                    t.join(timeout=1)
+                    if worker_errors:
+                        raise worker_errors[0]
+
+                batches = manager.backfill_incrementally(
+                    plan,
+                    batch_size=3,
+                    on_progress=on_progress,
+                    snapshot_isolation=False,
+                )
+                self.assertGreaterEqual(batches, 2)
+                # Behavioral check runs BEFORE static DDL check so mutation testing
+                # proves runtime MV != LIVE sensitivity.
+                actual = self.conn.execute(f"SELECT * FROM {vname} {order_sql};").fetchall()
+                expected = self.conn.execute(f"{select_sql} {order_sql};").fetchall()
+                self.assertEqual(actual, expected, f"{vname}: MV={actual} LIVE={expected}")
+
+                au_ddls = [d for d in plan.trigger_ddls if "_au" in d]
+                self.assertTrue(au_ddls, f"{vname}: missing AFTER UPDATE trigger")
+                m_of = re.search(
+                    r"AFTER\s+UPDATE\s+OF\s+(.+?)\s+ON\b",
+                    au_ddls[0],
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                self.assertIsNotNone(m_of, f"{vname}: expected AFTER UPDATE OF clause: {au_ddls[0]}")
+                assert m_of is not None
+                of_cols = {c.strip().strip('"').lower() for c in m_of.group(1).split(",")}
+                self.assertIn("id", of_cols, f"{vname}: unreferenced PK `id` missing from OF list: {of_cols}")
+                self.assertNotIn("note", of_cols, f"{vname}: unreferenced non-PK `note` should stay out of OF list")
+
+    def test_backfill_unreferenced_rowid_update_on_text_pk_table(self) -> None:
+        """On a SQLite TEXT PRIMARY KEY table (`wm_pk_col == 'rowid'`), UPDATE triggers
+        for aggregates, bag projections, and NOT NULL native-PK projections must omit
+        invalid `OF rowid`, guard via `OLD.rowid = NEW.rowid`, retract moved rows
+        without phantom retention when subsequently deleted, and remain exact."""
+        self.conn.execute(
+            "CREATE TABLE kv_text_pk (k TEXT PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL);"
+        )
+        self.conn.executemany(
+            "INSERT INTO kv_text_pk VALUES (?, ?, ?);",
+            [(f"k{i}", f"g{i % 2}", i * 10) for i in range(1, 11)],
+        )
+        self.conn.commit()
+
+        manager = MaterializedViewManager(self.conn)
+        agg_sql = "SELECT grp, SUM(val) AS s FROM kv_text_pk GROUP BY grp"
+        plan_agg = manager.register_view(f"CREATE VIEW v_kv_rowid AS {agg_sql};", populate=False)
+
+        def _make_on_progress(moves: tuple[str, ...]):
+            worker_errors: list[BaseException] = []
+
+            def on_progress(batch_idx: int, _rows_done: int) -> None:
+                if batch_idx != 1:
+                    return
+                done = threading.Event()
+
+                def worker() -> None:
+                    try:
+                        second = sqlite3.connect(self.db_path, timeout=10)
+                        try:
+                            second.execute("PRAGMA busy_timeout=10000;")
+                            _register_sqlite_compat_udfs(second)
+                            for stmt in moves:
+                                second.execute(stmt)
+                            second.commit()
+                        finally:
+                            second.close()
+                    except BaseException as exc:
+                        worker_errors.append(exc)
+                    finally:
+                        done.set()
+
+                t = threading.Thread(target=worker, daemon=True)
+                t.start()
+                self.assertTrue(done.wait(timeout=10), "worker timed out")
+                t.join(timeout=1)
+                if worker_errors:
+                    raise worker_errors[0]
+
+            return on_progress
+
+        batches_agg = manager.backfill_incrementally(
+            plan_agg,
+            batch_size=3,
+            on_progress=_make_on_progress(
+                (
+                    "UPDATE kv_text_pk SET rowid = 100 WHERE rowid = 8;",
+                    "UPDATE kv_text_pk SET rowid = 8 WHERE rowid = 2;",
+                )
+            ),
+            snapshot_isolation=False,
+        )
+        self.assertGreaterEqual(batches_agg, 2)
+        self.assertEqual(
+            self.conn.execute("SELECT grp, s FROM v_kv_rowid ORDER BY grp;").fetchall(),
+            self.conn.execute(f"{agg_sql} ORDER BY grp;").fetchall(),
+        )
+
+        # 2. Nullable TEXT PK projection moving rowid across watermark
+        self.conn.execute("CREATE TABLE kv_proj_src (k TEXT PRIMARY KEY, val INTEGER NOT NULL);")
+        self.conn.executemany(
+            "INSERT INTO kv_proj_src VALUES (?, ?);",
+            [(f"k{i}", i * 10) for i in range(1, 11)],
+        )
+        self.conn.commit()
+        p2 = manager.register_view("CREATE VIEW v_kv_proj2 AS SELECT k, val FROM kv_proj_src;", populate=False)
+        batches_proj = manager.backfill_incrementally(
+            p2,
+            batch_size=3,
+            on_progress=_make_on_progress(
+                (
+                    "UPDATE kv_proj_src SET rowid = 100 WHERE rowid = 8;",
+                    "UPDATE kv_proj_src SET rowid = 8 WHERE rowid = 2;",
+                )
+            ),
+            snapshot_isolation=False,
+        )
+        self.assertGreaterEqual(batches_proj, 2)
+        self.assertEqual(
+            self.conn.execute("SELECT k, val FROM v_kv_proj2 ORDER BY k;").fetchall(),
+            self.conn.execute("SELECT k, val FROM kv_proj_src ORDER BY k;").fetchall(),
+        )
+
+        # 3. NOT NULL TEXT PK native projection: moving backfilled rowid=2 into pending
+        #    range (rowid=8) and then deleting rowid=8 must retract immediately (no phantom row).
+        self.conn.execute("CREATE TABLE kv_nn_proj (k TEXT PRIMARY KEY NOT NULL, val INTEGER NOT NULL);")
+        self.conn.executemany(
+            "INSERT INTO kv_nn_proj VALUES (?, ?);",
+            [(f"k{i}", i * 10) for i in range(1, 11)],
+        )
+        self.conn.commit()
+        p3 = manager.register_view("CREATE VIEW v_kv_nn_proj AS SELECT val FROM kv_nn_proj;", populate=False)
+        batches_nn = manager.backfill_incrementally(
+            p3,
+            batch_size=3,
+            on_progress=_make_on_progress(
+                (
+                    "UPDATE kv_nn_proj SET rowid = 100 WHERE rowid = 8;",
+                    "UPDATE kv_nn_proj SET rowid = 8 WHERE rowid = 2;",
+                    "DELETE FROM kv_nn_proj WHERE rowid = 8;",
+                )
+            ),
+            snapshot_isolation=False,
+        )
+        self.assertGreaterEqual(batches_nn, 2)
+        self.assertEqual(
+            self.conn.execute("SELECT val FROM v_kv_nn_proj ORDER BY val;").fetchall(),
+            self.conn.execute("SELECT val FROM kv_nn_proj ORDER BY val;").fetchall(),
+        )
+
+        for p in (plan_agg, p2, p3):
+            au_ddls = [d for d in p.trigger_ddls if "_au" in d]
+            self.assertTrue(au_ddls)
+            self.assertNotIn("AFTER UPDATE OF", au_ddls[0])
+            self.assertIn("OLD.rowid = NEW.rowid", au_ddls[0])
+
+    def test_backfill_sqlite_without_rowid_shadowed_rowid_strict_and_desc_pk(self) -> None:
+        """SQLite WITHOUT ROWID, STRICT, lowercase integer PK, INTEGER PRIMARY KEY DESC,
+        non-STRICT INT/BIGINT PK with REAL/TEXT values, shadowed rowid aliases, and
+        nullable INT PRIMARY KEY tables must all backfill and maintain exact results."""
+        self.conn.executescript(
+            """
+            CREATE TABLE t_wor_txt (k TEXT PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL) WITHOUT ROWID;
+            INSERT INTO t_wor_txt VALUES ('a', 'g1', 10), ('b', 'g1', 20), ('c', 'g2', 30);
+
+            CREATE TABLE t_wor_nonstrict (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL) WITHOUT ROWID;
+            INSERT INTO t_wor_nonstrict VALUES (1, 'g1', 10), (2.5, 'g1', 25), ('abc', 'g2', 30);
+
+            CREATE TABLE t_wor_strict (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL) WITHOUT ROWID, STRICT;
+            INSERT INTO t_wor_strict VALUES (1, 'g1', 10), (2, 'g1', 20), (3, 'g2', 30),
+                                            (4, 'g2', 40), (5, 'g1', 50), (6, 'g2', 60),
+                                            (7, 'g1', 70), (8, 'g2', 80);
+
+            CREATE TABLE t_lower_int (id integer PRIMARY KEY, rowid TEXT, _rowid_ TEXT, oid TEXT, grp TEXT NOT NULL, val INTEGER NOT NULL);
+            INSERT INTO t_lower_int VALUES (1, 'a', 'b', 'c', 'g1', 10), (2, 'd', 'e', 'f', 'g2', 20),
+                                           (3, 'g', 'h', 'i', 'g1', 30), (4, 'j', 'k', 'l', 'g2', 40);
+
+            CREATE TABLE t_desc_inline (id INTEGER PRIMARY KEY DESC, grp TEXT NOT NULL, val INTEGER NOT NULL);
+            INSERT INTO t_desc_inline VALUES (NULL, 'g1', 100), (1, 'g1', 10), (2, 'g2', 20);
+
+            CREATE TABLE t_desc_tbl (id INTEGER, grp TEXT NOT NULL, val INTEGER NOT NULL, PRIMARY KEY (id DESC));
+            INSERT INTO t_desc_tbl VALUES (1, 'g1', 10), (2, 'g2', 20), (3, 'g1', 30);
+
+            CREATE TABLE t_nonstrict_nn (id INT PRIMARY KEY NOT NULL, grp TEXT NOT NULL, val INTEGER NOT NULL);
+            INSERT INTO t_nonstrict_nn VALUES (1, 'g1', 10), (2.5, 'g1', 25), ('abc', 'g2', 30);
+
+            CREATE TABLE t_shadow_rowid (rowid TEXT PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL);
+            INSERT INTO t_shadow_rowid VALUES ('r1', 'g1', 10), ('r2', 'g1', 20), ('r3', 'g2', 30),
+                                              ('r4', 'g2', 40), ('r5', 'g1', 50), ('r6', 'g2', 60),
+                                              ('r7', 'g1', 70), ('r8', 'g2', 80);
+
+            CREATE TABLE t_shadow_all (rowid TEXT, _rowid_ TEXT, oid TEXT, grp TEXT NOT NULL, val INTEGER NOT NULL);
+            INSERT INTO t_shadow_all VALUES ('a', 'b', 'c', 'g1', 10), ('d', 'e', 'f', 'g2', 20);
+
+            CREATE TABLE t_null_int_pk (id INT PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL);
+            INSERT INTO t_null_int_pk VALUES (NULL, 'g1', 100), (1, 'g1', 10), (2, 'g2', 20);
+            """
+        )
+        self.conn.commit()
+        manager = MaterializedViewManager(self.conn)
+
+        # 1. WITHOUT ROWID + TEXT PK: no watermark triggers, group_key_batch
+        p_wor_txt = manager.register_view(
+            "CREATE VIEW v_wor_txt AS SELECT grp, SUM(val) AS s FROM t_wor_txt GROUP BY grp;",
+            populate=True,
+        )
+        self.assertFalse(p_wor_txt.has_watermark_triggers)
+        assert p_wor_txt.incremental_backfill_spec is not None
+        self.assertEqual(p_wor_txt.incremental_backfill_spec.mode, "group_key_batch")
+        self.conn.execute("UPDATE t_wor_txt SET val = 99 WHERE k = 'a';")
+        self.conn.commit()
+        self.assertEqual(
+            self.conn.execute("SELECT grp, s FROM v_wor_txt ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, SUM(val) FROM t_wor_txt GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+
+        # 2. WITHOUT ROWID + non-STRICT INTEGER PK (allows 2.5 and 'abc'): must NOT use pk_range_fold
+        p_wor_ns = manager.register_view(
+            "CREATE VIEW v_wor_ns AS SELECT grp, SUM(val) AS s FROM t_wor_nonstrict GROUP BY grp;",
+            populate=True,
+            incremental_backfill=True,
+            batch_size=2,
+        )
+        self.assertFalse(p_wor_ns.has_watermark_triggers)
+        assert p_wor_ns.incremental_backfill_spec is not None
+        self.assertEqual(p_wor_ns.incremental_backfill_spec.mode, "group_key_batch")
+        self.assertEqual(
+            self.conn.execute("SELECT grp, s FROM v_wor_ns ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, SUM(val) FROM t_wor_nonstrict GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+
+        # 3. WITHOUT ROWID, STRICT + INTEGER PK: uses `id` and survives mid-backfill unreferenced PK UPDATE
+        p_wor_s = manager.register_view(
+            "CREATE VIEW v_wor_strict AS SELECT grp, SUM(val) AS s FROM t_wor_strict GROUP BY grp;",
+            populate=False,
+        )
+        self.assertTrue(p_wor_s.has_watermark_triggers)
+        assert p_wor_s.incremental_backfill_spec is not None
+        self.assertEqual(p_wor_s.incremental_backfill_spec.pk_column, "id")
+        wor_errors: list[BaseException] = []
+
+        def on_prog_wor(batch_idx: int, _done: int) -> None:
+            if batch_idx != 1:
+                return
+            ev = threading.Event()
+
+            def wrk() -> None:
+                try:
+                    c2 = sqlite3.connect(self.db_path, timeout=10)
+                    try:
+                        c2.execute("PRAGMA busy_timeout=10000;")
+                        _register_sqlite_compat_udfs(c2)
+                        c2.execute("UPDATE t_wor_strict SET id = 100 WHERE id = 7;")
+                        c2.execute("UPDATE t_wor_strict SET id = 7 WHERE id = 1;")
+                        c2.commit()
+                    finally:
+                        c2.close()
+                except BaseException as exc:
+                    wor_errors.append(exc)
+                finally:
+                    ev.set()
+
+            th = threading.Thread(target=wrk, daemon=True)
+            th.start()
+            self.assertTrue(ev.wait(timeout=10))
+            th.join(timeout=1)
+            if wor_errors:
+                raise wor_errors[0]
+
+        manager.backfill_incrementally(p_wor_s, batch_size=3, on_progress=on_prog_wor, snapshot_isolation=False)
+        self.assertEqual(
+            self.conn.execute("SELECT grp, s FROM v_wor_strict ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, SUM(val) FROM t_wor_strict GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+
+        # 4. Lowercase `integer PRIMARY KEY` even when rowid/_rowid_/oid are all shadowed: picks `id`
+        p_lower = manager.register_view(
+            "CREATE VIEW v_lower_int AS SELECT grp, SUM(val) AS s FROM t_lower_int GROUP BY grp;",
+            populate=False,
+        )
+        self.assertTrue(p_lower.has_watermark_triggers)
+        assert p_lower.incremental_backfill_spec is not None
+        self.assertEqual(p_lower.incremental_backfill_spec.pk_column, "id")
+        manager.backfill_incrementally(p_lower, batch_size=2, snapshot_isolation=False)
+        self.assertEqual(
+            self.conn.execute("SELECT grp, s FROM v_lower_int ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, SUM(val) FROM t_lower_int GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+
+        # 5. INTEGER PRIMARY KEY DESC (inline and table-level): NOT a rowid alias, preserves NULL-PK rows
+        for tbl, vn in (("t_desc_inline", "v_desc_inline"), ("t_desc_tbl", "v_desc_tbl")):
+            p_desc = manager.register_view(
+                f"CREATE VIEW {vn} AS SELECT grp, SUM(val) AS s FROM {tbl} GROUP BY grp;",
+                populate=True,
+                incremental_backfill=True,
+                batch_size=2,
+            )
+            assert p_desc.incremental_backfill_spec is not None
+            self.assertEqual(p_desc.incremental_backfill_spec.pk_column, "rowid")
+            self.assertEqual(
+                self.conn.execute(f"SELECT grp, s FROM {vn} ORDER BY grp;").fetchall(),
+                self.conn.execute(f"SELECT grp, SUM(val) FROM {tbl} GROUP BY grp ORDER BY grp;").fetchall(),
+            )
+
+        # 6. Non-STRICT `INT PRIMARY KEY NOT NULL` with REAL (2.5) and TEXT ('abc') PKs: uses `rowid`
+        p_ns_nn = manager.register_view(
+            "CREATE VIEW v_ns_nn AS SELECT grp, SUM(val) AS s FROM t_nonstrict_nn GROUP BY grp;",
+            populate=True,
+            incremental_backfill=True,
+            batch_size=2,
+        )
+        assert p_ns_nn.incremental_backfill_spec is not None
+        self.assertEqual(p_ns_nn.incremental_backfill_spec.pk_column, "rowid")
+        self.assertEqual(
+            self.conn.execute("SELECT grp, s FROM v_ns_nn ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, SUM(val) FROM t_nonstrict_nn GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+
+        # 7. User column named `rowid TEXT PRIMARY KEY`: falls back to `_rowid_`
+        p_sh1 = manager.register_view(
+            "CREATE VIEW v_shadow1 AS SELECT grp, SUM(val) AS s FROM t_shadow_rowid GROUP BY grp;",
+            populate=False,
+        )
+        self.assertTrue(p_sh1.has_watermark_triggers)
+        assert p_sh1.incremental_backfill_spec is not None
+        self.assertEqual(p_sh1.incremental_backfill_spec.pk_column, "_rowid_")
+        au1 = [d for d in p_sh1.trigger_ddls if "_au" in d][0]
+        self.assertIn("OLD._rowid_ = NEW._rowid_", au1)
+
+        worker_errors: list[BaseException] = []
+
+        def on_prog(batch_idx: int, _done: int) -> None:
+            if batch_idx != 1:
+                return
+            ev = threading.Event()
+
+            def wrk() -> None:
+                try:
+                    c2 = sqlite3.connect(self.db_path, timeout=10)
+                    try:
+                        c2.execute("PRAGMA busy_timeout=10000;")
+                        _register_sqlite_compat_udfs(c2)
+                        c2.execute("UPDATE t_shadow_rowid SET _rowid_ = 100 WHERE _rowid_ = 7;")
+                        c2.commit()
+                    finally:
+                        c2.close()
+                except BaseException as exc:
+                    worker_errors.append(exc)
+                finally:
+                    ev.set()
+
+            th = threading.Thread(target=wrk, daemon=True)
+            th.start()
+            self.assertTrue(ev.wait(timeout=10))
+            th.join(timeout=1)
+            if worker_errors:
+                raise worker_errors[0]
+
+        manager.backfill_incrementally(p_sh1, batch_size=3, on_progress=on_prog, snapshot_isolation=False)
+        self.assertEqual(
+            self.conn.execute("SELECT grp, s FROM v_shadow1 ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, SUM(val) FROM t_shadow_rowid GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+
+        # 8. All three aliases (`rowid`, `_rowid_`, `oid`) shadowed: no pk_range_fold
+        p_sh_all = manager.register_view(
+            "CREATE VIEW v_shadow_all AS SELECT grp, SUM(val) AS s FROM t_shadow_all GROUP BY grp;",
+            populate=True,
+        )
+        self.assertFalse(p_sh_all.has_watermark_triggers)
+        assert p_sh_all.incremental_backfill_spec is not None
+        self.assertEqual(p_sh_all.incremental_backfill_spec.mode, "group_key_batch")
+        self.assertEqual(
+            self.conn.execute("SELECT grp, s FROM v_shadow_all ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, SUM(val) FROM t_shadow_all GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+
+        # 9. Nullable SQLite `INT PRIMARY KEY`: uses `rowid`, never drops NULL-PK rows
+        p_null_pk = manager.register_view(
+            "CREATE VIEW v_null_int_pk AS SELECT grp, SUM(val) AS s FROM t_null_int_pk GROUP BY grp;",
+            populate=True,
+            incremental_backfill=True,
+            batch_size=2,
+        )
+        assert p_null_pk.incremental_backfill_spec is not None
+        self.assertEqual(p_null_pk.incremental_backfill_spec.pk_column, "rowid")
+        self.assertEqual(
+            self.conn.execute("SELECT grp, s FROM v_null_int_pk ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, SUM(val) FROM t_null_int_pk GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+
+    def test_aliased_projection_get_populate_statements_sqlite_execution(self) -> None:
+        """Aliased projection views must emit valid SQLite incremental populate CTEs
+        with zero syntax errors or unbound `?` placeholders."""
+        self.conn.executescript(
+            """
+            CREATE TABLE alias_src (id INTEGER PRIMARY KEY, val INTEGER NOT NULL);
+            INSERT INTO alias_src VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+            """
+        )
+        self.conn.commit()
+        manager = MaterializedViewManager(self.conn)
+        plan = manager.register_view(
+            "CREATE VIEW v_alias_proj AS SELECT s.val FROM alias_src AS s WHERE s.val >= 20;",
+            populate=False,
+        )
+        pop_sqls = plan.get_populate_statements(incremental_backfill=True)
+        for sql in pop_sqls:
+            self.assertNotIn("?", sql, f"unbound placeholder in SQLite incremental populate SQL:\n{sql}")
+            self.conn.execute(sql)
+        self.conn.commit()
+        self.assertEqual(
+            self.conn.execute("SELECT val FROM v_alias_proj ORDER BY val;").fetchall(),
+            self.conn.execute("SELECT s.val FROM alias_src AS s WHERE s.val >= 20 ORDER BY s.val;").fetchall(),
+        )
+
+    def test_register_view_incremental_backfill_and_generator_version_drift(self) -> None:
+        """`register_view(..., populate=True, incremental_backfill=True)` works on
+        unreferenced-PK views, and changing `MATVIEW_GENERATOR_VERSION` changes the
+        view signature so `sync_views` rebuilds stale trigger installations."""
+        import matview.manager as _mgr_mod
+
+        self.assertGreaterEqual(int(MATVIEW_GENERATOR_VERSION), 8)
+        self.conn.execute("CREATE TABLE t_inc_reg (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL);")
+        self.conn.executemany(
+            "INSERT INTO t_inc_reg VALUES (?, ?, ?);",
+            [(i, f"g{i % 2}", i * 5) for i in range(1, 9)],
+        )
+        self.conn.commit()
+        manager = MaterializedViewManager(self.conn)
+        view_sql = "CREATE VIEW v_inc_reg AS SELECT grp, SUM(val) AS s FROM t_inc_reg GROUP BY grp;"
+        plan = manager.register_view(view_sql, populate=True, incremental_backfill=True, batch_size=3)
+        self.assertEqual(
+            self.conn.execute("SELECT grp, s FROM v_inc_reg ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, SUM(val) FROM t_inc_reg GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+        schemas_now = manager.fetch_schema()
+        sig_current = manager._compute_signature(plan, schemas_now)
+        orig_ver = _mgr_mod.MATVIEW_GENERATOR_VERSION
+        try:
+            _mgr_mod.MATVIEW_GENERATOR_VERSION = "7"
+            sig_prev = manager._compute_signature(plan, schemas_now)
+        finally:
+            _mgr_mod.MATVIEW_GENERATOR_VERSION = orig_ver
+        self.assertNotEqual(sig_current, sig_prev, "MATVIEW_GENERATOR_VERSION bump did not change signature")
+        self.conn.execute(
+            "UPDATE __matview_catalog SET signature_hash = ? WHERE view_name = 'v_inc_reg';",
+            (sig_prev,),
+        )
+        self.conn.commit()
+        status = manager.sync_views([view_sql])
+        self.assertEqual(status["v_inc_reg"], "updated")
+
+
+class BackfillWatermarkCodegenTests(unittest.TestCase):
+    """Pure codegen tests (no temporary SQLite database required)."""
+
+    def test_mysql_and_mariadb_guard_tracks_unreferenced_and_reserved_pk_columns(self) -> None:
+        """On MySQL 8.4/9.7 and MariaDB, the outer AFTER UPDATE unchanged-row IF guard
+        must include an unreferenced integer PK (including reserved-keyword PKs) across
+        aggregates, DISTINCT, and projections even without COUNT(*)."""
+        cases = (
+            (
+                "agg_mysql84",
+                "mysql:8.4.0",
+                "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(32) NOT NULL, val INT NOT NULL, note TEXT);",
+                "CREATE VIEW v_my_unref_pk AS SELECT grp, SUM(val) AS s FROM items GROUP BY grp;",
+                "OLD.id",
+                "NEW.id",
+            ),
+            (
+                "agg_mysql97",
+                "mysql:9.7.0",
+                "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(32) NOT NULL, val INT NOT NULL, note TEXT);",
+                "CREATE VIEW v_my_unref_pk97 AS SELECT grp, SUM(val) AS s FROM items GROUP BY grp;",
+                "OLD.id",
+                "NEW.id",
+            ),
+            (
+                "reserved_mariadb",
+                "mariadb:11.8.0",
+                "CREATE TABLE orders (`order` INT UNSIGNED PRIMARY KEY, grp VARCHAR(32) NOT NULL, val INT NOT NULL);",
+                "CREATE VIEW v_ma_reserved_pk AS SELECT grp, SUM(val) AS s FROM orders GROUP BY grp;",
+                "OLD.`order`",
+                "NEW.`order`",
+            ),
+            (
+                "distinct_mysql84",
+                "mysql:8.4.0",
+                "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(32) NOT NULL, note TEXT);",
+                "CREATE VIEW v_my_dist AS SELECT DISTINCT grp FROM items;",
+                "OLD.id",
+                "NEW.id",
+            ),
+            (
+                "projection_mariadb",
+                "mariadb:11.8.0",
+                "CREATE TABLE items (id INT PRIMARY KEY, val INT NOT NULL, note TEXT);",
+                "CREATE VIEW v_ma_proj AS SELECT val FROM items;",
+                "OLD.id",
+                "NEW.id",
+            ),
+        )
+        for label, ver_str, ddl, view_sql, old_tok, new_tok in cases:
+            with self.subTest(case=label):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", EngineLimitationWarning)
+                    plan = generate_materialized_view(
+                        ddl,
+                        view_sql,
+                        dialect=Dialect.MYSQL,
+                        engine_version=ver_str,
+                        watermark_catalog_table="__matview_catalog",
+                        ignore_limitations=True,
+                    )
+                self.assertTrue(caught, "expected EngineLimitationWarning on MySQL/MariaDB TRUNCATE limitation")
+                au_ddls = [d for d in plan.trigger_ddls if "_au" in d]
+                self.assertTrue(au_ddls)
+                m_guard = re.search(r"IF\s*\(\s*NOT\s*\((.+?)\)\s*\)\s*THEN", au_ddls[0], flags=re.DOTALL)
+                self.assertIsNotNone(m_guard, f"missing outer unchanged-row guard: {au_ddls[0]}")
+                assert m_guard is not None
+                guard_expr = m_guard.group(1)
+                self.assertIn(old_tok, guard_expr)
+                self.assertIn(new_tok, guard_expr)
+                self.assertNotIn("OLD.note", guard_expr)
+
+    def test_aliased_projection_get_populate_statements_postgres_and_mysql(self) -> None:
+        """Aliased projection incremental populate SQL on PostgreSQL and MySQL must
+        replace every `%s` bound placeholder with procedural loop variables."""
+        for dialect, ver_str in ((Dialect.POSTGRES, "postgres:15.0"), (Dialect.MYSQL, "mysql:8.4.0")):
+            with self.subTest(dialect=dialect.value):
+                with warnings.catch_warnings(record=True):
+                    warnings.simplefilter("always", EngineLimitationWarning)
+                    plan = generate_materialized_view(
+                        "CREATE TABLE items (id INT PRIMARY KEY, val INT NOT NULL);",
+                        "CREATE VIEW v_aliased_p AS SELECT s.val FROM items AS s WHERE s.val > 0;",
+                        dialect=dialect,
+                        engine_version=ver_str,
+                        incremental_backfill=True,
+                        ignore_limitations=True,
+                    )
+                pop_sql = "\n".join(plan.get_populate_statements(incremental_backfill=True))
+                self.assertNotIn("%s", pop_sql, f"unbound %s in {dialect.value} incremental populate SQL:\n{pop_sql}")
+                self.assertIn("__mv_cur_pk", pop_sql)
+                self.assertIn("__mv_top_pk", pop_sql)
+
+    def test_non_integer_composite_and_holistic_views_do_not_use_pk_range_watermark(self) -> None:
+        """PostgreSQL INTERVAL/POINT PKs, composite PKs, and DISTINCT/holistic aggregate
+        views must NOT emit pk_range_fold or watermark-gated triggers."""
+        pg_cases = (
+            (
+                "interval_pk",
+                "CREATE TABLE t_iv (id INTERVAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL);",
+                "CREATE VIEW v_iv AS SELECT grp, SUM(val) AS s FROM t_iv GROUP BY grp;",
+            ),
+            (
+                "point_pk",
+                "CREATE TABLE t_pt (id POINT PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL);",
+                "CREATE VIEW v_pt AS SELECT grp, SUM(val) AS s FROM t_pt GROUP BY grp;",
+            ),
+            (
+                "composite_pk",
+                "CREATE TABLE t_cp (a INT, b INT, grp TEXT NOT NULL, val INT NOT NULL, PRIMARY KEY (a, b));",
+                "CREATE VIEW v_cp AS SELECT grp, SUM(val) AS s FROM t_cp GROUP BY grp;",
+            ),
+            (
+                "distinct_agg_group_key_batch",
+                "CREATE TABLE t_da (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL);",
+                "CREATE VIEW v_da AS SELECT grp, COUNT(DISTINCT val) AS cd FROM t_da GROUP BY grp;",
+            ),
+        )
+        for label, ddl, view_sql in pg_cases:
+            with self.subTest(case=label):
+                plan = generate_materialized_view(
+                    ddl,
+                    view_sql,
+                    dialect=Dialect.POSTGRES,
+                    watermark_catalog_table="__matview_catalog",
+                )
+                self.assertFalse(plan.has_watermark_triggers, f"{label}: unexpected watermark triggers")
+                assert plan.incremental_backfill_spec is not None
+                self.assertNotEqual(plan.incremental_backfill_spec.mode, "pk_range_fold")
 
 
 if __name__ == "__main__":

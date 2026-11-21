@@ -271,15 +271,10 @@ class PgStatementMaintenanceMixin(MixinHost):
         if not self.watermark_catalog_table:
             return None
         if pk_col is None:
-            if not self.primary_schema:
-                return None
-            for c_def in self.primary_schema.columns.values():
-                if c_def.primary_key and "INT" in c_def.data_type.upper():
-                    pk_col = c_def.name
-                    break
+            pk_col = self._resolve_pk_range_column(allow_sqlite_rowid=False)
         if not pk_col:
             return None
-        q_pk = self._q(pk_col)
+        q_pk = self._quote_pk_range_col(pk_col)
         view_lit = self.db_view_name.replace("'", "''")
         return (
             f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "

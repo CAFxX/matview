@@ -22,7 +22,7 @@ from .engines import (
     parse_engine_version,
 )
 from .logical_ir import ColumnDef, TableIndexDef, TableSchema
-from .sql_frontend import parse_table_index_def, parse_table_schema
+from .sql_frontend import _strip_sql_comments, parse_table_index_def, parse_table_schema
 
 def detect_engine_version(
     conn: Any,
@@ -662,6 +662,7 @@ def introspect_sqlite_schemas(
         rows = cur.fetchall() or []
         ddl_parts: List[str] = []
         table_names: List[str] = []
+        table_sqls: Dict[str, str] = {}
         for obj_type, name, sql, tbl_name in rows:
             if not name:
                 continue
@@ -675,6 +676,8 @@ def introspect_sqlite_schemas(
                 continue
             if str(obj_type).lower() == "table":
                 table_names.append(t_str)
+                if sql:
+                    table_sqls[t_str.lower()] = str(sql)
             if sql:
                 ddl_parts.append(str(sql).rstrip(";") + ";")
         schemas = (
@@ -697,19 +700,37 @@ def introspect_sqlite_schemas(
                 pk_entries = sorted(((int(r[5]), str(r[1])) for r in t_info if int(r[5] or 0) > 0), key=lambda x: x[0])
                 pk_cols_seq = tuple(name for _, name in pk_entries)
                 pk_count = len(pk_cols_seq)
+                raw_tbl_sql = _strip_sql_comments(table_sqls.get(t_str.lower(), ""))
+                rparen_idx = raw_tbl_sql.rfind(")")
+                fb_tail = raw_tbl_sql[rparen_idx + 1 :] if rparen_idx >= 0 else ""
+                fb_without_rowid = bool(re.search(r"\bWITHOUT\s+ROWID\b", fb_tail, re.IGNORECASE))
+                fb_strict = bool(re.search(r"\bSTRICT\b", fb_tail, re.IGNORECASE))
+                fb_pk_desc = bool(
+                    re.search(
+                        r"\bPRIMARY\s+KEY\s+DESC\b|\bPRIMARY\s+KEY\s*\([^)]*\bDESC\b",
+                        raw_tbl_sql,
+                        re.IGNORECASE,
+                    )
+                )
                 cols: Dict[str, ColumnDef] = {}
                 for r in t_info:
                     c_name = str(r[1])
                     c_type = str(r[2]).upper() if r[2] else "BLOB"  # no declared type: BLOB affinity
                     c_pk = bool(r[5])
-                    c_notnull = bool(r[3]) or (
-                        c_pk and pk_count == 1 and re.sub(r"\s+", " ", c_type.strip()) == "INTEGER"
+                    c_rowid_alias = (
+                        c_pk
+                        and pk_count == 1
+                        and not fb_without_rowid
+                        and not fb_pk_desc
+                        and re.sub(r"\s+", " ", c_type.strip().upper()) == "INTEGER"
                     )
+                    c_notnull = bool(r[3]) or (c_pk and (fb_without_rowid or c_rowid_alias))
                     cols[c_name] = ColumnDef(
                         name=c_name,
                         data_type=c_type,
                         not_null=c_notnull,
                         primary_key=c_pk,
+                        is_rowid_alias=c_rowid_alias,
                     )
                 fk_actions: List[str] = []
                 try:
@@ -759,6 +780,8 @@ def introspect_sqlite_schemas(
                     fk_cascade_actions=tuple(fk_actions),
                     indexes=tuple(sq_idx_defs),
                     pk_columns=pk_cols_seq,
+                    without_rowid=fb_without_rowid,
+                    strict=fb_strict,
                 )
             except Exception:
                 pass

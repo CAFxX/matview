@@ -81,7 +81,10 @@ from .sql_frontend import (
 #    and track all hashed columns in UPDATE triggers.
 # 7: dialect-native statistical aliases and native result representation
 #    (trigger/reader-only changes).
-MATVIEW_GENERATOR_VERSION = "7"
+# 8: Watermark-gated backfill UPDATE triggers always track the watermark/backfill
+#    range key (including unreferenced integer PKs and unshadowed SQLite rowid
+#    aliases) and strictly validate integer PK / WITHOUT ROWID eligibility.
+MATVIEW_GENERATOR_VERSION = "8"
 
 
 def _definition_digest(select_sql: str) -> str:
@@ -98,7 +101,6 @@ def _stored_select_sql(view_sql: str) -> str:
     first = re.split(r";\s*\n\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b", view_sql or "", maxsplit=1, flags=re.IGNORECASE)[0]
     m = re.match(r"\s*CREATE\s+VIEW\s+\S+\s+AS\s+(.*)$", first, flags=re.IGNORECASE | re.DOTALL)
     return m.group(1) if m else first
-
 
 # How to repopulate a view whose pk-range backfill is incomplete.
 _REPAIR_GUIDANCE = (

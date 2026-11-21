@@ -1858,6 +1858,97 @@ class DialectBaseMixin(MixinHost):
             out.append(expr[cursor:])
         return "".join(out)
 
+    _STRICT_INT_BASE_TYPES: frozenset[str] = frozenset(
+        {
+            "TINYINT",
+            "SMALLINT",
+            "MEDIUMINT",
+            "INT",
+            "INTEGER",
+            "BIGINT",
+            "INT1",
+            "INT2",
+            "INT3",
+            "INT4",
+            "INT8",
+            "SMALLSERIAL",
+            "SERIAL",
+            "BIGSERIAL",
+            "SERIAL2",
+            "SERIAL4",
+            "SERIAL8",
+        }
+    )
+
+    @classmethod
+    def _is_strict_integer_type(cls, data_type: str) -> bool:
+        """True only for exact integer column types (never INTERVAL, POINT, arrays, or ranges)."""
+        dt = re.sub(r"\s+", " ", (data_type or "").strip().upper())
+        if not dt:
+            return False
+        m = re.match(
+            r"^([A-Z0-9_]+)(?:\s*\(\s*\d+\s*\))?(?:\s+(?:UNSIGNED|SIGNED|ZEROFILL))*$",
+            dt,
+        )
+        if not m:
+            return False
+        return m.group(1) in cls._STRICT_INT_BASE_TYPES
+
+    def _is_implicit_sqlite_rowid(self, col_name: Optional[str]) -> bool:
+        if self.dialect != Dialect.SQLITE or not col_name:
+            return False
+        low = col_name.lower()
+        if low not in ("rowid", "_rowid_", "oid"):
+            return False
+        ts = self.primary_schema
+        return ts is None or all(c.lower() != low for c in ts.columns)
+
+    def _quote_pk_range_col(self, col_name: str) -> str:
+        if self._is_implicit_sqlite_rowid(col_name):
+            return col_name.lower()
+        return self._q(col_name)
+
+    def _resolve_pk_range_column(
+        self,
+        *,
+        allow_sqlite_rowid: bool = True,
+        require_non_composite_for_rowid: bool = False,
+    ) -> Optional[str]:
+        """Return the single non-null exact-integer column suitable for pk_range_fold
+        backfill and watermark trigger gating, or None when pk_range_fold is unsafe."""
+        ts = self.primary_schema
+        if ts is None:
+            return "rowid" if (allow_sqlite_rowid and self.dialect == Dialect.SQLITE) else None
+        pk_defs = [c for c in ts.columns.values() if c.primary_key]
+        if len(pk_defs) == 1:
+            pk_c = pk_defs[0]
+            if self.dialect == Dialect.SQLITE:
+                # On SQLite, non-STRICT INT/BIGINT/WITHOUT ROWID PKs only have
+                # integer affinity and accept REAL (2.5) or TEXT ('abc'), which
+                # would truncate or raise ValueError during pk_range_fold.
+                # Only a true INTEGER PRIMARY KEY rowid alias, or a NOT NULL
+                # integer PK on a STRICT table, is guaranteed 64-bit integer.
+                if pk_c.is_rowid_alias or (
+                    ts.strict and pk_c.not_null and self._is_strict_integer_type(pk_c.data_type)
+                ):
+                    return pk_c.name
+            else:
+                # PostgreSQL and MySQL/MariaDB enforce NOT NULL and strict
+                # integer typing on single-column integer PRIMARY KEY columns.
+                if self._is_strict_integer_type(pk_c.data_type):
+                    return pk_c.name
+        if (
+            allow_sqlite_rowid
+            and self.dialect == Dialect.SQLITE
+            and not ts.without_rowid
+            and (not require_non_composite_for_rowid or len(pk_defs) <= 1)
+        ):
+            user_cols_lower = {c.lower() for c in ts.columns}
+            for alias in ("rowid", "_rowid_", "oid"):
+                if alias not in user_cols_lower:
+                    return alias
+        return None
+
     def _referenced_columns_for_table(self, table_name: str) -> List[str]:
         ts = self._schemas_lower.get(table_name.lower())
         if not ts:

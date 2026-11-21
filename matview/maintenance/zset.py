@@ -955,20 +955,10 @@ class Tier1ZSetMixin(MixinHost):
         )
         q_base_prefix = f"{self._q(base_alias)}." if is_base_aliased else ""
 
-        wm_pk_col: Optional[str] = None
-        if uses_native_pk:
-            int_pk_cols = [
-                c for c in self.primary_schema.columns.values()
-                if c.primary_key and "INT" in c.data_type.upper()
-            ]
-            if len(int_pk_cols) == 1 and len(pk_names) == 1:
-                wm_pk_col = int_pk_cols[0].name
-        elif self.dialect == Dialect.SQLITE and len(pk_names) <= 1 and not is_base_aliased:
-            # Non-native single-column PK or keyless table on SQLite:
-            # use non-null 64-bit integer rowid so NULL-PK rows and TEXT PKs are
-            # never dropped or rejected during pk_range_fold backfill (composite
-            # PKs remain on offset_batch).
-            wm_pk_col = "rowid"
+        wm_pk_col = self._resolve_pk_range_column(
+            allow_sqlite_rowid=not is_base_aliased,
+            require_non_composite_for_rowid=True,
+        )
 
         if uses_native_pk:
             all_backing_cols = [*user_columns, *[h[0] for h in hidden_pk_defs]]
@@ -1005,7 +995,7 @@ class Tier1ZSetMixin(MixinHost):
                 )
             if wm_pk_col:
                 ph = "?" if self.dialect == Dialect.SQLITE else "%s"
-                q_wm_pk = self._q(wm_pk_col)
+                q_wm_pk = f"{q_base_prefix}{self._quote_pk_range_col(wm_pk_col)}"
                 chunk_w = (
                     f"({self.view.where_clause}) AND ({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
                     if self.view.where_clause
@@ -1021,7 +1011,7 @@ class Tier1ZSetMixin(MixinHost):
                             f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
                             f"SELECT * FROM (\n"
                             f"    SELECT {', '.join(aliased_chunk_sel)}\n"
-                            f"    FROM {q_base_t}\n"
+                            f"    FROM {from_base_sql}\n"
                             f"    WHERE {chunk_w}\n"
                             f") AS __mv_src\n"
                             f"ON DUPLICATE KEY UPDATE {chunk_upd};"
@@ -1029,14 +1019,14 @@ class Tier1ZSetMixin(MixinHost):
                     else:
                         chunk_upsert_sql = (
                             f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
-                            f"SELECT {', '.join(all_select_exprs)}\nFROM {q_base_t}\n"
+                            f"SELECT {', '.join(all_select_exprs)}\nFROM {from_base_sql}\n"
                             f"WHERE {chunk_w}\n"
                             f"ON DUPLICATE KEY UPDATE {upd_set};"
                         )
                 else:
                     chunk_upsert_sql = (
                         f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
-                        f"SELECT {', '.join(all_select_exprs)}\nFROM {q_base_t}\n"
+                        f"SELECT {', '.join(all_select_exprs)}\nFROM {from_base_sql}\n"
                         f"WHERE {chunk_w}\n"
                         f"ON CONFLICT ({', '.join(q_mv_pk_cols)}) DO UPDATE SET {upd_set};"
                     )
@@ -1054,11 +1044,18 @@ class Tier1ZSetMixin(MixinHost):
                 f"{q_base_t}.{self._q(src_c)} = OLD.{self._q(src_c)}"
                 for src_c in pk_names
             )
-            and_base_where = (
-                f" AND ({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})"
-                if self.view.where_clause
-                else ""
-            )
+            base_where_parts: List[str] = []
+            if self.view.where_clause:
+                base_where_parts.append(f"({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})")
+            if self.watermark_catalog_table and wm_pk_col:
+                q_wm = self._quote_pk_range_col(wm_pk_col)
+                view_lit = self.db_view_name.replace("'", "''")
+                base_where_parts.append(
+                    f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
+                    f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
+                    f"AND {q_base_t}.{q_wm} > backfill_cursor_pk AND {q_base_t}.{q_wm} <= backfill_max_pk)"
+                )
+            and_base_where = f" AND {' AND '.join(base_where_parts)}" if base_where_parts else ""
             upd_del_stmt = (
                 f"DELETE FROM {mv_table}\n"
                 f"    WHERE {del_where}\n"
@@ -1119,7 +1116,7 @@ class Tier1ZSetMixin(MixinHost):
                 )
             if wm_pk_col:
                 ph = "?" if self.dialect == Dialect.SQLITE else "%s"
-                q_wm_pk = self._q(wm_pk_col)
+                q_wm_pk = f"{q_base_prefix}{self._quote_pk_range_col(wm_pk_col)}"
                 chunk_w = (
                     f"({self.view.where_clause}) AND ({q_wm_pk} > {ph} AND {q_wm_pk} <= {ph})"
                     if self.view.where_clause
@@ -1183,15 +1180,16 @@ class Tier1ZSetMixin(MixinHost):
         )
 
         if self.watermark_catalog_table and wm_pk_col:
-            q_pk = self._q(wm_pk_col)
+            q_pk = self._quote_pk_range_col(wm_pk_col)
+            view_lit = self.db_view_name.replace("'", "''")
             wm_new = (
                 f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
-                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
                 f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"
             )
             wm_old = (
                 f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
-                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
+                f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
                 f"AND OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"
             )
             where_new = f"({where_new}) AND ({wm_new})" if where_new else wm_new
@@ -1253,7 +1251,13 @@ class Tier1ZSetMixin(MixinHost):
             pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
             trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
 
-        upd_key_cols = pk_names if uses_native_pk else pk_hash_cols  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
+        upd_key_cols = list(pk_names if uses_native_pk else pk_hash_cols)  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
+        if (
+            self.watermark_catalog_table
+            and wm_pk_col
+            and wm_pk_col.lower() not in {c.lower() for c in upd_key_cols}
+        ):
+            upd_key_cols.append(wm_pk_col)
         trigger_ddls, trig_names, fn_names = self._emit_dialect_triggers_for_table(
             view_name=view_name,
             base_t=base_t,

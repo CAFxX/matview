@@ -1106,20 +1106,25 @@ def parse_table_schema(
                     )
                 )
 
-        without_rowid = dialect == Dialect.SQLITE and bool(
-            re.search(r"\bWITHOUT\s+ROWID\b", raw_stmt_s, re.IGNORECASE)
-        )
-        col_items: List[Tuple[str, str, bool, bool]] = []
+        without_rowid = False
+        strict = False
+        if eff_dialect == Dialect.SQLITE:
+            stripped_stmt = _strip_sql_comments(raw_stmt_s)
+            rparen_idx = stripped_stmt.rfind(")")
+            tail_opts = stripped_stmt[rparen_idx + 1 :] if rparen_idx >= 0 else ""
+            without_rowid = bool(re.search(r"\bWITHOUT\s+ROWID\b", tail_opts, re.IGNORECASE))
+            strict = bool(re.search(r"\bSTRICT\b", tail_opts, re.IGNORECASE))
+        col_items: List[Tuple[str, str, bool, bool, bool]] = []
         generated_cols_lower: Set[str] = set()
         all_pk_cols_lower: Set[str] = set(table_pk_cols)
         ordered_pk_cols: List[str] = list(table_pk_cols_order)
         for expr_item in schema_node.expressions:
-            if dialect == Dialect.SQLITE and isinstance(expr_item, sqlglot_exp.Identifier) and expr_item.name:
+            if eff_dialect == Dialect.SQLITE and isinstance(expr_item, sqlglot_exp.Identifier) and expr_item.name:
                 # SQLite column without a declared type or constraints
                 # ("CREATE TABLE t (id INTEGER PRIMARY KEY, x)"): sqlglot yields
                 # a bare identifier. It is a real column with BLOB affinity
                 # (values keep their storage class).
-                col_items.append((expr_item.name, "BLOB", False, False))
+                col_items.append((expr_item.name, "BLOB", False, False, False))
                 continue
             if isinstance(expr_item, sqlglot_exp.ColumnDef):
                 col_name = expr_item.name
@@ -1152,6 +1157,11 @@ def parse_table_schema(
                     isinstance(c.kind, sqlglot_exp.PrimaryKeyColumnConstraint)
                     for c in expr_item.constraints
                 )
+                pk_desc = any(
+                    isinstance(c.kind, sqlglot_exp.PrimaryKeyColumnConstraint)
+                    and bool(c.kind.args.get("desc"))
+                    for c in expr_item.constraints
+                )
                 if any(
                     isinstance(c.kind, sqlglot_exp.UniqueColumnConstraint)
                     for c in expr_item.constraints
@@ -1177,19 +1187,26 @@ def parse_table_schema(
                 if is_pk and col_name.lower() not in all_pk_cols_lower:
                     all_pk_cols_lower.add(col_name.lower())
                     ordered_pk_cols.append(col_name)
-                col_items.append((col_name, data_type, is_pk, explicit_not_null))
+                col_items.append((col_name, data_type, is_pk, explicit_not_null, pk_desc))
 
         single_pk = len(all_pk_cols_lower) == 1
-        for col_name, data_type, is_pk, explicit_not_null in col_items:
+        for col_name, data_type, is_pk, explicit_not_null, pk_desc in col_items:
             eff_pk = is_pk or (col_name.lower() in all_pk_cols_lower)
-            if dialect == Dialect.SQLITE:
+            is_rowid_alias = False
+            if eff_dialect == Dialect.SQLITE:
                 # On SQLite, only explicit NOT NULL, WITHOUT ROWID PKs, or a
-                # single-column INTEGER PRIMARY KEY (rowid alias) disallow NULL.
-                raw_declared = raw_col_types.get(col_name.lower(), data_type.strip().upper())
+                # single-column INTEGER PRIMARY KEY (not DESC, not WITHOUT ROWID)
+                # disallow NULL and enforce 64-bit signed integer storage.
+                raw_declared = re.sub(
+                    r"\s+",
+                    " ",
+                    raw_col_types.get(col_name.lower(), data_type).strip().upper(),
+                )
                 is_rowid_alias = (
                     eff_pk
                     and single_pk
                     and not without_rowid
+                    and not pk_desc
                     and raw_declared == "INTEGER"
                 )
                 not_null = explicit_not_null or (eff_pk and (without_rowid or is_rowid_alias))
@@ -1201,6 +1218,7 @@ def parse_table_schema(
                 not_null=not_null,
                 primary_key=eff_pk,
                 generated=col_name.lower() in generated_cols_lower,
+                is_rowid_alias=is_rowid_alias,
             )
 
         schemas[table_name] = TableSchema(
@@ -1210,6 +1228,8 @@ def parse_table_schema(
             has_on_conflict_replace=has_on_conflict_replace,
             indexes=tuple(inline_indexes),
             pk_columns=tuple(ordered_pk_cols),
+            without_rowid=without_rowid,
+            strict=strict,
         )
 
     if pending_indexes:
@@ -1230,6 +1250,8 @@ def parse_table_schema(
                 has_on_conflict_replace=existing.has_on_conflict_replace,
                 indexes=tuple(merged),
                 pk_columns=existing.pk_columns,
+                without_rowid=existing.without_rowid,
+                strict=existing.strict,
             )
     return schemas
 
