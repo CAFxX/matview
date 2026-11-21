@@ -212,12 +212,16 @@ class AliasResolutionTests(unittest.TestCase):
 
 class AliasFloatRefusalTests(unittest.TestCase):
     """An alias-resolved statistic over a floating-point column takes the same
-    path as its canonical spelling: refused by default with the per-code
-    order-sensitivity limitation, accepted only when that code is accepted."""
+    path as its canonical spelling: exact by default (full refresh of the
+    original query, FLOAT_EXACT_REFRESH diagnostic), relaxed incremental
+    maintenance only when FLOAT_REASSOCIATION_ALLOWED is accepted per code."""
 
-    CODE = "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"
+    CODE = "FLOAT_REASSOCIATION_ALLOWED"
 
-    def test_alias_over_float_is_refused_by_default_and_accepted_per_code(self) -> None:
+    def test_alias_over_float_is_refreshed_by_default_and_relaxed_per_code(self) -> None:
+        from matview.diagnostics import FLOAT_EXACT_REFRESH
+        from matview_sync import MaintenanceStrategy
+
         for engine, canonical in (("postgres:18", {"VARIANCE": "VAR_SAMP", "STDDEV": "STDDEV_SAMP"}),
                                   ("mysql:8.4", {"VARIANCE": "VAR_POP", "STDDEV": "STDDEV_POP", "STD": "STDDEV_POP"}),
                                   ("mariadb:10.11", {"VARIANCE": "VAR_POP", "STDDEV": "STDDEV_POP", "STD": "STDDEV_POP"})):
@@ -228,9 +232,8 @@ class AliasFloatRefusalTests(unittest.TestCase):
                 with self.subTest(engine=engine, alias=alias):
                     view = f"CREATE VIEW v AS SELECT g, {alias}(x) AS s FROM t GROUP BY g;"
                     with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", EngineLimitationWarning)
-                        with self.assertRaisesRegex(EngineLimitationError, self.CODE):
-                            generate_materialized_view(schema, view, dialect=engine, ignore_limitations=True)
+                        warnings.simplefilter("ignore")
+                        default = generate_materialized_view(schema, view, dialect=engine, ignore_limitations=True)
                         plan = generate_materialized_view(
                             schema, view, dialect=engine, ignore_limitations=True, accept_limitations=[self.CODE]
                         )
@@ -238,6 +241,8 @@ class AliasFloatRefusalTests(unittest.TestCase):
                             schema, view.replace(f"{alias}(x)", f"{canon}(x)"), dialect=engine,
                             ignore_limitations=True, accept_limitations=[self.CODE],
                         )
+                    self.assertEqual(default.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
+                    self.assertEqual([d.code for d in default.strategy_diagnostics], [FLOAT_EXACT_REFRESH])
                     self.assertIn(self.CODE, {l.code for l in plan.limitations})
                     self.assertEqual({l.code for l in plan.limitations}, {l.code for l in canon_plan.limitations})
 

@@ -518,7 +518,7 @@ class NativePostgresReplacementTests(_ReplacementScenarios, unittest.TestCase):
             # SUM over a function result is not provably exact: per-code opt-in.
             manager.register_view(
                 V1.replace("SUM(amt)", "SUM(maybe_fail(amt))"), force_rebuild=True,
-                accept_limitations=["ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"],
+                accept_limitations=["FLOAT_REASSOCIATION_ALLOWED"],
             )
         self.execute(self.conn, "UPDATE fail_switch SET on_ = FALSE")
         self.assert_old_generation_intact(manager, before)

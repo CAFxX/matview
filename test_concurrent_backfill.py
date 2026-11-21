@@ -911,10 +911,10 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                 {
                     "MYSQL_NO_TRUNCATE_TRIGGER",
                     "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
-                    "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+                    "FLOAT_REASSOCIATION_ALLOWED",
                 }
                 if engine == Dialect.MYSQL
-                else {"ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"}
+                else {"FLOAT_REASSOCIATION_ALLOWED"}
             )
             self.assertEqual(
                 {lim.code for lim in plan.limitations},
