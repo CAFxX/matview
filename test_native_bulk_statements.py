@@ -988,31 +988,72 @@ _E2 = ("A single-table projection without its source primary key must still main
 
 
 BACKFILL_SCHEMA = {
-    "postgres": ["CREATE TABLE bt (id INT PRIMARY KEY, g INT NOT NULL, x NUMERIC(12,3))"],
-    "mysql": ["CREATE TABLE bt (id INT PRIMARY KEY, g INT NOT NULL, x DECIMAL(12,3)) ENGINE=InnoDB"],
+    "postgres": ["CREATE TABLE bt (id INT PRIMARY KEY, g INT NOT NULL, x INT)"],
+    "mysql": ["CREATE TABLE bt (id INT PRIMARY KEY, g INT NOT NULL, x INT) ENGINE=InnoDB"],
     "sqlite": ["CREATE TABLE bt (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, x INTEGER)"],
 }
+# One backfill batch of 20 is folded (ids 1..20, cursor 20) when the writes
+# run; the unfolded window is 21..28 (max_pk 28): one row per group, which a
+# trigger-side recompute must not read. Each group retracts one extreme by a
+# delete or by a pk move out of the window (the old pk is folded, the new one
+# beyond max_pk), then its unfolded row is deleted (the trigger skips that
+# delete and no later chunk touches the group).
+# group: (folded values, retracted value, unfolded value, how)
+_BACKFILL_GROUPS = {
+    1: ([12, 14], 12, -50, "delete"),  # MIN; the cursor row (id 20, value 13) becomes the MIN
+    2: ([12, 13], 12, -50, "move"),  # MIN
+    3: ([99, 20, 21], 99, 500, "delete"),  # MAX
+    4: ([99, 20], 99, 500, "move"),  # MAX
+    5: ([1, 2], 1, 1024, "delete"),  # BIT_OR
+    6: ([1, 2], 1, 1024, "move"),  # BIT_OR
+    7: ([3, 6], 3, 1, "delete"),  # BIT_AND
+    8: ([6, 3], 6, 1, "move"),  # BIT_AND
+}
+
+
+def _backfill_rows_and_writes() -> Tuple[List[Tuple[int, int, int]], List[str]]:
+    rows: List[Tuple[int, int, int]] = []
+    writes: List[str] = []
+    next_id = iter(range(1, 20))
+    for g, (folded, retracted, _, how) in _BACKFILL_GROUPS.items():
+        for x in folded:
+            i = next(next_id)
+            rows.append((i, g, x))
+            if x == retracted and not any(w.endswith(f"id = {i}") for w in writes):
+                writes.append(f"DELETE FROM bt WHERE id = {i}" if how == "delete"
+                              else f"UPDATE bt SET id = {900 + g} WHERE id = {i}")
+    for i in next_id:
+        rows.append((i, 9, i))  # filler up to id 19
+    rows.append((20, 1, 13))  # the cursor row
+    # 21 = cursor + 1 (group 1, MIN), 28 = max_pk (group 4, MAX): both bounds
+    # matter on every engine (SQLite has no BIT_AND/BIT_OR).
+    for i, g in enumerate((1, 2, 3, 5, 6, 7, 8, 4), start=21):
+        rows.append((i, g, _BACKFILL_GROUPS[g][2]))
+    writes.append("DELETE FROM bt WHERE id BETWEEN 21 AND 28")
+    return rows, writes
 
 
 @pytest.mark.parametrize("target", _params())
 def test_recompute_during_backfill_ignores_rows_not_yet_folded(make_env, target: Target) -> None:
     """While a pk-range backfill is active the triggers skip source rows in
     the unfolded window, which the backfill folds later. A native recompute
-    by a trigger (AVG, MIN/MAX after a retraction) must skip them too:
-    otherwise it stores a value that includes such a row, and when the row
-    is deleted before its chunk runs (the trigger skips that delete), no
-    chunk touches the group again and the stale value stays (CI failure of
+    by a trigger (MIN/MAX/BIT_AND/BIT_OR after a retraction, AVG where it is
+    recomputed) must skip them too: otherwise it stores a value that includes
+    such a row, and when the row is deleted before its chunk runs (the
+    trigger skips that delete) no chunk touches the group again and the
+    stale value stays (CI failure of
     test_pgmy_exact_float_aggregates.py::NativeConcurrentWriters on PG 15).
+    The rows at the cursor (folded), at cursor + 1 and at max_pk (unfolded)
+    check both window bounds.
 
     Deterministic: the writes run on an independent connection between two
     committed backfill batches (from the progress callback)."""
     env = make_env(target, views=[], seed=False, schema_sql=BACKFILL_SCHEMA[target.family])
-    # Group 1: ids 1..10 (first chunk) and id 25 (third chunk, the smallest
-    # value); group 2 fills the second and third chunks.
-    rows = [(i, 1, 10 + i) for i in range(1, 11)] + [(i, 2, i) for i in range(11, 25)] + [(25, 1, -50)]
+    rows, writes = _backfill_rows_and_writes()
     env.execute("INSERT INTO bt (id, g, x) VALUES " + ", ".join(f"({i}, {g}, {x})" for i, g, x in rows))
     env.commit()
-    vd = ViewDef("v_bt", "SELECT g, COUNT(*) AS n, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx FROM bt GROUP BY g")
+    bits = "" if target.family == "sqlite" else ", BIT_AND(x) AS ba, BIT_OR(x) AS bo"  # no SQLite BIT_AND
+    vd = ViewDef("v_bt", f"SELECT g, COUNT(*) AS n, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx{bits} FROM bt GROUP BY g")
     env.views = [vd]
     plan = env.register(vd, populate=False)
     writer = env.connect()
@@ -1021,18 +1062,14 @@ def test_recompute_during_backfill_ignores_rows_not_yet_folded(make_env, target:
     def on_progress(batch: int, _rows: int) -> None:
         if batch != 1:
             return
-        # Folded: ids 1..10; unfolded window: 11..25.
-        for sql in ("INSERT INTO bt (id, g, x) VALUES (1000, 1, 7)",  # AVG of group 1 recomputed
-                    "DELETE FROM bt WHERE id = 10",  # group 1's MAX retracted: recomputed
-                    "DELETE FROM bt WHERE id = 1",  # group 1's MIN retracted: recomputed
-                    "DELETE FROM bt WHERE id = 25"):  # in the window: skipped by the trigger
+        for sql in writes:
             env.execute(sql, conn=writer)
             env.commit(conn=writer)
         done.append(batch)
 
-    env.manager.backfill_incrementally(plan, batch_size=10, on_progress=on_progress, snapshot_isolation=False)
+    env.manager.backfill_incrementally(plan, batch_size=20, on_progress=on_progress, snapshot_isolation=False)
     assert done == [1]
-    env.check("backfill after writes that recomputed a group with unfolded rows")
+    env.check("backfill after recomputes of groups with unfolded rows")
 
 
 @pytest.mark.parametrize("target", _params())
