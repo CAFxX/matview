@@ -2305,6 +2305,11 @@ class TranspiledConnectionAdapter:
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
             ).fetchone()
             return [(found[0] if found else None,)], 1
+        if self.dialect == Dialect.MYSQL and s_up.startswith("SELECT GET_LOCK(CONCAT('__MATVIEW_BYPASS:'"):
+            # bulk_changes() session-bypass lock: one emulated session.
+            return [(1,)], 1
+        if self.dialect == Dialect.MYSQL and s_up.startswith("DO RELEASE_LOCK(CONCAT('__MATVIEW_BYPASS:'"):
+            return [], 0
         if self.dialect == Dialect.POSTGRES and s_up.startswith("LOCK TABLE "):
             # SQLite serializes writers database-wide: table locks are implied.
             return [], 0
@@ -2323,6 +2328,11 @@ class TranspiledConnectionAdapter:
                 self._skip_triggers = 1 if ("'ON'" in s_up or "= 1" in s_up or "=1" in s_up) else 0
             return [], 0
 
+        if "INFORMATION_SCHEMA.TRIGGERS" in s_up and "ORDER BY ACTION_ORDER" in s_up:
+            # Registration's "existing triggers of this table and event"
+            # lookup (PRECEDES placement): the emulation keeps no trigger
+            # order, so report none.
+            return [], 0
         if "INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS" in s_up:
             schemas = introspect_sqlite_schemas(self._sq_conn)
             rows = []
@@ -2612,7 +2622,8 @@ class TranspiledConnectionAdapter:
                     m_tr.group(4).strip(),
                 )
                 m_skip_wrap = re.match(
-                    r"^IF\s+COALESCE\(@__matview_skip_triggers,\s*0\)\s*=\s*0\s+THEN\s*(.*)\s*END\s+IF;$",
+                    r"^IF\s+NOT\s+\(COALESCE\(@__matview_skip_triggers,\s*0\)\s*<>\s*0\s+AND\s+IS_USED_LOCK\("
+                    r"CONCAT\('__matview_bypass:',\s*CONNECTION_ID\(\)\)\)\s*<=>\s*CONNECTION_ID\(\)\)\s+THEN\s*(.*)\s*END\s+IF;$",
                     body,
                     flags=re.I | re.S,
                 )
@@ -2624,6 +2635,23 @@ class TranspiledConnectionAdapter:
                     flags=re.I,
                 )
                 main_pks = self._table_pks.get(m_target.group(1).lower(), ["__mv_pk"]) if m_target else ["__mv_pk"]
+                # MariaDB ignored-update guard (a nested IF with a locking
+                # read of the source row): the emulation has no UPDATE IGNORE
+                # trigger quirk and SQLite no locking reads, so drop the guard
+                # and its END IF (the one closing just before the outer guard's).
+                m_ign = re.search(
+                    r"IF\s+[^\n]*?NOT\s+EXISTS\s*\(SELECT\s+1\s+FROM\s+\S+\s+AS\s+__mv_cur\s+WHERE\s+[^\n]*?"
+                    r"LOCK\s+IN\s+SHARE\s+MODE\)\)?\s+THEN\s*",
+                    body,
+                    flags=re.I,
+                )
+                if m_ign:
+                    tail = body[m_ign.end():]
+                    ends = [m.start() for m in re.finditer(r"END\s+IF;", tail, flags=re.I)]
+                    if len(ends) >= 2:
+                        cut = ends[-2]
+                        tail = tail[:cut] + re.sub(r"^END\s+IF;", "", tail[cut:], count=1, flags=re.I)
+                    body = body[:m_ign.start()] + tail
                 b_clean = self._convert_mysql_dml_to_sqlite(body, main_pks)
                 when_cl = ""
                 m_outer = re.match(

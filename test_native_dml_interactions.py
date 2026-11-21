@@ -93,6 +93,9 @@ class Cell:
     note: str
     since: Tuple[Tuple[str, Tuple[int, int]], ...]
     todo: str  # TODO.md item title (required for SILENTLY-WRONG)
+    # Products whose outcome was verified only outside CI (the PR-gate server
+    # lacks a setting the cell needs; the test skips there).
+    local_only: Tuple[str, ...] = ()
 
     def outcome(self, product: str) -> str:
         return dict(self.outcomes).get(product, NA)
@@ -109,13 +112,13 @@ AREA_C = "C. Transactions"
 
 
 def cell(cid: str, area: str, what: str, note: str = "", since: Optional[Dict[str, Tuple[int, int]]] = None,
-         todo: str = "", **outcomes: str) -> Callable[[Callable[["Ctx"], None]], Callable[["Ctx"], None]]:
+         todo: str = "", local_only: Tuple[str, ...] = (), **outcomes: str) -> Callable[[Callable[["Ctx"], None]], Callable[["Ctx"], None]]:
     for p, o in outcomes.items():
         assert p in PRODUCTS and o in OUTCOMES, (cid, p, o)
 
     def deco(fn: Callable[["Ctx"], None]) -> Callable[["Ctx"], None]:
         CELLS.append(Cell(cid, area, what, tuple(outcomes.items()), fn, note,
-                          tuple((since or {}).items()), todo))
+                          tuple((since or {}).items()), todo, tuple(local_only)))
         return fn
 
     return deco
@@ -651,6 +654,60 @@ def _mysql_replace(ctx: Ctx) -> None:
     ctx.commit_check("REPLACE")
 
 
+_KEY_SHAPES_SCHEMA = {"mysql": [
+    "CREATE TABLE nk (g INT, v INT) ENGINE=InnoDB",
+    "CREATE TABLE un (id INT NOT NULL UNIQUE, g INT, v INT) ENGINE=InnoDB",
+    "CREATE TABLE uq (u INT UNIQUE, g INT, v INT) ENGINE=InnoDB",
+    "CREATE TABLE cp (a INT, b INT, g INT, v INT, PRIMARY KEY (a, b)) ENGINE=InnoDB",
+]}
+
+
+@cell("mysql_update_ignore_key_shapes", AREA_A,
+      "UPDATE / UPDATE IGNORE on tables without a key and with identical duplicate rows, with only a UNIQUE NOT "
+      "NULL key, with only a nullable UNIQUE key (NULL twins) and with a composite primary key",
+      "the MariaDB ignored-update guard needs a key that identifies the row: a table without one cannot skip a "
+      "row on a duplicate key and gets no guard (an identical twin made a real update look skipped); rows with "
+      "a NULL in a nullable UNIQUE key are always applied. MariaDB limitation: wrong when the only key is a "
+      "nullable UNIQUE key and an IGNORE-skipped row has a NULL key (cell mariadb_update_ignore_null_unique_key)",
+      mysql=EXACT, mariadb=LIMITED)
+def _update_ignore_key_shapes(ctx: Ctx) -> None:
+    env = ctx.fresh(_KEY_SHAPES_SCHEMA,
+                    [ViewDef("v_nk", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nk GROUP BY g"),
+                     ViewDef("v_nkp", "SELECT g, v FROM nk WHERE v > 0"),
+                     ViewDef("v_un", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM un GROUP BY g"),
+                     ViewDef("v_uq", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM uq GROUP BY g"),
+                     ViewDef("v_cp", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM cp GROUP BY g")],
+                    ["INSERT INTO nk VALUES (1, 5), (1, 5), (2, 7)",
+                     "INSERT INTO un VALUES (1, 1, 5), (2, 1, 6), (3, 2, 7)",
+                     "INSERT INTO uq VALUES (NULL, 1, 5), (NULL, 1, 5), (10, 2, 7), (20, 3, 1)",
+                     "INSERT INTO cp VALUES (1, 1, 1, 5), (1, 2, 1, 6), (2, 1, 2, 7)"])
+    for sql in ["UPDATE nk SET v = 6 WHERE g = 1 LIMIT 1",
+                "UPDATE IGNORE nk SET v = v + 1 WHERE g = 2",
+                "UPDATE IGNORE un SET id = 1, v = 9 WHERE id = 2",
+                "UPDATE un SET v = v + 1 WHERE id = 3",
+                "UPDATE uq SET v = 6 WHERE u IS NULL LIMIT 1",
+                "UPDATE IGNORE uq SET u = 10, v = 0 WHERE u = 20",
+                "UPDATE IGNORE cp SET b = 1, v = 0 WHERE a = 1 AND b = 2",
+                "UPDATE cp SET v = v + 1 WHERE a = 2"]:
+        env.execute(sql)
+        ctx.check(sql + " (in transaction)", env, end_tx=False)
+    ctx.commit_check("UPDATE IGNORE across key shapes", env)
+
+
+@cell("mariadb_update_ignore_null_unique_key", AREA_A,
+      "UPDATE IGNORE skipping rows whose only key is a nullable UNIQUE key and whose key is NULL",
+      "rows with a NULL key can be identical twins, so the MariaDB ignored-update guard applies them and the "
+      "skipped update reaches the view (also with two nullable UNIQUE keys); MySQL fires no trigger for them",
+      todo="Exact Maintenance Under MariaDB UPDATE IGNORE (AFTER UPDATE Triggers Fire for Ignored Rows)",
+      mysql=EXACT, mariadb=WRONG)
+def _mariadb_null_unique(ctx: Ctx) -> None:
+    env = ctx.fresh({"mysql": ["CREATE TABLE nu (u INT UNIQUE, g INT, v INT) ENGINE=InnoDB"]},
+                    [ViewDef("v_nu", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nu GROUP BY g")],
+                    ["INSERT INTO nu VALUES (NULL, 1, 5), (NULL, 1, 5), (1, 1, 5), (2, 2, 7)"])
+    env.execute("UPDATE IGNORE nu SET u = 2, v = 9 WHERE u IS NULL")
+    ctx.commit_check("UPDATE IGNORE skipping NULL-key rows", env)
+
+
 @cell("mysql_insert_ignore_data_errors", AREA_A,
       "INSERT IGNORE / UPDATE IGNORE converting CHECK, range and duplicate-key errors to warnings",
       "twin", mysql=EXACT, mariadb=EXACT)
@@ -662,13 +719,20 @@ def _mysql_insert_ignore(ctx: Ctx) -> None:
 
 
 @cell("mysql_update_ignore_duplicate_key", AREA_A,
-      "UPDATE IGNORE whose rows hit a duplicate key on a UNIQUE column and are skipped",
-      "MariaDB fires the AFTER UPDATE trigger for a row whose update was ignored (reproduced without matview: "
-      "the trigger logs a change the table never had), so the view applies it; MySQL does not fire it",
-      todo="Exact Maintenance Under MariaDB UPDATE IGNORE (AFTER UPDATE Triggers Fire for Ignored Rows)",
-      mysql=EXACT, mariadb=WRONG)
+      "UPDATE IGNORE / INSERT IGNORE ... ON DUPLICATE KEY UPDATE whose row updates hit a duplicate key "
+      "(UNIQUE column or primary key) and are skipped, mixed with rows that succeed",
+      "twin; MariaDB fires the AFTER UPDATE trigger for a row whose update was skipped (reproduced without "
+      "matview; the row keeps its OLD values); its maintenance trigger now applies a change only when the row "
+      "is no longer in its OLD state. MySQL does not fire it",
+      mysql=EXACT, mariadb=EXACT)
 def _mysql_update_ignore_dup(ctx: Ctx) -> None:
     ctx.both("UPDATE IGNORE {t} SET u = 10, g = 4 WHERE id IN (2, 3)")
+    ctx.both("UPDATE IGNORE {t} SET u = u + 10, v = v + 1 ORDER BY id")  # some rows collide, others move
+    ctx.check("UPDATE IGNORE skipping duplicate keys", end_tx=False)
+    ctx.both("UPDATE IGNORE {t} SET id = id - 1, g = 3 WHERE id IN (2, 5, 9) ORDER BY id")  # PK collisions
+    ctx.both("UPDATE IGNORE {t} SET id = id + 1000 WHERE id IN (6, 7)")  # PK moves that succeed
+    ctx.both("INSERT IGNORE INTO {t} (id, g, v, w, u) VALUES (10, 1, 1, 1, NULL), (11, 1, 1, 1, NULL) "
+             "ON DUPLICATE KEY UPDATE u = 30, g = 2")
     ctx.commit_check("UPDATE IGNORE skipping duplicate keys")
 
 
@@ -948,12 +1012,45 @@ def _before_skips(ctx: Ctx) -> None:
 TRIGGER_ORDER_TODO = "Exact Maintenance When a User Trigger or FK Action Runs Before the Maintenance Trigger"
 
 
+def _sqlite_reorder_then_exact(ctx: Ctx, run: Callable[[], None]) -> None:
+    """SQLite: a user trigger created after registration that fires before the
+    maintenance triggers is reported by check_schema_drift() before any write;
+    repair_view() recreates the maintenance triggers (now the newest, so they
+    fire first) and the writes are then exact."""
+    env = ctx.env
+    drift = env.manager.check_schema_drift()
+    env.commit()
+    assert drift == {vd.name: "triggers_out_of_order" for vd in env.views}, drift
+    env.manager.repair_view()
+    env.commit()
+    assert set(env.manager.check_schema_drift().values()) == {"ok"}
+    env.commit()
+    run()
+
+
+@cell("sqlite_benign_user_trigger_after_registration", AREA_B,
+      "A user AFTER trigger created after registration that only writes a table no view reads",
+      "fires before the maintenance trigger, which it cannot disturb; check_schema_drift() stays ok", sqlite=EXACT)
+def _sqlite_benign_trigger(ctx: Ctx) -> None:
+    env = ctx.env
+    env.execute("CREATE TABLE au_log (id INTEGER, v INTEGER)")
+    env.execute("CREATE TRIGGER au_log_ai AFTER INSERT ON t FOR EACH ROW BEGIN "
+                "INSERT INTO au_log VALUES (NEW.id, NEW.v); SELECT RAISE(ABORT, 'au') WHERE NEW.v = 666; END")
+    ctx.cleanup("DROP TABLE IF EXISTS au_log", "DROP TRIGGER IF EXISTS au_log_ai")
+    env.commit()
+    assert set(env.manager.check_schema_drift().values()) == {"ok"}
+    env.commit()
+    env.execute("INSERT INTO t (id, g, v, w, u) VALUES (695, 1, 5, 0, NULL), (696, NULL, 9, 1, NULL)")
+    ctx.commit_check("benign newer trigger")
+
+
 @cell("user_after_trigger_writes_same_table", AREA_B,
       "User AFTER row trigger that updates the same row and inserts/deletes other rows of the source",
       "SQLite fires the newest trigger first, so a user trigger created after registration updates a row whose "
-      "INSERT maintenance has not run yet; the transient empty group is deleted with its other rows' sums. "
+      "INSERT maintenance has not run yet (the transient empty group lost its other rows' sums): "
+      "check_schema_drift() reports triggers_out_of_order and repair_view() puts the maintenance triggers first. "
       "MySQL/MariaDB forbid a trigger writing its own table (error 1442)",
-      todo=TRIGGER_ORDER_TODO, sqlite=WRONG, postgres=EXACT)
+      sqlite=LIMITED, postgres=EXACT)
 def _after_writes_same(ctx: Ctx) -> None:
     env = ctx.env
     if ctx.family == "postgres":
@@ -968,8 +1065,16 @@ def _after_writes_same(ctx: Ctx) -> None:
                     "DELETE FROM t WHERE id = NEW.id - 685 AND NEW.v > 4; END")
         ctx.cleanup("DROP TRIGGER IF EXISTS au_after")
         env.commit()
-    env.execute("INSERT INTO t (id, g, v, w, u) VALUES (690, 1, 5, 0, NULL), (691, 2, 3, NULL, NULL), (692, NULL, 9, 1, NULL)")
-    ctx.commit_check("AFTER trigger writing its own table")
+
+    def write() -> None:
+        env.execute("INSERT INTO t (id, g, v, w, u) VALUES (690, 1, 5, 0, NULL), (691, 2, 3, NULL, NULL), "
+                    "(692, NULL, 9, 1, NULL)")
+        ctx.commit_check("AFTER trigger writing its own table")
+
+    if ctx.family == "sqlite":
+        _sqlite_reorder_then_exact(ctx, write)
+    else:
+        write()
 
 
 @cell("sqlite_recursive_user_trigger", AREA_B,
@@ -1035,17 +1140,54 @@ def _user_trigger_raises(ctx: Ctx) -> None:
 
 @cell("sqlite_user_trigger_raise_fail", AREA_B,
       "A user AFTER trigger created after registration raising RAISE(FAIL) on the second row of a statement",
-      "FAIL keeps the rows already written, including the failing row itself, but the newer user trigger ran "
-      "first and the failing row's maintenance trigger never runs",
-      todo=TRIGGER_ORDER_TODO, sqlite=WRONG)
+      "FAIL keeps the rows already written, including the failing row itself; while the newer user trigger "
+      "fires first the failing row's maintenance never runs. check_schema_drift() reports triggers_out_of_order "
+      "(also for RAISE(IGNORE)) and repair_view() puts the maintenance triggers first",
+      sqlite=LIMITED)
 def _sqlite_raise_fail(ctx: Ctx) -> None:
     env = ctx.env
     env.execute("CREATE TRIGGER au_fail AFTER INSERT ON t FOR EACH ROW WHEN NEW.v = 667 "
                 "BEGIN SELECT RAISE(FAIL, 'au: rejected'); END")
     ctx.cleanup("DROP TRIGGER IF EXISTS au_fail")
     env.commit()
-    ctx.fails("INSERT INTO t (id, g, v, w, u) VALUES (710, 1, 1, 1, NULL), (711, 2, 667, 1, NULL)", match="rejected")
-    ctx.commit_check("RAISE(FAIL) keeps the earlier rows")
+
+    def write() -> None:
+        ctx.fails("INSERT INTO t (id, g, v, w, u) VALUES (710, 1, 1, 1, NULL), (711, 2, 667, 1, NULL)",
+                  match="rejected")
+        ctx.commit_check("RAISE(FAIL) keeps the earlier rows")
+
+    _sqlite_reorder_then_exact(ctx, write)
+
+
+@cell("sqlite_user_trigger_writes_source_indirectly", AREA_B,
+      "A newer user trigger whose writes reach the source only through other triggers: it inserts into a "
+      "table whose trigger updates the source, or into a view whose INSTEAD OF trigger updates the source",
+      "check_schema_drift() follows the trigger chain (bounded depth) and reports triggers_out_of_order; "
+      "repair_view() puts the maintenance triggers first. Writes hidden in application functions are not seen. "
+      "The check is conservative: a RAISE(FAIL/IGNORE) anywhere in the chain, even on an unrelated table, or a "
+      "chain deeper than 16 is reported too",
+      sqlite=LIMITED)
+def _sqlite_indirect(ctx: Ctx) -> None:
+    env = ctx.env
+    for ddl in ["CREATE TABLE au_x (id INTEGER)",
+                "CREATE TRIGGER au_x_ai AFTER INSERT ON au_x BEGIN UPDATE t SET w = COALESCE(w, 0) + 1 WHERE id = NEW.id; END",
+                "CREATE VIEW au_vw AS SELECT id FROM au_x",
+                "CREATE TRIGGER au_vw_io INSTEAD OF INSERT ON au_vw BEGIN UPDATE t SET v = v + 1 WHERE id = NEW.id; END",
+                "CREATE TRIGGER au_chain AFTER INSERT ON t FOR EACH ROW WHEN NEW.id BETWEEN 690 AND 699 BEGIN "
+                "INSERT INTO au_x VALUES (NEW.id); END",
+                "CREATE TRIGGER au_chain_view AFTER INSERT ON t FOR EACH ROW WHEN NEW.id >= 700 BEGIN "
+                "INSERT INTO au_vw VALUES (NEW.id); END"]:
+        env.execute(ddl)
+    ctx.cleanup("DROP TABLE IF EXISTS au_x", "DROP TRIGGER IF EXISTS au_x_ai", "DROP VIEW IF EXISTS au_vw",
+                "DROP TRIGGER IF EXISTS au_vw_io", "DROP TRIGGER IF EXISTS au_chain", "DROP TRIGGER IF EXISTS au_chain_view")
+    env.commit()
+
+    def write() -> None:
+        env.execute("INSERT INTO t (id, g, v, w, u) VALUES (690, 1, 5, 0, NULL), (692, NULL, 9, 1, NULL), "
+                    "(700, 2, 4, 1, NULL), (701, NULL, 3, 1, NULL)")
+        ctx.commit_check("indirect writes to the source")
+
+    _sqlite_reorder_then_exact(ctx, write)
 
 
 @cell("sqlite_user_triggers_older_than_views", AREA_B,
@@ -1090,9 +1232,13 @@ def _other_source_rows() -> str:
       "User trigger on one join source that writes the other source, firing BEFORE the maintenance trigger",
       "PostgreSQL row trigger (row triggers fire before statement triggers); SQLite trigger created after "
       "registration (SQLite fires the newest trigger first); MySQL/MariaDB PRECEDES. The join aggregate counts "
-      "the new pair twice where it is maintained algebraically",
+      "the new pair twice where it is maintained algebraically. SQLite: check_schema_drift() reports "
+      "triggers_out_of_order and repair_view() puts the maintenance triggers first. PostgreSQL and "
+      "MySQL/MariaDB: check_schema_drift() reports triggers_out_of_order for the join views before any write; "
+      "MySQL/MariaDB: re-registering the views puts their triggers first (exact); PostgreSQL row triggers always "
+      "fire before the statement-level maintenance, so it stays wrong until the user trigger is rewritten",
       todo=TRIGGER_ORDER_TODO,
-      sqlite=WRONG, postgres=WRONG, mysql=WRONG, mariadb=WRONG)
+      sqlite=LIMITED, postgres=WRONG, mysql=LIMITED, mariadb=LIMITED)
 def _other_source_first(ctx: Ctx) -> None:
     env = ctx.env
     if ctx.family == "postgres":
@@ -1110,8 +1256,43 @@ def _other_source_first(ctx: Ctx) -> None:
         ctx.cleanup("DROP TRIGGER IF EXISTS au_dim")
         env.commit()
     ctx.cleanup("DELETE FROM d WHERE g >= 50")
+
+    def write() -> None:
+        env.execute(f"INSERT INTO t (id, g, v, w, u) VALUES {_other_source_rows()}")
+        ctx.commit_check("trigger writing the other join source first")
+
+    if ctx.family == "sqlite":
+        _sqlite_reorder_then_exact(ctx, write)
+        return
+    joins = {vd.name for vd in env.views if vd.join}
+    drift = env.manager.check_schema_drift()
+    env.commit()
+    assert drift == {vd.name: ("triggers_out_of_order" if vd.name in joins else "ok") for vd in env.views}, drift
+    if ctx.family == "mysql":
+        for vd in env.views:
+            if vd.join:
+                env.manager.drop_view(vd.name)
+                env.register(vd)
+        assert set(env.manager.check_schema_drift().values()) == {"ok"}
+        env.commit()
+    write()
+
+
+@cell("mysql_preexisting_user_trigger_writes_other_source", AREA_B,
+      "A user trigger on one join source that writes the other source, created before the view was registered",
+      "MySQL/MariaDB fire triggers in creation order, so before this fix the older user trigger fired first and "
+      "the join aggregate counted the pair twice; registration now places the maintenance triggers first "
+      "(PRECEDES). SQLite fires older triggers last (user_trigger_writes_other_source_last)",
+      mysql=EXACT, mariadb=EXACT)
+def _mysql_preexisting_other_source(ctx: Ctx) -> None:
+    schema = BASE_SCHEMA["mysql"] + [
+        "CREATE TRIGGER au_dim AFTER INSERT ON t FOR EACH ROW "
+        "BEGIN IF NEW.g >= 50 THEN INSERT IGNORE INTO d (g, name) VALUES (NEW.g, 'nz'); END IF; END"]
+    env = ctx.fresh({"mysql": schema}, [V_J, V_PJ], _base_seed())
+    assert set(env.manager.check_schema_drift().values()) == {"ok"}
+    env.commit()
     env.execute(f"INSERT INTO t (id, g, v, w, u) VALUES {_other_source_rows()}")
-    ctx.commit_check("trigger writing the other join source first")
+    ctx.commit_check("pre-existing trigger writing the other join source", env)
 
 
 @cell("user_trigger_writes_other_source_last", AREA_B,
@@ -1258,19 +1439,32 @@ def _generated_virtual(ctx: Ctx) -> None:
 
 
 @cell("pg_domains", AREA_B,
-      "Source columns of domain types: grouped by, aggregated, projected (incl. a domain CHECK violation)",
-      "fixed here: registration failed (backing column declared as type DOMAIN) and a domain group key was "
-      "refused by the canonical group-key function", postgres=EXACT)
+      "Source columns of domain types over BIGINT, VARCHAR(n), TEXT, TEXT with CHECK, TEXT COLLATE \"C\" and CHAR(n): "
+      "grouped by, "
+      "aggregated, projected (incl. domain CHECK violations)",
+      "registration used to fail (backing column declared as type DOMAIN; for a domain over TEXT or CHAR(n) "
+      "the reflected collation \"default\" and the lost CHAR length) and a domain group key was refused by the "
+      "canonical group-key function; a domain over an array type still fails (array backing types)",
+      postgres=EXACT)
 def _pg_domains(ctx: Ctx) -> None:
     env = ctx.fresh({"postgres": ["CREATE DOMAIN au_pos AS BIGINT CHECK (VALUE > 0)",
                                   "CREATE DOMAIN au_label AS VARCHAR(10)",
-                                  "CREATE TABLE dm (id INT PRIMARY KEY, g au_label, v au_pos)"]},
+                                  "CREATE DOMAIN au_txt AS TEXT",
+                                  "CREATE DOMAIN au_code AS TEXT CHECK (VALUE <> '')",
+                                  "CREATE DOMAIN au_ch3 AS CHAR(3)",
+                                  "CREATE DOMAIN au_cc AS TEXT COLLATE \"C\"",
+                                  "CREATE TABLE dm (id INT PRIMARY KEY, g au_label, v au_pos, t au_txt, k au_code, "
+                                  "c au_ch3, cc au_cc)"]},
                     [ViewDef("v_dm", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM dm GROUP BY g"),
-                     ViewDef("v_dmp", "SELECT id, g, v FROM dm WHERE v > 3")],
-                    ["INSERT INTO dm VALUES " + _values([(i, f"l{i % 3}", i) for i in range(1, 13)])])
-    env.execute("INSERT INTO dm VALUES (100, 'l9', 5), (101, NULL, 1)")
-    env.execute("UPDATE dm SET g = 'l1', v = v + 2 WHERE id % 2 = 0")
+                     ViewDef("v_dmp", "SELECT id, g, v, t FROM dm WHERE v > 3"),
+                     ViewDef("v_dmt", "SELECT t, k, cc, COUNT(*) AS n FROM dm GROUP BY t, k, cc"),
+                     ViewDef("v_dmc", "SELECT c, MAX(v) AS hi, COUNT(*) AS n FROM dm GROUP BY c")],
+                    ["INSERT INTO dm VALUES " + _values(
+                        [(i, f"l{i % 3}", i, f"t{i % 2}", f"k{i % 4}", f"c{i % 3}", "Ab"[i % 2]) for i in range(1, 13)])])
+    env.execute("INSERT INTO dm VALUES (100, 'l9', 5, 'tz', 'kz', 'abc', 'a'), (101, NULL, 1, NULL, NULL, NULL, NULL)")
+    env.execute("UPDATE dm SET g = 'l1', v = v + 2, t = 'tz', c = 'xy' WHERE id % 2 = 0")
     ctx.fails("UPDATE dm SET v = v - 7", env)
+    ctx.fails("UPDATE dm SET k = '' WHERE id = 3", env)
     ctx.commit_check("domains", env)
 
 
@@ -1350,8 +1544,10 @@ _FK_LATE_SCHEMA = {
 
 @cell("fk_cascade_added_after_registration", AREA_B,
       "A cascading FK added to a source table after the view was registered (out-of-band ALTER TABLE)",
-      "MySQL/MariaDB: the cascaded deletes fire no triggers and check_schema_drift() still reports ok "
-      "(the registration-time refusal is never re-evaluated); SQLite cannot add an FK to an existing table",
+      "MySQL/MariaDB: the cascaded deletes fire no triggers, so the view diverges; check_schema_drift() reports "
+      "invalid from the moment the FK exists (the view no longer compiles under its accepted limitation codes: "
+      "MYSQL_FK_CASCADE_NO_TRIGGER is new), but nothing stops the writes. SQLite cannot add an FK to an "
+      "existing table",
       todo="Make Schema Introspection and Drift Signatures Semantically Complete and Fail-Closed",
       postgres=EXACT, mysql=WRONG, mariadb=WRONG)
 def _fk_late(ctx: Ctx) -> None:
@@ -1361,9 +1557,10 @@ def _fk_late(ctx: Ctx) -> None:
     other = env.connect()
     env.execute("ALTER TABLE c ADD CONSTRAINT au_fk FOREIGN KEY (pid) REFERENCES p (pid) ON DELETE CASCADE", other)
     other.commit()
-    env.execute("DELETE FROM p WHERE pid = 2")
-    env.commit()
     drift = env.manager.check_schema_drift()
+    env.commit()
+    assert drift == {"v_late": "invalid" if ctx.family == "mysql" else "ok"}, drift
+    env.execute("DELETE FROM p WHERE pid = 2")
     env.commit()
     try:
         ctx.check("cascade through an FK added after registration", env)
@@ -1426,11 +1623,11 @@ def _system_versioning(ctx: Ctx) -> None:
       "reported ok) and repair_view() rebuilds the views with enabled triggers",
       postgres=LIMITED)
 def _pg_disable(ctx: Ctx) -> None:
-    env = ctx.env
-    other = ctx.other_conn()
+    # Own small environment: the repair rebuilds every view it reports.
+    env = ctx.fresh(BASE_SCHEMA, [V_AGG, V_PR], _base_seed())
+    other = env.connect()
     env.execute("ALTER TABLE t DISABLE TRIGGER USER", other)
     other.commit()
-    ctx.cleanup("ALTER TABLE t ENABLE TRIGGER USER")
     env.execute("INSERT INTO t (id, g, v, w, u) VALUES (750, 1, 5, 1, NULL)")
     env.commit()
     drift = env.manager.check_schema_drift()
@@ -1439,10 +1636,10 @@ def _pg_disable(ctx: Ctx) -> None:
         assert drift == {vd.name: "triggers_disabled" for vd in env.views}, drift
         env.manager.repair_view()
         env.commit()
-        ctx.check("after repair_view()")
+        ctx.check("after repair_view()", env)
         return
     try:
-        ctx.check("writes with the maintenance triggers disabled")
+        ctx.check("writes with the maintenance triggers disabled", env)
     except ViewMismatch as exc:
         raise ViewMismatch(f"{exc}\n  check_schema_drift() = {drift}") from None
 
@@ -1464,64 +1661,96 @@ def _pg_replica(ctx: Ctx) -> None:
 
 @cell("mysql_session_skip_flag", AREA_B,
       "An application session setting @__matview_skip_triggers (the bulk_changes() bypass flag)",
-      "any session can set it and its writes are silently not maintained (documented)",
-      todo="Close Unsafe DML Paths That Bypass Trigger-Based Maintenance", mysql=WRONG, mariadb=WRONG)
+      "the triggers skip maintenance only while the session also holds the per-connection named lock "
+      "'__matview_bypass:<connection id>' that bulk_changes() takes for its block, so the flag alone (a stale "
+      "pooled connection, copied code) is ignored; deliberately taking that lock remains a privileged escape "
+      "hatch", mysql=EXACT, mariadb=EXACT)
 def _mysql_skip(ctx: Ctx) -> None:
     env = ctx.env
     w = ctx.other_conn()
     env.execute("SET @__matview_skip_triggers = 1", w)
     env.execute("INSERT INTO t (id, g, v, w, u) VALUES (770, 1, 5, 1, NULL)", w)
+    env.execute("UPDATE t SET v = v + 1 WHERE id % 3 = 0", w)
     w.commit()
     ctx.check("write with the session bypass flag")
+    # bulk_changes() itself still suspends maintenance and refreshes.
+    with env.manager.bulk_changes():
+        env.execute("INSERT INTO t (id, g, v, w, u) VALUES (771, 2, 7, 1, NULL)")
+    ctx.check("after bulk_changes()")
+    env.execute("SET @__matview_skip_triggers = 1")  # the lock was released with the block
+    env.execute("DELETE FROM t WHERE id = 771")
+    env.commit()
+    ctx.check("flag left set after bulk_changes()")
+    env.execute("SET @__matview_skip_triggers = 0")
 
 
-_X_SCHEMA = {
-    "postgres": ["CREATE TABLE x (id INT PRIMARY KEY, g INT, v BIGINT)"],
-    "mysql": ["CREATE TABLE x (id INT PRIMARY KEY, g INT, v BIGINT) ENGINE=InnoDB"],
-    "sqlite": ["CREATE TABLE x (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)"],
-}
-_X_VIEWS = [ViewDef("v_x", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM x GROUP BY g"),
-            ViewDef("v_xp", "SELECT id, v FROM x WHERE g = 1")]
-_X_SEED = ["INSERT INTO x (id, g, v) VALUES " + _values([(i, i % 3, i * 3 - 11) for i in range(1, 13)])]
+# The four out-of-band DDL cells share one environment (one source table and
+# one view each), so each cell pays no environment setup of its own.
+_DDL_TABLES = ("xa", "xd", "xr", "xc")
+_DDL_COLS = {"postgres": "id INT PRIMARY KEY, g INT, v BIGINT",
+             "mysql": "id INT PRIMARY KEY, g INT, v BIGINT",
+             "sqlite": "id INTEGER PRIMARY KEY, g INTEGER, v INTEGER"}
 
 
-def _drift_not_ok_then_repair(ctx: Ctx, env: Env, label: str) -> None:
-    """The documented recovery: the drift check reports every affected view
-    and repair_view() (on MySQL/MariaDB, which refuse a non-atomic rebuild:
-    drop_view() + register_view()) restores exactness."""
-    from matview import UnsafeReplacementError
+def _ddl_table_sql(family: str, table: str) -> str:
+    return f"CREATE TABLE {table} ({_DDL_COLS[family]})" + (" ENGINE=InnoDB" if family == "mysql" else "")
 
+
+def _ddl_view(table: str) -> ViewDef:
+    return ViewDef(f"v_{table}", f"SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {table} GROUP BY g")
+
+
+_DDL_ENVS: Dict[str, DEnv] = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _close_ddl_envs():
+    yield
+    while _DDL_ENVS:
+        _DDL_ENVS.popitem()[1].close()
+
+
+def _ddl_env(ctx: Ctx, table: str) -> DEnv:
+    env = _DDL_ENVS.get(ctx.target.id)
+    if env is None:
+        env = DEnv(ctx.target, [_ddl_view(t) for t in _DDL_TABLES],
+                   [_ddl_table_sql(ctx.family, t) for t in _DDL_TABLES],
+                   [f"INSERT INTO {t} (id, g, v) VALUES " + _values([(i, i % 3, i * 3 - 11) for i in range(1, 13)])
+                    for t in _DDL_TABLES])
+        _DDL_ENVS[ctx.target.id] = env
+    return env
+
+
+def _ddl_check(env: DEnv, table: str, label: str, select: Optional[str] = None) -> None:
+    vd = _ddl_view(table)
+    saved = env.views
+    env.views = [ViewDef(vd.name, select or vd.select)]
+    try:
+        env.check(label)
+    finally:
+        env.views = saved
+
+
+def _ddl_drift(env: DEnv, table: str) -> str:
     drift = env.manager.check_schema_drift()
     env.commit()
-    assert drift and all(s != "ok" for s in drift.values()), f"{label}: check_schema_drift() = {drift}"
-    if ctx.family == "mysql":
-        with pytest.raises(UnsafeReplacementError):
-            env.manager.repair_view()
-        env.rollback()
-        for vd in env.views:
-            env.manager.drop_view(vd.name)
-            env.register(vd)
-    else:
-        env.manager.repair_view()
-    env.commit()
-    ctx.check(f"{label} after repair", env)
+    return drift[_ddl_view(table).name]
 
 
 @cell("ddl_add_unused_column", AREA_B, "Out-of-band ALTER TABLE ADD COLUMN on a source (column unused by the view)",
       "maintenance continues exactly; check_schema_drift() reports drifted (the signature covers every column)",
       sqlite=EXACT, postgres=EXACT, mysql=EXACT, mariadb=EXACT)
 def _ddl_add(ctx: Ctx) -> None:
-    env = ctx.fresh(_X_SCHEMA, _X_VIEWS, _X_SEED)
+    env = _ddl_env(ctx, "xa")
     other = env.connect()
-    env.execute("ALTER TABLE x ADD COLUMN extra INT", other)
+    env.execute("ALTER TABLE xa ADD COLUMN extra INT", other)
     other.commit()
-    env.execute("INSERT INTO x (id, g, v, extra) VALUES (100, 1, 4, 9), (101, 2, 5, NULL)")
-    env.execute("UPDATE x SET v = v + 1, extra = 1 WHERE id % 2 = 0")
-    env.execute("DELETE FROM x WHERE id % 5 = 0")
-    ctx.commit_check("after ADD COLUMN", env)
-    drift = env.manager.check_schema_drift()
+    env.execute("INSERT INTO xa (id, g, v, extra) VALUES (100, 1, 4, 9), (101, 2, 5, NULL)")
+    env.execute("UPDATE xa SET v = v + 1, extra = 1 WHERE id % 2 = 0")
+    env.execute("DELETE FROM xa WHERE id % 5 = 0")
     env.commit()
-    assert set(drift.values()) == {"drifted"}, drift
+    _ddl_check(env, "xa", "after ADD COLUMN")
+    assert _ddl_drift(env, "xa") == "drifted"
 
 
 @cell("ddl_drop_used_column", AREA_B, "Out-of-band ALTER TABLE DROP COLUMN of a column the view uses",
@@ -1529,22 +1758,21 @@ def _ddl_add(ctx: Ctx) -> None:
       "INSERT/UPDATE of the source fails in the maintenance trigger and check_schema_drift() reports invalid",
       sqlite=REFUSED, postgres=REFUSED, mysql=REFUSED, mariadb=REFUSED)
 def _ddl_drop(ctx: Ctx) -> None:
-    env = ctx.fresh(_X_SCHEMA, _X_VIEWS, _X_SEED)
+    env = _ddl_env(ctx, "xd")
     other = env.connect()
     if ctx.family == "sqlite":
-        ctx.fails("ALTER TABLE x DROP COLUMN v", env, conn=other)
+        ctx.fails("ALTER TABLE xd DROP COLUMN v", env, conn=other)
         other.rollback()
-        env.execute("INSERT INTO x (id, g, v) VALUES (100, 1, 4)")
-        ctx.commit_check("after the refused DROP COLUMN", env)
+        env.execute("INSERT INTO xd (id, g, v) VALUES (100, 1, 4)")
+        env.commit()
+        _ddl_check(env, "xd", "after the refused DROP COLUMN")
         return
-    env.execute("ALTER TABLE x DROP COLUMN v", other)
+    env.execute("ALTER TABLE xd DROP COLUMN v", other)
     other.commit()
-    ctx.fails("INSERT INTO x (id, g) VALUES (100, 1)", env)
-    ctx.fails("UPDATE x SET g = 2 WHERE id = 1", env)
+    ctx.fails("INSERT INTO xd (id, g) VALUES (100, 1)", env)
+    ctx.fails("UPDATE xd SET g = 2 WHERE id = 1", env)
     env.rollback()
-    drift = env.manager.check_schema_drift()
-    env.commit()
-    assert set(drift.values()) == {"invalid"}, drift
+    assert _ddl_drift(env, "xd") == "invalid"
 
 
 @cell("ddl_rename_used_column", AREA_B, "Out-of-band ALTER TABLE RENAME COLUMN of a column the view uses",
@@ -1553,41 +1781,50 @@ def _ddl_drop(ctx: Ctx) -> None:
       "maintenance fails on every write, so writes fail closed",
       sqlite=LIMITED, postgres=REFUSED, mysql=REFUSED, mariadb=REFUSED)
 def _ddl_rename(ctx: Ctx) -> None:
-    env = ctx.fresh(_X_SCHEMA, _X_VIEWS, _X_SEED)
+    env = _ddl_env(ctx, "xr")
     other = env.connect()
-    env.execute("ALTER TABLE x RENAME COLUMN v TO v2", other)
+    env.execute("ALTER TABLE xr RENAME COLUMN v TO v2", other)
     other.commit()
     if ctx.family == "sqlite":
-        env.execute("INSERT INTO x (id, g, v2) VALUES (100, 1, 4), (101, 2, 5)")
-        env.execute("UPDATE x SET v2 = v2 + 1 WHERE id % 2 = 0")
+        env.execute("INSERT INTO xr (id, g, v2) VALUES (100, 1, 4), (101, 2, 5)")
+        env.execute("UPDATE xr SET v2 = v2 + 1 WHERE id % 2 = 0")
         env.commit()
-        renamed = [ViewDef(vd.name, vd.select.replace("v)", "v2)").replace(", v FROM", ", v2 AS v FROM")) for vd in _X_VIEWS]
-        env.views = renamed
-        ctx.check("maintenance on the renamed column", env)
-        drift = env.manager.check_schema_drift()
-        env.commit()
-        assert set(drift.values()) == {"invalid"}, drift
+        _ddl_check(env, "xr", "maintenance on the renamed column",
+                   select="SELECT g, SUM(v2) AS s, COUNT(*) AS c FROM xr GROUP BY g")
+        assert _ddl_drift(env, "xr") == "invalid"
         return
-    ctx.fails("INSERT INTO x (id, g, v2) VALUES (100, 1, 4)", env)
-    ctx.fails("UPDATE x SET v2 = v2 + 1 WHERE id = 1", env)
+    ctx.fails("INSERT INTO xr (id, g, v2) VALUES (100, 1, 4)", env)
+    ctx.fails("UPDATE xr SET v2 = v2 + 1 WHERE id = 1", env)
     env.rollback()
-    drift = env.manager.check_schema_drift()
-    env.commit()
-    assert drift and all(s != "ok" for s in drift.values()), drift
+    assert _ddl_drift(env, "xr") != "ok"
 
 
 @cell("ddl_drop_recreate_source", AREA_B, "Out-of-band DROP TABLE and re-CREATE of a source, then writes",
       "the new table has no maintenance triggers, so the view is stale; check_schema_drift() reports it and "
-      "repair_view() restores exactness",
+      "repair_view() (MySQL/MariaDB: drop_view() + register_view(), they refuse a non-atomic rebuild) restores "
+      "exactness",
       sqlite=LIMITED, postgres=LIMITED, mysql=LIMITED, mariadb=LIMITED)
 def _ddl_recreate(ctx: Ctx) -> None:
-    env = ctx.fresh(_X_SCHEMA, _X_VIEWS, _X_SEED)
+    from matview import UnsafeReplacementError
+
+    env = _ddl_env(ctx, "xc")
     other = env.connect()
-    env.execute("DROP TABLE x", other)
-    env.execute(_X_SCHEMA[ctx.family][0], other)
-    env.execute("INSERT INTO x (id, g, v) VALUES (1, 1, 1), (2, 1, 2), (50, 2, 3)", other)
+    env.execute("DROP TABLE xc", other)
+    env.execute(_ddl_table_sql(ctx.family, "xc"), other)
+    env.execute("INSERT INTO xc (id, g, v) VALUES (1, 1, 1), (2, 1, 2), (50, 2, 3)", other)
     other.commit()
-    _drift_not_ok_then_repair(ctx, env, "DROP + CREATE of the source")
+    assert _ddl_drift(env, "xc") != "ok"
+    vd = _ddl_view("xc")
+    if ctx.family == "mysql":
+        with pytest.raises(UnsafeReplacementError):
+            env.manager.repair_view(vd.name)
+        env.rollback()
+        env.manager.drop_view(vd.name)
+        env.register(vd)
+    else:
+        env.manager.repair_view(vd.name)
+    env.commit()
+    _ddl_check(env, "xc", "DROP + CREATE of the source after repair")
 
 
 # ---------------------------------------------------------------------------
@@ -1695,8 +1932,9 @@ def _autocommit(ctx: Ctx) -> None:
 
 @cell("two_phase_commit", AREA_C,
       "Two-phase commit: PREPARE TRANSACTION / COMMIT|ROLLBACK PREPARED; XA START ... XA COMMIT|ROLLBACK",
-      "PostgreSQL needs max_prepared_transactions > 0 (the CI service runs with the default 0, so it is skipped "
-      "there and was verified locally on 18)", sqlite=NA, postgres=EXACT, mysql=EXACT, mariadb=EXACT)
+      "PostgreSQL needs max_prepared_transactions > 0; the CI service runs with the default 0, so the cell is "
+      "skipped there (verified locally on 18)", local_only=("postgres",),
+      sqlite=NA, postgres=EXACT, mysql=EXACT, mariadb=EXACT)
 def _two_phase(ctx: Ctx) -> None:
     env = ctx.env
     w = ctx.other_conn()
@@ -1818,6 +2056,8 @@ def render_matrix() -> str:
             need = c.min_version(p)
             if need is not None and c.outcome(p) != NA:
                 o += f" ({need[0]}.{need[1]}+)" if p in ("sqlite", "mariadb") else f" ({need[0]}+)"
+            if p in c.local_only:
+                o += " (verified locally, not in CI)"
             outs.append(o)
         note = c.note.replace("|", "/")
         if c.todo:
