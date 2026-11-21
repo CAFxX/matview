@@ -2305,6 +2305,11 @@ class TranspiledConnectionAdapter:
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
             ).fetchone()
             return [(found[0] if found else None,)], 1
+        if self.dialect == Dialect.MYSQL and s_up.startswith("SELECT GET_LOCK(CONCAT('__MATVIEW_BYPASS:'"):
+            # bulk_changes() session-bypass lock: one emulated session.
+            return [(1,)], 1
+        if self.dialect == Dialect.MYSQL and s_up.startswith("DO RELEASE_LOCK(CONCAT('__MATVIEW_BYPASS:'"):
+            return [], 0
         if self.dialect == Dialect.POSTGRES and s_up.startswith("LOCK TABLE "):
             # SQLite serializes writers database-wide: table locks are implied.
             return [], 0
