@@ -13,7 +13,7 @@ index is missing the plan diagnostics (and the CLI text) carry a
 
 Measured natively for this lane (40k rows, 2 groups, 100 deletes of the
 current minimum in one transaction, net of the same DELETE without a
-materialized view; scripts in the PR): SQLite 3.46 no index 874 us, (g) 1967,
+materialized view; method in the PR description): SQLite 3.46 no index 874 us, (g) 1967,
 (g, v) 3; PostgreSQL 18 1268 / 1072 / 519; MySQL 8.4 7562 / 17060 / ~0;
 MariaDB 11.8 7680 / 7765 / 311. The multiset auxiliary table (research doc
 section 3.3 (b)) is not better on any engine for plain-column arguments; it
