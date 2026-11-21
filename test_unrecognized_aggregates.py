@@ -554,21 +554,26 @@ class PostgresUnrecognizedAggregateTests(unittest.TestCase):
     def test_join_key_collation(self) -> None:
         _join_key_check(self, "postgres", self.conn, MaterializedViewManager(self.conn).register_view)
 
-    def test_unknown_result_type_is_refused_with_cast_remedy(self) -> None:
+    def test_polymorphic_udf_aggregate_gets_the_server_type(self) -> None:
+        # The catalog result type is anyelement; the server reports the
+        # call's actual type (integer), so no CAST is needed. (Offline, with
+        # no server to ask, the CAST remedy still applies: OfflineRoutingTests.)
         cur = self.conn.cursor()
         cur.execute(_BASE_DDL.format(t="t", dbl="DOUBLE PRECISION"))
-        # A polymorphic user-defined aggregate: the catalog result type is
-        # anyelement, so the native type of the call is not known statically.
         cur.execute("CREATE FUNCTION first_sf(anyelement, anyelement) RETURNS anyelement LANGUAGE sql IMMUTABLE AS 'SELECT COALESCE($1, $2)'")
         cur.execute("CREATE AGGREGATE afirst(anyelement) (SFUNC = first_sf, STYPE = anyelement)")
+        cur.execute("INSERT INTO t (id, g, h, v, x, s) VALUES (1, 1, 1, 5, 0.5, 'a')")
         self.conn.commit()
         mgr = MaterializedViewManager(self.conn)
-        with self.assertRaisesRegex(UnsupportedMaterializedViewError, r"CAST\(\.\.\. AS <type>\)"):
-            mgr.register_view("CREATE VIEW isum_v AS SELECT g, afirst(v) AS a FROM t GROUP BY g")
-        self.conn.rollback()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            plan = mgr.register_view("CREATE VIEW afirst_v AS SELECT g, afirst(v) AS a FROM t GROUP BY g")
+        self.assertEqual(plan.strategy, T3)
         cur = self.conn.cursor()
-        cur.execute("SELECT count(*) FROM pg_class WHERE relname = 'isum_v' AND relnamespace = %s::regnamespace", (self.schema,))
-        self.assertEqual(cur.fetchone()[0], 0)
+        mv = _snapshot(cur, "SELECT * FROM afirst_v")
+        live = _snapshot(cur, "SELECT g, afirst(v) AS a FROM t GROUP BY g")
+        self.conn.commit()
+        self.assertEqual(mv, live)
 
 
 @unittest.skipUnless(_native("MYSQL_DSN"), "MYSQL_DSN not set")
@@ -964,6 +969,12 @@ class OfflineRoutingTests(unittest.TestCase):
             )
             self.assertEqual(plan.strategy, T3, expr)
             self.assertEqual([lim.code for lim in plan.limitations], [], expr)
+
+    def test_udf_aggregate_without_server_needs_a_cast(self) -> None:
+        # Offline (no server to ask for the result type) a compound over a
+        # user-classified aggregate cannot be typed: refused with the CAST hint.
+        with self.assertRaisesRegex(UnsupportedMaterializedViewError, r"CAST\(\.\.\. AS <type>\)"):
+            self._plan("postgres", "SELECT g, COUNT(*) + PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) AS a FROM t GROUP BY g")
 
     def test_compound_with_unrecognized_aggregate_on_mysql_is_refused_not_guessed(self) -> None:
         with self.assertRaisesRegex(UnsupportedMaterializedViewError, "CAST"):

@@ -71,7 +71,7 @@ def _drive(
         plan = register(";\n".join(f"CREATE VIEW {n} AS {sql}" for n, sql, _ in views))
     for (name, _sql, expected), sub in zip(views, list(plan.sub_plans) or [plan]):
         test.assertEqual(sub.strategy, expected, f"[{engine}] {name}")
-        if expected != T1:  # the routing fallback is announced (matview.diagnostics)
+        if expected != T1 and " OVER " not in _sql.upper():  # the routing fallback is announced
             test.assertTrue(
                 any(d.message.startswith("exact result required: falling back to strategy") for d in sub.strategy_diagnostics),
                 f"[{engine}] {name}: {sub.strategy_diagnostics!r}",
@@ -121,6 +121,16 @@ class SqliteTests(unittest.TestCase):
                 return self.total
 
         conn.create_aggregate("py_sum", 1, PySum)  # pyright: ignore[reportArgumentType]  # sqlite3 aggregate protocol
+
+        class PyWinSum(PySum):
+            def value(self) -> int:
+                return self.total
+
+            def inverse(self, value: Any) -> None:
+                self.total -= value or 0
+
+        # Registered as an aggregate window function: PRAGMA function_list type 'w'.
+        conn.create_window_function("py_wsum", 1, PyWinSum)  # pyright: ignore[reportArgumentType]  # sqlite3 window protocol
         conn.create_function("py_twice", 1, lambda x: None if x is None else 2 * x)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
         conn.commit()
@@ -137,6 +147,8 @@ class SqliteTests(unittest.TestCase):
                         ("v_ungrouped", "SELECT py_sum(v) AS a FROM t", T3),
                         ("v_key_arg", "SELECT g, COUNT(*) AS n, py_sum(g) AS a FROM t GROUP BY g", T3),
                         ("v_scalar", "SELECT id, py_twice(v) AS a FROM t", T1),
+                        ("v_window_agg", "SELECT py_wsum(v) AS a FROM t", T3),
+                        ("v_cte", "WITH x AS (SELECT * FROM t) SELECT py_sum(v) AS a FROM x", T3),
                     ],
                     ph="?",
                 )
@@ -216,12 +228,24 @@ class PostgresTests(unittest.TestCase):
         cur.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
         cur.execute("CREATE AGGREGATE isum(integer) (SFUNC = int4pl, STYPE = integer)")
         cur.execute("CREATE FUNCTION iadd(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2'")
+        # Same name, other arity: a scalar overload of the aggregate isum(int).
+        cur.execute("CREATE FUNCTION isum(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 * $2'")
+        # Default arguments: defarg(x) calls defarg(x, 3).
+        cur.execute("CREATE FUNCTION defarg(a integer, b integer DEFAULT 3) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2'")
+        # A schema outside the search_path: an aggregate that a visible
+        # scalar of the same name would shadow if the qualifier were dropped.
+        self.hid = f"{self.schema}_hid"
+        cur.execute(f'CREATE SCHEMA "{self.hid}"')
+        cur.execute(f'CREATE AGGREGATE "{self.hid}".hsum(integer) (SFUNC = int4pl, STYPE = integer)')
+        cur.execute(f'CREATE AGGREGATE "{self.hid}".shadowed(integer) (SFUNC = int4pl, STYPE = integer)')
+        cur.execute("CREATE FUNCTION shadowed(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1'")
         self.conn.commit()
 
     def tearDown(self) -> None:
         self.conn.rollback()
         cur = self.conn.cursor()
         cur.execute(f'DROP SCHEMA IF EXISTS "{self.schema}" CASCADE')
+        cur.execute(f'DROP SCHEMA IF EXISTS "{self.hid}" CASCADE')
         self.conn.commit()
         self.conn.close()
 
@@ -234,6 +258,17 @@ class PostgresTests(unittest.TestCase):
                 ("v_ordered", "SELECT g, isum(v ORDER BY id) AS a FROM t GROUP BY g", T2),
                 ("v_ungrouped", "SELECT isum(v) AS a FROM t", T3),
                 ("v_scalar", "SELECT id, iadd(v, id) AS a FROM t", T1),
+                # Arity decides: isum(v, id) is the scalar overload.
+                ("v_arity", "SELECT id, isum(v, id) AS a FROM t", T1),
+                ("v_defarg", "SELECT id, defarg(v) AS a FROM t", T1),
+                (f"v_qualified", f'SELECT "{self.hid}".hsum(v) AS a FROM t', T3),
+                (f"v_shadowed", f'SELECT "{self.hid}".shadowed(v) AS a FROM t', T3),
+                # Result types from the server (no TEXT guess): window, CTE,
+                # FILTER and compound expressions over a UDF aggregate.
+                ("v_window", "SELECT id, isum(v) OVER (PARTITION BY g) AS a FROM t", T2),
+                ("v_cte", "WITH x AS (SELECT * FROM t) SELECT isum(v) AS a FROM x", T3),
+                ("v_filter", "SELECT g, isum(v) FILTER (WHERE v > 1) AS a FROM t GROUP BY g", T3),
+                ("v_compound", "SELECT g, COALESCE(isum(v), 0) + 1 AS a FROM t GROUP BY g", T3),
             ],
         )
 
@@ -286,7 +321,12 @@ class MysqlTests(unittest.TestCase):
         self.conn.close()
 
     def test_catalog_classified_functions(self) -> None:
-        views = [("v_scalar", "SELECT id, iadd(v, id) AS a FROM t", T1)]
+        views = [
+            ("v_scalar", "SELECT id, iadd(v, id) AS a FROM t", T1),
+            # A built-in sqlglot does not model: no lookup; server-reported type.
+            ("v_builtin", "SELECT id, CRC32(v) AS a FROM t", T1),
+            (f"v_qualified", f"SELECT id, {self.database}.iadd(v, 1) AS a FROM t", T1),
+        ]
         if self.mariadb:  # MariaDB stored aggregate functions (CREATE AGGREGATE FUNCTION)
             views += [
                 ("v_ungrouped", "SELECT isum(v) AS a FROM t", T3),
@@ -295,6 +335,75 @@ class MysqlTests(unittest.TestCase):
         # ignore_limitations acknowledges MYSQL_NO_TRUNCATE_TRIGGER only.
         mgr = MaterializedViewManager(self.conn, ignore_limitations=True)
         _drive(self, "mariadb" if self.mariadb else "mysql", self.conn, mgr.register_view, views)
+
+
+@unittest.skipUnless(os.environ.get("MYSQL_DSN"), "MYSQL_DSN not set")
+class MysqlRestrictedUserTests(unittest.TestCase):
+    """A user with only GRANT ALL ON <db>.* cannot read the server-wide
+    function catalogs (MySQL performance_schema.user_defined_functions,
+    MariaDB mysql.func / mysql.proc): built-ins need no lookup, stored
+    functions visible in information_schema.ROUTINES are classified there,
+    and the rest falls back to the SQL text with an announcement -- never a
+    refusal."""
+
+    def test_restricted_user(self) -> None:
+        from urllib.parse import urlparse
+
+        import pymysql
+
+        p = urlparse(os.environ["MYSQL_DSN"])
+        root = pymysql.connect(host=p.hostname or "127.0.0.1", port=p.port or 3306, user=p.username or "root",
+                               password=p.password or "", autocommit=True)
+        db = f"l3r_{uuid.uuid4().hex[:8]}"
+        user = db
+        rc = root.cursor()
+        rc.execute("SELECT VERSION()")
+        mariadb = "mariadb" in str(rc.fetchone()[0]).lower()
+        try:
+            # Without SUPER, creating triggers with binary logging on needs
+            # log_bin_trust_function_creators (MySQL 8.4 default: binlog on).
+            rc.execute("SELECT @@GLOBAL.log_bin_trust_function_creators")
+            trust_before = rc.fetchone()[0]
+            rc.execute("SET GLOBAL log_bin_trust_function_creators = 1")
+            rc.execute(f"CREATE DATABASE {db}")
+            rc.execute(f"CREATE TABLE {db}.t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
+            rc.execute(f"CREATE FUNCTION {db}.iadd(a INT, b INT) RETURNS INT DETERMINISTIC RETURN a + b")
+            rc.execute(f"CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'")
+            rc.execute(f"GRANT ALL ON {db}.* TO '{user}'@'%'")
+            conn = pymysql.connect(host=p.hostname or "127.0.0.1", port=p.port or 3306, user=user, password="pw",
+                                   database=db, autocommit=False)
+            try:
+                mgr = MaterializedViewManager(conn, ignore_limitations=True)
+                with warnings.catch_warnings(record=True):
+                    warnings.simplefilter("always")
+                    plan = mgr.register_view(
+                        "CREATE VIEW v_builtin AS SELECT id, CRC32(v) AS a FROM t;\n"
+                        "CREATE VIEW v_stored AS SELECT id, iadd(v, 1) AS a FROM t"
+                    )
+                subs = list(plan.sub_plans)
+                self.assertEqual([sp.strategy for sp in subs], [T1, T1])
+                self.assertFalse([d for d in subs[0].strategy_diagnostics if d.code == "FUNCTION_CLASSIFICATION_FROM_TEXT"])
+                text_only = [d for d in subs[1].strategy_diagnostics if d.code == "FUNCTION_CLASSIFICATION_FROM_TEXT"]
+                # MySQL: ROUTINES lists the user's own routines; MariaDB keeps
+                # routines in mysql.proc, which this user cannot read.
+                self.assertEqual(len(text_only), 1 if mariadb else 0, subs[1].strategy_diagnostics)
+                if text_only:
+                    self.assertTrue(text_only[0].message.startswith("exact result required: falling back to strategy"))
+                cur = conn.cursor()
+                cur.execute("INSERT INTO t VALUES (1, 1, 5), (2, 2, NULL)")
+                conn.commit()
+                for name, sql in (("v_builtin", "SELECT id, CRC32(v) AS a FROM t"), ("v_stored", "SELECT id, iadd(v, 1) AS a FROM t")):
+                    mv, mv_t = _snap(cur, f"SELECT * FROM {name}")
+                    live, live_t = _snap(cur, sql)
+                    self.assertEqual((mv, mv_t), (live, live_t), name)
+                conn.commit()
+            finally:
+                conn.close()
+        finally:
+            rc.execute(f"SET GLOBAL log_bin_trust_function_creators = {int(trust_before)}" if "trust_before" in locals() else "SELECT 1")
+            rc.execute(f"DROP USER IF EXISTS '{user}'@'%'")
+            rc.execute(f"DROP DATABASE IF EXISTS {db}")
+            root.close()
 
 
 if __name__ == "__main__":
