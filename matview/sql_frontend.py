@@ -927,7 +927,10 @@ def _extract_declared_types_and_sanitized_ddl(
                             break
                     idx_t += 1
                 if dialect == Dialect.MYSQL:
-                    while idx_t < n_item and item_toks[idx_t].text.upper() in ("UNSIGNED", "SIGNED", "ZEROFILL"):
+                    while (
+                        idx_t < n_item
+                        and item_toks[idx_t].text.upper() in ("UNSIGNED", "SIGNED", "ZEROFILL")
+                    ):
                         t_toks.append(item_toks[idx_t])
                         idx_t += 1
                 break
@@ -938,7 +941,10 @@ def _extract_declared_types_and_sanitized_ddl(
                 and item_toks[idx_t + 1].text.upper() != "VARYING"
             ):
                 break
-            if tk.token_type != SQLGlotTokenType.IDENTIFIER and tk.text.upper().split()[0] in constraint_starts:
+            if (
+                tk.token_type != SQLGlotTokenType.IDENTIFIER
+                and tk.text.upper().split()[0] in constraint_starts
+            ):
                 break
             t_toks.append(tk)
             idx_t += 1

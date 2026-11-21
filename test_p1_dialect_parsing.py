@@ -135,7 +135,9 @@ class DialectAwareParsingTests(unittest.TestCase):
         self.assertIn("MEDIUMINT", cols["counter"].data_type.upper())
         self.assertEqual(cols["ratio"].data_type.upper(), "FLOAT UNSIGNED")
         self.assertEqual(cols["real_ratio"].data_type.upper(), "DOUBLE")
-        self.assertEqual(cols["real_precision"].data_type.upper().replace(" ", ""), "DOUBLE(10,2)")
+        self.assertEqual(
+            cols["real_precision"].data_type.upper().replace(" ", ""), "DOUBLE(10,2)"
+        )
 
     def test_mysql_real_uses_default_double_alias_without_fallback(self) -> None:
         schema_sql = """
@@ -149,7 +151,9 @@ class DialectAwareParsingTests(unittest.TestCase):
         self.assertIn("real_metrics", schemas)
         cols = schemas["real_metrics"].columns
         self.assertEqual(cols["value"].data_type.upper(), "DOUBLE")
-        self.assertEqual(cols["precise_value"].data_type.upper().replace(" ", ""), "DOUBLE(10,2)")
+        self.assertEqual(
+            cols["precise_value"].data_type.upper().replace(" ", ""), "DOUBLE(10,2)"
+        )
 
     def test_mariadb_schema_parsing_via_engine_version(self) -> None:
         """Verify MariaDB engine version passes down cleanly without unknown dialect errors."""
