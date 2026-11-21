@@ -20,7 +20,8 @@ Each fallback is announced through ``matview.diagnostics``.
 from __future__ import annotations
 
 import re
-from typing import List, Optional, Sequence
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
 
 import sqlglot
 import sqlglot.errors
@@ -33,19 +34,42 @@ from .aggregate_semantics import (
     has_grouping_sets,
     iter_unordered_order_sensitive_calls,
 )
-from .diagnostics import StrategyAnnouncement, exact_fallback
+from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, exact_fallback_message
 from .engines import AggFunc, Dialect, MaintenanceStrategy, UnsupportedMaterializedViewError, _sqlglot_dialect
 from .logical_ir import SelectItem
 from .sql_frontend import parse_sql_ast
 
+# Diagnostic codes (matview.diagnostics registry is open).
+UNRECOGNIZED_AGGREGATE_GROUP_RECOMPUTE = "UNRECOGNIZED_AGGREGATE_GROUP_RECOMPUTE"
+UNRECOGNIZED_AGGREGATE_FULL_REFRESH = "UNRECOGNIZED_AGGREGATE_FULL_REFRESH"
+ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH = "ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"
+OPAQUE_AGGREGATE_FULL_REFRESH = "OPAQUE_AGGREGATE_FULL_REFRESH"
+GROUPING_SETS_FULL_REFRESH = "GROUPING_SETS_FULL_REFRESH"
+
+
+@dataclass(frozen=True)
+class ExactRoutingFallback:
+    """One routing fallback, worded through matview.diagnostics."""
+
+    code: str
+    strategy: Strategy
+    reason: str
+    cost: str
+    remedy: str
+    expressions: Tuple[str, ...]
+
+    def message(self) -> str:
+        return exact_fallback_message(self.strategy, self.reason, self.cost, self.remedy)
+
+
 GROUP_RECOMPUTE_COST = (
     "every write recomputes each affected group from the base rows with the view's own "
     "aggregate: O(rows in the group) with an index on the GROUP BY columns "
-    "(recommended_base_indexes), O(table) without, on every engine"
+    "(recommended_base_indexes), O(table) without, on every engine."
 )
 FULL_REFRESH_COST = (
     "every write re-runs the whole view query: O(table) once per statement on PostgreSQL, "
-    "once per changed row on SQLite, MySQL and MariaDB"
+    "once per changed row on SQLite, MySQL and MariaDB."
 )
 
 # Aggregates with an algebraic delta rule (the decomposition targets).
@@ -199,41 +223,46 @@ class ExactAggregateRoutingMixin(MixinHost):
         )
 
     # -------------------------------------------------------------- routing
-    def _exact_full_refresh_fallback(self) -> Optional[StrategyAnnouncement]:
+    def _exact_full_refresh_fallback(self) -> Optional[ExactRoutingFallback]:
         """The full-refresh fallback this view needs for an exact result, if any."""
-        strategy = MaintenanceStrategy.ATOMIC_QUERY_SYNC.value
         if self._view_has_grouping_sets():
-            return exact_fallback(
-                strategy,
+            return ExactRoutingFallback(
+                GROUPING_SETS_FULL_REFRESH,
+                Strategy.FULL_REFRESH,
                 "GROUP BY ROLLUP/CUBE/GROUPING SETS (or WITH ROLLUP) is not decomposed into "
-                "incrementally maintained grouping levels yet",
+                "incrementally maintained grouping levels yet.",
                 FULL_REFRESH_COST,
                 "rewrite the view as a UNION ALL of plain GROUP BY queries, one per grouping level, "
-                "so that each level is maintained incrementally",
+                "so that each level is maintained incrementally.",
+                (),
             )
         if self.view.has_cte or self.view.has_compound_set_op or self.view.has_window_func:
             return None  # these shapes are full-refresh (or windowed) already
         unordered = self._unordered_order_sensitive_aggregates()
         if unordered:
-            return exact_fallback(
-                strategy,
+            return ExactRoutingFallback(
+                ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH,
+                Strategy.FULL_REFRESH,
                 "the result of " + ", ".join(unordered) + " depends on the order in which the "
                 "group's rows are read, and only a full evaluation of the original query reads "
-                "them as the live view does",
+                "them as the live view does.",
                 FULL_REFRESH_COST,
                 "add an ORDER BY that covers the primary key of every base table inside the "
                 "aggregate call (e.g. ARRAY_AGG(x ORDER BY <pk>)) to enable the group-scoped "
-                "recompute",
+                "recompute.",
+                tuple(unordered),
             )
         opaque = self._opaque_grouped_items()
         if opaque:
-            return exact_fallback(
-                strategy,
+            return ExactRoutingFallback(
+                OPAQUE_AGGREGATE_FULL_REFRESH,
+                Strategy.FULL_REFRESH,
                 "the expression(s) " + ", ".join(it.raw_expr for it in opaque) + " call a function "
                 "that is not a known built-in over non-GROUP BY columns (a user-defined aggregate), "
-                "whose order sensitivity is unknown",
+                "whose order sensitivity is unknown.",
                 FULL_REFRESH_COST,
-                "no change is needed for an exact result",
+                "no change is needed for an exact result.",
+                tuple(it.raw_expr for it in opaque),
             )
         return None
 
@@ -253,33 +282,67 @@ class ExactAggregateRoutingMixin(MixinHost):
         }
         return sorted(names)
 
-    def _unrecognized_aggregate_group_fallback(self) -> Optional[StrategyAnnouncement]:
+    def _unrecognized_aggregate_group_fallback(self) -> Optional[ExactRoutingFallback]:
         """Announcement for a group-scoped recompute chosen because of
         aggregates the algebraic compiler does not decompose."""
         names = self._non_algebraic_aggregate_names()
         if not names:
             return None
-        return exact_fallback(
-            MaintenanceStrategy.GROUP_SCOPED_DELTA.value,
+        return ExactRoutingFallback(
+            UNRECOGNIZED_AGGREGATE_GROUP_RECOMPUTE,
+            Strategy.GROUP_SCOPED_RECOMPUTE,
             "aggregate(s) " + ", ".join(names) + " have no algebraic delta rule; each "
-            "affected group is recomputed with the view's original aggregate",
+            "affected group is recomputed with the view's original aggregate.",
             GROUP_RECOMPUTE_COST,
             "create the indexes listed in recommended_base_indexes to keep the recompute "
-            "O(rows in the group)",
+            "O(rows in the group).",
+            tuple(names),
         )
 
-    def _unrecognized_aggregate_full_refresh_fallback(self) -> Optional[StrategyAnnouncement]:
+    def _unrecognized_aggregate_full_refresh_fallback(self) -> Optional[ExactRoutingFallback]:
         """Announcement for an ungrouped view (or a shape outside the group
         recompute) with aggregates that have no algebraic delta rule."""
         names = self._non_algebraic_aggregate_names()
         if not names:
             return None
-        return exact_fallback(
-            MaintenanceStrategy.ATOMIC_QUERY_SYNC.value,
+        return ExactRoutingFallback(
+            UNRECOGNIZED_AGGREGATE_FULL_REFRESH,
+            Strategy.FULL_REFRESH,
             "aggregate(s) " + ", ".join(names) + " have no algebraic delta rule and the view "
-            "has no plain GROUP BY whose groups could be recomputed separately",
+            "has no plain GROUP BY whose groups could be recomputed separately.",
             FULL_REFRESH_COST,
-            "no change is needed for an exact result",
+            "no change is needed for an exact result.",
+            tuple(names),
+        )
+
+    def _exact_routing_fallback_for(self, strategy: MaintenanceStrategy) -> Optional[ExactRoutingFallback]:
+        """The routing fallback announced for the selected strategy, if any."""
+        if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC:
+            fb = self._exact_full_refresh_fallback()
+            if fb is None and not self.view.group_by_cols and not self.view.has_window_func:
+                fb = self._unrecognized_aggregate_full_refresh_fallback()
+            return fb
+        if strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA and self._alg_mode != "window_partition":
+            return self._unrecognized_aggregate_group_fallback()
+        return None
+
+    def _exact_routing_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
+        """matview.diagnostics records for the routing fallback (emitted at
+        registration and listed in plan.strategy_diagnostics)."""
+        fb = self._exact_routing_fallback_for(strategy)
+        if fb is None:
+            return ()
+        return (
+            Diagnostic(
+                code=fb.code,
+                severity=DiagnosticSeverity.INFO,
+                view=self.logical_view_name,
+                strategy=fb.strategy,
+                columns=(),
+                expressions=fb.expressions,
+                message=fb.message(),
+                details={"maintenance_strategy": strategy.value},
+            ),
         )
 
     # ---------------------------------------------------------------- types
@@ -298,10 +361,30 @@ class ExactAggregateRoutingMixin(MixinHost):
         if not is_opaque and not pg_array_agg and not self._has_unrecognized_aggregate(item):
             return None
         node = self._item_ast(item.raw_expr)
+        resolved = self._routed_expr_storage_type(node, allow_aggregate=not is_opaque)
+        if resolved is None:
+            raise UnsupportedMaterializedViewError(
+                f"Cannot determine the native result type of {item.raw_expr!r} (column {item.alias!r}) "
+                f"on {self.dialect.value}; storing it with a guessed type would change the view's "
+                f"result. Wrap the expression in an explicit CAST(... AS <type>)."
+            )
+        return resolved
+
+    def _routed_expr_storage_type(self, node: Optional[sqlglot_exp.Expr], *, allow_aggregate: bool) -> Optional[str]:
+        """Native type of a routed select expression, or None when it is not
+        modelled: an aggregate call, a CAST, PostgreSQL ``COALESCE(<expr>,
+        '<literal>' | NULL)``, or a ``CASE`` whose non-NULL results all resolve
+        to the same type (PostgreSQL/MySQL resolve a CASE of one type to it)."""
         while isinstance(node, sqlglot_exp.Paren):
             node = node.this
-        resolved: Optional[str] = None
-        while (
+        if node is None:
+            return None
+        if isinstance(node, sqlglot_exp.Cast):
+            to = node.args.get("to")
+            if isinstance(to, sqlglot_exp.DataType):
+                return self._normalize_dialect_type(to.sql(dialect=_sqlglot_dialect(self.dialect)))
+            return None
+        if (
             self.dialect == Dialect.POSTGRES
             and isinstance(node, sqlglot_exp.Coalesce)
             and isinstance(node.this, sqlglot_exp.Expr)
@@ -310,25 +393,23 @@ class ExactAggregateRoutingMixin(MixinHost):
                 for e in node.expressions
             )
         ):
-            # PostgreSQL: COALESCE(<aggregate>, '<literal>' | NULL) has the
-            # aggregate's type (an untyped literal adopts it). Other fallbacks
-            # resolve a common type that is not modelled here.
-            node = node.this
-            while isinstance(node, sqlglot_exp.Paren):
-                node = node.this
-        if isinstance(node, sqlglot_exp.Cast):
-            to = node.args.get("to")
-            if isinstance(to, sqlglot_exp.DataType):
-                resolved = self._normalize_dialect_type(to.sql(dialect=_sqlglot_dialect(self.dialect)))
-        elif node is not None and not is_opaque and len(aggregate_calls(node)) == 1 and aggregate_calls(node)[0] is node:
-            resolved = self._aggregate_call_storage_type(node)
-        if resolved is None:
-            raise UnsupportedMaterializedViewError(
-                f"Cannot determine the native result type of {item.raw_expr!r} (column {item.alias!r}) "
-                f"on {self.dialect.value}; storing it with a guessed type would change the view's "
-                f"result. Wrap the expression in an explicit CAST(... AS <type>)."
-            )
-        return resolved
+            # PostgreSQL: an untyped literal fallback adopts the first
+            # argument's type. Other fallbacks resolve a common type that is
+            # not modelled here.
+            return self._routed_expr_storage_type(node.this, allow_aggregate=allow_aggregate)
+        if isinstance(node, sqlglot_exp.Case):
+            results = [i.args.get("true") for i in node.args.get("ifs") or ()] + [node.args.get("default")]
+            types = {
+                self._routed_expr_storage_type(r, allow_aggregate=allow_aggregate)
+                for r in results
+                if isinstance(r, sqlglot_exp.Expr) and not isinstance(r, sqlglot_exp.Null)
+            }
+            return types.pop() if len(types) == 1 and None not in types else None
+        if allow_aggregate:
+            calls = aggregate_calls(node)
+            if len(calls) == 1 and calls[0] is node:
+                return self._aggregate_call_storage_type(node)
+        return None
 
     def _arg_storage_type(self, arg: Optional[sqlglot_exp.Expr]) -> Optional[str]:
         if arg is None:
@@ -346,8 +427,12 @@ class ExactAggregateRoutingMixin(MixinHost):
                 return fn_up
         c_def = self._lookup_col_def(sql)
         if c_def is not None:
-            return self._normalize_dialect_type(c_def.data_type)
-        return self._infer_ast_expr_storage_type(sql)
+            arg_t: Optional[str] = self._normalize_dialect_type(c_def.data_type)
+        else:
+            arg_t = self._infer_ast_expr_storage_type(sql)
+        if arg_t is not None and self.dialect == Dialect.POSTGRES:
+            arg_t = _pg_drop_typmod(arg_t)
+        return arg_t
 
     def _aggregate_call_storage_type(self, call: sqlglot_exp.Expr) -> Optional[str]:
         name = call_name(call, _sqlglot_dialect(self.dialect))
@@ -415,3 +500,21 @@ class ExactAggregateRoutingMixin(MixinHost):
             return arg_t if arg_t.endswith("[]") else arg_t + "[]"
         return None
 
+
+def _pg_drop_typmod(type_sql: str) -> str:
+    """PostgreSQL polymorphic aggregates (ANY_VALUE, mode(), percentile_disc,
+    ARRAY_AGG, ...) return their argument's type without its modifier
+    (native: percentile_disc over numeric(10,2) is unconstrained numeric), so
+    the backing column drops it too. Values keep their own scale/length.
+    ``char(n)`` becomes ``bpchar`` (a bare ``char`` means ``char(1)``); a
+    ``bit(n)`` keeps its modifier (a bare ``bit`` means ``bit(1)``)."""
+    m = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_ ]*?)\s*\([^)]*\)\s*((?:\[\])*)\s*", type_sql)
+    if not m:
+        return type_sql
+    base, dims = m.group(1).strip(), m.group(2)
+    up = base.upper()
+    if up in ("BIT", "BIT VARYING", "VARBIT"):
+        return type_sql
+    if up in ("CHAR", "CHARACTER", "BPCHAR"):
+        base = "BPCHAR"
+    return base + dims

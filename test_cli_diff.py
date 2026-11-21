@@ -133,7 +133,7 @@ class TestPlanDiagnostics(unittest.TestCase):
         self.assertIsNone(diag.algebraic_mode)
         self.assertIsNotNone(diag.fallback_reason)
         self.assertIn("GROUP_CONCAT", diag.fallback_reason)
-        self.assertTrue(diag.fallback_reason.startswith("exact result required: falling back to strategy group_scoped_delta: "))
+        self.assertTrue(diag.fallback_reason.startswith("exact result required: falling back to strategy group-scoped recompute. Why: "))
 
     def test_unordered_holistic_aggregate_falls_back_to_full_refresh(self) -> None:
         # Without a total ORDER BY inside GROUP_CONCAT the concatenation order
@@ -142,7 +142,7 @@ class TestPlanDiagnostics(unittest.TestCase):
         view_sql = "CREATE VIEW v_holistic AS SELECT customer_id, GROUP_CONCAT(status) AS statuses FROM orders GROUP BY customer_id;"
         diag = generate_materialized_view(self.schemas, view_sql, dialect=Dialect.SQLITE).diagnostics
         self.assertEqual(diag.strategy, "atomic_query_sync")
-        self.assertTrue(diag.fallback_reason.startswith("exact result required: falling back to strategy atomic_query_sync: "))
+        self.assertTrue(diag.fallback_reason.startswith("exact result required: falling back to strategy full refresh of the original query. Why: "))
         self.assertIn("GROUP_CONCAT", diag.fallback_reason)
 
     def test_tier2_left_join_fallback_diagnostics(self) -> None:
