@@ -951,12 +951,45 @@ def _before_skips(ctx: Ctx) -> None:
 TRIGGER_ORDER_TODO = "Exact Maintenance When a User Trigger or FK Action Runs Before the Maintenance Trigger"
 
 
+def _sqlite_reorder_then_exact(ctx: Ctx, run: Callable[[], None]) -> None:
+    """SQLite: a user trigger created after registration that fires before the
+    maintenance triggers is reported by check_schema_drift() before any write;
+    repair_view() recreates the maintenance triggers (now the newest, so they
+    fire first) and the writes are then exact."""
+    env = ctx.env
+    drift = env.manager.check_schema_drift()
+    env.commit()
+    assert drift == {vd.name: "triggers_out_of_order" for vd in env.views}, drift
+    env.manager.repair_view()
+    env.commit()
+    assert set(env.manager.check_schema_drift().values()) == {"ok"}
+    env.commit()
+    run()
+
+
+@cell("sqlite_benign_user_trigger_after_registration", AREA_B,
+      "A user AFTER trigger created after registration that only writes a table no view reads",
+      "fires before the maintenance trigger, which it cannot disturb; check_schema_drift() stays ok", sqlite=EXACT)
+def _sqlite_benign_trigger(ctx: Ctx) -> None:
+    env = ctx.env
+    env.execute("CREATE TABLE au_log (id INTEGER, v INTEGER)")
+    env.execute("CREATE TRIGGER au_log_ai AFTER INSERT ON t FOR EACH ROW BEGIN "
+                "INSERT INTO au_log VALUES (NEW.id, NEW.v); SELECT RAISE(ABORT, 'au') WHERE NEW.v = 666; END")
+    ctx.cleanup("DROP TABLE IF EXISTS au_log", "DROP TRIGGER IF EXISTS au_log_ai")
+    env.commit()
+    assert set(env.manager.check_schema_drift().values()) == {"ok"}
+    env.commit()
+    env.execute("INSERT INTO t (id, g, v, w, u) VALUES (695, 1, 5, 0, NULL), (696, NULL, 9, 1, NULL)")
+    ctx.commit_check("benign newer trigger")
+
+
 @cell("user_after_trigger_writes_same_table", AREA_B,
       "User AFTER row trigger that updates the same row and inserts/deletes other rows of the source",
       "SQLite fires the newest trigger first, so a user trigger created after registration updates a row whose "
-      "INSERT maintenance has not run yet; the transient empty group is deleted with its other rows' sums. "
+      "INSERT maintenance has not run yet (the transient empty group lost its other rows' sums): "
+      "check_schema_drift() reports triggers_out_of_order and repair_view() puts the maintenance triggers first. "
       "MySQL/MariaDB forbid a trigger writing its own table (error 1442)",
-      todo=TRIGGER_ORDER_TODO, sqlite=WRONG, postgres=EXACT)
+      sqlite=LIMITED, postgres=EXACT)
 def _after_writes_same(ctx: Ctx) -> None:
     env = ctx.env
     if ctx.family == "postgres":
@@ -971,8 +1004,16 @@ def _after_writes_same(ctx: Ctx) -> None:
                     "DELETE FROM t WHERE id = NEW.id - 685 AND NEW.v > 4; END")
         ctx.cleanup("DROP TRIGGER IF EXISTS au_after")
         env.commit()
-    env.execute("INSERT INTO t (id, g, v, w, u) VALUES (690, 1, 5, 0, NULL), (691, 2, 3, NULL, NULL), (692, NULL, 9, 1, NULL)")
-    ctx.commit_check("AFTER trigger writing its own table")
+
+    def write() -> None:
+        env.execute("INSERT INTO t (id, g, v, w, u) VALUES (690, 1, 5, 0, NULL), (691, 2, 3, NULL, NULL), "
+                    "(692, NULL, 9, 1, NULL)")
+        ctx.commit_check("AFTER trigger writing its own table")
+
+    if ctx.family == "sqlite":
+        _sqlite_reorder_then_exact(ctx, write)
+    else:
+        write()
 
 
 @cell("sqlite_recursive_user_trigger", AREA_B,
@@ -1038,17 +1079,52 @@ def _user_trigger_raises(ctx: Ctx) -> None:
 
 @cell("sqlite_user_trigger_raise_fail", AREA_B,
       "A user AFTER trigger created after registration raising RAISE(FAIL) on the second row of a statement",
-      "FAIL keeps the rows already written, including the failing row itself, but the newer user trigger ran "
-      "first and the failing row's maintenance trigger never runs",
-      todo=TRIGGER_ORDER_TODO, sqlite=WRONG)
+      "FAIL keeps the rows already written, including the failing row itself; while the newer user trigger "
+      "fires first the failing row's maintenance never runs. check_schema_drift() reports triggers_out_of_order "
+      "(also for RAISE(IGNORE)) and repair_view() puts the maintenance triggers first",
+      sqlite=LIMITED)
 def _sqlite_raise_fail(ctx: Ctx) -> None:
     env = ctx.env
     env.execute("CREATE TRIGGER au_fail AFTER INSERT ON t FOR EACH ROW WHEN NEW.v = 667 "
                 "BEGIN SELECT RAISE(FAIL, 'au: rejected'); END")
     ctx.cleanup("DROP TRIGGER IF EXISTS au_fail")
     env.commit()
-    ctx.fails("INSERT INTO t (id, g, v, w, u) VALUES (710, 1, 1, 1, NULL), (711, 2, 667, 1, NULL)", match="rejected")
-    ctx.commit_check("RAISE(FAIL) keeps the earlier rows")
+
+    def write() -> None:
+        ctx.fails("INSERT INTO t (id, g, v, w, u) VALUES (710, 1, 1, 1, NULL), (711, 2, 667, 1, NULL)",
+                  match="rejected")
+        ctx.commit_check("RAISE(FAIL) keeps the earlier rows")
+
+    _sqlite_reorder_then_exact(ctx, write)
+
+
+@cell("sqlite_user_trigger_writes_source_indirectly", AREA_B,
+      "A newer user trigger whose writes reach the source only through other triggers: it inserts into a "
+      "table whose trigger updates the source, or into a view whose INSTEAD OF trigger updates the source",
+      "check_schema_drift() follows the trigger chain (bounded depth) and reports triggers_out_of_order; "
+      "repair_view() puts the maintenance triggers first. Writes hidden in application functions are not seen",
+      sqlite=LIMITED)
+def _sqlite_indirect(ctx: Ctx) -> None:
+    env = ctx.env
+    for ddl in ["CREATE TABLE au_x (id INTEGER)",
+                "CREATE TRIGGER au_x_ai AFTER INSERT ON au_x BEGIN UPDATE t SET w = COALESCE(w, 0) + 1 WHERE id = NEW.id; END",
+                "CREATE VIEW au_vw AS SELECT id FROM au_x",
+                "CREATE TRIGGER au_vw_io INSTEAD OF INSERT ON au_vw BEGIN UPDATE t SET v = v + 1 WHERE id = NEW.id; END",
+                "CREATE TRIGGER au_chain AFTER INSERT ON t FOR EACH ROW WHEN NEW.id BETWEEN 690 AND 699 BEGIN "
+                "INSERT INTO au_x VALUES (NEW.id); END",
+                "CREATE TRIGGER au_chain_view AFTER INSERT ON t FOR EACH ROW WHEN NEW.id >= 700 BEGIN "
+                "INSERT INTO au_vw VALUES (NEW.id); END"]:
+        env.execute(ddl)
+    ctx.cleanup("DROP TABLE IF EXISTS au_x", "DROP TRIGGER IF EXISTS au_x_ai", "DROP VIEW IF EXISTS au_vw",
+                "DROP TRIGGER IF EXISTS au_vw_io", "DROP TRIGGER IF EXISTS au_chain", "DROP TRIGGER IF EXISTS au_chain_view")
+    env.commit()
+
+    def write() -> None:
+        env.execute("INSERT INTO t (id, g, v, w, u) VALUES (690, 1, 5, 0, NULL), (692, NULL, 9, 1, NULL), "
+                    "(700, 2, 4, 1, NULL), (701, NULL, 3, 1, NULL)")
+        ctx.commit_check("indirect writes to the source")
+
+    _sqlite_reorder_then_exact(ctx, write)
 
 
 @cell("sqlite_user_triggers_older_than_views", AREA_B,
@@ -1093,9 +1169,10 @@ def _other_source_rows() -> str:
       "User trigger on one join source that writes the other source, firing BEFORE the maintenance trigger",
       "PostgreSQL row trigger (row triggers fire before statement triggers); SQLite trigger created after "
       "registration (SQLite fires the newest trigger first); MySQL/MariaDB PRECEDES. The join aggregate counts "
-      "the new pair twice where it is maintained algebraically",
+      "the new pair twice where it is maintained algebraically. SQLite: check_schema_drift() reports "
+      "triggers_out_of_order and repair_view() puts the maintenance triggers first",
       todo=TRIGGER_ORDER_TODO,
-      sqlite=WRONG, postgres=WRONG, mysql=WRONG, mariadb=WRONG)
+      sqlite=LIMITED, postgres=WRONG, mysql=WRONG, mariadb=WRONG)
 def _other_source_first(ctx: Ctx) -> None:
     env = ctx.env
     if ctx.family == "postgres":
@@ -1113,8 +1190,15 @@ def _other_source_first(ctx: Ctx) -> None:
         ctx.cleanup("DROP TRIGGER IF EXISTS au_dim")
         env.commit()
     ctx.cleanup("DELETE FROM d WHERE g >= 50")
-    env.execute(f"INSERT INTO t (id, g, v, w, u) VALUES {_other_source_rows()}")
-    ctx.commit_check("trigger writing the other join source first")
+
+    def write() -> None:
+        env.execute(f"INSERT INTO t (id, g, v, w, u) VALUES {_other_source_rows()}")
+        ctx.commit_check("trigger writing the other join source first")
+
+    if ctx.family == "sqlite":
+        _sqlite_reorder_then_exact(ctx, write)
+    else:
+        write()
 
 
 @cell("user_trigger_writes_other_source_last", AREA_B,
