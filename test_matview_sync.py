@@ -884,6 +884,12 @@ def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     # order; SQLite has no ctid (and visits a table in rowid order).
     s = re.sub(r"\s+ORDER\s+BY\s+(?:[A-Za-z0-9_]+|\"[^\"]+\")\.ctid\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+WITH\s*\([^)]*fillfactor[^)]*\)", "", s, flags=re.IGNORECASE)
+    s = re.sub(
+        r"\bFROM\s+generate_series\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s+AS\s+([A-Za-z0-9_]+)\b",
+        r"FROM (WITH RECURSIVE __mv_gs(\3) AS (SELECT \1 UNION ALL SELECT \3 + 1 FROM __mv_gs WHERE \3 < \2) SELECT \3 FROM __mv_gs) AS \3",
+        s,
+        flags=re.IGNORECASE,
+    )
     s = re.sub(rf"\bCAST\s*\(\s*ROW\s*\(({_PAREN_BALANCED}+)\)\s+AS\s+TEXT\s*\)", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
     s = re.sub(rf"\bROW\s*\(({_PAREN_BALANCED}+)\)\s*::\s*TEXT\b", r"PG_ROW_KEY(\1)", s, flags=re.IGNORECASE)
     # PostgreSQL numeric division never truncates; emulate a `(x)::NUMERIC`
@@ -2528,15 +2534,7 @@ class TranspiledConnectionAdapter:
 
                 cols_s_new = ', '.join(f'NEW."{c}" AS "{c}"' for c in col_names)
                 cols_s_old = ', '.join(f'OLD."{c}" AS "{c}"' for c in col_names)
-                # Group-scoped lock statements: SQLite serializes writers, so
-                # the SHARE lock is a no-op; `x = ANY (ARRAY(<subquery>))`
-                # becomes `x IN (<subquery>)`.
-                raw_code = re.sub(
-                    r"PERFORM\s+1\s+FROM\s+\S+\s+WHERE\s+__mv_id\s*=\s*0\s+FOR\s+SHARE;\s*IF\s+NOT\s+FOUND\s+THEN.*?END\s+IF;",
-                    "",
-                    raw_code,
-                    flags=re.I | re.S,
-                )
+                # `x = ANY (ARRAY(<subquery>))` becomes `x IN (<subquery>)`.
                 raw_code = _rewrite_pg_any_array_subqueries(raw_code)
                 raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_new_rows\s+AS\s+([A-Za-z0-9_]+)\b", rf"\1 (SELECT {cols_s_new}) AS \2", raw_code)
                 raw_code = re.sub(r"\b(FROM|JOIN)\s+__mv_old_rows\s+AS\s+([A-Za-z0-9_]+)\b", rf"\1 (SELECT {cols_s_old}) AS \2", raw_code)
@@ -2713,6 +2711,13 @@ class TranspiledConnectionAdapter:
                 s_exec = f"DELETE FROM {m_trunc.group(1)};"
             else:
                 s_exec = _transpile_pg_expr_to_sqlite(s)
+                if "ON CONFLICT" in s_exec.upper() and "FROM " in s_exec.upper():
+                    s_exec = re.sub(
+                        r"(\bFROM\s+.*?\bAS\s+[A-Za-z0-9_]+)\s+(ON\s+CONFLICT\b)",
+                        r"\1 WHERE 1=1 \2",
+                        s_exec,
+                        flags=re.I | re.S,
+                    )
                 if "NULLS NOT DISTINCT" in s_exec.upper():
                     s_exec = re.sub(r"\s+NULLS\s+NOT\s+DISTINCT\b", "", s_exec, flags=re.I)
                     s_exec = re.sub(r"^CREATE\s+UNIQUE\s+INDEX\b", "CREATE INDEX", s_exec, flags=re.I)

@@ -1159,7 +1159,9 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             del_pos = ddl.find(f"DELETE FROM {t2_join_plan.backing_table_name}")
             self.assertLess(lock_pos, del_pos, ddl)
 
-        # 3. Single-table group-scoped view must still use FOR SHARE + per-group locks.
+        # 3. Single-table group-scoped view must use bounded hash buckets (1..1024),
+        #    fillfactor = 50, NO FOR SHARE on row 0, and full-bucket locks on TRUNCATE
+        #    or non-base-table (subquery) triggers.
         t2_single_plan = generate_materialized_view(
             schemas,
             "CREATE VIEW v_t2_single AS SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids "
@@ -1167,11 +1169,104 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             dialect=Dialect.POSTGRES,
         )
         self.assertEqual(t2_single_plan.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA)
+        self.assertTrue(
+            any("WITH (fillfactor = 50)" in d for d in t2_single_plan.auxiliary_table_ddls),
+            t2_single_plan.auxiliary_table_ddls,
+        )
+        self.assertTrue(
+            any("generate_series(0, 1024)" in d for d in t2_single_plan.auxiliary_table_ddls),
+            t2_single_plan.auxiliary_table_ddls,
+        )
         single_ai = next(
             d for d in t2_single_plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_v_t2_single__t_ai" in d
         )
-        self.assertIn("FOR SHARE", single_ai)
-        self.assertIn("hashtextextended", single_ai)
+        self.assertNotIn("FOR SHARE", single_ai)
+        self.assertIn("((hashtextextended(", single_ai)
+        self.assertIn("& 1023) + 1)", single_ai)
+        self.assertIn("ORDER BY 1", single_ai)
+        single_trunc = next(
+            d for d in t2_single_plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_v_t2_single__t_trunc" in d
+        )
+        self.assertIn("generate_series(0, 1024)", single_trunc)
+        self.assertIn("ORDER BY 1", single_trunc)
+
+        # 3b. Subquery-filtered single-source group-scoped view: writes to t use bounded
+        #     group buckets, while writes to u (full refresh) lock all buckets 0..1024.
+        sub_schemas = parse_table_schema(
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL);"
+            "CREATE TABLE u (g INT PRIMARY KEY);",
+            dialect=Dialect.POSTGRES,
+        )
+        t2_sub_plan = generate_materialized_view(
+            sub_schemas,
+            "CREATE VIEW v_t2_sub AS SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids "
+            "FROM t WHERE g IN (SELECT g FROM u) GROUP BY g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertTrue(
+            any("generate_series(0, 1024)" in d for d in t2_sub_plan.auxiliary_table_ddls),
+            t2_sub_plan.auxiliary_table_ddls,
+        )
+        sub_t_ai = next(
+            d for d in t2_sub_plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_v_t2_sub__t_ai" in d
+        )
+        sub_u_ai = next(
+            d for d in t2_sub_plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_v_t2_sub__u_ai" in d
+        )
+        self.assertNotIn("FOR SHARE", sub_t_ai)
+        self.assertIn("& 1023) + 1)", sub_t_ai)
+        self.assertIn("generate_series(0, 1024)", sub_u_ai)
+        self.assertIn("ORDER BY 1", sub_u_ai)
+
+        # 3c. Self-subquery Tier 2 view (base_table also appears in subquery): never uses
+        #     per-group buckets, so it must seed and lock only row 0 (not 0..1024).
+        t2_self_sub_plan = generate_materialized_view(
+            sub_schemas,
+            "CREATE VIEW v_t2_self_sub AS SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids "
+            "FROM t WHERE v > (SELECT AVG(v) FROM t) GROUP BY g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertTrue(
+            any("VALUES (0, 0)" in d for d in t2_self_sub_plan.auxiliary_table_ddls),
+            t2_self_sub_plan.auxiliary_table_ddls,
+        )
+        self.assertFalse(
+            any("generate_series(0, 1024)" in d for d in t2_self_sub_plan.auxiliary_table_ddls),
+            t2_self_sub_plan.auxiliary_table_ddls,
+        )
+        self_sub_ai = next(
+            d for d in t2_self_sub_plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_v_t2_self_sub__t_ai" in d
+        )
+        self.assertIn("VALUES (0, 1)", self_sub_ai)
+        self.assertNotIn("generate_series", self_sub_ai)
+
+        # 3d. HAVING and SELECT-list subqueries: external table u uses full-bucket lock while
+        #     base table t uses bounded group buckets; self-subquery in HAVING uses row 0 only.
+        t2_having_u = generate_materialized_view(
+            sub_schemas,
+            "CREATE VIEW v_t2_hav_u AS SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids "
+            "FROM t GROUP BY g HAVING COUNT(*) > (SELECT COUNT(*) FROM u);",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertTrue(
+            any("generate_series(0, 1024)" in d for d in t2_having_u.auxiliary_table_ddls),
+            t2_having_u.auxiliary_table_ddls,
+        )
+        hav_u_ai = next(
+            d for d in t2_having_u.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_v_t2_hav_u__u_ai" in d
+        )
+        self.assertIn("generate_series(0, 1024)", hav_u_ai)
+
+        t2_having_self = generate_materialized_view(
+            sub_schemas,
+            "CREATE VIEW v_t2_hav_self AS SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids "
+            "FROM t GROUP BY g HAVING SUM(v) > (SELECT AVG(v) FROM t);",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertFalse(
+            any("generate_series(0, 1024)" in d for d in t2_having_self.auxiliary_table_ddls),
+            t2_having_self.auxiliary_table_ddls,
+        )
 
         # 4. Trigger firing order between any two views must be identical across every
         #    source table (including underscore/case boundaries and long shared prefixes).
