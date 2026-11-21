@@ -472,6 +472,9 @@ def _format_sa_column_type(
     # a type the backing table can be declared with. SQLAlchemy does not
     # reflect the base type's modifiers (VARCHAR(10) comes back as VARCHAR), so
     # an unconstrained VARCHAR stays VARCHAR (the result type the view reports).
+    # The reflected base type also carries the domain's collation, "default"
+    # for an uncollated domain, which is not a collation name; an explicit
+    # collation is kept with its original spelling.
     from_domain = False
     while type(col_type).__name__ == "DOMAIN" and getattr(col_type, "data_type", None) is not None:
         col_type = col_type.data_type
@@ -509,6 +512,12 @@ def _format_sa_column_type(
             quoted_schema = '"' + str(enum_schema).replace('"', '""') + '"'
             return f"{quoted_schema}.{enum_name}"
         return enum_name
+    domain_collation: Optional[str] = None
+    if from_domain and getattr(col_type, "collation", None):
+        coll = str(col_type.collation)
+        domain_collation = None if coll.lower() == "default" else coll
+        col_type = copy.copy(col_type)
+        col_type.collation = None
     precision = getattr(col_type, "precision", None)
     scale = getattr(col_type, "scale", None)
     raw_str = str(col_type).upper()
@@ -518,8 +527,13 @@ def _format_sa_column_type(
         raw_str = f"DECIMAL({int(precision)}, {int(scale)})"
     elif (from_domain or _in_array) and raw_str.startswith("VARCHAR") and not getattr(col_type, "length", None):
         raw_str = "VARCHAR"
-    elif _in_array and dialect == Dialect.POSTGRES and raw_str == "CHAR" and not getattr(col_type, "length", None):
-        # Unbounded CHAR[] in DDL means CHAR(1)[]; BPCHAR[] preserves unbounded char[].
+    elif (
+        dialect == Dialect.POSTGRES and (from_domain or _in_array)
+        and raw_str == "CHAR" and not getattr(col_type, "length", None)
+    ):
+        # CHAR without its reflected length (a domain's base type, an array
+        # element) would be CHAR(1); BPCHAR is the unbounded blank-padded type
+        # (same result type as CHAR(n)).
         raw_str = "BPCHAR"
     elif dialect == Dialect.POSTGRES and raw_str.startswith("VARCHAR") and not getattr(col_type, "length", None):
         raw_str = "TEXT"
@@ -546,6 +560,8 @@ def _format_sa_column_type(
             raw_str = raw_str + "(" + ", ".join("'" + str(m).replace("'", "''") + "'" for m in members) + ")"
     if getattr(col_type, "unsigned", False) and "UNSIGNED" not in raw_str:
         raw_str = f"{raw_str} UNSIGNED"
+    if domain_collation:
+        raw_str = f'{raw_str} COLLATE "{domain_collation}"'
     return raw_str
 
 
