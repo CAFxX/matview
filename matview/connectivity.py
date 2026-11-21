@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
@@ -466,10 +467,19 @@ def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
     # a type the backing table can be declared with. SQLAlchemy does not
     # reflect the base type's modifiers (VARCHAR(10) comes back as VARCHAR), so
     # an unconstrained VARCHAR stays VARCHAR (the result type the view reports).
+    # The reflected base type also carries the domain's collation, "default"
+    # for an uncollated domain, which is not a collation name; an explicit
+    # collation is kept with its original spelling.
     from_domain = False
     while type(col_type).__name__ == "DOMAIN" and getattr(col_type, "data_type", None) is not None:
         col_type = col_type.data_type
         from_domain = True
+    domain_collation: Optional[str] = None
+    if from_domain and getattr(col_type, "collation", None):
+        coll = str(col_type.collation)
+        domain_collation = None if coll.lower() == "default" else coll
+        col_type = copy.copy(col_type)
+        col_type.collation = None
     precision = getattr(col_type, "precision", None)
     scale = getattr(col_type, "scale", None)
     raw_str = str(col_type).upper()
@@ -479,6 +489,10 @@ def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
         raw_str = f"DECIMAL({int(precision)}, {int(scale)})"
     elif from_domain and raw_str.startswith("VARCHAR"):
         raw_str = "VARCHAR"
+    elif from_domain and raw_str.startswith("CHAR") and not raw_str.startswith("CHARACTER VARYING"):
+        # CHAR without its reflected length would be CHAR(1); BPCHAR is the
+        # unbounded blank-padded type (same result type as CHAR(n)).
+        raw_str = "BPCHAR"
     elif dialect == Dialect.POSTGRES and raw_str.startswith("VARCHAR") and not getattr(col_type, "length", None):
         raw_str = "TEXT"
     elif dialect == Dialect.POSTGRES and getattr(col_type, "timezone", False) and raw_str in ("TIMESTAMP", "TIME"):
@@ -486,6 +500,8 @@ def _format_sa_column_type(col_type: Any, dialect: Dialect) -> str:
         raw_str = f"{raw_str} WITH TIME ZONE"
     if getattr(col_type, "unsigned", False) and "UNSIGNED" not in raw_str:
         raw_str = f"{raw_str} UNSIGNED"
+    if domain_collation:
+        raw_str = f'{raw_str} COLLATE "{domain_collation}"'
     return raw_str
 
 
