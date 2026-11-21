@@ -184,11 +184,13 @@ class _NoFunctionListConnection(sqlite3.Connection):
 
 
 class SqliteWithoutFunctionListTests(unittest.TestCase):
-    """Without a catalog to ask, classification falls back to the SQL text
-    (the previous behaviour, as offline compilation does) and is announced
-    with FUNCTION_CLASSIFICATION_FROM_TEXT instead of refusing the view."""
+    """Without a catalog to ask, an unclassifiable function may be an
+    aggregate or a scalar: the view is maintained by the exact full refresh
+    of the original query and the fallback is announced
+    (UNCLASSIFIED_FUNCTION_FULL_REFRESH) -- never a text guess, never a
+    refusal."""
 
-    def test_falls_back_to_text_classification_and_announces_it(self) -> None:
+    def test_unclassifiable_function_gets_the_exact_full_refresh(self) -> None:
         from matview.diagnostics import MatviewDiagnosticWarning
 
         with tempfile.TemporaryDirectory() as d:
@@ -203,11 +205,15 @@ class SqliteWithoutFunctionListTests(unittest.TestCase):
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     plan = mgr.register_view(f"CREATE VIEW v_scalar AS {sql}")
-                codes = [d.code for d in plan.strategy_diagnostics]
-                self.assertIn("FUNCTION_CLASSIFICATION_FROM_TEXT", codes)
+                mine = [d for d in plan.strategy_diagnostics if d.code == "UNCLASSIFIED_FUNCTION_FULL_REFRESH"]
+                self.assertEqual(len(mine), 1, plan.strategy_diagnostics)
+                self.assertTrue(mine[0].message.startswith(
+                    "exact result required: falling back to strategy full refresh of the original query. Why: function(s) PY_TWICE"
+                ), mine[0].message)
+                self.assertIn("PRAGMA function_list", mine[0].message)
                 warned = [w.message.diagnostic.code for w in caught if isinstance(w.message, MatviewDiagnosticWarning)]
-                self.assertIn("FUNCTION_CLASSIFICATION_FROM_TEXT", warned)
-                self.assertEqual(plan.strategy, T1)
+                self.assertIn("UNCLASSIFIED_FUNCTION_FULL_REFRESH", warned)
+                self.assertEqual(plan.strategy, T3)
                 conn.execute("UPDATE t SET v = 5 WHERE id = 3")
                 conn.commit()
                 self.assertEqual(sorted(conn.execute("SELECT * FROM v_scalar").fetchall()), sorted(conn.execute(sql).fetchall()))
@@ -381,14 +387,17 @@ class MysqlRestrictedUserTests(unittest.TestCase):
                         "CREATE VIEW v_stored AS SELECT id, iadd(v, 1) AS a FROM t"
                     )
                 subs = list(plan.sub_plans)
-                self.assertEqual([sp.strategy for sp in subs], [T1, T1])
-                self.assertFalse([d for d in subs[0].strategy_diagnostics if d.code == "FUNCTION_CLASSIFICATION_FROM_TEXT"])
-                text_only = [d for d in subs[1].strategy_diagnostics if d.code == "FUNCTION_CLASSIFICATION_FROM_TEXT"]
-                # MySQL: ROUTINES lists the user's own routines; MariaDB keeps
-                # routines in mysql.proc, which this user cannot read.
-                self.assertEqual(len(text_only), 1 if mariadb else 0, subs[1].strategy_diagnostics)
-                if text_only:
-                    self.assertTrue(text_only[0].message.startswith("exact result required: falling back to strategy"))
+                # CRC32: a built-in, no lookup. iadd: MySQL lists the user's
+                # own routines in information_schema.ROUTINES (scalar); MariaDB
+                # keeps them in mysql.proc, which this user cannot read, so the
+                # view gets the exact full refresh, announced.
+                self.assertEqual([sp.strategy for sp in subs], [T1, T3 if mariadb else T1])
+                self.assertFalse([d for d in subs[0].strategy_diagnostics if d.code == "UNCLASSIFIED_FUNCTION_FULL_REFRESH"])
+                mine = [d for d in subs[1].strategy_diagnostics if d.code == "UNCLASSIFIED_FUNCTION_FULL_REFRESH"]
+                self.assertEqual(len(mine), 1 if mariadb else 0, subs[1].strategy_diagnostics)
+                if mine:
+                    self.assertTrue(mine[0].message.startswith("exact result required: falling back to strategy full refresh"))
+                    self.assertIn("mysql.proc", mine[0].message)
                 cur = conn.cursor()
                 cur.execute("INSERT INTO t VALUES (1, 1, 5), (2, 2, NULL)")
                 conn.commit()
@@ -404,6 +413,42 @@ class MysqlRestrictedUserTests(unittest.TestCase):
             rc.execute(f"DROP USER IF EXISTS '{user}'@'%'")
             rc.execute(f"DROP DATABASE IF EXISTS {db}")
             root.close()
+
+
+class OfflineTests(unittest.TestCase):
+    """Offline generation has no catalog: a call of a function that is
+    neither modelled nor a known built-in gets the exact full refresh; its
+    type needs a CAST where the engine has typed columns."""
+
+    def test_offline_unclassified_functions(self) -> None:
+        from matview_sync import generate_materialized_view, parse_table_schema
+
+        schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER);"
+        for dialect in ("sqlite", "postgres", "mysql"):
+            plan = generate_materialized_view(
+                parse_table_schema(schema, dialect=dialect),
+                "CREATE VIEW mv AS SELECT id, CAST(my_fn(v) AS INTEGER) AS a FROM t",
+                dialect=dialect, ignore_limitations=True,
+            )
+            self.assertEqual(plan.strategy, T3, dialect)
+            self.assertEqual([d.code for d in plan.strategy_diagnostics], ["UNCLASSIFIED_FUNCTION_FULL_REFRESH"], dialect)
+            # A known built-in stays catalog-free and incremental.
+            builtin = {"sqlite": "abs(v)", "postgres": "abs(v)", "mysql": "CRC32(v)"}[dialect]
+            plan = generate_materialized_view(
+                parse_table_schema(schema, dialect=dialect),
+                f"CREATE VIEW mv AS SELECT id, {builtin} AS a FROM t", dialect=dialect, ignore_limitations=True,
+            )
+            self.assertEqual(plan.strategy, T1, dialect)
+        for dialect in ("postgres", "mysql"):
+            with self.assertRaisesRegex(UnsupportedMaterializedViewError, r"CAST\(\.\.\. AS <type>\)"):
+                generate_materialized_view(
+                    parse_table_schema(schema, dialect=dialect),
+                    "CREATE VIEW mv AS SELECT id, my_fn(v) AS a FROM t", dialect=dialect, ignore_limitations=True,
+                )
+        plan = generate_materialized_view(
+            parse_table_schema(schema, dialect="sqlite"), "CREATE VIEW mv AS SELECT id, my_fn(v) AS a FROM t", dialect="sqlite"
+        )
+        self.assertEqual(plan.strategy, T3)  # SQLite: stored without affinity, no CAST needed
 
 
 if __name__ == "__main__":
