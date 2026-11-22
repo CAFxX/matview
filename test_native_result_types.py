@@ -312,7 +312,6 @@ class PostgresPlannedResultTypeTests(unittest.TestCase):
             "SELECT g, SUM(FLOOR(d)) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
             "SELECT g, SUM(ROUND(d, 1)) AS r FROM ik GROUP BY g": "DECIMAL(65, 1)",
             "SELECT g, SUM(TRUNCATE(d, 1)) AS r FROM ik GROUP BY g": "DECIMAL(65, 1)",
-            "SELECT g, AVG(u) AS r FROM ik GROUP BY g": "DECIMAL(14, 4)",
         }
         for select, expected_type in mysql_exact.items():
             with self.subTest(dialect="mysql", select=select):
@@ -325,6 +324,28 @@ class PostgresPlannedResultTypeTests(unittest.TestCase):
                         ignore_limitations=True,
                     )
                 self.assertIn(expected_type, plan.backing_table_ddl)
+
+        # MySQL exact AVG(u) (INT UNSIGNED): unindexed AVG is derived in the reader
+        # view with exact scale 0+4=4, while an indexed AVG keeps its DECIMAL(14, 4)
+        # backing column.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", EngineLimitationWarning)
+            avg_unindexed = generate_materialized_view(
+                mysql_schema,
+                "CREATE VIEW v AS SELECT g, AVG(u) AS r FROM ik GROUP BY g;",
+                dialect="mysql:8.4",
+                ignore_limitations=True,
+            )
+            avg_indexed = generate_materialized_view(
+                mysql_schema,
+                "CREATE VIEW v AS SELECT g, AVG(u) AS r FROM ik GROUP BY g;",
+                dialect="mysql:8.4",
+                indexes=["CREATE INDEX idx_v_r ON v (r);"],
+                ignore_limitations=True,
+            )
+        self.assertIn("DECIMAL(65, 0)", avg_unindexed.reader_view_ddl)
+        self.assertIn(") AS r", avg_unindexed.reader_view_ddl)
+        self.assertIn("DECIMAL(14, 4)", avg_indexed.backing_table_ddl)
 
         # Float branch inside CASE/IF and DOUBLE UNSIGNED must fail closed (never misclassified as exact).
         for approx_select in (

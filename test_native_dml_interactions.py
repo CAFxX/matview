@@ -949,10 +949,12 @@ TRIGGER_ORDER_TODO = "Exact Maintenance When a User Trigger or FK Action Runs Be
 
 @cell("user_after_trigger_writes_same_table", AREA_B,
       "User AFTER row trigger that updates the same row and inserts/deletes other rows of the source",
-      "SQLite fires the newest trigger first, so a user trigger created after registration updates a row whose "
-      "INSERT maintenance has not run yet; the transient empty group is deleted with its other rows' sums. "
-      "MySQL/MariaDB forbid a trigger writing its own table (error 1442)",
-      todo=TRIGGER_ORDER_TODO, sqlite=WRONG, postgres=EXACT)
+      "SQLite: Stage 4's same-group in-place UPDATE trigger avoids transiently deleting the group when a newer user "
+      "AFTER INSERT trigger updates a non-group column on an existing group (still wrong if the user trigger changes "
+      "a group key or updates an aggregated column of a brand-new group before INSERT maintenance runs — same-row "
+      "updates before outer AFTER STATEMENT also affect PostgreSQL). MySQL/MariaDB forbid a trigger writing its own "
+      "table (error 1442)",
+      sqlite=EXACT, postgres=EXACT)
 def _after_writes_same(ctx: Ctx) -> None:
     env = ctx.env
     if ctx.family == "postgres":
