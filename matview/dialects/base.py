@@ -2371,6 +2371,53 @@ class DialectBaseMixin(MixinHost):
             return False
         return src in recursive
 
+    def _reads_setop_cte_or_derived(self, arg_expr: Optional[str]) -> bool:
+        """Whether a bare column argument is read from a set-operation CTE or
+        derived table (`UNION [ALL]` / `INTERSECT` / `EXCEPT`).
+
+        Like recursive CTEs, MySQL 8.4/9.7 materialize set-operation CTEs and
+        derived tables into a temporary table holding the widened common column
+        type, so `MIN`/`MAX` over an integer column keeps that type (e.g. `INT`
+        stays `INT`, `SMALLINT + INT` stays `INT`) rather than widening to
+        `BIGINT` as single-SELECT non-recursive CTEs/derived tables do.
+        """
+        if not arg_expr:
+            return False
+        m = re.fullmatch(r"\s*(?:`?(\w+)`?\.)?`?(\w+)`?\s*", arg_expr)
+        if m is None:
+            return False
+        try:
+            q = parse_sql_ast(self.raw_view.raw_select_sql, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return False
+        setop_ctes: Set[str] = set()
+        with_ = q.args.get("with") or q.args.get("with_")
+        if isinstance(with_, sqlglot_exp.With):
+            for cte in with_.expressions:
+                body = cte.this
+                while isinstance(body, sqlglot_exp.Subquery):
+                    body = body.this
+                if isinstance(body, sqlglot_exp.SetOperation):
+                    setop_ctes.add(cte.alias_or_name.lower())
+        sources: Dict[str, bool] = {}
+        from_ = q.args.get("from") or q.args.get("from_")
+        tables = [from_.this] if from_ is not None else []
+        tables += [j.this for j in q.args.get("joins") or []]
+        for t in tables:
+            if isinstance(t, sqlglot_exp.Table):
+                sources[(t.alias_or_name or t.name).lower()] = t.name.lower() in setop_ctes
+            elif isinstance(t, sqlglot_exp.Subquery):
+                body = t.this
+                while isinstance(body, sqlglot_exp.Subquery):
+                    body = body.this
+                alias = (t.alias or "").lower()
+                sources[alias] = isinstance(body, sqlglot_exp.SetOperation)
+        if m.group(1):
+            return bool(sources.get(m.group(1).lower(), False))
+        if len(sources) == 1:
+            return bool(next(iter(sources.values())))
+        return False
+
     def _minmax_result_type(self, arg_type: str, arg_expr: Optional[str] = None) -> str:
         """MIN/MAX result type for an argument type.
 
@@ -2381,7 +2428,11 @@ class DialectBaseMixin(MixinHost):
         SQLite keep the argument type.
         """
         if (self.raw_view.has_cte or self.raw_view.has_subquery_in_from) and not (
-            self.dialect == Dialect.MYSQL and self._reads_recursive_cte(arg_expr)
+            self.dialect == Dialect.MYSQL
+            and (
+                self._reads_recursive_cte(arg_expr)
+                or self._reads_setop_cte_or_derived(arg_expr)
+            )
         ):
             arg_type = self._mysql_derived_minmax_type(arg_type)
         if self.dialect != Dialect.POSTGRES:
