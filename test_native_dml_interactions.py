@@ -1344,12 +1344,14 @@ _FK_LATE_SCHEMA = {
 
 @cell("fk_cascade_added_after_registration", AREA_B,
       "A cascading FK added to a source table after the view was registered (out-of-band ALTER TABLE)",
-      "MySQL/MariaDB: the cascaded deletes fire no triggers and check_schema_drift() still reports ok "
-      "(the registration-time refusal is never re-evaluated); SQLite cannot add an FK to an existing table",
-      todo="Make Schema Introspection and Drift Signatures Semantically Complete and Fail-Closed",
-      postgres=EXACT, mysql=WRONG, mariadb=WRONG)
+      "MySQL/MariaDB: InnoDB cascaded deletes fire no triggers, so the view becomes stale, but check_schema_drift() "
+      "reports invalid (re-evaluating MYSQL_FK_CASCADE_NO_TRIGGER), repair_view() and sync_views() refuse while the "
+      "cascading FK exists, and dropping the cascading FK + repair_view() restores exactness; SQLite cannot add an FK "
+      "to an existing table",
+      postgres=EXACT, mysql=LIMITED, mariadb=LIMITED)
 def _fk_late(ctx: Ctx) -> None:
-    env = ctx.fresh(_FK_LATE_SCHEMA, [ViewDef("v_late", "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM c GROUP BY g")],
+    v_select = "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM c GROUP BY g"
+    env = ctx.fresh(_FK_LATE_SCHEMA, [ViewDef("v_late", v_select)],
                     ["INSERT INTO p (pid) VALUES (1), (2), (3)",
                      "INSERT INTO c (id, g, v, pid) VALUES " + _values([(i, i % 4, i * 5 - 20, i % 3 + 1) for i in range(1, 13)])])
     other = env.connect()
@@ -1359,10 +1361,28 @@ def _fk_late(ctx: Ctx) -> None:
     env.commit()
     drift = env.manager.check_schema_drift()
     env.commit()
-    try:
-        ctx.check("cascade through an FK added after registration", env)
-    except ViewMismatch as exc:
-        raise ViewMismatch(f"{exc}\n  check_schema_drift() = {drift}") from None
+    if ctx.outcome == LIMITED:
+        from matview.connectivity import dbapi_transaction_state
+
+        assert drift == {"v_late": "invalid"}, drift
+        with pytest.raises(EngineLimitationError, match="MYSQL_FK_CASCADE_NO_TRIGGER"):
+            env.manager.repair_view()
+        assert dbapi_transaction_state(env.conn) is False
+        with pytest.raises(EngineLimitationError, match="MYSQL_FK_CASCADE_NO_TRIGGER"):
+            env.manager.sync_views(f"CREATE VIEW v_late AS {v_select};")
+        assert dbapi_transaction_state(env.conn) is False
+        env.execute("ALTER TABLE c DROP FOREIGN KEY au_fk", other)
+        other.commit()
+        drift_after_drop = env.manager.check_schema_drift()
+        env.commit()
+        assert drift_after_drop == {"v_late": "ok"}, drift_after_drop
+        repaired = env.manager.repair_view()
+        env.commit()
+        assert repaired == {"v_late": "repaired"}, repaired
+        ctx.check("after dropping cascading FK and repair_view()", env)
+        return
+    assert drift == {"v_late": "drifted"}, drift
+    ctx.check("cascade through an FK added after registration", env)
 
 
 _FKOFF_SCHEMA = {

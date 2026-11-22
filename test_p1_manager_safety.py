@@ -705,5 +705,434 @@ class TestNativeEngineManagerSafety(unittest.TestCase):
             tracked.close()
 
 
+class TestFkCascadeDriftAndFailClosedIntrospection(unittest.TestCase):
+    """Verify fail-closed FK metadata introspection and FK-cascade drift detection."""
+
+    def test_mysql_fk_introspection_fails_closed_on_metadata_error(self) -> None:
+        from matview import introspect_database_schemas
+
+        class FailingFkCursor:
+            def execute(self, sql: str) -> None:
+                if "referential_constraints" in sql.lower():
+                    raise RuntimeError("SELECT command denied for referential_constraints")
+
+            def fetchall(self) -> List[Tuple[Any, ...]]:
+                return []
+
+            def close(self) -> None:
+                pass
+
+        class FailingFkConn:
+            def cursor(self) -> FailingFkCursor:
+                return FailingFkCursor()
+
+        with self.assertRaisesRegex(RuntimeError, "referential_constraints"):
+            introspect_database_schemas(FailingFkConn(), dialect=Dialect.MYSQL)
+
+    def test_postgres_fk_introspection_fails_closed_and_decodes_pg_constraint(self) -> None:
+        from matview import introspect_database_schemas
+
+        class FailingPgCursor:
+            def __init__(self) -> None:
+                self.sql = ""
+
+            def execute(self, sql: str) -> None:
+                self.sql = sql
+                if "pg_constraint" in sql.lower():
+                    raise RuntimeError("permission denied for pg_constraint")
+
+            def fetchall(self) -> List[Tuple[Any, ...]]:
+                return []
+
+            def close(self) -> None:
+                pass
+
+        class FailingPgConn:
+            def cursor(self) -> FailingPgCursor:
+                return FailingPgCursor()
+
+        with self.assertRaisesRegex(RuntimeError, "pg_constraint"):
+            introspect_database_schemas(FailingPgConn(), dialect=Dialect.POSTGRES)
+
+        class DecodingPgCursor:
+            def __init__(self) -> None:
+                self.sql = ""
+
+            def execute(self, sql: str) -> None:
+                self.sql = sql
+
+            def fetchall(self) -> List[Tuple[Any, ...]]:
+                low = self.sql.lower()
+                if "table_constraints" in low and "key_column_usage" in low:
+                    return [("child", "id")]
+                if "pg_constraint" in low:
+                    return [
+                        ("child", b"c", b"n"),
+                        ("child", "d", "a"),
+                        ("child", "c", "r"),
+                    ]
+                if "information_schema.columns" in low:
+                    return [
+                        ("child", "id", "integer", "NO", None),
+                        ("child", "pid", "integer", "YES", None),
+                    ]
+                return []
+
+            def close(self) -> None:
+                pass
+
+        class DecodingPgConn:
+            def cursor(self) -> DecodingPgCursor:
+                return DecodingPgCursor()
+
+        schemas = introspect_database_schemas(DecodingPgConn(), dialect=Dialect.POSTGRES)
+        self.assertEqual(
+            schemas["child"].fk_cascade_actions,
+            ("ON DELETE CASCADE", "ON DELETE SET DEFAULT", "ON UPDATE SET NULL"),
+        )
+
+    def test_sqlite_fk_introspection_fails_closed_and_escapes_table_names(self) -> None:
+        from matview import introspect_sqlite_schemas
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute('CREATE TABLE parent (pid INTEGER PRIMARY KEY);')
+            conn.execute(
+                'CREATE TABLE "child""tbl" ('
+                'id INTEGER PRIMARY KEY, '
+                'pid INTEGER REFERENCES parent(pid) ON DELETE CASCADE ON UPDATE SET NULL'
+                ');'
+            )
+            schemas = introspect_sqlite_schemas(conn)
+            self.assertIn('child"tbl', schemas)
+            self.assertEqual(
+                schemas['child"tbl'].fk_cascade_actions,
+                ("ON DELETE CASCADE", "ON UPDATE SET NULL"),
+            )
+
+            class FailingPragmaCursor:
+                def __init__(self, inner: sqlite3.Cursor) -> None:
+                    self._inner = inner
+
+                def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                    if "foreign_key_list" in sql.lower():
+                        raise sqlite3.OperationalError("simulated foreign_key_list error")
+                    return self._inner.execute(sql, *args, **kwargs)
+
+                def fetchall(self) -> List[Tuple[Any, ...]]:
+                    return self._inner.fetchall()
+
+                def close(self) -> None:
+                    self._inner.close()
+
+            class FailingPragmaConn:
+                def cursor(self) -> FailingPragmaCursor:
+                    return FailingPragmaCursor(conn.cursor())
+
+            with self.assertRaisesRegex(sqlite3.OperationalError, "foreign_key_list"):
+                introspect_sqlite_schemas(FailingPragmaConn())
+
+            # Also verify fail-closed through introspect_database_schemas(sqlite_conn)
+            # (SQLAlchemy inspector path must not swallow introspect_sqlite_schemas errors).
+            from matview import introspect_database_schemas
+
+            def _deny_fk_pragma(action: int, arg1: Any, arg2: Any, db_name: Any, trigger: Any) -> int:
+                if action == sqlite3.SQLITE_PRAGMA and str(arg1 or "").lower() == "foreign_key_list":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            conn.set_authorizer(_deny_fk_pragma)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    introspect_database_schemas(conn, dialect=Dialect.SQLITE)
+            finally:
+                conn.set_authorizer(None)
+        finally:
+            conn.close()
+
+    def test_fk_cascade_drift_signature_and_mysql_limitation_reevaluation(self) -> None:
+        from dataclasses import replace
+        from matview import EngineLimitationError
+
+        # 1. SQLite: out-of-band recreation adding ON DELETE CASCADE triggers drift
+        sq_conn = sqlite3.connect(":memory:")
+        try:
+            sq_conn.execute("CREATE TABLE p (pid INTEGER PRIMARY KEY);")
+            sq_conn.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, pid INTEGER);")
+            sq_conn.execute("INSERT INTO p VALUES (1), (2);")
+            sq_conn.execute("INSERT INTO c VALUES (1, 10, 5, 1), (2, 10, 7, 2);")
+            sq_conn.commit()
+            mgr = MaterializedViewManager(sq_conn, dialect=Dialect.SQLITE)
+            mgr.register_view("CREATE VIEW v_c AS SELECT g, COUNT(*) AS cnt, SUM(v) AS s FROM c GROUP BY g;")
+            self.assertEqual(mgr.check_schema_drift(), {"v_c": "ok"})
+
+            # Recreate c with ON DELETE CASCADE (triggers also recreated by repair_view)
+            sq_conn.execute("DROP TABLE c;")
+            sq_conn.execute(
+                "CREATE TABLE c (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, "
+                "pid INTEGER REFERENCES p(pid) ON DELETE CASCADE);"
+            )
+            sq_conn.execute("INSERT INTO c VALUES (1, 10, 5, 1), (2, 10, 7, 2);")
+            sq_conn.commit()
+            self.assertEqual(mgr.check_schema_drift(), {"v_c": "drifted"})
+            self.assertEqual(mgr.repair_view(), {"v_c": "rebuilt"})
+            self.assertEqual(mgr.check_schema_drift(), {"v_c": "ok"})
+        finally:
+            sq_conn.close()
+
+        # 2. MySQL (transpiled): adding cascading FK after registration reports
+        #    "invalid" when unaccepted (and refuses repair_view/sync_views) and
+        #    "drifted" when MYSQL_FK_CASCADE_NO_TRIGGER was accepted.
+        from test_matview_sync import TranspiledConnectionAdapter
+
+        for accept_fk, expected_drift in ((False, "invalid"), (True, "drifted")):
+            tconn = TranspiledConnectionAdapter(Dialect.MYSQL)
+            try:
+                cur = tconn.cursor()
+                cur.execute("CREATE TABLE p (pid INT PRIMARY KEY, label VARCHAR(16));")
+                cur.execute("CREATE TABLE c (id INT PRIMARY KEY, g INT, v INT, pid INT);")
+                cur.execute("INSERT INTO p VALUES (1, 'a'), (2, 'b');")
+                cur.execute("INSERT INTO c VALUES (1, 10, 5, 1), (2, 10, 7, 2);")
+                tconn.commit()
+                mgr = MaterializedViewManager(
+                    tconn,
+                    dialect=Dialect.MYSQL,
+                    ignore_limitations=False,
+                    accept_limitations=(
+                        ("MYSQL_NO_TRUNCATE_TRIGGER", "MYSQL_FK_CASCADE_NO_TRIGGER")
+                        if accept_fk
+                        else ("MYSQL_NO_TRUNCATE_TRIGGER",)
+                    ),
+                )
+                view_sql = "CREATE VIEW v_late AS SELECT g, COUNT(*) AS cnt, SUM(v) AS s FROM c GROUP BY g;"
+                mgr.register_view(view_sql)
+                self.assertEqual(mgr.check_schema_drift(), {"v_late": "ok"})
+                tconn.commit()
+
+                base_schemas = mgr.fetch_schema()
+                mutated = dict(base_schemas)
+                mutated["c"] = replace(base_schemas["c"], fk_cascade_actions=("ON DELETE CASCADE",))
+                mgr.fetch_schema = lambda extra_schema_sql=None, _m=mutated: _m
+
+                self.assertEqual(mgr.check_schema_drift(), {"v_late": expected_drift})
+                tconn.commit()
+                if not accept_fk:
+                    with self.assertRaises(EngineLimitationError) as ctx:
+                        mgr.repair_view()
+                    self.assertIn("MYSQL_FK_CASCADE_NO_TRIGGER", str(ctx.exception))
+                    tconn.rollback()
+                    with self.assertRaises(EngineLimitationError) as ctx2:
+                        mgr.sync_views(view_sql)
+                    self.assertIn("MYSQL_FK_CASCADE_NO_TRIGGER", str(ctx2.exception))
+                    tconn.rollback()
+            finally:
+                tconn.close()
+
+    def test_native_postgres_fk_cascade_drift_and_tier2_strategy_rebuild(self) -> None:
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN is not set; skipping native PostgreSQL FK drift test")
+
+        import psycopg2
+        from matview import MaintenanceStrategy, introspect_database_schemas
+
+        conn = psycopg2.connect(dsn)
+        prefix = "t_fkd_pg_"
+        p_tbl = f"{prefix}p"
+        c_tbl = f"{prefix}c"
+        v_c = f"{prefix}v_c"
+        v_lj = f"{prefix}v_lj"
+        mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
+        cur = conn.cursor()
+        try:
+            for obj in (v_c, v_lj):
+                try:
+                    mgr.drop_view(obj)
+                except Exception:
+                    conn.rollback()
+            cur.execute(f"DROP TABLE IF EXISTS {c_tbl} CASCADE;")
+            cur.execute(f"DROP TABLE IF EXISTS {p_tbl} CASCADE;")
+            cur.execute(f"CREATE TABLE {p_tbl} (pid INT PRIMARY KEY);")
+            cur.execute(f"CREATE TABLE {c_tbl} (id INT PRIMARY KEY, g INT, v BIGINT, pid INT);")
+            cur.execute(f"INSERT INTO {p_tbl} VALUES (1), (2), (3);")
+            cur.execute(f"INSERT INTO {c_tbl} VALUES (1, 10, 5, 1), (2, 10, 7, 2), (3, 20, 9, 2);")
+            conn.commit()
+
+            p1 = mgr.register_view(f"CREATE VIEW {v_c} AS SELECT g, COUNT(*) AS cnt, SUM(v) AS s FROM {c_tbl} GROUP BY g;")
+            p2 = mgr.register_view(
+                f"CREATE VIEW {v_lj} AS SELECT p.pid, COUNT(c.id) AS cnt FROM {p_tbl} p "
+                f"LEFT JOIN {c_tbl} c ON p.pid = c.pid GROUP BY p.pid;"
+            )
+            self.assertEqual(p1.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+            self.assertEqual(p2.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA)
+            before_lj_ddls = list(mgr.get_catalog()[v_lj]["trigger_ddls"])
+            self.assertEqual(mgr.check_schema_drift().get(v_c), "ok")
+            self.assertEqual(mgr.check_schema_drift().get(v_lj), "ok")
+            conn.commit()
+
+            # Add cascading FK out-of-band (including PG 15+ column-scoped ON DELETE SET NULL (pid)
+            # test afterwards to verify SQLAlchemy inspector preserves column-list FK actions).
+            cur.execute(
+                f"ALTER TABLE {c_tbl} ADD CONSTRAINT {prefix}fk FOREIGN KEY (pid) "
+                f"REFERENCES {p_tbl} (pid) ON DELETE CASCADE ON UPDATE SET NULL;"
+            )
+            conn.commit()
+
+            pulled = introspect_database_schemas(conn, dialect=Dialect.POSTGRES)
+            self.assertEqual(
+                pulled[c_tbl].fk_cascade_actions,
+                ("ON DELETE CASCADE", "ON UPDATE SET NULL"),
+            )
+            drift = mgr.check_schema_drift()
+            conn.commit()
+            self.assertEqual(drift.get(v_c), "drifted")
+            self.assertEqual(drift.get(v_lj), "drifted")
+
+            self.assertEqual(mgr.repair_view(v_c), {v_c: "rebuilt"})
+            self.assertEqual(mgr.repair_view(v_lj), {v_lj: "rebuilt"})
+            self.assertEqual(mgr.check_schema_drift().get(v_c), "ok")
+            self.assertEqual(mgr.check_schema_drift().get(v_lj), "ok")
+            after_lj_ddls = list(mgr.get_catalog()[v_lj]["trigger_ddls"])
+            self.assertNotEqual(before_lj_ddls, after_lj_ddls)
+            conn.commit()
+
+            # Verify live maintenance stays exact across DELETE CASCADE and UPDATE SET NULL
+            cur.execute(f"DELETE FROM {p_tbl} WHERE pid = 2;")
+            cur.execute(f"UPDATE {p_tbl} SET pid = 10 WHERE pid = 1;")
+            conn.commit()
+            cur.execute(f"SELECT g, cnt, s FROM {v_c} ORDER BY g;")
+            got_c = cur.fetchall()
+            cur.execute(f"SELECT g, COUNT(*), SUM(v) FROM {c_tbl} GROUP BY g ORDER BY g;")
+            self.assertEqual(got_c, cur.fetchall())
+            cur.execute(f"SELECT pid, cnt FROM {v_lj} ORDER BY pid;")
+            got_lj = cur.fetchall()
+            cur.execute(
+                f"SELECT p.pid, COUNT(c.id) FROM {p_tbl} p LEFT JOIN {c_tbl} c ON p.pid = c.pid GROUP BY p.pid ORDER BY p.pid;"
+            )
+            self.assertEqual(got_lj, cur.fetchall())
+
+            # PostgreSQL 15+ column-scoped ON DELETE SET NULL (pid) must also be introspected
+            # through the SQLAlchemy inspector path (not dropped as an unrecognized action).
+            if mgr.engine_version.version >= (15, 0):
+                cur.execute(f"ALTER TABLE {c_tbl} DROP CONSTRAINT {prefix}fk;")
+                cur.execute(
+                    f"ALTER TABLE {c_tbl} ADD CONSTRAINT {prefix}fk_col FOREIGN KEY (pid) "
+                    f"REFERENCES {p_tbl} (pid) ON DELETE SET NULL (pid);"
+                )
+                conn.commit()
+                pulled_col = introspect_database_schemas(conn, dialect=Dialect.POSTGRES)
+                self.assertEqual(pulled_col[c_tbl].fk_cascade_actions, ("ON DELETE SET NULL",))
+                self.assertEqual(mgr.check_schema_drift().get(v_c), "drifted")
+                conn.commit()
+        finally:
+            conn.rollback()
+            try:
+                mgr.drop_view(v_c)
+            except Exception:
+                conn.rollback()
+            try:
+                mgr.drop_view(v_lj)
+            except Exception:
+                conn.rollback()
+            cur.execute(f"DROP TABLE IF EXISTS {c_tbl} CASCADE;")
+            cur.execute(f"DROP TABLE IF EXISTS {p_tbl} CASCADE;")
+            conn.commit()
+            cur.close()
+            conn.close()
+
+    def test_native_mysql_fk_cascade_added_after_registration_variants(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; skipping native MySQL/MariaDB FK drift test")
+
+        import pymysql
+        from urllib.parse import urlparse
+        from matview import EngineLimitationError
+
+        parsed = urlparse(dsn)
+        conn = pymysql.connect(
+            host=parsed.hostname or "127.0.0.1",
+            port=parsed.port or 3306,
+            user=parsed.username or "root",
+            password=parsed.password or "",
+            database=parsed.path.lstrip("/"),
+            autocommit=False,
+        )
+        prefix = "t_fkd_my_"
+        p_tbl = f"{prefix}p"
+        c_tbl = f"{prefix}c"
+        v_def = f"{prefix}v_def"
+        v_acc = f"{prefix}v_acc"
+        mgr_def = MaterializedViewManager(
+            conn,
+            dialect=Dialect.MYSQL,
+            ignore_limitations=False,
+            accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+        )
+        mgr_acc = MaterializedViewManager(
+            conn,
+            dialect=Dialect.MYSQL,
+            ignore_limitations=False,
+            accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER", "MYSQL_FK_CASCADE_NO_TRIGGER"),
+        )
+        cur = conn.cursor()
+        try:
+            for vn in (v_def, v_acc):
+                try:
+                    mgr_def.drop_view(vn)
+                except Exception:
+                    conn.rollback()
+            cur.execute(f"DROP TABLE IF EXISTS {c_tbl};")
+            cur.execute(f"DROP TABLE IF EXISTS {p_tbl};")
+            cur.execute(f"CREATE TABLE {p_tbl} (pid INT PRIMARY KEY) ENGINE=InnoDB;")
+            cur.execute(f"CREATE TABLE {c_tbl} (id INT PRIMARY KEY, g INT, v BIGINT, pid INT) ENGINE=InnoDB;")
+            cur.execute(f"INSERT INTO {p_tbl} VALUES (1), (2);")
+            cur.execute(f"INSERT INTO {c_tbl} VALUES (1, 10, 5, 1), (2, 10, 7, 2);")
+            conn.commit()
+
+            v_def_sql = f"CREATE VIEW {v_def} AS SELECT g, COUNT(*) AS cnt, SUM(v) AS s FROM {c_tbl} GROUP BY g;"
+            mgr_def.register_view(v_def_sql)
+            mgr_acc.register_view(f"CREATE VIEW {v_acc} AS SELECT g, COUNT(*) AS cnt FROM {c_tbl} GROUP BY g;")
+            self.assertEqual(mgr_def.check_schema_drift().get(v_def), "ok")
+            self.assertEqual(mgr_acc.check_schema_drift().get(v_acc), "ok")
+            conn.commit()
+
+            # Add ON UPDATE CASCADE + ON DELETE SET NULL out-of-band
+            cur.execute(
+                f"ALTER TABLE {c_tbl} ADD CONSTRAINT {prefix}fk FOREIGN KEY (pid) "
+                f"REFERENCES {p_tbl} (pid) ON UPDATE CASCADE ON DELETE SET NULL;"
+            )
+            conn.commit()
+
+            self.assertEqual(mgr_def.check_schema_drift().get(v_def), "invalid")
+            self.assertEqual(mgr_acc.check_schema_drift().get(v_acc), "drifted")
+            conn.commit()
+            with self.assertRaisesRegex(EngineLimitationError, "MYSQL_FK_CASCADE_NO_TRIGGER"):
+                mgr_def.repair_view(v_def)
+            conn.rollback()
+            with self.assertRaisesRegex(EngineLimitationError, "MYSQL_FK_CASCADE_NO_TRIGGER"):
+                mgr_def.sync_views(v_def_sql)
+            conn.rollback()
+
+            cur.execute(f"ALTER TABLE {c_tbl} DROP FOREIGN KEY {prefix}fk;")
+            conn.commit()
+            self.assertEqual(mgr_def.check_schema_drift().get(v_def), "ok")
+            self.assertEqual(mgr_acc.check_schema_drift().get(v_acc), "ok")
+            conn.commit()
+            self.assertEqual(mgr_def.repair_view(v_def), {v_def: "repaired"})
+        finally:
+            conn.rollback()
+            for vn in (v_def, v_acc):
+                try:
+                    mgr_def.drop_view(vn)
+                except Exception:
+                    conn.rollback()
+            cur.execute(f"DROP TABLE IF EXISTS {c_tbl};")
+            cur.execute(f"DROP TABLE IF EXISTS {p_tbl};")
+            conn.commit()
+            cur.close()
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

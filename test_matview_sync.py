@@ -2339,15 +2339,26 @@ class TranspiledConnectionAdapter:
             schemas = introspect_sqlite_schemas(self._sq_conn)
             rows = []
             for t_name, ts in schemas.items():
-                del_rule = "NO ACTION"
-                upd_rule = "NO ACTION"
                 for act in ts.fk_cascade_actions:
                     if act.startswith("ON DELETE "):
-                        del_rule = act[len("ON DELETE ") :]
+                        rows.append((t_name, act[len("ON DELETE ") :], "NO ACTION"))
                     elif act.startswith("ON UPDATE "):
-                        upd_rule = act[len("ON UPDATE ") :]
-                if del_rule != "NO ACTION" or upd_rule != "NO ACTION":
-                    rows.append((t_name, del_rule, upd_rule))
+                        rows.append((t_name, "NO ACTION", act[len("ON UPDATE ") :]))
+            return rows, len(rows)
+        if "PG_CATALOG.PG_CONSTRAINT" in s_up:
+            schemas = introspect_sqlite_schemas(self._sq_conn)
+            code_map = {"CASCADE": "c", "SET NULL": "n", "SET DEFAULT": "d"}
+            rows = []
+            for t_name, ts in schemas.items():
+                for act in ts.fk_cascade_actions:
+                    if act.startswith("ON DELETE "):
+                        code = code_map.get(act[len("ON DELETE ") :])
+                        if code:
+                            rows.append((t_name, code, "a"))
+                    elif act.startswith("ON UPDATE "):
+                        code = code_map.get(act[len("ON UPDATE ") :])
+                        if code:
+                            rows.append((t_name, "a", code))
             return rows, len(rows)
         if "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" in s_up and "KEY_COLUMN_USAGE" in s_up:
             schemas = introspect_sqlite_schemas(self._sq_conn)

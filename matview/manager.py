@@ -1002,7 +1002,9 @@ class MaterializedViewManager:
         # for trigger-only changes) is then rebuilt by register_view/sync_views
         # and repair_view instead of being kept with stale triggers.
         h.update(f"generator:{MATVIEW_GENERATOR_VERSION}".encode("utf-8"))
+        h.update(f"strategy:{plan.strategy.value}".encode("utf-8"))
         h.update(f"backing:{plan.backing_table_ddl}".encode("utf-8"))
+        h.update(f"reader:{plan.reader_view_ddl}".encode("utf-8"))
         h.update(_strip_sql_comments(plan.view_spec.raw_select_sql).encode("utf-8"))
         h.update(f"prefix:{plan.object_prefix}".encode("utf-8"))
         for idx_ddl in plan.index_ddls:
@@ -1016,6 +1018,14 @@ class MaterializedViewManager:
                     h.update(
                         f"{ts.name}.{c_name}:{c_def.data_type}:{c_def.not_null}:{c_def.primary_key}{vgen_sig}".encode("utf-8")
                     )
+                if ts.fk_cascade_actions:
+                    h.update(
+                        f"{ts.name}:fk:{','.join(sorted(set(ts.fk_cascade_actions)))}".encode("utf-8")
+                    )
+                if ts.without_rowid:
+                    h.update(f"{ts.name}:without_rowid".encode("utf-8"))
+                if ts.strict:
+                    h.update(f"{ts.name}:strict".encode("utf-8"))
         return h.hexdigest()
 
     @staticmethod
