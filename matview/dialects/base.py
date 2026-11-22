@@ -1101,6 +1101,84 @@ class DialectBaseMixin(MixinHost):
         s = shape(top)
         return s[0] + (1 if s[1] else 0) if s else None
 
+    def _mysql_group_key_narrow_integer_type(self, expr: str) -> Optional[str]:
+        """MySQL's grouped narrow-integer arithmetic key has INT result metadata.
+
+        MySQL 8.4/9.7 reports a plain projection such as s % 2 or s + s as
+        BIGINT, but the same expression selected as a GROUP BY key is INT.
+        This is distinct from MariaDB's display-length rule below. Keep the
+        inference deliberately narrow: only a direct group-key ADD of two
+        signed TINYINT/SMALLINT/MEDIUMINT columns, or MOD with a narrow signed
+        column on the left and a narrow column/small integer literal on the
+        right, is covered. Unsigned, multiplying, casted and unknown shapes
+        retain the ordinary expression inference.
+        """
+        if (
+            self.dialect != Dialect.MYSQL
+            or self.subdialect == EngineSubdialect.MARIADB
+            or tuple(self.engine_version.version[:2]) not in ((8, 4), (9, 7))
+            or not self.view.group_by_cols
+        ):
+            return None
+
+        try:
+            root = parse_sql_ast(expr, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None
+
+        def strip_parens(node: Any) -> Any:
+            while node.__class__.__name__ == "Paren":
+                node = node.this
+            return node
+
+        root = strip_parens(root)
+        kind = root.__class__.__name__
+        if kind not in ("Add", "Mod"):
+            return None
+
+        sql_dialect = _sqlglot_dialect(self.dialect)
+        root_sql = root.sql(dialect=sql_dialect)
+        for group_expr in self.view.group_by_cols:
+            try:
+                group_root = strip_parens(parse_sql_ast(group_expr, dialect=self.dialect))
+            except sqlglot.errors.SqlglotError:
+                continue
+            if group_root.sql(dialect=sql_dialect) != root_sql:
+                continue
+
+            def narrow_signed_column(node: Any) -> bool:
+                node = strip_parens(node)
+                if node.__class__.__name__ != "Column":
+                    return False
+                col = self._lookup_col_def(node.sql(dialect=sql_dialect)) or self._lookup_col_def(node.name)
+                if col is None:
+                    return False
+                declared = re.sub(r"\s+", " ", col.data_type.strip().upper())
+                return re.fullmatch(
+                    r"(?:TINYINT|SMALLINT|MEDIUMINT)(?:\s*\(\s*\d+\s*\))?",
+                    declared,
+                ) is not None
+
+            def small_integer_literal(node: Any) -> bool:
+                node = strip_parens(node)
+                if node.__class__.__name__ == "Neg":
+                    node = strip_parens(node.this)
+                if node.__class__.__name__ != "Literal" or node.args.get("is_string"):
+                    return False
+                value = str(node.this)
+                return re.fullmatch(r"\d+", value) is not None and int(value) < 2 ** 31
+
+            left = root.this
+            right = root.expression
+            if kind == "Add" and narrow_signed_column(left) and narrow_signed_column(right):
+                return "INT"
+            if kind == "Mod" and narrow_signed_column(left) and (
+                narrow_signed_column(right) or small_integer_literal(right)
+            ):
+                return "INT"
+            return None
+        return None
+
     def _infer_ast_expr_storage_type(self, expr: str) -> Optional[str]:
         """Infer storage type across dialects from AST nodes (CASE, COALESCE, arithmetic, scalars)."""
         try:
@@ -2171,6 +2249,9 @@ class DialectBaseMixin(MixinHost):
             window_t = self._window_aggregate_storage_type(item.raw_expr)
             if window_t is not None:
                 return window_t
+            mysql_group_key_type = self._mysql_group_key_narrow_integer_type(item.raw_expr)
+            if mysql_group_key_type is not None:
+                return mysql_group_key_type
             if (
                 self.dialect == Dialect.MYSQL
                 and self.subdialect != EngineSubdialect.MARIADB
