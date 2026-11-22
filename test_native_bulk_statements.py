@@ -1579,6 +1579,159 @@ def test_pg_opposite_order_multi_row_inserts_do_not_deadlock(make_env, target: T
     env.check("opposite-order concurrent multi-row inserts")
 
 
+@pytest.mark.parametrize("target", _params())
+def test_stage4_reader_derived_avg_and_same_group_update_exactness(make_env, target: Target) -> None:
+    """Stage 4: reader-derived AVG (standalone, shared with SUM, compound,
+    HAVING) and same-group UPDATE fast paths stay exact across NULL
+    transitions, value updates, group moves, deletes, and rollbacks."""
+    extra_views = [
+        ViewDef("v_s4_avg_only", "SELECT g, AVG(v) AS a FROM t GROUP BY g"),
+        ViewDef("v_s4_avg_sum", "SELECT g, SUM(v) AS s, COUNT(*) AS c, AVG(v) AS a FROM t GROUP BY g"),
+        ViewDef("v_s4_avg_comp", "SELECT g, AVG(v) * 2 AS a2, COUNT(*) AS c FROM t GROUP BY g HAVING AVG(v) > 0"),
+        ViewDef("v_s4_global_avg", "SELECT COUNT(*) AS c, AVG(v) AS a FROM t"),
+        ViewDef("v_s4_avg_dec", "SELECT g, AVG(m) AS am, SUM(m) AS sm, COUNT(*) AS c FROM t GROUP BY g", ("postgres", "mysql")),
+    ]
+    env = make_env(target, views=extra_views)
+    env.check("initial")
+    steps = [
+        ("same_group_upd_all", "UPDATE t SET v = v + 7 WHERE v IS NOT NULL"),
+        ("same_group_null_to_val", "UPDATE t SET v = 13 WHERE v IS NULL"),
+        ("same_group_val_to_null", "UPDATE t SET v = NULL WHERE id % 3 = 0"),
+        ("same_group_all_null_grp", "UPDATE t SET v = NULL WHERE g = 1"),
+        ("same_group_revive_null_grp", "UPDATE t SET v = 42 WHERE g = 1 AND id = (SELECT MIN(id) FROM t WHERE g = 1)"),
+        ("move_group", "UPDATE t SET g = CASE WHEN g IS NULL THEN 0 ELSE (g + 1) % 6 END"),
+        ("delete_half", "DELETE FROM t WHERE id % 2 = 0"),
+        ("delete_all", "DELETE FROM t"),
+        ("reinsert", "INSERT INTO t (id, g, v, w, m) VALUES (501, 1, 10, 1, NULL), (502, 1, NULL, 1, NULL), (503, 2, -5, 1, NULL)"),
+    ]
+    for label, sql in steps:
+        env.execute(sql)
+        env.commit()
+        env.check(label)
+    # Verify savepoint rollback restores same-group UPDATEs cleanly.
+    if target.family == "sqlite":
+        env.execute("BEGIN")
+    env.execute("UPDATE t SET v = 100 WHERE g = 1")
+    env.execute("SAVEPOINT sp_s4")
+    env.execute("UPDATE t SET v = NULL WHERE g = 1")
+    env.execute("ROLLBACK TO SAVEPOINT sp_s4")
+    env.commit()
+    env.check("savepoint_rollback_same_group")
+
+
+@pytest.mark.parametrize("target", _params(("sqlite",)))
+def test_stage4_sqlite_join_delete_index_and_cost_budget(target: Target) -> None:
+    """Stage 4: SQLite join empty-group deletes use PK index lookups (no SCAN),
+    scale independently of total group count, and lean agg/ds row triggers stay
+    within a bounded per-row budget relative to the measured trigger floor."""
+    con = sqlite3.connect(":memory:")
+    try:
+        MaterializedViewManager.configure_sqlite_connection(con)
+        con.executescript(
+            "CREATE TABLE d (g INTEGER PRIMARY KEY, name TEXT NOT NULL);"
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, v INTEGER NOT NULL, w INTEGER NOT NULL);"
+            "CREATE INDEX t_g ON t (g);"
+        )
+        # 1. Measure empty trigger floor on 4,000 rows.
+        con.executescript(
+            "CREATE TABLE floor_t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, v INTEGER NOT NULL);"
+            "CREATE TRIGGER floor_ai AFTER INSERT ON floor_t FOR EACH ROW BEGIN SELECT 1; END;"
+            "CREATE TRIGGER floor_au AFTER UPDATE ON floor_t FOR EACH ROW BEGIN SELECT 1; END;"
+        )
+        n_rows = 4000
+        t0 = time.perf_counter()
+        con.execute(
+            f"INSERT INTO floor_t (id, g, v) WITH RECURSIVE s(i) AS "
+            f"(SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < {n_rows}) "
+            f"SELECT i, i % 100, i FROM s"
+        )
+        con.commit()
+        floor_ins = max(time.perf_counter() - t0, 1e-4)
+        t0 = time.perf_counter()
+        con.execute("UPDATE floor_t SET v = v + 1")
+        con.commit()
+        floor_upd = max(time.perf_counter() - t0, 1e-4)
+
+        # 2. Lean single-table agg view cost relative to trigger floor.
+        mgr = MaterializedViewManager(con, dialect="sqlite")
+        agg_plan = mgr.register_view(
+            "CREATE VIEW mv_s4_agg AS SELECT g, SUM(v) AS s, COUNT(*) AS c, AVG(v) AS a FROM t GROUP BY g;"
+        )
+        con.commit()
+        t0 = time.perf_counter()
+        con.execute(
+            f"INSERT INTO t (id, g, v, w) WITH RECURSIVE s(i) AS "
+            f"(SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < {n_rows}) "
+            f"SELECT i, i % 100, (i * 7919) % 100003, i % 5 FROM s"
+        )
+        con.commit()
+        agg_ins = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        con.execute("UPDATE t SET v = v + 1")
+        con.commit()
+        agg_upd_v = time.perf_counter() - t0
+        # Exactness vs live view.
+        mv_rows = con.execute("SELECT g, s, c, a FROM mv_s4_agg ORDER BY g").fetchall()
+        live_rows = con.execute("SELECT g, SUM(v), COUNT(*), AVG(v) FROM t GROUP BY g ORDER BY g").fetchall()
+        assert mv_rows == live_rows
+        # Generous CI-safe budget catching O(group)/O(table) regressions while
+        # tolerating noisy runners (floor is ~2-5ms for 4k rows; lean agg is ~15-25ms).
+        assert agg_ins < max(floor_ins * 25.0, 0.25), f"agg ins={agg_ins:.4f}s floor={floor_ins:.4f}s"
+        assert agg_upd_v < max(floor_upd * 25.0, 0.25), f"agg upd_v={agg_upd_v:.4f}s floor={floor_upd:.4f}s"
+        assert "\n    a " not in agg_plan.backing_table_ddl
+
+        # 3. Join empty-group DELETE scaling: 1,500 groups vs 50 groups, plus
+        #    composite-PK EQP proving no table SCAN on mv_table.
+        def _measure_join_del(n_groups: int) -> float:
+            c2 = sqlite3.connect(":memory:")
+            try:
+                MaterializedViewManager.configure_sqlite_connection(c2)
+                c2.executescript(
+                    "CREATE TABLE d (g INTEGER PRIMARY KEY, name TEXT NOT NULL);"
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, w INTEGER NOT NULL);"
+                )
+                c2.executemany("INSERT INTO d VALUES (?, ?)", [(i, f"g_{i}") for i in range(n_groups)])
+                c2.executemany("INSERT INTO t VALUES (?, ?, ?)", [(i, i % n_groups, i % 3) for i in range(1500)])
+                c2.commit()
+                m2 = MaterializedViewManager(c2, dialect="sqlite")
+                jp = m2.register_view(
+                    "CREATE VIEW mv_jc AS SELECT d.name, t.w, COUNT(*) AS c "
+                    "FROM t JOIN d ON t.g = d.g GROUP BY d.name, t.w;"
+                )
+                c2.commit()
+                for tr in jp.trigger_ddls:
+                    if "_ad" not in tr:
+                        continue
+                    for stmt in tr.split("BEGIN", 1)[1].rsplit("END", 1)[0].split(";"):
+                        st = stmt.strip()
+                        if st.upper().startswith("DELETE"):
+                            probe = st.replace("OLD.g", "1").replace("OLD.name", "'g_1'").replace("OLD.w", "1")
+                            eqp = "\n".join(r[3] for r in c2.execute("EXPLAIN QUERY PLAN " + probe).fetchall())
+                            assert f"SCAN {jp.backing_table_name}" not in eqp, eqp
+                            assert f"SEARCH {jp.backing_table_name}" in eqp, eqp
+                ts = time.perf_counter()
+                c2.execute("DELETE FROM t WHERE id < 1000")
+                c2.commit()
+                dt = time.perf_counter() - ts
+                assert (
+                    c2.execute("SELECT name, w, c FROM mv_jc ORDER BY name, w").fetchall()
+                    == c2.execute(
+                        "SELECT d.name, t.w, COUNT(*) FROM t JOIN d ON t.g = d.g GROUP BY d.name, t.w ORDER BY d.name, t.w"
+                    ).fetchall()
+                )
+                return dt
+            finally:
+                c2.close()
+
+        dt_50 = _measure_join_del(50)
+        dt_1500 = _measure_join_del(1500)
+        # With an O(groups) full-table scan, 30x more groups slows deletes by
+        # ~15-30x; with O(1) indexed deletes, 1,500 groups stays within ~4x.
+        assert dt_1500 < max(dt_50 * 6.0, 0.10), f"dt_50={dt_50:.4f}s dt_1500={dt_1500:.4f}s"
+    finally:
+        con.close()
+
+
 # ---------------------------------------------------------------------------
 # Randomized, schema-aware statement generator
 # ---------------------------------------------------------------------------

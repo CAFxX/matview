@@ -242,6 +242,38 @@ MUTANTS = (
             "test_postgres_stage3_multi_source_inclusion_exclusion_codegen"
         ),
     ),
+    Mutant(
+        name="stage4-join-empty-group-delete-falls-back-to-full-table-scan",
+        source_path="matview/maintenance/join.py",
+        original=(
+            "                    del_zero_stmt = (\n"
+            "                        f\"DELETE FROM {mv_table}\\n\"\n"
+            "                        f\"    WHERE {pk_in_lhs} IN (\\n\"\n"
+            "                        f\"        SELECT {', '.join(pk_sel_old)}\\n\"\n"
+            "                        f\"        FROM {from_old_eff}{where_old_eff}\\n\"\n"
+            "                        f\"    ) AND {mv_table}.{self._q(row_count_col)} <= 0;\"\n"
+            "                    )"
+        ),
+        replacement=(
+            "                    del_zero_stmt = (\n"
+            "                        f\"DELETE FROM {mv_table} WHERE {mv_table}.{self._q(row_count_col)} <= 0;\"\n"
+            "                    )"
+        ),
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_stage4_lean_row_triggers_codegen_sqlite_and_mysql"
+        ),
+    ),
+    Mutant(
+        name="stage4-one-row-sqlite-sum-drops-scalar-subquery-scope",
+        source_path="matview/maintenance/join.py",
+        original="f\"THEN ({eff_s}) ELSE (SELECT SUM(__v) FROM (SELECT ({eff_s}) AS __v)) END)\"",
+        replacement="f\"THEN ({eff_s}) ELSE (SELECT SUM({eff_s})) END)\"",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_stage4_lean_row_triggers_codegen_sqlite_and_mysql"
+        ),
+    ),
 )
 
 

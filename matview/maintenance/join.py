@@ -55,12 +55,165 @@ from ..sql_frontend import (
     build_create_view_sql,
     build_insert_select_sql,
     build_select_sql,
+    parse_sql_ast,
     parse_view_ast,
     quote_sql_identifier,
 )
 
 
+_JOIN_INTEGER_COL_TYPE_RE = re.compile(
+    r"^(?:TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT|INT2|INT4|INT8)(?:\s*\(\s*\d+\s*\))?(?:\s+UNSIGNED)?(?:\s+ZEROFILL)?$",
+    re.IGNORECASE,
+)
+
+
 class Tier1JoinMixin(MixinHost):
+    def _substitute_join_alias_with_record(
+        self, expr: str, target_alias: str, rec_prefix: str
+    ) -> Optional[str]:
+        """Replace qualified `<target_alias>.<col>` references with `<rec_prefix>.<col>`.
+
+        Returns ``None`` if the expression cannot be safely tokenized or
+        contains a nested ``SELECT`` subquery where alias shadowing could apply.
+        """
+        if not expr:
+            return expr
+        try:
+            toks = _tokenize_sql(expr, read=_sqlglot_dialect(self.dialect))
+        except Exception:
+            return None
+        if any(tk.token_type == SQLGlotTokenType.SELECT for tk in toks):
+            return None
+        target_low = target_alias.lower()
+        out: List[str] = []
+        i = 0
+        n = len(toks)
+        cursor = 0
+        while i < n:
+            tk = toks[i]
+            if (
+                _is_word_or_ident_token(tk)
+                and tk.text.lower() == target_low
+                and (i == 0 or toks[i - 1].token_type != SQLGlotTokenType.DOT)
+                and i + 2 < n
+                and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                and _is_word_or_ident_token(toks[i + 2])
+            ):
+                if tk.start > cursor:
+                    out.append(expr[cursor:tk.start])
+                out.append(f"{rec_prefix}.{self._q(toks[i + 2].text)}")
+                cursor = toks[i + 2].end + 1
+                i += 3
+                continue
+            i += 1
+        if cursor < len(expr):
+            out.append(expr[cursor:])
+        return "".join(out)
+
+    def _join_expr_referenced_aliases(self, qual_expr: str) -> Optional[Set[str]]:
+        """Return lowercase join aliases referenced via `<alias>.<col>` in `qual_expr`."""
+        if not qual_expr:
+            return set()
+        known_aliases = {j.alias.lower() for j in self.view.joins}
+        try:
+            toks = _tokenize_sql(qual_expr, read=_sqlglot_dialect(self.dialect))
+        except Exception:
+            return None
+        if any(tk.token_type == SQLGlotTokenType.SELECT for tk in toks):
+            return None
+        found: Set[str] = set()
+        n = len(toks)
+        for i in range(n - 2):
+            if (
+                _is_word_or_ident_token(toks[i])
+                and (i == 0 or toks[i - 1].token_type != SQLGlotTokenType.DOT)
+                and toks[i + 1].token_type == SQLGlotTokenType.DOT
+                and _is_word_or_ident_token(toks[i + 2])
+            ):
+                al = toks[i].text.lower()
+                if al in known_aliases:
+                    found.add(al)
+        return found
+
+    def _is_unique_pk_lookup_join(
+        self,
+        j_idx: int,
+        other_j: JoinSpec,
+        combined_qual_conds: Sequence[str],
+    ) -> bool:
+        """True iff a 2-table INNER JOIN constrains every PK column of `other_j`
+        to equal an integer column of the firing table (guaranteeing 0 or 1
+        matched rows per trigger invocation with no cross-type 2-to-1 collisions)."""
+        if len(self.view.joins) != 2:
+            return False
+        firing_j = self.view.joins[j_idx]
+        other_schema = self._schemas_lower.get(other_j.table_name.lower())
+        firing_schema = self._schemas_lower.get(firing_j.table_name.lower())
+        if other_schema is None or firing_schema is None:
+            return False
+        other_pk_cols = [c for c, cd in other_schema.columns.items() if cd.primary_key]
+        if not other_pk_cols:
+            return False
+        other_cols_low = {c.lower(): cd for c, cd in other_schema.columns.items()}
+        firing_cols_low = {c.lower(): cd for c, cd in firing_schema.columns.items()}
+        other_al_low = other_j.alias.lower()
+        firing_al_low = firing_j.alias.lower()
+        if other_al_low == firing_al_low:
+            return False
+
+        matched_pks: Set[str] = set()
+
+        def _collect_eqs(node: Any) -> None:
+            if node is None:
+                return
+            if isinstance(node, sqlglot_exp.Paren):
+                _collect_eqs(node.this)
+                return
+            if isinstance(node, sqlglot_exp.And):
+                _collect_eqs(node.this)
+                _collect_eqs(node.expression)
+                return
+            if isinstance(node, sqlglot_exp.EQ):
+                lhs, rhs = node.this, node.expression
+                if isinstance(lhs, sqlglot_exp.Paren):
+                    lhs = lhs.this
+                if isinstance(rhs, sqlglot_exp.Paren):
+                    rhs = rhs.this
+                if isinstance(lhs, sqlglot_exp.Column) and isinstance(rhs, sqlglot_exp.Column):
+                    l_tbl = (lhs.table or "").lower()
+                    r_tbl = (rhs.table or "").lower()
+                    l_col = (lhs.name or "").lower()
+                    r_col = (rhs.name or "").lower()
+                    if l_tbl == other_al_low and r_tbl == firing_al_low:
+                        pk_cd = other_cols_low.get(l_col)
+                        src_cd = firing_cols_low.get(r_col)
+                        if (
+                            pk_cd is not None
+                            and pk_cd.primary_key
+                            and src_cd is not None
+                            and _JOIN_INTEGER_COL_TYPE_RE.fullmatch(pk_cd.data_type.strip())
+                            and _JOIN_INTEGER_COL_TYPE_RE.fullmatch(src_cd.data_type.strip())
+                        ):
+                            matched_pks.add(l_col)
+                    elif r_tbl == other_al_low and l_tbl == firing_al_low:
+                        pk_cd = other_cols_low.get(r_col)
+                        src_cd = firing_cols_low.get(l_col)
+                        if (
+                            pk_cd is not None
+                            and pk_cd.primary_key
+                            and src_cd is not None
+                            and _JOIN_INTEGER_COL_TYPE_RE.fullmatch(pk_cd.data_type.strip())
+                            and _JOIN_INTEGER_COL_TYPE_RE.fullmatch(src_cd.data_type.strip())
+                        ):
+                            matched_pks.add(r_col)
+
+        for cond in combined_qual_conds:
+            try:
+                ast = parse_sql_ast(cond, dialect=self.dialect)
+            except Exception:
+                continue
+            _collect_eqs(ast)
+        return all(c.lower() in matched_pks for c in other_pk_cols)
     def _qualify_join_expr(self, expr: Optional[str]) -> str:
         if not expr:
             return ""
@@ -75,6 +228,8 @@ class Tier1JoinMixin(MixinHost):
         for j in self.view.joins:
             ts = self._schemas_lower.get(j.table_name.lower())
             alias_remap[j.table_name.lower()] = (j.alias, ts)
+        for j in self.view.joins:
+            ts = self._schemas_lower.get(j.table_name.lower())
             alias_remap[j.alias.lower()] = (j.alias, ts)
 
         try:
@@ -443,9 +598,9 @@ class Tier1JoinMixin(MixinHost):
         )
 
         def _build_join_recompute_subquery(item: SelectItem) -> str:
-            alias_remap = {j.alias.lower(): f"__mv_j_{j.alias}" for j in self.view.joins}
+            alias_remap = {j.table_name.lower(): f"__mv_j_{j.alias}" for j in self.view.joins}
             for j in self.view.joins:
-                alias_remap[j.table_name.lower()] = f"__mv_j_{j.alias}"
+                alias_remap[j.alias.lower()] = f"__mv_j_{j.alias}"
 
             def _remap_to_j(frag: str) -> str:
                 q_frag = self._qualify_join_expr(frag)
@@ -964,37 +1119,371 @@ class Tier1JoinMixin(MixinHost):
                         overlap_lock_sql=pg_view_lock,
                     )
 
+        can_one_row_aggs = all(
+            (not it.is_aggregate)
+            or (
+                not it.is_distinct
+                and it.agg_func
+                in (
+                    AggFunc.COUNT_STAR,
+                    AggFunc.COUNT_COL,
+                    AggFunc.SUM,
+                    AggFunc.TOTAL,
+                    AggFunc.MIN,
+                    AggFunc.MAX,
+                )
+            )
+            for it in work_items
+        )
+        all_inner_joins = (
+            len(self.view.joins) >= 2
+            and all("." not in jj.table_name for jj in self.view.joins)
+            and all(
+                jj.join_type.upper() in ("INNER JOIN", "JOIN", "CROSS JOIN")
+                for jj in self.view.joins[1:]
+            )
+        )
+
+        def _build_one_row_select_exprs(
+            target_alias: str, rec_prefix: str
+        ) -> Optional[List[str]]:
+            out_exprs: List[str] = []
+
+            def _sub(e: str) -> Optional[str]:
+                return self._substitute_join_alias_with_record(e, target_alias, rec_prefix)
+
+            if not grp_exprs:
+                out_exprs.append("1")
+            elif has_nullable_grp:
+                s_pk = _sub(self._canonical_group_pk_expr(qual_grp_exprs))
+                if s_pk is None:
+                    return None
+                out_exprs.append(s_pk)
+
+            seen_h: Set[str] = set()
+            for g_raw, g_qual in zip(grp_exprs, qual_grp_exprs):
+                mv_col = self._group_col_alias(g_raw)
+                if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_h:
+                    seen_h.add(mv_col.lower())
+                    sg = _sub(g_qual)
+                    if sg is None:
+                        return None
+                    out_exprs.append(sg)
+
+            for item in work_items:
+                if not item.is_aggregate:
+                    s_raw = _sub(self._qualify_join_expr(item.raw_expr))
+                    if s_raw is None:
+                        return None
+                    out_exprs.append(s_raw)
+                    continue
+                eff_q = self._qualify_join_expr(
+                    self._effective_agg_value_expr(item, record_prefix=None)
+                )
+                eff_s = _sub(eff_q)
+                if eff_s is None:
+                    return None
+                if item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
+                    out_exprs.append("1")
+                elif item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                    out_exprs.append(f"(CASE WHEN ({eff_s}) IS NOT NULL THEN 1 ELSE 0 END)")
+                elif item.agg_func == AggFunc.SUM:
+                    if self.dialect == Dialect.SQLITE:
+                        # Preserve SQLite native SUM conversion on TEXT/BLOB/-0.0
+                        # when creating a new group while staying O(1) for integers.
+                        # Wrap in FROM (SELECT (...) AS __v) so referencing the
+                        # joined outer table cannot turn the enclosing SELECT into
+                        # an ungrouped aggregate when 0 rows match.
+                        out_exprs.append(
+                            f"(CASE WHEN typeof({eff_s}) IN ('integer', 'null') "
+                            f"THEN ({eff_s}) ELSE (SELECT SUM(__v) FROM (SELECT ({eff_s}) AS __v)) END)"
+                        )
+                    else:
+                        out_exprs.append(f"({eff_s})")
+                elif item.agg_func == AggFunc.TOTAL:
+                    if self.dialect == Dialect.SQLITE:
+                        out_exprs.append(
+                            f"(CASE WHEN typeof({eff_s}) = 'integer' THEN 1.0 * ({eff_s}) "
+                            f"WHEN ({eff_s}) IS NULL THEN 0.0 "
+                            f"ELSE (SELECT TOTAL(__v) FROM (SELECT ({eff_s}) AS __v)) END)"
+                        )
+                    else:
+                        out_exprs.append(
+                            f"(CASE WHEN ({eff_s}) IS NULL THEN 0.0 ELSE 1.0 * ({eff_s}) END)"
+                        )
+                elif item.agg_func in (AggFunc.MIN, AggFunc.MAX):
+                    out_exprs.append(f"({eff_s})")
+                else:
+                    return None
+
+            if count_star_alias is None:
+                out_exprs.append("1")
+
+            already_q = {self._q(c) for c in target_cols[: len(out_exprs)]}
+            for ekey, cnt_col in col_nonnull_count_map.items():
+                qc = self._q(cnt_col)
+                if qc not in already_q:
+                    it = ekey_to_item[ekey]
+                    eff_s = _sub(
+                        self._qualify_join_expr(
+                            self._effective_agg_value_expr(it, record_prefix=None)
+                        )
+                    )
+                    if eff_s is None:
+                        return None
+                    out_exprs.append(f"(CASE WHEN ({eff_s}) IS NOT NULL THEN 1 ELSE 0 END)")
+                    already_q.add(qc)
+            for ekey, sum_col in col_sum_map.items():
+                qs = self._q(sum_col)
+                if qs not in already_q:
+                    it = ekey_to_item[ekey]
+                    eff_s = _sub(
+                        self._qualify_join_expr(
+                            self._effective_agg_value_expr(it, record_prefix=None)
+                        )
+                    )
+                    if eff_s is None:
+                        return None
+                    out_exprs.append(f"({eff_s})")
+                    already_q.add(qs)
+            if len(out_exprs) != len(q_target_cols):
+                return None
+            return out_exprs
+
+        def _substitute_delta_refs(
+            assignments: Sequence[str], col_expr_map: Dict[str, str]
+        ) -> List[str]:
+            sorted_cols = sorted(col_expr_map.keys(), key=len, reverse=True)
+            out_a: List[str] = []
+            for stmt_a in assignments:
+                cur = stmt_a
+                for qc in sorted_cols:
+                    expr_rep = f"({col_expr_map[qc]})"
+                    if qc and (qc[0] in ('"', "`", "[")):
+                        cur = cur.replace(f"__mv_delta.{qc}", expr_rep)
+                    else:
+                        cur = re.sub(
+                            rf"\b__mv_delta\.{re.escape(qc)}\b",
+                            lambda _m, rep=expr_rep: rep,
+                            cur,
+                        )
+                out_a.append(cur)
+            return out_a
+
         for j_idx, j in enumerate(self.view.joins):
             base_t = j.table_name
             j_alias = j.alias
-            from_new = _build_join_from_clause(replace_alias=j_alias, rec_prefix="NEW")
-            from_old = _build_join_from_clause(replace_alias=j_alias, rec_prefix="OLD")
 
             delta_pk_match = " AND ".join(
                 f"{mv_table}.{self._q(c)} = __mv_delta.{self._q(c)}" for c in pk_cols
             )
             q_pk_cols_csv = ", ".join(self._q(c) for c in pk_cols)
-            if self.dialect == Dialect.MYSQL:
+
+            # On SQLite/MySQL/MariaDB, eliminate the single-row derived table
+            # `(SELECT NEW/OLD... [FROM DUAL]) AS <j_alias>` by inlining
+            # `<j_alias>.<col>` as `NEW.<col>` / `OLD.<col>` and moving join
+            # predicates referencing `<j_alias>` into WHERE.
+            use_inline = False
+            from_new_eff = ""
+            from_old_eff = ""
+            where_new_eff = where_sql
+            where_old_eff = where_sql
+            where_new_conds: List[str] = []
+            where_old_conds: List[str] = []
+            sel_new_eff = select_exprs
+            sel_old_eff = select_exprs
+            grp_new_sql = group_sql
+            grp_old_sql = group_sql
+            combined_qual_conds: List[str] = []
+
+            if self.dialect in (Dialect.SQLITE, Dialect.MYSQL) and all_inner_joins:
+                other_joins = [
+                    (idx_o, jj) for idx_o, jj in enumerate(self.view.joins) if idx_o != j_idx
+                ]
+                raw_extra_conds: List[str] = []
+                if j_idx > 0 and j.on_condition:
+                    raw_extra_conds.append(self._qualify_join_expr(j.on_condition))
+                if j_idx == 0 and other_joins[0][1].on_condition:
+                    raw_extra_conds.append(self._qualify_join_expr(other_joins[0][1].on_condition))
+                other_parts: List[str] = [
+                    f"{self._q(other_joins[0][1].table_name)} AS {self._q(other_joins[0][1].alias)}"
+                ]
+                inline_ok = True
+                for _, oj in other_joins[1:]:
+                    if oj.on_condition:
+                        q_on = self._qualify_join_expr(oj.on_condition)
+                        refs = self._join_expr_referenced_aliases(q_on)
+                        if refs is None:
+                            inline_ok = False
+                            break
+                        if j_alias.lower() in refs:
+                            raw_extra_conds.append(q_on)
+                            # Use INNER JOIN ... ON 1 = 1 rather than CROSS JOIN
+                            # so SQLite's planner remains free to reorder joins
+                            # when an indexed predicate from NEW/OLD targets `oj`.
+                            other_parts.append(
+                                f"INNER JOIN {self._q(oj.table_name)} AS {self._q(oj.alias)} ON 1 = 1"
+                            )
+                        else:
+                            other_parts.append(
+                                f"{oj.join_type} {self._q(oj.table_name)} AS {self._q(oj.alias)} ON {q_on}"
+                            )
+                    else:
+                        other_parts.append(
+                            f"{oj.join_type} {self._q(oj.table_name)} AS {self._q(oj.alias)}"
+                        )
+                if qual_where:
+                    raw_extra_conds.append(qual_where)
+                combined_qual_conds = list(raw_extra_conds)
+
+                if inline_ok:
+                    sub_w_new = [
+                        self._substitute_join_alias_with_record(c, j_alias, "NEW")
+                        for c in raw_extra_conds
+                    ]
+                    sub_w_old = [
+                        self._substitute_join_alias_with_record(c, j_alias, "OLD")
+                        for c in raw_extra_conds
+                    ]
+                    sub_s_new = [
+                        self._substitute_join_alias_with_record(ex, j_alias, "NEW")
+                        for ex in select_exprs
+                    ]
+                    sub_s_old = [
+                        self._substitute_join_alias_with_record(ex, j_alias, "OLD")
+                        for ex in select_exprs
+                    ]
+                    sub_g_new = [
+                        self._substitute_join_alias_with_record(g, j_alias, "NEW")
+                        for g in qual_grp_for_q
+                    ]
+                    sub_g_old = [
+                        self._substitute_join_alias_with_record(g, j_alias, "OLD")
+                        for g in qual_grp_for_q
+                    ]
+                    if (
+                        all(x is not None for x in sub_w_new)
+                        and all(x is not None for x in sub_w_old)
+                        and all(x is not None for x in sub_s_new)
+                        and all(x is not None for x in sub_s_old)
+                        and all(x is not None for x in sub_g_new)
+                        and all(x is not None for x in sub_g_old)
+                    ):
+                        use_inline = True
+                        from_new_eff = " ".join(other_parts)
+                        from_old_eff = from_new_eff
+                        where_new_conds = [x for x in sub_w_new if x is not None]
+                        where_old_conds = [x for x in sub_w_old if x is not None]
+                        where_new_eff = (
+                            f"\nWHERE {' AND '.join(f'({c})' for c in where_new_conds)}"
+                            if where_new_conds
+                            else ""
+                        )
+                        where_old_eff = (
+                            f"\nWHERE {' AND '.join(f'({c})' for c in where_old_conds)}"
+                            if where_old_conds
+                            else ""
+                        )
+                        sel_new_eff = [x for x in sub_s_new if x is not None]
+                        sel_old_eff = [x for x in sub_s_old if x is not None]
+                        grp_new_sql = (
+                            f"\nGROUP BY {', '.join(x for x in sub_g_new if x is not None)}"
+                            if sub_g_new
+                            else ""
+                        )
+                        grp_old_sql = (
+                            f"\nGROUP BY {', '.join(x for x in sub_g_old if x is not None)}"
+                            if sub_g_old
+                            else ""
+                        )
+
+            if not use_inline:
+                from_new_eff = _build_join_from_clause(replace_alias=j_alias, rec_prefix="NEW")
+                from_old_eff = _build_join_from_clause(replace_alias=j_alias, rec_prefix="OLD")
+
+            # Further optimize 2-table unique-PK-lookup joins (0 or 1 matching
+            # row per trigger invocation): drop GROUP BY and the __mv_delta
+            # derived table completely.
+            one_row_new: Optional[List[str]] = None
+            one_row_old: Optional[List[str]] = None
+            if (
+                use_inline
+                and can_one_row_aggs
+                and len(self.view.joins) == 2
+                and self._is_unique_pk_lookup_join(
+                    j_idx,
+                    self.view.joins[1 - j_idx],
+                    combined_qual_conds,
+                )
+            ):
+                one_row_new = _build_one_row_select_exprs(j_alias, "NEW")
+                one_row_old = _build_one_row_select_exprs(j_alias, "OLD")
+
+            aliased_delta_old = ", ".join(
+                f"{ex} AS {col}" for col, ex in zip(q_target_cols, sel_old_eff)
+            )
+
+            if one_row_new is not None and one_row_old is not None:
+                one_row_map_old = dict(zip(q_target_cols, one_row_old))
+                direct_minus = _substitute_delta_refs(ordered_minus, one_row_map_old)
+                direct_pk_match_old = " AND ".join(
+                    f"{mv_table}.{self._q(c)} = ({one_row_map_old[self._q(c)]})"
+                    for c in pk_cols
+                )
+                where_old_and = (
+                    " AND ".join(f"({c})" for c in where_old_conds) + " AND "
+                    if where_old_conds
+                    else ""
+                )
+                if self.dialect == Dialect.MYSQL:
+                    plus_stmt = (
+                        f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                        f"    SELECT {', '.join(one_row_new)}\n"
+                        f"    FROM {from_new_eff}{where_new_eff}\n"
+                        f"    ON DUPLICATE KEY UPDATE\n"
+                        f"        {', '.join(plus_merge_assignments)};"
+                    )
+                    minus_stmt = (
+                        f"UPDATE {mv_table}\n"
+                        f"    INNER JOIN {from_old_eff} ON {direct_pk_match_old}\n"
+                        f"    SET {', '.join(f'{mv_table}.{a}' for a in direct_minus)}"
+                        f"{where_old_eff};"
+                    )
+                else:
+                    plus_stmt = (
+                        f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
+                        f"    SELECT {', '.join(one_row_new)}\n"
+                        f"    FROM {from_new_eff}{where_new_eff}\n"
+                        f"    ON CONFLICT ({q_pk_cols_csv}) DO UPDATE SET\n"
+                        f"        {', '.join(plus_merge_assignments)};"
+                    )
+                    minus_stmt = (
+                        f"UPDATE {mv_table}\n"
+                        f"    SET {', '.join(direct_minus)}\n"
+                        f"    FROM {from_old_eff}\n"
+                        f"    WHERE {where_old_and}{direct_pk_match_old};"
+                    )
+            elif self.dialect == Dialect.MYSQL:
                 plus_stmt = (
                     f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
-                    f"    SELECT {', '.join(select_exprs)}\n"
-                    f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    SELECT {', '.join(sel_new_eff)}\n"
+                    f"    FROM {from_new_eff}{where_new_eff}{grp_new_sql}{having_non_empty}\n"
                     f"    ON DUPLICATE KEY UPDATE\n"
                     f"        {', '.join(plus_merge_assignments)};"
                 )
                 minus_stmt = (
                     f"UPDATE {mv_table}\n"
                     f"    INNER JOIN (\n"
-                    f"        SELECT {aliased_delta_select}\n"
-                    f"        FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"        SELECT {aliased_delta_old}\n"
+                    f"        FROM {from_old_eff}{where_old_eff}{grp_old_sql}{having_non_empty}\n"
                     f"    ) AS __mv_delta ON {delta_pk_match}\n"
                     f"    SET {', '.join(mysql_ordered_minus)};"
                 )
             else:
                 plus_stmt = (
                     f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
-                    f"    SELECT {', '.join(select_exprs)}\n"
-                    f"    FROM {from_new}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"    SELECT {', '.join(sel_new_eff)}\n"
+                    f"    FROM {from_new_eff}{where_new_eff}{grp_new_sql}{having_non_empty}\n"
                     f"    ON CONFLICT ({q_pk_cols_csv}) DO UPDATE SET\n"
                     f"        {', '.join(plus_merge_assignments)};"
                 )
@@ -1002,17 +1491,94 @@ class Tier1JoinMixin(MixinHost):
                     f"UPDATE {mv_table}\n"
                     f"    SET {', '.join(ordered_minus)}\n"
                     f"    FROM (\n"
-                    f"        SELECT {aliased_delta_select}\n"
-                    f"        FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
+                    f"        SELECT {aliased_delta_old}\n"
+                    f"        FROM {from_old_eff}{where_old_eff}{grp_old_sql}{having_non_empty}\n"
                     f"    ) AS __mv_delta\n"
                     f"    WHERE {delta_pk_match};"
                 )
 
-            del_zero_stmt = (
-                f"DELETE FROM {mv_table} WHERE {mv_table}.{self._q(row_count_col)} <= 0;"
-                if grp_exprs
-                else None
-            )
+            # Restrict empty-group DELETE to the key(s) touched by OLD so row
+            # triggers never full-scan `mv_table` on DELETE or UPDATE.
+            del_zero_stmt: Optional[str] = None
+            if grp_exprs:
+                col_to_sel_old = dict(zip(q_target_cols, sel_old_eff))
+                pk_sel_old = [col_to_sel_old[self._q(c)] for c in pk_cols]
+                grp_refs = [self._join_expr_referenced_aliases(g) for g in qual_grp_exprs]
+                grp_only_firing = all(
+                    r is not None and r <= {j_alias.lower()} for r in grp_refs
+                )
+                direct_old_grp: Optional[List[str]] = None
+                if grp_only_firing:
+                    sub_grps = [
+                        self._substitute_join_alias_with_record(g, j_alias, "OLD")
+                        for g in qual_grp_exprs
+                    ]
+                    if all(x is not None for x in sub_grps):
+                        direct_old_grp = [x for x in sub_grps if x is not None]
+
+                if direct_old_grp is not None:
+                    if has_nullable_grp:
+                        direct_pk_pred = (
+                            f"{mv_table}.__mv_pk = ({self._canonical_group_pk_expr(direct_old_grp)})"
+                        )
+                    else:
+                        seen_pk_preds: Set[str] = set()
+                        pk_pred_parts: List[str] = []
+                        for g_raw, old_g in zip(grp_exprs, direct_old_grp):
+                            mc = self._group_col_alias(g_raw)
+                            if mc not in seen_pk_preds:
+                                seen_pk_preds.add(mc)
+                                pk_pred_parts.append(f"{mv_table}.{self._q(mc)} = ({old_g})")
+                        direct_pk_pred = " AND ".join(pk_pred_parts)
+                    del_zero_stmt = (
+                        f"DELETE FROM {mv_table}\n"
+                        f"    WHERE ({direct_pk_pred}) AND {mv_table}.{self._q(row_count_col)} <= 0;"
+                    )
+                elif self.dialect == Dialect.MYSQL:
+                    if one_row_old is not None:
+                        one_row_map_old = dict(zip(q_target_cols, one_row_old))
+                        direct_pk_match_old = " AND ".join(
+                            f"{mv_table}.{self._q(c)} = ({one_row_map_old[self._q(c)]})"
+                            for c in pk_cols
+                        )
+                        where_old_and = (
+                            " AND ".join(f"({c})" for c in where_old_conds) + " AND "
+                            if where_old_conds
+                            else ""
+                        )
+                        del_zero_stmt = (
+                            f"DELETE {mv_table} FROM {mv_table}\n"
+                            f"    INNER JOIN {from_old_eff} ON {direct_pk_match_old}\n"
+                            f"    WHERE {where_old_and}{mv_table}.{self._q(row_count_col)} <= 0;"
+                        )
+                    else:
+                        pk_delta_sel = ", ".join(
+                            f"{ex} AS {self._q(c)}" for c, ex in zip(pk_cols, pk_sel_old)
+                        )
+                        del_zero_stmt = (
+                            f"DELETE {mv_table} FROM {mv_table}\n"
+                            f"    INNER JOIN (\n"
+                            f"        SELECT DISTINCT {pk_delta_sel}\n"
+                            f"        FROM {from_old_eff}{where_old_eff}\n"
+                            f"    ) AS __mv_delta ON {delta_pk_match}\n"
+                            f"    WHERE {mv_table}.{self._q(row_count_col)} <= 0;"
+                        )
+                else:
+                    if len(pk_cols) == 1:
+                        pk_in_lhs = f"{mv_table}.{self._q(pk_cols[0])}"
+                    else:
+                        pk_in_lhs = (
+                            "("
+                            + ", ".join(f"{mv_table}.{self._q(c)}" for c in pk_cols)
+                            + ")"
+                        )
+                    del_zero_stmt = (
+                        f"DELETE FROM {mv_table}\n"
+                        f"    WHERE {pk_in_lhs} IN (\n"
+                        f"        SELECT {', '.join(pk_sel_old)}\n"
+                        f"        FROM {from_old_eff}{where_old_eff}\n"
+                        f"    ) AND {mv_table}.{self._q(row_count_col)} <= 0;"
+                    )
             refresh_grp_stmts: List[str] = []
             if self.dialect == Dialect.SQLITE and grp_exprs:
                 seen_rcols: Set[str] = set()
@@ -1029,7 +1595,46 @@ class Tier1JoinMixin(MixinHost):
                         aff = _sqlite_type_affinity(c_def.data_type)
                         if aff in ("TEXT", "REAL"):
                             continue
-                        if aff in ("INTEGER", "NUMERIC"):
+                        is_int_num_aff = aff in ("INTEGER", "NUMERIC")
+                    else:
+                        is_int_num_aff = False
+                    sub_conds: List[str] = []
+                    if qual_where:
+                        sub_conds.append(f"({qual_where})")
+                    for g_raw, g_qual in zip(grp_exprs, qual_grp_exprs):
+                        mc = self._q(self._group_col_alias(g_raw))
+                        sub_conds.append(f"({g_qual}) IS ({mv_table}.{mc})")
+                    sub_w = f" WHERE {' AND '.join(sub_conds)}" if sub_conds else ""
+                    if one_row_old is not None:
+                        one_row_map_old = dict(zip(q_target_cols, one_row_old))
+                        old_val_expr = one_row_map_old[q_col]
+                        direct_pk_match_old = " AND ".join(
+                            f"{mv_table}.{self._q(c)} = ({one_row_map_old[self._q(c)]})"
+                            for c in pk_cols
+                        )
+                        if is_int_num_aff:
+                            val_guard_direct = (
+                                f"({old_val_expr}) = -9223372036854775808 "
+                                f"AND typeof({mv_table}.{q_col}) = typeof({old_val_expr})"
+                            )
+                        else:
+                            val_guard_direct = (
+                                f"typeof({old_val_expr}) IN ('integer', 'real') "
+                                f"AND typeof({mv_table}.{q_col}) = typeof({old_val_expr})"
+                            )
+                        where_old_and = (
+                            " AND ".join(f"({c})" for c in where_old_conds) + " AND "
+                            if where_old_conds
+                            else ""
+                        )
+                        refresh_grp_stmts.append(
+                            f"UPDATE {mv_table}\n"
+                            f"    SET {q_col} = COALESCE((SELECT {q_sel_e} FROM {full_from_sql}{sub_w} LIMIT 1), {mv_table}.{q_col})\n"
+                            f"    FROM {from_old_eff}\n"
+                            f"    WHERE ({val_guard_direct}) AND {where_old_and}{direct_pk_match_old};"
+                        )
+                    else:
+                        if is_int_num_aff:
                             val_guard = (
                                 f"__mv_delta.{q_col} = -9223372036854775808 "
                                 f"AND typeof({mv_table}.{q_col}) = typeof(__mv_delta.{q_col})"
@@ -1039,29 +1644,15 @@ class Tier1JoinMixin(MixinHost):
                                 f"typeof(__mv_delta.{q_col}) IN ('integer', 'real') "
                                 f"AND typeof({mv_table}.{q_col}) = typeof(__mv_delta.{q_col})"
                             )
-                    else:
-                        val_guard = (
-                            f"typeof(__mv_delta.{q_col}) IN ('integer', 'real') "
-                            f"AND typeof({mv_table}.{q_col}) = typeof(__mv_delta.{q_col})"
+                        refresh_grp_stmts.append(
+                            f"UPDATE {mv_table}\n"
+                            f"    SET {q_col} = COALESCE((SELECT {q_sel_e} FROM {full_from_sql}{sub_w} LIMIT 1), {mv_table}.{q_col})\n"
+                            f"    FROM (\n"
+                            f"        SELECT {aliased_delta_old}\n"
+                            f"        FROM {from_old_eff}{where_old_eff}{grp_old_sql}{having_non_empty}\n"
+                            f"    ) AS __mv_delta\n"
+                            f"    WHERE {delta_pk_match} AND {val_guard};"
                         )
-                    sub_conds: List[str] = []
-                    if qual_where:
-                        sub_conds.append(f"({qual_where})")
-                    for g_raw, g_qual in zip(grp_exprs, qual_grp_exprs):
-                        mc = self._q(self._group_col_alias(g_raw))
-                        sub_conds.append(f"({g_qual}) IS ({mv_table}.{mc})")
-                    sub_w = f" WHERE {' AND '.join(sub_conds)}" if sub_conds else ""
-                    refresh_grp_stmts.append(
-                        f"UPDATE {mv_table}\n"
-                        f"    SET {q_col} = COALESCE((SELECT {q_sel_e} FROM {full_from_sql}{sub_w} LIMIT 1), {mv_table}.{q_col})\n"
-                        f"    WHERE EXISTS (\n"
-                        f"        SELECT 1 FROM (\n"
-                        f"            SELECT {aliased_delta_select}\n"
-                        f"            FROM {from_old}{where_sql}{group_sql}{having_non_empty}\n"
-                        f"        ) AS __mv_delta\n"
-                        f"        WHERE {delta_pk_match} AND {val_guard}\n"
-                        f"    );"
-                    )
             del_stmts = [minus_stmt] + ([del_zero_stmt] if del_zero_stmt else []) + refresh_grp_stmts
             trunc_stmts = [f"DELETE FROM {mv_table};"] + (
                 [initial_populate_sql] if not grp_exprs else []

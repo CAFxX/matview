@@ -997,8 +997,7 @@ class Tier1ZSetMixin(MixinHost):
                     upd_set = ", ".join(f"{self._q(c)} = VALUES({self._q(c)})" for c in all_backing_cols)
                     plus_stmt = (
                         f"INSERT INTO {mv_table} ({', '.join(q_all_backing_cols)})\n"
-                        f"    SELECT {', '.join(all_new_vals)}{from_dual}\n"
-                        f"    WHERE TRUE\n"
+                        f"    VALUES ({', '.join(all_new_vals)})\n"
                         f"    ON DUPLICATE KEY UPDATE {upd_set};"
                     )
             else:
@@ -1118,8 +1117,7 @@ class Tier1ZSetMixin(MixinHost):
                     upd_set = ", ".join(f"{self._q(c)} = VALUES({self._q(c)})" for c in user_columns)
                     plus_stmt = (
                         f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
-                        f"    SELECT {pk_new}, {', '.join(new_vals)}, 1{from_dual}\n"
-                        f"    WHERE TRUE\n"
+                        f"    VALUES ({pk_new}, {', '.join(new_vals)}, 1)\n"
                         f"    ON DUPLICATE KEY UPDATE {upd_set}, __mv_row_count = {mv_table}.__mv_row_count + 1;"
                     )
             else:
