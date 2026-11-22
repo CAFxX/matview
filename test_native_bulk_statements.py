@@ -83,8 +83,6 @@ from matview import (
 
 LOCK_WAIT_TIMEOUT_S = 30.0
 
-STAGE3 = "TODO.md 'Bulk maintenance stage 3' (multi-source co-modification)"
-
 
 class ViewMismatch(AssertionError):
     """The materialized reader differs from the native view query."""
@@ -917,9 +915,7 @@ def test_fk_cascade_into_single_source_views(make_env, target: Target) -> None:
     env.check("ON DELETE CASCADE of all rows")
 
 
-@pytest.mark.parametrize("target", _params(("postgres", "sqlite"), xfail={
-    "pg": known_defect(f"finding 3: one query (FK cascade) modifies both join sources; Δt⋈Δd is wrong. {STAGE3}"),
-}))
+@pytest.mark.parametrize("target", _params(("postgres", "sqlite")))
 def test_fk_cascade_into_both_join_sources(make_env, target: Target) -> None:
     env = _fk_env(make_env, target, JOIN_VIEWS)
     env.execute("DELETE FROM p WHERE pid = 2")
@@ -959,10 +955,7 @@ def test_pg_writable_cte_both_sources_non_algebraic_views(shared_env, target: Ta
     env.check(name, views=[vd.name for vd in VIEWS if vd.name != "v_j"])
 
 
-_F3 = f"finding 3: a writable CTE modifies both sources of the join aggregate; Δt⋈Δd is wrong. {STAGE3}"
-
-
-@pytest.mark.parametrize("target", _params(("postgres",), xfail={"pg": known_defect(_F3)}))
+@pytest.mark.parametrize("target", _params(("postgres",)))
 @pytest.mark.parametrize("name,sql", CO_MODIFYING, ids=[c[0] for c in CO_MODIFYING])
 def test_pg_writable_cte_both_sources_join_aggregate(make_env, target: Target, name: str, sql: str) -> None:
     env = make_env(target, views=[vd for vd in VIEWS if vd.name == "v_j"])
