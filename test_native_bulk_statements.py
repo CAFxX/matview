@@ -1598,7 +1598,7 @@ def test_stage4_reader_derived_avg_and_same_group_update_exactness(make_env, tar
         ("same_group_null_to_val", "UPDATE t SET v = 13 WHERE v IS NULL"),
         ("same_group_val_to_null", "UPDATE t SET v = NULL WHERE id % 3 = 0"),
         ("same_group_all_null_grp", "UPDATE t SET v = NULL WHERE g = 1"),
-        ("same_group_revive_null_grp", "UPDATE t SET v = 42 WHERE g = 1 AND id = (SELECT MIN(id) FROM t WHERE g = 1)"),
+        ("same_group_revive_null_grp", "UPDATE t SET v = 42 WHERE g = 1 AND id = (SELECT mid FROM (SELECT MIN(id) AS mid FROM t WHERE g = 1) AS _mv_sub)"),
         ("move_group", "UPDATE t SET g = CASE WHEN g IS NULL THEN 0 ELSE (g + 1) % 6 END"),
         ("delete_half", "DELETE FROM t WHERE id % 2 = 0"),
         ("delete_all", "DELETE FROM t"),

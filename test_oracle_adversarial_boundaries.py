@@ -857,29 +857,59 @@ class LargeAggregatesAndCrossDialectPrecisionTests(unittest.TestCase):
         self.assertIn("sum_real DOUBLE PRECISION", pg_plan.backing_table_ddl)
         self.assertIn("avg_real DOUBLE PRECISION", pg_plan.backing_table_ddl)
 
-        # MySQL DDL preserves native exact types:
+        # MySQL DDL preserves native exact types; Stage 4 derives unindexed
+        # exact AVG columns in the reader view from exact DECIMAL(65, s) SUM/COUNT
+        # accumulators and stores them with native precision when indexed:
         mysql_plan = generate_materialized_view(
             schema, view, dialect="mysql", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
         )
         self.assertIn("sum_int DECIMAL(65, 0)", mysql_plan.backing_table_ddl)
         self.assertIn("sum_big DECIMAL(65, 0)", mysql_plan.backing_table_ddl)
         self.assertIn("sum_dec DECIMAL(65, 10)", mysql_plan.backing_table_ddl)
-        self.assertIn("avg_big DECIMAL(23, 4)", mysql_plan.backing_table_ddl)
-        self.assertIn("avg_dec DECIMAL(42, 14)", mysql_plan.backing_table_ddl)
+        self.assertNotIn("avg_big ", mysql_plan.backing_table_ddl)
+        self.assertNotIn("avg_dec ", mysql_plan.backing_table_ddl)
+        self.assertIn("AS avg_big", mysql_plan.reader_view_ddl)
+        self.assertIn("AS avg_dec", mysql_plan.reader_view_ddl)
+        self.assertIn("DECIMAL(65, 0)", mysql_plan.reader_view_ddl)
+        self.assertIn("DECIMAL(65, 10)", mysql_plan.reader_view_ddl)
         self.assertIn("SUM_REAL DOUBLE", mysql_plan.backing_table_ddl.upper())
         self.assertIn("AVG_REAL DOUBLE", mysql_plan.backing_table_ddl.upper())
+        mysql_indexed = generate_materialized_view(
+            schema,
+            view,
+            dialect="mysql",
+            indexes=["avg_big", "avg_dec"],
+            ignore_limitations=True,
+            accept_limitations=FLOAT_OPT_IN,
+        )
+        self.assertIn("avg_big DECIMAL(23, 4)", mysql_indexed.backing_table_ddl)
+        self.assertIn("avg_dec DECIMAL(42, 14)", mysql_indexed.backing_table_ddl)
 
         # SQLite DDL uses affinities. SUM over non-REAL inputs is stored
         # without affinity (BLOB): its result is INTEGER or REAL depending on
         # the stored values, and an affinity would convert one into the other.
+        # Stage 4 derives unindexed AVG columns in the reader view and stores
+        # them as REAL when indexed.
         sqlite_plan = generate_materialized_view(schema, view, dialect="sqlite")
         self.assertIn("sum_int BLOB", sqlite_plan.backing_table_ddl)
         self.assertIn("sum_big BLOB", sqlite_plan.backing_table_ddl)
-        self.assertIn("avg_big REAL", sqlite_plan.backing_table_ddl)
+        self.assertNotIn("avg_big ", sqlite_plan.backing_table_ddl)
         self.assertIn("sum_dec BLOB", sqlite_plan.backing_table_ddl)
-        self.assertIn("avg_dec REAL", sqlite_plan.backing_table_ddl)
+        self.assertNotIn("avg_dec ", sqlite_plan.backing_table_ddl)
         self.assertIn("sum_real REAL", sqlite_plan.backing_table_ddl)
-        self.assertIn("avg_real REAL", sqlite_plan.backing_table_ddl)
+        self.assertNotIn("avg_real ", sqlite_plan.backing_table_ddl)
+        self.assertIn("AS avg_big", sqlite_plan.reader_view_ddl)
+        self.assertIn("AS avg_dec", sqlite_plan.reader_view_ddl)
+        self.assertIn("AS avg_real", sqlite_plan.reader_view_ddl)
+        sqlite_indexed = generate_materialized_view(
+            schema,
+            view,
+            dialect="sqlite",
+            indexes=["avg_big", "avg_dec", "avg_real"],
+        )
+        self.assertIn("avg_big REAL", sqlite_indexed.backing_table_ddl)
+        self.assertIn("avg_dec REAL", sqlite_indexed.backing_table_ddl)
+        self.assertIn("avg_real REAL", sqlite_indexed.backing_table_ddl)
 
         # Inferred column tolerances: every column exact (SUM/AVG have no
         # budget on any engine; only SQLite VAR/STDDEV keep one):

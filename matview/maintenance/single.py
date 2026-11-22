@@ -1190,10 +1190,20 @@ class Tier1SingleMixin(MixinHost):
             ekey = _expr_key(item)
             q_cnt = self._q(col_nonnull_count_map[ekey])
             q_sum = self._q(col_sum_map[ekey])
-            derived = self._avg_from_sum_count_sql(item, q_sum, q_cnt)
-            derived_avg_reader_map[item.alias.lower()] = (
-                f"(CASE WHEN {q_cnt} = 0 THEN NULL ELSE {derived} END)"
-            )
+            if self.dialect == Dialect.MYSQL:
+                # Use NULLIF(cnt, 0) instead of CASE WHEN ... END so MySQL 9.x
+                # does not prematurely round the DECIMAL division to 4 digits
+                # before enclosing arithmetic (e.g. AVG(v) * 2), matching native
+                # Item_sum_avg intermediate decimal precision across MySQL 8.4/9.7
+                # and MariaDB.
+                derived_avg_reader_map[item.alias.lower()] = self._avg_from_sum_count_sql(
+                    item, q_sum, f"NULLIF({q_cnt}, 0)"
+                )
+            else:
+                derived = self._avg_from_sum_count_sql(item, q_sum, q_cnt)
+                derived_avg_reader_map[item.alias.lower()] = (
+                    f"(CASE WHEN {q_cnt} = 0 THEN NULL ELSE {derived} END)"
+                )
 
         reader_select_override: List[str] = []
         for u_col in user_columns:
