@@ -63,7 +63,13 @@ _VIEW = (
 )
 
 
-def _plan_statements(dialect: Dialect, version: str, amt_type: str) -> Tuple[str, List[str]]:
+def _plan_statements(
+    dialect: Dialect,
+    version: str,
+    amt_type: str,
+    *,
+    indexes: Optional[Sequence[str]] = None,
+) -> Tuple[str, str, List[str]]:
     schema = (
         f"CREATE TABLE t (id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, "
         f"amt {amt_type}, amt2 {amt_type});"
@@ -75,6 +81,7 @@ def _plan_statements(dialect: Dialect, version: str, amt_type: str) -> Tuple[str
             _VIEW,
             dialect=dialect,
             engine_version=version,
+            indexes=indexes,
             ignore_limitations=True,
             accept_limitations=FLOAT_OPT_IN,
             incremental_backfill=True,
@@ -82,7 +89,7 @@ def _plan_statements(dialect: Dialect, version: str, amt_type: str) -> Tuple[str
     stmts = list(plan.trigger_ddls)
     stmts.extend(plan.incremental_backfill_spec.chunk_sql_templates if plan.incremental_backfill_spec else [])
     stmts.extend(plan.incremental_populate_sqls or [])
-    return plan.backing_table_name, stmts
+    return plan.backing_table_name, plan.reader_view_ddl, stmts
 
 
 def _avg_assignments(stmts: Sequence[str], col: str) -> List[str]:
@@ -127,15 +134,38 @@ class AvgMaintenanceShapeTests(unittest.TestCase):
     def test_exact_avg_is_derived_from_locked_row_without_base_reads(self) -> None:
         for dialect, version, amt_type in self.DERIVABLE:
             with self.subTest(dialect=dialect.value, version=version, type=amt_type):
-                backing, stmts = _plan_statements(dialect, version, amt_type)
-                for col in ("a", "a2"):
-                    rhs = _avg_assignments(stmts, col)
-                    self.assertTrue(rhs, f"no maintenance assignment for {col}")
-                    for expr in rhs:
-                        # A subquery here would read the base table through
-                        # a snapshot that predates the backing-row lock.
-                        self.assertNotRegex(expr, r"(?i)\(\s*SELECT\b", expr)
-                        self.assertIn(backing, expr)
+                backing, reader_ddl, stmts = _plan_statements(dialect, version, amt_type)
+                if dialect == Dialect.MYSQL:
+                    # Stage 4 derives unindexed exact AVG in the reader view from
+                    # the locked row's running sum/count columns (zero base reads
+                    # and zero trigger assignments to a/a2), while indexed AVG
+                    # still derives from the locked backing row without base reads.
+                    for st in stmts:
+                        self.assertNotRegex(st, r"(?i)\(\s*SELECT\s+AVG\(", st)
+                    for col in ("a", "a2"):
+                        self.assertIn(f") AS {col}", reader_ddl)
+                        self.assertEqual(_avg_assignments(stmts, col), [])
+                    idx_backing, _, idx_stmts = _plan_statements(
+                        dialect,
+                        version,
+                        amt_type,
+                        indexes=["CREATE INDEX idx_t_avg_a ON t_avg (a);", "CREATE INDEX idx_t_avg_a2 ON t_avg (a2);"],
+                    )
+                    for col in ("a", "a2"):
+                        rhs = _avg_assignments(idx_stmts, col)
+                        self.assertTrue(rhs, f"no maintenance assignment for indexed {col}")
+                        for expr in rhs:
+                            self.assertNotRegex(expr, r"(?i)\(\s*SELECT\b", expr)
+                            self.assertIn(idx_backing, expr)
+                else:
+                    for col in ("a", "a2"):
+                        rhs = _avg_assignments(stmts, col)
+                        self.assertTrue(rhs, f"no maintenance assignment for {col}")
+                        for expr in rhs:
+                            # A subquery here would read the base table through
+                            # a snapshot that predates the backing-row lock.
+                            self.assertNotRegex(expr, r"(?i)\(\s*SELECT\b", expr)
+                            self.assertIn(backing, expr)
 
     def test_inexact_avg_types_keep_native_recompute(self) -> None:
         # These keep native recomputation (exact scale / approximate
@@ -143,7 +173,7 @@ class AvgMaintenanceShapeTests(unittest.TestCase):
         # (see test_pgmy_exact_float_aggregates.py).
         for dialect, version, amt_type in self.RECOMPUTED:
             with self.subTest(dialect=dialect.value, type=amt_type):
-                _, stmts = _plan_statements(dialect, version, amt_type)
+                _, _, stmts = _plan_statements(dialect, version, amt_type)
                 self.assertTrue(
                     any(re.search(r"(?i)\(SELECT AVG\(", e) for e in _avg_assignments(stmts, "a"))
                 )
