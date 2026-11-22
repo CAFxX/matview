@@ -1759,6 +1759,45 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
         finally:
             con.close()
 
+    def test_stage4_mysql_filtered_union_all_agg_preserves_branch_where_guard(self) -> None:
+        """Regression: MySQL VALUES (...) upserts in filtered UNION ALL aggregate
+        branches must still be guarded by the branch WHERE predicate via IF (...)."""
+        schema = parse_table_schema(
+            """
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY,
+                region VARCHAR(32),
+                status VARCHAR(32),
+                amount INTEGER
+            );
+            CREATE TABLE customers (
+                id INTEGER PRIMARY KEY,
+                tier VARCHAR(32)
+            );
+            """,
+            dialect=Dialect.MYSQL,
+        )
+        plan = generate_materialized_view(
+            schema,
+            """
+            CREATE VIEW v_uagg_filt AS
+            WITH u AS (
+                SELECT region AS k, amount AS v FROM orders WHERE status = 'settled'
+                UNION ALL
+                SELECT tier AS k, 10 AS v FROM customers
+            )
+            SELECT k, COUNT(*) AS cnt, SUM(v) AS sv FROM u GROUP BY k;
+            """,
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+        )
+        orders_ai = next(t for t in plan.trigger_ddls if "AFTER INSERT ON orders" in t)
+        orders_au = next(t for t in plan.trigger_ddls if "AFTER UPDATE ON orders" in t)
+        self.assertRegex(orders_ai, r"IF \(NEW\.`?status`? = 'settled'\) THEN")
+        self.assertIn("VALUES (", orders_ai)
+        self.assertRegex(orders_au, r"IF \(NEW\.`?status`? = 'settled'\) THEN")
+        self.assertNotIn("FROM DUAL", orders_ai)
+
 
 if __name__ == "__main__":
     unittest.main()
