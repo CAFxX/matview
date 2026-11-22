@@ -616,6 +616,7 @@ WHERE pg_catalog.pg_table_is_visible(cl.oid)
       OR u.typtype IN ('c', 'r', 'm', 'e')
       OR co.oid IS NOT NULL
       OR (u.base_oid = 'pg_catalog.bpchar'::pg_catalog.regtype AND a.atttypmod = -1 AND u.base_mod = -1)
+      OR u.base_oid = 'pg_catalog.name'::pg_catalog.regtype
   )
   AND a.attnum > 0
   AND NOT a.attisdropped

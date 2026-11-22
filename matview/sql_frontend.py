@@ -846,7 +846,7 @@ def _is_simple_column_expr(
         node = parse_sql_ast(s, dialect=dialect)
     except sqlglot.errors.SqlglotError:
         return False
-    return isinstance(node, sqlglot_exp.Column) and not isinstance(node.this, sqlglot_exp.Star)
+    return isinstance(node, sqlglot_exp.Column) and isinstance(node.this, sqlglot_exp.Identifier)
 
 
 def _sqlite_type_affinity(declared_type: str) -> str:
@@ -1316,6 +1316,15 @@ def parse_table_schema(
                         data_type = "BLOB"
                 elif expr_item.kind is not None:
                     data_type = expr_item.kind.sql(sg_d)
+                    if (
+                        eff_dialect == Dialect.MYSQL
+                        and "UNSIGNED" not in data_type.upper()
+                        and any(
+                            c.kind is not None and "ZEROFILL" in c.kind.sql(sg_d).upper()
+                            for c in expr_item.constraints
+                        )
+                    ):
+                        data_type = f"{data_type} UNSIGNED"
                 else:
                     data_type = "TEXT"
                 is_pk = any(
@@ -1498,6 +1507,97 @@ def _aggregate_function_for_dialect(fn_name: str, dialect: Dialect) -> Optional[
     return _FN_TO_AGG_ENUM.get(fn_up)
 
 
+def _is_pg_catalog_ident_token(tok_text: str, dialect: Dialect) -> bool:
+    """True when `tok_text` names PostgreSQL's built-in `pg_catalog` schema.
+
+    Unquoted identifiers fold to lowercase (`PG_CATALOG`, `pg_catalog`);
+    double-quoted identifiers must already be lowercase (`"pg_catalog"`).
+    """
+    raw = (tok_text or "").strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        return _unquote_ident(raw, dialect=dialect) == "pg_catalog"
+    return raw.lower() == "pg_catalog"
+
+
+def _is_pg_builtin_fn_token(tok_text: str, dialect: Dialect) -> bool:
+    """True when `tok_text` can match a lowercase PostgreSQL `pg_catalog` function name."""
+    raw = (tok_text or "").strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        unq = _unquote_ident(raw, dialect=dialect)
+        return bool(unq) and unq == unq.lower()
+    return True
+
+
+def _is_pg_catalog_qualified(toks: Sequence[Any], fn_idx: int, dialect: Dialect) -> bool:
+    """True when `toks[fn_idx]` is immediately preceded by `pg_catalog.` on PostgreSQL."""
+    return (
+        Dialect(dialect) == Dialect.POSTGRES
+        and fn_idx >= 2
+        and toks[fn_idx - 1].token_type == SQLGlotTokenType.DOT
+        and _is_pg_catalog_ident_token(toks[fn_idx - 2].text, dialect)
+        and _is_pg_builtin_fn_token(toks[fn_idx].text, dialect)
+        and (fn_idx < 3 or toks[fn_idx - 3].token_type != SQLGlotTokenType.DOT)
+    )
+
+
+def _is_pg_catalog_ast_ident(ident: Any) -> bool:
+    if not isinstance(ident, sqlglot_exp.Identifier):
+        return False
+    name = ident.name or ""
+    if ident.quoted:
+        return name == "pg_catalog"
+    return name.lower() == "pg_catalog"
+
+
+def _unwrap_pg_catalog_agg_node(
+    node: sqlglot_exp.Expr,
+    dialect: Dialect,
+) -> Optional[sqlglot_exp.Func]:
+    """Unwrap a PostgreSQL `pg_catalog.<fn>(...)` (with optional `FILTER`) AST node.
+
+    Handles both `Dot(this=Identifier('pg_catalog'), expression=fn)` and the
+    `Column(this=Filter(this=fn, ...), table=Identifier('pg_catalog'))` shape
+    that sqlglot emits for `pg_catalog.sum(x) FILTER (WHERE ...)`.
+    Returns the inner `Func`/`AggFunc`/`Anonymous` node, or None if `node` is
+    not a `pg_catalog`-qualified call.
+    """
+    if Dialect(dialect) != Dialect.POSTGRES:
+        return None
+    cur: sqlglot_exp.Expr = node
+    if isinstance(cur, sqlglot_exp.Filter):
+        cur = cur.this
+    if isinstance(cur, sqlglot_exp.Dot) and _is_pg_catalog_ast_ident(cur.this):
+        fn = cur.expression
+        if isinstance(fn, sqlglot_exp.Filter):
+            fn = fn.this
+        if isinstance(fn, (sqlglot_exp.AggFunc, sqlglot_exp.Func)):
+            if isinstance(fn, sqlglot_exp.Anonymous) and isinstance(fn.this, str):
+                # Quoted uppercase names are tokenized separately; raw Anonymous.this
+                # preserves exact case for quoted names in sqlglot.
+                if fn.sql("postgres").startswith('"') and fn.name != fn.name.lower():
+                    return None
+            return fn
+        return None
+    if (
+        isinstance(cur, sqlglot_exp.Column)
+        and _is_pg_catalog_ast_ident(cur.args.get("table"))
+        and not cur.args.get("db")
+        and not cur.args.get("catalog")
+        and isinstance(cur.this, sqlglot_exp.Filter)
+        and isinstance(cur.this.this, (sqlglot_exp.AggFunc, sqlglot_exp.Func))
+    ):
+        fn = cur.this.this
+        if isinstance(fn, sqlglot_exp.Anonymous) and fn.sql("postgres").startswith('"') and fn.name != fn.name.lower():
+            return None
+        return fn
+    return None
+
+
+def _is_untyped_null_expr(expr: str, dialect: Dialect = Dialect.SQLITE) -> bool:
+    """True when `expr` is a bare or parenthesized untyped `NULL` literal."""
+    return _unwrap_outer_parens(expr or "", dialect=dialect).strip().upper() == "NULL"
+
+
 def undefined_statistical_aggregate_aliases(sql: str, dialect: Dialect) -> List[str]:
     """Return the statistical alias calls in `sql` that `dialect` does not define."""
     defined = STATISTICAL_AGGREGATE_ALIASES.get(Dialect(dialect), {})
@@ -1507,13 +1607,17 @@ def undefined_statistical_aggregate_aliases(sql: str, dialect: Dialect) -> List[
         return []
     found: List[str] = []
     for idx in range(len(toks) - 1):
-        name = toks[idx].text.upper()
+        name = _unquote_ident(toks[idx].text, dialect=dialect).upper() if _is_pg_catalog_qualified(toks, idx, dialect) else toks[idx].text.upper()
         if (
             name in _STATISTICAL_ALIAS_NAMES
             and name not in defined
             and toks[idx + 1].token_type == SQLGlotTokenType.L_PAREN
             and toks[idx].token_type != SQLGlotTokenType.STRING
-            and (idx == 0 or toks[idx - 1].token_type != SQLGlotTokenType.DOT)
+            and (
+                idx == 0
+                or toks[idx - 1].token_type != SQLGlotTokenType.DOT
+                or _is_pg_catalog_qualified(toks, idx, dialect)
+            )
             and name not in found
         ):
             found.append(name)
@@ -1528,6 +1632,8 @@ def _leading_function_name(expr: str, dialect: Dialect) -> Optional[str]:
         return None
     if len(toks) >= 2 and toks[1].token_type == SQLGlotTokenType.L_PAREN:
         return toks[0].text.upper()
+    if len(toks) >= 4 and _is_pg_catalog_qualified(toks, 2, dialect) and toks[3].token_type == SQLGlotTokenType.L_PAREN:
+        return _unquote_ident(toks[2].text, dialect=dialect).upper()
     return None
 
 
@@ -1536,8 +1642,9 @@ def resolve_statistical_aggregate_aliases(view_spec: ViewSpec, dialect: Dialect)
 
     A `ViewSpec` may have been parsed for a different dialect than the one it
     is compiled for (the parser defaults to SQLite), so every top-level
-    aggregate spelled as an alias is re-parsed for `dialect`. Spellings the
-    engine does not define are rejected rather than guessed.
+    aggregate spelled as an alias (or PostgreSQL `pg_catalog.<agg>`) is
+    re-parsed for `dialect`. Spellings the engine does not define are rejected
+    rather than guessed.
     """
     dialect = Dialect(dialect)
     undefined = undefined_statistical_aggregate_aliases(view_spec.raw_select_sql, dialect)
@@ -1552,10 +1659,27 @@ def resolve_statistical_aggregate_aliases(view_spec: ViewSpec, dialect: Dialect)
     items: List[SelectItem] = []
     for it in view_spec.select_items:
         fn = _leading_function_name(it.raw_expr, dialect) if it.is_aggregate else None
-        if fn in _STATISTICAL_ALIAS_NAMES:
+        is_pg_cat_call = (
+            dialect == Dialect.POSTGRES
+            and it.agg_func is None
+            and "pg_catalog" in it.raw_expr.lower()
+        )
+        if fn in _STATISTICAL_ALIAS_NAMES or is_pg_cat_call:
             reparsed = _parse_single_agg_expr(it.raw_expr, it.alias, dialect=dialect)
             if reparsed is not None and reparsed != it:
                 items.append(reparsed)
+                changed = True
+                continue
+            if is_pg_cat_call and not it.is_aggregate and _contains_aggregate_call(it.raw_expr, dialect=dialect):
+                items.append(
+                    SelectItem(
+                        raw_expr=it.raw_expr,
+                        alias=it.alias,
+                        is_aggregate=True,
+                        agg_func=None,
+                        arg_expr=it.raw_expr,
+                    )
+                )
                 changed = True
                 continue
         items.append(it)
@@ -1613,18 +1737,31 @@ def _parse_single_agg_expr(
     if isinstance(ast_node, sqlglot_exp.Window) or ast_node.find(sqlglot_exp.Window):
         return None
 
-    agg_node: sqlglot_exp.Expr = ast_node.this if isinstance(ast_node, sqlglot_exp.Filter) else ast_node
+    pg_cat_unwrapped = _unwrap_pg_catalog_agg_node(ast_node, dialect)
+    agg_node: sqlglot_exp.Expr = (
+        pg_cat_unwrapped
+        if pg_cat_unwrapped is not None
+        else (ast_node.this if isinstance(ast_node, sqlglot_exp.Filter) else ast_node)
+    )
     if not isinstance(agg_node, (sqlglot_exp.AggFunc, sqlglot_exp.Func)):
         return None
 
     sg_d = _sqlglot_dialect(dialect)
     toks = _tokenize_sql(s, read=sg_d)
-    if len(toks) < 3 or not toks[0].text or not (toks[0].text[0].isalpha() or toks[0].text[0] == "_") or toks[1].token_type != SQLGlotTokenType.L_PAREN:
+    fn_tok_idx = 0
+    lp_idx = 1
+    if len(toks) >= 5 and _is_pg_catalog_qualified(toks, 2, dialect) and toks[3].token_type == SQLGlotTokenType.L_PAREN:
+        fn_tok_idx = 2
+        lp_idx = 3
+    if len(toks) < lp_idx + 2 or not toks[fn_tok_idx].text or toks[lp_idx].token_type != SQLGlotTokenType.L_PAREN:
+        return None
+    fn_ident = _unquote_ident(toks[fn_tok_idx].text, dialect=dialect) if fn_tok_idx == 2 else toks[fn_tok_idx].text
+    if not fn_ident or not (fn_ident[0].isalpha() or fn_ident[0] == "_"):
         return None
 
     depth = 0
     close_idx = -1
-    for idx in range(1, len(toks)):
+    for idx in range(lp_idx, len(toks)):
         if toks[idx].token_type == SQLGlotTokenType.L_PAREN:
             depth += 1
         elif toks[idx].token_type == SQLGlotTokenType.R_PAREN:
@@ -1673,8 +1810,8 @@ def _parse_single_agg_expr(
         if fw_d != 0:
             return None
 
-    fn_raw = toks[0].text.upper()
-    inner_args_sql = s[toks[1].end + 1 : toks[close_idx].start].strip()
+    fn_raw = fn_ident.upper()
+    inner_args_sql = s[toks[lp_idx].end + 1 : toks[close_idx].start].strip()
     in_toks = _tokenize_sql(inner_args_sql, read=sg_d)
     is_dist = bool(agg_node.args.get("distinct")) or isinstance(agg_node.this, sqlglot_exp.Distinct)
     if in_toks and in_toks[0].token_type == SQLGlotTokenType.DISTINCT:
@@ -1766,9 +1903,31 @@ def _contains_aggregate_call(
         return False
     if ast_node.find(sqlglot_exp.Window) or ast_node.find(sqlglot_exp.Subquery, sqlglot_exp.Select):
         return False
-    if ast_node.find(sqlglot_exp.AggFunc):
-        return True
+    def _is_non_pg_catalog_qualified_fn(node: sqlglot_exp.Expr) -> bool:
+        parent = node.parent
+        if isinstance(parent, sqlglot_exp.Filter) and parent.this is node:
+            gp = parent.parent
+            if isinstance(gp, sqlglot_exp.Column) and gp.this is parent and gp.args.get("table") is not None:
+                if Dialect(dialect) != Dialect.POSTGRES or not _is_pg_catalog_ast_ident(gp.args.get("table")):
+                    return True
+                if isinstance(node, sqlglot_exp.Anonymous) and node.sql("postgres").startswith('"') and node.name != node.name.lower():
+                    return True
+                return False
+            parent = gp
+        if isinstance(parent, sqlglot_exp.Dot) and parent.expression is node:
+            if Dialect(dialect) != Dialect.POSTGRES or not _is_pg_catalog_ast_ident(parent.this):
+                return True
+            if isinstance(node, sqlglot_exp.Anonymous) and node.sql("postgres").startswith('"') and node.name != node.name.lower():
+                return True
+            return False
+        return False
+
+    for agg_n in ast_node.find_all(sqlglot_exp.AggFunc):
+        if not _is_non_pg_catalog_qualified_fn(agg_n):
+            return True
     for anon_node in ast_node.find_all(sqlglot_exp.Anonymous):
+        if _is_non_pg_catalog_qualified_fn(anon_node):
+            continue
         name_up = anon_node.name.upper()
         if name_up in _FN_TO_AGG_ENUM or name_up in _STATISTICAL_ALIAS_NAMES or name_up == "COUNT":
             return True

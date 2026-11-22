@@ -36,12 +36,14 @@ from ..sql_frontend import (
     _extract_verbatim_cte_or_subquery_sql,
     _is_simple_column_expr,
     _parse_single_agg_expr,
+    _parse_single_create_view_stmt,
     _split_top_level,
     _unquote_ident,
     _unwrap_outer_parens,
     build_create_view_sql,
     build_insert_select_sql,
     build_select_sql,
+    parse_sql_ast,
     parse_view_ast,
     quote_sql_identifier,
 )
@@ -75,13 +77,50 @@ class Tier3Mixin(MixinHost):
                         dt = "VARCHAR(255)"
                     col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
         else:
-            for item in self.view.select_items:
+            # For top-level compound set operations (e.g. UNION ALL ... ORDER BY / LIMIT,
+            # keyless UNION ALL, or multi-branch INTERSECT/EXCEPT), widen each column's
+            # storage type across all branches rather than using only branch 0.
+            setop_col_types: Optional[List[str]] = None
+            if self.dialect != Dialect.SQLITE and self.view.has_compound_set_op:
+                try:
+                    q_ast = parse_sql_ast(self.view.raw_select_sql.strip(), dialect=self.dialect)
+                    if isinstance(q_ast, sqlglot_exp.SetOperation):
+                        _, b_sqls = _extract_set_op_branches_from_ast(
+                            q_ast, self.view.raw_select_sql.strip(), dialect=self.dialect
+                        )
+                        if len(b_sqls) >= 2:
+                            parsed_bs: List[ViewSpec] = []
+                            known_t = set(self._schemas_lower.keys())
+                            for bi, b_sql in enumerate(b_sqls):
+                                bs = _parse_single_create_view_stmt(
+                                    f"CREATE VIEW __t3_set_b_{bi} AS {b_sql}",
+                                    known_tables=known_t,
+                                    dialect=self.dialect,
+                                )
+                                parsed_bs.append(bs)
+                            if (
+                                parsed_bs
+                                and all(len(bs.select_items) == len(self.view.select_items) for bs in parsed_bs)
+                                and all(not any(it.raw_expr.strip() == "*" for it in bs.select_items) for bs in parsed_bs)
+                            ):
+                                m_ctx = self._union_all_common_ctx(parsed_bs)
+                                if m_ctx.primary_schema:
+                                    setop_col_types = [
+                                        m_ctx.primary_schema.columns[fb_it.alias].data_type
+                                        for fb_it in parsed_bs[0].select_items
+                                    ]
+                except Exception:
+                    setop_col_types = None
+
+            for col_i, item in enumerate(self.view.select_items):
                 user_columns.append(item.alias)
                 if self.dialect == Dialect.SQLITE:
                     # Tier 3 handles CTEs, compound set operations, ORDER BY,
                     # and compound aggregate expressions where any declared
                     # SQLite affinity could coerce runtime storage classes.
                     col_type = "BLOB"
+                elif setop_col_types is not None and col_i < len(setop_col_types):
+                    col_type = setop_col_types[col_i]
                 else:
                     col_type = self._infer_expr_storage_type(item)
                 if self.dialect == Dialect.MYSQL and col_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:

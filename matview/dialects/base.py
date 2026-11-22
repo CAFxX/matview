@@ -27,15 +27,17 @@ from ..engines import (
 from ..logical_ir import ColumnDef, JoinSpec, SelectItem, TableSchema, ViewSpec
 from ..sql_frontend import (
     _has_subquery_ast,
-    _parse_single_agg_expr,
     _is_simple_column_expr,
+    _is_untyped_null_expr,
     _is_word_or_ident_token,
+    _parse_single_agg_expr,
     _sanitize_ident,
     _split_top_level,
     _sqlite_type_affinity,
     _tokenize_sql,
     _unquote_ident,
     _unwrap_outer_parens,
+    _unwrap_pg_catalog_agg_node,
     build_create_view_sql,
     build_insert_select_sql,
     build_select_sql,
@@ -875,35 +877,63 @@ class DialectBaseMixin(MixinHost):
                         return self._normalize_dialect_type(c_def.data_type)
 
         for cte in q_ast.find_all(sqlglot_exp.CTE):
-            inner_query = cte.this
-            while isinstance(inner_query, sqlglot_exp.SetOperation):
-                inner_query = inner_query.this
-            if not isinstance(inner_query, sqlglot_exp.Select):
+            cte_branches: List[sqlglot_exp.Select] = []
+            stack: List[Any] = [cte.this]
+            while stack:
+                cur_q = stack.pop()
+                if isinstance(cur_q, sqlglot_exp.Subquery):
+                    stack.append(cur_q.this)
+                elif isinstance(cur_q, sqlglot_exp.SetOperation):
+                    stack.append(cur_q.expression)
+                    stack.append(cur_q.this)
+                elif isinstance(cur_q, sqlglot_exp.Select):
+                    cte_branches.append(cur_q)
+            if not cte_branches:
                 continue
+            inner_query = cte_branches[0]
 
+            col_pos: Optional[int] = None
             table_alias = cte.args.get("alias")
             if isinstance(table_alias, sqlglot_exp.TableAlias) and table_alias.columns:
                 hdr_cols = [c.name.lower() for c in table_alias.columns]
                 if ident.lower() in hdr_cols:
-                    idx_h = hdr_cols.index(ident.lower())
-                    if idx_h < len(inner_query.expressions):
-                        proj_e = inner_query.expressions[idx_h]
-                        src_e = proj_e.this if isinstance(proj_e, sqlglot_exp.Alias) else proj_e
-                        if isinstance(src_e, sqlglot_exp.Literal):
-                            return self._literal_storage_type(src_e)
-                        c_src = self._lookup_col_def(src_e.sql().strip())
-                        if c_src:
-                            return self._normalize_dialect_type(c_src.data_type)
-            for proj in inner_query.expressions:
-                c_name = proj.alias or (proj.this.name if isinstance(proj, sqlglot_exp.Alias) else proj.name)
-                if c_name.lower() == ident.lower():
-                    src_node = proj.this if isinstance(proj, sqlglot_exp.Alias) else proj
-                    if isinstance(src_node, sqlglot_exp.Literal):
-                        return self._literal_storage_type(src_node)
-                    src_col = src_node.name or src_node.sql().strip()
-                    c_src = self._lookup_col_def(src_col)
+                    col_pos = hdr_cols.index(ident.lower())
+            if col_pos is None:
+                for p_i, proj in enumerate(inner_query.expressions):
+                    c_name = proj.alias or (proj.this.name if isinstance(proj, sqlglot_exp.Alias) else proj.name)
+                    if c_name.lower() == ident.lower():
+                        col_pos = p_i
+                        break
+            if col_pos is not None:
+                b_types: List[str] = []
+                has_null_b = False
+                has_str_lit_b = False
+                for br in cte_branches:
+                    if col_pos >= len(br.expressions):
+                        continue
+                    proj_e = br.expressions[col_pos]
+                    src_e = proj_e.this if isinstance(proj_e, sqlglot_exp.Alias) else proj_e
+                    while isinstance(src_e, sqlglot_exp.Paren):
+                        src_e = src_e.this
+                    if isinstance(src_e, sqlglot_exp.Null):
+                        has_null_b = True
+                        continue
+                    if isinstance(src_e, sqlglot_exp.Literal):
+                        if self.dialect == Dialect.POSTGRES and src_e.args.get("is_string"):
+                            has_str_lit_b = True
+                        else:
+                            b_types.append(self._literal_storage_type(src_e))
+                        continue
+                    src_col = src_e.name or src_e.sql().strip()
+                    c_src = self._lookup_col_def(src_e.sql().strip()) or self._lookup_col_def(src_col)
                     if c_src:
-                        return self._normalize_dialect_type(c_src.data_type)
+                        b_types.append(c_src.data_type)
+                if not b_types and has_str_lit_b:
+                    b_types.append("TEXT")
+                if b_types:
+                    if len(cte_branches) > 1:
+                        return self._common_storage_type(b_types, has_null=has_null_b)
+                    return self._normalize_dialect_type(b_types[0])
 
         if "." in col_name:
             c_base = self._lookup_col_def(ident)
@@ -1101,7 +1131,9 @@ class DialectBaseMixin(MixinHost):
                 return "REAL"
             if upper in ("DOUBLE PRECISION", "DOUBLE", "FLOAT8", "FLOAT"):
                 return "DOUBLE PRECISION"
-            if upper in ("TEXT", "VARCHAR", "CHAR", "CHARACTER VARYING", "CHARACTER", "NVARCHAR", "NCHAR", "CLOB"):
+            if upper in ("TEXT", "VARCHAR", "CHAR", "BPCHAR", "CHARACTER VARYING", "CHARACTER", "NVARCHAR", "NCHAR", "CLOB") or (
+                self.dialect == Dialect.POSTGRES and upper == "NAME"
+            ):
                 return "TEXT"
             if upper in ("BOOLEAN", "BOOL"):
                 return "BOOLEAN"
@@ -1413,6 +1445,20 @@ class DialectBaseMixin(MixinHost):
                             return "BIGINT"
                         return "NUMERIC"
                     return None
+            if isinstance(node, (sqlglot_exp.Dot, sqlglot_exp.Column, sqlglot_exp.Filter)):
+                pg_cat_fn = _unwrap_pg_catalog_agg_node(node, self.dialect)
+                if pg_cat_fn is not None:
+                    pg_fn_up = (
+                        pg_cat_fn.name.upper()
+                        if isinstance(pg_cat_fn, sqlglot_exp.Anonymous)
+                        else pg_cat_fn.sql_name().upper()
+                    )
+                    if isinstance(pg_cat_fn, sqlglot_exp.AggFunc) or pg_fn_up in agg_fn_names:
+                        agg_item = _parse_single_agg_expr(
+                            node.sql(_sqlglot_dialect(self.dialect)), "__agg", dialect=self.dialect
+                        )
+                        if agg_item is not None and agg_item.agg_func is not None:
+                            return canonical_type(self._infer_expr_storage_type(agg_item))
             if isinstance(node, sqlglot_exp.AggFunc) or (
                 kind == "Anonymous" and node.name.upper() in agg_fn_names
             ):
@@ -1514,22 +1560,36 @@ class DialectBaseMixin(MixinHost):
             return None
         if kind == "Column":
             col = self._lookup_col_def(node.sql()) or self._lookup_col_def(node.name)
-            if col is None:
-                return "TEXT"
-            base = re.sub(r"\s*\(.*\)\s*$", "", col.data_type.strip().upper())
-            if base in ("VARCHAR", "CHARACTER VARYING"):
-                return "VARCHAR"
-            if base in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
-                return "BPCHAR"
+            if col is not None:
+                dt_raw = re.sub(r"\s+COLLATE\s+.*$", "", col.data_type.strip(), flags=re.IGNORECASE)
+                return self._pg_string_result_type_from_name(dt_raw)
+            cte_t = self._infer_cte_or_subquery_col_type(node.name)
+            if cte_t is not None:
+                dt_raw = re.sub(r"\s+COLLATE\s+.*$", "", cte_t.strip(), flags=re.IGNORECASE)
+                return self._pg_string_result_type_from_name(dt_raw)
             return "TEXT"
         if kind == "Cast":
             target = node.args.get("to")
             return self._pg_string_result_type_from_name(target.sql() if target is not None else "")
+        if kind == "Nullif":
+            # Verified natively across the full 6x6 matrix on PostgreSQL 18:
+            # NULLIF(a, b) returns the left-operand type of PostgreSQL's chosen `=` operator.
+            ta = self._pg_string_result_type(node.this) if node.this is not None else None
+            tb = self._pg_string_result_type(node.expression) if node.expression is not None else None
+            if ta == "NAME":
+                return "NAME"
+            if ta is None:
+                if tb in ("NAME", "BPCHAR"):
+                    return tb
+                return "TEXT" if tb is not None else None
+            if ta == "BPCHAR":
+                return "BPCHAR" if tb in (None, "BPCHAR", "VARCHAR") else "TEXT"
+            if ta == "VARCHAR":
+                return "BPCHAR" if tb == "BPCHAR" else "TEXT"
+            return "TEXT"
         branches: List[Any] = []
-        if kind in ("Coalesce", "IfNull"):
+        if kind in ("Coalesce", "IfNull", "Greatest", "Least"):
             branches = list(node.iter_expressions())
-        elif kind == "Nullif":
-            branches = [node.this]
         elif kind == "Case":
             # PostgreSQL resolves a CASE with its ELSE result first, then the
             # THEN results in order (transformCaseExpr), and keeps the first
@@ -1542,22 +1602,385 @@ class DialectBaseMixin(MixinHost):
             branches = [node.args.get("true"), node.args.get("false")]
         else:
             return "TEXT"
+        resolved_branches: List[str] = []
         for branch in branches:
             if branch is None:
                 continue
             t = self._pg_string_result_type(branch)
             if t is not None:
-                return t
-        return None
+                resolved_branches.append(t)
+        if not resolved_branches:
+            return None
+        # Verified natively on PostgreSQL 18: TEXT first stays TEXT (even when
+        # mixed with NAME); otherwise NAME beats VARCHAR/BPCHAR in either order
+        # (COALESCE/GREATEST/LEAST over name + char/varchar resolve to name);
+        # VARCHAR/BPCHAR/TEXT keep the first typed input.
+        if resolved_branches[0] == "TEXT":
+            return "TEXT"
+        if "NAME" in resolved_branches:
+            return "NAME"
+        return resolved_branches[0]
 
     @staticmethod
     def _pg_string_result_type_from_name(type_name: str) -> str:
-        base = re.sub(r"\s*\(.*\)\s*$", "", type_name.strip().upper())
+        clean = re.sub(r"\s+COLLATE\s+.*$", "", type_name.strip(), flags=re.IGNORECASE)
+        base = re.sub(r"\s*\(.*\)\s*$", "", clean.upper()).strip()
         if base in ("VARCHAR", "CHARACTER VARYING"):
             return "VARCHAR"
         if base in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
             return "BPCHAR"
+        if base == "NAME":
+            return "NAME"
         return "TEXT"
+
+    def _common_storage_type(self, types: Sequence[str], *, has_null: bool = False) -> str:
+        """Merge column storage types across branches of a set operation
+        (UNION ALL / UNION / INTERSECT / EXCEPT) using target dialect widening rules."""
+        raw_nonempty = [t.strip() for t in types if t and t.strip()]
+        if not raw_nonempty:
+            return "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
+
+        if self.dialect == Dialect.POSTGRES:
+            cleaned = [self._normalize_dialect_type(t).strip() for t in raw_nonempty]
+            no_coll = [re.sub(r"\s+COLLATE\s+.*$", "", t, flags=re.IGNORECASE).strip() for t in cleaned]
+            # Recursive array widening (e.g. SMALLINT[] + BIGINT[] -> BIGINT[], VARCHAR(5)[] + VARCHAR(50)[] -> VARCHAR[]).
+            arr_matches = [re.match(r"^(.*?)((?:\[\])+)$", t) for t in no_coll]
+            if all(m is not None for m in arr_matches):
+                brs = {m.group(2) for m in arr_matches if m is not None}
+                if len(brs) == 1:
+                    br = next(iter(brs))
+                    elems = [m.group(1).strip() for m in arr_matches if m is not None]
+                    merged_elem = self._common_storage_type(elems, has_null=has_null)
+                    if merged_elem.upper() == "VARCHAR(255)":
+                        merged_elem = "VARCHAR"
+                    return f"{merged_elem}{br}"
+            if len(cleaned) == 1:
+                if has_null:
+                    b0 = re.sub(r"\s*\([^)]*\)\s*$", "", no_coll[0].upper()).strip()
+                    if b0 in ("NUMERIC", "DECIMAL", "DEC"):
+                        return "NUMERIC"
+                    if b0 in ("VARCHAR", "CHARACTER VARYING"):
+                        return "VARCHAR"
+                    if b0 in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
+                        return "BPCHAR"
+                return cleaned[0]
+            if all(t.upper() == cleaned[0].upper() for t in cleaned):
+                if has_null:
+                    b0 = re.sub(r"\s*\([^)]*\)\s*$", "", no_coll[0].upper()).strip()
+                    if b0 in ("NUMERIC", "DECIMAL", "DEC"):
+                        return "NUMERIC"
+                    if b0 in ("VARCHAR", "CHARACTER VARYING"):
+                        return "VARCHAR"
+                    if b0 in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
+                        return "BPCHAR"
+                return cleaned[0]
+
+            pg_num_rank = {
+                "SMALLINT": (1, "SMALLINT"),
+                "INT2": (1, "SMALLINT"),
+                "INTEGER": (2, "INTEGER"),
+                "INT": (2, "INTEGER"),
+                "INT4": (2, "INTEGER"),
+                "BIGINT": (3, "BIGINT"),
+                "INT8": (3, "BIGINT"),
+                "NUMERIC": (4, "NUMERIC"),
+                "DECIMAL": (4, "NUMERIC"),
+                "DEC": (4, "NUMERIC"),
+                "REAL": (5, "REAL"),
+                "FLOAT4": (5, "REAL"),
+                "DOUBLE PRECISION": (6, "DOUBLE PRECISION"),
+                "FLOAT8": (6, "DOUBLE PRECISION"),
+            }
+            pg_str_map = {
+                "TEXT": "TEXT",
+                "VARCHAR": "VARCHAR",
+                "CHARACTER VARYING": "VARCHAR",
+                "CHAR": "BPCHAR",
+                "CHARACTER": "BPCHAR",
+                "BPCHAR": "BPCHAR",
+                "NCHAR": "BPCHAR",
+                "NAME": "NAME",
+            }
+            bases = [re.sub(r"\s*\([^)]*\)\s*$", "", t.upper()).strip() for t in no_coll]
+            if all(b in pg_num_rank for b in bases):
+                top_rank = max(pg_num_rank[b][0] for b in bases)
+                return next(name for r, name in pg_num_rank.values() if r == top_rank)
+            if all(b in pg_str_map for b in bases):
+                str_kinds = [pg_str_map[b] for b in bases]
+                if str_kinds[0] == "TEXT":
+                    return "TEXT"
+                if "NAME" in str_kinds:
+                    return "NAME"
+                return str_kinds[0]
+            pg_time_rank = {
+                "DATE": (1, "DATE"),
+                "TIMESTAMP": (2, "TIMESTAMP"),
+                "TIMESTAMP WITHOUT TIME ZONE": (2, "TIMESTAMP"),
+                "TIMESTAMPTZ": (3, "TIMESTAMPTZ"),
+                "TIMESTAMP WITH TIME ZONE": (3, "TIMESTAMPTZ"),
+            }
+            if all(b in pg_time_rank for b in bases):
+                top_t = max(pg_time_rank[b][0] for b in bases)
+                return next(name for r, name in pg_time_rank.values() if r == top_t)
+            pg_clock_rank = {
+                "TIME": (1, "TIME"),
+                "TIME WITHOUT TIME ZONE": (1, "TIME"),
+                "TIMETZ": (2, "TIMETZ"),
+                "TIME WITH TIME ZONE": (2, "TIMETZ"),
+            }
+            if all(b in pg_clock_rank for b in bases):
+                top_c = max(pg_clock_rank[b][0] for b in bases)
+                return next(name for r, name in pg_clock_rank.values() if r == top_c)
+            if all(b in ("BIT", "VARBIT", "BIT VARYING") for b in bases):
+                return "BIT VARYING"
+            if all(b == bases[0] for b in bases):
+                return bases[0]
+            return cleaned[0]
+
+        if self.dialect == Dialect.MYSQL:
+            if len(raw_nonempty) == 1:
+                return self._normalize_dialect_type(raw_nonempty[0])
+            if all(t.upper() == raw_nonempty[0].upper() for t in raw_nonempty):
+                return self._normalize_dialect_type(raw_nonempty[0])
+
+            # Keep raw TEXT/TINYTEXT/... distinct from VARCHAR(191) while stripping
+            # charset/collation and promoting ZEROFILL -> UNSIGNED (MySQL semantics).
+            stripped: List[str] = []
+            for t in raw_nonempty:
+                s = re.sub(r"\s+(?:COLLATE|CHARACTER\s+SET|CHARSET)\s+\S+", "", t.upper())
+                if re.search(r"\bZEROFILL\b", s):
+                    s = re.sub(r"\s*\bZEROFILL\b", "", s).strip()
+                    if "UNSIGNED" not in s:
+                        s = f"{s} UNSIGNED"
+                stripped.append(re.sub(r"\s+", " ", s).strip())
+
+            # Integer, DECIMAL, and floating-point numeric widening.
+            int_specs: Dict[str, Tuple[int, bool, int]] = {
+                # base_type: (width_rank, is_unsigned, max_decimal_digits)
+                "BOOL": (1, False, 3),
+                "BOOLEAN": (1, False, 3),
+                "TINYINT": (1, False, 3),
+                "TINYINT UNSIGNED": (1, True, 3),
+                "SMALLINT": (2, False, 5),
+                "SMALLINT UNSIGNED": (2, True, 5),
+                "MEDIUMINT": (3, False, 7),
+                "MEDIUMINT UNSIGNED": (3, True, 8),
+                "INT": (4, False, 10),
+                "INTEGER": (4, False, 10),
+                "INT UNSIGNED": (4, True, 10),
+                "INTEGER UNSIGNED": (4, True, 10),
+                "BIGINT": (5, False, 19),
+                "BIGINT UNSIGNED": (5, True, 20),
+            }
+            signed_by_rank = {1: "TINYINT", 2: "SMALLINT", 3: "MEDIUMINT", 4: "INT", 5: "BIGINT"}
+            unsigned_by_rank = {
+                1: "TINYINT UNSIGNED",
+                2: "SMALLINT UNSIGNED",
+                3: "MEDIUMINT UNSIGNED",
+                4: "INT UNSIGNED",
+                5: "BIGINT UNSIGNED",
+            }
+
+            def _mysql_num_kind(s: str) -> Optional[Tuple[str, Any]]:
+                no_w = re.sub(r"\(\s*\d+\s*\)", "", s).strip()
+                no_w = re.sub(r"\s+", " ", no_w)
+                if no_w in int_specs:
+                    return ("int", int_specs[no_w])
+                m_dec = re.match(r"^(?:DECIMAL|NUMERIC|DEC|FIXED)\s*(?:\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?(?:\s+UNSIGNED)?$", s)
+                if m_dec:
+                    p = int(m_dec.group(1)) if m_dec.group(1) else 10
+                    sc = int(m_dec.group(2)) if m_dec.group(2) else 0
+                    return ("dec", (p, sc))
+                if re.match(r"^(?:FLOAT)(?:\s*\([^)]*\))?(?:\s+UNSIGNED)?$", s):
+                    return ("float", None)
+                if re.match(r"^(?:DOUBLE|DOUBLE\s+PRECISION|REAL)(?:\s*\([^)]*\))?(?:\s+UNSIGNED)?$", s):
+                    return ("double", None)
+                return None
+
+            def _mysql_str_info(s: str) -> Optional[Tuple[str, int]]:
+                m_c = re.match(r"^(?:N?CHAR|CHARACTER|N?VARCHAR|CHARACTER\s+VARYING)\s*\(\s*(\d+)\s*\)$", s)
+                if m_c:
+                    is_fixed = s.startswith(("CHAR(", "CHAR ", "NCHAR(", "NCHAR ", "CHARACTER(", "CHARACTER ")) and "VARYING" not in s
+                    return ("char" if is_fixed else "varchar", int(m_c.group(1)))
+                if s in ("CHAR", "CHARACTER", "NCHAR"):
+                    return ("char", 1)
+                if s in ("VARCHAR", "NVARCHAR", "CHARACTER VARYING"):
+                    return ("varchar", 191)
+                if s in ("TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT"):
+                    rank_map = {"TINYTEXT": 1, "TEXT": 2, "MEDIUMTEXT": 3, "LONGTEXT": 4}
+                    return ("text", rank_map[s])
+                if s.startswith(("ENUM(", "SET(")):
+                    return ("varchar", 255)
+                return None
+
+            num_kinds = [_mysql_num_kind(s) for s in stripped]
+            if all(k is not None for k in num_kinds):
+                kinds = [k for k in num_kinds if k is not None]
+                tag_set = {k[0] for k in kinds}
+                if "double" in tag_set:
+                    return "DOUBLE"
+                if "float" in tag_set:
+                    # Mixing FLOAT with BIGINT or DECIMAL widens to DOUBLE in MySQL/MariaDB.
+                    if "dec" in tag_set or any(k[0] == "int" and k[1][0] >= 4 for k in kinds):
+                        return "DOUBLE"
+                    return "FLOAT"
+                if tag_set == {"int"}:
+                    s_ranks = [k[1][0] for k in kinds if not k[1][1]]
+                    u_ranks = [k[1][0] for k in kinds if k[1][1]]
+                    if not u_ranks:
+                        return signed_by_rank[max(s_ranks)]
+                    if not s_ranks:
+                        return unsigned_by_rank[max(u_ranks)]
+                    max_u = max(u_ranks)
+                    max_s = max(s_ranks)
+                    if max_u >= 5:
+                        return "DECIMAL(20, 0)"
+                    return signed_by_rank[max(max_s, max_u + 1)]
+                # Exact mix of integers and/or DECIMAL(p, s)
+                max_int_digits = 0
+                max_scale = 0
+                for tag, info in kinds:
+                    if tag == "int":
+                        max_int_digits = max(max_int_digits, info[2])
+                    else:
+                        p, sc = info
+                        max_int_digits = max(max_int_digits, max(0, p - sc))
+                        max_scale = max(max_scale, sc)
+                tot_p = min(65, max(1, max_int_digits + max_scale))
+                return f"DECIMAL({tot_p}, {max_scale})"
+
+            # BIT(n) widening
+            bit_matches = [re.match(r"^BIT(?:\s*\(\s*(\d+)\s*\))?$", s) for s in stripped]
+            if all(m is not None for m in bit_matches):
+                max_bits = max(int(m.group(1)) if (m is not None and m.group(1)) else 1 for m in bit_matches)
+                return f"BIT({max_bits})"
+
+            # Binary / BLOB widening
+            def _mysql_bin_info(s: str) -> Optional[Tuple[str, int]]:
+                m_b = re.match(r"^(BINARY|VARBINARY)\s*\(\s*(\d+)\s*\)$", s)
+                if m_b:
+                    return (m_b.group(1).lower(), int(m_b.group(2)))
+                if s in ("TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB"):
+                    b_rank = {"TINYBLOB": 1, "BLOB": 2, "MEDIUMBLOB": 3, "LONGBLOB": 4}
+                    return ("blob", b_rank[s])
+                return None
+
+            bin_infos = [_mysql_bin_info(s) for s in stripped]
+            if all(bi is not None for bi in bin_infos):
+                b_list = [bi for bi in bin_infos if bi is not None]
+                if any(tag == "blob" for tag, _ in b_list):
+                    max_var = max((n for tag, n in b_list if tag != "blob"), default=0)
+                    top_blob = max((lvl for tag, lvl in b_list if tag == "blob"), default=2)
+                    if max_var > 255 and top_blob < 2:
+                        top_blob = 2
+                    return {1: "TINYBLOB", 2: "BLOB", 3: "MEDIUMBLOB", 4: "LONGBLOB"}[top_blob]
+                max_len = max(n for _, n in b_list)
+                if all(tag == "binary" for tag, _ in b_list) and len({n for _, n in b_list}) == 1:
+                    return f"BINARY({max_len})"
+                return f"VARBINARY({max_len})"
+
+            # String widening (CHAR/VARCHAR/TEXT) and MySQL numeric + string widening
+            str_infos = [_mysql_str_info(s) for s in stripped]
+            if all(si is not None or nk is not None for si, nk in zip(str_infos, num_kinds)) and any(si is not None for si in str_infos):
+                s_list = [si for si in str_infos if si is not None]
+                has_num_mix = any(si is None for si in str_infos)
+                if any(tag == "text" for tag, _ in s_list):
+                    # TINYTEXT max is 255 bytes (63 utf8mb4 chars); promote to TEXT if any VARCHAR exceeds 63.
+                    max_vc = max((n for tag, n in s_list if tag != "text"), default=0)
+                    top_text = max((lvl for tag, lvl in s_list if tag == "text"), default=2)
+                    if max_vc > 63 and top_text < 2:
+                        top_text = 2
+                    return {1: "TINYTEXT", 2: "TEXT", 3: "MEDIUMTEXT", 4: "LONGTEXT"}[top_text]
+                max_len = max(n for _, n in s_list)
+                if has_num_mix:
+                    return f"VARCHAR({max(max_len, 24)})"
+                if all(tag == "char" for tag, _ in s_list) and len({n for _, n in s_list}) == 1:
+                    return f"CHAR({max_len})"
+                return f"VARCHAR({max_len})"
+
+            # Temporal widening preserving maximum fractional-seconds precision (fsp)
+            def _fsp(s: str) -> int:
+                m_f = re.search(r"\(\s*(\d+)\s*\)", s)
+                return int(m_f.group(1)) if m_f else 0
+
+            base_temps = [re.sub(r"\s*\([^)]*\)\s*$", "", s).strip() for s in stripped]
+            if all(bt in ("DATE", "DATETIME", "TIMESTAMP") for bt in base_temps):
+                max_fsp = max(_fsp(s) for s in stripped)
+                return f"DATETIME({max_fsp})" if max_fsp > 0 else "DATETIME"
+            if all(bt == "TIME" for bt in base_temps):
+                max_fsp = max(_fsp(s) for s in stripped)
+                return f"TIME({max_fsp})" if max_fsp > 0 else "TIME"
+
+            return self._normalize_dialect_type(raw_nonempty[0])
+
+        return self._normalize_dialect_type(raw_nonempty[0])
+
+    def _union_all_common_ctx(self, branch_specs: Sequence[ViewSpec]) -> Any:
+        """Build a compilation context whose `primary_schema` holds the widened
+        common column types across all `UNION ALL` branches (positional alignment)."""
+        if not branch_specs:
+            return self
+        first_b = branch_specs[0]
+        branch_ctxs = [
+            self.with_ir(
+                primary_schema=self._schemas_lower.get(bs.base_table.lower()),
+                view=bs,
+            )
+            for bs in branch_specs
+        ]
+        merged_cols: Dict[str, ColumnDef] = {}
+        for col_i, fb_it in enumerate(first_b.select_items):
+            col_b_types: List[str] = []
+            has_null = False
+            has_str_lit = False
+            all_not_null = True
+            for b_ctx, bs in zip(branch_ctxs, branch_specs):
+                if col_i >= len(bs.select_items):
+                    all_not_null = False
+                    continue
+                bi_item = bs.select_items[col_i]
+                if _is_untyped_null_expr(bi_item.raw_expr, dialect=self.dialect):
+                    has_null = True
+                    all_not_null = False
+                    continue
+                ts_b = self._schemas_lower.get(bs.base_table.lower())
+                c_b: Optional[ColumnDef] = None
+                if ts_b is not None and bi_item.source_col and _is_simple_column_expr(bi_item.raw_expr.strip(), dialect=self.dialect):
+                    src_low = _unquote_ident(bi_item.source_col, dialect=self.dialect).lower()
+                    c_b = next((c for k, c in ts_b.columns.items() if k.lower() == src_low), None)
+                if c_b is not None:
+                    col_b_types.append(c_b.data_type)
+                    if not c_b.not_null:
+                        all_not_null = False
+                    continue
+                all_not_null = False
+                if self.dialect == Dialect.POSTGRES:
+                    try:
+                        lit_ast = parse_sql_ast(_unwrap_outer_parens(bi_item.raw_expr, dialect=self.dialect), dialect=self.dialect)
+                        if isinstance(lit_ast, sqlglot_exp.Literal) and lit_ast.args.get("is_string"):
+                            has_str_lit = True
+                            continue
+                    except sqlglot.errors.SqlglotError:
+                        pass
+                col_b_types.append(b_ctx._infer_expr_storage_type(bi_item))
+            if not col_b_types and has_str_lit:
+                col_b_types.append("TEXT")
+            if self.dialect == Dialect.SQLITE:
+                common_dt = "BLOB"
+            elif col_b_types:
+                common_dt = self._common_storage_type(col_b_types, has_null=has_null)
+            else:
+                common_dt = "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
+            merged_cols[fb_it.alias] = ColumnDef(
+                name=fb_it.alias,
+                data_type=common_dt,
+                not_null=all_not_null,
+            )
+        merged_schema = TableSchema(
+            name=self.view.base_table or "__mv_union_all",
+            columns=merged_cols,
+        )
+        return self.with_ir(primary_schema=merged_schema)
 
     def _is_case_over_int_literals(self, expr: str) -> bool:
         try:
@@ -2002,7 +2425,7 @@ class DialectBaseMixin(MixinHost):
         base = re.sub(r"\s*\([^)]*\)", "", u).strip()
         if base in ("NUMERIC", "DECIMAL", "DEC"):
             return "NUMERIC"
-        if base in ("VARCHAR", "CHARACTER VARYING", "TEXT"):
+        if base in ("VARCHAR", "CHARACTER VARYING", "TEXT", "NAME"):
             return "TEXT"
         if base in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
             return "BPCHAR"

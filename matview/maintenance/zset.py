@@ -304,14 +304,17 @@ class Tier1ZSetMixin(MixinHost):
             col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
 
         indexed_cols_lower = self._indexed_column_names_lower()
-        for it in first_bs.select_items:
+        merged_ctx = self._union_all_common_ctx([bs for _, bs in branches])
+        merged_cols = merged_ctx.primary_schema.columns if merged_ctx.primary_schema else {}
+        for col_idx, it in enumerate(first_bs.select_items):
             if self.dialect == Dialect.SQLITE:
                 # SQLite compound SELECT columns have no affinity; storing
                 # without affinity (BLOB) preserves exact storage classes across
                 # branches with differing affinities.
                 dt = "BLOB"
             else:
-                dt = self._infer_expr_storage_type(it)
+                mc = merged_cols.get(it.alias)
+                dt = mc.data_type if mc is not None else self._infer_expr_storage_type(it)
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
             col_defs_sql.append(f"{self._q(it.alias)} {dt}")
