@@ -2910,6 +2910,8 @@ class Tier1SingleMixin(MixinHost):
                     if m_true:
                         return f"{s[:after_pos]}{m_true.group(1)}({where_cond}){after[m_true.end():]}"
                 return f"{s[:after_pos]} ({where_cond}) AND {after.lstrip()}"
+            if self.dialect == Dialect.MYSQL:
+                return f"IF ({where_cond}) THEN\n        {s}\n    END IF;"
         return stmt
 
 
