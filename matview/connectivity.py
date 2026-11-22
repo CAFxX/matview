@@ -808,11 +808,8 @@ def introspect_schemas_with_sqlalchemy(
     try:
         insp = _sa_inspect(insp_target)
         sqlite_ddl_schemas: Dict[str, TableSchema] = {}
-        if eff_dialect == Dialect.SQLITE:
-            try:
-                sqlite_ddl_schemas = introspect_sqlite_schemas(raw_conn, object_prefix=object_prefix)
-            except Exception:
-                sqlite_ddl_schemas = {}
+        if eff_dialect == Dialect.SQLITE and callable(getattr(raw_conn, "cursor", None)):
+            sqlite_ddl_schemas = introspect_sqlite_schemas(raw_conn, object_prefix=object_prefix)
         sqlite_low = {k.lower(): v for k, v in sqlite_ddl_schemas.items()}
         pg_array_types: Dict[Tuple[str, str], str] = (
             _pg_introspect_native_array_types(bind_or_conn if isinstance(bind_or_conn, (_SAEngine, _SAConnection)) else raw_conn)
@@ -870,9 +867,17 @@ def introspect_schemas_with_sqlalchemy(
             for fk in (insp.get_foreign_keys(t_name) or []):
                 opts = fk.get("options") or {}
                 for opt_key, sql_kw in (("ondelete", "ON DELETE"), ("onupdate", "ON UPDATE")):
-                    act_val = str(opts.get(opt_key) or "").upper()
-                    if act_val in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                        act_str = f"{sql_kw} {act_val}"
+                    act_val = str(opts.get(opt_key) or "").strip().upper()
+                    if act_val == "CASCADE":
+                        norm_act = "CASCADE"
+                    elif act_val == "SET NULL" or act_val.startswith(("SET NULL (", "SET NULL(")):
+                        norm_act = "SET NULL"
+                    elif act_val == "SET DEFAULT" or act_val.startswith(("SET DEFAULT (", "SET DEFAULT(")):
+                        norm_act = "SET DEFAULT"
+                    else:
+                        norm_act = ""
+                    if norm_act:
+                        act_str = f"{sql_kw} {norm_act}"
                         if act_str not in fk_actions:
                             fk_actions.append(act_str)
 
@@ -923,7 +928,7 @@ def introspect_schemas_with_sqlalchemy(
             schemas[t_name] = TableSchema(
                 name=t_name,
                 columns=col_defs,
-                fk_cascade_actions=tuple(fk_actions),
+                fk_cascade_actions=tuple(sorted(fk_actions)),
                 indexes=tuple(idx_defs),
                 pk_columns=pk_cols_seq,
             )
@@ -971,104 +976,123 @@ def introspect_sqlite_schemas(
         )
         low_known = {k.lower(): k for k in schemas}
 
-        # Fallback / enrichment via PRAGMA table_info, index_list & foreign_key_list for tables without standard DDL
+        # Enrich parsed tables with authoritative live FK actions from PRAGMA foreign_key_list
+        # (fail-closed: never swallow FK metadata query errors), and fall back to PRAGMA
+        # table_info / index_list / foreign_key_list for tables without standard DDL.
+        def _read_sqlite_fk_actions(table_name: str) -> List[str]:
+            t_q = table_name.replace('"', '""')
+            fk_list: List[str] = []
+            cur.execute(f'PRAGMA foreign_key_list("{t_q}")')
+            for fk_r in (cur.fetchall() or []):
+                on_upd = str(fk_r[5]).upper() if len(fk_r) > 5 and fk_r[5] else ""
+                on_del = str(fk_r[6]).upper() if len(fk_r) > 6 and fk_r[6] else ""
+                if on_del in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                    act = f"ON DELETE {on_del}"
+                    if act not in fk_list:
+                        fk_list.append(act)
+                if on_upd in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                    act = f"ON UPDATE {on_upd}"
+                    if act not in fk_list:
+                        fk_list.append(act)
+            return fk_list
+
         for t_str in table_names:
-            existing = schemas.get(low_known.get(t_str.lower(), t_str))
+            known_key = low_known.get(t_str.lower(), t_str)
+            existing = schemas.get(known_key)
             if existing and existing.columns:
+                live_fks = tuple(sorted(set(_read_sqlite_fk_actions(t_str))))
+                if live_fks != existing.fk_cascade_actions:
+                    schemas[known_key] = TableSchema(
+                        name=existing.name,
+                        columns=existing.columns,
+                        fk_cascade_actions=live_fks,
+                        has_on_conflict_replace=existing.has_on_conflict_replace,
+                        indexes=existing.indexes,
+                        pk_columns=existing.pk_columns,
+                        without_rowid=existing.without_rowid,
+                        strict=existing.strict,
+                    )
                 continue
+            t_q = t_str.replace('"', '""')
             try:
-                cur.execute(f'PRAGMA table_info("{t_str}")')
+                cur.execute(f'PRAGMA table_info("{t_q}")')
                 t_info = cur.fetchall() or []
-                if not t_info:
-                    continue
-                pk_entries = sorted(((int(r[5]), str(r[1])) for r in t_info if int(r[5] or 0) > 0), key=lambda x: x[0])
-                pk_cols_seq = tuple(name for _, name in pk_entries)
-                pk_count = len(pk_cols_seq)
-                raw_tbl_sql = _strip_sql_comments(table_sqls.get(t_str.lower(), ""))
-                rparen_idx = raw_tbl_sql.rfind(")")
-                fb_tail = raw_tbl_sql[rparen_idx + 1 :] if rparen_idx >= 0 else ""
-                fb_without_rowid = bool(re.search(r"\bWITHOUT\s+ROWID\b", fb_tail, re.IGNORECASE))
-                fb_strict = bool(re.search(r"\bSTRICT\b", fb_tail, re.IGNORECASE))
-                fb_pk_desc = bool(
-                    re.search(
-                        r"\bPRIMARY\s+KEY\s+DESC\b|\bPRIMARY\s+KEY\s*\([^)]*\bDESC\b",
-                        raw_tbl_sql,
-                        re.IGNORECASE,
-                    )
+            except Exception:
+                continue
+            if not t_info:
+                continue
+            pk_entries = sorted(((int(r[5]), str(r[1])) for r in t_info if int(r[5] or 0) > 0), key=lambda x: x[0])
+            pk_cols_seq = tuple(name for _, name in pk_entries)
+            pk_count = len(pk_cols_seq)
+            raw_tbl_sql = _strip_sql_comments(table_sqls.get(t_str.lower(), ""))
+            rparen_idx = raw_tbl_sql.rfind(")")
+            fb_tail = raw_tbl_sql[rparen_idx + 1 :] if rparen_idx >= 0 else ""
+            fb_without_rowid = bool(re.search(r"\bWITHOUT\s+ROWID\b", fb_tail, re.IGNORECASE))
+            fb_strict = bool(re.search(r"\bSTRICT\b", fb_tail, re.IGNORECASE))
+            fb_pk_desc = bool(
+                re.search(
+                    r"\bPRIMARY\s+KEY\s+DESC\b|\bPRIMARY\s+KEY\s*\([^)]*\bDESC\b",
+                    raw_tbl_sql,
+                    re.IGNORECASE,
                 )
-                cols: Dict[str, ColumnDef] = {}
-                for r in t_info:
-                    c_name = str(r[1])
-                    c_type = str(r[2]).upper() if r[2] else "BLOB"  # no declared type: BLOB affinity
-                    c_pk = bool(r[5])
-                    c_rowid_alias = (
-                        c_pk
-                        and pk_count == 1
-                        and not fb_without_rowid
-                        and not fb_pk_desc
-                        and re.sub(r"\s+", " ", c_type.strip().upper()) == "INTEGER"
+            )
+            cols: Dict[str, ColumnDef] = {}
+            for r in t_info:
+                c_name = str(r[1])
+                c_type = str(r[2]).upper() if r[2] else "BLOB"  # no declared type: BLOB affinity
+                c_pk = bool(r[5])
+                c_rowid_alias = (
+                    c_pk
+                    and pk_count == 1
+                    and not fb_without_rowid
+                    and not fb_pk_desc
+                    and re.sub(r"\s+", " ", c_type.strip().upper()) == "INTEGER"
+                )
+                c_notnull = bool(r[3]) or (c_pk and (fb_without_rowid or c_rowid_alias))
+                cols[c_name] = ColumnDef(
+                    name=c_name,
+                    data_type=c_type,
+                    not_null=c_notnull,
+                    primary_key=c_pk,
+                    is_rowid_alias=c_rowid_alias,
+                )
+            fk_actions = _read_sqlite_fk_actions(t_str)
+            sq_idx_defs: List[TableIndexDef] = []
+            try:
+                cur.execute(f'PRAGMA index_list("{t_q}")')
+                for il_row in (cur.fetchall() or []):
+                    ix_name = str(il_row[1])
+                    ix_unique = bool(il_row[2])
+                    ix_origin = str(il_row[3]) if len(il_row) > 3 and il_row[3] else ""
+                    if ix_origin == "pk":
+                        continue
+                    ix_q = ix_name.replace('"', '""')
+                    cur.execute(f'PRAGMA index_info("{ix_q}")')
+                    ii_rows = sorted(
+                        (r for r in (cur.fetchall() or []) if len(r) > 2 and r[2] is not None),
+                        key=lambda r: int(r[0]),
                     )
-                    c_notnull = bool(r[3]) or (c_pk and (fb_without_rowid or c_rowid_alias))
-                    cols[c_name] = ColumnDef(
-                        name=c_name,
-                        data_type=c_type,
-                        not_null=c_notnull,
-                        primary_key=c_pk,
-                        is_rowid_alias=c_rowid_alias,
-                    )
-                fk_actions: List[str] = []
-                try:
-                    cur.execute(f'PRAGMA foreign_key_list("{t_str}")')
-                    for fk_r in (cur.fetchall() or []):
-                        on_upd = str(fk_r[5]).upper() if len(fk_r) > 5 and fk_r[5] else ""
-                        on_del = str(fk_r[6]).upper() if len(fk_r) > 6 and fk_r[6] else ""
-                        if on_del in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                            act = f"ON DELETE {on_del}"
-                            if act not in fk_actions:
-                                fk_actions.append(act)
-                        if on_upd in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                            act = f"ON UPDATE {on_upd}"
-                            if act not in fk_actions:
-                                fk_actions.append(act)
-                except Exception:
-                    pass
-                sq_idx_defs: List[TableIndexDef] = []
-                try:
-                    cur.execute(f'PRAGMA index_list("{t_str}")')
-                    for il_row in (cur.fetchall() or []):
-                        ix_name = str(il_row[1])
-                        ix_unique = bool(il_row[2])
-                        ix_origin = str(il_row[3]) if len(il_row) > 3 and il_row[3] else ""
-                        if ix_origin == "pk":
-                            continue
-                        cur.execute(f'PRAGMA index_info("{ix_name}")')
-                        ii_rows = sorted(
-                            (r for r in (cur.fetchall() or []) if len(r) > 2 and r[2] is not None),
-                            key=lambda r: int(r[0]),
-                        )
-                        ix_cols = tuple(str(r[2]) for r in ii_rows)
-                        if ix_cols:
-                            sq_idx_defs.append(
-                                TableIndexDef(
-                                    name=ix_name,
-                                    table_name=t_str,
-                                    columns=ix_cols,
-                                    unique=ix_unique,
-                                )
+                    ix_cols = tuple(str(r[2]) for r in ii_rows)
+                    if ix_cols:
+                        sq_idx_defs.append(
+                            TableIndexDef(
+                                name=ix_name,
+                                table_name=t_str,
+                                columns=ix_cols,
+                                unique=ix_unique,
                             )
-                except Exception:
-                    pass
-                schemas[t_str] = TableSchema(
-                    name=t_str,
-                    columns=cols,
-                    fk_cascade_actions=tuple(fk_actions),
-                    indexes=tuple(sq_idx_defs),
-                    pk_columns=pk_cols_seq,
-                    without_rowid=fb_without_rowid,
-                    strict=fb_strict,
-                )
+                        )
             except Exception:
                 pass
+            schemas[t_str] = TableSchema(
+                name=t_str,
+                columns=cols,
+                fk_cascade_actions=tuple(sorted(fk_actions)),
+                indexes=tuple(sq_idx_defs),
+                pk_columns=pk_cols_seq,
+                without_rowid=fb_without_rowid,
+                strict=fb_strict,
+            )
         return schemas
     finally:
         close_fn = getattr(cur, "close", None)
@@ -1159,34 +1183,48 @@ def introspect_database_schemas(
                         )
             except Exception:
                 pass
+            def _norm_pg_fk_action(val: Any) -> str:
+                if isinstance(val, memoryview):
+                    val = val.tobytes()
+                if isinstance(val, (bytes, bytearray)):
+                    val = val.decode("utf-8")
+                s_val = str(val or "").strip().upper()
+                return {
+                    "C": "CASCADE",
+                    "N": "SET NULL",
+                    "D": "SET DEFAULT",
+                    "CASCADE": "CASCADE",
+                    "SET NULL": "SET NULL",
+                    "SET DEFAULT": "SET DEFAULT",
+                }.get(s_val, "")
+
+            # Query pg_catalog.pg_constraint directly (visible to non-owner roles,
+            # unlike information_schema.referential_constraints) and fail closed
+            # rather than silently swallowing FK metadata query errors.
             fk_by_table: Dict[str, List[str]] = {}
-            try:
-                cur.execute(
-                    """
-                    SELECT tc.table_name, rc.delete_rule, rc.update_rule
-                    FROM information_schema.table_constraints tc
-                    JOIN information_schema.referential_constraints rc
-                      ON tc.constraint_name = rc.constraint_name
-                     AND tc.table_schema = rc.constraint_schema
-                    WHERE tc.constraint_type = 'FOREIGN KEY'
-                      AND tc.table_schema = current_schema()
-                    """
-                )
-                for fk_r in (cur.fetchall() or []):
-                    t_low = str(fk_r[0]).lower()
-                    del_r = str(fk_r[1]).upper() if fk_r[1] else ""
-                    upd_r = str(fk_r[2]).upper() if fk_r[2] else ""
-                    acts = fk_by_table.setdefault(t_low, [])
-                    if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                        a_str = f"ON DELETE {del_r}"
-                        if a_str not in acts:
-                            acts.append(a_str)
-                    if upd_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                        a_str = f"ON UPDATE {upd_r}"
-                        if a_str not in acts:
-                            acts.append(a_str)
-            except Exception:
-                pass
+            cur.execute(
+                """
+                SELECT c.relname, con.confdeltype, con.confupdtype
+                FROM pg_catalog.pg_constraint con
+                JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE con.contype = 'f'
+                  AND n.nspname = current_schema()
+                """
+            )
+            for fk_r in (cur.fetchall() or []):
+                t_low = str(fk_r[0]).lower()
+                del_r = _norm_pg_fk_action(fk_r[1])
+                upd_r = _norm_pg_fk_action(fk_r[2])
+                acts = fk_by_table.setdefault(t_low, [])
+                if del_r:
+                    a_str = f"ON DELETE {del_r}"
+                    if a_str not in acts:
+                        acts.append(a_str)
+                if upd_r:
+                    a_str = f"ON UPDATE {upd_r}"
+                    if a_str not in acts:
+                        acts.append(a_str)
 
             pg_array_types = _pg_introspect_native_array_types(conn)
             pg_gen_cols = _pg_introspect_generated_columns(conn)
@@ -1246,7 +1284,7 @@ def introspect_database_schemas(
                 schemas[t_name] = TableSchema(
                     name=t_name,
                     columns=cols,
-                    fk_cascade_actions=tuple(fk_by_table.get(t_name.lower(), ())),
+                    fk_cascade_actions=tuple(sorted(fk_by_table.get(t_name.lower(), ()))),
                     indexes=tuple(pg_idx_by_table.get(t_name.lower(), ())),
                     pk_columns=tuple(pk_order_by_table.get(t_name.lower(), ())),
                 )
@@ -1257,30 +1295,29 @@ def introspect_database_schemas(
                 return val.decode("utf-8")
             return "" if val is None else str(val)
 
+        # Fail closed when FK metadata cannot be read: swallowing errors here
+        # would silently bypass MYSQL_FK_CASCADE_NO_TRIGGER.
         fk_by_table_my: Dict[str, List[str]] = {}
-        try:
-            cur.execute(
-                """
-                SELECT rc.table_name, rc.delete_rule, rc.update_rule
-                FROM information_schema.referential_constraints rc
-                WHERE rc.constraint_schema = DATABASE()
-                """
-            )
-            for fk_r in (cur.fetchall() or []):
-                t_low = _dec(fk_r[0]).lower()
-                del_r = _dec(fk_r[1]).upper()
-                upd_r = _dec(fk_r[2]).upper()
-                acts = fk_by_table_my.setdefault(t_low, [])
-                if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                    a_str = f"ON DELETE {del_r}"
-                    if a_str not in acts:
-                        acts.append(a_str)
-                if upd_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                    a_str = f"ON UPDATE {upd_r}"
-                    if a_str not in acts:
-                        acts.append(a_str)
-        except Exception:
-            pass
+        cur.execute(
+            """
+            SELECT rc.table_name, rc.delete_rule, rc.update_rule
+            FROM information_schema.referential_constraints rc
+            WHERE rc.constraint_schema = DATABASE()
+            """
+        )
+        for fk_r in (cur.fetchall() or []):
+            t_low = _dec(fk_r[0]).lower()
+            del_r = _dec(fk_r[1]).upper()
+            upd_r = _dec(fk_r[2]).upper()
+            acts = fk_by_table_my.setdefault(t_low, [])
+            if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                a_str = f"ON DELETE {del_r}"
+                if a_str not in acts:
+                    acts.append(a_str)
+            if upd_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                a_str = f"ON UPDATE {upd_r}"
+                if a_str not in acts:
+                    acts.append(a_str)
 
         cur.execute(
             """
@@ -1369,7 +1406,7 @@ def introspect_database_schemas(
             schemas[t_name] = TableSchema(
                 name=t_name,
                 columns=cols,
-                fk_cascade_actions=tuple(fk_by_table_my.get(t_name.lower(), ())),
+                fk_cascade_actions=tuple(sorted(fk_by_table_my.get(t_name.lower(), ()))),
                 indexes=tuple(my_idx_by_table.get(t_name.lower(), ())),
                 pk_columns=tuple(my_pk_by_table.get(t_name.lower(), ())),
             )

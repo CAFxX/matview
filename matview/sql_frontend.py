@@ -1391,7 +1391,7 @@ def parse_table_schema(
         schemas[table_name] = TableSchema(
             name=table_name,
             columns=cols,
-            fk_cascade_actions=tuple(fk_cascades),
+            fk_cascade_actions=tuple(sorted(fk_cascades)),
             has_on_conflict_replace=has_on_conflict_replace,
             indexes=tuple(inline_indexes),
             pk_columns=tuple(ordered_pk_cols),
