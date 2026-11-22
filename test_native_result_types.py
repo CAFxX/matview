@@ -365,6 +365,43 @@ class PostgresPlannedResultTypeTests(unittest.TestCase):
                     )
 
 
+class MySQLPlannedResultTypeTests(unittest.TestCase):
+    """Offline guards for MySQL's GROUP BY expression result metadata."""
+
+    SCHEMA = (
+        "CREATE TABLE ik (id INT PRIMARY KEY, i INT, s SMALLINT, b BIGINT, "
+        "ti TINYINT, mi MEDIUMINT, u INT UNSIGNED);"
+    )
+
+    def test_grouped_narrow_integer_arithmetic_uses_int(self) -> None:
+        import re
+
+        cases = {
+            "s % 2": "INT",
+            "ti % 2": "INT",
+            "mi % 2": "INT",
+            "s + s": "INT",
+            "i % 3": "BIGINT",
+            "s * s": "BIGINT",
+        }
+        for dialect in ("mysql:8.4", "mysql:9.7"):
+            for expr, expected_type in cases.items():
+                with self.subTest(dialect=dialect, expr=expr):
+                    select = f"SELECT {expr} AS k, COUNT(*) AS c FROM ik GROUP BY {expr}"
+                    plan = generate_materialized_view(
+                        self.SCHEMA,
+                        f"CREATE VIEW v AS {select};",
+                        dialect=dialect,
+                        ignore_limitations=True,
+                    )
+                    match = re.search(
+                        r'(?im)^\s*[\x60"]?k[\x60"]?\s+([A-Z]+(?:\s+UNSIGNED)?)\b',
+                        plan.backing_table_ddl,
+                    )
+                    self.assertIsNotNone(match, plan.backing_table_ddl)
+                    self.assertEqual(match.group(1), expected_type)
+
+
 class NativeResultTypeTests(unittest.TestCase):
     def _run(self, engine: Dialect, dsn: str) -> List[str]:
         conn = _connect(engine, dsn)
@@ -483,6 +520,105 @@ class NativeResultTypeTests(unittest.TestCase):
             conn.commit()
             conn.close()
         return failures
+
+    def test_mysql_group_key_integer_type_is_stable_across_access_paths(self) -> None:
+        mysql_engines = [(engine, dsn) for engine, dsn in _native_engines() if engine == Dialect.MYSQL]
+        if not mysql_engines:
+            self.skipTest("set MYSQL_DSN for native MySQL GROUP BY result-type tests")
+
+        tested_mysql = False
+        for engine, dsn in mysql_engines:
+            conn = _connect(engine, dsn)
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT VERSION()")
+                version = str(cur.fetchone()[0])
+                if "mariadb" in version.lower():
+                    continue
+                tested_mysql = True
+                table = f"gk_{uuid.uuid4().hex[:8]}"
+                cur.execute(
+                    f"CREATE TEMPORARY TABLE {table} ("
+                    "s SMALLINT NOT NULL, ti TINYINT NOT NULL, mi MEDIUMINT NOT NULL, "
+                    "g_s_mod INT GENERATED ALWAYS AS (s % 2) STORED, "
+                    "g_ti_mod INT GENERATED ALWAYS AS (ti % 2) STORED, "
+                    "g_mi_mod INT GENERATED ALWAYS AS (mi % 2) STORED, "
+                    "g_s_add INT GENERATED ALWAYS AS (s + s) STORED, "
+                    "KEY idx_s_mod (g_s_mod), KEY idx_ti_mod (g_ti_mod), "
+                    "KEY idx_mi_mod (g_mi_mod), KEY idx_s_add (g_s_add)"
+                    ") ENGINE=InnoDB"
+                )
+                rows = [
+                    (n % 65536 - 32768, n % 256 - 128, n % 16777216 - 8388608)
+                    for n in range(1, 1001)
+                ]
+                cur.executemany(
+                    f"INSERT INTO {table} (s, ti, mi) VALUES (%s, %s, %s)",
+                    rows,
+                )
+                conn.commit()
+
+                cases = (
+                    ("s % 2", "g_s_mod", "idx_s_mod"),
+                    ("ti % 2", "g_ti_mod", "idx_ti_mod"),
+                    ("mi % 2", "g_mi_mod", "idx_mi_mod"),
+                    ("s + s", "g_s_add", "idx_s_add"),
+                )
+                all_indexes = "idx_s_mod, idx_ti_mod, idx_mi_mod, idx_s_add"
+                for expr, generated_col, index_name in cases:
+                    cur.execute(f"SELECT {expr} AS k FROM {table} LIMIT 0")
+                    projection_type = cur.description[0][1]
+                    cur.execute(f"SELECT {generated_col} AS k FROM {table} LIMIT 0")
+                    expected_group_type = cur.description[0][1]
+                    self.assertNotEqual(
+                        projection_type,
+                        expected_group_type,
+                        f"{version}: plain projection unexpectedly has the generated INT type for {expr}",
+                    )
+
+                    access_results = []
+                    for hint, expected_key in (
+                        (f"IGNORE INDEX ({all_indexes})", None),
+                        (f"FORCE INDEX ({index_name})", index_name),
+                    ):
+                        query = (
+                            f"SELECT {expr} AS k, COUNT(*) AS c FROM {table} "
+                            f"{hint} GROUP BY {expr}"
+                        )
+                        cur.execute("EXPLAIN " + query)
+                        explain_names = [str(col[0]).lower() for col in cur.description]
+                        key_position = explain_names.index("key")
+                        explain_rows = cur.fetchall()
+                        observed_keys = {row[key_position] for row in explain_rows}
+                        if expected_key is None:
+                            self.assertEqual(observed_keys, {None}, f"{version}: {query}")
+                        else:
+                            self.assertIn(expected_key, observed_keys, f"{version}: {query}")
+
+                        cur.execute(query)
+                        description = tuple(cur.description[0][:7])
+                        actual_rows = sorted(cur.fetchall(), key=repr)
+                        self.assertEqual(
+                            description[1],
+                            expected_group_type,
+                            f"{version}: grouped {expr} metadata changed under {hint}",
+                        )
+                        access_results.append((description, actual_rows))
+
+                    self.assertEqual(
+                        access_results[0],
+                        access_results[1],
+                        f"{version}: grouped {expr} metadata/values depend on the access path",
+                    )
+            finally:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                conn.close()
+
+        if not tested_mysql:
+            self.skipTest("MYSQL_DSN resolves to MariaDB; this MySQL-only type rule is not applicable")
 
     def test_native_result_types_match_live_views(self) -> None:
         engines = _native_engines()

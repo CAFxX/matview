@@ -1239,16 +1239,16 @@ INT_KEY_EXPRS: List[Tuple[str, Tuple[str, ...]]] = [
 
 @pytest.mark.parametrize("target", _params())
 @pytest.mark.parametrize("expr", [e for e, _ in INT_KEY_EXPRS], ids=[e for e, _ in INT_KEY_EXPRS])
-def test_integer_expression_group_key_result_type(make_env, request, target: Target, expr: str) -> None:
-    _check_integer_expression_view(make_env, request, target, expr, lambda e: (
+def test_integer_expression_group_key_result_type(make_env, target: Target, expr: str) -> None:
+    _check_integer_expression_view(make_env, target, expr, lambda e: (
         ViewDef("ik_v", f"SELECT {e} AS k, COUNT(*) AS c FROM ik GROUP BY {e}")))
 
 
 @pytest.mark.parametrize("target", _params())
 @pytest.mark.parametrize("expr", [e for e, _ in INT_KEY_EXPRS], ids=[e for e, _ in INT_KEY_EXPRS])
 @pytest.mark.parametrize("agg", ["MIN", "MAX"])
-def test_min_max_of_integer_expression_result_type(make_env, request, target: Target, expr: str, agg: str) -> None:
-    _check_integer_expression_view(make_env, request, target, expr, lambda e: (
+def test_min_max_of_integer_expression_result_type(make_env, target: Target, expr: str, agg: str) -> None:
+    _check_integer_expression_view(make_env, target, expr, lambda e: (
         ViewDef("ik_a", f"SELECT s, {agg}({e}) AS a FROM ik GROUP BY s")))
 
 
@@ -1267,10 +1267,9 @@ SUM_INT_EXPRS: List[Tuple[str, Tuple[str, ...]]] = [
 
 @pytest.mark.parametrize("target", _params())
 @pytest.mark.parametrize("expr", [e for e, _ in SUM_INT_EXPRS], ids=[e for e, _ in SUM_INT_EXPRS])
-def test_sum_of_integer_expression_result_type(make_env, request, target: Target, expr: str) -> None:
+def test_sum_of_integer_expression_result_type(make_env, target: Target, expr: str) -> None:
     _check_integer_expression_view(
         make_env,
-        request,
         target,
         expr,
         lambda e: ViewDef("ik_s", f"SELECT s, SUM({e}) AS a FROM ik GROUP BY s"),
@@ -1278,26 +1277,14 @@ def test_sum_of_integer_expression_result_type(make_env, request, target: Target
     )
 
 
-_E6 = ("MySQL reports a GROUP BY expression over TINYINT/SMALLINT/MEDIUMINT arithmetic as INT (LONG) "
-       "while a plain SELECT of it is BIGINT; the backing column is BIGINT. TODO.md "
-       "'Integer Expression Result Types Not Yet Derived Exactly'")
-# (product, view name, expression) -> reason. Applied at run time because the
-# product (MySQL or MariaDB) is read from the server.
-KNOWN_INT_EXPR_TYPE_DEFECTS: Dict[Tuple[str, str, str], str] = {
-    **{("mysql", "ik_v", e): _E6 for e in ("s % 2", "ti % 2", "mi % 2", "s + s")},
-}
 
-
-def _check_integer_expression_view(make_env, request, target: Target, expr: str,
+def _check_integer_expression_view(make_env, target: Target, expr: str,
                                    view: Callable[[str], ViewDef],
                                    expr_families: Optional[Dict[str, Tuple[str, ...]]] = None) -> None:
     families = (expr_families or dict(INT_KEY_EXPRS))[expr]
     if target.family not in families:
         pytest.skip(f"{expr} is not {target.family} syntax")
     env = make_env(target, views=[], schema_sql=INT_KEY_SCHEMA[target.family], seed=False)
-    reason = KNOWN_INT_EXPR_TYPE_DEFECTS.get((env.product, view(expr).name, expr))
-    if reason:
-        request.node.add_marker(known_defect(reason))
     cols = "id, i, s, b" + (", ti, mi, u" if target.family == "mysql" else "")
     rows = []
     for n in range(1, 13):
