@@ -42,13 +42,16 @@ from .logical_ir import (
     ViewSpec,
 )
 from .sql_frontend import (
+    _FN_TO_AGG_ENUM,
     _SQL_EXPR_FUNCTIONS,
+    _STATISTICAL_ALIAS_NAMES,
     _contains_aggregate_call,
     _extract_cte_names_and_strip_with,
     _extract_set_op_branches_from_ast,
     _extract_verbatim_cte_or_subquery_sql,
     _find_top_level_token,
     _has_subquery_ast,
+    _is_pg_catalog_qualified,
     _is_simple_column_expr,
     _is_word_or_ident_token,
     _parse_index_col_ast,
@@ -61,6 +64,7 @@ from .sql_frontend import (
     _tokenize_sql,
     _unquote_ident,
     _unwrap_outer_parens,
+    _unwrap_pg_catalog_agg_node,
     build_create_index_sql,
     parse_sql_ast,
     parse_view_ast,
@@ -70,6 +74,37 @@ from .sql_frontend import (
 
 # Diagnostic code of the HAVING scalar-subquery-aggregate fallback.
 HAVING_SUBQUERY_AGGREGATE_FALLBACK = "HAVING_SUBQUERY_AGGREGATE_FALLBACK"
+
+def _iter_agg_ast_nodes(root: sqlglot_exp.Expr, dialect: Dialect) -> List[sqlglot_exp.Expr]:
+    """Return every aggregate call node in `root`, including PostgreSQL
+    `pg_catalog.<agg>(...)` (with or without `FILTER`), while skipping
+    non-`pg_catalog` schema-qualified UDFs (e.g. `myschema.sum(x)`)."""
+    out: List[sqlglot_exp.Expr] = []
+    seen: Set[int] = set()
+    known_names = set(_FN_TO_AGG_ENUM) | set(_STATISTICAL_ALIAS_NAMES) | {"COUNT"}
+    for n in root.walk():
+        if isinstance(n, (sqlglot_exp.Dot, sqlglot_exp.Column)):
+            unwrapped = _unwrap_pg_catalog_agg_node(n, dialect)
+            if unwrapped is not None:
+                fname = (
+                    unwrapped.name.upper()
+                    if isinstance(unwrapped, sqlglot_exp.Anonymous)
+                    else unwrapped.sql_name().upper()
+                )
+                if isinstance(unwrapped, sqlglot_exp.AggFunc) or fname in known_names:
+                    if id(unwrapped) not in seen:
+                        seen.add(id(unwrapped))
+                        out.append(n)
+                    continue
+        if isinstance(n, sqlglot_exp.AggFunc) and id(n) not in seen:
+            parent = n.parent
+            if isinstance(parent, sqlglot_exp.Dot) and parent.expression is n:
+                if _unwrap_pg_catalog_agg_node(parent, dialect) is None:
+                    continue
+            seen.add(id(n))
+            out.append(n)
+    return out
+
 
 def _has_subquery_aggregate(sql_text: str, dialect: Dialect) -> bool:
     """Whether an aggregate appears inside a (scalar) subquery of `sql_text`:
@@ -81,7 +116,7 @@ def _has_subquery_aggregate(sql_text: str, dialect: Dialect) -> bool:
     for sub in node.find_all(sqlglot_exp.Subquery, sqlglot_exp.Select):
         if sub is node:
             continue
-        if any(True for _ in sub.find_all(sqlglot_exp.AggFunc)):
+        if _iter_agg_ast_nodes(sub, dialect):
             return True
     return False
 
@@ -95,7 +130,7 @@ def _mixes_outer_and_subquery_aggregates(sql_text: str, dialect: Dialect) -> boo
         node = parse_sql_ast(sql_text, dialect=dialect)
     except sqlglot.errors.SqlglotError:
         return False
-    for agg in node.find_all(sqlglot_exp.AggFunc):
+    for agg in _iter_agg_ast_nodes(node, dialect):
         parent = agg.parent
         while parent is not None and parent is not node and not isinstance(parent, (sqlglot_exp.Subquery, sqlglot_exp.Select)):
             parent = parent.parent
@@ -231,14 +266,24 @@ class PlannerMixin(MixinHost):
         sg = _sqlglot_dialect(self.dialect)
         for w in root.find_all(sqlglot_exp.Window):
             fn = w.this
+            if fn is not None:
+                unwrapped_pg = _unwrap_pg_catalog_agg_node(fn, self.dialect)
+                if unwrapped_pg is not None:
+                    fn = unwrapped_pg
             if not isinstance(fn, sqlglot_exp.Func):
                 continue
-            fname = fn.sql_name().upper()
+            fname = (
+                fn.name.upper()
+                if isinstance(fn, sqlglot_exp.Anonymous)
+                else fn.sql_name().upper()
+            )
             if fname not in names and str(getattr(fn, "name", "")).upper() not in names:
                 continue
             arg = fn.this
             if isinstance(arg, sqlglot_exp.Distinct):
                 arg = arg.expressions[0] if arg.expressions else None
+            elif isinstance(fn, sqlglot_exp.Anonymous) and getattr(fn, "expressions", None):
+                arg = fn.expressions[0]
             arg_sql = arg.sql(dialect=sg) if arg is not None else ""
             if self._exact_numeric_precision_scale(arg_sql) is None or fname not in ("SUM", "AVG"):
                 out.append(w.sql(dialect=sg))
@@ -268,9 +313,15 @@ class PlannerMixin(MixinHost):
         """
         if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL):
             return []
+        uall_branches = self._union_all_branch_specs
+        if alg_mode == "union_all_agg" and not uall_branches:
+            meta = self._extract_union_all_agg_metadata()
+            if meta is not None:
+                uall_branches = tuple(meta[2])
+        check_ctx = self._union_all_common_ctx(uall_branches) if uall_branches else self
         items = [
             it.raw_expr for it in self._working_select_items
-            if it.is_aggregate and self._is_order_sensitive_aggregate(it)
+            if it.is_aggregate and check_ctx._is_order_sensitive_aggregate(it)
         ]
         items += self._window_order_sensitive_exprs()
         if not items:
@@ -731,7 +782,11 @@ class PlannerMixin(MixinHost):
         agg_call_to_alias: Dict[str, str] = {}
         for it in v.select_items:
             if it.is_aggregate and it.agg_func is not None:
-                agg_call_to_alias[" ".join(t.text.upper() for t in _tokenize_sql(it.raw_expr.strip(), read=sg_d))] = it.alias
+                unwrapped_it = _unwrap_outer_parens(it.raw_expr.strip(), dialect=self.dialect)
+                it_toks = _tokenize_sql(unwrapped_it, read=sg_d)
+                if len(it_toks) >= 4 and _is_pg_catalog_qualified(it_toks, 2, self.dialect):
+                    it_toks = it_toks[2:]
+                agg_call_to_alias[" ".join(t.text.upper() for t in it_toks)] = it.alias
 
         def _extract_agg_calls_from_expr(expr_str: str) -> Tuple[str, bool]:
             nonlocal elem_counter
@@ -749,7 +804,12 @@ class PlannerMixin(MixinHost):
             }
             while idx < n:
                 tk = toks[idx]
-                fn_up = tk.text.upper()
+                has_dot_prefix = idx >= 1 and toks[idx - 1].token_type == SQLGlotTokenType.DOT
+                is_pg_cat = _is_pg_catalog_qualified(toks, idx, self.dialect)
+                if has_dot_prefix and not is_pg_cat:
+                    idx += 1
+                    continue
+                fn_up = _unquote_ident(tk.text, dialect=self.dialect).upper() if is_pg_cat else tk.text.upper()
                 if fn_up in agg_targets and idx + 1 < n and toks[idx + 1].token_type == SQLGlotTokenType.L_PAREN:
                     depth = 0
                     rp_idx = -1
@@ -781,8 +841,10 @@ class PlannerMixin(MixinHost):
                                         break
                             if f_rp != -1:
                                 end_tok_idx = f_rp
-                        full_call = expr_str[tk.start : toks[end_tok_idx].end + 1]
-                        norm_key = " ".join(t.text.upper() for t in _tokenize_sql(full_call, read=sg_d))
+                        call_start = toks[idx - 2].start if is_pg_cat else tk.start
+                        full_call = expr_str[call_start : toks[end_tok_idx].end + 1]
+                        unqual_call = expr_str[tk.start : toks[end_tok_idx].end + 1]
+                        norm_key = " ".join(t.text.upper() for t in _tokenize_sql(unqual_call, read=sg_d))
                         if norm_key in agg_call_to_alias:
                             col_al = agg_call_to_alias[norm_key]
                         else:
@@ -794,8 +856,8 @@ class PlannerMixin(MixinHost):
                             agg_call_to_alias[norm_key] = col_al
                             work_items.append(parsed_el)
                             extra_having_items.append(parsed_el)
-                        if tk.start > cursor:
-                            out_parts.append(expr_str[cursor:tk.start])
+                        if call_start > cursor:
+                            out_parts.append(expr_str[cursor:call_start])
                         out_parts.append(self._q(col_al))
                         cursor = toks[end_tok_idx].end + 1
                         idx = end_tok_idx + 1

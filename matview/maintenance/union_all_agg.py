@@ -141,6 +141,11 @@ class Tier1UnionAllAggMixin(MixinHost):
         elif has_nullable_grp:
             col_defs_sql.append(f"__mv_pk {pk_type} NOT NULL PRIMARY KEY")
 
+        # Build a synthetic context whose primary_schema holds the widened common
+        # column types across all UNION ALL branches (aligned positionally).
+        first_b = branch_specs[0]
+        merged_ctx = self._union_all_common_ctx(branch_specs)
+
         non_agg_aliases_lower = {
             item.alias.lower() for item in work_items if not item.is_aggregate
         }
@@ -153,7 +158,7 @@ class Tier1UnionAllAggMixin(MixinHost):
                     dt = "BLOB"
                 else:
                     fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
-                    dt = self._infer_expr_storage_type(fake_it)
+                    dt = merged_ctx._infer_expr_storage_type(fake_it)
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
                         dt = "VARCHAR(255)"
                 nn = " NOT NULL" if not has_nullable_grp else ""
@@ -191,49 +196,19 @@ class Tier1UnionAllAggMixin(MixinHost):
                 group_mv_cols.append(mc)
         indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
 
-        # Infer aggregate types from first branch
-        first_b = branch_specs[0]
-        first_b_map = {it.alias.lower(): it.raw_expr for it in first_b.select_items}
-
         for item in work_items:
             if not item.is_aggregate:
                 if self.dialect == Dialect.SQLITE:
                     dt = "BLOB"
                 else:
-                    dt = self._infer_expr_storage_type(item)
+                    dt = merged_ctx._infer_expr_storage_type(item)
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
                         dt = "VARCHAR(255)"
                 nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
                 col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
             else:
-                # Check if arg_expr maps to an integer column across all branches
-                storage_type = self._infer_expr_storage_type(item)
-                if self.dialect != Dialect.SQLITE and item.agg_func in (AggFunc.SUM, AggFunc.MIN, AggFunc.MAX) and item.arg_expr:
-                    arg_id = _unquote_ident(item.arg_expr, dialect=self.dialect).lower()
-                    if arg_id in first_b_map:
-                        b_types = []
-                        for bs in branch_specs:
-                            b_m = {bi.alias.lower(): bi for bi in bs.select_items}
-                            if arg_id in b_m:
-                                bi_item = b_m[arg_id]
-                                ts_b = self._schemas_lower[bs.base_table.lower()]
-                                c_b = ts_b.columns.get(bi_item.source_col or "") if bi_item.source_col else None
-                                if c_b:
-                                    b_types.append(self._normalize_dialect_type(c_b.data_type))
-                                elif re.match(r"^\d+$", bi_item.raw_expr.strip()):
-                                    b_types.append("INT")
-                                else:
-                                    b_types.append(self._float_type())
-                        if b_types and all("INT" in bt.upper() for bt in b_types):
-                            if item.agg_func != AggFunc.SUM:
-                                storage_type = b_types[0]
-                            elif self.dialect == Dialect.MYSQL:
-                                # MySQL SUM of an exact argument is DECIMAL.
-                                storage_type = "DECIMAL(65, 0)"
-                            elif self.dialect == Dialect.POSTGRES and any("BIGINT" in bt.upper() for bt in b_types):
-                                storage_type = "NUMERIC"
-                            else:
-                                storage_type = self._int_type()
+                # Derive aggregate storage type from the widened common branch schema.
+                storage_type = merged_ctx._infer_expr_storage_type(item)
                 if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
                     storage_type = "VARCHAR(255)"
                 if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
@@ -275,7 +250,7 @@ class Tier1UnionAllAggMixin(MixinHost):
                     col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
 
             # Natively recomputed aggregates (PostgreSQL) need no running sums.
-            hidden_sums_needed = not self._pgmy_native_recompute_item(item)
+            hidden_sums_needed = not merged_ctx._pgmy_native_recompute_item(item)
             if hidden_sums_needed and item.agg_func in (
                 AggFunc.AVG,
                 AggFunc.VAR_POP,
@@ -287,7 +262,7 @@ class Tier1UnionAllAggMixin(MixinHost):
                     aux_idx += 1
                     sum_col = f"__mv_sum_{safe_id}_{aux_idx}"
                     col_sum_map[ekey] = sum_col
-                    col_defs_sql.append(f"{sum_col} {self._var_accum_type(item)}")
+                    col_defs_sql.append(f"{sum_col} {merged_ctx._var_accum_type(item)}")
 
             if hidden_sums_needed and item.agg_func in (
                 AggFunc.VAR_POP,
@@ -300,7 +275,7 @@ class Tier1UnionAllAggMixin(MixinHost):
                     s2_prefix = "__mv_m2_" if self.dialect == Dialect.SQLITE else "__mv_sum2_"
                     sum2_col = f"{s2_prefix}{safe_id}_{aux_idx}"
                     col_sum2_map[ekey] = sum2_col
-                    col_defs_sql.append(f"{sum2_col} {self._var_accum_type(item, squared=True)}")
+                    col_defs_sql.append(f"{sum2_col} {merged_ctx._var_accum_type(item, squared=True)}")
 
             if item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
                 if ekey not in col_true_cnt_map:
@@ -666,7 +641,7 @@ class Tier1UnionAllAggMixin(MixinHost):
                     value_key=_expr_key,
                     recompute=lambda it: self._build_recompute_subquery_raw(it, mv_table),
                     native_recompute=lambda it: (
-                        self._requires_native_avg_recompute(it) or self._pgmy_native_recompute_item(it)
+                        merged_ctx._requires_native_avg_recompute(it) or merged_ctx._pgmy_native_recompute_item(it)
                     ),
                 )
                 pg_bodies.update(self._pg_aggregate_bodies(spec, pg_sources, base_t=base_t))

@@ -897,5 +897,388 @@ class NativeMySQLIntegerMinMaxTests(unittest.TestCase):
         return failures
 
 
+class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
+    """Offline and native verification for:
+    1. Set-op and UNION ALL aggregate common column types across branches,
+    2. PostgreSQL pg_catalog.<agg>(...) parsing and compound/HAVING decomposition,
+    3. PostgreSQL NAME result types in COALESCE/CASE/NULLIF.
+    """
+
+    def test_setop_and_union_all_agg_common_types_offline(self) -> None:
+        from matview import EngineLimitationError
+
+        pg_schema = (
+            "CREATE TABLE a (id INT PRIMARY KEY, k SMALLINT NOT NULL, x SMALLINT, d NUMERIC(6, 2), s VARCHAR(5), "
+            "tm TIME, arr SMALLINT[], b BIT(2), n NAME);"
+            "CREATE TABLE b (id INT PRIMARY KEY, k BIGINT NOT NULL, y BIGINT, f DOUBLE PRECISION, d NUMERIC(12, 4), "
+            "s VARCHAR(50), tm TIMETZ, arr BIGINT[], b BIT(8), tx TEXT);"
+        )
+        p_uall = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_u AS SELECT id, x, d, s, tm, arr, b FROM a UNION ALL SELECT id, y, d, s, tm, arr, b FROM b;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_uall.backing_table_ddl, r"\bx BIGINT\b")
+        self.assertRegex(p_uall.backing_table_ddl, r"\bd NUMERIC\b")
+        self.assertRegex(p_uall.backing_table_ddl, r"\bs VARCHAR\b")
+        self.assertRegex(p_uall.backing_table_ddl, r"\btm TIMETZ\b")
+        self.assertRegex(p_uall.backing_table_ddl, r"\barr BIGINT\[\]")
+        self.assertRegex(p_uall.backing_table_ddl, r"\bb BIT VARYING\b")
+
+        # Positional alignment with differing branch column names (a.x vs b.y),
+        # MIN/MAX typmod dropping, BIT_XOR, AVG, compound expressions, and large literals.
+        p_uagg = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_ua AS WITH u AS (SELECT k, x, s, d, b FROM a UNION ALL SELECT k, y, s, d, b FROM b) "
+            "SELECT k, MIN(x) AS mnx, MAX(x) AS mxx, SUM(x) AS sx, MIN(s) AS mns, MIN(d) AS mnd, "
+            "BIT_XOR(x) AS bx, MIN(x + 1) AS mnx1 FROM u GROUP BY k;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_uagg.backing_table_ddl, r"\bk BIGINT\b")
+        self.assertRegex(p_uagg.backing_table_ddl, r"\bmnx BIGINT\b")
+        self.assertRegex(p_uagg.backing_table_ddl, r"\bmxx BIGINT\b")
+        self.assertRegex(p_uagg.backing_table_ddl, r"\bsx NUMERIC\b")
+        self.assertRegex(p_uagg.backing_table_ddl, r"\bmns TEXT\b")
+        self.assertRegex(p_uagg.backing_table_ddl, r"\bmnd NUMERIC\b")
+        self.assertRegex(p_uagg.backing_table_ddl, r"\bbx BIGINT\b")
+        self.assertRegex(p_uagg.backing_table_ddl, r"\bmnx1 BIGINT\b")
+
+        # Float branch in UNION ALL agg must trigger ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE by default,
+        # and widen SUM/AVG/VAR_POP to DOUBLE PRECISION when explicitly accepted.
+        float_uagg_sql = (
+            "CREATE VIEW v_uf AS WITH u AS (SELECT k, x FROM a UNION ALL SELECT k, f FROM b) "
+            "SELECT k, SUM(x) AS sx, AVG(x) AS ax, VAR_POP(x) AS vp FROM u GROUP BY k;"
+        )
+        with self.assertRaises(EngineLimitationError):
+            generate_materialized_view(pg_schema, float_uagg_sql, dialect="postgres:18")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", EngineLimitationWarning)
+            p_uf = generate_materialized_view(
+                pg_schema,
+                float_uagg_sql,
+                dialect="postgres:18",
+                accept_limitations=("ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",),
+            )
+        self.assertRegex(p_uf.backing_table_ddl, r"\bsx DOUBLE PRECISION\b")
+        self.assertRegex(p_uf.backing_table_ddl, r"\bax DOUBLE PRECISION\b")
+        self.assertRegex(p_uf.backing_table_ddl, r"\bvp DOUBLE PRECISION\b")
+
+        # NULL, (NULL), typmod dropping, untyped string literal + NAME, and Tier 3 ORDER BY set-op widening.
+        p_null = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_un AS SELECT id, (NULL) AS x, NULL AS d, 'lit' AS n FROM a "
+            "UNION ALL SELECT id, y, d, n FROM b JOIN a a2 ON a2.id = b.id;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_null.backing_table_ddl, r"\bx BIGINT\b")
+        self.assertRegex(p_null.backing_table_ddl, r"\bd NUMERIC\b")
+        self.assertRegex(p_null.backing_table_ddl, r"\bn NAME\b")
+
+        p_t3 = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_t3 AS SELECT id, x FROM a UNION ALL SELECT id, y FROM b ORDER BY id;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_t3.backing_table_ddl, r"\bx BIGINT\b")
+
+        my_schema = (
+            "CREATE TABLE a (id INT PRIMARY KEY, k SMALLINT NOT NULL, x SMALLINT, u INT UNSIGNED, "
+            "bu BIGINT UNSIGNED, z BIGINT ZEROFILL, fl BOOL, bt BIT(4), d DECIMAL(8, 2), s VARCHAR(5), "
+            "s500 VARCHAR(500), dt DATE);"
+            "CREATE TABLE b (id INT PRIMARY KEY, k BIGINT NOT NULL, y BIGINT, u INT, bu BIGINT, z INT, "
+            "fl BIGINT, bt BIT(16), d DECIMAL(12, 6), s TEXT, tt TINYTEXT, dt DATETIME(6));"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", EngineLimitationWarning)
+            pm_uall = generate_materialized_view(
+                my_schema,
+                "CREATE VIEW v_u AS SELECT id, x, u, bu, z, fl, bt, d, s, s500, dt FROM a "
+                "UNION ALL SELECT id, y, u, bu, z, fl, bt, d, s, tt, dt FROM b;",
+                dialect="mysql:8.4",
+                ignore_limitations=True,
+            )
+            pm_uagg = generate_materialized_view(
+                my_schema,
+                "CREATE VIEW v_ua AS WITH u AS (SELECT k, x, d FROM a UNION ALL SELECT k, y, d FROM b) "
+                "SELECT k, MIN(x) AS mnx, MAX(x) AS mxx, SUM(x) AS sx, AVG(d) AS ad FROM u GROUP BY k;",
+                dialect="mysql:8.4",
+                ignore_limitations=True,
+            )
+            pm_numstr = generate_materialized_view(
+                my_schema,
+                "CREATE VIEW v_ns AS SELECT id, x FROM a UNION ALL SELECT id, s500 FROM a;",
+                dialect="mysql:8.4",
+                ignore_limitations=True,
+            )
+        self.assertRegex(pm_uall.backing_table_ddl, r"\bx BIGINT\b")
+        self.assertRegex(pm_uall.backing_table_ddl, r"\bu BIGINT\b")
+        self.assertRegex(pm_uall.backing_table_ddl, r"\bbu DECIMAL\(20, 0\)")
+        self.assertRegex(pm_uall.backing_table_ddl, r"\bz DECIMAL\(20, 0\)")
+        self.assertRegex(pm_uall.backing_table_ddl, r"\bfl BIGINT\b")
+        self.assertRegex(pm_uall.backing_table_ddl, r"\bbt BIT\(16\)")
+        self.assertRegex(pm_uall.backing_table_ddl, r"\bd DECIMAL\(12, 6\)")
+        self.assertRegex(pm_uall.backing_table_ddl, r"\bs TEXT\b")
+        self.assertRegex(pm_uall.backing_table_ddl, r"\bs500 TEXT\b")
+        self.assertRegex(pm_uall.backing_table_ddl, r"\bdt DATETIME\(6\)")
+        self.assertRegex(pm_uagg.backing_table_ddl, r"\bk BIGINT\b")
+        self.assertRegex(pm_uagg.backing_table_ddl, r"\bmnx BIGINT\b")
+        self.assertRegex(pm_uagg.backing_table_ddl, r"\bmxx BIGINT\b")
+        self.assertRegex(pm_uagg.backing_table_ddl, r"\bsx DECIMAL\(65, 0\)")
+        self.assertRegex(pm_uagg.backing_table_ddl, r"\bad DECIMAL\(16, 10\)")
+        self.assertRegex(pm_numstr.backing_table_ddl, r"\bx VARCHAR\(500\)")
+
+    def test_pg_catalog_aggregates_and_name_coalesce_offline(self) -> None:
+        from matview import EngineLimitationError, MaintenanceStrategy, UnsupportedMaterializedViewError, parse_view_definition
+
+        pg_schema = "CREATE TABLE t (id INT PRIMARY KEY, g INT, x INT, f DOUBLE PRECISION, n NAME, c CHAR(4), vc VARCHAR(8), tx TEXT);"
+
+        # Elementary, FILTER, parenthesized, and compound pg_catalog.<agg>(...) calls,
+        # including SQLite-default pre-parsed ViewSpec.
+        view_sql = (
+            "CREATE VIEW v_pgcat AS SELECT g, pg_catalog.var_pop(x) AS vp, pg_catalog.variance(x) AS vs, "
+            'pg_catalog."stddev"(x) AS sd, COALESCE(pg_catalog.sum(x), 0) AS cs, '
+            "pg_catalog.sum(x) FILTER (WHERE x > 0) AS sf, "
+            "COALESCE(pg_catalog.sum(x) FILTER (WHERE x > 0), 0) AS csf "
+            "FROM t GROUP BY g HAVING pg_catalog.count(*) > 0 AND pg_catalog.sum(x) FILTER (WHERE x > 0) >= 0;"
+        )
+        for v_input in (view_sql, parse_view_definition(view_sql)):
+            plan = generate_materialized_view(pg_schema, v_input, dialect="postgres:18")
+            self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+            self.assertNotIn("pg_catalog.__mv_elem", plan.reader_view_ddl)
+            self.assertNotIn("pg_catalog.", plan.reader_view_ddl)
+            self.assertIn("VAR_POP", plan.initial_populate_sql)
+            self.assertIn("VAR_SAMP", plan.initial_populate_sql)
+            self.assertIn("STDDEV_SAMP", plan.initial_populate_sql)
+            self.assertRegex(plan.backing_table_ddl, r"\bsf BIGINT\b")
+
+        # pg_catalog.<agg>(...) inside scalar subqueries must trigger HAVING fallback / outer+subquery refusal.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            p_hav_sub = generate_materialized_view(
+                pg_schema,
+                "CREATE VIEW v_hs AS SELECT g, COUNT(*) AS c FROM t GROUP BY g "
+                "HAVING COUNT(*) > (SELECT pg_catalog.count(*) FROM t);",
+                dialect="postgres:18",
+            )
+        self.assertEqual(p_hav_sub.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA)
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            generate_materialized_view(
+                pg_schema,
+                "CREATE VIEW v_mix AS SELECT g, SUM(x) + (SELECT pg_catalog.max(x) FROM t) AS s FROM t GROUP BY g;",
+                dialect="postgres:18",
+            )
+
+        # pg_catalog.<agg>(...) OVER (...) on DOUBLE must still raise EngineLimitationError.
+        with self.assertRaises(EngineLimitationError):
+            generate_materialized_view(
+                pg_schema,
+                "CREATE VIEW v_win_pgcat AS SELECT id, pg_catalog.sum(f) OVER (PARTITION BY g) AS s FROM t;",
+                dialect="postgres:18",
+            )
+
+        # Non-decomposed Tier 3 pg_catalog.<agg>(...) preserves exact result types.
+        p_t3_pgcat = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_t3_pgcat AS SELECT g, COALESCE(pg_catalog.sum(x), 0) AS cs, "
+            "pg_catalog.var_pop(x) + pg_catalog.stddev(x) AS sv FROM t GROUP BY g ORDER BY g LIMIT 5;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_t3_pgcat.backing_table_ddl, r"\bcs BIGINT\b")
+        self.assertRegex(p_t3_pgcat.backing_table_ddl, r"\bsv NUMERIC\b")
+
+        # pg_catalog.std(x) is undefined on PostgreSQL and must be refused
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            generate_materialized_view(
+                pg_schema,
+                "CREATE VIEW v_bad_std AS SELECT g, pg_catalog.std(x) AS s FROM t GROUP BY g;",
+                dialect="postgres:18",
+            )
+
+        # PostgreSQL NAME result types in COALESCE, CASE, NULLIF, GREATEST/LEAST, and MIN/MAX
+        p_name = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_name AS SELECT id, "
+            "COALESCE(n, c) AS n_c, "
+            "COALESCE(c, n) AS c_n, "
+            "COALESCE(vc, n) AS vc_n, "
+            "COALESCE(tx, n) AS tx_n, "
+            "CASE WHEN id > 0 THEN c ELSE n END AS case_else_n, "
+            "CASE WHEN id > 0 THEN n ELSE tx END AS case_else_tx, "
+            "NULLIF(n, c) AS nif_nc, "
+            "NULLIF(c, n) AS nif_cn, "
+            "NULLIF(vc, n) AS nif_vcn, "
+            "NULLIF(vc, c) AS nif_vcc, "
+            "NULLIF('lit', n) AS nif_litn, "
+            "GREATEST(c, n) AS gr_cn, "
+            "LEAST(n, tx) AS ls_ntx, "
+            "GREATEST(tx, n) AS gr_txn, "
+            "GREATEST(c, vc) AS gr_cvc "
+            "FROM t;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_name.backing_table_ddl, r"\bn_c NAME\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bc_n NAME\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bvc_n NAME\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\btx_n TEXT\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bcase_else_n NAME\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bcase_else_tx TEXT\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bnif_nc NAME\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bnif_cn TEXT\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bnif_vcn TEXT\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bnif_vcc BPCHAR\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bnif_litn NAME\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bgr_cn NAME\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bls_ntx NAME\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bgr_txn TEXT\b")
+        self.assertRegex(p_name.backing_table_ddl, r"\bgr_cvc BPCHAR\b")
+
+        p_mm_name = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_mm_n AS SELECT g, MIN(n) AS mnn, MAX(n) AS mxn FROM t GROUP BY g;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_mm_name.backing_table_ddl, r"\bmnn TEXT\b")
+        self.assertRegex(p_mm_name.backing_table_ddl, r"\bmxn TEXT\b")
+
+    def test_native_postgres_setop_pg_catalog_and_name_types(self) -> None:
+        import os
+
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN not set")
+        tag = f"rtfix_{uuid.uuid4().hex[:8]}"
+        ta, tb, tn = f"a_{tag}", f"b_{tag}", f"n_{tag}"
+        conn = _connect(Dialect.POSTGRES, dsn)
+        cur = conn.cursor()
+        try:
+            cur.execute(f"CREATE TABLE {ta} (id INT PRIMARY KEY, k SMALLINT NOT NULL, x SMALLINT)")
+            cur.execute(f"CREATE TABLE {tb} (id INT PRIMARY KEY, k BIGINT NOT NULL, y BIGINT)")
+            cur.execute(f"CREATE TABLE {tn} (id INT PRIMARY KEY, g INT, x INT, n NAME, c CHAR(4), vc VARCHAR(8), tx TEXT)")
+            cur.execute(f"INSERT INTO {ta} VALUES (1, 1, 10), (2, 2, 20)")
+            cur.execute(f"INSERT INTO {tb} VALUES (1, 5000000000, 10000000000), (2, 2, 30000000000)")
+            cur.execute(
+                f"INSERT INTO {tn} VALUES "
+                "(1, 1, 10, 'alpha', 'ab', 'v1', 't1'), "
+                "(2, 1, 20, NULL, 'cd', 'v2', 't2'), "
+                "(3, 2, 30, 'beta', 'ef', NULL, NULL)"
+            )
+            conn.commit()
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
+            specs = [
+                ("uall", f"SELECT id, x FROM {ta} UNION ALL SELECT id, y FROM {tb}"),
+                ("uagg", f"WITH u AS (SELECT k, x FROM {ta} UNION ALL SELECT k, y FROM {tb}) SELECT k, MIN(x) AS mnx, MAX(x) AS mxx, SUM(x) AS sx, BIT_XOR(x) AS bx FROM u GROUP BY k"),
+                ("pgcat", f"SELECT g, pg_catalog.var_pop(x) AS vp, pg_catalog.variance(x) AS vs, COALESCE(pg_catalog.sum(x), 0) AS cs, pg_catalog.sum(x) FILTER (WHERE x > 15) AS sf FROM {tn} GROUP BY g HAVING pg_catalog.count(*) > 0"),
+                ("name", f"SELECT id, COALESCE(n, c) AS n_c, COALESCE(c, n) AS c_n, COALESCE(vc, n) AS vc_n, COALESCE(tx, n) AS tx_n, CASE WHEN id > 1 THEN c ELSE n END AS case_n, CASE WHEN id > 1 THEN n ELSE tx END AS case_tx, NULLIF(n, c) AS nif_nc, NULLIF(c, n) AS nif_cn, NULLIF(vc, c) AS nif_vcc, GREATEST(c, n) AS gr_cn, LEAST(n, tx) AS ls_ntx FROM {tn}"),
+                ("mmn", f"SELECT g, MIN(n) AS mnn, MAX(n) AS mxn FROM {tn} GROUP BY g"),
+            ]
+            pairs = []
+            for label, sel in specs:
+                mv, lv = f"mv_{label}_{tag}", f"lv_{label}_{tag}"
+                mgr.register_view(f"CREATE VIEW {mv} AS {sel};")
+                conn.commit()
+                cur.execute(f"CREATE VIEW {lv} AS {sel}")
+                conn.commit()
+                pairs.append((label, mv, lv))
+
+            def check(step: str) -> None:
+                for label, mv, lv in pairs:
+                    cur.execute(f"SELECT * FROM {mv}")
+                    got = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    da = _description(cur)
+                    cur.execute(f"SELECT * FROM {lv}")
+                    exp = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    db = _description(cur)
+                    conn.commit()
+                    self.assertEqual(got, exp, f"PG {label} {step}: {got} != {exp}")
+                    self.assertEqual(_metadata_mismatches(Dialect.POSTGRES, da, db), [], f"PG {label} {step} metadata")
+
+            check("initial")
+            cur.execute(f"INSERT INTO {tb} VALUES (3, 9000000000, 40000000000)")
+            cur.execute(f"UPDATE {tb} SET y = 50000000000 WHERE id = 1")
+            cur.execute(f"DELETE FROM {ta} WHERE id = 1")
+            cur.execute(f"INSERT INTO {tn} VALUES (4, 2, 50, NULL, 'gh', 'v4', 't4')")
+            cur.execute(f"UPDATE {tn} SET x = 40, n = 'gamma' WHERE id = 2")
+            cur.execute(f"DELETE FROM {tn} WHERE id = 1")
+            conn.commit()
+            check("after_dml")
+        finally:
+            conn.rollback()
+            for label in ("uall", "uagg", "pgcat", "name", "mmn"):
+                try:
+                    MaterializedViewManager(conn, dialect=Dialect.POSTGRES).drop_view(f"mv_{label}_{tag}")
+                except Exception:
+                    conn.rollback()
+                cur.execute(f"DROP VIEW IF EXISTS lv_{label}_{tag} CASCADE")
+            for tbl in (ta, tb, tn):
+                cur.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+            conn.commit()
+            conn.close()
+
+    def test_native_mysql_setop_common_types(self) -> None:
+        import os
+
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN not set")
+        tag = f"rtfix_{uuid.uuid4().hex[:8]}"
+        ta, tb = f"a_{tag}", f"b_{tag}"
+        conn = _connect(Dialect.MYSQL, dsn)
+        cur = conn.cursor()
+        try:
+            cur.execute(f"CREATE TABLE {ta} (id INT PRIMARY KEY, k SMALLINT NOT NULL, x SMALLINT) ENGINE=InnoDB")
+            cur.execute(f"CREATE TABLE {tb} (id INT PRIMARY KEY, k BIGINT NOT NULL, x BIGINT) ENGINE=InnoDB")
+            cur.execute(f"INSERT INTO {ta} VALUES (1, 1, 10), (2, 2, 20)")
+            cur.execute(f"INSERT INTO {tb} VALUES (1, 5000000000, 10000000000), (2, 2, 30000000000)")
+            conn.commit()
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.MYSQL)
+            specs = [
+                ("uall", f"SELECT id, x FROM {ta} UNION ALL SELECT id, x FROM {tb}"),
+                ("uagg", f"WITH u AS (SELECT k, x FROM {ta} UNION ALL SELECT k, x FROM {tb}) SELECT k, MIN(x) AS mnx, MAX(x) AS mxx, SUM(x) AS sx FROM u GROUP BY k"),
+            ]
+            pairs = []
+            for label, sel in specs:
+                mv, lv = f"mv_{label}_{tag}", f"lv_{label}_{tag}"
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                    mgr.register_view(f"CREATE VIEW {mv} AS {sel};", ignore_limitations=True)
+                conn.commit()
+                cur.execute(f"CREATE VIEW {lv} AS {sel}")
+                conn.commit()
+                pairs.append((label, mv, lv))
+
+            def check(step: str) -> None:
+                for label, mv, lv in pairs:
+                    cur.execute(f"SELECT * FROM {mv}")
+                    got = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    da = _description(cur)
+                    cur.execute(f"SELECT * FROM {lv}")
+                    exp = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    db = _description(cur)
+                    conn.commit()
+                    self.assertEqual(got, exp, f"MySQL {label} {step}: {got} != {exp}")
+                    self.assertEqual(_metadata_mismatches(Dialect.MYSQL, da, db), [], f"MySQL {label} {step} metadata")
+
+            check("initial")
+            cur.execute(f"INSERT INTO {tb} VALUES (3, 9000000000, 40000000000)")
+            cur.execute(f"UPDATE {tb} SET x = 50000000000 WHERE id = 1")
+            cur.execute(f"DELETE FROM {ta} WHERE id = 1")
+            conn.commit()
+            check("after_dml")
+        finally:
+            conn.rollback()
+            for label in ("uall", "uagg"):
+                try:
+                    MaterializedViewManager(conn, dialect=Dialect.MYSQL).drop_view(f"mv_{label}_{tag}")
+                except Exception:
+                    conn.rollback()
+                cur.execute(f"DROP VIEW IF EXISTS lv_{label}_{tag}")
+            for tbl in (ta, tb):
+                cur.execute(f"DROP TABLE IF EXISTS {tbl}")
+            conn.commit()
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
