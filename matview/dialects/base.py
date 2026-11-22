@@ -1087,15 +1087,12 @@ class DialectBaseMixin(MixinHost):
             if upper in ("SMALLINT", "INT2", "SMALLSERIAL", "SERIAL2"):
                 return "SMALLINT"
             if upper in (
-                "INTEGER", "INT", "INT4", "MEDIUMINT", "UMEDIUMINT", "TINYINT", "UTINYINT",
-                "TINYINT UNSIGNED", "SMALLINT UNSIGNED", "USMALLINT", "MEDIUMINT UNSIGNED",
+                "INTEGER", "INT", "INT4", "MEDIUMINT", "TINYINT",
                 "SERIAL", "SERIAL4",
             ):
                 return "INTEGER"
             if upper in (
-                "BIGINT", "UBIGINT", "INT8", "BIGINT UNSIGNED", "INT UNSIGNED", "INTEGER UNSIGNED",
-                "UINT", "BIGSERIAL", "SERIAL8", "SIGNED", "UNSIGNED",
-                "SIGNED INTEGER", "UNSIGNED INTEGER",
+                "BIGINT", "INT8", "BIGSERIAL", "SERIAL8", "SIGNED", "SIGNED INTEGER",
             ):
                 return "BIGINT"
             if upper in ("NUMERIC", "DECIMAL", "DEC", "FIXED"):
