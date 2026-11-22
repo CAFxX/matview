@@ -93,7 +93,13 @@ from .sql_frontend import (
 #     array unnest preserves composite elements, container nullness uses
 #     IS [NOT] DISTINCT FROM NULL for partially-/all-NULL composites, and
 #     registration probes refuse unsupported key types/collations up front.
-MATVIEW_GENERATOR_VERSION = "12"
+# 12: PostgreSQL Stage 3 multi-source statement maintenance via BEFORE/AFTER
+#     bracket and inclusion-exclusion reconciliation.
+# 13: Fail-closed incremental backfill: triggers gate on unclaimed
+#     (backfill_cursor_pk IS NULL, backfill_active = 1) watermarks across all
+#     dialects, and PostgreSQL watermark predicates take FOR SHARE on matched
+#     catalog rows to coordinate with chunk advances against phantom inserts.
+MATVIEW_GENERATOR_VERSION = "13"
 
 
 def _definition_digest(select_sql: str) -> str:
@@ -1224,16 +1230,38 @@ class MaterializedViewManager:
                         f"Unable to establish snapshot isolation for {self.dialect.value} backfill"
                     ) from exc
                 snapshot_started = True
+                if self.dialect == Dialect.POSTGRES:
+                    # Acquire catalog ROW EXCLUSIVE -> base_t SHARE BEFORE the
+                    # first query freezes the REPEATABLE READ snapshot: preserves
+                    # global catalog -> base_t lock order with register/drop/repair,
+                    # waits for in-flight writers, and blocks new writers until
+                    # this snapshot backfill commits (backfill_active = 0).
+                    cur.execute(f"LOCK TABLE {self.catalog_table} IN ROW EXCLUSIVE MODE;")
+                    pg_lock_targets = _postgres_base_table_lock_targets(
+                        plan, object_prefix=self.object_prefix
+                    )
+                    if pg_lock_targets:
+                        cur.execute(
+                            f"LOCK TABLE {', '.join(pg_lock_targets)} IN SHARE MODE;"
+                        )
 
             # Fail closed before folding anything: a claimed or completed
-            # pk-range watermark means another backfill is running, an earlier
-            # one was interrupted, or the view is already populated; folding
-            # again from MIN(pk) would double-count. (Read after the snapshot
-            # is established; the failure path below cannot reset a claimed
-            # watermark, see _best_effort_reset_backfill_watermark.)
+            # watermark means another backfill is running, an earlier one was
+            # interrupted, or the view is already populated; folding again
+            # would double-count.
             self._refuse_unless_backfill_unclaimed(
                 self._catalog_entry(cur, plan.view_name), plan.view_name
             )
+            if snapshot_isolation and self.dialect == Dialect.SQLITE:
+                # Upgrade the savepoint to a RESERVED write lock before reading
+                # base tables so no concurrent writer can interleave.
+                self._execute_param(
+                    cur,
+                    f"UPDATE {self.catalog_table} SET backfill_active = backfill_active "
+                    f"WHERE view_name = ? AND backfill_cursor_pk IS NULL",
+                    (plan.view_name,),
+                )
+
             return self._backfill_incrementally_with_cursor(
                 plan, batch_size, on_progress, snapshot_isolation, cur
             )
@@ -1337,7 +1365,7 @@ class MaterializedViewManager:
 
     @staticmethod
     def _is_backfill_incomplete(entry: Dict[str, Any]) -> bool:
-        return entry.get("backfill_active") == 1 and entry.get("backfill_cursor_pk") is not None
+        return entry.get("backfill_active") == 1
 
     @staticmethod
     def _refuse_unless_backfill_unclaimed(entry: Optional[Dict[str, Any]], view_name: str) -> None:
@@ -1484,14 +1512,26 @@ class MaterializedViewManager:
         token = self._backfill_owner_token
         if token is None:
             raise RuntimeError("internal error: pk-range batch without a claimed ownership token")
-        self._execute_param(
-            cur,
-            f"UPDATE {self.catalog_table} "
-            f"SET backfill_cursor_pk = ?, backfill_max_pk = ?, backfill_active = ? "
-            f"WHERE view_name = ? AND backfill_cursor_pk = ? AND backfill_max_pk = ? "
-            f"AND backfill_active = 1 AND backfill_owner = ?",
-            (upper_pk, max_pk, active, view_name, cursor_pk, max_pk, token),
-        )
+        try:
+            self._execute_param(
+                cur,
+                f"UPDATE {self.catalog_table} "
+                f"SET backfill_cursor_pk = ?, backfill_max_pk = ?, backfill_active = ? "
+                f"WHERE view_name = ? AND backfill_cursor_pk = ? AND backfill_max_pk = ? "
+                f"AND backfill_active = 1 AND backfill_owner = ?",
+                (upper_pk, max_pk, active, view_name, cursor_pk, max_pk, token),
+            )
+        except Exception as exc:
+            if self._is_snapshot_row_changed_error(exc):
+                self._rollback()
+                raise BackfillInterruptedError(
+                    view_name,
+                    "the backfill watermark was taken over (repair_view, rebuild or drop) while this "
+                    "backfill was running; its in-flight batch was rolled back and it stopped",
+                    cursor_pk,
+                    max_pk,
+                ) from exc
+            raise
         owned = getattr(cur, "rowcount", None)
         if owned is None or owned < 0:
             self._execute_param(
@@ -1514,27 +1554,13 @@ class MaterializedViewManager:
             )
 
     def _best_effort_reset_backfill_watermark(self, view_name: str) -> None:
-        try:
-            reset_cur = self.conn.cursor()
-            try:
-                self._execute_param(
-                    reset_cur,
-                    f"UPDATE {self.catalog_table} "
-                    f"SET backfill_cursor_pk = NULL, backfill_max_pk = NULL, backfill_active = 0 "
-                    # Never touch a claimed/completed pk-range watermark: a
-                    # failed call must not reset a watermark it does not own
-                    # (one this call claimed in a snapshot was rolled back).
-                    f"WHERE view_name = ? AND backfill_cursor_pk IS NULL",
-                    (view_name,),
-                )
-                self._commit()
-            finally:
-                reset_cur.close()
-        except Exception:
-            try:
-                self._rollback()
-            except Exception:
-                pass
+        # Unclaimed views stay fail-closed at (NULL, NULL, backfill_active=1) so
+        # triggers remain gated and check_schema_drift() continues to report
+        # backfill_incomplete until a backfill claims and completes them (or
+        # repair_view() / force_rebuild takes over). Claimed views likewise stay
+        # fail-closed at their last committed watermark.
+        _ = view_name
+        return None
 
     # Bounded retries for a non-snapshot pk-range batch chosen as a deadlock /
     # serialization victim by the engine while independent writers run.
@@ -1575,6 +1601,11 @@ class MaterializedViewManager:
             return code in ("40P01", "40001")
         return False
 
+    class _PhantomChunkInsert(Exception):
+        """Internal retry sentinel when a PostgreSQL concurrent INSERT lands in
+        a PK gap inside (cursor_pk, upper_pk] between the chunk's FOR UPDATE
+        and its watermark advance."""
+
     def _run_pk_range_batch(
         self,
         cur: Any,
@@ -1586,43 +1617,178 @@ class MaterializedViewManager:
         upper_pk: int,
         max_pk: int,
         snapshot_isolation: bool,
+        pg_lock_table: bool = False,
     ) -> None:
         """Fold one (cursor_pk, upper_pk] range and advance the watermark."""
-        sqlite_chunk_tx_began = False
+        before_pks: Optional[Set[Any]] = None
         if not snapshot_isolation:
-            if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+            if self.dialect == Dialect.POSTGRES:
+                if pg_lock_table:
+                    cur.execute(f"LOCK TABLE {self.catalog_table} IN ROW EXCLUSIVE MODE;")
+                    pg_lock_targets = _postgres_base_table_lock_targets(
+                        plan, object_prefix=self.object_prefix
+                    )
+                    if pg_lock_targets:
+                        cur.execute(
+                            f"LOCK TABLE {', '.join(pg_lock_targets)} IN SHARE MODE;"
+                        )
+                else:
+                    try:
+                        self._execute_param(
+                            cur,
+                            f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > ? AND {pk_col} <= ? FOR UPDATE",
+                            (cursor_pk, upper_pk),
+                        )
+                        before_pks = {r[0] for r in (cur.fetchall() or [])}
+                    except Exception as exc:
+                        # A deadlock or lock timeout here has already rolled back
+                        # or invalidated the range lock; propagate for batch retry.
+                        if self._is_transient_lock_error(exc) or self._is_lock_timeout_error(exc):
+                            raise
+            elif self.dialect == Dialect.MYSQL:
+                cur.execute("START TRANSACTION;")
                 try:
                     self._execute_param(
                         cur,
                         f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > ? AND {pk_col} <= ? FOR UPDATE",
                         (cursor_pk, upper_pk),
                     )
+                    cur.fetchall()
                 except Exception as exc:
-                    # A deadlock here has already rolled back the batch
-                    # transaction; continuing would fold without the range lock.
                     if self._is_transient_lock_error(exc):
                         raise
             elif self.dialect == Dialect.SQLITE:
-                if not getattr(self.conn, "in_transaction", False):
-                    try:
-                        cur.execute("BEGIN IMMEDIATE;")
-                        sqlite_chunk_tx_began = True
-                    except Exception:
-                        pass
+                self._reserve_sqlite_writer(cur)
         for tmpl in spec.chunk_sql_templates:
             cur.execute(tmpl, (cursor_pk, upper_pk))
         still_active = 1 if upper_pk < max_pk else 0
         self._advance_backfill_watermark(cur, plan.view_name, cursor_pk, upper_pk, max_pk, still_active)
+        if not snapshot_isolation and self.dialect == Dialect.POSTGRES and before_pks is not None:
+            # Because PostgreSQL SELECT ... FOR UPDATE has no gap locks, a
+            # concurrent INSERT whose PK falls in a gap inside (cursor_pk, upper_pk]
+            # may have skipped trigger maintenance (taking FOR SHARE on the catalog
+            # row) and committed after our fold scanned the range. Now that we hold
+            # the catalog row lock (waiting for all in-flight skippers and blocking
+            # new ones until COMMIT), verify no phantom PKs appeared in the chunk.
+            self._execute_param(
+                cur,
+                f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > ? AND {pk_col} <= ?",
+                (cursor_pk, upper_pk),
+            )
+            after_pks = {r[0] for r in (cur.fetchall() or [])}
+            if after_pks != before_pks:
+                self._rollback()
+                raise self._PhantomChunkInsert()
         if not snapshot_isolation:
             self._commit()
-            if sqlite_chunk_tx_began and (
-                not hasattr(self.conn, "commit")
-                or getattr(self.conn, "in_transaction", False)
-            ):
-                try:
-                    cur.execute("COMMIT;")
-                except Exception:
-                    pass
+
+    def _claim_non_snapshot_pk_range(
+        self, cur: Any, plan: MaterializedViewPlan, base_t: str, pk_col: str
+    ) -> Optional[Tuple[int, int]]:
+        """Atomically observe ``[MIN(pk), MAX(pk)]`` and claim the pk-range
+        watermark after every in-flight writer that saw ``backfill_cursor_pk IS NULL``
+        has committed.
+
+        Returns ``(min_pk, max_pk)`` when the table is non-empty (leaving the
+        catalog committed at ``(min_pk - 1, max_pk, 1, token)``), or ``None``
+        when the table is empty (leaving the catalog committed as completed
+        ``(_COMPLETED_MARKER_PK, _COMPLETED_MARKER_PK, 0)``).
+        """
+        view_name = plan.view_name
+        pg_lock_targets = (
+            _postgres_base_table_lock_targets(plan, object_prefix=self.object_prefix)
+            if self.dialect == Dialect.POSTGRES
+            else []
+        )
+        attempt = 0
+        while True:
+            try:
+                if self.dialect == Dialect.SQLITE:
+                    self._reserve_sqlite_writer(cur)
+                elif self.dialect == Dialect.POSTGRES:
+                    # Global lock order (catalog -> base_t): catalog ROW EXCLUSIVE
+                    # conflicts with register/drop/repair's SHARE ROW EXCLUSIVE
+                    # (preventing AB-BA deadlocks) while staying compatible with
+                    # writers' ACCESS SHARE reads; base_t SHARE waits for any
+                    # in-flight writer whose trigger saw cursor IS NULL.
+                    cur.execute(f"LOCK TABLE {self.catalog_table} IN ROW EXCLUSIVE MODE;")
+                    if pg_lock_targets:
+                        cur.execute(f"LOCK TABLE {', '.join(pg_lock_targets)} IN SHARE MODE;")
+                elif self.dialect == Dialect.MYSQL:
+                    # Start a fresh READ COMMITTED transaction so taking the catalog
+                    # row X-lock waits for in-flight writers (whose triggers hold an
+                    # S-lock on the catalog row while reading cursor IS NULL) and the
+                    # subsequent non-locking MIN/MAX sees all of their committed rows
+                    # without taking any locks on base_t.
+                    self._rollback()
+                    cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED;")
+                    cur.execute("START TRANSACTION;")
+                    self._execute_param(
+                        cur,
+                        f"SELECT view_name FROM {self.catalog_table} WHERE view_name = ? FOR UPDATE",
+                        (view_name,),
+                    )
+                    if cur.fetchone() is None:
+                        self._rollback()
+                        raise BackfillInterruptedError(
+                            view_name, "the view is no longer present in the catalog"
+                        )
+
+                cur.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}")
+                row = cur.fetchone()
+                if not row or row[0] is None or row[1] is None:
+                    self._claim_backfill_watermark(
+                        cur,
+                        view_name,
+                        self._COMPLETED_MARKER_PK,
+                        self._COMPLETED_MARKER_PK,
+                        active=0,
+                        retry=False,
+                    )
+                    return None
+                min_pk, max_pk = int(row[0]), int(row[1])
+                cursor_pk = min_pk - 1
+                self._claim_backfill_watermark(
+                    cur,
+                    view_name,
+                    cursor_pk,
+                    max_pk,
+                    active=1,
+                    retry=False,
+                )
+                return min_pk, max_pk
+            except BackfillInterruptedError:
+                raise
+            except Exception as exc:
+                if not (
+                    self._is_transient_lock_error(exc)
+                    or self._is_lock_timeout_error(exc)
+                    or self._is_snapshot_row_changed_error(exc)
+                ):
+                    raise
+                self._rollback()
+                if attempt >= self._BACKFILL_TRANSIENT_RETRIES:
+                    raise BackfillInterruptedError(
+                        view_name,
+                        f"could not atomically claim the pk-range backfill watermark after "
+                        f"{attempt + 1} attempts: {exc!r}",
+                    ) from exc
+                attempt += 1
+                self._backfill_sleep(self._backfill_retry_delay(attempt))
+
+    def _begin_single_shot_backfill_tx(self, cur: Any, plan: MaterializedViewPlan) -> None:
+        """Start an atomic transaction for single-shot non-snapshot backfill."""
+        if self.dialect == Dialect.SQLITE:
+            self._reserve_sqlite_writer(cur)
+        elif self.dialect == Dialect.POSTGRES:
+            cur.execute(f"LOCK TABLE {self.catalog_table} IN ROW EXCLUSIVE MODE;")
+            pg_lock_targets = _postgres_base_table_lock_targets(
+                plan, object_prefix=self.object_prefix
+            )
+            if pg_lock_targets:
+                cur.execute(f"LOCK TABLE {', '.join(pg_lock_targets)} IN SHARE MODE;")
+        elif self.dialect == Dialect.MYSQL:
+            cur.execute("START TRANSACTION;")
 
     def _backfill_incrementally_with_cursor(
         self,
@@ -1634,9 +1800,18 @@ class MaterializedViewManager:
     ) -> int:
         spec = plan.incremental_backfill_spec
         if spec is None or batch_size <= 0:
+            if not snapshot_isolation:
+                self._begin_single_shot_backfill_tx(cur, plan)
+            self._claim_backfill_watermark(
+                cur,
+                plan.view_name,
+                self._COMPLETED_MARKER_PK,
+                self._COMPLETED_MARKER_PK,
+                active=0,
+                retry=not snapshot_isolation,
+            )
             for s in plan.initial_populate_sqls:
                 cur.execute(s)
-            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
             if snapshot_isolation and self.dialect == Dialect.SQLITE:
                 self._savepoint_release(cur, "__mv_backfill_snap")
             self._commit()
@@ -1648,43 +1823,63 @@ class MaterializedViewManager:
         if spec.mode == "pk_range_fold" and spec.pk_column:
             base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect)
             pk_col = quote_sql_identifier(spec.pk_column, self.dialect)
-            cur.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}")
-            row = cur.fetchone()
-            if not row or row[0] is None or row[1] is None:
-                # Claim first (atomic vs. concurrent backfills), then record a
-                # *completed* marker: (NULL, NULL, 0) would let a later
-                # backfill fold rows that triggers have maintained since.
-                self._claim_backfill_watermark(
-                    cur, plan.view_name, self._COMPLETED_MARKER_PK, self._COMPLETED_MARKER_PK, active=0,
-                    retry=not snapshot_isolation,
-                )
-                if not plan.view_spec.group_by_cols and not plan.view_spec.has_top_level_distinct:
-                    for s in plan.get_populate_statements(incremental_backfill=False):
-                        cur.execute(s)
-                if snapshot_isolation and self.dialect == Dialect.SQLITE:
-                    cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
-                self._commit()
-                return 0
-            min_pk, max_pk = int(row[0]), int(row[1])
-            cursor_pk = min_pk - 1
-            total_span = max(1, max_pk - min_pk + 1)
-            self._claim_backfill_watermark(
-                cur, plan.view_name, cursor_pk, max_pk, retry=not snapshot_isolation
-            )
             if not snapshot_isolation:
+                bounds = self._claim_non_snapshot_pk_range(cur, plan, base_t, pk_col)
+                if bounds is None:
+                    if not plan.view_spec.group_by_cols and not plan.view_spec.has_top_level_distinct:
+                        for s in plan.get_populate_statements(incremental_backfill=False):
+                            cur.execute(s)
+                    self._commit()
+                    return 0
+                min_pk, max_pk = bounds
+                cursor_pk = min_pk - 1
+                total_span = max(1, max_pk - min_pk + 1)
                 self._commit()
                 self._backfill_watermark_claimed = True
                 self._backfill_committed_watermark = (cursor_pk, max_pk)
+            else:
+                cur.execute(f"SELECT MIN({pk_col}), MAX({pk_col}) FROM {base_t}")
+                row = cur.fetchone()
+                if not row or row[0] is None or row[1] is None:
+                    # Claim first (atomic vs. concurrent backfills), then record a
+                    # *completed* marker: (NULL, NULL, 0) would let a later
+                    # backfill fold rows that triggers have maintained since.
+                    self._claim_backfill_watermark(
+                        cur, plan.view_name, self._COMPLETED_MARKER_PK, self._COMPLETED_MARKER_PK, active=0,
+                        retry=False,
+                    )
+                    if not plan.view_spec.group_by_cols and not plan.view_spec.has_top_level_distinct:
+                        for s in plan.get_populate_statements(incremental_backfill=False):
+                            cur.execute(s)
+                    if self.dialect == Dialect.SQLITE:
+                        cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
+                    self._commit()
+                    return 0
+                min_pk, max_pk = int(row[0]), int(row[1])
+                cursor_pk = min_pk - 1
+                total_span = max(1, max_pk - min_pk + 1)
+                self._claim_backfill_watermark(
+                    cur, plan.view_name, cursor_pk, max_pk, retry=False
+                )
             while cursor_pk < max_pk:
                 upper_pk = min(max_pk, cursor_pk + batch_size)
                 attempt = 0
+                phantom_retries = 0
                 while True:
                     try:
                         self._run_pk_range_batch(
                             cur, plan, spec, base_t, pk_col,
                             cursor_pk, upper_pk, max_pk, snapshot_isolation,
+                            pg_lock_table=(phantom_retries >= 2),
                         )
                         break
+                    except self._PhantomChunkInsert:
+                        phantom_retries += 1
+                        if phantom_retries > 4:
+                            raise RuntimeError(
+                                f"pk-range chunk ({cursor_pk}, {upper_pk}] for '{plan.view_name}' "
+                                f"repeatedly observed concurrent phantom inserts"
+                            )
                     except Exception as exc:
                         # A non-snapshot batch is its own transaction: the chunk
                         # fold and its watermark advance commit together. A
@@ -1725,10 +1920,17 @@ class MaterializedViewManager:
             return batches_run
 
         elif spec.mode == "group_key_batch" and spec.distinct_group_query:
+            self._claim_backfill_watermark(
+                cur,
+                plan.view_name,
+                self._COMPLETED_MARKER_PK,
+                self._COMPLETED_MARKER_PK,
+                active=0,
+                retry=not snapshot_isolation,
+            )
             cur.execute(spec.distinct_group_query)
             all_keys = [r[0] for r in (cur.fetchall() or [])]
             if not all_keys:
-                self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
                 if snapshot_isolation and self.dialect == Dialect.SQLITE:
                     cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
                 self._commit()
@@ -1745,13 +1947,20 @@ class MaterializedViewManager:
                 batches_run += 1
                 if on_progress:
                     on_progress(batches_run, min(len(all_keys), i + batch_size))
-            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
             if snapshot_isolation and self.dialect == Dialect.SQLITE:
                 self._savepoint_release(cur, "__mv_backfill_snap")
             self._commit()
             return batches_run
 
         elif spec.mode == "offset_batch" and spec.offset_insert_template:
+            self._claim_backfill_watermark(
+                cur,
+                plan.view_name,
+                self._COMPLETED_MARKER_PK,
+                self._COMPLETED_MARKER_PK,
+                active=0,
+                retry=not snapshot_isolation,
+            )
             offset = 0
             while True:
                 self._execute_param(cur, spec.offset_insert_template, (batch_size, offset))
@@ -1773,18 +1982,28 @@ class MaterializedViewManager:
                     on_progress(batches_run, offset)
                 if inserted < batch_size:
                     break
-            self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
             if snapshot_isolation and self.dialect == Dialect.SQLITE:
                 self._savepoint_release(cur, "__mv_backfill_snap")
             self._commit()
             return batches_run
 
+        if not snapshot_isolation:
+            self._begin_single_shot_backfill_tx(cur, plan)
+        self._claim_backfill_watermark(
+            cur,
+            plan.view_name,
+            self._COMPLETED_MARKER_PK,
+            self._COMPLETED_MARKER_PK,
+            active=0,
+            retry=not snapshot_isolation,
+        )
         for s in plan.initial_populate_sqls:
             cur.execute(s)
-        self._update_backfill_watermark(cur, plan.view_name, None, None, 0)
         if snapshot_isolation and self.dialect == Dialect.SQLITE:
             cur.execute("RELEASE SAVEPOINT __mv_backfill_snap;")
         self._commit()
+        if on_progress:
+            on_progress(1, 1)
         return 1
 
     @staticmethod
@@ -1885,9 +2104,18 @@ class MaterializedViewManager:
         existing = catalog.get(plan.view_name)
         if existing and existing["signature_hash"] == sig and not force_rebuild:
             if self._is_backfill_incomplete(existing):
-                # Re-registering must not silently adopt an interrupted (or
-                # concurrently running) backfill as a complete view.
+                # Re-registering must not silently adopt an interrupted,
+                # concurrently running, or unpopulated backfill as complete.
                 self._refuse_unless_backfill_unclaimed(existing, plan.view_name)
+                if populate:
+                    raise BackfillInterruptedError(
+                        plan.view_name,
+                        "its backfill has not started or completed yet (registered unpopulated or "
+                        "stopped before claiming); run backfill_incrementally(), repair_view(), or "
+                        "register_view(..., force_rebuild=True)",
+                        None,
+                        None,
+                    )
             return plan
 
         if existing:
@@ -1927,44 +2155,57 @@ class MaterializedViewManager:
                     cur.execute(stmt)
                     if obj:
                         created_objects.append(obj)
-                for stmt in plan.trigger_ddls:
-                    obj = _extract_created_object(stmt)
-                    cur.execute(stmt)
-                    if obj:
-                        created_objects.append(obj)
 
                 stored_view_sql = self._serialize_view_sql_with_indexes(plan)
-                init_active = 1 if (populate and incremental_backfill) else 0
-                self._execute_param(
-                    cur,
-                    f"""
+                pending_backfill = (not populate) or incremental_backfill
+                init_cursor = None if pending_backfill else self._COMPLETED_MARKER_PK
+                init_max = None if pending_backfill else self._COMPLETED_MARKER_PK
+                init_active = 1 if pending_backfill else 0
+                catalog_insert_sql = f"""
                     INSERT INTO {self.catalog_table} (
                         view_name, view_sql, strategy, signature_hash, backing_table,
                         aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
                         backfill_cursor_pk, backfill_max_pk, backfill_active,
                         accepted_limitations_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        plan.view_name,
-                        stored_view_sql,
-                        plan.strategy.value,
-                        sig,
-                        plan.backing_table_name,
-                        json.dumps(plan.auxiliary_table_names),
-                        json.dumps(plan.trigger_names),
-                        json.dumps(plan.function_names),
-                        json.dumps(plan.trigger_ddls),
-                        None,
-                        None,
-                        init_active,
-                        json.dumps({
-                            "definition": _definition_digest(plan.view_spec.raw_select_sql),
-                            "codes": sorted({lim.code for lim in plan.limitations}),
-                        }),
-                    ),
+                    """
+                catalog_insert_params = (
+                    plan.view_name,
+                    stored_view_sql,
+                    plan.strategy.value,
+                    sig,
+                    plan.backing_table_name,
+                    json.dumps(plan.auxiliary_table_names),
+                    json.dumps(plan.trigger_names),
+                    json.dumps(plan.function_names),
+                    json.dumps(plan.trigger_ddls),
+                    init_cursor,
+                    init_max,
+                    init_active,
+                    json.dumps({
+                        "definition": _definition_digest(plan.view_spec.raw_select_sql),
+                        "codes": sorted({lim.code for lim in plan.limitations}),
+                    }),
                 )
-                catalog_inserted = True
+
+                # On MySQL/MariaDB, CREATE TRIGGER commits implicitly. Insert and
+                # commit the pending-backfill catalog row (NULL, NULL, active=1)
+                # BEFORE installing triggers so triggers gate every write from the
+                # very first microsecond they exist (no ungated double-count window).
+                if self.dialect == Dialect.MYSQL and pending_backfill:
+                    self._execute_param(cur, catalog_insert_sql, catalog_insert_params)
+                    catalog_inserted = True
+                    self._commit()
+
+                for stmt in plan.trigger_ddls:
+                    obj = _extract_created_object(stmt)
+                    cur.execute(stmt)
+                    if obj:
+                        created_objects.append(obj)
+
+                if not catalog_inserted:
+                    self._execute_param(cur, catalog_insert_sql, catalog_insert_params)
+                    catalog_inserted = True
 
                 if populate:
                     if incremental_backfill:
@@ -1995,27 +2236,46 @@ class MaterializedViewManager:
                 # rebuild or concurrent backfill), and dropping them would
                 # destroy that session's view.
                 if self.dialect == Dialect.MYSQL and not isinstance(exc, BackfillInterruptedError):
+                    # Verify no concurrent session claimed, repaired, or replaced
+                    # our committed catalog row before cleaning up objects.
+                    still_owned_by_us = True
                     if catalog_inserted:
                         try:
                             self._execute_param(
                                 cur,
-                                f"DELETE FROM {self.catalog_table} WHERE view_name = ?",
+                                f"SELECT backfill_cursor_pk, signature_hash "
+                                f"FROM {self.catalog_table} WHERE view_name = ?",
                                 (plan.view_name,),
                             )
-                            self._commit()
+                            cat_row = cur.fetchone()
+                            if cat_row is not None and (cat_row[0] is not None or cat_row[1] != sig):
+                                still_owned_by_us = False
                         except Exception:
-                            pass
-                    for kind, name in reversed(created_objects):
-                        try:
-                            if kind == "trigger":
-                                cur.execute(build_drop_sql("TRIGGER", name, dialect=self.dialect, allow_qualified=False))
-                            elif kind == "view":
-                                cur.execute(build_drop_sql("VIEW", name, dialect=self.dialect, allow_qualified=False))
-                            elif kind == "table":
-                                cur.execute(build_drop_sql("TABLE", name, dialect=self.dialect, allow_qualified=False))
-                        except Exception:
-                            pass
-                    self._commit()
+                            still_owned_by_us = False
+                    if still_owned_by_us:
+                        if catalog_inserted:
+                            try:
+                                self._execute_param(
+                                    cur,
+                                    f"DELETE FROM {self.catalog_table} "
+                                    f"WHERE view_name = ? AND backfill_cursor_pk IS NULL "
+                                    f"AND signature_hash = ?",
+                                    (plan.view_name, sig),
+                                )
+                                self._commit()
+                            except Exception:
+                                pass
+                        for kind, name in reversed(created_objects):
+                            try:
+                                if kind == "trigger":
+                                    cur.execute(build_drop_sql("TRIGGER", name, dialect=self.dialect, allow_qualified=False))
+                                elif kind == "view":
+                                    cur.execute(build_drop_sql("VIEW", name, dialect=self.dialect, allow_qualified=False))
+                                elif kind == "table":
+                                    cur.execute(build_drop_sql("TABLE", name, dialect=self.dialect, allow_qualified=False))
+                            except Exception:
+                                pass
+                        self._commit()
                 raise
         return plan
 
@@ -2484,6 +2744,10 @@ class MaterializedViewManager:
                             cur.execute(
                                 f"LOCK TABLE {', '.join(pg_lock_targets)} IN SHARE MODE;"
                             )
+                    elif self.dialect == Dialect.MYSQL:
+                        # Explicit transaction so autocommit=True connections
+                        # cannot commit the watermark/DELETE before repopulating.
+                        cur.execute("START TRANSACTION;")
                     self._execute_param(
                         cur,
                         f"UPDATE {self.catalog_table} SET backfill_cursor_pk = ?, "

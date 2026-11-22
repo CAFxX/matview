@@ -861,9 +861,14 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
 
 def _strip_row_locking_clause(s: str) -> str:
     # SQLite has no row locks (writers are serialized); emulate
-    # `SELECT ... FOR UPDATE [NOWAIT]` / `LOCK IN SHARE MODE` as a plain read.
+    # `SELECT ... FOR UPDATE/SHARE [NOWAIT]` / `LOCK IN SHARE MODE` as a plain read.
     s = re.sub(r"\s+LOCK\s+IN\s+SHARE\s+MODE\b", "", s, flags=re.IGNORECASE)
-    return re.sub(r"\s+FOR\s+UPDATE(?:\s+NOWAIT)?\b", "", s, flags=re.IGNORECASE)
+    return re.sub(
+        r"\s+FOR\s+(?:UPDATE|(?:KEY\s+)?SHARE)(?:\s+NOWAIT)?\b",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
 
 
 def _paren_balanced_pattern(depth: int) -> str:
@@ -7394,8 +7399,8 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     self.assertFalse(conn.in_transaction)
                     catalog_entry = manager.get_catalog()[plan.view_name]
                     self.assertEqual(catalog_entry["backfill_active"], 0)
-                    self.assertIsNone(catalog_entry["backfill_cursor_pk"])
-                    self.assertIsNone(catalog_entry["backfill_max_pk"])
+                    self.assertIsNotNone(catalog_entry["backfill_cursor_pk"])
+                    self.assertIsNotNone(catalog_entry["backfill_max_pk"])
 
                     actual = [
                         tuple(row)

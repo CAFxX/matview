@@ -526,8 +526,10 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                     self.assertEqual(actual, expected)
                     catalog = manager.get_catalog()[plan.view_name]
                     self.assertEqual(catalog["backfill_active"], 0)
-                    self.assertIsNone(catalog["backfill_cursor_pk"])
-                    self.assertIsNone(catalog["backfill_max_pk"])
+                    self.assertIsNotNone(catalog["backfill_cursor_pk"])
+                    self.assertIsNotNone(catalog["backfill_max_pk"])
+                    with self.assertRaises(BackfillInterruptedError):
+                        manager.backfill_incrementally(plan, batch_size=2, snapshot_isolation=True)
                     manager.drop_view(plan.view_name)
         finally:
             conn.close()
@@ -600,9 +602,10 @@ class IndependentSessionBackfillTests(unittest.TestCase):
                         "partial rows from the failed snapshot backfill were not rolled back",
                     )
                     catalog_entry = manager.get_catalog()[plan.view_name]
-                    self.assertEqual(catalog_entry["backfill_active"], 0)
+                    self.assertEqual(catalog_entry["backfill_active"], 1)
                     self.assertIsNone(catalog_entry["backfill_cursor_pk"])
                     self.assertIsNone(catalog_entry["backfill_max_pk"])
+                    self.assertEqual(manager.check_schema_drift()[plan.view_name], "backfill_incomplete")
                     self.assertEqual(conn.execute("SELECT 1;").fetchone()[0], 1)
 
                     batches = manager.backfill_incrementally(
@@ -4340,6 +4343,366 @@ class NativePostgresRepairConcurrencyTests(unittest.TestCase):
             )
         finally:
             self._drop_schema(dsn, schema, sessions)
+
+
+class FailClosedBackfillConcurrencyTests(unittest.TestCase):
+    """Independent-session tests for fail-closed incremental backfill pre-claim gating
+    and snapshot isolation under concurrent writers (SQLite + native PostgreSQL)."""
+
+    def test_sqlite_concurrent_writer_in_pre_claim_window_does_not_double_count(self) -> None:
+        fd, db_path = tempfile.mkstemp(prefix="matview-preclaim-", suffix=".sqlite")
+        os.close(fd)
+        conn = sqlite3.connect(db_path, timeout=15)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=15000;")
+        _register_sqlite_compat_udfs(conn)
+        conn.execute("CREATE TABLE pc_items (id INTEGER PRIMARY KEY, g TEXT NOT NULL, amt INTEGER NOT NULL);")
+        conn.executemany(
+            "INSERT INTO pc_items VALUES (?, ?, ?);",
+            [(i, f"G{i % 3}", i * 10) for i in range(1, 11)],
+        )
+        conn.commit()
+        manager = MaterializedViewManager(conn)
+        orig_claim = manager._claim_non_snapshot_pk_range
+        writer_ran = []
+        writer_errors: list[BaseException] = []
+
+        def claim_after_independent_writer(cur, view_name, base_t, pk_col):
+            # Runs strictly AFTER register_view committed (NULL, NULL, 1) and
+            # strictly BEFORE the watermark range is claimed.
+            def run_writer() -> None:
+                second = sqlite3.connect(db_path, timeout=15)
+                try:
+                    second.execute("PRAGMA busy_timeout=15000;")
+                    _register_sqlite_compat_udfs(second)
+                    second.execute("INSERT INTO pc_items VALUES (11, 'G1', 110);")
+                    second.execute("INSERT INTO pc_items VALUES (12, 'G2', 120);")
+                    second.execute("UPDATE pc_items SET amt = 999 WHERE id = 2;")
+                    second.execute("DELETE FROM pc_items WHERE id = 5;")
+                    second.commit()
+                    writer_ran.append(True)
+                except BaseException as exc:
+                    writer_errors.append(exc)
+                finally:
+                    second.close()
+
+            th = threading.Thread(target=run_writer, daemon=True)
+            th.start()
+            th.join(timeout=15)
+            self.assertFalse(th.is_alive())
+            if writer_errors:
+                raise writer_errors[0]
+            return orig_claim(cur, view_name, base_t, pk_col)
+
+        manager._claim_non_snapshot_pk_range = claim_after_independent_writer  # type: ignore[method-assign]
+        try:
+            plan = manager.register_view(
+                "CREATE VIEW v_pc AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM pc_items GROUP BY g;",
+                populate=True,
+                incremental_backfill=True,
+                batch_size=3,
+            )
+            self.assertEqual(writer_ran, [True])
+            self.assertEqual(manager.check_schema_drift()[plan.view_name], "ok")
+            self.assertEqual(
+                conn.execute("SELECT g, c, s FROM v_pc ORDER BY g;").fetchall(),
+                conn.execute("SELECT g, COUNT(*), SUM(amt) FROM pc_items GROUP BY g ORDER BY g;").fetchall(),
+            )
+        finally:
+            conn.close()
+            os.unlink(db_path)
+
+    @staticmethod
+    def _pg_dsn() -> str:
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            raise unittest.SkipTest("POSTGRES_DSN is not set; native PostgreSQL test only")
+        return dsn
+
+    @staticmethod
+    def _pg_connect(dsn: str, schema: str):
+        import psycopg2
+        conn = psycopg2.connect(dsn)
+        cur = conn.cursor()
+        cur.execute(f'SET search_path TO "{schema}"')
+        conn.commit()
+        cur.close()
+        return conn
+
+    def test_pg_register_incremental_backfill_under_continuous_concurrent_writers(self) -> None:
+        dsn = self._pg_dsn()
+        import psycopg2
+        schema = f"mv_fc_{uuid.uuid4().hex[:10]}"
+        admin = psycopg2.connect(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute(f'CREATE SCHEMA "{schema}"')
+            cur.execute(f'SET search_path TO "{schema}"')
+            cur.execute("CREATE TABLE t_live (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany(
+                "INSERT INTO t_live VALUES (%s, %s, %s)",
+                [(i, f"G{i % 4}", i * 10) for i in range(1, 31)],
+            )
+            admin.commit()
+            cur.close()
+
+            stop = threading.Event()
+            writers_ready = threading.Barrier(4)
+            in_gap_done = threading.Event()
+            errors: list[BaseException] = []
+            commits = [0, 0, 0]
+
+            def writer(wid: int) -> None:
+                c = self._pg_connect(dsn, schema)
+                sessions.append(c)
+                seq = 0
+                try:
+                    writers_ready.wait(timeout=20.0)
+                    while (not stop.is_set() or commits[wid] < 5) and seq < 35:
+                        seq += 1
+                        row_id = 40 + wid * 40 + seq
+                        for _attempt in range(TRANSIENT_RETRIES):
+                            try:
+                                wcur = c.cursor()
+                                wcur.execute(
+                                    "INSERT INTO t_live VALUES (%s, %s, %s)",
+                                    (row_id, f"G{(row_id + wid) % 4}", seq * 3),
+                                )
+                                if seq % 3 == 0:
+                                    wcur.execute(
+                                        "UPDATE t_live SET amt = amt + 5 WHERE id = %s",
+                                        ((seq % 20) + 1,),
+                                    )
+                                if seq % 5 == 0 and seq > 5:
+                                    wcur.execute(
+                                        "DELETE FROM t_live WHERE id = %s",
+                                        (40 + wid * 40 + seq - 2,),
+                                    )
+                                c.commit()
+                                wcur.close()
+                                commits[wid] += 1
+                                break
+                            except Exception as exc:
+                                c.rollback()
+                                if not _is_transient_lock_error(Dialect.POSTGRES, exc):
+                                    raise
+                                time.sleep(0.01)
+                        time.sleep(0.005)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=writer, args=(i,), daemon=True) for i in range(3)]
+            for th in threads:
+                th.start()
+            writers_ready.wait(timeout=20.0)
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            orig_claim = mgr._claim_non_snapshot_pk_range
+
+            def claim_with_gap_writer(ccur, view_name, base_t, pk_col):
+                # Force an explicit commit strictly inside the pre-claim gap.
+                gap_conn = self._pg_connect(dsn, schema)
+                try:
+                    gcur = gap_conn.cursor()
+                    gcur.execute("INSERT INTO t_live VALUES (200, 'G0', 777)")
+                    gcur.execute("UPDATE t_live SET amt = 888 WHERE id = 1")
+                    gap_conn.commit()
+                    gcur.close()
+                    in_gap_done.set()
+                finally:
+                    gap_conn.close()
+                return orig_claim(ccur, view_name, base_t, pk_col)
+
+            mgr._claim_non_snapshot_pk_range = claim_with_gap_writer  # type: ignore[method-assign]
+            plan = mgr.register_view(
+                "CREATE VIEW v_live AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t_live GROUP BY g;",
+                populate=True,
+                incremental_backfill=True,
+                batch_size=10,
+            )
+            stop.set()
+            for th in threads:
+                th.join(timeout=30.0)
+                self.assertFalse(th.is_alive())
+            self.assertEqual(errors, [], repr(errors))
+            self.assertTrue(in_gap_done.is_set())
+            self.assertTrue(all(n >= 5 for n in commits), f"expected concurrent writes: {commits}")
+            self.assertEqual(mgr.check_schema_drift()[plan.view_name], "ok")
+
+            vcur = admin.cursor()
+            vcur.execute("SELECT g, c, s FROM v_live ORDER BY g")
+            actual = [tuple(r) for r in vcur.fetchall()]
+            vcur.execute("SELECT g, COUNT(*), SUM(amt) FROM t_live GROUP BY g ORDER BY g")
+            expected = [tuple(r) for r in vcur.fetchall()]
+            admin.commit()
+            vcur.close()
+            self.assertEqual(actual, expected)
+        finally:
+            for s in sessions:
+                try:
+                    s.rollback()
+                    s.close()
+                except Exception:
+                    pass
+            cleanup = psycopg2.connect(dsn)
+            try:
+                cleanup.autocommit = True
+                cleanup.cursor().execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            finally:
+                cleanup.close()
+
+    def test_pg_snapshot_isolation_backfill_exact_under_concurrent_writers(self) -> None:
+        dsn = self._pg_dsn()
+        import psycopg2
+        for label, view_sql, live_sql in (
+            (
+                "pk_range_fold_snapshot",
+                "CREATE VIEW v_snap_pk AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t_snap GROUP BY g;",
+                "SELECT g, COUNT(*), SUM(amt) FROM t_snap GROUP BY g ORDER BY g",
+            ),
+            (
+                "group_key_batch_snapshot",
+                "CREATE VIEW v_snap_gk AS SELECT g, COUNT(DISTINCT amt) AS cd FROM t_snap GROUP BY g;",
+                "SELECT g, COUNT(DISTINCT amt) FROM t_snap GROUP BY g ORDER BY g",
+            ),
+        ):
+            with self.subTest(case=label):
+                schema = f"mv_sn_{uuid.uuid4().hex[:10]}"
+                admin = psycopg2.connect(dsn)
+                sessions = [admin]
+                try:
+                    cur = admin.cursor()
+                    cur.execute(f'CREATE SCHEMA "{schema}"')
+                    cur.execute(f'SET search_path TO "{schema}"')
+                    cur.execute("CREATE TABLE t_snap (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+                    cur.executemany(
+                        "INSERT INTO t_snap VALUES (%s, %s, %s)",
+                        [(i, f"G{i % 4}", (i % 7) * 10) for i in range(1, 25)],
+                    )
+                    admin.commit()
+                    cur.close()
+
+                    mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+                    plan = mgr.register_view(view_sql, populate=False)
+
+                    stop = threading.Event()
+                    ready = threading.Barrier(4)
+                    errors: list[BaseException] = []
+                    commits = [0, 0, 0]
+
+                    def writer(wid: int) -> None:
+                        c = self._pg_connect(dsn, schema)
+                        sessions.append(c)
+                        seq = 0
+                        try:
+                            ready.wait(timeout=20.0)
+                            while (not stop.is_set() or commits[wid] < 4) and seq < 30:
+                                seq += 1
+                                row_id = 30 + wid * 40 + seq
+                                for _ in range(TRANSIENT_RETRIES):
+                                    try:
+                                        wcur = c.cursor()
+                                        wcur.execute(
+                                            "INSERT INTO t_snap VALUES (%s, %s, %s)",
+                                            (row_id, f"G{row_id % 4}", (seq % 11) * 10),
+                                        )
+                                        if seq % 2 == 0:
+                                            wcur.execute(
+                                                "UPDATE t_snap SET amt = amt + 10 WHERE id = %s",
+                                                ((seq % 20) + 1,),
+                                            )
+                                        c.commit()
+                                        wcur.close()
+                                        commits[wid] += 1
+                                        break
+                                    except Exception as exc:
+                                        c.rollback()
+                                        if not _is_transient_lock_error(Dialect.POSTGRES, exc):
+                                            raise
+                                        time.sleep(0.01)
+                                time.sleep(0.005)
+                        except BaseException as exc:
+                            errors.append(exc)
+
+                    threads = [threading.Thread(target=writer, args=(i,), daemon=True) for i in range(3)]
+                    for th in threads:
+                        th.start()
+                    ready.wait(timeout=20.0)
+
+                    mgr.backfill_incrementally(plan, batch_size=8, snapshot_isolation=True)
+                    stop.set()
+                    for th in threads:
+                        th.join(timeout=30.0)
+                        self.assertFalse(th.is_alive())
+                    self.assertEqual(errors, [], repr(errors))
+                    self.assertTrue(all(n >= 4 for n in commits), repr(commits))
+
+                    vcur = admin.cursor()
+                    vcur.execute(f"SELECT * FROM {plan.view_name} ORDER BY g")
+                    actual = [tuple(r) for r in vcur.fetchall()]
+                    vcur.execute(live_sql)
+                    expected = [tuple(r) for r in vcur.fetchall()]
+                    admin.commit()
+                    vcur.close()
+                    self.assertEqual(actual, expected)
+                finally:
+                    for s in sessions:
+                        try:
+                            s.rollback()
+                            s.close()
+                        except Exception:
+                            pass
+                    cleanup = psycopg2.connect(dsn)
+                    try:
+                        cleanup.autocommit = True
+                        cleanup.cursor().execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+                    finally:
+                        cleanup.close()
+
+    def test_pg_same_definition_register_view_leaves_connection_idle(self) -> None:
+        dsn = self._pg_dsn()
+        import psycopg2
+        import psycopg2.extensions as ext
+        schema = f"mv_idle_{uuid.uuid4().hex[:10]}"
+        conn = psycopg2.connect(dsn)
+        try:
+            cur = conn.cursor()
+            cur.execute(f'CREATE SCHEMA "{schema}"')
+            cur.execute(f'SET search_path TO "{schema}"')
+            cur.execute("CREATE TABLE t_idle (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.execute("INSERT INTO t_idle VALUES (1, 'A', 10)")
+            conn.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
+            view_sql = "CREATE VIEW v_idle AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t_idle GROUP BY g;"
+            mgr.register_view(view_sql, populate=True)
+            self.assertEqual(conn.get_transaction_status(), ext.TRANSACTION_STATUS_IDLE)
+
+            # Same-definition early return must not leave a read transaction open.
+            mgr.register_view(view_sql, populate=True)
+            self.assertEqual(conn.get_transaction_status(), ext.TRANSACTION_STATUS_IDLE)
+
+            # Unpopulated view: same-definition populate=True refuses and leaves connection idle.
+            view_sql2 = "CREATE VIEW v_idle2 AS SELECT g, COUNT(*) AS c FROM t_idle GROUP BY g;"
+            mgr.register_view(view_sql2, populate=False)
+            self.assertEqual(conn.get_transaction_status(), ext.TRANSACTION_STATUS_IDLE)
+            with self.assertRaises(BackfillInterruptedError):
+                mgr.register_view(view_sql2, populate=True)
+            self.assertEqual(conn.get_transaction_status(), ext.TRANSACTION_STATUS_IDLE)
+        finally:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
+            cleanup = psycopg2.connect(dsn)
+            try:
+                cleanup.autocommit = True
+                cleanup.cursor().execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            finally:
+                cleanup.close()
 
 
 if __name__ == "__main__":

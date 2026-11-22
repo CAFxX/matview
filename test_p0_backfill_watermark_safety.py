@@ -95,11 +95,14 @@ class BackfillWatermarkSafetyTests(unittest.TestCase):
         # Fail closed: connection transaction/savepoint must be cleanly closed
         self.assertFalse(self.conn.in_transaction, "savepoint transaction was left unclosed")
 
-        # Stale active watermark must not remain in catalog
+        # Fail closed: unpopulated view stays unclaimed with active=1 so triggers
+        # remain gated and check_schema_drift() reports backfill_incomplete until
+        # a retry succeeds or repair_view()/force_rebuild completes it.
         catalog = manager.get_catalog()[plan.view_name]
-        self.assertEqual(catalog["backfill_active"], 0, "backfill_active was left as 1")
+        self.assertEqual(catalog["backfill_active"], 1, "unpopulated view must stay fail-closed (active=1)")
         self.assertIsNone(catalog["backfill_cursor_pk"])
         self.assertIsNone(catalog["backfill_max_pk"])
+        self.assertEqual(manager.check_schema_drift()[plan.view_name], "backfill_incomplete")
 
     def test_watermark_update_failure_propagates_and_keeps_watermark_under_non_snapshot(self) -> None:
         """Catalog update failure under non-snapshot backfill must propagate and fail closed.
@@ -237,9 +240,17 @@ class BackfillWatermarkSafetyTests(unittest.TestCase):
         # Under snapshot_isolation=True, un-gated plans execute safely
         batches_snap = manager.backfill_incrementally(plan_win, batch_size=2, snapshot_isolation=True)
         self.assertGreaterEqual(batches_snap, 1)
+        # Already populated: a second backfill must fail closed instead of double-counting.
+        from matview_sync import BackfillInterruptedError
+        with self.assertRaises(BackfillInterruptedError):
+            manager.backfill_incrementally(plan_win, batch_size=0, snapshot_isolation=False)
 
-        # Non-chunked backfill (batch_size <= 0) executes safely without snapshot isolation
-        batches_single = manager.backfill_incrementally(plan_win, batch_size=0, snapshot_isolation=False)
+        # Non-chunked backfill (batch_size <= 0) executes safely without snapshot isolation on an unclaimed view
+        plan_win_single = manager.register_view(
+            "CREATE VIEW v_win_single AS SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM win_tbl;",
+            populate=False,
+        )
+        batches_single = manager.backfill_incrementally(plan_win_single, batch_size=0, snapshot_isolation=False)
         self.assertEqual(batches_single, 1)
 
     def test_single_table_projection_with_int_pk_supports_watermark_and_pk_range_fold(self) -> None:
@@ -994,6 +1005,226 @@ class BackfillWatermarkSafetyTests(unittest.TestCase):
         status = manager.sync_views([view_sql])
         self.assertEqual(status["v_inc_reg"], "updated")
 
+    # -------------------------------------------------------------------------
+    # Fail-Closed Incremental Backfill (unclaimed gate, completed markers, non-PK modes)
+    # -------------------------------------------------------------------------
+
+    def test_populate_false_gates_writes_until_backfill_claims_and_reports_incomplete(self) -> None:
+        """register_view(populate=False) must gate triggers immediately via (NULL, NULL, 1),
+        report backfill_incomplete, refuse silent populate=True re-registration, and fold
+        exactly once when backfill_incrementally() claims the range."""
+        self.conn.execute(
+            "CREATE TABLE t_gate (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL);"
+        )
+        self.conn.executemany(
+            "INSERT INTO t_gate VALUES (?, ?, ?);",
+            [(1, "a", 10), (2, "a", 20), (3, "b", 30)],
+        )
+        self.conn.commit()
+
+        manager = MaterializedViewManager(self.conn)
+        agg_sql = "CREATE VIEW v_gate_agg AS SELECT grp, COUNT(*) AS c, SUM(val) AS s FROM t_gate GROUP BY grp;"
+        proj_sql = "CREATE VIEW v_gate_proj AS SELECT id, grp, val FROM t_gate WHERE val >= 15;"
+        plan_agg = manager.register_view(agg_sql, populate=False)
+        plan_proj = manager.register_view(proj_sql, populate=False)
+
+        for p in (plan_agg, plan_proj):
+            entry = manager.get_catalog()[p.view_name]
+            self.assertEqual(
+                (entry["backfill_cursor_pk"], entry["backfill_max_pk"], entry["backfill_active"]),
+                (None, None, 1),
+            )
+            self.assertEqual(manager.check_schema_drift()[p.view_name], "backfill_incomplete")
+
+        # Re-registering with populate=False is idempotent; populate=True must fail closed.
+        manager.register_view(agg_sql, populate=False)
+        with self.assertRaises(BackfillInterruptedError):
+            manager.register_view(agg_sql, populate=True)
+        with self.assertRaises(BackfillInterruptedError):
+            manager.register_view(agg_sql, populate=True, incremental_backfill=True)
+
+        # DML before backfill_incrementally() must be gated out (backing tables stay empty).
+        self.conn.execute("INSERT INTO t_gate VALUES (4, 'a', 40);")
+        self.conn.execute("UPDATE t_gate SET val = 25 WHERE id = 2;")
+        self.conn.execute("DELETE FROM t_gate WHERE id = 1;")
+        self.conn.commit()
+
+        self.assertEqual(
+            self.conn.execute(f"SELECT COUNT(*) FROM {plan_agg.backing_table_name};").fetchone()[0],
+            0,
+            "aggregate trigger fired while populate=False watermark was unclaimed",
+        )
+        self.assertEqual(
+            self.conn.execute(f"SELECT COUNT(*) FROM {plan_proj.backing_table_name};").fetchone()[0],
+            0,
+            "projection trigger fired while populate=False watermark was unclaimed",
+        )
+
+        # Backfill claims the post-DML range and folds every row exactly once.
+        manager.backfill_incrementally(plan_agg, batch_size=2, snapshot_isolation=False)
+        manager.backfill_incrementally(plan_proj, batch_size=2, snapshot_isolation=False)
+
+        self.assertEqual(manager.check_schema_drift()[plan_agg.view_name], "ok")
+        self.assertEqual(manager.check_schema_drift()[plan_proj.view_name], "ok")
+        self.assertEqual(
+            self.conn.execute("SELECT grp, c, s FROM v_gate_agg ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, COUNT(*), SUM(val) FROM t_gate GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+        self.assertEqual(
+            self.conn.execute("SELECT id, grp, val FROM v_gate_proj ORDER BY id;").fetchall(),
+            self.conn.execute("SELECT id, grp, val FROM t_gate WHERE val >= 15 ORDER BY id;").fetchall(),
+        )
+
+        # Post-backfill writes must now be maintained by triggers.
+        self.conn.execute("INSERT INTO t_gate VALUES (5, 'c', 50);")
+        self.conn.execute("UPDATE t_gate SET val = 5 WHERE id = 4;")
+        self.conn.commit()
+        self.assertEqual(
+            self.conn.execute("SELECT grp, c, s FROM v_gate_agg ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, COUNT(*), SUM(val) FROM t_gate GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+        self.assertEqual(
+            self.conn.execute("SELECT id, grp, val FROM v_gate_proj ORDER BY id;").fetchall(),
+            self.conn.execute("SELECT id, grp, val FROM t_gate WHERE val >= 15 ORDER BY id;").fetchall(),
+        )
+
+        # Duplicate backfill must refuse in both isolation modes.
+        for snap in (False, True):
+            with self.assertRaises(BackfillInterruptedError):
+                manager.backfill_incrementally(plan_agg, batch_size=2, snapshot_isolation=snap)
+
+    def test_populate_true_and_force_rebuild_record_completed_marker_and_refuse_backfill(self) -> None:
+        """populate=True (non-incremental) and force_rebuild=True must record a completed
+        watermark marker so a later backfill_incrementally() refuses fail-closed."""
+        self.conn.execute(
+            "CREATE TABLE t_done (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL);"
+        )
+        self.conn.executemany(
+            "INSERT INTO t_done VALUES (?, ?, ?);",
+            [(1, "x", 10), (2, "y", 20), (3, "x", 30)],
+        )
+        self.conn.commit()
+
+        manager = MaterializedViewManager(self.conn)
+        view_sql = "CREATE VIEW v_done AS SELECT grp, COUNT(*) AS c, SUM(val) AS s FROM t_done GROUP BY grp;"
+        plan = manager.register_view(view_sql, populate=True, incremental_backfill=False)
+        entry = manager.get_catalog()[plan.view_name]
+        self.assertIsNotNone(entry["backfill_cursor_pk"])
+        self.assertIsNotNone(entry["backfill_max_pk"])
+        self.assertEqual(entry["backfill_active"], 0)
+
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            manager.backfill_incrementally(plan, batch_size=2, snapshot_isolation=False)
+        with self.assertRaises(BackfillInterruptedError):
+            manager.backfill_incrementally(plan, batch_size=2, snapshot_isolation=True)
+        with self.assertRaises(BackfillInterruptedError):
+            manager.backfill_incrementally(plan, batch_size=0, snapshot_isolation=False)
+
+        # After force_rebuild=True, the completed marker must still be recorded and refuse backfill.
+        plan_rebuilt = manager.register_view(view_sql, populate=True, force_rebuild=True)
+        entry2 = manager.get_catalog()[plan_rebuilt.view_name]
+        self.assertIsNotNone(entry2["backfill_cursor_pk"])
+        self.assertIsNotNone(entry2["backfill_max_pk"])
+        self.assertEqual(entry2["backfill_active"], 0)
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            manager.backfill_incrementally(plan_rebuilt, batch_size=2, snapshot_isolation=False)
+        with self.assertRaises(BackfillInterruptedError):
+            manager.backfill_incrementally(plan_rebuilt, batch_size=2, snapshot_isolation=True)
+        with self.assertRaises(BackfillInterruptedError):
+            manager.backfill_incrementally(plan_rebuilt, batch_size=0, snapshot_isolation=False)
+
+        # Verify contents were never double-counted.
+        self.assertEqual(
+            self.conn.execute("SELECT grp, c, s FROM v_done ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, COUNT(*), SUM(val) FROM t_done GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+
+    def test_pre_claim_failure_stays_fail_closed_and_repairs_cleanly(self) -> None:
+        """If incremental backfill fails before claiming the watermark, the catalog stays
+        at (NULL, NULL, 1), drift reports backfill_incomplete, writes stay gated, and
+        repair_view() restores exact contents."""
+        self.conn.execute(
+            "CREATE TABLE t_pre (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL);"
+        )
+        self.conn.executemany(
+            "INSERT INTO t_pre VALUES (?, ?, ?);",
+            [(1, "a", 10), (2, "b", 20)],
+        )
+        self.conn.commit()
+
+        manager = MaterializedViewManager(self.conn)
+        orig_claim = manager._claim_non_snapshot_pk_range
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("injected pre-claim crash")
+
+        manager._claim_non_snapshot_pk_range = boom  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(RuntimeError, "injected pre-claim crash"):
+                manager.register_view(
+                    "CREATE VIEW v_pre AS SELECT grp, COUNT(*) AS c, SUM(val) AS s FROM t_pre GROUP BY grp;",
+                    populate=True,
+                    incremental_backfill=True,
+                    batch_size=1,
+                )
+        finally:
+            manager._claim_non_snapshot_pk_range = orig_claim  # type: ignore[method-assign]
+
+        entry = manager.get_catalog()["v_pre"]
+        self.assertEqual(
+            (entry["backfill_cursor_pk"], entry["backfill_max_pk"], entry["backfill_active"]),
+            (None, None, 1),
+        )
+        self.assertEqual(manager.check_schema_drift()["v_pre"], "backfill_incomplete")
+
+        # Writes while unclaimed stay gated (backing table stays empty).
+        self.conn.execute("INSERT INTO t_pre VALUES (3, 'a', 30);")
+        self.conn.commit()
+        self.assertEqual(
+            self.conn.execute(f"SELECT COUNT(*) FROM {entry['backing_table']};").fetchone()[0],
+            0,
+        )
+
+        # repair_view() populates and marks complete.
+        self.assertEqual(manager.repair_view("v_pre"), {"v_pre": "repaired"})
+        self.assertEqual(manager.check_schema_drift()["v_pre"], "ok")
+        self.assertEqual(
+            self.conn.execute("SELECT grp, c, s FROM v_pre ORDER BY grp;").fetchall(),
+            self.conn.execute("SELECT grp, COUNT(*), SUM(val) FROM t_pre GROUP BY grp ORDER BY grp;").fetchall(),
+        )
+
+    def test_non_pk_backfill_modes_record_completed_marker_and_refuse_duplicate_backfill(self) -> None:
+        """group_key_batch, offset_batch, and batch_size<=0 modes must stay backfill_incomplete
+        until backfilled, record a completed marker, and refuse duplicate backfills."""
+        self.conn.execute(
+            "CREATE TABLE t_nonpk (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL);"
+        )
+        self.conn.executemany(
+            "INSERT INTO t_nonpk VALUES (?, ?, ?);",
+            [(i, f"g{i % 2}", i * 10) for i in range(1, 7)],
+        )
+        self.conn.commit()
+        manager = MaterializedViewManager(self.conn)
+        cases = (
+            ("group_key_batch", "CREATE VIEW v_np_gk AS SELECT grp, COUNT(DISTINCT val) AS cd FROM t_nonpk GROUP BY grp;"),
+            ("offset_batch", "CREATE VIEW v_np_off AS SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM t_nonpk;"),
+        )
+        for mode, view_sql in cases:
+            with self.subTest(mode=mode):
+                plan = manager.register_view(view_sql, populate=False)
+                assert plan.incremental_backfill_spec is not None
+                self.assertEqual(plan.incremental_backfill_spec.mode, mode)
+                self.assertEqual(manager.check_schema_drift()[plan.view_name], "backfill_incomplete")
+                manager.backfill_incrementally(plan, batch_size=2, snapshot_isolation=True)
+                self.assertEqual(manager.check_schema_drift()[plan.view_name], "ok")
+                entry = manager.get_catalog()[plan.view_name]
+                self.assertEqual(entry["backfill_active"], 0)
+                self.assertIsNotNone(entry["backfill_cursor_pk"])
+                with self.assertRaises(BackfillInterruptedError):
+                    manager.backfill_incrementally(plan, batch_size=2, snapshot_isolation=True)
+                with self.assertRaises(BackfillInterruptedError):
+                    manager.backfill_incrementally(plan, batch_size=0, snapshot_isolation=False)
+
 
 class BackfillWatermarkCodegenTests(unittest.TestCase):
     """Pure codegen tests (no temporary SQLite database required)."""
@@ -1123,6 +1354,41 @@ class BackfillWatermarkCodegenTests(unittest.TestCase):
                 self.assertFalse(plan.has_watermark_triggers, f"{label}: unexpected watermark triggers")
                 assert plan.incremental_backfill_spec is not None
                 self.assertNotEqual(plan.incremental_backfill_spec.mode, "pk_range_fold")
+
+    def test_watermark_codegen_emits_null_cursor_gate_and_pg_share_lock(self) -> None:
+        """All three dialects must gate on backfill_cursor_pk IS NULL across aggregate and
+        projection views; PostgreSQL adds FOR SHARE to coordinate skipped rows with chunk
+        advances, while MySQL omits LOCK IN SHARE MODE to avoid catalog AB-BA deadlocks
+        and MariaDB snapshot-isolation (1020) aborts."""
+        ddl = "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(16) NOT NULL, val INT NOT NULL);"
+        views = (
+            ("agg", "CREATE VIEW v_wm AS SELECT grp, SUM(val) AS s FROM items GROUP BY grp;"),
+            ("proj", "CREATE VIEW v_wm_p AS SELECT id, grp, val FROM items WHERE val > 0;"),
+        )
+        for label, view_sql in views:
+            for dialect, ver in (
+                (Dialect.SQLITE, None),
+                (Dialect.POSTGRES, "postgres:15.0"),
+                (Dialect.MYSQL, "mysql:8.4.0"),
+            ):
+                with self.subTest(view=label, dialect=dialect.value):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        plan = generate_materialized_view(
+                            ddl,
+                            view_sql,
+                            dialect=dialect,
+                            engine_version=ver,
+                            watermark_catalog_table="__matview_catalog",
+                            ignore_limitations=True,
+                        )
+                    joined = "\n".join(plan.trigger_ddls)
+                    self.assertIn("backfill_cursor_pk IS NULL OR (", joined)
+                    if dialect == Dialect.POSTGRES:
+                        self.assertIn("FOR SHARE)", joined)
+                    else:
+                        self.assertNotIn("FOR SHARE)", joined)
+                        self.assertNotIn("LOCK IN SHARE MODE", joined)
 
 
 if __name__ == "__main__":
