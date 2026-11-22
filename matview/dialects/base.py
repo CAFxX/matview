@@ -223,12 +223,23 @@ class DialectBaseMixin(MixinHost):
                 return "NUMERIC"
             return self._float_type()
 
-        is_approximate = any(token in source_type for token in ("FLOAT", "DOUBLE", "REAL"))
-        is_integer = any(
-            token in source_type
-            for token in ("TINYINT", "SMALLINT", "MEDIUMINT", "INTEGER", "INT", "BIGINT", "SERIAL")
+        is_container_or_interval = any(
+            token in source_type for token in ("[", "]", "ARRAY", "RANGE", "INTERVAL")
         )
-        is_exact_decimal = any(token in source_type for token in ("DECIMAL", "NUMERIC"))
+        is_approximate = (not is_container_or_interval) and bool(
+            re.search(r"\b(?:FLOAT|FLOAT4|FLOAT8|DOUBLE|REAL)\b", source_type)
+        )
+        is_integer = (not is_container_or_interval) and (not is_approximate) and bool(
+            re.search(
+                r"\b(?:TINYINT|UTINYINT|SMALLINT|USMALLINT|MEDIUMINT|UMEDIUMINT|"
+                r"INTEGER|INT|UINT|INT2|INT4|INT8|BIGINT|UBIGINT|"
+                r"SMALLSERIAL|SERIAL|SERIAL2|SERIAL4|SERIAL8|BIGSERIAL)\b",
+                source_type,
+            )
+        )
+        is_exact_decimal = (not is_container_or_interval) and bool(
+            re.search(r"\b(?:DECIMAL|NUMERIC|DEC|FIXED)\b", source_type)
+        )
 
         if self.dialect == Dialect.MYSQL:
             # MySQL SUM returns DECIMAL for exact-value arguments (integers
@@ -245,11 +256,13 @@ class DialectBaseMixin(MixinHost):
         elif self.dialect == Dialect.POSTGRES:
             # PostgreSQL widens smallint/integer SUM to bigint and bigint /
             # numeric SUM to numeric; approximate SUM retains its input family.
-            if is_exact_decimal or "BIGINT" in source_type:
+            if is_exact_decimal or bool(
+                re.search(r"\b(?:BIGINT|INT8|BIGSERIAL|SERIAL8)\b", source_type)
+            ):
                 return "NUMERIC"
             if is_integer:
                 return "BIGINT"
-            if "REAL" in source_type:
+            if bool(re.search(r"\b(?:REAL|FLOAT4)\b", source_type)):
                 return "REAL"
             if is_approximate:
                 return "DOUBLE PRECISION"
@@ -297,27 +310,31 @@ class DialectBaseMixin(MixinHost):
         return 30
 
     def _numeric_precision_scale_from_type(self, data_type: str) -> Optional[Tuple[int, int]]:
-        upper = data_type.strip().upper()
+        upper = re.sub(r"\s+", " ", data_type.strip().upper())
+        if any(token in upper for token in ("[", "]", "ARRAY", "RANGE", "INTERVAL")):
+            return None
+        if re.search(r"\b(?:FLOAT|FLOAT4|FLOAT8|DOUBLE|REAL)\b", upper):
+            return None
         decimal_match = re.search(
             r"\b(?:DECIMAL|NUMERIC|DEC|FIXED)\s*(?:\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?",
             upper,
         )
         if decimal_match:
             return int(decimal_match.group(1) or 10), int(decimal_match.group(2) or 0)
-        if re.search(r"\bTINYINT\b", upper):
+        if re.search(r"\b(?:TINYINT|UTINYINT)\b", upper):
             return 3, 0
-        if re.search(r"\bSMALLINT\b", upper):
+        if re.search(r"\b(?:SMALLINT|USMALLINT|INT2|SMALLSERIAL|SERIAL2)\b", upper):
             return 5, 0
-        if re.search(r"\bMEDIUMINT\b", upper):
+        if re.search(r"\b(?:MEDIUMINT|UMEDIUMINT)\b", upper):
             return 7, 0
-        if re.search(r"\b(?:BIGINT|BIGSERIAL)\b", upper):
-            return (20 if "UNSIGNED" in upper or "SERIAL" in upper else 19), 0
-        if re.search(r"\b(?:INTEGER|INT)\b", upper):
+        if re.search(r"\b(?:BIGINT|UBIGINT|INT8|BIGSERIAL|SERIAL8)\b", upper):
+            return (20 if "UNSIGNED" in upper or "UBIGINT" in upper or "SERIAL" in upper else 19), 0
+        if re.search(r"\b(?:INTEGER|INT|UINT|INT4|SERIAL4)\b", upper):
             return 10, 0
         if re.search(r"\bSERIAL\b", upper):
             return (20 if self.dialect == Dialect.MYSQL else 10), 0
-        if re.search(r"\bSMALLSERIAL\b", upper):
-            return 5, 0
+        if re.fullmatch(r"(?:SIGNED|UNSIGNED)(?:\s+INTEGER)?", upper):
+            return (20 if "UNSIGNED" in upper else 19), 0
         return None
 
     def _resolve_cte_column_expression(self, column: Any) -> Optional[Any]:
@@ -502,17 +519,37 @@ class DialectBaseMixin(MixinHost):
                 if kind == "Sum":
                     return min(65, inner[0] + 22), inner[1]
                 return inner
-            if kind in ("Paren", "Neg", "Abs", "Floor", "Ceil", "Ceiling", "Sign", "Trunc"):
+            if kind in ("Paren", "Neg", "Abs"):
                 return infer(node.this)
+            if kind in ("Floor", "Ceil", "Ceiling", "Sign"):
+                if node.this is None:
+                    return None
+                value = infer(node.this)
+                if value is None:
+                    return None
+                if self.dialect == Dialect.POSTGRES:
+                    # PostgreSQL FLOOR/CEIL/SIGN only stay exact NUMERIC for
+                    # NUMERIC/DECIMAL inputs; integer inputs coerce to DOUBLE PRECISION.
+                    arg_t = self._infer_ast_expr_storage_type(node.this.sql(_sqlglot_dialect(self.dialect)))
+                    if arg_t != "NUMERIC":
+                        return None
+                    return min(65, max(1, value[0] - value[1] + 1)), 0
+                if self.dialect == Dialect.MYSQL:
+                    return min(65, max(1, value[0] - value[1] + 1)), 0
+                return value
             if kind == "Cast":
                 target = node.args.get("to")
                 return self._numeric_precision_scale_from_type(target.sql()) if target is not None else None
-            if kind in ("Add", "Sub", "Mul", "Div", "Mod"):
+            if kind in ("Add", "Sub", "Mul", "Div", "Mod", "IntDiv"):
                 left, right = infer(node.this), infer(node.expression)
                 if left is None or right is None:
                     return None
                 p1, s1 = left
                 p2, s2 = right
+                if kind == "IntDiv":
+                    # MySQL/MariaDB integer division (DIV) produces an exact
+                    # integer (scale 0) even for DECIMAL operands.
+                    return min(65, max(19, p1 - s1)), 0
                 if kind == "Mod":
                     # MySQL/MariaDB MOD keeps the larger scale and the larger
                     # integer part (DECIMAL(12,3) % 2 is DECIMAL(12,3)).
@@ -528,27 +565,83 @@ class DialectBaseMixin(MixinHost):
                     precision = (p1 - s1) + s2 + scale
                 scale = min(self._max_decimal_scale(), scale)
                 return min(65, max(scale, precision)), scale
-            if kind in ("Coalesce", "IfNull", "Nullif", "Greatest", "Least"):
-                values = [infer(child) for child in node.iter_expressions()]
-                if not values or any(value is None for value in values):
+            if kind == "Nullif":
+                if self.dialect == Dialect.POSTGRES:
+                    # PostgreSQL NULLIF(a, b) resolves via the `=` operator:
+                    # int = int keeps a's exact type; int = numeric promotes to
+                    # numeric; exact = float promotes to double precision (None here);
+                    # NULLIF(NULL, b) takes b's type.
+                    if isinstance(node.this, sqlglot_exp.Null):
+                        if node.expression is None or isinstance(node.expression, sqlglot_exp.Null):
+                            return None
+                        return infer(node.expression)
+                    left = infer(node.this)
+                    if left is None:
+                        return None
+                    if node.expression is None or isinstance(node.expression, sqlglot_exp.Null):
+                        return left
+                    right = infer(node.expression)
+                    if right is None:
+                        return None
+                    return merge_types([left, right])
+                if isinstance(node.this, sqlglot_exp.Null):
                     return None
-                return merge_types([value for value in values if value is not None])
+                return infer(node.this)
+            if kind in ("Coalesce", "IfNull", "Greatest", "Least"):
+                values = []
+                for child in node.iter_expressions():
+                    if isinstance(child, sqlglot_exp.Null):
+                        continue
+                    inferred = infer(child)
+                    if inferred is None:
+                        return None
+                    values.append(inferred)
+                return merge_types(values) if values else None
+            if kind == "If":
+                branches = []
+                for branch_key in ("true", "false"):
+                    branch_node = node.args.get(branch_key)
+                    if branch_node is None or isinstance(branch_node, sqlglot_exp.Null):
+                        continue
+                    inferred = infer(branch_node)
+                    if inferred is None:
+                        return None
+                    branches.append(inferred)
+                return merge_types(branches) if branches else None
             if kind == "Case":
                 branches = []
                 for branch in node.args.get("ifs") or ():
                     value = branch.args.get("true")
-                    if value is not None:
-                        branches.append(infer(value))
+                    if value is not None and not isinstance(value, sqlglot_exp.Null):
+                        inferred = infer(value)
+                        if inferred is None:
+                            return None
+                        branches.append(inferred)
                 default = node.args.get("default")
-                if default is not None:
-                    branches.append(infer(default))
-                if not branches or any(value is None for value in branches):
+                if default is not None and not isinstance(default, sqlglot_exp.Null):
+                    inferred = infer(default)
+                    if inferred is None:
+                        return None
+                    branches.append(inferred)
+                return merge_types(branches) if branches else None
+            if kind in ("Round", "Trunc"):
+                if node.this is None:
                     return None
-                return merge_types([value for value in branches if value is not None])
-            if kind == "Round":
                 value = infer(node.this)
-                scale_node = node.expression
-                if value is None or scale_node is None or scale_node.__class__.__name__ != "Literal":
+                if value is None:
+                    return None
+                scale_node = node.args.get("decimals") or node.expression
+                if self.dialect == Dialect.POSTGRES:
+                    # PostgreSQL 1-arg ROUND/TRUNC(int) coerces to DOUBLE PRECISION;
+                    # 2-arg ROUND/TRUNC(x, n) requires NUMERIC and returns NUMERIC.
+                    if scale_node is None:
+                        arg_t = self._infer_ast_expr_storage_type(node.this.sql(_sqlglot_dialect(self.dialect)))
+                        if arg_t != "NUMERIC":
+                            return None
+                        return min(65, max(1, value[0] - value[1] + 1)), 0
+                if scale_node is None:
+                    return min(65, max(1, value[0] - value[1] + 1)), 0
+                if scale_node.__class__.__name__ != "Literal":
                     return value
                 try:
                     requested_scale = max(0, int(scale_node.this))
@@ -989,12 +1082,21 @@ class DialectBaseMixin(MixinHost):
             # ("CHAR(5) COLLATE UTF8MB4_UNICODE_CI" under a non-default
             # server collation): the clause does not change the family.
             bare = re.sub(r"\s+(?:COLLATE|CHARACTER\s+SET|CHARSET)\s+\S+", "", data_type.upper())
+            bare = re.sub(r"\s+ZEROFILL\b", "", bare)
             upper = re.sub(r"\s*\(.*\)\s*$", "", bare).strip()
             if upper in ("SMALLINT", "INT2", "SMALLSERIAL", "SERIAL2"):
                 return "SMALLINT"
-            if upper in ("INTEGER", "INT", "INT4", "MEDIUMINT", "TINYINT", "SERIAL", "SERIAL4"):
+            if upper in (
+                "INTEGER", "INT", "INT4", "MEDIUMINT", "UMEDIUMINT", "TINYINT", "UTINYINT",
+                "TINYINT UNSIGNED", "SMALLINT UNSIGNED", "USMALLINT", "MEDIUMINT UNSIGNED",
+                "SERIAL", "SERIAL4",
+            ):
                 return "INTEGER"
-            if upper in ("BIGINT", "INT8", "BIGINT UNSIGNED", "INT UNSIGNED", "BIGSERIAL", "SERIAL8"):
+            if upper in (
+                "BIGINT", "UBIGINT", "INT8", "BIGINT UNSIGNED", "INT UNSIGNED", "INTEGER UNSIGNED",
+                "UINT", "BIGSERIAL", "SERIAL8", "SIGNED", "UNSIGNED",
+                "SIGNED INTEGER", "UNSIGNED INTEGER",
+            ):
                 return "BIGINT"
             if upper in ("NUMERIC", "DECIMAL", "DEC", "FIXED"):
                 return "NUMERIC"
@@ -1079,6 +1181,23 @@ class DialectBaseMixin(MixinHost):
                 return "BOOLEAN"
             if kind == "Abs":
                 return infer(node.this)
+            if kind in ("Floor", "Ceil", "Ceiling", "Sign") and self.dialect == Dialect.POSTGRES:
+                arg_t = infer(node.this)
+                if arg_t == "NUMERIC":
+                    return "NUMERIC"
+                if arg_t in ranks:
+                    return "DOUBLE PRECISION"
+                return None
+            if kind in ("Round", "Trunc") and self.dialect == Dialect.POSTGRES:
+                arg_t = infer(node.this)
+                scale_node = node.args.get("decimals") or node.expression
+                if scale_node is not None:
+                    return "NUMERIC" if arg_t in ranks else None
+                if arg_t == "NUMERIC":
+                    return "NUMERIC"
+                if arg_t in ranks:
+                    return "DOUBLE PRECISION"
+                return None
             if kind == "Column":
                 column = self._lookup_col_def(node.sql())
                 if column is None:
@@ -1168,11 +1287,47 @@ class DialectBaseMixin(MixinHost):
             if kind in ("Coalesce", "IfNull"):
                 vals = [infer(ch) for ch in node.iter_expressions()]
                 return merge(vals)
+            if kind in ("Greatest", "Least"):
+                vals = [infer(ch) for ch in node.iter_expressions()]
+                if any(v is None for v in vals):
+                    return None
+                return merge(vals)
             if kind == "Nullif":
+                if self.dialect == Dialect.POSTGRES:
+                    # PostgreSQL NULLIF(a, b) resolves via the `=` operator and
+                    # returns the coerced left operand (oprleft):
+                    # - int* = int* keeps a's type (no widening)
+                    # - float* = float* keeps a's type
+                    # - exact = float* promotes to DOUBLE PRECISION
+                    # - int* = numeric promotes to NUMERIC
+                    # - NULLIF(NULL, b) resolves to b
+                    a_t = infer(node.this)
+                    b_t = infer(node.expression) if node.expression is not None else "UNKNOWN"
+                    if a_t is None or b_t is None:
+                        return None
+                    if a_t == "UNKNOWN":
+                        return b_t
+                    if b_t == "UNKNOWN":
+                        return a_t
+                    int_types = ("SMALLINT", "INTEGER", "BIGINT")
+                    float_types = ("REAL", "DOUBLE PRECISION")
+                    if a_t in int_types and b_t in int_types:
+                        return a_t
+                    if a_t in float_types and b_t in float_types:
+                        return a_t
+                    if (a_t in (*int_types, "NUMERIC") and b_t in float_types) or (
+                        b_t in (*int_types, "NUMERIC") and a_t in float_types
+                    ):
+                        return "DOUBLE PRECISION"
+                    if (a_t in int_types and b_t == "NUMERIC") or (b_t in int_types and a_t == "NUMERIC"):
+                        return "NUMERIC"
+                    return merge((a_t, b_t))
                 return infer(node.this)
             if kind == "If":
                 t_br = infer(node.args.get("true"))
                 f_br = infer(node.args.get("false"))
+                if t_br is None or f_br is None:
+                    return None
                 return merge((t_br, f_br))
             if kind == "Case":
                 branches: List[Optional[str]] = []
@@ -1219,7 +1374,12 @@ class DialectBaseMixin(MixinHost):
                     # integer arithmetic is 64-bit (MariaDB's width rule is
                     # applied below).
                     return "BIGINT"
-                if merged == "REAL":
+                if merged == "REAL" and not (
+                    self.dialect == Dialect.POSTGRES
+                    and left == "REAL"
+                    and right == "REAL"
+                    and kind in ("Add", "Sub", "Mul", "Div")
+                ):
                     return "DOUBLE PRECISION"
                 return merged
             if kind == "Window" and self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):

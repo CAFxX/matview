@@ -1100,10 +1100,30 @@ def test_min_max_of_integer_expression_result_type(make_env, request, target: Ta
         ViewDef("ik_a", f"SELECT s, {agg}({e}) AS a FROM ik GROUP BY s")))
 
 
+SUM_INT_EXPRS: List[Tuple[str, Tuple[str, ...]]] = [
+    *INT_KEY_EXPRS,
+    ("b + 1", ("postgres", "mysql", "sqlite")),
+    ("ABS(i)", ("postgres", "mysql", "sqlite")),
+    ("CASE WHEN i > 0 THEN i ELSE NULL END", ("postgres", "mysql", "sqlite")),
+    ("NULLIF(i, 0)", ("postgres", "mysql", "sqlite")),
+    ("NULLIF(i, b)", ("postgres", "mysql", "sqlite")),
+    ("GREATEST(i, 0)", ("postgres", "mysql")),
+    ("IF(i > 0, i, 0)", ("mysql",)),
+    ("CAST(ABS(i) AS UNSIGNED)", ("mysql",)),
+]
+
+
 @pytest.mark.parametrize("target", _params())
-def test_sum_of_integer_expression_result_type(make_env, request, target: Target) -> None:
-    _check_integer_expression_view(make_env, request, target, "i % 3", lambda e: (
-        ViewDef("ik_s", f"SELECT s, SUM({e}) AS a FROM ik GROUP BY s")))
+@pytest.mark.parametrize("expr", [e for e, _ in SUM_INT_EXPRS], ids=[e for e, _ in SUM_INT_EXPRS])
+def test_sum_of_integer_expression_result_type(make_env, request, target: Target, expr: str) -> None:
+    _check_integer_expression_view(
+        make_env,
+        request,
+        target,
+        expr,
+        lambda e: ViewDef("ik_s", f"SELECT s, SUM({e}) AS a FROM ik GROUP BY s"),
+        expr_families=dict(SUM_INT_EXPRS),
+    )
 
 
 _E6 = ("MySQL reports a GROUP BY expression over TINYINT/SMALLINT/MEDIUMINT arithmetic as INT (LONG) "
@@ -1117,8 +1137,9 @@ KNOWN_INT_EXPR_TYPE_DEFECTS: Dict[Tuple[str, str, str], str] = {
 
 
 def _check_integer_expression_view(make_env, request, target: Target, expr: str,
-                                   view: Callable[[str], ViewDef]) -> None:
-    families = dict(INT_KEY_EXPRS)[expr]
+                                   view: Callable[[str], ViewDef],
+                                   expr_families: Optional[Dict[str, Tuple[str, ...]]] = None) -> None:
+    families = (expr_families or dict(INT_KEY_EXPRS))[expr]
     if target.family not in families:
         pytest.skip(f"{expr} is not {target.family} syntax")
     env = make_env(target, views=[], schema_sql=INT_KEY_SCHEMA[target.family], seed=False)

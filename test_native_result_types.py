@@ -225,6 +225,124 @@ class PostgresPlannedResultTypeTests(unittest.TestCase):
         )
         self.assertIn("depth INTEGER", plan.backing_table_ddl)
 
+    def test_sum_integer_expression_types_pg_and_mysql(self) -> None:
+        import re
+        from matview import EngineLimitationError
+
+        pg_schema = (
+            "CREATE TABLE ik (id INT PRIMARY KEY, g INT, i INT4, s INT2, b INT8, "
+            "d NUMERIC(12, 3), f4 FLOAT4, f8 DOUBLE PRECISION);"
+        )
+        pg_cases = {
+            "SELECT g, SUM(i % 3) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(MOD(i, 3)) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(s + s) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(-i) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(i / 2) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(b) AS r FROM ik GROUP BY g": "NUMERIC",
+            "SELECT g, SUM(b + 1) AS r FROM ik GROUP BY g": "NUMERIC",
+            "SELECT g, SUM(i % b) AS r FROM ik GROUP BY g": "NUMERIC",
+            "SELECT g, SUM(CASE WHEN i > 0 THEN i ELSE NULL END) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(COALESCE(NULL, i)) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(NULLIF(i, 0)) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(NULLIF(i, b)) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(NULLIF(NULL, i)) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(GREATEST(i, 0)) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(LEAST(b, 10)) AS r FROM ik GROUP BY g": "NUMERIC",
+            "SELECT g, SUM(ABS(i)) AS r FROM ik GROUP BY g": "BIGINT",
+            "SELECT g, SUM(FLOOR(d)) AS r FROM ik GROUP BY g": "NUMERIC",
+            "SELECT g, SUM(ROUND(d, 1)) AS r FROM ik GROUP BY g": "NUMERIC",
+        }
+        for select, expected_type in pg_cases.items():
+            with self.subTest(dialect="postgres", select=select):
+                plan = generate_materialized_view(pg_schema, f"CREATE VIEW v AS {select};", dialect="postgres:18")
+                m = re.search(r'"?r"?\s+([A-Z][A-Z0-9_ ()]*?)(?:\s+NOT\s+NULL)?\s*(?:,|\))', plan.backing_table_ddl)
+                assert m is not None, plan.backing_table_ddl
+                self.assertEqual(m.group(1).strip(), expected_type)
+
+        # Bare FLOAT4, f4 + f4, and NULLIF(f4, f8) keep REAL under opt-in;
+        # NULLIF(i, f4), NULLIF(i, f8), and FLOOR/CEIL/ROUND/TRUNC/SIGN(int) are DOUBLE PRECISION and refused by default.
+        for opt_select, opt_type in (
+            ("SELECT g, SUM(f4) AS r FROM ik GROUP BY g", "REAL"),
+            ("SELECT g, SUM(f4 + f4) AS r FROM ik GROUP BY g", "REAL"),
+            ("SELECT g, SUM(NULLIF(f4, f8)) AS r FROM ik GROUP BY g", "REAL"),
+            ("SELECT g, SUM(NULLIF(i, f4)) AS r FROM ik GROUP BY g", "DOUBLE PRECISION"),
+            ("SELECT g, SUM(FLOOR(i)) AS r FROM ik GROUP BY g", "DOUBLE PRECISION"),
+        ):
+            with self.subTest(dialect="postgres_float", select=opt_select):
+                with self.assertRaises(EngineLimitationError):
+                    generate_materialized_view(pg_schema, f"CREATE VIEW v AS {opt_select};", dialect="postgres:18")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                    plan_fl = generate_materialized_view(
+                        pg_schema,
+                        f"CREATE VIEW v AS {opt_select};",
+                        dialect="postgres:18",
+                        accept_limitations=FLOAT_OPT_IN,
+                    )
+                self.assertIn(f"r {opt_type}", plan_fl.backing_table_ddl)
+        for pg_refused in (
+            "SELECT g, SUM(NULLIF(i, f8)) AS r FROM ik GROUP BY g",
+            "SELECT g, SUM(CEIL(i)) AS r FROM ik GROUP BY g",
+            "SELECT g, SUM(ROUND(i)) AS r FROM ik GROUP BY g",
+            "SELECT g, SUM(TRUNC(i)) AS r FROM ik GROUP BY g",
+            "SELECT g, SUM(SIGN(i)) AS r FROM ik GROUP BY g",
+        ):
+            with self.subTest(dialect="postgres_refused", select=pg_refused):
+                with self.assertRaises(EngineLimitationError):
+                    generate_materialized_view(pg_schema, f"CREATE VIEW v AS {pg_refused};", dialect="postgres:18")
+
+        mysql_schema = (
+            "CREATE TABLE ik (id INT PRIMARY KEY, g INT, i INT, s SMALLINT, b BIGINT, "
+            "ti TINYINT, mi MEDIUMINT, u INT UNSIGNED, d DECIMAL(12, 3), f DOUBLE, du DOUBLE UNSIGNED);"
+        )
+        mysql_exact = {
+            "SELECT g, SUM(i % 3) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(MOD(i, 3)) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(i DIV 2) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(s + s) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(-i) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(u % 7) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(CASE WHEN i > 0 THEN i ELSE NULL END) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(COALESCE(NULL, i)) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(NULLIF(i, 0)) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(GREATEST(i, 0)) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(IF(i > 0, i, 0)) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(CAST(ABS(i) AS UNSIGNED)) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(FLOOR(d)) AS r FROM ik GROUP BY g": "DECIMAL(65, 0)",
+            "SELECT g, SUM(ROUND(d, 1)) AS r FROM ik GROUP BY g": "DECIMAL(65, 1)",
+            "SELECT g, SUM(TRUNCATE(d, 1)) AS r FROM ik GROUP BY g": "DECIMAL(65, 1)",
+            "SELECT g, AVG(u) AS r FROM ik GROUP BY g": "DECIMAL(14, 4)",
+        }
+        for select, expected_type in mysql_exact.items():
+            with self.subTest(dialect="mysql", select=select):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                    plan = generate_materialized_view(
+                        mysql_schema,
+                        f"CREATE VIEW v AS {select};",
+                        dialect="mysql:8.4",
+                        ignore_limitations=True,
+                    )
+                self.assertIn(expected_type, plan.backing_table_ddl)
+
+        # Float branch inside CASE/IF and DOUBLE UNSIGNED must fail closed (never misclassified as exact).
+        for approx_select in (
+            "SELECT g, SUM(CASE WHEN i > 0 THEN f ELSE NULL END) AS r FROM ik GROUP BY g",
+            "SELECT g, SUM(IF(i > 0, f, 0)) AS r FROM ik GROUP BY g",
+            "SELECT g, SUM(du) AS r FROM ik GROUP BY g",
+            "SELECT g, SUM(du + 1) AS r FROM ik GROUP BY g",
+            "SELECT g, AVG(du) AS r FROM ik GROUP BY g",
+        ):
+            with self.subTest(dialect="mysql_refused", select=approx_select):
+                with self.assertRaises(EngineLimitationError):
+                    generate_materialized_view(
+                        mysql_schema,
+                        f"CREATE VIEW v AS {approx_select};",
+                        dialect="mysql:8.4",
+                        ignore_limitations=True,
+                    )
+
 
 class NativeResultTypeTests(unittest.TestCase):
     def _run(self, engine: Dialect, dsn: str) -> List[str]:
