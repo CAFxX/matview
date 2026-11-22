@@ -1010,6 +1010,14 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 dialect="mysql:8.4",
                 ignore_limitations=True,
             )
+            pm_uagg_int = generate_materialized_view(
+                "CREATE TABLE a (id INT PRIMARY KEY, k INT NOT NULL, x SMALLINT);"
+                "CREATE TABLE b (id INT PRIMARY KEY, k INT NOT NULL, y INT);",
+                "CREATE VIEW v_uai AS WITH u AS (SELECT k, x FROM a UNION ALL SELECT k, y FROM b) "
+                "SELECT k, MIN(x) AS mnx, MAX(x) AS mxx FROM u GROUP BY k;",
+                dialect="mysql:8.4",
+                ignore_limitations=True,
+            )
         self.assertRegex(pm_uall.backing_table_ddl, r"\bx BIGINT\b")
         self.assertRegex(pm_uall.backing_table_ddl, r"\bu BIGINT\b")
         self.assertRegex(pm_uall.backing_table_ddl, r"\bbu DECIMAL\(20, 0\)")
@@ -1026,6 +1034,9 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         self.assertRegex(pm_uagg.backing_table_ddl, r"\bsx DECIMAL\(65, 0\)")
         self.assertRegex(pm_uagg.backing_table_ddl, r"\bad DECIMAL\(16, 10\)")
         self.assertRegex(pm_numstr.backing_table_ddl, r"\bx VARCHAR\(500\)")
+        # MySQL materializes UNION ALL CTEs, keeping the widened INT type for MIN/MAX (not BIGINT).
+        self.assertRegex(pm_uagg_int.backing_table_ddl, r"\bmnx INT\b")
+        self.assertRegex(pm_uagg_int.backing_table_ddl, r"\bmxx INT\b")
 
     def test_pg_catalog_aggregates_and_name_coalesce_offline(self) -> None:
         from matview import EngineLimitationError, MaintenanceStrategy, UnsupportedMaterializedViewError, parse_view_definition
@@ -1226,16 +1237,16 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         conn = _connect(Dialect.MYSQL, dsn)
         cur = conn.cursor()
         try:
-            cur.execute(f"CREATE TABLE {ta} (id INT PRIMARY KEY, k SMALLINT NOT NULL, x SMALLINT) ENGINE=InnoDB")
-            cur.execute(f"CREATE TABLE {tb} (id INT PRIMARY KEY, k BIGINT NOT NULL, x BIGINT) ENGINE=InnoDB")
-            cur.execute(f"INSERT INTO {ta} VALUES (1, 1, 10), (2, 2, 20)")
-            cur.execute(f"INSERT INTO {tb} VALUES (1, 5000000000, 10000000000), (2, 2, 30000000000)")
+            cur.execute(f"CREATE TABLE {ta} (id INT PRIMARY KEY, k SMALLINT NOT NULL, x SMALLINT, z SMALLINT) ENGINE=InnoDB")
+            cur.execute(f"CREATE TABLE {tb} (id INT PRIMARY KEY, k BIGINT NOT NULL, x BIGINT, z INT) ENGINE=InnoDB")
+            cur.execute(f"INSERT INTO {ta} VALUES (1, 1, 10, 100), (2, 2, 20, 200)")
+            cur.execute(f"INSERT INTO {tb} VALUES (1, 5000000000, 10000000000, 100000), (2, 2, 30000000000, 200000)")
             conn.commit()
 
             mgr = MaterializedViewManager(conn, dialect=Dialect.MYSQL)
             specs = [
                 ("uall", f"SELECT id, x FROM {ta} UNION ALL SELECT id, x FROM {tb}"),
-                ("uagg", f"WITH u AS (SELECT k, x FROM {ta} UNION ALL SELECT k, x FROM {tb}) SELECT k, MIN(x) AS mnx, MAX(x) AS mxx, SUM(x) AS sx FROM u GROUP BY k"),
+                ("uagg", f"WITH u AS (SELECT k, x, z FROM {ta} UNION ALL SELECT k, x, z FROM {tb}) SELECT k, MIN(x) AS mnx, MAX(x) AS mxx, MIN(z) AS mnz, MAX(z) AS mxz, SUM(x) AS sx FROM u GROUP BY k"),
             ]
             pairs = []
             for label, sel in specs:
@@ -1261,8 +1272,8 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                     self.assertEqual(_metadata_mismatches(Dialect.MYSQL, da, db), [], f"MySQL {label} {step} metadata")
 
             check("initial")
-            cur.execute(f"INSERT INTO {tb} VALUES (3, 9000000000, 40000000000)")
-            cur.execute(f"UPDATE {tb} SET x = 50000000000 WHERE id = 1")
+            cur.execute(f"INSERT INTO {tb} VALUES (3, 9000000000, 40000000000, 300000)")
+            cur.execute(f"UPDATE {tb} SET x = 50000000000, z = 400000 WHERE id = 1")
             cur.execute(f"DELETE FROM {ta} WHERE id = 1")
             conn.commit()
             check("after_dml")
