@@ -2162,6 +2162,11 @@ class TranspiledConnectionAdapter:
             tbl = m_ins.group(1)
             prefix_sql = re.split(r"\bON\s+DUPLICATE\s+KEY\s+UPDATE\b", m_ins.group(0), flags=re.I)[0].rstrip()
             assigns = m_ins.group(2)
+            m_row_alias = re.search(r"\)\s+AS\s+([A-Za-z0-9_]+)\s*$", prefix_sql, flags=re.I)
+            if m_row_alias and re.search(r"\bVALUES\s*\(", prefix_sql, flags=re.I):
+                row_al = m_row_alias.group(1)
+                prefix_sql = prefix_sql[: m_row_alias.start()] + ")"
+                assigns = re.sub(rf"\b{re.escape(row_al)}\.", "excluded.", assigns)
             pks = self._table_pks.get(tbl.lower())
             if not pks:
                 if "__matview_dist_" in tbl:
@@ -2197,6 +2202,47 @@ class TranspiledConnectionAdapter:
             ]
             return f"UPDATE {tbl}\n    SET {', '.join(cleaned_assigns)}\n    FROM {params} AS {alias}\n    WHERE {where_cl};"
 
+        def _repl_direct_join_upd(m_u: re.Match[str]) -> str:
+            tbl, src_tbl, src_al, on_c, set_cl, w_cl = (
+                m_u.group(1),
+                m_u.group(2),
+                m_u.group(3),
+                m_u.group(4).strip(),
+                m_u.group(5),
+                (m_u.group(6) or "").strip(),
+            )
+            cleaned_assigns = [
+                re.sub(rf"^\s*{re.escape(tbl)}\.", "", a_part.strip())
+                for a_part in _split_top_level(set_cl, ",")
+            ]
+            where_expr = f"({on_c}) AND ({w_cl})" if w_cl else on_c
+            return f"UPDATE {tbl}\n    SET {', '.join(cleaned_assigns)}\n    FROM {src_tbl} AS {src_al}\n    WHERE {where_expr};"
+
+        def _repl_multi_del_subq(m_d: re.Match[str]) -> str:
+            tbl, subq, on_c, w_cl = (
+                m_d.group(1),
+                m_d.group(2),
+                m_d.group(3).strip(),
+                m_d.group(4).strip(),
+            )
+            return (
+                f"DELETE FROM {tbl}\n"
+                f"    WHERE EXISTS (SELECT 1 FROM ({subq}) AS __mv_delta WHERE {on_c}) AND ({w_cl});"
+            )
+
+        def _repl_multi_del_direct(m_d: re.Match[str]) -> str:
+            tbl, src_tbl, src_al, on_c, w_cl = (
+                m_d.group(1),
+                m_d.group(2),
+                m_d.group(3),
+                m_d.group(4).strip(),
+                m_d.group(5).strip(),
+            )
+            return (
+                f"DELETE FROM {tbl}\n"
+                f"    WHERE EXISTS (SELECT 1 FROM {src_tbl} AS {src_al} WHERE ({on_c}) AND ({w_cl}));"
+            )
+
         s = re.sub(
             r"UPDATE\s+([A-Za-z0-9_]+)\s+INNER\s+JOIN\s+(\(SELECT\s.*?\))\s+AS\s+(__mv_[pr])\s+ON\s+TRUE\s+SET\s+(.*?)\n\s*WHERE\s+([^;]*);",
             _repl_param_upd,
@@ -2206,6 +2252,24 @@ class TranspiledConnectionAdapter:
         s = re.sub(
             r"UPDATE\s+([A-Za-z0-9_]+)\s+INNER\s+JOIN\s*\((.*?)\)\s*AS\s+__mv_delta\s+ON\s+([^\n]+?)\s+SET\s+([^;]+);?",
             _repl_multi_upd,
+            s,
+            flags=re.I | re.S,
+        )
+        s = re.sub(
+            r"UPDATE\s+([A-Za-z0-9_]+)\s+INNER\s+JOIN\s+([A-Za-z0-9_\"`]+)\s+AS\s+([A-Za-z0-9_\"`]+)\s+ON\s+([^\n]+?)\s+SET\s+([^;\n]+)(?:\s+WHERE\s+([^;]+))?;",
+            _repl_direct_join_upd,
+            s,
+            flags=re.I | re.S,
+        )
+        s = re.sub(
+            r"DELETE\s+([A-Za-z0-9_]+)\s+FROM\s+\1\s+INNER\s+JOIN\s*\((.*?)\)\s*AS\s+__mv_delta\s+ON\s+([^\n]+?)\s+WHERE\s+([^;]+);",
+            _repl_multi_del_subq,
+            s,
+            flags=re.I | re.S,
+        )
+        s = re.sub(
+            r"DELETE\s+([A-Za-z0-9_]+)\s+FROM\s+\1\s+INNER\s+JOIN\s+([A-Za-z0-9_\"`]+)\s+AS\s+([A-Za-z0-9_\"`]+)\s+ON\s+([^\n]+?)\s+WHERE\s+([^;]+);",
+            _repl_multi_del_direct,
             s,
             flags=re.I | re.S,
         )
@@ -2660,8 +2724,7 @@ class TranspiledConnectionAdapter:
                         when_cl = f" WHEN ({m_outer.group(1)})"
                         b_clean = inner_my
 
-                def _unwrap_my_if(m_inner: re.Match[str]) -> str:
-                    c_in, st_in = m_inner.group(1).strip(), m_inner.group(2).strip()
+                def _guard_sqlite_stmts(st_in: str, c_in: str) -> str:
                     out_sts = []
                     for st_p in _split_top_level(st_in, ";"):
                         sp = st_p.strip()
@@ -2676,6 +2739,24 @@ class TranspiledConnectionAdapter:
                                     count=1,
                                     flags=re.I,
                                 )
+                            elif re.search(r"\n\s*VALUES\s*\(", sp, flags=re.I):
+                                m_val = re.search(
+                                    r"\n(\s*)VALUES\s*\((.*)\)\s*(?:AS\s+([A-Za-z0-9_]+)\s*)?\n(\s*ON\s+CONFLICT\b)",
+                                    sp,
+                                    flags=re.I | re.S,
+                                )
+                                if m_val:
+                                    sp = (
+                                        sp[: m_val.start()]
+                                        + f"\n{m_val.group(1)}SELECT {m_val.group(2)}\n{m_val.group(1)}WHERE ({c_in})\n{m_val.group(4)}"
+                                        + sp[m_val.end() :]
+                                    )
+                                    if m_val.group(3):
+                                        sp = re.sub(
+                                            rf"\b{re.escape(m_val.group(3))}\.",
+                                            "excluded.",
+                                            sp,
+                                        )
                             else:
                                 sp = re.sub(
                                     r"\n\s*WHERE\s+",
@@ -2695,12 +2776,33 @@ class TranspiledConnectionAdapter:
                         out_sts.append(sp + ";")
                     return "\n".join(out_sts)
 
-                b_clean = re.sub(
-                    r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
-                    _unwrap_my_if,
-                    b_clean,
+                def _unwrap_my_if(m_inner: re.Match[str]) -> str:
+                    return _guard_sqlite_stmts(m_inner.group(2).strip(), m_inner.group(1).strip())
+
+                # Handle top-level `IF (<same_cond>) THEN <same_stmts> ELSE <else_block> END IF;`
+                m_if_else = re.match(
+                    r"^IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\n\s*ELSE\s*(.*?)\n\s*END\s+IF;$",
+                    b_clean.strip(),
                     flags=re.I | re.S,
                 )
+                if m_if_else:
+                    c_same = m_if_else.group(1).strip()
+                    same_part = _guard_sqlite_stmts(m_if_else.group(2).strip(), c_same)
+                    else_raw = re.sub(
+                        r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
+                        _unwrap_my_if,
+                        m_if_else.group(3).strip(),
+                        flags=re.I | re.S,
+                    )
+                    else_part = _guard_sqlite_stmts(else_raw, f"COALESCE(({c_same}), 0) = 0")
+                    b_clean = f"{same_part}\n{else_part}"
+                else:
+                    b_clean = re.sub(
+                        r"IF\s*\(([^\n]+?)\)\s*THEN\s*(.*?)\s*END\s+IF;",
+                        _unwrap_my_if,
+                        b_clean,
+                        flags=re.I | re.S,
+                    )
                 if when_cl:
                     when_cl = f" WHEN ({when_cl[len(' WHEN '):]}) AND (__mv_skip_triggers() = 0)"
                 else:
@@ -6453,12 +6555,25 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         )
         self.assertIn("sum_integer DECIMAL(65, 0)", mysql.backing_table_ddl)
         self.assertIn("sum_decimal DECIMAL(65, 8)", mysql.backing_table_ddl)
-        self.assertIn("avg_integer DECIMAL(14, 4)", mysql.backing_table_ddl)
-        self.assertIn("avg_decimal DECIMAL(22, 12)", mysql.backing_table_ddl)
+        # Stage 4: unindexed exact AVG on MySQL is derived in the reader view
+        # rather than stored and updated on every row.
+        self.assertNotIn("avg_integer ", mysql.backing_table_ddl)
+        self.assertNotIn("avg_decimal ", mysql.backing_table_ddl)
+        self.assertIn("AS DECIMAL(65, 0)) /", mysql.reader_view_ddl)
+        self.assertIn("AS DECIMAL(65, 8)) /", mysql.reader_view_ddl)
         self.assertIn("AVG_APPROXIMATE DOUBLE", mysql.backing_table_ddl.upper())
         self.assertIn("VARIANCE_DECIMAL DOUBLE", mysql.backing_table_ddl.upper())
         self.assertIn("STDDEV_DECIMAL DOUBLE", mysql.backing_table_ddl.upper())
         self.assertIn("VARIANCE_APPROXIMATE DOUBLE", mysql.backing_table_ddl.upper())
+
+        # When AVG is explicitly indexed, it must still be stored with the
+        # native DECIMAL / REAL result type in the backing table.
+        indexed_avg_view = view + "\nCREATE INDEX idx_avg_cols ON avg_types (avg_integer, avg_decimal);"
+        mysql_idx = generate_materialized_view(
+            schema, indexed_avg_view, dialect="mysql", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
+        )
+        self.assertIn("avg_integer DECIMAL(14, 4)", mysql_idx.backing_table_ddl)
+        self.assertIn("avg_decimal DECIMAL(22, 12)", mysql_idx.backing_table_ddl)
 
         postgres = generate_materialized_view(
             schema, view, dialect="postgres", accept_limitations=FLOAT_OPT_IN
@@ -6476,14 +6591,21 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         # SQLite SUM is INTEGER or REAL depending on the stored values, not on
         # the declared column type: the backing column has no affinity (BLOB)
         # so an integral REAL sum is not converted to INTEGER (or vice versa).
+        # Stage 4: unindexed SQLite AVG is derived in the reader view.
         self.assertIn("sum_integer BLOB", sqlite.backing_table_ddl)
         self.assertIn("sum_decimal BLOB", sqlite.backing_table_ddl)
-        self.assertIn("avg_integer REAL", sqlite.backing_table_ddl)
-        self.assertIn("avg_decimal REAL", sqlite.backing_table_ddl)
-        self.assertIn("avg_approximate REAL", sqlite.backing_table_ddl)
+        self.assertNotIn("avg_integer ", sqlite.backing_table_ddl)
+        self.assertNotIn("avg_decimal ", sqlite.backing_table_ddl)
+        self.assertNotIn("avg_approximate ", sqlite.backing_table_ddl)
+        self.assertIn("AS avg_integer", sqlite.reader_view_ddl)
+        self.assertIn("AS avg_decimal", sqlite.reader_view_ddl)
+        self.assertIn("AS avg_approximate", sqlite.reader_view_ddl)
         self.assertIn("variance_decimal REAL", sqlite.backing_table_ddl)
         self.assertIn("stddev_decimal REAL", sqlite.backing_table_ddl)
         self.assertIn("variance_approximate REAL", sqlite.backing_table_ddl)
+        sqlite_idx = generate_materialized_view(schema, indexed_avg_view, dialect="sqlite")
+        self.assertIn("avg_integer REAL", sqlite_idx.backing_table_ddl)
+        self.assertIn("avg_decimal REAL", sqlite_idx.backing_table_ddl)
 
         # Numeric expressions retain exactness and derive their native precision.
         expression_view = """
@@ -6539,13 +6661,17 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("SELECT AVG(", union_mysql_triggers)
         self.assertIn("UNION ALL", union_mysql_triggers)
 
-        # Exact-value AVG must never be forced to DOUBLE in its population SQL.
+        # Exact-value AVG must never be forced to DOUBLE in its population SQL
+        # or reader view (unindexed AVG is derived in the reader view; indexed
+        # AVG populates natively via AVG(...)).
         mysql_population = "\\n".join(mysql.initial_populate_sqls)
         self.assertIn("SUM(whole)", mysql_population)
         self.assertIn("SUM(exact_value)", mysql_population)
-        self.assertIn("AVG(whole)", mysql_population)
-        self.assertIn("AVG(exact_value)", mysql_population)
         self.assertNotIn("AVG(1.0 *", mysql_population)
+        mysql_idx_population = "\\n".join(mysql_idx.initial_populate_sqls)
+        self.assertIn("AVG(whole)", mysql_idx_population)
+        self.assertIn("AVG(exact_value)", mysql_idx_population)
+        self.assertNotIn("AVG(1.0 *", mysql_idx_population)
 
     def test_23_statistical_delta_triggers_recompute_native_aggregates(self) -> None:
         single_schema = """
@@ -6587,8 +6713,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertGreaterEqual(single_triggers.count("SELECT STDDEV_SAMP("), 2)
 
         # MySQL exact-value AVG (integer and fixed-point DECIMAL; MySQL NUMERIC
-        # is DECIMAL(10,0)) is my_decimal_div(sum, count): derive it with the
-        # sum normalized to the native SUM scale. DOUBLE keeps recomputation.
+        # is DECIMAL(10,0)) is my_decimal_div(sum, count): derive it in the
+        # reader view with the sum normalized to the native SUM scale. DOUBLE
+        # keeps native recomputation.
         mysql_single = generate_materialized_view(
             single_schema, single_view, dialect="mysql", ignore_limitations=True,
             accept_limitations=FLOAT_OPT_IN,
@@ -6596,7 +6723,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         mysql_triggers = "\\n".join(mysql_single.trigger_ddls).upper()
         self.assertEqual(mysql_triggers.count("SELECT AVG(WHOLE)"), 0)
         self.assertEqual(mysql_triggers.count("SELECT AVG(EXACT_VALUE)"), 0)
-        self.assertIn("AS DECIMAL(65, 0)) / (", mysql_triggers)
+        self.assertIn("AS DECIMAL(65, 0)) /", mysql_single.reader_view_ddl.upper())
         self.assertGreaterEqual(mysql_triggers.count("SELECT AVG(VALUE)"), 2)
 
         # MySQL BIT_* aggregates return unsigned 64-bit integers. The reader
@@ -6772,7 +6899,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         self.assertIn("SELECT VAR_POP(", mysql_chunk_sql)
         self.assertIn("SELECT STDDEV_SAMP(", mysql_chunk_sql)
         self.assertNotIn("SELECT AVG(whole)", mysql_chunk_sql)
-        self.assertIn("AS DECIMAL(65, 0)) / (", mysql_chunk_sql)
+        self.assertIn("AS DECIMAL(65, 0)) /", mysql_exact_plan.reader_view_ddl.upper())
 
         # Chunk-fold recomputation must correlate an expression group against
         # its materialized projection alias, not a base-table column that the

@@ -796,7 +796,7 @@ class PlannerMixin(MixinHost):
                             extra_having_items.append(parsed_el)
                         if tk.start > cursor:
                             out_parts.append(expr_str[cursor:tk.start])
-                        out_parts.append(col_al)
+                        out_parts.append(self._q(col_al))
                         cursor = toks[end_tok_idx].end + 1
                         idx = end_tok_idx + 1
                         continue
@@ -864,7 +864,7 @@ class PlannerMixin(MixinHost):
                     work_items.append(it)
                     reader_exprs[it.alias] = it.alias
                 else:
-                    reader_exprs[it.alias] = f"({rewritten_e}) AS {it.alias}"
+                    reader_exprs[it.alias] = f"({rewritten_e}) AS {self._q(it.alias)}"
 
         rewritten_having: Optional[str] = None
         if v.having_clause:

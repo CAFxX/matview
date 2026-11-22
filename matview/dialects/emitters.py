@@ -580,6 +580,10 @@ class DialectEmitMixin(MixinHost):
         pg_au_body: Optional[str] = None,
         pg_bracket: Optional[Any] = None,
         mysql_prelock: Optional[Dict[str, str]] = None,
+        mysql_same_group_cond: Optional[str] = None,
+        mysql_same_group_stmts: Optional[List[str]] = None,
+        sqlite_same_group_cond: Optional[str] = None,
+        sqlite_same_group_stmts: Optional[List[str]] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         if self.dialect == Dialect.POSTGRES:
             # Statement-level transition-table triggers are the only
@@ -672,12 +676,25 @@ class DialectEmitMixin(MixinHost):
         cleanup_stmts = upd_cleanup_old_stmts or []
 
         if self.dialect == Dialect.SQLITE:
+            def _to_sqlite_values_upsert(stmt: str) -> str:
+                # Replace unconditional `SELECT <vals>\n    WHERE TRUE\n    ON CONFLICT`
+                # with direct `VALUES (<vals>)\n    ON CONFLICT` to avoid an extra
+                # SELECT subquery coroutine per row.
+                return re.sub(
+                    r"\n(\s*)SELECT\s+(.+?)\n\s*WHERE\s+TRUE\n(\s*ON\s+CONFLICT\b)",
+                    r"\n\1VALUES (\2)\n\3",
+                    stmt,
+                    count=1,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+
+            lean_ins_stmts = [_to_sqlite_values_upsert(s) for s in ins_stmts]
             trig_ins = render_procedural_sql(
                 "trigger_sqlite_after_insert",
                 trg_name=t_ai_name,
                 q_base_t=q_base_t,
                 when_clause=where_new,
-                body="\n    ".join(ins_stmts),
+                body="\n    ".join(lean_ins_stmts),
             )
             trig_del = render_procedural_sql(
                 "trigger_sqlite_after_delete",
@@ -686,11 +703,48 @@ class DialectEmitMixin(MixinHost):
                 when_clause=where_old,
                 body="\n    ".join(del_stmts),
             )
+            upd_new_guarded = (
+                [self._apply_where_guard_to_stmt(s, where_new) for s in upd_new_stmts]
+                if where_new
+                else [_to_sqlite_values_upsert(s) for s in upd_new_stmts]
+            )
             upd_stmts = (
                 [self._apply_where_guard_to_stmt(s, where_old) for s in upd_old_stmts]
-                + [self._apply_where_guard_to_stmt(s, where_new) for s in upd_new_stmts]
+                + upd_new_guarded
                 + [self._apply_where_guard_to_stmt(s, where_old) for s in cleanup_stmts]
             )
+            if sqlite_same_group_cond and sqlite_same_group_stmts:
+                move_when = (
+                    f"({changed_guard}) AND NOT ({sqlite_same_group_cond})"
+                    if changed_guard
+                    else f"NOT ({sqlite_same_group_cond})"
+                )
+                same_when_parts: List[str] = []
+                if changed_guard:
+                    same_when_parts.append(f"({changed_guard})")
+                same_when_parts.append(f"({sqlite_same_group_cond})")
+                if where_new:
+                    same_when_parts.append(f"({where_new})")
+                same_when = " AND ".join(same_when_parts)
+                trig_upd = render_procedural_sql(
+                    "trigger_sqlite_after_update",
+                    trg_name=t_au_name,
+                    upd_of_clause=upd_of_clause,
+                    q_base_t=q_base_t,
+                    when_clause=move_when,
+                    body="\n    ".join(upd_stmts),
+                )
+                t_aus_name = self._bounded_ident(f"{p}trg_", stem, "_aus")
+                trig_upd_same = render_procedural_sql(
+                    "trigger_sqlite_after_update",
+                    trg_name=t_aus_name,
+                    upd_of_clause=upd_of_clause,
+                    q_base_t=q_base_t,
+                    when_clause=same_when,
+                    body="\n    ".join(sqlite_same_group_stmts),
+                )
+                t_names = [t_ai_name, t_ad_name, t_au_name, t_aus_name]
+                return [trig_ins, trig_del, trig_upd, trig_upd_same], t_names, []
             trig_upd = render_procedural_sql(
                 "trigger_sqlite_after_update",
                 trg_name=t_au_name,
@@ -742,6 +796,22 @@ class DialectEmitMixin(MixinHost):
                 if old_section.strip()
                 else f"{new_section}{clean_section}"
             )
+            if mysql_same_group_cond and mysql_same_group_stmts:
+                same_cond_parts: List[str] = []
+                if where_old:
+                    same_cond_parts.append(f"({where_old})")
+                if where_new:
+                    same_cond_parts.append(f"({where_new})")
+                same_cond_parts.append(f"({mysql_same_group_cond})")
+                full_same_cond = " AND ".join(same_cond_parts)
+                same_block = "\n        ".join(mysql_same_group_stmts)
+                upd_inner = (
+                    f"IF ({full_same_cond}) THEN\n"
+                    f"        {same_block}\n"
+                    f"    ELSE\n"
+                    f"        {upd_inner}\n"
+                    f"    END IF;"
+                )
 
             trig_ins = render_procedural_sql(
                 "mysql_row_trigger",

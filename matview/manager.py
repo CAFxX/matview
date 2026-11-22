@@ -99,7 +99,11 @@ from .sql_frontend import (
 #     (backfill_cursor_pk IS NULL, backfill_active = 1) watermarks across all
 #     dialects, and PostgreSQL watermark predicates take FOR SHARE on matched
 #     catalog rows to coordinate with chunk advances against phantom inserts.
-MATVIEW_GENERATOR_VERSION = "13"
+# 14: Stage 4 lean row-trigger bodies on SQLite, MySQL, and MariaDB: key-scoped
+#     join empty-group deletes, inlined join delta triggers (dropping single-row
+#     derived tables and redundant GROUP BY), reader-view derived AVG, VALUES
+#     upserts without SELECT/FROM DUAL WHERE TRUE, and same-group UPDATE fast paths.
+MATVIEW_GENERATOR_VERSION = "14"
 
 
 def _definition_digest(select_sql: str) -> str:

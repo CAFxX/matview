@@ -1472,6 +1472,293 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             5,
         )
 
+    def test_stage4_lean_row_triggers_codegen_sqlite_and_mysql(self) -> None:
+        """Stage 4: row-trigger bodies on SQLite/MySQL/MariaDB restrict join
+        empty-group deletes to touched keys, inline single-row derived tables,
+        derive unindexed AVG in the reader view, use VALUES upserts, and emit
+        same-group UPDATE fast paths."""
+        import re
+        import sqlite3
+        from matview_sync import MaterializedViewManager
+
+        schema = """
+        CREATE TABLE d (g INT PRIMARY KEY, name VARCHAR(20) NOT NULL);
+        CREATE TABLE d_str (code VARCHAR(20) PRIMARY KEY, label VARCHAR(20) NOT NULL);
+        CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL, w INT, code VARCHAR(20));
+        CREATE TABLE u (uid INT PRIMARY KEY, tid INT NOT NULL, x INT NOT NULL);
+        """
+        unrestricted_del_re = re.compile(
+            r"DELETE\s+FROM\s+\S+\s+WHERE\s+\S+\.\S+\s*<=\s*0\s*;",
+            re.IGNORECASE,
+        )
+
+        # 1. Join views: no unrestricted DELETE, no single-row derived tables,
+        #    and 2-table unique-PK-lookup drops GROUP BY / __mv_delta.
+        for engine in ("sqlite", "mysql:8.4", "mariadb:10.11"):
+            with self.subTest(engine=engine, shape="join_pk"):
+                plan = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v_j AS SELECT d.name, SUM(t.v) AS s, COUNT(*) AS c "
+                    "FROM t JOIN d ON t.g = d.g GROUP BY d.name;",
+                    dialect=engine,
+                    ignore_limitations=True,
+                )
+                all_trigs = "\n".join(plan.trigger_ddls)
+                self.assertIsNone(unrestricted_del_re.search(all_trigs), all_trigs)
+                self.assertNotIn("(SELECT NEW.", all_trigs)
+                self.assertNotIn("(SELECT OLD.", all_trigs)
+                self.assertNotIn("FROM DUAL", all_trigs)
+                t_trigs = [d for d in plan.trigger_ddls if "__t_" in d]
+                self.assertTrue(t_trigs)
+                for td in t_trigs:
+                    self.assertNotIn("GROUP BY", td, td)
+                    self.assertNotIn("__mv_delta", td, td)
+                d_ad = next(d for d in plan.trigger_ddls if "__d_ad" in d)
+                self.assertIn("OLD.name", d_ad)
+
+            # Non-integer VARCHAR PK joined to INT must NOT assume unique 1-row
+            # match on MySQL/MariaDB (e.g. '01' = 1 and '1' = 1).
+            with self.subTest(engine=engine, shape="join_varchar_pk_keeps_groupby"):
+                plan_str = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v_js AS SELECT d_str.label, COUNT(*) AS c "
+                    "FROM t JOIN d_str ON t.g = d_str.code GROUP BY d_str.label;",
+                    dialect=engine,
+                    ignore_limitations=True,
+                )
+                all_str = "\n".join(plan_str.trigger_ddls)
+                self.assertIsNone(unrestricted_del_re.search(all_str), all_str)
+                self.assertNotIn("(SELECT NEW.", all_str)
+                t_ai = next(d for d in plan_str.trigger_ddls if "__t_ai" in d)
+                self.assertIn("GROUP BY", t_ai)
+
+            # 3-table join and composite-PK join: inlined, key-restricted delete.
+            with self.subTest(engine=engine, shape="join_3t_and_composite"):
+                p3 = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v_j3 AS SELECT d.name, t.w, COUNT(*) AS c "
+                    "FROM d JOIN t ON t.g = d.g JOIN u ON u.tid = t.id "
+                    "GROUP BY d.name, t.w;",
+                    dialect=engine,
+                    ignore_limitations=True,
+                )
+                all_p3 = "\n".join(p3.trigger_ddls)
+                self.assertIsNone(unrestricted_del_re.search(all_p3), all_p3)
+                self.assertNotIn("(SELECT NEW.", all_p3)
+                self.assertNotIn("(SELECT OLD.", all_p3)
+                self.assertNotIn("FROM DUAL", all_p3)
+                self.assertNotIn("CROSS JOIN", all_p3)
+
+            # 2. Single-table agg: reader-derived AVG, NOT NULL count reuse,
+            #    VALUES upsert, and same-group UPDATE fast path.
+            with self.subTest(engine=engine, shape="single_agg"):
+                p_agg = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v_agg AS SELECT g, SUM(v) AS s, COUNT(*) AS c, AVG(v) AS a "
+                    "FROM t GROUP BY g;",
+                    dialect=engine,
+                    ignore_limitations=True,
+                )
+                self.assertNotIn("\n    a ", p_agg.backing_table_ddl)
+                self.assertNotIn("__mv_cnt_", p_agg.backing_table_ddl)
+                self.assertIn("AS a", p_agg.reader_view_ddl)
+                t_ai = next(d for d in p_agg.trigger_ddls if d.startswith("CREATE TRIGGER") and "__t_ai" in d)
+                self.assertIn("VALUES (", t_ai)
+                self.assertNotIn("FROM DUAL", t_ai)
+                self.assertNotIn("WHERE TRUE", t_ai)
+                if engine == "sqlite":
+                    self.assertTrue(any("__t_aus" in d for d in p_agg.trigger_ddls))
+                else:
+                    self.assertEqual(len(p_agg.trigger_ddls), 3)
+                    t_au = next(d for d in p_agg.trigger_ddls if "__t_au" in d)
+                    self.assertIn("ELSE", t_au)
+
+            # Compound AVG expression + HAVING AVG(...): still reader-derived.
+            with self.subTest(engine=engine, shape="compound_having_avg"):
+                p_comp = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v_comp AS SELECT g, AVG(v) * 2 AS a2, COUNT(*) AS c "
+                    "FROM t GROUP BY g HAVING AVG(v) > 5;",
+                    dialect=engine,
+                    ignore_limitations=True,
+                )
+                self.assertNotIn("__mv_elem_", p_comp.backing_table_ddl)
+                self.assertIn("AS a2", p_comp.reader_view_ddl)
+                self.assertIn("WHERE", p_comp.reader_view_ddl.upper())
+
+            # MariaDB projection trigger uses VALUES without FROM DUAL WHERE TRUE.
+            if engine == "mariadb:10.11":
+                p_proj = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v_proj AS SELECT id, g, v FROM t;",
+                    dialect=engine,
+                    ignore_limitations=True,
+                )
+                ai_proj = next(d for d in p_proj.trigger_ddls if "__t_ai" in d)
+                self.assertIn("VALUES (", ai_proj)
+                self.assertNotIn("FROM DUAL", ai_proj)
+                self.assertNotIn("WHERE TRUE", ai_proj)
+
+        # 3. Live SQLite EXPLAIN QUERY PLAN check & adversarial edge cases:
+        #    join empty-group DELETE and refresh_grp_stmts use indexed SEARCH
+        #    (never SCAN); one-row SUM(d.x)/TOTAL(d.x)/FILTER(WHERE d.x > 0)
+        #    never emit phantom rows on unmatched inserts; user index modifiers
+        #    / partial / expression / quoted aliases keep AVG stored; AST
+        #    reader-view substitution never corrupts CAST types, IS NOT NULL,
+        #    or escaped alias quotes; swapped aliases and 4-trigger lifecycle.
+        con = sqlite3.connect(":memory:")
+        try:
+            MaterializedViewManager.configure_sqlite_connection(con)
+            con.executescript(
+                "CREATE TABLE d (g INTEGER PRIMARY KEY, name TEXT NOT NULL, x INTEGER);"
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, v INTEGER NOT NULL);"
+                "INSERT INTO d VALUES (1, 'A', 10);"
+            )
+            mgr = MaterializedViewManager(con, dialect="sqlite")
+            plan_live = mgr.register_view(
+                "CREATE VIEW mv_j_eqp AS SELECT d.name, COUNT(*) AS c "
+                "FROM t JOIN d ON t.g = d.g GROUP BY d.name;"
+            )
+            for tr in plan_live.trigger_ddls:
+                if "_ad" not in tr and "_au" not in tr:
+                    continue
+                body = tr.split("BEGIN", 1)[1].rsplit("END", 1)[0]
+                for stmt in body.split(";"):
+                    st = stmt.strip()
+                    if not st.upper().startswith("DELETE"):
+                        continue
+                    probe = (
+                        st.replace("OLD.g", "1")
+                        .replace("OLD.name", "'x'")
+                        .replace("OLD.id", "1")
+                        .replace("OLD.v", "1")
+                    )
+                    eqp_lines = [r[3] for r in con.execute("EXPLAIN QUERY PLAN " + probe).fetchall()]
+                    eqp_text = "\n".join(eqp_lines)
+                    self.assertNotIn(f"SCAN {plan_live.backing_table_name}", eqp_text)
+                    self.assertIn(f"SEARCH {plan_live.backing_table_name}", eqp_text)
+
+            # One-row SQLite SUM/TOTAL/FILTER referencing joined table `d` must
+            # not turn the enclosing `FROM d` SELECT into an ungrouped aggregate.
+            # Test GROUP BY t.g first so dropping the subquery scope produces a
+            # phantom row caught by assertEqual (killing the curated mutant via
+            # assertion rather than IntegrityError on NOT NULL d.name).
+            mgr.register_view(
+                "CREATE VIEW mv_j_tg AS SELECT t.g, SUM(d.x) AS sx, COUNT(*) AS c "
+                "FROM t JOIN d ON t.g = d.g GROUP BY t.g;"
+            )
+            con.execute("INSERT INTO t VALUES (1, 99, 5);")  # unmatched in d
+            con.commit()
+            self.assertEqual(con.execute("SELECT * FROM mv_j_tg").fetchall(), [])
+            mgr.register_view(
+                "CREATE VIEW mv_j_dsum AS SELECT d.name, SUM(d.x) AS sx, TOTAL(d.x) AS tx, "
+                "SUM(t.v) FILTER (WHERE d.x > 0) AS sf, COUNT(*) AS c "
+                "FROM t JOIN d ON t.g = d.g GROUP BY d.name;"
+            )
+            con.execute("INSERT INTO t VALUES (10, 99, 5);")  # unmatched in d
+            con.commit()
+            self.assertEqual(con.execute("SELECT * FROM mv_j_dsum").fetchall(), [])
+            con.execute("INSERT INTO t VALUES (2, 1, 7);")   # matched in d
+            con.commit()
+            self.assertEqual(
+                con.execute("SELECT * FROM mv_j_dsum ORDER BY name").fetchall(),
+                con.execute(
+                    "SELECT d.name, SUM(d.x), TOTAL(d.x), SUM(t.v) FILTER (WHERE d.x > 0), COUNT(*) "
+                    "FROM t JOIN d ON t.g = d.g GROUP BY d.name ORDER BY d.name"
+                ).fetchall(),
+            )
+
+            # User indexes with DESC, partial WHERE, expression, and quoted
+            # reserved alias must keep AVG stored in the backing table.
+            for vname, vsql in (
+                (
+                    "mv_idx_desc",
+                    "CREATE VIEW mv_idx_desc AS SELECT g, AVG(v) AS a FROM t GROUP BY g;\n"
+                    "CREATE INDEX idx_d ON mv_idx_desc (a DESC);",
+                ),
+                (
+                    "mv_idx_part",
+                    "CREATE VIEW mv_idx_part AS SELECT g, AVG(v) AS a FROM t GROUP BY g;\n"
+                    "CREATE INDEX idx_p ON mv_idx_part (g) WHERE a > 5;",
+                ),
+                (
+                    "mv_idx_expr",
+                    "CREATE VIEW mv_idx_expr AS SELECT g, AVG(v) AS a FROM t GROUP BY g;\n"
+                    "CREATE INDEX idx_e ON mv_idx_expr ((a * 2));",
+                ),
+                (
+                    "mv_idx_quot",
+                    'CREATE VIEW mv_idx_quot AS SELECT g, AVG(v) AS "order" FROM t GROUP BY g;\n'
+                    'CREATE INDEX idx_q ON mv_idx_quot ("order");',
+                ),
+            ):
+                p_idx = mgr.register_view(vsql)
+                self.assertEqual(
+                    con.execute(f"SELECT * FROM {vname} ORDER BY 1").fetchall(),
+                    con.execute("SELECT g, AVG(v) FROM t GROUP BY g ORDER BY 1").fetchall(),
+                    vname,
+                )
+                self.assertTrue(p_idx.index_ddls)
+
+            # AST-based reader substitution must not corrupt CAST types,
+            # IS NOT NULL, or escaped double-quoted aliases.
+            mgr.register_view(
+                'CREATE VIEW mv_ast_real AS SELECT g, AVG(v) AS "real", '
+                'CAST(SUM(v) AS REAL) AS s_real FROM t GROUP BY g;'
+            )
+            mgr.register_view(
+                'CREATE VIEW mv_ast_null AS SELECT g, AVG(v) AS "null", '
+                'SUM(v) AS s FROM t GROUP BY g HAVING SUM(v) IS NOT NULL;'
+            )
+            mgr.register_view(
+                'CREATE VIEW mv_ast_esc AS SELECT g, AVG(v) AS av, '
+                'AVG(v) * 2 AS "my ""av""" FROM t GROUP BY g;'
+            )
+            self.assertEqual(
+                con.execute("SELECT * FROM mv_ast_real ORDER BY g").fetchall(),
+                con.execute("SELECT g, AVG(v), CAST(SUM(v) AS REAL) FROM t GROUP BY g ORDER BY g").fetchall(),
+            )
+            self.assertEqual(
+                con.execute("SELECT * FROM mv_ast_null ORDER BY g").fetchall(),
+                con.execute("SELECT g, AVG(v), SUM(v) FROM t GROUP BY g HAVING SUM(v) IS NOT NULL ORDER BY g").fetchall(),
+            )
+            self.assertEqual(
+                con.execute("SELECT * FROM mv_ast_esc ORDER BY g").fetchall(),
+                con.execute("SELECT g, AVG(v), AVG(v) * 2 FROM t GROUP BY g ORDER BY g").fetchall(),
+            )
+
+            # Swapped table/alias names (`FROM t AS d JOIN d AS t`).
+            mgr.register_view(
+                "CREATE VIEW mv_swap_al AS SELECT t.name, SUM(d.v) AS sv, COUNT(*) AS c "
+                "FROM t AS d JOIN d AS t ON d.g = t.g GROUP BY t.name;"
+            )
+            self.assertEqual(
+                con.execute("SELECT * FROM mv_swap_al ORDER BY name").fetchall(),
+                con.execute(
+                    "SELECT t.name, SUM(d.v), COUNT(*) FROM t AS d JOIN d AS t ON d.g = t.g GROUP BY t.name ORDER BY t.name"
+                ).fetchall(),
+            )
+
+            # 4-trigger SQLite lifecycle (register, bulk_changes, repair_view, drop_view).
+            p_life = mgr.register_view(
+                "CREATE VIEW mv_life AS SELECT g, SUM(v) AS s, COUNT(*) AS c, AVG(v) AS a FROM t GROUP BY g;"
+            )
+            self.assertTrue(any("_aus" in tn for tn in p_life.trigger_names))
+            with mgr.bulk_changes(["mv_life"]):
+                con.execute("INSERT INTO t VALUES (3, 1, 13);")
+            mgr.repair_view("mv_life")
+            self.assertEqual(
+                con.execute("SELECT g, s, c, a FROM mv_life ORDER BY g").fetchall(),
+                con.execute("SELECT g, SUM(v), COUNT(*), AVG(v) FROM t GROUP BY g ORDER BY g").fetchall(),
+            )
+            mgr.drop_view("mv_life")
+            leftover = con.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE '%mv_life%'"
+            ).fetchall()
+            self.assertEqual(leftover, [])
+        finally:
+            con.close()
+
 
 if __name__ == "__main__":
     unittest.main()

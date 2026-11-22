@@ -40,10 +40,12 @@ from ..sql_frontend import (
     _extract_verbatim_cte_or_subquery_sql,
     _find_top_level_token,
     _is_simple_column_expr,
+    _is_word_or_ident_token,
     _parse_single_agg_expr,
     _sanitize_ident,
     _split_top_level,
     _sqlite_type_affinity,
+    _tokenize_sql,
     _unquote_ident,
     _unwrap_outer_parens,
     build_create_view_sql,
@@ -683,6 +685,48 @@ class Tier1SingleMixin(MixinHost):
         uniq = list(dict.fromkeys(exact_conds))
         return f"{q_dirty} = CASE WHEN {' AND '.join(uniq)} THEN {mv_table}.{q_dirty} ELSE 1 END"
 
+    def _is_reader_derived_avg_item(self, item: SelectItem) -> bool:
+        """True when an AVG column is computed in the reader view from maintained
+        SUM/COUNT columns instead of being stored and updated on every row."""
+        return (
+            item.is_aggregate
+            and item.agg_func == AggFunc.AVG
+            and item.alias.lower() in getattr(self, "_reader_derived_avg_aliases", ())
+        )
+
+    def _replace_reader_col_refs(
+        self, expr: str, replacements: Dict[str, str], *, preserve_alias: bool = False
+    ) -> str:
+        """Replace unqualified column references in a reader-view AST expression.
+
+        Operates on the parsed SQLGlot AST (`exp.Column` with no table qualifier)
+        so SQL type keywords (e.g. `CAST(... AS REAL)`), `NULL` literals, and
+        escaped double-quoted aliases are never corrupted.
+        """
+        if not expr or not replacements:
+            return expr
+        sg_d = _sqlglot_dialect(self.dialect)
+        parsed_reps: Dict[str, sqlglot_exp.Expr] = {}
+        try:
+            for k, v in replacements.items():
+                parsed_reps[k] = parse_sql_ast(v, dialect=self.dialect)
+            root = parse_sql_ast(expr, dialect=self.dialect)
+        except Exception:
+            return expr
+
+        def _xform(node: sqlglot_exp.Expr) -> sqlglot_exp.Expr:
+            if isinstance(node, sqlglot_exp.Column) and not node.table:
+                low = (node.name or "").lower()
+                if low in parsed_reps:
+                    return parsed_reps[low].copy()
+            return node
+
+        if preserve_alias and isinstance(root, sqlglot_exp.Alias):
+            new_this = root.this.transform(_xform)
+            new_root = sqlglot_exp.Alias(this=new_this, alias=root.args.get("alias"))
+            return new_root.sql(dialect=sg_d)
+        return root.transform(_xform).sql(dialect=sg_d)
+
     def _sqlite_recompute_dirty_stmt(
         self,
         mv_table: str,
@@ -707,6 +751,8 @@ class Tier1SingleMixin(MixinHost):
         seen: Set[str] = set()
         for item in self._working_select_items:
             if not item.is_aggregate or item.is_distinct:
+                continue
+            if self._is_reader_derived_avg_item(item):
                 continue
             ekey = expr_key_fn(item)
             if ekey not in acnt_map or item.agg_func not in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG):
@@ -869,6 +915,59 @@ class Tier1SingleMixin(MixinHost):
                 group_mv_cols.append(mc)
         indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
 
+        backing_col_map = {
+            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            for u_col, expr_s in self._compound_reader_exprs.items()
+            if expr_s != u_col and "__mv_elem_" in expr_s
+        }
+        backing_col_map_lower = {k.lower(): v for k, v in backing_col_map.items()}
+
+        def _extract_ast_col_names_lower(sql_frag: str) -> Set[str]:
+            found: Set[str] = set()
+            if not sql_frag or not sql_frag.strip():
+                return found
+            try:
+                ast_node = parse_sql_ast(sql_frag, dialect=self.dialect)
+                for col_node in ast_node.find_all(sqlglot_exp.Column):
+                    if col_node.name:
+                        found.add(col_node.name.lower())
+            except Exception:
+                try:
+                    for tk in _tokenize_sql(sql_frag, read=_sqlglot_dialect(self.dialect)):
+                        if _is_word_or_ident_token(tk):
+                            found.add(_unquote_ident(tk.text, dialect=self.dialect).lower())
+                except Exception:
+                    pass
+            return found
+
+        user_idx_cols_lower: Set[str] = set()
+        for idx_spec in self.user_indexes:
+            idx_frags: List[str] = list(idx_spec.columns)
+            if idx_spec.where_clause:
+                idx_frags.append(idx_spec.where_clause)
+            for frag in idx_frags:
+                raw_unq = _unquote_ident(frag.strip(), dialect=self.dialect).lower()
+                refs = _extract_ast_col_names_lower(frag)
+                refs.add(raw_unq)
+                for ref in list(refs):
+                    user_idx_cols_lower.add(ref)
+                    mapped = backing_col_map_lower.get(ref)
+                    if mapped:
+                        user_idx_cols_lower.update(_extract_ast_col_names_lower(mapped))
+
+        self._reader_derived_avg_aliases: Set[str] = set()
+        if self.dialect in (Dialect.SQLITE, Dialect.MYSQL) and self._alg_mode == "single":
+            for item in work_items:
+                if (
+                    item.is_aggregate
+                    and item.agg_func == AggFunc.AVG
+                    and not item.is_distinct
+                    and not self._pgmy_native_recompute_item(item)
+                    and not self._requires_native_avg_recompute(item)
+                    and item.alias.lower() not in user_idx_cols_lower
+                ):
+                    self._reader_derived_avg_aliases.add(item.alias.lower())
+
         for item in work_items:
             if not item.is_aggregate:
                 if self.dialect == Dialect.SQLITE:
@@ -884,6 +983,10 @@ class Tier1SingleMixin(MixinHost):
                         dt = "VARCHAR(255)"
                 nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
                 col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
+            elif self._is_reader_derived_avg_item(item):
+                # Computed in the reader view from the maintained SUM/COUNT
+                # columns instead of stored and updated on every row.
+                continue
             else:
                 storage_type = self._infer_expr_storage_type(item)
                 if self.dialect == Dialect.MYSQL and storage_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
@@ -921,10 +1024,23 @@ class Tier1SingleMixin(MixinHost):
                 if item.agg_func == AggFunc.COUNT_STAR and item.filter_where:
                     col_nonnull_count_map[ekey] = self._q(item.alias)
                 elif ekey not in col_nonnull_count_map:
-                    aux_idx += 1
-                    cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
-                    col_nonnull_count_map[ekey] = cnt_col
-                    col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
+                    # For an unfiltered, non-distinct NOT NULL base column on a
+                    # single-table view, COUNT(col) == COUNT(*): reuse the
+                    # backing row-count column instead of maintaining a duplicate.
+                    if (
+                        self._alg_mode == "single"
+                        and not item.filter_where
+                        and not item.is_distinct
+                        and item.arg_expr
+                        and self._is_simple_col_ref(item.arg_expr)
+                        and self._col_def(item.arg_expr).not_null
+                    ):
+                        col_nonnull_count_map[ekey] = row_count_col
+                    else:
+                        aux_idx += 1
+                        cnt_col = f"__mv_cnt_{safe_id}_{aux_idx}"
+                        col_nonnull_count_map[ekey] = cnt_col
+                        col_defs_sql.append(f"{cnt_col} {self._int_type()} NOT NULL DEFAULT 0")
 
             # Natively recomputed (PostgreSQL/MySQL order-sensitive) AVG and
             # VAR/STDDEV need no running sums; folding them would only risk
@@ -1028,11 +1144,6 @@ class Tier1SingleMixin(MixinHost):
             )
             aux_index_specs.append((aux_tbl, rep_item.alias, list(aux_pk), bool(grp_exprs and not has_nullable_grp)))
 
-        backing_col_map = {
-            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
-            for u_col, expr_s in self._compound_reader_exprs.items()
-            if expr_s != u_col and "__mv_elem_" in expr_s
-        }
         can_pg15_unique_nnd = (
             bool(grp_exprs)
             and has_nullable_grp
@@ -1072,16 +1183,48 @@ class Tier1SingleMixin(MixinHost):
             )
             index_names.append(dirty_idx)
 
-        reader_select_override = [
-            self._compound_reader_exprs.get(u_col, u_col) for u_col in user_columns
-        ]
+        derived_avg_reader_map: Dict[str, str] = {}
+        for item in work_items:
+            if not self._is_reader_derived_avg_item(item):
+                continue
+            ekey = _expr_key(item)
+            q_cnt = self._q(col_nonnull_count_map[ekey])
+            q_sum = self._q(col_sum_map[ekey])
+            derived = self._avg_from_sum_count_sql(item, q_sum, q_cnt)
+            derived_avg_reader_map[item.alias.lower()] = (
+                f"(CASE WHEN {q_cnt} = 0 THEN NULL ELSE {derived} END)"
+            )
+
+        reader_select_override: List[str] = []
+        for u_col in user_columns:
+            comp_expr = self._compound_reader_exprs.get(u_col)
+            if comp_expr is not None and comp_expr.strip().lower() != u_col.strip().lower():
+                expr_s = (
+                    self._replace_reader_col_refs(
+                        comp_expr, derived_avg_reader_map, preserve_alias=True
+                    )
+                    if derived_avg_reader_map
+                    else comp_expr
+                )
+                reader_select_override.append(expr_s)
+            elif u_col.lower() in derived_avg_reader_map:
+                reader_select_override.append(
+                    f"{derived_avg_reader_map[u_col.lower()]} AS {self._q(u_col)}"
+                )
+            else:
+                reader_select_override.append(u_col)
+        reader_having_filter = (
+            self._replace_reader_col_refs(self._rewritten_having_clause, derived_avg_reader_map)
+            if self._rewritten_having_clause and derived_avg_reader_map
+            else self._rewritten_having_clause
+        )
         reader_view_ddl, ro_trigs, ro_trig_names, ro_fn_names = (
             self._build_readonly_view_and_triggers(
                 view_name,
                 mv_table,
                 user_columns,
                 select_exprs_override=reader_select_override,
-                extra_where_filter=self._rewritten_having_clause,
+                extra_where_filter=reader_having_filter,
             )
         )
 
@@ -1291,6 +1434,8 @@ class Tier1SingleMixin(MixinHost):
                 select_exprs.append(g_expr)
 
         for item in work_items:
+            if self._is_reader_derived_avg_item(item):
+                continue
             target_cols.append(item.alias)
             if not item.is_aggregate:
                 select_exprs.append(self._rewrite_expr_for_record(item.raw_expr, None))
@@ -1647,7 +1792,7 @@ class Tier1SingleMixin(MixinHost):
             )
 
         for item in work_items:
-            if not item.is_aggregate:
+            if not item.is_aggregate or self._is_reader_derived_avg_item(item):
                 continue
             c = self._q(item.alias)
             updated.add(c)
@@ -2065,6 +2210,8 @@ class Tier1SingleMixin(MixinHost):
                 insert_vals.append(self._rewrite_expr_for_record(g_expr, record_prefix))
 
         for item in work_items:
+            if self._is_reader_derived_avg_item(item):
+                continue
             col_alias = self._q(item.alias)
             insert_cols.append(col_alias)
             if not item.is_aggregate:
@@ -2387,8 +2534,7 @@ class Tier1SingleMixin(MixinHost):
         if self.dialect == Dialect.MYSQL:
             stmts.append(
                 f"INSERT INTO {mv_table} ({', '.join(q_insert_cols)})\n"
-                f"    SELECT {', '.join(insert_vals)}{from_dual}\n"
-                f"    WHERE TRUE\n"
+                f"    VALUES ({', '.join(insert_vals)})\n"
                 f"    ON DUPLICATE KEY UPDATE\n"
                 f"        {', '.join(ordered_updates)};"
             )
@@ -2504,7 +2650,7 @@ class Tier1SingleMixin(MixinHost):
         updated_cols: Set[str] = set()
 
         for item in work_items:
-            if not item.is_aggregate:
+            if not item.is_aggregate or self._is_reader_derived_avg_item(item):
                 continue
             col_alias = self._q(item.alias)
             updated_cols.add(col_alias)
@@ -2832,6 +2978,255 @@ class Tier1SingleMixin(MixinHost):
         )
         return self._pg_aggregate_bodies(spec, [source], base_t=self.view.base_table)
 
+    def _build_same_group_update_plan(
+        self,
+        mv_table: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+        wm_pk_col: Optional[str],
+        recompute_new: Optional[str],
+    ) -> Tuple[Optional[str], Optional[List[str]]]:
+        """Build a single-statement in-place UPDATE for same-group UPDATEs on
+        SQLite and MySQL/MariaDB pure algebraic single-table grouped views.
+
+        Avoids the 3-statement retract + upsert + empty-group delete sequence
+        when a row stays in its existing group (e.g. ``UPDATE t SET v = v + 1``).
+        """
+        if (
+            self.dialect not in (Dialect.SQLITE, Dialect.MYSQL)
+            or self._alg_mode != "single"
+            or not self._effective_group_by_exprs
+            or distinct_aux_tables
+            or self._pgmy_native_recompute_items()
+        ):
+            return None, None
+        if self.dialect == Dialect.SQLITE and self.view.where_clause:
+            return None, None
+
+        work_items = self._working_select_items
+        for it in work_items:
+            if not it.is_aggregate:
+                continue
+            if it.is_distinct:
+                return None, None
+            if it.agg_func not in (
+                AggFunc.COUNT_STAR,
+                AggFunc.COUNT_COL,
+                AggFunc.SUM,
+                AggFunc.TOTAL,
+                AggFunc.AVG,
+            ):
+                return None, None
+            if it.agg_func == AggFunc.AVG and not self._is_reader_derived_avg_item(it):
+                return None, None
+
+        grp_exprs = self._effective_group_by_exprs
+        same_cond_parts: List[str] = []
+        seen_expr_low: Set[str] = set()
+        for g_expr in grp_exprs:
+            g_low = g_expr.strip().lower()
+            if g_low in seen_expr_low:
+                continue
+            seen_expr_low.add(g_low)
+            is_null = not (self._is_simple_col_ref(g_expr) and self._col_def(g_expr).not_null)
+            same_cond_parts.append(
+                self._identical_row_values_sql(
+                    self._rewrite_expr_for_record(g_expr, "OLD"),
+                    self._rewrite_expr_for_record(g_expr, "NEW"),
+                    is_null,
+                )
+            )
+        for it in work_items:
+            if it.is_aggregate:
+                continue
+            r_low = it.raw_expr.strip().lower()
+            if r_low in seen_expr_low:
+                continue
+            seen_expr_low.add(r_low)
+            is_null = not (self._is_simple_col_ref(it.raw_expr) and self._col_def(it.raw_expr).not_null)
+            same_cond_parts.append(
+                self._identical_row_values_sql(
+                    self._rewrite_expr_for_record(it.raw_expr, "OLD"),
+                    self._rewrite_expr_for_record(it.raw_expr, "NEW"),
+                    is_null,
+                )
+            )
+        if self.dialect == Dialect.SQLITE and wm_pk_col:
+            q_wm_pk = self._quote_pk_range_col(wm_pk_col)
+            same_cond_parts.append(f"OLD.{q_wm_pk} IS NEW.{q_wm_pk}")
+        same_cond = " AND ".join(same_cond_parts)
+
+        acnt_map = self._sqlite_acnt_map()
+        same_fold_conds: List[str] = []
+        q_row_count = self._q(row_count_col)
+        ekey_to_item: Dict[str, SelectItem] = {
+            expr_key_fn(it): it for it in work_items if it.is_aggregate
+        }
+
+        def _is_not_null_unfiltered(item: SelectItem) -> bool:
+            return bool(
+                not item.filter_where
+                and item.arg_expr
+                and self._is_simple_col_ref(item.arg_expr)
+                and self._col_def(item.arg_expr).not_null
+            )
+
+        def _same_sum_fold(
+            item: SelectItem, col_alias: str, cnt_col: str, *, is_real_accum: bool
+        ) -> str:
+            q_col = self._q(col_alias)
+            q_cnt = self._q(cnt_col)
+            old_v = self._effective_agg_value_expr(item, record_prefix="OLD")
+            new_v = self._effective_agg_value_expr(item, record_prefix="NEW")
+            is_nn = _is_not_null_unfiltered(item)
+            if is_nn:
+                step1 = f"({mv_table}.{q_col} - ({old_v}))"
+                raw_fold = f"({step1} + ({new_v}))"
+            else:
+                old_inc = f"(CASE WHEN ({old_v}) IS NOT NULL THEN 1 ELSE 0 END)"
+                new_inc = f"(CASE WHEN ({new_v}) IS NOT NULL THEN 1 ELSE 0 END)"
+                new_cnt = f"({mv_table}.{q_cnt} - {old_inc} + {new_inc})"
+                step1 = f"(COALESCE({mv_table}.{q_col}, 0) - COALESCE(({old_v}), 0))"
+                raw_fold = (
+                    f"(CASE WHEN {new_cnt} <= 0 THEN NULL "
+                    f"ELSE ({step1} + COALESCE(({new_v}), 0)) END)"
+                )
+            ekey = expr_key_fn(item)
+            if ekey not in acnt_map:
+                return raw_fold
+            q_acnt = self._q(acnt_map[ekey])
+            if is_real_accum:
+                exact_c = (
+                    f"({mv_table}.{q_acnt} = 0 "
+                    f"AND typeof({old_v}) IN ('integer', 'null') "
+                    f"AND typeof({new_v}) IN ('integer', 'null') "
+                    f"AND typeof({mv_table}.{q_col}) IN ('real', 'null') "
+                    f"AND ABS(1.0 * COALESCE({mv_table}.{q_col}, 0)) "
+                    f"+ ABS(1.0 * COALESCE({old_v}, 0)) "
+                    f"+ ABS(1.0 * COALESCE({new_v}, 0)) < {self._SQLITE_EXACT_FLOAT_LIMIT})"
+                )
+            else:
+                exact_c = (
+                    f"({mv_table}.{q_acnt} = 0 "
+                    f"AND typeof({old_v}) IN ('integer', 'null') "
+                    f"AND typeof({new_v}) IN ('integer', 'null') "
+                    f"AND typeof({mv_table}.{q_col}) IN ('integer', 'null') "
+                    f"AND typeof({step1}) IN ('integer', 'null') "
+                    f"AND typeof({raw_fold}) IN ('integer', 'null'))"
+                )
+            same_fold_conds.append(exact_c)
+            return f"(CASE WHEN {exact_c} THEN {raw_fold} ELSE {mv_table}.{q_col} END)"
+
+        sum_assignments: List[str] = []
+        cnt_assignments: List[str] = []
+        updated_cols: Set[str] = {q_row_count}
+
+        for item in work_items:
+            if not item.is_aggregate or self._is_reader_derived_avg_item(item):
+                continue
+            q_col = self._q(item.alias)
+            if q_col in updated_cols:
+                continue
+            ekey = expr_key_fn(item)
+            if item.agg_func == AggFunc.COUNT_STAR and not item.filter_where:
+                updated_cols.add(q_col)
+                continue
+            if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
+                updated_cols.add(q_col)
+                if _is_not_null_unfiltered(item):
+                    continue
+                old_v = self._effective_agg_value_expr(item, record_prefix="OLD")
+                new_v = self._effective_agg_value_expr(item, record_prefix="NEW")
+                old_inc = f"(CASE WHEN ({old_v}) IS NOT NULL THEN 1 ELSE 0 END)"
+                new_inc = f"(CASE WHEN ({new_v}) IS NOT NULL THEN 1 ELSE 0 END)"
+                cnt_assignments.append(f"{q_col} = {mv_table}.{q_col} - {old_inc} + {new_inc}")
+            elif item.agg_func == AggFunc.SUM:
+                updated_cols.add(q_col)
+                cnt_c = col_nonnull_count_map[ekey]
+                sum_assignments.append(
+                    f"{q_col} = {_same_sum_fold(item, item.alias, cnt_c, is_real_accum=False)}"
+                )
+            elif item.agg_func == AggFunc.TOTAL:
+                updated_cols.add(q_col)
+                old_v = self._effective_agg_value_expr(item, record_prefix="OLD")
+                new_v = self._effective_agg_value_expr(item, record_prefix="NEW")
+                old_f = f"(CASE WHEN ({old_v}) IS NULL THEN 0.0 ELSE 1.0 * ({old_v}) END)"
+                new_f = f"(CASE WHEN ({new_v}) IS NULL THEN 0.0 ELSE 1.0 * ({new_v}) END)"
+                raw_tot = f"({mv_table}.{q_col} - {old_f} + {new_f})"
+                if ekey in acnt_map:
+                    q_acnt = self._q(acnt_map[ekey])
+                    exact_c = (
+                        f"({mv_table}.{q_acnt} = 0 "
+                        f"AND typeof({old_v}) IN ('integer', 'null') "
+                        f"AND typeof({new_v}) IN ('integer', 'null') "
+                        f"AND typeof({mv_table}.{q_col}) = 'real' "
+                        f"AND ABS({mv_table}.{q_col}) + ABS(1.0 * COALESCE({old_v}, 0)) "
+                        f"+ ABS(1.0 * COALESCE({new_v}, 0)) < {self._SQLITE_EXACT_FLOAT_LIMIT})"
+                    )
+                    same_fold_conds.append(exact_c)
+                    sum_assignments.append(
+                        f"{q_col} = (CASE WHEN {exact_c} THEN {raw_tot} ELSE {mv_table}.{q_col} END)"
+                    )
+                else:
+                    sum_assignments.append(f"{q_col} = {raw_tot}")
+
+        for ekey, cnt_col in col_nonnull_count_map.items():
+            q_cnt = self._q(cnt_col)
+            if q_cnt in updated_cols:
+                continue
+            updated_cols.add(q_cnt)
+            it = ekey_to_item[ekey]
+            if _is_not_null_unfiltered(it):
+                continue
+            old_v = self._effective_agg_value_expr(it, record_prefix="OLD")
+            new_v = self._effective_agg_value_expr(it, record_prefix="NEW")
+            old_inc = f"(CASE WHEN ({old_v}) IS NOT NULL THEN 1 ELSE 0 END)"
+            new_inc = f"(CASE WHEN ({new_v}) IS NOT NULL THEN 1 ELSE 0 END)"
+            cnt_assignments.append(f"{q_cnt} = {mv_table}.{q_cnt} - {old_inc} + {new_inc}")
+
+        for ekey, sum_col in col_sum_map.items():
+            q_sum = self._q(sum_col)
+            if q_sum in updated_cols:
+                continue
+            updated_cols.add(q_sum)
+            it = ekey_to_item[ekey]
+            cnt_c = col_nonnull_count_map[ekey]
+            sum_assignments.append(
+                f"{q_sum} = {_same_sum_fold(it, sum_col, cnt_c, is_real_accum=(self.dialect == Dialect.SQLITE))}"
+            )
+
+        for ekey, acnt_col in acnt_map.items():
+            it = ekey_to_item[ekey]
+            q_acnt = self._q(acnt_col)
+            old_a = self._sqlite_is_approx_value_sql(
+                self._effective_agg_value_expr(it, record_prefix="OLD")
+            )
+            new_a = self._sqlite_is_approx_value_sql(
+                self._effective_agg_value_expr(it, record_prefix="NEW")
+            )
+            cnt_assignments.append(f"{q_acnt} = {mv_table}.{q_acnt} - {old_a} + {new_a}")
+        if acnt_map:
+            cnt_assignments.append(self._sqlite_dirty_fold_assignment(mv_table, same_fold_conds))
+
+        # MySQL evaluates SET left-to-right: SUM expressions read mv.cnt before
+        # cnt columns are updated, so sum_assignments must precede cnt_assignments.
+        ordered_same = sum_assignments + cnt_assignments
+        if not ordered_same:
+            return None, None
+
+        grp_pred_new = self._group_match_predicate_tier1(mv_table, "NEW")
+        same_stmts: List[str] = [
+            f"UPDATE {mv_table}\n"
+            f"    SET {', '.join(ordered_same)}\n"
+            f"    WHERE {grp_pred_new};"
+        ]
+        if self.dialect == Dialect.SQLITE and recompute_new:
+            same_stmts.append(recompute_new)
+        return same_cond, same_stmts
+
     def _build_tier1_triggers(
         self,
         view_name: str,
@@ -2934,6 +3329,17 @@ class Tier1SingleMixin(MixinHost):
             where_new = f"({where_new}) AND ({wm_new})" if where_new else wm_new
             where_old = f"({where_old}) AND ({wm_old})" if where_old else wm_old
 
+        same_grp_cond, same_grp_stmts = self._build_same_group_update_plan(
+            mv_table=mv_table,
+            row_count_col=row_count_col,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            distinct_aux_tables=distinct_aux_tables,
+            expr_key_fn=expr_key_fn,
+            wm_pk_col=wm_pk_col,
+            recompute_new=recompute_new,
+        )
+
         trunc_stmts = [
             f"DELETE FROM {aux_tbl};" for aux_tbl, _, _ in distinct_aux_tables.values()
         ] + [f"DELETE FROM {mv_table};"]
@@ -2965,6 +3371,10 @@ class Tier1SingleMixin(MixinHost):
             view_name=view_name,
             base_t=base_t,
             mysql_prelock=mysql_prelock,
+            mysql_same_group_cond=same_grp_cond if self.dialect == Dialect.MYSQL else None,
+            mysql_same_group_stmts=same_grp_stmts if self.dialect == Dialect.MYSQL else None,
+            sqlite_same_group_cond=same_grp_cond if self.dialect == Dialect.SQLITE else None,
+            sqlite_same_group_stmts=same_grp_stmts if self.dialect == Dialect.SQLITE else None,
             ins_stmts=plus_new_stmts,
             del_stmts=minus_old_del_stmts,
             upd_old_stmts=minus_old_upd_stmts,
