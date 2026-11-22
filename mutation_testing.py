@@ -165,8 +165,8 @@ MUTANTS = (
     Mutant(
         name="zset-watermark-new-skips-update-at-inclusive-cursor",
         source_path="matview/maintenance/zset.py",
-        original='                f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"',
-        replacement='                f"AND NEW.{q_pk} >= backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"',
+        original='                f"AND (backfill_cursor_pk IS NULL OR (NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)))"',
+        replacement='                f"AND (backfill_cursor_pk IS NULL OR (NEW.{q_pk} >= backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)))"',
         target_test=(
             "test_p0_backfill_watermark_safety.BackfillWatermarkSafetyTests."
             "test_projection_watermark_updates_exact_inclusive_cursor_row"
@@ -175,11 +175,21 @@ MUTANTS = (
     Mutant(
         name="zset-watermark-old-skips-retraction-at-inclusive-cursor",
         source_path="matview/maintenance/zset.py",
-        original='                f"AND OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"',
-        replacement='                f"AND OLD.{q_pk} >= backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"',
+        original='                f"AND (backfill_cursor_pk IS NULL OR (OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)))"',
+        replacement='                f"AND (backfill_cursor_pk IS NULL OR (OLD.{q_pk} >= backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)))"',
         target_test=(
             "test_p0_backfill_watermark_safety.BackfillWatermarkSafetyTests."
             "test_projection_watermark_deletes_exact_inclusive_cursor_row"
+        ),
+    ),
+    Mutant(
+        name="single-watermark-drops-unclaimed-null-cursor-gate",
+        source_path="matview/maintenance/single.py",
+        original='                f"AND (backfill_cursor_pk IS NULL OR (NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)))"',
+        replacement='                f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"',
+        target_test=(
+            "test_p0_backfill_watermark_safety.BackfillWatermarkSafetyTests."
+            "test_populate_false_gates_writes_until_backfill_claims_and_reports_incomplete"
         ),
     ),
     Mutant(

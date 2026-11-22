@@ -1069,7 +1069,7 @@ class Tier1ZSetMixin(MixinHost):
                 base_where_parts.append(
                     f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
                     f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
-                    f"AND {q_base_t}.{q_wm} > backfill_cursor_pk AND {q_base_t}.{q_wm} <= backfill_max_pk)"
+                    f"AND (backfill_cursor_pk IS NULL OR ({q_base_t}.{q_wm} > backfill_cursor_pk AND {q_base_t}.{q_wm} <= backfill_max_pk)))"
                 )
             and_base_where = f" AND {' AND '.join(base_where_parts)}" if base_where_parts else ""
             upd_del_stmt = (
@@ -1201,12 +1201,12 @@ class Tier1ZSetMixin(MixinHost):
             wm_new = (
                 f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
                 f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
-                f"AND NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)"
+                f"AND (backfill_cursor_pk IS NULL OR (NEW.{q_pk} > backfill_cursor_pk AND NEW.{q_pk} <= backfill_max_pk)))"
             )
             wm_old = (
                 f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
                 f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
-                f"AND OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)"
+                f"AND (backfill_cursor_pk IS NULL OR (OLD.{q_pk} > backfill_cursor_pk AND OLD.{q_pk} <= backfill_max_pk)))"
             )
             where_new = f"({where_new}) AND ({wm_new})" if where_new else wm_new
             where_old = f"({where_old}) AND ({wm_old})" if where_old else wm_old

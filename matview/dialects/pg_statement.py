@@ -691,7 +691,8 @@ class PgStatementMaintenanceMixin(MixinHost):
         return (
             f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
             f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
-            f"AND {record}.{q_pk} > backfill_cursor_pk AND {record}.{q_pk} <= backfill_max_pk)"
+            f"AND (backfill_cursor_pk IS NULL OR ({record}.{q_pk} > backfill_cursor_pk AND {record}.{q_pk} <= backfill_max_pk)) "
+            f"FOR SHARE)"
         )
 
     @staticmethod
