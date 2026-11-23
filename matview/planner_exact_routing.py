@@ -164,6 +164,14 @@ class ExactAggregateRoutingMixin(MixinHost):
             for call in iter_unordered_order_sensitive_calls(node, self._order_keys_cover_every_primary_key):
                 if self._is_float_policy_aggregate(call):
                     continue
+                if call_name(call, sg_d) in _ALGEBRAIC_AGGREGATE_NAMES | _RECOGNIZED_HOLISTIC_NAMES:
+                    # Aggregates the planner already recognizes keep their
+                    # strategy (group-scoped recompute for GROUP_CONCAT /
+                    # STRING_AGG / ARRAY_AGG / json_group_*): this routing
+                    # only places aggregates nothing else handles. Their
+                    # order sensitivity under a group recompute is recorded
+                    # in TODO.md.
+                    continue
                 out.append(call.sql(dialect=sg_d))
         return out
 
