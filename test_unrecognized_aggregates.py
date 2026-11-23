@@ -120,9 +120,9 @@ PG_CASES: List[Case] = [
     _grouped("regr_count", "REGR_COUNT(x, v)", T2),
     _grouped("covar_pop", "COVAR_POP(v, id)", T3),
     _grouped("array_agg_ordered", "ARRAY_AGG(v ORDER BY v, id)", T2),
-    _grouped("array_agg_unordered", "ARRAY_AGG(v)", T3),
+    _grouped("array_agg_unordered", "ARRAY_AGG(v)", T2),  # recognized: keeps the group recompute
     _grouped("string_agg_ordered", "STRING_AGG(s, ',' ORDER BY id)", T2),
-    _grouped("string_agg_unordered", "STRING_AGG(s, ',')", T3),
+    _grouped("string_agg_unordered", "STRING_AGG(s, ',')", T2),  # recognized
     _grouped("xmlagg_ordered", "XMLAGG(XMLELEMENT(NAME e, v) ORDER BY id)", T2),
     _grouped("range_agg", "RANGE_AGG(INT4RANGE(v, v + 2))", T2),
     _grouped("json_arrayagg", "JSON_ARRAYAGG(v ORDER BY id)", T2, min_version=(16,)),
@@ -160,8 +160,8 @@ MY_CASES: List[Case] = [
     # compared in its own view, where the live view's type is BIGINT.
     _grouped("any_value", "ANY_VALUE(v)", T3, engines=("mysql",), standalone=True),
     _grouped("group_concat_ordered", "GROUP_CONCAT(v ORDER BY id)", T2, skip_type_code=("a",)),
-    _grouped("group_concat_unordered", "GROUP_CONCAT(s)", T3, skip_type_code=("a",)),
-    _grouped("group_concat_distinct", "GROUP_CONCAT(DISTINCT v ORDER BY v)", T3, skip_type_code=("a",)),
+    _grouped("group_concat_unordered", "GROUP_CONCAT(s)", T2, skip_type_code=("a",)),  # recognized
+    _grouped("group_concat_distinct", "GROUP_CONCAT(DISTINCT v ORDER BY v)", T2, skip_type_code=("a",)),  # recognized
     Case("with_rollup", "SELECT g, SUM(v) AS sv, COUNT(*) AS n FROM {t} GROUP BY g WITH ROLLUP", T3, engines=("mariadb",)),
     Case(
         "with_rollup_grouping",
@@ -174,9 +174,9 @@ MY_CASES: List[Case] = [
 
 SQLITE_ORDERED_AGG = sqlite3.sqlite_version_info >= (3, 44, 0)
 SQLITE_CASES: List[Case] = [
-    _grouped("json_group_array", "json_group_array(v)", T3),
-    _grouped("json_group_object", "json_group_object(id, v)", T3),
-    _grouped("group_concat_unordered", "group_concat(v, ',')", T3),
+    _grouped("json_group_array", "json_group_array(v)", T2),  # recognized
+    _grouped("json_group_object", "json_group_object(id, v)", T2),  # recognized
+    _grouped("group_concat_unordered", "group_concat(v, ',')", T2),  # recognized
     _grouped("udf_aggregate", "py_sum(v)", T3),
     Case("ungrouped_json_group_array", "SELECT json_group_array(v) AS a FROM {t}", T3),
 ] + (
@@ -628,17 +628,37 @@ class OfflineRoutingTests(unittest.TestCase):
         for order, expected in (("a, b", T2), ("b, a", T2), ("a", T3), ("v", T3), ("v, a, b", T2)):
             plan = generate_materialized_view(
                 parse_table_schema(schema, dialect="postgres"),
-                f"CREATE VIEW mv AS SELECT g, ARRAY_AGG(v ORDER BY {order}) AS a FROM t2 GROUP BY g",
+                f"CREATE VIEW mv AS SELECT g, JSONB_AGG(v ORDER BY {order}) AS a FROM t2 GROUP BY g",
                 dialect="postgres",
             )
             self.assertEqual(plan.strategy, expected, order)
 
+    def test_recognized_holistic_aggregates_keep_the_group_recompute(self) -> None:
+        # The routing only places aggregates nothing else handles: recognized
+        # holistic aggregates keep group_scoped_delta whatever their ORDER BY
+        # (including over a join), never a costlier strategy.
+        cases = [
+            ("postgres", "SELECT g, STRING_AGG(s, ',') AS a FROM t GROUP BY g"),
+            ("postgres", "SELECT g, ARRAY_AGG(v ORDER BY v) AS a FROM t GROUP BY g"),
+            ("mysql", "SELECT g, GROUP_CONCAT(DISTINCT v ORDER BY id) AS a FROM t GROUP BY g"),
+            ("sqlite", "SELECT g, json_group_array(v) AS a FROM t GROUP BY g"),
+        ]
+        for dialect, select in cases:
+            self.assertEqual(self._plan(dialect, select).strategy, T2, (dialect, select))
+        schema = self.SCHEMA + "CREATE TABLE u (id INTEGER PRIMARY KEY, tid INTEGER, w VARCHAR(8));"
+        plan = generate_materialized_view(
+            parse_table_schema(schema, dialect="postgres"),
+            "CREATE VIEW mv AS SELECT t.g, STRING_AGG(u.w, ',' ORDER BY u.w) AS a FROM t JOIN u ON u.tid = t.id GROUP BY t.g",
+            dialect="postgres",
+        )
+        self.assertEqual(plan.strategy, T2)
+
     def test_distinct_ordered_aggregate_is_not_total(self) -> None:
-        plan = self._plan("mysql", "SELECT g, GROUP_CONCAT(DISTINCT v ORDER BY id) AS a FROM t GROUP BY g")
+        plan = self._plan("mysql", "SELECT g, JSON_ARRAYAGG(DISTINCT v) AS a FROM t GROUP BY g")
         self.assertEqual(plan.strategy, T3)
 
     def test_fallback_messages_name_cost_and_remedy(self) -> None:
-        plan = self._plan("postgres", "SELECT g, ARRAY_AGG(v) AS a FROM t GROUP BY g")
+        plan = self._plan("postgres", "SELECT g, JSON_AGG(v) AS a FROM t GROUP BY g")
         msg = plan.diagnostics.fallback_reason
         self.assertTrue(msg.startswith(f"{EXACT_LEAD} {Strategy.FULL_REFRESH.value}. Why: "), msg)
         self.assertIn("Cost: ", msg)
