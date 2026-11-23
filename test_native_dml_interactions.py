@@ -2041,9 +2041,8 @@ def _autocommit(ctx: Ctx) -> None:
 
 @cell("two_phase_commit", AREA_C,
       "Two-phase commit: PREPARE TRANSACTION / COMMIT|ROLLBACK PREPARED; XA START ... XA COMMIT|ROLLBACK",
-      "PostgreSQL needs max_prepared_transactions > 0; the CI service runs with the default 0, so the cell is "
-      "skipped there (verified locally on 18)", local_only=("postgres",),
-      sqlite=NA, postgres=EXACT, mysql=EXACT, mariadb=EXACT)
+      "PostgreSQL needs max_prepared_transactions > 0 (enabled in PostgreSQL 15/18 CI, where the cell fails "
+      "instead of skipping if it is 0; local servers with the default 0 skip this cell)", sqlite=NA, postgres=EXACT, mysql=EXACT, mariadb=EXACT)
 def _two_phase(ctx: Ctx) -> None:
     env = ctx.env
     w = ctx.other_conn()
@@ -2053,6 +2052,8 @@ def _two_phase(ctx: Ctx) -> None:
         n = int(cur.fetchone()[0])
         env.commit()
         if n == 0:
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                pytest.fail("PostgreSQL CI must enable max_prepared_transactions for the two_phase_commit cell")
             pytest.skip("max_prepared_transactions = 0 on this server")
         admin = ctx.other_conn()
         admin.autocommit = True

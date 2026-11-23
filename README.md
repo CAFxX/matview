@@ -438,8 +438,9 @@ Engines: the PR-gate jobs run the cells against PostgreSQL 15 and 18, MySQL
 8.4 and 9.7, MariaDB 10.11, 11.8 and 12.3 and SQLite through the
 standard-library `sqlite3` driver. The SQLite compatibility drivers (APSW,
 SQLCipher, libSQL) do not run this module. PostgreSQL two-phase commit needs
-`max_prepared_transactions > 0`, which the CI service does not set, so that
-cell is skipped there (verified on PostgreSQL 18 locally).
+`max_prepared_transactions > 0`: the PostgreSQL 15 and 18 CI containers set it
+(`-c max_prepared_transactions=10`) and the cell fails there if it is 0, while
+a local server with the default 0 skips the cell.
 
 <!-- BEGIN GENERATED: dml-matrix -->
 | Cell | Interaction | SQLite | PostgreSQL | MySQL | MariaDB | Notes |
@@ -510,7 +511,7 @@ cell is skipped there (verified on PostgreSQL 18 locally).
 | `savepoints_with_upserts` | Upserts and REPLACE inside nested savepoints, ROLLBACK TO and RELEASE | exact | exact | exact | exact | twin |
 | `deferred_constraints` | Deferred UNIQUE/FK constraints failing at COMMIT or at SET CONSTRAINTS ... IMMEDIATE | exact | exact | n/a | n/a | SQLite: a failed COMMIT keeps the transaction open (rolled back by the test); MySQL/MariaDB have no deferred constraints |
 | `autocommit_writers` | Writes from an autocommit connection (each statement its own transaction), including a failing statement | exact | exact | exact | exact |  |
-| `two_phase_commit` | Two-phase commit: PREPARE TRANSACTION / COMMIT/ROLLBACK PREPARED; XA START ... XA COMMIT/ROLLBACK | n/a | exact (verified locally, not in CI) | exact | exact | PostgreSQL needs max_prepared_transactions > 0; the CI service runs with the default 0, so the cell is skipped there (verified locally on 18) |
+| `two_phase_commit` | Two-phase commit: PREPARE TRANSACTION / COMMIT/ROLLBACK PREPARED; XA START ... XA COMMIT/ROLLBACK | n/a | exact | exact | exact | PostgreSQL needs max_prepared_transactions > 0 (enabled in PostgreSQL 15/18 CI, where the cell fails instead of skipping if it is 0; local servers with the default 0 skip this cell) |
 | `statement_fails_midway` | An upsert failing on its third row (CHECK) inside a multi-statement transaction, then more statements | exact | exact | exact | exact | twin; PostgreSQL continues after ROLLBACK TO SAVEPOINT, the others after the statement-level rollback |
 
 Counts per product (exact, limited, refused, WRONG, n/a): sqlite 34/7/1/2/21; postgres 38/2/2/2/21; mysql 31/3/5/0/26; mariadb 31/4/5/1/24.
