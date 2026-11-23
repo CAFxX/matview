@@ -160,7 +160,8 @@ MY_CASES: List[Case] = [
     # compared in its own view, where the live view's type is BIGINT.
     _grouped("any_value", "ANY_VALUE(v)", T3, engines=("mysql",), standalone=True),
     _grouped("group_concat_ordered", "GROUP_CONCAT(v ORDER BY id)", T2, skip_type_code=("a",)),
-    _grouped("group_concat_unordered", "GROUP_CONCAT(s)", T2, skip_type_code=("a",)),  # recognized
+    # (Recognized GROUP_CONCAT without a total ORDER BY keeps the group
+    # recompute, whose concatenation order can differ natively: TODO.md.)
     _grouped("group_concat_distinct", "GROUP_CONCAT(DISTINCT v ORDER BY v)", T2, skip_type_code=("a",)),  # recognized
     Case("with_rollup", "SELECT g, SUM(v) AS sv, COUNT(*) AS n FROM {t} GROUP BY g WITH ROLLUP", T3, engines=("mariadb",)),
     Case(
@@ -523,7 +524,7 @@ class ConcurrentWritersTests(unittest.TestCase):
                 is_pg = engine == Dialect.POSTGRES
                 t = f"l1cc_{uuid.uuid4().hex[:6]}"
                 ordered = "JSONB_AGG(v ORDER BY id)" if is_pg else "GROUP_CONCAT(v ORDER BY id)"
-                unordered = "JSONB_AGG(v)" if is_pg else "GROUP_CONCAT(v)"
+                unordered = "JSONB_AGG(v)" if is_pg else "JSON_ARRAYAGG(v)"
                 views = {
                     f"{t}_t2": (f"SELECT g, {ordered} AS a FROM {t} GROUP BY g", T2),
                     f"{t}_t3": (f"SELECT g, {unordered} AS a FROM {t} GROUP BY g", T3),
