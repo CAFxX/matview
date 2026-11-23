@@ -448,6 +448,7 @@ cell is skipped there (verified on PostgreSQL 18 locally).
 | `user_before_trigger_skips_row` | User BEFORE row trigger that suppresses some rows (RETURN NULL / RAISE(IGNORE)) | exact | exact | n/a | n/a | MySQL/MariaDB triggers cannot skip a row |
 | `sqlite_benign_user_trigger_after_registration` | A user AFTER trigger created after registration that only writes a table no view reads | exact | n/a | n/a | n/a | fires before the maintenance trigger, which it cannot disturb; check_schema_drift() stays ok |
 | `user_after_trigger_writes_same_table` | User AFTER row trigger that updates the same row and inserts/deletes other rows of the source | exact | exact | n/a | n/a | SQLite: Stage 4's same-group in-place UPDATE trigger avoids transiently deleting the group when a newer user AFTER INSERT trigger updates a non-group column on an existing group (still wrong if the user trigger changes a group key or updates an aggregated column of a brand-new group before INSERT maintenance runs — same-row updates before outer AFTER STATEMENT also affect PostgreSQL); check_schema_drift() therefore still reports triggers_out_of_order for such a newer self-writing trigger and repair_view() puts the maintenance triggers first. MySQL/MariaDB forbid a trigger writing its own table (error 1442) |
+| `user_after_trigger_updates_aggregated_column` | User AFTER row trigger that updates an aggregated column of the row the statement just inserted | limited | **WRONG** | n/a | n/a | PostgreSQL: the row trigger's UPDATE is maintained (its own statement triggers) before the INSERT's statement-level maintenance, which then adds the row from its transition table; the view is silently wrong and nothing reports it. SQLite: same divergence while the user trigger fires first; check_schema_drift() reports triggers_out_of_order and repair_view() puts the maintenance triggers first; TODO: PostgreSQL: AFTER ROW User Trigger Writing the Aggregated Column of the Just-Written Row (no detection) |
 | `sqlite_recursive_user_trigger` | A user trigger that re-fires itself (unguarded self-UPDATE) | limited | n/a | n/a | n/a | configure_sqlite_connection() turns recursive_triggers ON, so such a trigger recurses until SQLite's depth limit and the statement fails (it ran once with the SQLite default); the view stays exact either way; PostgreSQL user triggers recurse regardless (guard with pg_trigger_depth()) |
 | `user_trigger_raises` | A user trigger raising an error mid-statement (RAISE EXCEPTION / SIGNAL / RAISE(ABORT/FAIL/ROLLBACK)) | exact | exact | exact | exact | rollback atomicity of the statement (SQLite FAIL keeps the earlier rows, ROLLBACK ends the transaction) |
 | `sqlite_user_trigger_raise_fail` | A user AFTER trigger created after registration raising RAISE(FAIL) on the second row of a statement | limited | n/a | n/a | n/a | FAIL keeps the rows already written, including the failing row itself; while the newer user trigger fires first the failing row's maintenance never runs. check_schema_drift() reports triggers_out_of_order (also for RAISE(IGNORE)) and repair_view() puts the maintenance triggers first |
@@ -482,7 +483,7 @@ cell is skipped there (verified on PostgreSQL 18 locally).
 | `two_phase_commit` | Two-phase commit: PREPARE TRANSACTION / COMMIT/ROLLBACK PREPARED; XA START ... XA COMMIT/ROLLBACK | n/a | exact (verified locally, not in CI) | exact | exact | PostgreSQL needs max_prepared_transactions > 0; the CI service runs with the default 0, so the cell is skipped there (verified locally on 18) |
 | `statement_fails_midway` | An upsert failing on its third row (CHECK) inside a multi-statement transaction, then more statements | exact | exact | exact | exact | twin; PostgreSQL continues after ROLLBACK TO SAVEPOINT, the others after the statement-level rollback |
 
-Counts per product (exact, limited, refused, WRONG, n/a): sqlite 33/6/2/2/21; postgres 37/2/3/1/21; mysql 30/3/6/0/25; mariadb 30/4/6/1/23.
+Counts per product (exact, limited, refused, WRONG, n/a): sqlite 33/7/2/2/21; postgres 37/2/3/2/21; mysql 30/3/6/0/26; mariadb 30/4/6/1/24.
 <!-- END GENERATED: dml-matrix -->
 
 Not covered by the matrix: a real logical-replication subscription (its apply
@@ -761,13 +762,13 @@ protocol at all: run it with writes to the source tables stopped.
   fires before the maintenance trigger, because SQLite fires the newest trigger
   first) or `triggers_orphaned` when maintenance triggers are gone, disabled,
   preceded or on a detached partition (`repair_view()` rebuilds them).
-  PostgreSQL and MySQL/MariaDB also report `triggers_out_of_order` for a
-  multi-source view when a user trigger on one source fires before the
-  maintenance trigger and writes another source; there `repair_view()` only
-  repopulates and does not reorder triggers: on MySQL/MariaDB re-register the
-  view (`drop_view()` then `register_view()`, which places its triggers
-  first), on PostgreSQL rewrite the user trigger as a statement-level trigger
-  named after the maintenance triggers.
+  MySQL/MariaDB also report `triggers_out_of_order` for a multi-source view
+  when a user trigger on one source, placed before the maintenance trigger
+  with `PRECEDES`, writes another source. There `repair_view()` only
+  repopulates and `register_view(..., force_rebuild=True)` is refused
+  (`UnsafeReplacementError`): run `drop_view()` and then `register_view()`,
+  which places the new maintenance triggers first. (PostgreSQL reconciles
+  such writes in its multi-source statement maintenance.)
   `diff_views()` / `matview diff` shows what a registration would change.
 - `repair_view(name=None)` (`--repair`) repopulates (or rebuilds after drift)
   each view in its own transaction; there is no all-view atomicity (see
