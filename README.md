@@ -757,10 +757,12 @@ protocol at all: run it with writes to the source tables stopped.
 - `check_schema_drift()` (`--check-drift`) compares each registered view with
   the live schema: `ok`, `drifted`, `invalid`, `backfill_incomplete`, or
   `triggers_missing`, `triggers_disabled` (PostgreSQL `ALTER TABLE ... DISABLE
-  TRIGGER`), `triggers_out_of_order` (SQLite: a user trigger created after
-  registration that writes a source table or uses `RAISE(FAIL)`/`RAISE(IGNORE)`
-  fires before the maintenance trigger, because SQLite fires the newest trigger
-  first) or `triggers_orphaned` when maintenance triggers are gone, disabled,
+  TRIGGER`), `triggers_modified` (PostgreSQL maintenance/helper function body,
+  `search_path`, or trigger definition altered out of band),
+  `triggers_out_of_order` (SQLite: a user trigger created after registration
+  that writes a source table or uses `RAISE(FAIL)`/`RAISE(IGNORE)` fires before
+  the maintenance trigger, because SQLite fires the newest trigger first) or
+  `triggers_orphaned` when maintenance triggers are gone, disabled, modified,
   preceded or on a detached partition (`repair_view()` rebuilds them).
   MySQL/MariaDB also report `triggers_out_of_order` for a multi-source view
   when a user trigger on one source, placed before the maintenance trigger

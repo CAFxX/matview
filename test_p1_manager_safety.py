@@ -1134,5 +1134,159 @@ class TestFkCascadeDriftAndFailClosedIntrospection(unittest.TestCase):
             conn.close()
 
 
+class TestPostgresTriggerAndFunctionDriftParsers(unittest.TestCase):
+    """Offline tests for PostgreSQL function/trigger DDL and search_path parsers."""
+
+    def test_parse_expected_functions_all_templates(self) -> None:
+        ddls = [
+            (
+                "CREATE OR REPLACE FUNCTION __matview_fn_sync_v__ins()\n"
+                "RETURNS TRIGGER AS $$\n"
+                "BEGIN\n"
+                "    -- literal mentioning SET search_path inside body\n"
+                "    RETURN NULL;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql SET search_path FROM CURRENT;"
+            ),
+            (
+                "CREATE OR REPLACE FUNCTION __matview_key_v(v anyelement) RETURNS text\n"
+                "LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE SET search_path FROM CURRENT AS $mv_key$\n"
+                "BEGIN\n"
+                "    RETURN v::pg_catalog.text;\n"
+                "END;\n"
+                "$mv_key$;"
+            ),
+            (
+                'CREATE OR REPLACE FUNCTION "__matview_fn_readonly_strict immutable ""View"""()\n'
+                "RETURNS TRIGGER AS $$\n"
+                "BEGIN\n"
+                "    RAISE EXCEPTION 'SET search_path read-only';\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql;"
+            ),
+            (
+                "CREATE OR REPLACE FUNCTION __matview_fn_s3_j_reconcile()\n"
+                "RETURNS VOID AS $$\n"
+                "BEGIN\n"
+                "    RETURN;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql SET search_path FROM CURRENT;"
+            ),
+        ]
+        parsed = MaterializedViewManager._pg_parse_expected_functions(ddls)
+        self.assertEqual(len(parsed), 4)
+        # (proname, arg_type, ret_type, prosrc, requires_search_path, is_strict, is_immutable)
+        self.assertEqual(parsed[0][0], "__matview_fn_sync_v__ins")
+        self.assertIsNone(parsed[0][1])
+        self.assertEqual(parsed[0][2], "trigger")
+        self.assertIn("RETURN NULL;", parsed[0][3])
+        self.assertTrue(parsed[0][4])
+        self.assertFalse(parsed[0][5])
+        self.assertFalse(parsed[0][6])
+
+        self.assertEqual(parsed[1][0], "__matview_key_v")
+        self.assertEqual(parsed[1][1], "anyelement")
+        self.assertEqual(parsed[1][2], "text")
+        self.assertIn("RETURN v::pg_catalog.text;", parsed[1][3])
+        self.assertTrue(parsed[1][4])
+        self.assertTrue(parsed[1][5])
+        self.assertTrue(parsed[1][6])
+
+        # Quoted identifier preserves case/quotes; words like strict/immutable in
+        # the function name and 'SET search_path' inside body must NOT trigger flags.
+        self.assertEqual(parsed[2][0], '__matview_fn_readonly_strict immutable "View"')
+        self.assertIsNone(parsed[2][1])
+        self.assertEqual(parsed[2][2], "trigger")
+        self.assertFalse(parsed[2][4])
+        self.assertFalse(parsed[2][5])
+        self.assertFalse(parsed[2][6])
+
+        self.assertEqual(parsed[3][0], "__matview_fn_s3_j_reconcile")
+        self.assertIsNone(parsed[3][1])
+        self.assertEqual(parsed[3][2], "void")
+        self.assertTrue(parsed[3][4])
+        self.assertFalse(parsed[3][5])
+        self.assertFalse(parsed[3][6])
+
+    def test_parse_expected_triggers_all_kinds_and_tgtype(self) -> None:
+        ddls = [
+            (
+                '  CREATE TRIGGER __matview_trg_v_ins\n'
+                'AFTER INSERT ON "orders"\n'
+                'REFERENCING NEW TABLE AS __mv_new\n'
+                'FOR EACH STATEMENT EXECUTE FUNCTION __matview_fn_sync_v_ins();'
+            ),
+            (
+                'CREATE TRIGGER __matview_trg_v_upd\n'
+                'AFTER UPDATE ON "s1"."orders"\n'
+                'REFERENCING OLD TABLE AS __mv_old NEW TABLE AS __mv_new\n'
+                'FOR EACH STATEMENT EXECUTE FUNCTION __matview_fn_sync_v_upd();'
+            ),
+            (
+                'CREATE TRIGGER __matview_trg_v_mixed1\n'
+                'AFTER DELETE ON s1."My Table"\n'
+                'REFERENCING OLD TABLE AS __mv_old\n'
+                'FOR EACH STATEMENT EXECUTE FUNCTION __matview_fn_sync_v_del();'
+            ),
+            (
+                'CREATE TRIGGER __matview_trg_v_mixed2\n'
+                'AFTER TRUNCATE ON "My Schema".orders\n'
+                'FOR EACH STATEMENT EXECUTE FUNCTION __matview_fn_sync_v_trunc();'
+            ),
+            (
+                'CREATE TRIGGER __matview_trg_v_bkt\n'
+                'BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON "orders"\n'
+                'FOR EACH STATEMENT EXECUTE FUNCTION __matview_fn_bkt_v();'
+            ),
+            (
+                'CREATE TRIGGER "__matview_trg_My View__readonly"\n'
+                'INSTEAD OF INSERT OR UPDATE OR DELETE ON "My View"\n'
+                'FOR EACH ROW EXECUTE FUNCTION "__matview_fn_readonly_My View"();'
+            ),
+            # Function body containing literal CREATE TRIGGER text must NOT be parsed as a trigger.
+            (
+                "CREATE OR REPLACE FUNCTION __matview_fn_literal()\n"
+                "RETURNS TRIGGER AS $$\n"
+                "BEGIN\n"
+                "PERFORM '\n"
+                'CREATE TRIGGER fake_trg AFTER INSERT ON "orders" FOR EACH STATEMENT EXECUTE FUNCTION fake_fn();\n'
+                "';\n"
+                "RETURN NULL;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql SET search_path FROM CURRENT;"
+            ),
+        ]
+        parsed = MaterializedViewManager._pg_parse_expected_triggers(ddls)
+        self.assertEqual(
+            parsed,
+            [
+                ("__matview_trg_v_ins", '"orders"', "__matview_fn_sync_v_ins", 4, "", "__mv_new"),
+                ("__matview_trg_v_upd", '"s1"."orders"', "__matview_fn_sync_v_upd", 16, "__mv_old", "__mv_new"),
+                ("__matview_trg_v_mixed1", 's1."My Table"', "__matview_fn_sync_v_del", 8, "__mv_old", ""),
+                ("__matview_trg_v_mixed2", '"My Schema".orders', "__matview_fn_sync_v_trunc", 32, "", ""),
+                ("__matview_trg_v_bkt", '"orders"', "__matview_fn_bkt_v", 62, "", ""),
+                ("__matview_trg_My View__readonly", '"My View"', "__matview_fn_readonly_My View", 93, "", ""),
+            ],
+        )
+
+    def test_search_path_setting_validation(self) -> None:
+        check = MaterializedViewManager._pg_search_path_setting_is_valid
+        self.assertTrue(check("mv_schema, public", "mv_schema", current_user="postgres"))
+        self.assertTrue(check('"$user", public', "public", current_user="postgres"))
+        # "$user" only resolves schema_name when schema_name == current_user.
+        self.assertTrue(check('"$user", public', "alice", current_user="alice"))
+        self.assertFalse(check('"$user", public', "mv_schema", current_user="postgres"))
+        self.assertFalse(check('"$user", public', "alice"))
+        # Embedded double quotes (both single " and consecutive "") must unescape exactly once.
+        self.assertTrue(check('"My ""Schema""", public', 'My "Schema"', current_user="postgres"))
+        self.assertTrue(check('"My """"Schema""""", public', 'My ""Schema""', current_user="postgres"))
+        self.assertFalse(check('"My """"Schema""""", public', 'My "Schema"', current_user="postgres"))
+        self.assertFalse(check(None, "public", current_user="postgres"))
+        self.assertFalse(check("", "public", current_user="postgres"))
+        self.assertFalse(check("   ", "public", current_user="postgres"))
+        self.assertFalse(check("pg_catalog", "mv_schema", current_user="postgres"))
+        self.assertFalse(check("other_schema, public", "mv_schema", current_user="postgres"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -13,7 +13,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import sqlglot
 import sqlglot.errors
@@ -1098,6 +1098,32 @@ class MaterializedViewManager:
                 cur.execute(build_drop_sql("TRIGGER", t_name, dialect=self.dialect))
         for fn_name in entry["function_names"]:
             cur.execute(f"DROP FUNCTION IF EXISTS {fn_name if '(' in fn_name else fn_name + '()'} CASCADE;")
+        if self.dialect == Dialect.POSTGRES:
+            # DROP FUNCTION ... CASCADE removes triggers still pointing at our
+            # functions (including on DETACHed partitions), but a trigger
+            # repointed out-of-band to another function would otherwise survive
+            # and collide when repair_view() reinstalls it.
+            seen_drop_pairs: Set[Tuple[str, str]] = set()
+            for trg, table, *_ in self._pg_parse_expected_triggers(entry.get("trigger_ddls") or []):
+                pair = (trg, table)
+                if pair in seen_drop_pairs:
+                    continue
+                seen_drop_pairs.add(pair)
+                lit_t = "'" + table.replace("'", "''") + "'"
+                lit_trg = "'" + trg.replace("'", "''") + "'"
+                cur.execute(
+                    "DO $mv_drop$ DECLARE __mv_rel pg_catalog.regclass; BEGIN "
+                    "FOR __mv_rel IN "
+                    "  WITH RECURSIVE __mv_tree(relid, depth) AS ("
+                    f"    SELECT pg_catalog.to_regclass({lit_t})::oid, 0"
+                    "    UNION ALL SELECT i.inhrelid, __mv_tree.depth + 1 FROM pg_catalog.pg_inherits i"
+                    "    JOIN __mv_tree ON i.inhparent = __mv_tree.relid"
+                    "  ) SELECT relid::pg_catalog.regclass FROM __mv_tree"
+                    "    WHERE relid IS NOT NULL ORDER BY depth, relid "
+                    "LOOP "
+                    f"  EXECUTE pg_catalog.format('DROP TRIGGER IF EXISTS %I ON %s', {lit_trg}, __mv_rel); "
+                    "END LOOP; END $mv_drop$;"
+                )
         cur.execute(build_drop_sql("VIEW", resolved_name, dialect=self.dialect, allow_qualified=False))
         cur.execute(build_drop_sql("TABLE", entry["backing_table"], dialect=self.dialect))
         for aux_t in entry["aux_tables"]:
@@ -2391,12 +2417,16 @@ class MaterializedViewManager:
         Declaratively synchronizes a collection of materialized view definitions against
         the connected database (supporting multi-view SQL files/strings as well).
         Returns a status map `{view_name: "created" | "updated" | "unchanged" |
-        "backfill_incomplete" | "triggers_missing" | "triggers_disabled" | "triggers_out_of_order" |
-        "triggers_orphaned" | "dropped"}`
-        ("triggers_missing": maintenance triggers of an unchanged view are gone; "triggers_disabled": a
-        PostgreSQL maintenance trigger is disabled; "triggers_out_of_order": a newer SQLite user trigger
-        that writes a source table fires before the maintenance trigger; "triggers_orphaned": a PostgreSQL
-        maintenance trigger is on a DETACHed partition; repair both with `repair_view()`); "backfill_incomplete" means the definition
+        "backfill_incomplete" | "triggers_missing" | "triggers_disabled" |
+        "triggers_modified" | "triggers_out_of_order" | "triggers_orphaned" | "dropped"}`
+        ("triggers_missing": maintenance triggers or helper functions of an unchanged view are gone;
+        "triggers_disabled": a PostgreSQL maintenance trigger is disabled;
+        "triggers_modified": a PostgreSQL maintenance/helper function body, `search_path`, or trigger
+        definition was altered out of band; "triggers_out_of_order": a newer SQLite user trigger
+        that writes a source table fires before the maintenance trigger, or a MySQL/MariaDB
+        `PRECEDES` user trigger writes another join source first; "triggers_orphaned": a PostgreSQL
+        maintenance trigger is on a DETACHed partition; repair any of these with `repair_view()`);
+        "backfill_incomplete" means the definition
         is current but a pk-range backfill is running elsewhere or was interrupted
         (repair with `repair_view()`). ``accept_limitations`` behaves as in
         `register_view()`.
@@ -2407,7 +2437,6 @@ class MaterializedViewManager:
         effective_strict = self.strict if strict is None else strict
         schemas = self.fetch_schema(extra_schema_sql=schema_sql)
         catalog = self.get_catalog()
-        trigger_drift = self._views_trigger_drift(catalog)
         status: Dict[str, str] = {}
         desired_names: Set[str] = set()
 
@@ -2429,6 +2458,13 @@ class MaterializedViewManager:
                 watermark_catalog_table=self.catalog_table if incremental_backfill else None,
             )
             planned.append((v_spec, plan, self._compute_signature(plan, schemas)))
+
+        extra_ddls_by_view = {
+            plan.view_name: plan.readonly_trigger_ddls
+            for _, plan, _ in planned
+            if plan.readonly_trigger_ddls
+        }
+        trigger_drift = self._views_trigger_drift(catalog, extra_ddls_by_view=extra_ddls_by_view)
 
         # Refuse an unsafe replacement before applying anything, so a refused
         # request leaves every view as it was.
@@ -2498,26 +2534,215 @@ class MaterializedViewManager:
         Dialect.MYSQL: "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE()",
     }
 
-    def _views_missing_triggers(self, catalog: Dict[str, Dict[str, Any]]) -> Set[str]:
-        """Registered views whose maintenance triggers are not exactly where
-        they must be (see ``_views_trigger_drift``)."""
-        return set(self._views_trigger_drift(catalog))
+    def _views_missing_triggers(
+        self,
+        catalog: Dict[str, Dict[str, Any]],
+        extra_ddls_by_view: Optional[Mapping[str, Sequence[str]]] = None,
+    ) -> Set[str]:
+        """Registered views whose maintenance triggers or functions are not
+        exactly where and how they must be (see ``_views_trigger_drift``)."""
+        return set(self._views_trigger_drift(catalog, extra_ddls_by_view=extra_ddls_by_view))
 
+    _PG_IDENT_PAT = r'(?:"(?:""|[^"])+"|[A-Za-z_][A-Za-z0-9_$]*)'
     _PG_CREATE_TRIGGER_RE = re.compile(
-        r'^CREATE TRIGGER (\S+)\s+(?:AFTER\s+\w+|BEFORE\s+(?:INSERT|UPDATE|DELETE|TRUNCATE)(?:\s+OR\s+(?:INSERT|UPDATE|DELETE|TRUNCATE))*)\s+ON\s+((?:"(?:""|[^"])+"(?:\."(?:""|[^"])+")?|\S+))',
-        flags=re.IGNORECASE | re.MULTILINE,
+        r'^\s*CREATE\s+TRIGGER\s+(' + _PG_IDENT_PAT + r')\s+'
+        r'(AFTER|BEFORE|INSTEAD\s+OF)\s+'
+        r'((?:INSERT|UPDATE|DELETE|TRUNCATE)(?:\s+OR\s+(?:INSERT|UPDATE|DELETE|TRUNCATE))*)\s+'
+        r'ON\s+(' + _PG_IDENT_PAT + r'(?:\.' + _PG_IDENT_PAT + r')?)'
+        r'(?:\s+REFERENCING\s+(.*?))?'
+        r'\s+FOR\s+EACH\s+(ROW|STATEMENT)\s+EXECUTE\s+(?:FUNCTION|PROCEDURE)\s+'
+        r'(' + _PG_IDENT_PAT + r')\s*\(\s*\)',
+        flags=re.IGNORECASE | re.DOTALL,
     )
+    _PG_CREATE_FUNCTION_HEADER_RE = re.compile(
+        r'^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(' + _PG_IDENT_PAT + r')\s*\(([^)]*)\)',
+        flags=re.IGNORECASE,
+    )
+    _PG_DOLLAR_BODY_RE = re.compile(
+        r'\bAS\s+(\$[A-Za-z0-9_]*\$)(.*?)\1',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    _PG_RETURNS_RE = re.compile(
+        r'\bRETURNS\s+([A-Za-z_][A-Za-z0-9_.\s\[\]]*?)(?=\s+(?:AS\b|LANGUAGE\b|IMMUTABLE\b|STABLE\b|VOLATILE\b|STRICT\b|CALLED\b|RETURNS\b|PARALLEL\b|SECURITY\b|SET\b|COST\b|ROWS\b|LEAKPROOF\b|NOT\b)|$)',
+        flags=re.IGNORECASE,
+    )
+    _PG_TRIGGER_EVENT_BITS = {
+        "INSERT": 4,
+        "DELETE": 8,
+        "UPDATE": 16,
+        "TRUNCATE": 32,
+    }
 
-    def _views_trigger_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
-        """``{view: "triggers_missing" | "triggers_disabled" | "triggers_out_of_order" | "triggers_orphaned"}``
-        for views whose maintenance triggers drifted.
+    @staticmethod
+    def _pg_unquote_ident(ident: str) -> str:
+        s = ident.strip()
+        if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+            return s[1:-1].replace('""', '"')
+        return s.lower()
 
-        "triggers_missing": a recorded trigger does not exist (PostgreSQL: on
-        the source table or on one of its current partitions, e.g. one
-        attached or created after registration). "triggers_disabled"
+    @classmethod
+    def _pg_parse_expected_functions(
+        cls, ddls: Sequence[str]
+    ) -> List[Tuple[str, Optional[str], Optional[str], str, bool, bool, bool]]:
+        """Extract ``(proname, arg_type_or_none, ret_type_or_none, prosrc,
+        requires_search_path, is_strict, is_immutable)`` from PostgreSQL
+        ``CREATE [OR REPLACE] FUNCTION`` DDLs."""
+        out: List[Tuple[str, Optional[str], Optional[str], str, bool, bool, bool]] = []
+        for stmt in ddls:
+            m_hdr = cls._PG_CREATE_FUNCTION_HEADER_RE.match(stmt)
+            if m_hdr is None:
+                continue
+            m_body = cls._PG_DOLLAR_BODY_RE.search(stmt, pos=m_hdr.end())
+            if m_body is None:
+                continue
+            fn_name = cls._pg_unquote_ident(m_hdr.group(1))
+            args_raw = m_hdr.group(2).strip()
+            arg_type: Optional[str] = None
+            if args_raw:
+                # Strip optional parameter mode (IN/OUT/INOUT/VARIADIC) and
+                # leading parameter name while preserving multi-word types.
+                parts = args_raw.split()
+                if parts and parts[0].upper() in ("IN", "OUT", "INOUT", "VARIADIC"):
+                    parts = parts[1:]
+                if len(parts) >= 2 and parts[0].lower() not in (
+                    "double",
+                    "character",
+                    "time",
+                    "timestamp",
+                    "bit",
+                    "unsigned",
+                ):
+                    parts = parts[1:]
+                arg_type = " ".join(parts).lower() if parts else None
+            prosrc = m_body.group(2).replace("\r\n", "\n")
+            outer_sql = stmt[m_hdr.end() : m_body.start()] + " " + stmt[m_body.end() :]
+            m_ret = cls._PG_RETURNS_RE.search(outer_sql)
+            ret_type = re.sub(r"\s+", " ", m_ret.group(1).strip().lower()) if m_ret else None
+            requires_search_path = bool(
+                re.search(r"\bSET\s+search_path\b", outer_sql, flags=re.IGNORECASE)
+            )
+            is_strict = bool(
+                re.search(r"\b(?:STRICT|RETURNS\s+NULL\s+ON\s+NULL\s+INPUT)\b", outer_sql, flags=re.IGNORECASE)
+            )
+            is_immutable = bool(
+                re.search(r"\bIMMUTABLE\b", outer_sql, flags=re.IGNORECASE)
+            )
+            out.append((fn_name, arg_type, ret_type, prosrc, requires_search_path, is_strict, is_immutable))
+        return out
+
+    @classmethod
+    def _pg_parse_expected_triggers(
+        cls, ddls: Sequence[str]
+    ) -> List[Tuple[str, str, str, int, str, str]]:
+        """Extract ``(tgname, table_ref, fn_name, tgtype, old_table, new_table)``
+        from PostgreSQL ``CREATE TRIGGER`` DDLs."""
+        out: List[Tuple[str, str, str, int, str, str]] = []
+        for stmt in ddls:
+            m = cls._PG_CREATE_TRIGGER_RE.match(stmt)
+            if m is None:
+                continue
+            trg_name = cls._pg_unquote_ident(m.group(1))
+            timing = re.sub(r"\s+", " ", m.group(2).strip().upper())
+            events = [ev.strip().upper() for ev in re.split(r"\s+OR\s+", m.group(3).strip(), flags=re.IGNORECASE)]
+            table_ref = m.group(4).strip()
+            ref_clause = (m.group(5) or "").strip()
+            level = m.group(6).strip().upper()
+            fn_name = cls._pg_unquote_ident(m.group(7))
+            tgtype = 0
+            if level == "ROW":
+                tgtype |= 1
+            if timing == "BEFORE":
+                tgtype |= 2
+            elif timing == "INSTEAD OF":
+                tgtype |= 64
+            for ev in events:
+                tgtype |= cls._PG_TRIGGER_EVENT_BITS.get(ev, 0)
+            old_tbl = ""
+            new_tbl = ""
+            if ref_clause:
+                m_old = re.search(
+                    r"\bOLD\s+TABLE\s+(?:AS\s+)?(" + cls._PG_IDENT_PAT + r")",
+                    ref_clause,
+                    flags=re.IGNORECASE,
+                )
+                if m_old:
+                    old_tbl = cls._pg_unquote_ident(m_old.group(1))
+                m_new = re.search(
+                    r"\bNEW\s+TABLE\s+(?:AS\s+)?(" + cls._PG_IDENT_PAT + r")",
+                    ref_clause,
+                    flags=re.IGNORECASE,
+                )
+                if m_new:
+                    new_tbl = cls._pg_unquote_ident(m_new.group(1))
+            out.append((trg_name, table_ref, fn_name, tgtype, old_tbl, new_tbl))
+        return out
+
+    @staticmethod
+    def _pg_search_path_setting_is_valid(
+        sp_raw: Optional[str],
+        schema_name: str,
+        current_user: Optional[str] = None,
+    ) -> bool:
+        """Return True iff the ``search_path`` value extracted from
+        ``pg_proc.proconfig`` is non-empty and resolves ``schema_name``
+        (either directly or via ``"$user"`` when ``schema_name == current_user``)."""
+        if sp_raw is None:
+            return False
+        sp_val = sp_raw.strip()
+        if not sp_val:
+            return False
+        # Parse comma-separated schema entries respecting double-quoted identifiers.
+        tokens: List[str] = []
+        cur_tok: List[str] = []
+        in_quote = False
+        i = 0
+        while i < len(sp_val):
+            ch = sp_val[i]
+            if ch == '"':
+                if in_quote and i + 1 < len(sp_val) and sp_val[i + 1] == '"':
+                    cur_tok.append('""')
+                    i += 2
+                    continue
+                in_quote = not in_quote
+                cur_tok.append(ch)
+            elif ch == "," and not in_quote:
+                tokens.append("".join(cur_tok).strip())
+                cur_tok = []
+            else:
+                cur_tok.append(ch)
+            i += 1
+        tokens.append("".join(cur_tok).strip())
+        parsed: Set[str] = set()
+        for tok in tokens:
+            if not tok:
+                continue
+            if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
+                parsed.add(tok[1:-1].replace('""', '"'))
+            else:
+                parsed.add(tok.lower())
+        return schema_name in parsed or (
+            current_user is not None and schema_name == current_user and "$user" in parsed
+        )
+
+    def _views_trigger_drift(
+        self,
+        catalog: Dict[str, Dict[str, Any]],
+        extra_ddls_by_view: Optional[Mapping[str, Sequence[str]]] = None,
+    ) -> Dict[str, str]:
+        """``{view: "triggers_missing" | "triggers_disabled" | "triggers_modified" | "triggers_out_of_order" | "triggers_orphaned"}``
+        for views whose maintenance triggers or functions drifted.
+
+        "triggers_missing": a recorded trigger or helper function does not exist
+        (PostgreSQL: on the source table or on one of its current partitions,
+        e.g. one attached or created after registration). "triggers_disabled"
         (PostgreSQL): a maintenance trigger exists but does not fire for
         ordinary sessions (``ALTER TABLE ... DISABLE TRIGGER`` or ``ENABLE
-        REPLICA TRIGGER``). "triggers_orphaned"
+        REPLICA TRIGGER``). "triggers_modified" (PostgreSQL): a maintenance or
+        helper function's body, language, security mode, or ``search_path``
+        configuration was modified out of band (e.g. ``CREATE OR REPLACE
+        FUNCTION`` or ``ALTER FUNCTION ... RESET search_path``), or a trigger
+        was altered to invoke a different function, event/timing, transition
+        table, or ``WHEN`` predicate. "triggers_orphaned"
         (PostgreSQL): a maintenance trigger function also fires for a table
         that is no longer in the source's partition tree (a DETACHed
         partition, whose writes would still change the view). Never ends a
@@ -2530,7 +2755,7 @@ class MaterializedViewManager:
             # A user trigger writing another join source before the
             # statement-level maintenance is reconciled by the stage-3
             # multi-source bracket: nothing to report.
-            return self._pg_trigger_drift(catalog)
+            return self._pg_trigger_drift(catalog, extra_ddls_by_view=extra_ddls_by_view)
         if self.dialect == Dialect.MYSQL:
             order_drift = self._join_source_order_drift(catalog)
             presence = self._views_trigger_presence_drift(catalog)
@@ -2753,13 +2978,70 @@ class MaterializedViewManager:
                     break
         return out
 
-    def _pg_trigger_drift(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    def _pg_trigger_drift(
+        self,
+        catalog: Dict[str, Dict[str, Any]],
+        extra_ddls_by_view: Optional[Mapping[str, Sequence[str]]] = None,
+    ) -> Dict[str, str]:
+        # Priority: missing > disabled > modified > orphaned.
+        _RANK = {
+            "triggers_orphaned": 1,
+            "triggers_modified": 2,
+            "triggers_disabled": 3,
+            "triggers_missing": 4,
+        }
+
+        def _merge(cur_status: Optional[str], candidate: str) -> str:
+            if cur_status is None or _RANK[candidate] > _RANK[cur_status]:
+                return candidate
+            return cur_status
+
         out: Dict[str, str] = {}
         with self._cursor() as cur:
+            # Resolve the catalog's own schema (and current_user) once so we
+            # reject cross-schema decoy functions and validate "$user" strictly
+            # against current_user.
+            expected_schema_oid: Optional[int] = None
+            expected_schema_name: Optional[str] = None
+            pg_current_user: Optional[str] = None
+            lit_cat = "'" + self.catalog_table.replace("'", "''") + "'"
+            meta_rows = self._catalog_select(
+                cur,
+                f"SELECT c.relnamespace, n.nspname, current_user"
+                f" FROM pg_catalog.pg_class c"
+                f" JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+                f" WHERE c.oid = pg_catalog.to_regclass({lit_cat})::oid",
+            )
+            if not meta_rows:
+                meta_rows = self._catalog_select(
+                    cur,
+                    "SELECT n.oid, n.nspname, current_user"
+                    " FROM pg_catalog.pg_namespace n"
+                    " WHERE n.nspname = pg_catalog.current_schema()",
+                )
+            if meta_rows:
+                expected_schema_oid = int(meta_rows[0][0])
+                expected_schema_name = str(meta_rows[0][1])
+                pg_current_user = str(meta_rows[0][2])
+
             for name, entry in catalog.items():
                 status: Optional[str] = None
-                ddls = "\n".join(entry.get("trigger_ddls") or [])
-                for trg, table in self._PG_CREATE_TRIGGER_RE.findall(ddls):
+                all_ddls: List[str] = list(entry.get("trigger_ddls") or [])
+                if extra_ddls_by_view and name in extra_ddls_by_view:
+                    all_ddls.extend(extra_ddls_by_view[name])
+                expected_fns = self._pg_parse_expected_functions(all_ddls)
+                expected_fn_map: Dict[
+                    Tuple[str, Optional[str]], Tuple[Optional[str], str, bool, bool, bool]
+                ] = {
+                    (fn_name, arg_type): (ret_type, prosrc, req_sp, is_strict, is_imm)
+                    for fn_name, arg_type, ret_type, prosrc, req_sp, is_strict, is_imm in expected_fns
+                }
+                expected_triggers = self._pg_parse_expected_triggers(all_ddls)
+                checked_trig_names: Set[str] = set()
+                verified_trigger_fn_names: Set[str] = set()
+
+                for trg, table, exp_fn, exp_tgtype, exp_old, exp_new in expected_triggers:
+                    checked_trig_names.add(trg)
                     lit_t = "'" + table.replace("'", "''") + "'"
                     lit_n = "'" + trg.replace("'", "''") + "'"
                     rows = self._catalog_select(
@@ -2769,36 +3051,226 @@ class MaterializedViewManager:
                         f" UNION ALL SELECT i.inhrelid FROM pg_catalog.pg_inherits i"
                         f" JOIN __mv_tree ON i.inhparent = __mv_tree.relid),"
                         f" __mv_fn AS (SELECT t.tgfoid FROM pg_catalog.pg_trigger t"
-                        f" WHERE t.tgrelid = pg_catalog.to_regclass({lit_t})::oid AND lower(t.tgname) = lower({lit_n}))"
+                        f" WHERE t.tgrelid = pg_catalog.to_regclass({lit_t})::oid"
+                        f"  AND NOT t.tgisinternal AND t.tgname = {lit_n})"
                         f" SELECT"
                         f" (SELECT count(*) FROM __mv_tree WHERE __mv_tree.relid IS NULL OR NOT EXISTS ("
                         f"  SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = __mv_tree.relid"
-                        f"  AND lower(t.tgname) = lower({lit_n}))),"
+                        f"  AND NOT t.tgisinternal AND t.tgname = {lit_n})),"
                         f" (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgfoid IN (SELECT tgfoid FROM __mv_fn)"
+                        f"  AND NOT t.tgisinternal"
                         f"  AND t.tgrelid NOT IN (SELECT relid FROM __mv_tree WHERE relid IS NOT NULL)),"
                         # ALTER TABLE ... DISABLE TRIGGER ('D') or ENABLE REPLICA
                         # TRIGGER ('R'): the trigger does not fire for ordinary
                         # sessions, so their writes are not maintained.
                         f" (SELECT count(*) FROM pg_catalog.pg_trigger t JOIN __mv_tree ON t.tgrelid = __mv_tree.relid"
-                        f"  WHERE lower(t.tgname) = lower({lit_n}) AND t.tgenabled NOT IN ('O', 'A'))",
+                        f"  WHERE NOT t.tgisinternal AND t.tgname = {lit_n} AND t.tgenabled NOT IN ('O', 'A'))",
                     )
                     if rows is None:
                         continue
                     missing, orphaned, disabled = int(rows[0][0]), int(rows[0][1]), int(rows[0][2])
                     if missing:
-                        status = "triggers_missing"
+                        status = _merge(status, "triggers_missing")
                         break
                     if disabled:
-                        status = "triggers_disabled"
-                    elif orphaned and status is None:
-                        status = "triggers_orphaned"
+                        status = _merge(status, "triggers_disabled")
+                    if orphaned:
+                        status = _merge(status, "triggers_orphaned")
+
+                    # Verify live trigger definition (tgtype, transition tables, no WHEN qual,
+                    # no UPDATE OF column filter, no extra trigger args or constraint trigger)
+                    # and the target function's schema/visibility, identity, return type, kind,
+                    # body, language, security mode, and search_path across every relation in
+                    # the partition tree (OID-independent, so pg_dump/restore remains "ok").
+                    fn_rows = self._catalog_select(
+                        cur,
+                        f"WITH RECURSIVE __mv_tree(relid) AS ("
+                        f" SELECT pg_catalog.to_regclass({lit_t})::oid"
+                        f" UNION ALL SELECT i.inhrelid FROM pg_catalog.pg_inherits i"
+                        f" JOIN __mv_tree ON i.inhparent = __mv_tree.relid)"
+                        f" SELECT t.tgtype, COALESCE(t.tgoldtable, ''), COALESCE(t.tgnewtable, ''),"
+                        f"  t.tgqual IS NOT NULL,"
+                        f"  pg_catalog.cardinality(t.tgattr::pg_catalog.int2[]) > 0,"
+                        f"  t.tgnargs <> 0, t.tgconstraint <> 0,"
+                        f"  p.proname, p.prosrc,"
+                        f"  (SELECT pg_catalog.substr(cfg, 13) FROM pg_catalog.unnest(p.proconfig) AS cfg"
+                        f"   WHERE cfg LIKE 'search_path=%' LIMIT 1),"
+                        f"  l.lanname, p.prosecdef, p.prokind,"
+                        f"  p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype,"
+                        f"  p.pronamespace, n.nspname, pg_catalog.pg_function_is_visible(p.oid)"
+                        f" FROM pg_catalog.pg_trigger t"
+                        f" JOIN __mv_tree ON t.tgrelid = __mv_tree.relid"
+                        f" JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid"
+                        f" JOIN pg_catalog.pg_language l ON l.oid = p.prolang"
+                        f" JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace"
+                        f" WHERE NOT t.tgisinternal AND t.tgname = {lit_n}",
+                    )
+                    if fn_rows is None:
+                        continue
+                    if not fn_rows:
+                        status = _merge(status, "triggers_missing")
+                        break
+                    exp_fn_spec = expected_fn_map.get((exp_fn, None))
+                    all_rows_match_fn = True
+                    for (
+                        live_tgtype,
+                        live_old,
+                        live_new,
+                        has_qual,
+                        has_col_filter,
+                        has_args,
+                        is_constraint,
+                        live_proname,
+                        live_prosrc,
+                        live_sp_raw,
+                        live_lang,
+                        live_secdef,
+                        live_prokind,
+                        live_ret_is_trigger,
+                        live_nspoid,
+                        live_schema,
+                        live_visible,
+                    ) in fn_rows:
+                        if (
+                            int(live_tgtype) != exp_tgtype
+                            or str(live_old or "") != exp_old
+                            or str(live_new or "") != exp_new
+                            or bool(has_qual)
+                            or bool(has_col_filter)
+                            or bool(has_args)
+                            or bool(is_constraint)
+                            or str(live_proname) != exp_fn
+                            or not bool(live_visible)
+                            or (
+                                expected_schema_oid is not None
+                                and int(live_nspoid) != expected_schema_oid
+                            )
+                        ):
+                            status = _merge(status, "triggers_modified")
+                            all_rows_match_fn = False
+                            break
+                        if exp_fn_spec is not None:
+                            _, exp_src, req_sp, _, _ = exp_fn_spec
+                            norm_live_src = str(live_prosrc or "").replace("\r\n", "\n")
+                            sp_schema = expected_schema_name or str(live_schema or "")
+                            if (
+                                norm_live_src != exp_src
+                                or str(live_lang or "").lower() != "plpgsql"
+                                or bool(live_secdef)
+                                or str(live_prokind or "") != "f"
+                                or not bool(live_ret_is_trigger)
+                                or (
+                                    req_sp
+                                    and not self._pg_search_path_setting_is_valid(
+                                        None if live_sp_raw is None else str(live_sp_raw),
+                                        sp_schema,
+                                        current_user=pg_current_user,
+                                    )
+                                )
+                            ):
+                                status = _merge(status, "triggers_modified")
+                                all_rows_match_fn = False
+                                break
+                    if all_rows_match_fn and exp_fn_spec is not None:
+                        verified_trigger_fn_names.add(exp_fn)
+
+                if status != "triggers_missing":
+                    # Verify non-trigger helper functions (e.g. Stage 3 reconcile
+                    # functions and __matview_key_*(anyelement)) by visible signature,
+                    # schema, kind, return type, volatility, strictness, and body,
+                    # OID-independently.
+                    for (
+                        fn_name,
+                        arg_type,
+                        exp_ret_type,
+                        exp_src,
+                        req_sp,
+                        exp_strict,
+                        exp_immutable,
+                    ) in expected_fns:
+                        if arg_type is None and fn_name in verified_trigger_fn_names:
+                            continue
+                        lit_fn = "'" + fn_name.replace("'", "''") + "'"
+                        if arg_type is None:
+                            sig_pred = "p.pronargs = 0"
+                        else:
+                            lit_arg = "'" + arg_type.replace("'", "''") + "'"
+                            sig_pred = (
+                                f"p.pronargs = 1 AND p.proargtypes[0] = pg_catalog.to_regtype({lit_arg})"
+                            )
+                        if exp_ret_type:
+                            lit_ret = "'" + exp_ret_type.replace("'", "''") + "'"
+                            ret_sel = f"COALESCE(p.prorettype = pg_catalog.to_regtype({lit_ret}), false)"
+                        else:
+                            ret_sel = "true"
+                        h_rows = self._catalog_select(
+                            cur,
+                            f"SELECT p.prosrc,"
+                            f"  (SELECT pg_catalog.substr(cfg, 13) FROM pg_catalog.unnest(p.proconfig) AS cfg"
+                            f"   WHERE cfg LIKE 'search_path=%' LIMIT 1),"
+                            f"  l.lanname, p.prosecdef, p.proisstrict, p.prokind,"
+                            f"  p.provolatile, {ret_sel}, p.pronamespace, n.nspname"
+                            f" FROM pg_catalog.pg_proc p"
+                            f" JOIN pg_catalog.pg_language l ON l.oid = p.prolang"
+                            f" JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace"
+                            f" WHERE p.proname = {lit_fn} AND {sig_pred}"
+                            f"  AND pg_catalog.pg_function_is_visible(p.oid)",
+                        )
+                        if h_rows is None:
+                            continue
+                        if not h_rows:
+                            status = _merge(status, "triggers_missing")
+                            break
+                        (
+                            live_src,
+                            live_sp_raw,
+                            live_lang,
+                            live_secdef,
+                            live_strict,
+                            live_prokind,
+                            live_volatile,
+                            live_ret_ok,
+                            live_nspoid,
+                            live_schema,
+                        ) = h_rows[0]
+                        sp_schema = expected_schema_name or str(live_schema or "")
+                        if (
+                            str(live_src or "").replace("\r\n", "\n") != exp_src
+                            or str(live_lang or "").lower() != "plpgsql"
+                            or bool(live_secdef)
+                            or str(live_prokind or "") != "f"
+                            or not bool(live_ret_ok)
+                            or (exp_strict and not bool(live_strict))
+                            or (exp_immutable and str(live_volatile or "") != "i")
+                            or (
+                                expected_schema_oid is not None
+                                and int(live_nspoid) != expected_schema_oid
+                            )
+                            or (
+                                req_sp
+                                and not self._pg_search_path_setting_is_valid(
+                                    None if live_sp_raw is None else str(live_sp_raw),
+                                    sp_schema,
+                                    current_user=pg_current_user,
+                                )
+                            )
+                        ):
+                            status = _merge(status, "triggers_modified")
+
                 if status is None:
-                    # Read-only/other triggers recorded by name only.
-                    names = [t for t in entry.get("trigger_names") or [] if t not in ddls]
+                    # Read-only/other triggers recorded by name only (when extra_ddls_by_view
+                    # was not provided).
+                    names = [
+                        t
+                        for t in (entry.get("trigger_names") or [])
+                        if self._pg_unquote_ident(str(t)) not in checked_trig_names
+                    ]
                     if names:
                         lits = ", ".join("'" + t.lower().replace("'", "''") + "'" for t in names)
                         rows = self._catalog_select(
-                            cur, f"SELECT count(DISTINCT lower(tgname)) FROM pg_catalog.pg_trigger WHERE lower(tgname) IN ({lits})"
+                            cur,
+                            f"SELECT count(DISTINCT lower(tgname)) FROM pg_catalog.pg_trigger"
+                            f" WHERE NOT tgisinternal AND lower(tgname) IN ({lits})",
                         )
                         if rows is not None and int(rows[0][0]) < len({n.lower() for n in names}):
                             status = "triggers_missing"
@@ -2812,31 +3284,51 @@ class MaterializedViewManager:
         Inspects all registered views in `__matview_catalog` against the current live base
         table schemas and returns `{view_name: "ok" | "drifted" | "invalid" |
         "backfill_incomplete" | "triggers_missing" | "triggers_disabled" |
-        "triggers_out_of_order" | "triggers_orphaned"}`;
+        "triggers_modified" | "triggers_out_of_order" | "triggers_orphaned"}`;
         "backfill_incomplete" (definition current, but a pk-range backfill is
         running elsewhere or was interrupted) is never "ok"; "triggers_missing"
-        means maintenance triggers recorded for the view do not exist, also on a
-        PostgreSQL partition attached or created later (writes are not
-        maintained); "triggers_disabled" means a PostgreSQL maintenance trigger
-        was disabled (`ALTER TABLE ... DISABLE TRIGGER`, as `pg_restore
-        --disable-triggers` does; writes are not maintained); "triggers_out_of_order"
-        means a SQLite user trigger created after registration fires before a
-        maintenance trigger and writes a source table or uses RAISE(FAIL/IGNORE)
-        (see `_sqlite_trigger_order_drift`); "triggers_orphaned" means a PostgreSQL maintenance trigger
+        means maintenance triggers or helper functions recorded for the view do
+        not exist, also on a PostgreSQL partition attached or created later
+        (writes are not maintained); "triggers_disabled" means a PostgreSQL
+        maintenance trigger was disabled (`ALTER TABLE ... DISABLE TRIGGER`, as
+        `pg_restore --disable-triggers` does; writes are not maintained);
+        "triggers_modified" means a PostgreSQL maintenance/helper function body,
+        `search_path`, or trigger definition was modified out of band (e.g.
+        `CREATE OR REPLACE FUNCTION` or `ALTER FUNCTION ... RESET search_path`);
+        "triggers_out_of_order" means a SQLite user trigger created after
+        registration fires before a maintenance trigger and writes a source
+        table or uses RAISE(FAIL/IGNORE) (see `_sqlite_trigger_order_drift`),
+        or a MySQL/MariaDB `PRECEDES` user trigger writes another join source
+        first; "triggers_orphaned" means a PostgreSQL maintenance trigger
         is on a table outside the source's partition tree, e.g. a DETACHed
         partition (its writes still change the view, and its rows are still in
-        the view). Repair both with `repair_view()`, which rebuilds the view.
+        the view). Repair any trigger/function drift with `repair_view()`, which
+        rebuilds the view.
         """
         schemas = self.fetch_schema()
         catalog = self.get_catalog()
-        trigger_drift = self._views_trigger_drift(catalog)
-        report: Dict[str, str] = {}
+        plans_by_view: Dict[str, MaterializedViewPlan] = {}
+        invalid_views: Set[str] = set()
         for v_name, entry in catalog.items():
             try:
-                plan = self._stored_plan(schemas, entry)
+                plans_by_view[v_name] = self._stored_plan(schemas, entry)
             except Exception:
+                invalid_views.add(v_name)
+        extra_ddls_by_view = {
+            v_name: plan.readonly_trigger_ddls
+            for v_name, plan in plans_by_view.items()
+            if plan.readonly_trigger_ddls
+        }
+        valid_catalog = {k: v for k, v in catalog.items() if k not in invalid_views}
+        trigger_drift = self._views_trigger_drift(
+            valid_catalog, extra_ddls_by_view=extra_ddls_by_view
+        )
+        report: Dict[str, str] = {}
+        for v_name, entry in catalog.items():
+            if v_name in invalid_views:
                 report[v_name] = "invalid"
                 continue
+            plan = plans_by_view[v_name]
             try:
                 sig = self._compute_signature(plan, schemas)
                 if sig != entry["signature_hash"]:
@@ -2907,8 +3399,6 @@ class MaterializedViewManager:
             target_names = list(catalog.keys())
 
         schemas = self.fetch_schema()
-        # Views whose maintenance triggers are gone are rebuilt like drifted ones.
-        missing_triggers = self._views_missing_triggers(catalog)
         results: Dict[str, str] = {}
         for idx, target_name in enumerate(target_names):
             if idx > 0:
@@ -2920,12 +3410,22 @@ class MaterializedViewManager:
                 if target_name not in catalog:
                     continue
                 schemas = self.fetch_schema()
-                missing_triggers = self._views_missing_triggers(catalog)
             entry = catalog[target_name]
             v_name = entry["view_name"]
             plan = self._stored_plan(schemas, entry)
             sig = self._compute_signature(plan, schemas)
-            if rebuild_on_schema_drift and (sig != entry["signature_hash"] or v_name in missing_triggers):
+            extra_ddls = (
+                {target_name: plan.readonly_trigger_ddls}
+                if plan.readonly_trigger_ddls
+                else None
+            )
+            drift_catalog = (
+                {target_name: entry} if self.dialect == Dialect.POSTGRES else catalog
+            )
+            has_trigger_drift = target_name in self._views_missing_triggers(
+                drift_catalog, extra_ddls_by_view=extra_ddls
+            )
+            if rebuild_on_schema_drift and (sig != entry["signature_hash"] or has_trigger_drift):
                 # Rebuilt under exactly the acceptance stored with the view
                 # (never a blanket override of per-code limitations).
                 self.register_view(
