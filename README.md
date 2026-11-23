@@ -1001,11 +1001,15 @@ observe depends on the engine:
   `READ COMMITTED` writers serialize cleanly while concurrent readers
   (`ACCESS SHARE`) remain unblocked (verified natively). Rebuilding after
   schema drift or missing triggers (`"rebuilt"`) uses `register_view(...,
-  force_rebuild=True)` DDL locks (which block readers while running). Known
-  exclusion: a concurrent `REPEATABLE READ` or `SERIALIZABLE` transaction whose
-  snapshot was already established *before* `repair_view()` committed can still
-  observe the pre-repair catalog/backing snapshot in its trigger (e.g. an
-  active watermark or empty `ATOMIC_QUERY_SYNC` store) and silently diverge.
+  force_rebuild=True)` DDL locks (which block readers while running). Under
+  `REPEATABLE READ` and `SERIALIZABLE`, manager-installed triggers fence the
+  view's catalog row (`SELECT ... FOR SHARE`), so any transaction whose
+  snapshot predates `repair_view()` (or initial registration/rebuild/backfill)
+  fails closed with SQLSTATE `40001` (`serialization_failure`) instead of
+  silently diverging, while concurrent `REPEATABLE READ`/`SERIALIZABLE` writers
+  do not block each other and `READ COMMITTED` writers take no catalog lock
+  from the repair fence (verified natively; standalone CLI SQL without a
+  catalog table does not emit the catalog fence).
 - MySQL/MariaDB (InnoDB, default `REPEATABLE READ`): the repopulating
   `INSERT ... SELECT` of `repair_view()` takes shared locks on the rows it reads,
   so writers serialize with it (verified natively with concurrent writers).

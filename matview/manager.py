@@ -103,7 +103,11 @@ from .sql_frontend import (
 #     join empty-group deletes, inlined join delta triggers (dropping single-row
 #     derived tables and redundant GROUP BY), reader-view derived AVG, VALUES
 #     upserts without SELECT/FROM DUAL WHERE TRUE, and same-group UPDATE fast paths.
-MATVIEW_GENERATOR_VERSION = "14"
+# 15: PostgreSQL manager-installed statement triggers fence REPEATABLE READ /
+#     SERIALIZABLE snapshots against repair_view(), rebuild, and backfill via
+#     SELECT ... FOR SHARE on the view's catalog row (raising 40001 on stale
+#     or missing catalog visibility; zero locks under READ COMMITTED).
+MATVIEW_GENERATOR_VERSION = "15"
 
 
 def _definition_digest(select_sql: str) -> str:
@@ -2097,6 +2101,7 @@ class MaterializedViewManager:
             engine_version=self.engine_version,
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=getattr(self, "pg_fillfactor", 80),
+            repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
         )
 
     def _stored_plan(self, schemas: Dict[str, TableSchema], entry: Dict[str, Any]) -> MaterializedViewPlan:
@@ -3373,12 +3378,14 @@ class MaterializedViewManager:
             deadlock). Under `READ COMMITTED` (and for transactions whose
             snapshot starts after the repair commits), in-flight writers commit
             or roll back first, later writers wait until the repair commits,
-            and concurrent readers (`ACCESS SHARE`) remain unblocked.
-            Caveat: a concurrent `REPEATABLE READ` / `SERIALIZABLE` writer
-            whose snapshot was already established *before* `repair_view()`
-            committed can still observe the pre-repair catalog/backing snapshot
-            in its trigger (for example an active backfill watermark or an
-            empty `ATOMIC_QUERY_SYNC` store) and silently diverge.
+            and concurrent readers (`ACCESS SHARE`) remain unblocked. Under
+            `REPEATABLE READ` and `SERIALIZABLE`, manager-installed triggers
+            additionally fence the view's catalog row with `SELECT ... FOR SHARE`:
+            concurrent writers serialize cleanly without blocking each other,
+            while any transaction whose snapshot predates `repair_view()` (or
+            initial view registration/rebuild) fails closed with SQLSTATE
+            `40001` (`serialization_failure`) instead of applying maintenance
+            against a stale catalog or backing-table snapshot.
           - On the `"rebuilt"` path (schema drift or missing triggers),
             rebuilds via `register_view(..., force_rebuild=True)`, whose
             `DROP`/`CREATE TRIGGER` DDL serializes writers (`ACCESS EXCLUSIVE`
@@ -4158,6 +4165,7 @@ class MaterializedViewManager:
                 engine_version=self.engine_version,
                 pg_fillfactor=getattr(self, "pg_fillfactor", 80),
                 watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+                repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
             )
             v_name = plan.view_name
             desired_names.add(v_name)
@@ -4528,6 +4536,7 @@ def generate_materialized_view(
     engine_version: Optional[EngineVersion | str] = None,
     watermark_catalog_table: Optional[str] = None,
     pg_fillfactor: Optional[int] = 80,
+    repair_fence_catalog_table: Optional[str] = None,
 ) -> MaterializedViewPlan:
     """
     Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
@@ -4596,6 +4605,7 @@ def generate_materialized_view(
         engine_version=resolved_ev,
         watermark_catalog_table=watermark_catalog_table,
         pg_fillfactor=pg_fillfactor,
+        repair_fence_catalog_table=repair_fence_catalog_table,
     )
     return compiler.compile()
 
@@ -4612,7 +4622,9 @@ def generate_materialized_views(
     batch_size: int = 1000,
     strict: bool = False,
     engine_version: Optional[EngineVersion | str] = None,
+    watermark_catalog_table: Optional[str] = None,
     pg_fillfactor: Optional[int] = 80,
+    repair_fence_catalog_table: Optional[str] = None,
 ) -> List[MaterializedViewPlan]:
     """
     Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
@@ -4651,7 +4663,9 @@ def generate_materialized_views(
             batch_size=batch_size,
             strict=strict,
             engine_version=resolved_ev,
+            watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=pg_fillfactor,
+            repair_fence_catalog_table=repair_fence_catalog_table,
         )
         plans.append(comp._compile_single_plan())
     return plans

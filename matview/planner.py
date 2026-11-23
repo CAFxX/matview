@@ -2499,7 +2499,9 @@ class PlannerMixin(MixinHost):
                 batch_size=self.batch_size,
                 strict=self.strict,
                 engine_version=self.engine_version,
+                watermark_catalog_table=self.watermark_catalog_table,
                 pg_fillfactor=getattr(self, "pg_fillfactor", 80),
+                repair_fence_catalog_table=self.repair_fence_catalog_table,
             )
             sub_plans.append(sub_comp._compile_single_plan())
 

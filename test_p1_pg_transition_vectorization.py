@@ -210,6 +210,7 @@ class TestPGStatementLevelDDL(unittest.TestCase):
                     flags=re.S,
                 )
                 body = re.sub(r"/\*\s*__MV_BRACKET_START__\s*\*/.*?/\*\s*__MV_BRACKET_END__\s*\*/", "", body, flags=re.S)
+                body = re.sub(r"/\*\s*__MV_REPAIR_FENCE_START__\s*\*/.*?/\*\s*__MV_REPAIR_FENCE_END__\s*\*/", "", body, flags=re.S)
                 body = "\n".join(stage_blocks) + "\n" + body
                 body = re.sub(r"(?s)IF NOT EXISTS .*?END IF;", "", body)
                 body = re.sub(r"(?s)IF NOT \(.*?END IF;", "", body)

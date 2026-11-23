@@ -239,6 +239,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         installs: List[Tuple[str, str, str, Optional[str], str]] = []
 
         lock_reg: Optional[str] = None
+        repair_fence_sql = self._pg_repair_snapshot_fence_sql()
         trunc_refresh_sql = trunc_body.strip()
         overlap_close_sql = ""
         if bracket is not None:
@@ -288,6 +289,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                         trunc_refresh_sql=trunc_refresh_sql,
                         overlap_close_sql=overlap_close_sql,
                         body_sql=bodies[event].strip(),
+                        repair_fence_sql=repair_fence_sql,
                     )
                 )
             else:
@@ -297,6 +299,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                         fn_name=fn,
                         guard_table=guard_table[event],
                         body_sql=bodies[event].strip(),
+                        repair_fence_sql=repair_fence_sql,
                     )
                 )
             ddls.append(
@@ -324,10 +327,18 @@ class PgStatementMaintenanceMixin(MixinHost):
                     lock_reg=lock_reg,
                     overlap_lock_sql=bracket.overlap_lock_sql.strip(),
                     trunc_refresh_sql=trunc_refresh_sql,
+                    repair_fence_sql=repair_fence_sql,
                 )
             )
         else:
-            ddls.append(render_procedural_sql("pg_truncate_function", fn_name=fn_trunc, trunc_block=trunc_body.strip()))
+            ddls.append(
+                render_procedural_sql(
+                    "pg_truncate_function",
+                    fn_name=fn_trunc,
+                    trunc_block=trunc_body.strip(),
+                    repair_fence_sql=repair_fence_sql,
+                )
+            )
         ddls.append(render_procedural_sql("pg_truncate_trigger", trg_name=trg_trunc, q_base_t=q_base_t, fn_name=fn_trunc))
         installs.append((trg_trunc, "AFTER", "TRUNCATE", None, fn_trunc))
         trig_names.append(trg_trunc)
@@ -672,6 +683,44 @@ class PgStatementMaintenanceMixin(MixinHost):
             where = f"\n        WHERE {src.where}" if src.where else ""
             parts.append(f"SELECT {', '.join(cols)}\n        FROM {src.from_sql(signed)}{where}")
         return "(\n        " + "\n        UNION ALL\n        ".join(parts) + "\n    ) AS __mv_p"
+
+    def _pg_repair_snapshot_fence_sql(self) -> str:
+        """Fence pre-repair REPEATABLE READ / SERIALIZABLE snapshots against stale maintenance.
+
+        Under READ COMMITTED this is a single GUC check (no locks). Under
+        REPEATABLE READ or SERIALIZABLE, ``SELECT ... FOR SHARE`` on the
+        view's catalog row succeeds concurrently for writers (``ROW SHARE`` is
+        compatible with ``FOR SHARE`` and with ``repair_view()``'s catalog
+        ``SHARE ROW EXCLUSIVE`` table lock), fails closed with SQLSTATE
+        ``40001`` if ``repair_view()``, rebuild, or backfill updated the
+        catalog row after the transaction's snapshot started, and raises
+        ``40001`` (``NOT FOUND``) if the view was created or replaced after
+        the snapshot started.
+
+        Note on chunked ``backfill_incrementally(snapshot_isolation=False)``:
+        a chunk locks backing rows before updating the catalog watermark,
+        whereas a concurrent ``REPEATABLE READ`` / ``SERIALIZABLE`` writer
+        acquires ``FOR SHARE`` on the catalog row before locking backing rows,
+        so a concurrent overlap can resolve as ``40P01`` (deadlock) instead of
+        ``40001``; ``_run_pk_range_batch`` retries ``40P01`` and application
+        transactions must retry on both ``40001`` and ``40P01`` anyway.
+        ``READ COMMITTED`` writers never enter this fence.
+        """
+        if not self.repair_fence_catalog_table:
+            return ""
+        view_lit = self.db_view_name.replace("'", "''")
+        return (
+            "/* __MV_REPAIR_FENCE_START__ */\n"
+            "    IF pg_catalog.current_setting('transaction_isolation') IN ('repeatable read', 'serializable') THEN\n"
+            f"        PERFORM 1 FROM {self.repair_fence_catalog_table} WHERE view_name = '{view_lit}' FOR SHARE;\n"
+            "        IF NOT FOUND THEN\n"
+            "            RAISE EXCEPTION 'matview: materialized view % was created or rebuilt after this % transaction started; retry the transaction',\n"
+            f"                '{view_lit}', pg_catalog.current_setting('transaction_isolation')\n"
+            "                USING ERRCODE = 'serialization_failure';\n"
+            "        END IF;\n"
+            "    END IF;\n"
+            "    /* __MV_REPAIR_FENCE_END__ */"
+        )
 
     def _pg_watermark_predicate(self, record: str, pk_col: Optional[str] = None) -> Optional[str]:
         """Skip source rows inside an active pk-range backfill window.

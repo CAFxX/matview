@@ -2607,6 +2607,12 @@ class TranspiledConnectionAdapter:
                     body,
                     flags=re.I | re.S,
                 )
+                body = re.sub(
+                    r"/\*\s*__MV_REPAIR_FENCE_START__\s*\*/.*?/\*\s*__MV_REPAIR_FENCE_END__\s*\*/",
+                    "",
+                    body,
+                    flags=re.I | re.S,
+                )
                 # Statement-level bodies start with an early return on an
                 # empty transition table; a SQLite row trigger always has
                 # its one row.

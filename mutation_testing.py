@@ -274,6 +274,26 @@ MUTANTS = (
             "test_stage4_lean_row_triggers_codegen_sqlite_and_mysql"
         ),
     ),
+    Mutant(
+        name="pg-repair-fence-omits-repeatable-read-check",
+        source_path="matview/dialects/pg_statement.py",
+        original="\"    IF pg_catalog.current_setting('transaction_isolation') IN ('repeatable read', 'serializable') THEN\\n\"",
+        replacement="\"    IF pg_catalog.current_setting('transaction_isolation') IN ('serializable') THEN\\n\"",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_repair_snapshot_fence_codegen"
+        ),
+    ),
+    Mutant(
+        name="pg-repair-fence-weakens-for-share-to-for-key-share",
+        source_path="matview/dialects/pg_statement.py",
+        original="f\"        PERFORM 1 FROM {self.repair_fence_catalog_table} WHERE view_name = '{view_lit}' FOR SHARE;\\n\"",
+        replacement="f\"        PERFORM 1 FROM {self.repair_fence_catalog_table} WHERE view_name = '{view_lit}' FOR KEY SHARE;\\n\"",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_repair_snapshot_fence_codegen"
+        ),
+    ),
 )
 
 

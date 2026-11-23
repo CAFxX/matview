@@ -63,6 +63,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
         watermark_catalog_table: Optional[str] = None,
         pg_fillfactor: Optional[int] = 80,
         accept_limitations: Sequence[str] = (),
+        repair_fence_catalog_table: Optional[str] = None,
     ) -> None:
         self._context: CompilationContext = self._build_compilation_context(
             schemas=schemas,
@@ -77,6 +78,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=pg_fillfactor,
             accept_limitations=accept_limitations,
+            repair_fence_catalog_table=repair_fence_catalog_table,
         )
 
     @classmethod
@@ -94,6 +96,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
         watermark_catalog_table: Optional[str] = None,
         pg_fillfactor: Optional[int] = 80,
         accept_limitations: Sequence[str] = (),
+        repair_fence_catalog_table: Optional[str] = None,
     ) -> CompilationContext:
         schemas_ro = MappingProxyType(dict(schemas))
         schemas_lower_ro = MappingProxyType({k.lower(): v for k, v in schemas_ro.items()})
@@ -154,6 +157,7 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
             alg_mode="single",
             ir=base_ir,
             accepted_limitations=tuple(sorted({str(c).strip() for c in (accept_limitations or ()) if str(c).strip()})),
+            repair_fence_catalog_table=repair_fence_catalog_table,
         )
         stage1 = cls._from_context(stage_ctx)
 
@@ -291,6 +295,10 @@ class IncrementalViewCompiler(PlannerMixin, MaintenanceMixin, DialectMixin):
     @property
     def watermark_catalog_table(self) -> Optional[str]:
         return self._context.watermark_catalog_table
+
+    @property
+    def repair_fence_catalog_table(self) -> Optional[str]:
+        return self._context.repair_fence_catalog_table
 
     @property
     def pg_fillfactor(self) -> Optional[int]:
