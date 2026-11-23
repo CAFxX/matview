@@ -3480,8 +3480,8 @@ def test_pg_dump_restore_real_pg_dump_cli(make_env) -> None:
         env.register(vd)
     env.check("source initial")
     view_sqls = [f"CREATE VIEW {vd.name} AS {vd.select};" for vd in views]
-    cur.execute("SELECT current_schema()")
-    src_schema = cur.fetchone()[0]
+    cur.execute("SELECT current_schema(), current_setting('server_version_num')::int")
+    src_schema, server_ver_num = cur.fetchone()
     env.commit()
 
     dst_db = f"mv_dump_{uuid.uuid4().hex[:8]}"
@@ -3498,9 +3498,18 @@ def test_pg_dump_restore_real_pg_dump_cli(make_env) -> None:
             capture_output=True,
             text=True,
         )
+        dump_sql = dump_res.stdout
+        if server_ver_num < 170000:
+            # pg_dump 17+ emits `SET transaction_timeout = 0;` even when dumping
+            # a PostgreSQL < 17 server, which PostgreSQL 15/16 rejects under
+            # psql ON_ERROR_STOP=1. Strip only that client-version GUC line.
+            dump_sql = "\n".join(
+                line for line in dump_sql.splitlines()
+                if line.strip() != "SET transaction_timeout = 0;"
+            ) + "\n"
         subprocess.run(
             [psql_bin, "-v", "ON_ERROR_STOP=1", "-d", dst_dsn],
-            input=dump_res.stdout,
+            input=dump_sql,
             check=True,
             capture_output=True,
             text=True,
