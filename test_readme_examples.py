@@ -438,6 +438,42 @@ class ReadmeLinks(unittest.TestCase):
                 self.assertIn(label, titles, "README names a TODO.md item that does not exist (by exact title)")
 
 
+class MakefileCoverage(unittest.TestCase):
+    def test_local_regression_target_runs_every_root_test_module(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        match = re.search(r"(?ms)^test-regressions:\n(.*?)(?=^[A-Za-z0-9_.-]+:|\Z)", makefile)
+        self.assertIsNotNone(match, "Makefile must define test-regressions")
+        recipe = match.group(1) if match else ""
+        listed = re.search(r"(?ms)^REGRESSION_TESTS = \\\n(.*?)(?=^test:)", makefile)
+        self.assertIsNotNone(listed, "Makefile must declare the regression test list")
+        regression_list = listed.group(1) if listed else ""
+        # Discovery-based: every root test module must be run by `make test`
+        # (its own recipe lines or REGRESSION_TESTS), so a new module that is
+        # not added to the Makefile fails here instead of silently never
+        # running locally.
+        test_match = re.search(r"(?ms)^test:\n(.*?)(?=^[A-Za-z0-9_.-]+:|\Z)", makefile)
+        self.assertIsNotNone(test_match)
+        runnable = regression_list + (test_match.group(1) if test_match else "") + recipe
+        modules = sorted(p.name for p in ROOT.glob("test_*.py"))
+        self.assertGreater(len(modules), 30)
+        pytest_case = re.search(r"([\w.]+\.py(?:\|[\w.]+\.py)*)\)[\s\\]*\$\(PYTHON\) -m pytest", recipe)
+        self.assertIsNotNone(pytest_case, "recipe must route pytest-only modules through pytest")
+        pytest_modules = set((pytest_case.group(1) if pytest_case else "").split("|"))
+        for module in modules:
+            with self.subTest(module=module):
+                self.assertIn(module, runnable, f"{module} is not run by `make test`")
+                # A module without a __main__ runner would be a silent no-op when
+                # executed as a script, so it must be routed through pytest.
+                src = (ROOT / module).read_text(encoding="utf-8")
+                if "__main__" not in src:
+                    self.assertIn(module, pytest_modules, f"{module} has no __main__ runner; run it under pytest")
+        self.assertIn("test_strength_reporting.py", recipe)
+        self.assertIn('case "$$test" in', recipe)
+        self.assertIn('$(PYTHON) -m pytest -v "$$test"', recipe)
+        self.assertIn('$(PYTHON) "$$test"', recipe)
+        self.assertIn("$(MAKE) test-regressions", test_match.group(1) if test_match else "")
+
+
 class ReadmeMatrix(unittest.TestCase):
     def test_matrix_matches_workflows(self) -> None:
         text = README.read_text(encoding="utf-8")
