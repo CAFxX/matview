@@ -478,21 +478,29 @@ jobs:
       fail-fast: false
       matrix:
         pg-version: ["15", "18"]
-    services:
-      postgres:
-        image: postgres:${{ matrix.pg-version }}
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: matview_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd="pg_isready -U postgres -d matview_test"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=15
     steps:
+      - name: Start PostgreSQL ${{ matrix.pg-version }} with prepared transactions enabled
+        env:
+          POSTGRES_IMAGE: postgres:${{ matrix.pg-version }}
+        run: |
+          docker pull "$POSTGRES_IMAGE"
+          docker run -d --name postgres-srv \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=password \
+            -e POSTGRES_DB=matview_test \
+            -p 5432:5432 \
+            "$POSTGRES_IMAGE" \
+            -c max_prepared_transactions=10
+          for i in $(seq 1 60); do
+            if docker exec postgres-srv pg_isready -h 127.0.0.1 -U postgres -d matview_test; then
+              echo "PostgreSQL ${{ matrix.pg-version }} is ready!"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs postgres-srv
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@v4
 

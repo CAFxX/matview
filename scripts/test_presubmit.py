@@ -72,7 +72,40 @@ def git(cwd: Path, *args: str, **kw: Any) -> str:
     return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True, **kw).stdout
 
 
-def make_repo(tmp: Path, *, extra_change: str = "matview_sync.py") -> Path:
+# The PR-gate workflow no longer declares any ``services:`` container (the
+# PostgreSQL jobs start their server with an explicit ``docker run`` step so
+# they can pass ``-c max_prepared_transactions=10``). The presubmit's
+# ``services:`` support is still part of its contract, so the tests that cover
+# it run against this explicit services-based form of the postgres job.
+_PG_SERVICE_BLOCK = """    services:
+      postgres:
+        image: postgres:${{ matrix.pg-version }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: matview_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d matview_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+"""
+
+
+def postgres_job_with_services(workflow: str) -> str:
+    """Rewrite the workflow's postgres job to use a ``services:`` container."""
+    job_at = workflow.index("\n  postgres:\n")
+    steps_hdr = "    steps:\n"
+    steps_at = workflow.index(steps_hdr, job_at)
+    start_at = workflow.index("      - name: Start PostgreSQL", steps_at)
+    checkout_at = workflow.index("      - name: Checkout repository", start_at)
+    assert "services:" not in workflow[job_at:steps_at]
+    return workflow[:steps_at] + _PG_SERVICE_BLOCK + steps_hdr + workflow[checkout_at:]
+
+
+def make_repo(tmp: Path, *, extra_change: str = "matview_sync.py", postgres_services: bool = False) -> Path:
     repo = tmp / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "master")
@@ -80,6 +113,9 @@ def make_repo(tmp: Path, *, extra_change: str = "matview_sync.py") -> Path:
     git(repo, "config", "user.name", "t")
     (repo / ".github" / "workflows").mkdir(parents=True)
     shutil.copy(CI_YML, repo / ".github" / "workflows" / "ci.yml")
+    if postgres_services:
+        wf = repo / ".github" / "workflows" / "ci.yml"
+        wf.write_text(postgres_job_with_services(wf.read_text(encoding="utf-8")), encoding="utf-8")
     (repo / "scripts").mkdir()
     shutil.copy(HERE / "presubmit.py", repo / "scripts" / "presubmit.py")
     (repo / "README.md").write_text("readme\n")
@@ -531,7 +567,7 @@ class ContainerRuntimeTests(TmpCase):
         self.assertIsNone(outcome.stamp)
 
     def test_runtime_present_provisions_isolated_services_and_cleans_up(self) -> None:
-        repo = make_repo(self.tmp)
+        repo = make_repo(self.tmp, postgres_services=True)
         os.environ["PRESUBMIT_CONTAINER_RUNTIME"] = "podman --remote"
         runner = FakeRunner(runtimes_ok=("podman --remote",))
         outcome, text = run_fake(repo, runner, self.tmp, only=["postgres"])
@@ -556,22 +592,29 @@ class ContainerRuntimeTests(TmpCase):
             self.assertRegex(d, r"^postgresql://postgres:password@127\.0\.0\.1:41\d\d\d/matview_test$")
 
     def test_docker_run_steps_are_rewritten_for_parallel_isolation(self) -> None:
-        repo = make_repo(self.tmp)
-        runner = FakeRunner()
-        outcome, _ = run_fake(repo, runner, self.tmp, only=["mysql"])
-        starts = [s for s, _ in runner.scripts() if "docker run -d" in s]
-        self.assertEqual(len(starts), 2)
-        for s in starts:
-            self.assertIn('docker() { docker "$@"; }', s)
-            self.assertNotIn("--name mysql-srv ", s)
-            self.assertNotIn("exec mysql-srv ", s)
-            self.assertRegex(s, r"-p 127\.0\.0\.1:41\d\d\d:3306")
-        envs = [e for _, e in runner.scripts() if e.get("MYSQL_DSN")]
-        self.assertTrue(all(":3306/" not in e["MYSQL_DSN"] for e in envs))
-        # every renamed container is removed
-        rms = [c[1][-1] for c in runner.calls if c[0] == "run" and c[1][:3] == ["docker", "rm", "-f"]]
-        self.assertEqual(len(rms), 2)
-        self.assertTrue(all(n.startswith("presubmit-") for n in rms))
+        for job, container, port, dsn_var in (
+            ("mysql", "mysql-srv", "3306", "MYSQL_DSN"),
+            ("postgres", "postgres-srv", "5432", "POSTGRES_DSN"),
+        ):
+            with self.subTest(job=job):
+                (self.tmp / job).mkdir()
+                repo = make_repo(self.tmp / job)
+                runner = FakeRunner()
+                outcome, _ = run_fake(repo, runner, self.tmp / job, only=[job])
+                starts = [s for s, _ in runner.scripts() if "docker run -d" in s]
+                self.assertEqual(len(starts), 2)
+                for s in starts:
+                    self.assertIn('docker() { docker "$@"; }', s)
+                    self.assertNotIn(f"--name {container} ", s)
+                    self.assertNotIn(f"exec {container} ", s)
+                    self.assertRegex(s, rf"-p 127\.0\.0\.1:41\d\d\d:{port}")
+                envs = [e for _, e in runner.scripts() if e.get(dsn_var)]
+                self.assertTrue(envs)
+                self.assertTrue(all(f":{port}/" not in e[dsn_var] for e in envs))
+                # every renamed container is removed
+                rms = [c[1][-1] for c in runner.calls if c[0] == "run" and c[1][:3] == ["docker", "rm", "-f"]]
+                self.assertEqual(len(rms), 2)
+                self.assertTrue(all(n.startswith("presubmit-") for n in rms))
 
 
 # ---------------------------------------------------------------------------
@@ -760,7 +803,7 @@ class FailureTests(TmpCase):
         self.assertEqual(sum(1 for s, _ in runner.scripts() if "python3 test_cli_diff.py" in s), 1)
 
     def test_service_health_failure_fails_job_and_collects_logs(self) -> None:
-        repo = make_repo(self.tmp)
+        repo = make_repo(self.tmp, postgres_services=True)
 
         class Unhealthy(FakeRunner):
             def run(self, argv, **kw):
