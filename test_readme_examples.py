@@ -261,10 +261,15 @@ def _job_database(job: Dict[str, Any], row: Dict[str, Any]) -> str:
             images.append(str(row[key]))
     for step in job.get("steps") or []:
         env = step.get("env") or {}
-        if "MYSQL_IMAGE" in env and "docker run" in str(step.get("run", "")):
-            img = _subst(env["MYSQL_IMAGE"], row)
-            if img:
-                images.append(img)
+        if "docker run" in str(step.get("run", "")):
+            # A server container started by an explicit `docker run` step takes
+            # its image from a <ENGINE>_IMAGE step variable (MYSQL_IMAGE,
+            # POSTGRES_IMAGE).
+            for key, value in env.items():
+                if str(key).endswith("_IMAGE"):
+                    img = _subst(value, row)
+                    if img:
+                        images.append(img)
     images = list(dict.fromkeys(i for i in images if i))
     if images:
         return ", ".join(f"`{i}`" for i in images)
