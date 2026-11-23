@@ -868,16 +868,22 @@ def _sqlite_type_affinity(declared_type: str) -> str:
     return "NUMERIC"
 
 
-def _extract_sqlite_raw_types_and_sanitized_ddl(stmt_sql: str) -> Tuple[Dict[str, str], str]:
-    """Extract raw SQLite declared types per column and a sqlglot-parseable DDL.
+def _extract_declared_types_and_sanitized_ddl(
+    stmt_sql: str,
+    dialect: Dialect = Dialect.SQLITE,
+    *,
+    sanitize_all: bool = True,
+) -> Tuple[Dict[str, str], str]:
+    """Extract declared column types and optionally sanitize them for sqlglot.
 
-    SQLite accepts arbitrary multi-word column type names (e.g. ``POINT REAL``,
-    ``FLOATING POINT``, ``UNSIGNED BIG INT``, ``ANY``) that sqlglot's parser
-    rejects. Returns ``(raw_types_by_col_lower, sanitized_ddl)`` where
-    ``sanitized_ddl`` replaces each column's declared type span with ``BLOB``
-    so sqlglot can parse constraints/PKs/FKs while callers restore the raw type.
+    SQLite accepts arbitrary multi-word type names, while MySQL's grammar has
+    type modifiers (notably FLOAT UNSIGNED) that sqlglot does not accept in
+    every supported release. The returned mapping preserves each declaration;
+    sanitize_all replaces type spans with BLOB for the SQLite fallback, while
+    the MySQL fallback removes only FLOAT/REAL's unsupported UNSIGNED modifier.
     """
-    toks = _tokenize_sql(stmt_sql, read="sqlite")
+    read_dialect = _sqlglot_dialect(dialect)
+    toks = _tokenize_sql(stmt_sql, read=read_dialect)
     depth = 0
     lp_idx: Optional[int] = None
     rp_idx: Optional[int] = None
@@ -898,6 +904,13 @@ def _extract_sqlite_raw_types_and_sanitized_ddl(stmt_sql: str) -> Tuple[Dict[str
         "COLLATE", "REFERENCES", "GENERATED", "AS", "CONSTRAINT",
     }
     table_constraint_starts = {"CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"}
+    if dialect == Dialect.MYSQL:
+        constraint_starts.update({
+            "AUTO_INCREMENT", "COMMENT", "COLUMN_FORMAT", "STORAGE", "SRID",
+            "VISIBLE", "INVISIBLE", "ENGINE_ATTRIBUTE", "SECONDARY_ENGINE_ATTRIBUTE",
+            "ON", "CHARSET",
+        })
+        table_constraint_starts.update({"KEY", "INDEX", "FULLTEXT", "SPATIAL"})
     raw_types: Dict[str, str] = {}
     type_spans: List[Tuple[int, int]] = []
     items: List[List[Any]] = []
@@ -930,7 +943,8 @@ def _extract_sqlite_raw_types_and_sanitized_ddl(stmt_sql: str) -> Tuple[Dict[str
         while idx_t < n_item:
             tk = item_toks[idx_t]
             if tk.token_type == SQLGlotTokenType.L_PAREN:
-                # Include optional type parameter list like DECIMAL(12, 4) or VARCHAR(32)
+                # Include the complete type parameter list, then any MySQL
+                # numeric modifiers that legally follow it (for example FLOAT(24) UNSIGNED).
                 if not t_toks:
                     break
                 p_depth = 0
@@ -945,8 +959,25 @@ def _extract_sqlite_raw_types_and_sanitized_ddl(stmt_sql: str) -> Tuple[Dict[str
                             idx_t += 1
                             break
                     idx_t += 1
+                if dialect == Dialect.MYSQL:
+                    while (
+                        idx_t < n_item
+                        and item_toks[idx_t].text.upper() in ("UNSIGNED", "SIGNED", "ZEROFILL")
+                    ):
+                        t_toks.append(item_toks[idx_t])
+                        idx_t += 1
                 break
-            if tk.token_type != SQLGlotTokenType.IDENTIFIER and tk.text.upper().split()[0] in constraint_starts:
+            if (
+                dialect == Dialect.MYSQL
+                and tk.text.upper() == "CHARACTER"
+                and idx_t + 1 < n_item
+                and item_toks[idx_t + 1].text.upper() != "VARYING"
+            ):
+                break
+            if (
+                tk.token_type != SQLGlotTokenType.IDENTIFIER
+                and tk.text.upper().split()[0] in constraint_starts
+            ):
                 break
             t_toks.append(tk)
             idx_t += 1
@@ -965,15 +996,43 @@ def _extract_sqlite_raw_types_and_sanitized_ddl(stmt_sql: str) -> Tuple[Dict[str
     for s_start, s_end in sorted(type_spans):
         if s_start >= cursor:
             out_parts.append(stmt_sql[cursor:s_start])
-            out_parts.append("BLOB")
+            raw_span = stmt_sql[s_start:s_end]
+            if sanitize_all:
+                replacement = "BLOB"
+            elif dialect == Dialect.MYSQL and re.match(
+                r"^\s*(?:FLOAT|REAL)(?:\s*\([^)]*\))?\s+UNSIGNED\b",
+                raw_span,
+                re.IGNORECASE,
+            ):
+                replacement = re.sub(r"\s+UNSIGNED\b", "", raw_span, count=1, flags=re.IGNORECASE)
+            else:
+                replacement = raw_span
+            out_parts.append(replacement)
             cursor = s_end
     out_parts.append(stmt_sql[cursor:])
     return raw_types, "".join(out_parts)
 
 
+def _mysql_default_mode_declared_type(raw_decl: str) -> str:
+    """Normalize MySQL REAL to its default DOUBLE alias.
+
+    The static DDL parser has no session sql_mode input; REAL_AS_FLOAT is
+    therefore outside this parser's model and callers using that non-default
+    mode must declare FLOAT explicitly or use live schema introspection.
+    """
+    normalized = re.sub(r"\s+", " ", raw_decl.strip())
+    return re.sub(
+        r"^REAL(?=\s|\(|$)",
+        "DOUBLE",
+        normalized,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+
 def _extract_sqlite_raw_declared_types(stmt_sql: str) -> Dict[str, str]:
     """Extract raw SQLite declared types per column from a CREATE TABLE statement."""
-    return _extract_sqlite_raw_types_and_sanitized_ddl(stmt_sql)[0]
+    return _extract_declared_types_and_sanitized_ddl(stmt_sql, dialect=Dialect.SQLITE)[0]
 
 
 def parse_table_index_def(
@@ -1165,6 +1224,20 @@ def parse_table_schema(
             r"\bGENERATED\s+ALWAYS\s+AS\s*\(", raw_stmt_s, re.IGNORECASE
         ):
             parse_input_s, pg_virtual_cols_lower = _normalize_pg_virtual_generated_ddl(raw_stmt_s)
+        is_create_table = bool(
+            re.match(r"^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\b", raw_stmt_s, re.IGNORECASE)
+        )
+        mysql_compatible_sql: Optional[str] = None
+        if (
+            eff_dialect == Dialect.MYSQL
+            and is_create_table
+            and re.search(r"\b(?:REAL|FLOAT)\b", raw_stmt_s, re.IGNORECASE)
+        ):
+            raw_col_types, mysql_compatible_sql = _extract_declared_types_and_sanitized_ddl(
+                raw_stmt_s,
+                dialect=eff_dialect,
+                sanitize_all=False,
+            )
         try:
             stmt_ast = parse_sql_ast(parse_input_s, dialect=eff_dialect)
         except sqlglot.errors.SqlglotError:
@@ -1174,13 +1247,19 @@ def parse_table_schema(
                     stmt_ast = parse_sql_ast(pg_norm_sql, dialect=eff_dialect)
                 except sqlglot.errors.SqlglotError:
                     continue
-            elif eff_dialect == Dialect.SQLITE and re.match(
-                r"^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\b", raw_stmt_s, re.IGNORECASE
-            ):
-                raw_col_types, sanitized_sql = _extract_sqlite_raw_types_and_sanitized_ddl(raw_stmt_s)
+            elif eff_dialect == Dialect.SQLITE and is_create_table:
+                raw_col_types, sanitized_sql = _extract_declared_types_and_sanitized_ddl(
+                    raw_stmt_s,
+                    dialect=eff_dialect,
+                )
                 try:
                     stmt_ast = parse_sql_ast(sanitized_sql, dialect=eff_dialect)
                     used_sqlite_type_fallback = True
+                except sqlglot.errors.SqlglotError:
+                    continue
+            elif eff_dialect == Dialect.MYSQL and mysql_compatible_sql is not None:
+                try:
+                    stmt_ast = parse_sql_ast(mysql_compatible_sql, dialect=eff_dialect)
                 except sqlglot.errors.SqlglotError:
                     continue
             else:
@@ -1188,7 +1267,10 @@ def parse_table_schema(
         if not isinstance(stmt_ast, sqlglot_exp.Create) or (stmt_ast.kind or "").upper() != "TABLE":
             continue
         if eff_dialect == Dialect.SQLITE and not raw_col_types:
-            raw_col_types, _ = _extract_sqlite_raw_types_and_sanitized_ddl(raw_stmt_s)
+            raw_col_types, _ = _extract_declared_types_and_sanitized_ddl(
+                raw_stmt_s,
+                dialect=eff_dialect,
+            )
         schema_node = stmt_ast.this
         if not isinstance(schema_node, sqlglot_exp.Schema) or not isinstance(schema_node.this, sqlglot_exp.Table):
             continue
@@ -1313,6 +1395,20 @@ def parse_table_schema(
                         # No declared type: BLOB affinity in SQLite. Declaring the
                         # derived backing columns TEXT would convert numbers to text.
                         data_type = "BLOB"
+                elif eff_dialect == Dialect.MYSQL and raw_col_types.get(col_name.lower(), "").strip():
+                    raw_decl = raw_col_types[col_name.lower()].strip()
+                    if re.match(r"^REAL(?=\s|\(|$)", raw_decl, re.IGNORECASE):
+                        data_type = _mysql_default_mode_declared_type(raw_decl)
+                    elif re.match(
+                        r"^FLOAT(?:\s*\([^)]*\))?\s+UNSIGNED\b",
+                        raw_decl,
+                        re.IGNORECASE,
+                    ):
+                        data_type = raw_decl
+                    elif expr_item.kind is not None:
+                        data_type = expr_item.kind.sql(sg_d)
+                    else:
+                        data_type = "TEXT"
                 elif expr_item.kind is not None:
                     data_type = expr_item.kind.sql(sg_d)
                     if (
