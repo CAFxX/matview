@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -281,6 +282,30 @@ def _job_database(job: Dict[str, Any], row: Dict[str, Any]) -> str:
     return "SQLite bundled with CPython (`sqlite3`)"
 
 
+def gate_server_flags(workflow: Dict[str, Any]) -> Dict[str, Tuple[str, ...]]:
+    """Server arguments each PR-gate `docker run` step passes after its image.
+
+    Maps the rendered image (e.g. ``postgres:15``) to the argument tuple that
+    follows ``"$<ENGINE>_IMAGE"`` on the step's (continuation-joined)
+    ``docker run`` command line."""
+    flags: Dict[str, Tuple[str, ...]] = {}
+    for job in (workflow.get("jobs") or {}).values():
+        if not _job_runs_tests(job):
+            continue
+        for row in _matrix_rows(job):
+            for step in job.get("steps") or []:
+                lines = str(step.get("run", "")).replace("\\\n", " ").splitlines()
+                run_lines = [ln for ln in lines if re.match(r"\s*docker\s+run\b", ln)]
+                for key, value in (step.get("env") or {}).items():
+                    if not str(key).endswith("_IMAGE"):
+                        continue
+                    for ln in run_lines:
+                        tokens = shlex.split(ln)
+                        if f"${key}" in tokens:
+                            flags[_subst(value, row)] = tuple(tokens[tokens.index(f"${key}") + 1:])
+    return flags
+
+
 def render_matrix_rows(workflow: Dict[str, Any]) -> List[Tuple[str, str, str]]:
     rows: List[Tuple[str, str, str]] = []
     for job in (workflow.get("jobs") or {}).values():
@@ -452,6 +477,19 @@ class ReadmeMatrix(unittest.TestCase):
         for _, _, db in render_matrix_rows(load_workflow(WORKFLOWS / "ci.yml")):
             gate_images.update(re.findall(r"`([^`]+:[^`]+)`", db))
         self.assertEqual(compose_images - {i for i in compose_images if not i.startswith(("postgres", "mysql", "mariadb"))}, gate_images)
+
+    def test_docker_compose_server_flags_match_the_pr_gate(self) -> None:
+        # The compose environment must start each server the way the PR gate
+        # does (character set, durability, max_prepared_transactions, ...), or a
+        # local run silently skips/behaves differently from CI.
+        gate = gate_server_flags(load_workflow(WORKFLOWS / "ci.yml"))
+        self.assertTrue(gate, "no server flags found in the PR-gate docker run steps")
+        compose = load_workflow(ROOT / "docker-compose.yml")  # same YAML loader
+        by_image = {str(svc.get("image")): svc for svc in compose["services"].values() if svc.get("image")}
+        for image, flags in gate.items():
+            with self.subTest(image=image):
+                self.assertIn(image, by_image, f"docker-compose.yml has no service for {image}")
+                self.assertEqual(tuple(str(c) for c in by_image[image].get("command") or ()), flags)
 
 
 class ConventionParserSelfTest(unittest.TestCase):
