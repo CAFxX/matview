@@ -1745,6 +1745,11 @@ class PgStatementMaintenanceMixin(MixinHost):
         or FROM subqueries)."""
         if self.view.has_cte or self.view.has_compound_set_op or self.view.has_subquery_in_from:
             return None, []
+        if self._view_has_grouping_sets():
+            # ROLLUP/CUBE/GROUPING SETS views use the full refresh, which keys
+            # nothing by the grouping expressions (and those are not
+            # expressions: probing "GROUPING SETS (...)" is a syntax error).
+            return None, []
         if self.view.joins:
             parts: List[str] = []
             for idx, j in enumerate(self.view.joins):
