@@ -5,6 +5,11 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
       POSTGRES_DB: matview_test
+    # Same server flags as the PostgreSQL CI jobs (the two_phase_commit DML cell
+    # needs prepared transactions); test_readme_examples.py keeps them in sync.
+    command:
+      - -c
+      - max_prepared_transactions=10
     ports:
       - "${POSTGRES15_PORT:-5432}:5432"
     healthcheck:
@@ -19,6 +24,11 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
       POSTGRES_DB: matview_test
+    # Same server flags as the PostgreSQL CI jobs (the two_phase_commit DML cell
+    # needs prepared transactions); test_readme_examples.py keeps them in sync.
+    command:
+      - -c
+      - max_prepared_transactions=10
     ports:
       - "${POSTGRES18_PORT:-5433}:5432"
     healthcheck:
