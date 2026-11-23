@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import FrozenInstanceError
+import io
 import importlib
 import pkgutil
 import re
 import subprocess
 import sys
 import unittest
+import warnings
 from pathlib import Path
 
 import matview
@@ -194,6 +197,94 @@ for name in matview.__all__:
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_cli_output_matches_legacy_api_plan_across_dialects(self) -> None:
+        schema_sql = """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            category VARCHAR(32) NOT NULL,
+            amount INTEGER NOT NULL
+        );
+        """
+        view_sql = """
+        CREATE VIEW order_totals AS
+        SELECT category, COUNT(*) AS row_count, SUM(amount) AS total_amount
+        FROM orders
+        GROUP BY category;
+        """
+        # Exercise three materially different CLI modes: ordinary SQLite
+        # population, PostgreSQL incremental backfill, and MySQL no-populate.
+        # MySQL has no AFTER TRUNCATE trigger, so every MySQL view needs the
+        # global --ignore-limitations (MYSQL_NO_TRUNCATE_TRIGGER); the CLI and
+        # the API must then emit the same limitation warning.
+        cases = (
+            ("sqlite:3.46.0", False, False, False),
+            ("postgres:18.0", True, False, False),
+            ("mysql:8.4.0", False, True, True),
+        )
+        for engine_spec, incremental, no_populate, ignore_limitations in cases:
+            with self.subTest(
+                engine=engine_spec,
+                incremental_backfill=incremental,
+                no_populate=no_populate,
+                ignore_limitations=ignore_limitations,
+            ):
+                engine = ms.parse_engine_version(engine_spec)
+                schemas = ms.parse_table_schema(schema_sql, dialect=engine.dialect)
+                with warnings.catch_warnings(record=True) as api_warnings:
+                    warnings.simplefilter("always")
+                    api_plan = ms.generate_materialized_view(
+                        schemas,
+                        view_sql,
+                        dialect=engine.dialect,
+                        engine_version=engine,
+                        object_prefix="compat_",
+                        incremental_backfill=incremental,
+                        batch_size=7,
+                        ignore_limitations=ignore_limitations,
+                    )
+                expected_sql = api_plan.render_sql_script(
+                    include_populate=not no_populate,
+                    incremental_backfill=incremental,
+                    batch_size=7,
+                )
+
+                argv = [
+                    "--schema",
+                    schema_sql,
+                    "--view",
+                    view_sql,
+                    "--engine-version",
+                    engine_spec,
+                    "--object-prefix",
+                    "compat_",
+                    "--batch-size",
+                    "7",
+                ]
+                if incremental:
+                    argv.append("--incremental-backfill")
+                if no_populate:
+                    argv.append("--no-populate")
+                if ignore_limitations:
+                    argv.append("--ignore-limitations")
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with warnings.catch_warnings(record=True) as cli_warnings:
+                    warnings.simplefilter("always")
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        exit_code = matview.main(argv)
+
+                self.assertEqual(exit_code, 0, stderr.getvalue())
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(
+                    [(w.category, str(w.message)) for w in cli_warnings],
+                    [(w.category, str(w.message)) for w in api_warnings],
+                )
+                self.assertEqual(bool(api_warnings), ignore_limitations)
+                # CLI output is print(plan.render_sql_script(...)), so include
+                # exactly the one newline added by print().
+                self.assertEqual(stdout.getvalue(), expected_sql + "\n")
 
     def test_cli_entrypoints_help(self) -> None:
         r1 = subprocess.run(
