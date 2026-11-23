@@ -2045,11 +2045,15 @@ class Tier1SingleMixin(MixinHost):
             )
         wm_pk = self._watermark_pk_column() if processed_only else None
         if wm_pk:
-            q_pk = "rowid" if wm_pk == "rowid" else self._q(wm_pk)
+            # Same window as _build_native_group_recompute and the trigger
+            # guards (a claimed but not yet advanced watermark, cursor NULL,
+            # covers the whole claimed range).
+            q_pk = self._quote_pk_range_col(wm_pk)
+            view_lit = self.db_view_name.replace("'", "''")
             conds.append(
                 f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
-                f"WHERE view_name = '{self.db_view_name}' AND backfill_active = 1 "
-                f"AND {q_base_t}.{q_pk} > backfill_cursor_pk AND {q_base_t}.{q_pk} <= backfill_max_pk)"
+                f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
+                f"AND (backfill_cursor_pk IS NULL OR ({q_base_t}.{q_pk} > backfill_cursor_pk AND {q_base_t}.{q_pk} <= backfill_max_pk)))"
             )
         # PostgreSQL order-sensitive aggregates (opt-in only) accumulate in
         # sequential-scan (ctid) order whatever access path the group filter uses.
