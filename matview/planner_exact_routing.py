@@ -30,11 +30,12 @@ from sqlglot import exp as sqlglot_exp
 from ._host import MixinHost
 from .aggregate_semantics import (
     aggregate_calls,
+    aggregate_order_keys,
     call_name,
     has_grouping_sets,
     iter_unordered_order_sensitive_calls,
 )
-from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, exact_fallback_message
+from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, exact_fallback_message, relaxed_message
 from .engines import AggFunc, Dialect, MaintenanceStrategy, UnsupportedMaterializedViewError, _sqlglot_dialect
 from .logical_ir import SelectItem
 from .sql_frontend import parse_sql_ast
@@ -57,8 +58,11 @@ class ExactRoutingFallback:
     cost: str
     remedy: str
     expressions: Tuple[str, ...]
+    relaxed_text: str = ""
 
     def message(self) -> str:
+        if self.relaxed_text:
+            return self.relaxed_text
         return exact_fallback_message(self.strategy, self.reason, self.cost, self.remedy)
 
 
@@ -71,6 +75,11 @@ FULL_REFRESH_COST = (
     "every write re-runs the whole view query: O(table) once per statement on PostgreSQL, "
     "once per changed row on SQLite, MySQL and MariaDB."
 )
+
+# Per-code opt-in that accepts a non-reproducible element order (shared with
+# the floating-point policy: both concern the order the engine reads rows).
+ORDER_SENSITIVE_OPT_IN = "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"
+ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE = "ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE"
 
 # Aggregates with an algebraic delta rule (the decomposition targets).
 _ALGEBRAIC_AGGREGATE_NAMES = frozenset(
@@ -150,8 +159,20 @@ class ExactAggregateRoutingMixin(MixinHost):
                     return False
         return True
 
-    def _unordered_order_sensitive_aggregates(self) -> List[str]:
-        """SQL of order-sensitive aggregate calls without a total input order."""
+    def _unordered_order_sensitive_aggregates(self, *, include_relaxed: bool = False) -> List[str]:
+        """SQL of order-sensitive aggregate calls whose result a group-scoped
+        recompute cannot reproduce exactly:
+
+        * aggregates the planner recognizes (GROUP_CONCAT, STRING_AGG,
+          ARRAY_AGG, json_group_*) WITHOUT an aggregate-level ORDER BY: their
+          element order is whatever the engine's plan reads, and a recompute
+          restricted to one group reads through another plan (observed on
+          MariaDB 11.8). With an ORDER BY they keep their strategy.
+          ``accept_limitations=['ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE']``
+          relaxes this (``include_relaxed`` lists them anyway);
+        * other order-sensitive aggregates without a total aggregate-level
+          ORDER BY (one covering every source primary key)."""
+        relaxed = ORDER_SENSITIVE_OPT_IN in set(self.accepted_limitations)
         out: List[str] = []
         exprs = [it.raw_expr for it in self.view.select_items]
         if self.view.having_clause:
@@ -164,14 +185,14 @@ class ExactAggregateRoutingMixin(MixinHost):
             for call in iter_unordered_order_sensitive_calls(node, self._order_keys_cover_every_primary_key):
                 if self._is_float_policy_aggregate(call):
                     continue
-                if call_name(call, sg_d) in _ALGEBRAIC_AGGREGATE_NAMES | _RECOGNIZED_HOLISTIC_NAMES:
-                    # Aggregates the planner already recognizes keep their
-                    # strategy (group-scoped recompute for GROUP_CONCAT /
-                    # STRING_AGG / ARRAY_AGG / json_group_*): this routing
-                    # only places aggregates nothing else handles. Their
-                    # order sensitivity under a group recompute is recorded
-                    # in TODO.md.
+                name = call_name(call, sg_d)
+                if name in _ALGEBRAIC_AGGREGATE_NAMES:
                     continue
+                if name in _RECOGNIZED_HOLISTIC_NAMES:
+                    if aggregate_order_keys(call) is not None:
+                        continue  # an inner ORDER BY: keeps its strategy
+                    if relaxed and not include_relaxed:
+                        continue  # per-code opt-in: the group recompute
                 out.append(call.sql(dialect=sg_d))
         return out
 
@@ -255,9 +276,11 @@ class ExactAggregateRoutingMixin(MixinHost):
                 "group's rows are read, and only a full evaluation of the original query reads "
                 "them as the live view does.",
                 FULL_REFRESH_COST,
-                "add an ORDER BY that covers the primary key of every base table inside the "
-                "aggregate call (e.g. ARRAY_AGG(x ORDER BY <pk>)) to enable the group-scoped "
-                "recompute.",
+                "add an ORDER BY inside the aggregate call (e.g. ARRAY_AGG(x ORDER BY <pk>); for "
+                "aggregates other than GROUP_CONCAT/STRING_AGG/ARRAY_AGG/json_group_* it must cover "
+                "the primary key of every base table) to enable the group-scoped recompute, or accept "
+                "a non-reproducible element order with accept_limitations="
+                "['ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE'] (relaxed).",
                 tuple(unordered),
             )
         opaque = self._opaque_grouped_items()
@@ -296,6 +319,28 @@ class ExactAggregateRoutingMixin(MixinHost):
         names = self._non_algebraic_aggregate_names()
         if not names:
             return None
+        relaxed_calls = (
+            self._unordered_order_sensitive_aggregates(include_relaxed=True)
+            if ORDER_SENSITIVE_OPT_IN in set(self.accepted_limitations)
+            else []
+        )
+        if relaxed_calls:
+            return ExactRoutingFallback(
+                ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE,
+                Strategy.GROUP_SCOPED_RECOMPUTE,
+                "",
+                "",
+                "",
+                tuple(relaxed_calls),
+                relaxed_text=relaxed_message(
+                    Strategy.GROUP_SCOPED_RECOMPUTE,
+                    "the element order of " + ", ".join(relaxed_calls) + " is the order in which "
+                    "the group recompute reads the group's rows, which can differ from the live "
+                    "view's (the elements are the same). Cost: " + GROUP_RECOMPUTE_COST,
+                    "remove ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE from accept_limitations (exact "
+                    "full refresh), or add an ORDER BY inside the aggregate call.",
+                ),
+            )
         return ExactRoutingFallback(
             UNRECOGNIZED_AGGREGATE_GROUP_RECOMPUTE,
             Strategy.GROUP_SCOPED_RECOMPUTE,
@@ -343,7 +388,7 @@ class ExactAggregateRoutingMixin(MixinHost):
         return (
             Diagnostic(
                 code=fb.code,
-                severity=DiagnosticSeverity.INFO,
+                severity=DiagnosticSeverity.WARNING if fb.relaxed_text else DiagnosticSeverity.INFO,
                 view=self.logical_view_name,
                 strategy=fb.strategy,
                 columns=(),
