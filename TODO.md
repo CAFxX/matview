@@ -689,8 +689,8 @@ The existing differential-testing harness is useful, but its current headline co
  
 - [ ] **Make LogicalIR, CompilationContext and Plan Data Deeply Immutable**:
   PR #214 uses frozen dataclasses, but TableSchema.columns, IncrementalBackfillSpec.chunk_sql_templates, PlanDiagnostics lists/details and LogicalIR mapping fields remain mutable. MappingProxyType only protects the outer schemas mapping; nested TableSchema dictionaries remain mutable, and PlanDiagnostics.to_dict performs shallow copies. Normalize mutable inputs to tuples/immutable mappings or detached private copies and test nested mutation attempts, including mutation of diagnostic output after compilation.
-- [ ] **Expand Modular-Package Compatibility Tests Before Accepting the Refactor**:
-  PR #214 changes 54 files and is a large extraction. Its five modular-package tests are smoke tests, not a complete compatibility proof. Add complete facade-export parity, import-order/cycle, CLI/API parity and full native differential/concurrency regression runs on the exact package head. Keep public API compatibility explicit.
+- [x] **Expand Modular-Package Compatibility Tests After the Refactor**:
+  - Done: `test_p1_modular_package.py` verifies package-module discovery, complete `matview.__all__` object-identity parity through the legacy `matview_sync` facade, both import orders in fresh interpreters, compiler/IR non-mutation across dialects, and exact CLI/API SQL-output parity for SQLite, PostgreSQL and MySQL (full population, incremental backfill and no-populate modes). The suite runs in the SQLite PR gate; the full native differential and concurrency suites run on the exact PR head in the engine matrix.
 - [ ] **Normalize Introspected SQL Type Metadata Semantically**:
   PR #197 exact-head CI fails test_08 across several SQLite-compatible jobs because DECIMAL(18, 4) and DECIMAL(18,4) are compared as raw strings. Normalize base type, precision, scale and modifiers into structured metadata; preserve the original declaration separately and ensure genuinely different types remain distinct.
 - [ ] **Split the Test Harness by Contract After P0 Stabilization**:
