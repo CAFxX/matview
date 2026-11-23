@@ -2470,6 +2470,10 @@ class TranspiledConnectionAdapter:
             # Installs the statement triggers on every partition; SQLite has
             # no partitions or inheritance, so there is nothing to emulate.
             return [], 0
+        if s_up.startswith("DO $MV_DROP$"):
+            # Drops repointed triggers across PostgreSQL partition trees;
+            # DROP FUNCTION ... CASCADE already removed the SQLite triggers.
+            return [], 0
         if s_up.startswith("DO $MV_COLL$"):
             # Refuses nondeterministic collations, which SQLite does not have.
             return [], 0
