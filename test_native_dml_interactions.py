@@ -1399,21 +1399,74 @@ def _dml_through_views(ctx: Ctx) -> None:
 
 
 @cell("view_as_source", AREA_B, "Registering a materialized view whose FROM names a plain (non-materialized) view",
-      "refused at registration: a view has no triggers to maintain it",
-      sqlite=REFUSED, postgres=REFUSED, mysql=REFUSED, mariadb=REFUSED)
+      "plain SQL views are recursively inlined into base-table queries (rejecting cycles), triggers install on underlying base tables, and check_schema_drift() detects out-of-band view changes (repair_view() rebuilds on SQLite/PostgreSQL; MySQL/MariaDB use drop_view() + register_view())",
+      sqlite=EXACT, postgres=EXACT, mysql=EXACT, mariadb=EXACT)
 def _view_as_source(ctx: Ctx) -> None:
     env = ctx.env
     env.execute("CREATE VIEW au_src AS SELECT id, g, v FROM t WHERE g IS NOT NULL")
     env.commit()
     ctx.cleanup("DROP VIEW IF EXISTS au_src")
-    with pytest.raises(Exception) as info:
-        env.manager.register_view("CREATE VIEW v_over_view AS SELECT g, COUNT(*) AS c FROM au_src GROUP BY g;",
-                                  ignore_limitations=True)
-    env.rollback()
-    assert isinstance(info.value, ValueError), repr(info.value)
-    assert "does not reference any known base tables" in str(info.value), str(info.value)
-    assert "v_over_view" not in env.manager.get_catalog()
-    env.rollback()
+    plan = env.manager.register_view(
+        "CREATE VIEW v_over_view AS SELECT g, COUNT(*) AS c, SUM(v) AS s FROM au_src GROUP BY g;",
+        ignore_limitations=True,
+    )
+    assert plan.strategy.value == "algebraic_delta", plan.strategy
+    assert "v_over_view" in env.manager.get_catalog()
+    try:
+        def _check_mv(step: str) -> None:
+            cur = env.conn.cursor()
+            try:
+                actual = h._relation(cur, "SELECT g, c, s FROM v_over_view ORDER BY g")
+                expected = h._relation(cur, "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM au_src GROUP BY g ORDER BY g")
+            finally:
+                cur.close()
+            env.commit()
+            assert actual == expected, f"{step}: actual={actual!r} expected={expected!r}"
+
+        _check_mv("initial populate over plain view")
+        env.execute("INSERT INTO t (id, g, v, w, u) VALUES (745, 1, 50, 0, NULL), (746, NULL, 99, 0, NULL)")
+        env.execute("UPDATE t SET v = v + 7 WHERE id = 745")
+        env.execute("DELETE FROM t WHERE id = 1")
+        env.commit()
+        _check_mv("DML on underlying base table")
+        assert env.manager.check_schema_drift()["v_over_view"] == "ok"
+
+        # Altering the plain view out of band is reported as drifted and rebuilt.
+        if ctx.family == "sqlite":
+            env.execute("DROP VIEW au_src")
+            env.execute("CREATE VIEW au_src AS SELECT id, g, v * 2 AS v FROM t WHERE g IS NOT NULL AND v > 0")
+        else:
+            env.execute("CREATE OR REPLACE VIEW au_src AS SELECT id, g, v * 2 AS v FROM t WHERE g IS NOT NULL AND v > 0")
+        env.commit()
+        assert env.manager.check_schema_drift()["v_over_view"] == "drifted"
+        if ctx.family == "mysql":
+            from matview import UnsafeReplacementError
+
+            with pytest.raises(UnsafeReplacementError):
+                env.manager.repair_view("v_over_view")
+            env.manager.drop_view("v_over_view")
+            env.manager.register_view(
+                "CREATE VIEW v_over_view AS SELECT g, COUNT(*) AS c, SUM(v) AS s FROM au_src GROUP BY g;",
+                ignore_limitations=True,
+            )
+        else:
+            rep = env.manager.repair_view("v_over_view")
+            assert rep == {"v_over_view": "rebuilt"}, rep
+        assert env.manager.check_schema_drift()["v_over_view"] == "ok"
+        _check_mv("after plain-view alter + rebuild")
+
+        env.execute("INSERT INTO t (id, g, v, w, u) VALUES (747, 2, 11, 0, NULL)")
+        env.commit()
+        _check_mv("DML after rebuild")
+    finally:
+        try:
+            env.rollback()
+        except Exception:
+            pass
+        try:
+            env.manager.drop_view("v_over_view")
+        except Exception:
+            pass
 
 
 @cell("pg_rules", AREA_B, "Rewrite rules on the source: conditional DO INSTEAD (soft delete) and DO ALSO",

@@ -2404,6 +2404,18 @@ class TranspiledConnectionAdapter:
                 self._skip_triggers = 1 if ("'ON'" in s_up or "= 1" in s_up or "=1" in s_up) else 0
             return [], 0
 
+        if "PG_GET_VIEWDEF" in s_up:
+            rows_v = self._sq_conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'view' AND sql IS NOT NULL ORDER BY name"
+            ).fetchall()
+            out_v = [("public", r[0], r[1]) for r in rows_v]
+            return out_v, len(out_v)
+        if "INFORMATION_SCHEMA.VIEWS" in s_up:
+            rows_v = self._sq_conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'view' AND sql IS NOT NULL ORDER BY name"
+            ).fetchall()
+            out_v = [("main", r[0], r[1]) for r in rows_v]
+            return out_v, len(out_v)
         if "INFORMATION_SCHEMA.TRIGGERS" in s_up and "ORDER BY ACTION_ORDER" in s_up:
             # Registration's "existing triggers of this table and event"
             # lookup (PRECEDES placement): the emulation keeps no trigger

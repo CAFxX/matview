@@ -29,6 +29,7 @@ from test_matview_sync import FLOAT_OPT_IN
 from matview_sync import (
     DEFAULT_OBJECT_PREFIX,
     Dialect,
+    MaintenanceStrategy,
     MaterializedViewManager,
     _extract_created_object,
     parse_table_schema,
@@ -427,6 +428,7 @@ class TestMySqlNonAtomicRegistrationRollback(unittest.TestCase):
         view_sql = "CREATE VIEW mv_users AS SELECT status, SUM(score) as tot FROM users GROUP BY status;"
         schemas = parse_table_schema("CREATE TABLE users (id INTEGER PRIMARY KEY, status TEXT, score REAL);")
         manager.fetch_schema = lambda extra_schema_sql=None: schemas
+        manager._fetch_plain_views = lambda **_kw: ({}, None)
 
         # Intercept cursor execution: let CREATE TABLE and CREATE VIEW succeed, but fail on CREATE TRIGGER
         executed_statements: List[str] = []
@@ -1286,6 +1288,475 @@ class TestPostgresTriggerAndFunctionDriftParsers(unittest.TestCase):
         self.assertFalse(check("   ", "public", current_user="postgres"))
         self.assertFalse(check("pg_catalog", "mv_schema", current_user="postgres"))
         self.assertFalse(check("other_schema, public", "mv_schema", current_user="postgres"))
+
+
+class TestPlainViewAsSource(unittest.TestCase):
+    """Tests for plain (non-materialized) SQL views used as materialized view sources."""
+
+    def test_sqlite_plain_view_simple_unwraps_to_tier1_and_detects_drift(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, v INTEGER NOT NULL);")
+            conn.executemany(
+                "INSERT INTO t VALUES (?, ?, ?)",
+                [(1, "A", 10), (2, "A", 20), (3, "B", 30), (4, None, 99)],
+            )
+            conn.execute("CREATE VIEW pv_src AS SELECT id, g, v FROM t WHERE g IS NOT NULL;")
+            conn.commit()
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+            mv_sql = "CREATE VIEW mv_over_pv AS SELECT g, COUNT(*) AS c, SUM(v) AS s FROM pv_src GROUP BY g;"
+            plan = mgr.register_view(mv_sql)
+            self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+            self.assertEqual(plan.view_spec.referenced_tables, ("t",))
+            self.assertEqual(
+                conn.execute("SELECT g, c, s FROM mv_over_pv ORDER BY g").fetchall(),
+                [("A", 2, 30), ("B", 1, 30)],
+            )
+
+            # Re-registering same definition is a no-op; drift/diff/sync agree.
+            mgr.register_view(mv_sql)
+            self.assertEqual(mgr.check_schema_drift(), {"mv_over_pv": "ok"})
+            diff = mgr.diff_views(mv_sql)
+            self.assertEqual(diff["mv_over_pv"].status, "NOOP")
+            self.assertEqual(mgr.sync_views(mv_sql), {"mv_over_pv": "unchanged"})
+
+            # Base table mutations maintain exactness through the inlined plain view.
+            conn.execute("INSERT INTO t VALUES (5, 'A', 5), (6, NULL, 100);")
+            conn.execute("UPDATE t SET v = v + 10 WHERE id = 2;")
+            conn.execute("DELETE FROM t WHERE id = 3;")
+            conn.commit()
+            self.assertEqual(
+                conn.execute("SELECT g, c, s FROM mv_over_pv ORDER BY g").fetchall(),
+                conn.execute("SELECT g, COUNT(*), SUM(v) FROM pv_src GROUP BY g ORDER BY g").fetchall(),
+            )
+
+            # Out-of-band plain-view change -> check_schema_drift() == "drifted", repair_view() rebuilds.
+            conn.execute("DROP VIEW pv_src;")
+            conn.execute("CREATE VIEW pv_src AS SELECT id, g, v * 2 AS v FROM t WHERE g IS NOT NULL AND v > 10;")
+            conn.commit()
+            self.assertEqual(mgr.check_schema_drift(), {"mv_over_pv": "drifted"})
+            self.assertEqual(mgr.repair_view("mv_over_pv"), {"mv_over_pv": "rebuilt"})
+            self.assertEqual(mgr.check_schema_drift(), {"mv_over_pv": "ok"})
+            self.assertEqual(
+                conn.execute("SELECT g, c, s FROM mv_over_pv ORDER BY g").fetchall(),
+                conn.execute("SELECT g, COUNT(*), SUM(v) FROM pv_src GROUP BY g ORDER BY g").fetchall(),
+            )
+
+            # Out-of-band plain-view drop -> check_schema_drift() == "invalid".
+            conn.execute("DROP VIEW pv_src;")
+            conn.commit()
+            self.assertEqual(mgr.check_schema_drift(), {"mv_over_pv": "invalid"})
+        finally:
+            conn.close()
+
+    def test_sqlite_chained_diamond_joined_grouped_cte_and_explicit_columns(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, d_id INTEGER NOT NULL, g TEXT NOT NULL, v INTEGER NOT NULL);")
+            conn.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+            conn.executemany("INSERT INTO d VALUES (?, ?)", [(1, "D1"), (2, "D2")])
+            conn.executemany(
+                "INSERT INTO t VALUES (?, ?, ?, ?)",
+                [(1, 1, "A", 10), (2, 1, "A", 20), (3, 2, "B", 30)],
+            )
+            # Chained views v2 -> v1 -> t
+            conn.execute("CREATE VIEW v1 AS SELECT id, d_id, g, v FROM t WHERE v >= 10;")
+            conn.execute("CREATE VIEW v2 AS SELECT id, d_id, g, v * 3 AS v3 FROM v1;")
+            # Explicit column list (projection, SELECT *, and UNION ALL)
+            conn.execute("CREATE VIEW v_cols(k, amt) AS SELECT g, v FROM t;")
+            conn.execute("CREATE VIEW v_star(x_id, x_did, x_g, x_v) AS SELECT * FROM t;")
+            conn.execute("CREATE VIEW v_ucols(k, amt) AS SELECT g, v FROM t UNION ALL SELECT name, id FROM d;")
+            # Diamond DAG: v_left + v_right both read v1
+            conn.execute("CREATE VIEW v_left AS SELECT g, SUM(v) AS sl FROM v1 GROUP BY g;")
+            conn.execute("CREATE VIEW v_right AS SELECT g, COUNT(*) AS cr FROM v1 GROUP BY g;")
+            # Plain view with CTE and quoted/special-character plain view name
+            conn.execute("CREATE VIEW v_cte AS WITH base AS (SELECT g, v FROM t WHERE v > 0) SELECT g, SUM(v) AS sv FROM base GROUP BY g;")
+            conn.execute('CREATE VIEW "v\'s src" AS SELECT id, g, v FROM t WHERE v > 5;')
+            conn.commit()
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+            mvs = [
+                ("mv_chain", "SELECT g, SUM(v3) AS s FROM v2 GROUP BY g", "SELECT g, SUM(v3) FROM v2 GROUP BY g ORDER BY g"),
+                ("mv_cols", "SELECT k, SUM(amt) AS s FROM v_cols GROUP BY k", "SELECT k, SUM(amt) FROM v_cols GROUP BY k ORDER BY k"),
+                ("mv_star", "SELECT x_g, SUM(x_v) AS s FROM v_star GROUP BY x_g", "SELECT x_g, SUM(x_v) FROM v_star GROUP BY x_g ORDER BY x_g"),
+                ("mv_ucols", "SELECT k, SUM(amt) AS s FROM v_ucols GROUP BY k", "SELECT k, SUM(amt) FROM v_ucols GROUP BY k ORDER BY k"),
+                ("mv_join_base", "SELECT d.name, SUM(v1.v) AS s FROM v1 JOIN d ON d.id = v1.d_id GROUP BY d.name", "SELECT d.name, SUM(v1.v) FROM v1 JOIN d ON d.id = v1.d_id GROUP BY d.name ORDER BY d.name"),
+                ("mv_diamond", "SELECT l.g, l.sl, r.cr FROM v_left l JOIN v_right r ON r.g = l.g", "SELECT l.g, l.sl, r.cr FROM v_left l JOIN v_right r ON r.g = l.g ORDER BY l.g"),
+                ("mv_cte", "SELECT g, sv * 2 AS sv2 FROM v_cte WHERE sv >= 20", "SELECT g, sv * 2 FROM v_cte WHERE sv >= 20 ORDER BY g"),
+                ("mv_in_subq", "SELECT id, name FROM d WHERE id IN (SELECT d_id FROM v1 WHERE v >= 20)", "SELECT id, name FROM d WHERE id IN (SELECT d_id FROM v1 WHERE v >= 20) ORDER BY id"),
+                ("mv_quoted_pv", 'SELECT g, COUNT(*) AS c FROM "v\'s src" GROUP BY g', 'SELECT g, COUNT(*) FROM "v\'s src" GROUP BY g ORDER BY g'),
+            ]
+            for vn, sel, _ in mvs:
+                mgr.register_view(f"CREATE VIEW {vn} AS {sel};")
+
+            def _assert_all() -> None:
+                for vn, _, live in mvs:
+                    actual = conn.execute(f"SELECT * FROM {vn} ORDER BY 1").fetchall()
+                    expected = conn.execute(live).fetchall()
+                    self.assertEqual(actual, expected, f"mismatch on {vn}")
+
+            _assert_all()
+            conn.execute("INSERT INTO d VALUES (3, 'D3');")
+            conn.execute("INSERT INTO t VALUES (4, 3, 'C', 15), (5, 1, 'A', 5);")
+            conn.execute("UPDATE d SET name = 'D1_NEW' WHERE id = 1;")
+            conn.execute("UPDATE t SET v = 25 WHERE id = 5;")
+            conn.execute("DELETE FROM t WHERE id = 2;")
+            conn.commit()
+            _assert_all()
+
+            # Altering transitive upstream view v1 drifts mv_chain, mv_diamond, mv_join_base, mv_in_subq.
+            conn.execute("DROP VIEW v1;")
+            conn.execute("CREATE VIEW v1 AS SELECT id, d_id, g, v + 1 AS v FROM t WHERE v >= 10;")
+            conn.commit()
+            drift = mgr.check_schema_drift()
+            for drifted_mv in ("mv_chain", "mv_diamond", "mv_join_base", "mv_in_subq"):
+                self.assertEqual(drift[drifted_mv], "drifted", f"{drifted_mv}: {drift}")
+            self.assertEqual(drift["mv_cols"], "ok")
+            mgr.repair_view()
+            _assert_all()
+        finally:
+            conn.close()
+
+    def test_cte_shadowing_cycle_depth_and_registered_mv_refusal(self) -> None:
+        from matview.sql_frontend import inline_plain_views
+
+        # 1. Cycle detection (mutual and self-cycle) raises ValueError.
+        with self.assertRaisesRegex(ValueError, "Cyclic plain SQL view reference"):
+            inline_plain_views(
+                "SELECT * FROM v1",
+                {"v1": "CREATE VIEW v1 AS SELECT * FROM v2", "v2": "CREATE VIEW v2 AS SELECT * FROM v1"},
+                dialect=Dialect.SQLITE,
+            )
+        with self.assertRaisesRegex(ValueError, "Cyclic plain SQL view reference"):
+            inline_plain_views(
+                "SELECT * FROM self_v",
+                {"self_v": "CREATE VIEW self_v AS SELECT * FROM self_v"},
+                dialect=Dialect.SQLITE,
+            )
+
+        # 2. Nesting depth limit raises ValueError.
+        deep_chain = {f"v{i}": f"CREATE VIEW v{i} AS SELECT * FROM v{i + 1}" for i in range(20)}
+        deep_chain["v20"] = "CREATE VIEW v20 AS SELECT id FROM t"
+        with self.assertRaisesRegex(ValueError, "nesting/expansion limit"):
+            inline_plain_views("SELECT * FROM v0", deep_chain, dialect=Dialect.SQLITE, known_tables={"t"})
+
+        # 3. CTE shadowing: CTE of the same name shadows plain view; non-recursive CTE body
+        #    can read the plain view of the same name while the outer query reads the CTE.
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT NOT NULL, v INTEGER NOT NULL);")
+            conn.executemany("INSERT INTO t VALUES (?, ?, ?)", [(1, "A", 10), (2, "B", 20)])
+            conn.execute("CREATE VIEW pv AS SELECT g, v FROM t WHERE g = 'A';")
+            conn.commit()
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+            mgr.register_view(
+                "CREATE VIEW mv_shadow AS WITH pv AS (SELECT g, v FROM t WHERE g = 'B') SELECT g, SUM(v) AS s FROM pv GROUP BY g;"
+            )
+            self.assertEqual(conn.execute("SELECT g, s FROM mv_shadow").fetchall(), [("B", 20)])
+
+            mgr.register_view(
+                "CREATE VIEW mv_self_cte AS WITH pv AS (SELECT g, v * 10 AS v FROM pv) SELECT g, SUM(v) AS s FROM pv GROUP BY g;"
+            )
+            self.assertEqual(conn.execute("SELECT g, s FROM mv_self_cte").fetchall(), [("A", 100)])
+
+            # 4. Referencing another registered materialized view (directly or via a plain view) is refused.
+            with self.assertRaisesRegex(ValueError, "does not reference any known base tables"):
+                mgr.register_view("CREATE VIEW mv_over_mv AS SELECT g, s FROM mv_shadow;")
+            conn.execute("CREATE VIEW pv_over_mv AS SELECT g, s FROM mv_shadow;")
+            conn.commit()
+            with self.assertRaisesRegex(ValueError, "does not reference any known base tables"):
+                mgr.register_view("CREATE VIEW mv_indirect_mv AS SELECT g, s FROM pv_over_mv;")
+        finally:
+            conn.close()
+
+    def test_offline_generate_materialized_view_and_mysql_db_qualifier_stripping(self) -> None:
+        from matview import generate_materialized_view, generate_materialized_views
+
+        schema_with_view = """
+        CREATE TABLE orders (id BIGINT PRIMARY KEY, region TEXT NOT NULL, amount BIGINT NOT NULL);
+        CREATE VIEW settled_orders AS SELECT id, region, amount FROM orders WHERE amount > 0;
+        """
+        for d in (Dialect.SQLITE, Dialect.POSTGRES, Dialect.MYSQL):
+            plan = generate_materialized_view(
+                schema_with_view,
+                "CREATE VIEW mv_sales AS SELECT region, SUM(amount) AS total FROM settled_orders GROUP BY region;",
+                dialect=d,
+                ignore_limitations=(d == Dialect.MYSQL),
+            )
+            self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA, d)
+            self.assertEqual(plan.view_spec.referenced_tables, ("orders",), d)
+            self.assertEqual(len(plan.view_spec.referenced_plain_views), 1, d)
+
+        plans = generate_materialized_views(
+            schema_with_view,
+            "CREATE VIEW mv_a AS SELECT region, COUNT(*) AS c FROM settled_orders GROUP BY region;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0].strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+
+        # MySQL information_schema.VIEWS emits `current_db`.`table`.`col` qualifiers;
+        # stripping current_schema unwraps cleanly to Tier 1 ALGEBRAIC_DELTA while
+        # preserving foreign-database qualifiers (which fail closed).
+        mysql_view_def = (
+            "select `mydb`.`orders`.`id` AS `id`,`mydb`.`orders`.`region` AS `region`,"
+            "`mydb`.`orders`.`amount` AS `amount` from `mydb`.`orders` "
+            "where (`mydb`.`orders`.`amount` > 0)"
+        )
+        plan_my = generate_materialized_view(
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY, region VARCHAR(32) NOT NULL, amount BIGINT NOT NULL);",
+            "CREATE VIEW mv_my AS SELECT region, SUM(amount) AS total FROM settled_orders GROUP BY region;",
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+            plain_views={"settled_orders": mysql_view_def},
+            current_schema="mydb",
+        )
+        self.assertEqual(plan_my.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+        self.assertEqual(plan_my.view_spec.referenced_tables, ("orders",))
+
+        # Foreign-database table inside plain view is not stripped and fails closed,
+        # even when a same-named local table (`orders`) exists in the target schema.
+        foreign_view_def = "select `otherdb`.`orders`.`id` AS `id` from `otherdb`.`orders`"
+        with self.assertRaisesRegex(ValueError, "outside the current schema/database"):
+            generate_materialized_view(
+                "CREATE TABLE orders (id BIGINT PRIMARY KEY, region VARCHAR(32) NOT NULL, amount BIGINT NOT NULL);",
+                "CREATE VIEW mv_bad AS SELECT id FROM foreign_v;",
+                dialect=Dialect.MYSQL,
+                ignore_limitations=True,
+                plain_views={"foreign_v": foreign_view_def},
+                current_schema="mydb",
+            )
+
+        # Passing a ViewSpec object directly to generate_materialized_view() also inlines plain views.
+        from matview.sql_frontend import parse_plain_views, parse_view_definition
+
+        spec = parse_view_definition(
+            "CREATE VIEW mv_from_spec AS SELECT region, SUM(amount) AS total FROM settled_orders GROUP BY region;",
+            dialect=Dialect.POSTGRES,
+        )
+        plan_spec = generate_materialized_view(
+            schema_with_view,
+            spec,
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(plan_spec.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+        self.assertEqual(plan_spec.view_spec.referenced_tables, ("orders",))
+        self.assertEqual(len(plan_spec.view_spec.referenced_plain_views), 1)
+
+        # parse_plain_views() ignores PostgreSQL CREATE MATERIALIZED VIEW statements.
+        parsed = parse_plain_views(
+            "CREATE MATERIALIZED VIEW pg_mv AS SELECT id FROM orders;"
+            "CREATE VIEW pv_ok AS SELECT id FROM orders;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(list(parsed.keys()), ["pv_ok"])
+
+        # FROM pv AS x(i, r, amt) column-alias list: simple view unwraps with alias
+        # mapping to Tier 1; grouped view retains AS x(r, tot) intact.
+        plan_alias_list = generate_materialized_view(
+            schema_with_view,
+            "CREATE VIEW mv_col_alias AS SELECT r, SUM(amt) AS s FROM settled_orders AS x(i, r, amt) GROUP BY r;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(plan_alias_list.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+        self.assertEqual(plan_alias_list.view_spec.referenced_tables, ("orders",))
+        schema_with_grouped = schema_with_view + (
+            "\nCREATE VIEW grouped_orders AS SELECT region, SUM(amount) AS tot FROM orders GROUP BY region;\n"
+        )
+        plan_grp_alias = generate_materialized_view(
+            schema_with_grouped,
+            "CREATE VIEW mv_grp_alias AS SELECT r, tot + 1 AS tot1 FROM grouped_orders AS x(r, tot);",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(plan_grp_alias.view_spec.referenced_tables, ("orders",))
+        self.assertIn("AS x(r, tot)", plan_grp_alias.view_spec.raw_select_sql)
+
+        # Chained flat plain views (including PG 15 style view-qualified columns like
+        # `pv_base.amount * 2`) recursively unwrap to Tier 1 ALGEBRAIC_DELTA so exact
+        # column types resolve cleanly against the underlying base table.
+        plan_pg15_chain = generate_materialized_view(
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY, region TEXT, amount BIGINT NOT NULL);",
+            "CREATE VIEW mv_chain_pg15 AS SELECT region, SUM(amt2) AS s FROM pv_chain GROUP BY region;",
+            dialect=Dialect.POSTGRES,
+            plain_views={
+                "pv_base": "SELECT orders.id, orders.region, orders.amount FROM orders WHERE (orders.region IS NOT NULL)",
+                "pv_chain": "SELECT pv_base.id, pv_base.region, (pv_base.amount * 2) AS amt2 FROM pv_base WHERE (pv_base.amount >= 10)",
+            },
+            current_schema="public",
+        )
+        self.assertEqual(plan_pg15_chain.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+        self.assertEqual(plan_pg15_chain.view_spec.referenced_tables, ("orders",))
+
+    def test_adversarial_edge_cases_unwrap_aliases_scoping_and_table_switch(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, v INTEGER NOT NULL);")
+            conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, g TEXT, v INTEGER NOT NULL);")
+            conn.execute("CREATE TABLE d (g TEXT PRIMARY KEY);")
+            conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, g TEXT, v INTEGER NOT NULL);")
+            conn.executemany(
+                "INSERT INTO t VALUES (?, ?, ?)",
+                [(1, "t.A", 10), (2, "A", 20), (3, "B", 30), (4, "t.A", 5)],
+            )
+            conn.executemany("INSERT INTO t2 VALUES (?, ?, ?)", [(1, "X", 100), (2, "Y", 200)])
+            conn.executemany("INSERT INTO d VALUES (?)", [("t.A",), ("B",)])
+            conn.executemany("INSERT INTO s VALUES (?, ?, ?)", [(1, "Z", 999)])
+
+            # 1. String literal containing 't.A' must never be rewritten by alias stripping.
+            conn.execute("CREATE VIEW pv_lit AS SELECT t.id, t.g, t.v FROM t WHERE t.g = 't.A';")
+            # 2. Plain view with WHERE subquery referencing another table `d`.
+            conn.execute("CREATE VIEW pv_subq AS SELECT id, g, v FROM t WHERE g IN (SELECT g FROM d);")
+            # 3. Plain view with explicit aliases matching SQL keywords + GROUP BY / HAVING.
+            conn.execute('CREATE VIEW pv_kw AS SELECT id, g AS "select", v AS "from" FROM t WHERE v > 0;')
+            conn.execute(
+                'CREATE VIEW pv_grp("select", "order") AS '
+                "SELECT g, SUM(v) AS tot FROM t GROUP BY g HAVING tot >= 15;"
+            )
+            # 4. Qualified SELECT t.* and chained SELECT * explicit-column views.
+            conn.execute("CREATE VIEW pv_qstar(a, b, c) AS SELECT t.* FROM t;")
+            conn.execute("CREATE VIEW pv_chain_star(x, y, z) AS SELECT * FROM pv_qstar;")
+            # 5. Plain views for SELECT * / pv.* (including projected subset different from base table)
+            #    and HAVING outer-alias collision.
+            conn.execute("CREATE VIEW pv_double AS SELECT id, g, v * 2 AS v FROM t WHERE v > 0;")
+            conn.execute("CREATE VIEW pv_2cols AS SELECT id, v * 3 AS v3 FROM t WHERE v > 0;")
+            # 6. Plain view with nested CTE named `s` colliding with real base table `s`.
+            conn.execute(
+                "CREATE VIEW pv_cte_s AS "
+                "WITH s AS (SELECT g, v FROM t WHERE v >= 10) SELECT g, SUM(v) AS sv FROM s GROUP BY g;"
+            )
+            # 7. Parenthesized join views + schema-qualified + TEMP shadowing main view.
+            conn.execute("CREATE VIEW pv_p1 AS SELECT id, g, v FROM t WHERE v >= 10;")
+            conn.execute("CREATE VIEW pv_p2 AS SELECT id, v AS v2 FROM t WHERE v <= 20;")
+            conn.execute("CREATE VIEW tv AS SELECT id, g, v FROM t;")
+            conn.execute("CREATE TEMP VIEW tv AS SELECT id, g, v * 10 AS v FROM t;")
+            # 8. Plain view that will later switch base tables from `t` to `t2`.
+            conn.execute("CREATE VIEW pv_switch AS SELECT id, g, v FROM t;")
+            conn.commit()
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+            views = [
+                ("mv_lit", "SELECT g, SUM(v) AS s FROM pv_lit GROUP BY g", "SELECT g, SUM(v) FROM pv_lit GROUP BY g ORDER BY g"),
+                ("mv_subq", "SELECT g, SUM(v) AS s FROM pv_subq GROUP BY g", "SELECT g, SUM(v) FROM pv_subq GROUP BY g ORDER BY g"),
+                ("mv_kw", 'SELECT "select", SUM("from") AS s FROM pv_kw GROUP BY "select"', 'SELECT "select", SUM("from") FROM pv_kw GROUP BY "select" ORDER BY 1'),
+                ("mv_grp", 'SELECT "select", "order" FROM pv_grp', 'SELECT "select", "order" FROM pv_grp ORDER BY 1'),
+                ("mv_cstar", "SELECT y, SUM(z) AS s FROM pv_chain_star GROUP BY y", "SELECT y, SUM(z) FROM pv_chain_star GROUP BY y ORDER BY y"),
+                ("mv_star_pv", "SELECT * FROM pv_double", "SELECT * FROM pv_double ORDER BY id"),
+                ("mv_qstar_pv", "SELECT pv_double.* FROM pv_double", "SELECT pv_double.* FROM pv_double ORDER BY id"),
+                ("mv_star_2cols", "SELECT * FROM pv_2cols", "SELECT * FROM pv_2cols ORDER BY id"),
+                ("mv_qstar_2cols", "SELECT pv_2cols.* FROM pv_2cols", "SELECT pv_2cols.* FROM pv_2cols ORDER BY id"),
+                ("mv_having", "SELECT g, SUM(v) AS v FROM pv_double GROUP BY g HAVING v >= 30", "SELECT g, SUM(v) AS v FROM pv_double GROUP BY g HAVING v >= 30 ORDER BY g"),
+                ("mv_cte_s", "SELECT g, sv FROM pv_cte_s", "SELECT g, sv FROM pv_cte_s ORDER BY g"),
+                ("mv_paren_j", "SELECT a.g, SUM(a.v + b.v2) AS s FROM (pv_p1 a JOIN pv_p2 b ON b.id = a.id) GROUP BY a.g", "SELECT a.g, SUM(a.v + b.v2) FROM (pv_p1 a JOIN pv_p2 b ON b.id = a.id) GROUP BY a.g ORDER BY a.g"),
+                ("mv_main_qual", "SELECT main.pv_p1.g, SUM(main.pv_p1.v) AS s FROM main.pv_p1 GROUP BY main.pv_p1.g", "SELECT main.pv_p1.g, SUM(main.pv_p1.v) FROM main.pv_p1 GROUP BY main.pv_p1.g ORDER BY 1"),
+                ("mv_temp_shadow", "SELECT g, SUM(v) AS s FROM tv GROUP BY g", "SELECT g, SUM(v) FROM tv GROUP BY g ORDER BY g"),
+                ("mv_main_tv", "SELECT g, SUM(v) AS s FROM main.tv GROUP BY g", "SELECT g, SUM(v) FROM main.tv GROUP BY g ORDER BY g"),
+                ("mv_switch", "SELECT g, SUM(v) AS s FROM pv_switch GROUP BY g", "SELECT g, SUM(v) FROM pv_switch GROUP BY g ORDER BY g"),
+            ]
+            plans = {}
+            for vn, sel, _ in views:
+                plans[vn] = mgr.register_view(f"CREATE VIEW {vn} AS {sel};")
+
+            # Verify subquery plain view tracks BOTH `t` and `d`.
+            self.assertEqual(set(plans["mv_subq"].view_spec.referenced_tables), {"t", "d"})
+            # Verify CTE named `s` does NOT spuriously attach to unrelated base table `s`.
+            self.assertEqual(plans["mv_cte_s"].view_spec.referenced_tables, ("t",))
+
+            def _assert_all() -> None:
+                for vn, _, live in views:
+                    actual = conn.execute(f"SELECT * FROM {vn} ORDER BY 1").fetchall()
+                    expected = conn.execute(live).fetchall()
+                    self.assertEqual(actual, expected, f"mismatch on {vn}")
+
+            _assert_all()
+            # Mutate t, d, and unrelated table s; verify every view matches live SQL.
+            conn.execute("INSERT INTO t VALUES (5, 't.A', 15), (6, 'C', 40);")
+            conn.execute("INSERT INTO d VALUES ('C');")
+            conn.execute("DELETE FROM d WHERE g = 'B';")
+            conn.execute("UPDATE t SET v = v + 5 WHERE id = 1;")
+            conn.execute("INSERT INTO s VALUES (2, 'W', 500);")
+            conn.commit()
+            _assert_all()
+
+            # Switch pv_switch from base table `t` to `t2` -> drifted -> repair_view() rebuilds triggers onto `t2`.
+            conn.execute("DROP VIEW pv_switch;")
+            conn.execute("CREATE VIEW pv_switch AS SELECT id, g, v FROM t2;")
+            conn.commit()
+            self.assertEqual(mgr.check_schema_drift()["mv_switch"], "drifted")
+            self.assertEqual(mgr.repair_view("mv_switch"), {"mv_switch": "rebuilt"})
+            self.assertEqual(mgr.check_schema_drift()["mv_switch"], "ok")
+            conn.execute("INSERT INTO t2 VALUES (3, 'X', 50);")
+            conn.execute("INSERT INTO t VALUES (7, 'X', 999);")
+            conn.commit()
+            self.assertEqual(
+                conn.execute("SELECT g, s FROM mv_switch ORDER BY g").fetchall(),
+                conn.execute("SELECT g, SUM(v) FROM pv_switch GROUP BY g ORDER BY g").fetchall(),
+            )
+            # Confirm no triggers remain on `t` for mv_switch.
+            t_trigs = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 't' AND name LIKE '%mv_switch%'"
+                ).fetchall()
+            ]
+            self.assertEqual(t_trigs, [])
+        finally:
+            conn.close()
+
+    def test_introspect_plain_views_fail_closed_and_no_idle_tx_leak(self) -> None:
+        from matview.connectivity import introspect_plain_views
+
+        # 1. Real DB/permission error must propagate (fail closed), never silently return {}.
+        class _BrokenCursor:
+            def execute(self, _sql: str) -> None:
+                raise RuntimeError("permission denied for relation pg_class")
+
+            def close(self) -> None:
+                pass
+
+        class _BrokenConn:
+            def cursor(self) -> _BrokenCursor:
+                return _BrokenCursor()
+
+            def rollback(self) -> None:
+                pass
+
+        with self.assertRaisesRegex(RuntimeError, "permission denied"):
+            introspect_plain_views(_BrokenConn(), dialect=Dialect.POSTGRES)
+
+        # 2. Standalone call on an idle sqlite3 connection must not leave a transaction open.
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            conn.execute("CREATE VIEW pv AS SELECT id FROM t;")
+            conn.commit()
+            self.assertFalse(conn.in_transaction)
+            res, cur_schema = introspect_plain_views(conn, dialect=Dialect.SQLITE)
+            self.assertIn("pv", res)
+            self.assertEqual(cur_schema, "main")
+            self.assertFalse(conn.in_transaction)
+        finally:
+            conn.close()
+
+        # 3. Standalone call on an idle SQLAlchemy Connection must not leave a transaction open.
+        try:
+            import sqlalchemy as sa
+        except ImportError:
+            return
+        eng = sa.create_engine("sqlite:///:memory:")
+        try:
+            with eng.connect() as sa_conn:
+                sa_conn.execute(sa.text("CREATE TABLE t (id INTEGER PRIMARY KEY)"))
+                sa_conn.execute(sa.text("CREATE VIEW pv AS SELECT id FROM t"))
+                sa_conn.commit()
+                self.assertFalse(sa_conn.in_transaction())
+                res, cur_schema = introspect_plain_views(sa_conn, dialect=Dialect.SQLITE)
+                self.assertIn("pv", res)
+                self.assertEqual(cur_schema, "main")
+                self.assertFalse(sa_conn.in_transaction())
+        finally:
+            eng.dispose()
 
 
 if __name__ == "__main__":

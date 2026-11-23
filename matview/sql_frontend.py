@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import re
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import sqlglot
 import sqlglot.errors
@@ -2217,11 +2217,11 @@ def _extract_all_referenced_tables(
         "false", "dual", "lateral", "values",
     }
 
-    def _add_candidate(cand: str, was_quoted: bool = False) -> None:
+    def _add_candidate(cand: str, was_quoted: bool = False, scope_ctes: FrozenSet[str] = frozenset()) -> None:
         if not cand:
             return
         c_low = cand.lower()
-        if c_low in cte_lower or c_low.startswith(("__matview_", "__mv_")):
+        if c_low in scope_ctes or c_low.startswith(("__matview_", "__mv_")):
             return
         if not was_quoted and c_low in sql_reserved and (not known_tables or c_low not in known_tables):
             return
@@ -2232,22 +2232,67 @@ def _extract_all_referenced_tables(
             found.append(cand)
 
     sg_d = _sqlglot_dialect(dialect)
+    ast_parsed = False
     try:
         q_ast = parse_sql_ast(select_sql, dialect=dialect)
-        for tbl_node in q_ast.find_all(sqlglot_exp.Table):
-            id_node = tbl_node.this
-            was_q = isinstance(id_node, sqlglot_exp.Identifier) and id_node.quoted
-            _add_candidate(tbl_node.name, was_quoted=was_q)
+        ast_parsed = True
+
+        def _walk_tables(node: sqlglot_exp.Expr, scope_ctes: FrozenSet[str]) -> None:
+            if isinstance(node, (sqlglot_exp.Select, sqlglot_exp.SetOperation)):
+                with_node = node.args.get("with_") or node.args.get("with")
+                if isinstance(with_node, sqlglot_exp.With):
+                    is_rec = bool(with_node.args.get("recursive"))
+                    inner_ctes: Set[str] = set(scope_ctes)
+                    if is_rec:
+                        for cte in with_node.expressions:
+                            if isinstance(cte, sqlglot_exp.CTE) and cte.alias:
+                                inner_ctes.add(cte.alias.lower())
+                    for cte in with_node.expressions:
+                        if isinstance(cte, sqlglot_exp.CTE):
+                            if isinstance(cte.this, sqlglot_exp.Expr):
+                                _walk_tables(cte.this, frozenset(inner_ctes))
+                            if not is_rec and cte.alias:
+                                inner_ctes.add(cte.alias.lower())
+                    frozen_inner = frozenset(inner_ctes)
+                    for key, val in node.args.items():
+                        if key in ("with_", "with"):
+                            continue
+                        if isinstance(val, sqlglot_exp.Expr):
+                            _walk_tables(val, frozen_inner)
+                        elif isinstance(val, list):
+                            for item in val:
+                                if isinstance(item, sqlglot_exp.Expr):
+                                    _walk_tables(item, frozen_inner)
+                    return
+            if isinstance(node, sqlglot_exp.Table):
+                id_node = node.this
+                was_q = isinstance(id_node, sqlglot_exp.Identifier) and id_node.quoted
+                _add_candidate(node.name, was_quoted=was_q, scope_ctes=scope_ctes)
+                return
+            for val in node.args.values():
+                if isinstance(val, sqlglot_exp.Expr):
+                    _walk_tables(val, scope_ctes)
+                elif isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, sqlglot_exp.Expr):
+                            _walk_tables(item, scope_ctes)
+
+        _walk_tables(q_ast, frozenset(cte_lower))
     except sqlglot.errors.SqlglotError:
         pass
 
-    # Also scan token stream for any `FROM <ident>` / `JOIN <ident>` inside nested expressions
-    toks = _tokenize_sql(select_sql, read=sg_d)
-    for idx, tk in enumerate(toks):
-        if tk.token_type in (SQLGlotTokenType.FROM, SQLGlotTokenType.JOIN) and idx + 1 < len(toks):
-            nxt = toks[idx + 1]
-            if _is_word_or_ident_token(nxt):
-                _add_candidate(nxt.text, was_quoted=(nxt.token_type == SQLGlotTokenType.IDENTIFIER))
+    if not ast_parsed:
+        # Fallback token scan only when AST parsing failed.
+        toks = _tokenize_sql(select_sql, read=sg_d)
+        for idx, tk in enumerate(toks):
+            if tk.token_type in (SQLGlotTokenType.FROM, SQLGlotTokenType.JOIN) and idx + 1 < len(toks):
+                nxt = toks[idx + 1]
+                if _is_word_or_ident_token(nxt):
+                    _add_candidate(
+                        nxt.text,
+                        was_quoted=(nxt.token_type == SQLGlotTokenType.IDENTIFIER),
+                        scope_ctes=frozenset(cte_lower),
+                    )
 
     return found
 
@@ -2400,11 +2445,387 @@ def parse_view_ast(
     )
 
 
+def _is_materialized_view_create(stmt_ast: sqlglot_exp.Create) -> bool:
+    props = stmt_ast.args.get("properties")
+    if isinstance(props, sqlglot_exp.Properties):
+        return any(isinstance(p, sqlglot_exp.MaterializedProperty) for p in props.expressions)
+    return False
+
+
+def parse_plain_views(
+    schema_sql: str,
+    dialect: Dialect = Dialect.SQLITE,
+) -> Dict[str, str]:
+    """Extract plain ``CREATE [OR REPLACE] VIEW ... AS ...`` definitions from a schema SQL script."""
+    eff_dialect = dialect if dialect is not None else Dialect.SQLITE
+    clean = _strip_sql_comments(schema_sql, dialect=eff_dialect)
+    out: Dict[str, str] = {}
+    for raw_stmt in _split_top_level(clean, ";", dialect=eff_dialect):
+        stmt_s = raw_stmt.strip()
+        if not stmt_s:
+            continue
+        try:
+            stmt_ast = parse_sql_ast(stmt_s, dialect=eff_dialect)
+        except sqlglot.errors.SqlglotError:
+            continue
+        if (
+            not isinstance(stmt_ast, sqlglot_exp.Create)
+            or (stmt_ast.kind or "").upper() != "VIEW"
+            or _is_materialized_view_create(stmt_ast)
+        ):
+            continue
+        target = stmt_ast.this
+        if isinstance(target, sqlglot_exp.Schema) and isinstance(target.this, sqlglot_exp.Table):
+            v_name = target.this.name
+        elif isinstance(target, sqlglot_exp.Table):
+            v_name = target.name
+        else:
+            v_name = ""
+        if not v_name or v_name.startswith(("__matview_", "__mv_")):
+            continue
+        out[v_name] = stmt_s
+    return out
+
+
+_MAX_PLAIN_VIEW_DEPTH = 16
+_MAX_PLAIN_VIEW_EXPANSIONS = 64
+
+
+def inline_plain_views(
+    select_sql: str,
+    plain_views: Mapping[str, str],
+    *,
+    dialect: Dialect = Dialect.SQLITE,
+    known_tables: Optional[Set[str]] = None,
+    current_schema: Optional[str] = None,
+    schemas: Optional[Mapping[str, TableSchema]] = None,
+) -> Tuple[str, Tuple[Tuple[str, str], ...]]:
+    """Recursively inline referenced plain SQL views into ``select_sql`` as derived subqueries.
+
+    Returns ``(inlined_select_sql, referenced_plain_views)``. When ``select_sql``
+    references no plain views, returns ``(select_sql, ())`` verbatim.
+    Raises ``ValueError`` on cyclic plain-view references, foreign-schema/database
+    references inside a plain view, or excessive nesting.
+    """
+    if not plain_views:
+        return select_sql, ()
+
+    known_low = {t.lower() for t in (known_tables or ())}
+    if schemas:
+        known_low.update(k.lower() for k in schemas)
+    schemas_low: Dict[str, TableSchema] = {k.lower(): v for k, v in (schemas or {}).items()}
+
+    pv_map: Dict[str, Tuple[str, str]] = {}
+    for pv_name, pv_sql in plain_views.items():
+        low = pv_name.lower()
+        # Allow explicit schema-qualified keys (`main.<v>`, `temp.<v>`) as well as unqualified names.
+        base_low = low.split(".", 1)[1] if "." in low else low
+        if "." not in low and base_low in known_low:
+            continue
+        if not pv_sql or not pv_sql.strip():
+            continue
+        pv_map[low] = (pv_name, pv_sql.strip())
+    if not pv_map:
+        return select_sql, ()
+
+    sg_d = _sqlglot_dialect(dialect)
+    try:
+        root_ast = parse_sql_ast(select_sql, dialect=dialect).copy()
+    except sqlglot.errors.SqlglotError:
+        return select_sql, ()
+
+    cur_schema_low = current_schema.lower() if current_schema else None
+
+    def _needs_ident_quote(name: str) -> bool:
+        return (not bool(_SIMPLE_IDENT_RE.match(name))) or (name.upper() in _SQL_RESERVED_KEYWORDS)
+
+    def _strip_current_schema_qualifiers(expr: sqlglot_exp.Expr) -> None:
+        if not cur_schema_low:
+            return
+        for tbl in expr.find_all(sqlglot_exp.Table):
+            if tbl.db and not tbl.catalog and tbl.db.lower() == cur_schema_low:
+                tbl.set("db", None)
+        for col in expr.find_all(sqlglot_exp.Column):
+            if col.db and not col.catalog and col.db.lower() == cur_schema_low:
+                col.set("db", None)
+
+    def _is_star_projection(proj: sqlglot_exp.Expr) -> bool:
+        return isinstance(proj, sqlglot_exp.Star) or (
+            isinstance(proj, sqlglot_exp.Column) and isinstance(proj.this, sqlglot_exp.Star)
+        )
+
+    def _subquery_output_columns(sub_expr: sqlglot_exp.Expr) -> Optional[List[str]]:
+        inner = sub_expr
+        while isinstance(inner, (sqlglot_exp.SetOperation, sqlglot_exp.Subquery)):
+            inner = inner.this
+        if not isinstance(inner, sqlglot_exp.Select):
+            return None
+        cols: List[str] = []
+        for p in inner.expressions:
+            if _is_star_projection(p):
+                return None
+            nm = p.alias_or_name
+            if not nm:
+                return None
+            cols.append(nm)
+        return cols
+
+    def _apply_explicit_view_columns(
+        body: sqlglot_exp.Expr, view_name: str, view_cols: Sequence[str]
+    ) -> sqlglot_exp.Expr:
+        first_sel: sqlglot_exp.Expr = body
+        while isinstance(first_sel, (sqlglot_exp.SetOperation, sqlglot_exp.Subquery)):
+            first_sel = first_sel.this
+        if not isinstance(first_sel, sqlglot_exp.Select):
+            raise ValueError(
+                f"Plain view {view_name!r} has an explicit column list that cannot be mapped onto its query."
+            )
+        projs = list(first_sel.expressions)
+        if len(projs) == 1 and _is_star_projection(projs[0]):
+            from_node = first_sel.args.get("from_") or first_sel.args.get("from")
+            joins = first_sel.args.get("joins") or []
+            src_cols: Optional[List[str]] = None
+            if isinstance(from_node, sqlglot_exp.From) and not joins:
+                if isinstance(from_node.this, sqlglot_exp.Table):
+                    base_ts = schemas_low.get(from_node.this.name.lower())
+                    if base_ts is not None:
+                        src_cols = list(base_ts.columns.keys())
+                elif isinstance(from_node.this, sqlglot_exp.Subquery):
+                    src_cols = _subquery_output_columns(from_node.this)
+            if src_cols is not None and len(src_cols) == len(view_cols):
+                expanded_projs: List[sqlglot_exp.Expr] = []
+                for col_name, alias_name in zip(src_cols, view_cols):
+                    expanded_projs.append(
+                        sqlglot_exp.alias_(
+                            sqlglot_exp.column(col_name, quoted=_needs_ident_quote(col_name)),
+                            alias_name,
+                            quoted=_needs_ident_quote(alias_name),
+                        )
+                    )
+                first_sel.set("expressions", expanded_projs)
+                return body
+            raise ValueError(
+                f"Plain view {view_name!r} uses SELECT * with an explicit column list whose column count could not be resolved."
+            )
+        if len(projs) != len(view_cols) or any(_is_star_projection(p) for p in projs):
+            raise ValueError(
+                f"Plain view {view_name!r} column list length ({len(view_cols)}) does not match its SELECT projection list ({len(projs)})."
+            )
+        # If the inner SELECT has GROUP BY / HAVING / ORDER BY and any explicit alias
+        # differs from its target column name, avoid clobbering aliases referenced by
+        # those clauses: wrap in an outer projection over the inner query instead.
+        has_alias_clauses = any(first_sel.args.get(k) for k in ("group", "having", "order"))
+        alias_would_change = any(
+            isinstance(p, sqlglot_exp.Alias) and p.alias and p.alias.lower() != vc.lower()
+            for p, vc in zip(projs, view_cols)
+        )
+        if has_alias_clauses and alias_would_change and isinstance(body, sqlglot_exp.Select):
+            inner_names = [p.alias_or_name for p in projs]
+            if all(inner_names) and len({n.lower() for n in inner_names}) == len(inner_names):
+                wrap_projs = [
+                    sqlglot_exp.alias_(
+                        sqlglot_exp.column(in_nm, table="__mv_vc", quoted=_needs_ident_quote(in_nm)),
+                        vc,
+                        quoted=_needs_ident_quote(vc),
+                    )
+                    for in_nm, vc in zip(inner_names, view_cols)
+                ]
+                return sqlglot_exp.Select(expressions=wrap_projs).from_(
+                    sqlglot_exp.Subquery(
+                        this=body,
+                        alias=sqlglot_exp.TableAlias(this=sqlglot_exp.to_identifier("__mv_vc")),
+                    )
+                )
+            raise ValueError(
+                f"Plain view {view_name!r} renames aliases referenced by GROUP BY/HAVING/ORDER BY with ambiguous projection names."
+            )
+        renamed: List[sqlglot_exp.Expr] = []
+        for proj, alias_name in zip(projs, view_cols):
+            base_expr = proj.unalias() if isinstance(proj, sqlglot_exp.Alias) else proj
+            renamed.append(
+                sqlglot_exp.alias_(
+                    base_expr,
+                    alias_name,
+                    quoted=_needs_ident_quote(alias_name),
+                )
+            )
+        first_sel.set("expressions", renamed)
+        return body
+
+    def _parse_plain_view_body(view_name: str, def_sql: str) -> Tuple[sqlglot_exp.Expr, List[str]]:
+        cleaned = _strip_sql_comments(def_sql, dialect=dialect).strip().rstrip(";").strip()
+        try:
+            ast = parse_sql_ast(cleaned, dialect=dialect).copy()
+        except sqlglot.errors.SqlglotError as exc:
+            raise ValueError(f"Unable to parse plain SQL view {view_name!r}: {def_sql!r}") from exc
+        view_cols: List[str] = []
+        if isinstance(ast, sqlglot_exp.Create) and (ast.kind or "").upper() == "VIEW":
+            if _is_materialized_view_create(ast):
+                raise ValueError(f"Materialized view {view_name!r} cannot be inlined as a plain SQL view.")
+            target = ast.this
+            if isinstance(target, sqlglot_exp.Schema):
+                view_cols = [c.name for c in target.expressions if c.name]
+            body = ast.expression
+        else:
+            body = ast
+        if not isinstance(body, (sqlglot_exp.Select, sqlglot_exp.SetOperation)):
+            raise ValueError(f"Plain SQL view {view_name!r} does not have a SELECT body: {def_sql!r}")
+        _strip_current_schema_qualifiers(body)
+        return body, view_cols
+
+    def _is_table_source_position(node: sqlglot_exp.Table) -> bool:
+        p = node.parent
+        while isinstance(p, sqlglot_exp.Subquery) and not isinstance(
+            p.this, (sqlglot_exp.Select, sqlglot_exp.SetOperation)
+        ):
+            p = p.parent
+        return isinstance(p, (sqlglot_exp.From, sqlglot_exp.Join))
+
+    def _strip_enclosing_view_col_db(
+        node: sqlglot_exp.Expr, tbl_db_low: str, alias_low: str
+    ) -> None:
+        enc = node.parent
+        while enc is not None and not isinstance(enc, sqlglot_exp.Select):
+            enc = enc.parent
+        if not isinstance(enc, sqlglot_exp.Select):
+            return
+        for col in enc.find_all(sqlglot_exp.Column):
+            if (
+                col.db
+                and not col.catalog
+                and col.db.lower() == tbl_db_low
+                and col.table
+                and col.table.lower() == alias_low
+            ):
+                col.set("db", None)
+
+    def _reject_foreign_table_qualifiers(expr: sqlglot_exp.Expr, view_name: str) -> None:
+        for tbl in expr.find_all(sqlglot_exp.Table):
+            if tbl.db or tbl.catalog:
+                raise ValueError(
+                    f"Plain SQL view {view_name!r} references table {tbl.sql(sg_d)!r} outside the "
+                    "current schema/database, which is not supported."
+                )
+
+    used_views: Dict[str, str] = {}
+    expansions = [0]
+
+    def _walk(node: sqlglot_exp.Expr, scope_ctes: FrozenSet[str], active_stack: Tuple[str, ...]) -> None:
+        if isinstance(node, (sqlglot_exp.Select, sqlglot_exp.SetOperation)):
+            with_node = node.args.get("with_") or node.args.get("with")
+            if isinstance(with_node, sqlglot_exp.With):
+                is_rec = bool(with_node.args.get("recursive"))
+                inner_ctes: Set[str] = set(scope_ctes)
+                if is_rec:
+                    for cte in with_node.expressions:
+                        if isinstance(cte, sqlglot_exp.CTE) and cte.alias:
+                            inner_ctes.add(cte.alias.lower())
+                for cte in with_node.expressions:
+                    if isinstance(cte, sqlglot_exp.CTE):
+                        if isinstance(cte.this, sqlglot_exp.Expr):
+                            _walk(cte.this, frozenset(inner_ctes), active_stack)
+                        if not is_rec and cte.alias:
+                            inner_ctes.add(cte.alias.lower())
+                frozen_inner = frozenset(inner_ctes)
+                for key, val in list(node.args.items()):
+                    if key in ("with_", "with"):
+                        continue
+                    if isinstance(val, sqlglot_exp.Expr):
+                        _walk(val, frozen_inner, active_stack)
+                    elif isinstance(val, list):
+                        for item in list(val):
+                            if isinstance(item, sqlglot_exp.Expr):
+                                _walk(item, frozen_inner, active_stack)
+                return
+
+        if isinstance(node, sqlglot_exp.Table) and _is_table_source_position(node):
+            tbl_db = (node.db or "").strip()
+            tbl_cat = (node.catalog or "").strip()
+            t_low = (node.name or "").lower()
+            matched_entry: Optional[Tuple[str, str]] = None
+            stack_key = t_low
+            if not tbl_cat and t_low and (tbl_db or t_low not in scope_ctes):
+                if tbl_db:
+                    q_key = f"{tbl_db.lower()}.{t_low}"
+                    if q_key in pv_map:
+                        matched_entry = pv_map[q_key]
+                        stack_key = q_key
+                    elif cur_schema_low is not None and tbl_db.lower() == cur_schema_low and t_low in pv_map:
+                        matched_entry = pv_map[t_low]
+                        stack_key = t_low
+                elif t_low in pv_map:
+                    matched_entry = pv_map[t_low]
+                    stack_key = t_low
+            if matched_entry is not None:
+                canon_name, raw_def = matched_entry
+                unqual_canon = canon_name.split(".", 1)[1] if "." in canon_name else canon_name
+                if stack_key in active_stack or (not tbl_db and t_low in active_stack):
+                    chain = " -> ".join([*active_stack, canon_name])
+                    raise ValueError(f"Cyclic plain SQL view reference detected: {chain}")
+                if len(active_stack) >= _MAX_PLAIN_VIEW_DEPTH or expansions[0] >= _MAX_PLAIN_VIEW_EXPANSIONS:
+                    raise ValueError(
+                        f"Plain SQL view nesting/expansion limit exceeded while resolving {canon_name!r}."
+                    )
+                expansions[0] += 1
+                body, view_cols = _parse_plain_view_body(canon_name, raw_def)
+                _walk(body, frozenset(), active_stack + (stack_key,))
+                _reject_foreign_table_qualifiers(body, canon_name)
+                if view_cols:
+                    body = _apply_explicit_view_columns(body, canon_name, view_cols)
+                used_views[canon_name] = body.sql(dialect=sg_d).strip()
+                existing_alias = node.args.get("alias")
+                if isinstance(existing_alias, sqlglot_exp.TableAlias):
+                    sub_alias = existing_alias.copy()
+                    eff_alias_low = (existing_alias.name or unqual_canon).lower()
+                else:
+                    id_node = (
+                        node.this.copy()
+                        if isinstance(node.this, sqlglot_exp.Identifier)
+                        else sqlglot_exp.to_identifier(
+                            unqual_canon, quoted=_needs_ident_quote(unqual_canon)
+                        )
+                    )
+                    sub_alias = sqlglot_exp.TableAlias(this=id_node)
+                    eff_alias_low = unqual_canon.lower()
+                if tbl_db:
+                    _strip_enclosing_view_col_db(node, tbl_db.lower(), eff_alias_low)
+                # Parenthesized joins (`FROM (pv1 a JOIN pv2 b ON ...)`) attach the
+                # sibling JOIN list directly to the leading Table node in SQLGlot;
+                # walk and preserve those joins so they are never dropped on replace.
+                node_joins = node.args.get("joins")
+                if isinstance(node_joins, list) and node_joins:
+                    for j_item in list(node_joins):
+                        if isinstance(j_item, sqlglot_exp.Expr):
+                            _walk(j_item, scope_ctes, active_stack)
+                subq = sqlglot_exp.Subquery(this=body, alias=sub_alias)
+                if isinstance(node_joins, list) and node_joins:
+                    subq.set("joins", node_joins)
+                node.replace(subq)
+                return
+
+        for _, val in list(node.args.items()):
+            if isinstance(val, sqlglot_exp.Expr):
+                _walk(val, scope_ctes, active_stack)
+            elif isinstance(val, list):
+                for item in list(val):
+                    if isinstance(item, sqlglot_exp.Expr):
+                        _walk(item, scope_ctes, active_stack)
+
+    _walk(root_ast, frozenset(), ())
+    if not used_views:
+        return select_sql, ()
+    inlined_sql = root_ast.sql(dialect=sg_d).strip()
+    return inlined_sql, tuple(sorted(used_views.items(), key=lambda kv: kv[0].lower()))
+
+
 def _parse_single_create_view_stmt(
     stmt_sql: str,
     known_tables: Optional[Set[str]] = None,
     extra_indexes: Sequence[ViewIndexSpec] = (),
     dialect: Dialect = Dialect.SQLITE,
+    plain_views: Optional[Mapping[str, str]] = None,
+    current_schema: Optional[str] = None,
+    schemas: Optional[Mapping[str, TableSchema]] = None,
 ) -> ViewSpec:
     """Parses a single `CREATE VIEW ... AS SELECT ...` statement into a `ViewSpec` using `sqlglot.parse_one`."""
     clean = _strip_sql_comments(stmt_sql, dialect=dialect).strip().rstrip(";").strip()
@@ -2428,6 +2849,23 @@ def _parse_single_create_view_stmt(
     sg_d = _sqlglot_dialect(dialect)
     as_tok = _find_top_level_token(clean, (SQLGlotTokenType.ALIAS,), dialect=dialect)
     raw_select = clean[as_tok.end + 1 :].strip() if as_tok is not None else query_ast.sql(sg_d).strip()
+
+    original_select: Optional[str] = None
+    ref_plain_views: Tuple[Tuple[str, str], ...] = ()
+    if plain_views:
+        inlined_select, ref_plain_views = inline_plain_views(
+            raw_select,
+            plain_views,
+            dialect=dialect,
+            known_tables=known_tables,
+            current_schema=current_schema,
+            schemas=schemas,
+        )
+        if ref_plain_views:
+            original_select = raw_select
+            raw_select = inlined_select
+            query_ast = parse_sql_ast(raw_select, dialect=dialect)
+
     cte_names, main_select_body, has_cte = _extract_cte_names_and_strip_with(raw_select, dialect=dialect)
 
     has_window = bool(query_ast.find(sqlglot_exp.Window))
@@ -2561,6 +2999,8 @@ def _parse_single_create_view_stmt(
         has_limit_or_order=has_limit_or_order,
         has_subquery_in_from=has_subquery_in_from,
         user_indexes=tuple(extra_indexes),
+        original_select_sql=original_select,
+        referenced_plain_views=ref_plain_views,
     )
 
 
@@ -2569,6 +3009,9 @@ def parse_view_definitions(
     known_tables: Optional[Set[str]] = None,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     dialect: Dialect = Dialect.SQLITE,
+    plain_views: Optional[Mapping[str, str]] = None,
+    current_schema: Optional[str] = None,
+    schemas: Optional[Mapping[str, TableSchema]] = None,
 ) -> List[ViewSpec]:
     """
     Parses one or more CREATE VIEW statements (and optional inline `CREATE [UNIQUE] INDEX`
@@ -2583,11 +3026,26 @@ def parse_view_definitions(
     initial_specs: List[ViewSpec] = []
     pending_index_specs: List[ViewIndexSpec] = []
 
+    def _maybe_inline_spec(vs: ViewSpec) -> ViewSpec:
+        if not plain_views or vs.referenced_plain_views:
+            return vs
+        q_vn = quote_sql_identifier(vs.view_name, dialect, allow_qualified=False)
+        re_parsed = _parse_single_create_view_stmt(
+            f"CREATE VIEW {q_vn} AS {vs.raw_select_sql}",
+            known_tables=known_tables,
+            extra_indexes=vs.user_indexes,
+            dialect=dialect,
+            plain_views=plain_views,
+            current_schema=current_schema,
+            schemas=schemas,
+        )
+        return re_parsed if re_parsed.referenced_plain_views else vs
+
     for item in raw_inputs:
         if isinstance(item, ViewSpec):
-            initial_specs.append(item)
+            initial_specs.append(_maybe_inline_spec(item))
             for av in item.additional_views:
-                initial_specs.append(av)
+                initial_specs.append(_maybe_inline_spec(av))
             continue
         clean = _strip_sql_comments(item, dialect=dialect).strip()
         stmts = [st.strip() for st in _split_top_level(clean, ";", dialect=dialect) if st.strip()]
@@ -2596,7 +3054,16 @@ def parse_view_definitions(
         for st in stmts:
             st_ast = parse_sql_ast(st, dialect=dialect)
             if isinstance(st_ast, sqlglot_exp.Create) and (st_ast.kind or "").upper() == "VIEW":
-                initial_specs.append(_parse_single_create_view_stmt(st, known_tables=known_tables, dialect=dialect))
+                initial_specs.append(
+                    _parse_single_create_view_stmt(
+                        st,
+                        known_tables=known_tables,
+                        dialect=dialect,
+                        plain_views=plain_views,
+                        current_schema=current_schema,
+                        schemas=schemas,
+                    )
+                )
             elif isinstance(st_ast, sqlglot_exp.Create) and (st_ast.kind or "").upper() == "INDEX":
                 pending_index_specs.append(parse_view_index_spec(st, dialect=dialect))
             else:
@@ -2669,6 +3136,8 @@ def parse_view_definitions(
                 has_limit_or_order=vs.has_limit_or_order,
                 has_subquery_in_from=vs.has_subquery_in_from,
                 user_indexes=tuple(by_view_idx[i]),
+                original_select_sql=vs.original_select_sql,
+                referenced_plain_views=vs.referenced_plain_views,
             )
         )
     return out_specs
@@ -2679,6 +3148,9 @@ def parse_view_definition(
     known_tables: Optional[Set[str]] = None,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     dialect: Dialect = Dialect.SQLITE,
+    plain_views: Optional[Mapping[str, str]] = None,
+    current_schema: Optional[str] = None,
+    schemas: Optional[Mapping[str, TableSchema]] = None,
 ) -> ViewSpec:
     """
     Parses a single-view or multi-view SQL script into a `ViewSpec`.
@@ -2686,7 +3158,15 @@ def parse_view_definition(
     carries the remaining views in `additional_views` so both `parse_view_definition`
     and `generate_materialized_view` handle multi-view `.sql` files seamlessly.
     """
-    specs = parse_view_definitions(view_sql, known_tables=known_tables, indexes=indexes, dialect=dialect)
+    specs = parse_view_definitions(
+        view_sql,
+        known_tables=known_tables,
+        indexes=indexes,
+        dialect=dialect,
+        plain_views=plain_views,
+        current_schema=current_schema,
+        schemas=schemas,
+    )
     if len(specs) == 1:
         return specs[0]
     first = specs[0]
@@ -2708,6 +3188,8 @@ def parse_view_definition(
         has_subquery_in_from=first.has_subquery_in_from,
         user_indexes=first.user_indexes,
         additional_views=tuple(specs[1:]),
+        original_select_sql=first.original_select_sql,
+        referenced_plain_views=first.referenced_plain_views,
     )
 
 

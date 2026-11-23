@@ -3550,3 +3550,128 @@ def test_pg_dump_restore_real_pg_dump_cli(make_env) -> None:
             )
             acur.execute(f'DROP DATABASE IF EXISTS "{dst_db}"')
         admin_conn.close()
+
+
+def test_pg_plain_view_as_source_and_drift_repair(make_env) -> None:
+    """Native PostgreSQL verification of plain SQL views as materialized view sources:
+    Tier 1 unwrapping, explicit column lists, WITH CHECK OPTION, CTEs, chained views,
+    plain-view + base-table joins (including Stage 3 writable CTEs), quoted view names,
+    CREATE OR REPLACE VIEW drift/repair, DROP VIEW invalidation, and refusal of native
+    PostgreSQL MATERIALIZED VIEWs (relkind='m') and matview-registered MVs."""
+    env = make_env(
+        views=[],
+        schema_sql=[
+            "CREATE TABLE pv_t (id BIGINT PRIMARY KEY, d_id BIGINT NOT NULL, g TEXT, v BIGINT NOT NULL)",
+            "CREATE TABLE pv_t2 (id BIGINT PRIMARY KEY, d_id BIGINT NOT NULL, g TEXT, v BIGINT NOT NULL)",
+            "CREATE TABLE pv_d (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
+            "CREATE TABLE s (id BIGINT PRIMARY KEY, g TEXT, v BIGINT NOT NULL)",
+        ],
+        seed=False,
+    )
+    conn = env.conn
+    mgr = env.manager
+
+    def _run_stmts(*stmts: str) -> None:
+        cur = conn.cursor()
+        try:
+            for st in stmts:
+                cur.execute(st)
+        finally:
+            cur.close()
+        conn.commit()
+
+    _run_stmts(
+        "INSERT INTO pv_d VALUES (1, 'D1'), (2, 'D2')",
+        "INSERT INTO pv_t VALUES (1, 1, 'A', 10), (2, 1, 'A', 20), (3, 2, 'B', 30), (4, 2, NULL, 99)",
+        "INSERT INTO pv_t2 VALUES (1, 1, 'X', 100), (2, 2, 'Y', 200)",
+        "INSERT INTO s VALUES (1, 'Z', 999)",
+        "CREATE VIEW pv_base AS SELECT id, d_id, g, v FROM pv_t WHERE g IS NOT NULL WITH LOCAL CHECK OPTION",
+        "CREATE VIEW pv_chain AS SELECT id, d_id, g, v * 2 AS v2 FROM pv_base WHERE v >= 10",
+        "CREATE VIEW pv_cols(k, amt) AS SELECT g, v FROM pv_t WHERE g IS NOT NULL",
+        "CREATE VIEW pv_cte AS WITH s AS (SELECT g, v FROM pv_t WHERE g IS NOT NULL) SELECT g, SUM(v) AS sv FROM s GROUP BY g",
+        'CREATE VIEW "pv\'s src" AS SELECT id, g, v FROM pv_t WHERE v > 0',
+        "CREATE VIEW pv_switch AS SELECT id, g, v FROM pv_t WHERE g IS NOT NULL",
+        "CREATE MATERIALIZED VIEW pg_native_mv AS SELECT id, g, v FROM pv_t",
+    )
+
+    p_base = mgr.register_view("CREATE VIEW mv_pv_base AS SELECT g, COUNT(*) AS c, SUM(v) AS s FROM pv_base GROUP BY g;")
+    assert p_base.strategy.value == "algebraic_delta"
+    mgr.register_view("CREATE VIEW mv_pv_chain AS SELECT g, SUM(v2) AS s2 FROM pv_chain GROUP BY g;")
+    mgr.register_view("CREATE VIEW mv_pv_cols AS SELECT k, SUM(amt) AS s FROM pv_cols GROUP BY k;")
+    p_cte = mgr.register_view("CREATE VIEW mv_pv_cte AS SELECT g, sv + 1 AS sv1 FROM pv_cte;")
+    # CTE named `s` must NOT spuriously attach triggers to unrelated base table `s`.
+    assert p_cte.view_spec.referenced_tables == ("pv_t",)
+    mgr.register_view("CREATE VIEW mv_pv_join AS SELECT d.name, SUM(b.v) AS s FROM pv_base b JOIN pv_d d ON d.id = b.d_id GROUP BY d.name;")
+    mgr.register_view('CREATE VIEW mv_pv_quoted AS SELECT g, COUNT(*) AS c FROM "pv\'s src" GROUP BY g;')
+    mgr.register_view("CREATE VIEW mv_pv_col_alias AS SELECT cg, SUM(cv) AS s FROM pv_base AS x(cid, cdid, cg, cv) GROUP BY cg;")
+    mgr.register_view("CREATE VIEW mv_pv_switch AS SELECT g, SUM(v) AS s FROM pv_switch GROUP BY g;")
+
+    # Native PostgreSQL MATERIALIZED VIEW (relkind = 'm') and registered MVs must remain refused.
+    with pytest.raises(ValueError, match="does not reference any known base tables"):
+        mgr.register_view("CREATE VIEW mv_bad_native AS SELECT g, COUNT(*) AS c FROM pg_native_mv GROUP BY g;")
+    with pytest.raises(ValueError, match="does not reference any known base tables"):
+        mgr.register_view("CREATE VIEW mv_bad_chained_mv AS SELECT g, c FROM mv_pv_base;")
+
+    def _assert_all() -> None:
+        checks = [
+            ("SELECT g, c, s FROM mv_pv_base ORDER BY g", "SELECT g, COUNT(*), SUM(v) FROM pv_base GROUP BY g ORDER BY g"),
+            ("SELECT g, s2 FROM mv_pv_chain ORDER BY g", "SELECT g, SUM(v2) FROM pv_chain GROUP BY g ORDER BY g"),
+            ("SELECT k, s FROM mv_pv_cols ORDER BY k", "SELECT k, SUM(amt) FROM pv_cols GROUP BY k ORDER BY k"),
+            ("SELECT g, sv1 FROM mv_pv_cte ORDER BY g", "SELECT g, sv + 1 FROM pv_cte ORDER BY g"),
+            ("SELECT name, s FROM mv_pv_join ORDER BY name", "SELECT d.name, SUM(b.v) FROM pv_base b JOIN pv_d d ON d.id = b.d_id GROUP BY d.name ORDER BY d.name"),
+            ("SELECT g, c FROM mv_pv_quoted ORDER BY g NULLS FIRST", 'SELECT g, COUNT(*) FROM "pv\'s src" GROUP BY g ORDER BY g NULLS FIRST'),
+            ("SELECT cg, s FROM mv_pv_col_alias ORDER BY cg", "SELECT cg, SUM(cv) FROM pv_base AS x(cid, cdid, cg, cv) GROUP BY cg ORDER BY cg"),
+            ("SELECT g, s FROM mv_pv_switch ORDER BY g", "SELECT g, SUM(v) FROM pv_switch GROUP BY g ORDER BY g"),
+        ]
+        for mv_q, live_q in checks:
+            cur = conn.cursor()
+            cur.execute(mv_q)
+            actual = cur.fetchall()
+            cur.execute(live_q)
+            expected = cur.fetchall()
+            cur.close()
+            conn.commit()
+            assert actual == expected, f"{mv_q}: actual={actual!r} expected={expected!r}"
+
+    _assert_all()
+    assert all(st == "ok" for st in mgr.check_schema_drift().values())
+
+    # Single-table DML + multi-source writable CTE modifying both pv_d and pv_t.
+    _run_stmts(
+        "INSERT INTO pv_t VALUES (5, 1, 'A', 5), (6, 2, NULL, 50)",
+        "UPDATE pv_t SET v = v + 10 WHERE id = 2",
+        "DELETE FROM pv_t WHERE id = 3",
+        "WITH nd AS (INSERT INTO pv_d VALUES (3, 'D3') RETURNING id) INSERT INTO pv_t SELECT 7, id, 'C', 40 FROM nd",
+        "INSERT INTO s VALUES (2, 'W', 777)",
+    )
+    _assert_all()
+
+    # Out-of-band CREATE OR REPLACE VIEW on pv_base drifts pv_base dependents only.
+    _run_stmts("CREATE OR REPLACE VIEW pv_base AS SELECT id, d_id, g, v + 1 AS v FROM pv_t WHERE g IS NOT NULL")
+    drift = mgr.check_schema_drift()
+    assert drift["mv_pv_base"] == "drifted"
+    assert drift["mv_pv_chain"] == "drifted"
+    assert drift["mv_pv_join"] == "drifted"
+    assert drift["mv_pv_col_alias"] == "drifted"
+    assert drift["mv_pv_cols"] == "ok"
+    rep = mgr.repair_view()
+    assert rep["mv_pv_base"] == "rebuilt"
+    assert rep["mv_pv_chain"] == "rebuilt"
+    assert rep["mv_pv_join"] == "rebuilt"
+    assert rep["mv_pv_col_alias"] == "rebuilt"
+    _assert_all()
+
+    # Switching pv_switch to a different base table (pv_t -> pv_t2) drifts and rebuilds triggers onto pv_t2.
+    _run_stmts("CREATE OR REPLACE VIEW pv_switch AS SELECT id, g, v FROM pv_t2 WHERE g IS NOT NULL")
+    assert mgr.check_schema_drift()["mv_pv_switch"] == "drifted"
+    assert mgr.repair_view("mv_pv_switch") == {"mv_pv_switch": "rebuilt"}
+    _run_stmts("INSERT INTO pv_t2 VALUES (3, 1, 'X', 50)")
+    _assert_all()
+
+    # TRUNCATE maintains exactness through plain views.
+    _run_stmts("TRUNCATE pv_t")
+    _assert_all()
+
+    # Out-of-band DROP VIEW reports invalid.
+    _run_stmts("DROP VIEW pv_cols")
+    assert mgr.check_schema_drift()["mv_pv_cols"] == "invalid"

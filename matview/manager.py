@@ -27,6 +27,7 @@ from .connectivity import (
     dbapi_transaction_state,
     detect_engine_version,
     introspect_database_schemas,
+    introspect_plain_views,
     render_parameterized_sql,
     unwrap_dbapi_connection,
 )
@@ -55,6 +56,7 @@ from .sql_frontend import (
     build_alter_rename_table_sql,
     build_create_view_sql,
     build_drop_sql,
+    parse_plain_views,
     parse_sql_ast,
     parse_table_schema,
     parse_view_definition,
@@ -821,6 +823,25 @@ class MaterializedViewManager:
             schemas.update(parse_table_schema(extra_schema_sql, dialect=self.dialect))
         return schemas
 
+    def _fetch_plain_views(
+        self,
+        extra_schema_sql: Optional[str] = None,
+        exclude_views: Sequence[str] = (),
+    ) -> Tuple[Dict[str, str], Optional[str]]:
+        """Fetches live plain (non-materialized) SQL views, merged with any in `extra_schema_sql`."""
+        plain_views, current_schema = introspect_plain_views(
+            self.conn,
+            dialect=self.dialect,
+            object_prefix=self.object_prefix,
+            exclude_views=exclude_views,
+        )
+        if extra_schema_sql:
+            excl_low = {str(v).lower() for v in exclude_views if v}
+            for pv_name, pv_sql in parse_plain_views(extra_schema_sql, dialect=self.dialect).items():
+                if pv_name.lower() not in excl_low:
+                    plain_views[pv_name] = pv_sql
+        return plain_views, current_schema
+
     @_manager_owned_operation("apply_schema_ddl")
     def apply_schema_ddl(self, ddl_sql: str, auto_sync_views: bool = True) -> None:
         """
@@ -882,11 +903,18 @@ class MaterializedViewManager:
             if not tables:
                 return sorted(published)
             touched.update(t.name.lower() for t in tables if t.name)
+        plain_views, cur_schema = self._fetch_plain_views(exclude_views=list(catalog.keys()))
         affected = []
         for name, entry in published.items():
             try:
-                specs = parse_view_definitions(entry["view_sql"], dialect=self.dialect)
+                specs = parse_view_definitions(
+                    entry["view_sql"],
+                    dialect=self.dialect,
+                    plain_views=plain_views,
+                    current_schema=cur_schema,
+                )
                 referenced = {r.lower().split(".")[-1].strip('`"') for s in specs for r in s.referenced_tables}
+                referenced.update(pv_name.lower() for s in specs for pv_name, _ in s.referenced_plain_views)
             except Exception:
                 affected.append(name)
                 continue
@@ -1014,6 +1042,8 @@ class MaterializedViewManager:
         h.update(f"backing:{plan.backing_table_ddl}".encode("utf-8"))
         h.update(f"reader:{plan.reader_view_ddl}".encode("utf-8"))
         h.update(_strip_sql_comments(plan.view_spec.raw_select_sql).encode("utf-8"))
+        for pv_name, pv_def in sorted(plan.view_spec.referenced_plain_views, key=lambda kv: kv[0].lower()):
+            h.update(f"pv:{pv_name.lower()}:{pv_def}".encode("utf-8"))
         h.update(f"prefix:{plan.object_prefix}".encode("utf-8"))
         for idx_ddl in plan.index_ddls:
             h.update(f"idx:{idx_ddl}".encode("utf-8"))
@@ -1039,7 +1069,8 @@ class MaterializedViewManager:
     @staticmethod
     def _serialize_view_sql_with_indexes(plan: MaterializedViewPlan, raw_view_sql: Optional[str] = None) -> str:
         q_vname = quote_sql_identifier(plan.logical_view_name, plan.dialect, allow_qualified=False)
-        parts = [f"CREATE VIEW {q_vname} AS {plan.view_spec.raw_select_sql.strip().rstrip(';')};"]
+        src_select = plan.view_spec.original_select_sql or plan.view_spec.raw_select_sql
+        parts = [f"CREATE VIEW {q_vname} AS {src_select.strip().rstrip(';')};"]
         for idx_spec in plan.user_indexes:
             u_kw = "UNIQUE " if idx_spec.unique else ""
             n_str = f"{quote_sql_identifier(idx_spec.name, plan.dialect, allow_qualified=False)} " if idx_spec.name else ""
@@ -2075,7 +2106,7 @@ class MaterializedViewManager:
         entry = catalog.get(self._resolve_catalog_name(v_spec.view_name, catalog)) or {}
         stored: Sequence[str] = ()
         if entry.get("accepted_limitations") and entry.get("accepted_definition") == _definition_digest(
-            v_spec.raw_select_sql
+            v_spec.original_select_sql or v_spec.raw_select_sql
         ):
             stored = entry["accepted_limitations"]
         return tuple(sorted(set(self.accept_limitations) | set(stored)))
@@ -2089,6 +2120,8 @@ class MaterializedViewManager:
         ignore: bool,
         strict: bool = False,
         watermark_catalog_table: Optional[str] = None,
+        plain_views: Optional[Mapping[str, str]] = None,
+        current_schema: Optional[str] = None,
     ) -> MaterializedViewPlan:
         return generate_materialized_view(
             schemas,
@@ -2102,17 +2135,32 @@ class MaterializedViewManager:
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=getattr(self, "pg_fillfactor", 80),
             repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
+            plain_views=plain_views,
+            current_schema=current_schema,
         )
 
-    def _stored_plan(self, schemas: Dict[str, TableSchema], entry: Dict[str, Any]) -> MaterializedViewPlan:
+    def _stored_plan(
+        self,
+        schemas: Dict[str, TableSchema],
+        entry: Dict[str, Any],
+        *,
+        plain_views: Optional[Mapping[str, str]] = None,
+        current_schema: Optional[str] = None,
+        exclude_views: Sequence[str] = (),
+    ) -> MaterializedViewPlan:
         """Recompile an installed view under exactly the limitation codes it
         was installed with (plus the manager's accept_limitations); never a
         blanket override."""
+        if plain_views is None:
+            excl = list(exclude_views) if exclude_views else [entry["view_name"]]
+            plain_views, current_schema = self._fetch_plain_views(exclude_views=excl)
         return self._compile_view(
             schemas,
             entry["view_sql"],
             accept=self._stored_accept(entry),
             ignore=self.ignore_limitations,
+            plain_views=plain_views,
+            current_schema=current_schema,
         )
 
     def _stored_accept(self, entry: Dict[str, Any]) -> Tuple[str, ...]:
@@ -2228,7 +2276,9 @@ class MaterializedViewManager:
                     init_max,
                     init_active,
                     json.dumps({
-                        "definition": _definition_digest(plan.view_spec.raw_select_sql),
+                        "definition": _definition_digest(
+                            plan.view_spec.original_select_sql or plan.view_spec.raw_select_sql
+                        ),
                         "codes": sorted({lim.code for lim in plan.limitations}),
                     }),
                 )
@@ -2355,11 +2405,19 @@ class MaterializedViewManager:
         )
         effective_strict = self.strict if strict is None else strict
         schemas = self.fetch_schema(extra_schema_sql=schema_sql)
+        catalog_for_pv = self.get_catalog()
+        plain_views, cur_schema = self._fetch_plain_views(
+            extra_schema_sql=schema_sql,
+            exclude_views=list(catalog_for_pv.keys()),
+        )
         specs = parse_view_definitions(
             view_sql,
             known_tables={k.lower() for k in schemas},
             indexes=indexes,
             dialect=self.dialect,
+            plain_views=plain_views,
+            current_schema=cur_schema,
+            schemas=schemas,
         )
         sub_plans: List[MaterializedViewPlan] = []
         for vs in specs:
@@ -2442,6 +2500,10 @@ class MaterializedViewManager:
         effective_strict = self.strict if strict is None else strict
         schemas = self.fetch_schema(extra_schema_sql=schema_sql)
         catalog = self.get_catalog()
+        plain_views, cur_schema = self._fetch_plain_views(
+            extra_schema_sql=schema_sql,
+            exclude_views=list(catalog.keys()),
+        )
         status: Dict[str, str] = {}
         desired_names: Set[str] = set()
 
@@ -2450,6 +2512,9 @@ class MaterializedViewManager:
             known_tables={k.lower() for k in schemas},
             indexes=indexes,
             dialect=self.dialect,
+            plain_views=plain_views,
+            current_schema=cur_schema,
+            schemas=schemas,
         )
 
         planned: List[Tuple[Any, MaterializedViewPlan, str]] = []
@@ -2461,6 +2526,8 @@ class MaterializedViewManager:
                 ignore=effective_ignore,
                 strict=effective_strict,
                 watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+                plain_views=plain_views,
+                current_schema=cur_schema,
             )
             planned.append((v_spec, plan, self._compute_signature(plan, schemas)))
 
@@ -3312,11 +3379,14 @@ class MaterializedViewManager:
         """
         schemas = self.fetch_schema()
         catalog = self.get_catalog()
+        plain_views, cur_schema = self._fetch_plain_views(exclude_views=list(catalog.keys()))
         plans_by_view: Dict[str, MaterializedViewPlan] = {}
         invalid_views: Set[str] = set()
         for v_name, entry in catalog.items():
             try:
-                plans_by_view[v_name] = self._stored_plan(schemas, entry)
+                plans_by_view[v_name] = self._stored_plan(
+                    schemas, entry, plain_views=plain_views, current_schema=cur_schema
+                )
             except Exception:
                 invalid_views.add(v_name)
         extra_ddls_by_view = {
@@ -3406,6 +3476,7 @@ class MaterializedViewManager:
             target_names = list(catalog.keys())
 
         schemas = self.fetch_schema()
+        plain_views, cur_schema = self._fetch_plain_views(exclude_views=list(catalog.keys()))
         results: Dict[str, str] = {}
         for idx, target_name in enumerate(target_names):
             if idx > 0:
@@ -3417,9 +3488,10 @@ class MaterializedViewManager:
                 if target_name not in catalog:
                     continue
                 schemas = self.fetch_schema()
+                plain_views, cur_schema = self._fetch_plain_views(exclude_views=list(catalog.keys()))
             entry = catalog[target_name]
             v_name = entry["view_name"]
-            plan = self._stored_plan(schemas, entry)
+            plan = self._stored_plan(schemas, entry, plain_views=plain_views, current_schema=cur_schema)
             sig = self._compute_signature(plan, schemas)
             extra_ddls = (
                 {target_name: plan.readonly_trigger_ddls}
@@ -3658,8 +3730,22 @@ class MaterializedViewManager:
         else:  # pragma: no cover - guarded by bulk_changes
             raise AssertionError(f"maintenance DDL is not transactional on {self.dialect}")
 
-    def _bulk_plan(self, schemas: Dict[str, TableSchema], entry: Dict[str, Any]) -> MaterializedViewPlan:
-        return self._stored_plan(schemas, entry)
+    def _bulk_plan(
+        self,
+        schemas: Dict[str, TableSchema],
+        entry: Dict[str, Any],
+        *,
+        plain_views: Optional[Mapping[str, str]] = None,
+        current_schema: Optional[str] = None,
+        exclude_views: Sequence[str] = (),
+    ) -> MaterializedViewPlan:
+        return self._stored_plan(
+            schemas,
+            entry,
+            plain_views=plain_views,
+            current_schema=current_schema,
+            exclude_views=exclude_views,
+        )
 
     @staticmethod
     def _catalog_identity(catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Tuple[Any, ...]]:
@@ -3679,7 +3765,12 @@ class MaterializedViewManager:
             )
 
     def _bulk_refresh(
-        self, cur: Any, targets: Sequence[Dict[str, Any]], use_shadow_swap: bool, recreate_triggers: bool
+        self,
+        cur: Any,
+        targets: Sequence[Dict[str, Any]],
+        use_shadow_swap: bool,
+        recreate_triggers: bool,
+        all_catalog_views: Optional[Sequence[str]] = None,
     ) -> None:
         """Repopulate every target view inside the current transaction.
 
@@ -3689,8 +3780,20 @@ class MaterializedViewManager:
         repopulated). Any error propagates; the caller rolls back.
         """
         schemas = self.fetch_schema()
+        target_names_excl = (
+            list(all_catalog_views)
+            if all_catalog_views is not None
+            else [e["view_name"] for e in targets]
+        )
+        plain_views, cur_schema = self._fetch_plain_views(exclude_views=target_names_excl)
         for entry in targets:
-            plan = self._bulk_plan(schemas, entry)
+            plan = self._bulk_plan(
+                schemas,
+                entry,
+                plain_views=plain_views,
+                current_schema=cur_schema,
+                exclude_views=target_names_excl,
+            )
             self._execute_param(
                 cur,
                 f"UPDATE {self.catalog_table} SET backfill_cursor_pk = ?, "
@@ -3985,7 +4088,13 @@ class MaterializedViewManager:
                     # mode): the simplest path that restores maintenance.
                     self._begin_bulk_transaction(cur)
                     self._bulk_require_unchanged_catalog(catalog, catalog_lock)
-                    self._bulk_refresh(cur, targets, False, recreate_triggers=not session_bypass)
+                    self._bulk_refresh(
+                        cur,
+                        targets,
+                        False,
+                        recreate_triggers=not session_bypass,
+                        all_catalog_views=list(catalog.keys()),
+                    )
                     self._commit()
                 except BaseException as recovery_exc:
                     self._bulk_rollback("recovering from a block that ended the transaction failed")
@@ -4014,7 +4123,13 @@ class MaterializedViewManager:
             try:
                 if suspends:
                     self._bulk_require_unchanged_catalog(catalog, catalog_lock)
-                    self._bulk_refresh(cur, targets, use_shadow_swap, recreate_triggers=not session_bypass)
+                    self._bulk_refresh(
+                        cur,
+                        targets,
+                        use_shadow_swap,
+                        recreate_triggers=not session_bypass,
+                        all_catalog_views=list(catalog.keys()),
+                    )
                 self._commit()
                 if dbapi_transaction_state(self.conn) is not False:
                     raise RuntimeError(
@@ -4146,11 +4261,18 @@ class MaterializedViewManager:
         else:
             specs_input = view_sqls
 
+        plain_views, cur_schema = self._fetch_plain_views(
+            extra_schema_sql=schema_sql,
+            exclude_views=list(catalog.keys()),
+        )
         all_specs = parse_view_definitions(
             specs_input,
             known_tables={k.lower() for k in schemas},
             indexes=indexes,
             dialect=self.dialect,
+            plain_views=plain_views,
+            current_schema=cur_schema,
+            schemas=schemas,
         )
 
         for v_spec in all_specs:
@@ -4166,6 +4288,8 @@ class MaterializedViewManager:
                 pg_fillfactor=getattr(self, "pg_fillfactor", 80),
                 watermark_catalog_table=self.catalog_table if incremental_backfill else None,
                 repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
+                plain_views=plain_views,
+                current_schema=cur_schema,
             )
             v_name = plan.view_name
             desired_names.add(v_name)
@@ -4537,6 +4661,8 @@ def generate_materialized_view(
     watermark_catalog_table: Optional[str] = None,
     pg_fillfactor: Optional[int] = 80,
     repair_fence_catalog_table: Optional[str] = None,
+    plain_views: Optional[Mapping[str, str]] = None,
+    current_schema: Optional[str] = None,
 ) -> MaterializedViewPlan:
     """
     Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
@@ -4546,24 +4672,37 @@ def generate_materialized_view(
     resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
     eff_dialect = resolved_ev.dialect
 
+    eff_plain_views: Optional[Mapping[str, str]] = plain_views
+    eff_current_schema: Optional[str] = current_schema
     if isinstance(schema_sql_or_dict, str):
         schemas = parse_table_schema(schema_sql_or_dict, dialect=eff_dialect)
+        if eff_plain_views is None:
+            eff_plain_views = parse_plain_views(schema_sql_or_dict, dialect=eff_dialect)
     elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
         schemas = introspect_database_schemas(
             schema_sql_or_dict,
             dialect=eff_dialect,
             object_prefix=object_prefix,
         )
+        if eff_plain_views is None:
+            eff_plain_views, eff_current_schema = introspect_plain_views(
+                schema_sql_or_dict,
+                dialect=eff_dialect,
+                object_prefix=object_prefix,
+            )
     else:
         schemas = dict(schema_sql_or_dict)
 
     known_tables = {k.lower() for k in schemas}
-    if isinstance(view_sql_or_spec, str):
+    if isinstance(view_sql_or_spec, str) or (eff_plain_views and not view_sql_or_spec.referenced_plain_views):
         view_spec = parse_view_definition(
             view_sql_or_spec,
             known_tables=known_tables,
             indexes=indexes,
             dialect=eff_dialect,
+            plain_views=eff_plain_views,
+            current_schema=eff_current_schema,
+            schemas=schemas,
         )
     elif indexes:
         parsed_idxs = tuple(
@@ -4588,6 +4727,8 @@ def generate_materialized_view(
             has_subquery_in_from=view_sql_or_spec.has_subquery_in_from,
             user_indexes=view_sql_or_spec.user_indexes + parsed_idxs,
             additional_views=view_sql_or_spec.additional_views,
+            original_select_sql=view_sql_or_spec.original_select_sql,
+            referenced_plain_views=view_sql_or_spec.referenced_plain_views,
         )
     else:
         view_spec = view_sql_or_spec
@@ -4625,6 +4766,8 @@ def generate_materialized_views(
     watermark_catalog_table: Optional[str] = None,
     pg_fillfactor: Optional[int] = 80,
     repair_fence_catalog_table: Optional[str] = None,
+    plain_views: Optional[Mapping[str, str]] = None,
+    current_schema: Optional[str] = None,
 ) -> List[MaterializedViewPlan]:
     """
     Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
@@ -4633,14 +4776,24 @@ def generate_materialized_views(
     resolved_ev = _resolve_dialect_and_engine_version(schema_sql_or_dict, dialect, engine_version)
     eff_dialect = resolved_ev.dialect
 
+    eff_plain_views: Optional[Mapping[str, str]] = plain_views
+    eff_current_schema: Optional[str] = current_schema
     if isinstance(schema_sql_or_dict, str):
         schemas = parse_table_schema(schema_sql_or_dict, dialect=eff_dialect)
+        if eff_plain_views is None:
+            eff_plain_views = parse_plain_views(schema_sql_or_dict, dialect=eff_dialect)
     elif hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
         schemas = introspect_database_schemas(
             schema_sql_or_dict,
             dialect=eff_dialect,
             object_prefix=object_prefix,
         )
+        if eff_plain_views is None:
+            eff_plain_views, eff_current_schema = introspect_plain_views(
+                schema_sql_or_dict,
+                dialect=eff_dialect,
+                object_prefix=object_prefix,
+            )
     else:
         schemas = dict(schema_sql_or_dict)
 
@@ -4649,6 +4802,9 @@ def generate_materialized_views(
         known_tables={k.lower() for k in schemas},
         indexes=indexes,
         dialect=eff_dialect,
+        plain_views=eff_plain_views,
+        current_schema=eff_current_schema,
+        schemas=schemas,
     )
     plans: List[MaterializedViewPlan] = []
     for vs in specs:
