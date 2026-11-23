@@ -992,13 +992,10 @@ BACKFILL_SCHEMA = {
     "mysql": ["CREATE TABLE bt (id INT PRIMARY KEY, g INT NOT NULL, x INT) ENGINE=InnoDB"],
     "sqlite": ["CREATE TABLE bt (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, x INTEGER)"],
 }
-# One backfill batch of 20 is folded (ids 1..20, cursor 20) when the writes
-# run; the unfolded window is 21..28 (max_pk 28): one row per group, which a
-# trigger-side recompute must not read. Each group retracts one extreme by a
-# delete or by a pk move out of the window (the old pk is folded, the new one
-# beyond max_pk), then its unfolded row is deleted (the trigger skips that
-# delete and no later chunk touches the group).
-# group: (folded values, retracted value, unfolded value, how)
+# Groups 1..8 each retract one extreme (MIN, MAX, BIT_OR, BIT_AND), once by a
+# delete and once by a pk move out of the window (the old pk is folded, the
+# new one beyond max_pk): group -> (folded values, retracted value, unfolded
+# value, how). Group 9 fills, group 10 serves the claimed-state writes.
 _BACKFILL_GROUPS = {
     1: ([12, 14], 12, -50, "delete"),  # MIN; the cursor row (id 20, value 13) becomes the MIN
     2: ([12, 13], 12, -50, "move"),  # MIN
@@ -1012,152 +1009,130 @@ _BACKFILL_GROUPS = {
 
 
 def _backfill_rows_and_writes() -> Tuple[List[Tuple[int, int, int]], List[str]]:
+    """Rows 1..28 and the writes run after the first batch of 20 is folded
+    (cursor 20; ids 21..30 unfolded, 30 = max_pk once the unclaimed writes
+    have run)."""
     rows: List[Tuple[int, int, int]] = []
     writes: List[str] = []
-    next_id = iter(range(1, 20))
+    next_id = iter(range(1, 19))
     for g, (folded, retracted, _, how) in _BACKFILL_GROUPS.items():
         for x in folded:
             i = next(next_id)
             rows.append((i, g, x))
             if x == retracted and not any(w.endswith(f"id = {i}") for w in writes):
                 writes.append(f"DELETE FROM bt WHERE id = {i}" if how == "delete"
-                              else f"UPDATE bt SET id = {900 + g} WHERE id = {i}")
-    for i in next_id:
-        rows.append((i, 9, i))  # filler up to id 19
+                              else f"UPDATE bt SET id = {30 + g} WHERE id = {i}")  # beyond max_pk 30
+    rows.append((18, 9, 18))
+    rows.append((19, 10, -7))  # group 10's only original row (see the claimed state)
     rows.append((20, 1, 13))  # the cursor row
-    # 21 = cursor + 1 (group 1, MIN), 28 = max_pk (group 4, MAX): both bounds
-    # matter on every engine (SQLite has no BIT_AND/BIT_OR).
-    for i, g in enumerate((1, 2, 3, 5, 6, 7, 8, 4), start=21):
+    # 21 = cursor + 1 (group 1, MIN) ... (group 4's unfolded row at max_pk is
+    # inserted in the unclaimed state, id 30).
+    for i, g in enumerate((1, 2, 3, 5, 6, 7, 8), start=21):
         rows.append((i, g, _BACKFILL_GROUPS[g][2]))
-    writes.append("DELETE FROM bt WHERE id BETWEEN 21 AND 28")
+    rows.append((28, 9, 28))
+    writes.append("DELETE FROM bt WHERE id BETWEEN 21 AND 30")
     return rows, writes
 
 
-@pytest.mark.parametrize("target", _params())
-def test_recompute_during_backfill_ignores_rows_not_yet_folded(make_env, target: Target) -> None:
-    """While a pk-range backfill is active the triggers skip source rows in
-    the unfolded window, which the backfill folds later. A native recompute
-    by a trigger (MIN/MAX/BIT_AND/BIT_OR after a retraction, AVG where it is
-    recomputed) must skip them too: otherwise it stores a value that includes
-    such a row, and when the row is deleted before its chunk runs (the
-    trigger skips that delete) no chunk touches the group again and the
-    stale value stays (CI failure of
-    test_pgmy_exact_float_aggregates.py::NativeConcurrentWriters on PG 15).
-    The rows at the cursor (folded), at cursor + 1 and at max_pk (unfolded)
-    check both window bounds.
+# Run while every view is registered without population (watermark active,
+# cursor NULL): the triggers must skip them all. Net inserts, so a trigger that
+# applied them would double-count once the backfill folds; they also set
+# max_pk to 30 (group 4's unfolded row).
+_UNCLAIMED_WRITES = (
+    "INSERT INTO bt (id, g, x) VALUES (29, 9, 1), (30, 4, 500)",
+    "DELETE FROM bt WHERE id = 28",
+)
+# Run while view vc's backfill has claimed its range (cursor = min - 1) and is
+# held before its first chunk: group 10's MIN and MAX are retracted among rows
+# outside the claimed range, then its only claimed row (19, the smallest
+# value) is deleted (skipped by vc's trigger; no chunk of vc touches group 10).
+_CLAIMED_WRITES = (
+    "INSERT INTO bt (id, g, x) VALUES (1001, 10, 100), (1002, 10, 5)",
+    "DELETE FROM bt WHERE id = 1002",
+    "UPDATE bt SET x = 50 WHERE id = 1001",
+    "DELETE FROM bt WHERE id = 19",
+)
 
-    Deterministic: the writes run on an independent connection between two
-    committed backfill batches (from the progress callback)."""
+
+@pytest.mark.parametrize("target", _params())
+def test_trigger_recomputes_skip_rows_the_backfill_has_not_folded(make_env, target: Target) -> None:
+    """While a pk-range backfill is pending or running, the triggers skip the
+    source rows it will fold. Their native recomputes (MIN/MAX/BIT_AND/BIT_OR
+    after a retraction, AVG where recomputed) must skip them too: otherwise a
+    stored value includes such a row, and when the row is deleted before its
+    chunk runs (the trigger skips that delete) no chunk touches the group
+    again and the stale value stays (CI failure of
+    test_pgmy_exact_float_aggregates.py::NativeConcurrentWriters on PG 15).
+
+    One table, views registered without population, three watermark
+    states:
+    - unclaimed (cursor NULL): both views skip _UNCLAIMED_WRITES;
+    - after the first chunk of va (cursor 20): _backfill_rows_and_writes'
+      retractions; rows at the cursor, at cursor + 1 and at max_pk check both
+      window bounds;
+    - claimed, not advanced (PostgreSQL only): vc's first chunk is held by a
+      row lock it waits for (observed through pg_stat_activity), and
+      _CLAIMED_WRITES run. SQLite serializes writers, and on MySQL/MariaDB the
+      held chunk blocks the writers, so vc is not registered there.
+    Independent connections, no sleeps."""
     env = make_env(target, views=[], seed=False, schema_sql=BACKFILL_SCHEMA[target.family])
     rows, writes = _backfill_rows_and_writes()
     env.execute("INSERT INTO bt (id, g, x) VALUES " + ", ".join(f"({i}, {g}, {x})" for i, g, x in rows))
     env.commit()
     bits = "" if target.family == "sqlite" else ", BIT_AND(x) AS ba, BIT_OR(x) AS bo"  # no SQLite BIT_AND
-    vd = ViewDef("v_bt", f"SELECT g, COUNT(*) AS n, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx{bits} FROM bt GROUP BY g")
-    env.views = [vd]
-    plan = env.register(vd, populate=False)
-    writer = env.connect()
-    done: List[int] = []
-
-    def on_progress(batch: int, _rows: int) -> None:
-        if batch != 1:
-            return
-        for sql in writes:
-            env.execute(sql, conn=writer)
-            env.commit(conn=writer)
-        done.append(batch)
-
-    env.manager.backfill_incrementally(plan, batch_size=20, on_progress=on_progress, snapshot_isolation=False)
-    assert done == [1]
-    env.check("backfill after recomputes of groups with unfolded rows")
-
-
-# Writes of group 10 while the watermark does not cover any folded row yet:
-# its only claimed row (id 29, the smallest value) is deleted after its MIN and
-# MAX were retracted among rows outside the claimed range.
-_UNFOLDED_GROUP_WRITES = (
-    "INSERT INTO bt (id, g, x) VALUES (1001, 10, 100), (1002, 10, 5)",
-    "DELETE FROM bt WHERE id = 1002",  # MIN retracted: recomputed
-    "UPDATE bt SET x = 50 WHERE id = 1001",  # MAX retracted: recomputed
-    "DELETE FROM bt WHERE id = 29",  # claimed and unfolded: skipped by the trigger
-    # Net row-count changes that do not cancel out: a trigger that applied
-    # writes it must skip would double-count them once the backfill folds.
-    "INSERT INTO bt (id, g, x) VALUES (1003, 10, 60), (1004, 9, 1)",
-)
-
-
-@pytest.mark.parametrize("phase", ["unclaimed", "claimed"])
-@pytest.mark.parametrize("target", _params())
-def test_recompute_before_the_backfill_folds_anything(make_env, target: Target, phase: str) -> None:
-    """The watermark states before the first chunk commits.
-
-    ``unclaimed``: registered without population; the watermark is active
-    with no cursor (backfill_cursor_pk IS NULL), so the triggers skip every
-    write and the backfill folds everything. ``claimed``: the backfill has
-    committed its claim (cursor = min - 1, max_pk) and is held before its
-    first chunk by a row lock: the triggers maintain rows outside the claimed
-    range, and their recomputes must not read the claimed rows (none is
-    folded yet). In both, the writes of the shared setup and of group 10
-    must leave the view exact. In the unclaimed state no trigger reaches a
-    recompute (the guard skips every row), so the recompute window predicate's
-    handling of a NULL cursor is not observable there.
-
-    Deterministic: independent connections; the claimed state is held by a
-    row lock the first chunk waits for (checked through the engine's lock
-    view), not by sleeps. The claimed state runs on PostgreSQL only (see the
-    skip reason)."""
-    if phase == "claimed" and target.family != "postgres":
-        # SQLite serializes writers; on MySQL/MariaDB the held first chunk
-        # already blocks the writers (measured: lock wait timeout 1205), so
-        # the state cannot be held while they write.
-        pytest.skip("the backfill cannot be held between its claim and first chunk while writers proceed")
-    env = make_env(target, views=[], seed=False, schema_sql=BACKFILL_SCHEMA[target.family])
-    rows, writes = _backfill_rows_and_writes()
-    rows.append((29, 10, -7))
-    env.execute("INSERT INTO bt (id, g, x) VALUES " + ", ".join(f"({i}, {g}, {x})" for i, g, x in rows))
-    env.commit()
-    bits = "" if target.family == "sqlite" else ", BIT_AND(x) AS ba, BIT_OR(x) AS bo"
-    vd = ViewDef("v_bt", f"SELECT g, COUNT(*) AS n, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx{bits} FROM bt GROUP BY g")
-    env.views = [vd]
-    plan = env.register(vd, populate=False)
+    select = f"SELECT g, COUNT(*) AS n, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx{bits} FROM bt GROUP BY g"
+    # vc (the claimed state) only where that state can be held.
+    env.views = [ViewDef("va", select)] + ([ViewDef("vc", select)] if target.family == "postgres" else [])
+    plans = [env.register(vd, populate=False) for vd in env.views]
     writer = env.connect()
 
     def run_writes(sqls: Sequence[str]) -> None:
+        # One transaction: each statement still fires its own maintenance.
         for sql in sqls:
             env.execute(sql, conn=writer)
-            env.commit(conn=writer)
+        env.commit(conn=writer)
 
-    if phase == "unclaimed":
-        run_writes([*writes, *_UNFOLDED_GROUP_WRITES])
-        env.manager.backfill_incrementally(plan, batch_size=20, snapshot_isolation=False)
-        env.check("backfill after writes while the watermark was unclaimed")
+    run_writes(_UNCLAIMED_WRITES)
+    done: List[int] = []
+
+    def after_first_chunk(batch: int, _rows: int) -> None:
+        if batch == 1:
+            run_writes(writes)
+            done.append(batch)
+
+    env.manager.backfill_incrementally(plans[0], batch_size=20, on_progress=after_first_chunk, snapshot_isolation=False)
+    assert done == [1]
+    if target.family != "postgres":
+        env.check("backfill after writes in the unclaimed and first-chunk states")
         return
+    plan_c = plans[1]
     blocker, monitor = env.connect(), env.connect()
     sid_bf, sid_blocker = _session_id(env, env.conn), _session_id(env, blocker)
-    blocker.cursor().execute("SELECT id FROM bt WHERE id = 1 FOR UPDATE")
+    # The lowest id is the first row vc's first chunk locks (FOR UPDATE).
+    blocker.cursor().execute("SELECT id FROM bt WHERE id = (SELECT MIN(id) FROM bt) FOR UPDATE")
     errors: List[BaseException] = []
     finished = threading.Event()
 
-    def backfill() -> None:
+    def backfill_c() -> None:
         try:
-            env.manager.backfill_incrementally(plan, batch_size=20, snapshot_isolation=False)
+            env.manager.backfill_incrementally(plan_c, batch_size=20, snapshot_isolation=False)
         except BaseException as exc:  # inspected below
             errors.append(exc)
         finally:
             finished.set()
 
-    th = threading.Thread(target=backfill, daemon=True)
+    th = threading.Thread(target=backfill_c, daemon=True)
     th.start()
     try:
         _wait_for(lambda: _row_lock_waiting(env, monitor, sid_bf, sid_blocker), finished,
-                  "the first chunk waits for the row lock after the claim committed")
-        run_writes(_UNFOLDED_GROUP_WRITES)
+                  "vc's first chunk waits for the row lock after its claim committed")
+        run_writes(_CLAIMED_WRITES)
     finally:
         blocker.commit()
         th.join(LOCK_WAIT_TIMEOUT_S)
     if errors:
         raise errors[0]
-    env.check("backfill after writes while claimed and not yet advanced")
+    env.check("backfills after writes in the unclaimed, first-chunk and claimed states")
 
 
 @pytest.mark.parametrize("target", _params())
