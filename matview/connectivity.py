@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import re
 import sqlite3
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import create_engine as _sa_create_engine, event as _sa_event, inspect as _sa_inspect
 from sqlalchemy.engine import Connection as _SAConnection, Engine as _SAEngine
@@ -1432,4 +1432,227 @@ def introspect_database_schemas(
         close_fn = getattr(cur, "close", None)
         if callable(close_fn):
             close_fn()
+
+
+def _exec_plain_view_query(
+    conn_or_bind: Any,
+    sql: str,
+    savepoint_name: str,
+    *,
+    ignore_missing_relation: bool = False,
+) -> List[Any]:
+    """Run a read-only view-introspection query safely across SQLAlchemy and DB-API.
+
+    Propagates real database/permission errors fail-closed (never silently
+    returning empty results on failure) while keeping idle connections idle
+    and protecting open transactions via a SAVEPOINT.
+    """
+    def _is_missing_rel(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "no such table" in msg or "does not exist" in msg
+
+    if isinstance(conn_or_bind, _SAEngine):
+        try:
+            with conn_or_bind.connect() as sa_conn:
+                return list(sa_conn.exec_driver_sql(sql).fetchall() or ())
+        except Exception as exc:
+            if ignore_missing_relation and _is_missing_rel(exc):
+                return []
+            raise
+    if isinstance(conn_or_bind, _SAConnection):
+        started_in_tx = bool(conn_or_bind.in_transaction())
+        try:
+            if started_in_tx:
+                with conn_or_bind.begin_nested():
+                    return list(conn_or_bind.exec_driver_sql(sql).fetchall() or ())
+            return list(conn_or_bind.exec_driver_sql(sql).fetchall() or ())
+        except Exception as exc:
+            if ignore_missing_relation and _is_missing_rel(exc):
+                return []
+            raise
+        finally:
+            if not started_in_tx and conn_or_bind.in_transaction():
+                try:
+                    conn_or_bind.rollback()
+                except Exception:
+                    pass
+    if hasattr(conn_or_bind, "cursor"):
+        cur = conn_or_bind.cursor()
+        tx_state = dbapi_transaction_state(conn_or_bind)
+        started_idle = tx_state is False
+        used_sp = False
+        try:
+            if tx_state is True:
+                cur.execute(f"SAVEPOINT {savepoint_name}")
+                used_sp = True
+            cur.execute(sql)
+            rows = list(cur.fetchall() or ())
+            if used_sp:
+                cur.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+            return rows
+        except Exception as exc:
+            if used_sp:
+                try:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                    cur.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                except Exception:
+                    pass
+            elif started_idle:
+                rb = getattr(conn_or_bind, "rollback", None)
+                if callable(rb):
+                    try:
+                        rb()
+                    except Exception:
+                        pass
+            if ignore_missing_relation and _is_missing_rel(exc):
+                return []
+            raise
+        finally:
+            close_fn = getattr(cur, "close", None)
+            if callable(close_fn):
+                close_fn()
+            if started_idle and dbapi_transaction_state(conn_or_bind) is True:
+                rb = getattr(conn_or_bind, "rollback", None)
+                if callable(rb):
+                    try:
+                        rb()
+                    except Exception:
+                        pass
+    return []
+
+
+def introspect_plain_views(
+    conn: Any,
+    dialect: Optional[Dialect | str | EngineVersion] = None,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    exclude_views: Sequence[str] = (),
+) -> Tuple[Dict[str, str], Optional[str]]:
+    """Introspect non-internal plain (non-materialized) SQL views from a live database.
+
+    Returns ``(plain_views, current_schema)`` mapping each plain view name to
+    its SQL definition (``CREATE VIEW ...`` on SQLite, ``pg_get_viewdef``
+    SELECT on PostgreSQL, ``VIEW_DEFINITION`` SELECT on MySQL/MariaDB), plus
+    the active schema/database name when reported by the engine.
+
+    Registered materialized views (``exclude_views``), internal
+    ``object_prefix`` / ``__matview_`` / ``__mv_`` / ``sqlite_`` objects, and
+    PostgreSQL native ``MATERIALIZED VIEW``s (``relkind = 'm'``) are excluded.
+    """
+    if dialect is None:
+        eff_dialect = detect_engine_version(conn).dialect
+    elif isinstance(dialect, EngineVersion):
+        eff_dialect = dialect.dialect
+    elif isinstance(dialect, str):
+        eff_dialect = parse_engine_version(dialect).dialect
+    else:
+        eff_dialect = dialect
+
+    excluded_low = {str(n).lower() for n in exclude_views if n}
+    if object_prefix:
+        for n in exclude_views:
+            if n:
+                n_low = str(n).lower()
+                if n_low.startswith(object_prefix.lower()):
+                    excluded_low.add(n_low[len(object_prefix) :])
+                else:
+                    excluded_low.add(f"{object_prefix.lower()}{n_low}")
+
+    def _dec(val: Any) -> str:
+        if isinstance(val, memoryview):
+            val = val.tobytes()
+        if isinstance(val, (bytes, bytearray)):
+            return val.decode("utf-8")
+        return "" if val is None else str(val)
+
+    def _should_skip(name: str) -> bool:
+        if not name:
+            return True
+        low = name.lower()
+        if low in excluded_low:
+            return True
+        if low.startswith(("__matview_", "__mv_", "sqlite_")):
+            return True
+        if object_prefix and low.startswith(object_prefix.lower()):
+            return True
+        return False
+
+    views: Dict[str, str] = {}
+    current_schema: Optional[str] = None
+
+    if eff_dialect == Dialect.SQLITE:
+        current_schema = "main"
+        for sch_prefix, tbl_cat, sp, ign_miss in (
+            ("main", "sqlite_master", "__mv_sq_pv_main", False),
+            ("temp", "sqlite_temp_master", "__mv_sq_pv_temp", True),
+        ):
+            rows = _exec_plain_view_query(
+                conn,
+                f"SELECT name, sql FROM {tbl_cat} WHERE type = 'view' AND sql IS NOT NULL ORDER BY name",
+                sp,
+                ignore_missing_relation=ign_miss,
+            )
+            for row in rows:
+                if len(row) < 2:
+                    continue
+                v_name = _dec(row[0])
+                v_sql = _dec(row[1]).strip()
+                if _should_skip(v_name) or not v_sql:
+                    continue
+                # Explicit schema-qualified key (`main.<v>` / `temp.<v>`) preserves
+                # exact namespace lookup, while unqualified `<v>` lets TEMP shadow main.
+                views[f"{sch_prefix}.{v_name}"] = v_sql
+                for existing_k in [k for k in views if k.lower() == v_name.lower()]:
+                    views.pop(existing_k, None)
+                views[v_name] = v_sql
+        return views, current_schema
+
+    if eff_dialect == Dialect.POSTGRES:
+        rows = _exec_plain_view_query(
+            conn,
+            """
+            SELECT current_schema(), c.relname, pg_catalog.pg_get_viewdef(c.oid, true)
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind = 'v'
+              AND n.nspname = current_schema()
+            ORDER BY c.relname
+            """,
+            "__mv_pg_pv_introspect",
+        )
+        for row in rows:
+            if len(row) < 3:
+                continue
+            sch = _dec(row[0]).strip()
+            if sch and current_schema is None:
+                current_schema = sch
+            v_name = _dec(row[1])
+            v_sql = _dec(row[2]).strip().rstrip(";").strip()
+            if _should_skip(v_name) or not v_sql:
+                continue
+            views[v_name] = v_sql
+        return views, current_schema
+
+    # MySQL / MariaDB
+    rows = _exec_plain_view_query(
+        conn,
+        """
+        SELECT DATABASE(), TABLE_NAME, VIEW_DEFINITION
+        FROM information_schema.VIEWS
+        WHERE TABLE_SCHEMA = DATABASE()
+        ORDER BY TABLE_NAME
+        """,
+        "__mv_my_pv_introspect",
+    )
+    for row in rows:
+        if len(row) < 3:
+            continue
+        db_name = _dec(row[0]).strip()
+        if db_name and current_schema is None:
+            current_schema = db_name
+        v_name = _dec(row[1])
+        v_sql = _dec(row[2]).strip().rstrip(";").strip()
+        if _should_skip(v_name) or not v_sql:
+            continue
+        views[v_name] = v_sql
+    return views, current_schema
 

@@ -165,6 +165,12 @@ class ViewSpec:
     has_subquery_in_from: bool = False
     user_indexes: Tuple[ViewIndexSpec, ...] = ()
     additional_views: Tuple["ViewSpec", ...] = ()
+    # Original user SELECT SQL before plain-view inlining (None when no plain
+    # SQL views were inlined).
+    original_select_sql: Optional[str] = None
+    # Sorted (plain_view_name, normalized_view_def_sql) pairs transitively
+    # inlined into raw_select_sql, included in drift signatures.
+    referenced_plain_views: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)

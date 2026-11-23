@@ -68,6 +68,7 @@ from .sql_frontend import (
     build_create_index_sql,
     parse_sql_ast,
     parse_view_ast,
+    quote_sql_identifier,
 )
 
 
@@ -548,21 +549,24 @@ class PlannerMixin(MixinHost):
             has_subquery_in_from=v.has_subquery_in_from,
             user_indexes=v.user_indexes,
             additional_views=v.additional_views,
+            original_select_sql=v.original_select_sql,
+            referenced_plain_views=v.referenced_plain_views,
         )
 
-    def _try_unwrap_simple_cte_or_derived_view(self, v: ViewSpec) -> ViewSpec:
+    def _try_unwrap_simple_cte_or_derived_view(self, v: ViewSpec, _depth: int = 0) -> ViewSpec:
         """
         Unwraps a non-recursive single-CTE or derived subquery over a single base table
-        when the inner query is a flat projection/filter (no inner GROUP BY, aggregates,
-        DISTINCT, window functions, set ops, or LIMIT) so the outer query can use Tier 1 O(1)
-        algebraic maintenance.
+        (including linearly chained flat plain views) when the inner query is a flat
+        projection/filter (no inner GROUP BY, aggregates, DISTINCT, window functions,
+        set ops, or LIMIT) so the outer query can use Tier 1 O(1) algebraic maintenance.
         """
-        if v.has_window_func or v.has_compound_set_op or v.has_limit_or_order:
+        if _depth >= 16 or v.has_window_func or v.has_compound_set_op or v.has_limit_or_order:
             return v
 
         inner_sql: Optional[str] = None
         cte_or_sub_alias: Optional[str] = None
         outer_sql: Optional[str] = None
+        inner_ast_node: Optional[sqlglot_exp.Expr] = None
 
         try:
             q_ast = parse_sql_ast(v.raw_select_sql, dialect=self.dialect)
@@ -572,6 +576,7 @@ class PlannerMixin(MixinHost):
             return v
 
         sg_d = _sqlglot_dialect(self.dialect)
+        alias_col_names: Optional[List[str]] = None
         if v.has_cte:
             with_node = q_ast.args.get("with_") or q_ast.args.get("with")
             if not isinstance(with_node, sqlglot_exp.With) or bool(with_node.args.get("recursive")) or len(with_node.expressions) != 1:
@@ -581,7 +586,12 @@ class PlannerMixin(MixinHost):
                 return v
             cte_alias_node = cte_node.args.get("alias")
             if isinstance(cte_alias_node, sqlglot_exp.TableAlias) and cte_alias_node.columns:
-                return v
+                alias_col_names = [
+                    c.name for c in cte_alias_node.columns if isinstance(c, sqlglot_exp.Identifier) and c.name
+                ]
+                if len(alias_col_names) != len(cte_alias_node.columns):
+                    return v
+            inner_ast_node = cte_node.this
             inner_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, True, dialect=self.dialect) or cte_node.this.sql(sg_d).strip()
             cte_or_sub_alias = cte_node.alias
             _, outer_sql, _ = _extract_cte_names_and_strip_with(v.raw_select_sql, dialect=self.dialect)
@@ -590,24 +600,40 @@ class PlannerMixin(MixinHost):
             if not isinstance(from_node, sqlglot_exp.From) or not isinstance(from_node.this, sqlglot_exp.Subquery):
                 return v
             sub_node = from_node.this
+            sub_alias_node = sub_node.args.get("alias")
+            if isinstance(sub_alias_node, sqlglot_exp.TableAlias) and sub_alias_node.columns:
+                alias_col_names = [
+                    c.name for c in sub_alias_node.columns if isinstance(c, sqlglot_exp.Identifier) and c.name
+                ]
+                if len(alias_col_names) != len(sub_alias_node.columns):
+                    return v
             if not isinstance(sub_node.this, sqlglot_exp.Expr):
                 return v
+            inner_ast_node = sub_node.this
             inner_sql = _extract_verbatim_cte_or_subquery_sql(v.raw_select_sql, False, dialect=self.dialect) or sub_node.this.sql(sg_d).strip()
             cte_or_sub_alias = sub_node.alias or "__mv_sub"
             outer_sql = v.raw_select_sql
         else:
             return v
 
-        if not inner_sql or not outer_sql:
+        if not inner_sql or not outer_sql or inner_ast_node is None:
             return v
-        try:
-            inner_ast_check = parse_sql_ast(inner_sql, dialect=self.dialect)
-        except sqlglot.errors.SqlglotError:
+        # Bail out if outer query references additional tables or contains any nested
+        # subquery outside the single CTE / FROM derived table being unwrapped.
+        if len(v.referenced_tables) != 1:
             return v
-        if not isinstance(inner_ast_check, sqlglot_exp.Select) or any(
-            inner_ast_check.args.get(k) for k in ("group", "having", "order", "limit", "offset")
-        ):
-            return v
+
+        def _within_inner(node: sqlglot_exp.Expr) -> bool:
+            cur: Optional[sqlglot_exp.Expr] = node
+            while cur is not None:
+                if cur is inner_ast_node:
+                    return True
+                cur = cur.parent
+            return False
+
+        for sel_node in q_ast.find_all(sqlglot_exp.Select):
+            if sel_node is not q_ast and not _within_inner(sel_node):
+                return v
 
         try:
             inner_spec = _parse_single_create_view_stmt(
@@ -618,6 +644,25 @@ class PlannerMixin(MixinHost):
         except Exception:
             return v
 
+        # Recursively unwrap linearly chained flat derived views (e.g. pv2 -> pv1 -> base).
+        if inner_spec.has_cte or inner_spec.has_subquery_in_from:
+            inner_spec = self._try_unwrap_simple_cte_or_derived_view(inner_spec, _depth=_depth + 1)
+
+        try:
+            inner_ast_check = parse_sql_ast(inner_spec.raw_select_sql, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return v
+        if not isinstance(inner_ast_check, sqlglot_exp.Select) or any(
+            inner_ast_check.args.get(k) for k in ("group", "having", "order", "limit", "offset")
+        ):
+            return v
+        if len(list(inner_ast_check.find_all(sqlglot_exp.Select))) != 1:
+            return v
+        inner_from = inner_ast_check.args.get("from_") or inner_ast_check.args.get("from")
+        if isinstance(inner_from, sqlglot_exp.From) and isinstance(inner_from.this, sqlglot_exp.Table):
+            if inner_from.this.db or inner_from.this.catalog:
+                return v
+
         if (
             inner_spec.has_cte
             or inner_spec.has_window_func
@@ -626,6 +671,7 @@ class PlannerMixin(MixinHost):
             or inner_spec.has_limit_or_order
             or inner_spec.has_subquery_in_from
             or len(inner_spec.joins) != 1
+            or len(inner_spec.referenced_tables) != 1
             or inner_spec.group_by_cols
             or any(it.is_aggregate for it in inner_spec.select_items)
         ):
@@ -638,26 +684,84 @@ class PlannerMixin(MixinHost):
         if inner_base.lower() not in self._schemas_lower:
             return v
 
-        # Build column substitution map: alias -> raw_expr (with inner table alias stripped)
+        # Build column substitution map: alias -> raw_expr (with inner table alias stripped
+        # via SQL tokenization so string literals like `'t.A'` are never modified).
         inner_alias = inner_spec.joins[0].alias
-        col_map: Dict[str, str] = {}
+
+        def _strip_inner_alias(frag: str) -> str:
+            toks_f = _tokenize_sql(frag, read=sg_d)
+            if not toks_f:
+                return frag
+            pieces: List[str] = []
+            cur_pos = 0
+            idx_t = 0
+            n_t = len(toks_f)
+            al_low = inner_alias.lower()
+            while idx_t < n_t:
+                tk_t = toks_f[idx_t]
+                if (
+                    tk_t.token_type in (SQLGlotTokenType.VAR, SQLGlotTokenType.IDENTIFIER)
+                    and tk_t.text.lower() == al_low
+                    and (idx_t == 0 or toks_f[idx_t - 1].token_type != SQLGlotTokenType.DOT)
+                    and idx_t + 2 < n_t
+                    and toks_f[idx_t + 1].token_type == SQLGlotTokenType.DOT
+                    and _is_word_or_ident_token(toks_f[idx_t + 2])
+                ):
+                    if tk_t.start > cur_pos:
+                        pieces.append(frag[cur_pos : tk_t.start])
+                    cur_pos = toks_f[idx_t + 1].end + 1
+                    idx_t += 2
+                    continue
+                idx_t += 1
+            if cur_pos < len(frag):
+                pieces.append(frag[cur_pos:])
+            return "".join(pieces)
+
+        inner_expanded: List[Tuple[str, str]] = []
+        inner_base_low = inner_base.lower()
+        inner_alias_low = inner_alias.lower()
         for it in inner_spec.select_items:
-            if it.raw_expr.strip() == "*":
-                ts = self._schemas_lower[inner_base.lower()]
+            raw_in = it.raw_expr.strip()
+            is_inner_star = raw_in == "*" or (
+                raw_in.endswith(".*")
+                and _unquote_ident(raw_in[:-2].strip(), dialect=self.dialect).lower() in (inner_base_low, inner_alias_low)
+            )
+            if is_inner_star:
+                ts = self._schemas_lower[inner_base_low]
                 for c_name in ts.columns:
-                    col_map[c_name.lower()] = c_name
+                    inner_expanded.append((c_name, quote_sql_identifier(c_name, self.dialect, allow_qualified=False)))
+            elif raw_in.endswith(".*"):
+                return v
             else:
-                cleaned_e = re.sub(
-                    rf"\b{re.escape(inner_alias)}\.",
-                    "",
-                    it.raw_expr.strip(),
-                    flags=re.IGNORECASE,
-                )
-                col_map[it.alias.lower()] = (
+                cleaned_e = _strip_inner_alias(raw_in).strip()
+                wrapped_e = (
                     cleaned_e
-                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", cleaned_e)
+                    if re.match(r'^(?:[A-Za-z_][A-Za-z0-9_]*|"[^"]+"|`[^`]+`)$', cleaned_e)
                     else f"({cleaned_e})"
                 )
+                inner_expanded.append((it.alias, wrapped_e))
+
+        if alias_col_names:
+            if len(alias_col_names) > len(inner_expanded):
+                return v
+            inner_expanded = [
+                (alias_col_names[idx] if idx < len(alias_col_names) else cname, expr)
+                for idx, (cname, expr) in enumerate(inner_expanded)
+            ]
+
+        col_map: Dict[str, str] = {cname.lower(): expr for cname, expr in inner_expanded}
+
+        # If HAVING references an outer SELECT alias that collides with an inner
+        # column name (e.g. `SUM(v) AS v ... HAVING v >= 10`), bail out rather than
+        # substituting the inner expression into HAVING.
+        if v.having_clause:
+            outer_agg_aliases = {
+                it.alias.lower()
+                for it in v.select_items
+                if it.alias and (it.is_aggregate or it.alias.lower() != it.raw_expr.strip().lower())
+            }
+            if outer_agg_aliases & set(col_map.keys()):
+                return v
 
         outer_alias = v.joins[0].alias
 
@@ -674,7 +778,7 @@ class PlannerMixin(MixinHost):
             while i < n:
                 tk = toks[i]
                 if (
-                    _is_word_or_ident_token(tk)
+                    tk.token_type in (SQLGlotTokenType.VAR, SQLGlotTokenType.IDENTIFIER)
                     and i + 2 < n
                     and toks[i + 1].token_type == SQLGlotTokenType.DOT
                     and _is_word_or_ident_token(toks[i + 2])
@@ -689,7 +793,7 @@ class PlannerMixin(MixinHost):
                         cursor = toks[i + 2].end + 1
                         i += 3
                         continue
-                if _is_word_or_ident_token(tk):
+                if tk.token_type in (SQLGlotTokenType.VAR, SQLGlotTokenType.IDENTIFIER):
                     is_after_dot = (i > 0 and toks[i - 1].token_type == SQLGlotTokenType.DOT)
                     is_before_dot = (i + 1 < n and toks[i + 1].token_type == SQLGlotTokenType.DOT)
                     is_fn = (
@@ -711,20 +815,29 @@ class PlannerMixin(MixinHost):
                 out.append(frag[cursor:])
             return "".join(out)
 
+        outer_alias_set = {outer_alias.lower(), (cte_or_sub_alias or "").lower()}
         new_items: List[SelectItem] = []
         for it in v.select_items:
-            sub_raw = _subst(it.raw_expr) or it.raw_expr
-            parsed = _parse_select_item(f"{sub_raw} AS {it.alias}", 0, dialect=self.dialect)
-            new_items.append(parsed)
+            raw_out = it.raw_expr.strip()
+            is_outer_star = raw_out == "*" or (
+                raw_out.endswith(".*")
+                and _unquote_ident(raw_out[:-2].strip(), dialect=self.dialect).lower() in outer_alias_set
+            )
+            if is_outer_star:
+                for cname, cexpr in inner_expanded:
+                    q_al = quote_sql_identifier(cname, self.dialect, allow_qualified=False)
+                    new_items.append(_parse_select_item(f"{cexpr} AS {q_al}", 0, dialect=self.dialect))
+            elif raw_out.endswith(".*"):
+                return v
+            else:
+                sub_raw = _subst(it.raw_expr) or it.raw_expr
+                q_al = quote_sql_identifier(it.alias, self.dialect, allow_qualified=False)
+                parsed = _parse_select_item(f"{sub_raw} AS {q_al}", 0, dialect=self.dialect)
+                new_items.append(parsed)
 
         inner_w = None
         if inner_spec.where_clause:
-            inner_w = re.sub(
-                rf"\b{re.escape(inner_alias)}\.",
-                "",
-                inner_spec.where_clause,
-                flags=re.IGNORECASE,
-            )
+            inner_w = _strip_inner_alias(inner_spec.where_clause).strip()
         outer_w = _subst(v.where_clause)
         if inner_w and outer_w:
             comb_w = f"({inner_w}) AND ({outer_w})"
@@ -734,9 +847,13 @@ class PlannerMixin(MixinHost):
         new_grps = tuple(_subst(g) or g for g in v.group_by_cols)
         new_hav = _subst(v.having_clause)
 
-        sel_str = ", ".join(f"{it.raw_expr} AS {it.alias}" for it in new_items)
+        sel_str = ", ".join(
+            f"{it.raw_expr} AS {quote_sql_identifier(it.alias, self.dialect, allow_qualified=False)}"
+            for it in new_items
+        )
         Dist = "DISTINCT " if v.has_top_level_distinct else ""
-        rebuilt_sql = f"SELECT {Dist}{sel_str} FROM {inner_base}"
+        q_inner_base = quote_sql_identifier(inner_base, self.dialect, allow_qualified=False)
+        rebuilt_sql = f"SELECT {Dist}{sel_str} FROM {q_inner_base}"
         if comb_w:
             rebuilt_sql += f" WHERE {comb_w}"
         if new_grps:
@@ -761,6 +878,8 @@ class PlannerMixin(MixinHost):
             has_limit_or_order=False,
             has_subquery_in_from=False,
             user_indexes=v.user_indexes,
+            original_select_sql=v.original_select_sql,
+            referenced_plain_views=v.referenced_plain_views,
         )
 
     def _decompose_compound_aggregates_and_having(

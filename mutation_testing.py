@@ -294,6 +294,16 @@ MUTANTS = (
             "test_postgres_repair_snapshot_fence_codegen"
         ),
     ),
+    Mutant(
+        name="plain-view-inliner-skips-cycle-check",
+        source_path="matview/sql_frontend.py",
+        original="                if stack_key in active_stack or (not tbl_db and t_low in active_stack):\n                    chain = \" -> \".join([*active_stack, canon_name])\n                    raise ValueError(f\"Cyclic plain SQL view reference detected: {chain}\")",
+        replacement="                if False:\n                    chain = \" -> \".join([*active_stack, canon_name])\n                    raise ValueError(f\"Cyclic plain SQL view reference detected: {chain}\")",
+        target_test=(
+            "test_p1_manager_safety.TestPlainViewAsSource."
+            "test_cte_shadowing_cycle_depth_and_registered_mv_refusal"
+        ),
+    ),
 )
 
 
