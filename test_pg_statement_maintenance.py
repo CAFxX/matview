@@ -3033,3 +3033,511 @@ def test_pg_stage3_multi_source_overlap_bracket_and_inclusion_exclusion(make_env
         mv1.close()
         mv2.close()
     _check_adv("multi-view concurrent shared-source s3_a writer + (s3_a, s3_b) writable CTE")
+
+
+def test_pg_function_and_trigger_tampering_detected_and_repaired(make_env) -> None:
+    """Out-of-band tampering with PostgreSQL maintenance functions, helper
+    functions, search_path settings, or triggers (same OID via CREATE OR REPLACE
+    FUNCTION, ALTER FUNCTION RESET/SET search_path, dropped helper function,
+    repointed leaf-partition trigger, or added WHEN predicate) is reported by
+    check_schema_drift() and sync_views(), and repair_view() rebuilds and
+    restores exact maintenance."""
+    schema = [
+        "CREATE TABLE tp (id INT NOT NULL, g INT, v BIGINT, PRIMARY KEY (id, g)) PARTITION BY RANGE (id)",
+        "CREATE TABLE tp_lo PARTITION OF tp FOR VALUES FROM (0) TO (100)",
+        "CREATE TABLE tp_hi PARTITION OF tp FOR VALUES FROM (100) TO (200)",
+        "CREATE TABLE a (g INT PRIMARY KEY, label TEXT NOT NULL)",
+        "CREATE TABLE b (id INT PRIMARY KEY, g INT NOT NULL, x BIGINT NOT NULL)",
+        "CREATE TABLE ngrp (id INT PRIMARY KEY, g NUMERIC(10, 2), v BIGINT NOT NULL)",
+    ]
+    seed = [
+        "INSERT INTO tp VALUES (1, 1, 10), (101, 2, 20)",
+        "INSERT INTO a VALUES (1, 'one'), (2, 'two')",
+        "INSERT INTO b VALUES (10, 1, 5), (20, 2, 7)",
+        "INSERT INTO ngrp VALUES (1, 1.0, 10), (2, 1.00, 20), (3, NULL, 30)",
+    ]
+    views = [
+        ViewDef("v_part", "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM tp GROUP BY g"),
+        ViewDef("v_s3", "SELECT a.g, a.label, COUNT(*) AS c, SUM(b.x) AS sx FROM a JOIN b ON b.g = a.g GROUP BY a.g, a.label"),
+        ViewDef("v_key", "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM ngrp GROUP BY g"),
+    ]
+    env = make_env(views=[], schema_sql=schema, seed=False)
+    for stmt in seed:
+        env.execute(stmt)
+    env.commit()
+    env.views = views
+    for vd in views:
+        env.register(vd)
+    env.check("initial")
+    assert env.manager.check_schema_drift() == {"v_part": "ok", "v_s3": "ok", "v_key": "ok"}
+    env.commit()
+    view_sqls = [f"CREATE VIEW {vd.name} AS {vd.select};" for vd in views]
+
+    def _expect_drift_and_repair(
+        tampered_view: str, expected_status: str, label: str, post_dml: str
+    ) -> None:
+        drift = env.manager.check_schema_drift()
+        env.commit()
+        assert drift[tampered_view] == expected_status, f"{label}: check_schema_drift={drift}"
+        for other in ("v_part", "v_s3", "v_key"):
+            if other != tampered_view:
+                assert drift[other] == "ok", f"{label}: unrelated view drifted: {drift}"
+        sync_res = env.manager.sync_views(view_sqls)
+        env.commit()
+        assert sync_res[tampered_view] == expected_status, f"{label}: sync_views={sync_res}"
+        rep = env.manager.repair_view(tampered_view)
+        env.commit()
+        assert rep == {tampered_view: "rebuilt"}, f"{label}: repair_view={rep}"
+        assert env.manager.check_schema_drift() == {"v_part": "ok", "v_s3": "ok", "v_key": "ok"}
+        env.commit()
+        env.execute(post_dml)
+        env.commit()
+        env.check(f"after repair ({label})")
+
+    cat = env.manager.get_catalog()
+    env.commit()
+
+    # 1. Hand-replace a maintenance trigger function (CREATE OR REPLACE keeps OID).
+    part_ins_fn = next(
+        fn for fn in cat["v_part"]["function_names"] if "_fn_sync_" in fn and fn.endswith("_ai")
+    )
+    cur = env.conn.cursor()
+    cur.execute("SELECT oid FROM pg_proc WHERE proname = %s AND pg_function_is_visible(oid)", (part_ins_fn,))
+    oid_before = cur.fetchone()[0]
+    cur.execute(
+        f"CREATE OR REPLACE FUNCTION {part_ins_fn}() RETURNS TRIGGER AS $$ "
+        f"BEGIN RETURN NULL; END; $$ LANGUAGE plpgsql SET search_path FROM CURRENT;"
+    )
+    cur.execute("SELECT oid FROM pg_proc WHERE proname = %s AND pg_function_is_visible(oid)", (part_ins_fn,))
+    assert cur.fetchone()[0] == oid_before, "CREATE OR REPLACE FUNCTION must keep the OID"
+    env.commit()
+    _expect_drift_and_repair("v_part", "triggers_modified", "replace_trigger_fn_same_oid", "INSERT INTO tp VALUES (2, 1, 15)")
+
+    # 2. Strip search_path via ALTER FUNCTION ... RESET search_path.
+    cat = env.manager.get_catalog()
+    env.commit()
+    part_ins_fn = next(
+        fn for fn in cat["v_part"]["function_names"] if "_fn_sync_" in fn and fn.endswith("_ai")
+    )
+    env.execute(f"ALTER FUNCTION {part_ins_fn}() RESET search_path;")
+    env.commit()
+    _expect_drift_and_repair("v_part", "triggers_modified", "reset_search_path", "INSERT INTO tp VALUES (3, 1, 25)")
+
+    # 3. Redirect search_path to pg_catalog (drops the view's own schema).
+    cat = env.manager.get_catalog()
+    env.commit()
+    part_ins_fn = next(
+        fn for fn in cat["v_part"]["function_names"] if "_fn_sync_" in fn and fn.endswith("_ai")
+    )
+    env.execute(f"ALTER FUNCTION {part_ins_fn}() SET search_path TO pg_catalog;")
+    env.commit()
+    _expect_drift_and_repair("v_part", "triggers_modified", "redirect_search_path", "INSERT INTO tp VALUES (4, 1, 5)")
+
+    # 4. Hand-replace Stage 3 reconcile helper function.
+    cat = env.manager.get_catalog()
+    env.commit()
+    s3_rec_fn = next(fn for fn in cat["v_s3"]["function_names"] if "_reconcile" in fn)
+    env.execute(
+        f"CREATE OR REPLACE FUNCTION {s3_rec_fn}() RETURNS VOID AS $$ "
+        f"BEGIN RETURN; END; $$ LANGUAGE plpgsql SET search_path FROM CURRENT;"
+    )
+    env.commit()
+    _expect_drift_and_repair(
+        "v_s3",
+        "triggers_modified",
+        "replace_s3_reconcile_fn",
+        "WITH ia AS (INSERT INTO a VALUES (3, 'three') RETURNING g) INSERT INTO b VALUES (30, 3, 9)",
+    )
+
+    # 5. Hand-replace canonical key helper function (__matview_key_*(anyelement)).
+    cat = env.manager.get_catalog()
+    env.commit()
+    key_fn = next(fn for fn in cat["v_key"]["function_names"] if fn.endswith("(anyelement)"))
+    key_fn_bare = key_fn[: -len("(anyelement)")]
+    env.execute(
+        f"CREATE OR REPLACE FUNCTION {key_fn_bare}(v anyelement) RETURNS text "
+        f"LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE SET search_path FROM CURRENT AS $$ "
+        f"BEGIN RETURN 'tampered'; END; $$;"
+    )
+    env.commit()
+    _expect_drift_and_repair("v_key", "triggers_modified", "replace_key_text_fn", "INSERT INTO ngrp VALUES (4, 1.000, 40)")
+
+    # 6. Hand-replace read-only view trigger function, and verify read-only
+    # rejection is actually restored after repair_view().
+    cat = env.manager.get_catalog()
+    env.commit()
+    ro_fn = next(fn for fn in cat["v_key"]["function_names"] if "_fn_readonly_" in fn)
+    env.execute(
+        f'CREATE OR REPLACE FUNCTION "{ro_fn}"() RETURNS TRIGGER AS $$ '
+        f"BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;"
+    )
+    env.commit()
+    _expect_drift_and_repair("v_key", "triggers_modified", "replace_readonly_fn", "INSERT INTO ngrp VALUES (5, 2.50, 50)")
+    with pytest.raises(Exception, match="read-only"):
+        env.execute("INSERT INTO v_key VALUES (1.0, 1, 1)")
+    env.conn.rollback()
+
+    # 7. Repoint a leaf-partition trigger with the same name to a no-op function.
+    cat = env.manager.get_catalog()
+    env.commit()
+    part_ins_trg = next(
+        t for t in cat["v_part"]["trigger_names"] if t.endswith("_ai")
+    )
+    env.execute(
+        "CREATE OR REPLACE FUNCTION __mv_test_noop() RETURNS TRIGGER AS $$ "
+        "BEGIN RETURN NULL; END; $$ LANGUAGE plpgsql SET search_path FROM CURRENT;"
+    )
+    env.execute(f"DROP TRIGGER {part_ins_trg} ON tp_hi;")
+    env.execute(
+        f"CREATE TRIGGER {part_ins_trg} AFTER INSERT ON tp_hi "
+        f"REFERENCING NEW TABLE AS __mv_new FOR EACH STATEMENT EXECUTE FUNCTION __mv_test_noop();"
+    )
+    env.commit()
+    _expect_drift_and_repair("v_part", "triggers_modified", "repoint_leaf_partition_trigger", "INSERT INTO tp_hi VALUES (102, 2, 30)")
+
+    # 8. Recreate trigger pointing to the REAL function but with a WHEN (false) predicate (tgqual IS NOT NULL).
+    cat = env.manager.get_catalog()
+    env.commit()
+    part_ins_trg = next(
+        t for t in cat["v_part"]["trigger_names"] if t.endswith("_ai")
+    )
+    part_ins_fn = next(
+        fn for fn in cat["v_part"]["function_names"] if "_fn_sync_" in fn and fn.endswith("_ai")
+    )
+    env.execute(f"DROP TRIGGER {part_ins_trg} ON tp_hi;")
+    env.execute(
+        f"CREATE TRIGGER {part_ins_trg} AFTER INSERT ON tp_hi "
+        f"REFERENCING NEW TABLE AS __mv_new FOR EACH STATEMENT WHEN (false) EXECUTE FUNCTION {part_ins_fn}();"
+    )
+    env.commit()
+    _expect_drift_and_repair("v_part", "triggers_modified", "add_when_false_qual_on_partition", "INSERT INTO tp_hi VALUES (103, 2, 35)")
+
+    # 9. BEFORE ... UPDATE OF <col> tampering (tgattr non-empty with identical
+    # tgtype/tgoldtable/tgnewtable/tgqual/tgfoid) must be caught.
+    cat = env.manager.get_catalog()
+    env.commit()
+    s3_bs_trg = next(t for t in cat["v_s3"]["trigger_names"] if t.endswith("__a_bs"))
+    s3_bs_fn = next(fn for fn in cat["v_s3"]["function_names"] if fn.endswith("__a_bs"))
+    env.execute(f"DROP TRIGGER {s3_bs_trg} ON a;")
+    env.execute(
+        f"CREATE TRIGGER {s3_bs_trg} BEFORE INSERT OR UPDATE OF g OR DELETE OR TRUNCATE ON a "
+        f"FOR EACH STATEMENT EXECUTE FUNCTION {s3_bs_fn}();"
+    )
+    env.commit()
+    _expect_drift_and_repair("v_s3", "triggers_modified", "update_of_col_filter_tgattr", "UPDATE a SET label = 'ONE' WHERE g = 1")
+
+    # 10. Cross-schema decoy function with identical name and body must be caught.
+    import uuid as _uuid
+    decoy_schema = f"mv_decoy_{_uuid.uuid4().hex[:8]}"
+    cat = env.manager.get_catalog()
+    env.commit()
+    part_ins_trg = next(t for t in cat["v_part"]["trigger_names"] if t.endswith("_ai"))
+    part_ins_fn = next(fn for fn in cat["v_part"]["function_names"] if "_fn_sync_" in fn and fn.endswith("_ai"))
+    cur.execute(
+        "SELECT prosrc FROM pg_proc WHERE proname = %s AND pg_function_is_visible(oid)",
+        (part_ins_fn,),
+    )
+    real_src = cur.fetchone()[0]
+    try:
+        cur.execute(f'CREATE SCHEMA "{decoy_schema}"')
+        cur.execute(
+            f'CREATE FUNCTION "{decoy_schema}"."{part_ins_fn}"() RETURNS TRIGGER '
+            f'LANGUAGE plpgsql SET search_path TO "{decoy_schema}" AS $decoy${real_src}$decoy$;'
+        )
+        cur.execute(f"DROP TRIGGER {part_ins_trg} ON tp_hi;")
+        cur.execute(
+            f'CREATE TRIGGER {part_ins_trg} AFTER INSERT ON tp_hi '
+            f'REFERENCING NEW TABLE AS __mv_new_rows FOR EACH STATEMENT '
+            f'EXECUTE FUNCTION "{decoy_schema}"."{part_ins_fn}"();'
+        )
+        env.commit()
+        _expect_drift_and_repair("v_part", "triggers_modified", "cross_schema_decoy_fn", "INSERT INTO tp_hi VALUES (104, 2, 40)")
+    finally:
+        env.conn.rollback()
+        cur.execute(f'DROP SCHEMA IF EXISTS "{decoy_schema}" CASCADE')
+        env.commit()
+
+    # 11. Redirect search_path to '"$user", public' inside a non-public, non-$user schema.
+    cat = env.manager.get_catalog()
+    env.commit()
+    part_ins_fn = next(fn for fn in cat["v_part"]["function_names"] if "_fn_sync_" in fn and fn.endswith("_ai"))
+    env.execute(f'ALTER FUNCTION {part_ins_fn}() SET search_path TO "$user", public;')
+    env.commit()
+    _expect_drift_and_repair("v_part", "triggers_modified", "dollar_user_search_path_in_other_schema", "INSERT INTO tp VALUES (6, 1, 6)")
+
+    # 12. SECURITY DEFINER tampering on trigger function.
+    cat = env.manager.get_catalog()
+    env.commit()
+    part_ins_fn = next(fn for fn in cat["v_part"]["function_names"] if "_fn_sync_" in fn and fn.endswith("_ai"))
+    env.execute(f"ALTER FUNCTION {part_ins_fn}() SECURITY DEFINER;")
+    env.commit()
+    _expect_drift_and_repair("v_part", "triggers_modified", "security_definer_fn", "INSERT INTO tp VALUES (7, 1, 7)")
+
+    # 13. Volatility (VOLATILE) and strictness (CALLED ON NULL INPUT) tampering on __matview_key_*.
+    cat = env.manager.get_catalog()
+    env.commit()
+    key_fn = next(fn for fn in cat["v_key"]["function_names"] if fn.endswith("(anyelement)"))
+    env.execute(f"ALTER FUNCTION {key_fn} VOLATILE;")
+    env.commit()
+    _expect_drift_and_repair("v_key", "triggers_modified", "key_fn_volatile", "INSERT INTO ngrp VALUES (8, 3.00, 8)")
+
+    cat = env.manager.get_catalog()
+    env.commit()
+    key_fn = next(fn for fn in cat["v_key"]["function_names"] if fn.endswith("(anyelement)"))
+    env.execute(f"ALTER FUNCTION {key_fn} CALLED ON NULL INPUT;")
+    env.commit()
+    _expect_drift_and_repair("v_key", "triggers_modified", "key_fn_not_strict", "INSERT INTO ngrp VALUES (9, NULL, 9)")
+
+    # 14. PROCEDURE substitution for Stage 3 reconcile function (prokind='p' with identical body).
+    cat = env.manager.get_catalog()
+    env.commit()
+    s3_rec_fn = next(fn for fn in cat["v_s3"]["function_names"] if "_reconcile" in fn)
+    cur.execute("SELECT prosrc FROM pg_proc WHERE proname = %s AND pg_function_is_visible(oid)", (s3_rec_fn,))
+    rec_src = cur.fetchone()[0]
+    cur.execute(f"DROP FUNCTION {s3_rec_fn}();")
+    cur.execute(
+        f"CREATE PROCEDURE {s3_rec_fn}() LANGUAGE plpgsql SET search_path FROM CURRENT AS $p${rec_src}$p$;"
+    )
+    env.commit()
+    drift_proc = env.manager.check_schema_drift()
+    env.commit()
+    assert drift_proc["v_s3"] == "triggers_modified", drift_proc
+    # Clean up the spoofed procedure before repair_view (DROP FUNCTION won't drop a PROCEDURE).
+    cur.execute(f"DROP PROCEDURE {s3_rec_fn}();")
+    env.commit()
+    _expect_drift_and_repair(
+        "v_s3",
+        "triggers_missing",
+        "drop_s3_reconcile_fn",
+        "WITH ua AS (UPDATE a SET label = 'THREE' WHERE g = 3 RETURNING g) UPDATE b SET x = 11 WHERE id = 30",
+    )
+
+    # 15. Priority precedence: disabled > modified > orphaned; missing > disabled.
+    cat = env.manager.get_catalog()
+    env.commit()
+    part_ins_fn = next(fn for fn in cat["v_part"]["function_names"] if "_fn_sync_" in fn and fn.endswith("_ai"))
+    part_ins_trg = next(t for t in cat["v_part"]["trigger_names"] if t.endswith("_ai"))
+    env.execute(f"ALTER FUNCTION {part_ins_fn}() RESET search_path;")
+    env.execute(f"ALTER TABLE tp_hi DISABLE TRIGGER {part_ins_trg};")
+    env.commit()
+    assert env.manager.check_schema_drift()["v_part"] == "triggers_disabled"
+    env.commit()
+    env.execute(f"DROP TRIGGER {part_ins_trg} ON tp_hi;")
+    env.commit()
+    assert env.manager.check_schema_drift()["v_part"] == "triggers_missing"
+    env.commit()
+    assert env.manager.repair_view("v_part") == {"v_part": "rebuilt"}
+    env.commit()
+    assert env.manager.check_schema_drift() == {"v_part": "ok", "v_s3": "ok", "v_key": "ok"}
+    env.commit()
+
+
+def test_pg_dump_restore_fresh_oids_stays_ok_and_exact(make_env) -> None:
+    """Recreating every PostgreSQL maintenance function and trigger under
+    brand-new OIDs via pg_get_functiondef / pg_get_triggerdef (running
+    unconditionally on every PG CI runner) keeps check_schema_drift() == 'ok',
+    sync_views() == 'unchanged', read-only enforcement active, and exact DML
+    maintenance across partitions, canonical keys, and Stage 3 writable CTEs."""
+    schema = [
+        "CREATE TABLE tp (id INT NOT NULL, g INT, v BIGINT, PRIMARY KEY (id, g)) PARTITION BY RANGE (id)",
+        "CREATE TABLE tp_lo PARTITION OF tp FOR VALUES FROM (0) TO (100)",
+        "CREATE TABLE tp_hi PARTITION OF tp FOR VALUES FROM (100) TO (200)",
+        "CREATE TABLE a (g INT PRIMARY KEY, label TEXT NOT NULL)",
+        "CREATE TABLE b (id INT PRIMARY KEY, g INT NOT NULL, x BIGINT NOT NULL)",
+        "CREATE TABLE ngrp (id INT PRIMARY KEY, g NUMERIC(10, 2), v BIGINT NOT NULL)",
+    ]
+    seed = [
+        "INSERT INTO tp VALUES (1, 1, 10), (101, 2, 20)",
+        "INSERT INTO a VALUES (1, 'one'), (2, 'two')",
+        "INSERT INTO b VALUES (10, 1, 5), (20, 2, 7)",
+        "INSERT INTO ngrp VALUES (1, 1.0, 10), (2, 1.00, 20), (3, NULL, 30)",
+    ]
+    views = [
+        ViewDef("v_part", "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM tp GROUP BY g"),
+        ViewDef("v_s3", "SELECT a.g, a.label, COUNT(*) AS c, SUM(b.x) AS sx FROM a JOIN b ON b.g = a.g GROUP BY a.g, a.label"),
+        ViewDef("v_key", "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM ngrp GROUP BY g"),
+    ]
+    env = make_env(views=[], schema_sql=schema, seed=False)
+    for stmt in seed:
+        env.execute(stmt)
+    env.commit()
+    env.views = views
+    for vd in views:
+        env.register(vd)
+    env.check("source initial")
+    view_sqls = [f"CREATE VIEW {vd.name} AS {vd.select};" for vd in views]
+
+    cur = env.conn.cursor()
+    cur.execute("SELECT current_schema()")
+    src_schema = cur.fetchone()[0]
+    cur.execute(
+        "SELECT proname, oid FROM pg_proc WHERE pronamespace = %s::regnamespace ORDER BY proname",
+        (src_schema,),
+    )
+    src_fn_oids = dict(cur.fetchall())
+    assert src_fn_oids
+    env.commit()
+
+    # Recreate every function and trigger from pg_get_functiondef /
+    # pg_get_triggerdef after DROP + CREATE (giving every function and trigger
+    # a brand-new OID, just as pg_dump/pg_restore does).
+    cur.execute(
+        "SELECT p.oid, p.proname, pg_catalog.pg_get_functiondef(p.oid),"
+        " pg_catalog.pg_get_function_identity_arguments(p.oid)"
+        " FROM pg_catalog.pg_proc p WHERE p.pronamespace = %s::regnamespace ORDER BY p.oid",
+        (src_schema,),
+    )
+    fn_defs = cur.fetchall()
+    cur.execute(
+        "SELECT c.relname, t.tgname, pg_catalog.pg_get_triggerdef(t.oid)"
+        " FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid"
+        " WHERE c.relnamespace = %s::regnamespace AND NOT t.tgisinternal ORDER BY t.oid",
+        (src_schema,),
+    )
+    trg_defs = cur.fetchall()
+    for relname, tgname, _ in trg_defs:
+        cur.execute(f'DROP TRIGGER "{tgname}" ON "{src_schema}"."{relname}";')
+    for _, proname, _, ident_args in fn_defs:
+        cur.execute(f'DROP FUNCTION "{src_schema}"."{proname}"({ident_args});')
+    for _, _, fdef, _ in fn_defs:
+        cur.execute(fdef)
+    for _, _, tdef in trg_defs:
+        cur.execute(tdef)
+    env.commit()
+
+    cur.execute(
+        "SELECT proname, oid FROM pg_proc WHERE pronamespace = %s::regnamespace ORDER BY proname",
+        (src_schema,),
+    )
+    new_fn_oids = dict(cur.fetchall())
+    assert set(new_fn_oids.keys()) == set(src_fn_oids.keys())
+    for fn_name, old_oid in src_fn_oids.items():
+        assert new_fn_oids[fn_name] != old_oid, f"function {fn_name} kept old OID {old_oid}"
+    env.commit()
+
+    assert env.manager.check_schema_drift() == {"v_part": "ok", "v_s3": "ok", "v_key": "ok"}
+    env.commit()
+    assert env.manager.sync_views(view_sqls) == {"v_part": "unchanged", "v_s3": "unchanged", "v_key": "unchanged"}
+    env.commit()
+    with pytest.raises(Exception, match="read-only"):
+        env.execute("INSERT INTO v_key VALUES (1.0, 1, 1)")
+    env.conn.rollback()
+    env.execute("INSERT INTO tp VALUES (5, 1, 11)")
+    env.execute("INSERT INTO tp_hi VALUES (105, 2, 22)")
+    env.execute("WITH ia AS (INSERT INTO a VALUES (4, 'four') RETURNING g) INSERT INTO b VALUES (40, 4, 13)")
+    env.execute("INSERT INTO ngrp VALUES (6, 1.000, 7)")
+    env.commit()
+    env.check("after fresh-OID recreate")
+
+
+def test_pg_dump_restore_real_pg_dump_cli(make_env) -> None:
+    """End-to-end pg_dump -> psql into a fresh database (explicitly skipped
+    when pg_dump/psql client binaries or CREATEDB privilege are absent)."""
+    import shutil
+    import subprocess
+    import uuid
+    import psycopg2
+    import psycopg2.extensions
+    from matview import Dialect, MaterializedViewManager
+
+    pg_dump_bin = shutil.which("pg_dump")
+    psql_bin = shutil.which("psql")
+    if not (pg_dump_bin and psql_bin and PG_DSN):
+        pytest.skip("pg_dump and psql client binaries are required for real CLI dump/restore test")
+
+    schema = [
+        "CREATE TABLE tp (id INT NOT NULL, g INT, v BIGINT, PRIMARY KEY (id, g)) PARTITION BY RANGE (id)",
+        "CREATE TABLE tp_lo PARTITION OF tp FOR VALUES FROM (0) TO (100)",
+        "CREATE TABLE tp_hi PARTITION OF tp FOR VALUES FROM (100) TO (200)",
+        "CREATE TABLE a (g INT PRIMARY KEY, label TEXT NOT NULL)",
+        "CREATE TABLE b (id INT PRIMARY KEY, g INT NOT NULL, x BIGINT NOT NULL)",
+        "CREATE TABLE ngrp (id INT PRIMARY KEY, g NUMERIC(10, 2), v BIGINT NOT NULL)",
+    ]
+    seed = [
+        "INSERT INTO tp VALUES (1, 1, 10), (101, 2, 20)",
+        "INSERT INTO a VALUES (1, 'one'), (2, 'two')",
+        "INSERT INTO b VALUES (10, 1, 5), (20, 2, 7)",
+        "INSERT INTO ngrp VALUES (1, 1.0, 10), (2, 1.00, 20), (3, NULL, 30)",
+    ]
+    views = [
+        ViewDef("v_part", "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM tp GROUP BY g"),
+        ViewDef("v_s3", "SELECT a.g, a.label, COUNT(*) AS c, SUM(b.x) AS sx FROM a JOIN b ON b.g = a.g GROUP BY a.g, a.label"),
+        ViewDef("v_key", "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM ngrp GROUP BY g"),
+    ]
+    env = make_env(views=[], schema_sql=schema, seed=False)
+    cur = env.conn.cursor()
+    cur.execute("SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname = current_user")
+    can_createdb = bool(cur.fetchone()[0])
+    env.commit()
+    if not can_createdb:
+        pytest.skip("current PostgreSQL role lacks CREATEDB privilege")
+
+    for stmt in seed:
+        env.execute(stmt)
+    env.commit()
+    env.views = views
+    for vd in views:
+        env.register(vd)
+    env.check("source initial")
+    view_sqls = [f"CREATE VIEW {vd.name} AS {vd.select};" for vd in views]
+    cur.execute("SELECT current_schema()")
+    src_schema = cur.fetchone()[0]
+    env.commit()
+
+    dst_db = f"mv_dump_{uuid.uuid4().hex[:8]}"
+    dsn_params = psycopg2.extensions.parse_dsn(PG_DSN)
+    dst_dsn = psycopg2.extensions.make_dsn(**{**dsn_params, "dbname": dst_db})
+    admin_conn = psycopg2.connect(PG_DSN)
+    admin_conn.autocommit = True
+    try:
+        with admin_conn.cursor() as acur:
+            acur.execute(f'CREATE DATABASE "{dst_db}"')
+        dump_res = subprocess.run(
+            [pg_dump_bin, "-d", PG_DSN, "-n", src_schema],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [psql_bin, "-v", "ON_ERROR_STOP=1", "-d", dst_dsn],
+            input=dump_res.stdout,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        dst_conn = psycopg2.connect(dst_dsn)
+        try:
+            dcur = dst_conn.cursor()
+            dcur.execute(f'SET search_path TO "{src_schema}", public')
+            dst_conn.commit()
+            dmgr = MaterializedViewManager(dst_conn, dialect=Dialect.POSTGRES)
+            assert dmgr.check_schema_drift() == {"v_part": "ok", "v_s3": "ok", "v_key": "ok"}
+            dst_conn.commit()
+            assert dmgr.sync_views(view_sqls) == {"v_part": "unchanged", "v_s3": "unchanged", "v_key": "unchanged"}
+            dst_conn.commit()
+            with pytest.raises(Exception, match="read-only"):
+                dcur.execute("INSERT INTO v_key VALUES (1.0, 1, 1)")
+            dst_conn.rollback()
+            dcur.execute(f'SET search_path TO "{src_schema}", public')
+            dcur.execute("INSERT INTO tp VALUES (6, 1, 100)")
+            dcur.execute("INSERT INTO tp_hi VALUES (106, 2, 200)")
+            dcur.execute("WITH ia AS (INSERT INTO a VALUES (5, 'five') RETURNING g) INSERT INTO b VALUES (50, 5, 19)")
+            dcur.execute("INSERT INTO ngrp VALUES (7, 1.0, 99)")
+            dst_conn.commit()
+            for vd in views:
+                dcur.execute(f"SELECT * FROM {vd.name} ORDER BY 1, 2")
+                got = dcur.fetchall()
+                dcur.execute(f"SELECT * FROM ({vd.select}) _q ORDER BY 1, 2")
+                exp = dcur.fetchall()
+                assert got == exp, f"pg_dump/restore mismatch on {vd.name}: {got} != {exp}"
+            dst_conn.commit()
+        finally:
+            dst_conn.close()
+    finally:
+        with admin_conn.cursor() as acur:
+            acur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
+                (dst_db,),
+            )
+            acur.execute(f'DROP DATABASE IF EXISTS "{dst_db}"')
+        admin_conn.close()
