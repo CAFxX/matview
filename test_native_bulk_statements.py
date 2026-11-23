@@ -1072,6 +1072,94 @@ def test_recompute_during_backfill_ignores_rows_not_yet_folded(make_env, target:
     env.check("backfill after recomputes of groups with unfolded rows")
 
 
+# Writes of group 10 while the watermark does not cover any folded row yet:
+# its only claimed row (id 29, the smallest value) is deleted after its MIN and
+# MAX were retracted among rows outside the claimed range.
+_UNFOLDED_GROUP_WRITES = (
+    "INSERT INTO bt (id, g, x) VALUES (1001, 10, 100), (1002, 10, 5)",
+    "DELETE FROM bt WHERE id = 1002",  # MIN retracted: recomputed
+    "UPDATE bt SET x = 50 WHERE id = 1001",  # MAX retracted: recomputed
+    "DELETE FROM bt WHERE id = 29",  # claimed and unfolded: skipped by the trigger
+    # Net row-count changes that do not cancel out: a trigger that applied
+    # writes it must skip would double-count them once the backfill folds.
+    "INSERT INTO bt (id, g, x) VALUES (1003, 10, 60), (1004, 9, 1)",
+)
+
+
+@pytest.mark.parametrize("phase", ["unclaimed", "claimed"])
+@pytest.mark.parametrize("target", _params())
+def test_recompute_before_the_backfill_folds_anything(make_env, target: Target, phase: str) -> None:
+    """The watermark states before the first chunk commits.
+
+    ``unclaimed``: registered without population; the watermark is active
+    with no cursor (backfill_cursor_pk IS NULL), so the triggers skip every
+    write and the backfill folds everything. ``claimed``: the backfill has
+    committed its claim (cursor = min - 1, max_pk) and is held before its
+    first chunk by a row lock: the triggers maintain rows outside the claimed
+    range, and their recomputes must not read the claimed rows (none is
+    folded yet). In both, the writes of the shared setup and of group 10
+    must leave the view exact. In the unclaimed state no trigger reaches a
+    recompute (the guard skips every row), so the recompute window predicate's
+    handling of a NULL cursor is not observable there.
+
+    Deterministic: independent connections; the claimed state is held by a
+    row lock the first chunk waits for (checked through the engine's lock
+    view), not by sleeps. The claimed state runs on PostgreSQL only (see the
+    skip reason)."""
+    if phase == "claimed" and target.family != "postgres":
+        # SQLite serializes writers; on MySQL/MariaDB the held first chunk
+        # already blocks the writers (measured: lock wait timeout 1205), so
+        # the state cannot be held while they write.
+        pytest.skip("the backfill cannot be held between its claim and first chunk while writers proceed")
+    env = make_env(target, views=[], seed=False, schema_sql=BACKFILL_SCHEMA[target.family])
+    rows, writes = _backfill_rows_and_writes()
+    rows.append((29, 10, -7))
+    env.execute("INSERT INTO bt (id, g, x) VALUES " + ", ".join(f"({i}, {g}, {x})" for i, g, x in rows))
+    env.commit()
+    bits = "" if target.family == "sqlite" else ", BIT_AND(x) AS ba, BIT_OR(x) AS bo"
+    vd = ViewDef("v_bt", f"SELECT g, COUNT(*) AS n, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx{bits} FROM bt GROUP BY g")
+    env.views = [vd]
+    plan = env.register(vd, populate=False)
+    writer = env.connect()
+
+    def run_writes(sqls: Sequence[str]) -> None:
+        for sql in sqls:
+            env.execute(sql, conn=writer)
+            env.commit(conn=writer)
+
+    if phase == "unclaimed":
+        run_writes([*writes, *_UNFOLDED_GROUP_WRITES])
+        env.manager.backfill_incrementally(plan, batch_size=20, snapshot_isolation=False)
+        env.check("backfill after writes while the watermark was unclaimed")
+        return
+    blocker, monitor = env.connect(), env.connect()
+    sid_bf, sid_blocker = _session_id(env, env.conn), _session_id(env, blocker)
+    blocker.cursor().execute("SELECT id FROM bt WHERE id = 1 FOR UPDATE")
+    errors: List[BaseException] = []
+    finished = threading.Event()
+
+    def backfill() -> None:
+        try:
+            env.manager.backfill_incrementally(plan, batch_size=20, snapshot_isolation=False)
+        except BaseException as exc:  # inspected below
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    th = threading.Thread(target=backfill, daemon=True)
+    th.start()
+    try:
+        _wait_for(lambda: _row_lock_waiting(env, monitor, sid_bf, sid_blocker), finished,
+                  "the first chunk waits for the row lock after the claim committed")
+        run_writes(_UNFOLDED_GROUP_WRITES)
+    finally:
+        blocker.commit()
+        th.join(LOCK_WAIT_TIMEOUT_S)
+    if errors:
+        raise errors[0]
+    env.check("backfill after writes while claimed and not yet advanced")
+
+
 @pytest.mark.parametrize("target", _params())
 def test_projection_without_key_after_primary_key_update(make_env, target: Target) -> None:
     """Minimal repro: change only the key, then delete the row."""
