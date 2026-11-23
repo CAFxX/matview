@@ -1084,6 +1084,42 @@ def _after_writes_same(ctx: Ctx) -> None:
         env.commit()
 
 
+PG_SELF_UPDATE_TODO = ("PostgreSQL: AFTER ROW User Trigger Writing the Aggregated Column of the Just-Written Row "
+                       "(no detection)")
+
+
+@cell("user_after_trigger_updates_aggregated_column", AREA_B,
+      "User AFTER row trigger that updates an aggregated column of the row the statement just inserted",
+      "PostgreSQL: the row trigger's UPDATE is maintained (its own statement triggers) before the INSERT's "
+      "statement-level maintenance, which then adds the row from its transition table; the view is silently wrong "
+      "and nothing reports it. SQLite: same divergence while the user trigger fires first; check_schema_drift() "
+      "reports triggers_out_of_order and repair_view() puts the maintenance triggers first",
+      todo=PG_SELF_UPDATE_TODO, sqlite=LIMITED, postgres=WRONG)
+def _after_updates_aggregated(ctx: Ctx) -> None:
+    env = ctx.fresh(BASE_SCHEMA, [V_AGG], _base_seed())
+    if ctx.family == "postgres":
+        fn_body = "UPDATE t SET v = v + 1000 WHERE id = NEW.id; RETURN NULL;"
+        env.execute(f"CREATE FUNCTION au_bump() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {fn_body} END $$")
+        env.execute("CREATE TRIGGER au_bump AFTER INSERT ON t FOR EACH ROW WHEN (NEW.id >= 900) "
+                    "EXECUTE FUNCTION au_bump()")
+    else:
+        env.execute("CREATE TRIGGER au_bump AFTER INSERT ON t FOR EACH ROW WHEN NEW.id >= 900 "
+                    "BEGIN UPDATE t SET v = v + 1000 WHERE id = NEW.id; END")
+    env.commit()
+
+    def write() -> None:
+        env.execute("INSERT INTO t (id, g, v, w, u) VALUES (900, 1, 10, 1, NULL), (901, 7, 5, 1, NULL)")
+        ctx.commit_check("user trigger updating the aggregated column of the new row", env)
+
+    if ctx.family == "sqlite":
+        drift = env.manager.check_schema_drift()
+        env.commit()
+        assert drift == {"v_agg": "triggers_out_of_order"}, drift
+        env.manager.repair_view()
+        env.commit()
+    write()
+
+
 @cell("sqlite_recursive_user_trigger", AREA_B,
       "A user trigger that re-fires itself (unguarded self-UPDATE)",
       "configure_sqlite_connection() turns recursive_triggers ON, so such a trigger recurses until SQLite's depth "
