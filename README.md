@@ -137,6 +137,10 @@ dependencies `hypothesis` and `pytest`. SQLite uses the standard-library
 `sqlite3` module. The Python versions exercised in CI are listed in the
 [CI matrix](#ci-matrix).
 
+For the complete local test target (`make test`), also install
+`requirements-dev.txt`: it supplies PyYAML and the pinned pyright version used
+by the static-typing regression. These tools are not needed to use the library.
+
 The command-line interface is `python3 matview_sync.py` from the checkout.
 `matview_sync.py` is a compatibility facade over the `matview` package; new
 code should `import matview`.
@@ -1430,9 +1434,10 @@ specified there. [TODO.md](TODO.md) is the prioritized backlog.
 
 ### Running tests
 
-Every `test_*.py` module is a standalone script (`python3 test_x.py`); the
-Hypothesis module runs under `pytest`. The authoritative list of what runs in
-which job is the step list in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+Most `test_*.py` modules are standalone scripts (`python3 test_x.py`). The
+Hypothesis, native bulk-statement and native DML-interaction modules run under
+`pytest` and are invoked that way by the Makefile regression target. The
+authoritative list of what runs in which job is the step list in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 Commonly used entry points:
 
 ```sh no-run
@@ -1446,7 +1451,8 @@ python3 test_concurrent_backfill.py       # independent-session backfill concurr
 python3 test_query_ast_materialization.py # generated SELECT ASTs materialized and compared
 python3 mutation_testing.py --list        # curated mutants; run without --list to check they are killed
 python3 test_readme_examples.py           # this README's examples, links and CI matrix
-make test                                 # a subset of the SQLite suites (not the full CI list)
+make test                                 # core SQLite suites + standalone regressions + strength reporting
+make test-regressions                     # only the standalone regressions + strength reporting
 ```
 
 Native engines are enabled by environment variables; without them those tests
@@ -1458,12 +1464,18 @@ MYSQL_DSN="mysql://root:password@127.0.0.1:3306/matview_test" python3 test_matvi
 SQLITE_COMPAT_ENGINE=apsw python3 test_matview_sync.py   # apsw, sqlcipher, libsql, sqlite3mc, sqlean
 ```
 
+`make test` runs the core SQLite suites plus the standalone P0/P1 regression
+programs and `test_strength_reporting.py`; `make test-regressions` runs only
+that regression/coverage subset. Native-engine portions of these programs are
+skipped unless their DSNs are configured. These targets are broader than the
+old smoke-test subset but are not a claim of full CI equivalence.
+
 `make docker-test` starts the PR gate's PostgreSQL, MySQL and MariaDB server
 images with Docker Compose ([`docker-compose.yml`](docker-compose.yml)), checks
 each server's product and version with `verify_engine_matrix.py`, and runs
 `test_matview_sync.py` and `test_concurrent_backfill.py` against each, plus the
-SQLite suites (`run_docker_tests.py --engine <id>` selects one engine). This is
-a subset of the CI steps; the local presubmit below runs all of them.
+SQLite suites (`run_docker_tests.py --engine <id>` selects one engine). The
+`make presubmit-full` target below is the local runner for the full PR gate.
 
 ### Local presubmit
 
