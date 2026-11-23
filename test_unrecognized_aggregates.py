@@ -120,9 +120,9 @@ PG_CASES: List[Case] = [
     _grouped("regr_count", "REGR_COUNT(x, v)", T2),
     _grouped("covar_pop", "COVAR_POP(v, id)", T3),
     _grouped("array_agg_ordered", "ARRAY_AGG(v ORDER BY v, id)", T2),
-    _grouped("array_agg_unordered", "ARRAY_AGG(v)", T2),  # recognized: keeps the group recompute
+    _grouped("array_agg_unordered", "ARRAY_AGG(v)", T3),  # no inner ORDER BY: plan-dependent order
     _grouped("string_agg_ordered", "STRING_AGG(s, ',' ORDER BY id)", T2),
-    _grouped("string_agg_unordered", "STRING_AGG(s, ',')", T2),  # recognized
+    _grouped("string_agg_unordered", "STRING_AGG(s, ',')", T3),
     _grouped("xmlagg_ordered", "XMLAGG(XMLELEMENT(NAME e, v) ORDER BY id)", T2),
     _grouped("range_agg", "RANGE_AGG(INT4RANGE(v, v + 2))", T2),
     _grouped("json_arrayagg", "JSON_ARRAYAGG(v ORDER BY id)", T2, min_version=(16,)),
@@ -160,9 +160,11 @@ MY_CASES: List[Case] = [
     # compared in its own view, where the live view's type is BIGINT.
     _grouped("any_value", "ANY_VALUE(v)", T3, engines=("mysql",), standalone=True),
     _grouped("group_concat_ordered", "GROUP_CONCAT(v ORDER BY id)", T2, skip_type_code=("a",)),
-    # (Recognized GROUP_CONCAT without a total ORDER BY keeps the group
-    # recompute, whose concatenation order can differ natively: TODO.md.)
-    _grouped("group_concat_distinct", "GROUP_CONCAT(DISTINCT v ORDER BY v)", T2, skip_type_code=("a",)),  # recognized
+    # Without an inner ORDER BY the concatenation order is plan-dependent (a
+    # group recompute returned 'c,c,a,c' where the live view returned
+    # 'c,a,c,c' on MariaDB 11.8): exact full refresh.
+    _grouped("group_concat_unordered", "GROUP_CONCAT(s)", T3, skip_type_code=("a",)),
+    _grouped("group_concat_distinct", "GROUP_CONCAT(DISTINCT v ORDER BY v)", T2, skip_type_code=("a",)),  # inner ORDER BY: keeps the group recompute
     Case("with_rollup", "SELECT g, SUM(v) AS sv, COUNT(*) AS n FROM {t} GROUP BY g WITH ROLLUP", T3, engines=("mariadb",)),
     Case(
         "with_rollup_grouping",
@@ -175,9 +177,9 @@ MY_CASES: List[Case] = [
 
 SQLITE_ORDERED_AGG = sqlite3.sqlite_version_info >= (3, 44, 0)
 SQLITE_CASES: List[Case] = [
-    _grouped("json_group_array", "json_group_array(v)", T2),  # recognized
-    _grouped("json_group_object", "json_group_object(id, v)", T2),  # recognized
-    _grouped("group_concat_unordered", "group_concat(v, ',')", T2),  # recognized
+    _grouped("json_group_array", "json_group_array(v)", T3),
+    _grouped("json_group_object", "json_group_object(id, v)", T3),
+    _grouped("group_concat_unordered", "group_concat(v, ',')", T3),
     _grouped("udf_aggregate", "py_sum(v)", T3),
     Case("ungrouped_json_group_array", "SELECT json_group_array(v) AS a FROM {t}", T3),
 ] + (
@@ -634,25 +636,50 @@ class OfflineRoutingTests(unittest.TestCase):
             )
             self.assertEqual(plan.strategy, expected, order)
 
-    def test_recognized_holistic_aggregates_keep_the_group_recompute(self) -> None:
-        # The routing only places aggregates nothing else handles: recognized
-        # holistic aggregates keep group_scoped_delta whatever their ORDER BY
-        # (including over a join), never a costlier strategy.
-        cases = [
-            ("postgres", "SELECT g, STRING_AGG(s, ',') AS a FROM t GROUP BY g"),
-            ("postgres", "SELECT g, ARRAY_AGG(v ORDER BY v) AS a FROM t GROUP BY g"),
-            ("mysql", "SELECT g, GROUP_CONCAT(DISTINCT v ORDER BY id) AS a FROM t GROUP BY g"),
-            ("sqlite", "SELECT g, json_group_array(v) AS a FROM t GROUP BY g"),
-        ]
-        for dialect, select in cases:
-            self.assertEqual(self._plan(dialect, select).strategy, T2, (dialect, select))
+    def test_recognized_order_sensitive_aggregates(self) -> None:
+        # With an ORDER BY inside the call, recognized order-sensitive
+        # aggregates keep the group recompute (single table and join);
+        # without one their element order is plan-dependent: exact full
+        # refresh by default, on every engine.
         schema = self.SCHEMA + "CREATE TABLE u (id INTEGER PRIMARY KEY, tid INTEGER, w VARCHAR(8));"
-        plan = generate_materialized_view(
-            parse_table_schema(schema, dialect="postgres"),
-            "CREATE VIEW mv AS SELECT t.g, STRING_AGG(u.w, ',' ORDER BY u.w) AS a FROM t JOIN u ON u.tid = t.id GROUP BY t.g",
-            dialect="postgres",
-        )
-        self.assertEqual(plan.strategy, T2)
+        join = "FROM t JOIN u ON u.tid = t.id GROUP BY t.g"
+        cases = [
+            ("postgres", "STRING_AGG(s, ',' ORDER BY s)", "STRING_AGG(s, ',')"),
+            ("postgres", "ARRAY_AGG(v ORDER BY v)", "ARRAY_AGG(v)"),
+            ("mysql", "GROUP_CONCAT(DISTINCT v ORDER BY id)", "GROUP_CONCAT(v)"),
+            ("sqlite", "group_concat(v, ',' ORDER BY v)", "group_concat(v, ',')"),
+            ("sqlite", "json_group_array(v ORDER BY v)", "json_group_array(v)"),
+        ]
+        for dialect, ordered, unordered in cases:
+            sch = parse_table_schema(schema if dialect == "postgres" else schema.replace("DOUBLE PRECISION", "DOUBLE"), dialect=dialect)
+            for expr, expected in ((ordered, T2), (unordered, T3)):
+                jexpr = expr
+                for a, b in (("(v", "(u.w"), ("(s", "(u.w"), ("DISTINCT v", "DISTINCT u.w"), ("ORDER BY v", "ORDER BY u.w"),
+                             ("ORDER BY s", "ORDER BY u.w"), ("ORDER BY id", "ORDER BY u.id")):
+                    jexpr = jexpr.replace(a, b)
+                for shape in (f"SELECT g, {expr} AS a FROM t GROUP BY g", f"SELECT t.g, {jexpr} AS a {join}"):
+                    plan = generate_materialized_view(sch, f"CREATE VIEW mv AS {shape}", dialect=dialect, ignore_limitations=True)
+                    self.assertEqual(plan.strategy, expected, (dialect, shape))
+                    if expected == T3:
+                        self.assertEqual([d.code for d in plan.strategy_diagnostics], ["ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"], shape)
+
+    def test_relaxed_opt_in_keeps_the_group_recompute(self) -> None:
+        # Named exclusion from the exact differential: with the per-code
+        # opt-in the element order may differ from the live view's.
+        for dialect, expr in (("postgres", "STRING_AGG(s, ',')"), ("mysql", "GROUP_CONCAT(v)"), ("sqlite", "group_concat(v, ',')")):
+            sch = parse_table_schema(self.SCHEMA if dialect == "postgres" else self.SCHEMA.replace("DOUBLE PRECISION", "DOUBLE"), dialect=dialect)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                plan = generate_materialized_view(
+                    sch, f"CREATE VIEW mv AS SELECT g, {expr} AS a FROM t GROUP BY g", dialect=dialect,
+                    ignore_limitations=True, accept_limitations=["ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"],
+                )
+            self.assertEqual(plan.strategy, T2, dialect)
+            diags = [d for d in plan.strategy_diagnostics if d.code == "ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE"]
+            self.assertEqual(len(diags), 1, plan.strategy_diagnostics)
+            self.assertTrue(diags[0].message.startswith("relaxed result allowed: using strategy group-scoped recompute"), diags[0].message)
+            self.assertIn("ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE", diags[0].message)
+            self.assertTrue(any(isinstance(w.message, MatviewDiagnosticWarning) for w in caught))
 
     def test_distinct_ordered_aggregate_is_not_total(self) -> None:
         plan = self._plan("mysql", "SELECT g, JSON_ARRAYAGG(DISTINCT v) AS a FROM t GROUP BY g")
