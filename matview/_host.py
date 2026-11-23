@@ -55,6 +55,7 @@ class MixinHost:
             watermark_catalog_table: Optional[str] = None,
             pg_fillfactor: Optional[int] = 80,
             accept_limitations: Sequence[str] = (),
+            repair_fence_catalog_table: Optional[str] = None,
         ) -> None: ...
 
         # --- read-only accessors implemented by IncrementalViewCompiler (compiler.py) ---
@@ -116,6 +117,8 @@ class MixinHost:
         def user_indexes(self) -> Tuple[ViewIndexSpec, ...]: ...
         @property
         def view(self) -> ViewSpec: ...
+        @property
+        def repair_fence_catalog_table(self) -> Optional[str]: ...
         @property
         def watermark_catalog_table(self) -> Optional[str]: ...
 

@@ -4344,6 +4344,490 @@ class NativePostgresRepairConcurrencyTests(unittest.TestCase):
         finally:
             self._drop_schema(dsn, schema, sessions)
 
+    def _assert_serialization_failure(self, exc: BaseException) -> None:
+        sqlstate = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+        if sqlstate is None and getattr(exc, "orig", None) is not None:
+            sqlstate = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+        self.assertEqual(
+            sqlstate,
+            "40001",
+            f"expected PostgreSQL SQLSTATE 40001 serialization_failure, got sqlstate={sqlstate!r} exc={exc!r}",
+        )
+
+    def test_pre_repair_repeatable_read_and_serializable_writers_fail_closed_with_40001(self) -> None:
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, d_id BIGINT NOT NULL, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.execute("CREATE TABLE d (id BIGINT PRIMARY KEY, label VARCHAR(16) NOT NULL)")
+            cur.executemany("INSERT INTO d VALUES (%s, %s)", [(1, "D1"), (2, "D2")])
+            cur.executemany(
+                "INSERT INTO t VALUES (%s, %s, %s, %s)",
+                [(1, 1, "A", 10), (2, 1, "A", 20), (3, 2, "B", 30)],
+            )
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            view_defs = [
+                ("v_pop", "CREATE VIEW v_pop AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t GROUP BY g;", True),
+                ("v_t2", "CREATE VIEW v_t2 AS SELECT g, STRING_AGG(id::text, ',' ORDER BY id) AS ids FROM t GROUP BY g;", True),
+                ("v_t3_pop", "CREATE VIEW v_t3_pop AS SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM t;", True),
+                ("v_join", "CREATE VIEW v_join AS SELECT d.label, COUNT(*) AS c, SUM(t.amt) AS s FROM t JOIN d ON d.id = t.d_id GROUP BY d.label;", True),
+                ("v's repair", 'CREATE VIEW "v\'s repair" AS SELECT g, SUM(amt) AS s FROM t GROUP BY g;', True),
+            ]
+            for _, vsql, pop in view_defs:
+                mgr.register_view(vsql, populate=pop)
+
+            # Verify manager signature/drift parity with repair_fence_catalog_table enabled.
+            drift = mgr.check_schema_drift()
+            self.assertEqual(
+                drift,
+                {vn: "ok" for vn, _, _ in view_defs},
+            )
+            diff_rep = mgr.diff_views([vsql for _, vsql, _ in view_defs])
+            self.assertTrue(
+                all(d.signature_hash == d.current_signature_hash for d in diff_rep.values()),
+                repr(diff_rep),
+            )
+            sync_rep = mgr.sync_views([vsql for _, vsql, _ in view_defs])
+            self.assertEqual(sync_rep, {vn: "unchanged" for vn, _, _ in view_defs})
+
+            writer = self._connect_in_schema(dsn, schema)
+            repairer = self._connect_in_schema(dsn, schema)
+            sessions.extend([writer, repairer])
+            rmgr = MaterializedViewManager(repairer, dialect=Dialect.POSTGRES)
+
+            next_id = 100
+            for iso_idx, iso in enumerate(("REPEATABLE READ", "SERIALIZABLE")):
+                # Register fresh unpopulated (populate=False) Tier 1 and Tier 3 views
+                # per isolation level so both REPEATABLE READ and SERIALIZABLE exercise
+                # the empty-store + active-watermark pre-repair snapshot path.
+                v_unpop = f"v_unpop_{iso_idx}"
+                v_t3_unpop = f"v_t3_unpop_{iso_idx}"
+                mgr.register_view(
+                    f"CREATE VIEW {v_unpop} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t GROUP BY g;",
+                    populate=False,
+                )
+                mgr.register_view(
+                    f"CREATE VIEW {v_t3_unpop} AS SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM t;",
+                    populate=False,
+                )
+
+                # Repair ONE view at a time so only that single view's catalog row is
+                # updated: every earlier trigger's FOR SHARE succeeds, proving that
+                # specifically the repaired view's own fence fires and raises 40001.
+                per_view_dmls = [
+                    (v_unpop, [("insert", f"INSERT INTO t VALUES ({next_id}, 1, 'A', 5)"), ("update", "UPDATE t SET amt = amt + 1 WHERE id = 1"), ("delete", "DELETE FROM t WHERE id = 2"), ("truncate", "TRUNCATE t")]),
+                    ("v_pop", [("insert", f"INSERT INTO t VALUES ({next_id}, 1, 'A', 5)"), ("update", "UPDATE t SET amt = amt + 1 WHERE id = 1"), ("delete", "DELETE FROM t WHERE id = 2"), ("truncate", "TRUNCATE t")]),
+                    ("v_t2", [("update", "UPDATE t SET amt = amt + 1 WHERE id = 1"), ("truncate", "TRUNCATE t")]),
+                    (v_t3_unpop, [("delete", "DELETE FROM t WHERE id = 2"), ("truncate", "TRUNCATE t")]),
+                    ("v_t3_pop", [("update", "UPDATE t SET amt = amt + 1 WHERE id = 1")]),
+                    ("v's repair", [("insert", f"INSERT INTO t VALUES ({next_id}, 1, 'A', 5)"), ("truncate", "TRUNCATE t")]),
+                    (
+                        "v_join",
+                        [
+                            ("single_source_insert", f"INSERT INTO t VALUES ({next_id}, 1, 'A', 5)"),
+                            (
+                                "stage3_wcte",
+                                f"WITH nd AS (INSERT INTO d VALUES ({next_id}, 'D_NEW') RETURNING id) "
+                                f"INSERT INTO t SELECT {next_id}, id, 'Z', 99 FROM nd",
+                            ),
+                            ("stage3_truncate_d_first", "TRUNCATE d, t"),
+                        ],
+                    ),
+                ]
+                for target_view, dml_cases in per_view_dmls:
+                    with self.subTest(isolation=iso, target_view=target_view):
+                        wcur = writer.cursor()
+                        wcur.execute(f"BEGIN ISOLATION LEVEL {iso}")
+                        wcur.execute("SELECT COUNT(*) FROM t")
+                        wcur.fetchone()
+
+                        self.assertEqual(rmgr.repair_view(target_view), {target_view: "repaired"})
+
+                        for label, dml in dml_cases:
+                            with self.subTest(isolation=iso, target_view=target_view, dml=label):
+                                wcur.execute("SAVEPOINT sp_fence")
+                                with self.assertRaises(Exception) as ctx:
+                                    wcur.execute(dml)
+                                self._assert_serialization_failure(ctx.exception)
+                                wcur.execute("ROLLBACK TO SAVEPOINT sp_fence")
+                        writer.rollback()
+                        wcur.close()
+
+                # A fresh transaction started AFTER repair_view() commits cleanly and stays exact.
+                wcur = writer.cursor()
+                wcur.execute(f"BEGIN ISOLATION LEVEL {iso}")
+                wcur.execute(
+                    "WITH nd AS (INSERT INTO d VALUES (%s, %s) RETURNING id) "
+                    "INSERT INTO t SELECT %s, id, 'C', 40 FROM nd",
+                    (next_id, f"D_{next_id}", next_id),
+                )
+                writer.commit()
+                wcur.close()
+                next_id += 1
+
+                for vn in (v_unpop, "v_pop"):
+                    self._assert_view_matches_live(
+                        admin,
+                        f"SELECT g, c, s FROM {vn} ORDER BY g",
+                        "SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g ORDER BY g",
+                    )
+                self._assert_view_matches_live(
+                    admin,
+                    "SELECT g, ids FROM v_t2 ORDER BY g",
+                    "SELECT g, STRING_AGG(id::text, ',' ORDER BY id) FROM t GROUP BY g ORDER BY g",
+                )
+                for vn in (v_t3_unpop, "v_t3_pop"):
+                    self._assert_view_matches_live(
+                        admin,
+                        f"SELECT id, g, rn FROM {vn} ORDER BY id",
+                        "SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) FROM t ORDER BY id",
+                    )
+                self._assert_view_matches_live(
+                    admin,
+                    "SELECT label, c, s FROM v_join ORDER BY label",
+                    "SELECT d.label, COUNT(*), SUM(t.amt) FROM t JOIN d ON d.id = t.d_id GROUP BY d.label ORDER BY d.label",
+                )
+                self._assert_view_matches_live(
+                    admin,
+                    'SELECT g, s FROM "v\'s repair" ORDER BY g',
+                    "SELECT g, SUM(amt) FROM t GROUP BY g ORDER BY g",
+                )
+
+            # Pre-register_view() snapshot (NOT FOUND branch in the fence) must fail closed with 40001.
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE t_fresh (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.execute("INSERT INTO t_fresh VALUES (1, 'A', 10)")
+            admin.commit()
+            cur.close()
+            for idx, iso in enumerate(("REPEATABLE READ", "SERIALIZABLE")):
+                vname = f"v_pre_reg_{idx}"
+                wcur = writer.cursor()
+                wcur.execute(f"BEGIN ISOLATION LEVEL {iso}")
+                wcur.execute("SELECT COUNT(*) FROM t_fresh")
+                wcur.fetchone()
+
+                mgr.register_view(
+                    f"CREATE VIEW {vname} AS SELECT g, SUM(amt) AS s FROM t_fresh GROUP BY g;",
+                    populate=True,
+                )
+                with self.assertRaises(Exception) as ctx:
+                    wcur.execute("INSERT INTO t_fresh VALUES (%s, 'A', 5)", (10 + idx,))
+                self._assert_serialization_failure(ctx.exception)
+                writer.rollback()
+                wcur.close()
+                self._assert_view_matches_live(
+                    admin,
+                    f"SELECT g, s FROM {vname} ORDER BY g",
+                    "SELECT g, SUM(amt) FROM t_fresh GROUP BY g ORDER BY g",
+                )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+    def test_pre_rebuild_0row_tier2_join_wcte_partition_and_backfill_fail_closed_with_40001(self) -> None:
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE d2 (id BIGINT PRIMARY KEY, label VARCHAR(16) NOT NULL)")
+            cur.execute("CREATE TABLE t2 (id BIGINT PRIMARY KEY, d_id BIGINT NOT NULL, amt BIGINT NOT NULL)")
+            cur.execute("INSERT INTO d2 VALUES (1, 'D1')")
+            cur.execute("INSERT INTO t2 VALUES (1, 1, 10)")
+            # Partitioned source table for direct-partition + parent write fencing.
+            cur.execute("CREATE TABLE tp (id BIGINT NOT NULL, p INT NOT NULL, amt BIGINT NOT NULL, PRIMARY KEY (id, p)) PARTITION BY LIST (p)")
+            cur.execute("CREATE TABLE tp_p1 PARTITION OF tp FOR VALUES IN (1)")
+            cur.execute("CREATE TABLE tp_p2 PARTITION OF tp FOR VALUES IN (2)")
+            cur.executemany("INSERT INTO tp VALUES (%s, %s, %s)", [(1, 1, 10), (2, 2, 20)])
+            # Source table for backfill_incrementally() (chunked + snapshot_isolation).
+            cur.execute("CREATE TABLE tb (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany("INSERT INTO tb VALUES (%s, %s, %s)", [(1, "A", 10), (2, "B", 20), (3, "A", 30)])
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            writer = self._connect_in_schema(dsn, schema)
+            repairer = self._connect_in_schema(dsn, schema)
+            sessions.extend([writer, repairer])
+            rmgr = MaterializedViewManager(repairer, dialect=Dialect.POSTGRES)
+
+            # 1. Regression for unfenced overlap_close_sql: 0-row multi-source writable CTE
+            #    on a Tier 2 multi-source join under a pre-register / pre-rebuild snapshot
+            #    must fail closed with 40001 instead of inserting stale phantom rows.
+            #    Freeze the writer snapshot via an unrelated table (tb) so DROP/CREATE
+            #    TRIGGER DDL (ACCESS EXCLUSIVE on t2/d2) does not block on writer's
+            #    ACCESS SHARE lock.
+            wcur = writer.cursor()
+            wcur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            wcur.execute("SELECT COUNT(*) FROM tb")
+            wcur.fetchone()
+
+            cur = admin.cursor()
+            cur.execute("DELETE FROM t2")
+            admin.commit()
+            cur.close()
+            mgr.register_view(
+                "CREATE VIEW v_t2_join AS SELECT d2.label, STRING_AGG(t2.id::text, ',' ORDER BY t2.id) AS ids "
+                "FROM d2 LEFT JOIN t2 ON t2.d_id = d2.id GROUP BY d2.label;",
+                populate=True,
+            )
+            with self.assertRaises(Exception) as ctx:
+                wcur.execute(
+                    "WITH u AS (UPDATE d2 SET label = label WHERE id = -999 RETURNING id) "
+                    "UPDATE t2 SET amt = amt WHERE id = -999"
+                )
+            self._assert_serialization_failure(ctx.exception)
+            writer.rollback()
+            wcur.close()
+            self._assert_view_matches_live(
+                admin,
+                "SELECT label, ids FROM v_t2_join ORDER BY label",
+                "SELECT d2.label, STRING_AGG(t2.id::text, ',' ORDER BY t2.id) FROM d2 LEFT JOIN t2 ON t2.d_id = d2.id GROUP BY d2.label ORDER BY d2.label",
+            )
+
+            # 2. repair_view() "rebuilt" path (dropped trigger triggers full rebuild) under
+            #    pre-existing REPEATABLE READ and SERIALIZABLE snapshots fails closed with 40001.
+            for iso in ("REPEATABLE READ", "SERIALIZABLE"):
+                with self.subTest(rebuilt_iso=iso):
+                    plan_j = mgr.get_catalog()["v_t2_join"]
+                    trig_to_drop = next(tn for tn in plan_j["trigger_names"] if tn.endswith("_ai"))
+                    # Determine which table owns trig_to_drop and drop it to force rebuild.
+                    cur = admin.cursor()
+                    cur.execute(
+                        "SELECT c.relname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE n.nspname = current_schema() AND t.tgname = %s",
+                        (trig_to_drop,),
+                    )
+                    owner_tbl = cur.fetchone()[0]
+                    cur.execute(f'DROP TRIGGER "{trig_to_drop}" ON "{owner_tbl}"')
+                    admin.commit()
+                    cur.close()
+
+                    wcur = writer.cursor()
+                    wcur.execute(f"BEGIN ISOLATION LEVEL {iso}")
+                    wcur.execute("SELECT COUNT(*) FROM tb")
+                    wcur.fetchone()
+
+                    self.assertEqual(rmgr.repair_view("v_t2_join"), {"v_t2_join": "rebuilt"})
+
+                    with self.assertRaises(Exception) as ctx:
+                        wcur.execute(
+                            "WITH u AS (UPDATE d2 SET label = label WHERE id = -999 RETURNING id) "
+                            "UPDATE t2 SET amt = amt WHERE id = -999"
+                        )
+                    self._assert_serialization_failure(ctx.exception)
+                    writer.rollback()
+                    wcur.close()
+
+            # 3. Partitioned source table: both parent write and direct child-partition write
+            #    fail closed with 40001 under pre-repair REPEATABLE READ and SERIALIZABLE.
+            mgr.register_view("CREATE VIEW v_part AS SELECT p, SUM(amt) AS s FROM tp GROUP BY p;", populate=True)
+            for iso in ("REPEATABLE READ", "SERIALIZABLE"):
+                with self.subTest(partition_iso=iso):
+                    wcur = writer.cursor()
+                    wcur.execute(f"BEGIN ISOLATION LEVEL {iso}")
+                    wcur.execute("SELECT COUNT(*) FROM tp")
+                    wcur.fetchone()
+
+                    self.assertEqual(rmgr.repair_view("v_part"), {"v_part": "repaired"})
+
+                    for label, dml in (
+                        ("parent_insert", "INSERT INTO tp VALUES (100, 1, 5)"),
+                        ("child_partition_insert", "INSERT INTO tp_p2 VALUES (101, 2, 7)"),
+                        ("child_partition_truncate", "TRUNCATE tp_p1"),
+                    ):
+                        with self.subTest(partition_iso=iso, dml=label):
+                            wcur.execute("SAVEPOINT sp_part")
+                            with self.assertRaises(Exception) as ctx:
+                                wcur.execute(dml)
+                            self._assert_serialization_failure(ctx.exception)
+                            wcur.execute("ROLLBACK TO SAVEPOINT sp_part")
+                    writer.rollback()
+                    wcur.close()
+            self._assert_view_matches_live(
+                admin,
+                "SELECT p, s FROM v_part ORDER BY p",
+                "SELECT p, SUM(amt) FROM tp GROUP BY p ORDER BY p",
+            )
+
+            # 4. backfill_incrementally() (both chunked and snapshot_isolation=True) fences
+            #    pre-backfill REPEATABLE READ and SERIALIZABLE snapshots with 40001.
+            for idx, (snap_iso, iso) in enumerate((
+                (False, "REPEATABLE READ"),
+                (True, "REPEATABLE READ"),
+                (True, "SERIALIZABLE"),
+            )):
+                vname = f"v_bf_{idx}"
+                with self.subTest(backfill_snapshot_iso=snap_iso, writer_iso=iso):
+                    plan_bf = mgr.register_view(
+                        f"CREATE VIEW {vname} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM tb GROUP BY g;",
+                        populate=False,
+                    )
+                    wcur = writer.cursor()
+                    wcur.execute(f"BEGIN ISOLATION LEVEL {iso}")
+                    wcur.execute("SELECT COUNT(*) FROM tb")
+                    wcur.fetchone()
+
+                    rmgr.backfill_incrementally(plan_bf, batch_size=2, snapshot_isolation=snap_iso)
+
+                    with self.assertRaises(Exception) as ctx:
+                        wcur.execute("UPDATE tb SET amt = amt + 1 WHERE id = 1")
+                    self._assert_serialization_failure(ctx.exception)
+                    writer.rollback()
+                    wcur.close()
+                    self._assert_view_matches_live(
+                        admin,
+                        f"SELECT g, c, s FROM {vname} ORDER BY g",
+                        "SELECT g, COUNT(*), SUM(amt) FROM tb GROUP BY g ORDER BY g",
+                    )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
+    def test_repeatable_read_and_serializable_concurrent_writers_and_inflight_repair_do_not_deadlock(self) -> None:
+        from test_avg_concurrent_maintenance import _is_lock_waiting, _lock_diagnostics, _session_id
+
+        dsn = self._dsn()
+        schema, admin = self._make_schema(dsn)
+        sessions = [admin]
+        try:
+            cur = admin.cursor()
+            cur.execute("CREATE TABLE t1 (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.execute("CREATE TABLE t2 (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.executemany("INSERT INTO t1 VALUES (%s, %s, %s)", [(1, "A", 10), (2, "B", 20)])
+            cur.executemany("INSERT INTO t2 VALUES (%s, %s, %s)", [(1, "X", 100), (2, "Y", 200)])
+            admin.commit()
+            cur.close()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.POSTGRES)
+            mgr.register_view("CREATE VIEW v1 AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t1 GROUP BY g;")
+            mgr.register_view("CREATE VIEW v2 AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM t2 GROUP BY g;")
+
+            w1 = self._connect_in_schema(dsn, schema)
+            w2 = self._connect_in_schema(dsn, schema)
+            repairer = self._connect_in_schema(dsn, schema)
+            monitor = self._connect_in_schema(dsn, schema)
+            sessions.extend([w1, w2, repairer, monitor])
+            rmgr = MaterializedViewManager(repairer, dialect=Dialect.POSTGRES)
+
+            # 1. Two concurrent REPEATABLE READ / SERIALIZABLE writers on disjoint groups
+            #    both commit cleanly (FOR SHARE is mutually compatible, no SSI false conflict).
+            base_id = 10
+            for iso in ("REPEATABLE READ", "SERIALIZABLE"):
+                with self.subTest(concurrent_writers_iso=iso):
+                    barrier = threading.Barrier(2)
+                    errs: Dict[str, BaseException] = {}
+
+                    def _run_writer(conn: Any, row_id: int, grp: str, key: str) -> None:
+                        try:
+                            c = conn.cursor()
+                            c.execute(f"BEGIN ISOLATION LEVEL {iso}")
+                            c.execute("INSERT INTO t1 VALUES (%s, %s, %s)", (row_id, grp, 5))
+                            barrier.wait(timeout=10.0)
+                            conn.commit()
+                            c.close()
+                        except BaseException as exc:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            errs[key] = exc
+
+                    th1 = threading.Thread(target=_run_writer, args=(w1, base_id, "A", "w1"), daemon=True)
+                    th2 = threading.Thread(target=_run_writer, args=(w2, base_id + 1, "B", "w2"), daemon=True)
+                    th1.start()
+                    th2.start()
+                    th1.join(timeout=20.0)
+                    th2.join(timeout=20.0)
+                    self.assertEqual(errs, {}, repr(errs))
+                    base_id += 2
+
+            # 2. In-flight REPEATABLE READ writer holding ROW EXCLUSIVE on t1 + FOR SHARE on
+            #    v1's catalog row blocks repair_view("v1") on t1, then executes a SECOND write
+            #    and commits without deadlocking.
+            w1_sid = _session_id(Dialect.POSTGRES, w1)
+            rep_sid = _session_id(Dialect.POSTGRES, repairer)
+            w1_cur = w1.cursor()
+            w1_cur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            w1_cur.execute("INSERT INTO t1 VALUES (50, 'C', 500)")
+
+            rep_outcome: Dict[str, Any] = {}
+
+            def _run_rep() -> None:
+                try:
+                    rep_outcome["res"] = rmgr.repair_view("v1")
+                except BaseException as exc:
+                    rep_outcome["err"] = exc
+
+            r_th = threading.Thread(target=_run_rep, daemon=True)
+            r_th.start()
+            deadline = time.monotonic() + 20.0
+            waited = False
+            while time.monotonic() < deadline:
+                if _is_lock_waiting(Dialect.POSTGRES, monitor, rep_sid, blocker_sid=w1_sid):
+                    waited = True
+                    break
+                if rep_outcome:
+                    break
+                time.sleep(0.02)
+            self.assertTrue(
+                waited,
+                f"repair_view did not block on in-flight REPEATABLE READ writer: "
+                f"outcome={rep_outcome!r} diag={_lock_diagnostics(Dialect.POSTGRES, monitor, rep_sid)!r}",
+            )
+
+            # Second DML inside the same in-flight REPEATABLE READ transaction must not deadlock.
+            w1_cur.execute("UPDATE t1 SET amt = amt + 50 WHERE id = 50")
+            w1.commit()
+            w1_cur.close()
+            r_th.join(timeout=20.0)
+            self.assertFalse(r_th.is_alive())
+            self.assertNotIn("err", rep_outcome, repr(rep_outcome.get("err")))
+            self.assertEqual(rep_outcome.get("res"), {"v1": "repaired"})
+
+            # 3. Repairing unrelated view v1 does not abort a pre-existing REPEATABLE READ writer on v2.
+            w2_cur = w2.cursor()
+            w2_cur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            w2_cur.execute("SELECT COUNT(*) FROM t2")
+            w2_cur.fetchone()
+            self.assertEqual(rmgr.repair_view("v1"), {"v1": "repaired"})
+            w2_cur.execute("INSERT INTO t2 VALUES (50, 'X', 50)")
+            w2.commit()
+            w2_cur.close()
+
+            # 4. READ COMMITTED writers take zero locks on the catalog table.
+            rc_cur = w1.cursor()
+            rc_cur.execute("BEGIN ISOLATION LEVEL READ COMMITTED")
+            rc_cur.execute("INSERT INTO t1 VALUES (60, 'A', 60)")
+            rc_cur.execute(
+                "SELECT COUNT(*) FROM pg_locks l "
+                "JOIN pg_class c ON c.oid = l.relation "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE l.pid = pg_backend_pid() AND n.nspname = current_schema() AND c.relname = %s",
+                (mgr.catalog_table,),
+            )
+            cat_locks = rc_cur.fetchone()[0]
+            w1.commit()
+            rc_cur.close()
+            self.assertEqual(cat_locks, 0, f"expected 0 catalog locks under READ COMMITTED, got {cat_locks}")
+
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v1 ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM t1 GROUP BY g ORDER BY g",
+            )
+            self._assert_view_matches_live(
+                admin,
+                "SELECT g, c, s FROM v2 ORDER BY g",
+                "SELECT g, COUNT(*), SUM(amt) FROM t2 GROUP BY g ORDER BY g",
+            )
+        finally:
+            self._drop_schema(dsn, schema, sessions)
+
 
 class FailClosedBackfillConcurrencyTests(unittest.TestCase):
     """Independent-session tests for fail-closed incremental backfill pre-claim gating

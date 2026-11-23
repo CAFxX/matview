@@ -736,6 +736,9 @@ class CompilationContext:
     ir: LogicalIR
     # Limitation codes explicitly accepted by the caller (accept_limitations).
     accepted_limitations: Tuple[str, ...] = ()
+    # PostgreSQL catalog table used to fence pre-repair REPEATABLE READ /
+    # SERIALIZABLE snapshots inside statement-level maintenance triggers.
+    repair_fence_catalog_table: Optional[str] = None
 
     def with_ir(self, **ir_changes: Any) -> "CompilationContext":
         return replace(self, ir=self.ir.with_updates(**ir_changes))

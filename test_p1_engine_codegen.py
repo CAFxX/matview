@@ -22,6 +22,7 @@ from matview_sync import (
     MaterializedViewManager,
     TableSchema,
     generate_materialized_view,
+    generate_materialized_views,
     parse_engine_version,
     parse_table_schema,
 )
@@ -1797,6 +1798,125 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
         self.assertIn("VALUES (", orders_ai)
         self.assertRegex(orders_au, r"IF \(NEW\.`?status`? = 'settled'\) THEN")
         self.assertNotIn("FROM DUAL", orders_ai)
+
+    def test_postgres_repair_snapshot_fence_codegen(self) -> None:
+        schema = """
+        CREATE TABLE orders (
+            id BIGINT PRIMARY KEY,
+            d_id BIGINT NOT NULL,
+            region TEXT NOT NULL,
+            amount BIGINT NOT NULL
+        );
+        CREATE TABLE dims (
+            id BIGINT PRIMARY KEY,
+            label TEXT NOT NULL
+        );
+        """
+        # 1. Standalone CLI / generate_materialized_view() without repair_fence_catalog_table
+        #    stays self-contained with no catalog dependency.
+        standalone = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_plain AS SELECT region, SUM(amount) AS total FROM orders GROUP BY region;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertNotIn("__MV_REPAIR_FENCE_START__", "\n".join(standalone.trigger_ddls))
+        self.assertNotIn("FOR SHARE", "\n".join(standalone.trigger_ddls))
+
+        # 2. Single-table view with repair_fence_catalog_table emits the fence in
+        #    all statement + truncate functions.
+        fenced = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_fence AS SELECT region, SUM(amount) AS total FROM orders GROUP BY region;",
+            dialect=Dialect.POSTGRES,
+            repair_fence_catalog_table="__matview_catalog",
+        )
+        fn_ddls = [d for d in fenced.trigger_ddls if d.lstrip().startswith("CREATE OR REPLACE FUNCTION")]
+        self.assertEqual(len(fn_ddls), 4)
+        for fn in fn_ddls:
+            self.assertIn("__MV_REPAIR_FENCE_START__", fn)
+            self.assertIn("pg_catalog.current_setting('transaction_isolation') IN ('repeatable read', 'serializable')", fn)
+            self.assertIn("PERFORM 1 FROM __matview_catalog WHERE view_name = 'v_fence' FOR SHARE;", fn)
+            self.assertIn("USING ERRCODE = 'serialization_failure'", fn)
+
+        # 3. Stage 3 bracketed multi-source join emits the fence on overlap staging,
+        #    truncate overlap, single-source fast path, and bracketed truncate.
+        fenced_join = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_j AS SELECT d.label, SUM(o.amount) AS total FROM orders o JOIN dims d ON d.id = o.d_id GROUP BY d.label;",
+            dialect=Dialect.POSTGRES,
+            repair_fence_catalog_table="__matview_catalog",
+        )
+        stmt_fns = [
+            d for d in fenced_join.trigger_ddls
+            if d.lstrip().startswith("CREATE OR REPLACE FUNCTION")
+            and not any(s in d.splitlines()[0] for s in ("_bs()", "_trunc()", "_reconcile()"))
+        ]
+        trunc_fns = [
+            d for d in fenced_join.trigger_ddls
+            if d.lstrip().startswith("CREATE OR REPLACE FUNCTION") and "_trunc()" in d.splitlines()[0]
+        ]
+        self.assertEqual(len(stmt_fns), 6)
+        self.assertEqual(len(trunc_fns), 2)
+        for fn in stmt_fns:
+            self.assertEqual(fn.count("__MV_REPAIR_FENCE_START__"), 3)
+            self.assertIn("PERFORM 1 FROM __matview_catalog WHERE view_name = 'v_j' FOR SHARE;", fn)
+            # The closing bracket (IF __mv_nd = 0 THEN) fences BOTH trunc_refresh_sql
+            # and overlap_close_sql (not only IF __mv_tr <> 0).
+            close_idx = fn.index("IF __mv_nd = 0 THEN")
+            trunc_branch_idx = fn.index("IF __mv_tr <> 0 THEN", close_idx)
+            self.assertIn("__MV_REPAIR_FENCE_START__", fn[close_idx:trunc_branch_idx])
+        for fn in trunc_fns:
+            self.assertEqual(fn.count("__MV_REPAIR_FENCE_START__"), 1)
+            self.assertIn("PERFORM 1 FROM __matview_catalog WHERE view_name = 'v_j' FOR SHARE;", fn)
+
+        # 4. Quoted view name with single quote and custom object_prefix catalog table.
+        fenced_quoted = generate_materialized_view(
+            schema,
+            'CREATE VIEW "v\'s fence" AS SELECT region, COUNT(*) AS cnt FROM orders GROUP BY region;',
+            dialect=Dialect.POSTGRES,
+            object_prefix="custom_mv_",
+            repair_fence_catalog_table="custom_mv_catalog",
+        )
+        quoted_fns = [d for d in fenced_quoted.trigger_ddls if d.lstrip().startswith("CREATE OR REPLACE FUNCTION")]
+        self.assertTrue(quoted_fns)
+        for fn in quoted_fns:
+            self.assertIn("PERFORM 1 FROM custom_mv_catalog WHERE view_name = 'v''s fence' FOR SHARE;", fn)
+
+        # 5. Multi-view script propagates repair_fence_catalog_table to additional_views
+        #    and generate_materialized_views() forwards it symmetrically.
+        multi_sql = (
+            "CREATE VIEW v_m1 AS SELECT region, COUNT(*) AS c FROM orders GROUP BY region;\n"
+            "CREATE VIEW v_m2 AS SELECT label, COUNT(*) AS c FROM dims GROUP BY label;"
+        )
+        multi = generate_materialized_view(
+            schema,
+            multi_sql,
+            dialect=Dialect.POSTGRES,
+            repair_fence_catalog_table="__matview_catalog",
+        )
+        self.assertEqual(len(multi.sub_plans), 2)
+        self.assertIn("WHERE view_name = 'v_m1' FOR SHARE;", "\n".join(multi.sub_plans[0].trigger_ddls))
+        self.assertIn("WHERE view_name = 'v_m2' FOR SHARE;", "\n".join(multi.sub_plans[1].trigger_ddls))
+        multi_list = generate_materialized_views(
+            schema,
+            multi_sql,
+            dialect=Dialect.POSTGRES,
+            repair_fence_catalog_table="__matview_catalog",
+        )
+        self.assertEqual(len(multi_list), 2)
+        self.assertIn("WHERE view_name = 'v_m1' FOR SHARE;", "\n".join(multi_list[0].trigger_ddls))
+        self.assertIn("WHERE view_name = 'v_m2' FOR SHARE;", "\n".join(multi_list[1].trigger_ddls))
+
+        # 6. Non-PostgreSQL dialects ignore repair_fence_catalog_table cleanly.
+        for non_pg in (Dialect.SQLITE, Dialect.MYSQL):
+            plan = generate_materialized_view(
+                schema,
+                "CREATE VIEW v_nonpg AS SELECT region, COUNT(*) AS c FROM orders GROUP BY region;",
+                dialect=non_pg,
+                ignore_limitations=(non_pg == Dialect.MYSQL),
+                repair_fence_catalog_table="__matview_catalog",
+            )
+            self.assertNotIn("__MV_REPAIR_FENCE_START__", "\n".join(plan.trigger_ddls))
 
 
 if __name__ == "__main__":

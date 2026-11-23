@@ -174,6 +174,9 @@ END;""",
     "pg_truncate_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
 RETURNS TRIGGER AS $$
 BEGIN
+{% if repair_fence_sql | default('') %}
+    {{ repair_fence_sql }}
+{% endif %}
     {{ trunc_block }}
     RETURN NULL;
 END;
@@ -229,6 +232,9 @@ BEGIN
     END IF;
     IF __mv_overlap OR __mv_tr <> 0 THEN
         IF __mv_tr = 0 AND EXISTS (SELECT 1 FROM {{ guard_table }}) THEN
+{% if repair_fence_sql | default('') %}
+            {{ repair_fence_sql }}
+{% endif %}
 {% if overlap_lock_sql %}
             {{ overlap_lock_sql }}
 {% endif %}
@@ -239,6 +245,9 @@ BEGIN
 {% endif %}
         END IF;
         IF __mv_nd = 0 THEN
+{% if repair_fence_sql | default('') %}
+            {{ repair_fence_sql }}
+{% endif %}
             IF __mv_tr <> 0 THEN
                 {{ trunc_refresh_sql }}
             ELSE
@@ -251,6 +260,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM {{ guard_table }}) THEN
         RETURN NULL;
     END IF;
+{% if repair_fence_sql | default('') %}
+    {{ repair_fence_sql }}
+{% endif %}
     {{ body_sql }}
     RETURN NULL;
 END;
@@ -265,6 +277,9 @@ DECLARE
     __mv_bseq INT := pg_catalog.split_part(__mv_raw, ':', 3)::int;
     __mv_nd INT := GREATEST(__mv_d - 1, 0);
 BEGIN
+{% if repair_fence_sql | default('') %}
+    {{ repair_fence_sql }}
+{% endif %}
     IF __mv_nd = 0 THEN
         PERFORM pg_catalog.set_config(__mv_guc, '0:0:' || __mv_bseq::pg_catalog.text || ':0', true);
         {{ trunc_refresh_sql }}
@@ -299,6 +314,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM {{ guard_table }}) THEN
         RETURN NULL;
     END IF;
+{% if repair_fence_sql | default('') %}
+    {{ repair_fence_sql }}
+{% endif %}
     {{ body_sql }}
     RETURN NULL;
 END;
