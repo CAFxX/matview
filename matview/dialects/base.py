@@ -2542,6 +2542,18 @@ class DialectBaseMixin(MixinHost):
                     "(supported: BINARY, NOCASE, RTRIM)"
                 )
             return None
+        if self.dialect == Dialect.MYSQL and self.subdialect != EngineSubdialect.MARIADB:
+            # A character value that derives from no column compares under the
+            # session's collation_connection (known when a connection was probed).
+            effective = name or (self.engine_version.mysql_connection_collation or "")
+            if key_collation.mysql_collation_is_plan_dependent(effective):
+                return (
+                    f"it compares under collation {effective.upper()}, a MySQL PAD SPACE collation under which "
+                    "GROUP BY / DISTINCT treat characters weighing like a space (NBSP, ideographic space, ...) as "
+                    "trailing padding in some execution plans (index scan, COUNT(DISTINCT)) and not in others, so "
+                    "the original view has no single result for such values and no group key can reproduce it "
+                    "(MySQL groups PAD SPACE UCA text plan-dependently)"
+                )
         if self.dialect == Dialect.MYSQL and key_collation.mysql_collation_has_unsound_weights(name):
             return (
                 f"it compares under collation {name}, a multi-level collation whose equality is not a function of "
@@ -2746,7 +2758,7 @@ class DialectBaseMixin(MixinHost):
                     return f"{label}: a column name is declared differently by several tables of the view"
                 if label not in argument_labels and self._key_spelling_sensitive(cp) and not (
                     strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA
-                    or (strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and mode in ("single", "join", "union_all_agg"))
+                    or (strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and mode in ("single", "join", "union_all_agg", "distinct"))
                 ):
                     return (
                         f"{label}: values equal under its collation can be spelled differently, and the "

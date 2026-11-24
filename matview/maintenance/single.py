@@ -26,6 +26,7 @@ from ..engines import (
     _sqlglot_dialect,
 )
 from ..logical_ir import (
+    GROUP_KEY_PLACEHOLDERS,
     ColumnDef,
     IncrementalBackfillSpec,
     JoinSpec,
@@ -278,7 +279,7 @@ class Tier1SingleMixin(MixinHost):
         if self.dialect not in (Dialect.SQLITE, Dialect.MYSQL) or not self._effective_group_by_exprs:
             return []
         alg_mode = getattr(self, "_alg_mode", "single")
-        if alg_mode not in ("single", "union_all_agg"):
+        if alg_mode not in ("single", "distinct", "union_all_agg"):
             return []
         sensitive: List[SelectItem] = []
         seen_cols: Set[str] = set()
@@ -302,20 +303,22 @@ class Tier1SingleMixin(MixinHost):
         else:
             sel_es = [self._rewrite_expr_for_record(it.raw_expr, q_base_t) for it in sensitive]
         if sqlite:
+            # Every spelling-sensitive column shows the leaving row's value (a NULL
+            # shows NULL, which has no other spelling); at least one is text.
             same_old = " AND ".join(
-                f"{mv_table}.{qc} IS ({o}) COLLATE BINARY AND typeof({o}) = 'text'" for qc, o in zip(q_cols, old_es)
-            )
+                f"{mv_table}.{qc} IS ({o}) COLLATE BINARY" for qc, o in zip(q_cols, old_es)
+            ) + " AND (" + " OR ".join(f"typeof({o}) = 'text'" for o in old_es) + ")"
             is_member = " AND ".join(f"({e}) IS {mv_table}.{qc} COLLATE BINARY" for qc, e in zip(q_cols, sel_es))
             order = ", ".join(f"({e}) COLLATE BINARY" for e in sel_es) if len(sel_es) > 1 else None
         else:
             same_old = " AND ".join(
                 f"CAST({mv_table}.{qc} AS BINARY) <=> CAST({o} AS BINARY)" for qc, o in zip(q_cols, old_es)
-            ) + " AND " + " AND ".join(f"{o} IS NOT NULL" for o in old_es)
+            ) + " AND (" + " OR ".join(f"{o} IS NOT NULL" for o in old_es) + ")"
             is_member = " AND ".join(
                 f"CAST({e} AS BINARY) <=> CAST({mv_table}.{qc} AS BINARY)" for qc, e in zip(q_cols, sel_es)
             )
             order = ", ".join(f"CAST({e} AS BINARY)" for e in sel_es) if len(sel_es) > 1 else None
-        lock = not sqlite and alg_mode == "single"
+        lock = not sqlite and alg_mode in ("single", "distinct")
 
         def _members(agg: str, rows_filter: Optional[str], order_by: Optional[str]) -> str:
             if alg_mode == "union_all_agg":
@@ -1698,6 +1701,10 @@ class Tier1SingleMixin(MixinHost):
                 chunk_sql_templates=chunk_templates_pk,
             )
         elif grp_exprs:
+            if GROUP_KEY_PLACEHOLDERS in (self.view.raw_select_sql or ""):
+                raise UnsupportedMaterializedViewError(
+                    f"the view definition contains the reserved backfill token {GROUP_KEY_PLACEHOLDERS}"
+                )
             grp_expr = self._canonical_group_pk_expr(grp_exprs)
             w_grp = f" WHERE {self.view.where_clause}" if self.view.where_clause else ""
             dist_grp_query = (
@@ -1729,7 +1736,7 @@ class Tier1SingleMixin(MixinHost):
                 dist_aliased_sel = [
                     f"{expr} AS {col}" for expr, col in zip(dist_sel, q_dist_cols_flat)
                 ]
-                w_p = [f"({eff}) IS NOT NULL", f"({grp_expr}) IN ({{placeholders}})"]
+                w_p = [f"({eff}) IS NOT NULL", f"({grp_expr}) IN ({GROUP_KEY_PLACEHOLDERS})"]
                 if self.view.where_clause:
                     w_p.insert(0, f"({self.view.where_clause})")
                 if self.dialect == Dialect.MYSQL:
@@ -1779,7 +1786,7 @@ class Tier1SingleMixin(MixinHost):
                         f"WHERE {' AND '.join(w_p)}\n"
                         f"GROUP BY {', '.join(dist_grp_list)}{aux_conflict};"
                     )
-            w_main = [f"({grp_expr}) IN ({{placeholders}})"]
+            w_main = [f"({grp_expr}) IN ({GROUP_KEY_PLACEHOLDERS})"]
             if self.view.where_clause:
                 w_main.insert(0, f"({self.view.where_clause})")
             q_pk_cols = [self._q(c) for c in pk_cols]

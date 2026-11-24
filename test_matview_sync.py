@@ -1446,11 +1446,16 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", EngineLimitationWarning)
         mgr = MaterializedViewManager(conn, dialect=dialect, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
+        # An explicit collation keeps the text group key incremental on MySQL: its PAD SPACE
+        # UCA server defaults (utf8mb4_unicode_ci) are refused as plan-dependent
+        # (COLLATION_KEY_FALLBACK, see test_group_key_collation.py), which would leave the
+        # backfill strategies below untested.
+        grp_collation = "COLLATE utf8mb4_bin" if dialect == Dialect.MYSQL else ""
         mgr.apply_schema_ddl(
-            """
+            f"""
             CREATE TABLE mgr_items (
                 id INT PRIMARY KEY,
-                grp VARCHAR(32) NOT NULL,
+                grp VARCHAR(32) {grp_collation} NOT NULL,
                 tag VARCHAR(32),
                 val INT NOT NULL
             );

@@ -1274,13 +1274,24 @@ views, each key value is mapped to a canonical text by a per-view function
   Shapes whose key cannot be kept exact incrementally run as a full refresh of the
   original query (exact by construction) with the announced diagnostic
   `COLLATION_KEY_FALLBACK` (`exact result required: falling back to strategy full
-  refresh of the original query`): `DISTINCT` and de-duplicating set operations over
-  collation-sensitive text columns (their displayed spelling is not refreshed
-  incrementally), SQLite user-registered collations, expressions whose character
-  collation is not known, UNION ALL aggregates keyed by an expression, MariaDB's
-  multi-level `uca1400_*_ai_cs/_as_ci/_as_cs` collations, and MEDIUMTEXT/LONGTEXT group
-  columns on MySQL/MariaDB (see TODO.md, "Group keys follow the grouped expression's
-  collation", for the incremental follow-ups).
+  refresh of the original query`): de-duplicating set operations (`UNION`, `INTERSECT`,
+  `EXCEPT`) over collation-sensitive text columns (their displayed spelling is not
+  refreshed incrementally; `DISTINCT`, `COUNT(DISTINCT ...)` and `GROUP BY` keep the
+  spelling a current member row has), SQLite user-registered collations, expressions
+  whose character collation is not known, UNION ALL aggregates keyed by an
+  expression, MariaDB's multi-level `uca1400_*_ai_cs/_as_ci/_as_cs` collations,
+  MEDIUMTEXT/LONGTEXT group columns on MySQL/MariaDB, and **MySQL PAD SPACE UCA
+  collations** (`utf8mb4_unicode_ci`, `utf8mb4_unicode_520_ci`, the language
+  collations such as `utf8mb4_danish_ci`, and the `utf8mb3`/`ucs2`/`utf16`/`utf32`
+  equivalents; a common server default). There MySQL itself groups plan-dependently:
+  `'a'` and `'a'` plus an ideographic space or NBSP are one group when GROUP BY/DISTINCT
+  walk an index on the column and two groups otherwise (and with `COUNT(DISTINCT)`), so
+  the original view has no single result for such values and no group key can
+  reproduce it. Declare the column (or `GROUP BY x COLLATE ...`) with a collation
+  that has no such plan dependence to keep the view incremental: any
+  `utf8mb4_0900_*` collation (MySQL's default), `utf8mb4_general_ci`,
+  `utf8mb4_bin`, or `latin1_*` (see TODO.md, "Group keys follow the grouped
+  expression's collation", for the incremental follow-ups).
 - PostgreSQL and MySQL/MariaDB: integer and `DECIMAL`/`NUMERIC` `SUM`/`AVG`
   (and PostgreSQL `VAR`/`STDDEV` of them, computed in `NUMERIC`) are
   maintained exactly (PostgreSQL sums of variable-scale `NUMERIC` are
