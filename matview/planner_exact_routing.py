@@ -88,13 +88,15 @@ FULL_REFRESH_COST = (
 AGGREGATE_ORDER_OPT_IN = "AGGREGATE_ORDER_NOT_REPRODUCIBLE"
 ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE = "ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE"
 
-# sqlglot models these window functions as AggFunc subclasses; they are not
-# aggregates over the partition's multiset (their maintenance is the window
-# partition path's).
-_WINDOW_ONLY_FUNCS: Tuple[type, ...] = (
+# Window functions that give tied rows (peers) the same result.
+_PEER_DETERMINISTIC_WINDOW_FUNCS: Tuple[type, ...] = (
     sqlglot_exp.Rank, sqlglot_exp.DenseRank, sqlglot_exp.PercentRank, sqlglot_exp.CumeDist,
-    sqlglot_exp.Ntile, sqlglot_exp.Lag, sqlglot_exp.Lead, sqlglot_exp.FirstValue,
-    sqlglot_exp.LastValue, sqlglot_exp.NthValue,
+)
+# Window functions that number or pick individual rows: tied rows are
+# numbered / picked in plan order unless the window ORDER BY is total.
+_ROW_DEPENDENT_WINDOW_FUNCS: Tuple[type, ...] = (
+    sqlglot_exp.RowNumber, sqlglot_exp.Ntile, sqlglot_exp.Lag, sqlglot_exp.Lead,
+    sqlglot_exp.FirstValue, sqlglot_exp.LastValue, sqlglot_exp.NthValue,
 )
 
 # Aggregates with an algebraic delta rule (the decomposition targets).
@@ -256,11 +258,23 @@ class ExactAggregateRoutingMixin(MixinHost):
         return out
 
     def _unordered_window_aggregates(self, *, include_relaxed: bool = False) -> List[str]:
-        """Order-sensitive aggregates used as window functions whose input
-        order (the window's ORDER BY, else an aggregate-level ORDER BY) is not
-        total: ``STRING_AGG(s, ',') OVER (PARTITION BY g)`` concatenates the
-        partition in plan order, which a partition-scoped recompute cannot
-        reproduce."""
+        """Window functions whose result depends on the order of rows that
+        their window ORDER BY leaves tied (it is not a total order of the
+        partition's rows), which a partition-scoped recompute cannot reproduce:
+
+        * order-sensitive aggregates used as window functions
+          (``STRING_AGG(s, ',') OVER (PARTITION BY g)``: the input order;
+          an aggregate-level ORDER BY counts when the window has none);
+        * ROW_NUMBER, LAG/LEAD, FIRST_VALUE/LAST_VALUE/NTH_VALUE and NTILE,
+          which number or pick individual rows (tied rows are numbered or
+          picked in plan order);
+        * any window function with a ROWS frame (the frame boundary falls
+          between tied rows).
+
+        RANK, DENSE_RANK, PERCENT_RANK and CUME_DIST, and order-insensitive
+        aggregates over the default RANGE/GROUPS frames, treat tied rows as
+        peers and stay exact. The partition keys count towards the total
+        order."""
         if not self.view.has_window_func:
             return []
         relaxed = AGGREGATE_ORDER_OPT_IN in set(self.accepted_limitations)
@@ -276,21 +290,34 @@ class ExactAggregateRoutingMixin(MixinHost):
                 func = win.this
                 while isinstance(func, sqlglot_exp.Filter):
                     func = func.this
-                if not isinstance(func, (sqlglot_exp.AggFunc, sqlglot_exp.Anonymous)) or isinstance(func, _WINDOW_ONLY_FUNCS):
-                    continue  # ranking / navigation window functions are not aggregates
-                if isinstance(func, sqlglot_exp.Anonymous) and str(func.name).upper() not in (
-                    KNOWN_AGGREGATE_NAMES | self._native_aggregate_names()
-                ):
-                    continue  # not an aggregate (a window function such as ROW_NUMBER is modelled)
-                if not is_order_sensitive(func) or self._is_float_policy_aggregate(func):
+                if not isinstance(func, sqlglot_exp.Expr):
                     continue
-                if call_name(func, sg_d) in _ALGEBRAIC_AGGREGATE_NAMES:
+                spec = win.args.get("spec")
+                rows_frame = isinstance(spec, sqlglot_exp.WindowSpec) and str(spec.args.get("kind") or "").upper() == "ROWS"
+                if isinstance(func, _PEER_DETERMINISTIC_WINDOW_FUNCS) and not rows_frame:
+                    continue
+                if isinstance(func, _ROW_DEPENDENT_WINDOW_FUNCS) or rows_frame:
+                    order_dependent = True
+                else:
+                    if not isinstance(func, (sqlglot_exp.AggFunc, sqlglot_exp.Anonymous)):
+                        continue
+                    if isinstance(func, sqlglot_exp.Anonymous) and str(func.name).upper() not in (
+                        KNOWN_AGGREGATE_NAMES | self._native_aggregate_names()
+                    ):
+                        continue  # not an aggregate
+                    order_dependent = (
+                        is_order_sensitive(func)
+                        and not self._is_float_policy_aggregate(func)
+                        and call_name(func, sg_d) not in _ALGEBRAIC_AGGREGATE_NAMES
+                    )
+                if not order_dependent:
                     continue
                 order = win.args.get("order")
-                keys = [o.this if isinstance(o, sqlglot_exp.Ordered) else o for o in order.expressions] if isinstance(order, sqlglot_exp.Order) else None
-                if not keys:
-                    keys = aggregate_order_keys(func)
-                if keys and self._order_keys_cover_every_primary_key(keys):
+                keys = [o.this if isinstance(o, sqlglot_exp.Ordered) else o for o in order.expressions] if isinstance(order, sqlglot_exp.Order) else []
+                if not keys and not isinstance(func, _ROW_DEPENDENT_WINDOW_FUNCS):
+                    keys = aggregate_order_keys(func) or []
+                partition = [p for p in (win.args.get("partition_by") or []) if isinstance(p, sqlglot_exp.Expr)]
+                if keys and self._order_keys_cover_every_primary_key(list(keys) + partition):
                     continue
                 out.append(win.sql(dialect=sg_d))
         return out
