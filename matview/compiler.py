@@ -70,6 +70,7 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
         watermark_catalog_table: Optional[str] = None,
         pg_fillfactor: Optional[int] = 80,
         sqlite_strict_backing: bool = False,
+        sqlite_without_rowid: bool = True,
         accept_limitations: Sequence[str] = (),
         repair_fence_catalog_table: Optional[str] = None,
     ) -> None:
@@ -86,6 +87,7 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=pg_fillfactor,
             sqlite_strict_backing=sqlite_strict_backing,
+            sqlite_without_rowid=sqlite_without_rowid,
             accept_limitations=accept_limitations,
             repair_fence_catalog_table=repair_fence_catalog_table,
         )
@@ -105,6 +107,7 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
         watermark_catalog_table: Optional[str] = None,
         pg_fillfactor: Optional[int] = 80,
         sqlite_strict_backing: bool = False,
+        sqlite_without_rowid: bool = True,
         accept_limitations: Sequence[str] = (),
         repair_fence_catalog_table: Optional[str] = None,
     ) -> CompilationContext:
@@ -163,6 +166,7 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=pg_fillfactor,
             sqlite_strict_backing=sqlite_strict_backing,
+            sqlite_without_rowid=sqlite_without_rowid,
             limitations=(),
             strategy=MaintenanceStrategy.ATOMIC_QUERY_SYNC,
             alg_mode="single",
@@ -320,6 +324,10 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
     @property
     def sqlite_strict_backing(self) -> bool:
         return self._context.sqlite_strict_backing
+
+    @property
+    def sqlite_without_rowid(self) -> bool:
+        return self._context.sqlite_without_rowid
 
     @property
     def logical_view_name(self) -> str:

@@ -112,6 +112,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX; --ignore-limitations does not cover them.",
     )
     parser.add_argument(
+        "--no-sqlite-without-rowid",
+        action="store_true",
+        help="SQLite: keep the rowid on every matview-owned table (default: WITHOUT ROWID for narrow tables with "
+        "a NOT NULL primary key; the row-width estimate cannot see real value sizes, so tables whose TEXT/BLOB "
+        "values are large may be faster with a rowid).",
+    )
+    parser.add_argument(
         "--sqlite-strict-backing",
         action="store_true",
         help="SQLite: declare matview-owned backing/auxiliary tables STRICT where every column type is "
@@ -198,6 +205,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     object_prefix=args.object_prefix,
                     strict=args.strict,
                     sqlite_strict_backing=args.sqlite_strict_backing,
+                    sqlite_without_rowid=not args.no_sqlite_without_rowid,
                     engine_version=args.engine_version,
                 )
                 try:
@@ -244,6 +252,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     batch_size=args.batch_size,
                     strict=args.strict,
                     sqlite_strict_backing=args.sqlite_strict_backing,
+                    sqlite_without_rowid=not args.no_sqlite_without_rowid,
                     engine_version=detected_ev,
                 )
                 diffs: Dict[str, ViewDiff] = {}
@@ -292,6 +301,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 object_prefix=args.object_prefix,
                 strict=args.strict,
                 sqlite_strict_backing=args.sqlite_strict_backing,
+                sqlite_without_rowid=not args.no_sqlite_without_rowid,
                 engine_version=args.engine_version,
             )
             try:
@@ -329,6 +339,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 object_prefix=args.object_prefix,
                 strict=args.strict,
                 sqlite_strict_backing=args.sqlite_strict_backing,
+                sqlite_without_rowid=not args.no_sqlite_without_rowid,
                 engine_version=args.engine_version,
             )
             try:
@@ -398,6 +409,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             batch_size=args.batch_size,
             strict=args.strict,
             sqlite_strict_backing=args.sqlite_strict_backing,
+            sqlite_without_rowid=not args.no_sqlite_without_rowid,
             engine_version=detected_ev,
         )
         _announce_recommendations(plan, args.json)

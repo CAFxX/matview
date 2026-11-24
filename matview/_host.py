@@ -58,6 +58,7 @@ class MixinHost:
             watermark_catalog_table: Optional[str] = None,
             pg_fillfactor: Optional[int] = 80,
             sqlite_strict_backing: bool = False,
+            sqlite_without_rowid: bool = True,
             accept_limitations: Sequence[str] = (),
             repair_fence_catalog_table: Optional[str] = None,
         ) -> None: ...
@@ -107,6 +108,8 @@ class MixinHost:
         def pg_fillfactor(self) -> Optional[int]: ...
         @property
         def sqlite_strict_backing(self) -> bool: ...
+        @property
+        def sqlite_without_rowid(self) -> bool: ...
         _sqlite_provable_int_cols: FrozenSet[str]
         _sqlite_table_shape_notes: Dict[str, str]
         @property

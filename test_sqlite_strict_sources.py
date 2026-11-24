@@ -167,6 +167,43 @@ class SqliteStrictSourceTests(unittest.TestCase):
             self.assertEqual(views, len(VIEWS))
             self.assertGreaterEqual(transitions, 21)
 
+    def test_strict_backing_never_rejects_legal_ill_typed_source_data(self) -> None:
+        """SQLite's dynamic typing lets REAL/INTEGER-declared plain columns hold TEXT. Aggregates fold such
+        values; a STRICT REAL/INTEGER accumulator would reject the user's legal write (regression: review of
+        the STRICT backing PR). With STRICT backing on, every write must succeed and equal the live view."""
+        views = {
+            "avg_f": "SELECT g, AVG(f) AS a FROM t GROUP BY g",
+            "avg_v": "SELECT g, AVG(v) AS a FROM t GROUP BY g",
+            "sum_all": "SELECT g, SUM(f) AS s, SUM(v) AS sv, TOTAL(v) AS tt, COUNT(*) AS n FROM t GROUP BY g",
+        }
+        dml = [
+            "INSERT INTO t VALUES (1,'a','z',1,NULL,NULL)",  # TEXT in the REAL column
+            "INSERT INTO t VALUES (2,'a',1.5,'q',NULL,NULL)",  # TEXT in the INTEGER column
+            "INSERT INTO t VALUES (3,'b',2,3,NULL,NULL), (4,'b','1e2','7',NULL,NULL)",
+            "UPDATE t SET f = 'y' WHERE id = 3",
+            "UPDATE t SET v = 2.5 WHERE id = 3",
+            "DELETE FROM t WHERE id IN (1, 2)",
+            "INSERT OR REPLACE INTO t VALUES (3,'a','w','w',NULL,NULL)",
+            "DELETE FROM t",
+        ]
+        for strict_backing in (False, True):
+            conn = sqlite3.connect(":memory:")
+            try:
+                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, f REAL, v INTEGER, x BLOB, b BLOB)")
+                conn.commit()
+                mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE, sqlite_strict_backing=strict_backing)
+                plans = {n: mgr.register_view(f"CREATE VIEW ill_{n} AS {sel};") for n, sel in views.items()}
+                for stmt in dml:
+                    conn.execute(stmt)  # must not raise
+                    conn.commit()
+                    for n, sel in views.items():
+                        self.assertEqual(
+                            _rows(conn, f"SELECT * FROM {plans[n].db_view_name}"), _rows(conn, sel),
+                            f"strict_backing={strict_backing} view={n} after {stmt}",
+                        )
+            finally:
+                conn.close()
+
     def test_strict_detected_from_ddl_and_live_connection(self) -> None:
         from matview.sql_frontend import parse_table_schema
 

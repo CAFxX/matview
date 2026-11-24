@@ -863,6 +863,8 @@ class CompilationContext:
     repair_fence_catalog_table: Optional[str] = None
     # SQLite: opt in to STRICT backing/auxiliary tables where every column type is provable.
     sqlite_strict_backing: bool = False
+    # SQLite: WITHOUT ROWID for narrow NOT NULL-keyed tables (default); False keeps every rowid.
+    sqlite_without_rowid: bool = True
 
     def with_ir(self, **ir_changes: Any) -> "CompilationContext":
         return replace(self, ir=self.ir.with_updates(**ir_changes))

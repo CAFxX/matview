@@ -2971,6 +2971,7 @@ class PlannerMixin(MixinHost):
                 watermark_catalog_table=self.watermark_catalog_table,
                 pg_fillfactor=getattr(self, "pg_fillfactor", 80),
                 sqlite_strict_backing=self.sqlite_strict_backing,
+                sqlite_without_rowid=self.sqlite_without_rowid,
                 repair_fence_catalog_table=self.repair_fence_catalog_table,
             )
             sub_plans.append(sub_comp._compile_single_plan())

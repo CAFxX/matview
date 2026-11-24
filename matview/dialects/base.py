@@ -222,8 +222,10 @@ class DialectBaseMixin(MixinHost):
         STRICT raises on a wrong-typed value, and an error inside a maintenance trigger aborts
         the user's DML, so a column is only declared with a STRICT type when the plan fixes the
         type of every value it will ever hold: BLOB (no affinity, any value) -> ANY (same
-        semantics); maintained counters and COUNT outputs -> INTEGER; `__mv_*` floating
-        accumulators -> REAL; `__mv_pk` -> TEXT. A column copied from a base table keeps its
+        semantics); maintained counters and COUNT outputs -> INTEGER; `__mv_pk` -> TEXT. Accumulators
+        (`__mv_sum_*`, `__mv_m2_*`, ...) are NOT provable: SQLite lets a REAL or INTEGER source column
+        hold TEXT, which a SUM/AVG then folds into the accumulator, so a STRICT REAL/INTEGER accumulator
+        would reject the user's legal write. Such a table stays non-STRICT (announced). A column copied from a base table keeps its
         declared affinity type (a plain base column may hold any storage class), so a table with
         one is not STRICT."""
         provable_ints = {n.lower() for n in getattr(self, "_sqlite_provable_int_cols", ())}
@@ -247,8 +249,6 @@ class DialectBaseMixin(MixinHost):
                 self._SQLITE_STRICT_COUNTER_RE.match(name) or low in provable_ints
             ):
                 new_t = "INTEGER"
-            elif base in ("REAL", "DOUBLE") and low.startswith("__mv_"):
-                new_t = "REAL"
             elif base == "TEXT" and low == "__mv_pk":
                 new_t = "TEXT"
             if new_t is None:
@@ -273,25 +273,41 @@ class DialectBaseMixin(MixinHost):
         if self.dialect == Dialect.SQLITE:
             cols, pks, autoinc = self._sqlite_parse_col_defs(col_defs_sql)
             rowid_reason = self._sqlite_rowid_reason(cols, pks, autoinc, pk_cols)
+            if not self.sqlite_without_rowid and not rowid_reason:
+                rowid_reason = "WITHOUT ROWID was disabled (sqlite_without_rowid=False / --no-sqlite-without-rowid)"
+            notes = dict(self._sqlite_table_shape_notes)
             if rowid_reason:
-                notes = dict(self._sqlite_table_shape_notes)
                 notes[table_name] = f"{table_name} keeps its rowid: {rowid_reason}."
-                self._sqlite_table_shape_notes = notes
             else:
                 table_options.append("WITHOUT ROWID")
+                if any(c[1] in ("TEXT", "BLOB", "ANY") for c in cols):
+                    notes[table_name + "#wor"] = (
+                        f"{table_name} is WITHOUT ROWID on an estimated row width ({self._SQLITE_UNBOUNDED_BYTES} bytes "
+                        f"per TEXT/BLOB column, real value sizes are not known); if those values are hundreds of "
+                        f"bytes or more it is slower this way: opt out with sqlite_without_rowid=False / "
+                        f"--no-sqlite-without-rowid."
+                    )
             if self.sqlite_strict_backing:
-                strict_cols, reasons = self._sqlite_strict_columns(col_defs_sql, cols)
+                if self.engine_version is not None and not self.engine_version.at_least((3, 37)):
+                    notes[table_name + "#strict"] = (
+                        f"{table_name} is not STRICT: STRICT tables need SQLite 3.37 or newer "
+                        f"(target is {self.engine_version.label})."
+                    )
+                    strict_cols = None
+                    reasons: List[str] = []
+                else:
+                    strict_cols, reasons = self._sqlite_strict_columns(col_defs_sql, cols)
+                    if strict_cols is None:
+                        notes[table_name + "#strict"] = (
+                            f"{table_name} is not STRICT although strict backing tables were requested: the value "
+                            f"type of column(s) {', '.join(reasons)} is not fixed by the plan (a column copied from a "
+                            f"base table keeps that table's affinity, which can hold any storage class; an accumulator "
+                            f"can fold TEXT stored in a numeric source column)."
+                        )
                 if strict_cols is not None:
                     col_defs_sql = strict_cols
                     table_options.append("STRICT")
-                else:
-                    notes = dict(self._sqlite_table_shape_notes)
-                    notes[table_name + "#strict"] = (
-                        f"{table_name} is not STRICT although strict backing tables were requested: the value "
-                        f"type of column(s) {', '.join(reasons)} is not fixed by the plan (a column copied from a "
-                        f"base table keeps that table's affinity, which can hold any storage class)."
-                    )
-                    self._sqlite_table_shape_notes = notes
+            self._sqlite_table_shape_notes = notes
             self._sqlite_provable_int_cols = frozenset()
 
         cols_joined = ",\n    ".join(col_defs_sql)

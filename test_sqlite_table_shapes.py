@@ -66,6 +66,28 @@ class SqliteTableShapeTests(unittest.TestCase):
                 for n in copied.diagnostics.details["performance_notes"])
         )
 
+    def test_opt_out_and_version_gate_and_unbounded_note(self) -> None:
+        schemas = parse_table_schema(SCHEMA, dialect=Dialect.SQLITE)
+        agg = "CREATE VIEW oa AS SELECT g, COUNT(*) AS n FROM narrow GROUP BY g;"
+        default = generate_materialized_view(schemas, agg, dialect=Dialect.SQLITE)
+        self.assertIn("WITHOUT ROWID", default.backing_table_ddl)
+        # the width estimate cannot see value sizes: the note says so and names the opt-out
+        notes = default.diagnostics.details["performance_notes"]
+        self.assertTrue(any("estimated row width" in n and "sqlite_without_rowid=False" in n for n in notes), notes)
+        off = generate_materialized_view(schemas, agg, dialect=Dialect.SQLITE, sqlite_without_rowid=False)
+        self.assertNotIn("WITHOUT ROWID", off.backing_table_ddl)
+        self.assertTrue(any("keeps its rowid: WITHOUT ROWID was disabled" in n for n in off.diagnostics.details["performance_notes"]))
+        # STRICT needs SQLite 3.37: an older target falls back, announced, instead of emitting invalid DDL
+        old = generate_materialized_view(
+            schemas, agg, dialect=Dialect.SQLITE, engine_version="sqlite:3.30.0", sqlite_strict_backing=True
+        )
+        self.assertNotIn("STRICT", old.backing_table_ddl)
+        self.assertTrue(any("STRICT tables need SQLite 3.37" in n for n in old.diagnostics.details["performance_notes"]))
+        new = generate_materialized_view(
+            schemas, agg, dialect=Dialect.SQLITE, engine_version="sqlite:3.45.1", sqlite_strict_backing=True
+        )
+        self.assertIn("STRICT", new.backing_table_ddl)
+
 
 if __name__ == "__main__":
     unittest.main()
