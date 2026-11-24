@@ -1375,7 +1375,8 @@ def introspect_database_schemas(
 
         cur.execute(
             """
-            SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_key, c.column_type
+            SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_key, c.column_type,
+                   c.collation_name
             FROM information_schema.columns c
             JOIN information_schema.tables t
               ON c.table_schema = t.table_schema AND c.table_name = t.table_name
@@ -1411,11 +1412,13 @@ def introspect_database_schemas(
             ) and col_type:
                 dt_up = col_type.upper()
             is_pk = col_key.upper() == "PRI"
+            coll_name = _dec(row[6]) if len(row) > 6 and row[6] is not None else None
             grouped_my.setdefault(t_name, {})[c_name] = ColumnDef(
                 name=c_name,
                 data_type=dt_up,
                 not_null=(str(is_null).upper() == "NO") or is_pk,
                 primary_key=is_pk,
+                collation=coll_name.upper() if coll_name else None,
             )
         my_pk_by_table: Dict[str, List[str]] = {}
         my_idx_by_table: Dict[str, List[TableIndexDef]] = {}

@@ -1196,13 +1196,15 @@ class Tier2Mixin(MixinHost):
                 mv_c = f"__mv_grp_{idx_g}"
                 target_cols.append(mv_c)
                 if self.dialect == Dialect.SQLITE:
-                    dt = "BLOB"
+                    dt = "BLOB" + self._sqlite_key_collate_suffix(g_expr)
                 else:
                     dt = self._infer_expr_storage_type(
                         SelectItem(raw_expr=g_expr, alias=mv_c, is_aggregate=False)
                     )
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
                         dt = "VARCHAR(255)"
+                if self.dialect == Dialect.MYSQL:
+                    dt = dt + self._key_col_collate_suffix(g_expr, dt)
                 hidden_grp_defs.append((mv_c, g_expr, dt))
             group_mv_cols.append((g_expr, mv_c))
 
@@ -1225,11 +1227,13 @@ class Tier2Mixin(MixinHost):
                 )
                 or (it.is_aggregate and it.agg_func is None)
             ):
-                dt = "BLOB"
+                dt = "BLOB" + self._sqlite_key_collate_suffix(it.raw_expr)
             else:
                 dt = self._infer_expr_storage_type(it)
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
+            if self.dialect == Dialect.MYSQL:
+                dt = dt + self._key_col_collate_suffix(it.raw_expr, dt)
             col_types_by_lower[it.alias.lower()] = dt
             col_defs_sql.append(f"{self._q(it.alias)} {dt}")
         for mv_c, _, dt in hidden_grp_defs:

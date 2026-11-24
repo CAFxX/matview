@@ -160,12 +160,14 @@ class Tier1UnionAllAggMixin(MixinHost):
             if mv_col.lower() not in non_agg_aliases_lower and mv_col.lower() not in seen_hidden_grp:
                 seen_hidden_grp.add(mv_col.lower())
                 if self.dialect == Dialect.SQLITE:
-                    dt = "BLOB"
+                    dt = "BLOB" + self._sqlite_key_collate_suffix(g_expr)
                 else:
                     fake_it = SelectItem(raw_expr=g_expr, alias=mv_col, is_aggregate=False)
                     dt = merged_ctx._infer_expr_storage_type(fake_it)
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
                         dt = "VARCHAR(255)"
+                if self.dialect == Dialect.MYSQL:
+                    dt = dt + self._key_col_collate_suffix(g_expr, dt)
                 nn = " NOT NULL" if not has_nullable_grp else ""
                 col_defs_sql.append(f"{self._q(mv_col)} {dt}{nn}")
 
@@ -204,11 +206,13 @@ class Tier1UnionAllAggMixin(MixinHost):
         for item in work_items:
             if not item.is_aggregate:
                 if self.dialect == Dialect.SQLITE:
-                    dt = "BLOB"
+                    dt = "BLOB" + self._sqlite_key_collate_suffix(item.raw_expr)
                 else:
                     dt = merged_ctx._infer_expr_storage_type(item)
                     if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
                         dt = "VARCHAR(255)"
+                if self.dialect == Dialect.MYSQL:
+                    dt = dt + self._key_col_collate_suffix(item.raw_expr, dt)
                 nn = " NOT NULL" if (grp_exprs and not has_nullable_grp) else ""
                 col_defs_sql.append(f"{self._q(item.alias)} {dt}{nn}")
             else:

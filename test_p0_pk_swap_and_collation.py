@@ -984,12 +984,18 @@ class TestFinding7CollationAndGroupPk(unittest.TestCase):
         self.assertIn(f"__mv_pk {expected_pk_type} NOT NULL", aux_ddl)
 
     def test_mysql_canonical_group_pk_expr_generation(self) -> None:
-        """Verify _canonical_group_pk_expr uses OCTET_LENGTH, utf8mb4 charset, and COLLATE utf8mb4_bin."""
+        """Keys of non-character columns use OCTET_LENGTH text under utf8mb4_bin; keys of
+        character columns are the digest of the collation's weight string (values the
+        server groups together must share one key), also under utf8mb4_bin COLLATE."""
         schema_map = {
             "t": TableSchema(
                 "t",
                 {
-                    "col": ColumnDef("col", "VARCHAR(50)", not_null=False),
+                    "col": ColumnDef("col", "INT", not_null=False),
+                    "txt": ColumnDef("txt", "VARCHAR(50)", not_null=False),
+                    "txtbin": ColumnDef("txtbin", "VARCHAR(50)", not_null=False, collation="UTF8MB4_BIN"),
+                    "txtnp": ColumnDef("txtnp", "VARCHAR(50)", not_null=False, collation="UTF8MB4_0900_AI_CI"),
+                    "blobby": ColumnDef("blobby", "VARBINARY(50)", not_null=False),
                 },
             )
         }
@@ -1000,6 +1006,17 @@ class TestFinding7CollationAndGroupPk(unittest.TestCase):
         self.assertIn("OCTET_LENGTH(CAST(col AS CHAR CHARACTER SET utf8mb4))", pk_expr)
         self.assertIn("CAST(col AS CHAR CHARACTER SET utf8mb4)", pk_expr)
         self.assertTrue(pk_expr.endswith("COLLATE utf8mb4_bin"))
+        self.assertNotIn("WEIGHT_STRING", pk_expr)
+        self.assertNotIn("WEIGHT_STRING", compiler._canonical_group_pk_expr(["blobby"]))
+        # Unknown collation: the server default (NO PAD on MySQL); PAD SPACE collations trim.
+        self.assertIn("SHA2(WEIGHT_STRING((txt)), 256)", compiler._canonical_group_pk_expr(["txt"]))
+        self.assertIn("SHA2(WEIGHT_STRING(RTRIM(txtbin)), 256)", compiler._canonical_group_pk_expr(["txtbin"]))
+        self.assertIn("SHA2(WEIGHT_STRING((txtnp)), 256)", compiler._canonical_group_pk_expr(["txtnp"]))
+        # An explicit COLLATE decides the weights.
+        self.assertIn(
+            "WEIGHT_STRING(RTRIM(txt) COLLATE utf8mb4_general_ci)",
+            compiler._canonical_group_pk_expr(["txt COLLATE utf8mb4_general_ci"]),
+        )
 
     def test_canonical_pk_preserves_case_and_accents(self) -> None:
         """Verify that case-variants and accent-variants produce distinct PK tokens."""

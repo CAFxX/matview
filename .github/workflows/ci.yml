@@ -309,6 +309,9 @@ jobs:
       - name: Differentially test STRICT SQLite source tables (skips below SQLite 3.37)
         run: python3 test_sqlite_strict_sources.py
 
+      - name: Test group keys follow the column collation (SQLite NOCASE/RTRIM/BINARY)
+        run: python3 test_group_key_collation.py
+
       - name: Test PostgreSQL/MySQL order-sensitive aggregate SQL-shape guards (offline)
         run: python3 test_pgmy_exact_float_aggregates.py
 
@@ -711,6 +714,11 @@ jobs:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_concurrent_backfill.py
 
+      - name: Test group keys follow the column collation (native MySQL/MariaDB)
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_group_key_collation.py
+
       - name: Test native expression and aggregate result types (MySQL)
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
@@ -886,6 +894,11 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
         run: python3 test_concurrent_backfill.py
+
+      - name: Test group keys follow the column collation (native MySQL/MariaDB)
+        env:
+          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
+        run: python3 test_group_key_collation.py
 
       - name: Test native expression and aggregate result types (MariaDB)
         env:
