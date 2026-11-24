@@ -159,7 +159,13 @@ def test_subscription_refusal_wiring_without_a_publisher(monkeypatch: pytest.Mon
         assert manager._pg_subscription_targets(["tt", "missing_table"]) == []
         conn.commit()
 
-        monkeypatch.setattr(MaterializedViewManager, "_pg_subscription_targets", lambda self, tables: list(tables))
+        seen: list = []
+
+        def fake_targets(self, tables):  # a catalog hit for every table asked about
+            seen.extend(tables)
+            return list(tables)
+
+        monkeypatch.setattr(MaterializedViewManager, "_pg_subscription_targets", fake_targets)
         assert manager.check_schema_drift() == {"mv": "invalid"}
         conn.commit()
         with pytest.raises(UnsupportedMaterializedViewError, match="logical-replication"):
@@ -168,6 +174,8 @@ def test_subscription_refusal_wiring_without_a_publisher(monkeypatch: pytest.Mon
         with pytest.raises(UnsupportedMaterializedViewError, match="logical-replication"):
             manager.register_view("CREATE VIEW mv2 AS SELECT id FROM tt;")
         conn.rollback()
+        # The view's own backing table is checked as well (a subscription would write it too).
+        assert any(str(t).startswith("__matview_store_") for t in seen), seen
     finally:
         conn.rollback()
         conn.autocommit = True

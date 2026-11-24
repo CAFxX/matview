@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import time
 import uuid
+import warnings
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import sqlglot
@@ -2375,7 +2376,12 @@ class MaterializedViewManager:
             # Every path that installs, replaces, repairs or re-validates a view
             # compiles it here: a subscription target is refused at registration,
             # refused by repair_view() and reported "invalid" by check_schema_drift().
-            self._refuse_subscription_targets(plan.view_name, plan.view_spec.referenced_tables)
+            # The view's own backing and auxiliary tables must not be subscribed
+            # either (the subscription would also write derived rows).
+            self._refuse_subscription_targets(
+                plan.view_name,
+                [*plan.view_spec.referenced_tables, plan.backing_table_name, *plan.auxiliary_table_names],
+            )
         return plan
 
     def _classify_native_functions(
@@ -2964,7 +2970,19 @@ class MaterializedViewManager:
                     f" SELECT count(*) FROM pg_catalog.pg_subscription_rel sr"
                     f" WHERE sr.srrelid IN (SELECT relid FROM __mv_down UNION SELECT relid FROM __mv_up)",
                 )
-                if rows is not None and int(rows[0][0]) > 0:
+                if rows is None:
+                    # Cannot tell: the view is let through (the read may fail on a
+                    # mock or a restricted role), but never silently.
+                    if not getattr(self, "_subscription_probe_warned", False):
+                        self._subscription_probe_warned = True
+                        warnings.warn(
+                            "could not read pg_subscription_rel: logical-replication subscription targets "
+                            "cannot be detected (an unsupported configuration: replicated changes would not be maintained)",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    continue
+                if int(rows[0][0]) > 0:
                     found.append(table)
         return found
 
