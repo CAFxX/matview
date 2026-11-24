@@ -652,6 +652,16 @@ The existing differential-testing harness is useful, but its current headline co
   - Add bounded repeated stress campaigns with deterministic seeds/traces and promote minimized failures to permanent regressions.
   - Keep same-connection callback interleavings classified as deterministic sequencing tests, not concurrency tests.
 
+## SQLite STRICT, rowid and minimal-columns initiative
+
+- [x] **Support and recommend STRICT source tables** (README "SQLite STRICT tables", `docs/design-sqlite-strict.md`, `test_sqlite_strict_sources.py`, STRICT scenarios in the SQLite fuzzer).
+- [ ] **STRICT-aware diagnostics and drift** (note per non-STRICT source with the affected columns, STRICT -> plain drift is `invalid`, `PRAGMA table_list` introspection).
+- [ ] **WITHOUT ROWID / STRICT backing and aux tables** (audit, measure, rule; opt-in `strict_backing_tables` unless <5% write cost).
+- [ ] **Audit every matview-owned column, index and implicit key on all engines** (hidden keys, counters, accumulators, InnoDB DB_ROW_ID, extra PG indexes; README "columns we add and why").
+- [ ] **Tier-1 efficiency from STRICT sources**, each only when provably exact (standing goal: no view needs tier 3, few tier 2, bulk writes tier 1 with <= 1 write per row, no no-op rewrites):
+  - Drop the hidden "approximate count" column of SQLite `SUM`/`TOTAL`/`AVG` (`_sqlite_acnt_cols`, `maintenance/single.py`) when the argument is a bare STRICT `INTEGER`/`INT` column: every non-NULL value is an integer, so the pure integer fold is exact and the `typeof() <> 'integer'` dirty checks and group recompute fallback cannot trigger. (Not for REAL columns: a REAL fold still needs recompute; not for expressions: `a * b` can overflow into REAL.)
+  - Audit the unchanged-row guards and comparison/collation guards for `typeof()`/affinity companions that a STRICT column type makes redundant (only where a guard is actually emitted today; none identified yet).
+
 ## P1 — Modular Architecture, Engine/Version Optimizations & Developer Experience
  
 - [ ] **Make LogicalIR, CompilationContext and Plan Data Deeply Immutable**:
