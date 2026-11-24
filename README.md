@@ -1587,6 +1587,7 @@ Correctness gaps (the materialized view can differ from the original view):
 - [Fail-Closed Incremental Backfill (no silent missing or double-counted rows after a failed backfill)](TODO.md) (remaining known exclusions)
 - [Fix Pre-Existing SQLite Divergences Found by the Exact SUM/TOTAL/AVG Differential](TODO.md) (storage-class changes for `MIN`/`MAX`/group keys, `LEFT JOIN` group moves, primary-key updates during backfill)
 - [Model MySQL/MariaDB Result Nullability, DECIMAL Precision and String Length](TODO.md) (result metadata only; values match)
+- [Integer Expression Result Types Not Yet Derived Exactly](TODO.md) (MySQL 8.4/9.7, result metadata only; values match): the wire type (INT or BIGINT) of an integer arithmetic `GROUP BY` key is plan dependent in the engine itself (BIGINT when an index on a generated column equal to the key expression serves the GROUP BY), so no single stored type matches every plan; the reader follows the plan without such an index. A few arithmetic shapes (signed/unsigned column mixes in `+`/`-`, unary minus of a column) keep the conservative BIGINT where MySQL sends INT
 - [Close Unsafe DML Paths That Bypass Trigger-Based Maintenance](TODO.md)
 - [Exact Maintenance When a User Trigger or FK Action Runs Before the Maintenance Trigger](TODO.md)
 - [Exact Maintenance Under MariaDB UPDATE IGNORE (AFTER UPDATE Triggers Fire for Ignored Rows)](TODO.md)

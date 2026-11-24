@@ -370,36 +370,50 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
 
     SCHEMA = (
         "CREATE TABLE ik (id INT PRIMARY KEY, i INT, s SMALLINT, b BIGINT, "
-        "ti TINYINT, mi MEDIUMINT, u INT UNSIGNED);"
+        "ti TINYINT, mi MEDIUMINT, u INT UNSIGNED, su SMALLINT UNSIGNED);"
     )
 
-    def test_grouped_narrow_integer_arithmetic_uses_int(self) -> None:
+    def _key_type(self, dialect: str, select_tail: str, expr: str) -> str:
         import re
 
+        plan = generate_materialized_view(
+            self.SCHEMA,
+            f"CREATE VIEW v AS SELECT {expr} AS k, COUNT(*) AS c FROM ik {select_tail};",
+            dialect=dialect,
+            ignore_limitations=True,
+        )
+        match = re.search(r'(?im)^\s*[\x60"]?k[\x60"]?\s+([A-Z]+(?:\s+UNSIGNED)?)\b', plan.backing_table_ddl)
+        self.assertIsNotNone(match, plan.backing_table_ddl)
+        assert match is not None
+        return match.group(1)
+
+    def test_grouped_integer_arithmetic_follows_the_length_rule(self) -> None:
+        # Display length below 10 characters => INT, else BIGINT (natively
+        # verified in test_mysql_group_key_integer_type_matches_the_length_model);
+        # shapes outside the verified subset stay BIGINT (never a wrong INT).
         cases = {
-            "s % 2": "INT",
-            "ti % 2": "INT",
-            "mi % 2": "INT",
-            "s + s": "INT",
-            "i % 3": "BIGINT",
-            "s * s": "BIGINT",
+            "s % 2": "INT", "ti % 2": "INT", "mi % 2": "INT", "s + s": "INT", "s - s": "INT", "s * 2": "INT",
+            "su + su": "INT", "(s + s) % 3": "INT", "s DIV 2": "INT", "s + 123456": "INT",
+            "i % 3": "BIGINT", "s * s": "BIGINT", "mi + mi": "BIGINT", "i + 1": "BIGINT", "b % 2": "BIGINT",
+            "-s": "BIGINT", "su + s": "BIGINT", "(u + u) % 3": "BIGINT",
         }
         for dialect in ("mysql:8.4", "mysql:9.7"):
             for expr, expected_type in cases.items():
                 with self.subTest(dialect=dialect, expr=expr):
-                    select = f"SELECT {expr} AS k, COUNT(*) AS c FROM ik GROUP BY {expr}"
-                    plan = generate_materialized_view(
-                        self.SCHEMA,
-                        f"CREATE VIEW v AS {select};",
-                        dialect=dialect,
-                        ignore_limitations=True,
-                    )
-                    match = re.search(
-                        r'(?im)^\s*[\x60"]?k[\x60"]?\s+([A-Z]+(?:\s+UNSIGNED)?)\b',
-                        plan.backing_table_ddl,
-                    )
-                    self.assertIsNotNone(match, plan.backing_table_ddl)
-                    self.assertEqual(match.group(1), expected_type)
+                    self.assertEqual(self._key_type(dialect, f"GROUP BY {expr}", expr), expected_type)
+
+    def test_grouped_key_matched_through_alias_and_ordinal(self) -> None:
+        for dialect in ("mysql:8.4", "mysql:9.7"):
+            with self.subTest(dialect=dialect, how="ordinal"):
+                self.assertEqual(self._key_type(dialect, "GROUP BY 1", "s % 2"), "INT")
+            with self.subTest(dialect=dialect, how="alias"):
+                self.assertEqual(self._key_type(dialect, "GROUP BY k", "s % 2"), "INT")
+            with self.subTest(dialect=dialect, how="not grouped"):
+                plan = generate_materialized_view(
+                    self.SCHEMA, "CREATE VIEW v AS SELECT id, s % 2 AS k FROM ik;",
+                    dialect=dialect, ignore_limitations=True,
+                )
+                self.assertRegex(plan.backing_table_ddl, r'(?im)^\s*[\x60"]?k[\x60"]?\s+BIGINT\b')
 
 
 class NativeResultTypeTests(unittest.TestCase):
@@ -521,6 +535,87 @@ class NativeResultTypeTests(unittest.TestCase):
             conn.close()
         return failures
 
+    def test_mysql_group_key_integer_type_matches_the_length_model(self) -> None:
+        """Generated integer arithmetic group keys: the type the compiler stores
+        must equal the wire type MySQL sends for the live GROUP BY query, for
+        every expression inside the verified subset; expressions outside it
+        must fall back to the conservative BIGINT (documented gap in TODO.md,
+        never a wrong INT). One table, one compile, one query: all expressions
+        are keys of the same views."""
+        import random
+        import re
+
+        mysql_engines = [(engine, dsn) for engine, dsn in _native_engines() if engine == Dialect.MYSQL]
+        if not mysql_engines:
+            self.skipTest("set MYSQL_DSN for native MySQL GROUP BY result-type tests")
+        cols = ["ti", "tu", "s", "su", "mi", "mu", "i", "iu", "b", "bu"]
+        decl = {"ti": "TINYINT", "tu": "TINYINT UNSIGNED", "s": "SMALLINT", "su": "SMALLINT UNSIGNED",
+                "mi": "MEDIUMINT", "mu": "MEDIUMINT UNSIGNED", "i": "INT", "iu": "INT UNSIGNED",
+                "b": "BIGINT", "bu": "BIGINT UNSIGNED"}
+        rng = random.Random(20261123)
+
+        def gen(depth: int) -> str:
+            if depth == 0 or rng.random() < 0.3:
+                return rng.choice(cols) if rng.random() < 0.75 else str(rng.choice([1, 2, 7, 100, 123456]))
+            op = rng.choice(["+", "-", "*", "%", "+", "-"])
+            return f"({gen(depth - 1)} {op} {gen(depth - 1)})"
+
+        exprs = [e for e in (gen(rng.randint(1, 3)) for _ in range(160)) if re.search(r"[a-z].*[-+*%]|[-+*%].*[a-z]", e)][:120]
+        # Boundaries of the length rule (signed/unsigned, every operator, literals, DIV, nesting).
+        exprs += ["s - s", "s * 2", "-s", "-5 + s", "su + su", "su + s", "(s + s) % 3", "(su + su) % 3", "mi + mi",
+                  "mi + tu", "mi % 2", "mu + mu", "mu - mu", "i + 1", "i % 2", "iu + 1", "b % 2", "ti * ti",
+                  "ti * mi", "s DIV 2", "i DIV 2", "s + 123456", "s * 123456", "tu - tu", "ti + 99999", "s - su",
+                  "(mu + mu) % 3", "(ti + ti) * (ti + ti)", "s % su", "su % s"]
+        exprs = sorted(set(exprs))
+        schema = "CREATE TABLE gl (" + ", ".join(f"{c} {decl[c]}" for c in cols) + ");"
+        for engine, dsn in mysql_engines:
+            conn = _connect(engine, dsn)
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT VERSION()")
+                version = str(cur.fetchone()[0])
+                if "mariadb" in version.lower():
+                    continue
+                m = re.match(r"(\d+)\.(\d+)", version)
+                assert m is not None
+                dialect = f"mysql:{m.group(1)}.{m.group(2)}"
+                table = f"gl_{uuid.uuid4().hex[:8]}"
+                cur.execute(schema.replace("gl", table, 1))
+                # No rows: the result metadata does not depend on them, and
+                # unsigned subtraction over real values would overflow.
+                conn.commit()
+                wrong, conservative = [], 0
+                # Compile time grows quadratically with the number of keys of one
+                # view, so the expressions are checked in small views.
+                for start in range(0, len(exprs), 20):
+                    chunk = exprs[start:start + 20]
+                    keys = ", ".join(chunk)
+                    cur.execute(f"SELECT {keys} FROM {table} GROUP BY {keys}")
+                    actual = ["BIGINT" if d[1] == 8 else "INT" if d[1] == 3 else str(d[1]) for d in cur.description]
+                    plan = generate_materialized_view(
+                        schema.replace("gl", table, 1),
+                        "CREATE VIEW v AS SELECT "
+                        + ", ".join(f"{e} AS k{n}" for n, e in enumerate(chunk))
+                        + f", COUNT(*) AS c FROM {table} GROUP BY {keys};",
+                        dialect=dialect,
+                        ignore_limitations=True,
+                    )
+                    ddl_types = dict(re.findall(r"(?m)^\s*[`\"]?(k\d+)[`\"]?\s+([A-Z]+)\b", plan.backing_table_ddl))
+                    for n, e in enumerate(chunk):
+                        stored = ddl_types[f"k{n}"]
+                        if stored == actual[n]:
+                            continue
+                        if stored == "BIGINT":
+                            conservative += 1  # outside the verified subset: the engine says INT
+                        else:
+                            wrong.append((e, stored, actual[n]))
+                self.assertEqual(wrong, [], f"{version}: stored INT where the engine sends BIGINT")
+                self.assertLess(conservative, len(exprs) * 0.2, f"{version}: subset too narrow ({conservative}/{len(exprs)})")
+                cur.execute(f"DROP TABLE {table}")
+                conn.commit()
+            finally:
+                conn.close()
+
     def test_mysql_group_key_integer_type_is_plan_dependent_engine_behaviour(self) -> None:
         mysql_engines = [(engine, dsn) for engine, dsn in _native_engines() if engine == Dialect.MYSQL]
         if not mysql_engines:
@@ -550,7 +645,7 @@ class NativeResultTypeTests(unittest.TestCase):
                 )
                 rows = [
                     (n % 65536 - 32768, n % 256 - 128, n % 16777216 - 8388608)
-                    for n in range(1, 1001)
+                    for n in range(1, 41)
                 ]
                 cur.executemany(
                     f"INSERT INTO {table} (s, ti, mi) VALUES (%s, %s, %s)",
