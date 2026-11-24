@@ -969,9 +969,11 @@ print(writer.execute("PRAGMA recursive_triggers").fetchone())
 
 `STRICT` source tables (SQLite 3.37+) are supported and **recommended** for
 every table a materialized view reads. A STRICT column can only hold its
-declared type (`INT`, `INTEGER`, `REAL`, `TEXT`, `BLOB`, or `ANY`): a value that
+declared type (`INT`, `INTEGER`, `REAL`, `TEXT`, `BLOB`): a value that
 cannot be converted losslessly is rejected at write time, and a stored value is
-never `'10'` where `10` was meant. On a plain table the declared type is only
+never `'10'` where `10` was meant (`ANY` is the exception: it keeps whatever
+storage class it is given, so it gives no type guarantee, and matview treats an
+`ANY` column like a plain one). On a plain table the declared type is only
 an affinity, so any column can hold any storage class (an `INTEGER` column can
 hold `REAL 0.6` or `'abc'`). matview always compares the materialized view with
 the original view exactly, storage class included, so it has to assume the
@@ -1003,9 +1005,14 @@ Requirements and behaviour:
   `sqlite3.sqlite_version`; APSW, SQLCipher and sqlean builds ship their own
   SQLite). On an older library the `CREATE TABLE ... STRICT` statement itself
   fails, so there is nothing for matview to detect; tables stay plain.
-- SQLite cannot `ALTER` a table into STRICT. Convert with the 12-step rebuild
-  (create the STRICT table, `INSERT ... SELECT`, drop, rename), then re-register
-  the views: a registered view whose source stops being STRICT is drift.
+- SQLite cannot `ALTER` a table into STRICT. Follow SQLite's complete table
+  rebuild procedure (<https://www.sqlite.org/lang_altertable.html#otheralter>):
+  `PRAGMA foreign_keys=OFF` first (dropping the old table would otherwise run
+  `ON DELETE CASCADE` on child rows), create the STRICT table, `INSERT ... SELECT`,
+  drop the old table, rename the new one, recreate its indexes, triggers and
+  views, run `PRAGMA foreign_key_check`, and turn foreign keys back on. The
+  rebuild drops matview's maintenance triggers with the old table: unregister
+  the views before and register them again after.
 - STRICT rejects wrong-typed values with an error that aborts the DML
   statement that wrote them (and rolls back its maintenance); that is SQLite's
   contract, not matview's, and the materialized view stays equal to the live view.
