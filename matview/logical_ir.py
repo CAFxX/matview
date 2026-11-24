@@ -38,21 +38,94 @@ class ColumnDef:
     is_rowid_alias: bool = False
 
 
-def _normalize_index_column_key(col_spec: str) -> str:
+def _strip_single_quoted_ident(s: str) -> Optional[str]:
+    """If ``s`` is a single quoted SQL identifier, return its unescaped text; else None."""
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        inner = s[1:-1]
+        if '"' not in inner.replace('""', ""):
+            return inner.replace('""', '"')
+    elif len(s) >= 2 and s[0] == "`" and s[-1] == "`":
+        inner = s[1:-1]
+        if "`" not in inner.replace("``", ""):
+            return inner.replace("``", "`")
+    elif len(s) >= 2 and s[0] == "[" and s[-1] == "]" and "]" not in s[1:-1]:
+        return s[1:-1]
+    return None
+
+
+def _split_top_level_dots_simple(s: str) -> List[str]:
+    """Split ``s`` on '.' outside quotes and parentheses."""
+    parts: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    quote: Optional[str] = None
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if quote is not None:
+            cur.append(ch)
+            if quote == "[" and ch == "]":
+                quote = None
+            elif ch == quote:
+                if i + 1 < n and s[i + 1] == quote:
+                    cur.append(s[i + 1])
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if ch in ('"', "`", "["):
+            quote = ch
+            cur.append(ch)
+        elif ch == "(":
+            depth += 1
+            cur.append(ch)
+        elif ch == ")" and depth > 0:
+            depth -= 1
+            cur.append(ch)
+        elif ch == "." and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    parts.append("".join(cur).strip())
+    return parts
+
+
+def _normalize_index_column_key(
+    col_spec: str,
+    known_columns_lower: Optional[frozenset[str]] = None,
+) -> str:
     """Normalize a column or key specification for prefix-coverage comparison."""
     s = str(col_spec or "").strip()
+    if known_columns_lower and s.lower() in known_columns_lower:
+        return s.lower()
+    single = _strip_single_quoted_ident(s)
+    if single is not None:
+        return single.strip().lower()
     s = re.sub(r"\s+NULLS\s+(?:FIRST|LAST)\s*$", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+(?:ASC|DESC)\s*$", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s+COLLATE\s+\S+\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(
+        r'\s+COLLATE\s+(?:"(?:""|[^"])+"|`(?:``|[^`])+`|\S+)\s*$',
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
     s = s.strip()
-    if "." in s and not s.startswith(("(", "\"", "`", "[")):
-        s = s.rsplit(".", 1)[-1].strip()
-    if (
-        (len(s) >= 2 and s[0] == '"' and s[-1] == '"')
-        or (len(s) >= 2 and s[0] == "`" and s[-1] == "`")
-        or (len(s) >= 2 and s[0] == "[" and s[-1] == "]")
-    ):
-        s = s[1:-1]
+    if known_columns_lower and s.lower() in known_columns_lower:
+        return s.lower()
+    single2 = _strip_single_quoted_ident(s)
+    if single2 is not None:
+        return single2.strip().lower()
+    if "." in s and not s.startswith("("):
+        parts = _split_top_level_dots_simple(s)
+        if len(parts) > 1 and parts[-1]:
+            s = parts[-1]
+            single3 = _strip_single_quoted_ident(s)
+            if single3 is not None:
+                return single3.strip().lower()
     return s.strip().lower()
 
 
@@ -90,17 +163,18 @@ class TableSchema:
         partial_ok: bool = False,
     ) -> Tuple[str, ...]:
         """Return existing index / PRIMARY KEY names whose leading columns cover `cols`."""
-        req = [_normalize_index_column_key(c) for c in cols if str(c).strip()]
+        known_cols = frozenset(c.lower() for c in self.columns)
+        req = [_normalize_index_column_key(c, known_cols) for c in cols if str(c).strip()]
         if not req:
             return ()
         matches: List[str] = []
-        pk_cols = [_normalize_index_column_key(c) for c in self.effective_pk_columns()]
+        pk_cols = [_normalize_index_column_key(c, known_cols) for c in self.effective_pk_columns()]
         if pk_cols and len(pk_cols) >= len(req) and pk_cols[: len(req)] == req:
             matches.append("PRIMARY KEY")
         for idx in self.indexes:
             if idx.where_clause and not partial_ok:
                 continue
-            idx_cols = [_normalize_index_column_key(c) for c in idx.columns]
+            idx_cols = [_normalize_index_column_key(c, known_cols) for c in idx.columns]
             if len(idx_cols) >= len(req) and idx_cols[: len(req)] == req:
                 if idx.name not in matches:
                     matches.append(idx.name)
@@ -441,13 +515,13 @@ class MaterializedViewPlan:
         stmts = []
         if self.dialect != Dialect.POSTGRES:
             for t_name in self.trigger_names:
-                stmts.append(build_drop_sql("TRIGGER", t_name, dialect=self.dialect))
+                stmts.append(build_drop_sql("TRIGGER", t_name, dialect=self.dialect, allow_qualified=False))
         for fn_name in self.function_names:
             stmts.append(f"DROP FUNCTION IF EXISTS {fn_name if '(' in fn_name else fn_name + '()'} CASCADE;")
         stmts.append(build_drop_sql("VIEW", self.view_name, dialect=self.dialect, allow_qualified=False))
-        stmts.append(build_drop_sql("TABLE", self.backing_table_name, dialect=self.dialect))
+        stmts.append(build_drop_sql("TABLE", self.backing_table_name, dialect=self.dialect, allow_qualified=False))
         for aux_t in self.auxiliary_table_names:
-            stmts.append(build_drop_sql("TABLE", aux_t, dialect=self.dialect))
+            stmts.append(build_drop_sql("TABLE", aux_t, dialect=self.dialect, allow_qualified=False))
         return stmts
 
     def render_sql_script(

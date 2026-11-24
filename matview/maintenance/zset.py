@@ -44,6 +44,7 @@ from ..sql_frontend import (
     _parse_single_create_view_stmt,
     _sanitize_ident,
     _split_top_level,
+    _strip_outer_ident_quotes,
     _unquote_ident,
     _unwrap_outer_parens,
     build_create_view_sql,
@@ -434,8 +435,8 @@ class Tier1ZSetMixin(MixinHost):
                     else self._q(bs.base_table)
                 )
                 u_parts.append(f"    SELECT {sel_aliased} FROM {from_tbl}{w_sql}")
-            pk_u = self._canonical_group_pk_expr(user_columns)
-            grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
+            pk_u = self._canonical_group_pk_expr(q_user_columns)
+            grp_u = ", ".join(self._group_by_exprs_for_query(q_user_columns, include_canonical_pk=True))
             initial_populate_sqls.append(
                 f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
                 f"SELECT {pk_u}, {', '.join(q_user_columns)}, COUNT(*) FROM (\n"
@@ -460,8 +461,8 @@ class Tier1ZSetMixin(MixinHost):
                 u_parts.append(
                     f"    SELECT {sel_aliased}, {b0} AS __mv_b0, {b1} AS __mv_b1 FROM {from_tbl}{w_sql}"
                 )
-            pk_u = self._canonical_group_pk_expr(user_columns)
-            grp_u = ", ".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))
+            pk_u = self._canonical_group_pk_expr(q_user_columns)
+            grp_u = ", ".join(self._group_by_exprs_for_query(q_user_columns, include_canonical_pk=True))
             initial_populate_sqls.append(
                 f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_cnt_0, __mv_cnt_1)\n"
                 f"SELECT {pk_u}, {', '.join(q_user_columns)}, SUM(__mv_b0), SUM(__mv_b1) FROM (\n"
@@ -931,14 +932,23 @@ class Tier1ZSetMixin(MixinHost):
             c_low = c_def.name.lower()
             matched_alias: Optional[str] = None
             for it in self.view.select_items:
-                raw_s = _unquote_ident(it.raw_expr.strip(), dialect=self.dialect).lower() if re.match(r'^[A-Za-z0-9_."`\[\]]+$', it.raw_expr.strip()) else ""
-                raw_full = it.raw_expr.strip().lower()
-                raw_parts = [p.strip().strip('"').strip('`').strip('[').strip(']').lower() for p in raw_full.split('.')]
+                raw_expr_s = it.raw_expr.strip()
+                raw_full = raw_expr_s.lower()
+                if _is_simple_column_expr(raw_expr_s, dialect=self.dialect):
+                    try:
+                        raw_parts = [
+                            _strip_outer_ident_quotes(p).lower()
+                            for p in _split_top_level(raw_expr_s, ".", dialect=self.dialect)
+                            if p.strip()
+                        ]
+                    except sqlglot.errors.SqlglotError:
+                        raw_parts = []
+                else:
+                    raw_parts = []
                 col_match = (
                     raw_full == c_low
                     or raw_full == f"{base_alias}.{c_low}"
                     or raw_full == f"{base_name}.{c_low}"
-                    or (raw_s == c_low and "." not in raw_full)
                     or (len(raw_parts) == 2 and raw_parts[0] in (base_alias, base_name) and raw_parts[1] == c_low)
                     or (len(raw_parts) == 1 and raw_parts[0] == c_low)
                 )

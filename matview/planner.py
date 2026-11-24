@@ -60,6 +60,7 @@ from .sql_frontend import (
     _parse_single_create_view_stmt,
     _sanitize_ident,
     _split_top_level,
+    _strip_outer_ident_quotes,
     _strip_sql_comments,
     _tokenize_sql,
     _unquote_ident,
@@ -418,7 +419,7 @@ class PlannerMixin(MixinHost):
             want = set(group_cols)
             candidates = [list(schema.effective_pk_columns())] + [list(idx.columns) for idx in schema.indexes if not idx.where_clause]
             for cols in candidates:
-                lead = [str(c).strip().strip('`"').lower() for c in cols[: len(want)]]
+                lead = [_strip_outer_ident_quotes(str(c)).lower() for c in cols[: len(want)]]
                 if len(lead) == len(want) and set(lead) == want:
                     covered = True
                     break
@@ -494,21 +495,26 @@ class PlannerMixin(MixinHost):
             return v
         base_alias = v.joins[0].alias.lower() if v.joins else v.base_table.lower()
         base_name = v.base_table.lower()
-        has_star = any(
-            it.raw_expr.strip() == "*"
-            or it.raw_expr.strip().lower() in (f"{base_alias}.*", f"{base_name}.*")
-            for it in v.select_items
-        )
+
+        def _is_base_star(raw_expr: str) -> bool:
+            rs = raw_expr.strip()
+            if rs == "*":
+                return True
+            if rs.endswith(".*"):
+                prefix = _strip_outer_ident_quotes(rs[:-2].strip()).lower()
+                return prefix in (base_alias, base_name)
+            return False
+
+        has_star = any(_is_base_star(it.raw_expr) for it in v.select_items)
         if not has_star:
             return v
         expanded: List[SelectItem] = []
         for it in v.select_items:
-            raw_s = it.raw_expr.strip()
-            if raw_s == "*" or raw_s.lower() in (f"{base_alias}.*", f"{base_name}.*"):
+            if _is_base_star(it.raw_expr):
                 for c_def in self.primary_schema.columns.values():
                     expanded.append(
                         SelectItem(
-                            raw_expr=c_def.name,
+                            raw_expr=self._q(c_def.name),
                             alias=c_def.name,
                             is_aggregate=False,
                             source_col=c_def.name,
@@ -516,13 +522,13 @@ class PlannerMixin(MixinHost):
                     )
             else:
                 expanded.append(it)
-        sel_str = ", ".join(f"{it.raw_expr} AS {it.alias}" for it in expanded)
+        sel_str = ", ".join(f"{it.raw_expr} AS {self._q(it.alias)}" for it in expanded)
         dist_kw = "DISTINCT " if v.has_top_level_distinct else ""
         from_j = v.joins[0]
         from_str = (
-            f"{from_j.table_name} AS {from_j.alias}"
+            f"{self._q(from_j.table_name)} AS {self._q(from_j.alias)}"
             if from_j.alias and from_j.alias.lower() != from_j.table_name.lower()
-            else from_j.table_name
+            else self._q(from_j.table_name)
         )
         rebuilt_sql = f"SELECT {dist_kw}{sel_str} FROM {from_str}"
         if v.where_clause:
@@ -1027,15 +1033,18 @@ class PlannerMixin(MixinHost):
                 ):
                     result_scale = self._mariadb_statistical_result_scale(it)
                     if 0 <= result_scale < self.MARIADB_NOT_FIXED_DEC:
-                        reader_exprs[it.alias] = f"ROUND({it.alias}, {result_scale}) AS {it.alias}"
+                        q_al = self._q(it.alias)
+                        reader_exprs[it.alias] = f"ROUND({q_al}, {result_scale}) AS {q_al}"
                     else:
                         reader_exprs[it.alias] = it.alias
                 elif self.dialect == Dialect.MYSQL and it.agg_func in (AggFunc.BIT_OR, AggFunc.BIT_XOR):
                     # Keep COALESCE's result type unsigned, matching MySQL's
                     # BIT_* aggregate contract (unsigned 64-bit integer).
-                    reader_exprs[it.alias] = f"COALESCE({it.alias}, CAST(0 AS UNSIGNED)) AS {it.alias}"
+                    q_al = self._q(it.alias)
+                    reader_exprs[it.alias] = f"COALESCE({q_al}, CAST(0 AS UNSIGNED)) AS {q_al}"
                 elif self.dialect == Dialect.MYSQL and it.agg_func == AggFunc.BIT_AND:
-                    reader_exprs[it.alias] = f"COALESCE({it.alias}, CAST(18446744073709551615 AS UNSIGNED)) AS {it.alias}"
+                    q_al = self._q(it.alias)
+                    reader_exprs[it.alias] = f"COALESCE({q_al}, CAST(18446744073709551615 AS UNSIGNED)) AS {q_al}"
                 else:
                     reader_exprs[it.alias] = it.alias
             else:
@@ -1056,14 +1065,43 @@ class PlannerMixin(MixinHost):
             )
             if ok_h:
                 # Also strip table qualifiers on group columns in HAVING if they match group aliases
+                qual_group_map: Dict[Tuple[str, str], str] = {}
                 for g_it in v.select_items:
                     if not g_it.is_aggregate and "." in g_it.raw_expr:
-                        rh = re.sub(
-                            rf"\b{re.escape(g_it.raw_expr.strip())}\b",
-                            g_it.alias,
-                            rh,
-                            flags=re.IGNORECASE,
-                        )
+                        g_parts = _split_top_level(g_it.raw_expr.strip(), ".", dialect=self.dialect)
+                        if len(g_parts) == 2:
+                            q_k = _strip_outer_ident_quotes(g_parts[0]).lower()
+                            c_k = _strip_outer_ident_quotes(g_parts[1]).lower()
+                            qual_group_map[(q_k, c_k)] = self._q(g_it.alias)
+                if qual_group_map:
+                    try:
+                        rh_toks = _tokenize_sql(rh, read=sg_d)
+                    except sqlglot.errors.SqlglotError:
+                        rh_toks = []
+                    if rh_toks:
+                        rh_parts: List[str] = []
+                        rh_cur = 0
+                        rh_i = 0
+                        while rh_i < len(rh_toks):
+                            if (
+                                rh_i + 2 < len(rh_toks)
+                                and _is_word_or_ident_token(rh_toks[rh_i])
+                                and rh_toks[rh_i + 1].token_type == SQLGlotTokenType.DOT
+                                and _is_word_or_ident_token(rh_toks[rh_i + 2])
+                            ):
+                                pair_k = (rh_toks[rh_i].text.lower(), rh_toks[rh_i + 2].text.lower())
+                                repl_al = qual_group_map.get(pair_k)
+                                if repl_al is not None:
+                                    if rh_toks[rh_i].start > rh_cur:
+                                        rh_parts.append(rh[rh_cur : rh_toks[rh_i].start])
+                                    rh_parts.append(repl_al)
+                                    rh_cur = rh_toks[rh_i + 2].end + 1
+                                    rh_i += 3
+                                    continue
+                            rh_i += 1
+                        if rh_cur < len(rh):
+                            rh_parts.append(rh[rh_cur:])
+                        rh = "".join(rh_parts)
                 rewritten_having = rh
             else:
                 all_ok = False
@@ -1087,9 +1125,10 @@ class PlannerMixin(MixinHost):
                 if 0 <= pos < len(self.view.select_items):
                     resolved.append(self.view.select_items[pos].raw_expr.strip())
                     continue
-            if gs.lower() in alias_to_raw:
+            gs_unq_low = _strip_outer_ident_quotes(gs).lower()
+            if gs_unq_low in alias_to_raw:
                 # Check if gs is an alias for an expression rather than a base column
-                raw_e = alias_to_raw[gs.lower()]
+                raw_e = alias_to_raw[gs_unq_low]
                 if self._lookup_col_def(gs) is None and raw_e.lower() != gs.lower():
                     resolved.append(raw_e)
                     continue
@@ -1566,7 +1605,42 @@ class PlannerMixin(MixinHost):
             return cols
         return [item.alias for item in self.view.select_items]
 
+    def _parse_user_index_col_info(
+        self, col_spec: str, exposed_lower: Optional[Set[str]] = None
+    ) -> Tuple[Optional[str], List[str], Optional[sqlglot_exp.Expr]]:
+        """Parse a user index key spec via sqlglot AST.
+
+        Returns ``(simple_col_name, referenced_col_names, parsed_ast)`` where
+        ``simple_col_name`` is non-None when the key targets a single column
+        (with optional COLLATE / ASC / DESC / NULLS FIRST|LAST) and None for
+        expression keys.
+        """
+        from .sql_frontend import _parse_index_col_ast
+
+        s = col_spec.strip()
+        if not s:
+            return None, [], None
+        if exposed_lower is not None and s.lower() in exposed_lower:
+            return s, [s], sqlglot_exp.Column(this=sqlglot_exp.to_identifier(s, quoted=True))
+        try:
+            parsed = _parse_index_col_ast(s, self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None, [], None
+        inner = parsed
+        while isinstance(inner, (sqlglot_exp.Ordered, sqlglot_exp.Collate, sqlglot_exp.Paren)) and inner.this is not None:
+            inner = inner.this
+        if isinstance(inner, sqlglot_exp.Column) and inner.name and not inner.table:
+            return inner.name, [inner.name], parsed
+        refs = [c.name for c in inner.find_all(sqlglot_exp.Column) if c.name and not c.table]
+        return None, refs, parsed
+
     def _extract_index_col_base_ident(self, col_spec: str) -> str:
+        exposed_lower = {c.lower() for c in self._exposed_view_columns()}
+        simple_col, refs, _ = self._parse_user_index_col_info(col_spec, exposed_lower)
+        if simple_col is not None:
+            return simple_col
+        if refs:
+            return refs[0]
         cleaned = re.sub(
             r"\b(?:ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST|COLLATE\s+[A-Za-z0-9_.\"'`]+)\b",
             "",
@@ -1580,12 +1654,6 @@ class PlannerMixin(MixinHost):
             return
         exposed = self._exposed_view_columns()
         exposed_lower = {c.lower() for c in exposed}
-        sql_kw = {
-            "asc", "desc", "nulls", "first", "last", "collate", "nocase", "binary",
-            "rtrim", "and", "or", "not", "is", "null", "true", "false", "in",
-            "between", "like", "case", "when", "then", "else", "end", "cast", "as",
-            "int", "integer", "text", "real", "double", "precision", "varchar", "char",
-        } | {f.lower() for f in _SQL_EXPR_FUNCTIONS}
 
         for idx_spec in self.user_indexes:
             if idx_spec.target_view is not None:
@@ -1604,37 +1672,30 @@ class PlannerMixin(MixinHost):
             if not idx_spec.columns:
                 raise ValueError(f"Index on view '{self.logical_view_name}' must specify at least one column.")
             for col_spec in idx_spec.columns:
-                base_expr = re.sub(
-                    r"\b(?:ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST|COLLATE\s+[A-Za-z0-9_.\"'`]+)\b",
-                    "",
-                    col_spec,
-                    flags=re.IGNORECASE,
-                ).strip()
-                if re.match(r"^[A-Za-z0-9_\"`\[\]]+$", base_expr):
-                    c_ident = _unquote_ident(base_expr, dialect=self.dialect)
-                    if c_ident.lower() not in exposed_lower:
+                simple_col, referenced_cols, parsed = self._parse_user_index_col_info(col_spec, exposed_lower)
+                if simple_col is not None:
+                    if simple_col.lower() not in exposed_lower:
                         raise ValueError(
                             f"Index on view '{self.logical_view_name}' references unknown column "
-                            f"{c_ident!r}. Available view columns: {exposed}"
+                            f"{simple_col!r}. Available view columns: {exposed}"
                         )
-                else:
-                    no_str = re.sub(r"'(?:''|[^'])*'", "''", base_expr)
-                    referenced_cols: List[str] = []
-                    for m_id in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()", no_str):
-                        tok = m_id.group(1)
-                        if tok.lower() in sql_kw:
-                            continue
-                        if tok.lower() not in exposed_lower:
-                            raise ValueError(
-                                f"Index expression {col_spec!r} on view '{self.logical_view_name}' "
-                                f"references unknown column {tok!r}. Available view columns: {exposed}"
-                            )
-                        referenced_cols.append(tok)
-                    if not referenced_cols:
+                    continue
+                if parsed is None:
+                    raise ValueError(
+                        f"Index expression {col_spec!r} on view '{self.logical_view_name}' "
+                        f"could not be parsed. Available view columns: {exposed}"
+                    )
+                for col_ref in referenced_cols:
+                    if col_ref.lower() not in exposed_lower:
                         raise ValueError(
                             f"Index expression {col_spec!r} on view '{self.logical_view_name}' "
-                            f"does not reference any view column. Available view columns: {exposed}"
+                            f"references unknown column {col_ref!r}. Available view columns: {exposed}"
                         )
+                if not referenced_cols:
+                    raise ValueError(
+                        f"Index expression {col_spec!r} on view '{self.logical_view_name}' "
+                        f"does not reference any view column. Available view columns: {exposed}"
+                    )
 
     def _indexed_column_names_lower(self, auto_group_cols: Sequence[str] = ()) -> Set[str]:
         out: Set[str] = {c.lower() for c in auto_group_cols}
@@ -1678,6 +1739,7 @@ class PlannerMixin(MixinHost):
                             aux_tbl,
                             [self._q(g_col)],
                             dialect=self.dialect,
+                            allow_qualified=False,
                         )
                     )
                     names.append(g_idx_name)
@@ -1696,6 +1758,7 @@ class PlannerMixin(MixinHost):
                         aux_tbl,
                         [self._q(val_col)],
                         dialect=self.dialect,
+                        allow_qualified=False,
                     )
                 )
                 names.append(v_idx_name)
@@ -1839,6 +1902,7 @@ class PlannerMixin(MixinHost):
                     dialect=self.dialect,
                     unique=use_nnd,
                     nulls_not_distinct=use_nnd,
+                    allow_qualified=False,
                 )
             )
             names.append(idx_name)
@@ -1848,7 +1912,13 @@ class PlannerMixin(MixinHost):
                 sub_idx_name = self._bounded_ident(f"{p}idx_", f"{log_vname}__{_sanitize_ident(g_col)}", f"__g{g_idx}")
                 if sub_idx_name not in names:
                     ddls.append(
-                        build_create_index_sql(sub_idx_name, mv_table, [self._q(g_col)], dialect=self.dialect)
+                        build_create_index_sql(
+                            sub_idx_name,
+                            mv_table,
+                            [self._q(g_col)],
+                            dialect=self.dialect,
+                            allow_qualified=False,
+                        )
                     )
                     names.append(sub_idx_name)
                     covered_leading_low.add(g_col.lower())
@@ -1869,9 +1939,55 @@ class PlannerMixin(MixinHost):
                         mv_table,
                         [self._q(extra_col)],
                         dialect=self.dialect,
+                        allow_qualified=False,
                     )
                 )
                 names.append(extra_idx_name)
+
+        exposed_lower = {c.lower() for c in self._exposed_view_columns()}
+        backing_map_lower = {k.lower(): v for k, v in (backing_col_map or {}).items()}
+        sg_d = _sqlglot_dialect(self.dialect)
+
+        def _rewrite_index_ast_cols(node: sqlglot_exp.Expr) -> sqlglot_exp.Expr:
+            if not backing_map_lower:
+                return node
+            copied = node.copy()
+            if isinstance(copied, sqlglot_exp.Column) and copied.name and not copied.table:
+                mapped_root = backing_map_lower.get(copied.name.lower())
+                if mapped_root is not None:
+                    return parse_sql_ast(mapped_root, dialect=self.dialect)
+            for col_n in list(copied.find_all(sqlglot_exp.Column)):
+                if col_n is copied:
+                    continue
+                if col_n.name and not col_n.table and col_n.name.lower() in backing_map_lower:
+                    repl_expr = parse_sql_ast(backing_map_lower[col_n.name.lower()], dialect=self.dialect)
+                    col_n.replace(repl_expr)
+            return copied
+
+        def _explicit_nulls_clause(sql_frag: str) -> str:
+            if self.dialect == Dialect.MYSQL:
+                return ""
+            try:
+                toks = _tokenize_sql(sql_frag, read=sg_d)
+            except sqlglot.errors.SqlglotError:
+                return ""
+            depth = 0
+            for idx_t, tk in enumerate(toks):
+                if tk.token_type == SQLGlotTokenType.L_PAREN:
+                    depth += 1
+                elif tk.token_type == SQLGlotTokenType.R_PAREN and depth > 0:
+                    depth -= 1
+                elif (
+                    depth == 0
+                    and tk.token_type != SQLGlotTokenType.IDENTIFIER
+                    and tk.text.upper() == "NULLS"
+                    and idx_t + 1 < len(toks)
+                    and toks[idx_t + 1].token_type != SQLGlotTokenType.IDENTIFIER
+                ):
+                    nxt = toks[idx_t + 1].text.upper()
+                    if nxt in ("FIRST", "LAST"):
+                        return f" NULLS {nxt}"
+            return ""
 
         for i, idx_spec in enumerate(self.user_indexes, 1):
             if idx_spec.name:
@@ -1880,6 +1996,7 @@ class PlannerMixin(MixinHost):
                     idx_name = f"{self.object_prefix}{raw_n}"
                 else:
                     idx_name = raw_n
+                idx_name = self._bound_user_index_name(idx_name)
             else:
                 col_tag = "_".join(_sanitize_ident(self._extract_index_col_base_ident(c)) for c in idx_spec.columns)
                 idx_name = self._bounded_ident(f"{p}idx_", f"{log_vname}__{col_tag}", f"_{i}")
@@ -1887,43 +2004,62 @@ class PlannerMixin(MixinHost):
             mapped_cols: List[str] = []
             for col_spec in idx_spec.columns:
                 c_mod = col_spec.strip()
-                if backing_col_map:
-                    for u_col, b_expr in backing_col_map.items():
-                        c_mod = re.sub(rf"\b{re.escape(u_col)}\b", b_expr, c_mod, flags=re.IGNORECASE)
-                m_ident = re.match(
-                    r"^((?:\"[^\"]+\"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*))"
-                    r"(\s+COLLATE\s+\S+)?"
-                    r"(\s+(?:ASC|DESC))?"
-                    r"(\s+NULLS\s+(?:FIRST|LAST))?$",
-                    c_mod,
-                    flags=re.IGNORECASE,
-                )
-                if m_ident:
-                    q_col = self._q(m_ident.group(1))
-                    collate_s = m_ident.group(2) or ""
-                    dir_s = m_ident.group(3) or ""
-                    nulls_s = m_ident.group(4) or ""
-                    if self.dialect == Dialect.MYSQL:
-                        c_mod = f"{q_col}{collate_s}{dir_s}"
-                    else:
-                        c_mod = f"{q_col}{collate_s}{dir_s}{nulls_s}"
+                if c_mod.lower() in exposed_lower:
+                    c_mod = quote_sql_identifier(c_mod, self.dialect, allow_qualified=False)
+                explicit_nulls = _explicit_nulls_clause(c_mod)
+                simple_col, _, parsed_col = self._parse_user_index_col_info(c_mod, exposed_lower)
+                if parsed_col is not None and backing_map_lower:
+                    parsed_col = _rewrite_index_ast_cols(parsed_col)
+                    c_mod = parsed_col.sql(dialect=sg_d)
+                    simple_col, _, parsed_col = self._parse_user_index_col_info(c_mod, None)
+                if parsed_col is not None and simple_col is not None:
+                    ord_node = parsed_col if isinstance(parsed_col, sqlglot_exp.Ordered) else None
+                    inner_node = ord_node.this if ord_node is not None else parsed_col
+                    while isinstance(inner_node, sqlglot_exp.Paren) and inner_node.this is not None:
+                        inner_node = inner_node.this
+                    collate_s = ""
+                    if isinstance(inner_node, sqlglot_exp.Collate) and inner_node.expression is not None:
+                        collate_s = f" COLLATE {inner_node.expression.sql(dialect=sg_d)}"
+                    dir_s = ""
+                    nulls_s = ""
+                    if ord_node is not None:
+                        desc_val = ord_node.args.get("desc")
+                        if desc_val is True:
+                            dir_s = " DESC"
+                        elif desc_val is False:
+                            dir_s = " ASC"
+                        nulls_s = explicit_nulls
+                    q_col = quote_sql_identifier(simple_col, self.dialect, allow_qualified=False)
+                    c_mod = f"{q_col}{collate_s}{dir_s}{nulls_s}"
                 elif self.dialect == Dialect.MYSQL:
-                    c_mod = re.sub(r"\bNULLS\s+(?:FIRST|LAST)\b", "", c_mod, flags=re.IGNORECASE).strip()
-                    m_dir = re.search(r"\s+(ASC|DESC)\s*$", c_mod, flags=re.IGNORECASE)
-                    dir_s = f" {m_dir.group(1).upper()}" if m_dir else ""
-                    expr_part = c_mod[: m_dir.start()].strip() if m_dir else c_mod
-                    if not (expr_part.startswith("((") and expr_part.endswith("))")):
-                        c_mod = f"(({expr_part})){dir_s}"
+                    ord_node = parsed_col if isinstance(parsed_col, sqlglot_exp.Ordered) else None
+                    if ord_node is not None and ord_node.this is not None:
+                        desc_val = ord_node.args.get("desc")
+                        dir_s = " DESC" if desc_val is True else (" ASC" if desc_val is False else "")
+                        expr_part = ord_node.this.sql(dialect=sg_d).strip()
+                    else:
+                        dir_s = ""
+                        expr_part = c_mod
+                    inner1 = _unwrap_outer_parens(expr_part)
+                    has_double = inner1 != expr_part and _unwrap_outer_parens(inner1) != inner1
+                    if not has_double:
+                        c_mod = f"(({inner1})){dir_s}"
+                    else:
+                        c_mod = f"{expr_part}{dir_s}"
                 elif self.dialect in (Dialect.SQLITE, Dialect.POSTGRES):
-                    m_tail = re.search(
-                        r"(\s+(?:ASC|DESC))?(\s+NULLS\s+(?:FIRST|LAST))?\s*$",
-                        c_mod,
-                        flags=re.IGNORECASE,
-                    )
-                    tail_s = m_tail.group(0) if m_tail else ""
-                    expr_part = c_mod[: len(c_mod) - len(tail_s)].strip()
-                    if not (expr_part.startswith("(") and expr_part.endswith(")")):
+                    ord_node = parsed_col if isinstance(parsed_col, sqlglot_exp.Ordered) else None
+                    if ord_node is not None and ord_node.this is not None:
+                        desc_val = ord_node.args.get("desc")
+                        dir_s = " DESC" if desc_val is True else (" ASC" if desc_val is False else "")
+                        tail_s = f"{dir_s}{explicit_nulls}"
+                        expr_part = ord_node.this.sql(dialect=sg_d).strip()
+                    else:
+                        tail_s = ""
+                        expr_part = c_mod
+                    if _unwrap_outer_parens(expr_part) == expr_part:
                         c_mod = f"({expr_part}){tail_s}"
+                    else:
+                        c_mod = f"{expr_part}{tail_s}"
                 mapped_cols.append(c_mod)
 
             using_method = (
@@ -1934,9 +2070,13 @@ class PlannerMixin(MixinHost):
             where_clause = None
             if idx_spec.where_clause and self.dialect in (Dialect.SQLITE, Dialect.POSTGRES):
                 w_mod = idx_spec.where_clause
-                if backing_col_map:
-                    for u_col, b_expr in backing_col_map.items():
-                        w_mod = re.sub(rf"\b{re.escape(u_col)}\b", b_expr, w_mod, flags=re.IGNORECASE)
+                if backing_map_lower:
+                    try:
+                        w_ast = _rewrite_index_ast_cols(parse_sql_ast(w_mod, dialect=self.dialect))
+                        w_mod = w_ast.sql(dialect=sg_d)
+                    except sqlglot.errors.SqlglotError:
+                        for u_col, b_expr in backing_col_map.items() if backing_col_map else ():
+                            w_mod = re.sub(rf"\b{re.escape(u_col)}\b", b_expr, w_mod, flags=re.IGNORECASE)
                 where_clause = w_mod
 
             ddls.append(
@@ -1948,6 +2088,7 @@ class PlannerMixin(MixinHost):
                     unique=idx_spec.unique,
                     using_method=using_method,
                     where_clause=where_clause,
+                    allow_qualified=False,
                 )
             )
             names.append(idx_name)
@@ -2294,6 +2435,7 @@ class PlannerMixin(MixinHost):
                 ts.name,
                 [self._q(c) for c in cols],
                 dialect=self.dialect,
+                allow_qualified=False,
             )
             rec_ddls.append(ddl)
             rec_meta.append(

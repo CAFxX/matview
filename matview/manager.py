@@ -52,6 +52,7 @@ from .logical_ir import (
 from .sql_frontend import (
     _extract_created_object,
     _split_top_level,
+    _strip_outer_ident_quotes,
     _strip_sql_comments,
     build_alter_rename_table_sql,
     build_create_view_sql,
@@ -182,10 +183,13 @@ def _postgres_ident_sort_key(part: Any) -> Optional[str]:
 
 
 def _quote_postgres_fallback_table(ref_t: str) -> Tuple[Tuple[str, str, str], str]:
-    """Quote a fallback table reference (possibly schema-qualified) for PostgreSQL
-    and return ``((table_key, schema_key, catalog_key), sql_ref)``."""
-    parts = [p.strip() for p in ref_t.split(".") if p.strip()]
-    quoted_parts = [quote_sql_identifier(p, Dialect.POSTGRES) for p in parts]
+    """Quote a fallback table reference (possibly schema-qualified or containing
+    literal dots) for PostgreSQL and return ``((table_key, schema_key, catalog_key), sql_ref)``."""
+    try:
+        parts = [p.strip() for p in _split_top_level(ref_t, ".", dialect=Dialect.POSTGRES) if p.strip()]
+    except sqlglot.errors.SqlglotError:
+        parts = [ref_t.strip()] if ref_t.strip() else []
+    quoted_parts = [quote_sql_identifier(p, Dialect.POSTGRES, allow_qualified=False) for p in parts]
     raw_keys = [
         p[1:-1].replace('""', '"') if len(p) >= 2 and p[0] == '"' and p[-1] == '"' else p.lower()
         for p in parts
@@ -915,7 +919,7 @@ class MaterializedViewManager:
                     plain_views=plain_views,
                     current_schema=cur_schema,
                 )
-                referenced = {r.lower().split(".")[-1].strip('`"') for s in specs for r in s.referenced_tables}
+                referenced = {_strip_outer_ident_quotes(r).lower() for s in specs for r in s.referenced_tables}
                 referenced.update(pv_name.lower() for s in specs for pv_name, _ in s.referenced_plain_views)
             except Exception:
                 affected.append(name)
@@ -1106,15 +1110,24 @@ class MaterializedViewManager:
     def _serialize_view_sql_with_indexes(plan: MaterializedViewPlan, raw_view_sql: Optional[str] = None) -> str:
         q_vname = quote_sql_identifier(plan.logical_view_name, plan.dialect, allow_qualified=False)
         src_select = plan.view_spec.original_select_sql or plan.view_spec.raw_select_sql
+        exposed_low = {c.lower() for c in plan.user_columns if c} | {
+            it.alias.lower() for it in plan.view_spec.select_items if it.alias
+        }
         parts = [f"CREATE VIEW {q_vname} AS {src_select.strip().rstrip(';')};"]
         for idx_spec in plan.user_indexes:
             u_kw = "UNIQUE " if idx_spec.unique else ""
             n_str = f"{quote_sql_identifier(idx_spec.name, plan.dialect, allow_qualified=False)} " if idx_spec.name else ""
             using_str = f" USING {idx_spec.using_method}" if idx_spec.using_method else ""
             w_str = f" WHERE {idx_spec.where_clause}" if idx_spec.where_clause else ""
+            ser_cols = [
+                quote_sql_identifier(c, plan.dialect, allow_qualified=False)
+                if c.strip().lower() in exposed_low
+                else c
+                for c in idx_spec.columns
+            ]
             parts.append(
                 f"CREATE {u_kw}INDEX {n_str}ON {q_vname}{using_str} "
-                f"({', '.join(idx_spec.columns)}){w_str};"
+                f"({', '.join(ser_cols)}){w_str};"
             )
         return "\n".join(parts)
 
@@ -1166,7 +1179,7 @@ class MaterializedViewManager:
         """Drop one registered generation (objects and catalog row) without committing."""
         for t_name in entry["trigger_names"]:
             if self.dialect != Dialect.POSTGRES:
-                cur.execute(build_drop_sql("TRIGGER", t_name, dialect=self.dialect))
+                cur.execute(build_drop_sql("TRIGGER", t_name, dialect=self.dialect, allow_qualified=False))
         for fn_name in entry["function_names"]:
             cur.execute(f"DROP FUNCTION IF EXISTS {fn_name if '(' in fn_name else fn_name + '()'} CASCADE;")
         if self.dialect == Dialect.POSTGRES:
@@ -1196,9 +1209,9 @@ class MaterializedViewManager:
                     "END LOOP; END $mv_drop$;"
                 )
         cur.execute(build_drop_sql("VIEW", resolved_name, dialect=self.dialect, allow_qualified=False))
-        cur.execute(build_drop_sql("TABLE", entry["backing_table"], dialect=self.dialect))
+        cur.execute(build_drop_sql("TABLE", entry["backing_table"], dialect=self.dialect, allow_qualified=False))
         for aux_t in entry["aux_tables"]:
-            cur.execute(build_drop_sql("TABLE", aux_t, dialect=self.dialect))
+            cur.execute(build_drop_sql("TABLE", aux_t, dialect=self.dialect, allow_qualified=False))
         if self.dialect == Dialect.SQLITE and self.engine_version.supports_sqlite_returning:
             self._execute_param(
                 cur,
@@ -1932,8 +1945,8 @@ class MaterializedViewManager:
 
         batches_run = 0
         if spec.mode == "pk_range_fold" and spec.pk_column:
-            base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect)
-            pk_col = quote_sql_identifier(spec.pk_column, self.dialect)
+            base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect, allow_qualified=False)
+            pk_col = quote_sql_identifier(spec.pk_column, self.dialect, allow_qualified=False)
             if not snapshot_isolation:
                 bounds = self._claim_non_snapshot_pk_range(cur, plan, base_t, pk_col)
                 if bounds is None:
@@ -2925,7 +2938,7 @@ class MaterializedViewManager:
     )
     _SQLITE_TRIGGER_WRITE_RE = re.compile(
         r"\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE(?:\s+OR\s+\w+)?|DELETE\s+FROM)\s+"
-        r"(?:(?:main|\"main\")\s*\.\s*)?[\"`\[]?([^\s\"`\]\(.;]+)",
+        r'(?:(?:main|"main")\s*\.\s*)?("(?:""|[^"])+"|`(?:``|[^`])+`|\[[^\]]+\]|[^\s"`\]\(.;]+)',
         flags=re.IGNORECASE,
     )
     _SQLITE_RAISE_SKIP_RE = re.compile(r"\bRAISE\s*\(\s*(?:FAIL|IGNORE)\b", flags=re.IGNORECASE)
@@ -2981,7 +2994,7 @@ class MaterializedViewManager:
             if str(t_name).lower() in maint_names:
                 maint[str(t_name).lower()] = (int(rowid), str(tbl).lower(), event)
                 continue
-            writes = {m.group(1).lower() for m in self._SQLITE_TRIGGER_WRITE_RE.finditer(body)}
+            writes = {_strip_outer_ident_quotes(m.group(1)).lower() for m in self._SQLITE_TRIGGER_WRITE_RE.finditer(body)}
             effects_on.setdefault(str(tbl).lower(), []).append(
                 (writes, bool(self._SQLITE_RAISE_SKIP_RE.search(body))))
             if timing == "AFTER":
@@ -2994,7 +3007,7 @@ class MaterializedViewManager:
             writes a source table or raises FAIL/IGNORE. Bounded depth."""
             if self._SQLITE_RAISE_SKIP_RE.search(body):
                 return True
-            frontier = {m.group(1).lower() for m in self._SQLITE_TRIGGER_WRITE_RE.finditer(body)}
+            frontier = {_strip_outer_ident_quotes(m.group(1)).lower() for m in self._SQLITE_TRIGGER_WRITE_RE.finditer(body)}
             seen: Set[str] = set()
             for _ in range(16):
                 if frontier & source_tables:
@@ -3024,8 +3037,9 @@ class MaterializedViewManager:
                     break
         return out
 
+    _MYSQL_IDENT_PAT = r"(?:`(?:``|[^`])+`|[A-Za-z0-9_$]+)"
     _MYSQL_AFTER_TRIGGER_RE = re.compile(
-        r"^\s*CREATE\s+TRIGGER\s+(\S+)\s+AFTER\s+(INSERT|UPDATE|DELETE)\s+ON\s+(\S+)\s+FOR\s+EACH\s+ROW\b",
+        r"^\s*CREATE\s+TRIGGER\s+(" + _MYSQL_IDENT_PAT + r")\s+AFTER\s+(INSERT|UPDATE|DELETE)\s+ON\s+(" + _MYSQL_IDENT_PAT + r")\s+FOR\s+EACH\s+ROW\b",
         flags=re.IGNORECASE,
     )
 
@@ -3042,7 +3056,7 @@ class MaterializedViewManager:
         m = self._MYSQL_AFTER_TRIGGER_RE.match(stmt)
         if not m:
             return stmt
-        table = m.group(3).strip("`")
+        table = _strip_outer_ident_quotes(m.group(3))
         own = {str(n).lower() for n in own_names}
         self._execute_param(
             cur,
@@ -3061,7 +3075,7 @@ class MaterializedViewManager:
     _BODY_WRITE_RE = re.compile(
         r"\b(?:INSERT(?:\s+(?:IGNORE|OR\s+\w+))?\s+INTO|REPLACE\s+INTO|MERGE\s+INTO|"
         r"UPDATE(?:\s+(?:IGNORE|OR\s+\w+))?|DELETE\s+FROM)\s+"
-        r"(?:[\"`]?\w+[\"`]?\s*\.\s*)?[\"`]?(\w+)",
+        r'(?:(?:"(?:""|[^"])+"|`(?:``|[^`])+`|\w+)\s*\.\s*)?("(?:""|[^"])+"|`(?:``|[^`])+`|\w+)',
         flags=re.IGNORECASE,
     )
 
@@ -3105,7 +3119,7 @@ class MaterializedViewManager:
             for n, tname, evs, order, body, after in trigs:
                 if n.lower() in maint_names or not after:
                     continue
-                writes = {m.group(1).lower() for m in self._BODY_WRITE_RE.finditer(body)}
+                writes = {_strip_outer_ident_quotes(m.group(1)).lower() for m in self._BODY_WRITE_RE.finditer(body)}
                 if not (writes & (sources - {tname})):
                     continue
                 if any(m_t == tname and (m_ev & evs) and order < m_order for _, m_t, m_ev, m_order, _, _ in mine):
@@ -3827,7 +3841,7 @@ class MaterializedViewManager:
             old_tables = [old_tbl]
             for aux_t in plan.auxiliary_table_names:
                 old_tables.append(self._old_name(aux_t))
-            sqls.append(build_drop_sql("TABLE", old_tables, dialect=self.dialect))
+            sqls.append(build_drop_sql("TABLE", old_tables, dialect=self.dialect, allow_qualified=False))
 
             rename_pairs = [
                 f"{plan.backing_table_name} TO {old_tbl}",
@@ -3842,14 +3856,14 @@ class MaterializedViewManager:
             if plan.reader_view_ddl:
                 sqls.append(self._make_replace_view_ddl(plan.reader_view_ddl))
 
-            sqls.append(build_drop_sql("TABLE", old_tables, dialect=self.dialect))
+            sqls.append(build_drop_sql("TABLE", old_tables, dialect=self.dialect, allow_qualified=False))
 
         else:  # SQLite and generic fallback
             sqls.append(build_drop_sql("VIEW", plan.view_name, dialect=self.dialect, allow_qualified=False))
-            sqls.append(build_drop_sql("TABLE", plan.backing_table_name, dialect=self.dialect))
+            sqls.append(build_drop_sql("TABLE", plan.backing_table_name, dialect=self.dialect, allow_qualified=False))
             sqls.append(build_alter_rename_table_sql(shadow_tbl, plan.backing_table_name, dialect=self.dialect))
             for aux_t, s_aux in shadow_aux_map.items():
-                sqls.append(build_drop_sql("TABLE", aux_t, dialect=self.dialect))
+                sqls.append(build_drop_sql("TABLE", aux_t, dialect=self.dialect, allow_qualified=False))
                 sqls.append(build_alter_rename_table_sql(s_aux, aux_t, dialect=self.dialect))
             if plan.reader_view_ddl:
                 sqls.append(plan.reader_view_ddl)

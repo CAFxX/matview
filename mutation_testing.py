@@ -364,6 +364,56 @@ MUTANTS = (
             "test_postgres_registration_expr_type_probing_complex_shapes_codegen"
         ),
     ),
+    Mutant(
+        name="dotted-base-table-q-splits-known-ident",
+        source_path="matview/dialects/base.py",
+        original="        if \".\" in s and self._is_known_single_ident(s):",
+        replacement="        if False and \".\" in s and self._is_known_single_ident(s):",
+        target_test=(
+            "test_p1_sqlglot_builders.TestSqlglotExpBuilders."
+            "test_dotted_base_tables_and_special_char_user_indexes"
+        ),
+    ),
+    Mutant(
+        name="backfill-dotted-table-splits-qualified",
+        source_path="matview/manager.py",
+        original="            base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect, allow_qualified=False)",
+        replacement="            base_t = quote_sql_identifier(plan.view_spec.base_table, self.dialect)",
+        target_test=(
+            "test_p1_sqlglot_builders.TestSqlglotExpBuilders."
+            "test_dotted_base_tables_and_special_char_user_indexes"
+        ),
+    ),
+    Mutant(
+        name="user-index-backing-col-map-drops-special-alias",
+        source_path="matview/maintenance/single.py",
+        original="                r'\\s+AS\\s+(?:\"(?:\"\"|[^\"])+\"|`(?:``|[^`])+`|\\[[^\\]]+\\]|[A-Za-z0-9_]+)\\s*$',",
+        replacement="                r'\\s+AS\\s+[A-Za-z0-9_\"`\\[\\]]+\\s*$',",
+        target_test=(
+            "test_p1_sqlglot_builders.TestSqlglotExpBuilders."
+            "test_dotted_base_tables_and_special_char_user_indexes"
+        ),
+    ),
+    Mutant(
+        name="user-index-bare-compound-root-replace",
+        source_path="matview/planner.py",
+        original="            if isinstance(copied, sqlglot_exp.Column) and copied.name and not copied.table:",
+        replacement="            if False and isinstance(copied, sqlglot_exp.Column) and copied.name and not copied.table:",
+        target_test=(
+            "test_p1_sqlglot_builders.TestSqlglotExpBuilders."
+            "test_dotted_base_tables_and_special_char_user_indexes"
+        ),
+    ),
+    Mutant(
+        name="zset-union-populate-unquoted-cols",
+        source_path="matview/maintenance/zset.py",
+        original="            pk_u = self._canonical_group_pk_expr(q_user_columns)\n            grp_u = \", \".join(self._group_by_exprs_for_query(q_user_columns, include_canonical_pk=True))\n            initial_populate_sqls.append(\n                f\"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\\n\"",
+        replacement="            pk_u = self._canonical_group_pk_expr(user_columns)\n            grp_u = \", \".join(self._group_by_exprs_for_query(user_columns, include_canonical_pk=True))\n            initial_populate_sqls.append(\n                f\"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\\n\"",
+        target_test=(
+            "test_p1_sqlglot_builders.TestSqlglotExpBuilders."
+            "test_dotted_base_tables_and_special_char_user_indexes"
+        ),
+    ),
 )
 
 

@@ -573,7 +573,9 @@ class PgStatementMaintenanceMixin(MixinHost):
                 continue
             if tk.start > cursor:
                 out.append(expr[cursor : tk.start])
-            out.append(f"{record_prefix}.{quote_sql_identifier(actual_c, dialect=Dialect.POSTGRES, force=True)}")
+            out.append(
+                f"{record_prefix}.{quote_sql_identifier(actual_c, dialect=Dialect.POSTGRES, force=True, allow_qualified=False)}"
+            )
             cursor = tk.end + 1
         if cursor < len(expr):
             out.append(expr[cursor:])
@@ -619,7 +621,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         def _select_list(rec: str) -> str:
             items: List[str] = []
             for c_def in ts.columns.values():
-                q_c = quote_sql_identifier(c_def.name, dialect=Dialect.POSTGRES, force=True)
+                q_c = quote_sql_identifier(c_def.name, dialect=Dialect.POSTGRES, force=True, allow_qualified=False)
                 if not c_def.generated_virtual:
                     items.append(f"{rec}.{q_c} AS {q_c}")
                     continue

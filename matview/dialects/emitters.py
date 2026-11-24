@@ -65,7 +65,7 @@ class DialectEmitMixin(MixinHost):
         )
 
         if repeat_count_col:
-            q_mv_table = _ast_table_expr(mv_table, self.dialect).sql(dialect=sg_d)
+            q_mv_table = _ast_table_expr(mv_table, self.dialect, allow_qualified=False).sql(dialect=sg_d)
             q_rep = self._q(repeat_count_col)
             qual_proj = (
                 [
@@ -206,9 +206,9 @@ class DialectEmitMixin(MixinHost):
             q_cond_pk = f"{q_table_ref}.{q_pk_col}" if is_base_aliased else q_pk_col
             from_join_target = f"{q_base_t} AS {self._q(base_alias)}" if is_base_aliased else q_base_t
             from_base_pat = (
-                rf"\nFROM\s+{re.escape(q_base_t)}(?:\s+AS\s+{re.escape(self._q(base_alias))})?\b"
+                rf"\nFROM\s+{re.escape(q_base_t)}(?:\s+AS\s+{re.escape(self._q(base_alias))})?(?=$|\s|[,;)])"
                 if is_base_aliased
-                else rf"\nFROM\s+{re.escape(q_base_t)}\b"
+                else rf"\nFROM\s+{re.escape(q_base_t)}(?=$|\s|[,;)])"
             )
 
             def _bound_follow_up_templates() -> List[str]:
@@ -231,7 +231,9 @@ class DialectEmitMixin(MixinHost):
                             bound = bound.replace("__mv_p.lo", "__mv_cur_pk").replace("__mv_p.hi", "__mv_top_pk")
                             # Single-table UPDATE now: unqualified SET targets.
                             bound = re.sub(
-                                r"(\bSET\s+|,\n\s+)[`\w]+\.([`\w]+ = \(SELECT\b)", r"\1\2", bound
+                                r"(\bSET\s+|,\n\s+)(?:`(?:``|[^`])+`|\w+)\.((?:`(?:``|[^`])+`|\w+) = \(SELECT\b)",
+                                r"\1\2",
+                                bound,
                             )
                     for var in ("__mv_cur_pk", "__mv_top_pk"):
                         bound = bound.replace("%s", var, 1)

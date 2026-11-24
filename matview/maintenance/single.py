@@ -41,10 +41,12 @@ from ..sql_frontend import (
     _find_top_level_token,
     _is_simple_column_expr,
     _is_word_or_ident_token,
+    _parse_index_col_ast,
     _parse_single_agg_expr,
     _sanitize_ident,
     _split_top_level,
     _sqlite_type_affinity,
+    _strip_outer_ident_quotes,
     _tokenize_sql,
     _unquote_ident,
     _unwrap_outer_parens,
@@ -915,19 +917,29 @@ class Tier1SingleMixin(MixinHost):
                 group_mv_cols.append(mc)
         indexed_cols_lower = self._indexed_column_names_lower(group_mv_cols)
 
+        stored_work_aliases_lower = {it.alias.lower() for it in work_items if it.alias}
         backing_col_map = {
-            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            u_col: re.sub(
+                r'\s+AS\s+(?:"(?:""|[^"])+"|`(?:``|[^`])+`|\[[^\]]+\]|[A-Za-z0-9_]+)\s*$',
+                "",
+                expr_s,
+                flags=re.IGNORECASE,
+            )
             for u_col, expr_s in self._compound_reader_exprs.items()
-            if expr_s != u_col and "__mv_elem_" in expr_s
+            if expr_s != u_col and ("__mv_elem_" in expr_s or u_col.lower() not in stored_work_aliases_lower)
         }
         backing_col_map_lower = {k.lower(): v for k, v in backing_col_map.items()}
 
-        def _extract_ast_col_names_lower(sql_frag: str) -> Set[str]:
+        def _extract_ast_col_names_lower(sql_frag: str, *, is_index_col: bool = False) -> Set[str]:
             found: Set[str] = set()
             if not sql_frag or not sql_frag.strip():
                 return found
             try:
-                ast_node = parse_sql_ast(sql_frag, dialect=self.dialect)
+                ast_node = (
+                    _parse_index_col_ast(sql_frag, self.dialect)
+                    if is_index_col
+                    else parse_sql_ast(sql_frag, dialect=self.dialect)
+                )
                 for col_node in ast_node.find_all(sqlglot_exp.Column):
                     if col_node.name:
                         found.add(col_node.name.lower())
@@ -935,19 +947,19 @@ class Tier1SingleMixin(MixinHost):
                 try:
                     for tk in _tokenize_sql(sql_frag, read=_sqlglot_dialect(self.dialect)):
                         if _is_word_or_ident_token(tk):
-                            found.add(_unquote_ident(tk.text, dialect=self.dialect).lower())
+                            found.add(_strip_outer_ident_quotes(tk.text).lower())
                 except Exception:
                     pass
             return found
 
         user_idx_cols_lower: Set[str] = set()
         for idx_spec in self.user_indexes:
-            idx_frags: List[str] = list(idx_spec.columns)
+            idx_frags: List[Tuple[str, bool]] = [(c, True) for c in idx_spec.columns]
             if idx_spec.where_clause:
-                idx_frags.append(idx_spec.where_clause)
-            for frag in idx_frags:
-                raw_unq = _unquote_ident(frag.strip(), dialect=self.dialect).lower()
-                refs = _extract_ast_col_names_lower(frag)
+                idx_frags.append((idx_spec.where_clause, False))
+            for frag, is_col_spec in idx_frags:
+                raw_unq = _strip_outer_ident_quotes(frag.strip()).lower()
+                refs = _extract_ast_col_names_lower(frag, is_index_col=is_col_spec)
                 refs.add(raw_unq)
                 for ref in list(refs):
                     user_idx_cols_lower.add(ref)

@@ -4483,3 +4483,148 @@ def test_pg_drop_partition_drift_edge_cases_and_diff_views_noop(make_env) -> Non
             _exec(f'DROP SCHEMA IF EXISTS "{ext_schema}" CASCADE')
         except Exception:
             conn.rollback()
+
+
+def test_pg_dotted_base_tables_and_special_char_user_indexes(make_env):
+    """Native PostgreSQL verification of literal-dot base tables/columns,
+    incremental backfill, joins, compound backing_col_map, and user-defined
+    CREATE INDEX statements with special-character view/column/index names."""
+    env = make_env(
+        views=[],
+        schema_sql=[
+            'CREATE TABLE "my.orders" ('
+            '"row.id" INT PRIMARY KEY, '
+            '"grp.id" INT NOT NULL, '
+            '"a-b" TEXT, '
+            '"desc" INT, '
+            '"nulls last" INT, '
+            '"unit.price" NUMERIC(10,2) NOT NULL'
+            ")",
+            'CREATE TABLE "my.dim" ('
+            '"dim.id" INT PRIMARY KEY, '
+            '"dim.name" TEXT NOT NULL'
+            ")",
+        ],
+        seed=False,
+    )
+    conn = env.conn
+    mgr = env.manager
+
+    def _exec(sql: str) -> None:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+    _exec("""INSERT INTO "my.dim" VALUES (1, 'Alpha'), (2, 'Beta');""")
+    _exec(
+        """INSERT INTO "my.orders" VALUES """
+        """(1, 1, 'Foo', 10, 1, 12.50), """
+        """(2, 1, 'Bar', 20, 2, 7.50), """
+        """(3, 2, 'Baz', 30, 3, 5.00), """
+        """(4, 2, 'Qux', 40, 4, 15.00);"""
+    )
+    long_idx_name = "idx_" + ("x" * 58)
+    vsql1 = (
+        'CREATE VIEW "v.agg\'s 1" AS '
+        'SELECT "grp.id", "a-b", "desc", "nulls last", '
+        'SUM("unit.price") AS "tot.price", '
+        'SUM("unit.price") + 1 AS "net.price", '
+        '(SUM("unit.price") > 0) AS "pos.flag" '
+        'FROM "my.orders" '
+        'GROUP BY "grp.id", "a-b", "desc", "nulls last";\n'
+        'CREATE INDEX "idx v.agg\'s" ON "v.agg\'s 1" ("tot.price" DESC NULLS LAST, "desc" ASC, "nulls last" DESC);\n'
+        'CREATE INDEX "idx net.1" ON "v.agg\'s 1" ("net.price" DESC) WHERE "net.price" > 0;\n'
+        'CREATE INDEX "idx net.bare" ON "v.agg\'s 1" ("net.price") WHERE "pos.flag";\n'
+        'CREATE INDEX "idx bin.1" ON "v.agg\'s 1" ((("grp.id" + 1) + ("desc" + 2)));\n'
+        'CREATE INDEX "idx coll.1" ON "v.agg\'s 1" (("a-b" COLLATE "C") DESC);\n'
+        f'CREATE INDEX "{long_idx_name}" ON "v.agg\'s 1" ("tot.price");\n'
+        'CREATE INDEX "idx expr.1" ON "v.agg\'s 1" (LOWER("a-b") DESC NULLS LAST) WHERE "tot.price" > 0;'
+    )
+    vsql2 = (
+        'CREATE VIEW "v.join\'s 2" AS '
+        'SELECT d."dim.name", SUM(o."unit.price") AS "tot.p", COUNT(*) AS "cnt.p" '
+        'FROM "my.orders" o JOIN "my.dim" d ON o."grp.id" = d."dim.id" '
+        'GROUP BY d."dim.name";\n'
+        'CREATE INDEX "idx join.1" ON "v.join\'s 2" ("dim.name" ASC, "tot.p" DESC NULLS LAST);'
+    )
+    vsql3 = 'CREATE VIEW "v.star.3" AS SELECT * FROM "my.orders";'
+    vsql4 = (
+        'CREATE VIEW "v.union.4" AS '
+        'SELECT "grp.id", "a-b" FROM "my.orders" '
+        'UNION '
+        'SELECT "dim.id" AS "grp.id", "dim.name" AS "a-b" FROM "my.dim";'
+    )
+
+    plan1 = mgr.register_view(vsql1, populate=False, incremental_backfill=True)
+    batches = mgr.backfill_incrementally(plan1, batch_size=2)
+    assert batches >= 2
+    mgr.register_view(vsql2)
+    mgr.register_view(vsql3)
+    mgr.register_view(vsql4)
+
+    _exec("""INSERT INTO "my.orders" VALUES (5, 1, 'New', 50, 5, 25.00);""")
+    _exec("""UPDATE "my.orders" SET "unit.price" = 10.00 WHERE "row.id" = 1;""")
+    _exec("""UPDATE "my.dim" SET "dim.name" = 'Alpha-2' WHERE "dim.id" = 1;""")
+    _exec("""DELETE FROM "my.orders" WHERE "row.id" = 3;""")
+
+    with conn.cursor() as cur:
+        cur.execute('SELECT * FROM "v.agg\'s 1" ORDER BY "grp.id", "a-b", "desc";')
+        got1 = cur.fetchall()
+        cur.execute(
+            'SELECT "grp.id", "a-b", "desc", "nulls last", SUM("unit.price"), SUM("unit.price") + 1, SUM("unit.price") > 0 '
+            'FROM "my.orders" GROUP BY "grp.id", "a-b", "desc", "nulls last" '
+            'ORDER BY "grp.id", "a-b", "desc";'
+        )
+        exp1 = cur.fetchall()
+        assert got1 == exp1
+
+        cur.execute('SELECT * FROM "v.join\'s 2" ORDER BY "dim.name";')
+        got2 = cur.fetchall()
+        cur.execute(
+            'SELECT d."dim.name", SUM(o."unit.price"), COUNT(*) '
+            'FROM "my.orders" o JOIN "my.dim" d ON o."grp.id" = d."dim.id" '
+            'GROUP BY d."dim.name" ORDER BY d."dim.name";'
+        )
+        exp2 = cur.fetchall()
+        assert got2 == exp2
+
+        cur.execute('SELECT * FROM "v.star.3" ORDER BY "row.id";')
+        got3 = cur.fetchall()
+        cur.execute('SELECT * FROM "my.orders" ORDER BY "row.id";')
+        assert got3 == cur.fetchall()
+
+        cur.execute('SELECT * FROM "v.union.4" ORDER BY 1, 2;')
+        got4 = cur.fetchall()
+        cur.execute(
+            'SELECT "grp.id", "a-b" FROM "my.orders" '
+            'UNION '
+            'SELECT "dim.id", "dim.name" FROM "my.dim" ORDER BY 1, 2;'
+        )
+        assert got4 == cur.fetchall()
+
+        cur.execute("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema();")
+        live_idxs = {r[0] for r in cur.fetchall()}
+    conn.commit()
+
+    for expected_idx in (
+        "__matview_idx v.agg's",
+        "__matview_idx net.1",
+        "__matview_idx net.bare",
+        "__matview_idx bin.1",
+        "__matview_idx coll.1",
+        "__matview_idx expr.1",
+        "__matview_idx join.1",
+    ):
+        assert expected_idx in live_idxs, (expected_idx, live_idxs)
+    assert all(len(ix.encode("utf-8")) <= 63 for ix in plan1.index_names)
+
+    expected_ok = {"v.agg's 1": "ok", "v.join's 2": "ok", "v.star.3": "ok", "v.union.4": "ok"}
+    assert mgr.check_schema_drift() == expected_ok
+    diff_rep = mgr.diff_views([vsql1, vsql2, vsql3, vsql4])
+    assert {k: v.status for k, v in diff_rep.items()} == {k: "NOOP" for k in expected_ok}
+    for vn in expected_ok:
+        mgr.repair_view(vn)
+    assert mgr.check_schema_drift() == expected_ok
+    for vn in expected_ok:
+        assert mgr.drop_view(vn) is True
+
