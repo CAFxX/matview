@@ -1237,8 +1237,16 @@ INT_KEY_EXPRS: List[Tuple[str, Tuple[str, ...]]] = [
 ]
 
 
+# `ti % 2` / `mi % 2` as group keys: the wire type is verified natively for these (and
+# 150 more shapes) in one query by test_native_result_types.py::
+# test_mysql_group_key_integer_type_matches_the_length_model, so the per-expression
+# environment (about 2 s each) is not repeated here; MIN/MAX/SUM keep them.
+_GROUP_KEY_COVERED_ELSEWHERE = {"ti % 2", "mi % 2"}
+_GROUP_KEY_EXPRS = [e for e, _ in INT_KEY_EXPRS if e not in _GROUP_KEY_COVERED_ELSEWHERE]
+
+
 @pytest.mark.parametrize("target", _params())
-@pytest.mark.parametrize("expr", [e for e, _ in INT_KEY_EXPRS], ids=[e for e, _ in INT_KEY_EXPRS])
+@pytest.mark.parametrize("expr", _GROUP_KEY_EXPRS, ids=_GROUP_KEY_EXPRS)
 def test_integer_expression_group_key_result_type(make_env, target: Target, expr: str) -> None:
     _check_integer_expression_view(make_env, target, expr, lambda e: (
         ViewDef("ik_v", f"SELECT {e} AS k, COUNT(*) AS c FROM ik GROUP BY {e}")))
