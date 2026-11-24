@@ -2167,7 +2167,7 @@ class MaterializedViewManager:
         plain_views: Optional[Mapping[str, str]] = None,
         current_schema: Optional[str] = None,
     ) -> MaterializedViewPlan:
-        view = self._classify_native_functions(schemas, view)
+        view = self._classify_native_functions(schemas, view, plain_views=plain_views, current_schema=current_schema)
         plan = generate_materialized_view(
             schemas,
             view,
@@ -2186,7 +2186,12 @@ class MaterializedViewManager:
         return plan
 
     def _classify_native_functions(
-        self, schemas: Dict[str, TableSchema], view: Any
+        self,
+        schemas: Dict[str, TableSchema],
+        view: Any,
+        *,
+        plain_views: Optional[Mapping[str, str]] = None,
+        current_schema: Optional[str] = None,
     ) -> Any:
         """Ask the engine catalog whether unmodelled function calls are
         aggregates (see matview.native_functions); refuse when it cannot tell.
@@ -2194,7 +2199,17 @@ class MaterializedViewManager:
         spec (``unclassified_functions``) and force the exact full refresh."""
         spec = view
         if isinstance(view, str):
-            spec = parse_view_definition(view, known_tables={k.lower() for k in schemas}, dialect=self.dialect)
+            # Parsed exactly as generate_materialized_view would (plain views
+            # inlined); a spec that references no plain view is kept as is
+            # there, so the classification survives.
+            spec = parse_view_definition(
+                view,
+                known_tables={k.lower() for k in schemas},
+                dialect=self.dialect,
+                plain_views=plain_views,
+                current_schema=current_schema,
+                schemas=schemas,
+            )
         if not isinstance(spec, ViewSpec):
             return view
         if self.dialect != Dialect.MYSQL:
@@ -2240,43 +2255,6 @@ class MaterializedViewManager:
         current_schema: Optional[str] = None,
         exclude_views: Sequence[str] = (),
     ) -> MaterializedViewPlan:
-    @staticmethod
-    def _text_only_classification_diagnostics(
-        plan: MaterializedViewPlan,
-        text_only: Sequence[Tuple[str, Tuple[str, ...], str]],
-        dialect: Dialect = Dialect.SQLITE,
-    ) -> List[Diagnostic]:
-        remedy = (
-            "use a SQLite build or driver that supports PRAGMA function_list (SQLite 3.30+)."
-            if dialect == Dialect.SQLITE
-            else "grant this user SELECT on the function catalogs named above (MySQL: "
-            "performance_schema.user_defined_functions; MariaDB: mysql.func and mysql.proc)."
-        )
-        strategy = {
-            MaintenanceStrategy.ALGEBRAIC_DELTA: Strategy.ALGEBRAIC_DELTA,
-            MaintenanceStrategy.GROUP_SCOPED_DELTA: Strategy.GROUP_SCOPED_RECOMPUTE,
-        }.get(plan.strategy, Strategy.FULL_REFRESH)
-        return [
-            Diagnostic(
-                code=FUNCTION_CLASSIFICATION_FROM_TEXT,
-                severity=DiagnosticSeverity.WARNING,
-                view=view_name,
-                strategy=strategy,
-                columns=(),
-                expressions=names,
-                message=exact_fallback_message(
-                    strategy,
-                    f"{', '.join(names)} could not be looked up in the engine catalog ({why}), so they are "
-                    f"classified from the SQL text: a call without GROUP BY context is maintained as a scalar "
-                    f"function; if one is a user-defined aggregate, the view's rows can differ from the live view.",
-                    "the selected strategy's.",
-                    remedy,
-                ),
-            )
-            for view_name, names, why in text_only
-        ]
-
-    def _stored_plan(self, schemas: Dict[str, TableSchema], entry: Dict[str, Any]) -> MaterializedViewPlan:
         """Recompile an installed view under exactly the limitation codes it
         was installed with (plus the manager's accept_limitations); never a
         blanket override."""
