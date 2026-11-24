@@ -822,6 +822,31 @@ def _extract_set_op_branches_from_ast(
     return ops, branches
 
 
+def _set_operation_arm_tree(query_ast: sqlglot_exp.Expr) -> Tuple[List[sqlglot_exp.Expr], Any]:
+    """Return ``(leaves, tree)`` for a (possibly nested / parenthesised) set operation.
+
+    ``leaves`` are the non-set-operation arms in source order (parentheses and
+    subquery wrappers removed); ``tree`` mirrors the parse tree with leaf indices
+    at the leaves and ``(left, right)`` tuples at set-operation nodes, i.e. exactly
+    the pairwise structure PostgreSQL resolves column types over (``a UNION b UNION c``
+    is ``((a, b), c)``, ``a UNION (b UNION c)`` is ``(a, (b, c))``, and
+    ``a UNION b INTERSECT c`` is ``(a, (b, c))`` by operator precedence).
+    """
+    leaves: List[sqlglot_exp.Expr] = []
+
+    def _walk(node: Any) -> Any:
+        while isinstance(node, (sqlglot_exp.Paren, sqlglot_exp.Subquery)) and node.this is not None:
+            node = node.this
+        if isinstance(node, sqlglot_exp.SetOperation):
+            left = _walk(node.this)
+            right = _walk(node.expression)
+            return (left, right)
+        leaves.append(node)
+        return len(leaves) - 1
+
+    return leaves, _walk(query_ast)
+
+
 def _has_subquery_ast(
     expr_or_sql: Optional[str | sqlglot_exp.Expr],
     dialect: Dialect = Dialect.SQLITE,
@@ -2991,6 +3016,12 @@ def _parse_single_create_view_stmt(
     while isinstance(first_select, sqlglot_exp.SetOperation):
         first_select = first_select.this
     if not isinstance(first_select, sqlglot_exp.Select):
+        if isinstance(first_select, (sqlglot_exp.Paren, sqlglot_exp.Subquery)):
+            raise UnsupportedMaterializedViewError(
+                f"View {view_name!r}: a set operation whose first arm is parenthesised "
+                f"(for example `(A UNION B) UNION C`) is not supported; remove the leading parentheses "
+                f"or put the nested set operation on the right-hand side."
+            )
         raise ValueError(f"Unable to parse SELECT clause in view {view_name!r}: {raw_select!r}")
 
     has_limit_or_order = bool(

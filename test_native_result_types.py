@@ -2124,6 +2124,274 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             conn.commit()
             conn.close()
 
+    _TREE_SCHEMA = (
+        "CREATE TABLE a (id INT PRIMARY KEY, s TEXT, i4 INT, i2 SMALLINT, r REAL, d DOUBLE PRECISION, n BIGINT, "
+        "nu NUMERIC(6,2), ci CITEXT, arrt TEXT[], e TEXT, c TEXT COLLATE \"C\");"
+        "CREATE TABLE b (id INT PRIMARY KEY, z TEXT COLLATE \"POSIX\", e TEXT);"
+    )
+    # (view body, accepted?) -- accepted iff no arm reaches the final type through a lossy REAL pair.
+    _TREE_VIEWS = [
+        # right-nested / parenthesised forms: the inner set operation is itself an operand, so its
+        # (DOUBLE PRECISION) result type is what the left arm joins; only a REAL pair that
+        # contains the exact arm is lossy.
+        ("SELECT i4 AS v FROM a UNION ALL (SELECT r FROM a UNION ALL SELECT d FROM a)", True),
+        ("SELECT i4 AS v FROM a UNION (SELECT r FROM a UNION ALL SELECT d FROM a)", True),
+        ("SELECT i4 AS v FROM a INTERSECT (SELECT r FROM a UNION ALL SELECT d FROM a)", True),
+        ("SELECT n AS v FROM a UNION ALL (SELECT r FROM a UNION ALL SELECT d FROM a)", True),
+        ("SELECT nu AS v FROM a UNION ALL (SELECT r FROM a UNION ALL SELECT d FROM a)", True),
+        ("SELECT i2 AS v FROM a UNION ALL (SELECT r FROM a UNION ALL SELECT d FROM a)", True),
+        ("SELECT i4 AS v FROM a UNION ALL (SELECT d FROM a UNION ALL SELECT r FROM a)", True),
+        ("SELECT r AS v FROM a UNION ALL (SELECT i4 FROM a UNION ALL SELECT d FROM a)", True),
+        ("SELECT d AS v FROM a UNION ALL (SELECT r FROM a UNION ALL SELECT i4 FROM a)", False),
+        ("SELECT d AS v FROM a UNION ALL (SELECT i4 FROM a UNION ALL SELECT r FROM a)", False),
+        ("SELECT d AS v FROM a UNION (SELECT r FROM a INTERSECT SELECT n FROM a)", False),
+        # flat left-to-right chains
+        ("SELECT i4 AS v FROM a UNION ALL SELECT r FROM a UNION ALL SELECT d FROM a", False),
+        ("SELECT i4 AS v FROM a UNION SELECT r FROM a UNION SELECT d FROM a", False),
+        ("SELECT d AS v FROM a UNION ALL SELECT i4 FROM a UNION ALL SELECT r FROM a", True),
+        ("SELECT r AS v FROM a UNION ALL SELECT d FROM a UNION ALL SELECT i4 FROM a", True),
+        ("SELECT i4 AS v FROM a UNION ALL SELECT d FROM a UNION ALL SELECT r FROM a UNION ALL SELECT i2 FROM a", True),
+        ("SELECT i2 AS v FROM a UNION ALL SELECT r FROM a UNION ALL SELECT d FROM a", True),
+        ("SELECT max(v) AS m FROM (SELECT d AS v FROM a UNION ALL SELECT i4 FROM a UNION ALL SELECT r FROM a) q", True),
+        ("SELECT max(v) AS m FROM (SELECT i4 AS v FROM a UNION ALL SELECT r FROM a UNION ALL SELECT d FROM a) q", False),
+        ("SELECT d AS v FROM a UNION ALL SELECT i4 FROM a UNION ALL SELECT r FROM a ORDER BY 1", True),
+    ]
+
+    def test_postgres_set_operation_pairwise_tree_type_resolution_offline(self) -> None:
+        """PostgreSQL resolves set-operation column types pairwise over the parse tree; only a
+        lossy REAL intermediate (INTEGER/BIGINT/NUMERIC -> REAL -> DOUBLE PRECISION) is refused."""
+        for body, accepted in self._TREE_VIEWS:
+            with self.subTest(view=body):
+                if accepted:
+                    plan = generate_materialized_view(
+                        self._TREE_SCHEMA, f"CREATE VIEW mv AS {body};", dialect="postgres:18"
+                    )
+                    if "max(v)" not in body:
+                        self.assertRegex(plan.backing_table_ddl, r"\bv DOUBLE PRECISION\b")
+                else:
+                    with self.assertRaises(UnsupportedMaterializedViewError):
+                        generate_materialized_view(
+                            self._TREE_SCHEMA, f"CREATE VIEW mv AS {body};", dialect="postgres:18"
+                        )
+        # The accepted nested form widens to the final type of the tree (DOUBLE PRECISION), not the
+        # first nested SELECT's REAL.
+        plan = generate_materialized_view(
+            self._TREE_SCHEMA,
+            "CREATE VIEW mv AS SELECT i2 AS v FROM a UNION ALL (SELECT r FROM a UNION ALL SELECT d FROM a);",
+            dialect="postgres:18",
+        )
+        self.assertRegex(plan.backing_table_ddl, r"\bv DOUBLE PRECISION\b")
+
+    def test_postgres_array_scalar_inference_collation_and_unmodelled_arms_offline(self) -> None:
+        schema = self._TREE_SCHEMA
+        # Array-valued functions and ARRAY[] over an extension-typed column are arrays, so they
+        # unify with array arms (no false "cannot mix array and scalar" refusal).
+        for sel in (
+            "SELECT ARRAY[s] AS v FROM a INTERSECT ALL SELECT string_to_array(e, 'b') FROM a",
+            "SELECT arrt AS v FROM a UNION ALL SELECT ARRAY[ci] FROM a",
+            "SELECT ARRAY[ci] AS v FROM a UNION ALL SELECT arrt FROM a",
+            "SELECT arrt AS v FROM a UNION SELECT regexp_split_to_array(e, 'b') FROM a",
+        ):
+            with self.subTest(sel=sel):
+                plan = generate_materialized_view(schema, f"CREATE VIEW mv AS {sel};", dialect="postgres:18")
+                self.assertRegex(plan.backing_table_ddl, r"\bv TEXT\[\]")
+        # citext only casts implicitly to text: any other string arm resolves to text.
+        plan = generate_materialized_view(
+            schema, "CREATE VIEW mv AS SELECT ci AS v FROM a UNION ALL SELECT s FROM a;", dialect="postgres:18"
+        )
+        self.assertRegex(plan.backing_table_ddl, r"\bv TEXT\b")
+        # A numeric literal with an exponent is NUMERIC in PostgreSQL.
+        for lit in ("1.5e0", "1e2", "2.5E-3"):
+            plan = generate_materialized_view(
+                schema, f"CREATE VIEW mv AS SELECT {lit} AS v FROM a;", dialect="postgres:18"
+            )
+            self.assertRegex(plan.backing_table_ddl, r"\bv NUMERIC\b", lit)
+            plan = generate_materialized_view(
+                schema, f"CREATE VIEW mv AS WITH u AS (SELECT id, {lit} AS v FROM a) SELECT id, v FROM u;", dialect="postgres:18"
+            )
+            self.assertRegex(plan.backing_table_ddl, r"\bv NUMERIC\b", f"derived {lit}")
+            plan = generate_materialized_view(
+                schema,
+                f"CREATE VIEW mv AS WITH u AS (SELECT {lit} AS v FROM a UNION ALL SELECT 2.5 FROM a) SELECT v FROM u;",
+                dialect="postgres:18",
+            )
+            self.assertRegex(plan.backing_table_ddl, r"\bv NUMERIC\b", f"cte union {lit}")
+        # Arms whose result types the compiler does not model at all are refused, not guessed as TEXT.
+        for sel in (
+            "SELECT to_jsonb(s) AS v FROM a UNION ALL SELECT to_jsonb(e) FROM b",
+            "SELECT e::bytea || '\\x00'::bytea AS v FROM a UNION ALL SELECT e::bytea || '\\x01'::bytea FROM b",
+        ):
+            with self.subTest(sel=sel), self.assertRaises(UnsupportedMaterializedViewError):
+                generate_materialized_view(schema, f"CREATE VIEW mv AS {sel};", dialect="postgres:18")
+        # An explicit cast has exactly its target type, modelled or not.
+        plan = generate_materialized_view(
+            schema,
+            "CREATE VIEW mv AS SELECT e::bytea AS v FROM a UNION ALL SELECT e::bytea FROM b;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(plan.backing_table_ddl, r"\bv BYTEA\b")
+        # ...while known text-valued expressions keep working.
+        for sel in (
+            "SELECT s || 'x' AS v FROM a UNION ALL SELECT e || 'y' FROM b",
+            "SELECT md5(s) AS v FROM a UNION ALL SELECT md5(e) FROM b",
+        ):
+            with self.subTest(sel=sel):
+                generate_materialized_view(schema, f"CREATE VIEW mv AS {sel};", dialect="postgres:18")
+        # An explicit COLLATE names a collation, never a column: the set-operation trigger bodies must
+        # not qualify it as a record field (`__mv_d.c COLLATE __mv_d.c`).
+        plan = generate_materialized_view(
+            schema,
+            'CREATE VIEW mv AS SELECT c COLLATE "C" AS v FROM a UNION SELECT z FROM b;',
+            dialect="postgres:18",
+        )
+        trigger_sql = "\n".join(str(t) for t in plan.trigger_ddls)
+        self.assertNotRegex(trigger_sql, r"COLLATE\s+__mv_d\.")
+        self.assertRegex(trigger_sql, r'__mv_d\.c COLLATE "C"')
+        # Clear refusals instead of raw parse/driver errors.
+        for sel in (
+            "(SELECT i4 AS v FROM a UNION ALL SELECT r FROM a) UNION ALL SELECT d FROM a",
+            "SELECT * FROM (SELECT i4 AS x FROM a UNION SELECT i2 FROM a) q",
+            "WITH u AS (SELECT i4 AS x FROM a UNION SELECT i2 FROM a) SELECT * FROM u",
+        ):
+            with self.subTest(sel=sel), self.assertRaises(UnsupportedMaterializedViewError):
+                generate_materialized_view(schema, f"CREATE VIEW mv AS {sel};", dialect="postgres:18")
+
+    def test_native_postgres_set_operation_tree_types_arrays_and_collate(self) -> None:
+        """Native: every accepted view is compared with the live view (values bit-for-bit, pg_attribute
+        type/typmod/collation) after population and DML; refused views leave nothing behind."""
+        import os
+        import re
+
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN not set")
+        tag = f"utree_{uuid.uuid4().hex[:8]}"
+        ta, tb = f"a_{tag}", f"b_{tag}"
+        conn = _connect(Dialect.POSTGRES, dsn)
+        cur = conn.cursor()
+        mv_names: List[str] = []
+        lv_names: List[str] = []
+        try:
+            cur.execute("SELECT VERSION()")
+            ver_row = cur.fetchone()
+            assert ver_row is not None
+            self.assertIn("PostgreSQL", str(ver_row[0]))
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS citext")
+                conn.commit()
+                ci_type = "CITEXT"
+            except Exception:
+                conn.rollback()
+                ci_type = "TEXT"
+            cur.execute(
+                f"CREATE TABLE {ta} (id INT PRIMARY KEY, s TEXT, i4 INT, i2 SMALLINT, r REAL, d DOUBLE PRECISION, "
+                f'n BIGINT, nu NUMERIC(6,2), ci {ci_type}, arrt TEXT[], e TEXT, c TEXT COLLATE "C")'
+            )
+            cur.execute(f'CREATE TABLE {tb} (id INT PRIMARY KEY, z TEXT COLLATE "POSIX", e TEXT)')
+            cur.execute(
+                f"INSERT INTO {ta} VALUES "
+                "(1,'a',16777217,3,1.5,2.25,16777217,12.34,'Ab',ARRAY['x','y'],'xbyb','Y'),"
+                "(2,'b',5,4,16777217,3e10,9007199254740993,1.00,'cd',ARRAY['z'],'q','z')"
+            )
+            cur.execute(f"INSERT INTO {tb} VALUES (1,'Z','abc'),(2,'a','b')")
+            conn.commit()
+
+            def sub(body: str) -> str:
+                return re.sub(r"\bFROM a\b", f"FROM {ta}", re.sub(r"\bFROM b\b", f"FROM {tb}", body))
+
+            accepted = [sub(b) for b, ok in self._TREE_VIEWS if ok]
+            accepted += [
+                sub(b)
+                for b in (
+                    "SELECT ARRAY[s] AS v FROM a INTERSECT ALL SELECT string_to_array(e, 'b') FROM a",
+                    "SELECT arrt AS v FROM a UNION ALL SELECT ARRAY[ci] FROM a",
+                    "SELECT ARRAY[ci] AS v FROM a UNION ALL SELECT arrt FROM a",
+                    "SELECT ci AS v FROM a UNION ALL SELECT s FROM a",
+                    "SELECT s AS v FROM a UNION ALL SELECT ci FROM a",
+                    "SELECT 1.5e0 AS v FROM a",
+                    'SELECT c COLLATE "C" AS v FROM a UNION SELECT z FROM b',
+                    'SELECT c COLLATE "C" AS v FROM a UNION ALL SELECT z FROM b',
+                    "SELECT s || 'x' AS v FROM a UNION ALL SELECT e || 'y' FROM b",
+                )
+            ]
+            refused = [sub(b) for b, ok in self._TREE_VIEWS if not ok] + [
+                sub("SELECT to_jsonb(s) AS v FROM a UNION ALL SELECT to_jsonb(e) FROM b"),
+                sub("(SELECT i4 AS v FROM a UNION ALL SELECT r FROM a) UNION ALL SELECT d FROM a"),
+            ]
+            if ci_type != "CITEXT":
+                accepted = [v for v in accepted if "ci" not in v.replace("nu", "")]
+            mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
+            pairs = []
+            for idx, sel in enumerate(accepted):
+                mv, lv = f"mv{idx}_{tag}", f"lv{idx}_{tag}"
+                mgr.register_view(f"CREATE VIEW {mv} AS {sel};")
+                conn.commit()
+                mv_names.append(mv)
+                cur.execute(f"CREATE VIEW {lv} AS {sel}")
+                conn.commit()
+                lv_names.append(lv)
+                pairs.append((sel, mv, lv))
+
+            def attr_sig(name: str) -> List[Tuple[str, str, int, int, str]]:
+                cur.execute(
+                    "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.atttypid::int, "
+                    "       a.atttypmod::int, COALESCE(co.collname, '-') "
+                    "FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+                    "LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation "
+                    "WHERE c.relname = %s AND pg_catalog.pg_table_is_visible(c.oid) AND a.attnum > 0 "
+                    "  AND NOT a.attisdropped ORDER BY a.attnum",
+                    (name,),
+                )
+                return [(str(r[0]), str(r[1]), int(r[2]), int(r[3]), str(r[4])) for r in cur.fetchall()]
+
+            def check(step: str) -> None:
+                for sel, mv, lv in pairs:
+                    cur.execute(f"SELECT * FROM {mv}")
+                    got = sorted((tuple(_exact_deep(v) for v in r) for r in cur.fetchall()), key=repr)
+                    cur.execute(f"SELECT * FROM {lv}")
+                    exp = sorted((tuple(_exact_deep(v) for v in r) for r in cur.fetchall()), key=repr)
+                    mv_sig, lv_sig = attr_sig(mv), attr_sig(lv)
+                    conn.commit()
+                    self.assertEqual(got, exp, f"{step}: {sel}")
+                    self.assertEqual(mv_sig, lv_sig, f"{step}: pg_attribute type/typmod/collation of {sel}")
+
+            check("initial")
+            for dml in (
+                f"INSERT INTO {ta} VALUES (3,'c',16777219,1,16777219,1e20,16777219,99.99,'Ab',ARRAY['x'],'bb','C')",
+                f"UPDATE {ta} SET i4 = 16777221, r = 3.5, c = 'k', ci = 'ZZ' WHERE id = 2",
+                f"DELETE FROM {tb} WHERE id = 1",
+                f"INSERT INTO {tb} VALUES (3,'zz','xbb')",
+                f"DELETE FROM {ta} WHERE id = 1",
+            ):
+                cur.execute(dml)
+                conn.commit()
+                check(dml[:20])
+
+            for idx, bad in enumerate(refused):
+                bad_mv = f"mvbad{idx}_{tag}"
+                with self.assertRaises(UnsupportedMaterializedViewError, msg=bad):
+                    mgr.register_view(f"CREATE VIEW {bad_mv} AS {bad};")
+                conn.rollback()
+                cur.execute(
+                    "SELECT 1 FROM pg_catalog.pg_class WHERE relname = %s AND pg_catalog.pg_table_is_visible(oid)",
+                    (bad_mv,),
+                )
+                self.assertIsNone(cur.fetchone(), f"Failed registration {bad_mv} must roll back cleanly")
+                conn.rollback()
+        finally:
+            conn.rollback()
+            for mv in mv_names:
+                try:
+                    MaterializedViewManager(conn, dialect=Dialect.POSTGRES).drop_view(mv)
+                except Exception:
+                    conn.rollback()
+            for lv in lv_names:
+                cur.execute(f"DROP VIEW IF EXISTS {lv} CASCADE")
+            for tbl in (ta, tb):
+                cur.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+            conn.commit()
+            conn.close()
+
     def test_native_postgres_setop_pg_catalog_and_name_types(self) -> None:
         import os
 

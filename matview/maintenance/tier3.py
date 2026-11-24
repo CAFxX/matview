@@ -33,6 +33,7 @@ from ..logical_ir import (
 from ..sql_frontend import (
     _contains_aggregate_call,
     _extract_set_op_branches_from_ast,
+    _set_operation_arm_tree,
     _extract_verbatim_cte_or_subquery_sql,
     _is_simple_column_expr,
     _parse_single_agg_expr,
@@ -59,7 +60,7 @@ class Tier3Mixin(MixinHost):
         extra_auto_cols = self._auto_backing_extra_index_cols()
         indexed_cols_lower = self._indexed_column_names_lower(extra_auto_cols)
 
-        def _parse_and_expand_setop_branches() -> Optional[List[ViewSpec]]:
+        def _parse_and_expand_setop_branches() -> Optional[Tuple[List[ViewSpec], Any]]:
             if self.dialect == Dialect.SQLITE or not self.view.has_compound_set_op:
                 return None
             raw_q = self.view.raw_select_sql.strip()
@@ -69,6 +70,14 @@ class Tier3Mixin(MixinHost):
             _, b_sqls = _extract_set_op_branches_from_ast(q_ast, raw_q, dialect=self.dialect)
             if len(b_sqls) < 2:
                 return None
+            # PostgreSQL resolves the column types over the parse tree (`a UNION (b UNION c)` is
+            # not `(a UNION b) UNION c`): take the pairwise structure from the AST and, when
+            # parenthesised arms are themselves set operations, every leaf arm as well (the
+            # token splitter only sees the depth-0 arms and would type a nested arm by its
+            # first SELECT alone).
+            leaf_nodes, arm_tree = _set_operation_arm_tree(q_ast)
+            if len(leaf_nodes) != len(b_sqls):
+                b_sqls = [leaf.sql(_sqlglot_dialect(self.dialect)) for leaf in leaf_nodes]
             with_node = q_ast.args.get("with_") or q_ast.args.get("with")
             with_prefix = (
                 with_node.sql(_sqlglot_dialect(self.dialect)) + " "
@@ -137,19 +146,20 @@ class Tier3Mixin(MixinHost):
                 and all(len(bs.select_items) == len(expanded_bs[0].select_items) for bs in expanded_bs)
                 and all(not any(it.raw_expr.strip() == "*" for it in bs.select_items) for bs in expanded_bs)
             ):
-                return expanded_bs
+                return expanded_bs, arm_tree
             return None
 
         if len(self.view.select_items) == 1 and self.view.select_items[0].raw_expr.strip() == "*":
             setop_star_done = False
             try:
-                expanded_bs = _parse_and_expand_setop_branches()
+                expanded = _parse_and_expand_setop_branches()
             except UnsupportedMaterializedViewError:
                 raise
             except Exception:
-                expanded_bs = None
-            if expanded_bs is not None:
-                m_ctx = self._union_all_common_ctx(expanded_bs)
+                expanded = None
+            if expanded is not None:
+                expanded_bs, expanded_tree = expanded
+                m_ctx = self._union_all_common_ctx(expanded_bs, expanded_tree)
                 if m_ctx.primary_schema:
                     for fb_it in expanded_bs[0].select_items:
                         user_columns.append(fb_it.alias)
@@ -158,6 +168,14 @@ class Tier3Mixin(MixinHost):
                             dt = "VARCHAR(255)"
                         col_defs_sql.append(f"{self._q(fb_it.alias)} {dt}")
                     setop_star_done = True
+            if not setop_star_done and self.dialect == Dialect.POSTGRES:
+                star_ast = parse_sql_ast(self.view.raw_select_sql.strip(), dialect=self.dialect)
+                if not isinstance(star_ast, sqlglot_exp.SetOperation) and star_ast.find(sqlglot_exp.SetOperation) is not None:
+                    raise UnsupportedMaterializedViewError(
+                        "SELECT * over a CTE or derived table that is itself a set operation is not supported "
+                        "(the output columns would be taken from the base table, not from the set operation); "
+                        "list the columns explicitly."
+                    )
             if not setop_star_done:
                 for j in self.view.joins or []:
                     t_schema = self._schemas_lower.get(j.table_name.lower())
@@ -182,13 +200,14 @@ class Tier3Mixin(MixinHost):
             # storage type across all branches rather than using only branch 0.
             setop_col_types: Optional[List[str]] = None
             try:
-                parsed_bs = _parse_and_expand_setop_branches()
+                parsed = _parse_and_expand_setop_branches()
             except UnsupportedMaterializedViewError:
                 raise
             except Exception:
-                parsed_bs = None
-            if parsed_bs is not None and len(parsed_bs[0].select_items) == len(self.view.select_items):
-                m_ctx = self._union_all_common_ctx(parsed_bs)
+                parsed = None
+            if parsed is not None and len(parsed[0][0].select_items) == len(self.view.select_items):
+                parsed_bs, parsed_tree = parsed
+                m_ctx = self._union_all_common_ctx(parsed_bs, parsed_tree)
                 if m_ctx.primary_schema:
                     setop_col_types = [
                         m_ctx.primary_schema.columns[fb_it.alias].data_type

@@ -551,11 +551,41 @@ MUTANTS = (
     Mutant(
         name="pg-union-arm-chain-through-real-not-refused",
         source_path="matview/dialects/base.py",
-        original="            if len(raw_nonempty) >= 3:\n                # PostgreSQL resolves a chain",
-        replacement="            if False and len(raw_nonempty) >= 3:\n                # PostgreSQL resolves a chain",
+        original="                if rank == 5 and wide and not is_root:",
+        replacement="                if False and rank == 5 and wide and not is_root:",
         target_test=(
             "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
-            "test_postgres_set_operation_quantifiers_nested_collation_and_arm_chain_offline"
+            "test_postgres_set_operation_pairwise_tree_type_resolution_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-union-arm-chain-ignores-set-operation-tree",
+        source_path="matview/dialects/base.py",
+        original="        tree = arm_tree\n        if tree is None:",
+        replacement="        tree = None\n        if tree is None:",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_set_operation_pairwise_tree_type_resolution_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-union-nested-arms-typed-by-first-select",
+        source_path="matview/maintenance/tier3.py",
+        original="            if len(leaf_nodes) != len(b_sqls):",
+        replacement="            if False and len(leaf_nodes) != len(b_sqls):",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_set_operation_pairwise_tree_type_resolution_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-union-trigger-qualifies-collation-name",
+        source_path="matview/maintenance/zset.py",
+        original="not is_after_dot and not is_before_dot and not is_fn_call and not is_collation_name:",
+        replacement="not is_after_dot and not is_before_dot and not is_fn_call:",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_array_scalar_inference_collation_and_unmodelled_arms_offline"
         ),
     ),
     Mutant(
