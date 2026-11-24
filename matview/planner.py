@@ -407,6 +407,34 @@ class PlannerMixin(MixinHost):
                 out.append(node.sql(dialect=sg))
         return list(dict.fromkeys(out))
 
+    def _refuse_unprovable_float_refresh_types(self) -> None:
+        """The exact full refresh stores the original query's result, so the
+        stored column types must equal the engine's result types. They are
+        derived from declared source columns; a recursive CTE's column type
+        is the engine's union of its anchor and recursive terms (an INT
+        anchor with a `v * 1.5` term is NUMERIC/DECIMAL), which is not
+        derived here, so such views are refused (fail-closed, as before the
+        refresh default). Server-derived result types are a TODO."""
+        try:
+            root = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return
+        recursive = [
+            w for w in root.find_all(sqlglot_exp.With) if w.args.get("recursive")
+        ]
+        if not recursive:
+            return
+        listed = ", ".join(dict.fromkeys(e for _, e in self._order_sensitive_float_items()))
+        raise UnsupportedMaterializedViewError(
+            f"View '{self.logical_view_name}' uses {listed} together with a recursive CTE: "
+            f"the exact full refresh cannot prove the result types of a recursive CTE's "
+            f"columns from the declared source columns (the engine unifies the anchor and "
+            f"recursive terms), so it would store a different type than the original view. "
+            f"CAST the recursive CTE's columns (or the aggregate's argument) to an explicit "
+            f"type in the anchor and recursive terms is not enough either; materialize the "
+            f"recursive CTE's result in a table, or accept FLOAT_REASSOCIATION_ALLOWED."
+        )
+
     def _float_relaxed_requested(self) -> bool:
         return self.FLOAT_RELAXED_CODE in set(self.accepted_limitations)
 
@@ -1740,6 +1768,7 @@ class PlannerMixin(MixinHost):
             # rows; no shape is proven yet (a WHERE + index plan restricted
             # to one group reorders rows: measured 1.5 vs 2.0), so every
             # shape uses the full refresh.
+            self._refuse_unprovable_float_refresh_types()
             return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
         strategy, mode = self._natural_strategy_and_mode()
         if self._key_collation_fallback_reason(strategy, mode):

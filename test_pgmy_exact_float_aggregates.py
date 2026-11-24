@@ -1659,6 +1659,57 @@ class NativeUnionAllMixedTypes(_ExactCase):
                     fx.close()
 
 
+class NativeRecursiveCteSources(_ExactCase):
+    """Natively, default mode: SUM/AVG over a recursive CTE's column is
+    refused (the live view returns int on PostgreSQL and Decimal on MySQL/
+    MariaDB for an INT anchor and a `v * 2` term, Decimal for `v * 1.5`; the
+    refresh stored float). A recursive CTE joined to a table with only
+    exact aggregates is accepted and equals the live view (types and values)."""
+
+    def test_recursive_cte_sources(self) -> None:
+        engines = _native_engines()
+        if not engines:
+            self.skipTest("set POSTGRES_DSN and/or MYSQL_DSN")
+        for engine, dsn in engines:
+            with self.subTest(engine=engine.value):
+                fx = _Fixture(engine, dsn)
+                try:
+                    int_t = "INT" if engine == Dialect.POSTGRES else "SIGNED"
+                    t = fx.table("rc", "id BIGINT PRIMARY KEY, g INT, k INT")
+                    for term in ("v * 2", "v * 1.5"):
+                        sel = (
+                            f"WITH RECURSIVE c(n, v) AS (SELECT 1, CAST(1 AS {int_t}) UNION ALL "
+                            f"SELECT n + 1, {term} FROM c WHERE n < 3) "
+                            f"SELECT {t}.g, SUM(c.v + {t}.k) AS s FROM {t} CROSS JOIN c GROUP BY {t}.g"
+                        )
+                        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "recursive CTE"):
+                            fx.register(sel, relaxed=False)
+                        fx.conn.rollback()
+                    ok_sel = (
+                        f"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) "
+                        f"SELECT {t}.g, COUNT(*) AS cnt, SUM({t}.k) AS sk FROM {t} CROSS JOIN c GROUP BY {t}.g"
+                    )
+                    plan = fx.register(ok_sel, relaxed=False)
+                    cur = fx.conn.cursor()
+                    for sql, params in (
+                        (f"INSERT INTO {t} VALUES (%s, %s, %s), (%s, %s, %s)", (1, 1, 5, 2, 1, 7)),
+                        (f"INSERT INTO {t} VALUES (%s, %s, %s)", (3, 2, 2147483647)),
+                        (f"UPDATE {t} SET g = %s WHERE id = %s", (2, 1)),
+                        (f"DELETE FROM {t} WHERE id = %s", (2,)),
+                    ):
+                        cur.execute(sql, params)
+                        fx.conn.commit()
+                        mv_cur = fx.conn.cursor()
+                        mv_cur.execute(f"SELECT * FROM {plan.view_name}")
+                        mv = sorted(tuple((type(v).__name__, _exact(v)) for v in r) for r in mv_cur.fetchall())
+                        mv_cur.execute(ok_sel)
+                        lv = sorted(tuple((type(v).__name__, _exact(v)) for v in r) for r in mv_cur.fetchall())
+                        fx.conn.commit()
+                        self.assertEqual(mv, lv, f"{engine.value}: {sql}")
+                finally:
+                    fx.close()
+
+
 class NativeWindowExactTypes(_ExactCase):
     """Window SUM/AVG/COUNT of exact arguments keep the engine's result type
     (NUMERIC / DECIMAL), so they are compared exactly with no budget (stored
@@ -1870,6 +1921,57 @@ class OfflineDefaultExactRefresh(unittest.TestCase):
     and strategy name from matview.diagnostics). The global override does not
     change that; only the per-code FLOAT_REASSOCIATION_ALLOWED selects the
     relaxed incremental mode, with a FLOAT_RELAXED_MAINTENANCE diagnostic."""
+
+    def test_recursive_cte_sources_are_refused_and_never_recurse(self) -> None:
+        """A recursive CTE column's type is the engine's union of its anchor
+        and recursive terms, which the exact full refresh cannot prove from
+        declared columns: an order-sensitive aggregate over it is refused
+        (it would store float where the view returns int/Decimal). Typing
+        self- and mutually-referencing CTEs terminates (no RecursionError),
+        and aggregates that are not floating point keep working."""
+        cases = (
+            ("postgres:18", "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT, k INT, f DOUBLE PRECISION);", "INT"),
+            ("mysql:8.4", "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT, k INT, f DOUBLE);", "SIGNED"),
+            ("mariadb:11.8", "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT, k INT, f DOUBLE);", "SIGNED"),
+        )
+        for dialect, schema, int_t in cases:
+            for term in ("v * 2", "v * 1.5", "v + t2.f"):
+                body = (
+                    f"WITH RECURSIVE c(n, v) AS (SELECT 1, CAST(1 AS {int_t}) UNION ALL "
+                    f"SELECT n + 1, {term} FROM c, t t2 WHERE n < 3 AND t2.id = 1) "
+                    f"SELECT t.g, SUM(c.v + t.k) AS s, AVG(c.v) AS a FROM t CROSS JOIN c GROUP BY t.g"
+                )
+                with self.subTest(dialect=dialect, term=term):
+                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "recursive CTE"):
+                        generate_materialized_view(schema, f"CREATE VIEW v AS {body};", dialect=dialect,
+                                                   ignore_limitations=True)
+            mutual = (
+                "WITH RECURSIVE a(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM b WHERE n < 3), "
+                "b(n) AS (SELECT n FROM a UNION ALL SELECT n FROM a) "
+            )
+            for agg, refused in (("SUM(b.n * 1.5)", True), ("COUNT(*)", False)):
+                body = f"{mutual}SELECT t.g, {agg} AS x FROM t CROSS JOIN b GROUP BY t.g"
+                with self.subTest(dialect=dialect, mutual=agg):
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            generate_materialized_view(schema, f"CREATE VIEW v AS {body};", dialect=dialect,
+                                                       ignore_limitations=True)
+                        outcome = "accepted"
+                    except UnsupportedMaterializedViewError:
+                        outcome = "refused"
+                    if refused:
+                        self.assertEqual(outcome, "refused")
+            self_ref = (
+                "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) "
+                "SELECT t.g, COUNT(*) AS x, SUM(t.k) AS sk FROM t CROSS JOIN c GROUP BY t.g"
+            )
+            with self.subTest(dialect=dialect, self_ref=True):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    plan = generate_materialized_view(schema, f"CREATE VIEW v AS {self_ref};", dialect=dialect,
+                                                      ignore_limitations=True)
+                self.assertEqual(plan.strategy_diagnostics, [])
 
     def test_default_is_full_refresh_with_diagnostic(self) -> None:
         for dialect, version, types in _ENGINES:
