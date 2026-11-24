@@ -494,6 +494,16 @@ MUTANTS = (
             "test_mysql_minmax_and_bitwise_recompute_subqueries_emit_lock_in_share_mode"
         ),
     ),
+    Mutant(
+        name="sqlite-var-distinct-drops-deduplication",
+        source_path="matview/dialects/sqlite.py",
+        original="                if is_distinct and fn_up in (",
+        replacement="                if False and is_distinct and fn_up in (",
+        target_test=(
+            "test_sqlite_distinct_filtered_aggregates.TestDistinctAndFilteredStatBitBool."
+            "test_exact_differential_deterministic_scenarios"
+        ),
+    ),
 )
 
 

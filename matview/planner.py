@@ -86,6 +86,8 @@ from .sql_frontend import (
 # Diagnostic code of the HAVING scalar-subquery-aggregate fallback.
 HAVING_SUBQUERY_AGGREGATE_FALLBACK = "HAVING_SUBQUERY_AGGREGATE_FALLBACK"
 COLLATION_KEY_FALLBACK = "COLLATION_KEY_FALLBACK"
+# Diagnostic code of the full refresh of the original query (``atomic_query_sync``).
+FULL_REFRESH_FALLBACK = "FULL_REFRESH_FALLBACK"
 
 def _iter_agg_ast_nodes(root: sqlglot_exp.Expr, dialect: Dialect) -> List[sqlglot_exp.Expr]:
     """Return every aggregate call node in `root`, including PostgreSQL
@@ -1146,6 +1148,12 @@ class PlannerMixin(MixinHost):
             for it in self.view.select_items
             if not it.is_aggregate
         }
+        non_base_alias_to_raw = {
+            al: raw_e
+            for al, raw_e in alias_to_raw.items()
+            if self._lookup_col_def(al) is None and raw_e.lower() != al
+        }
+        sg_dialect = _sqlglot_dialect(self.dialect)
         for g in self.view.group_by_cols:
             gs = g.strip()
             if re.match(r"^\d+$", gs):
@@ -1154,11 +1162,64 @@ class PlannerMixin(MixinHost):
                     resolved.append(self.view.select_items[pos].raw_expr.strip())
                     continue
             gs_unq_low = _strip_outer_ident_quotes(gs).lower()
-            if gs_unq_low in alias_to_raw:
-                # Check if gs is an alias for an expression rather than a base column
-                raw_e = alias_to_raw[gs_unq_low]
-                if self._lookup_col_def(gs) is None and raw_e.lower() != gs.lower():
-                    resolved.append(raw_e)
+            if gs_unq_low in non_base_alias_to_raw:
+                resolved.append(non_base_alias_to_raw[gs_unq_low])
+                continue
+            try:
+                ge_ast: Any = parse_sql_ast(gs, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                resolved.append(gs)
+                continue
+            if (
+                isinstance(ge_ast, sqlglot_exp.Collate)
+                and isinstance(ge_ast.this, sqlglot_exp.Literal)
+                and not ge_ast.this.args.get("is_string")
+                and str(ge_ast.this.this).isdigit()
+                and ge_ast.expression is not None
+            ):
+                pos = int(str(ge_ast.this.this)) - 1
+                if 0 <= pos < len(self.view.select_items):
+                    raw_pos = self.view.select_items[pos].raw_expr.strip()
+                    resolved.append(f"({raw_pos}) COLLATE {ge_ast.expression.sql(sg_dialect)}")
+                    continue
+            if non_base_alias_to_raw:
+                changed = False
+
+                def _subst(cur: Any) -> Any:
+                    nonlocal changed
+                    if isinstance(cur, (sqlglot_exp.Subquery, sqlglot_exp.Select)):
+                        return cur
+                    if (
+                        isinstance(cur, sqlglot_exp.Column)
+                        and not cur.table
+                        and cur.name.lower() in non_base_alias_to_raw
+                    ):
+                        try:
+                            rep_ast = parse_sql_ast(
+                                non_base_alias_to_raw[cur.name.lower()],
+                                dialect=self.dialect,
+                            )
+                            changed = True
+                            return sqlglot_exp.Paren(this=rep_ast)
+                        except sqlglot.errors.SqlglotError:
+                            return cur
+                    if not hasattr(cur, "args"):
+                        return cur
+                    for arg_k, arg_v in list(cur.args.items()):
+                        if hasattr(arg_v, "args"):
+                            nv = _subst(arg_v)
+                            if nv is not arg_v:
+                                cur.set(arg_k, nv)
+                        elif isinstance(arg_v, list):
+                            cur.set(
+                                arg_k,
+                                [_subst(x) if hasattr(x, "args") else x for x in arg_v],
+                            )
+                    return cur
+
+                rewritten_ast = _subst(ge_ast.copy())
+                if changed:
+                    resolved.append(rewritten_ast.sql(sg_dialect))
                     continue
             resolved.append(gs)
         return tuple(resolved)
@@ -2726,6 +2787,10 @@ class PlannerMixin(MixinHost):
     def _fallback_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
         """Announced fallbacks of this plan (see matview.diagnostics)."""
         routed = self._exact_routing_diagnostics(strategy) + self._collation_fallback_diagnostics(strategy)
+        if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC and not routed:
+            # Every full refresh is announced; a routing or collation fallback
+            # already names its specific reason (and is not repeated here).
+            return (self._full_refresh_diagnostic(strategy),)
         having = self.view.having_clause
         if not having or strategy != MaintenanceStrategy.GROUP_SCOPED_DELTA or not _has_subquery_aggregate(having, self.dialect):
             # (The HAVING-subquery note describes the group-scoped recompute;
@@ -2797,6 +2862,61 @@ class PlannerMixin(MixinHost):
         if self.dialect != Dialect.SQLITE:
             return []
         return [f"sqlite_table_shape: {n}" for n in self._sqlite_table_shape_notes.values()]
+
+    def _full_refresh_reasons(self) -> List[str]:
+        """Why no incremental strategy applies: the query shapes that the
+        algebraic and group-scoped strategies cannot maintain."""
+        v = self.view
+        reasons: List[str] = []
+        if v.has_cte:
+            reasons.append("it uses a CTE that cannot be inlined into a single maintainable query")
+        if v.has_subquery_in_from:
+            reasons.append("it reads from a derived table (subquery in FROM)")
+        if v.has_compound_set_op:
+            reasons.append("it combines queries with UNION/INTERSECT/EXCEPT in a shape no strategy maintains")
+        if v.has_window_func:
+            reasons.append("it uses window functions without a common PARTITION BY")
+        if v.has_limit_or_order:
+            reasons.append("it has ORDER BY/LIMIT")
+        scalar_exprs = [it.raw_expr for it in v.select_items] + ([v.where_clause] if v.where_clause else [])
+        def _has_subquery_safely(e: str) -> bool:
+            try:
+                return _has_subquery_ast(e, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                return False  # a diagnostic must never fail the compilation
+
+        if any(_has_subquery_safely(e) for e in scalar_exprs):
+            reasons.append("it contains a (correlated) scalar subquery in the SELECT list or WHERE clause")
+        has_agg = any(it.is_aggregate for it in v.select_items)
+        if has_agg and not v.group_by_cols:
+            reasons.append(
+                "it is a global aggregate (no GROUP BY) whose aggregates cannot be folded algebraically "
+                "(e.g. DISTINCT VAR/STDDEV/BIT_XOR on SQLite)"
+            )
+        if not reasons:
+            reasons.append("no algebraic or group-scoped strategy applies to this query shape")
+        return reasons
+
+    def _full_refresh_diagnostic(self, strategy: MaintenanceStrategy) -> Diagnostic:
+        return Diagnostic(
+            code=FULL_REFRESH_FALLBACK,
+            severity=DiagnosticSeverity.INFO,
+            view=self.logical_view_name,
+            strategy=Strategy.FULL_REFRESH,
+            columns=(),
+            expressions=(),
+            message=exact_fallback_message(
+                Strategy.FULL_REFRESH,
+                (lambda r: r[0].upper() + r[1:] + ".")("; ".join(self._full_refresh_reasons())),
+                "every write to a table the view reads re-runs the original query and replaces the "
+                "stored result (O(size of the query result and its inputs) per statement on PostgreSQL, "
+                "and per affected row on SQLite and MySQL/MariaDB, whose triggers are row-level).",
+                "rewrite the view as a single-level GROUP BY (or projection) over base tables without "
+                "CTEs, derived tables, correlated subqueries or global DISTINCT statistical/bitwise "
+                "aggregates, so that a cheaper strategy applies.",
+            ),
+            details={"maintenance_strategy": strategy.value, "reasons": self._full_refresh_reasons()},
+        )
 
     def _performance_notes(self) -> List[str]:
         """Documented maintenance cost classes that are not O(1) per write."""
@@ -2925,7 +3045,36 @@ class PlannerMixin(MixinHost):
             strategy_diagnostics=strategy_diagnostics,
         )
 
+    def _refuse_trigger_record_aliases(self) -> None:
+        """Refuse a table, join, subquery or CTE alias, or a base table, named OLD or NEW
+        (any case, any quoting). The maintenance statements run inside triggers, where
+        OLD/NEW name the changed row: qualified references such as ``OLD.x`` (or ``"old".x``
+        for a table of that name) would silently read the trigger record instead of the
+        scanned table."""
+        for tbl in tuple(self.view.referenced_tables) + (self.view.base_table,):
+            if _strip_outer_ident_quotes(str(tbl)).lower() in ("old", "new"):
+                raise UnsupportedMaterializedViewError(
+                    f"The base table {tbl!r} is not supported: OLD and NEW are the trigger records of the "
+                    "maintenance statements, so a table with that name (in any case or quoting) would be "
+                    "confused with the changed row. Rename the table or read it through a view."
+                )
+        try:
+            ast = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return
+        if not isinstance(ast, sqlglot_exp.Expr):
+            return
+        for ta in ast.find_all(sqlglot_exp.TableAlias):
+            name = ta.this.name if ta.this is not None and getattr(ta.this, "name", None) else ""
+            if _strip_outer_ident_quotes(str(name)).lower() in ("old", "new"):
+                raise UnsupportedMaterializedViewError(
+                    f"The alias {name!r} is not supported: OLD and NEW are the trigger records of the "
+                    "maintenance statements, so a table, join, subquery or CTE alias with that name "
+                    "(in any case or quoting) would resolve to the changed row. Rename the alias."
+                )
+
     def _compile_single_plan(self) -> MaterializedViewPlan:
+        self._refuse_trigger_record_aliases()
         if self.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA:
             if self._alg_mode == "join":
                 raw = self._compile_tier1_join_algebraic()

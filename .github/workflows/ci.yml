@@ -350,6 +350,9 @@ jobs:
       - name: Test SQLite table shapes (WITHOUT ROWID rule, opt-in STRICT backing)
         run: python3 test_sqlite_table_shapes.py
 
+      - name: Test SQLite DISTINCT/FILTER VAR/STDDEV/BIT/BOOL against the original view (no tolerance)
+        run: python3 test_sqlite_distinct_filtered_aggregates.py
+
       - name: Test PostgreSQL/MySQL order-sensitive aggregate SQL-shape guards (offline)
         run: python3 test_pgmy_exact_float_aggregates.py
 
@@ -502,6 +505,11 @@ jobs:
 
       - name: Test lifecycle transaction ownership (raw driver connection, e.g. APSW)
         run: python3 test_registration_lifecycle.py
+
+      - name: Test SQLite DISTINCT/FILTER statistical, bitwise and boolean aggregates (SQLCipher; others skip)
+        env:
+          SQLITE_COMPAT_ENGINE: ${{ matrix.engine }}
+        run: python3 test_sqlite_distinct_filtered_aggregates.py
       - name: Archive fuzz campaign manifest
         if: always()
         uses: actions/upload-artifact@v4
