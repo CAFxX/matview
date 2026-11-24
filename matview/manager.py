@@ -45,6 +45,7 @@ from .engines import (
     EngineSubdialect,
     EngineVersion,
     MaintenanceStrategy,
+    PER_CODE_OPT_IN_LIMITATIONS,
     UnsupportedMaterializedViewError,
     _sqlglot_dialect,
     parse_engine_version,
@@ -2483,7 +2484,7 @@ class MaterializedViewManager:
         exclude_views: Sequence[str] = (),
     ) -> MaterializedViewPlan:
         """Recompile an installed view under exactly the limitation codes it
-        was installed with (plus the manager's accept_limitations); never a
+        was installed with (not the manager's current defaults); never a
         blanket override."""
         if plain_views is None:
             excl = list(exclude_views) if exclude_views else [entry["view_name"]]
@@ -2498,15 +2499,23 @@ class MaterializedViewManager:
         )
 
     def _stored_accept(self, entry: Dict[str, Any]) -> Tuple[str, ...]:
-        return tuple(sorted(set(entry.get("accepted_limitations") or ()) | set(self.accept_limitations)))
+        # The per-code result contract (weaker result guarantees such as
+        # FLOAT_REASSOCIATION_ALLOWED) is the one the view was installed
+        # under, never widened by this manager's current defaults: a manager
+        # created with accept_limitations must not reconstruct, check or
+        # repair an exact view as relaxed. Other accepted engine limitations
+        # (e.g. MYSQL_FK_CASCADE_NO_TRIGGER) keep coming from both.
+        manager_codes = {c for c in self.accept_limitations if c not in PER_CODE_OPT_IN_LIMITATIONS}
+        return tuple(sorted(set(entry.get("accepted_limitations") or ()) | manager_codes))
 
     @_manager_read_operation
     def get_diagnostics(self, view_name: Optional[str] = None) -> Dict[str, List[Any]]:
         """Strategy diagnostics (matview.diagnostics.Diagnostic) of installed
         views, reconstructed from their stored definitions and accepted
         limitation codes: ``{view_name: [Diagnostic, ...]}``. Not emitted as
-        warnings. A view that no longer compiles maps to an empty list
-        (see check_schema_drift)."""
+        warnings. A view that no longer compiles, or whose installed strategy
+        differs from the recompiled one, maps to an empty list (see
+        check_schema_drift; repair_view rebuilds it)."""
         import warnings as _warnings
 
         schemas = self.fetch_schema()
@@ -2522,6 +2531,14 @@ class MaterializedViewManager:
                     _warnings.simplefilter("ignore")
                     plan = self._stored_plan(schemas, entry)
             except Exception:
+                out[name] = []
+                continue
+            if plan.strategy.value != entry.get("strategy"):
+                # The installed view is not what its stored definition and
+                # acceptance compile to now (drifted, or its acceptance record
+                # changed): its recompiled diagnostics would describe a plan
+                # that is not installed. Report nothing until repair_view()
+                # rebuilds it (check_schema_drift reports the state).
                 out[name] = []
                 continue
             out[name] = list(plan.strategy_diagnostics)
@@ -5394,7 +5411,6 @@ def generate_materialized_view(
     dialect: Optional[Dialect | str | EngineVersion] = None,
     ignore_limitations: bool = False,
     accept_limitations: Sequence[str] = (),
-    silence_diagnostics: Sequence[str] = (),
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     incremental_backfill: bool = False,
@@ -5408,6 +5424,8 @@ def generate_materialized_view(
     repair_fence_catalog_table: Optional[str] = None,
     plain_views: Optional[Mapping[str, str]] = None,
     current_schema: Optional[str] = None,
+    *,
+    silence_diagnostics: Sequence[str] = (),
 ) -> MaterializedViewPlan:
     """
     Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
@@ -5510,7 +5528,6 @@ def generate_materialized_views(
     dialect: Optional[Dialect | str | EngineVersion] = None,
     ignore_limitations: bool = False,
     accept_limitations: Sequence[str] = (),
-    silence_diagnostics: Sequence[str] = (),
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     incremental_backfill: bool = False,
@@ -5524,6 +5541,8 @@ def generate_materialized_views(
     repair_fence_catalog_table: Optional[str] = None,
     plain_views: Optional[Mapping[str, str]] = None,
     current_schema: Optional[str] = None,
+    *,
+    silence_diagnostics: Sequence[str] = (),
 ) -> List[MaterializedViewPlan]:
     """
     Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
@@ -5596,10 +5615,11 @@ def install_materialized_view_sqlite(
     on_progress: Optional[Callable[[int, int], None]] = None,
     ignore_limitations: bool = False,
     accept_limitations: Sequence[str] = (),
-    silence_diagnostics: Sequence[str] = (),
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     strict: bool = False,
+    *,
+    silence_diagnostics: Sequence[str] = (),
 ) -> MaterializedViewPlan:
     """Installs one or more materialized views directly into a live SQLite connection."""
     mgr = MaterializedViewManager(

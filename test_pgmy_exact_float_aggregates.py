@@ -147,7 +147,8 @@ class _Fixture:
         self.tables.append(t)
         return t
 
-    def register(self, select_sql: str, relaxed: bool = True, **kw: Any) -> Any:
+    def register(self, select_sql: str, relaxed: bool = True, expect_diagnostic: Optional[bool] = None,
+                 **kw: Any) -> Any:
         """Register a view. ``relaxed`` (the historical default of this suite)
         opts in to FLOAT_REASSOCIATION_ALLOWED (incremental maintenance,
         asserted exact here only under the pinned plan); ``relaxed=False``
@@ -165,11 +166,18 @@ class _Fixture:
                 accept_limitations=FLOAT_OPT_IN if relaxed else None,
                 **kw,
             )
-        codes = [d.code for d in _diag_warnings(caught)]
-        if plan.strategy_diagnostics:
-            expected = FLOAT_RELAXED_MAINTENANCE if relaxed else FLOAT_EXACT_REFRESH
-            if codes != [expected]:
-                raise AssertionError(f"expected diagnostic {expected}, got {codes}")
+        float_codes = (FLOAT_EXACT_REFRESH, FLOAT_RELAXED_MAINTENANCE)
+        codes = [d.code for d in _diag_warnings(caught) if d.code in float_codes]
+        plan_codes = [d.code for d in plan.strategy_diagnostics if d.code in float_codes]
+        expected = FLOAT_RELAXED_MAINTENANCE if relaxed else FLOAT_EXACT_REFRESH
+        if expect_diagnostic is True and (codes != [expected] or plan_codes != [expected]):
+            # A known floating-point view must announce its strategy in both
+            # the plan and the warning: never silent.
+            raise AssertionError(f"expected diagnostic {expected}: warnings {codes}, plan {plan_codes}")
+        if expect_diagnostic is False and (codes or plan_codes):
+            raise AssertionError(f"expected no strategy diagnostic: warnings {codes}, plan {plan_codes}")
+        if plan_codes and codes != [expected]:
+            raise AssertionError(f"expected diagnostic {expected}, got {codes}")
         self.conn.commit()
         self.plans.append(plan)
         return plan
@@ -1315,7 +1323,7 @@ class NativeDefaultExactRefresh(_ExactCase):
                 try:
                     t = fx.table("ca", f"id BIGINT PRIMARY KEY, g INT NOT NULL, x {self._ty(engine)}", group_index="g")
                     live = f"SELECT g, COUNT(*) AS c, SUM(x) AS s, AVG(x) AS a FROM {t} GROUP BY g"
-                    exact = fx.register(live, relaxed=False)
+                    exact = fx.register(live, relaxed=False, expect_diagnostic=True)
                     self.assertEqual(exact.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
                     cur = fx.conn.cursor()
                     for sql, params in (
@@ -1350,10 +1358,15 @@ class NativeDefaultExactRefresh(_ExactCase):
                     cur.execute(f"ANALYZE {t}" if engine == Dialect.POSTGRES else f"ANALYZE TABLE {t}")
                     if engine == Dialect.MYSQL:
                         cur.fetchall()
+                    if engine == Dialect.POSTGRES:
+                        # Precondition made explicit: the original query reads
+                        # through the y index (the refresh, run in this
+                        # session's writes, uses the same setting).
+                        cur.execute("SET enable_seqscan = off")
                     fx.conn.commit()
                     live = f"SELECT COUNT(*) AS c, SUM(x) AS s FROM {t} WHERE y < 10"
-                    exact = fx.register(live, relaxed=False)
-                    relaxed = fx.register(live, relaxed=True)
+                    exact = fx.register(live, relaxed=False, expect_diagnostic=True)
+                    relaxed = fx.register(live, relaxed=True, expect_diagnostic=True)
                     cur.execute(f"INSERT INTO {t} VALUES (4, 1, 5, 0.0)")
                     fx.conn.commit()
                     cur.execute(live)
@@ -1363,11 +1376,13 @@ class NativeDefaultExactRefresh(_ExactCase):
                     cur.execute(f"SELECT s FROM {relaxed.view_name}")
                     relaxed_sum = cur.fetchall()[0][0]
                     fx.conn.commit()
-                    if live_sum == 1.5 and engine == Dialect.POSTGRES:
-                        # The plan reads through the y index: the relaxed
-                        # recompute (pinned to ctid order) gives 2.0.
-                        # (MySQL/MariaDB's relaxed locking read may itself use
-                        # the y index, so either value is allowed there.)
+                    if engine == Dialect.POSTGRES:
+                        # The plan reads through the y index (index order:
+                        # 1.5, 1e16, -1e16 -> 1.5); the relaxed recompute
+                        # (pinned to ctid order) gives 2.0. (MySQL/MariaDB's
+                        # relaxed locking read may itself use the y index, so
+                        # either value is allowed there.)
+                        self.assertEqual(live_sum, 1.5, "precondition: index-ordered plan")
                         self.assertEqual(relaxed_sum, 2.0)
                 finally:
                     fx.close()
@@ -1384,7 +1399,7 @@ class NativeDefaultExactRefresh(_ExactCase):
                         f"SELECT id, g, SUM(x) OVER (PARTITION BY g) AS s FROM {a}",
                         f"SELECT {a}.g, COUNT(*) AS c, SUM({b}.y) AS s FROM {a} JOIN {b} ON {b}.aid = {a}.id GROUP BY {a}.g",
                     ]
-                    plans = [(fx.register(v, relaxed=False), v) for v in views]
+                    plans = [(fx.register(v, relaxed=False, expect_diagnostic=True), v) for v in views]
                     for p, _ in plans:
                         self.assertEqual(p.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
                     cur = fx.conn.cursor()
@@ -1417,7 +1432,7 @@ class NativeDefaultExactRefresh(_ExactCase):
                         f"SELECT g, COUNT(*) AS c FROM {t} GROUP BY g HAVING SUM(x) > 1",
                         f"SELECT g, SUM(x) AS s FROM {t} GROUP BY g UNION ALL SELECT g, SUM(y) FROM {u} GROUP BY g",
                     ]
-                    plans = [(fx.register(v, relaxed=False), v) for v in views]
+                    plans = [(fx.register(v, relaxed=False, expect_diagnostic=True), v) for v in views]
                     cur = fx.conn.cursor()
                     for sql in (
                         f"INSERT INTO {t} VALUES (1, 1, 1e16), (2, 1, 1.5), (3, 2, 0.1), (4, 2, 0.2), (5, 2, 0.3)",
@@ -1441,7 +1456,7 @@ class NativeDefaultExactRefresh(_ExactCase):
                 try:
                     t = fx.table("cw", f"id BIGINT PRIMARY KEY, g INT NOT NULL, x {self._ty(engine)}", group_index="g")
                     live = f"SELECT g, COUNT(*) AS c, SUM(x) AS s FROM {t} GROUP BY g"
-                    plan = fx.register(live, relaxed=False)
+                    plan = fx.register(live, relaxed=False, expect_diagnostic=True)
                     s1, s2 = fx.session(), fx.session()
                     try:
                         c1, c2 = s1.cursor(), s2.cursor()
@@ -1465,6 +1480,7 @@ class NativeDefaultExactRefresh(_ExactCase):
                         self.assertFalse(done.is_set())
                         s1.commit()
                         th.join(LOCK_WAIT_TIMEOUT_S)
+                        self.assertFalse(th.is_alive(), "second writer did not finish after the first committed")
                         self.assertFalse(err, err)
                     finally:
                         s1.close()
@@ -1630,6 +1646,7 @@ class NativeUnionAllMixedTypes(_ExactCase):
                     rng = random.Random(280)
                     vals = (1e16, -1e16, 1.5, 0.1, 0.2, 0.3, 2.5, None)
                     cur = fx.conn.cursor()
+                    applied = 0
                     for step in range(30):
                         tb = rng.choice((t, u))
                         i = rng.randrange(1, 25)
@@ -1646,8 +1663,14 @@ class NativeUnionAllMixedTypes(_ExactCase):
                                             (rng.choice(vals), rng.randrange(-5, 9), rng.randrange(3), i))
                             else:
                                 cur.execute(f"DELETE FROM {tb} WHERE id = %s", (i,))
+                            applied += 1 if cur.rowcount and cur.rowcount > 0 else 0
                             fx.conn.commit()
-                        except Exception:
+                        except Exception as exc:
+                            # Only a duplicate primary key is an expected
+                            # rejection; anything else (a failing trigger)
+                            # must fail the test.
+                            if type(exc).__name__ not in ("UniqueViolation", "IntegrityError"):
+                                raise
                             fx.conn.rollback()
                             cur = fx.conn.cursor()
                         for plan, sel in plans:
@@ -1655,6 +1678,75 @@ class NativeUnionAllMixedTypes(_ExactCase):
                                 self._q(fx.conn, f"SELECT * FROM {plan.view_name}"), self._q(fx.conn, sel),
                                 f"{engine.value} step {step}: {sel}",
                             )
+                    self.assertGreaterEqual(applied, 15, "too few writes changed rows")
+                finally:
+                    fx.close()
+
+
+class NativeSubqueryScopes(_ExactCase):
+    """Natively, default mode: a column inside a subquery resolves in the
+    subquery's own scope first (inner u.x DOUBLE, not the outer t.x INT of
+    the same name). Aggregates over the inner float are classified floating
+    point (exact full refresh, FLOAT_EXACT_REFRESH) and projected scalar
+    subqueries store the live type; correlated and exact shapes keep exact
+    types. A projected subquery aggregating a derived table's column (type
+    not provable) is refused. Types and values compared exactly with the
+    live view after every write."""
+
+    def test_subquery_scopes(self) -> None:
+        engines = _native_engines()
+        if not engines:
+            self.skipTest("set POSTGRES_DSN and/or MYSQL_DSN")
+        for engine, dsn in engines:
+            with self.subTest(engine=engine.value):
+                fx = _Fixture(engine, dsn)
+                try:
+                    f_t = "DOUBLE PRECISION" if engine == Dialect.POSTGRES else "DOUBLE"
+                    t = fx.table("so", "id BIGINT PRIMARY KEY, g INT, x INT")
+                    u = fx.table("si", f"id BIGINT PRIMARY KEY, g INT, x {f_t}, k INT")
+                    float_views = [
+                        f"SELECT g, COUNT(*) AS n, (SELECT SUM(x) FROM {u}) AS s FROM {t} GROUP BY g",
+                        f"SELECT g, (SELECT AVG(x) FROM {u}) AS a FROM {t} GROUP BY g",
+                        f"SELECT g, COUNT(*) AS n FROM {t} GROUP BY g HAVING (SELECT SUM(x) FROM {u}) > 0.25",
+                        f"SELECT g, SUM(x) AS s FROM {t} WHERE x < (SELECT SUM(x) FROM {u}) GROUP BY g",
+                        f"SELECT g, (SELECT SUM({u}.x) FROM {u} WHERE {u}.g = {t}.g) AS s FROM {t} GROUP BY g",
+                        # alias shadowing: inner alias named like the outer table
+                        f"SELECT g, (SELECT SUM(z.x) FROM {u} z) AS s FROM {t} z GROUP BY g",
+                    ]
+                    exact_views = [
+                        f"SELECT g, COUNT(*) AS n, (SELECT SUM(k) FROM {u}) AS s FROM {t} GROUP BY g",
+                        f"SELECT g, (SELECT SUM({u}.k) FROM {u} WHERE {u}.g = {t}.g) AS s FROM {t} GROUP BY g",
+                    ]
+                    plans = [(fx.register(v, relaxed=False, expect_diagnostic=True), v) for v in float_views]
+                    plans += [(fx.register(v, relaxed=False), v) for v in exact_views]
+                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "derived table"):
+                        fx.register(
+                            f"SELECT g, (SELECT SUM(x) FROM (SELECT x FROM {u}) d) AS s FROM {t} GROUP BY g",
+                            relaxed=False,
+                        )
+                    fx.conn.rollback()
+                    cur = fx.conn.cursor()
+                    rng = random.Random(255)
+                    writes = [
+                        (f"INSERT INTO {t} VALUES (%s, %s, %s)", (1, 1, 5)),
+                        (f"INSERT INTO {t} VALUES (%s, %s, %s)", (2, 2, 7)),
+                    ]
+                    for i in range(1, 13):
+                        writes.append((f"INSERT INTO {u} VALUES (%s, %s, %s, %s)",
+                                       (i, rng.choice((1, 2)), rng.choice((1e16, -1e16, 0.1, 0.2, 0.3, 1.5)), i)))
+                    writes += [(f"DELETE FROM {u} WHERE id = %s", (i,)) for i in (2, 5, 7)]
+                    writes.append((f"UPDATE {t} SET x = %s WHERE id = %s", (1, 1)))
+                    for sql, params in writes:
+                        cur.execute(sql, params)
+                        fx.conn.commit()
+                        for plan, sel in plans:
+                            mv_cur = fx.conn.cursor()
+                            mv_cur.execute(f"SELECT * FROM {plan.view_name}")
+                            mv = sorted((tuple((type(v).__name__, _exact(v)) for v in r) for r in mv_cur.fetchall()), key=repr)
+                            mv_cur.execute(sel)
+                            lv = sorted((tuple((type(v).__name__, _exact(v)) for v in r) for r in mv_cur.fetchall()), key=repr)
+                            fx.conn.commit()
+                            self.assertEqual(mv, lv, f"{engine.value}: {sql} {params}: {sel}")
                 finally:
                     fx.close()
 
@@ -1689,7 +1781,7 @@ class NativeRecursiveCteSources(_ExactCase):
                         f"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) "
                         f"SELECT {t}.g, COUNT(*) AS cnt, SUM({t}.k) AS sk FROM {t} CROSS JOIN c GROUP BY {t}.g"
                     )
-                    plan = fx.register(ok_sel, relaxed=False)
+                    plan = fx.register(ok_sel, relaxed=False, expect_diagnostic=False)
                     cur = fx.conn.cursor()
                     for sql, params in (
                         (f"INSERT INTO {t} VALUES (%s, %s, %s), (%s, %s, %s)", (1, 1, 5, 2, 1, 7)),
@@ -2037,7 +2129,7 @@ class OfflineDefaultExactRefresh(unittest.TestCase):
                     )
                     self.assertEqual(diags[0].strategy, expected)
                     self.assertTrue(diags[0].message.startswith(f"{RELAXED_LEAD} {expected.value}."))
-                    self.assertIn("may differ from the live view in the last digits", diags[0].message)
+                    self.assertIn("may differ from the live view with no fixed error bound", diags[0].message)
                     self.assertEqual(_diag_warnings(caught), diags)
 
     def test_exact_types_have_no_diagnostic(self) -> None:
@@ -2143,23 +2235,28 @@ class OfflineDefaultExactRefresh(unittest.TestCase):
         ):
             with self.subTest(code=code):
                 base = ["--schema", schema, "--view", view, "--dialect", "postgresql:18", *extra]
-                with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err, \
-                        warnings.catch_warnings():
-                    warnings.simplefilter("always")
+
+                def run(argv: List[str]) -> Tuple[str, str]:
                     import sys as _sys
-                    old = warnings.showwarning
-                    warnings.showwarning = lambda m, c, f, l, file=None, line=None: print(str(m), file=_sys.stderr)
-                    try:
-                        self.assertEqual(cli_main(base), 0)
-                        self.assertEqual(cli_main(base + ["--diff", "--json"]), 0)
-                    finally:
-                        warnings.showwarning = old
-                self.assertIn(f"[{code}; view v]", err.getvalue())
-                self.assertIn(f"{lead} {strat.value}", err.getvalue())
+                    with contextlib.redirect_stdout(io.StringIO()) as out, \
+                            contextlib.redirect_stderr(io.StringIO()) as err, warnings.catch_warnings():
+                        warnings.simplefilter("always")
+                        old = warnings.showwarning
+                        warnings.showwarning = lambda m, c, f, l, file=None, line=None: print(str(m), file=_sys.stderr)
+                        try:
+                            self.assertEqual(cli_main(argv), 0)
+                        finally:
+                            warnings.showwarning = old
+                    return out.getvalue(), err.getvalue()
+
+                text_out, text_err = run(base)
+                self.assertIn(f"[{code}; view v]", text_err)
+                self.assertIn(f"{lead} {strat.value}", text_err)
                 # Text output: the diagnostic leads a stdout comment line.
-                self.assertIn(f"-- {lead} {strat.value}", out.getvalue())
-                payload = out.getvalue()[out.getvalue().index("{\n"):]
-                doc = _json.loads(payload)
+                self.assertIn(f"-- {lead} {strat.value}", text_out)
+                # --diff --json: stdout is exactly one JSON document.
+                json_out, _ = run(base + ["--diff", "--json"])
+                doc = _json.loads(json_out)
                 self.assertEqual([d["code"] for d in doc["diagnostics"]], [code])
                 self.assertEqual(doc["diagnostics"][0]["strategy"], strat.value)
                 self.assertTrue(doc["diagnostics"][0]["message"].startswith(lead))
@@ -2251,6 +2348,29 @@ class OfflineManagerAcceptance(unittest.TestCase):
                 (d,) = mgr.get_diagnostics("v_up")["v_up"]
                 self.assertEqual((d.code, d.strategy), (FLOAT_EXACT_REFRESH, Strategy.FULL_REFRESH))
 
+    def test_manager_defaults_never_widen_an_installed_contract(self) -> None:
+        """A view installed under the exact default keeps it when a later
+        manager has relaxed defaults: diagnostics, drift and repair use the
+        stored contract, not the manager's current accept_limitations."""
+        for dialect in (Dialect.POSTGRES, Dialect.MYSQL):
+            with self.subTest(dialect=dialect.value):
+                conn, mgr = self._manager(dialect, ignore_limitations=True)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    mgr.register_view(self.VIEW)
+                self.assertEqual(self._strategy(mgr), MaintenanceStrategy.ATOMIC_QUERY_SYNC.value)
+                relaxed_mgr = MaterializedViewManager(
+                    conn, dialect=dialect, ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
+                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    (d,) = relaxed_mgr.get_diagnostics("v_up")["v_up"]
+                    self.assertEqual((d.code, d.strategy), (FLOAT_EXACT_REFRESH, Strategy.FULL_REFRESH))
+                    self.assertEqual(relaxed_mgr.check_schema_drift(), {"v_up": "ok"})
+                    relaxed_mgr.repair_view("v_up")
+                self.assertEqual(self._strategy(relaxed_mgr), MaintenanceStrategy.ATOMIC_QUERY_SYNC.value)
+                self.assertNotIn(_NR, relaxed_mgr.get_catalog()["v_up"]["accepted_limitations"])
+
     def test_acceptance_is_stored_and_reused(self) -> None:
         for dialect in (Dialect.POSTGRES, Dialect.MYSQL):
             with self.subTest(dialect=dialect.value):
@@ -2328,6 +2448,14 @@ class OfflineManagerAcceptance(unittest.TestCase):
         self.assertEqual(e2["accepted_limitations"], [])
         # Recompiled without the relaxed acceptance: exact default, so drifted.
         self.assertEqual(other.check_schema_drift(), {"v_up": "drifted"})
+        # The installed view is still the relaxed one: no diagnostic claims
+        # an exact guarantee it does not have yet ...
+        self.assertEqual(other.get_diagnostics("v_up")["v_up"], [])
+        # ... until repair rebuilds it under the exact default.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            other.repair_view("v_up")
+        self.assertEqual(other.get_catalog()["v_up"]["strategy"], MaintenanceStrategy.ATOMIC_QUERY_SYNC.value)
         (d,) = other.get_diagnostics("v_up")["v_up"]
         self.assertEqual(d.code, FLOAT_EXACT_REFRESH)
 

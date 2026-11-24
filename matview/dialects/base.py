@@ -434,7 +434,8 @@ class DialectBaseMixin(MixinHost):
             # has the common type of all its branches, not the first one's.
             try:
                 setop_t = self._setop_derived_col_type(
-                    parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect), node.name
+                    parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect), node.name,
+                    node.table or None,
                 )
             except sqlglot.errors.SqlglotError:
                 setop_t = None
@@ -752,6 +753,17 @@ class DialectBaseMixin(MixinHost):
                     return self._numeric_precision_scale_from_type(setop_def.data_type)
                 cte_expression = self._resolve_cte_column_expression(node)
                 return infer(cte_expression) if cte_expression is not None else None
+            if kind in ("Subquery", "Select"):
+                # A scalar subquery: the exact type of its single projection,
+                # resolved in the subquery's own scope.
+                inner = node.this if kind == "Subquery" else node
+                if not isinstance(inner, sqlglot_exp.Select) or len(inner.expressions) != 1:
+                    return None
+                proj = inner.expressions[0]
+                if isinstance(proj, sqlglot_exp.Alias):
+                    proj = proj.this
+                scoped = self._scope_qualified_expr(proj)
+                return infer(scoped) if scoped is not None else None
             if kind == "Literal":
                 if node.args.get("is_string"):
                     return None
@@ -1479,7 +1491,99 @@ class DialectBaseMixin(MixinHost):
 
         return None
 
-    def _setop_derived_col_type(self, q_ast: Any, ident: str) -> Optional[str]:
+    def _scope_sources(self, select: Any) -> List[Tuple[str, Optional[str]]]:
+        """(name or alias, base table name | None) of a SELECT's FROM/JOIN
+        sources. None marks a derived table, a CTE or anything else whose
+        columns are not declared base-table columns."""
+        root = select
+        while root.parent is not None:
+            root = root.parent
+        cte_names = {c.alias.lower() for c in root.find_all(sqlglot_exp.CTE) if c.alias}
+        out: List[Tuple[str, Optional[str]]] = []
+        from_clause = select.args.get("from_") or select.args.get("from")
+        srcs: List[Any] = [getattr(from_clause, "this", None)] if from_clause is not None else []
+        srcs += [getattr(j, "this", None) for j in (select.args.get("joins") or ())]
+        for src in srcs:
+            if src is None:
+                continue
+            if isinstance(src, sqlglot_exp.Table) and src.name:
+                t_name = src.name.lower()
+                base = None if t_name in cte_names else (t_name if t_name in self._schemas_lower else None)
+                out.append(((src.alias or src.name).lower(), base))
+                if src.alias:
+                    out.append((src.name.lower(), base))
+            else:
+                alias = getattr(src, "alias", "") or ""
+                out.append((alias.lower(), None))
+        return out
+
+    _OUTER_REFERENCE = "\x00outer"
+
+    def _resolve_scoped_column(self, col: Any) -> Optional[str]:
+        """Base table of a column reference, resolved through its scope
+        chain: the innermost SELECT's own sources first, then each enclosing
+        SELECT (correlated references). None (unknown) when the column comes
+        from a derived table or CTE, or cannot be resolved unambiguously."""
+        name = col.name.lower()
+        qual = (col.table or "").lower()
+        sel = col.parent
+        while sel is not None:
+            if isinstance(sel, sqlglot_exp.Select):
+                sources = self._scope_sources(sel)
+                if qual:
+                    hits = [base for (n, base) in sources if n == qual]
+                    if hits:
+                        return hits[0]
+                else:
+                    if any(base is None for (_, base) in sources):
+                        # A derived/CTE source may define this column.
+                        return None
+                    owners = {
+                        base for (_, base) in sources
+                        if base is not None and any(
+                            c.lower() == name for c in self._schemas_lower[base].columns
+                        )
+                    }
+                    if len(owners) == 1:
+                        return owners.pop()
+                    if len(owners) > 1:
+                        return None
+            sel = sel.parent
+        # Not defined by any enclosing scope seen here: an outer reference
+        # beyond this (sub)tree (a scalar subquery typed on its own); keep
+        # the reference as written.
+        return self._OUTER_REFERENCE
+
+    def _scope_qualified_sql(self, expr: Any) -> Optional[str]:
+        q = self._scope_qualified_expr(expr)
+        return None if q is None else q.sql(dialect=_sqlglot_dialect(self.dialect))
+
+    def _scope_qualified_expr(self, expr: Any) -> Optional[Any]:
+        """``expr`` (inside its query tree) with every column qualified by
+        the base table its scope resolves it to, or None when any column is
+        unknown (fail closed: the caller treats the expression as of unknown
+        type, never as the type of a same-named column of an outer table)."""
+        repl: Dict[int, Any] = {}
+        for col in expr.find_all(sqlglot_exp.Column):
+            if isinstance(col.this, sqlglot_exp.Star):
+                return None
+            base = self._resolve_scoped_column(col)
+            if base is None:
+                return None
+            repl[id(col)] = (
+                col.copy() if base == self._OUTER_REFERENCE else sqlglot_exp.column(col.name, table=base)
+            )
+        cp = expr.copy()
+        orig = list(expr.find_all(sqlglot_exp.Column))
+        for o, c in zip(orig, list(cp.find_all(sqlglot_exp.Column))):
+            new = repl[id(o)]
+            if c is cp:
+                cp = new
+            else:
+                c.replace(new)
+        return cp
+
+    def _setop_derived_col_type(self, q_ast: Any, ident: str, qualifier: Optional[str] = None) -> Optional[str]:
         """Common storage type of column ``ident`` of a multi-branch set
         operation defined in a CTE or a derived table (subquery in FROM).
         None when no such set operation defines it, or when a branch's
@@ -1500,6 +1604,14 @@ class DialectBaseMixin(MixinHost):
             if isinstance(sub.parent, sqlglot_exp.SetOperation):
                 continue
             sources.append((sub.this, sub.args.get("alias")))
+        if qualifier:
+            # q.x: only the relation named q defines it.
+            q_low = qualifier.lower()
+            sources = [
+                (b_, a_) for (b_, a_) in sources
+                if isinstance(a_, sqlglot_exp.TableAlias) and (a_.name or "").lower() == q_low
+            ]
+        found: List[Optional[str]] = []
         for body, table_alias in sources:
             while isinstance(body, sqlglot_exp.Subquery):
                 body = body.this
@@ -1535,6 +1647,7 @@ class DialectBaseMixin(MixinHost):
                 continue
             b_types: List[str] = []
             has_null = False
+            has_str_lit = False
             for br in branches:
                 if col_pos >= len(br.expressions):
                     return None
@@ -1547,7 +1660,9 @@ class DialectBaseMixin(MixinHost):
                     continue
                 if isinstance(src_e, sqlglot_exp.Literal):
                     if self.dialect == Dialect.POSTGRES and src_e.args.get("is_string"):
-                        b_types.append("TEXT")
+                        # An unknown-type literal: it takes the type of the
+                        # typed branches (TEXT only when none is typed).
+                        has_str_lit = True
                     else:
                         b_types.append(self._literal_storage_type(src_e))
                     continue
@@ -1569,10 +1684,15 @@ class DialectBaseMixin(MixinHost):
                 if not e_t:
                     return None
                 b_types.append(e_t)
+            if not b_types and has_str_lit:
+                b_types.append("TEXT")
             if not b_types:
                 return None
-            return self._common_storage_type(b_types, has_null=has_null)
-        return None
+            found.append(self._common_storage_type(b_types, has_null=has_null))
+        distinct = set(found)
+        # Unqualified and defined differently by several relations: not
+        # resolvable here (the caller falls back).
+        return found[0] if len(distinct) == 1 else None
 
     # MariaDB integer column display lengths (sign included when signed); the
     # declared display width (INT(5)) does not change arithmetic lengths.
@@ -2253,6 +2373,13 @@ class DialectBaseMixin(MixinHost):
                     e = inner.expressions[0]
                     if isinstance(e, sqlglot_exp.Alias):
                         e = e.this
+                    # Resolve the projection's columns in the subquery's own
+                    # scope first (u.x, not an outer t.x of the same name);
+                    # unknown when that is not provable.
+                    scoped = self._scope_qualified_expr(e) if e.parent is not None else None
+                    if scoped is None:
+                        return None
+                    e = scoped
                     if isinstance(e, (sqlglot_exp.Sum, sqlglot_exp.Avg, sqlglot_exp.Count)):
                         return infer(sqlglot_exp.Window(this=e.copy()))
                     if isinstance(e, (sqlglot_exp.Min, sqlglot_exp.Max)):

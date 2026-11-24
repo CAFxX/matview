@@ -280,6 +280,10 @@ class PlannerMixin(MixinHost):
         sg = _sqlglot_dialect(self.dialect)
         for w in root.find_all(sqlglot_exp.Window):
             fn = w.this
+            if isinstance(fn, sqlglot_exp.Filter):
+                # SUM(x) FILTER (WHERE ...) OVER (...): the aggregate is
+                # inside the FILTER node.
+                fn = fn.this
             if fn is not None:
                 unwrapped_pg = _unwrap_pg_catalog_agg_node(fn, self.dialect)
                 if unwrapped_pg is not None:
@@ -363,8 +367,11 @@ class PlannerMixin(MixinHost):
         top = root if isinstance(root, sqlglot_exp.Select) else None
         top_exprs = {id(e) for e in (top.expressions if top is not None else [])}
         out: List[str] = []
+        self._unprovable_projection_exprs: List[str] = []
         for node in root.walk():
-            if not isinstance(node, sqlglot_exp.Func) or isinstance(node.parent, sqlglot_exp.Window):
+            if not isinstance(node, sqlglot_exp.Func) or isinstance(node.parent, sqlglot_exp.Window) or (
+                isinstance(node.parent, sqlglot_exp.Filter) and isinstance(node.parent.parent, sqlglot_exp.Window)
+            ):
                 continue
             names = {node.sql_name().upper(), str(getattr(node, "name", "") or "").upper()}
             if not names & self._ORDER_SENSITIVE_FN_NAMES:
@@ -400,7 +407,20 @@ class PlannerMixin(MixinHost):
             elif isinstance(arg, str):
                 arg_sql = arg
             else:
-                arg_sql = arg.sql(dialect=sg)
+                # Resolve the argument's columns through their own scope
+                # chain (a subquery's FROM before the outer query): an inner
+                # u.x DOUBLE is never typed as an outer t.x INT. Unknown
+                # (derived table, CTE, ambiguous) counts as approximate.
+                arg_sql = self._scope_qualified_sql(arg) or ""
+                if not arg_sql and nested and top is not None:
+                    # Unknown type inside a subquery of the top-level
+                    # projection: that subquery's value is a stored column,
+                    # whose type the full refresh could not derive.
+                    a2 = node.parent
+                    while a2 is not None and id(a2) not in top_exprs:
+                        a2 = a2.parent
+                    if a2 is not None:
+                        self._unprovable_projection_exprs.append(node.sql(dialect=sg))
             is_stat = bool(names & self._STAT_FN_NAMES)
             exact = bool(arg_sql) and self._exact_numeric_precision_scale(arg_sql) is not None
             if (is_stat and self.dialect == Dialect.MYSQL) or not exact:
@@ -419,6 +439,16 @@ class PlannerMixin(MixinHost):
             root = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
             return
+        self._nested_order_sensitive_exprs()
+        unprovable = list(dict.fromkeys(getattr(self, "_unprovable_projection_exprs", [])))
+        if unprovable:
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}' projects a subquery with {', '.join(unprovable)} "
+                f"whose argument comes from a derived table, a CTE or an ambiguous reference: the "
+                f"exact full refresh cannot prove that column's result type from declared source "
+                f"columns, so it could store a different type than the original view. Aggregate "
+                f"a base-table column directly in the subquery."
+            )
         recursive = [
             w for w in root.find_all(sqlglot_exp.With) if w.args.get("recursive")
         ]
@@ -454,7 +484,7 @@ class PlannerMixin(MixinHost):
         _float_strategy_diagnostics), and no limitation applies. Only with the
         explicit per-code opt-in FLOAT_REASSOCIATION_ALLOWED does the planner
         use incremental maintenance whose float result may differ from the
-        original view in the last digits (the original view accumulates in
+        original view with no fixed error bound (the original view accumulates in
         its plan's row order); shapes whose incremental maintenance is not
         the race-free post-lock recompute also need
         ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE."""
@@ -499,7 +529,7 @@ class PlannerMixin(MixinHost):
                 description=(
                     f"Relaxed result allowed for {listed}: maintained incrementally on a BEST-EFFORT basis (race-free native "
                     f"recompute in {order} where available); the floating-point result may differ from "
-                    f"the original view in the last digits, because the original view accumulates in its "
+                    f"the original view, with no fixed error bound (1e16 + 1.5 - 1e16: 2.0 vs 1.5), because the original view accumulates in its "
                     f"plan's row order."
                 ),
                 mitigation="Remove FLOAT_REASSOCIATION_ALLOWED to get the exact default (full refresh).",
@@ -532,7 +562,8 @@ class PlannerMixin(MixinHost):
         )
         if self.dialect == Dialect.POSTGRES:
             cost = (
-                "on PostgreSQL, O(rows in the view's source tables) per writing statement "
+                "on PostgreSQL, the cost of evaluating the view's query (O(source rows) for one "
+                "table; a join can process the product of its inputs) per writing statement "
                 "(statement-level triggers re-run the whole view query once per INSERT/UPDATE/DELETE "
                 "statement); the refresh locks the whole view, so all writers of the view serialize "
                 "(writers of different groups wait for each other) and under REPEATABLE READ a "
@@ -540,8 +571,8 @@ class PlannerMixin(MixinHost):
             )
         else:
             cost = (
-                f"on {'MariaDB' if self.subdialect == EngineSubdialect.MARIADB else 'MySQL'}, O(rows in "
-                f"the view's source tables) per written ROW (row triggers re-run the whole view query "
+                f"on {'MariaDB' if self.subdialect == EngineSubdialect.MARIADB else 'MySQL'}, the cost "
+                f"of evaluating the view's query per written ROW (row triggers re-run the whole view query "
                 f"for every inserted, updated or deleted row); the refresh locks every row of the view, "
                 f"so all writers of the view serialize and concurrent writers deadlock often (error "
                 f"1213, retryable; measured with 4 single-write writers: MySQL 8.4 285/600 "
@@ -556,7 +587,7 @@ class PlannerMixin(MixinHost):
                 strat = Strategy.ALGEBRAIC_DELTA
             msg = relaxed_message(
                 strat,
-                "the floating-point result may differ from the live view in the last digits (it is "
+                "the floating-point result may differ from the live view with no fixed error bound (it is "
                 "accumulated in another row order than the original view's plan).",
                 "remove FLOAT_REASSOCIATION_ALLOWED from accept_limitations / --accept-limitation.",
             )
@@ -572,7 +603,7 @@ class PlannerMixin(MixinHost):
             "store the values as DECIMAL/NUMERIC or integers (exact, fast incremental maintenance), or "
             "accept a relaxed result with accept_limitations=['FLOAT_REASSOCIATION_ALLOWED'] / "
             "--accept-limitation FLOAT_REASSOCIATION_ALLOWED (fast incremental maintenance, may differ "
-            "from the live view in the last digits).",
+            "from the live view, with no fixed error bound).",
         )
         return [Diagnostic(
             code=FLOAT_EXACT_REFRESH, severity=DiagnosticSeverity.WARNING,
@@ -1758,6 +1789,19 @@ class PlannerMixin(MixinHost):
         return self._effective_group_by_exprs
 
     def _select_strategy_and_mode(self) -> Tuple[MaintenanceStrategy, str]:
+        strategy, mode = self._select_strategy_and_mode_unchecked()
+        if (
+            strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC
+            and self._float_relaxed_requested()
+            and self._order_sensitive_float_items()
+        ):
+            # Relaxed mode that still ends in a full refresh stores the
+            # original query's result with the same derived column types:
+            # the same type-provability guard applies.
+            self._refuse_unprovable_float_refresh_types()
+        return strategy, mode
+
+    def _select_strategy_and_mode_unchecked(self) -> Tuple[MaintenanceStrategy, str]:
         if self._exact_full_refresh_fallback() is not None:
             return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
         if self._float_refresh_required():

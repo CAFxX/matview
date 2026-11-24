@@ -333,7 +333,8 @@ Errors raised before anything is installed:
   they are refused there; use `VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`.
   On MariaDB it is also raised for `VAR_*`/`STDDEV_*` results the view cannot
   reproduce exactly: window statistics, and statistics over exact
-  (integer/`DECIMAL`) or `FLOAT(M,D)` arguments anywhere except as a whole
+  (integer/`DECIMAL`) or `FLOAT(M,D)` arguments: always under the exact default,
+  and under the `FLOAT_REASSOCIATION_ALLOWED` opt-in everywhere except as a whole
   top-level projected aggregate of a single query (also not in `HAVING`; MariaDB
   fixes their decimals and rounds results to them). Some exact shapes are
   refused conservatively too (`SELECT DISTINCT`, `ORDER BY ... LIMIT`, a
@@ -349,8 +350,8 @@ Errors raised before anything is installed:
 | `MYSQL_FK_CASCADE_NO_TRIGGER` | A source table on MySQL/MariaDB has `ON DELETE`/`ON UPDATE` cascading foreign keys. | InnoDB cascades do not fire triggers. |
 | `SQLITE_VERSION_NO_WINDOW_FUNC`, `MYSQL_VERSION_NO_WINDOW_FUNC` | Window functions on an engine version without them. | The query cannot run there. |
 | `FLOAT_REASSOCIATION_ALLOWED` | Never raised by default: accepting it per code selects the relaxed incremental mode for floating-point `SUM`/`AVG`/`VAR`/`STDDEV` on PostgreSQL/MySQL/MariaDB (see [Floating-point aggregates](#floating-point-aggregates)); without it such views are exact via a full refresh. | The relaxed result may differ from the live view in the last digits. |
-| `ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE` | Such an aggregate over a join, a window, or (MySQL/MariaDB) `UNION ALL`. Per-code opt-in only. | It is folded or re-evaluated without the lock-then-recompute protocol: values can drift until `repair_view()`. |
-| `MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX` | MySQL/MariaDB: a grouped view with such an aggregate and no source-table index whose leading columns are the `GROUP BY` columns. Per-code opt-in only. | The recompute is a locking read; without the index it share-locks the whole table and concurrent writers deadlock. |
+| `ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE` | Relaxed mode only (the exact default uses the full refresh): such an aggregate over a join, a window, or (MySQL/MariaDB) `UNION ALL`. Per-code opt-in only. | It is folded or re-evaluated without the lock-then-recompute protocol: values can drift until `repair_view()`. |
+| `MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX` | Relaxed mode only, MySQL/MariaDB: a grouped view with such an aggregate and no source-table index whose leading columns are the `GROUP BY` columns. Per-code opt-in only. | The recompute is a locking read; without the index it share-locks the whole table and concurrent writers deadlock. |
 
 ```python run
 import warnings
@@ -1438,11 +1439,13 @@ views, each key value is mapped to a canonical text by a per-view function
 
   | Engine | Full refresh cost | Concurrency |
   | --- | --- | --- |
-  | PostgreSQL | O(rows of the view's source tables) per writing **statement** (statement-level triggers) | the refresh locks the whole view: all writers of the view serialize, also writers of different groups; under REPEATABLE READ a concurrent second writer fails with 40001 |
-  | MySQL/MariaDB | O(rows of the view's source tables) per written **row** (row triggers) | all writers of the view serialize and deadlock often (1213, retryable): measured with 4 single-write writers, 600 transactions: MySQL 8.4 285 (relaxed mode 56), MariaDB 138 (relaxed 106) |
+  | PostgreSQL | the cost of evaluating the original query (O(source rows) for one table; a join can process the product of its inputs) per writing **statement** (statement-level triggers) | the refresh locks the whole view: all writers of the view serialize, also writers of different groups; under REPEATABLE READ a concurrent second writer fails with 40001 |
+  | MySQL/MariaDB | the cost of evaluating the original query per written **row** (row triggers) | all writers of the view serialize and deadlock often (1213, retryable): measured with 4 single-write writers, 600 transactions: MySQL 8.4 285 (relaxed mode 56), MariaDB 138 (relaxed 106) |
 
   Store the values as `DECIMAL`/`NUMERIC` or integers for exact incremental
-  maintenance at O(1) per row.
+  `SUM`/`AVG` maintenance at O(1) per row (MySQL/MariaDB `VAR_*`/`STDDEV_*`
+  are computed in `DOUBLE` whatever the argument type, so they keep the full
+  refresh).
 - **Relaxed (opt-in)**: `accept_limitations=["FLOAT_REASSOCIATION_ALLOWED"]` /
   `--accept-limitation FLOAT_REASSOCIATION_ALLOWED` (per code; the global
   `ignore_limitations` never enables it; stored with the view and bound to
@@ -1452,7 +1455,7 @@ views, each key value is mapped to a canonical text by a per-view function
   PostgreSQL `UNION ALL` aggregates) recompute the affected groups natively
   after the group lock (PostgreSQL in `ctid` order, MySQL/MariaDB with a
   locking read after `BEFORE` triggers lock the group row); the result may
-  differ from the live view in the last digits. Joins, windows and
+  differ from the live view, with no fixed error bound (`1e16 + 1.5 - 1e16`: 2.0 vs 1.5). Joins, windows and
   MySQL/MariaDB `UNION ALL` fold or re-evaluate without that protocol and
   also need `ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE`; grouped
   MySQL/MariaDB views without a group-key index need
@@ -1482,7 +1485,9 @@ views, each key value is mapped to a canonical text by a per-view function
     405.0 MiB (exact: 9.3); every pooled connection keeps its own copy. Keep
     such views per source table to a handful
     ([Share Float-Recompute Triggers Per Table on MySQL/MariaDB](TODO.md)).
-- Diagnostics. Whenever the fast exact algebraic maintenance does not apply,
+- Diagnostics. On PostgreSQL/MySQL/MariaDB, whenever the fast exact algebraic
+  maintenance does not apply for a floating-point aggregate (SQLite's exact
+  native group recompute keeps the algebraic strategy and is not announced),
   registration, `sync_views()`, `generate_materialized_view(s)` and the CLI
   (`--diff`, generate) report a structured diagnostic
   (`matview.diagnostics.Diagnostic`: code, severity, view, strategy, columns,
