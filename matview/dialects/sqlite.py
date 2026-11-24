@@ -56,9 +56,10 @@ class SQLiteDialectMixin(MixinHost):
         ignore_limitations (no relaxed guarantee covers it).
         """
         flagged = self.engine_version.sqlite_nonstandard_statistics
-        if self.dialect != Dialect.SQLITE or not flagged:
+        unprobed = self.engine_version.sqlite_statistics_unprobed
+        if self.dialect != Dialect.SQLITE or not (flagged or unprobed):
             return
-        from ..engines import UnsupportedMaterializedViewError
+        from ..engines import SQLITE_STATISTICAL_FUNCTIONS, UnsupportedMaterializedViewError
 
         try:
             root = sqlglot.parse_one(self.raw_view.raw_select_sql, read="sqlite")
@@ -73,7 +74,7 @@ class SQLiteDialectMixin(MixinHost):
             name = canonical.get(type(node))
             if name is None and isinstance(node, sqlglot_exp.Anonymous):
                 name = node.name.lower()
-            if name in flagged:
+            if name is not None and name in (flagged if flagged else SQLITE_STATISTICAL_FUNCTIONS):
                 used.add(name)
         if not used:
             return
@@ -87,15 +88,23 @@ class SQLiteDialectMixin(MixinHost):
                 end += 1
             calls.append(source[m.start():end])
         shown = ", ".join(dict.fromkeys(calls)) or ", ".join(sorted(used))
+        if not flagged:
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}' uses {shown}, but the connection could not be probed "
+                "(no usable cursor, e.g. another thread, or a stub), so it is unknown whether its "
+                "VAR_*/STDDEV_* functions (SQLite has none built in: sqlean's stats extension, a loaded "
+                "extension or an application-defined function) match the exact definition matview "
+                "maintains. Register the view from a usable connection of the thread that owns it."
+            )
         raise UnsupportedMaterializedViewError(
             f"View '{self.logical_view_name}' uses {shown}, but this SQLite connection defines "
-            f"{', '.join(sorted(flagged))} (SQLite has none built in: sqlean's stats extension, a loaded "
+            f"{', '.join(sorted(used))} (SQLite has none built in: sqlean's stats extension, a loaded "
             "extension or an application-defined function) with results that differ from the exact "
             "definition matview maintains (e.g. a sample statistic of one value is NULL there, 0.0 in "
             "sqlean), so the materialized view could not equal the original view. Use the connection's "
             "own differently named functions (sqlean: stats_var_pop, stats_var_samp, stats_stddev_pop, "
-            "stats_stddev_samp), or a connection that does not define var_pop/var_samp/stddev_pop/"
-            "stddev_samp, on which matview maintains the exact aggregate itself."
+            "stats_stddev_samp), or a connection that does not define "
+            f"{', '.join(sorted(used))}, on which matview maintains the exact aggregate itself."
         )
 
     def _sqlite_m2_agg_sql(
