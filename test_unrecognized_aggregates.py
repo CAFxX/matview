@@ -161,7 +161,7 @@ MY_CASES: List[Case] = [
     # MySQL's protocol type for ANY_VALUE(int) is plan-dependent (native 8.4:
     # BIGINT alone, INT next to JSON_ARRAYAGG or ungrouped), so it is
     # compared in its own view, where the live view's type is BIGINT.
-    _grouped("any_value", "ANY_VALUE(v)", T3, engines=("mysql",), skip_type_code=("a",)),
+    _grouped("any_value", "ANY_VALUE(v)", T3, engines=("mysql",), standalone=True),
     _grouped("group_concat_ordered", "GROUP_CONCAT(v ORDER BY id)", T2, skip_type_code=("a",)),
     # Without an inner ORDER BY the concatenation order is plan-dependent (a
     # group recompute returned 'c,c,a,c' where the live view returned
@@ -747,6 +747,45 @@ class OfflineRoutingTests(unittest.TestCase):
         ):
             plan = generate_materialized_view(schema, f"CREATE VIEW v AS SELECT d2.label, {expr} AS ids {join}", dialect="postgres")
             self.assertEqual(plan.strategy, expected, expr)
+
+    def test_total_order_proof_edges(self) -> None:
+        # Review findings (each reproduced offline before the fix).
+        pg = parse_table_schema(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, c VARCHAR(8));"
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, tid INTEGER, flag INTEGER, code VARCHAR(8));",
+            dialect="postgres",
+        )
+        cases = [
+            # self-join: t.id orders t's rows, not b's
+            ("SELECT t.g, JSON_AGG(b.v ORDER BY t.id) AS a FROM t JOIN t AS b ON b.g = t.g GROUP BY t.g", T3),
+            # an OR branch does not bind u's key
+            ("SELECT t.g, JSON_AGG(u.flag ORDER BY t.id) AS a FROM t JOIN u ON u.id = t.id OR u.flag = 1 GROUP BY t.g", T3),
+            ("SELECT t.g, JSON_AGG(u.flag ORDER BY t.id) AS a FROM t JOIN u ON u.id = t.id GROUP BY t.g", T2),
+            # a key bound to a column of another type family is not bound
+            ("SELECT t.g, JSON_AGG(u.flag ORDER BY t.id) AS a FROM t JOIN u ON u.id = t.c GROUP BY t.g", T3),
+        ]
+        for select, expected in cases:
+            plan = generate_materialized_view(pg, f"CREATE VIEW mv AS {select}", dialect="postgres")
+            self.assertEqual(plan.strategy, expected, select)
+        # SQLite: a nullable TEXT primary key admits tied NULLs
+        lite = parse_table_schema("CREATE TABLE s (id TEXT PRIMARY KEY, g INTEGER, v INTEGER);")
+        plan = generate_materialized_view(lite, "CREATE VIEW mv AS SELECT g, group_concat(v, ',' ORDER BY id) AS a FROM s GROUP BY g", dialect="sqlite")
+        self.assertEqual(plan.strategy, T3)
+        lite = parse_table_schema("CREATE TABLE s (id TEXT NOT NULL PRIMARY KEY, g INTEGER, v INTEGER);")
+        plan = generate_materialized_view(lite, "CREATE VIEW mv AS SELECT g, group_concat(v, ',' ORDER BY id) AS a FROM s GROUP BY g", dialect="sqlite")
+        self.assertEqual(plan.strategy, T2)
+        # FILTER keeps the aggregate's type; an array fraction via CAST is an array; COLLATE stays out of the array type
+        for expr, typ in (
+            ("ARRAY_AGG(v ORDER BY id) FILTER (WHERE v IS NOT NULL)", "INT[]"),
+            ("PERCENTILE_DISC(CAST(ARRAY[0.5] AS DOUBLE PRECISION[])) WITHIN GROUP (ORDER BY v)", "INT[]"),
+        ):
+            plan = self._plan("postgres", f"SELECT g, {expr} AS a FROM t GROUP BY g")
+            m = re.search(r"\ba\s+([A-Za-z0-9_ ()\[\],]+?)\s*(?:,\n|\n\))", plan.backing_table_ddl)
+            assert m is not None, plan.backing_table_ddl
+            self.assertEqual(m.group(1).strip().upper(), typ, expr)
+        coll = parse_table_schema('CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, s VARCHAR(8) COLLATE "C");', dialect="postgres")
+        plan = generate_materialized_view(coll, "CREATE VIEW mv AS SELECT g, ARRAY_AGG(s ORDER BY id) AS a FROM t GROUP BY g", dialect="postgres")
+        self.assertNotIn('COLLATE "C"[]', plan.backing_table_ddl)
 
     def test_distinct_ordered_aggregate_is_not_total(self) -> None:
         plan = self._plan("mysql", "SELECT g, JSON_ARRAYAGG(DISTINCT v) AS a FROM t GROUP BY g")
