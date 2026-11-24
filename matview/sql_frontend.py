@@ -1933,6 +1933,8 @@ def _contains_aggregate_call(
         if not _is_non_pg_catalog_qualified_fn(agg_n):
             return True
     for anon_node in ast_node.find_all(sqlglot_exp.Anonymous):
+        if anon_node.name.upper() in extra_names:
+            return True  # catalog-classified aggregate, qualified or not
         if _is_non_pg_catalog_qualified_fn(anon_node):
             continue
         name_up = anon_node.name.upper()

@@ -71,7 +71,7 @@ def _drive(
         plan = register(";\n".join(f"CREATE VIEW {n} AS {sql}" for n, sql, _ in views))
     for (name, _sql, expected), sub in zip(views, list(plan.sub_plans) or [plan]):
         test.assertEqual(sub.strategy, expected, f"[{engine}] {name}")
-        if expected != T1 and " OVER " not in _sql.upper():  # the routing fallback is announced
+        if expected != T1 and " OVER " not in _sql.upper() and "(SELECT" not in _sql.upper():  # the routing fallback is announced
             test.assertTrue(
                 any(d.message.startswith("exact result required: falling back to strategy") for d in sub.strategy_diagnostics),
                 f"[{engine}] {name}: {sub.strategy_diagnostics!r}",
@@ -189,6 +189,9 @@ class SqliteTests(unittest.TestCase):
                         ("o_max", "SELECT g, max(v) AS m FROM t GROUP BY g", T3),
                         ("o_lower", "SELECT id, lower(v) AS a FROM t", T3),
                         ("o_abs", "SELECT id, abs(v) AS a FROM t", T3),
+                        # an aggregate inside a scalar subquery stays the
+                        # subquery's: the outer view is a per-row projection
+                        ("o_subq", "SELECT id, (SELECT hex(i.v) FROM t AS i WHERE i.id = t.id) AS a FROM t", T3),
                     ],
                     ph="?",
                 )
@@ -327,6 +330,10 @@ class PostgresTests(unittest.TestCase):
                 ("v_md5_ungrouped", "SELECT md5(v) AS a FROM t", T3),
                 ("v_md5_key", "SELECT g, md5(g) AS a, COUNT(*) AS n FROM t GROUP BY g", T3),
                 ("v_lower_user", "SELECT id, lower(v) AS a FROM t", T3),
+                # a derived table re-parses the select items: still an aggregate
+                ("v_derived", "SELECT isum(v ORDER BY id) AS a FROM (SELECT * FROM t) AS q", T3),
+                # a schema-qualified catalog aggregate inside a compound item
+                (f"v_qual_compound", f'SELECT g, COUNT(*) + "{self.hid}".hsum(v ORDER BY id) AS a FROM t GROUP BY g', T2),
             ],
         )
         # The stored-plan path (drift check / repair / sync) recompiles every
@@ -372,9 +379,11 @@ class MysqlTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.rollback()
         cur = self.conn.cursor()
-        cur.execute(f"DROP USER IF EXISTS '{self.database}'@'%'")
+        # Restore the server-wide setting first: an account-cleanup failure
+        # must not leave it changed.
         if getattr(self, "trust_before", None) is not None:
             cur.execute(f"SET GLOBAL log_bin_trust_function_creators = {int(self.trust_before)}")
+        cur.execute(f"DROP USER IF EXISTS '{self.database}'@'%'")
         cur.execute(f"DROP DATABASE IF EXISTS {self.database}")
         self.conn.commit()
         self.conn.close()

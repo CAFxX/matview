@@ -729,7 +729,7 @@ class ExactAggregateRoutingMixin(MixinHost):
             return None
         # Verbatim: the server's own spelling is valid DDL (PostgreSQL
         # format_type, MySQL SHOW COLUMNS) and keeps modifiers such as UNSIGNED.
-        return native_t.upper()
+        return native_t if self.dialect == Dialect.POSTGRES else native_t.upper()
 
     def _native_scalar_storage_type(self, item: SelectItem) -> Optional[str]:
         """Native result type of a non-aggregate item that is one call of a
@@ -744,7 +744,11 @@ class ExactAggregateRoutingMixin(MixinHost):
         native_t = dict(self.view.native_scalar_types).get(f"{str(node.name).upper()}/{len(node.expressions)}")
         if native_t is None:
             return None
-        return native_t if native_t == "BLOB" else self._normalize_dialect_type(native_t)
+        if native_t == "BLOB" or self.dialect == Dialect.POSTGRES:
+            # PostgreSQL: format_type's spelling is valid DDL as is (quoted
+            # enum names, unbounded "character varying").
+            return native_t
+        return self._normalize_dialect_type(native_t)
 
     def _routed_expr_storage_type(self, node: Optional[sqlglot_exp.Expr], *, allow_aggregate: bool) -> Optional[str]:
         """Native type of a routed select expression, or None when it is not
@@ -819,7 +823,9 @@ class ExactAggregateRoutingMixin(MixinHost):
         native = dict(self.view.native_aggregates)
         if isinstance(call, sqlglot_exp.Anonymous) and name in native:
             native_t = native[name]
-            return self._normalize_dialect_type(native_t) if native_t else None
+            if not native_t:
+                return None
+            return native_t if self.dialect == Dialect.POSTGRES else self._normalize_dialect_type(native_t)
         raw_up = call.sql(dialect=_sqlglot_dialect(self.dialect)).upper()
         if " RETURNING " in f" {raw_up} ":
             return None

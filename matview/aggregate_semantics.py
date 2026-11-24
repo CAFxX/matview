@@ -46,6 +46,8 @@ KNOWN_AGGREGATE_NAMES = frozenset(
         # SQL/JSON standard spelling (PostgreSQL 16+, MySQL, MariaDB)
         "JSON_ARRAYAGG",
         "JSON_OBJECTAGG",
+        # MySQL 8.0.24+ spatial aggregate
+        "ST_COLLECT",
         # SQLite JSONB variants
         "JSONB_GROUP_ARRAY",
         "JSONB_GROUP_OBJECT",

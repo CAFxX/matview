@@ -26,6 +26,7 @@ from .logical_ir import (
     ViewSpec,
 )
 from .maintenance import MaintenanceMixin
+from .native_functions import mark_native_aggregates
 from .planner import PlannerMixin
 from .planner_exact_routing import ExactAggregateRoutingMixin
 from .sql_frontend import resolve_statistical_aggregate_aliases
@@ -173,9 +174,11 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
             )
 
         stage2 = stage1.with_ir(primary_schema=primary_schema)
-        expanded_view = replace(
-            stage2._try_expand_select_star(unwrapped_view),
-            view_name=logical_view_name,
+        # The CTE/derived-table unwrap re-parses the select items, which marks
+        # only aggregates sqlglot models: re-apply the catalog classification.
+        expanded_view = mark_native_aggregates(
+            replace(stage2._try_expand_select_star(unwrapped_view), view_name=logical_view_name),
+            stage2.dialect,
         )
         stage3 = stage2.with_ir(view=expanded_view)
 
