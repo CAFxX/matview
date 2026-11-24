@@ -371,7 +371,9 @@ class ExactAggregateRoutingMixin(MixinHost):
                     func = func.this
                 if not isinstance(func, (sqlglot_exp.AggFunc, sqlglot_exp.Anonymous)) or isinstance(func, _WINDOW_ONLY_FUNCS):
                     continue  # ranking / navigation window functions are not aggregates
-                if isinstance(func, sqlglot_exp.Anonymous) and str(func.name).upper() not in KNOWN_AGGREGATE_NAMES:
+                if isinstance(func, sqlglot_exp.Anonymous) and str(func.name).upper() not in (
+                    KNOWN_AGGREGATE_NAMES | self._native_aggregate_names()
+                ):
                     continue  # not an aggregate (a window function such as ROW_NUMBER is modelled)
                 if not is_order_sensitive(func) or self._is_float_policy_aggregate(func):
                     continue
@@ -461,8 +463,6 @@ class ExactAggregateRoutingMixin(MixinHost):
                 "so that each level is maintained incrementally.",
                 (),
             )
-        if self.view.has_cte or self.view.has_compound_set_op:
-            return None  # these shapes are full-refresh already
         unclassified = self._unclassified_functions()
         if unclassified:
             names = sorted({n for n, _ in unclassified})
@@ -480,8 +480,8 @@ class ExactAggregateRoutingMixin(MixinHost):
                 "through MaterializedViewManager on a connection instead of generating it offline.",
                 tuple(names),
             )
-        if self.view.has_cte or self.view.has_compound_set_op or self.view.has_window_func:
-            return None  # these shapes are full-refresh (or windowed) already
+        if self.view.has_cte or self.view.has_compound_set_op:
+            return None  # these shapes are full-refresh already
         unordered = self._unordered_order_sensitive_aggregates()
         if unordered:
             return ExactRoutingFallback(

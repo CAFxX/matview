@@ -288,6 +288,9 @@ class PostgresTests(unittest.TestCase):
         # overload a call reaches depends on argument types, so a name mixing
         # aggregates and functions, or a modelled built-in a user function can
         # shadow, gets the exact full refresh.
+        # A plain SQL view in the schema: registration inlines plain views, and
+        # the catalog classification must survive that path.
+        cur.execute("CREATE VIEW pv_plain AS SELECT id, g, v FROM t")
         cur.execute("CREATE AGGREGATE md5(integer) (SFUNC = int4pl, STYPE = integer)")
         cur.execute("CREATE FUNCTION lower(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 * 10'")
         self.conn.commit()
@@ -320,11 +323,18 @@ class PostgresTests(unittest.TestCase):
                 ("v_cte", "WITH x AS (SELECT * FROM t) SELECT isum(v) AS a FROM x", T3),
                 ("v_filter", "SELECT g, isum(v) FILTER (WHERE v > 1) AS a FROM t GROUP BY g", T3),
                 ("v_compound", "SELECT g, COALESCE(isum(v), 0) + 1 AS a FROM t GROUP BY g", T3),
+                ("v_over_plain", "SELECT g, isum(v) AS a FROM pv_plain GROUP BY g", T3),
                 ("v_md5_ungrouped", "SELECT md5(v) AS a FROM t", T3),
                 ("v_md5_key", "SELECT g, md5(g) AS a, COUNT(*) AS n FROM t GROUP BY g", T3),
                 ("v_lower_user", "SELECT id, lower(v) AS a FROM t", T3),
             ],
         )
+        # The stored-plan path (drift check / repair / sync) recompiles every
+        # view with the schema's plain views: the catalog classification must
+        # survive it, or the recompiled plan differs from the installed one.
+        self.conn.commit()
+        drift = mgr.check_schema_drift()
+        self.assertEqual({k: v for k, v in drift.items() if v != "ok"}, {})
 
 
 @unittest.skipUnless(os.environ.get("MYSQL_DSN"), "MYSQL_DSN not set")
