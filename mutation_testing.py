@@ -589,6 +589,36 @@ MUTANTS = (
         ),
     ),
     Mutant(
+        name="pg-union-arm-typed-from-base-table-through-cte-output-name",
+        source_path="matview/dialects/base.py",
+        original="                    and not (bs.has_cte or bs.has_subquery_in_from)\n",
+        replacement="",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_set_operation_pairwise_tree_type_resolution_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-star-over-setop-relation-accepted",
+        source_path="matview/planner.py",
+        original="            if isinstance(star_ast, sqlglot_exp.Select) and any(\n                n is not None",
+        replacement="            if False and isinstance(star_ast, sqlglot_exp.Select) and any(\n                n is not None",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_array_scalar_inference_collation_and_unmodelled_arms_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-citext-mixed-with-char-varchar-widens-to-text",
+        source_path="matview/dialects/base.py",
+        original='                if any(b != "CITEXT" and b != "TEXT" for b in bases):',
+        replacement='                if False and any(b != "CITEXT" and b != "TEXT" for b in bases):',
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_array_scalar_inference_collation_and_unmodelled_arms_offline"
+        ),
+    ),
+    Mutant(
         name="pg-union-zset-skips-branch-cast",
         source_path="matview/maintenance/zset.py",
         original="                if col_i < len(col_types) and self._pg_branch_expr_needs_cast(it, b_ctx, col_types[col_i]):",
