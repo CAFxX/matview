@@ -2635,8 +2635,10 @@ class PlannerMixin(MixinHost):
         # (a) SUM / TOTAL / AVG arguments: a plain column may hold REAL or TEXT, so the
         #     fold keeps a hidden non-integer counter and recomputes the group when one is seen.
         agg_cols: Dict[str, Set[str]] = {t: set() for t in plain}
-        for item in self.view.select_items if self._sqlite_exact_sum_enabled() else ():
-            if not (item.is_aggregate and item.agg_func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG) and item.arg_expr):
+        # The decomposed items: COALESCE(SUM(q), 0) maintains an elementary SUM(q); DISTINCT
+        # aggregates always recompute their group and never use the conditional counter.
+        for item in self._working_select_items if self._sqlite_exact_sum_enabled() else ():
+            if not (item.is_aggregate and not item.is_distinct and item.agg_func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG) and item.arg_expr):
                 continue
             try:
                 names = {c.name.lower() for c in parse_sql_ast(item.arg_expr, dialect=self.dialect).find_all(sqlglot_exp.Column)}
@@ -2670,7 +2672,7 @@ class PlannerMixin(MixinHost):
                 )
             if t == watermark_table:
                 reasons.append(
-                    "an incremental backfill: the primary key of this WITHOUT ROWID table is not a trusted "
+                    "if an incremental backfill is used (--incremental-backfill / incremental_backfill=True): the primary key of this WITHOUT ROWID table is not a trusted "
                     "64-bit integer (it may hold REAL or TEXT), so no watermark column is available and the "
                     "backfill uses the slower group_key_batch mode (a STRICT NOT NULL integer key is trusted)"
                 )

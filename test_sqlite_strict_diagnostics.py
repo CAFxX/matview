@@ -72,6 +72,19 @@ class SqliteStrictDiagnosticsTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_note_follows_decomposed_aggregates_and_skips_distinct(self) -> None:
+        cases = {
+            "SELECT g, COALESCE(SUM(q), 0) AS s FROM o GROUP BY g": 1,  # compound expr over an elementary SUM
+            "SELECT g, SUM(DISTINCT q) AS s FROM o GROUP BY g": 0,  # DISTINCT always recomputes its group
+        }
+        for select, expected in cases.items():
+            conn = _conn(False)
+            try:
+                plan = MaterializedViewManager(conn, dialect=Dialect.SQLITE).register_view(f"CREATE VIEW dv AS {select};")
+                self.assertEqual(len(_notes(plan)), expected, select)
+            finally:
+                conn.close()
+
     def test_watermark_note_on_plain_without_rowid_and_not_on_strict(self) -> None:
         view = "CREATE VIEW wv AS SELECT g, COUNT(*) AS c FROM w GROUP BY g;"
         out: Dict[bool, Any] = {}
