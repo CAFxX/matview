@@ -182,7 +182,9 @@ definitions, optionally `prune_removed=True`), `drop_view()`, `diff_views()`,
 
 ## Quick start: command line
 
-Given a schema file and a view file:
+Given a schema file and a view file (the tables are `STRICT`, which SQLite
+supports from 3.37 and matview recommends; see [SQLite STRICT
+diagnostics](#sqlite-strict-diagnostics)):
 
 ```sql file=schema.sql
 CREATE TABLE orders (
@@ -190,7 +192,7 @@ CREATE TABLE orders (
     customer_id INTEGER NOT NULL,
     amount      INTEGER NOT NULL,
     status      TEXT NOT NULL
-);
+) STRICT;
 ```
 
 ```sql file=views.sql
@@ -941,6 +943,34 @@ refresh does not lock source tables (see
 See
 [Make `bulk_changes()` Fail-Closed, Exception-Safe and Transaction-Ownership-Safe](TODO.md)
 for the remaining work.
+
+### SQLite STRICT diagnostics
+
+On SQLite, registration adds a **note** (code `SQLITE_STRICT_RECOMMENDED`,
+severity `note`, message starting `recommendation:`) when a non-STRICT source
+table costs the view something that STRICT would remove:
+
+- `SUM`/`TOTAL`/`AVG` over an integer-affinity column: the column can also hold
+  `REAL` or `TEXT`, so every group keeps a hidden non-integer counter and is
+  recomputed from the base table whenever such a value is stored. A STRICT
+  `INTEGER` column can never hold one, so those recomputes cannot happen.
+- A `WITHOUT ROWID` table whose integer primary key is only an affinity: it has
+  no trusted watermark column, so an incremental backfill uses the slower
+  `group_key_batch` mode (a STRICT `NOT NULL` integer key is trusted).
+
+A note names the table and the columns, the cost, the `CREATE TABLE ... STRICT`
+hint and the rebuild requirement (SQLite cannot `ALTER` a table into STRICT).
+It is a recommendation, not a fallback: the result is exact either way, so it
+is never a Python warning. It is kept in `plan.strategy_diagnostics`, logged
+at INFO on the `matview` logger, and shown by `matview diff` as
+`Recommendations` (text) and `diagnostics.details.recommendations` (`--json`).
+No note is produced for a view that does not depend on the table's types.
+
+`check_schema_drift()` reports a source table that was rebuilt as STRICT or as
+a plain table after registration as drift (STRICT-ness is part of the
+registered signature, read from `PRAGMA table_list`, with the `CREATE TABLE`
+text as the fallback on libraries older than 3.37); `repair_view()` re-registers
+the view with the new facts.
 
 ### SQLite writer connections
 

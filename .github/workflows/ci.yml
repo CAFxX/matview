@@ -300,6 +300,9 @@ jobs:
       - name: Test differential oracle adversarial boundaries
         run: python3 test_oracle_adversarial_boundaries.py
 
+      - name: Test STRICT-aware SQLite diagnostics, introspection and drift (skips below SQLite 3.37)
+        run: python3 test_sqlite_strict_diagnostics.py
+
       - name: Test exact SQLite SUM/TOTAL/AVG maintenance (no tolerance)
         run: python3 test_sqlite_exact_float_aggregates.py
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -967,6 +968,21 @@ def introspect_schemas_with_sqlalchemy(
             owned_engine.dispose()
 
 
+def _sqlite_table_list_strict_flags(cur: Any) -> Dict[str, bool]:
+    """`{lower(table): STRICT?}` from `PRAGMA table_list`, or `{}` when the library lacks it (< 3.37)."""
+    try:
+        cur.execute("PRAGMA table_list")
+        rows = cur.fetchall() or []
+    except Exception:
+        return {}
+    out: Dict[str, bool] = {}
+    for r in rows:
+        # (schema, name, type, ncol, wr, strict)
+        if len(r) >= 6 and str(r[0]).lower() == "main" and str(r[2]).lower() == "table":
+            out[str(r[1]).lower()] = bool(r[5])
+    return out
+
+
 def introspect_sqlite_schemas(
     conn: Any,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
@@ -1004,6 +1020,15 @@ def introspect_sqlite_schemas(
             else {}
         )
         low_known = {k.lower(): k for k in schemas}
+
+        # STRICT-ness: `PRAGMA table_list` (SQLite 3.37+) is authoritative; the CREATE TABLE text
+        # parsed above is the fallback (older libraries have no STRICT tables and no such pragma).
+        strict_flags = _sqlite_table_list_strict_flags(cur)
+        for known_key, is_strict in strict_flags.items():
+            parsed_key = low_known.get(known_key)
+            parsed_ts = schemas.get(parsed_key) if parsed_key else None
+            if parsed_key is not None and parsed_ts is not None and parsed_ts.strict != is_strict:
+                schemas[parsed_key] = dataclasses.replace(parsed_ts, strict=is_strict)
 
         # Enrich parsed tables with authoritative live FK actions from PRAGMA foreign_key_list
         # (fail-closed: never swallow FK metadata query errors), and fall back to PRAGMA
@@ -1120,7 +1145,7 @@ def introspect_sqlite_schemas(
                 indexes=tuple(sq_idx_defs),
                 pk_columns=pk_cols_seq,
                 without_rowid=fb_without_rowid,
-                strict=fb_strict,
+                strict=strict_flags.get(t_str.lower(), fb_strict),
             )
         return schemas
     finally:
