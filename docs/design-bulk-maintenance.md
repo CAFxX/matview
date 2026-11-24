@@ -518,9 +518,13 @@ superseded by this roadmap.
 - PostgreSQL single-row statements get about 6–10 µs slower. This is accepted
   for O(groups) bulk cost; stage 2 sets the budget.
 - PostgreSQL maintenance triggers are `ENABLE ALWAYS`, so
-  `session_replication_role = replica` does not bypass them. Logical-replication
-  publications must exclude matview backing and auxiliary tables to avoid
-  applying derived writes twice. `ALTER TABLE ... DISABLE TRIGGER` and MySQL
+  `session_replication_role = replica` does not bypass them. This does NOT make
+  logical-replication subscribers work: the apply worker fires only row-level
+  triggers, and these triggers are statement-level, so replicated
+  INSERT/UPDATE/DELETE are not maintained. Views over subscription targets are
+  refused at registration and reported `invalid` by `check_schema_drift()`
+  (see the README and `test_pg_logical_subscription.py`); supporting them needs a
+  row-level maintenance path (TODO.md). `ALTER TABLE ... DISABLE TRIGGER` and MySQL
   `TRUNCATE` still bypass maintenance and remain tracked in "Close Unsafe DML
   Paths That Bypass Trigger-Based Maintenance".
 - Rule 6 relies on the `BEFORE`/`AFTER STATEMENT` firing order traced in
