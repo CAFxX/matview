@@ -728,6 +728,26 @@ class OfflineRoutingTests(unittest.TestCase):
             self.assertIn("AGGREGATE_ORDER_NOT_REPRODUCIBLE", diags[0].message)
             self.assertTrue(any(isinstance(w.message, MatviewDiagnosticWarning) for w in caught))
 
+    def test_left_join_total_order(self) -> None:
+        # d LEFT JOIN t ON t.d_id = d.id: ORDER BY t.id identifies matched
+        # rows; unmatched d rows tie on NULL keys but contribute identical
+        # all-NULL elements when the argument reads only t (exact, stays
+        # group-scoped); an argument reading d would distinguish them.
+        schema = parse_table_schema(
+            "CREATE TABLE d2 (id BIGINT PRIMARY KEY, label VARCHAR(16) NOT NULL);"
+            "CREATE TABLE t2 (id BIGINT PRIMARY KEY, d_id BIGINT NOT NULL, amt BIGINT NOT NULL);",
+            dialect="postgres",
+        )
+        join = "FROM d2 LEFT JOIN t2 ON t2.d_id = d2.id GROUP BY d2.label"
+        for expr, expected in (
+            ("STRING_AGG(t2.id::text, ',' ORDER BY t2.id)", T2),
+            ("STRING_AGG(d2.label || t2.id::text, ',' ORDER BY t2.id)", T3),
+            ("STRING_AGG(t2.id::text, ',' ORDER BY d2.id)", T3),
+            ("STRING_AGG(t2.id::text, ',' ORDER BY d2.id, t2.id)", T2),
+        ):
+            plan = generate_materialized_view(schema, f"CREATE VIEW v AS SELECT d2.label, {expr} AS ids {join}", dialect="postgres")
+            self.assertEqual(plan.strategy, expected, expr)
+
     def test_distinct_ordered_aggregate_is_not_total(self) -> None:
         plan = self._plan("mysql", "SELECT g, JSON_ARRAYAGG(DISTINCT v) AS a FROM t GROUP BY g")
         self.assertEqual(plan.strategy, T3)

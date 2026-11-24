@@ -145,7 +145,9 @@ class ExactAggregateRoutingMixin(MixinHost):
         selects = [q] if isinstance(q, sqlglot_exp.Select) else list(q.find_all(sqlglot_exp.Select))
         return any(has_grouping_sets(s) for s in selects)
 
-    def _order_keys_cover_every_primary_key(self, keys: Sequence[sqlglot_exp.Expr]) -> bool:
+    def _order_keys_cover_every_primary_key(
+        self, keys: Sequence[sqlglot_exp.Expr], call: Optional[sqlglot_exp.Expr] = None
+    ) -> bool:
         """Whether ORDER BY keys are a total order over the view's input rows.
 
         A source table is *determined* when its whole primary key is among the
@@ -154,7 +156,13 @@ class ExactAggregateRoutingMixin(MixinHost):
         columns with a column of an already determined table (it then joins at
         most one row per determined row: ``t JOIN d ON t.g = d.g`` with
         ``d.g`` the key of ``d``). The order is total when every source is
-        determined: the keys then identify each input row."""
+        determined: the keys then identify each input row.
+
+        ``X LEFT JOIN Y ON ...`` contributes its equalities too: binding Y's
+        (the NULL-extended side's) key to X's columns is always sound, and
+        binding X's key to Y's columns is sound when the aggregated arguments
+        of ``call`` read only Y: X rows without a match tie on Y's NULL keys
+        but contribute identical all-NULL elements."""
         v = self.view
         if v.has_cte or v.has_subquery_in_from or v.has_compound_set_op or not v.joins:
             return False
@@ -182,18 +190,29 @@ class ExactAggregateRoutingMixin(MixinHost):
         for alias, _names, pk in sources:
             if all(any(kc.name.lower() == c and _owner(kc) == alias for kc in key_cols) for c in pk):
                 determined.add(alias)
-        # Equalities from INNER/CROSS join ON clauses (outer joins add
-        # NULL-extended rows: not used).
-        equalities: List[Tuple[sqlglot_exp.Column, sqlglot_exp.Column]] = []
+        # Aggregated argument columns (outside the call's ORDER BY).
+        arg_owners: Optional[Set[Optional[str]]] = None
+        if call is not None:
+            key_col_ids = {id(c) for o in call.find_all(sqlglot_exp.Ordered) for c in o.find_all(sqlglot_exp.Column)}
+            arg_owners = {_owner(c) for c in call.find_all(sqlglot_exp.Column) if id(c) not in key_col_ids}
+        # Equalities from join ON clauses: (a, b, NULL-extended alias or None).
+        equalities: List[Tuple[sqlglot_exp.Column, sqlglot_exp.Column, Optional[str]]] = []
         for j in v.joins:
-            if j.join_type not in ("FROM", "INNER JOIN", "JOIN") or not j.on_condition:
+            jt = j.join_type.upper()
+            if not j.on_condition:
                 continue
+            if jt in ("FROM", "INNER JOIN", "JOIN"):
+                nullable: Optional[str] = None
+            elif jt.startswith("LEFT"):
+                nullable = (j.alias or j.table_name).lower()
+            else:
+                continue  # RIGHT/FULL joins: not used
             on_ast = self._item_ast(j.on_condition)
             if on_ast is None:
                 continue
             for eq in on_ast.find_all(sqlglot_exp.EQ):
                 if isinstance(eq.this, sqlglot_exp.Column) and isinstance(eq.expression, sqlglot_exp.Column):
-                    equalities.append((eq.this, eq.expression))
+                    equalities.append((eq.this, eq.expression, nullable))
         changed = True
         while changed:
             changed = False
@@ -201,10 +220,15 @@ class ExactAggregateRoutingMixin(MixinHost):
                 if alias in determined:
                     continue
                 bound: Set[str] = set()
-                for a, b in equalities:
+                for a, b, nullable in equalities:
                     for mine, other in ((a, b), (b, a)):
-                        if _owner(mine) == alias and _owner(other) in determined:
-                            bound.add(mine.name.lower())
+                        if _owner(mine) != alias or _owner(other) not in determined:
+                            continue
+                        if nullable is not None and alias != nullable and (
+                            arg_owners is None or arg_owners != {nullable}
+                        ):
+                            continue  # preserved side from the NULL-extended side: see docstring
+                        bound.add(mine.name.lower())
                 if all(c in bound for c in pk):
                     determined.add(alias)
                     changed = True
@@ -278,7 +302,7 @@ class ExactAggregateRoutingMixin(MixinHost):
                 keys = [o.this if isinstance(o, sqlglot_exp.Ordered) else o for o in order.expressions] if isinstance(order, sqlglot_exp.Order) else None
                 if not keys:
                     keys = aggregate_order_keys(func)
-                if keys and self._order_keys_cover_every_primary_key(keys):
+                if keys and self._order_keys_cover_every_primary_key(keys, func):
                     continue
                 out.append(win.sql(dialect=sg_d))
         return out
