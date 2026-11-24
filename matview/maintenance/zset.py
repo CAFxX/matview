@@ -309,6 +309,7 @@ class Tier1ZSetMixin(MixinHost):
         indexed_cols_lower = self._indexed_column_names_lower()
         merged_ctx = self._union_all_common_ctx([bs for _, bs in branches])
         merged_cols = merged_ctx.primary_schema.columns if merged_ctx.primary_schema else {}
+        merged_col_types: List[str] = []
         for col_idx, it in enumerate(first_bs.select_items):
             if self.dialect == Dialect.SQLITE:
                 # SQLite compound SELECT columns have no affinity; storing
@@ -320,6 +321,7 @@ class Tier1ZSetMixin(MixinHost):
                 dt = mc.data_type if mc is not None else self._infer_expr_storage_type(it)
             if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and it.alias.lower() in indexed_cols_lower:
                 dt = "VARCHAR(255)"
+            merged_col_types.append(dt)
             col_defs_sql.append(f"{self._q(it.alias)} {dt}")
 
         if op_type in ("UNION", "UNION ALL"):
@@ -382,7 +384,17 @@ class Tier1ZSetMixin(MixinHost):
                 ts = self._schemas_lower[bs.base_table.lower()]
                 pk_defs = [c for c in ts.columns.values() if c.primary_key]
                 pk_names = [c.name for c in pk_defs]
-                sel_exprs = [it.raw_expr for it in bs.select_items]
+                b_ctx_init = self.with_ir(primary_schema=ts, view=bs)
+                sel_exprs = [
+                    self._pg_cast_expr_to_type(it.raw_expr, merged_col_types[c_i])
+                    if (
+                        self.dialect == Dialect.POSTGRES
+                        and c_i < len(merged_col_types)
+                        and self._pg_branch_expr_needs_cast(it, b_ctx_init, merged_col_types[c_i])
+                    )
+                    else it.raw_expr
+                    for c_i, it in enumerate(bs.select_items)
+                ]
                 w_sql = f" WHERE {bs.where_clause}" if bs.where_clause else ""
                 b_alias = bs.joins[0].alias if bs.joins else bs.base_table
                 is_aliased = b_alias.lower() != bs.base_table.lower()
@@ -448,8 +460,17 @@ class Tier1ZSetMixin(MixinHost):
         else:  # INTERSECT or EXCEPT
             u_parts = []
             for b_idx, (_, bs) in enumerate(branches):
+                ts_u = self._schemas_lower.get(bs.base_table.lower())
+                b_ctx_u = self.with_ir(primary_schema=ts_u, view=bs)
                 sel_aliased = ", ".join(
-                    f"{it.raw_expr} AS {self._q(col)}" for it, col in zip(bs.select_items, user_columns)
+                    f"{self._pg_cast_expr_to_type(it.raw_expr, merged_col_types[c_i])} AS {self._q(col)}"
+                    if (
+                        self.dialect == Dialect.POSTGRES
+                        and c_i < len(merged_col_types)
+                        and self._pg_branch_expr_needs_cast(it, b_ctx_u, merged_col_types[c_i])
+                    )
+                    else f"{it.raw_expr} AS {self._q(col)}"
+                    for c_i, (it, col) in enumerate(zip(bs.select_items, user_columns))
                 )
                 b0 = "1" if b_idx == 0 else "0"
                 b1 = "1" if b_idx == 1 else "0"
@@ -753,6 +774,7 @@ class Tier1ZSetMixin(MixinHost):
                     user_columns,
                     use_native_uall_pk,
                     uall_pk_cols,
+                    col_types=merged_col_types,
                     refresh_key_cols=pg_refresh_key_cols,
                     recompute_val_col_names=pg_recompute_val_col_names,
                     recompute_val_row_sql=pg_recompute_val_row_sql,
@@ -823,6 +845,7 @@ class Tier1ZSetMixin(MixinHost):
         user_columns: Sequence[str],
         use_native_uall_pk: bool,
         uall_pk_cols: Sequence[str],
+        col_types: Sequence[str] = (),
         refresh_key_cols: Sequence[str] = (),
         recompute_val_col_names: Sequence[str] = (),
         recompute_val_row_sql: Optional[str] = None,
@@ -842,9 +865,15 @@ class Tier1ZSetMixin(MixinHost):
         sources: List[Tuple[PgDeltaSource, Dict[str, str]]] = []
         for b_idx, bs in b_list:
             ts = self._schemas_lower[bs.base_table.lower()]
+            b_ctx = self.with_ir(primary_schema=ts, view=bs)
             b_alias = bs.joins[0].alias if bs.joins else bs.base_table
             where = self._rewrite_branch_expr(bs.where_clause, ts, b_alias, rec) if bs.where_clause else None
-            vals = [self._rewrite_branch_expr(it.raw_expr, ts, b_alias, rec) for it in bs.select_items]
+            vals: List[str] = []
+            for col_i, it in enumerate(bs.select_items):
+                val_expr = self._rewrite_branch_expr(it.raw_expr, ts, b_alias, rec)
+                if col_i < len(col_types) and self._pg_branch_expr_needs_cast(it, b_ctx, col_types[col_i]):
+                    val_expr = self._pg_cast_expr_to_type(val_expr, col_types[col_i])
+                vals.append(val_expr)
             values = dict(zip(user_columns, vals))
             pk_defs = [c for c in ts.columns.values() if c.primary_key]
             pk_names = [c.name for c in pk_defs]

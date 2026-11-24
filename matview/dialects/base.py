@@ -1062,70 +1062,139 @@ class DialectBaseMixin(MixinHost):
                 return "VARCHAR(191)"
         return dt
 
-    def _infer_cte_or_subquery_col_type(self, col_name: str) -> Optional[str]:
-        ident = _unquote_ident(col_name, dialect=self.dialect).strip()
+    def _infer_cte_or_subquery_col_type(
+        self,
+        col_name: str,
+        *,
+        _seen_ctes: Optional[frozenset[str]] = None,
+        _outer_only: bool = False,
+    ) -> Optional[str]:
+        raw_col = col_name.strip()
+        qual_low: Optional[str] = None
+        if "." in raw_col:
+            q_part, c_part = raw_col.rsplit(".", 1)
+            qual_low = _unquote_ident(q_part, dialect=self.dialect).strip().lower() or None
+            ident = _unquote_ident(c_part, dialect=self.dialect).strip()
+        else:
+            ident = _unquote_ident(raw_col, dialect=self.dialect).strip()
         if not ident:
             return None
+        seen_ctes: frozenset[str] = _seen_ctes or frozenset()
+        active_ctes_attr = "_active_cte_type_infer"
+        active_ctes: Set[str] = getattr(self, active_ctes_attr, set())
         try:
             q_ast = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
             return None
 
-        for alias_node in q_ast.find_all(sqlglot_exp.Alias):
-            if alias_node.alias.lower() == ident.lower():
-                inner = alias_node.this
-                if isinstance(inner, (sqlglot_exp.Count, sqlglot_exp.Window)):
-                    return self._int_type()
-                if isinstance(inner, sqlglot_exp.Sum):
-                    arg_expr = inner.this.sql() if inner.this is not None else ""
-                    sum_item = SelectItem(
-                        raw_expr=inner.sql(),
-                        alias=ident,
-                        is_aggregate=True,
-                        agg_func=AggFunc.SUM,
-                        arg_expr=arg_expr,
-                    )
-                    return self._sum_result_storage_type(sum_item)
-                if isinstance(inner, (sqlglot_exp.Min, sqlglot_exp.Max)):
-                    if self.dialect == Dialect.SQLITE:
-                        return "BLOB"
-                    agg_item = _parse_single_agg_expr(
-                        inner.sql(_sqlglot_dialect(self.dialect)), ident, dialect=self.dialect
-                    )
-                    if agg_item is not None and agg_item.agg_func is not None:
-                        return self._infer_expr_storage_type(agg_item)
-                    c_arg = self._lookup_col_def(inner.this.sql().strip() if isinstance(inner.this, sqlglot_exp.Expr) else None)
-                    if c_arg:
-                        return self._minmax_result_type(
-                            self._normalize_dialect_type(c_arg.data_type),
-                            inner.this.sql(_sqlglot_dialect(self.dialect)) if isinstance(inner.this, sqlglot_exp.Expr) else None,
-                        )
-                    return self._float_type()
-                if isinstance(inner, sqlglot_exp.Avg):
-                    arg_expr = inner.this.sql() if inner.this is not None else ""
-                    return self._avg_result_storage_type_for_expr(arg_expr)
-                if isinstance(inner, (sqlglot_exp.AggFunc, sqlglot_exp.Anonymous)) and not isinstance(inner, sqlglot_exp.Count):
-                    # Any other aggregate: its verified projection result type
-                    # (e.g. PostgreSQL VAR_SAMP(int) is NUMERIC, not DOUBLE).
-                    agg_item = _parse_single_agg_expr(
-                        inner.sql(_sqlglot_dialect(self.dialect)), ident, dialect=self.dialect
-                    )
-                    if agg_item is not None and agg_item.agg_func is not None:
-                        return self._infer_expr_storage_type(agg_item)
-                if isinstance(inner, (sqlglot_exp.AggFunc, sqlglot_exp.Func, sqlglot_exp.Anonymous)):
-                    fn_up = (inner.sql_name().upper() if hasattr(inner, "sql_name") else "") or inner.name.upper()
-                    if fn_up in ("COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "BIT_AND", "BIT_OR", "BIT_XOR", "BITWISEANDAGG", "BITWISEORAGG", "BITWISEXORAGG", "BOOL_AND", "BOOL_OR", "LOGICALAND", "LOGICALOR"):
-                        return self._int_type()
-                    if fn_up in ("SUM", "TOTAL", "AVG", "VAR_POP", "VARIANCE", "VARIANCE_POP", "VARIANCEPOP", "VAR_SAMP", "VARSAMP", "STDDEV_POP", "STDDEV", "STD", "STDDEV_SAMP", "STDDEVSAMP"):
-                        return self._float_type()
-                if isinstance(inner, sqlglot_exp.Column) and not isinstance(inner.this, sqlglot_exp.Star):
-                    c_def = self._lookup_col_def(inner.name)
-                    if c_def:
-                        return self._normalize_dialect_type(c_def.data_type)
-
+        cte_by_name: Dict[str, sqlglot_exp.CTE] = {}
+        cte_order: List[Tuple[str, sqlglot_exp.CTE]] = []
         for cte in q_ast.find_all(sqlglot_exp.CTE):
-            cte_branches: List[sqlglot_exp.Select] = []
-            stack: List[Any] = [cte.this]
+            cname = (cte.alias_or_name or "").lower()
+            if cname:
+                cte_by_name[cname] = cte
+                cte_order.append((cname, cte))
+
+        def _branch_scoped_ctx(br_select: sqlglot_exp.Select) -> Any:
+            from_node = br_select.args.get("from_") or br_select.args.get("from")
+            br_tables: List[sqlglot_exp.Table] = []
+            if from_node is not None and isinstance(from_node.this, sqlglot_exp.Table):
+                br_tables.append(from_node.this)
+            for jn in br_select.args.get("joins") or ():
+                if isinstance(jn.this, sqlglot_exp.Table):
+                    br_tables.append(jn.this)
+            if not br_tables:
+                return self
+            primary_t = br_tables[0]
+            ts_primary = self._schemas_lower.get(primary_t.name.lower())
+            if ts_primary is None:
+                return self
+            br_joins = tuple(
+                JoinSpec(
+                    join_type="FROM" if idx == 0 else "JOIN",
+                    table_name=t.name,
+                    alias=t.alias or t.name,
+                )
+                for idx, t in enumerate(br_tables)
+            )
+            br_view = ViewSpec(
+                view_name=self.view.view_name,
+                raw_select_sql=br_select.sql(_sqlglot_dialect(self.dialect)),
+                base_table=primary_t.name,
+                joins=br_joins,
+                referenced_tables=tuple(t.name for t in br_tables),
+                select_items=(),
+            )
+            return self.with_ir(primary_schema=ts_primary, view=br_view)
+
+        def _branch_table_alias_map(br_select: sqlglot_exp.Select) -> Dict[str, str]:
+            out_map: Dict[str, str] = {}
+            from_node = br_select.args.get("from_") or br_select.args.get("from")
+            if from_node is not None and isinstance(from_node.this, sqlglot_exp.Table):
+                t = from_node.this
+                out_map[(t.alias_or_name or t.name).lower()] = t.name.lower()
+            for jn in br_select.args.get("joins") or ():
+                if isinstance(jn.this, sqlglot_exp.Table):
+                    t = jn.this
+                    out_map[(t.alias_or_name or t.name).lower()] = t.name.lower()
+            return out_map
+
+        def _infer_alias_expr_type(inner: Any, br_ctx: Any) -> Optional[str]:
+            if isinstance(inner, (sqlglot_exp.Count, sqlglot_exp.Window)):
+                return self._int_type()
+            if isinstance(inner, sqlglot_exp.Sum):
+                arg_expr = inner.this.sql() if inner.this is not None else ""
+                sum_item = SelectItem(
+                    raw_expr=inner.sql(),
+                    alias=ident,
+                    is_aggregate=True,
+                    agg_func=AggFunc.SUM,
+                    arg_expr=arg_expr,
+                )
+                return br_ctx._sum_result_storage_type(sum_item)
+            if isinstance(inner, (sqlglot_exp.Min, sqlglot_exp.Max)):
+                if self.dialect == Dialect.SQLITE:
+                    return "BLOB"
+                agg_item = _parse_single_agg_expr(
+                    inner.sql(_sqlglot_dialect(self.dialect)), ident, dialect=self.dialect
+                )
+                if agg_item is not None and agg_item.agg_func is not None:
+                    return br_ctx._infer_expr_storage_type(agg_item)
+                c_arg = br_ctx._lookup_col_def(
+                    inner.this.sql().strip() if isinstance(inner.this, sqlglot_exp.Expr) else None
+                )
+                if c_arg:
+                    return br_ctx._minmax_result_type(
+                        self._normalize_dialect_type(c_arg.data_type),
+                        inner.this.sql(_sqlglot_dialect(self.dialect)) if isinstance(inner.this, sqlglot_exp.Expr) else None,
+                    )
+                return self._float_type()
+            if isinstance(inner, sqlglot_exp.Avg):
+                arg_expr = inner.this.sql() if inner.this is not None else ""
+                return br_ctx._avg_result_storage_type_for_expr(arg_expr)
+            if isinstance(inner, (sqlglot_exp.AggFunc, sqlglot_exp.Anonymous)) and not isinstance(inner, sqlglot_exp.Count):
+                agg_item = _parse_single_agg_expr(
+                    inner.sql(_sqlglot_dialect(self.dialect)), ident, dialect=self.dialect
+                )
+                if agg_item is not None and agg_item.agg_func is not None:
+                    return br_ctx._infer_expr_storage_type(agg_item)
+            if isinstance(inner, (sqlglot_exp.AggFunc, sqlglot_exp.Func, sqlglot_exp.Anonymous)):
+                fn_up = (inner.sql_name().upper() if hasattr(inner, "sql_name") else "") or inner.name.upper()
+                if fn_up in ("COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "BIT_AND", "BIT_OR", "BIT_XOR", "BITWISEANDAGG", "BITWISEORAGG", "BITWISEXORAGG", "BOOL_AND", "BOOL_OR", "LOGICALAND", "LOGICALOR"):
+                    return self._int_type()
+                if fn_up in ("SUM", "TOTAL", "AVG", "VAR_POP", "VARIANCE", "VARIANCE_POP", "VARIANCEPOP", "VAR_SAMP", "VARSAMP", "STDDEV_POP", "STDDEV", "STD", "STDDEV_SAMP", "STDDEVSAMP"):
+                    return self._float_type()
+            return None
+
+        def _infer_relation_branches_col_type(
+            root_query: Any,
+            header_cols: Optional[List[str]] = None,
+            owner_cte_name: Optional[str] = None,
+        ) -> Optional[str]:
+            if owner_cte_name and (owner_cte_name in seen_ctes or owner_cte_name in active_ctes):
+                return None
+            branches: List[sqlglot_exp.Select] = []
+            stack: List[Any] = [root_query]
             while stack:
                 cur_q = stack.pop()
                 if isinstance(cur_q, sqlglot_exp.Subquery):
@@ -1134,29 +1203,42 @@ class DialectBaseMixin(MixinHost):
                     stack.append(cur_q.expression)
                     stack.append(cur_q.this)
                 elif isinstance(cur_q, sqlglot_exp.Select):
-                    cte_branches.append(cur_q)
-            if not cte_branches:
-                continue
-            inner_query = cte_branches[0]
-
+                    branches.append(cur_q)
+            if not branches:
+                return None
+            inner_query = branches[0]
             col_pos: Optional[int] = None
-            table_alias = cte.args.get("alias")
-            if isinstance(table_alias, sqlglot_exp.TableAlias) and table_alias.columns:
-                hdr_cols = [c.name.lower() for c in table_alias.columns]
-                if ident.lower() in hdr_cols:
-                    col_pos = hdr_cols.index(ident.lower())
+            if header_cols and ident.lower() in header_cols:
+                col_pos = header_cols.index(ident.lower())
             if col_pos is None:
                 for p_i, proj in enumerate(inner_query.expressions):
                     c_name = proj.alias or (proj.this.name if isinstance(proj, sqlglot_exp.Alias) else proj.name)
                     if c_name.lower() == ident.lower():
                         col_pos = p_i
                         break
-            if col_pos is not None:
+            if col_pos is None:
+                return None
+
+            next_seen = seen_ctes | ({owner_cte_name} if owner_cte_name else set())
+            added_active = False
+            if owner_cte_name and owner_cte_name not in active_ctes:
+                if not hasattr(self, active_ctes_attr):
+                    setattr(self, active_ctes_attr, active_ctes)
+                active_ctes.add(owner_cte_name)
+                added_active = True
+            try:
                 b_types: List[str] = []
+                b_exp_colls: List[Optional[str]] = []
                 has_null_b = False
                 has_str_lit_b = False
-                for br in cte_branches:
+                sg_d = _sqlglot_dialect(self.dialect)
+                for br in branches:
                     if col_pos >= len(br.expressions):
+                        continue
+                    br_alias_map = _branch_table_alias_map(br)
+                    # Skip recursive self-reference branches of WITH RECURSIVE CTEs;
+                    # SQL types recursive CTE columns from the non-recursive anchor branch(es).
+                    if owner_cte_name and owner_cte_name in br_alias_map.values():
                         continue
                     proj_e = br.expressions[col_pos]
                     src_e = proj_e.this if isinstance(proj_e, sqlglot_exp.Alias) else proj_e
@@ -1170,17 +1252,191 @@ class DialectBaseMixin(MixinHost):
                             has_str_lit_b = True
                         else:
                             b_types.append(self._literal_storage_type(src_e))
+                            b_exp_colls.append(None)
                         continue
-                    src_col = src_e.name or src_e.sql().strip()
-                    c_src = self._lookup_col_def(src_e.sql().strip()) or self._lookup_col_def(src_col)
-                    if c_src:
-                        b_types.append(c_src.data_type)
+                    br_ctx = _branch_scoped_ctx(br)
+                    br_expr_sql = src_e.sql(sg_d).strip()
+                    exp_c = self._extract_pg_explicit_collation(br_expr_sql) if self.dialect == Dialect.POSTGRES else None
+                    # First handle aggregates/windows inside the branch projection.
+                    agg_t = _infer_alias_expr_type(src_e, br_ctx)
+                    if agg_t is not None:
+                        b_types.append(agg_t)
+                        b_exp_colls.append(exp_c)
+                        continue
+                    if isinstance(src_e, sqlglot_exp.Column) and not isinstance(src_e.this, sqlglot_exp.Star):
+                        c_src = br_ctx._lookup_col_def(br_expr_sql) or br_ctx._lookup_col_def(src_e.name)
+                        if c_src is not None:
+                            b_types.append(c_src.data_type)
+                            b_exp_colls.append(exp_c)
+                            continue
+                        # Column may come from an earlier CTE referenced in this branch's FROM/JOIN.
+                        ref_cte: Optional[str] = None
+                        if src_e.table:
+                            cand_t = br_alias_map.get(src_e.table.lower(), src_e.table.lower())
+                            if cand_t in cte_by_name and cand_t not in next_seen:
+                                ref_cte = cand_t
+                        else:
+                            for t_name in br_alias_map.values():
+                                if t_name in cte_by_name and t_name not in next_seen:
+                                    ref_cte = t_name
+                                    break
+                        if ref_cte is not None:
+                            cte_ref_t = self._infer_cte_or_subquery_col_type(
+                                f"{ref_cte}.{src_e.name}", _seen_ctes=next_seen
+                            )
+                            if cte_ref_t is not None:
+                                b_types.append(cte_ref_t)
+                                b_exp_colls.append(exp_c)
+                                continue
+                    # Fallback to AST expression inference within this branch's scope
+                    # (guarded against CTE recursion via active_ctes).
+                    if br_expr_sql and not (
+                        isinstance(src_e, sqlglot_exp.Column) and src_e.name.lower() == ident.lower()
+                    ):
+                        ast_t = br_ctx._infer_ast_expr_storage_type(br_expr_sql)
+                        if ast_t is not None:
+                            if self.dialect == Dialect.POSTGRES and br_ctx._pg_type_supports_collation(ast_t):
+                                c_coll = br_ctx._infer_pg_expr_collation(br_expr_sql)
+                                if c_coll:
+                                    ast_t = f"{self._PG_COLLATE_TAIL_RE.sub('', ast_t).strip()}{c_coll}"
+                            b_types.append(ast_t)
+                            b_exp_colls.append(exp_c)
+                            continue
                 if not b_types and has_str_lit_b:
                     b_types.append("TEXT")
+                    b_exp_colls.append(None)
                 if b_types:
-                    if len(cte_branches) > 1:
-                        return self._common_storage_type(b_types, has_null=has_null_b)
-                    return self._normalize_dialect_type(b_types[0])
+                    if len(branches) > 1:
+                        return self._common_storage_type(
+                            b_types,
+                            has_null=has_null_b or (self.dialect == Dialect.POSTGRES and has_str_lit_b),
+                            explicit_colls=b_exp_colls if self.dialect == Dialect.POSTGRES else None,
+                        )
+                    t0 = b_types[0]
+                    if self.dialect == Dialect.POSTGRES:
+                        tp0, ct0 = self._pg_split_type_and_collation(t0)
+                        if re.sub(r"\s+", " ", tp0.upper()).strip() in ("CHARACTER VARYING", "VARCHAR"):
+                            return f"VARCHAR{ct0}"
+                    return self._normalize_dialect_type(t0)
+                return None
+            finally:
+                if added_active:
+                    active_ctes.discard(owner_cte_name)  # type: ignore[arg-type]
+
+        def _cte_hdr_cols(cte_node: sqlglot_exp.CTE) -> Optional[List[str]]:
+            table_alias = cte_node.args.get("alias")
+            if isinstance(table_alias, sqlglot_exp.TableAlias) and table_alias.columns:
+                return [c.name.lower() for c in table_alias.columns]
+            return None
+
+        # 1. Resolve against the outermost query's FROM / JOIN relations FIRST so
+        #    qualifiers (u1.v vs u2.v), nested CTEs (u2 over u1), and outer derived
+        #    subqueries shadowing inner CTE columns (COUNT(*) AS txt over u.txt) all
+        #    follow SQL lexical scoping.
+        outer_select = q_ast
+        while isinstance(outer_select, sqlglot_exp.Subquery):
+            outer_select = outer_select.this
+        if isinstance(outer_select, sqlglot_exp.Select):
+            outer_rels: List[Tuple[Optional[str], Any]] = []
+            from_node = outer_select.args.get("from_") or outer_select.args.get("from")
+            if from_node is not None and from_node.this is not None:
+                outer_rels.append(((from_node.this.alias or getattr(from_node.this, "name", "") or "").lower() or None, from_node.this))
+            for jn in outer_select.args.get("joins") or ():
+                if jn.this is not None:
+                    outer_rels.append(((jn.this.alias or getattr(jn.this, "name", "") or "").lower() or None, jn.this))
+            for rel_alias, rel_node in outer_rels:
+                if qual_low is not None and rel_alias != qual_low:
+                    continue
+                if isinstance(rel_node, sqlglot_exp.Subquery):
+                    table_alias = rel_node.args.get("alias")
+                    hdr_cols = (
+                        [c.name.lower() for c in table_alias.columns]
+                        if isinstance(table_alias, sqlglot_exp.TableAlias) and table_alias.columns
+                        else None
+                    )
+                    res = _infer_relation_branches_col_type(rel_node.this, hdr_cols)
+                    if res is not None:
+                        return res
+                elif isinstance(rel_node, sqlglot_exp.Table):
+                    t_low = rel_node.name.lower()
+                    if t_low in cte_by_name:
+                        cte_n = cte_by_name[t_low]
+                        res = _infer_relation_branches_col_type(
+                            cte_n.this, _cte_hdr_cols(cte_n), owner_cte_name=t_low
+                        )
+                        if res is not None:
+                            return res
+
+        if _outer_only:
+            return None
+
+        # 2. If qualified with an explicit CTE or subquery name (e.g. from a nested
+        #    branch lookup `u1.v`), match that named CTE/subquery directly.
+        if qual_low is not None:
+            if qual_low in cte_by_name:
+                cte_n = cte_by_name[qual_low]
+                res = _infer_relation_branches_col_type(
+                    cte_n.this, _cte_hdr_cols(cte_n), owner_cte_name=qual_low
+                )
+                if res is not None:
+                    return res
+            for subq in q_ast.find_all(sqlglot_exp.Subquery):
+                if (subq.alias or "").lower() == qual_low:
+                    table_alias = subq.args.get("alias")
+                    hdr_cols = (
+                        [c.name.lower() for c in table_alias.columns]
+                        if isinstance(table_alias, sqlglot_exp.TableAlias) and table_alias.columns
+                        else None
+                    )
+                    res = _infer_relation_branches_col_type(subq.this, hdr_cols)
+                    if res is not None:
+                        return res
+
+        # 3. Fallback: check set-operation CTEs (in reverse declaration order so later
+        #    CTEs win over earlier ones) and set-operation subqueries before generic aliases.
+        for cname, cte_n in reversed(cte_order):
+            cte_body = cte_n.this
+            while isinstance(cte_body, sqlglot_exp.Subquery):
+                cte_body = cte_body.this
+            if isinstance(cte_body, sqlglot_exp.SetOperation):
+                res = _infer_relation_branches_col_type(
+                    cte_n.this, _cte_hdr_cols(cte_n), owner_cte_name=cname
+                )
+                if res is not None:
+                    return res
+
+        for subq in q_ast.find_all(sqlglot_exp.Subquery):
+            sub_body = subq.this
+            while isinstance(sub_body, sqlglot_exp.Subquery):
+                sub_body = sub_body.this
+            if isinstance(sub_body, sqlglot_exp.SetOperation):
+                table_alias = subq.args.get("alias")
+                hdr_cols = (
+                    [c.name.lower() for c in table_alias.columns]
+                    if isinstance(table_alias, sqlglot_exp.TableAlias) and table_alias.columns
+                    else None
+                )
+                res = _infer_relation_branches_col_type(subq.this, hdr_cols)
+                if res is not None:
+                    return res
+
+        for alias_node in q_ast.find_all(sqlglot_exp.Alias):
+            if alias_node.alias.lower() == ident.lower():
+                inner = alias_node.this
+                agg_t = _infer_alias_expr_type(inner, self)
+                if agg_t is not None:
+                    return agg_t
+                if isinstance(inner, sqlglot_exp.Column) and not isinstance(inner.this, sqlglot_exp.Star):
+                    c_def = self._lookup_col_def(inner.name)
+                    if c_def:
+                        return self._normalize_dialect_type(c_def.data_type)
+
+        for cname, cte_n in reversed(cte_order):
+            res = _infer_relation_branches_col_type(
+                cte_n.this, _cte_hdr_cols(cte_n), owner_cte_name=cname
+            )
+            if res is not None:
+                return res
 
         if "." in col_name:
             c_base = self._lookup_col_def(ident)
@@ -1499,6 +1755,11 @@ class DialectBaseMixin(MixinHost):
                 return "BOOLEAN"
             if upper in ("DATE", "DATETIME", "TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITHOUT TIME ZONE"):
                 return upper
+            if self.dialect == Dialect.POSTGRES and (
+                upper in ("TIME", "TIMETZ", "TIME WITH TIME ZONE", "TIME WITHOUT TIME ZONE", "INET", "CIDR")
+                or upper.startswith("INTERVAL")
+            ):
+                return "INTERVAL" if upper.startswith("INTERVAL") else upper
             return None
 
         def merge(types: Sequence[Optional[str]]) -> Optional[str]:
@@ -1508,12 +1769,42 @@ class DialectBaseMixin(MixinHost):
             if any(value not in ranks for value in known):
                 if all(value == known[0] for value in known):
                     return known[0]
+                if self.dialect == Dialect.POSTGRES and all(
+                    value in ("TEXT", "VARCHAR", "BPCHAR", "NAME") for value in known
+                ):
+                    if known[0] == "TEXT":
+                        return "TEXT"
+                    if "NAME" in known:
+                        return "NAME"
+                    return known[0]
                 if all(value in ("TEXT", "VARCHAR", "BPCHAR") for value in known):
                     if all(value == "VARCHAR" for value in known):
                         return "VARCHAR"
                     if all(value == "BPCHAR" for value in known):
                         return "BPCHAR"
                     return "TEXT"
+                if self.dialect == Dialect.POSTGRES:
+                    pg_t_rank = {
+                        "DATE": (1, "DATE"),
+                        "TIMESTAMP": (2, "TIMESTAMP"),
+                        "TIMESTAMP WITHOUT TIME ZONE": (2, "TIMESTAMP"),
+                        "TIMESTAMPTZ": (3, "TIMESTAMP WITH TIME ZONE"),
+                        "TIMESTAMP WITH TIME ZONE": (3, "TIMESTAMP WITH TIME ZONE"),
+                    }
+                    if all(v in pg_t_rank for v in known):
+                        top_t = max(pg_t_rank[v][0] for v in known)
+                        return next(name for r, name in pg_t_rank.values() if r == top_t)
+                    pg_c_rank = {
+                        "TIME": (1, "TIME"),
+                        "TIME WITHOUT TIME ZONE": (1, "TIME"),
+                        "TIMETZ": (2, "TIME WITH TIME ZONE"),
+                        "TIME WITH TIME ZONE": (2, "TIME WITH TIME ZONE"),
+                    }
+                    if all(v in pg_c_rank for v in known):
+                        top_c = max(pg_c_rank[v][0] for v in known)
+                        return next(name for r, name in pg_c_rank.values() if r == top_c)
+                    if all(v in ("INET", "CIDR") for v in known):
+                        return "INET"
                 if self.dialect == Dialect.POSTGRES and all(value.endswith("[]") for value in known):
                     elems = [re.sub(r"(?:\[\])+$", "", v).strip() for v in known]
                     if all(e == elems[0] for e in elems):
@@ -1521,18 +1812,22 @@ class DialectBaseMixin(MixinHost):
                     stripped = [_pg_strip_arr_elem_mod(e) for e in elems]
                     if all(s in ranks for s in stripped):
                         return f"{max(stripped, key=lambda v: ranks[v])}[]"
-                    if all(s in ("TEXT", "VARCHAR", "BPCHAR") for s in stripped):
-                        if all(s == "VARCHAR" for s in stripped):
-                            return "VARCHAR[]"
-                        if all(s == "BPCHAR" for s in stripped):
-                            return "BPCHAR[]"
-                        return "TEXT[]"
+                    if all(s in ("TEXT", "VARCHAR", "BPCHAR", "NAME") for s in stripped):
+                        if stripped[0] == "TEXT":
+                            return "TEXT[]"
+                        if "NAME" in stripped:
+                            return "NAME[]"
+                        return f"{stripped[0]}[]"
+                    merged_e = merge(stripped)
+                    if merged_e is not None:
+                        return f"{merged_e}[]"
                     if all(s == stripped[0] for s in stripped):
                         return f"{stripped[0]}[]"
                 if self.dialect == Dialect.POSTGRES and all(
-                    v == "BIT" or v == "BIT VARYING" or v.startswith("BIT(") for v in known
+                    v in ("BIT", "BIT VARYING", '"bit"', 'pg_catalog."bit"') or v.startswith("BIT(")
+                    for v in known
                 ):
-                    return "BIT VARYING"
+                    return "BIT VARYING" if known[0] == "BIT VARYING" else 'pg_catalog."bit"'
                 return None
             return max(known, key=lambda value: ranks[value])
 
@@ -1654,7 +1949,7 @@ class DialectBaseMixin(MixinHost):
                             no_coll = self._PG_COLLATE_TAIL_RE.sub("", dt_raw.strip()).strip()
                             if not no_coll.endswith("[]"):
                                 base_str = _pg_strip_arr_elem_mod(no_coll)
-                                if base_str in ("VARCHAR", "BPCHAR"):
+                                if base_str in ("VARCHAR", "BPCHAR", "NAME"):
                                     return base_str
                     return infer(ch)
                 elem_types = [_infer_arr_elem(ch) for ch in ch_nodes]
@@ -1671,7 +1966,10 @@ class DialectBaseMixin(MixinHost):
                 ]
                 merged_elem = merge(non_str_lit_types) if non_str_lit_types else merge(elem_types)
                 if merged_elem is not None:
-                    return f"{merged_elem}[]"
+                    # PostgreSQL array types are dimension-independent:
+                    # ARRAY[ARRAY[1, 2]] has the same OID (integer[]) as ARRAY[1, 2].
+                    elem_no_br = re.sub(r"(?:\[\])+$", "", merged_elem).strip()
+                    return f"{elem_no_br}[]"
                 return None
             if kind == "Bracket" and self.dialect == Dialect.POSTGRES:
                 # Unwrap nested brackets (e.g. a_int2d[1][1] or a_int2d[1:2][1:2]):
@@ -1741,6 +2039,13 @@ class DialectBaseMixin(MixinHost):
                 return merge((t_br, f_br))
             if kind == "Case":
                 branches: List[Optional[str]] = []
+                default = node.args.get("default")
+                if self.dialect == Dialect.POSTGRES and default is not None:
+                    # PostgreSQL transformCaseExpr resolves ELSE before THEN branches.
+                    inferred = infer(default)
+                    if inferred is None:
+                        return None
+                    branches.append(inferred)
                 for branch in node.args.get("ifs") or ():
                     value = branch.args.get("true")
                     if value is not None:
@@ -1748,8 +2053,7 @@ class DialectBaseMixin(MixinHost):
                         if inferred is None:
                             return None
                         branches.append(inferred)
-                default = node.args.get("default")
-                if default is not None:
+                if self.dialect != Dialect.POSTGRES and default is not None:
                     inferred = infer(default)
                     if inferred is None:
                         return None
@@ -2028,58 +2332,282 @@ class DialectBaseMixin(MixinHost):
             return "NAME"
         return "TEXT"
 
-    def _common_storage_type(self, types: Sequence[str], *, has_null: bool = False) -> str:
+    def _pg_split_type_and_collation(self, data_type: str) -> Tuple[str, str]:
+        s = data_type.strip()
+        m = self._PG_COLLATE_TAIL_RE.search(s)
+        if m:
+            return s[: m.start()].strip(), s[m.start() :].rstrip()
+        return s, ""
+
+    def _pg_cast_expr_to_type(self, expr: str, target_dt: str) -> str:
+        type_part, coll_tail = self._pg_split_type_and_collation(target_dt)
+        if not type_part:
+            return expr
+        casted = f"CAST(({expr}) AS {type_part})"
+        return f"({casted}{coll_tail})" if coll_tail else casted
+
+    def _pg_branch_expr_needs_cast(
+        self,
+        item: SelectItem,
+        branch_ctx: Any,
+        common_dt: str,
+    ) -> bool:
+        """Whether a PostgreSQL set-operation branch expression must be cast to
+        the widened ``common_dt`` before key canonicalization / trigger upserts."""
+        if self.dialect != Dialect.POSTGRES or not common_dt or not common_dt.strip():
+            return False
+        raw = item.raw_expr.strip()
+        if _is_untyped_null_expr(raw, dialect=Dialect.POSTGRES):
+            return True
+        try:
+            lit_ast = parse_sql_ast(_unwrap_outer_parens(raw, dialect=Dialect.POSTGRES), dialect=Dialect.POSTGRES)
+            if isinstance(lit_ast, sqlglot_exp.Literal) and lit_ast.args.get("is_string"):
+                return True
+        except sqlglot.errors.SqlglotError:
+            pass
+        b_dt: Optional[str] = None
+        ts_b = branch_ctx.primary_schema
+        if ts_b is not None and item.source_col and _is_simple_column_expr(raw, dialect=Dialect.POSTGRES):
+            src_low = _unquote_ident(item.source_col, dialect=Dialect.POSTGRES).lower()
+            c_b = next((c for k, c in ts_b.columns.items() if k.lower() == src_low), None)
+            if c_b is not None:
+                b_dt = c_b.data_type
+        resolved_b_dt: str = b_dt if b_dt is not None else str(branch_ctx._infer_expr_storage_type(item))
+        return self._pg_canonical_compare_type(resolved_b_dt) != self._pg_canonical_compare_type(common_dt)
+
+    def _pg_canonical_compare_type(self, data_type: str) -> str:
+        """Canonicalize a PostgreSQL type string for widened-branch equality checks."""
+        type_part, coll_tail = self._pg_split_type_and_collation(data_type)
+        m_arr = re.match(r"^(.*?)((?:\[\])+)$", type_part)
+        arr_suffix = "[]" if m_arr else ""
+        elem = m_arr.group(1).strip() if m_arr else type_part
+        if '"' in elem:
+            low_e = re.sub(r"\s+", " ", elem).strip()
+            if low_e.lower() in ('"bit"', 'pg_catalog."bit"'):
+                norm_elem = 'pg_catalog."bit"'
+            else:
+                norm_elem = low_e
+        else:
+            u = re.sub(r"\s+", " ", elem.upper()).strip()
+            m_mod = re.match(r"^([A-Z ]+?)\s*(\([^)]*\))(.*)$", u)
+            if m_mod:
+                base_n = f"{m_mod.group(1).strip()}{m_mod.group(3)}".strip()
+                mod_s = re.sub(r"\s+", "", m_mod.group(2))
+            else:
+                base_n, mod_s = u, ""
+            alias_map = {
+                "INT2": "SMALLINT",
+                "SMALLSERIAL": "SMALLINT",
+                "SERIAL2": "SMALLINT",
+                "INT": "INTEGER",
+                "INT4": "INTEGER",
+                "SERIAL": "INTEGER",
+                "SERIAL4": "INTEGER",
+                "INT8": "BIGINT",
+                "BIGSERIAL": "BIGINT",
+                "SERIAL8": "BIGINT",
+                "DECIMAL": "NUMERIC",
+                "DEC": "NUMERIC",
+                "FLOAT4": "REAL",
+                "FLOAT8": "DOUBLE PRECISION",
+                "DOUBLE": "DOUBLE PRECISION",
+                "BOOL": "BOOLEAN",
+                "CHARACTER VARYING": "VARCHAR",
+                "CHARACTER": "BPCHAR",
+                "CHAR": "BPCHAR",
+                "NCHAR": "BPCHAR",
+                "VARBIT": "BIT VARYING",
+                "TIMESTAMP WITHOUT TIME ZONE": "TIMESTAMP",
+                "TIMESTAMP WITH TIME ZONE": "TIMESTAMPTZ",
+                "TIME WITHOUT TIME ZONE": "TIME",
+                "TIME WITH TIME ZONE": "TIMETZ",
+            }
+            canon_base = alias_map.get(base_n, base_n)
+            if not mod_s and not arr_suffix:
+                if base_n == "BIT":
+                    mod_s = "(1)"
+                elif base_n in ("CHAR", "CHARACTER", "NCHAR"):
+                    mod_s = "(1)"
+            norm_elem = f"{canon_base}{mod_s}"
+        norm_coll = ""
+        if coll_tail:
+            c_body = re.sub(r"^\s*COLLATE\s+", "", coll_tail.strip(), flags=re.IGNORECASE)
+            c_body = re.sub(r'^(?:"pg_catalog"|pg_catalog)\.', "", c_body, flags=re.IGNORECASE).strip()
+            if c_body and not c_body.startswith('"'):
+                c_body = f'"{c_body.lower()}"'
+            norm_coll = f" COLLATE {c_body}"
+        return f"{norm_elem}{arr_suffix}{norm_coll}"
+
+    def _common_storage_type(
+        self,
+        types: Sequence[str],
+        *,
+        has_null: bool = False,
+        explicit_colls: Optional[Sequence[Optional[str]]] = None,
+    ) -> str:
         """Merge column storage types across branches of a set operation
         (UNION ALL / UNION / INTERSECT / EXCEPT) using target dialect widening rules."""
-        raw_nonempty = [t.strip() for t in types if t and t.strip()]
+        paired = [
+            (t.strip(), explicit_colls[idx] if (explicit_colls is not None and idx < len(explicit_colls)) else None)
+            for idx, t in enumerate(types)
+            if t and t.strip()
+        ]
+        raw_nonempty = [t for t, _ in paired]
+        exp_colls_nonempty = [ec for _, ec in paired]
         if not raw_nonempty:
             return "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
 
         if self.dialect == Dialect.POSTGRES:
-            cleaned = [self._normalize_dialect_type(t).strip() for t in raw_nonempty]
-            no_coll = [self._PG_COLLATE_TAIL_RE.sub("", t).strip() for t in cleaned]
-            colls = [
-                (m.group(0).rstrip() if (m := self._PG_COLLATE_TAIL_RE.search(t)) else "")
-                for t in cleaned
-            ]
-            # Preserve a consistent explicit/column collation across all non-NULL branches.
+            def _pg_norm_branch_type(raw_t: str) -> str:
+                t_part, c_tail = self._pg_split_type_and_collation(raw_t)
+                # Preserve unbounded CHARACTER VARYING / VARCHAR (do not let
+                # _normalize_dialect_type invent a synthetic VARCHAR(255) cap).
+                if re.sub(r"\s+", " ", t_part.upper()).strip() in ("CHARACTER VARYING", "VARCHAR"):
+                    return f"VARCHAR{c_tail}"
+                m_a = re.match(r"^(.*?)((?:\[\])+)$", t_part)
+                if m_a:
+                    el = m_a.group(1).strip()
+                    if re.sub(r"\s+", " ", el.upper()).strip() in ("CHARACTER VARYING", "VARCHAR"):
+                        return f"VARCHAR{m_a.group(2)}{c_tail}"
+                    return f"{self._normalize_dialect_type(el)}{m_a.group(2)}{c_tail}"
+                return f"{self._normalize_dialect_type(t_part).strip()}{c_tail}"
+
+            def _pg_norm_coll_key(coll_clause: str) -> str:
+                body = re.sub(r"^\s*COLLATE\s+", "", coll_clause.strip(), flags=re.IGNORECASE)
+                body = re.sub(r'^(?:"pg_catalog"|pg_catalog)\.', "", body, flags=re.IGNORECASE).strip()
+                if body and not body.startswith('"'):
+                    body = f'"{body.lower()}"'
+                return body
+
+            def _pg_base_token(type_no_coll: str) -> str:
+                s = type_no_coll.strip()
+                if s.lower() in ('"bit"', 'pg_catalog."bit"'):
+                    return "BIT"
+                if '"' in s:
+                    return s
+                u = re.sub(r"\s*\([^)]*\)", "", re.sub(r"\s+", " ", s.upper())).strip()
+                if u.startswith("INTERVAL"):
+                    return "INTERVAL"
+                return u
+
+            def _pg_strip_typmod(type_no_coll: str) -> str:
+                b = _pg_base_token(type_no_coll)
+                if b in ("NUMERIC", "DECIMAL", "DEC"):
+                    return "NUMERIC"
+                if b in ("VARCHAR", "CHARACTER VARYING"):
+                    return "VARCHAR"
+                if b in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
+                    return "BPCHAR"
+                if b == "BIT":
+                    return 'pg_catalog."bit"'
+                if b in ("VARBIT", "BIT VARYING"):
+                    return "BIT VARYING"
+                if b in ("TIMESTAMP", "TIMESTAMP WITHOUT TIME ZONE"):
+                    return "TIMESTAMP"
+                if b in ("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"):
+                    return "TIMESTAMPTZ"
+                if b in ("TIME", "TIME WITHOUT TIME ZONE"):
+                    return "TIME"
+                if b in ("TIMETZ", "TIME WITH TIME ZONE"):
+                    return "TIMETZ"
+                if b == "INTERVAL":
+                    return "INTERVAL"
+                return type_no_coll
+
+            pg_builtin_cat = {
+                "SMALLINT": "N", "INT2": "N", "INTEGER": "N", "INT": "N", "INT4": "N",
+                "BIGINT": "N", "INT8": "N", "NUMERIC": "N", "DECIMAL": "N", "DEC": "N",
+                "REAL": "N", "FLOAT4": "N", "DOUBLE PRECISION": "N", "FLOAT8": "N",
+                "TEXT": "S", "VARCHAR": "S", "CHARACTER VARYING": "S",
+                "CHAR": "S", "CHARACTER": "S", "BPCHAR": "S", "NCHAR": "S", "NAME": "S",
+                "DATE": "D", "TIMESTAMP": "D", "TIMESTAMP WITHOUT TIME ZONE": "D",
+                "TIMESTAMPTZ": "D", "TIMESTAMP WITH TIME ZONE": "D",
+                "TIME": "T", "TIME WITHOUT TIME ZONE": "T",
+                "TIMETZ": "T", "TIME WITH TIME ZONE": "T",
+                "INTERVAL": "I",
+                "BIT": "V", "VARBIT": "V", "BIT VARYING": "V",
+                "INET": "INET", "CIDR": "INET",
+                "BOOLEAN": "B", "BOOL": "B",
+                "BYTEA": "BYTEA", "UUID": "UUID", "JSON": "JSON", "JSONB": "JSONB",
+                "XML": "XML", "MONEY": "MONEY", "OID": "OID",
+                "MACADDR": "MACADDR", "MACADDR8": "MACADDR8",
+                "POINT": "POINT", "LINE": "LINE", "LSEG": "LSEG", "BOX": "BOX",
+                "PATH": "PATH", "POLYGON": "POLYGON", "CIRCLE": "CIRCLE",
+                "INT4RANGE": "INT4RANGE", "INT8RANGE": "INT8RANGE", "NUMRANGE": "NUMRANGE",
+                "TSRANGE": "TSRANGE", "TSTZRANGE": "TSTZRANGE", "DATERANGE": "DATERANGE",
+            }
+
+            cleaned = [_pg_norm_branch_type(t) for t in raw_nonempty]
+            no_coll: List[str] = []
+            implicit_colls: List[str] = []
+            explicit_nonempty: List[str] = []
+            for t, exp_c in zip(cleaned, exp_colls_nonempty):
+                tp, ct = self._pg_split_type_and_collation(t)
+                no_coll.append(tp)
+                if exp_c:
+                    explicit_nonempty.append(exp_c)
+                    implicit_colls.append("")
+                elif ct:
+                    implicit_colls.append(ct)
+                else:
+                    # PostgreSQL NAME (and NAME[]) carries intrinsic implicit collation "C".
+                    elem_no_br = re.sub(r"(?:\[\])+$", "", tp).strip()
+                    if _pg_base_token(elem_no_br) == "NAME":
+                        implicit_colls.append(' COLLATE "C"')
+                    else:
+                        implicit_colls.append("")
+
+            # PostgreSQL collation strength: explicit COLLATE overrides implicit column
+            # collations; otherwise a single consistent non-default implicit collation
+            # wins over default collation.
             shared_coll = ""
-            if colls and all(colls):
-                norm_colls = {re.sub(r"\s+", " ", c.strip()).lower() for c in colls}
-                if len(norm_colls) == 1:
-                    shared_coll = colls[0]
-            # Recursive array widening (e.g. SMALLINT[] + BIGINT[] -> BIGINT[], VARCHAR(5)[] + VARCHAR(50)[] -> VARCHAR[]).
+            if explicit_nonempty:
+                norm_exp = {_pg_norm_coll_key(c) for c in explicit_nonempty}
+                if len(norm_exp) == 1:
+                    shared_coll = explicit_nonempty[0]
+            else:
+                nonempty_imp = [c for c in implicit_colls if c]
+                if nonempty_imp:
+                    norm_imp = {_pg_norm_coll_key(c) for c in nonempty_imp}
+                    if len(norm_imp) == 1:
+                        shared_coll = nonempty_imp[0]
+
+            def _attach_coll(res_t: str) -> str:
+                if not shared_coll:
+                    return res_t
+                res_elem = re.sub(r"(?:\[\])+$", "", res_t).strip()
+                res_base = _pg_base_token(res_elem)
+                # Allow collations on collatable built-ins AND custom collatable domains
+                # (whose base token is not a non-collatable built-in).
+                is_collatable = self._pg_type_supports_collation(res_t) or (res_base not in pg_builtin_cat)
+                if not is_collatable:
+                    return res_t
+                if res_base == "NAME" and _pg_norm_coll_key(shared_coll) == '"C"':
+                    return res_t
+                return f"{res_t}{shared_coll}"
+
+            # Recursive array widening across arbitrary bracket depths (`T[]`, `T[][]`, ...):
+            # PostgreSQL gives all dimensions of an element type the same 1D array OID.
             arr_matches = [re.match(r"^(.*?)((?:\[\])+)$", t) for t in no_coll]
+            if any(m is not None for m in arr_matches) and not all(m is not None for m in arr_matches):
+                raise UnsupportedMaterializedViewError(
+                    f"Incompatible PostgreSQL set-operation column types (cannot mix array and scalar): {', '.join(raw_nonempty)}"
+                )
             if all(m is not None for m in arr_matches):
-                brs = {m.group(2) for m in arr_matches if m is not None}
-                if len(brs) == 1:
-                    br = next(iter(brs))
-                    elems = [m.group(1).strip() for m in arr_matches if m is not None]
-                    merged_elem = self._common_storage_type(elems, has_null=has_null)
-                    if merged_elem.upper() == "VARCHAR(255)":
-                        merged_elem = "VARCHAR"
-                    res_arr = f"{merged_elem}{br}"
-                    return f"{res_arr}{shared_coll}" if shared_coll and self._pg_type_supports_collation(res_arr) else res_arr
-            if len(cleaned) == 1:
-                if has_null:
-                    b0 = re.sub(r"\s*\([^)]*\)\s*$", "", no_coll[0].upper()).strip()
-                    if b0 in ("NUMERIC", "DECIMAL", "DEC"):
-                        return "NUMERIC"
-                    if b0 in ("VARCHAR", "CHARACTER VARYING"):
-                        return f"VARCHAR{shared_coll}"
-                    if b0 in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
-                        return f"BPCHAR{shared_coll}"
-                return cleaned[0]
-            if all(t.upper() == cleaned[0].upper() for t in cleaned):
-                if has_null:
-                    b0 = re.sub(r"\s*\([^)]*\)\s*$", "", no_coll[0].upper()).strip()
-                    if b0 in ("NUMERIC", "DECIMAL", "DEC"):
-                        return "NUMERIC"
-                    if b0 in ("VARCHAR", "CHARACTER VARYING"):
-                        return f"VARCHAR{shared_coll}"
-                    if b0 in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
-                        return f"BPCHAR{shared_coll}"
-                return cleaned[0]
+                elems = [m.group(1).strip() for m in arr_matches if m is not None]
+                merged_elem = self._common_storage_type(
+                    elems, has_null=has_null, explicit_colls=exp_colls_nonempty
+                )
+                merged_elem_no_coll, _ = self._pg_split_type_and_collation(merged_elem)
+                res_arr = f"{merged_elem_no_coll}[]"
+                return _attach_coll(res_arr)
+
+            if len(no_coll) == 1 or all(
+                self._pg_canonical_compare_type(t) == self._pg_canonical_compare_type(no_coll[0])
+                for t in no_coll
+            ):
+                base_res = _pg_strip_typmod(no_coll[0]) if has_null else no_coll[0]
+                return _attach_coll(base_res)
 
             pg_num_rank = {
                 "SMALLINT": (1, "SMALLINT"),
@@ -2107,7 +2635,12 @@ class DialectBaseMixin(MixinHost):
                 "NCHAR": "BPCHAR",
                 "NAME": "NAME",
             }
-            bases = [re.sub(r"\s*\([^)]*\)\s*$", "", t.upper()).strip() for t in no_coll]
+            bases = [_pg_base_token(t) for t in no_coll]
+            cats = [pg_builtin_cat.get(b) for b in bases]
+            if len(bases) >= 2 and all(c is not None for c in cats) and len(set(cats)) > 1:
+                raise UnsupportedMaterializedViewError(
+                    f"Incompatible PostgreSQL set-operation column types: {', '.join(raw_nonempty)}"
+                )
             if all(b in pg_num_rank for b in bases):
                 top_rank = max(pg_num_rank[b][0] for b in bases)
                 return next(name for r, name in pg_num_rank.values() if r == top_rank)
@@ -2119,7 +2652,7 @@ class DialectBaseMixin(MixinHost):
                     res_s = "NAME"
                 else:
                     res_s = str_kinds[0]
-                return f"{res_s}{shared_coll}" if shared_coll and res_s != "NAME" else res_s
+                return _attach_coll(res_s)
             pg_time_rank = {
                 "DATE": (1, "DATE"),
                 "TIMESTAMP": (2, "TIMESTAMP"),
@@ -2139,11 +2672,18 @@ class DialectBaseMixin(MixinHost):
             if all(b in pg_clock_rank for b in bases):
                 top_c = max(pg_clock_rank[b][0] for b in bases)
                 return next(name for r, name in pg_clock_rank.values() if r == top_c)
+            if all(b == "INTERVAL" for b in bases):
+                return "INTERVAL"
             if all(b in ("BIT", "VARBIT", "BIT VARYING") for b in bases):
-                return "BIT VARYING"
+                # Verified natively on PostgreSQL 18: BIT(n) + BIT(m) and BIT(n) + VARBIT
+                # resolve to unbounded fixed-length bit (`pg_catalog."bit"`, OID 1560, mod -1),
+                # while VARBIT + BIT(n) resolves to `BIT VARYING` (OID 1562, mod -1).
+                return "BIT VARYING" if bases[0] in ("VARBIT", "BIT VARYING") else 'pg_catalog."bit"'
+            if all(b in ("INET", "CIDR") for b in bases):
+                return "INET"
             if all(b == bases[0] for b in bases):
-                return bases[0]
-            return cleaned[0]
+                return _attach_coll(_pg_strip_typmod(no_coll[0]))
+            return _attach_coll(no_coll[0])
 
         if self.dialect == Dialect.MYSQL:
             if len(raw_nonempty) == 1:
@@ -2339,6 +2879,7 @@ class DialectBaseMixin(MixinHost):
         merged_cols: Dict[str, ColumnDef] = {}
         for col_i, fb_it in enumerate(first_b.select_items):
             col_b_types: List[str] = []
+            col_b_exp_colls: List[Optional[str]] = []
             has_null = False
             has_str_lit = False
             all_not_null = True
@@ -2351,6 +2892,11 @@ class DialectBaseMixin(MixinHost):
                     has_null = True
                     all_not_null = False
                     continue
+                exp_c = (
+                    self._extract_pg_explicit_collation(bi_item.raw_expr)
+                    if self.dialect == Dialect.POSTGRES
+                    else None
+                )
                 ts_b = self._schemas_lower.get(bs.base_table.lower())
                 c_b: Optional[ColumnDef] = None
                 if ts_b is not None and bi_item.source_col and _is_simple_column_expr(bi_item.raw_expr.strip(), dialect=self.dialect):
@@ -2358,6 +2904,7 @@ class DialectBaseMixin(MixinHost):
                     c_b = next((c for k, c in ts_b.columns.items() if k.lower() == src_low), None)
                 if c_b is not None:
                     col_b_types.append(c_b.data_type)
+                    col_b_exp_colls.append(exp_c)
                     if not c_b.not_null:
                         all_not_null = False
                     continue
@@ -2370,13 +2917,27 @@ class DialectBaseMixin(MixinHost):
                             continue
                     except sqlglot.errors.SqlglotError:
                         pass
+                    # If a bare column reference is missing from offline test schemas,
+                    # do not treat the fallback "TEXT" as a resolved string type.
+                    if _is_simple_column_expr(bi_item.raw_expr.strip(), dialect=self.dialect):
+                        if (
+                            b_ctx._lookup_col_def(bi_item.raw_expr) is None
+                            and b_ctx._infer_cte_or_subquery_col_type(bi_item.raw_expr) is None
+                        ):
+                            continue
                 col_b_types.append(b_ctx._infer_expr_storage_type(bi_item))
+                col_b_exp_colls.append(exp_c)
             if not col_b_types and has_str_lit:
                 col_b_types.append("TEXT")
+                col_b_exp_colls.append(None)
             if self.dialect == Dialect.SQLITE:
                 common_dt = "BLOB"
             elif col_b_types:
-                common_dt = self._common_storage_type(col_b_types, has_null=has_null)
+                common_dt = self._common_storage_type(
+                    col_b_types,
+                    has_null=has_null or (self.dialect == Dialect.POSTGRES and has_str_lit),
+                    explicit_colls=col_b_exp_colls if self.dialect == Dialect.POSTGRES else None,
+                )
             else:
                 common_dt = "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
             merged_cols[fb_it.alias] = ColumnDef(
@@ -2450,6 +3011,10 @@ class DialectBaseMixin(MixinHost):
         if routed_type is not None:
             return routed_type
         if not item.is_aggregate:
+            if self.view.has_cte or self.view.has_subquery_in_from:
+                outer_cte_t = self._infer_cte_or_subquery_col_type(item.raw_expr, _outer_only=True)
+                if outer_cte_t:
+                    return outer_cte_t
             c_def = self._lookup_col_def(item.raw_expr)
             if c_def:
                 return self._normalize_dialect_type(c_def.data_type)
@@ -3296,7 +3861,8 @@ class DialectBaseMixin(MixinHost):
             m = self._PG_COLLATE_TAIL_RE.search(dt.strip())
             if m:
                 return m.group(0).rstrip()
-            base_u = re.sub(r"\s*\([^)]*\)", "", dt.strip().upper()).strip()
+            elem_no_br = re.sub(r"(?:\[\])+$", "", dt.strip()).strip()
+            base_u = re.sub(r"\s*\([^)]*\)", "", elem_no_br.upper()).strip()
             if base_u == "NAME":
                 return ' COLLATE "C"'
             return None
@@ -3408,16 +3974,20 @@ class DialectBaseMixin(MixinHost):
     @classmethod
     def _pg_type_has_variable_numeric_scale(cls, data_type: str) -> bool:
         """Whether a PostgreSQL type string can store equal values with
-        different display scales (unconstrained ``NUMERIC``, multi-dimensional
-        ``NUMERIC[]``/``NUMERIC[][]``, ``NUMRANGE``/``NUMRANGE[]``,
-        ``NUMMULTIRANGE``/``NUMMULTIRANGE[]``). Fixed-scale ``NUMERIC(p, s)``
-        returns False."""
+        different display representations (unconstrained ``NUMERIC`` / ``NUMERIC[]``,
+        ``NUMRANGE`` / ``NUMMULTIRANGE``, or unconstrained ``BPCHAR`` / ``BPCHAR[]``
+        where trailing spaces compare equal yet display differently).
+        Fixed-scale ``NUMERIC(p, s)`` and fixed-width ``CHAR(n)`` return False."""
         if not data_type or not data_type.strip():
             return False
         clean = cls._PG_COLLATE_TAIL_RE.sub("", data_type.strip()).strip()
+        is_array = clean.endswith("[]")
         elem = re.sub(r"(?:\[\])+$", "", clean).strip()
         dt_u = re.sub(r"\s+", " ", elem.upper())
-        return dt_u in ("NUMERIC", "DECIMAL", "DEC", "NUMRANGE", "NUMMULTIRANGE")
+        # PostgreSQL 15 format_type('bpchar[]', -1) returns 'character[]'.
+        return dt_u in ("NUMERIC", "DECIMAL", "DEC", "NUMRANGE", "NUMMULTIRANGE", "BPCHAR") or (
+            is_array and dt_u == "CHARACTER"
+        )
 
     def _pg_expr_has_variable_numeric_scale(self, expr: str) -> bool:
         """Whether a PostgreSQL expression's type can store equal values with
@@ -3699,8 +4269,51 @@ class DialectBaseMixin(MixinHost):
         i = 0
         n = len(toks)
         cursor = 0
+        paren_depth = 0
+        # Stack of (cast_paren_depth, in_type_region) so type names inside
+        # CAST(... AS <type>) are never rewritten as table columns.
+        cast_stack: List[List[Any]] = []
         while i < n:
             tk = toks[i]
+            if tk.token_type == SQLGlotTokenType.L_PAREN:
+                paren_depth += 1
+                if i > 0 and toks[i - 1].text.upper() == "CAST":
+                    cast_stack.append([paren_depth, False])
+                i += 1
+                continue
+            if tk.token_type == SQLGlotTokenType.R_PAREN:
+                if cast_stack and cast_stack[-1][0] == paren_depth:
+                    cast_stack.pop()
+                if paren_depth > 0:
+                    paren_depth -= 1
+                i += 1
+                continue
+            if (
+                tk.token_type == SQLGlotTokenType.ALIAS
+                or tk.text.upper() == "AS"
+            ) and cast_stack and cast_stack[-1][0] == paren_depth:
+                cast_stack[-1][1] = True
+                i += 1
+                continue
+            if cast_stack and cast_stack[-1][1]:
+                i += 1
+                continue
+            # Never rewrite collation names after COLLATE (`COLLATE "C"` or `COLLATE pg_catalog."C"`).
+            if tk.text.upper() == "COLLATE" and tk.token_type != SQLGlotTokenType.IDENTIFIER:
+                i += 1
+                if i < n and _is_word_or_ident_token(toks[i]):
+                    i += 1
+                    if i + 1 < n and toks[i].token_type == SQLGlotTokenType.DOT and _is_word_or_ident_token(toks[i + 1]):
+                        i += 2
+                continue
+            # Never rewrite PostgreSQL `::type` targets (including `::schema.type` and multi-word types).
+            if tk.token_type == SQLGlotTokenType.DCOLON:
+                i += 1
+                if i < n and _is_word_or_ident_token(toks[i]):
+                    i += 1
+                    if i + 1 < n and toks[i].token_type == SQLGlotTokenType.DOT and _is_word_or_ident_token(toks[i + 1]):
+                        i += 2
+                continue
             if (
                 _is_word_or_ident_token(tk)
                 and i + 2 < n

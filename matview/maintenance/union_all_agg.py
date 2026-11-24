@@ -417,16 +417,27 @@ class Tier1UnionAllAggMixin(MixinHost):
 
             for bs in b_list:
                 b_alias = bs.joins[0].alias if bs.joins else base_t
+                b_type_ctx = self.with_ir(primary_schema=ts, view=bs)
+                merged_cols_u = merged_ctx.primary_schema.columns if merged_ctx.primary_schema else {}
                 col_subst: Dict[str, str] = {}
                 for col_i, b_it in enumerate(bs.select_items):
-                    u_col_name = first_b.select_items[col_i].alias.lower()
+                    u_col_orig = first_b.select_items[col_i].alias
+                    u_col_name = u_col_orig.lower()
                     cleaned = re.sub(
                         rf"\b{re.escape(b_alias)}\.",
                         "",
                         b_it.raw_expr.strip(),
                         flags=re.IGNORECASE,
                     )
-                    col_subst[u_col_name] = f"({cleaned})"
+                    common_col = merged_cols_u.get(u_col_orig)
+                    if (
+                        self.dialect == Dialect.POSTGRES
+                        and common_col is not None
+                        and self._pg_branch_expr_needs_cast(b_it, b_type_ctx, common_col.data_type)
+                    ):
+                        col_subst[u_col_name] = f"({self._pg_cast_expr_to_type(cleaned, common_col.data_type)})"
+                    else:
+                        col_subst[u_col_name] = f"({cleaned})"
 
                 def _subst_u(frag: Optional[str]) -> Optional[str]:
                     if frag is None:

@@ -58,59 +58,136 @@ class Tier3Mixin(MixinHost):
 
         extra_auto_cols = self._auto_backing_extra_index_cols()
         indexed_cols_lower = self._indexed_column_names_lower(extra_auto_cols)
+
+        def _parse_and_expand_setop_branches() -> Optional[List[ViewSpec]]:
+            if self.dialect == Dialect.SQLITE or not self.view.has_compound_set_op:
+                return None
+            raw_q = self.view.raw_select_sql.strip()
+            q_ast = parse_sql_ast(raw_q, dialect=self.dialect)
+            if not isinstance(q_ast, sqlglot_exp.SetOperation):
+                return None
+            _, b_sqls = _extract_set_op_branches_from_ast(q_ast, raw_q, dialect=self.dialect)
+            if len(b_sqls) < 2:
+                return None
+            with_node = q_ast.args.get("with_") or q_ast.args.get("with")
+            with_prefix = (
+                with_node.sql(_sqlglot_dialect(self.dialect)) + " "
+                if isinstance(with_node, sqlglot_exp.With)
+                else ""
+            )
+            known_t = set(self._schemas_lower.keys())
+            expanded_bs: List[ViewSpec] = []
+            for bi, b_sql in enumerate(b_sqls):
+                b_clean = _unwrap_outer_parens(b_sql.strip(), dialect=self.dialect)
+                if with_prefix and not re.match(r"^\s*WITH\b", b_clean, flags=re.IGNORECASE):
+                    b_clean = f"{with_prefix}{b_clean}"
+                bs = _parse_single_create_view_stmt(
+                    f"CREATE VIEW __t3_set_b_{bi} AS {b_clean}",
+                    known_tables=known_t,
+                    dialect=self.dialect,
+                )
+                if len(bs.select_items) == 1 and bs.select_items[0].raw_expr.strip() == "*":
+                    exp_items: List[SelectItem] = []
+                    seen_names_low: Set[str] = set()
+                    has_join = len(bs.joins or ()) > 1
+                    for j_idx, bj in enumerate(bs.joins or ()):
+                        bt_sc = self._schemas_lower.get(bj.table_name.lower())
+                        if bt_sc is None:
+                            exp_items = []
+                            break
+                        for c_def in bt_sc.columns.values():
+                            if c_def.name.lower() in seen_names_low:
+                                # Duplicate column names from multi-table SELECT * cannot be
+                                # disambiguated safely into a positional merged schema.
+                                return None
+                            seen_names_low.add(c_def.name.lower())
+                            qual_raw = (
+                                f"{self._q(bj.alias)}.{self._q(c_def.name)}"
+                                if has_join
+                                else self._q(c_def.name)
+                            )
+                            exp_items.append(
+                                SelectItem(
+                                    raw_expr=qual_raw,
+                                    alias=c_def.name,
+                                    is_aggregate=False,
+                                    source_col=c_def.name if j_idx == 0 else None,
+                                )
+                            )
+                    if not exp_items:
+                        return None
+                    bs = ViewSpec(
+                        view_name=bs.view_name,
+                        raw_select_sql=bs.raw_select_sql,
+                        base_table=bs.base_table,
+                        joins=bs.joins,
+                        referenced_tables=bs.referenced_tables,
+                        select_items=tuple(exp_items),
+                    )
+                expanded_bs.append(bs)
+            if (
+                len(expanded_bs) == len(b_sqls)
+                and expanded_bs[0].select_items
+                and all(len(bs.select_items) == len(expanded_bs[0].select_items) for bs in expanded_bs)
+                and all(not any(it.raw_expr.strip() == "*" for it in bs.select_items) for bs in expanded_bs)
+            ):
+                return expanded_bs
+            return None
+
         if len(self.view.select_items) == 1 and self.view.select_items[0].raw_expr.strip() == "*":
-            for j in self.view.joins or []:
-                t_schema = self._schemas_lower.get(j.table_name.lower())
-                if t_schema:
-                    for c_def in t_schema.columns.values():
-                        if c_def.name not in user_columns:
-                            user_columns.append(c_def.name)
-                            dt = "BLOB" if self.dialect == Dialect.SQLITE else self._normalize_dialect_type(c_def.data_type)
-                            if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
-                                dt = "VARCHAR(255)"
-                            col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
-            if not user_columns and self.primary_schema:
-                for c_def in self.primary_schema.columns.values():
-                    user_columns.append(c_def.name)
-                    dt = "BLOB" if self.dialect == Dialect.SQLITE else self._normalize_dialect_type(c_def.data_type)
-                    if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
-                        dt = "VARCHAR(255)"
-                    col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
+            setop_star_done = False
+            try:
+                expanded_bs = _parse_and_expand_setop_branches()
+            except UnsupportedMaterializedViewError:
+                raise
+            except Exception:
+                expanded_bs = None
+            if expanded_bs is not None:
+                m_ctx = self._union_all_common_ctx(expanded_bs)
+                if m_ctx.primary_schema:
+                    for fb_it in expanded_bs[0].select_items:
+                        user_columns.append(fb_it.alias)
+                        dt = m_ctx.primary_schema.columns[fb_it.alias].data_type
+                        if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and fb_it.alias.lower() in indexed_cols_lower:
+                            dt = "VARCHAR(255)"
+                        col_defs_sql.append(f"{self._q(fb_it.alias)} {dt}")
+                    setop_star_done = True
+            if not setop_star_done:
+                for j in self.view.joins or []:
+                    t_schema = self._schemas_lower.get(j.table_name.lower())
+                    if t_schema:
+                        for c_def in t_schema.columns.values():
+                            if c_def.name not in user_columns:
+                                user_columns.append(c_def.name)
+                                dt = "BLOB" if self.dialect == Dialect.SQLITE else self._normalize_dialect_type(c_def.data_type)
+                                if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                                    dt = "VARCHAR(255)"
+                                col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
+                if not user_columns and self.primary_schema:
+                    for c_def in self.primary_schema.columns.values():
+                        user_columns.append(c_def.name)
+                        dt = "BLOB" if self.dialect == Dialect.SQLITE else self._normalize_dialect_type(c_def.data_type)
+                        if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
+                            dt = "VARCHAR(255)"
+                        col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
         else:
             # For top-level compound set operations (e.g. UNION ALL ... ORDER BY / LIMIT,
             # keyless UNION ALL, or multi-branch INTERSECT/EXCEPT), widen each column's
             # storage type across all branches rather than using only branch 0.
             setop_col_types: Optional[List[str]] = None
-            if self.dialect != Dialect.SQLITE and self.view.has_compound_set_op:
-                try:
-                    q_ast = parse_sql_ast(self.view.raw_select_sql.strip(), dialect=self.dialect)
-                    if isinstance(q_ast, sqlglot_exp.SetOperation):
-                        _, b_sqls = _extract_set_op_branches_from_ast(
-                            q_ast, self.view.raw_select_sql.strip(), dialect=self.dialect
-                        )
-                        if len(b_sqls) >= 2:
-                            parsed_bs: List[ViewSpec] = []
-                            known_t = set(self._schemas_lower.keys())
-                            for bi, b_sql in enumerate(b_sqls):
-                                bs = _parse_single_create_view_stmt(
-                                    f"CREATE VIEW __t3_set_b_{bi} AS {b_sql}",
-                                    known_tables=known_t,
-                                    dialect=self.dialect,
-                                )
-                                parsed_bs.append(bs)
-                            if (
-                                parsed_bs
-                                and all(len(bs.select_items) == len(self.view.select_items) for bs in parsed_bs)
-                                and all(not any(it.raw_expr.strip() == "*" for it in bs.select_items) for bs in parsed_bs)
-                            ):
-                                m_ctx = self._union_all_common_ctx(parsed_bs)
-                                if m_ctx.primary_schema:
-                                    setop_col_types = [
-                                        m_ctx.primary_schema.columns[fb_it.alias].data_type
-                                        for fb_it in parsed_bs[0].select_items
-                                    ]
-                except Exception:
-                    setop_col_types = None
+            try:
+                parsed_bs = _parse_and_expand_setop_branches()
+            except UnsupportedMaterializedViewError:
+                raise
+            except Exception:
+                parsed_bs = None
+            if parsed_bs is not None and len(parsed_bs[0].select_items) == len(self.view.select_items):
+                m_ctx = self._union_all_common_ctx(parsed_bs)
+                if m_ctx.primary_schema:
+                    setop_col_types = [
+                        m_ctx.primary_schema.columns[fb_it.alias].data_type
+                        for fb_it in parsed_bs[0].select_items
+                    ]
 
             for col_i, item in enumerate(self.view.select_items):
                 user_columns.append(item.alias)

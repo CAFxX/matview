@@ -129,7 +129,12 @@ from .sql_frontend import (
 # 18: SQLite matview-owned tables are WITHOUT ROWID whenever they have a NOT NULL
 #     non-rowid PRIMARY KEY and narrow rows (not only composite keys), and may be
 #     STRICT (opt-in sqlite_strict_backing).
-MATVIEW_GENERATOR_VERSION = "18"
+# 19: PostgreSQL cross-branch UNION/INTERSECT/EXCEPT type widening and trigger
+#     coercion (mixed-dimension arrays, BIT/VARBIT, temporal/network/collation
+#     widening, branch-expression casts before canonical key hashing, BPCHAR
+#     surviving-representative refresh via ROW(...)::pg_catalog.text, and
+#     DISTINCT ON branch-0 representative selection for array INTERSECT/EXCEPT).
+MATVIEW_GENERATOR_VERSION = "19"
 
 
 def _definition_digest(select_sql: str) -> str:

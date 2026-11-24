@@ -1203,7 +1203,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         self.assertRegex(p_uall.backing_table_ddl, r"\bs VARCHAR\b")
         self.assertRegex(p_uall.backing_table_ddl, r"\btm TIMETZ\b")
         self.assertRegex(p_uall.backing_table_ddl, r"\barr BIGINT\[\]")
-        self.assertRegex(p_uall.backing_table_ddl, r"\bb BIT VARYING\b")
+        self.assertRegex(p_uall.backing_table_ddl, r'\bb pg_catalog\."bit"(?=[,\s\)])')
 
         # Positional alignment with differing branch column names (a.x vs b.y),
         # MIN/MAX typmod dropping, BIT_XOR, AVG, compound expressions, and large literals.
@@ -1430,6 +1430,640 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         )
         self.assertRegex(p_mm_name.backing_table_ddl, r"\bmnn TEXT\b")
         self.assertRegex(p_mm_name.backing_table_ddl, r"\bmxn TEXT\b")
+
+    def test_postgres_cross_branch_union_array_scalar_and_collation_widening_offline(self) -> None:
+        pg_schema = (
+            "CREATE TABLE a ("
+            "  id INT PRIMARY KEY, "
+            "  ai2 SMALLINT[], ai2_2d SMALLINT[][], ai4 INT[], "
+            "  avc5 VARCHAR(5)[], ach4 CHAR(4)[], atxt TEXT[], at_c TEXT[] COLLATE \"C\", "
+            "  ab4 BIT(4)[], avb VARBIT(8)[], "
+            "  ad DATE[], ats2 TIMESTAMP(2) WITHOUT TIME ZONE[], atm2 TIME(2) WITHOUT TIME ZONE[], "
+            "  aiv2 INTERVAL(2)[], acidr CIDR[], "
+            "  vc5 VARCHAR(5), ch4 CHAR(4), txt TEXT, t_c TEXT COLLATE \"C\", "
+            "  b4 BIT(4), vb VARBIT(8), d DATE, ts2 TIMESTAMP(2) WITHOUT TIME ZONE, "
+            "  tm2 TIME(2) WITHOUT TIME ZONE, num NUMERIC(6, 2), cidr_c CIDR, "
+            "  vc_unb VARCHAR, avc255 VARCHAR(255)[], x SMALLINT"
+            ");"
+            "CREATE TABLE b ("
+            "  id INT PRIMARY KEY, "
+            "  ai8 BIGINT[], ai8_2d BIGINT[][], anum NUMERIC(10, 2)[], af4 REAL[], af8 DOUBLE PRECISION[], "
+            "  avc20 VARCHAR(20)[], ach4 CHAR(4)[], atxt TEXT[], at_c TEXT[] COLLATE \"C\", anm NAME[], "
+            "  ab8 BIT(8)[], avb VARBIT[], "
+            "  ats4 TIMESTAMP(4) WITHOUT TIME ZONE[], atstz4 TIMESTAMP(4) WITH TIME ZONE[], atmtz4 TIME(4) WITH TIME ZONE[], "
+            "  aiv4 INTERVAL(4)[], ainet INET[], "
+            "  vc20 VARCHAR(20), txt TEXT, t_c TEXT COLLATE \"C\", nm NAME, "
+            "  b8 BIT(8), vb VARBIT, ts4 TIMESTAMP(4) WITHOUT TIME ZONE, "
+            "  tstz4 TIMESTAMP(4) WITH TIME ZONE, tmtz4 TIME(4) WITH TIME ZONE, "
+            "  inet_c INET, vc_unb VARCHAR, avc255 VARCHAR(255)[], y BIGINT"
+            ");"
+        )
+
+        # 1. Mixed array dimensions, element widening, unknown literals, bit/temporal/network arrays,
+        #    and single-branch non-default collation propagation.
+        p1 = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_u1 AS "
+            "SELECT id, ai2_2d AS arr_dim, ai4 AS arr_num, ai4 AS arr_f4, ai4 AS arr_lit, "
+            "  avc5 AS avc_lit, avc5 AS avc_ch, ach4 AS ach_vc, atxt AS atxt_nm, avc5 AS avc_nm, "
+            "  at_c AS at_coll, t_c AS t_coll, vc5 AS vc_coll, "
+            "  ab4 AS ab_b, ab4 AS ab_vb, avb AS avb_b, b4 AS b_vb, vb AS vb_b, "
+            "  ad AS ad_ts, ats2 AS ats_tz, atm2 AS atm_tz, aiv2 AS aiv, acidr AS anet, cidr_c AS net, "
+            "  vc5 AS vc_lit, num AS num_lit, vc_unb, avc255 "
+            "FROM a "
+            "UNION ALL "
+            "SELECT id, ai8, anum, af4, '{1,2}', "
+            "  '{abcdef}', ach4, avc20, anm, anm, "
+            "  atxt, txt, t_c, "
+            "  ab8, avb, ab8, vb, b8, "
+            "  ats4, atstz4, atmtz4, aiv4, ainet, inet_c, "
+            "  'abcdef', '1234567.891', vc_unb, avc255 "
+            "FROM b;",
+            dialect="postgres:18",
+        )
+        ddl1 = p1.backing_table_ddl
+        self.assertRegex(ddl1, r"\barr_dim BIGINT\[\]")
+        self.assertRegex(ddl1, r"\barr_num NUMERIC\[\]")
+        self.assertRegex(ddl1, r"\barr_f4 REAL\[\]")
+        self.assertRegex(ddl1, r"\barr_lit INT(?:EGER)?\[\]")
+        self.assertRegex(ddl1, r"\bavc_lit VARCHAR\[\]")
+        self.assertRegex(ddl1, r"\bavc_ch VARCHAR\[\]")
+        self.assertRegex(ddl1, r"\bach_vc BPCHAR\[\]")
+        self.assertRegex(ddl1, r'\batxt_nm TEXT\[\] COLLATE "C"')
+        self.assertRegex(ddl1, r"\bavc_nm NAME\[\]")
+        self.assertRegex(ddl1, r'\bat_coll TEXT\[\] COLLATE "C"')
+        self.assertRegex(ddl1, r'\bt_coll TEXT COLLATE "C"')
+        self.assertRegex(ddl1, r'\bvc_coll VARCHAR COLLATE "C"')
+        self.assertRegex(ddl1, r'\bab_b pg_catalog\."bit"\[\]')
+        self.assertRegex(ddl1, r'\bab_vb pg_catalog\."bit"\[\]')
+        self.assertRegex(ddl1, r"\bavb_b BIT VARYING\[\]")
+        self.assertRegex(ddl1, r'\bb_vb pg_catalog\."bit"(?=[,\s\)])')
+        self.assertRegex(ddl1, r"\bvb_b BIT VARYING\b")
+        self.assertRegex(ddl1, r"\bad_ts TIMESTAMP\[\]")
+        self.assertRegex(ddl1, r"\bats_tz TIMESTAMPTZ\[\]")
+        self.assertRegex(ddl1, r"\batm_tz TIMETZ\[\]")
+        self.assertRegex(ddl1, r"\baiv INTERVAL\[\]")
+        self.assertRegex(ddl1, r"\banet INET\[\]")
+        self.assertRegex(ddl1, r"\bnet INET\b")
+        self.assertRegex(ddl1, r"\bvc_lit VARCHAR\b")
+        self.assertRegex(ddl1, r"\bnum_lit NUMERIC\b")
+        self.assertRegex(ddl1, r"\bvc_unb VARCHAR\b")
+        self.assertNotIn("VARCHAR(255),", ddl1)
+        self.assertRegex(ddl1, r"\bavc255 VARCHAR\(255\)\[\]")
+
+        # 2. UNION trigger bodies must cast widened / unknown-literal branches to the
+        #    common type before canonical key computation.
+        p_un = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_un_cast AS "
+            "SELECT d AS dt, ai2_2d AS arr, ch4 AS s FROM a "
+            "UNION "
+            "SELECT ts4, '{1,2}', vc20 FROM b;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_un.backing_table_ddl, r"\bdt TIMESTAMP\b")
+        self.assertRegex(p_un.backing_table_ddl, r"\barr SMALLINT\[\]")
+        self.assertRegex(p_un.backing_table_ddl, r"\bs BPCHAR\b")
+        trig_sql_un = "\n".join(p_un.trigger_ddls)
+        self.assertIn("CAST((__mv_d.d) AS TIMESTAMP)", trig_sql_un)
+        self.assertIn("CAST(('{1,2}') AS SMALLINT[])", trig_sql_un)
+        self.assertIn("CAST((__mv_d.vc20) AS BPCHAR)", trig_sql_un)
+
+        # 3. CTE / derived-subquery UNION widening must not be short-circuited by branch-0 aliases,
+        #    and UNION ALL GROUP BY must cast widened branch columns.
+        p_cte = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_cte_arr AS "
+            "WITH u AS (SELECT id, ai2_2d AS arr, b4 AS bt FROM a UNION ALL SELECT id, ai8 AS arr, b8 AS bt FROM b) "
+            "SELECT id, arr, bt FROM u ORDER BY id;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_cte.backing_table_ddl, r"\barr BIGINT\[\]")
+        self.assertRegex(p_cte.backing_table_ddl, r'\bbt pg_catalog\."bit"(?=[,\s\)])')
+
+        p_sub = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_sub_arr AS "
+            "SELECT id, arr FROM (SELECT id, ai2_2d AS arr FROM a UNION ALL SELECT id, ai8 AS arr FROM b) AS sub ORDER BY id;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_sub.backing_table_ddl, r"\barr BIGINT\[\]")
+
+        p_uagg_arr = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_uagg_arr AS "
+            "WITH u AS (SELECT ai2_2d AS g, ai2 AS a, x FROM a UNION ALL SELECT ai8 AS g, ai8 AS a, y FROM b) "
+            "SELECT g, MIN(a) AS mna, SUM(x) AS sx FROM u GROUP BY g;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_uagg_arr.backing_table_ddl, r"\bg BIGINT\[\]")
+        self.assertRegex(p_uagg_arr.backing_table_ddl, r"\bmna BIGINT\[\]")
+        self.assertRegex(p_uagg_arr.backing_table_ddl, r"\bsx NUMERIC\b")
+        self.assertIn("CAST((__mv_d.ai2_2d) AS BIGINT[])", "\n".join(p_uagg_arr.trigger_ddls))
+        self.assertIn("CAST((__mv_d.ai2) AS BIGINT[])", "\n".join(p_uagg_arr.trigger_ddls))
+
+        # 4. Tier 3 SELECT * UNION widens positionally across branches.
+        star_schema = (
+            "CREATE TABLE s1 (id INT PRIMARY KEY, arr SMALLINT[][], dt DATE);"
+            "CREATE TABLE s2 (id INT PRIMARY KEY, arr BIGINT[], dt TIMESTAMPTZ);"
+        )
+        p_star = generate_materialized_view(
+            star_schema,
+            "CREATE VIEW v_star_u AS SELECT * FROM s1 UNION SELECT * FROM s2;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_star.backing_table_ddl, r"\barr BIGINT\[\]")
+        self.assertRegex(p_star.backing_table_ddl, r"\bdt TIMESTAMPTZ\b")
+
+        # 5. ARRAY[...] element widening across strings, NAME, temporal, network, and nested arrays.
+        p_arr_expr = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_arr_expr AS SELECT id, "
+            "  ARRAY[vc5, ch4] AS a_vc_ch, "
+            "  ARRAY[ch4, vc5] AS a_ch_vc, "
+            "  ARRAY[vc5, nm] AS a_vc_nm, "
+            "  ARRAY[txt, nm] AS a_txt_nm, "
+            "  ARRAY[d, ts2] AS a_d_ts, "
+            "  ARRAY[cidr_c, inet_c] AS a_net "
+            "FROM a JOIN b USING (id);",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_arr_expr.backing_table_ddl, r"\ba_vc_ch VARCHAR\[\]")
+        self.assertRegex(p_arr_expr.backing_table_ddl, r"\ba_ch_vc BPCHAR\[\]")
+        self.assertRegex(p_arr_expr.backing_table_ddl, r"\ba_vc_nm NAME\[\]")
+        self.assertRegex(p_arr_expr.backing_table_ddl, r'\ba_txt_nm TEXT\[\] COLLATE "C"')
+        self.assertRegex(p_arr_expr.backing_table_ddl, r"\ba_d_ts TIMESTAMP\[\]")
+        self.assertRegex(p_arr_expr.backing_table_ddl, r"\ba_net INET\[\]")
+
+        # 6. Adversarial edge cases:
+        #    (a) Column names colliding with type / collation tokens in UNION ALL GROUP BY triggers.
+        coll_schema = (
+            'CREATE TABLE a (id INT PRIMARY KEY, c TEXT COLLATE "C", name NAME, dt DATE, x INT);'
+            "CREATE TABLE b (id INT PRIMARY KEY, c TEXT, name VARCHAR(20), dt TIMESTAMP, y BIGINT);"
+        )
+        p_col_hit = generate_materialized_view(
+            coll_schema,
+            "CREATE VIEW v_col_hit AS "
+            "WITH u AS (SELECT c AS g, name AS nm, dt, x FROM a UNION ALL SELECT c, name, dt, y FROM b) "
+            "SELECT g, nm, dt, SUM(x) AS sx FROM u GROUP BY g, nm, dt;",
+            dialect="postgres:18",
+        )
+        trig_hit = "\n".join(p_col_hit.trigger_ddls)
+        self.assertNotIn("COLLATE __mv_d.c", trig_hit)
+        self.assertNotIn("AS __mv_d.name", trig_hit)
+        self.assertIn('COLLATE "C"', trig_hit)
+        self.assertIn("AS NAME", trig_hit)
+
+        #    (b) Recursive CTEs must not recurse infinitely across PostgreSQL, MySQL, and MariaDB.
+        rec_schema = "CREATE TABLE a (id INT PRIMARY KEY, x SMALLINT);"
+        rec_view = (
+            "CREATE VIEW v_rec AS "
+            "WITH RECURSIVE r(id, depth) AS ("
+            "  SELECT id, 0 FROM a UNION ALL SELECT id, depth + 1 FROM r WHERE depth < 5"
+            ") SELECT id, depth FROM r;"
+        )
+        for d_name in ("postgres:18", "mysql:8.4", "mariadb:11.4"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                p_rec = generate_materialized_view(
+                    rec_schema, rec_view, dialect=d_name, ignore_limitations=True
+                )
+            self.assertIn("depth", p_rec.backing_table_ddl)
+
+        #    (c) Multi-CTE qualifier disambiguation, nested set-op CTE widening, and outer alias shadowing.
+        p_multi_cte = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_mcte AS "
+            "WITH u1 AS (SELECT id, ai2 AS v FROM a UNION ALL SELECT id, ai8 AS v FROM b), "
+            "     u2 AS (SELECT id, txt AS v FROM b UNION ALL SELECT id, txt AS v FROM b) "
+            "SELECT u1.v AS v1, u2.v AS v2 FROM u1 JOIN u2 ON u1.id = u2.id;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_multi_cte.backing_table_ddl, r"\bv1 BIGINT\[\]")
+        self.assertRegex(p_multi_cte.backing_table_ddl, r"\bv2 TEXT\b")
+
+        p_nested_cte = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_ncte AS "
+            "WITH u1 AS (SELECT id, ai2 AS v FROM a UNION ALL SELECT id, ai8 AS v FROM b), "
+            "     u2 AS (SELECT id, v FROM u1 UNION ALL SELECT id, anum AS v FROM b) "
+            "SELECT id, v FROM u2;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_nested_cte.backing_table_ddl, r"\bv NUMERIC\[\]")
+
+        p_shadow = generate_materialized_view(
+            pg_schema,
+            "CREATE VIEW v_shadow AS "
+            "WITH u AS (SELECT id, txt FROM a UNION ALL SELECT id, txt FROM b) "
+            "SELECT id, txt FROM (SELECT id, COUNT(*) AS txt FROM u GROUP BY id) AS s;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_shadow.backing_table_ddl, r"\btxt BIGINT\b")
+
+        #    (d) Asymmetric Tier 3 SELECT col UNION SELECT * widens symmetrically.
+        p_star_asym = generate_materialized_view(
+            star_schema,
+            "CREATE VIEW v_star_asym AS SELECT id, arr, dt FROM s1 UNION SELECT * FROM s2;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_star_asym.backing_table_ddl, r"\barr BIGINT\[\]")
+        self.assertRegex(p_star_asym.backing_table_ddl, r"\bdt TIMESTAMPTZ\b")
+
+        #    (e) Explicit COLLATE overrides implicit collation; collatable custom domains keep COLLATE;
+        #        BIT + BIT(1) keeps BIT(1); TIMESTAMP(2) + NULL drops typmod.
+        extra_schema = (
+            'CREATE TABLE e1 (id INT PRIMARY KEY, t_c TEXT COLLATE "C", nm NAME, b BIT, d_c my_dom COLLATE "C", ts2 TIMESTAMP(2) WITHOUT TIME ZONE);'
+            "CREATE TABLE e2 (id INT PRIMARY KEY, txt TEXT, b1 BIT(1), d_c my_dom COLLATE \"C\");"
+        )
+        p_extra = generate_materialized_view(
+            extra_schema,
+            'CREATE VIEW v_extra AS '
+            'SELECT id, t_c AS c_exp, nm AS nm_exp, b AS b_one, d_c, ts2 AS ts_null FROM e1 '
+            'UNION ALL '
+            'SELECT id, txt COLLATE "POSIX", txt COLLATE "POSIX", b1, d_c, NULL FROM e2;',
+            dialect="postgres:18",
+        )
+        self.assertRegex(p_extra.backing_table_ddl, r'\bc_exp TEXT COLLATE "POSIX"')
+        self.assertRegex(p_extra.backing_table_ddl, r'\bnm_exp NAME COLLATE "POSIX"')
+        self.assertRegex(p_extra.backing_table_ddl, r"\bb_one BIT(?:\(1\))?(?=[,\s\)])")
+        self.assertRegex(p_extra.backing_table_ddl, r'\bd_c my_dom COLLATE "C"')
+        self.assertRegex(p_extra.backing_table_ddl, r"\bts_null TIMESTAMP(?=[,\s\)])")
+
+        #    (f) Incompatible PostgreSQL UNION / UNION ALL mixes fail closed offline.
+        for bad_sql in (
+            "CREATE VIEW v_bad1 AS SELECT txt AS v FROM a UNION ALL SELECT ai4 FROM a;",
+            "CREATE VIEW v_bad2 AS SELECT ai4 AS v FROM a UNION ALL SELECT x FROM a;",
+            "CREATE VIEW v_bad3 AS SELECT txt AS v FROM a UNION ALL SELECT x FROM a;",
+            "CREATE VIEW v_bad4 AS SELECT ai4 AS v FROM a UNION ALL SELECT atxt FROM a;",
+        ):
+            with self.assertRaises(UnsupportedMaterializedViewError):
+                generate_materialized_view(pg_schema, bad_sql, dialect="postgres:18")
+
+    def test_native_postgres_cross_branch_union_array_and_scalar_widening(self) -> None:
+        import os
+
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN not set")
+        tag = f"uwide_{uuid.uuid4().hex[:8]}"
+        ta, tb, ts1, ts2, tcol = f"ua_{tag}", f"ub_{tag}", f"us1_{tag}", f"us2_{tag}", f"uc_{tag}"
+        tcol2 = f"uc2_{tag}"
+        conn = _connect(Dialect.POSTGRES, dsn)
+        cur = conn.cursor()
+        mv_names: List[str] = []
+        lv_names: List[str] = []
+        try:
+            cur.execute("SELECT VERSION()")
+            ver_row = cur.fetchone()
+            self.assertIsNotNone(ver_row)
+            assert ver_row is not None
+            self.assertIn("PostgreSQL", str(ver_row[0]))
+
+            cur.execute(
+                f"CREATE TABLE {ta} ("
+                "  id INT PRIMARY KEY, "
+                "  x SMALLINT, "
+                "  ai2 SMALLINT[], "
+                "  ai2_2d SMALLINT[][], "
+                "  ai4 INT[], "
+                "  avc5 VARCHAR(5)[], "
+                "  ach4 CHAR(4)[], "
+                "  atxt TEXT[], "
+                '  at_c TEXT[] COLLATE "C", '
+                "  ab4 BIT(4)[], "
+                "  avb VARBIT(8)[], "
+                "  ad DATE[], "
+                "  ats2 TIMESTAMP(2) WITHOUT TIME ZONE[], "
+                "  atm2 TIME(2) WITHOUT TIME ZONE[], "
+                "  aiv2 INTERVAL(2)[], "
+                "  acidr CIDR[], "
+                "  vc5 VARCHAR(5), "
+                "  ch4 CHAR(4), "
+                "  txt TEXT, "
+                '  t_c TEXT COLLATE "C", '
+                "  b4 BIT(4), "
+                "  vb VARBIT(8), "
+                "  d DATE, "
+                "  ts2 TIMESTAMP(2) WITHOUT TIME ZONE, "
+                "  tm2 TIME(2) WITHOUT TIME ZONE, "
+                "  iv2 INTERVAL(2), "
+                "  num NUMERIC(6, 2), "
+                "  cidr_c CIDR"
+                ")"
+            )
+            cur.execute(
+                f"CREATE TABLE {tb} ("
+                "  id INT PRIMARY KEY, "
+                "  y BIGINT, "
+                "  ai8 BIGINT[], "
+                "  anum NUMERIC(10, 2)[], "
+                "  af4 REAL[], "
+                "  avc20 VARCHAR(20)[], "
+                "  atxt TEXT[], "
+                "  anm NAME[], "
+                "  ab8 BIT(8)[], "
+                "  avb VARBIT[], "
+                "  atstz4 TIMESTAMP(4) WITH TIME ZONE[], "
+                "  atmtz4 TIME(4) WITH TIME ZONE[], "
+                "  aiv4 INTERVAL(4)[], "
+                "  ainet INET[], "
+                "  vc20 VARCHAR(20), "
+                "  txt TEXT, "
+                "  nm NAME, "
+                "  b8 BIT(8), "
+                "  vb VARBIT, "
+                "  ts4 TIMESTAMP(4) WITHOUT TIME ZONE, "
+                "  tstz4 TIMESTAMP(4) WITH TIME ZONE, "
+                "  tmtz4 TIME(4) WITH TIME ZONE, "
+                "  iv4 INTERVAL(4), "
+                "  inet_c INET"
+                ")"
+            )
+            cur.execute(f"CREATE TABLE {ts1} (id INT PRIMARY KEY, arr SMALLINT[][], dt DATE)")
+            cur.execute(f"CREATE TABLE {ts2} (id INT PRIMARY KEY, arr BIGINT[], dt TIMESTAMPTZ)")
+            cur.execute(f'CREATE TABLE {tcol} (id INT PRIMARY KEY, c TEXT COLLATE "C", name NAME, x INT)')
+            cur.execute(f"CREATE TABLE {tcol2} (id INT PRIMARY KEY, c TEXT, name VARCHAR(20), y BIGINT)")
+
+            cur.execute(
+                f"INSERT INTO {ta} VALUES ("
+                "  1, 10, ARRAY[1, 2]::smallint[], ARRAY[ARRAY[1, 2]]::smallint[][], ARRAY[1, 2], "
+                "  ARRAY['hi']::varchar(5)[], ARRAY['ab']::char(4)[], ARRAY['t1'], ARRAY['c1'], "
+                "  ARRAY[B'1010'], ARRAY[B'101'], ARRAY[DATE '2026-01-01'], "
+                "  ARRAY[TIMESTAMP '2026-01-01 00:00:00.12'], ARRAY[TIME '12:30:00.12'], "
+                "  ARRAY[INTERVAL '1 hour'], "
+                "  ARRAY['10.0.0.0/8'::cidr], 'ab', 'ab', 't1', 'c1', "
+                "  B'1010', B'101', DATE '2026-01-01', TIMESTAMP '2026-01-01 00:00:00', "
+                "  TIME '12:30:00.12', INTERVAL '1 hour', 12.34, '10.0.0.0/8'::cidr"
+                "), ("
+                "  2, 20, ARRAY[3, 4]::smallint[], ARRAY[ARRAY[3, 4]]::smallint[][], ARRAY[5, 6], "
+                "  NULL, ARRAY['cd']::char(4)[], ARRAY['t2'], ARRAY['c2'], "
+                "  ARRAY[B'0101'], ARRAY[B'11'], ARRAY[DATE '2026-02-02'], "
+                "  ARRAY[TIMESTAMP '2026-02-02 01:02:03.45'], ARRAY[TIME '08:00:00'], "
+                "  ARRAY[INTERVAL '2 hours'], "
+                "  ARRAY['172.16.0.0/12'::cidr], 'xy', 'xy', 't2', 'c2', "
+                "  B'0101', B'11', DATE '2026-02-02', TIMESTAMP '2026-02-02 00:00:00', "
+                "  TIME '08:00:00', INTERVAL '2 hours', 56.78, '172.16.0.0/12'::cidr"
+                ")"
+            )
+            cur.execute(
+                f"INSERT INTO {tb} VALUES ("
+                "  1, 5000000000, ARRAY[1, 2]::bigint[], ARRAY[1.00, 2.00]::numeric(10,2)[], ARRAY[1.5]::real[], "
+                "  ARRAY['ab  ']::varchar(20)[], ARRAY['t1'], ARRAY['n1']::name[], "
+                "  ARRAY[B'10101010'], ARRAY[B'10101010'], "
+                "  ARRAY[TIMESTAMPTZ '2026-01-01 00:00:00+00'], ARRAY[TIMETZ '12:30:00+00'], "
+                "  ARRAY[INTERVAL '30 minutes'], "
+                "  ARRAY['10.0.0.0/8'::inet], 'ab  ', 't1', 'n1'::name, "
+                "  B'10101010', B'10101010', TIMESTAMP '2026-01-01 00:00:00', "
+                "  TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMETZ '12:30:00+00', INTERVAL '30 minutes', '10.0.0.0/8'::inet"
+                "), ("
+                "  2, 6000000000, ARRAY[9000000000, 10]::bigint[], ARRAY[7.25, 8.50]::numeric(10,2)[], ARRAY[2.5]::real[], "
+                "  ARRAY['longervalue']::varchar(20)[], ARRAY['t3'], ARRAY['n2']::name[], "
+                "  ARRAY[B'11110000'], ARRAY[B'11110000'], "
+                "  ARRAY[TIMESTAMPTZ '2026-03-03 00:00:00+00'], ARRAY[TIMETZ '09:15:00+00'], "
+                "  ARRAY[INTERVAL '45 minutes'], "
+                "  ARRAY['192.168.1.5/24'::inet], 'zz', 't3', 'n2'::name, "
+                "  B'11110000', B'11110000', TIMESTAMP '2026-03-03 00:00:00', "
+                "  TIMESTAMPTZ '2026-03-03 00:00:00+00', TIMETZ '09:15:00+00', INTERVAL '45 minutes', '192.168.1.5/24'::inet"
+                ")"
+            )
+            cur.execute(
+                f"INSERT INTO {ts1} VALUES (1, ARRAY[ARRAY[1, 2]]::smallint[][], DATE '2026-01-01')"
+            )
+            cur.execute(
+                f"INSERT INTO {ts2} VALUES (2, ARRAY[5000000000]::bigint[], TIMESTAMPTZ '2026-04-04 00:00:00+00')"
+            )
+            cur.execute(f"INSERT INTO {tcol} VALUES (1, 'k1', 'n1'::name, 10)")
+            cur.execute(f"INSERT INTO {tcol2} VALUES (1, 'k1', 'n1', 5000000000)")
+            conn.commit()
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
+            specs = [
+                (
+                    "uall_all",
+                    f"SELECT id, ai2_2d AS arr_dim, ai4 AS arr_num, ai4 AS arr_f4, ai4 AS arr_lit, "
+                    f"  avc5 AS avc_lit, avc5 AS avc_null, atxt AS atxt_nm, avc5 AS avc_nm, "
+                    f"  at_c AS at_coll, t_c AS t_coll, t_c AS t_exp_coll, "
+                    f"  b4 AS b_b, ab4 AS ab_vb, avb AS avb_b, "
+                    f"  ad AS ad_ts, ats2 AS ats_tz, atm2 AS atm_tz, ts2 AS ts_null, "
+                    f"  iv2 AS iv_mix, aiv2 AS aiv_mix, "
+                    f"  acidr AS anet, cidr_c AS net, vc5 AS vc_lit, num AS num_lit "
+                    f"FROM {ta} "
+                    f"UNION ALL "
+                    f"SELECT id, ai8, anum, af4, '{{1,2}}', "
+                    f"  '{{toolongfor5}}', NULL, anm, anm, "
+                    f"  atxt, txt, txt COLLATE \"POSIX\", "
+                    f"  b8, avb, ab8, "
+                    f"  ARRAY[ts4], atstz4, atmtz4, NULL, "
+                    f"  iv4, aiv4, "
+                    f"  ainet, inet_c, 'longstring', '12345678.901' "
+                    f"FROM {tb}",
+                ),
+                (
+                    "un_arr_dim",
+                    f"SELECT ai2_2d AS arr FROM {ta} UNION SELECT ai8 FROM {tb}",
+                ),
+                (
+                    "un_arr_num",
+                    f"SELECT ai4 AS arr FROM {ta} UNION SELECT anum FROM {tb}",
+                ),
+                (
+                    "un_arr_lit",
+                    f"SELECT ai4 AS arr FROM {ta} UNION SELECT '{{1,2}}' FROM {tb}",
+                ),
+                (
+                    "un_date_ts",
+                    f"SELECT d AS dt FROM {ta} UNION SELECT ts4 FROM {tb}",
+                ),
+                (
+                    "un_ch_vc",
+                    f"SELECT ch4 AS s FROM {ta} UNION SELECT vc20 FROM {tb}",
+                ),
+                (
+                    "un_vc_ch",
+                    f"SELECT vc20 AS s FROM {tb} UNION SELECT ch4 FROM {ta}",
+                ),
+                (
+                    "un_net",
+                    f"SELECT cidr_c AS net FROM {ta} UNION SELECT inet_c FROM {tb}",
+                ),
+                (
+                    "un_coll",
+                    f"SELECT t_c AS s FROM {ta} UNION SELECT txt FROM {tb}",
+                ),
+                (
+                    "inter_mix",
+                    f"SELECT d AS dt, ai2 AS arr FROM {ta} INTERSECT SELECT ts4, ai8 FROM {tb}",
+                ),
+                (
+                    "inter_num_bp_arr",
+                    f"SELECT ai4 AS arr, ach4 AS s FROM {ta} INTERSECT SELECT anum, avc20 FROM {tb}",
+                ),
+                (
+                    "except_num_bp",
+                    f"SELECT ai4 AS arr, ch4 AS s FROM {ta} EXCEPT SELECT anum, vc20 FROM {tb}",
+                ),
+                (
+                    "except_lit",
+                    f"SELECT ai4 AS arr FROM {ta} EXCEPT SELECT '{{1,2}}' FROM {tb}",
+                ),
+                (
+                    "uagg_arr",
+                    f"WITH u AS ("
+                    f"  SELECT ai2 AS g, ai2 AS a, x FROM {ta} "
+                    f"  UNION ALL "
+                    f"  SELECT ai8 AS g, ai8 AS a, y FROM {tb}"
+                    f") SELECT g, COUNT(*) AS cnt, SUM(x) AS sx, MIN(a) AS mna, MAX(a) AS mxa FROM u GROUP BY g",
+                ),
+                (
+                    "uagg_dt_null",
+                    f"WITH u AS ("
+                    f"  SELECT d AS g, x FROM {ta} "
+                    f"  UNION ALL "
+                    f"  SELECT ts4 AS g, NULL AS x FROM {tb}"
+                    f") SELECT g, COUNT(*) AS cnt, SUM(x) AS sx FROM u GROUP BY g",
+                ),
+                (
+                    "uagg_col_hit",
+                    f"WITH u AS ("
+                    f"  SELECT c AS g, name AS nm, x FROM {tcol} "
+                    f"  UNION ALL "
+                    f"  SELECT c, name, y FROM {tcol2}"
+                    f") SELECT g, nm, SUM(x) AS sx FROM u GROUP BY g, nm",
+                ),
+                (
+                    "rec_cte",
+                    f"WITH RECURSIVE r(id, depth) AS ("
+                    f"  SELECT id, 0 FROM {tcol} "
+                    f"  UNION ALL "
+                    f"  SELECT id, depth + 1 FROM r WHERE depth < 2"
+                    f") SELECT id, depth FROM r",
+                ),
+                (
+                    "cte_sub",
+                    f"WITH u AS ("
+                    f"  SELECT id, ai2_2d AS arr, b4 AS bt FROM {ta} "
+                    f"  UNION ALL "
+                    f"  SELECT id, ai8 AS arr, b8 AS bt FROM {tb}"
+                    f") SELECT id, arr, bt FROM u ORDER BY id, arr",
+                ),
+                (
+                    "derived_sub",
+                    f"SELECT id, arr FROM ("
+                    f"  SELECT id, ai2_2d AS arr FROM {ta} "
+                    f"  UNION ALL "
+                    f"  SELECT id, ai8 AS arr FROM {tb}"
+                    f") AS sub ORDER BY id, arr",
+                ),
+                (
+                    "star_u",
+                    f"SELECT * FROM {ts1} UNION SELECT * FROM {ts2}",
+                ),
+                (
+                    "star_asym",
+                    f"SELECT id, arr, dt FROM {ts1} UNION SELECT * FROM {ts2}",
+                ),
+            ]
+            pairs = []
+            for label, sel in specs:
+                mv, lv = f"mv_{label}_{tag}", f"lv_{label}_{tag}"
+                mgr.register_view(f"CREATE VIEW {mv} AS {sel};")
+                conn.commit()
+                cur.execute(f"CREATE VIEW {lv} AS {sel}")
+                conn.commit()
+                mv_names.append(mv)
+                lv_names.append(lv)
+                pairs.append((label, mv, lv))
+
+            def _pg_view_attr_sig(view_name: str) -> List[Tuple[str, str, int, int, str]]:
+                cur.execute(
+                    "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), "
+                    "       a.atttypid::int, a.atttypmod::int, COALESCE(co.collname, '-') "
+                    "FROM pg_catalog.pg_attribute a "
+                    "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+                    "LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation "
+                    "WHERE c.relname = %s AND pg_catalog.pg_table_is_visible(c.oid) "
+                    "  AND a.attnum > 0 AND NOT a.attisdropped "
+                    "ORDER BY a.attnum",
+                    (view_name,),
+                )
+                return [(str(r[0]), str(r[1]), int(r[2]), int(r[3]), str(r[4])) for r in cur.fetchall()]
+
+            def check(step: str) -> None:
+                for label, mv, lv in pairs:
+                    cur.execute(f"SELECT * FROM {mv}")
+                    got = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    da = _description(cur)
+                    cur.execute(f"SELECT * FROM {lv}")
+                    exp = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    db = _description(cur)
+                    mv_sig = _pg_view_attr_sig(mv)
+                    lv_sig = _pg_view_attr_sig(lv)
+                    conn.commit()
+                    self.assertEqual(got, exp, f"PG {label} {step}: {got} != {exp}")
+                    self.assertEqual(_metadata_mismatches(Dialect.POSTGRES, da, db), [], f"PG {label} {step} description")
+                    self.assertEqual(mv_sig, lv_sig, f"PG {label} {step} pg_attribute type/mod/collation")
+
+            check("initial")
+
+            # Mutate across INSERT, UPDATE, and DELETE on all tables (including overlapping
+            # widened keys, array scale changes, trailing spaces, CIDR/INET, INTERVAL, and NULLs).
+            cur.execute(
+                f"INSERT INTO {ta} VALUES ("
+                "  3, 30, ARRAY[9000, 10]::smallint[], ARRAY[ARRAY[9, 10]]::smallint[][], ARRAY[7, 8], "
+                "  ARRAY['ok']::varchar(5)[], ARRAY['zz']::char(4)[], ARRAY['t3'], ARRAY['c3'], "
+                "  ARRAY[B'1100'], ARRAY[B'1'], ARRAY[DATE '2026-03-03'], "
+                "  ARRAY[TIMESTAMP '2026-03-03 00:00:00'], ARRAY[TIME '09:15:00'], "
+                "  ARRAY[INTERVAL '15 minutes'], "
+                "  ARRAY['10.0.0.0/8'::cidr], 'zz', 'zz', 't3', 'c3', "
+                "  B'1100', B'1', DATE '2026-03-03', TIMESTAMP '2026-03-03 00:00:00', "
+                "  TIME '09:15:00', INTERVAL '15 minutes', 99.99, '10.0.0.0/8'::cidr"
+                ")"
+            )
+            cur.execute(
+                f"UPDATE {tb} SET ai8 = ARRAY[3, 4]::bigint[], anum = ARRAY[5.00, 6.00]::numeric(10,2)[], "
+                "  avc20 = ARRAY['cd  ']::varchar(20)[], "
+                "  ts4 = TIMESTAMP '2026-02-02 00:00:00', vc20 = 'cd  ', inet_c = '172.16.0.0/12'::inet "
+                "WHERE id = 2"
+            )
+            cur.execute(f"DELETE FROM {ta} WHERE id = 1")
+            cur.execute(f"DELETE FROM {tb} WHERE id = 1")
+            cur.execute(f"INSERT INTO {ts1} VALUES (3, ARRAY[ARRAY[5, 6]]::smallint[][], DATE '2026-05-05')")
+            cur.execute(f"DELETE FROM {ts2} WHERE id = 2")
+            cur.execute(f"INSERT INTO {tcol} VALUES (2, 'k2', 'n2'::name, 20)")
+            cur.execute(f"UPDATE {tcol2} SET c = 'k2', name = 'n2', y = 7000000000 WHERE id = 1")
+            conn.commit()
+            check("after_dml")
+
+            # Negative fail-closed checks: mixing typed array with typed scalar or incompatible
+            # scalar categories in UNION / UNION ALL must fail cleanly and roll back.
+            for idx, bad_sel in enumerate((
+                f"SELECT ai4 AS v FROM {ta} UNION SELECT x FROM {ta}",
+                f"SELECT txt AS v FROM {ta} UNION ALL SELECT ai4 FROM {ta}",
+                f"SELECT txt AS v FROM {ta} UNION ALL SELECT x FROM {ta}",
+            )):
+                bad_mv = f"mv_bad_u_{idx}_{tag}"
+                with self.assertRaises(Exception):
+                    mgr.register_view(f"CREATE VIEW {bad_mv} AS {bad_sel};")
+                conn.rollback()
+                cur.execute(
+                    "SELECT 1 FROM pg_catalog.pg_class WHERE relname = %s AND pg_catalog.pg_table_is_visible(oid)",
+                    (bad_mv,),
+                )
+                self.assertIsNone(cur.fetchone(), f"Failed registration {bad_mv} must roll back cleanly")
+        finally:
+            conn.rollback()
+            for mv in mv_names:
+                try:
+                    MaterializedViewManager(conn, dialect=Dialect.POSTGRES).drop_view(mv)
+                except Exception:
+                    conn.rollback()
+            for lv in lv_names:
+                cur.execute(f"DROP VIEW IF EXISTS {lv} CASCADE")
+            for tbl in (ta, tb, ts1, ts2, tcol, tcol2):
+                cur.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+            conn.commit()
+            conn.close()
 
     def test_native_postgres_setop_pg_catalog_and_name_types(self) -> None:
         import os
