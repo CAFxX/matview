@@ -1177,6 +1177,13 @@ class NativeMySQLIntegerMinMaxTests(unittest.TestCase):
         return failures
 
 
+def _exact_deep(value: Any) -> Any:
+    """``_exact`` that also compares array elements exactly (Decimal scale, float bits, types)."""
+    if isinstance(value, (list, tuple)):
+        return ("array", tuple(_exact_deep(v) for v in value))
+    return _exact(value)
+
+
 class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
     """Offline and native verification for:
     1. Set-op and UNION ALL aggregate common column types across branches,
@@ -1700,6 +1707,45 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             with self.assertRaises(UnsupportedMaterializedViewError):
                 generate_materialized_view(pg_schema, bad_sql, dialect="postgres:18")
 
+    def test_postgres_set_operation_quantifiers_nested_collation_and_arm_chain_offline(self) -> None:
+        schema = (
+            'CREATE TABLE a (id INT PRIMARY KEY, s TEXT, i INT, r REAL, d DOUBLE PRECISION, n BIGINT);'
+            'CREATE TABLE b (id DOUBLE PRECISION PRIMARY KEY, s TEXT COLLATE "C", n DOUBLE PRECISION);'
+        )
+        # An ALL / DISTINCT quantifier must not hide the second arm's types from Tier 3 widening.
+        for op in ("EXCEPT ALL", "INTERSECT ALL", "EXCEPT DISTINCT", "UNION DISTINCT"):
+            with self.subTest(op=op):
+                plan = generate_materialized_view(
+                    schema,
+                    f"CREATE VIEW v_q AS SELECT id, n FROM a {op} SELECT id, n FROM b;",
+                    dialect="postgres:18",
+                )
+                self.assertRegex(plan.backing_table_ddl, r"\bid DOUBLE PRECISION\b")
+                self.assertRegex(plan.backing_table_ddl, r"\bn DOUBLE PRECISION\b")
+        plan_star = generate_materialized_view(
+            "CREATE TABLE a (id BIGINT PRIMARY KEY); CREATE TABLE b (id DOUBLE PRECISION PRIMARY KEY);",
+            "CREATE VIEW v_qs AS SELECT * FROM a EXCEPT ALL SELECT * FROM b;",
+            dialect="postgres:18",
+        )
+        self.assertRegex(plan_star.backing_table_ddl, r"\bid DOUBLE PRECISION\b")
+
+        # An explicit COLLATE below a string function wins over the other arm's implicit collation.
+        plan_c = generate_materialized_view(
+            schema,
+            'CREATE VIEW v_c AS SELECT lower(s COLLATE "POSIX") AS v FROM a UNION ALL SELECT s FROM b;',
+            dialect="postgres:18",
+        )
+        self.assertRegex(plan_c.backing_table_ddl, r'\bv TEXT COLLATE "POSIX"')
+
+        # PostgreSQL converts arms pairwise (INTEGER -> REAL -> DOUBLE PRECISION): refused, not modelled.
+        for op in ("UNION", "UNION ALL"):
+            with self.subTest(chain=op), self.assertRaises(UnsupportedMaterializedViewError):
+                generate_materialized_view(
+                    schema,
+                    f"CREATE VIEW v_ch AS SELECT i AS v FROM a {op} SELECT r FROM a {op} SELECT d FROM a;",
+                    dialect="postgres:18",
+                )
+
     def test_native_postgres_cross_branch_union_array_and_scalar_widening(self) -> None:
         import os
 
@@ -1963,15 +2009,23 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                     "star_asym",
                     f"SELECT id, arr, dt FROM {ts1} UNION SELECT * FROM {ts2}",
                 ),
+                # ALL / DISTINCT quantifiers on Tier 3 `SELECT *` set operations must not hide
+                # the second arm's column types from the widening.
+                ("star_except_all", f"SELECT * FROM {ts1} EXCEPT ALL SELECT * FROM {ts2}"),
+                ("star_intersect_all", f"SELECT * FROM {ts1} INTERSECT ALL SELECT * FROM {ts2}"),
+                ("star_union_distinct", f"SELECT * FROM {ts1} UNION DISTINCT SELECT * FROM {ts2}"),
+                # An explicit COLLATE below a string function still wins over the other arm's
+                # implicit non-default collation.
+                ("lower_explicit_collate", f'SELECT lower(c COLLATE "POSIX") AS v FROM {tcol2} UNION ALL SELECT c FROM {tcol}'),
             ]
             pairs = []
             for label, sel in specs:
                 mv, lv = f"mv_{label}_{tag}", f"lv_{label}_{tag}"
                 mgr.register_view(f"CREATE VIEW {mv} AS {sel};")
                 conn.commit()
+                mv_names.append(mv)
                 cur.execute(f"CREATE VIEW {lv} AS {sel}")
                 conn.commit()
-                mv_names.append(mv)
                 lv_names.append(lv)
                 pairs.append((label, mv, lv))
 
@@ -1992,10 +2046,10 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             def check(step: str) -> None:
                 for label, mv, lv in pairs:
                     cur.execute(f"SELECT * FROM {mv}")
-                    got = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    got = sorted((tuple(_exact_deep(v) for v in r) for r in cur.fetchall()), key=repr)
                     da = _description(cur)
                     cur.execute(f"SELECT * FROM {lv}")
-                    exp = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    exp = sorted((tuple(_exact_deep(v) for v in r) for r in cur.fetchall()), key=repr)
                     db = _description(cur)
                     mv_sig = _pg_view_attr_sig(mv)
                     lv_sig = _pg_view_attr_sig(lv)
@@ -2041,9 +2095,13 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 f"SELECT ai4 AS v FROM {ta} UNION SELECT x FROM {ta}",
                 f"SELECT txt AS v FROM {ta} UNION ALL SELECT ai4 FROM {ta}",
                 f"SELECT txt AS v FROM {ta} UNION ALL SELECT x FROM {ta}",
+                # PostgreSQL pairs arms left to right (int -> REAL -> DOUBLE PRECISION): refused, not
+                # silently mis-converted (16777217 would survive instead of becoming 16777216).
+                f"SELECT x::int AS v FROM {ta} UNION SELECT x::real FROM {ta} UNION SELECT x::float8 FROM {ta}",
+                f"SELECT x::int AS v FROM {ta} UNION ALL SELECT x::real FROM {ta} UNION ALL SELECT x::float8 FROM {ta}",
             )):
                 bad_mv = f"mv_bad_u_{idx}_{tag}"
-                with self.assertRaises(Exception):
+                with self.assertRaises(UnsupportedMaterializedViewError, msg=bad_sel):
                     mgr.register_view(f"CREATE VIEW {bad_mv} AS {bad_sel};")
                 conn.rollback()
                 cur.execute(
@@ -2051,6 +2109,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                     (bad_mv,),
                 )
                 self.assertIsNone(cur.fetchone(), f"Failed registration {bad_mv} must roll back cleanly")
+                conn.rollback()  # end the catalog read's transaction before the next registration
         finally:
             conn.rollback()
             for mv in mv_names:
