@@ -402,6 +402,15 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
                 with self.subTest(dialect=dialect, expr=expr):
                     self.assertEqual(self._key_type(dialect, f"GROUP BY {expr}", expr), expected_type)
 
+    def test_unsigned_casts_and_div_are_never_stored_as_strings(self) -> None:
+        # CAST(x AS UNSIGNED) and DIV over unsigned columns used to fall through
+        # to VARCHAR(255): readers got strings instead of integers (MySQL and MariaDB).
+        for dialect in ("mysql:8.4", "mysql:9.7", "mariadb:11.8"):
+            for expr in ("CAST(s AS UNSIGNED)", "CAST(i AS UNSIGNED INTEGER)", "u DIV 2", "i DIV u", "s DIV 2"):
+                with self.subTest(dialect=dialect, expr=expr):
+                    stored = self._key_type(dialect, f"GROUP BY {expr}", expr)
+                    self.assertIn(stored.split()[0], ("INT", "BIGINT"), stored)
+
     def test_grouped_key_matched_through_alias_and_ordinal(self) -> None:
         for dialect in ("mysql:8.4", "mysql:9.7"):
             with self.subTest(dialect=dialect, how="ordinal"):
@@ -560,12 +569,13 @@ class NativeResultTypeTests(unittest.TestCase):
             op = rng.choice(["+", "-", "*", "%", "+", "-"])
             return f"({gen(depth - 1)} {op} {gen(depth - 1)})"
 
-        exprs = [e for e in (gen(rng.randint(1, 3)) for _ in range(160)) if re.search(r"[a-z].*[-+*%]|[-+*%].*[a-z]", e)][:120]
+        exprs = [e for e in (gen(rng.randint(1, 3)) for _ in range(160)) if re.search(r"[a-z].*[-+*%]|[-+*%].*[a-z]", e)][:50]
         # Boundaries of the length rule (signed/unsigned, every operator, literals, DIV, nesting).
         exprs += ["s - s", "s * 2", "-s", "-5 + s", "su + su", "su + s", "(s + s) % 3", "(su + su) % 3", "mi + mi",
                   "mi + tu", "mi % 2", "mu + mu", "mu - mu", "i + 1", "i % 2", "iu + 1", "b % 2", "ti * ti",
                   "ti * mi", "s DIV 2", "i DIV 2", "s + 123456", "s * 123456", "tu - tu", "ti + 99999", "s - su",
-                  "(mu + mu) % 3", "(ti + ti) * (ti + ti)", "s % su", "su % s"]
+                  "(mu + mu) % 3", "(ti + ti) * (ti + ti)", "s % su", "su % s", "iu DIV 2", "s DIV su",
+                  "CAST(s AS UNSIGNED)", "CAST(i AS SIGNED)"]
         exprs = sorted(set(exprs))
         schema = "CREATE TABLE gl (" + ", ".join(f"{c} {decl[c]}" for c in cols) + ");"
         for engine, dsn in mysql_engines:

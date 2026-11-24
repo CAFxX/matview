@@ -1312,6 +1312,9 @@ class DialectBaseMixin(MixinHost):
             bare = re.sub(r"\s+(?:COLLATE|CHARACTER\s+SET|CHARSET)\s+\S+", "", data_type.upper())
             bare = re.sub(r"\s+ZEROFILL\b", "", bare)
             upper = re.sub(r"\s*\(.*\)\s*$", "", bare).strip()
+            if self.dialect == Dialect.MYSQL and upper in ("UNSIGNED", "UNSIGNED INTEGER", "UBIGINT"):
+                # CAST(x AS UNSIGNED [INTEGER]) is a BIGINT UNSIGNED (MySQL and MariaDB).
+                return "BIGINT UNSIGNED"
             if upper in ("SMALLINT", "INT2", "SMALLSERIAL", "SERIAL2"):
                 return "SMALLINT"
             if upper in (
@@ -1701,6 +1704,20 @@ class DialectBaseMixin(MixinHost):
             return None
 
         inferred = infer(root)
+        if (inferred is None or inferred == "UNKNOWN") and self.dialect == Dialect.MYSQL:
+            top = root
+            while top.__class__.__name__ == "Paren":
+                top = top.this
+            if top.__class__.__name__ == "IntDiv" and self._mariadb_int_arithmetic_length(top) is not None:
+                # `x DIV y` over integer columns, including unsigned ones (which
+                # infer() does not type): an integer result, unsigned when either
+                # operand is (Item_func_int_div), instead of the VARCHAR default.
+                unsigned = any(
+                    (c_def := self._lookup_col_def(c.sql()) or self._lookup_col_def(c.name)) is not None
+                    and "UNSIGNED" in c_def.data_type.upper()
+                    for c in top.find_all(sqlglot_exp.Column)
+                )
+                return "BIGINT UNSIGNED" if unsigned else "BIGINT"
         if inferred is None or inferred == "UNKNOWN":
             return None
         if inferred.startswith("MYSQL_WINDOW_DECIMAL:"):
