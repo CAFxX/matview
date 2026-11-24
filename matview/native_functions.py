@@ -56,6 +56,11 @@ _POLYMORPHIC_PG_TYPES = frozenset(
 )
 
 
+# Row-value constructor syntax that sqlglot parses as a call: ROW is a
+# reserved keyword (PostgreSQL, MySQL), so no user function can take its name.
+_ROW_VALUE_CONSTRUCTORS = frozenset({"ROW"})
+
+
 @dataclass(frozen=True)
 class FunctionCall:
     name: str  # upper case
@@ -98,7 +103,14 @@ def unclassified_calls(spec: ViewSpec, dialect: Dialect) -> List[FunctionCall]:
                 str(parent.this.name) if isinstance(parent, sqlglot_exp.Dot) and parent.expression is anon
                 and isinstance(parent.this, (sqlglot_exp.Identifier, sqlglot_exp.Column)) else None
             )
-            if not name or name in KNOWN_AGGREGATE_NAMES or name in _FN_TO_AGG_ENUM or name in _STATISTICAL_ALIAS_NAMES or name == "COUNT":
+            if (
+                not name
+                or name in KNOWN_AGGREGATE_NAMES
+                or name in _FN_TO_AGG_ENUM
+                or name in _STATISTICAL_ALIAS_NAMES
+                or name == "COUNT"
+                or name in _ROW_VALUE_CONSTRUCTORS
+            ):
                 continue
             if schema is None and dialect == Dialect.MYSQL and name in MYSQL_BUILTIN_SCALAR_FUNCTIONS:
                 # MySQL/MariaDB resolve an unqualified built-in name before any
