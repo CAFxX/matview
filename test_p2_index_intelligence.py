@@ -295,32 +295,50 @@ class TestRecommendedBaseIndexesAndAutoIndexes(unittest.TestCase):
         # URL would make SQLAlchemy import undeclared drivers (psycopg, MySQLdb).
         sa_url, _, connect_args = ms.normalize_sqlalchemy_url(dsn)
         eng = sa.create_engine(sa_url, **connect_args)
-        try:
+        title_index = "CREATE INDEX __matview_base_idx_p2_idx_depts__title ON p2_idx_depts (title);"
+        # (title column collation, expected recommendations). The join key is indexed
+        # (idx_p2_emps_dept), so only the displayed-spelling refresh of the group key
+        # can ask for an index: it reads the group's rows by key value when the row
+        # that supplied the stored spelling leaves, which is needed exactly when equal
+        # keys can be spelled differently ('Eng'/'eng'/'Eng ').
+        cases = [("", [])]
+        if dialect == ms.Dialect.MYSQL:
             with eng.begin() as conn:
-                conn.exec_driver_sql("DROP VIEW IF EXISTS mv_p2_idx_test")
-                conn.exec_driver_sql("DROP TABLE IF EXISTS __matview_store_mv_p2_idx_test")
-                conn.exec_driver_sql("DROP TABLE IF EXISTS p2_idx_emps")
-                conn.exec_driver_sql("DROP TABLE IF EXISTS p2_idx_depts")
-                conn.exec_driver_sql(
-                    "CREATE TABLE p2_idx_depts (id INTEGER PRIMARY KEY, title VARCHAR(64) NOT NULL)"
-                )
-                conn.exec_driver_sql(
-                    "CREATE TABLE p2_idx_emps (id INTEGER PRIMARY KEY, dept_id INTEGER NOT NULL, salary INTEGER NOT NULL)"
-                )
-                conn.exec_driver_sql("CREATE INDEX idx_p2_emps_dept ON p2_idx_emps (dept_id)")
-            schemas = ms.introspect_database_schemas(eng, dialect=dialect)
-            self.assertTrue(schemas["p2_idx_emps"].has_index_covering(["dept_id"]))
-            view_sql = """
-            CREATE VIEW mv_p2_idx_test AS
-            SELECT d.title AS dept_title, COUNT(*) AS cnt, SUM(e.salary) AS total_sal
-            FROM p2_idx_emps e
-            INNER JOIN p2_idx_depts d ON e.dept_id = d.id
-            GROUP BY d.title;
-            """
-            plan = ms.generate_materialized_view(
-                schemas, view_sql, dialect=dialect, ignore_limitations=(dialect == ms.Dialect.MYSQL)
-            )
-            self.assertEqual(plan.recommended_base_indexes, [])
+                is_mariadb = "mariadb" in str(conn.exec_driver_sql("SELECT VERSION()").scalar()).lower()
+            byte_exact = "utf8mb4_nopad_bin" if is_mariadb else "utf8mb4_0900_bin"
+            cases = [
+                (f" COLLATE {byte_exact}", []),
+                (" COLLATE utf8mb4_general_ci", [title_index]),
+            ]
+        try:
+            for title_collation, expected in cases:
+                with self.subTest(collation=title_collation.strip() or "default"):
+                    with eng.begin() as conn:
+                        conn.exec_driver_sql("DROP VIEW IF EXISTS mv_p2_idx_test")
+                        conn.exec_driver_sql("DROP TABLE IF EXISTS __matview_store_mv_p2_idx_test")
+                        conn.exec_driver_sql("DROP TABLE IF EXISTS p2_idx_emps")
+                        conn.exec_driver_sql("DROP TABLE IF EXISTS p2_idx_depts")
+                        conn.exec_driver_sql(
+                            f"CREATE TABLE p2_idx_depts (id INTEGER PRIMARY KEY, title VARCHAR(64){title_collation} NOT NULL)"
+                        )
+                        conn.exec_driver_sql(
+                            "CREATE TABLE p2_idx_emps (id INTEGER PRIMARY KEY, dept_id INTEGER NOT NULL, salary INTEGER NOT NULL)"
+                        )
+                        conn.exec_driver_sql("CREATE INDEX idx_p2_emps_dept ON p2_idx_emps (dept_id)")
+                    schemas = ms.introspect_database_schemas(eng, dialect=dialect)
+                    self.assertTrue(schemas["p2_idx_emps"].has_index_covering(["dept_id"]))
+                    view_sql = """
+                    CREATE VIEW mv_p2_idx_test AS
+                    SELECT d.title AS dept_title, COUNT(*) AS cnt, SUM(e.salary) AS total_sal
+                    FROM p2_idx_emps e
+                    INNER JOIN p2_idx_depts d ON e.dept_id = d.id
+                    GROUP BY d.title;
+                    """
+                    plan = ms.generate_materialized_view(
+                        schemas, view_sql, dialect=dialect, ignore_limitations=(dialect == ms.Dialect.MYSQL)
+                    )
+                    self.assertEqual(plan.strategy, ms.MaintenanceStrategy.ALGEBRAIC_DELTA)
+                    self.assertEqual(plan.recommended_base_indexes, expected)
         finally:
             with eng.begin() as conn:
                 conn.exec_driver_sql("DROP TABLE IF EXISTS p2_idx_emps")

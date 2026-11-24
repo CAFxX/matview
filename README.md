@@ -1268,6 +1268,12 @@ views, each key value is mapped to a canonical text by a per-view function
   together (SQLite `COLLATE NOCASE`/`RTRIM`, MySQL/MariaDB case-/accent-insensitive
   and PAD SPACE collations, including the servers' defaults) share one group, and the
   displayed spelling is a spelling of a current member (SQL leaves which one open).
+  Keeping it so costs a read of the group's base rows by key value when a deleted
+  or updated row supplied the stored spelling, so such views add the group-key
+  columns to `plan.recommended_base_indexes` (reason `group_key_spelling_refresh`).
+  Only keys whose equal values are byte-identical (MySQL `binary`/`utf8mb4_0900_bin`,
+  MariaDB `*_nopad_bin`, SQLite `BINARY`, every PostgreSQL deterministic collation)
+  need no refresh and no index.
   The collation of an expression is derived from the engine's rules (SQLite: columns,
   explicit `COLLATE`, `CAST`/unary `+`/parentheses; MySQL/MariaDB: the server's own
   `WEIGHT_STRING` of any character-valued expression, pad-normalised per engine).
