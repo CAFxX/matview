@@ -326,18 +326,32 @@ def _lock_wait_evidence(
             evidence.append(("pg_stat_activity", frozenset(int(p) for p in (rows[0][2] or []))))
         return evidence, seen
 
+    # Attribute the blocker by its *transaction*, never by BLOCKING_THREAD_ID: when the
+    # blocker holds only an implicit lock (an uncommitted INSERT), InnoDB materialises the
+    # record lock on behalf of the blocker from the waiter's own thread, so
+    # BLOCKING_THREAD_ID resolves to the waiter itself (observed on MySQL 8.4 and 9.7:
+    # the waiter 120 "blocked" by 120 while the writer 119 was RUNNING in innodb_trx).
     rows = query(
         "performance_schema.data_lock_waits",
-        "SELECT bt.PROCESSLIST_ID FROM performance_schema.data_lock_waits w "
+        "SELECT DISTINCT w.BLOCKING_ENGINE_TRANSACTION_ID FROM performance_schema.data_lock_waits w "
         "JOIN performance_schema.threads rt ON rt.THREAD_ID = w.REQUESTING_THREAD_ID "
-        "LEFT JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID "
         "WHERE rt.PROCESSLIST_ID = %s",
         (sid,),
     )
     if rows:
-        evidence.append(
-            ("performance_schema.data_lock_waits", frozenset(int(r[0]) for r in rows if r[0] is not None))
+        # Resolve blocking transaction ids to connection ids through information_schema.innodb_trx
+        # (read only after a positive wait, spaced by the cache idle interval so it is fresh).
+        time.sleep(_IS_TRX_CACHE_IDLE_S)
+        _mark_is_trx_read()
+        trx_rows = query(
+            "information_schema.innodb_trx(blocker ids)",
+            "SELECT trx_id, trx_mysql_thread_id FROM information_schema.innodb_trx",
         )
+        by_trx = {int(t): int(c) for t, c in (trx_rows or []) if t is not None and c is not None}
+        want = [int(r[0]) for r in rows if r[0] is not None]
+        resolved = frozenset(by_trx[t] for t in want if t in by_trx)
+        # Unresolved transactions leave the blocker unattributed (never guessed).
+        evidence.append(("performance_schema.data_lock_waits", resolved or None))
 
     if force_is_trx:
         time.sleep(_IS_TRX_CACHE_IDLE_S)

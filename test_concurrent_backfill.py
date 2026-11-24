@@ -23,6 +23,7 @@ from matview_sync import (
     EngineLimitationError,
     EngineLimitationWarning,
     MaterializedViewManager,
+    TransactionOwnershipError,
     UnsafeReplacementError,
 )
 from test_matview_sync import FLOAT_OPT_IN, _register_sqlite_compat_udfs, pin_native_plan
@@ -5246,7 +5247,10 @@ class TestMySqlRepairViewLockingOffline(unittest.TestCase):
         stmts_keyless = _mysql_base_table_lock_stmts(plan_keyless, schemas=schema)
         self.assertEqual(
             stmts_keyless,
-            ["SELECT SUM(ISNULL(g) + ISNULL(x)) FROM no_pk_tbl LOCK IN SHARE MODE;"],
+            [
+                "SELECT SUM((CASE WHEN g IS NULL THEN 1 ELSE 0 END) + (CASE WHEN x IS NULL THEN 1 ELSE 0 END)) "
+                "FROM no_pk_tbl LOCK IN SHARE MODE;"
+            ],
         )
 
         # UNIQUE NOT NULL table without PRIMARY index must NOT emit FORCE INDEX (PRIMARY)
@@ -5254,7 +5258,63 @@ class TestMySqlRepairViewLockingOffline(unittest.TestCase):
         stmts_uq = _mysql_base_table_lock_stmts(plan_uq_only, schemas=schema)
         self.assertEqual(
             stmts_uq,
-            ["SELECT SUM(ISNULL(id) + ISNULL(g)) FROM uq_only_tbl LOCK IN SHARE MODE;"],
+            [
+                "SELECT SUM((CASE WHEN id IS NULL THEN 1 ELSE 0 END) + (CASE WHEN g IS NULL THEN 1 ELSE 0 END)) "
+                "FROM uq_only_tbl LOCK IN SHARE MODE;"
+            ],
+        )
+
+    def test_mysql_lock_planner_locks_a_table_that_is_only_a_cte_under_looser_server_rules(self) -> None:
+        """MySQL with lower_case_table_names=0 compares CTE names case-sensitively and never resolves a
+        forward sibling CTE; MariaDB does neither (verified natively: ``WITH Src AS (...) SELECT .. FROM src``
+        reads the physical table on MySQL 8.4 and the CTE on MariaDB 11.8).  A name that is a CTE only under
+        the looser rules but also names a real table must still be locked; a name that certainly is a CTE
+        (exact match, earlier sibling) or has no physical table must not be."""
+        from types import SimpleNamespace
+
+        from matview.manager import _mysql_base_table_lock_stmts
+        from matview_sync import parse_table_schema
+
+        schema = parse_table_schema(
+            "CREATE TABLE src (id INT PRIMARY KEY); CREATE TABLE later (id INT PRIMARY KEY);"
+            "CREATE TABLE base (id INT PRIMARY KEY);",
+            dialect=Dialect.MYSQL,
+        )
+
+        def lock_stmts(select_sql: str) -> List[str]:
+            plan = SimpleNamespace(
+                sub_plans=None, view_spec=SimpleNamespace(raw_select_sql=select_sql, referenced_tables=())
+            )
+            return _mysql_base_table_lock_stmts(plan, schemas=schema)
+
+        def lock(tbl: str) -> str:
+            return f"SELECT COUNT(*) FROM {tbl} FORCE INDEX (PRIMARY) LOCK IN SHARE MODE;"
+
+        # Case-only match with a physical table `src`: locked (the CTE `Src` does not shadow it on MySQL).
+        self.assertEqual(
+            lock_stmts("WITH Src AS (SELECT id FROM base) SELECT id FROM src"),
+            [lock("base"), lock("src")],
+        )
+        # Exact-case reference to the CTE: never locked as a table.
+        self.assertEqual(
+            lock_stmts("WITH Src AS (SELECT id FROM base) SELECT id FROM Src"),
+            [lock("base")],
+        )
+        # Forward sibling under WITH RECURSIVE: MySQL reads the physical table `later`.
+        self.assertEqual(
+            lock_stmts(
+                "WITH RECURSIVE first_cte AS (SELECT id FROM later), later AS (SELECT id FROM base) "
+                "SELECT id FROM first_cte"
+            ),
+            [lock("base"), lock("later")],
+        )
+        # A recursive self-reference and a later sibling's reference to an earlier one are CTEs.
+        self.assertEqual(
+            lock_stmts(
+                "WITH RECURSIVE r AS (SELECT id FROM base UNION ALL SELECT id FROM r), s AS (SELECT id FROM r) "
+                "SELECT id FROM s"
+            ),
+            [lock("base")],
         )
 
     def test_mysql_minmax_and_bitwise_recompute_subqueries_emit_lock_in_share_mode(self) -> None:
@@ -5862,6 +5922,16 @@ class TestMySqlIsolationLevelConcurrency(unittest.TestCase):
                         _wait_until_lock_waiting(
                             Dialect.MYSQL, monitor, rep_sid, rep_done, blocker_sid=wh_sid
                         )
+                        # The wait must be on the base-table shared-lock scan that
+                        # repair_view() issues before touching the backing table (taking the
+                        # base locks first matches the writers' base-then-backing order), not
+                        # on some later statement of the repair.
+                        mcur = monitor.cursor()
+                        mcur.execute("SELECT info FROM information_schema.processlist WHERE id = %s", (rep_sid,))
+                        waiting_sql = str((mcur.fetchone() or ("",))[0] or "")
+                        monitor.commit()
+                        self.assertIn("LOCK IN SHARE MODE", waiting_sql.upper(), waiting_sql)
+                        self.assertIn(tbl, waiting_sql, waiting_sql)
 
                         # Execute a second write on the held row (non-indexed column) and commit;
                         # must not deadlock with repair_view() waiting on base_t.
@@ -5890,6 +5960,24 @@ class TestMySqlIsolationLevelConcurrency(unittest.TestCase):
                                 pass
                     _assert_all_exact(f"{iso} in-flight writer")
 
+                    if iso_idx == 0:
+                        # repair_view() rolls back its own read snapshots on MySQL/MariaDB, so it
+                        # must refuse (before any SQL) a connection holding caller-owned writes
+                        # instead of discarding them.
+                        own = self._connect(dsn)
+                        try:
+                            own_mgr = MaterializedViewManager(own, dialect=Dialect.MYSQL)
+                            ocur = own.cursor()
+                            ocur.execute(f"INSERT INTO {tbl} (id, g, amt) VALUES (900001, 'g0', 1)")
+                            with self.assertRaises(TransactionOwnershipError):
+                                own_mgr.repair_view(v_t3)
+                            ocur.execute(f"SELECT COUNT(*) FROM {tbl} WHERE id = 900001")
+                            self.assertEqual(ocur.fetchone()[0], 1, "repair_view() discarded caller-owned writes")
+                            own.rollback()
+                        finally:
+                            own.close()
+                        _assert_all_exact(f"{iso} after refused repair")
+
                     # 2. Concurrent multi-writer stress racing repeated repair_view() across
                     #    algebraic, recomputed, keyless Tier 3, and join views.
                     stop_writers = threading.Event()
@@ -5897,6 +5985,10 @@ class TestMySqlIsolationLevelConcurrency(unittest.TestCase):
                     errors: List[BaseException] = []
                     err_lock = threading.Lock()
                     repairs_done = {"count": 0}
+                    # Handshake: the repairs must overlap live writer traffic, so the repair
+                    # runner starts only after both writers committed a transaction.
+                    writer_committed = [threading.Event(), threading.Event()]
+                    commits = [0, 0]
 
                     def _stress_writer(wid: int) -> None:
                         wconn = None
@@ -5928,6 +6020,8 @@ class TestMySqlIsolationLevelConcurrency(unittest.TestCase):
                                             wconn.rollback()
                                         else:
                                             wconn.commit()
+                                            commits[wid] += 1
+                                            writer_committed[wid].set()
                                         break
                                     except BaseException as exc:
                                         try:
@@ -5965,6 +6059,9 @@ class TestMySqlIsolationLevelConcurrency(unittest.TestCase):
                             rconn.commit()
                             rm = MaterializedViewManager(rconn, dialect=Dialect.MYSQL)
                             writer_ready.wait(timeout=20.0)
+                            for committed in writer_committed:
+                                if not committed.wait(timeout=30.0):
+                                    raise AssertionError("a stress writer never committed a transaction")
                             for target_v in (v_alg, v_rec, v_t3, v_join, v_t3, v_rec):
                                 res = rm.repair_view(target_v)
                                 self.assertEqual(res, {target_v: "repaired"})
@@ -6001,6 +6098,7 @@ class TestMySqlIsolationLevelConcurrency(unittest.TestCase):
                     self.assertFalse([th.name for th in ths if th.is_alive()], f"MySQL {iso} repair stress hung")
                     self.assertEqual(errors, [], f"MySQL {iso} repair stress errors: {errors!r}")
                     self.assertEqual(repairs_done["count"], 6)
+                    self.assertTrue(all(c > 0 for c in commits), f"writers did not run: {commits!r}")
                     _assert_all_exact(f"{iso} repair stress")
         finally:
             try:
