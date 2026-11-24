@@ -84,7 +84,12 @@ class Tier1UnionAllAggMixin(MixinHost):
             first_b_aliases = [it.alias.lower() for it in branch_specs[0].select_items]
             seen_g_al: Set[str] = set()
             for g_expr in grp_exprs:
-                g_id = _unquote_ident(g_expr.split(".")[-1], dialect=self.dialect).lower() if _is_simple_column_expr(g_expr.strip(), dialect=self.dialect) else ""
+                g_s = g_expr.strip()
+                if _is_simple_column_expr(g_s, dialect=self.dialect):
+                    g_parts = _split_top_level(g_s, ".", dialect=self.dialect)
+                    g_id = _unquote_ident(g_parts[-1], dialect=self.dialect).lower() if g_parts else ""
+                else:
+                    g_id = ""
                 if not g_id or g_id not in first_b_aliases:
                     uall_has_nullable = True
                     break
@@ -293,10 +298,16 @@ class Tier1UnionAllAggMixin(MixinHost):
             is_backing_store=True,
             pk_cols=pk_cols if (grp_exprs and not has_nullable_grp) else None,
         )
+        stored_work_aliases_lower = {it.alias.lower() for it in work_items if it.alias}
         backing_col_map = {
-            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            u_col: re.sub(
+                r'\s+AS\s+(?:"(?:""|[^"])+"|`(?:``|[^`])+`|\[[^\]]+\]|[A-Za-z0-9_]+)\s*$',
+                "",
+                expr_s,
+                flags=re.IGNORECASE,
+            )
             for u_col, expr_s in self._compound_reader_exprs.items()
-            if expr_s != u_col and "__mv_elem_" in expr_s
+            if expr_s != u_col and ("__mv_elem_" in expr_s or u_col.lower() not in stored_work_aliases_lower)
         }
         can_pg15_unique_nnd = (
             bool(grp_exprs)

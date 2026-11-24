@@ -450,7 +450,7 @@ def build_drop_sql(
     name_seq = [names] if isinstance(names, str) else list(names)
     tables = [_ast_table_expr(n, dialect, allow_qualified=allow_qualified) for n in name_seq]
     cluster = (
-        sqlglot_exp.OnProperty(this=_ast_table_expr(on_table, dialect))
+        sqlglot_exp.OnProperty(this=_ast_table_expr(on_table, dialect, allow_qualified=allow_qualified))
         if on_table
         else None
     )
@@ -524,7 +524,7 @@ def build_insert_select_sql(
     target = (
         sqlglot_exp.Schema(
             this=_ast_table_expr(target_table, dialect),
-            expressions=[_ast_ident_expr(c, dialect) for c in columns],
+            expressions=[_ast_ident_expr(c, dialect, allow_qualified=False) for c in columns],
         )
         if columns
         else _ast_table_expr(target_table, dialect)
@@ -570,8 +570,8 @@ def build_create_view_sql(
 def _parse_index_col_ast(col_spec: str, dialect: Dialect) -> sqlglot_exp.Expr:
     """Parses an index key specification into a sqlglot AST expression."""
     cleaned = col_spec.strip()
-    if re.match(r"^(?:\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)$", cleaned):
-        return sqlglot_exp.Column(this=_ast_ident_expr(cleaned, dialect))
+    if re.match(r'^(?:"(?:""|[^"])+"|`(?:``|[^`])+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)$', cleaned):
+        return sqlglot_exp.Column(this=_ast_ident_expr(cleaned, dialect, allow_qualified=False))
     # MySQL functional index keys wrap expressions in outer `((expr))`; strip one layer
     # before feeding sqlglot so serialization does not emit redundant triple parens.
     probe_spec = cleaned
@@ -601,6 +601,7 @@ def build_create_index_sql(
     using_method: Optional[str] = None,
     where_clause: Optional[str] = None,
     nulls_not_distinct: bool = False,
+    allow_qualified: bool = True,
 ) -> str:
     """Builds a `CREATE [UNIQUE] INDEX` statement via `sqlglot.exp.Create` and `sqlglot.exp.Index`."""
     sg_dialect = _sqlglot_dialect(dialect)
@@ -613,11 +614,12 @@ def build_create_index_sql(
         columns=cols,
         where=where_node,
     )
-    tbl_sql = _ast_table_expr(table_name, dialect).sql(dialect=sg_dialect)
+    tbl_expr = _ast_table_expr(table_name, dialect, allow_qualified=allow_qualified)
+    tbl_sql = tbl_expr.sql(dialect=sg_dialect)
     node = sqlglot_exp.Create(
         this=sqlglot_exp.Index(
-            this=_ast_ident_expr(index_name, dialect),
-            table=_ast_table_expr(table_name, dialect),
+            this=_ast_ident_expr(index_name, dialect, allow_qualified=False),
+            table=tbl_expr,
             params=params,
         ),
         kind="INDEX",
@@ -663,11 +665,7 @@ def _unquote_ident(
     s = ident.strip()
     if not s:
         return s
-    if "." in s and not (
-        (s.startswith('"') and s.endswith('"') and '".' not in s)
-        or (s.startswith("`") and s.endswith("`") and "`." not in s)
-        or (s.startswith("[") and s.endswith("]") and "]." not in s)
-    ):
+    if "." in s:
         try:
             parts = _split_top_level(s, ".", dialect=dialect)
             if len(parts) > 1:
@@ -2325,7 +2323,7 @@ def parse_view_index_spec(
     if isinstance(spec, dict):
         cols_raw = spec.get("columns") or spec.get("cols")
         if isinstance(cols_raw, str):
-            cols = tuple(c.strip() for c in cols_raw.split(",") if c.strip())
+            cols = tuple(c.strip() for c in _split_top_level(cols_raw, ",", dialect=dialect) if c.strip())
         elif isinstance(cols_raw, Sequence):
             cols = tuple(str(c).strip() for c in cols_raw if str(c).strip())
         else:
@@ -2401,8 +2399,7 @@ def parse_view_index_spec(
         where_sh = s[where_tok.end + 1 :].strip()
         s = s[: where_tok.start].strip()
 
-    if s.startswith("(") and s.endswith(")"):
-        s = s[1:-1].strip()
+    s = _unwrap_outer_parens(s)
 
     cols_sh = tuple(c.strip() for c in _split_top_level(s, ",", dialect=dialect) if c.strip())
     if not cols_sh:
@@ -3126,10 +3123,29 @@ def parse_view_definitions(
         else:
             for i, vs in enumerate(initial_specs):
                 exposed_low = {it.alias.lower() for it in vs.select_items}
-                cols_low = {
-                    _unquote_ident(re.sub(r"\b(?:ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST)\b", "", c, flags=re.IGNORECASE).strip(), dialect=dialect).lower()
-                    for c in idx_spec.columns
-                }
+                cols_low: Set[str] = set()
+                for c in idx_spec.columns:
+                    c_s = c.strip()
+                    if c_s.lower() in exposed_low:
+                        cols_low.add(c_s.lower())
+                        continue
+                    try:
+                        c_ast = _parse_index_col_ast(c_s, dialect)
+                        while isinstance(c_ast, (sqlglot_exp.Ordered, sqlglot_exp.Collate, sqlglot_exp.Paren)) and c_ast.this is not None:
+                            c_ast = c_ast.this
+                        if isinstance(c_ast, sqlglot_exp.Column) and c_ast.name:
+                            cols_low.add(c_ast.name.lower())
+                        else:
+                            for col_n in c_ast.find_all(sqlglot_exp.Column):
+                                if col_n.name:
+                                    cols_low.add(col_n.name.lower())
+                    except sqlglot.errors.SqlglotError:
+                        cols_low.add(
+                            _unquote_ident(
+                                re.sub(r"\b(?:ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST)\b", "", c_s, flags=re.IGNORECASE).strip(),
+                                dialect=dialect,
+                            ).lower()
+                        )
                 if cols_low and cols_low.issubset(exposed_low):
                     by_view_idx[i].append(idx_spec)
                     matched = True

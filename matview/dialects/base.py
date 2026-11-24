@@ -34,6 +34,7 @@ from ..sql_frontend import (
     _sanitize_ident,
     _split_top_level,
     _sqlite_type_affinity,
+    _strip_outer_ident_quotes,
     _tokenize_sql,
     _unquote_ident,
     _unwrap_outer_parens,
@@ -73,6 +74,34 @@ class DialectBaseMixin(MixinHost):
         p = self.object_prefix if self.object_prefix else "__matview_"
         return self._bounded_ident(f"{p}store_", self.logical_view_name)
 
+    def _bound_user_index_name(self, idx_name: str) -> str:
+        """Keep a user-supplied index name verbatim when it fits within the
+        target engine's identifier limit; otherwise hash-truncate deterministically."""
+        if self.dialect == Dialect.POSTGRES:
+            max_bytes = 63
+            if len(idx_name.encode("utf-8")) <= max_bytes:
+                return idx_name
+            h = hashlib.sha1(idx_name.encode("utf-8")).hexdigest()[:8]
+            suffix = f"_{h}"
+            budget = max_bytes - len(suffix.encode("utf-8"))
+            prefix_chars: List[str] = []
+            used = 0
+            for ch in idx_name:
+                ch_b = len(ch.encode("utf-8"))
+                if used + ch_b > budget:
+                    break
+                prefix_chars.append(ch)
+                used += ch_b
+            return "".join(prefix_chars) + suffix
+        if self.dialect == Dialect.MYSQL:
+            max_chars = 64
+            if len(idx_name) <= max_chars:
+                return idx_name
+            h = hashlib.sha1(idx_name.encode("utf-8")).hexdigest()[:8]
+            suffix = f"_{h}"
+            return idx_name[: max_chars - len(suffix)] + suffix
+        return idx_name
+
     def _create_table_ddl(
         self,
         table_name: str,
@@ -92,8 +121,8 @@ class DialectBaseMixin(MixinHost):
                     m = re.search(r"PRIMARY\s+KEY\s*\(([^)]+)\)", line, flags=re.IGNORECASE)
                     if m:
                         effective_pks = [
-                            c.strip().strip('"').strip("`")
-                            for c in m.group(1).split(",")
+                            _strip_outer_ident_quotes(c)
+                            for c in _split_top_level(m.group(1), ",", dialect=self.dialect)
                             if c.strip()
                         ]
                         break
@@ -107,9 +136,14 @@ class DialectBaseMixin(MixinHost):
                         continue
                     if "AUTOINCREMENT" in line_s.upper():
                         has_autoincrement = True
-                    col_match = re.match(r'^("([^"]+)"|`([^`]+)`|([A-Za-z0-9_]+))\s+(.*)$', line_s)
+                    col_match = re.match(r'^("((?:""|[^"])+)"|`((?:``|[^`])+)`|([A-Za-z0-9_]+))\s+(.*)$', line_s)
                     if col_match:
-                        col_ident = (col_match.group(2) or col_match.group(3) or col_match.group(4)).lower()
+                        if col_match.group(2) is not None:
+                            col_ident = col_match.group(2).replace('""', '"').lower()
+                        elif col_match.group(3) is not None:
+                            col_ident = col_match.group(3).replace("``", "`").lower()
+                        else:
+                            col_ident = col_match.group(4).lower()
                         if col_ident in pk_set:
                             rest = col_match.group(5).upper()
                             if "NOT NULL" in rest:
@@ -121,8 +155,45 @@ class DialectBaseMixin(MixinHost):
         return f"CREATE TABLE {table_name} (\n    {cols_joined}\n){fillfactor_tail}{without_rowid_tail};"
 
 
+    def _is_known_single_ident(self, raw: str) -> bool:
+        low = raw.lower()
+        if low in self._schemas_lower:
+            return True
+        for ts in self._schemas_lower.values():
+            for c_name in ts.columns:
+                if c_name.lower() == low:
+                    return True
+        for it in self.view.select_items:
+            if it.alias and it.alias.lower() == low:
+                return True
+        if low in (
+            (self.logical_view_name or "").lower(),
+            (self.db_view_name or "").lower(),
+        ):
+            return True
+        return False
+
     def _q(self, ident: str) -> str:
-        return quote_sql_identifier(ident, self.dialect)
+        s = ident.strip()
+        if not s:
+            return s
+        # Preserve literal dots inside already-quoted single identifiers (e.g.
+        # `"my.orders"`, `` `a.b` ``) and known unquoted table/column/view names
+        # from the schema instead of splitting them as `schema.table`.
+        is_quoted = (
+            (s.startswith('"') and s.endswith('"') and len(s) >= 2)
+            or (s.startswith("`") and s.endswith("`") and len(s) >= 2)
+            or (s.startswith("[") and s.endswith("]") and len(s) >= 2)
+        )
+        if is_quoted:
+            try:
+                if len(_split_top_level(s, ".", dialect=self.dialect)) == 1:
+                    return quote_sql_identifier(s, self.dialect, allow_qualified=False)
+            except sqlglot.errors.SqlglotError:
+                pass
+        if "." in s and self._is_known_single_ident(s):
+            return quote_sql_identifier(s, self.dialect, allow_qualified=False)
+        return quote_sql_identifier(s, self.dialect)
 
     def _lookup_col_def(self, expr: Optional[str]) -> Optional[ColumnDef]:
         if not expr:
@@ -135,8 +206,10 @@ class DialectBaseMixin(MixinHost):
             prefix, col_part = parts[0], parts[1]
             prefix_clean = _unquote_ident(prefix, dialect=self.dialect).lower()
             col_clean = _unquote_ident(col_part, dialect=self.dialect).lower()
+            known_qual = False
             for j in self.view.joins:
                 if j.alias.lower() == prefix_clean or j.table_name.lower() == prefix_clean:
+                    known_qual = True
                     ts = self._schemas_lower.get(j.table_name.lower())
                     if ts:
                         for c_def in ts.columns.values():
@@ -144,12 +217,18 @@ class DialectBaseMixin(MixinHost):
                                 return c_def
             ts = self._schemas_lower.get(prefix_clean)
             if ts:
+                known_qual = True
                 for c_def in ts.columns.values():
                     if c_def.name.lower() == col_clean:
                         return c_def
-            return None
+            if known_qual:
+                return None
 
-        col_clean = _unquote_ident(s, dialect=self.dialect).lower()
+        col_clean = (
+            s.lower()
+            if ("." in s and not (s.startswith('"') or s.startswith("`") or s.startswith("[")))
+            else _unquote_ident(s, dialect=self.dialect).lower()
+        )
         if self.primary_schema:
             for c_def in self.primary_schema.columns.values():
                 if c_def.name.lower() == col_clean:
@@ -2960,6 +3039,7 @@ class DialectBaseMixin(MixinHost):
                                 tk.text,
                                 self.dialect,
                                 force=(self.dialect == Dialect.POSTGRES),
+                                allow_qualified=False,
                             )
                         )
                         cursor = tk.end + 1

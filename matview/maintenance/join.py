@@ -478,10 +478,16 @@ class Tier1JoinMixin(MixinHost):
             is_backing_store=True,
         )
 
+        stored_work_aliases_lower = {it.alias.lower() for it in work_items if it.alias}
         backing_col_map = {
-            u_col: re.sub(r"\s+AS\s+[A-Za-z0-9_\"`\[\]]+\s*$", "", expr_s, flags=re.IGNORECASE)
+            u_col: re.sub(
+                r'\s+AS\s+(?:"(?:""|[^"])+"|`(?:``|[^`])+`|\[[^\]]+\]|[A-Za-z0-9_]+)\s*$',
+                "",
+                expr_s,
+                flags=re.IGNORECASE,
+            )
             for u_col, expr_s in self._compound_reader_exprs.items()
-            if expr_s != u_col and "__mv_elem_" in expr_s
+            if expr_s != u_col and ("__mv_elem_" in expr_s or u_col.lower() not in stored_work_aliases_lower)
         }
         can_pg15_unique_nnd = (
             bool(grp_exprs)
