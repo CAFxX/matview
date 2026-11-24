@@ -628,6 +628,33 @@ MUTANTS = (
             "test_postgres_cross_branch_union_array_scalar_and_collation_widening_offline"
         ),
     ),
+    Mutant(
+        name="window-cte-truncates-to-int",
+        source_path="matview/dialects/base.py",
+        original=(
+            "            if isinstance(inner, sqlglot_exp.Window):\n"
+            "                win_sql = inner.sql(_sqlglot_dialect(self.dialect))"
+        ),
+        replacement=(
+            "            if isinstance(inner, sqlglot_exp.Window):\n"
+            "                return self._int_type()\n"
+            "                win_sql = inner.sql(_sqlglot_dialect(self.dialect))"
+        ),
+        target_test=(
+            "test_native_result_types.ExactWindowExpressionTypesTests."
+            "test_exact_window_expression_types_and_fail_closed_offline"
+        ),
+    ),
+    Mutant(
+        name="window-filter-skips-float-refusal",
+        source_path="matview/planner.py",
+        original="            if isinstance(fn, sqlglot_exp.Filter) and fn.this is not None:\n                fn = fn.this",
+        replacement="            if False and isinstance(fn, sqlglot_exp.Filter) and fn.this is not None:\n                fn = fn.this",
+        target_test=(
+            "test_native_result_types.ExactWindowExpressionTypesTests."
+            "test_exact_window_expression_types_and_fail_closed_offline"
+        ),
+    ),
 )
 
 

@@ -2717,5 +2717,273 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             conn.close()
 
 
+class ExactWindowExpressionTypesTests(unittest.TestCase):
+    """Exact storage-type inference and native SQLite preservation for window
+    SUM/AVG over expressions, nested aggregates, CTE passthroughs, and derived
+    tables (covering SQLite >2**53 integers and MySQL/MariaDB/PostgreSQL exact
+    window expressions while keeping approximate inputs refused by default)."""
+
+    def test_sqlite_window_sum_preserves_int64_above_2_53_and_mixed_storage_classes(self) -> None:
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, b INTEGER, r REAL)")
+            conn.executemany(
+                "INSERT INTO t VALUES (?, ?, ?, ?)",
+                [
+                    (1, "a", 2**53, 1.5),
+                    (2, "a", 1, 2.5),
+                    (3, "a", 2, 3.0),
+                    (4, "b", 2**60, 0.5),
+                    (5, "b", 3, 0.5),
+                    (6, "c", None, None),
+                ],
+            )
+            conn.commit()
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+            views = [
+                (
+                    "v_win_t2",
+                    "SELECT id, g, SUM(b) OVER (PARTITION BY g ORDER BY id) AS s_run, "
+                    "SUM(b) OVER (PARTITION BY g) AS s_part, SUM(b) OVER () AS s_all FROM t",
+                ),
+                (
+                    "v_win_expr",
+                    "SELECT id, g, COALESCE(SUM(b) OVER (PARTITION BY g), 0) AS s_coal, "
+                    "SUM(b) OVER (PARTITION BY g) + 1 AS s_add FROM t",
+                ),
+                (
+                    "v_win_cte",
+                    "WITH c AS (SELECT id, g, SUM(b) OVER (PARTITION BY g) AS s_cte FROM t) "
+                    "SELECT id, g, s_cte FROM c",
+                ),
+                (
+                    "v_win_grp",
+                    "SELECT g, SUM(COUNT(*)) OVER () AS s_cnt, SUM(SUM(b)) OVER () AS s_sum "
+                    "FROM t GROUP BY g",
+                ),
+            ]
+            for vn, q in views:
+                mgr.register_view(f"CREATE VIEW {vn} AS {q};")
+
+            def _check(step: str) -> None:
+                for vn, q in views:
+                    got = conn.execute(f"SELECT * FROM {vn} ORDER BY 1").fetchall()
+                    exp = conn.execute(f"{q} ORDER BY 1").fetchall()
+                    self.assertEqual(got, exp, f"SQLite {vn} {step}: {got!r} != {exp!r}")
+                    got_types = [[type(v) for v in row] for row in got]
+                    exp_types = [[type(v) for v in row] for row in exp]
+                    self.assertEqual(got_types, exp_types, f"SQLite {vn} {step} types: {got_types!r} != {exp_types!r}")
+
+            _check("initial")
+            # Confirm exact 2**53 + 1 and 2**60 + 3 integer values (not rounded floats).
+            row_id2 = conn.execute("SELECT s_run, s_part FROM v_win_t2 WHERE id = 2").fetchone()
+            self.assertEqual(row_id2, (2**53 + 1, 2**53 + 3))
+            self.assertIs(type(row_id2[0]), int)
+            self.assertIs(type(row_id2[1]), int)
+
+            # DML: INSERT above 2**53, UPDATE, DELETE, and mixed REAL value in INTEGER column.
+            conn.execute("INSERT INTO t VALUES (7, 'a', ?, 1.0)", (2**53 + 5,))
+            conn.commit()
+            _check("after_insert")
+            conn.execute("UPDATE t SET b = ? WHERE id = 2", (2**53 + 7,))
+            conn.commit()
+            _check("after_update")
+            conn.execute("INSERT INTO t VALUES (8, 'b', 10.0, 2.0)")
+            conn.commit()
+            _check("after_real_into_int_col")
+            conn.execute("DELETE FROM t WHERE id = 8")
+            conn.commit()
+            _check("after_delete_real_back_to_int")
+        finally:
+            conn.close()
+
+    def test_exact_window_expression_types_and_fail_closed_offline(self) -> None:
+        import re
+
+        my_schema = (
+            "CREATE TABLE t (id INT PRIMARY KEY, g VARCHAR(10), i INT, b BIGINT, "
+            "d DECIMAL(10, 2), s VARCHAR(20), dt DATE, tm6 TIME(6), bin VARBINARY(16), f DOUBLE);"
+            "CREATE TABLE t2 (id INT PRIMARY KEY, g VARCHAR(10), x DOUBLE);"
+        )
+        pg_schema = (
+            "CREATE TABLE t (id INT PRIMARY KEY, g VARCHAR(10), i INT, b BIGINT, "
+            "d NUMERIC(10, 2), s VARCHAR(20), dt DATE, b1 BIT(4), b2 BIT(4), f DOUBLE PRECISION);"
+            "CREATE TABLE t2 (id INT PRIMARY KEY, g VARCHAR(10), x DOUBLE PRECISION);"
+        )
+
+        def _col_type(plan: Any, col: str) -> str:
+            m = re.search(
+                rf'(?m)^\s*"?{re.escape(col)}"?\s+([A-Z][A-Z0-9_ (),]*?)(?:\s+NOT\s+NULL)?\s*,?\s*$',
+                plan.backing_table_ddl,
+            )
+            assert m is not None, f"column {col!r} not found in:\n{plan.backing_table_ddl}"
+            return m.group(1).strip()
+
+        mysql_cases = [
+            ("SELECT id, SUM(i > 0) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(65, 0)"}),
+            ("SELECT id, AVG(i > 0) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(5, 4)"}),
+            ("SELECT id, SUM(i / 2) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(65, 4)"}),
+            ("SELECT id, AVG(i / 2) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(18, 8)"}),
+            ("SELECT id, SUM(LENGTH(s)) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(65, 0)"}),
+            ("SELECT id, SUM(YEAR(dt)) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(65, 0)"}),
+            ("SELECT id, SUM(DATEDIFF(dt, dt)) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(65, 0)"}),
+            ("SELECT id, SUM(i & 7) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(65, 0)"}),
+            ("SELECT id, ~i AS w FROM t", {"w": "BIGINT UNSIGNED"}),
+            ("SELECT id, AVG(BIT_COUNT(bin)) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(23, 4)"}),
+            ("SELECT id, SUM(ROUND(d, -1)) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(65, 0)"}),
+            ("SELECT id, SUM(TRUNCATE(d, -1)) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(65, 0)"}),
+            ("SELECT id, SUM(ROUND(d, 5)) OVER (PARTITION BY g) AS w FROM t", {"w": "DECIMAL(65, 2)"}),
+            ("SELECT id, COALESCE(SUM(d) OVER (PARTITION BY g), 0) AS w FROM t", {"w": "DECIMAL(65, 2)"}),
+            ("SELECT id, SUM(d) OVER (PARTITION BY g) + 1 AS w FROM t", {"w": "DECIMAL(65, 2)"}),
+            ("SELECT id, COALESCE(AVG(i) OVER (PARTITION BY g), 0) AS w FROM t", {"w": "DECIMAL(65, 4)"}),
+            ("SELECT g, SUM(COUNT(*)) OVER () AS w FROM t GROUP BY g", {"w": "DECIMAL(65, 0)"}),
+            ("SELECT g, AVG(COUNT(*)) OVER () AS w FROM t GROUP BY g", {"w": "DECIMAL(23, 4)"}),
+            ("SELECT g, SUM(AVG(d)) OVER () AS w FROM t GROUP BY g", {"w": "DECIMAL(65, 6)"}),
+            (
+                "WITH c AS (SELECT id, SUM(d) OVER (PARTITION BY g) AS w, AVG(i) OVER (PARTITION BY g) AS a FROM t) "
+                "SELECT id, w, a FROM c",
+                {"w": "DECIMAL(65, 2)", "a": "DECIMAL(14, 4)"},
+            ),
+            (
+                "WITH w AS (SELECT id, g, LAG(d, 1, 0) OVER (PARTITION BY g ORDER BY id) AS prev_d, "
+                "ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM t) "
+                "SELECT id, SUM(prev_d) OVER (PARTITION BY g) AS w, SUM(rn) OVER (PARTITION BY g) AS a FROM w",
+                {"w": "DECIMAL(65, 2)", "a": "DECIMAL(65, 0)"},
+            ),
+            (
+                "SELECT id, SUM(d) OVER (PARTITION BY g) AS w FROM (SELECT a.id, a.g, a.i * 2 AS d FROM t a) sub",
+                {"w": "DECIMAL(65, 0)"},
+            ),
+            (
+                "WITH c1 AS (SELECT id, g, i * 2 AS x FROM t), c2 AS (SELECT id, g, x + 1 AS y FROM c1) "
+                "SELECT id, SUM(y) OVER (PARTITION BY g) AS w, y / 2 AS a FROM c2",
+                {"w": "DECIMAL(65, 0)", "a": "DECIMAL(16, 4)"},
+            ),
+            (
+                "WITH c(id, g, x) AS (SELECT id, g, i * 2 FROM t) SELECT id, SUM(x) OVER (PARTITION BY g) AS w FROM c",
+                {"w": "DECIMAL(65, 0)"},
+            ),
+            (
+                "WITH c AS (SELECT id, g, LAG(i, 1, 0.5) OVER (PARTITION BY g ORDER BY id) AS w FROM t) "
+                "SELECT id, w FROM c",
+                {"w": "DECIMAL(11, 1)"},
+            ),
+            (
+                "WITH c AS (SELECT id, g, g AS x FROM t) SELECT id, x AS w, COUNT(*) OVER () AS x FROM c",
+                {"w": "VARCHAR(10)"},
+            ),
+            (
+                "WITH RECURSIVE r AS (SELECT id, 1 AS n FROM t UNION ALL SELECT id, n + 1 FROM r WHERE n < 5) "
+                "SELECT id, n + 1 AS w FROM r",
+                {"w": "BIGINT"},
+            ),
+        ]
+        for q, expected in mysql_cases:
+            with self.subTest(engine="mysql:8.4", select=q):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                    plan = generate_materialized_view(
+                        my_schema,
+                        f"CREATE VIEW v AS {q};",
+                        dialect="mysql:8.4",
+                        accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                    )
+                for col, exp_t in expected.items():
+                    self.assertEqual(_col_type(plan, col), exp_t)
+
+        pg_cases = [
+            ("SELECT id, SUM(LENGTH(s)) OVER (PARTITION BY g) AS w FROM t", {"w": "BIGINT"}),
+            ("SELECT id, SUM(i & 7) OVER (PARTITION BY g) AS w FROM t", {"w": "BIGINT"}),
+            ("SELECT id, SUM((i / 2) & 7) OVER (PARTITION BY g) AS w FROM t", {"w": "BIGINT"}),
+            ("SELECT id, b1 & b2 AS w FROM t", {"w": "BIT(4)"}),
+            ("SELECT id, SUM(b & 7) OVER (PARTITION BY g) AS w FROM t", {"w": "NUMERIC"}),
+            ("SELECT id, COALESCE(SUM(d) OVER (PARTITION BY g), 0) AS w FROM t", {"w": "NUMERIC"}),
+            ("SELECT id, SUM(d) OVER (PARTITION BY g) + 1 AS w FROM t", {"w": "NUMERIC"}),
+            ("SELECT g, SUM(COUNT(*)) OVER () AS w FROM t GROUP BY g", {"w": "NUMERIC"}),
+            ("SELECT g, AVG(COUNT(*)) OVER () AS w FROM t GROUP BY g", {"w": "NUMERIC"}),
+            ("SELECT g, SUM(AVG(d)) OVER () AS w FROM t GROUP BY g", {"w": "NUMERIC"}),
+            (
+                "WITH c AS (SELECT id, SUM(d) OVER (PARTITION BY g) AS w, AVG(i) OVER (PARTITION BY g) AS a FROM t) "
+                "SELECT id, w, a FROM c",
+                {"w": "NUMERIC", "a": "NUMERIC"},
+            ),
+            (
+                "SELECT id, SUM(d) OVER (PARTITION BY g) AS w FROM (SELECT a.id, a.g, a.i * 2 AS d FROM t a) sub",
+                {"w": "BIGINT"},
+            ),
+            (
+                "WITH c1 AS (SELECT id, g, i * 2 AS x FROM t), c2 AS (SELECT id, g, x + 1 AS y FROM c1) "
+                "SELECT id, SUM(y) OVER (PARTITION BY g) AS w FROM c2",
+                {"w": "BIGINT"},
+            ),
+            (
+                "WITH c(id, g, x) AS (SELECT id, g, i * 2 FROM t) SELECT id, SUM(x) OVER (PARTITION BY g) AS w FROM c",
+                {"w": "BIGINT"},
+            ),
+            (
+                "WITH c AS (SELECT id, g, LAG(i, 1, 0.5) OVER (PARTITION BY g ORDER BY id) AS w FROM t) "
+                "SELECT id, w FROM c",
+                {"w": "NUMERIC"},
+            ),
+            (
+                "WITH c AS (SELECT id, g, g AS x FROM t) SELECT id, x AS w, COUNT(*) OVER () AS x FROM c",
+                {"w": "VARCHAR(10)"},
+            ),
+            (
+                "WITH RECURSIVE r AS (SELECT id, 1 AS n FROM t UNION ALL SELECT id, n + 1 FROM r WHERE n < 5) "
+                "SELECT id, n + 1 AS w FROM r",
+                {"w": "INTEGER"},
+            ),
+        ]
+        for q, expected in pg_cases:
+            with self.subTest(engine="postgres:18", select=q):
+                plan = generate_materialized_view(pg_schema, f"CREATE VIEW v AS {q};", dialect="postgres:18")
+                for col, exp_t in expected.items():
+                    self.assertEqual(_col_type(plan, col), exp_t)
+
+        # Approximate or unprovably exact expressions MUST remain refused by default.
+        for q in (
+            "SELECT id, SUM(f) OVER (PARTITION BY g) AS w FROM t",
+            "SELECT id, SUM(SQRT(i)) OVER (PARTITION BY g) AS w FROM t",
+            "SELECT id, SUM(ROUND(f, 1)) OVER (PARTITION BY g) AS w FROM t",
+            "SELECT id, SUM(i & f) OVER (PARTITION BY g) AS w FROM t",
+            "SELECT id, SUM(f) FILTER (WHERE i > 0) OVER (PARTITION BY g) AS w FROM t",
+            "WITH u AS (SELECT id, g, i AS x FROM t UNION ALL SELECT * FROM t2) "
+            "SELECT id, SUM(x) OVER (PARTITION BY g) AS w FROM u",
+            "SELECT id, SUM(x) OVER (PARTITION BY g) AS w "
+            "FROM (SELECT id, g, i AS x FROM t UNION ALL SELECT id, g, f FROM t) sub",
+        ):
+            with self.subTest(refused_pg=q):
+                with self.assertRaises(EngineLimitationError):
+                    generate_materialized_view(pg_schema, f"CREATE VIEW v AS {q};", dialect="postgres:18")
+            with self.subTest(refused_my=q):
+                with self.assertRaises(EngineLimitationError):
+                    generate_materialized_view(
+                        my_schema,
+                        f"CREATE VIEW v AS {q};",
+                        dialect="mysql:8.4",
+                        accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                    )
+        # MySQL/MariaDB-specific fail-closed cases: MariaDB TIME_TO_SEC returns DOUBLE,
+        # MySQL BIT_AND(VARBINARY) returns VARBINARY -> SUM converts to DOUBLE,
+        # and `||` inside a CTE is string concatenation under PIPES_AS_CONCAT.
+        for my_dialect, my_refused in (
+            ("mariadb:10.11", "SELECT id, SUM(TIME_TO_SEC(tm6)) OVER (PARTITION BY g) AS w FROM t"),
+            ("mysql:8.4", "SELECT g, SUM(BIT_AND(bin)) OVER () AS w FROM t GROUP BY g"),
+            ("mysql:8.4", "WITH c AS (SELECT id, g, s || 'x' AS flag FROM t) SELECT id, SUM(flag) OVER (PARTITION BY g) AS w FROM c"),
+        ):
+            with self.subTest(refused_dialect=my_dialect, select=my_refused):
+                with self.assertRaises(EngineLimitationError):
+                    generate_materialized_view(
+                        my_schema,
+                        f"CREATE VIEW v AS {my_refused};",
+                        dialect=my_dialect,
+                        accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                    )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

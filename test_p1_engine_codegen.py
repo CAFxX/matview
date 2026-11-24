@@ -2035,7 +2035,8 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
                 num NUMERIC,
                 num2 NUMERIC,
                 num2d NUMERIC[][],
-                nra NUMRANGE[]
+                nra NUMRANGE[],
+                v INT
             );
             CREATE TABLE "order" (id INT PRIMARY KEY, g INT NOT NULL, num NUMERIC);
             CREATE TABLE "my dim" (g INT PRIMARY KEY, tag TEXT);

@@ -1382,6 +1382,91 @@ class NativeWindowExactTypes(_ExactCase):
                 finally:
                     fx.close()
 
+    def test_window_aggregates_of_exact_expressions_ctes_and_nested_aggs(self) -> None:
+        engines = _native_engines()
+        if not engines:
+            self.skipTest("set POSTGRES_DSN and/or MYSQL_DSN")
+        for engine, dsn in engines:
+            with self.subTest(engine=engine.value):
+                fx = _Fixture(engine, dsn)
+                try:
+                    t = fx.table(
+                        "we",
+                        "id INT PRIMARY KEY, team VARCHAR(10), score INT, n NUMERIC(10, 2), dt DATE",
+                    )
+                    cur = fx.conn.cursor()
+                    cur.execute(
+                        f"INSERT INTO {t} VALUES "
+                        f"(1,'alpha',50,12.34,'2026-01-10'),"
+                        f"(2,'alpha',80,25.67,'2026-02-20'),"
+                        f"(3,'b',30,1.05,'2026-03-15'),"
+                        f"(4,'b',90,4.50,'2026-04-05')"
+                    )
+                    fx.conn.commit()
+
+                    if engine == Dialect.MYSQL:
+                        expr_live = (
+                            f"SELECT id, "
+                            f"SUM(score > 40) OVER (PARTITION BY team) AS s_cmp, "
+                            f"AVG(score > 40) OVER (PARTITION BY team) AS a_cmp, "
+                            f"SUM(score / 2) OVER (PARTITION BY team) AS s_div, "
+                            f"SUM(LENGTH(team)) OVER (PARTITION BY team) AS s_len, "
+                            f"SUM(YEAR(dt)) OVER (PARTITION BY team) AS s_yr, "
+                            f"SUM(score & 7) OVER (PARTITION BY team) AS s_bit, "
+                            f"SUM(ROUND(n, -1)) OVER (PARTITION BY team) AS s_rnd, "
+                            f"SUM(TRUNCATE(n, -1)) OVER (PARTITION BY team) AS s_trn, "
+                            f"COALESCE(SUM(n) OVER (PARTITION BY team), 0) AS s_coal, "
+                            f"SUM(n) OVER (PARTITION BY team) + 1 AS s_add "
+                            f"FROM {t}"
+                        )
+                    else:
+                        expr_live = (
+                            f"SELECT id, "
+                            f"SUM(LENGTH(team)) OVER (PARTITION BY team) AS s_len, "
+                            f"SUM(score & 7) OVER (PARTITION BY team) AS s_bit, "
+                            f"SUM(ROUND(n, -1)) OVER (PARTITION BY team) AS s_rnd, "
+                            f"COALESCE(SUM(n) OVER (PARTITION BY team), 0) AS s_coal, "
+                            f"SUM(n) OVER (PARTITION BY team) + 1 AS s_add "
+                            f"FROM {t}"
+                        )
+                    nested_live = (
+                        f"SELECT team, SUM(COUNT(*)) OVER () AS sc, "
+                        f"AVG(COUNT(*)) OVER () AS ac, SUM(AVG(n)) OVER () AS sa "
+                        f"FROM {t} GROUP BY team"
+                    )
+                    cte_live = (
+                        f"WITH c AS (SELECT id, team, SUM(n) OVER (PARTITION BY team) AS wn, "
+                        f"AVG(score) OVER (PARTITION BY team) AS wa FROM {t}) "
+                        f"SELECT id, team, wn, wa FROM c"
+                    )
+                    shadow_live = (
+                        f"SELECT id, SUM(n) OVER (PARTITION BY team) AS sn "
+                        f"FROM (SELECT id, team, score * 2 AS n FROM {t}) sub"
+                    )
+
+                    plans = [
+                        (lbl, q, fx.register(q))
+                        for lbl, q in (
+                            ("expr", expr_live),
+                            ("nested", nested_live),
+                            ("cte", cte_live),
+                            ("shadow", shadow_live),
+                        )
+                    ]
+                    for lbl, q, p in plans:
+                        self.assertViewExact(fx.conn, p, q, f"{lbl}:initial")
+                    for stmt in (
+                        f"INSERT INTO {t} VALUES (5,'alpha',15,9.99,'2027-05-01')",
+                        f"UPDATE {t} SET score = 95, n = 100.25 WHERE id = 3",
+                        f"DELETE FROM {t} WHERE id = 2",
+                    ):
+                        cur.execute(stmt)
+                        fx.conn.commit()
+                        for lbl, q, p in plans:
+                            self.assertViewExact(fx.conn, p, q, f"{lbl}:{stmt}")
+                finally:
+                    fx.close()
+
 
 class NativeMysqlGroupIndexRecognition(_ExactCase):
     """MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX is decided from the

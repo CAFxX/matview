@@ -280,6 +280,8 @@ class PlannerMixin(MixinHost):
         sg = _sqlglot_dialect(self.dialect)
         for w in root.find_all(sqlglot_exp.Window):
             fn = w.this
+            if isinstance(fn, sqlglot_exp.Filter) and fn.this is not None:
+                fn = fn.this
             if fn is not None:
                 unwrapped_pg = _unwrap_pg_catalog_agg_node(fn, self.dialect)
                 if unwrapped_pg is not None:
