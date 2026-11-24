@@ -303,6 +303,9 @@ jobs:
       - name: Test exact SQLite SUM/TOTAL/AVG maintenance (no tolerance)
         run: python3 test_sqlite_exact_float_aggregates.py
 
+      - name: Differentially test STRICT SQLite source tables (skips below SQLite 3.37)
+        run: python3 test_sqlite_strict_sources.py
+
       - name: Test PostgreSQL/MySQL order-sensitive aggregate SQL-shape guards (offline)
         run: python3 test_pgmy_exact_float_aggregates.py
 

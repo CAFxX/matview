@@ -8088,7 +8088,16 @@ class DifferentialSQLFuzzer:
         dialect: Dialect = Dialect.SQLITE,
         views_count: int = 80,
         mutations_count: int = 60,
+        strict: bool = False,
     ) -> Tuple[str, List[Tuple[str, str]], List[str], List[Tuple[str, str]]]:
+        """Generate one scenario; ``strict`` declares every source table ``STRICT`` (SQLite only).
+
+        The schema only uses STRICT-legal column types (INTEGER/REAL/TEXT) and the
+        data and DML are identical to the non-strict scenario (same rng stream), so
+        a strict run is the same workload against typed storage.
+        """
+        if strict and dialect != Dialect.SQLITE:
+            raise ValueError("strict source tables exist only on SQLite")
         rng = random.Random((self.seed * 1000003) ^ (scenario_idx * 104729))
         p = f"fz{scenario_idx}"
 
@@ -8620,6 +8629,9 @@ class DifferentialSQLFuzzer:
             ),
         ])
 
+        if strict:
+            schema_sql = re.sub(r"\n        \);", "\n        ) STRICT;", schema_sql)
+            assert schema_sql.count("STRICT;") == 5, "every generated source table must be STRICT"
         return schema_sql, views, seed_sqls, mutations
 
 
@@ -9434,6 +9446,23 @@ def fuzz_replay_command(config: Mapping[str, Any], seeds: Sequence[int]) -> str:
     return " ".join(f"{k}={v}" for k, v in env.items()) + " python3 test_matview_sync.py --fuzz"
 
 
+def _sqlite_supports_strict(compat_engine: Optional[str] = None) -> bool:
+    """STRICT tables need SQLite >= 3.37: ask the library the test connection really uses."""
+    if not compat_engine:
+        return sqlite3.sqlite_version_info >= (3, 37, 0)
+    try:
+        conn = _open_sqlite_compat_connection(compat_engine, ":memory:")
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT sqlite_version()")
+            version = tuple(int(x) for x in str(cur.fetchone()[0]).split(".")[:3])
+        finally:
+            conn.close()
+        return version >= (3, 37, 0)
+    except Exception:
+        return False
+
+
 def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
     """
     Suite 12: Extensive Multi-Order-of-Magnitude Differential Random SQL Fuzzer.
@@ -9511,6 +9540,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
     current_scenario = None
     write_manifest()
 
+    strict_ok = runner.default_dialect == Dialect.SQLITE and _sqlite_supports_strict(runner.sqlite_compat_engine)
     for s_val in seeds:
         current_seed = s_val
         print(f"  [FUZZ SEED] seed={s_val} (reproduce with: {fuzz_replay_command(config, [s_val])})")
@@ -9518,11 +9548,18 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
         for sc_idx in range(1, num_scenarios + 1):
             current_scenario = sc_idx
             # 1. Default runner dialect (SQLite locally, or live Postgres/MySQL/SQLite-compat in CI)
+            # On SQLite every even scenario declares its source tables STRICT (same
+            # workload, typed storage): half the scenarios, so no extra run time.
+            use_strict = (
+                runner.default_dialect == Dialect.SQLITE and sc_idx % 2 == 0 and strict_ok
+            )
             s_def, v_def, seed_def, m_def = fuzzer.generate_scenario(
-                sc_idx, runner.default_dialect, views_count=views_count, mutations_count=mutations_count
+                sc_idx, runner.default_dialect, views_count=views_count, mutations_count=mutations_count,
+                strict=use_strict,
             )
             run_fuzz_batch(
-                f"Suite 12a (Differential Fuzzer seed={s_val} sc={sc_idx} - Default Engine)",
+                f"Suite 12a (Differential Fuzzer seed={s_val} sc={sc_idx} - Default Engine"
+                f"{', STRICT sources' if use_strict else ''})",
                 s_def,
                 v_def,
                 seed_def,

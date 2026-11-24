@@ -965,6 +965,57 @@ print(writer.execute("PRAGMA recursive_triggers").fetchone())
 (1,)
 ```
 
+### SQLite STRICT tables
+
+`STRICT` source tables (SQLite 3.37+) are supported and **recommended** for
+every table a materialized view reads. A STRICT column can only hold its
+declared type (`INT`, `INTEGER`, `REAL`, `TEXT`, `BLOB`, or `ANY`): a value that
+cannot be converted losslessly is rejected at write time, and a stored value is
+never `'10'` where `10` was meant. On a plain table the declared type is only
+an affinity, so any column can hold any storage class (an `INTEGER` column can
+hold `REAL 0.6` or `'abc'`). matview always compares the materialized view with
+the original view exactly, storage class included, so it has to assume the
+worst for plain tables; STRICT removes that assumption.
+
+```sql
+CREATE TABLE orders (
+    id     INTEGER PRIMARY KEY,
+    region TEXT    NOT NULL,
+    qty    INTEGER NOT NULL,
+    price  REAL
+) STRICT;                       -- WITHOUT ROWID tables: ") WITHOUT ROWID, STRICT"
+```
+
+What matview does with the knowledge (`TableSchema.strict`, read from the
+`CREATE TABLE ... STRICT` text, also for live connections):
+
+| Where | Plain table | STRICT table |
+| --- | --- | --- |
+| Incremental-backfill watermark (`pk_range_fold`, watermark triggers) | Only a rowid-alias `INTEGER PRIMARY KEY` (or the implicit rowid) is trusted as a 64-bit integer; a `WITHOUT ROWID` table with an `INT`/`BIGINT` key, which may hold `2.5` or `'abc'`, has no usable watermark and falls back to `group_key_batch` | A `NOT NULL` integer key is trusted too, so a `WITHOUT ROWID, STRICT` table keeps `pk_range_fold` |
+
+Not yet exploited (tracked in `TODO.md` with the design): dropping the hidden
+non-integer counter that SQLite `SUM`/`TOTAL`/`AVG` keep per argument when the
+argument is a STRICT `INTEGER` column, (plus an audit for other guards a STRICT type makes redundant).
+
+Requirements and behaviour:
+
+- `STRICT` needs SQLite 3.37 or newer in the library your driver uses (check
+  `sqlite3.sqlite_version`; APSW, SQLCipher and sqlean builds ship their own
+  SQLite). On an older library the `CREATE TABLE ... STRICT` statement itself
+  fails, so there is nothing for matview to detect; tables stay plain.
+- SQLite cannot `ALTER` a table into STRICT. Convert with the 12-step rebuild
+  (create the STRICT table, `INSERT ... SELECT`, drop, rename), then re-register
+  the views: a registered view whose source stops being STRICT is drift.
+- STRICT rejects wrong-typed values with an error that aborts the DML
+  statement that wrote them (and rolls back its maintenance); that is SQLite's
+  contract, not matview's, and the materialized view stays equal to the live view.
+- Tested: `test_sqlite_strict_sources.py` runs 14 view classes (grouped
+  aggregates, joins, windows, DISTINCT, set operations, expression views) over
+  plain and STRICT variants of one schema through INSERT, UPDATE, DELETE,
+  UPSERT, REPLACE, bulk statements, rollback and rejected statements, comparing
+  every cell exactly (type and bit pattern); half of the SQLite fuzzer scenarios
+  declare their source tables STRICT.
+
 ### Concurrency notes
 
 Maintenance runs in the writer's transaction, so what concurrent writers can
