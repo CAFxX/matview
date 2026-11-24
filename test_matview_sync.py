@@ -2657,6 +2657,18 @@ class TranspiledConnectionAdapter:
                 self._sq_conn.execute(f"DROP TRIGGER IF EXISTS {tr_n};")
             return [], 0
 
+        if self.dialect == Dialect.POSTGRES and re.match(
+            r"ALTER\s+TABLE\s+\S+\s+(?:ENABLE|DISABLE)(?:\s+(?:ALWAYS|REPLICA))?\s+TRIGGER\s+\S+\s*;?\s*$",
+            s,
+            flags=re.I,
+        ):
+            # PostgreSQL-only trigger enable mode (origin/replica/always vs
+            # session_replication_role): SQLite has no equivalent, so the
+            # emulation drops it. This adapter is not evidence for the mode's
+            # semantics; those are verified natively on PostgreSQL (see
+            # test_native_dml_interactions.py).
+            return [], 0
+
         if self.dialect == Dialect.POSTGRES and s_up.startswith("CREATE TRIGGER"):
             if "AFTER TRUNCATE ON" in s_up or "BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON" in s_up:
                 return [], 0

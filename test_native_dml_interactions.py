@@ -1746,6 +1746,24 @@ def _pg_disable(ctx: Ctx) -> None:
         env.manager.repair_view()
         env.commit()
         ctx.check("after repair_view()", env)
+
+        # Plain ENABLE (origin; what pg_restore --disable-triggers leaves behind)
+        # and ENABLE REPLICA are also drift: only ALWAYS fires under every
+        # session_replication_role. repair_view() restores ALWAYS.
+        entry = env.manager.get_catalog()["v_agg"]
+        recorded_ddls = "\n".join(entry["trigger_ddls"])
+        maintenance_trigger = next(name for name in entry["trigger_names"] if name in recorded_ddls)
+        for mode in ("ENABLE", "ENABLE REPLICA"):
+            env.execute(f"ALTER TABLE t {mode} TRIGGER {maintenance_trigger}", other)
+            other.commit()
+            drift = env.manager.check_schema_drift()
+            env.commit()
+            assert drift.get("v_agg") == "triggers_disabled", (mode, drift)
+        env.manager.repair_view("v_agg")
+        env.commit()
+        assert env.manager.check_schema_drift().get("v_agg") == "ok"
+        env.commit()
+        ctx.check("after restoring ENABLE ALWAYS", env)
         return
     try:
         ctx.check("writes with the maintenance triggers disabled", env)
@@ -1754,18 +1772,39 @@ def _pg_disable(ctx: Ctx) -> None:
 
 
 @cell("pg_session_replication_role", AREA_B,
-      "Writes under session_replication_role = replica (logical-replication apply workers, some restore tools)",
-      "ENABLE (origin) triggers do not fire; not detectable afterwards. A real subscription was not exercised: "
-      "apply workers use this setting",
-      todo="Detect PostgreSQL Maintenance Triggers Disabled by `session_replication_role = replica` or "
-           "`ALTER TABLE ... DISABLE TRIGGER`", postgres=WRONG)
+      "Writes under session_replication_role = replica (restore tools, COPY with replica role; NOT logical-replication apply workers)",
+      "ENABLE ALWAYS statement-level maintenance triggers fire under the replica role. A logical-replication "
+      "subscription apply worker fires only row-level triggers, so subscription targets are refused at "
+      "registration and reported invalid by check_schema_drift() (test_pg_logical_subscription.py), not "
+      "maintained",
+      postgres=EXACT)
 def _pg_replica(ctx: Ctx) -> None:
     env = ctx.env
     w = ctx.other_conn()
     env.execute("SET session_replication_role = replica", w)
+
     env.execute("INSERT INTO t (id, g, v, w, u) VALUES (760, 1, 5, 1, NULL)", w)
     w.commit()
-    ctx.check("write under session_replication_role = replica")
+    ctx.check("replica-role INSERT")
+
+    env.execute("UPDATE t SET v = v + 7 WHERE id = 760", w)
+    w.commit()
+    ctx.check("replica-role UPDATE")
+
+    env.execute("DELETE FROM t WHERE id = 760", w)
+    w.commit()
+    ctx.check("replica-role DELETE")
+
+    env.execute("INSERT INTO t (id, g, v, w, u) VALUES (761, 2, 9, 1, NULL)", w)
+    w.commit()
+    ctx.check("replica-role second INSERT")
+
+    env.execute("TRUNCATE t", w)
+    w.commit()
+    ctx.check("replica-role TRUNCATE")
+
+    env.execute("SET session_replication_role = origin", w)
+    w.commit()
 
 
 @cell("mysql_session_skip_flag", AREA_B,

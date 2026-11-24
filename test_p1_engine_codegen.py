@@ -2224,6 +2224,49 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             for frag in expected_fragments:
                 self.assertIn(frag, probe_section, f"{vname}: missing {frag!r} in probe block")
 
+    def test_postgres_maintenance_triggers_are_enabled_always_on_root_and_partitions(self):
+        schema_sql = (
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT);"
+            "CREATE TABLE d (g INT PRIMARY KEY, name TEXT NOT NULL);"
+        )
+        schemas = parse_table_schema(schema_sql, dialect=Dialect.POSTGRES)
+        plans = (
+            generate_materialized_view(
+                schemas,
+                "CREATE VIEW v_projection AS SELECT id, v FROM t;",
+                dialect=Dialect.POSTGRES,
+            ),
+            generate_materialized_view(
+                schemas,
+                "CREATE VIEW v_join AS SELECT d.name, COUNT(*) AS c "
+                "FROM t JOIN d ON t.g = d.g GROUP BY d.name;",
+                dialect=Dialect.POSTGRES,
+            ),
+        )
+        for plan in plans:
+            with self.subTest(view=plan.view_name):
+                root_triggers = [d for d in plan.trigger_ddls if d.startswith("CREATE TRIGGER ")]
+                self.assertTrue(root_triggers, plan.trigger_ddls)
+                partition_install_sql = "\n".join(
+                    d for d in plan.trigger_ddls if d.startswith("DO $mv_install$")
+                )
+                self.assertTrue(partition_install_sql, plan.trigger_ddls)
+                root_always_ddls = {
+                    d for d in plan.trigger_ddls
+                    if d.startswith("ALTER TABLE ") and " ENABLE ALWAYS TRIGGER " in d
+                }
+                for ddl in root_triggers:
+                    trigger_name = ddl.split("CREATE TRIGGER ", 1)[1].split()[0]
+                    table_name = ddl.split(" ON ", 1)[1].split()[0]
+                    self.assertIn(
+                        f"ALTER TABLE {table_name} ENABLE ALWAYS TRIGGER {trigger_name};",
+                        root_always_ddls,
+                    )
+                    self.assertIn(
+                        f"ALTER TABLE %s ENABLE ALWAYS TRIGGER {trigger_name}",
+                        partition_install_sql,
+                    )
+
 
 def detect_version_for(conn):
     from matview.connectivity import detect_engine_version
