@@ -196,12 +196,15 @@ def _classify_sqlite(conn: Any, calls: Sequence[FunctionCall]) -> Dict[FunctionC
     out: Dict[FunctionCall, FunctionClass] = {}
     for call in calls:
         cands = [r for r in rows if str(r[0]).upper() == call.name and (int(r[4]) == call.arity or int(r[4]) < 0)]
-        exact = [r for r in cands if int(r[4]) == call.arity]
-        if exact:
-            cands = exact  # SQLite prefers the exact-arity registration
+        # SQLite searches application-defined functions before built-ins
+        # (a variadic application hex() wins over the built-in hex/1), and
+        # prefers the exact arity within the chosen set.
         user = [r for r in cands if int(r[1]) == 0]
         if user:
-            cands = user  # an application-defined function overrides the built-in
+            cands = user
+        exact = [r for r in cands if int(r[4]) == call.arity]
+        if exact:
+            cands = exact
         kinds = {"aggregate" if str(r[2]) in ("a", "w") else "scalar" for r in cands}
         if not cands:
             out[call] = FunctionClass(UNKNOWN, reason="no function of that name and arity in PRAGMA function_list")
@@ -288,7 +291,11 @@ def mark_native_aggregates(spec: ViewSpec, dialect: Dialect) -> ViewSpec:
         if not it.is_aggregate:
             node = _parse(it.raw_expr, dialect)
             if node is not None and any(
-                str(a.name).upper() in names and a.find_ancestor(sqlglot_exp.Window) is None
+                str(a.name).upper() in names
+                and a.find_ancestor(sqlglot_exp.Window) is None
+                # an aggregate inside a scalar subquery aggregates the
+                # subquery's rows, not the outer view's
+                and a.find_ancestor(sqlglot_exp.Subquery, sqlglot_exp.Select) is None
                 for a in node.find_all(sqlglot_exp.Anonymous)
             ):
                 it = replace(it, is_aggregate=True, agg_func=None, arg_expr=it.raw_expr, source_col=None)
@@ -448,7 +455,8 @@ def _mysql_type_from_metadata(desc: Sequence[Any], field: Any) -> Optional[str]:
         base = "TIMESTAMP" if code == 7 else "DATETIME"
         return f"{base}({fsp})" if 0 < fsp <= 6 else base
     if code == 11:
-        return "TIME"
+        fsp_t = int(desc[5] or 0)
+        return f"TIME({fsp_t})" if 0 < fsp_t <= 6 else "TIME"
     if code == 13:
         return "YEAR"
     if code == 245:
