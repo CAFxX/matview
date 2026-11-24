@@ -342,14 +342,12 @@ class PlannerMixin(MixinHost):
             return cached
         nodes: List[FloatAuditNode] = []
         self._float_audit_cache = nodes
-        self._float_audit_recursive = False
         if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL):
             return nodes
         try:
             root = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
             return nodes
-        self._float_audit_recursive = any(w.args.get("recursive") for w in root.find_all(sqlglot_exp.With))
         resolver = ScopeResolver(
             root, self._schemas_lower,
             common_type=lambda ts, has_null: self._common_storage_type(list(ts), has_null=has_null),
@@ -638,6 +636,80 @@ class PlannerMixin(MixinHost):
             or bool(self._legacy_window_order_sensitive_exprs())
         )
 
+    def _table_instances(self, node: Any, root: Any, depth: int = 0) -> int:
+        """How many table instances are read TOGETHER to produce the rows of
+        ``node``: a join or a subquery adds them up, the branches of a set
+        operation are read one after the other (the largest branch counts), a
+        non-recursive CTE reference counts its body, a recursive self-reference
+        counts one."""
+        ctes: Dict[str, Any] = {}
+        for c in root.find_all(sqlglot_exp.CTE):
+            if c.alias:
+                ctes[c.alias.lower()] = c
+        active: Set[int] = set()
+
+        def cnt(n: Any, d: int) -> int:
+            if d > 64:
+                return 99
+            if isinstance(n, sqlglot_exp.SetOperation):
+                return max(cnt(n.this, d + 1), cnt(n.expression, d + 1))
+            if isinstance(n, (sqlglot_exp.With, sqlglot_exp.CTE)):
+                return 0  # a CTE body counts where it is referenced
+            if isinstance(n, sqlglot_exp.Table):
+                cte = ctes.get(n.name.lower()) if n.name and not n.args.get("db") else None
+                if cte is None or id(cte) in active:
+                    return 1
+                active.add(id(cte))
+                try:
+                    return max(1, cnt(cte.this, d + 1))
+                finally:
+                    active.discard(id(cte))
+            return sum(cnt(c, d + 1) for c in n.iter_expressions())
+
+        return cnt(node, depth)
+
+    def _refuse_plan_dependent_float_order(self) -> None:
+        """MySQL/MariaDB: the full refresh runs inside the maintenance
+        statement and a later read of the original view can choose another join
+        order (measured on MySQL 8.4: the refresh gave ...001, SELECT / CTAS /
+        INSERT..SELECT ...002 for `SUM(tb.x) FROM ta JOIN tb USING (g, x)`; and a
+        MariaDB window SUM over a join returned different LIVE values across
+        runs). A floating-point sum over rows read through a multi-table plan
+        is therefore not exact by construction: refused under the exact
+        default (the relaxed opt-in remains). A single-table query reads its
+        rows in one fixed order and stays exact. PostgreSQL keeps the full
+        refresh (no mismatch found; the plan-dependence is documented)."""
+        if self.dialect != Dialect.MYSQL:
+            return
+        root = getattr(self, "_float_root", None)
+        if root is None:
+            self._float_audit_nodes()
+            root = getattr(self, "_float_root", None)
+        if root is None:
+            return
+        scopes: List[Any] = []
+        for n in self._float_audit_nodes():
+            if n.order_sensitive:
+                sel = n.site
+                while sel is not None and not isinstance(sel, sqlglot_exp.Select):
+                    sel = sel.parent
+                scopes.append(sel if sel is not None else root)
+        if not scopes and self._order_sensitive_float_items():
+            scopes = [root]
+        listed = ", ".join(dict.fromkeys(e for _, e in self._order_sensitive_float_items()))
+        for scope in scopes:
+            n_tables = self._table_instances(scope, root)
+            if n_tables >= 2:
+                engine = "MariaDB" if self.subdialect == EngineSubdialect.MARIADB else "MySQL"
+                raise UnsupportedMaterializedViewError(
+                    f"View '{self.logical_view_name}' sums floating-point values ({listed}) over a query that "
+                    f"reads {n_tables} table instances (a join, a subquery or a derived table over other tables): "
+                    f"on {engine} the full refresh runs inside the maintenance statement and a later read of the "
+                    f"view can use another join order, so the two floating-point results can differ in the last "
+                    f"bits; it cannot be exact by construction. Aggregate a single table (materialize the join "
+                    f"first) or accept FLOAT_REASSOCIATION_ALLOWED (relaxed, announced)."
+                )
+
     def _refuse_unprovable_float_refresh_types(self) -> None:
         """Fail closed. The exact full refresh stores the original query's
         result, so each stored column type must equal the type the engine
@@ -692,16 +764,6 @@ class PlannerMixin(MixinHost):
                 f"aggregates), which stores the original query's result; the stored column types "
                 f"cannot be proven from declared base-table columns for: {listed}. Aggregate base-table "
                 f"columns directly in the outermost SELECT (or UNION ALL branches), or accept "
-                f"FLOAT_REASSOCIATION_ALLOWED."
-            )
-        if self._float_audit_recursive:
-            listed = ", ".join(dict.fromkeys(e for _, e in self._order_sensitive_float_items()))
-            raise UnsupportedMaterializedViewError(
-                f"View '{self.logical_view_name}' uses {listed} together with a recursive CTE: "
-                f"the exact full refresh cannot prove the result types of a recursive CTE's "
-                f"columns from the declared source columns (the engine unifies the anchor and "
-                f"recursive terms), so it would store a different type than the original view. "
-                f"Materialize the recursive CTE's result in a table, or accept "
                 f"FLOAT_REASSOCIATION_ALLOWED."
             )
 
@@ -1079,7 +1141,9 @@ class PlannerMixin(MixinHost):
         reason = (
             f"{', '.join(exprs)} accumulate(s) in floating point, and floating-point addition is not "
             f"associative: adding and subtracting deltas (or recomputing in another row order) can "
-            f"differ from the original view (1e16 + 1.5 - 1e16 gives 2.0, the view returns 1.5)."
+            f"differ from the original view (1e16 + 1.5 - 1e16 gives 2.0, the view returns 1.5). The refresh evaluates the "
+            f"original query itself, so it equals a later read of the view when that read uses the same plan; a "
+            f"different plan (another join order, parallel aggregation) can change the last bits of a floating-point sum."
         )
         if self.dialect == Dialect.POSTGRES:
             cost = (
@@ -2334,6 +2398,7 @@ class PlannerMixin(MixinHost):
             # rows; no shape is proven yet (a WHERE + index plan restricted
             # to one group reorders rows: measured 1.5 vs 2.0), so every
             # shape uses the full refresh.
+            self._refuse_plan_dependent_float_order()
             self._refuse_unprovable_float_refresh_types()
             return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
         strategy, mode = self._natural_strategy_and_mode()

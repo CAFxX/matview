@@ -1419,13 +1419,30 @@ views, each key value is mapped to a canonical text by a per-view function
   re-run and replaces the contents, in a fresh snapshot after the view's lock
   (PostgreSQL: a separate statement after the statement-level lock; MySQL/
   MariaDB: the store rows are locked first, the query is a locking read). The
-  result is the same evaluation as reading the original view at that moment.
-  Inherent limit: the planner may later choose another plan for the live view
-  (statistics, table size, parallel query, which `INSERT ... SELECT` does not
-  use on PostgreSQL), and that can change the live result itself. A scoped
-  refresh (only the affected groups) is not used: restricting the query to a
-  group can change its plan and row order (measured), and no shape has been
-  proven equivalent yet.
+  result is the original query evaluated by the engine at that moment: it equals
+  a later read of the view only when that read uses the same plan. This is the
+  inherent limit of the strategy, not a guarantee "by construction": the planner
+  may choose another plan for a later read (statistics, table size, parallel
+  query, a different join order), and floating-point sums over rows read in
+  another order differ in the last bits. Measured: on MySQL 8.4 a sum over a
+  two-table join (`SELECT ta.g, SUM(tb.x) FROM ta JOIN tb USING (g, x) GROUP BY
+  ta.g`, hostile values, random writes) was refreshed as `...001` while a later
+  `SELECT` / `CREATE TABLE ... AS` / `INSERT ... SELECT` returned `...002`, and a
+  MariaDB window `SUM` over a join returned different values across runs of
+  the live view itself. Therefore:
+  - **MySQL/MariaDB:** an order-sensitive floating-point aggregate over a query
+    that reads two or more table instances together (a join, or a derived table,
+    `LATERAL` or subquery over other tables; the branches of a `UNION` are read
+    one after the other and count separately) is REFUSED under the exact default
+    (`UnsupportedMaterializedViewError`, "table instances"); materialize the join
+    into a table, or accept `FLOAT_REASSOCIATION_ALLOWED` (relaxed, announced). A
+    single-table query reads its rows in one fixed order and keeps the exact full
+    refresh.
+  - **PostgreSQL:** the full refresh is kept for joins (no divergence was found
+    in stress tests), with the plan-dependence above stated in the registration
+    diagnostic. A scoped refresh (only the affected groups) is not used:
+    restricting the query to a group can change its plan and row order
+    (measured), and no shape has been proven equivalent yet.
   Fail-closed typing: the refresh stores the original query's result, so every
   stored column type must equal the engine's. One scope resolver proves, for every
   aggregate or window function (any nesting level, `ON`/`USING`/`NATURAL` joins,

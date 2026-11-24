@@ -35,6 +35,7 @@ from .logical_ir import ColumnDef
 
 BASE = "base"
 UNKNOWN = "unknown"
+SELF = "self"  # a recursive CTE column that refers back to itself (neutral in its own type)
 CONFLICT = "conflict"
 
 
@@ -86,6 +87,9 @@ class _Source:
     cols: Optional[List[str]] = None
     body: Any = None  # the Select a pass-through column is resolved in
     branches: Optional[List[Any]] = None  # the Selects of a set-operation derived table
+    header: Optional[List[str]] = None  # explicit column list of a CTE: name(a, b)
+    cte_key: Optional[int] = None  # id of the CTE node (a recursive CTE refers to itself)
+    recursive: bool = False
 
 
 def _src_alias(node: Any) -> str:
@@ -119,6 +123,7 @@ class ScopeResolver:
         self._sources_cache: Dict[int, List[_Source]] = {}
         self._merged_cache: Dict[int, Set[str]] = {}
         self._active: Set[int] = set()
+        self._rec_active: Set[Tuple[int, int]] = set()
 
     # ---- scope construction -------------------------------------------------
 
@@ -173,10 +178,12 @@ class ScopeResolver:
                 cte, recursive = self._ctes[tname]
                 tbl_alias = cte.args.get("alias")
                 renamed = isinstance(tbl_alias, sqlglot_exp.TableAlias) and bool(tbl_alias.columns)
-                if recursive or renamed:
-                    cols = [c.name.lower() for c in tbl_alias.columns] if renamed else None
-                    return _Source(names=names, kind="cte", cols=cols, body=None)
-                return self._body_source(cte.this, names, "cte")
+                made = self._body_source(cte.this, names, "cte")
+                made.cte_key, made.recursive = id(cte), recursive
+                if renamed:
+                    made.header = [c.name.lower() for c in tbl_alias.columns]
+                    made.cols = made.header
+                return made
             if tname in self.schemas:
                 return _Source(names=names, kind="base", table=tname)
             return _Source(names=names, kind="other")
@@ -229,9 +236,7 @@ class ScopeResolver:
         if src.kind in ("cte", "derived") and src.body is not None:
             return self._passthrough(src, name)
         if src.kind == "cte":
-            return Resolution(UNKNOWN, reason=f"column {name} of a recursive CTE (or a CTE with a column list)")
-        if src.kind in ("derived", "cte") and src.branches:
-            return self._setop_column(src, name)
+            return Resolution(UNKNOWN, reason=f"column {name} of a CTE whose body is not a SELECT or a set operation of SELECTs (recursive CTE)")
         if src.kind == "derived":
             return Resolution(UNKNOWN, reason=f"column {name} of a set-operation derived table")
         return Resolution(UNKNOWN, reason=f"column {name} of a table function or unsupported source")
@@ -243,6 +248,23 @@ class ScopeResolver:
         if self.common_type is None or src.cols is None or name not in src.cols:
             return Resolution(UNKNOWN, reason=f"column {name} of a set-operation derived table")
         pos = src.cols.index(name)
+        key = (src.cte_key, pos) if src.cte_key is not None else None
+        if key is not None:
+            if key in self._rec_active:
+                return Resolution(SELF, reason=f"column {name} refers back to its own recursive CTE")
+            self._rec_active.add(key)
+        try:
+            return self._setop_column_types(src, name, pos)
+        finally:
+            if key is not None:
+                self._rec_active.discard(key)
+
+    def _is_self_ref(self, e: Any) -> bool:
+        return isinstance(e, sqlglot_exp.Column) and self.resolve(e).status == SELF
+
+    def _setop_column_types(self, src: _Source, name: str, pos: int) -> Resolution:
+        assert self.common_type is not None
+        kind_txt = "a recursive CTE" if src.recursive else "a set-operation derived table"
         types: List[str] = []
         has_null = False
         for br in src.branches or []:
@@ -258,13 +280,25 @@ class ScopeResolver:
             if isinstance(inner, sqlglot_exp.Literal) and not inner.args.get("is_string") and self.literal_type is not None:
                 types.append(self.literal_type(inner))  # a numeric literal has its own engine type
                 continue
+            if (
+                src.recursive
+                and isinstance(inner, (sqlglot_exp.Add, sqlglot_exp.Sub))
+                and isinstance(inner.expression, sqlglot_exp.Literal)
+                and re.fullmatch(r"\d+", str(inner.expression.this))
+                and self._is_self_ref(inner.this)
+            ):
+                # recursive step ``<this column of the previous level> +/- <integer literal>``:
+                # keeps the integer type of the anchor term (checked natively)
+                continue
             if not isinstance(inner, sqlglot_exp.Column) or isinstance(inner.this, sqlglot_exp.Star):
                 et = self.expr_type(inner) if self.expr_type is not None else None
                 if et:
                     types.append(et)
                     continue
-                return Resolution(UNKNOWN, reason=f"column {name} of a set-operation derived table is an expression in a branch")
+                return Resolution(UNKNOWN, reason=f"column {name} of {kind_txt} is an expression in a branch")
             r = self.resolve(inner)
+            if r.status == SELF:
+                continue  # the recursive term passes the previous level's column through
             if not r.ok or r.column is None:
                 return Resolution(UNKNOWN if r.status != CONFLICT else CONFLICT, reason=r.reason or f"a branch of column {name} is not a base column")
             types.append(r.column.data_type)
@@ -275,7 +309,12 @@ class ScopeResolver:
 
     def _passthrough(self, src: _Source, name: str) -> Resolution:
         body = src.body
-        matches = [p for p in body.expressions if (p.alias_or_name or "").lower() == name]
+        if src.header is not None:
+            if name not in src.header or src.header.index(name) >= len(body.expressions):
+                return Resolution(UNKNOWN, reason=f"column {name} is not in the CTE column list")
+            matches = [body.expressions[src.header.index(name)]]
+        else:
+            matches = [p for p in body.expressions if (p.alias_or_name or "").lower() == name]
         if len(matches) != 1:
             return Resolution(UNKNOWN, reason=f"derived column {name} is ambiguous or not projected")
         proj = matches[0]

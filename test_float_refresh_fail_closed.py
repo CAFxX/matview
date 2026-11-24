@@ -83,7 +83,7 @@ def _plan(kind: str, select: str) -> Any:
 def _resolver(select: str, kind: str = "pg") -> Tuple[Any, ScopeResolver]:
     dialect, _, ddl = _SCHEMAS[kind]
     root = sqlglot.parse_one(select, read="postgres" if dialect == Dialect.POSTGRES else "mysql")
-    return root, ScopeResolver(root, parse_table_schema(ddl, dialect=dialect), common_type=lambda ts, has_null: ts[0])
+    return root, ScopeResolver(root, parse_table_schema(ddl, dialect=dialect), common_type=lambda ts, has_null: next((t for t in ts if "DOUBLE" in t), ts[0]), literal_type=lambda lit: "INT")
 
 
 class ResolverVerdicts(unittest.TestCase):
@@ -122,8 +122,21 @@ class ResolverVerdicts(unittest.TestCase):
             # Correlated reference to the OUTER query.
             ("SELECT g FROM ta t WHERE EXISTS (SELECT 1 FROM tb u GROUP BY u.g HAVING SUM(t.x) > 0)", "x", "t", BASE, "ta.INT"),
             # Set-operation derived table: the common type of bare base columns.
-            ("SELECT SUM(u.x) FROM (SELECT x FROM ta UNION ALL SELECT x FROM tb) u", "x", "u", BASE, "None.INT"),
+            ("SELECT SUM(u.x) FROM (SELECT x FROM ta UNION ALL SELECT x FROM tb) u", "x", "u", BASE, "None.DOUBLE PRECISION"),
             ("SELECT SUM(u.x) FROM (SELECT x * 2 AS x FROM ta UNION ALL SELECT x FROM tb) u", "x", "u", UNKNOWN, "expression"),
+            # Recursive CTE: an anchor/step pair of the same base type, a depth counter
+            # (integer literal anchor, `previous + 1` step) and a pass-through are provable.
+            ("WITH RECURSIVE r(id, root_id, score, depth) AS (SELECT id, id, x, 0 FROM ta UNION ALL "
+             "SELECT n.id, t.root_id, n.x, t.depth + 1 FROM ta n JOIN r t ON n.g = t.id WHERE t.depth < 3) "
+             "SELECT root_id, SUM(score), MAX(depth) FROM r GROUP BY root_id", "score", "", BASE, "None.INT"),
+            ("WITH RECURSIVE r(id, root_id, score, depth) AS (SELECT id, id, x, 0 FROM ta UNION ALL "
+             "SELECT n.id, t.root_id, n.x, t.depth + 1 FROM ta n JOIN r t ON n.g = t.id WHERE t.depth < 3) "
+             "SELECT root_id, SUM(score), MAX(depth) FROM r GROUP BY root_id", "depth", "", BASE, "None.INT"),
+            # ... a step that changes the type (`v * 1.5`) or reads another table's column is not.
+            ("WITH RECURSIVE r(n, v) AS (SELECT 1, 1 UNION ALL SELECT n + 1, v * 1.5 FROM r WHERE n < 3) SELECT SUM(v) FROM r",
+             "v", "", UNKNOWN, "recursive CTE"),
+            ("WITH RECURSIVE r(n, v) AS (SELECT 1, x FROM ta UNION ALL SELECT n + 1, b.x FROM r JOIN tb b ON b.id = r.n) "
+             "SELECT SUM(v) FROM r", "v", "", BASE, "None.DOUBLE PRECISION"),
             # Table function / unknown relation.
             ("SELECT SUM(s.v) FROM generate_series(1, 3) AS s(v)", "v", "s", UNKNOWN, ""),
             ("SELECT SUM(zz) FROM ta", "zz", "", UNKNOWN, ""),
@@ -199,18 +212,37 @@ _REFRESHED: List[Tuple[str, str]] = [
      "(SELECT g, x FROM ta UNION ALL SELECT g, x FROM tb) u GROUP BY u.g"),
     ("scalar_subquery_projection", "SELECT g, SUM(x) AS s, (SELECT MAX(w.y) FROM tc w) AS m FROM tb GROUP BY g"),
     ("setop_same_typed_shape", "SELECT g, SUM(y) AS s FROM ta GROUP BY g UNION ALL SELECT g, SUM(x) AS s FROM tb GROUP BY g"),
+    ("recursive_passthrough", "WITH RECURSIVE r(id, g, y, d) AS (SELECT id, g, y, 0 FROM ta UNION ALL "
+     "SELECT n.id, n.g, r.y, r.d + 1 FROM ta n JOIN r ON n.g = r.id WHERE r.d < 2) SELECT g, SUM(y) AS s FROM r GROUP BY g"),
     ("float_compound", "SELECT g, COALESCE(SUM(y), 0) - COALESCE(SUM(y * 2), 0) AS d FROM ta GROUP BY g"),
 ]
 
 
+# Shapes whose float aggregate reads 2+ table instances: refused on MySQL/MariaDB
+# (plan dependence), announced full refresh on PostgreSQL.
+_MULTI_TABLE = {
+    "qualified_other_table", "same_name_exact_vs_float", "shadowed_alias_in_subquery", "using_same_type",
+    "scalar_subquery_projection", "recursive_passthrough",
+}
+# Refusal cases whose type-provability reason is reported on MySQL/MariaDB too
+# (the aggregate reads one table instance, or the type check runs first).
+_TYPE_REASON_ON_MYSQL = {"derived_count", "derived_sum_of_float", "compound_decimal",
+                         "setop_branch_types_differ", "using_conflict", "using_right_join", "natural_conflict",
+                         "using_conflict_minmax"}
+
+
 class OfflinePlanDecisions(unittest.TestCase):
     def test_unprovable_types_are_refused_on_every_engine(self) -> None:
+        # PostgreSQL states the exact reason (type provability); MySQL/MariaDB
+        # refuse multi-table float sums earlier (plan dependence), so there the
+        # case must be refused, whatever the reason.
         for kind in _SCHEMAS:
             for label, select, fragment in _REFUSED:
                 with self.subTest(engine=kind, case=label):
                     with self.assertRaises(UnsupportedMaterializedViewError) as ctx:
                         _plan(kind, select)
-                    self.assertIn(fragment, str(ctx.exception))
+                    if kind == "pg" or label in _TYPE_REASON_ON_MYSQL:
+                        self.assertIn(fragment, str(ctx.exception))
 
     def test_alias_cycle_is_a_clear_refusal_not_a_recursion_error(self) -> None:
         # A derived-table alias equal to an inner table alias (u) used to recurse
@@ -227,6 +259,43 @@ class OfflinePlanDecisions(unittest.TestCase):
         for kind in _SCHEMAS:
             for label, select in _REFRESHED:
                 with self.subTest(engine=kind, case=label):
+                    if kind != "pg" and label in _MULTI_TABLE:
+                        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "table instances"):
+                            _plan(kind, select)
+                        continue
+                    plan = _plan(kind, select)
+                    self.assertEqual(plan.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
+                    self.assertEqual([d.code for d in plan.strategy_diagnostics], [FLOAT_EXACT_REFRESH])
+
+    def test_mysql_multi_table_float_sum_is_not_exact_by_construction(self) -> None:
+        # Measured on MySQL 8.4 (seed 7, 30 random writes): the refresh gave
+        # ...4000000000001p+55, a later SELECT / CTAS / INSERT..SELECT ...002.
+        select = "SELECT ta.g AS g, SUM(tb.x) AS s FROM ta JOIN tb USING (g, x) GROUP BY ta.g"
+        for kind in ("mysql", "mariadb"):
+            with self.subTest(engine=kind):
+                with self.assertRaisesRegex(UnsupportedMaterializedViewError, "table instances"):
+                    _plan(kind, select)
+                # The relaxed opt-in stays available and is announced.
+                dialect, version, ddl = _SCHEMAS[kind]
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    plan = generate_materialized_view(
+                        parse_table_schema(ddl, dialect=dialect), f"CREATE VIEW v AS {select};",
+                        dialect=dialect, engine_version=version, ignore_limitations=True,
+                        accept_limitations=(
+                            "FLOAT_REASSOCIATION_ALLOWED", "ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE",
+                            "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
+                        ),
+                    )
+                self.assertTrue(plan.strategy_diagnostics)
+        # PostgreSQL keeps the announced full refresh.
+        self.assertEqual(_plan("pg", select).strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
+
+    def test_single_table_float_sums_stay_exact_by_full_refresh_on_every_engine(self) -> None:
+        for kind in _SCHEMAS:
+            for select in ("SELECT g, SUM(y) AS s, AVG(y) AS a FROM ta GROUP BY g",
+                           "SELECT id, SUM(x) OVER (PARTITION BY g) AS w FROM tb"):
+                with self.subTest(engine=kind, select=select):
                     plan = _plan(kind, select)
                     self.assertEqual(plan.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
                     self.assertEqual([d.code for d in plan.strategy_diagnostics], [FLOAT_EXACT_REFRESH])
@@ -369,6 +438,14 @@ class NativeDifferential(unittest.TestCase):
             conn.commit()
             for i, (label, select) in enumerate(_REFRESHED):
                 sql = render(select)
+                if engine == Dialect.MYSQL and label in _MULTI_TABLE:
+                    # Plan-dependent float order over a join: refused on MySQL/MariaDB.
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "table instances"):
+                            mgr.register_view(f"CREATE VIEW v{i}_{sfx} AS {sql};", ignore_limitations=True)
+                    conn.rollback()
+                    continue
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     plan = mgr.register_view(f"CREATE VIEW v{i}_{sfx} AS {sql};", ignore_limitations=True)
@@ -383,6 +460,17 @@ class NativeDifferential(unittest.TestCase):
                         with self.assertRaises(UnsupportedMaterializedViewError):
                             mgr.register_view(f"CREATE VIEW r_{label}_{sfx} AS {render(select)};", ignore_limitations=True)
                     conn.rollback()
+            if engine == Dialect.MYSQL:
+                # The measured MySQL 8.4 repro (refresh ...4000000000001p+55, later read ...002).
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "table instances"):
+                        mgr.register_view(
+                            f"CREATE VIEW r_plan_{sfx} AS " + render(
+                                "SELECT ta.g AS g, SUM(tb.x) AS s FROM ta JOIN tb USING (g, x) GROUP BY ta.g;"),
+                            ignore_limitations=True,
+                        )
+                conn.rollback()
             ops: List[Tuple[str, Tuple[Any, ...]]] = []
             for _ in range(12):
                 ops.append(insert(rng.choice(list(_TABLES))))

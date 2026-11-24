@@ -1395,10 +1395,18 @@ class NativeDefaultExactRefresh(_ExactCase):
                     ty = self._ty(engine)
                     a = fx.table("ja", f"id BIGINT PRIMARY KEY, g INT NOT NULL, x {ty}", group_index="g")
                     b = fx.table("jb", f"id BIGINT PRIMARY KEY, aid BIGINT NOT NULL, y {ty}")
-                    views = [
-                        f"SELECT id, g, SUM(x) OVER (PARTITION BY g) AS s FROM {a}",
-                        f"SELECT {a}.g, COUNT(*) AS c, SUM({b}.y) AS s FROM {a} JOIN {b} ON {b}.aid = {a}.id GROUP BY {a}.g",
-                    ]
+                    join_view = (
+                        f"SELECT {a}.g, COUNT(*) AS c, SUM({b}.y) AS s FROM {a} JOIN {b} ON {b}.aid = {a}.id GROUP BY {a}.g"
+                    )
+                    views = [f"SELECT id, g, SUM(x) OVER (PARTITION BY g) AS s FROM {a}"]
+                    if engine == Dialect.MYSQL:
+                        # MySQL/MariaDB: a later read can use another join order, so a
+                        # float sum over a join is refused under the exact default.
+                        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "table instances"):
+                            fx.register(join_view, relaxed=False)
+                        fx.conn.rollback()
+                    else:
+                        views.append(join_view)
                     plans = [(fx.register(v, relaxed=False, expect_diagnostic=True), v) for v in views]
                     for p, _ in plans:
                         self.assertEqual(p.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
@@ -1783,7 +1791,7 @@ class NativeRecursiveCteSources(_ExactCase):
                             f"SELECT n + 1, {term} FROM c WHERE n < 3) "
                             f"SELECT {t}.g, SUM(c.v + {t}.k) AS s FROM {t} CROSS JOIN c GROUP BY {t}.g"
                         )
-                        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "recursive CTE"):
+                        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "recursive CTE|table instances"):
                             fx.register(sel, relaxed=False)
                         fx.conn.rollback()
                     ok_sel = (
@@ -2043,14 +2051,20 @@ class OfflineDefaultExactRefresh(unittest.TestCase):
                     f"SELECT t.g, SUM(c.v + t.k) AS s, AVG(c.v) AS a FROM t CROSS JOIN c GROUP BY t.g"
                 )
                 with self.subTest(dialect=dialect, term=term):
-                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "recursive CTE"):
+                    # MySQL/MariaDB refuse the 2+ table float sum first (plan dependence);
+                    # PostgreSQL reports the unprovable recursive CTE column type.
+                    reason = "table instances|recursive CTE" if not dialect.startswith("postgres") else "recursive CTE"
+                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, reason):
                         generate_materialized_view(schema, f"CREATE VIEW v AS {body};", dialect=dialect,
                                                    ignore_limitations=True)
             mutual = (
                 "WITH RECURSIVE a(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM b WHERE n < 3), "
                 "b(n) AS (SELECT n FROM a UNION ALL SELECT n FROM a) "
             )
-            for agg, refused in (("SUM(b.n * 1.5)", True), ("COUNT(*)", False)):
+            # Both CTE columns are provably INT (an integer literal anchor and a
+            # `n + 1` step over the previous level, passed through b): the
+            # resolver terminates, and SUM(INT * 1.5) is exact decimal arithmetic.
+            for agg, refused in (("SUM(b.n * 1.5)", False), ("COUNT(*)", False)):
                 body = f"{mutual}SELECT t.g, {agg} AS x FROM t CROSS JOIN b GROUP BY t.g"
                 with self.subTest(dialect=dialect, mutual=agg):
                     try:
@@ -2081,6 +2095,14 @@ class OfflineDefaultExactRefresh(unittest.TestCase):
                 for label, select, _recomputed in _ORDER_SENSITIVE_SHAPES:
                     view = f"CREATE VIEW v AS {select};"
                     with self.subTest(version=version, ty=ty, shape=label):
+                        if dialect == Dialect.MYSQL and label in ("join", "left_join"):
+                            # A float sum over a join: another join order on a later read
+                            # can differ in the last bits (MySQL/MariaDB): refused.
+                            with self.assertRaisesRegex(UnsupportedMaterializedViewError, "table instances"):
+                                generate_materialized_view(
+                                    parsed, view, dialect=dialect, engine_version=version, ignore_limitations=True,
+                                )
+                            continue
                         for ignore in (False, True):
                             with warnings.catch_warnings(record=True) as caught:
                                 warnings.simplefilter("always")

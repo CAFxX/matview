@@ -47,7 +47,7 @@ def _announce_recommendations(plan: Any, as_json: bool) -> None:
         print(json.dumps({"recommendations": [d.to_dict() for d in notes]}, indent=2, sort_keys=True), file=sys.stderr)
     else:
         for d in notes:
-            print(f"NOTE {d}", file=sys.stderr)
+            print(f"NOTE [{d.code}] view {d.view}: {d.message}", file=sys.stderr)
 
 
 def _print_strategy_diagnostics(plan: Any) -> None:

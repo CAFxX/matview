@@ -3268,7 +3268,7 @@ def _compile_plan_for_test(
                 # be reproduced from a stored double): the relaxed incremental
                 # mode is the maintenance this view is offered, as before the
                 # refresh default. Anything else propagates.
-                if "on MariaDB" not in str(refusal):
+                if "on MariaDB" not in str(refusal) and "table instances" not in str(refusal):
                     raise
                 del emitted[:]
                 plan = generate_materialized_view(
@@ -3307,6 +3307,23 @@ def _compile_plan_for_test(
                 raise AssertionError("Opt-in warning does not state the best-effort contract")
             _ORDER_SENSITIVE_OPT_IN_VIEWS.add(plan.view_name.lower())
         return plan, True, tuple(sorted(expected_codes))
+    except UnsupportedMaterializedViewError as refusal:
+        # MySQL/MariaDB refuse a floating-point sum over a multi-table query under
+        # the exact default (a later read can use another join order); the relaxed
+        # per-code opt-in is the maintenance such a view is offered.
+        if "table instances" not in str(refusal):
+            raise
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter("always", EngineLimitationWarning)
+            plan = generate_materialized_view(
+                schema_source, view_ddl, ignore_limitations=True,
+                accept_limitations=sorted(FLOAT_OPT_IN), **options
+            )
+        relaxed_codes = {lim.code for lim in plan.limitations} & set(FLOAT_OPT_IN)
+        if "FLOAT_REASSOCIATION_ALLOWED" not in relaxed_codes:
+            raise AssertionError(f"relaxed plan lacks FLOAT_REASSOCIATION_ALLOWED: {sorted(relaxed_codes)}") from refusal
+        _ORDER_SENSITIVE_OPT_IN_VIEWS.add(plan.view_name.lower())
+        return plan, True, tuple(sorted(relaxed_codes))
 
 
 # Views installed together on one live MySQL/MariaDB database (run_batch and
