@@ -176,7 +176,20 @@ class ExactAggregateRoutingMixin(MixinHost):
             pk_cols = tuple(c.lower() for c in ts.effective_pk_columns())
             if not pk_cols:
                 return False
-            sources.append(((j.alias or j.table_name).lower(), {j.table_name.lower(), (j.alias or j.table_name).lower()}, pk_cols))
+            if self.dialect == Dialect.SQLITE:
+                # A non-STRICT SQLite PRIMARY KEY admits NULLs (rows tie on
+                # them) unless declared NOT NULL or an INTEGER PRIMARY KEY
+                # (the rowid alias).
+                defs = {k.lower(): cd for k, cd in ts.columns.items()}
+                for c in pk_cols:
+                    cd = defs.get(c)
+                    rowid_alias = len(pk_cols) == 1 and cd is not None and cd.data_type.strip().upper() == "INTEGER"
+                    if cd is None or not (cd.not_null or rowid_alias):
+                        return False
+            # Only the name visible in the query identifies the occurrence
+            # (FROM t JOIN t AS b: t.id orders t's rows, not b's).
+            visible = (j.alias or j.table_name).lower()
+            sources.append((visible, {visible}, pk_cols))
 
         def _owner(col: sqlglot_exp.Column) -> Optional[str]:
             if col.table:
@@ -210,8 +223,23 @@ class ExactAggregateRoutingMixin(MixinHost):
             on_ast = self._item_ast(j.on_condition)
             if on_ast is None:
                 continue
-            for eq in on_ast.find_all(sqlglot_exp.EQ):
-                if isinstance(eq.this, sqlglot_exp.Column) and isinstance(eq.expression, sqlglot_exp.Column):
+            conjuncts: List[sqlglot_exp.Expr] = []
+            stack: List[sqlglot_exp.Expr] = [on_ast]
+            while stack:
+                node = stack.pop()
+                while isinstance(node, sqlglot_exp.Paren):
+                    node = node.this
+                if isinstance(node, sqlglot_exp.And):
+                    stack.extend([node.this, node.expression])
+                else:
+                    conjuncts.append(node)
+            for eq in conjuncts:  # only equalities every joined row satisfies (no OR branches)
+                if (
+                    isinstance(eq, sqlglot_exp.EQ)
+                    and isinstance(eq.this, sqlglot_exp.Column)
+                    and isinstance(eq.expression, sqlglot_exp.Column)
+                    and self._same_comparison_type(eq.this, eq.expression)
+                ):
                     equalities.append((eq.this, eq.expression, nullable))
         changed = True
         while changed:
@@ -233,6 +261,25 @@ class ExactAggregateRoutingMixin(MixinHost):
                     determined.add(alias)
                     changed = True
         return all(alias in determined for alias, _n, _p in sources)
+
+    def _same_comparison_type(self, a: sqlglot_exp.Column, b: sqlglot_exp.Column) -> bool:
+        """Whether a join equality compares two columns of one type family
+        (MySQL compares VARCHAR with INT as floating point: '1' and '01' both
+        equal 1, so a key would not be bound to one row)."""
+        da = self._lookup_col_def(a.sql(dialect=_sqlglot_dialect(self.dialect)))
+        db = self._lookup_col_def(b.sql(dialect=_sqlglot_dialect(self.dialect)))
+        if da is None or db is None:
+            return False
+
+        def family(t: str) -> str:
+            base = re.sub(r"\s*\(.*\)", "", t).strip().upper()
+            if re.search(r"INT|SERIAL", base):
+                return "int"
+            if re.search(r"CHAR|TEXT|STRING|CLOB", base):
+                return "text"
+            return base
+
+        return family(da.data_type) == family(db.data_type)
 
     def _unordered_order_sensitive_aggregates(self, *, include_relaxed: bool = False) -> List[str]:
         """SQL of order-sensitive aggregate calls whose result a group-scoped
@@ -443,9 +490,10 @@ class ExactAggregateRoutingMixin(MixinHost):
             tuple(relaxed_calls),
             relaxed_text=relaxed_message(
                 Strategy.GROUP_SCOPED_RECOMPUTE,
-                "the element order of " + ", ".join(relaxed_calls) + " is the order in which "
+                "the element order (or, for ANY_VALUE-like aggregates, the selected value) of "
+                + ", ".join(relaxed_calls) + " follows the order in which "
                 "the scoped recompute reads the group's (or partition's) rows, which can differ "
-                "from the live view's (the elements are the same). Cost: " + GROUP_RECOMPUTE_COST,
+                "from the live view's. Cost: " + GROUP_RECOMPUTE_COST,
                 "remove AGGREGATE_ORDER_NOT_REPRODUCIBLE from accept_limitations (exact full "
                 "refresh), or add an ORDER BY inside the aggregate call (or the window) that is a "
                 "total order of the input rows.",
@@ -550,7 +598,8 @@ class ExactAggregateRoutingMixin(MixinHost):
         modelled: an aggregate call, a CAST, PostgreSQL ``COALESCE(<expr>,
         '<literal>' | NULL)``, or a ``CASE`` whose non-NULL results all resolve
         to the same type (PostgreSQL/MySQL resolve a CASE of one type to it)."""
-        while isinstance(node, sqlglot_exp.Paren):
+        while isinstance(node, (sqlglot_exp.Paren, sqlglot_exp.Filter)):
+            # AGG(...) FILTER (WHERE ...) has the aggregate's type.
             node = node.this
         if node is None:
             return None
@@ -606,6 +655,9 @@ class ExactAggregateRoutingMixin(MixinHost):
         else:
             arg_t = self._infer_ast_expr_storage_type(sql)
         if arg_t is not None and self.dialect == Dialect.POSTGRES:
+            # A column's COLLATE clause is not part of the type name (an array
+            # of it is declared "varchar[]", not 'varchar COLLATE "C"[]').
+            arg_t = re.sub(r"\s+COLLATE\s+.*$", "", arg_t, flags=re.IGNORECASE)
             arg_t = _pg_drop_typmod(arg_t)
         return arg_t
 
@@ -619,7 +671,11 @@ class ExactAggregateRoutingMixin(MixinHost):
             keys = order.expressions if isinstance(order, sqlglot_exp.Order) else []
             key_t = self._arg_storage_type(keys[0]) if len(keys) == 1 else None
             fraction = call.this.this if isinstance(call.this, sqlglot_exp.Func) else None
-            is_array = isinstance(fraction, sqlglot_exp.Array)
+            is_array = isinstance(fraction, sqlglot_exp.Array) or (
+                isinstance(fraction, sqlglot_exp.Cast)
+                and isinstance(fraction.args.get("to"), sqlglot_exp.DataType)
+                and fraction.args["to"].is_type(sqlglot_exp.DataType.Type.ARRAY)
+            )
             if self.dialect != Dialect.POSTGRES:
                 return None
             if name in ("RANK", "DENSE_RANK"):

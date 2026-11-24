@@ -2587,7 +2587,9 @@ class PlannerMixin(MixinHost):
         """Announced fallbacks of this plan (see matview.diagnostics)."""
         routed = self._exact_routing_diagnostics(strategy)
         having = self.view.having_clause
-        if not having or strategy == MaintenanceStrategy.ALGEBRAIC_DELTA or not _has_subquery_aggregate(having, self.dialect):
+        if not having or strategy != MaintenanceStrategy.GROUP_SCOPED_DELTA or not _has_subquery_aggregate(having, self.dialect):
+            # (The HAVING-subquery note describes the group-scoped recompute;
+            # a full-refresh plan is announced by the routing diagnostic.)
             return routed
         cost = (
             "a write to a table the subquery reads recomputes every group of the view; other writes "
