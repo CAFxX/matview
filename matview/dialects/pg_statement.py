@@ -1738,98 +1738,819 @@ class PgStatementMaintenanceMixin(MixinHost):
             "$mv_key$;"
         )
 
-    def _pg_probe_key_exprs(self) -> Tuple[Optional[str], List[str]]:
-        """Return ``(from_clause, key_exprs)`` for registration-time probing of
-        GROUP BY and window PARTITION BY expression types, or ``(None, [])``
-        when the view's FROM clause cannot be probed directly (CTEs, set ops,
-        or FROM subqueries)."""
-        if self.view.has_cte or self.view.has_compound_set_op or self.view.has_subquery_in_from:
-            return None, []
-        if self.view.joins:
-            parts: List[str] = []
-            for idx, j in enumerate(self.view.joins):
-                q_t = self._q(j.table_name)
-                alias_part = (
-                    f" AS {self._q(j.alias)}"
-                    if j.alias and j.alias.lower() != j.table_name.lower()
-                    else ""
-                )
-                if idx == 0:
-                    parts.append(f"{q_t}{alias_part}")
-                else:
-                    on_part = f" ON {j.on_condition}" if j.on_condition else ""
-                    parts.append(f"{j.join_type} {q_t}{alias_part}{on_part}")
-            from_clause = " ".join(parts)
-        elif self.view.base_table:
-            from_clause = self._q(self.view.base_table)
-        else:
-            return None, []
+    def _pg_probe_queries(self) -> List[Tuple[str, str, Optional[str], bool]]:
+        """Return ``[(label, probe_sql, fallback_sql, check_key_type), ...]``
+        for registration-time probing of grouping, deduplication, set-operation,
+        window-partition, aggregate-DISTINCT, and MIN/MAX expression types.
 
-        base_cols_lower: set[str] = set()
-        for ref_t in self.view.referenced_tables:
-            ts = self._schemas_lower.get(ref_t.lower())
-            if ts is not None:
-                base_cols_lower.update(c.lower() for c in ts.columns)
+        Supports plain queries, CTEs (including ``WITH RECURSIVE``, ``SEARCH``,
+        ``CYCLE``, and branch-local ``WITH``), compound set operations
+        (``UNION``/``INTERSECT``/``EXCEPT``/``UNION ALL``, including ``*``,
+        ``VALUES``, ``TABLE``, and parenthesized branches with trailing
+        ``ORDER BY``/``LIMIT``), ``FROM`` subqueries, ``LATERAL`` joins,
+        ``JOIN ... USING``, and ``NATURAL JOIN`` by preserving ``WITH``
+        prefixes and slicing each branch's ``FROM`` clause verbatim from
+        ``raw_select_sql``. Each probe query returns a single ``pg_catalog.oid``
+        row at zero-row cost (``WHERE false``).
+        """
+        from typing import Any
+        import sqlglot.errors
+        from sqlglot import exp as sqlglot_exp
+        from sqlglot import TokenType as SQLGlotTokenType
+        from ..engines import Dialect
+        from ..sql_frontend import _tokenize_sql, parse_sql_ast
 
-        alias_to_expr: Dict[str, str] = {}
-        for it in self.view.select_items:
-            if it.alias and it.raw_expr and not it.is_aggregate:
-                alias_to_expr[it.alias.lower()] = it.raw_expr
+        raw_sql = self.view.raw_select_sql.strip().rstrip(";").strip()
+        if not raw_sql:
+            return []
+        try:
+            toks = _tokenize_sql(raw_sql, read="postgres")
+        except sqlglot.errors.SqlglotError:
+            return []
+        if not toks:
+            return []
 
-        exprs: List[str] = []
-        seen: set[str] = set()
-        for g in self.view.group_by_cols:
-            gs = g.strip()
-            if not gs:
-                continue
-            if gs.isdigit():
-                pos = int(gs)
-                if 1 <= pos <= len(self.view.select_items):
-                    it = self.view.select_items[pos - 1]
-                    if it.raw_expr and not it.is_aggregate:
-                        resolved = it.raw_expr.strip()
+        def _extract_with_prefix(lo: int, hi: int) -> Tuple[int, str, bool]:
+            """If ``toks[lo:hi]`` begins with ``WITH [RECURSIVE] ...``, return
+            ``(body_start_idx, with_prefix_sql, is_recursive)``; otherwise
+            ``(lo, "", False)``."""
+            if lo >= hi or toks[lo].token_type != SQLGlotTokenType.WITH:
+                return lo, "", False
+            i = lo + 1
+            is_rec = False
+            if i < hi and toks[i].token_type == SQLGlotTokenType.RECURSIVE:
+                is_rec = True
+                i += 1
+            while i < hi:
+                # CTE name
+                i += 1
+                # Optional column list: cte_name(c1, c2)
+                if i < hi and toks[i].token_type == SQLGlotTokenType.L_PAREN:
+                    d = 0
+                    while i < hi:
+                        if toks[i].token_type == SQLGlotTokenType.L_PAREN:
+                            d += 1
+                        elif toks[i].token_type == SQLGlotTokenType.R_PAREN:
+                            d -= 1
+                            if d == 0:
+                                i += 1
+                                break
+                        i += 1
+                # AS [NOT] [MATERIALIZED] ( ... )
+                while i < hi and toks[i].token_type != SQLGlotTokenType.L_PAREN:
+                    i += 1
+                if i >= hi:
+                    return hi, "", is_rec
+                d = 0
+                while i < hi:
+                    if toks[i].token_type == SQLGlotTokenType.L_PAREN:
+                        d += 1
+                    elif toks[i].token_type == SQLGlotTokenType.R_PAREN:
+                        d -= 1
+                        if d == 0:
+                            i += 1
+                            break
+                    i += 1
+                # Optional PG 14+ SEARCH {BREADTH|DEPTH} FIRST BY ... SET <col>
+                # and/or CYCLE ... SET <col> [TO ... DEFAULT ...] USING <col>.
+                while i < hi and toks[i].token_type == SQLGlotTokenType.VAR and toks[i].text.upper() in ("SEARCH", "CYCLE"):
+                    kw = toks[i].text.upper()
+                    i += 1
+                    if kw == "SEARCH":
+                        while i < hi and toks[i].token_type != SQLGlotTokenType.SET:
+                            i += 1
+                        if i < hi:
+                            i += 2  # SET <seq_col>
                     else:
-                        continue
-                else:
+                        while i < hi and toks[i].token_type != SQLGlotTokenType.USING:
+                            i += 1
+                        if i < hi:
+                            i += 2  # USING <path_col>
+                if i < hi and toks[i].token_type == SQLGlotTokenType.COMMA:
+                    i += 1
                     continue
-            else:
-                # PostgreSQL binds bare GROUP BY identifiers to input columns
-                # before output aliases; only substitute an alias when no
-                # referenced table has a column of that name.
-                bare_ident = gs.strip('"').lower()
-                if bare_ident in base_cols_lower:
-                    resolved = gs
-                else:
-                    resolved = alias_to_expr.get(bare_ident, gs)
-            if resolved and resolved not in seen:
-                seen.add(resolved)
-                exprs.append(resolved)
-        if self.view.has_top_level_distinct and not self.view.group_by_cols:
-            for it in self.view.select_items:
-                if it.raw_expr and not it.is_aggregate:
-                    rs = it.raw_expr.strip()
-                    if rs and rs not in seen:
-                        seen.add(rs)
-                        exprs.append(rs)
-        if self.view.has_window_func:
-            from ..sql_frontend import parse_sql_ast
-            import sqlglot.errors
-            from sqlglot import exp as sqlglot_exp
+                break
+            if i >= hi:
+                return hi, "", is_rec
+            prefix = raw_sql[toks[lo].start : toks[i].start].strip() + "\n"
+            return i, prefix, is_rec
 
-            for it in self.view.select_items:
-                if not it.raw_expr:
+        def _combine_with_prefixes(
+            outer_prefix: str, outer_rec: bool, inner_prefix: str, inner_rec: bool
+        ) -> str:
+            if not outer_prefix:
+                return inner_prefix
+            if not inner_prefix:
+                return outer_prefix
+            # Merge `WITH [RECURSIVE] a AS (...)` and `WITH [RECURSIVE] b AS (...)`
+            # into a single valid PostgreSQL `WITH [RECURSIVE] a AS (...), b AS (...)`.
+            merged_outer = outer_prefix.strip()
+            if inner_rec and not outer_rec:
+                merged_outer = re.sub(r"^WITH\b", "WITH RECURSIVE", merged_outer, count=1, flags=re.IGNORECASE)
+            inner_rest = re.sub(
+                r"^WITH\s+(?:RECURSIVE\s+)?", "", inner_prefix.strip(), count=1, flags=re.IGNORECASE
+            )
+            return f"{merged_outer}, {inner_rest}\n"
+
+        # 1. Extract leading WITH [RECURSIVE] ... prefix verbatim.
+        main_start, with_prefix, with_is_rec = _extract_with_prefix(0, len(toks))
+        if main_start >= len(toks):
+            return []
+
+        # Collect CTE projected column counts/names from a query AST (for `*` expansion).
+        def _extract_cte_cols_from_sql(sql_text: str) -> Dict[str, Optional[List[str]]]:
+            out_map: Dict[str, Optional[List[str]]] = {}
+            try:
+                ast_obj: Any = parse_sql_ast(sql_text, dialect=Dialect.POSTGRES)
+            except sqlglot.errors.SqlglotError:
+                return out_map
+            with_node = ast_obj.args.get("with_") if hasattr(ast_obj, "args") else None
+            if with_node is None:
+                return out_map
+            for cte in list(with_node.expressions or ()):
+                cte_alias = cte.alias
+                if not cte_alias:
                     continue
+                t_al: Any = cte.args.get("alias")
+                if isinstance(t_al, sqlglot_exp.TableAlias) and t_al.columns:
+                    out_map[cte_alias.lower()] = [c.name for c in list(t_al.columns) if c.name]
+                    continue
+                body = cte.this
+                while isinstance(body, sqlglot_exp.SetOperation):
+                    body = body.this
+                if isinstance(body, sqlglot_exp.Select):
+                    exprs_c = list(body.expressions or ())
+                    if any(
+                        isinstance(ce, sqlglot_exp.Star)
+                        or (isinstance(ce, sqlglot_exp.Column) and isinstance(ce.this, sqlglot_exp.Star))
+                        for ce in exprs_c
+                    ):
+                        out_map[cte_alias.lower()] = None
+                    else:
+                        out_map[cte_alias.lower()] = [
+                            ce.alias or (ce.this.name if isinstance(ce, sqlglot_exp.Alias) else ce.name) or f"col_{idx_c}"
+                            for idx_c, ce in enumerate(exprs_c)
+                        ]
+                else:
+                    out_map[cte_alias.lower()] = None
+            return out_map
+
+        cte_cols_map = _extract_cte_cols_from_sql(raw_sql)
+
+        # 2. Split top-level set operations within [main_start, len(toks)) into
+        #    individual branches, handling parenthesized branches and trailing
+        #    ORDER BY / LIMIT / OFFSET / FETCH / FOR modifiers.
+        setop_types = (
+            SQLGlotTokenType.UNION,
+            SQLGlotTokenType.INTERSECT,
+            SQLGlotTokenType.EXCEPT,
+        )
+        trailing_mod_types = {
+            SQLGlotTokenType.ORDER_BY,
+            SQLGlotTokenType.LIMIT,
+            SQLGlotTokenType.OFFSET,
+            SQLGlotTokenType.FETCH,
+            SQLGlotTokenType.FOR,
+            SQLGlotTokenType.SEMICOLON,
+        }
+        has_dedup_setop = False
+        branch_ranges: List[Tuple[int, int]] = []
+
+        def _trim_outer_parens(lo: int, hi: int) -> Tuple[int, int]:
+            while (
+                lo < hi
+                and toks[lo].token_type == SQLGlotTokenType.L_PAREN
+                and toks[hi - 1].token_type == SQLGlotTokenType.R_PAREN
+            ):
+                d = 0
+                wraps_all = True
+                for k in range(lo, hi):
+                    if toks[k].token_type == SQLGlotTokenType.L_PAREN:
+                        d += 1
+                    elif toks[k].token_type == SQLGlotTokenType.R_PAREN:
+                        d -= 1
+                        if d == 0 and k != hi - 1:
+                            wraps_all = False
+                            break
+                if wraps_all and d == 0:
+                    lo += 1
+                    hi -= 1
+                else:
+                    break
+            return lo, hi
+
+        def _collect_branches(lo: int, hi: int) -> None:
+            nonlocal has_dedup_setop
+            lo, hi = _trim_outer_parens(lo, hi)
+            if lo >= hi:
+                return
+            splits: List[Tuple[int, int]] = []
+            cur_lo = lo
+            d = 0
+            k = lo
+            while k < hi:
+                tt = toks[k].token_type
+                if tt == SQLGlotTokenType.L_PAREN:
+                    d += 1
+                elif tt == SQLGlotTokenType.R_PAREN:
+                    d = max(0, d - 1)
+                elif d == 0 and tt in setop_types:
+                    splits.append((cur_lo, k))
+                    nxt = k + 1
+                    is_all = nxt < hi and toks[nxt].token_type == SQLGlotTokenType.ALL
+                    if tt != SQLGlotTokenType.UNION or not is_all:
+                        has_dedup_setop = True
+                    if nxt < hi and toks[nxt].token_type in (
+                        SQLGlotTokenType.ALL,
+                        SQLGlotTokenType.DISTINCT,
+                    ):
+                        nxt += 1
+                    cur_lo = nxt
+                    k = nxt
+                    continue
+                k += 1
+            if splits:
+                splits.append((cur_lo, hi))
+                for s_lo, s_hi in splits:
+                    _collect_branches(s_lo, s_hi)
+                return
+
+            # No top-level set op: strip trailing depth-0 ORDER BY/LIMIT/OFFSET/
+            # FETCH/FOR so a parenthesized branch like `(SELECT ... UNION ...) ORDER BY 1`
+            # or `(SELECT ... LIMIT 5) ORDER BY n` unwraps cleanly.
+            d = 0
+            trimmed_hi = hi
+            for k in range(lo, hi):
+                tt = toks[k].token_type
+                if tt == SQLGlotTokenType.L_PAREN:
+                    d += 1
+                elif tt == SQLGlotTokenType.R_PAREN:
+                    d = max(0, d - 1)
+                elif d == 0 and tt in trailing_mod_types:
+                    trimmed_hi = k
+                    break
+            if trimmed_hi < hi and trimmed_hi > lo:
+                new_lo, new_hi = _trim_outer_parens(lo, trimmed_hi)
+                if new_lo != lo or new_hi != trimmed_hi:
+                    _collect_branches(new_lo, new_hi)
+                    return
+            branch_ranges.append((lo, hi))
+
+        _collect_branches(main_start, len(toks))
+
+        probes_by_key: Dict[Tuple[str, Optional[str]], Tuple[str, bool]] = {}
+
+        def _add_probe(
+            label: str,
+            probe_sql: str,
+            check_key_type: bool,
+            fallback_sql: Optional[str] = None,
+        ) -> None:
+            key = (probe_sql, fallback_sql)
+            prev = probes_by_key.get(key)
+            if prev is None:
+                probes_by_key[key] = (label, check_key_type)
+            elif check_key_type and not prev[1]:
+                probes_by_key[key] = (prev[0], True)
+
+        def _expand_source_col_count(
+            src: Any, local_ctes: Dict[str, Optional[List[str]]]
+        ) -> Optional[List[str]]:
+            if src is None:
+                return None
+            if isinstance(src, sqlglot_exp.Table):
+                t_low = src.name.lower()
+                if t_low in local_ctes:
+                    return local_ctes[t_low]
+                ts = self._schemas_lower.get(t_low)
+                if ts is None and src.db:
+                    ts = self._schemas_lower.get(f"{src.db.lower()}.{t_low}")
+                if ts is not None:
+                    return list(ts.columns.keys())
+                return None
+            if isinstance(src, sqlglot_exp.Subquery):
+                t_al: Any = src.args.get("alias")
+                if isinstance(t_al, sqlglot_exp.TableAlias) and t_al.columns:
+                    return [c.name for c in list(t_al.columns) if c.name]
+                sub_q = src.this
+                while isinstance(sub_q, sqlglot_exp.SetOperation):
+                    sub_q = sub_q.this
+                if isinstance(sub_q, sqlglot_exp.Select):
+                    return _select_output_cols(sub_q, local_ctes)
+                return None
+            if isinstance(src, (sqlglot_exp.Join, sqlglot_exp.Lateral)):
+                return _expand_source_col_count(src.this, local_ctes)
+            return None
+
+        def _select_output_cols(
+            sel_ast: sqlglot_exp.Select,
+            local_ctes: Dict[str, Optional[List[str]]],
+        ) -> Optional[List[str]]:
+            exprs_s = list(sel_ast.expressions or ())
+            if not exprs_s:
+                return None
+            sources_by_alias: Dict[str, Optional[List[str]]] = {}
+            all_source_cols: List[Optional[List[str]]] = []
+
+            def _reg_src(src: Any) -> None:
+                if src is None:
+                    return
+                if isinstance(src, sqlglot_exp.Join):
+                    _reg_src(src.this)
+                    return
+                if isinstance(src, sqlglot_exp.Paren):
+                    _reg_src(src.this)
+                    for sj in list(src.args.get("joins") or ()):
+                        _reg_src(sj)
+                    return
+                cols = _expand_source_col_count(src, local_ctes)
+                all_source_cols.append(cols)
+                if isinstance(src, sqlglot_exp.Table):
+                    al = (src.alias or src.name or "").lower()
+                    if al:
+                        sources_by_alias[al] = cols
+                elif isinstance(src, sqlglot_exp.Subquery):
+                    al = (src.alias or "").lower()
+                    if al:
+                        sources_by_alias[al] = cols
+
+            f_node = sel_ast.args.get("from_") or sel_ast.args.get("from")
+            if f_node is not None:
+                _reg_src(f_node.this)
+            for jn in list(sel_ast.args.get("joins") or ()):
+                _reg_src(jn)
+
+            out_cols: List[str] = []
+            for idx_e, e in enumerate(exprs_s):
+                if isinstance(e, sqlglot_exp.Star):
+                    if not all_source_cols or any(c is None for c in all_source_cols):
+                        return None
+                    for cl in all_source_cols:
+                        assert cl is not None
+                        out_cols.extend(cl)
+                elif isinstance(e, sqlglot_exp.Column) and isinstance(e.this, sqlglot_exp.Star):
+                    tbl_k = (e.table or "").lower()
+                    cl = sources_by_alias.get(tbl_k)
+                    if cl is None:
+                        return None
+                    out_cols.extend(cl)
+                else:
+                    out_cols.append(e.alias or e.sql(dialect="postgres").strip() or f"col_{idx_e + 1}")
+            return out_cols
+
+        def _branch_output_cols(
+            b_lo: int, b_hi: int, local_ctes: Dict[str, Optional[List[str]]]
+        ) -> Optional[List[str]]:
+            if b_lo >= b_hi:
+                return None
+            # Handle branch-local WITH
+            body_lo, _, _ = _extract_with_prefix(b_lo, b_hi)
+            if body_lo >= b_hi:
+                return None
+            b_txt = raw_sql[toks[b_lo].start : toks[b_hi - 1].end + 1].strip()
+            eff_ctes = dict(local_ctes)
+            if body_lo > b_lo:
+                eff_ctes.update(_extract_cte_cols_from_sql(b_txt))
+            tt0 = toks[body_lo].token_type
+            # TABLE <name>
+            if tt0 == SQLGlotTokenType.TABLE and body_lo + 1 < b_hi:
+                t_name = toks[body_lo + 1].text.strip('"').lower()
+                if t_name in eff_ctes:
+                    return eff_ctes[t_name]
+                ts = self._schemas_lower.get(t_name)
+                return list(ts.columns.keys()) if ts is not None else None
+            # VALUES (...)
+            if tt0 == SQLGlotTokenType.VALUES:
                 try:
-                    ast = parse_sql_ast(it.raw_expr, dialect=self.dialect)
+                    v_ast = parse_sql_ast(b_txt, dialect=Dialect.POSTGRES)
+                    if isinstance(v_ast, sqlglot_exp.Values) and v_ast.expressions:
+                        first_row = v_ast.expressions[0]
+                        if isinstance(first_row, sqlglot_exp.Tuple):
+                            return [f"column{i + 1}" for i in range(len(first_row.expressions or ()))]
                 except sqlglot.errors.SqlglotError:
+                    return None
+                return None
+            if tt0 == SQLGlotTokenType.SELECT:
+                body_txt = raw_sql[toks[body_lo].start : toks[b_hi - 1].end + 1].strip()
+                try:
+                    s_ast = parse_sql_ast(body_txt, dialect=Dialect.POSTGRES)
+                    if isinstance(s_ast, sqlglot_exp.Select):
+                        return _select_output_cols(s_ast, eff_ctes)
+                except sqlglot.errors.SqlglotError:
+                    return None
+            return None
+
+        def _probe_query_output_columns(
+            query_sql: str,
+            prefix_sql: str,
+            col_labels: Optional[List[str]],
+            fallback_label: str,
+        ) -> None:
+            if col_labels:
+                ncols = len(col_labels)
+                col_list = ", ".join(f"__mv_c{ci}" for ci in range(ncols))
+                for ci in range(ncols):
+                    q_sql = (
+                        f"{prefix_sql}"
+                        f"SELECT pg_catalog.pg_typeof(q.__mv_c{ci})::pg_catalog.oid "
+                        f"FROM (SELECT 1) AS __mv_one "
+                        f"LEFT JOIN (SELECT * FROM ({query_sql}\n) AS __mv_v({col_list}) WHERE false) AS q ON true"
+                    )
+                    _add_probe(col_labels[ci] or f"{fallback_label} {ci + 1}", q_sql, True)
+            else:
+                for it in self.view.select_items:
+                    if not it.alias or it.raw_expr.strip() == "*" or it.raw_expr.strip().endswith(".*"):
+                        continue
+                    q_col = self._q(it.alias)
+                    q_sql = (
+                        f"{prefix_sql}"
+                        f"SELECT pg_catalog.pg_typeof(q.{q_col})::pg_catalog.oid "
+                        f"FROM (SELECT 1) AS __mv_one "
+                        f"LEFT JOIN (SELECT * FROM ({query_sql}\n) AS __mv_v WHERE false) AS q ON true"
+                    )
+                    _add_probe(it.alias, q_sql, True)
+
+        # 3. For deduplicating set operations (UNION / INTERSECT [ALL] / EXCEPT [ALL]),
+        #    resolve output column count across ALL branches and probe every output column.
+        if has_dedup_setop:
+            resolved_cols: Optional[List[str]] = None
+            for b_lo, b_hi in branch_ranges:
+                resolved_cols = _branch_output_cols(b_lo, b_hi, cte_cols_map)
+                if resolved_cols:
+                    break
+            _probe_query_output_columns(raw_sql, "", resolved_cols, "set-operation column")
+
+        # 4. For each SELECT branch, slice FROM verbatim and probe GROUP BY,
+        #    SELECT DISTINCT / DISTINCT ON, window PARTITION BY, aggregate
+        #    DISTINCT args, and MIN/MAX args (including in HAVING).
+        clause_stop_types = {
+            SQLGlotTokenType.WHERE,
+            SQLGlotTokenType.GROUP_BY,
+            SQLGlotTokenType.HAVING,
+            SQLGlotTokenType.WINDOW,
+            SQLGlotTokenType.ORDER_BY,
+            SQLGlotTokenType.LIMIT,
+            SQLGlotTokenType.OFFSET,
+            SQLGlotTokenType.FETCH,
+            SQLGlotTokenType.FOR,
+            SQLGlotTokenType.UNION,
+            SQLGlotTokenType.INTERSECT,
+            SQLGlotTokenType.EXCEPT,
+            SQLGlotTokenType.SEMICOLON,
+        }
+
+        def _unwrap_group_elements(node: Any) -> List[Any]:
+            if node is None:
+                return []
+            if isinstance(node, (sqlglot_exp.GroupingSets, sqlglot_exp.Cube, sqlglot_exp.Rollup)):
+                out: List[Any] = []
+                for child in list(node.expressions or ()):
+                    out.extend(_unwrap_group_elements(child))
+                return out
+            if isinstance(node, sqlglot_exp.Tuple):
+                out = []
+                for child in list(node.expressions or ()):
+                    out.extend(_unwrap_group_elements(child))
+                return out
+            if isinstance(node, sqlglot_exp.Paren):
+                return _unwrap_group_elements(node.this)
+            return [node]
+
+        def _find_top_level_minmax(node: Any, out: List[Tuple[str, bool]]) -> None:
+            if node is None or isinstance(node, (sqlglot_exp.Subquery, sqlglot_exp.Select)):
+                return
+            if isinstance(node, (sqlglot_exp.Min, sqlglot_exp.Max)) and node.this is not None:
+                arg = node.this
+                if isinstance(arg, sqlglot_exp.Distinct):
+                    exprs_d = list(arg.expressions or ())
+                    arg = exprs_d[0] if exprs_d else None
+                if arg is not None:
+                    s_arg = arg.sql(dialect="postgres").strip()
+                    if s_arg:
+                        has_inner_agg = isinstance(arg, sqlglot_exp.AggFunc) or bool(
+                            arg.find(sqlglot_exp.AggFunc)
+                        )
+                        out.append((s_arg, has_inner_agg))
+                return
+            if not hasattr(node, "args"):
+                return
+            for arg_v in node.args.values():
+                if hasattr(arg_v, "args"):
+                    _find_top_level_minmax(arg_v, out)
+                elif isinstance(arg_v, list):
+                    for item_v in arg_v:
+                        if hasattr(item_v, "args"):
+                            _find_top_level_minmax(item_v, out)
+
+        def _find_top_level_distinct_agg_args(node: Any, out: List[Tuple[str, bool]]) -> None:
+            if node is None or isinstance(node, (sqlglot_exp.Subquery, sqlglot_exp.Select)):
+                return
+            if isinstance(node, sqlglot_exp.AggFunc) and isinstance(node.this, sqlglot_exp.Distinct):
+                for arg in list(node.this.expressions or ()):
+                    s_arg = arg.sql(dialect="postgres").strip()
+                    if s_arg:
+                        has_inner_agg = isinstance(arg, sqlglot_exp.AggFunc) or bool(
+                            arg.find(sqlglot_exp.AggFunc)
+                        )
+                        out.append((s_arg, has_inner_agg))
+                return
+            if not hasattr(node, "args"):
+                return
+            for arg_v in node.args.values():
+                if hasattr(arg_v, "args"):
+                    _find_top_level_distinct_agg_args(arg_v, out)
+                elif isinstance(arg_v, list):
+                    for item_v in arg_v:
+                        if hasattr(item_v, "args"):
+                            _find_top_level_distinct_agg_args(item_v, out)
+
+        for orig_b_lo, orig_b_hi in branch_ranges:
+            if orig_b_lo >= orig_b_hi:
+                continue
+            b_lo, b_with_prefix, b_with_rec = _extract_with_prefix(orig_b_lo, orig_b_hi)
+            b_hi = orig_b_hi
+            if b_lo >= b_hi or toks[b_lo].token_type != SQLGlotTokenType.SELECT:
+                continue
+            eff_with_prefix = _combine_with_prefixes(
+                with_prefix, with_is_rec, b_with_prefix, b_with_rec
+            )
+            eff_ctes = dict(cte_cols_map)
+            if b_with_prefix:
+                eff_ctes.update(
+                    _extract_cte_cols_from_sql(
+                        raw_sql[toks[orig_b_lo].start : toks[orig_b_hi - 1].end + 1].strip()
+                    )
+                )
+
+            branch_end_char = toks[b_hi - 1].end + 1
+            branch_sql = raw_sql[toks[b_lo].start : branch_end_char].strip()
+            try:
+                b_ast = parse_sql_ast(branch_sql, dialect=Dialect.POSTGRES)
+            except sqlglot.errors.SqlglotError:
+                continue
+            if not isinstance(b_ast, sqlglot_exp.Select):
+                continue
+
+            # Slice FROM ... JOIN ... verbatim at depth 0 within [b_lo, b_hi),
+            # ignoring `IS [NOT] DISTINCT FROM` in the SELECT list and stopping
+            # strictly on keyword token types (never quoted identifiers/strings).
+            from_idx: Optional[int] = None
+            from_end_idx: Optional[int] = None
+            c_depth = 0
+            for k in range(b_lo, b_hi):
+                tt = toks[k].token_type
+                if tt == SQLGlotTokenType.L_PAREN:
+                    c_depth += 1
                     continue
-                for win in ast.find_all(sqlglot_exp.Window):
-                    for pe in (win.args.get("partition_by") or ()):
-                        ps = pe.sql(dialect="postgres").strip()
-                        if ps and ps not in seen:
-                            seen.add(ps)
-                            exprs.append(ps)
-        return from_clause, exprs
+                if tt == SQLGlotTokenType.R_PAREN:
+                    c_depth = max(0, c_depth - 1)
+                    continue
+                if c_depth != 0:
+                    continue
+                if from_idx is None:
+                    if tt == SQLGlotTokenType.FROM:
+                        is_distinct_from = (
+                            k >= b_lo + 2
+                            and toks[k - 1].token_type == SQLGlotTokenType.DISTINCT
+                            and (
+                                toks[k - 2].token_type == SQLGlotTokenType.IS
+                                or (
+                                    k >= b_lo + 3
+                                    and toks[k - 2].token_type == SQLGlotTokenType.NOT
+                                    and toks[k - 3].token_type == SQLGlotTokenType.IS
+                                )
+                            )
+                        )
+                        if not is_distinct_from:
+                            from_idx = k
+                else:
+                    if tt in clause_stop_types:
+                        from_end_idx = k
+                        break
+
+            branch_from_sql: Optional[str] = None
+            if from_idx is not None:
+                end_char = toks[from_end_idx].start if from_end_idx is not None else branch_end_char
+                sliced = raw_sql[toks[from_idx].end + 1 : end_char].strip()
+                if sliced:
+                    branch_from_sql = sliced
+
+            sel_exprs = list(b_ast.expressions or ())
+            select_pos_list: List[Optional[str]] = []
+            select_pos_all: List[str] = []
+            alias_to_expr: Dict[str, str] = {}
+            all_alias_to_expr: Dict[str, str] = {}
+            for se in sel_exprs:
+                inner_se = se.this if isinstance(se, sqlglot_exp.Alias) else se
+                is_agg = isinstance(inner_se, sqlglot_exp.AggFunc) or bool(
+                    inner_se.find(sqlglot_exp.AggFunc)
+                )
+                raw_se = inner_se.sql(dialect="postgres").strip()
+                select_pos_all.append(raw_se)
+                select_pos_list.append(None if is_agg else raw_se)
+                al_name = se.alias if isinstance(se, sqlglot_exp.Alias) else ""
+                if al_name and raw_se:
+                    all_alias_to_expr[al_name.lower()] = raw_se
+                    if not is_agg:
+                        alias_to_expr[al_name.lower()] = raw_se
+
+            def _make_branch_probe_sql(expr_sql: str, group_by_sql: Optional[str] = None) -> str:
+                from_part = f" FROM {branch_from_sql}\n" if branch_from_sql else " "
+                gb_part = f" GROUP BY {group_by_sql}\n" if group_by_sql else ""
+                return (
+                    f"{eff_with_prefix}"
+                    f"SELECT pg_catalog.pg_typeof(q.__mv_k)::pg_catalog.oid "
+                    f"FROM (SELECT 1) AS __mv_one "
+                    f"LEFT JOIN (SELECT ({expr_sql}) AS __mv_k{from_part}WHERE false{gb_part}) AS q ON true"
+                )
+
+            def _emit_branch_expr(
+                expr_sql: str,
+                check_key_type: bool,
+                *,
+                fallback_expr_sql: Optional[str] = None,
+                group_by_sql: Optional[str] = None,
+            ) -> None:
+                es = expr_sql.strip()
+                if not es:
+                    return
+                q_sql = _make_branch_probe_sql(es, group_by_sql=group_by_sql)
+                fb_sql = (
+                    _make_branch_probe_sql(fallback_expr_sql.strip(), group_by_sql=group_by_sql)
+                    if fallback_expr_sql and fallback_expr_sql.strip() and fallback_expr_sql.strip() != es
+                    else None
+                )
+                _add_probe(es, q_sql, check_key_type, fallback_sql=fb_sql)
+
+            # 4a. GROUP BY expressions (including GROUPING SETS / ROLLUP / CUBE).
+            #     For bare identifiers matching a SELECT output alias, probe the
+            #     input column FIRST and only fall back to the output alias on
+            #     undefined_column — exact PostgreSQL binding even across SELECT *.
+            group_node = b_ast.args.get("group")
+            resolved_group_exprs: List[str] = []
+            if group_node is not None:
+                raw_g_nodes: List[Any] = list(group_node.expressions or ())
+                for extra_k in ("grouping_sets", "cube", "rollup"):
+                    raw_g_nodes.extend(list(group_node.args.get(extra_k) or ()))
+                for raw_ge in raw_g_nodes:
+                    for ge in _unwrap_group_elements(raw_ge):
+                        coll_suffix = ""
+                        inner_ge = ge
+                        if (
+                            isinstance(ge, sqlglot_exp.Collate)
+                            and ge.this is not None
+                            and ge.expression is not None
+                        ):
+                            coll_suffix = f" COLLATE {ge.expression.sql(dialect='postgres')}"
+                            inner_ge = ge.this
+                        if (
+                            isinstance(inner_ge, sqlglot_exp.Literal)
+                            and not inner_ge.args.get("is_string")
+                            and str(inner_ge.this).isdigit()
+                        ):
+                            pos_i = int(str(inner_ge.this))
+                            if 1 <= pos_i <= len(select_pos_list):
+                                pos_e = select_pos_list[pos_i - 1]
+                                if pos_e:
+                                    e_sql = f"({pos_e}){coll_suffix}" if coll_suffix else pos_e
+                                    resolved_group_exprs.append(e_sql)
+                                    _emit_branch_expr(e_sql, True)
+                            continue
+                        direct_sql = ge.sql(dialect="postgres")
+                        fb_sql_expr: Optional[str] = None
+                        if (
+                            isinstance(inner_ge, sqlglot_exp.Column)
+                            and not inner_ge.table
+                            and inner_ge.name.lower() in alias_to_expr
+                        ):
+                            al_e = alias_to_expr[inner_ge.name.lower()]
+                            fb_sql_expr = f"({al_e}){coll_suffix}" if coll_suffix else al_e
+                        resolved_group_exprs.append(direct_sql)
+                        _emit_branch_expr(direct_sql, True, fallback_expr_sql=fb_sql_expr)
+
+            probe_group_sql = ", ".join(resolved_group_exprs) if resolved_group_exprs else None
+
+            # 4b. SELECT DISTINCT / DISTINCT ON (...)
+            distinct_node = b_ast.args.get("distinct")
+            if distinct_node is not None:
+                on_node = distinct_node.args.get("on")
+                if on_node is not None:
+                    on_exprs = (
+                        list(on_node.expressions or ())
+                        if isinstance(on_node, sqlglot_exp.Tuple)
+                        else [on_node]
+                    )
+                    for oe in on_exprs:
+                        coll_suffix = ""
+                        inner_oe = oe
+                        if (
+                            isinstance(oe, sqlglot_exp.Collate)
+                            and oe.this is not None
+                            and oe.expression is not None
+                        ):
+                            coll_suffix = f" COLLATE {oe.expression.sql(dialect='postgres')}"
+                            inner_oe = oe.this
+                        if (
+                            isinstance(inner_oe, sqlglot_exp.Literal)
+                            and not inner_oe.args.get("is_string")
+                            and str(inner_oe.this).isdigit()
+                        ):
+                            pos_i = int(str(inner_oe.this))
+                            if 1 <= pos_i <= len(select_pos_all):
+                                pos_e = select_pos_all[pos_i - 1]
+                                if pos_e:
+                                    e_sql = f"({pos_e}){coll_suffix}" if coll_suffix else pos_e
+                                    has_a = select_pos_list[pos_i - 1] is None
+                                    _emit_branch_expr(
+                                        e_sql,
+                                        True,
+                                        group_by_sql=probe_group_sql if has_a else None,
+                                    )
+                            continue
+                        oe_sql = oe.sql(dialect="postgres")
+                        has_a = isinstance(oe, sqlglot_exp.AggFunc) or bool(oe.find(sqlglot_exp.AggFunc))
+                        if (
+                            isinstance(inner_oe, sqlglot_exp.Column)
+                            and not inner_oe.table
+                            and inner_oe.name.lower() in all_alias_to_expr
+                        ):
+                            al_e = all_alias_to_expr[inner_oe.name.lower()]
+                            al_sql = f"({al_e}){coll_suffix}" if coll_suffix else al_e
+                            al_has_a = inner_oe.name.lower() not in alias_to_expr
+                            # DISTINCT ON follows ORDER BY precedence: output alias first.
+                            _emit_branch_expr(
+                                al_sql,
+                                True,
+                                fallback_expr_sql=oe_sql,
+                                group_by_sql=probe_group_sql if (al_has_a or has_a) else None,
+                            )
+                        else:
+                            _emit_branch_expr(
+                                oe_sql,
+                                True,
+                                group_by_sql=probe_group_sql if has_a else None,
+                            )
+                elif not has_dedup_setop:
+                    # Probe every output column of the SELECT DISTINCT branch directly
+                    # (handles SELECT DISTINCT *, named WINDOW, GROUP BY + aggregate,
+                    # and window functions like LAG without tearing them out of scope).
+                    dist_cols = _select_output_cols(b_ast, eff_ctes)
+                    _probe_query_output_columns(branch_sql, eff_with_prefix, dist_cols, "DISTINCT column")
+
+            # 4c. Window PARTITION BY (inline OVER (...) and named WINDOW clauses)
+            for se in sel_exprs:
+                for win in se.find_all(sqlglot_exp.Window):
+                    for pe in list(win.args.get("partition_by") or ()):
+                        pe_has_agg = isinstance(pe, sqlglot_exp.AggFunc) or bool(
+                            pe.find(sqlglot_exp.AggFunc)
+                        )
+                        _emit_branch_expr(
+                            pe.sql(dialect="postgres"),
+                            True,
+                            group_by_sql=probe_group_sql if pe_has_agg else None,
+                        )
+            for win_def in list(b_ast.args.get("windows") or ()):
+                for pe in list(win_def.args.get("partition_by") or ()):
+                    pe_has_agg = isinstance(pe, sqlglot_exp.AggFunc) or bool(
+                        pe.find(sqlglot_exp.AggFunc)
+                    )
+                    _emit_branch_expr(
+                        pe.sql(dialect="postgres"),
+                        True,
+                        group_by_sql=probe_group_sql if pe_has_agg else None,
+                    )
+
+            # 4d. Aggregate DISTINCT arguments (e.g. COUNT(DISTINCT ...)) in SELECT and HAVING
+            dist_agg_args: List[Tuple[str, bool]] = []
+            for se in sel_exprs:
+                _find_top_level_distinct_agg_args(se, dist_agg_args)
+            having_node = b_ast.args.get("having")
+            if having_node is not None:
+                _find_top_level_distinct_agg_args(having_node, dist_agg_args)
+            for da_sql, da_has_agg in dist_agg_args:
+                _emit_branch_expr(
+                    da_sql,
+                    True,
+                    group_by_sql=probe_group_sql if da_has_agg else None,
+                )
+
+            # 4e. MIN/MAX arguments (nondeterministic collation check only) in SELECT and HAVING
+            minmax_args: List[Tuple[str, bool]] = []
+            for se in sel_exprs:
+                _find_top_level_minmax(se, minmax_args)
+            if having_node is not None:
+                _find_top_level_minmax(having_node, minmax_args)
+            for ma_sql, ma_has_agg in minmax_args:
+                _emit_branch_expr(
+                    ma_sql,
+                    False,
+                    group_by_sql=probe_group_sql if ma_has_agg else None,
+                )
+
+        return [
+            (lbl, q_sql, fb_sql, chk)
+            for (q_sql, fb_sql), (lbl, chk) in probes_by_key.items()
+        ]
 
     def _pg_collation_guard_ddl(self) -> Optional[str]:
         """Refuse (0A000) at registration any view whose keys use a
@@ -1854,25 +2575,36 @@ class PgStatementMaintenanceMixin(MixinHost):
             tag = tag[:-1] + "x$"
         table_list = ", ".join("'" + self._q(t).replace("'", "''") + "'" for t in tables)
 
-        probe_from, probe_exprs = self._pg_probe_key_exprs()
+        probe_queries = self._pg_probe_queries()
         probe_block = ""
-        if probe_from and probe_exprs:
+        if probe_queries:
             def _lit(val: str) -> str:
                 return "'" + val.replace("'", "''") + "'"
 
-            expr_arr = ", ".join(_lit(e) for e in probe_exprs)
+            values_rows = ",\n      ".join(
+                f"({_lit(lbl)}::pg_catalog.text, {_lit(q_sql)}::pg_catalog.text, "
+                f"{_lit(fb_sql) + '::pg_catalog.text' if fb_sql is not None else 'NULL::pg_catalog.text'}, "
+                f"{'true' if chk else 'false'})"
+                for lbl, q_sql, fb_sql, chk in probe_queries
+            )
             probe_block = (
-                f"  FOREACH probe_expr IN ARRAY ARRAY[{expr_arr}]::pg_catalog.text[] LOOP\n"
+                "  FOR probe_rec IN\n"
+                "    SELECT * FROM (VALUES\n"
+                f"      {values_rows}\n"
+                "    ) AS __mv_p(lbl, q_sql, fb_sql, chk_type)\n"
+                "  LOOP\n"
                 "    k_oid := NULL;\n"
                 "    BEGIN\n"
-                "      EXECUTE pg_catalog.format(\n"
-                "        'SELECT pg_catalog.pg_typeof(q.__mv_k)::pg_catalog.oid '\n"
-                "        'FROM (SELECT 1) AS __mv_one '\n"
-                "        'LEFT JOIN (SELECT (%s) AS __mv_k FROM %s WHERE false) AS q ON true',\n"
-                f"        probe_expr, {_lit(probe_from)}\n"
-                "      ) INTO k_oid;\n"
+                "      EXECUTE probe_rec.q_sql INTO k_oid;\n"
                 "    EXCEPTION WHEN undefined_column OR undefined_table OR undefined_function THEN\n"
                 "      k_oid := NULL;\n"
+                "      IF probe_rec.fb_sql IS NOT NULL THEN\n"
+                "        BEGIN\n"
+                "          EXECUTE probe_rec.fb_sql INTO k_oid;\n"
+                "        EXCEPTION WHEN undefined_column OR undefined_table OR undefined_function THEN\n"
+                "          k_oid := NULL;\n"
+                "        END;\n"
+                "      END IF;\n"
                 "    END;\n"
                 "    IF k_oid IS NOT NULL THEN\n"
                 "      type_walk_sql :=\n"
@@ -1891,14 +2623,16 @@ class PgStatementMaintenanceMixin(MixinHost):
                 "        || '   UNION ALL SELECT fa.atttypid, fa.attcollation FROM pg_catalog.pg_attribute fa WHERE t.typtype = ''c'' AND t.typrelid <> 0 AND fa.attrelid = t.typrelid AND fa.attnum > 0 AND NOT fa.attisdropped'\n"
                 "        ' ) AS nxt WHERE kt.depth < 16'\n"
                 "        ') ';\n"
-                "      EXECUTE type_walk_sql\n"
-                "        || 'SELECT t.oid FROM kt JOIN pg_catalog.pg_type t ON t.oid = kt.type_oid '\n"
-                "        || 'WHERE t.typtype NOT IN (''b'', ''e'', ''d'', ''r'', ''m'', ''c'') '\n"
-                "        || '   OR (t.typtype = ''c'' AND t.typrelid = 0) LIMIT 1'\n"
-                "        INTO bad_oid USING k_oid;\n"
-                "      IF bad_oid IS NOT NULL THEN\n"
-                "        RAISE EXCEPTION 'matview: a grouping key of type % is not supported', pg_catalog.format_type(bad_oid, NULL)\n"
-                "          USING ERRCODE = 'feature_not_supported';\n"
+                "      IF probe_rec.chk_type THEN\n"
+                "        EXECUTE type_walk_sql\n"
+                "          || 'SELECT t.oid FROM kt JOIN pg_catalog.pg_type t ON t.oid = kt.type_oid '\n"
+                "          || 'WHERE t.typtype NOT IN (''b'', ''e'', ''d'', ''r'', ''m'', ''c'') '\n"
+                "          || '   OR (t.typtype = ''c'' AND t.typrelid = 0) LIMIT 1'\n"
+                "          INTO bad_oid USING k_oid;\n"
+                "        IF bad_oid IS NOT NULL THEN\n"
+                "          RAISE EXCEPTION 'matview: a grouping key of type % is not supported', pg_catalog.format_type(bad_oid, NULL)\n"
+                "            USING ERRCODE = 'feature_not_supported';\n"
+                "        END IF;\n"
                 "      END IF;\n"
                 "      IF ver_num >= 120000 THEN\n"
                 "        EXECUTE type_walk_sql\n"
@@ -1907,7 +2641,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                 "          INTO bad_coll USING k_oid;\n"
                 "        IF bad_coll IS NOT NULL THEN\n"
                 "          RAISE EXCEPTION 'matview: % uses the nondeterministic collation %, which is not supported for grouping, DISTINCT, set operations, window partitions or MIN/MAX',\n"
-                "            probe_expr, pg_catalog.quote_ident(bad_coll)\n"
+                "            probe_rec.lbl, pg_catalog.quote_ident(bad_coll)\n"
                 "            USING ERRCODE = 'feature_not_supported';\n"
                 "        END IF;\n"
                 "      END IF;\n"
@@ -1915,13 +2649,12 @@ class PgStatementMaintenanceMixin(MixinHost):
                 "  END LOOP;\n"
             )
 
-        return (
-            "DO $mv_coll$\n"
+        body = (
             "DECLARE\n"
             f"  q pg_catalog.text := {tag}{sql}{tag};\n"
             "  ver_num pg_catalog.int4 := pg_catalog.current_setting('server_version_num')::pg_catalog.int4;\n"
             "  r record;\n"
-            "  probe_expr pg_catalog.text;\n"
+            "  probe_rec record;\n"
             "  type_walk_sql pg_catalog.text;\n"
             "  k_oid pg_catalog.oid;\n"
             "  bad_oid pg_catalog.oid;\n"
@@ -1964,5 +2697,8 @@ class PgStatementMaintenanceMixin(MixinHost):
             "    END IF;\n"
             "  END LOOP;\n"
             "END\n"
-            "$mv_coll$;"
         )
+        do_tag = "$mv_coll$"
+        while do_tag in body:
+            do_tag = do_tag[:-1] + "x$"
+        return f"DO {do_tag}\n{body}{do_tag};"

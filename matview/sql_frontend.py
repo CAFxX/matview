@@ -2921,7 +2921,20 @@ def _parse_single_create_view_stmt(
                 sel_tok_i = t_i
             elif sel_tok_i != -1:
                 if tt == SQLGlotTokenType.FROM and from_tok_i == -1:
-                    from_tok_i = t_i
+                    is_distinct_from = (
+                        t_i >= 2
+                        and fb_toks[t_i - 1].token_type == SQLGlotTokenType.DISTINCT
+                        and (
+                            fb_toks[t_i - 2].token_type == SQLGlotTokenType.IS
+                            or (
+                                t_i >= 3
+                                and fb_toks[t_i - 2].token_type == SQLGlotTokenType.NOT
+                                and fb_toks[t_i - 3].token_type == SQLGlotTokenType.IS
+                            )
+                        )
+                    )
+                    if not is_distinct_from:
+                        from_tok_i = t_i
                 elif tt == SQLGlotTokenType.WHERE and where_tok_i == -1:
                     where_tok_i = t_i
                 elif tt == SQLGlotTokenType.GROUP_BY and group_tok_i == -1:
