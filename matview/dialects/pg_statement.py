@@ -150,6 +150,8 @@ class PgAggregateSpec:
     value_key: Callable[[SelectItem], str]
     recompute: Callable[[SelectItem], str]
     native_recompute: Callable[[SelectItem], bool]
+    recompute_group_keys: Optional[Callable[[Sequence[str]], str]] = None
+    has_variable_numeric_scale: Optional[Callable[[str], bool]] = None
 
 
 @dataclass(frozen=True)
@@ -1214,6 +1216,63 @@ class PgStatementMaintenanceMixin(MixinHost):
                 cond = f"(__mv_r.{rcol} > 0)"
                 rec_assigns.append(f"{col} = CASE WHEN {cond} THEN {spec.recompute(it)} ELSE {mv}.{col} END")
                 rec_conds.append(cond)
+        if (has_old or force_recompute_extremes) and spec.recompute_group_keys is not None and grp_exprs:
+            var_scale_check = spec.has_variable_numeric_scale or self._pg_expr_has_variable_numeric_scale
+            rep_targets: List[Tuple[str, str, str]] = []
+            seen_rep_cols: set = set()
+            for g_idx, g_expr in enumerate(grp_exprs):
+                if var_scale_check(g_expr):
+                    mc = self._group_col_alias(g_expr)
+                    if mc.lower() not in seen_rep_cols:
+                        seen_rep_cols.add(mc.lower())
+                        rep_targets.append((g_expr, q(mc), keys[g_idx]))
+            for it in items:
+                if not it.is_aggregate and it.alias.lower() in extra_of_alias:
+                    if it.alias.lower() not in seen_rep_cols and var_scale_check(it.raw_expr):
+                        seen_rep_cols.add(it.alias.lower())
+                        rep_targets.append((it.raw_expr, q(it.alias), f"__mv_p.{extra_of_alias[it.alias.lower()]}"))
+            if rep_targets:
+                rep_conds: List[str] = []
+                if force_recompute_extremes:
+                    rep_conds.append("TRUE")
+                else:
+                    for r_idx, (_g_expr, col, k_expr) in enumerate(rep_targets):
+                        dcol = f"__mv_gd{r_idx}"
+                        icol = f"__mv_gi{r_idx}"
+                        rec_cols.append(
+                            f"pg_catalog.array_agg(DISTINCT ({k_expr})::pg_catalog.text) "
+                            f"FILTER (WHERE {s} < 0 AND ({k_expr}) IS NOT NULL) AS {dcol}"
+                        )
+                        rec_cols.append(
+                            f"pg_catalog.array_agg(DISTINCT ({k_expr})::pg_catalog.text) "
+                            f"FILTER (WHERE {s} > 0 AND ({k_expr}) IS NOT NULL) AS {icol}"
+                        )
+                        rep_conds.append(
+                            f"({mv}.{col} IS NOT NULL AND "
+                            f"({mv}.{col})::pg_catalog.text = ANY(__mv_r.{dcol}) AND "
+                            f"NOT (({mv}.{col})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))"
+                        )
+                any_rep_cond = "TRUE" if force_recompute_extremes else " OR ".join(rep_conds)
+                inner_lat = spec.recompute_group_keys([expr_sql for expr_sql, _, _ in rep_targets])
+                if len(rep_targets) == 1:
+                    col = rep_targets[0][1]
+                    if force_recompute_extremes:
+                        rec_assigns.append(f"{col} = COALESCE(({inner_lat}), {mv}.{col})")
+                    else:
+                        rec_assigns.append(
+                            f"{col} = CASE WHEN {any_rep_cond} THEN COALESCE(({inner_lat}), {mv}.{col}) ELSE {mv}.{col} END"
+                        )
+                else:
+                    lhs_cols = ", ".join(col for _, col, _ in rep_targets)
+                    sel_cols = ", ".join(
+                        f"COALESCE(__mv_l.__mv_l{r_idx}, {mv}.{col})"
+                        for r_idx, (_, col, _) in enumerate(rep_targets)
+                    )
+                    rec_assigns.append(
+                        f"({lhs_cols}) = (SELECT {sel_cols} FROM (SELECT 1) AS __mv_1 "
+                        f"LEFT JOIN LATERAL ({inner_lat}) AS __mv_l ON ({any_rep_cond}))"
+                    )
+                rec_conds.append(any_rep_cond)
         if rec_assigns:
             key_cols = [f"{e} AS __mv_key{i}" for i, e in enumerate(pk_exprs)]
             rec_group = f"\n        GROUP BY {', '.join(group_by)}" if group_by else "\n        GROUP BY 1"
@@ -1238,6 +1297,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         sources: Sequence[PgDeltaSource],
         count_col: Optional[str] = None,
         base_t: Optional[str] = None,
+        refresh_key_cols: Sequence[str] = (),
     ) -> Dict[str, str]:
         """Bodies for a backing table with exactly one row per source row.
 
@@ -1250,6 +1310,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         q = self._q
         q_keys = [q(c) for c in key_cols]
         q_vals = [q(c) for c in value_cols]
+        q_refresh_keys = [q(c) for c in refresh_key_cols]
 
         def _key_columns(src: PgDeltaSource) -> List[str]:
             return [f"{k} AS __mv_k{i}" for i, k in enumerate(src.keys)]
@@ -1275,7 +1336,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                 vals = [f"__mv_p.__mv_k{i}" for i in range(len(key_cols))] + [
                     f"__mv_p.__mv_c{j}" for j in range(len(value_cols))
                 ] + (["1"] if count_col else [])
-                sets = [f"{c} = EXCLUDED.{c}" for c in q_vals]
+                sets = [f"{c} = EXCLUDED.{c}" for c in q_refresh_keys] + [f"{c} = EXCLUDED.{c}" for c in q_vals]
                 if count_col:
                     sets.append(f"{q(count_col)} = 1")
                 conflict = f"DO UPDATE SET {', '.join(sets)}" if sets else "DO NOTHING"
@@ -1301,6 +1362,10 @@ class PgStatementMaintenanceMixin(MixinHost):
         sources: Sequence[Tuple[PgDeltaSource, Mapping[str, str]]],
         empty_condition: str,
         base_t: Optional[str] = None,
+        recompute_val_col_names: Sequence[str] = (),
+        recompute_val_row_sql: Optional[str] = None,
+        surviving_cond: Optional[str] = None,
+        adopt_on_cnt0_cols: Sequence[str] = (),
     ) -> Dict[str, str]:
         """Bodies for a backing table with one row per distinct value tuple.
 
@@ -1317,6 +1382,9 @@ class PgStatementMaintenanceMixin(MixinHost):
         q_cnts = [q(c) for c in count_cols]
         contrib_of = {id(src): contrib for src, contrib in sources}
         srcs = [src for src, _ in sources]
+        adopt_set = {c.lower() for c in adopt_on_cnt0_cols}
+        has_cnt0 = any(c == "__mv_cnt_0" for c in count_cols)
+        recompute_set = {c.lower() for c in recompute_val_col_names}
 
         def _columns(src: PgDeltaSource) -> List[str]:
             contrib = contrib_of[id(src)]
@@ -1329,12 +1397,39 @@ class PgStatementMaintenanceMixin(MixinHost):
         s = f"__mv_p.{SIGN}"
         for event in EVENTS:
             proj = self._pg_projection_sql(event, srcs, _columns, base_t=base_t)
-            group_cols = ["__mv_p.__mv_k0"] + [f"__mv_p.__mv_c{j}" for j in range(len(value_cols))]
+            if adopt_set and has_cnt0:
+                # For INTERSECT / EXCEPT with variable-scale numeric columns,
+                # pick a branch-0 representative when branch 0 contributes in
+                # this statement so a same-statement branch-1 row never shadows
+                # branch 0's display scale.
+                sel_val_cols: List[str] = ["__mv_p.__mv_k0"]
+                group_cols: List[str] = ["__mv_p.__mv_k0"]
+                for j, c in enumerate(value_cols):
+                    if c.lower() in adopt_set:
+                        sel_val_cols.append(
+                            f"COALESCE((pg_catalog.array_agg(__mv_p.__mv_c{j}) "
+                            f"FILTER (WHERE {s} > 0 AND __mv_p.__mv_n0 > 0))[1], "
+                            f"(pg_catalog.array_agg(__mv_p.__mv_c{j}))[1])"
+                        )
+                    else:
+                        sel_val_cols.append(f"__mv_p.__mv_c{j}")
+                        group_cols.append(f"__mv_p.__mv_c{j}")
+            else:
+                group_cols = ["__mv_p.__mv_k0"] + [f"__mv_p.__mv_c{j}" for j in range(len(value_cols))]
+                sel_val_cols = list(group_cols)
             cnt_vals = [f"SUM({s} * __mv_p.__mv_n{j})" for j in range(len(count_cols))]
             sets = [f"{c} = {mv_table}.{c} + EXCLUDED.{c}" for c in q_cnts]
+            if adopt_set and has_cnt0:
+                adopt_sets = [
+                    f"{qc} = CASE WHEN {mv_table}.__mv_cnt_0 <= 0 AND EXCLUDED.__mv_cnt_0 > 0 "
+                    f"THEN EXCLUDED.{qc} ELSE {mv_table}.{qc} END"
+                    for c, qc in zip(value_cols, q_vals)
+                    if c.lower() in adopt_set
+                ]
+                sets = adopt_sets + sets
             stmts = [
                 f"INSERT INTO {mv_table} ({', '.join([q_key, *q_vals, *q_cnts])})\n"
-                f"    SELECT {', '.join(group_cols + cnt_vals)}\n"
+                f"    SELECT {', '.join(sel_val_cols + cnt_vals)}\n"
                 f"    FROM {proj}\n"
                 f"    GROUP BY {', '.join(group_cols)}\n"
                 f"    ORDER BY __mv_p.__mv_k0\n"
@@ -1346,6 +1441,54 @@ class PgStatementMaintenanceMixin(MixinHost):
                     f"    WHERE {mv_table}.{q_key} IN (SELECT __mv_p.__mv_k0 FROM {proj} WHERE {s} < 0)\n"
                     f"    AND {empty_condition};"
                 )
+                if recompute_set and recompute_val_row_sql:
+                    branch0_filter = " AND __mv_p.__mv_n0 > 0" if has_cnt0 else ""
+                    ref_targets: List[Tuple[int, str]] = [
+                        (j, q_vals[j]) for j, c in enumerate(value_cols) if c.lower() in recompute_set
+                    ]
+                    rec_cols: List[str] = []
+                    rec_conds: List[str] = []
+                    for r_idx, (j, qc) in enumerate(ref_targets):
+                        dcol = f"__mv_vd{r_idx}"
+                        icol = f"__mv_vi{r_idx}"
+                        rec_cols.append(
+                            f"pg_catalog.array_agg(DISTINCT (__mv_p.__mv_c{j})::pg_catalog.text) "
+                            f"FILTER (WHERE {s} < 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS NOT NULL) AS {dcol}"
+                        )
+                        rec_cols.append(
+                            f"pg_catalog.array_agg(DISTINCT (__mv_p.__mv_c{j})::pg_catalog.text) "
+                            f"FILTER (WHERE {s} > 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS NOT NULL) AS {icol}"
+                        )
+                        rec_conds.append(
+                            f"({mv_table}.{qc} IS NOT NULL AND "
+                            f"({mv_table}.{qc})::pg_catalog.text = ANY(__mv_r.{dcol}) AND "
+                            f"NOT (({mv_table}.{qc})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))"
+                        )
+                    if ref_targets:
+                        any_cond = " OR ".join(rec_conds)
+                        if len(ref_targets) == 1:
+                            qc = ref_targets[0][1]
+                            set_clause = f"{qc} = COALESCE(({recompute_val_row_sql}), {mv_table}.{qc})"
+                        else:
+                            lhs_cols = ", ".join(qc for _, qc in ref_targets)
+                            sel_cols = ", ".join(
+                                f"COALESCE(__mv_l.__mv_l{r_idx}, {mv_table}.{qc})"
+                                for r_idx, (_, qc) in enumerate(ref_targets)
+                            )
+                            set_clause = (
+                                f"({lhs_cols}) = (SELECT {sel_cols} FROM (SELECT 1) AS __mv_1 "
+                                f"LEFT JOIN LATERAL ({recompute_val_row_sql}) AS __mv_l ON TRUE)"
+                            )
+                        surv = f" AND ({surviving_cond})" if surviving_cond else ""
+                        stmts.append(
+                            f"UPDATE {mv_table} SET {set_clause}\n"
+                            f"    FROM (\n"
+                            f"        SELECT __mv_p.__mv_k0 AS __mv_key0, {', '.join(rec_cols)}\n"
+                            f"        FROM {proj}\n"
+                            f"        GROUP BY __mv_p.__mv_k0\n"
+                            f"    ) AS __mv_r\n"
+                            f"    WHERE {mv_table}.{q_key} = __mv_r.__mv_key0{surv} AND ({any_cond});"
+                        )
             bodies[event] = "\n".join(stmts)
         return bodies
 

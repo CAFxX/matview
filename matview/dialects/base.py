@@ -850,9 +850,17 @@ class DialectBaseMixin(MixinHost):
                 if isinstance(inner, (sqlglot_exp.Min, sqlglot_exp.Max)):
                     if self.dialect == Dialect.SQLITE:
                         return "BLOB"
+                    agg_item = _parse_single_agg_expr(
+                        inner.sql(_sqlglot_dialect(self.dialect)), ident, dialect=self.dialect
+                    )
+                    if agg_item is not None and agg_item.agg_func is not None:
+                        return self._infer_expr_storage_type(agg_item)
                     c_arg = self._lookup_col_def(inner.this.sql().strip() if isinstance(inner.this, sqlglot_exp.Expr) else None)
                     if c_arg:
-                        return self._normalize_dialect_type(c_arg.data_type)
+                        return self._minmax_result_type(
+                            self._normalize_dialect_type(c_arg.data_type),
+                            inner.this.sql(_sqlglot_dialect(self.dialect)) if isinstance(inner.this, sqlglot_exp.Expr) else None,
+                        )
                     return self._float_type()
                 if isinstance(inner, sqlglot_exp.Avg):
                     arg_expr = inner.this.sql() if inner.this is not None else ""
@@ -1086,28 +1094,26 @@ class DialectBaseMixin(MixinHost):
             if self.dialect == Dialect.POSTGRES:
                 stripped_dt = data_type.strip()
                 norm_dt = self._normalize_dialect_type(stripped_dt)
-                # Strip trailing COLLATE clause on array types before parsing brackets
-                no_coll = re.sub(
-                    r'\s+COLLATE\s+(?:"[^"]*"|\S+)\s*$',
-                    "",
-                    norm_dt.strip(),
-                    flags=re.IGNORECASE,
-                )
-                m_arr = re.match(r"^(.*?)((?:\[\])+)$", no_coll.strip())
+                # Strip trailing COLLATE clause before parsing array brackets or
+                # checking for quoted custom type names (e.g. `VARCHAR(20) COLLATE "C"`).
+                no_coll = self._PG_COLLATE_TAIL_RE.sub("", norm_dt.strip()).strip()
+                no_coll_raw = self._PG_COLLATE_TAIL_RE.sub("", stripped_dt).strip()
+                m_arr = re.match(r"^(.*?)((?:\[\])+)$", no_coll)
                 if m_arr:
                     elem_raw = m_arr.group(1).strip()
                     # PostgreSQL array columns/values all share a single 1D
                     # array type OID regardless of declared bracket count.
                     return f"{_pg_canonical_arr_elem(elem_raw)}[]"
-                if '"' in stripped_dt:
-                    return stripped_dt
-                dt_up = re.sub(r"\s+", " ", stripped_dt.upper())
+                if '"' in no_coll_raw:
+                    return no_coll_raw
+                dt_up = re.sub(r"\s+", " ", no_coll_raw.upper())
                 if dt_up == "BIT" or re.match(r"^BIT\s*\(\s*\d+\s*\)$", dt_up):
                     return re.sub(r"\s+", "", dt_up)
                 if dt_up in ("VARBIT", "BIT VARYING") or re.match(
                     r"^(?:VARBIT|BIT VARYING)\s*\(\s*\d+\s*\)$", dt_up
                 ):
                     return "BIT VARYING"
+                data_type = no_coll_raw
             # Introspected MySQL/MariaDB string types carry their collation
             # ("CHAR(5) COLLATE UTF8MB4_UNICODE_CI" under a non-default
             # server collation): the clause does not change the family.
@@ -1276,7 +1282,28 @@ class DialectBaseMixin(MixinHost):
                 ch_nodes = list(node.expressions or ())
                 if not ch_nodes:
                     return None
-                elem_types = [infer(ch) for ch in ch_nodes]
+                def _infer_arr_elem(ch: Any) -> Optional[str]:
+                    unw = ch
+                    while isinstance(unw, (sqlglot_exp.Paren, sqlglot_exp.Collate)) and unw.this is not None:
+                        unw = unw.this
+                    if isinstance(unw, sqlglot_exp.Column):
+                        col = self._lookup_col_def(unw.sql()) or self._lookup_col_def(unw.name)
+                        dt_raw = (
+                            col.data_type
+                            if col is not None
+                            else (
+                                self._infer_cte_or_subquery_col_type(unw.sql())
+                                or self._infer_cte_or_subquery_col_type(unw.name)
+                            )
+                        )
+                        if dt_raw:
+                            no_coll = self._PG_COLLATE_TAIL_RE.sub("", dt_raw.strip()).strip()
+                            if not no_coll.endswith("[]"):
+                                base_str = _pg_strip_arr_elem_mod(no_coll)
+                                if base_str in ("VARCHAR", "BPCHAR"):
+                                    return base_str
+                    return infer(ch)
+                elem_types = [_infer_arr_elem(ch) for ch in ch_nodes]
                 if all(t == "UNKNOWN" for t in elem_types):
                     return "TEXT[]"
                 # In PostgreSQL, bare string literals have type `unknown` and
@@ -1552,7 +1579,7 @@ class DialectBaseMixin(MixinHost):
         literal branches resolve to text.
         """
         kind = node.__class__.__name__
-        if kind == "Paren":
+        if kind in ("Paren", "Collate"):
             return self._pg_string_result_type(node.this)
         if kind == "Literal":
             return None
@@ -1642,7 +1669,17 @@ class DialectBaseMixin(MixinHost):
 
         if self.dialect == Dialect.POSTGRES:
             cleaned = [self._normalize_dialect_type(t).strip() for t in raw_nonempty]
-            no_coll = [re.sub(r"\s+COLLATE\s+.*$", "", t, flags=re.IGNORECASE).strip() for t in cleaned]
+            no_coll = [self._PG_COLLATE_TAIL_RE.sub("", t).strip() for t in cleaned]
+            colls = [
+                (m.group(0).rstrip() if (m := self._PG_COLLATE_TAIL_RE.search(t)) else "")
+                for t in cleaned
+            ]
+            # Preserve a consistent explicit/column collation across all non-NULL branches.
+            shared_coll = ""
+            if colls and all(colls):
+                norm_colls = {re.sub(r"\s+", " ", c.strip()).lower() for c in colls}
+                if len(norm_colls) == 1:
+                    shared_coll = colls[0]
             # Recursive array widening (e.g. SMALLINT[] + BIGINT[] -> BIGINT[], VARCHAR(5)[] + VARCHAR(50)[] -> VARCHAR[]).
             arr_matches = [re.match(r"^(.*?)((?:\[\])+)$", t) for t in no_coll]
             if all(m is not None for m in arr_matches):
@@ -1653,16 +1690,17 @@ class DialectBaseMixin(MixinHost):
                     merged_elem = self._common_storage_type(elems, has_null=has_null)
                     if merged_elem.upper() == "VARCHAR(255)":
                         merged_elem = "VARCHAR"
-                    return f"{merged_elem}{br}"
+                    res_arr = f"{merged_elem}{br}"
+                    return f"{res_arr}{shared_coll}" if shared_coll and self._pg_type_supports_collation(res_arr) else res_arr
             if len(cleaned) == 1:
                 if has_null:
                     b0 = re.sub(r"\s*\([^)]*\)\s*$", "", no_coll[0].upper()).strip()
                     if b0 in ("NUMERIC", "DECIMAL", "DEC"):
                         return "NUMERIC"
                     if b0 in ("VARCHAR", "CHARACTER VARYING"):
-                        return "VARCHAR"
+                        return f"VARCHAR{shared_coll}"
                     if b0 in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
-                        return "BPCHAR"
+                        return f"BPCHAR{shared_coll}"
                 return cleaned[0]
             if all(t.upper() == cleaned[0].upper() for t in cleaned):
                 if has_null:
@@ -1670,9 +1708,9 @@ class DialectBaseMixin(MixinHost):
                     if b0 in ("NUMERIC", "DECIMAL", "DEC"):
                         return "NUMERIC"
                     if b0 in ("VARCHAR", "CHARACTER VARYING"):
-                        return "VARCHAR"
+                        return f"VARCHAR{shared_coll}"
                     if b0 in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
-                        return "BPCHAR"
+                        return f"BPCHAR{shared_coll}"
                 return cleaned[0]
 
             pg_num_rank = {
@@ -1708,10 +1746,12 @@ class DialectBaseMixin(MixinHost):
             if all(b in pg_str_map for b in bases):
                 str_kinds = [pg_str_map[b] for b in bases]
                 if str_kinds[0] == "TEXT":
-                    return "TEXT"
-                if "NAME" in str_kinds:
-                    return "NAME"
-                return str_kinds[0]
+                    res_s = "TEXT"
+                elif "NAME" in str_kinds:
+                    res_s = "NAME"
+                else:
+                    res_s = str_kinds[0]
+                return f"{res_s}{shared_coll}" if shared_coll and res_s != "NAME" else res_s
             pg_time_rank = {
                 "DATE": (1, "DATE"),
                 "TIMESTAMP": (2, "TIMESTAMP"),
@@ -2088,6 +2128,11 @@ class DialectBaseMixin(MixinHost):
             raw_u = raw_expr.upper()
             ast_inferred = self._infer_ast_expr_storage_type(raw_expr)
             if ast_inferred is not None:
+                if self.dialect == Dialect.POSTGRES and self._pg_type_supports_collation(ast_inferred):
+                    inferred_coll = self._infer_pg_expr_collation(raw_expr)
+                    if inferred_coll:
+                        base_no_coll = self._PG_COLLATE_TAIL_RE.sub("", ast_inferred).strip()
+                        return f"{base_no_coll}{inferred_coll}"
                 return ast_inferred
             m_coal = re.match(
                 r'^(?:COALESCE|IFNULL)\s*\(\s*([A-Za-z0-9_."`\[\]]+)\s*,',
@@ -2147,8 +2192,14 @@ class DialectBaseMixin(MixinHost):
             # 1.0 * SUM(x), ...): type it from its AST, aggregates included.
             # (Validated natively on PostgreSQL; MySQL/SQLite keep the
             # previous inference until their native result types are modelled.)
-            compound_t = self._infer_ast_expr_storage_type(_unwrap_outer_parens(item.raw_expr, dialect=self.dialect))
+            unwrapped_raw = _unwrap_outer_parens(item.raw_expr, dialect=self.dialect)
+            compound_t = self._infer_ast_expr_storage_type(unwrapped_raw)
             if compound_t is not None:
+                if self.dialect == Dialect.POSTGRES and self._pg_type_supports_collation(compound_t):
+                    comp_coll = self._infer_pg_expr_collation(unwrapped_raw)
+                    if comp_coll:
+                        base_no_coll = self._PG_COLLATE_TAIL_RE.sub("", compound_t).strip()
+                        return f"{base_no_coll}{comp_coll}"
                 return compound_t
         if item.agg_func in (
             AggFunc.BIT_AND,
@@ -2418,14 +2469,204 @@ class DialectBaseMixin(MixinHost):
             return bool(next(iter(sources.values())))
         return False
 
+    _PG_COLLATE_TAIL_RE = re.compile(
+        r'\s+COLLATE\s+(?:(?:"(?:""|[^"])*"|[A-Za-z_][A-Za-z0-9_$]*)\.)?'
+        r'(?:"(?:""|[^"])*"|[A-Za-z_][A-Za-z0-9_$]*)\s*$',
+        re.IGNORECASE,
+    )
+
+    def _extract_pg_explicit_collation(self, expr: Optional[str]) -> Optional[str]:
+        """Return ``' COLLATE <coll>'`` when ``expr`` has a top-level PostgreSQL COLLATE clause."""
+        if self.dialect != Dialect.POSTGRES or not expr or not expr.strip():
+            return None
+        try:
+            node = parse_sql_ast(expr, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None
+        while isinstance(node, sqlglot_exp.Paren) and node.this is not None:
+            node = node.this
+        if isinstance(node, sqlglot_exp.Collate) and node.expression is not None:
+            coll_sql = node.expression.sql(dialect="postgres").strip()
+            if coll_sql:
+                return f" COLLATE {coll_sql}"
+        return None
+
+    def _infer_pg_expr_collation(self, expr: Optional[str]) -> Optional[str]:
+        """Infer the PostgreSQL result collation clause (``' COLLATE <coll>'``)
+        of an expression when it carries an explicit ``COLLATE`` or a consistent
+        non-default implicit column collation (propagated through string
+        functions, ``||``, ``CASE``, ``COALESCE``, ``NULLIF``, ``MIN``/``MAX``).
+        Returns ``None`` when the expression resolves to the database default
+        collation or when multiple non-default collations conflict."""
+        if self.dialect != Dialect.POSTGRES or not expr or not expr.strip():
+            return None
+        try:
+            root = parse_sql_ast(expr, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None
+
+        def _norm_coll_key(coll_clause: str) -> str:
+            # Normalize pg_catalog."C" vs "C" for consistency comparison.
+            body = re.sub(r"^\s*COLLATE\s+", "", coll_clause.strip(), flags=re.IGNORECASE)
+            body = re.sub(r"^(?:pg_catalog\.)", "", body, flags=re.IGNORECASE)
+            return body.strip()
+
+        def _extract_from_dt(dt: Optional[str]) -> Optional[str]:
+            if not dt:
+                return None
+            m = self._PG_COLLATE_TAIL_RE.search(dt.strip())
+            if m:
+                return m.group(0).rstrip()
+            base_u = re.sub(r"\s*\([^)]*\)", "", dt.strip().upper()).strip()
+            if base_u == "NAME":
+                return ' COLLATE "C"'
+            return None
+
+        def _merge_children(children: Sequence[Any]) -> Tuple[Optional[str], bool]:
+            # Returns (coll_clause, is_explicit). Explicit COLLATE overrides implicit.
+            explicits: List[str] = []
+            implicits: List[str] = []
+            for ch in children:
+                if ch is None:
+                    continue
+                c_val, c_exp = _walk(ch)
+                if c_val is None:
+                    continue
+                if c_exp:
+                    explicits.append(c_val)
+                else:
+                    implicits.append(c_val)
+            if explicits:
+                keys = {_norm_coll_key(c) for c in explicits}
+                return (explicits[0], True) if len(keys) == 1 else (None, False)
+            if implicits:
+                keys = {_norm_coll_key(c) for c in implicits}
+                return (implicits[0], False) if len(keys) == 1 else (None, False)
+            return None, False
+
+        def _walk(node: Any) -> Tuple[Optional[str], bool]:
+            if node is None:
+                return None, False
+            if isinstance(node, sqlglot_exp.Paren):
+                return _walk(node.this)
+            if isinstance(node, sqlglot_exp.Collate) and node.expression is not None:
+                coll_sql = node.expression.sql(dialect="postgres").strip()
+                if coll_sql:
+                    return f" COLLATE {coll_sql}", True
+                return None, False
+            if isinstance(node, sqlglot_exp.Column):
+                c_def = self._lookup_col_def(node.sql()) or self._lookup_col_def(node.name)
+                if c_def is not None:
+                    return _extract_from_dt(c_def.data_type), False
+                cte_t = self._infer_cte_or_subquery_col_type(node.sql()) or self._infer_cte_or_subquery_col_type(node.name)
+                return _extract_from_dt(cte_t), False
+            if isinstance(node, (sqlglot_exp.Min, sqlglot_exp.Max)):
+                return _walk(node.this)
+            if isinstance(node, sqlglot_exp.Distinct):
+                return _merge_children(list(node.iter_expressions()))
+            if isinstance(node, sqlglot_exp.Window):
+                return _walk(node.this)
+            if isinstance(node, sqlglot_exp.Case):
+                branches = [node.args.get("default")] + [
+                    b.args.get("true") for b in (node.args.get("ifs") or ())
+                ]
+                return _merge_children(branches)
+            if isinstance(node, sqlglot_exp.If):
+                return _merge_children([node.args.get("true"), node.args.get("false")])
+            if isinstance(node, (sqlglot_exp.Coalesce, sqlglot_exp.Greatest, sqlglot_exp.Least, sqlglot_exp.Array)):
+                return _merge_children(list(node.iter_expressions()))
+            if isinstance(node, sqlglot_exp.Nullif):
+                return _merge_children([node.this, node.expression])
+            if isinstance(node, sqlglot_exp.DPipe):
+                return _merge_children([node.this, node.expression])
+            if isinstance(node, sqlglot_exp.Func):
+                fn_name = (node.sql_name() or node.__class__.__name__).upper()
+                if fn_name in (
+                    "UPPER",
+                    "LOWER",
+                    "TRIM",
+                    "LTRIM",
+                    "RTRIM",
+                    "BTRIM",
+                    "SUBSTR",
+                    "SUBSTRING",
+                    "REPLACE",
+                    "LEFT",
+                    "RIGHT",
+                    "LPAD",
+                    "RPAD",
+                    "REVERSE",
+                    "INITCAP",
+                    "CONCAT",
+                    "CONCAT_WS",
+                    "IFNULL",
+                ):
+                    return _merge_children(list(node.iter_expressions()))
+            return None, False
+
+        coll_val, _ = _walk(root)
+        return coll_val
+
+    @classmethod
+    def _pg_type_supports_collation(cls, data_type: str) -> bool:
+        """Whether a PostgreSQL storage type accepts a column-level COLLATE clause."""
+        clean = cls._PG_COLLATE_TAIL_RE.sub("", data_type.strip()).strip()
+        m_arr = re.match(r"^(.*?)((?:\[\])+)$", clean)
+        elem = m_arr.group(1).strip() if m_arr else clean
+        base = re.sub(r"\s*\([^)]*\)", "", re.sub(r"\s+", " ", elem.upper())).strip()
+        return base in (
+            "TEXT",
+            "VARCHAR",
+            "CHARACTER VARYING",
+            "CHAR",
+            "CHARACTER",
+            "BPCHAR",
+            "NCHAR",
+            "NAME",
+            "CITEXT",
+        )
+
+    @classmethod
+    def _pg_type_has_variable_numeric_scale(cls, data_type: str) -> bool:
+        """Whether a PostgreSQL type string can store equal values with
+        different display scales (unconstrained ``NUMERIC``, multi-dimensional
+        ``NUMERIC[]``/``NUMERIC[][]``, ``NUMRANGE``/``NUMRANGE[]``,
+        ``NUMMULTIRANGE``/``NUMMULTIRANGE[]``). Fixed-scale ``NUMERIC(p, s)``
+        returns False."""
+        if not data_type or not data_type.strip():
+            return False
+        clean = cls._PG_COLLATE_TAIL_RE.sub("", data_type.strip()).strip()
+        elem = re.sub(r"(?:\[\])+$", "", clean).strip()
+        dt_u = re.sub(r"\s+", " ", elem.upper())
+        return dt_u in ("NUMERIC", "DECIMAL", "DEC", "NUMRANGE", "NUMMULTIRANGE")
+
+    def _pg_expr_has_variable_numeric_scale(self, expr: str) -> bool:
+        """Whether a PostgreSQL expression's type can store equal values with
+        different display scales (e.g. unconstrained ``NUMERIC`` 1.0 vs 1.00,
+        domains over unconstrained ``NUMERIC``, ``NUMERIC[]``/``NUMERIC[][]``,
+        ``NUMRANGE``/``NUMRANGE[]``, ``NUMMULTIRANGE``). Fixed-scale
+        ``NUMERIC(p, s)`` returns False."""
+        if self.dialect != Dialect.POSTGRES or not expr or not expr.strip():
+            return False
+        c_def = self._lookup_col_def(expr)
+        if c_def is not None:
+            dt = self._normalize_dialect_type(c_def.data_type)
+        else:
+            dt = self._infer_expr_storage_type(
+                SelectItem(raw_expr=expr, alias="__mv_g", is_aggregate=False)
+            )
+        return self._pg_type_has_variable_numeric_scale(dt)
+
     def _minmax_result_type(self, arg_type: str, arg_expr: Optional[str] = None) -> str:
         """MIN/MAX result type for an argument type.
 
         PostgreSQL's MIN/MAX are declared over unmodified base types, so the
         result drops the argument's type modifier and character types resolve
-        to their aggregate's type: numeric(12,3) -> numeric, varchar(10) ->
-        text, char(5) -> bpchar, timestamp(0) -> timestamp. MySQL/MariaDB and
-        SQLite keep the argument type.
+        to their aggregate's type while preserving collation: numeric(12,3) ->
+        numeric, varchar(10) [COLLATE c] -> text [COLLATE c], char(5)
+        [COLLATE c] -> bpchar [COLLATE c], name -> text COLLATE "C",
+        timestamp(0) -> timestamp. MySQL/MariaDB and SQLite keep the argument
+        type.
         """
         if (self.raw_view.has_cte or self.raw_view.has_subquery_in_from) and not (
             self.dialect == Dialect.MYSQL
@@ -2438,11 +2679,25 @@ class DialectBaseMixin(MixinHost):
         if self.dialect != Dialect.POSTGRES:
             return arg_type
         s_raw = arg_type.strip()
-        m_arr = re.match(r"^(.*?)((?:\[\])+)$", s_raw)
+        m_coll = self._PG_COLLATE_TAIL_RE.search(s_raw)
+        if m_coll:
+            type_part = s_raw[: m_coll.start()].strip()
+            coll_tail = s_raw[m_coll.start() :].rstrip()
+        else:
+            type_part = s_raw
+            coll_tail = ""
+        explicit_coll = self._extract_pg_explicit_collation(arg_expr)
+        if explicit_coll:
+            coll_tail = explicit_coll
+        elif not coll_tail and arg_expr:
+            inferred_coll = self._infer_pg_expr_collation(arg_expr)
+            if inferred_coll:
+                coll_tail = inferred_coll
+        m_arr = re.match(r"^(.*?)((?:\[\])+)$", type_part)
         if m_arr:
             elem_raw, brackets = m_arr.group(1).strip(), m_arr.group(2)
             if '"' in elem_raw:
-                return f"{elem_raw}{brackets}"
+                return f"{elem_raw}{brackets}{coll_tail}"
             elem_u = re.sub(r"\s+", " ", elem_raw.upper())
             elem_base = re.sub(r"\s*\([^)]*\)", "", elem_u).strip()
             # PostgreSQL MIN/MAX(anyarray) is polymorphic over the array type
@@ -2468,18 +2723,23 @@ class DialectBaseMixin(MixinHost):
                 "TIME WITH TIME ZONE": "TIMETZ",
             }
             if elem_base in arr_map:
-                return f"{arr_map[elem_base]}{brackets}"
+                res_arr = f"{arr_map[elem_base]}{brackets}"
+                return f"{res_arr}{coll_tail}" if coll_tail and self._pg_type_supports_collation(res_arr) else res_arr
             if elem_base.startswith("INTERVAL"):
                 return f"INTERVAL{brackets}"
-            return arg_type
-        u = re.sub(r"\s+", " ", s_raw.upper())
+            return f"{type_part}{coll_tail}" if coll_tail and self._pg_type_supports_collation(type_part) else type_part
+        u = re.sub(r"\s+", " ", type_part.upper())
         base = re.sub(r"\s*\([^)]*\)", "", u).strip()
         if base in ("NUMERIC", "DECIMAL", "DEC"):
             return "NUMERIC"
-        if base in ("VARCHAR", "CHARACTER VARYING", "TEXT", "NAME"):
-            return "TEXT"
+        if base == "NAME":
+            # PostgreSQL NAME has intrinsic collation "C", which MIN/MAX(name)
+            # preserves on its TEXT result unless overridden by an explicit COLLATE.
+            return f"TEXT{coll_tail}" if coll_tail else 'TEXT COLLATE "C"'
+        if base in ("VARCHAR", "CHARACTER VARYING", "TEXT"):
+            return f"TEXT{coll_tail}"
         if base in ("CHAR", "CHARACTER", "BPCHAR", "NCHAR"):
-            return "BPCHAR"
+            return f"BPCHAR{coll_tail}"
         if base in ("TIMESTAMP", "TIMESTAMP WITHOUT TIME ZONE"):
             return "TIMESTAMP"
         if base in ("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"):
@@ -2490,7 +2750,7 @@ class DialectBaseMixin(MixinHost):
             return "TIMETZ"
         if base.startswith("INTERVAL"):
             return "INTERVAL"
-        return arg_type
+        return f"{type_part}{coll_tail}" if coll_tail and self._pg_type_supports_collation(type_part) else arg_type
 
     def _null_safe_eq(self, left_expr: str, right_expr: str, is_nullable: bool = True) -> str:
         if not is_nullable:

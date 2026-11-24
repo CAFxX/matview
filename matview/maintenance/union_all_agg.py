@@ -626,6 +626,17 @@ class Tier1UnionAllAggMixin(MixinHost):
             trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
             pg_bodies: Dict[str, Optional[str]] = {"INSERT": None, "UPDATE": None, "DELETE": None}
             if self.dialect == Dialect.POSTGRES:
+                def _uall_recompute_group_keys(exprs: Sequence[str]) -> str:
+                    u_conds: List[str] = []
+                    if self.view.where_clause:
+                        u_conds.append(f"({self.view.where_clause})")
+                    for og in orig_grp_exprs:
+                        rhs_g = f"{mv_table}.{self._q(self._group_col_alias(og))}"
+                        u_conds.append(self._null_safe_eq(f"({og})", f"({rhs_g})", is_nullable=True))
+                    w_u = f" WHERE {' AND '.join(u_conds)}" if u_conds else ""
+                    sel_cols = ", ".join(f"({e}) AS __mv_l{idx}" for idx, e in enumerate(exprs))
+                    return f"SELECT {sel_cols} FROM ({inner_u_sql}) AS {u_alias}{w_u} LIMIT 1"
+
                 spec = PgAggregateSpec(
                     mv_table=mv_table,
                     row_count_col=row_count_col,
@@ -643,6 +654,8 @@ class Tier1UnionAllAggMixin(MixinHost):
                     native_recompute=lambda it: (
                         merged_ctx._requires_native_avg_recompute(it) or merged_ctx._pgmy_native_recompute_item(it)
                     ),
+                    recompute_group_keys=_uall_recompute_group_keys,
+                    has_variable_numeric_scale=merged_ctx._pg_expr_has_variable_numeric_scale,
                 )
                 pg_bodies.update(self._pg_aggregate_bodies(spec, pg_sources, base_t=base_t))
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(

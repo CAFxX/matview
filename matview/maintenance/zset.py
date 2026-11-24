@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import sqlglot
 import sqlglot.errors
@@ -702,8 +702,59 @@ class Tier1ZSetMixin(MixinHost):
             pg_au_body: Optional[str] = None
 
             if self.dialect == Dialect.POSTGRES:
+                pg_recompute_val_col_names: List[str] = []
+                pg_recompute_val_row_sql: Optional[str] = None
+                pg_surv_cond: Optional[str] = None
+                pg_adopt_cnt0: List[str] = []
+                pg_refresh_key_cols: List[str] = []
+                if op_type == "UNION ALL" and use_native_uall_pk:
+                    pg_refresh_key_cols = [
+                        pk_c
+                        for pk_c, dt_i in zip(uall_pk_cols[1:], uall_pk_col_types)
+                        if self._pg_type_has_variable_numeric_scale(dt_i)
+                    ]
+                elif op_type in ("UNION", "INTERSECT", "EXCEPT") and u_parts:
+                    var_cols: List[str] = []
+                    for c in user_columns:
+                        mc = merged_cols.get(c)
+                        if mc is not None:
+                            is_var = self._pg_type_has_variable_numeric_scale(mc.data_type)
+                        else:
+                            is_var = merged_ctx._pg_expr_has_variable_numeric_scale(self._q(c))
+                        if is_var:
+                            var_cols.append(c)
+                    if var_cols:
+                        surv_src = "\n    UNION ALL\n".join(u_parts) if op_type == "UNION" else u_parts[0]
+                        pg_surv_cond = (
+                            f"{mv_table}.__mv_row_count > 0"
+                            if op_type == "UNION"
+                            else f"{mv_table}.__mv_cnt_0 > 0"
+                        )
+                        match_all = " AND ".join(
+                            f"__mv_u.{self._q(c)} IS NOT DISTINCT FROM {mv_table}.{self._q(c)}"
+                            for c in user_columns
+                        )
+                        sel_var = ", ".join(
+                            f"__mv_u.{self._q(c)} AS __mv_l{idx}" for idx, c in enumerate(var_cols)
+                        )
+                        pg_recompute_val_col_names = list(var_cols)
+                        pg_recompute_val_row_sql = (
+                            f"SELECT {sel_var} FROM (\n{surv_src}\n    ) AS __mv_u WHERE {match_all} LIMIT 1"
+                        )
+                        if op_type in ("INTERSECT", "EXCEPT"):
+                            pg_adopt_cnt0 = list(var_cols)
                 pg_bodies = self._pg_setop_bodies(
-                    op_type, b_list, mv_table, user_columns, use_native_uall_pk, uall_pk_cols
+                    op_type,
+                    b_list,
+                    mv_table,
+                    user_columns,
+                    use_native_uall_pk,
+                    uall_pk_cols,
+                    refresh_key_cols=pg_refresh_key_cols,
+                    recompute_val_col_names=pg_recompute_val_col_names,
+                    recompute_val_row_sql=pg_recompute_val_row_sql,
+                    surviving_cond=pg_surv_cond,
+                    adopt_on_cnt0_cols=pg_adopt_cnt0,
                 )
                 pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
 
@@ -769,6 +820,11 @@ class Tier1ZSetMixin(MixinHost):
         user_columns: Sequence[str],
         use_native_uall_pk: bool,
         uall_pk_cols: Sequence[str],
+        refresh_key_cols: Sequence[str] = (),
+        recompute_val_col_names: Sequence[str] = (),
+        recompute_val_row_sql: Optional[str] = None,
+        surviving_cond: Optional[str] = None,
+        adopt_on_cnt0_cols: Sequence[str] = (),
     ) -> Dict[str, str]:
         """PostgreSQL statement-level bodies for the branches of one source table.
 
@@ -817,6 +873,7 @@ class Tier1ZSetMixin(MixinHost):
                 [src for src, _ in sources],
                 count_col="__mv_row_count",
                 base_t=setop_base_t,
+                refresh_key_cols=refresh_key_cols,
             )
         if op_type == "UNION":
             return self._pg_counted_rows_bodies(
@@ -827,6 +884,9 @@ class Tier1ZSetMixin(MixinHost):
                 sources,
                 f"{mv_table}.__mv_row_count <= 0",
                 base_t=setop_base_t,
+                recompute_val_col_names=recompute_val_col_names,
+                recompute_val_row_sql=recompute_val_row_sql,
+                surviving_cond=surviving_cond,
             )
         return self._pg_counted_rows_bodies(
             mv_table,
@@ -836,6 +896,10 @@ class Tier1ZSetMixin(MixinHost):
             sources,
             f"{mv_table}.__mv_cnt_0 <= 0 AND {mv_table}.__mv_cnt_1 <= 0",
             base_t=setop_base_t,
+            recompute_val_col_names=recompute_val_col_names,
+            recompute_val_row_sql=recompute_val_row_sql,
+            surviving_cond=surviving_cond,
+            adopt_on_cnt0_cols=adopt_on_cnt0_cols,
         )
 
     def _compile_tier1_zset_distinct(self) -> MaterializedViewPlan:
@@ -1235,6 +1299,15 @@ class Tier1ZSetMixin(MixinHost):
                 for hid_col, src_col, _dt in hidden_pk_defs:
                     pg_values[hid_col] = f"{rec}.{self._q(src_col)}"
                 value_cols = [c for c in [*user_columns, *[h[0] for h in hidden_pk_defs]] if c.lower() not in pk_col_lower]
+                pg_refresh_pk = [
+                    mv_c for mv_c, src_c in zip(mv_pk_cols, pk_names)
+                    if (
+                        self.primary_schema is not None
+                        and src_c in self.primary_schema.columns
+                        and self._pg_type_has_variable_numeric_scale(self.primary_schema.columns[src_c].data_type)
+                    )
+                    or self._pg_expr_has_variable_numeric_scale(self._q(src_c))
+                ]
                 pg_bodies = self._pg_keyed_rows_bodies(
                     mv_table,
                     mv_pk_cols,
@@ -1247,6 +1320,7 @@ class Tier1ZSetMixin(MixinHost):
                         values=pg_values,
                     )],
                     base_t=self.view.base_table,
+                    refresh_key_cols=pg_refresh_pk,
                 )
             else:
                 pg_bodies = self._pg_counted_rows_bodies(

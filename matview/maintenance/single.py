@@ -235,7 +235,7 @@ class Tier1SingleMixin(MixinHost):
         q_base_t = self._q(self.view.base_table)
         conds: List[str] = []
         if self.view.where_clause:
-            conds.append(f"({self.view.where_clause})")
+            conds.append(f"({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})")
         for g_expr in self._effective_group_by_exprs:
             if record_prefix == self._backing_table_name():
                 rhs_g = f"{record_prefix}.{self._q(self._group_col_alias(g_expr))}"
@@ -1381,7 +1381,18 @@ class Tier1SingleMixin(MixinHost):
     ) -> Tuple[List[str], IncrementalBackfillSpec]:
         stmts: List[str] = []
         has_nullable_grp = self._has_nullable_group_col()
-        q_base_t = self._q(self.view.base_table)
+        base_alias = (
+            self.view.joins[0].alias
+            if len(self.view.joins) == 1
+            and self.view.joins[0].alias
+            and self.view.joins[0].alias.lower() != self.view.base_table.lower()
+            else None
+        )
+        q_base_t = (
+            f"{self._q(self.view.base_table)} AS {self._q(base_alias)}"
+            if base_alias
+            else self._q(self.view.base_table)
+        )
         pk_cols = self._tier1_pk_cols()
         work_items = self._working_select_items
         grp_exprs = self._effective_group_by_exprs
@@ -1482,7 +1493,6 @@ class Tier1SingleMixin(MixinHost):
             group_sql = ""
             having_sql = ""
 
-        q_base_t = self._q(self.view.base_table)
         main_backfill_sql = (
             f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
             f"SELECT {', '.join(select_exprs)}\n"
@@ -2004,7 +2014,7 @@ class Tier1SingleMixin(MixinHost):
         q_base_t = self._q(base_t)
         conds: List[str] = []
         if self.view.where_clause:
-            conds.append(f"({self.view.where_clause})")
+            conds.append(f"({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})")
         nullable_keys: List[Tuple[str, str]] = []
         for g_expr in self._effective_group_by_exprs:
             lhs_g = self._rewrite_expr_for_record(g_expr, q_base_t)
@@ -2987,6 +2997,15 @@ class Tier1SingleMixin(MixinHost):
             native_recompute=lambda it: (
                 self._requires_native_avg_recompute(it) or self._pgmy_native_recompute_item(it)
             ),
+            recompute_group_keys=lambda exprs: self._build_native_group_recompute(
+                ", ".join(
+                    f"{self._rewrite_expr_for_record(e, self._q(self.view.base_table))} AS __mv_l{idx}"
+                    for idx, e in enumerate(exprs)
+                ),
+                mv_table,
+                processed_only=True,
+                limit_one=True,
+            )[1:-1],
         )
         return self._pg_aggregate_bodies(spec, [source], base_t=self.view.base_table)
 

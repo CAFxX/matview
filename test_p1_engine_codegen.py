@@ -1918,6 +1918,237 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             )
             self.assertNotIn("__MV_REPAIR_FENCE_START__", "\n".join(plan.trigger_ddls))
 
+    def test_postgres_minmax_varchar_collation_name_and_numeric_group_rep_codegen(self) -> None:
+        """PostgreSQL MIN/MAX over collated VARCHAR/CHAR, NAME, and explicit COLLATE
+        expressions resolve to TEXT/BPCHAR with preserved collation; unconstrained
+        NUMERIC group keys emit variable-scale representative refresh while
+        fixed-scale NUMERIC(p, s) and integer keys do not."""
+        schema = parse_table_schema(
+            """
+            CREATE TABLE items (
+                id BIGINT PRIMARY KEY,
+                g INT NOT NULL,
+                vc VARCHAR(20),
+                vc_c VARCHAR(20) COLLATE "C",
+                ch_c CHAR(5) COLLATE "C",
+                nm NAME,
+                vca VARCHAR(20)[] COLLATE "C",
+                num NUMERIC,
+                num_nn NUMERIC NOT NULL,
+                num_fixed NUMERIC(10, 2)
+            );
+            """,
+            dialect=Dialect.POSTGRES,
+        )
+        # 1. MIN/MAX over collated VARCHAR, CHAR, NAME, explicit COLLATE, array, and window.
+        p_mm = generate_materialized_view(
+            schema,
+            """
+            CREATE VIEW mv_pg_mm AS
+            SELECT
+                g,
+                MIN(vc) AS mn_vc,
+                MIN(vc_c) AS mn_vcc,
+                MAX(ch_c) AS mx_chc,
+                MIN(nm) AS mn_nm,
+                MIN(vc COLLATE "C") AS mn_expr_c,
+                MAX(vc_c COLLATE "POSIX") AS mx_override,
+                MIN(vca) AS mn_vca
+            FROM items GROUP BY g;
+            """,
+            dialect=Dialect.POSTGRES,
+        )
+        ddl = p_mm.backing_table_ddl
+        self.assertRegex(ddl, r"\bmn_vc\s+TEXT\b")
+        self.assertRegex(ddl, r'\bmn_vcc\s+TEXT\s+COLLATE\s+"C"')
+        self.assertRegex(ddl, r'\bmx_chc\s+BPCHAR\s+COLLATE\s+"C"')
+        self.assertRegex(ddl, r'\bmn_nm\s+TEXT\s+COLLATE\s+"C"')
+        self.assertRegex(ddl, r'\bmn_expr_c\s+TEXT\s+COLLATE\s+"C"')
+        self.assertRegex(ddl, r'\bmx_override\s+TEXT\s+COLLATE\s+"POSIX"')
+        self.assertRegex(ddl, r'\bmn_vca\s+VARCHAR\[\]\s+COLLATE\s+"C"')
+
+        p_win = generate_materialized_view(
+            schema,
+            "CREATE VIEW mv_pg_win_mm AS SELECT id, MIN(vc_c) OVER (PARTITION BY g) AS mn_w FROM items;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertRegex(p_win.backing_table_ddl, r'\bmn_w\s+TEXT\s+COLLATE\s+"C"')
+
+        p_proj_coll = generate_materialized_view(
+            schema,
+            'CREATE VIEW mv_pg_proj_coll AS SELECT id, vc COLLATE "C" AS vc_lit_c FROM items;',
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertRegex(p_proj_coll.backing_table_ddl, r'\bvc_lit_c\s+VARCHAR\s+COLLATE\s+"C"')
+
+        # 2. Unconstrained NUMERIC group key emits representative refresh on UPDATE/DELETE,
+        #    while fixed-scale NUMERIC(10, 2) and INT do not.
+        p_num = generate_materialized_view(
+            schema,
+            "CREATE VIEW mv_num AS SELECT num, COUNT(*) AS c FROM items GROUP BY num;",
+            dialect=Dialect.POSTGRES,
+        )
+        num_au = "\n".join(t for t in p_num.trigger_ddls if "_au()" in t)
+        num_ad = "\n".join(t for t in p_num.trigger_ddls if "_ad()" in t)
+        num_ai = "\n".join(t for t in p_num.trigger_ddls if "_ai()" in t)
+        self.assertIn("__mv_gd0", num_au)
+        self.assertIn("__mv_gd0", num_ad)
+        self.assertNotIn("__mv_gd0", num_ai)
+
+        p_num_nn = generate_materialized_view(
+            schema,
+            "CREATE VIEW mv_num_nn AS SELECT num_nn, COUNT(*) AS c FROM items GROUP BY num_nn;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertIn("__mv_gd0", "\n".join(t for t in p_num_nn.trigger_ddls if "_au()" in t))
+
+        p_fixed = generate_materialized_view(
+            schema,
+            "CREATE VIEW mv_num_fixed AS SELECT num_fixed, COUNT(*) AS c FROM items GROUP BY num_fixed;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertNotIn("__mv_gd0", "\n".join(p_fixed.trigger_ddls))
+
+        p_int = generate_materialized_view(
+            schema,
+            "CREATE VIEW mv_int AS SELECT g, COUNT(*) AS c FROM items GROUP BY g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertNotIn("__mv_gd0", "\n".join(p_int.trigger_ddls))
+
+        # 3. Adversarial regressions: ARRAY[vc_c, vc_c], COALESCE(MIN(DISTINCT vc_c), 'x'),
+        #    COALESCE(vc_c, 'long'), CTE MIN(vc_c), non-decomposed MIN(vc) COLLATE "C",
+        #    string expressions over collated columns, NUMERIC[][]/NUMRANGE[], quoted
+        #    table/column names, and multi-column correlated LATERAL refresh.
+        adv_schema = parse_table_schema(
+            """
+            CREATE TABLE items (
+                id BIGINT PRIMARY KEY,
+                g INT NOT NULL,
+                vc VARCHAR(20),
+                vc_c VARCHAR(20) COLLATE "C",
+                vc30_c VARCHAR(30) COLLATE "C",
+                num NUMERIC,
+                num2 NUMERIC,
+                num2d NUMERIC[][],
+                nra NUMRANGE[]
+            );
+            CREATE TABLE "order" (id INT PRIMARY KEY, g INT NOT NULL, num NUMERIC);
+            CREATE TABLE "my dim" (g INT PRIMARY KEY, tag TEXT);
+            CREATE TABLE t_sp ("my key" NUMERIC PRIMARY KEY, "my num" NUMERIC, v INT);
+            CREATE TABLE t_sp2 ("my num" NUMERIC, v INT);
+            CREATE TABLE t_int (id INT PRIMARY KEY, num INT, v INT);
+            """,
+            dialect=Dialect.POSTGRES,
+        )
+        p_arr = generate_materialized_view(
+            adv_schema,
+            "CREATE VIEW mv_arr_c AS SELECT id, ARRAY[vc_c, vc_c] AS a FROM items;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertNotIn('COLLATE "C"[]', p_arr.backing_table_ddl)
+        self.assertRegex(p_arr.backing_table_ddl, r'\ba\s+VARCHAR\[\]\s+COLLATE\s+"C"')
+
+        p_coal_d = generate_materialized_view(
+            adv_schema,
+            "CREATE VIEW mv_coal_d AS SELECT g, COALESCE(MIN(DISTINCT vc_c), 'x') AS mn FROM items GROUP BY g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertRegex(p_coal_d.backing_table_ddl, r'\bmn\s+TEXT\s+COLLATE\s+"C"')
+
+        p_coal_v = generate_materialized_view(
+            adv_schema,
+            "CREATE VIEW mv_coal_v AS SELECT id, COALESCE(vc_c, 'a_very_long_string_exceeding_20_chars') AS x FROM items;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertRegex(p_coal_v.backing_table_ddl, r'\bx\s+VARCHAR\s+COLLATE\s+"C"')
+
+        p_cte_mm = generate_materialized_view(
+            adv_schema,
+            'CREATE VIEW mv_cte_mm AS WITH c AS (SELECT g, MIN(vc) AS mn, MIN(vc_c) AS mnc, MIN(vc COLLATE "C") AS mnx FROM items GROUP BY g) SELECT g, mn, mnc, mnx FROM c;',
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertRegex(p_cte_mm.backing_table_ddl, r"\bmn\s+TEXT\b")
+        self.assertRegex(p_cte_mm.backing_table_ddl, r'\bmnc\s+TEXT\s+COLLATE\s+"C"')
+        self.assertRegex(p_cte_mm.backing_table_ddl, r'\bmnx\s+TEXT\s+COLLATE\s+"C"')
+
+        p_lim_coll = generate_materialized_view(
+            adv_schema,
+            'CREATE VIEW mv_lim_c AS SELECT g, MIN(vc) COLLATE "C" AS mn, MIN(vc_c) COLLATE "POSIX" AS mnp FROM items GROUP BY g ORDER BY g LIMIT 5;',
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertRegex(p_lim_coll.backing_table_ddl, r'\bmn\s+TEXT\s+COLLATE\s+"C"')
+        self.assertRegex(p_lim_coll.backing_table_ddl, r'\bmnp\s+TEXT\s+COLLATE\s+"POSIX"')
+
+        p_str_expr = generate_materialized_view(
+            adv_schema,
+            "CREATE VIEW mv_str_e AS SELECT g, MIN(UPPER(vc_c)) AS mu, MIN(vc_c || 'x') AS mc, MIN(CASE WHEN id > 0 THEN vc_c ELSE 'z' END) AS mcase FROM items GROUP BY g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertRegex(p_str_expr.backing_table_ddl, r'\bmu\s+TEXT\s+COLLATE\s+"C"')
+        self.assertRegex(p_str_expr.backing_table_ddl, r'\bmc\s+TEXT\s+COLLATE\s+"C"')
+        self.assertRegex(p_str_expr.backing_table_ddl, r'\bmcase\s+TEXT\s+COLLATE\s+"C"')
+
+        p_uall_coll = generate_materialized_view(
+            adv_schema,
+            "CREATE VIEW mv_uall_c AS WITH u AS (SELECT g, vc_c AS s FROM items UNION ALL SELECT g, vc30_c AS s FROM items) SELECT g, MIN(s) AS ms FROM u GROUP BY g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertRegex(p_uall_coll.backing_table_ddl, r'\bms\s+TEXT\s+COLLATE\s+"C"')
+
+        # Multi-dimensional NUMERIC[][] and NUMRANGE[] get representative refresh.
+        for vn, col in (("mv_n2d", "num2d"), ("mv_nra", "nra")):
+            p_arr_n = generate_materialized_view(
+                adv_schema,
+                f"CREATE VIEW {vn} AS SELECT {col}, COUNT(*) AS c FROM items GROUP BY {col};",
+                dialect=Dialect.POSTGRES,
+            )
+            self.assertIn("__mv_gd0", "\n".join(t for t in p_arr_n.trigger_ddls if "_au()" in t), vn)
+
+        # Quoted/keyword/space table & column names in join, projection, and UNION.
+        p_kw_j = generate_materialized_view(
+            adv_schema,
+            'CREATE VIEW mv_kw_j AS SELECT "order".num, COUNT(*) AS c FROM "order" JOIN "my dim" ON "my dim".g = "order".g GROUP BY "order".num;',
+            dialect=Dialect.POSTGRES,
+        )
+        kw_au = "\n".join(t for t in p_kw_j.trigger_ddls if "_au()" in t)
+        self.assertIn("__mv_j_0", kw_au)
+        self.assertIn("__mv_j_1", kw_au)
+        self.assertNotIn("AS __mv_j_my dim", kw_au)
+
+        p_sp_pk = generate_materialized_view(
+            adv_schema,
+            'CREATE VIEW mv_sp_pk AS SELECT "my key", v FROM t_sp;',
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertIn('"my key" = EXCLUDED."my key"', "\n".join(p_sp_pk.trigger_ddls))
+
+        p_sp_un = generate_materialized_view(
+            adv_schema,
+            'CREATE VIEW mv_sp_un AS SELECT "my num" FROM t_sp UNION SELECT "my num" FROM t_sp2;',
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertIn("__mv_vd0", "\n".join(t for t in p_sp_un.trigger_ddls if "_au()" in t))
+
+        # Multi-column variable-scale GROUP BY emits correlated single-row LATERAL refresh.
+        p_multi = generate_materialized_view(
+            adv_schema,
+            "CREATE VIEW mv_multi_n AS SELECT num, num2, COUNT(*) AS c FROM items GROUP BY num, num2;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertIn("LEFT JOIN LATERAL", "\n".join(t for t in p_multi.trigger_ddls if "_au()" in t))
+
+        # Widened UNION ALL INT + NUMERIC with extra projected `num + 0` refreshes both columns.
+        p_widen = generate_materialized_view(
+            adv_schema,
+            "CREATE VIEW mv_widen AS WITH u AS (SELECT num, v FROM t_int UNION ALL SELECT num, v FROM items) SELECT num AS a, num + 0 AS c_num, SUM(v) AS s FROM u GROUP BY num;",
+            dialect=Dialect.POSTGRES,
+        )
+        widen_au = "\n".join(t for t in p_widen.trigger_ddls if "_au()" in t)
+        self.assertIn("__mv_gd0", widen_au)
+        self.assertIn("__mv_gd1", widen_au)
+        self.assertIn("LEFT JOIN LATERAL", widen_au)
+
 
 if __name__ == "__main__":
     unittest.main()
