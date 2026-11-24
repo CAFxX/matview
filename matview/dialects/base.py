@@ -33,6 +33,7 @@ from ..sql_frontend import (
     _is_word_or_ident_token,
     _parse_single_agg_expr,
     _sanitize_ident,
+    _set_operation_arm_tree,
     _split_top_level,
     _sqlite_type_affinity,
     _strip_outer_ident_quotes,
@@ -1193,17 +1194,13 @@ class DialectBaseMixin(MixinHost):
         ) -> Optional[str]:
             if owner_cte_name and (owner_cte_name in seen_ctes or owner_cte_name in active_ctes):
                 return None
+            all_arms, arm_tree = _set_operation_arm_tree(root_query)
             branches: List[sqlglot_exp.Select] = []
-            stack: List[Any] = [root_query]
-            while stack:
-                cur_q = stack.pop()
-                if isinstance(cur_q, sqlglot_exp.Subquery):
-                    stack.append(cur_q.this)
-                elif isinstance(cur_q, sqlglot_exp.SetOperation):
-                    stack.append(cur_q.expression)
-                    stack.append(cur_q.this)
-                elif isinstance(cur_q, sqlglot_exp.Select):
-                    branches.append(cur_q)
+            branch_arm_ids: List[int] = []
+            for arm_i, arm_node in enumerate(all_arms):
+                if isinstance(arm_node, sqlglot_exp.Select):
+                    branches.append(arm_node)
+                    branch_arm_ids.append(arm_i)
             if not branches:
                 return None
             inner_query = branches[0]
@@ -1229,10 +1226,12 @@ class DialectBaseMixin(MixinHost):
             try:
                 b_types: List[str] = []
                 b_exp_colls: List[Optional[str]] = []
+                b_ids: List[int] = []
                 has_null_b = False
+                has_unmodelled_b = False
                 has_str_lit_b = False
                 sg_d = _sqlglot_dialect(self.dialect)
-                for br in branches:
+                for br_i, br in enumerate(branches):
                     if col_pos >= len(br.expressions):
                         continue
                     br_alias_map = _branch_table_alias_map(br)
@@ -1253,6 +1252,7 @@ class DialectBaseMixin(MixinHost):
                         else:
                             b_types.append(self._literal_storage_type(src_e))
                             b_exp_colls.append(None)
+                            b_ids.append(branch_arm_ids[br_i])
                         continue
                     br_ctx = _branch_scoped_ctx(br)
                     br_expr_sql = src_e.sql(sg_d).strip()
@@ -1262,12 +1262,14 @@ class DialectBaseMixin(MixinHost):
                     if agg_t is not None:
                         b_types.append(agg_t)
                         b_exp_colls.append(exp_c)
+                        b_ids.append(branch_arm_ids[br_i])
                         continue
                     if isinstance(src_e, sqlglot_exp.Column) and not isinstance(src_e.this, sqlglot_exp.Star):
                         c_src = br_ctx._lookup_col_def(br_expr_sql) or br_ctx._lookup_col_def(src_e.name)
                         if c_src is not None:
                             b_types.append(c_src.data_type)
                             b_exp_colls.append(exp_c)
+                            b_ids.append(branch_arm_ids[br_i])
                             continue
                         # Column may come from an earlier CTE referenced in this branch's FROM/JOIN.
                         ref_cte: Optional[str] = None
@@ -1287,6 +1289,7 @@ class DialectBaseMixin(MixinHost):
                             if cte_ref_t is not None:
                                 b_types.append(cte_ref_t)
                                 b_exp_colls.append(exp_c)
+                                b_ids.append(branch_arm_ids[br_i])
                                 continue
                     # Fallback to AST expression inference within this branch's scope
                     # (guarded against CTE recursion via active_ctes).
@@ -1301,16 +1304,33 @@ class DialectBaseMixin(MixinHost):
                                     ast_t = f"{self._PG_COLLATE_TAIL_RE.sub('', ast_t).strip()}{c_coll}"
                             b_types.append(ast_t)
                             b_exp_colls.append(exp_c)
+                            b_ids.append(branch_arm_ids[br_i])
                             continue
+                    if (
+                        self.dialect == Dialect.POSTGRES
+                        and not isinstance(src_e, sqlglot_exp.Column)
+                        and not re.match(r"\s*ROW\s*\(", br_expr_sql, flags=re.IGNORECASE)
+                        and self._pg_explicit_cast_target(br_expr_sql) is None
+                    ):
+                        has_unmodelled_b = True
+                if self.dialect == Dialect.POSTGRES and has_unmodelled_b and not b_types and not has_str_lit_b and not has_null_b:
+                    raise UnsupportedMaterializedViewError(
+                        f"A PostgreSQL set-operation column ({ident}) whose arms all have result types the "
+                        "compiler does not model (for example a jsonb/bytea/interval-valued expression) cannot be "
+                        "typed without asking the server; cast the arms to an explicit type."
+                    )
                 if not b_types and has_str_lit_b:
                     b_types.append("TEXT")
                     b_exp_colls.append(None)
+                    b_ids.append(branch_arm_ids[0])
                 if b_types:
                     if len(branches) > 1:
                         return self._common_storage_type(
                             b_types,
                             has_null=has_null_b or (self.dialect == Dialect.POSTGRES and has_str_lit_b),
                             explicit_colls=b_exp_colls if self.dialect == Dialect.POSTGRES else None,
+                            arm_ids=b_ids,
+                            arm_tree=arm_tree,
                         )
                     t0 = b_types[0]
                     if self.dialect == Dialect.POSTGRES:
@@ -1901,7 +1921,10 @@ class DialectBaseMixin(MixinHost):
                     if -(2 ** 63) <= number < 2 ** 63:
                         return "BIGINT"
                     return "NUMERIC"
-                if re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?", value):
+                if re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+|\d+(?=[eE]))(?:[eE][+-]?\d+)?", value):
+                    # PostgreSQL types every non-integer numeric literal, exponent included, as NUMERIC.
+                    if self.dialect == Dialect.POSTGRES:
+                        return "NUMERIC"
                     return "DOUBLE PRECISION" if ("e" in value.lower() or self.dialect == Dialect.SQLITE) else "NUMERIC"
                 return None
             if kind in ("Neg", "Positive"):
@@ -1970,6 +1993,23 @@ class DialectBaseMixin(MixinHost):
                     # ARRAY[ARRAY[1, 2]] has the same OID (integer[]) as ARRAY[1, 2].
                     elem_no_br = re.sub(r"(?:\[\])+$", "", merged_elem).strip()
                     return f"{elem_no_br}[]"
+                # Elements of a type the inference does not model (an extension type such as
+                # citext, a domain): ARRAY[col, ...] is still an array of that declared type.
+                opaque: List[str] = []
+                for ch in ch_nodes:
+                    unw_ch = ch
+                    while isinstance(unw_ch, (sqlglot_exp.Paren, sqlglot_exp.Collate)) and unw_ch.this is not None:
+                        unw_ch = unw_ch.this
+                    col_def = (
+                        self._lookup_col_def(unw_ch.sql()) or self._lookup_col_def(unw_ch.name)
+                        if isinstance(unw_ch, sqlglot_exp.Column)
+                        else None
+                    )
+                    if col_def is None or col_def.data_type.strip().endswith("]"):
+                        return None
+                    opaque.append(self._PG_COLLATE_TAIL_RE.sub("", col_def.data_type).strip())
+                if opaque and len({o.lower() for o in opaque}) == 1:
+                    return f"{opaque[0]}[]"
                 return None
             if kind == "Bracket" and self.dialect == Dialect.POSTGRES:
                 # Unwrap nested brackets (e.g. a_int2d[1][1] or a_int2d[1:2][1:2]):
@@ -2156,9 +2196,26 @@ class DialectBaseMixin(MixinHost):
                 if agg_item is None or agg_item.agg_func is None:
                     return None
                 return canonical_type(self._infer_expr_storage_type(agg_item))
+            if self.dialect == Dialect.POSTGRES:
+                if kind == "StringToArray" or (
+                    kind == "Anonymous" and node.name.upper() in ("REGEXP_SPLIT_TO_ARRAY", "STRING_TO_ARRAY")
+                ):
+                    return "TEXT[]"
+                if kind in ("ArrayConcat", "ArrayAppend", "ArrayRemove", "ArrayReplace") and node.this is not None:
+                    arr_t = infer(node.this)
+                    return arr_t if arr_t is not None and arr_t.endswith("[]") else None
+                if kind == "DPipe":
+                    # `a || b`: text when either operand is text (anynonarray || text and
+                    # text || anynonarray); bytea, array and jsonb concatenation stay unknown.
+                    l_t, r_t = infer(node.this), infer(node.expression)
+                    if l_t == "TEXT" or r_t == "TEXT":
+                        return "TEXT"
+                    return None
             if isinstance(node, sqlglot_exp.Func):
                 fn_name = (node.sql_name() or kind).upper()
                 if fn_name in str_fn_names:
+                    return "TEXT"
+                if self.dialect == Dialect.POSTGRES and fn_name in self._PG_TEXT_FN_NAMES:
                     return "TEXT"
                 if fn_name in int_fn_names:
                     return "BIGINT"
@@ -2230,7 +2287,8 @@ class DialectBaseMixin(MixinHost):
                 if -(2 ** 31) <= n < 2 ** 31:
                     return "INTEGER"
                 return "BIGINT" if -(2 ** 63) <= n < 2 ** 63 else "NUMERIC"
-            return "DOUBLE PRECISION" if "e" in text.lower() else "NUMERIC"
+            # Every non-integer numeric literal, exponent included, is NUMERIC.
+            return "NUMERIC"
         if (
             self.subdialect == EngineSubdialect.MARIADB
             and re.fullmatch(r"[+-]?\d+", text)
@@ -2438,47 +2496,105 @@ class DialectBaseMixin(MixinHost):
             norm_coll = f" COLLATE {c_body}"
         return f"{norm_elem}{arr_suffix}{norm_coll}"
 
+    # PostgreSQL functions whose result is always `text` (for any argument types).
+    _PG_TEXT_FN_NAMES = frozenset({
+        "MD5", "ENCODE", "TO_CHAR", "LPAD", "RPAD", "LEFT", "RIGHT", "INITCAP", "REVERSE", "REPEAT",
+        "TRANSLATE", "SPLIT_PART", "FORMAT", "QUOTE_IDENT", "QUOTE_LITERAL", "QUOTE_NULLABLE", "BTRIM",
+        "CHR", "REGEXP_REPLACE", "OVERLAY", "TO_HEX", "CONCAT", "CONCAT_WS", "UPPER", "LOWER", "SUBSTRING",
+        "SUBSTR", "TRIM", "LTRIM", "RTRIM", "REPLACE",
+    })
+
+    _PG_NUMERIC_CHAIN_RANK = {
+        "SMALLINT": 1, "INT2": 1, "INTEGER": 2, "INT": 2, "INT4": 2, "BIGINT": 3, "INT8": 3,
+        "NUMERIC": 4, "DECIMAL": 4, "DEC": 4, "REAL": 5, "FLOAT4": 5,
+        "DOUBLE PRECISION": 6, "FLOAT8": 6, "FLOAT": 6,
+    }
+
+    def _pg_refuse_lossy_setop_conversion(
+        self, types: Sequence[str], arm_ids: Sequence[int], arm_tree: Any
+    ) -> None:
+        """Refuse a set operation in which an arm is converted through a lossy intermediate type.
+
+        PostgreSQL resolves each set operation's column types pairwise over the parse
+        tree: every node's result type is the common type of its two operands, and an
+        arm's values are converted at every node on the path to the root. The widened
+        storage type and the population/trigger casts convert each arm once, directly to
+        the final type, which equals PostgreSQL's chain unless an intermediate type is
+        narrower than the arm and the final type. The only such case among the numeric
+        family is REAL as an intermediate type for INTEGER/BIGINT/NUMERIC arms joined to
+        DOUBLE PRECISION later (16777217 -> REAL -> DOUBLE PRECISION is 16777216, while
+        16777217 -> DOUBLE PRECISION is exact). That path is refused only when it
+        actually occurs in the tree (`d UNION ALL i UNION ALL r` converts `i` straight
+        from the DOUBLE PRECISION node and is exact)."""
+        ranks: Dict[int, int] = {}
+        for t, arm in zip(types, arm_ids):
+            base = re.sub(
+                r"\s*\([^)]*\)", "", re.sub(r"\s+", " ", self._pg_split_type_and_collation(t)[0].upper())
+            ).strip()
+            rank = self._PG_NUMERIC_CHAIN_RANK.get(base)
+            if rank is None:
+                return  # not a purely numeric column: category rules decide
+            ranks[arm] = max(ranks.get(arm, 0), rank)
+        if max(ranks.values(), default=0) != 6:
+            return
+        tree = arm_tree
+        if tree is None:
+            ordered = list(arm_ids)
+            tree = ordered[0]
+            for nxt in ordered[1:]:
+                tree = (tree, nxt)
+
+        def _walk(node: Any, is_root: bool) -> Tuple[int, bool]:
+            if isinstance(node, tuple):
+                l_rank, l_wide = _walk(node[0], False)
+                r_rank, r_wide = _walk(node[1], False)
+                rank, wide = max(l_rank, r_rank), l_wide or r_wide
+                if rank == 5 and wide and not is_root:
+                    raise UnsupportedMaterializedViewError(
+                        "PostgreSQL converts an INTEGER, BIGINT or NUMERIC arm of this set operation through REAL "
+                        "before joining it with a DOUBLE PRECISION arm (for example 16777217 becomes 16777216), "
+                        "which the incremental maintenance does not model; cast the arms explicitly or reorder "
+                        "the arms so that no REAL-typed pair is formed first."
+                    )
+                return rank, wide
+            rank = ranks.get(node, 0)
+            return rank, rank in (2, 3, 4)
+
+        _walk(tree, True)
+
     def _common_storage_type(
         self,
         types: Sequence[str],
         *,
         has_null: bool = False,
         explicit_colls: Optional[Sequence[Optional[str]]] = None,
+        arm_ids: Optional[Sequence[int]] = None,
+        arm_tree: Any = None,
     ) -> str:
         """Merge column storage types across branches of a set operation
-        (UNION ALL / UNION / INTERSECT / EXCEPT) using target dialect widening rules."""
+        (UNION ALL / UNION / INTERSECT / EXCEPT) using target dialect widening rules.
+
+        ``arm_ids[k]`` is the identifier of the arm that contributed ``types[k]`` and
+        ``arm_tree`` is the set-operation tree over those identifiers (nested tuples,
+        see ``_set_operation_arm_tree``). Without a tree the arms form one flat
+        left-to-right chain."""
         paired = [
-            (t.strip(), explicit_colls[idx] if (explicit_colls is not None and idx < len(explicit_colls)) else None)
+            (t.strip(), explicit_colls[idx] if (explicit_colls is not None and idx < len(explicit_colls)) else None, idx)
             for idx, t in enumerate(types)
             if t and t.strip()
         ]
-        raw_nonempty = [t for t, _ in paired]
-        exp_colls_nonempty = [ec for _, ec in paired]
+        raw_nonempty = [t for t, _, _ in paired]
+        exp_colls_nonempty = [ec for _, ec, _ in paired]
+        ids_nonempty = [
+            arm_ids[idx] if (arm_ids is not None and idx < len(arm_ids)) else idx for _, _, idx in paired
+        ]
         if not raw_nonempty:
             return "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
 
         if self.dialect == Dialect.POSTGRES:
             if len(raw_nonempty) >= 3:
-                # PostgreSQL resolves a chain of set operations pairwise, converting each
-                # arm through every intermediate common type.  Pairing an exact numeric arm
-                # with REAL before a DOUBLE PRECISION arm joins (16777217 -> REAL -> DOUBLE
-                # PRECISION) therefore differs from one direct conversion, and neither the
-                # population casts nor the trigger key casts model the intermediate step.
-                # The arm tree is not known here, so reject the whole class explicitly.
-                bases = {
-                    re.sub(r"\s*\([^)]*\)", "", re.sub(r"\s+", " ", self._pg_split_type_and_collation(t)[0].upper())).strip()
-                    for t in raw_nonempty
-                }
-                if (
-                    bases & {"REAL", "FLOAT4"}
-                    and bases & {"DOUBLE PRECISION", "FLOAT8", "FLOAT"}
-                    and bases & {"SMALLINT", "INT2", "INTEGER", "INT", "INT4", "BIGINT", "INT8", "NUMERIC", "DECIMAL", "DEC"}
-                ):
-                    raise UnsupportedMaterializedViewError(
-                        "PostgreSQL set operations over three or more arms mixing an exact numeric type, REAL and "
-                        "DOUBLE PRECISION convert arms through intermediate common types, which the "
-                        "incremental maintenance does not model; use a two-arm set operation or cast the arms explicitly."
-                    )
+                self._pg_refuse_lossy_setop_conversion(raw_nonempty, ids_nonempty, arm_tree)
+
             def _pg_norm_branch_type(raw_t: str) -> str:
                 t_part, c_tail = self._pg_split_type_and_collation(raw_t)
                 # Preserve unbounded CHARACTER VARYING / VARCHAR (do not let
@@ -2617,7 +2733,11 @@ class DialectBaseMixin(MixinHost):
             if all(m is not None for m in arr_matches):
                 elems = [m.group(1).strip() for m in arr_matches if m is not None]
                 merged_elem = self._common_storage_type(
-                    elems, has_null=has_null, explicit_colls=exp_colls_nonempty
+                    elems,
+                    has_null=has_null,
+                    explicit_colls=exp_colls_nonempty,
+                    arm_ids=ids_nonempty,
+                    arm_tree=arm_tree,
                 )
                 merged_elem_no_coll, _ = self._pg_split_type_and_collation(merged_elem)
                 res_arr = f"{merged_elem_no_coll}[]"
@@ -2665,6 +2785,10 @@ class DialectBaseMixin(MixinHost):
             if all(b in pg_num_rank for b in bases):
                 top_rank = max(pg_num_rank[b][0] for b in bases)
                 return next(name for r, name in pg_num_rank.values() if r == top_rank)
+            if "CITEXT" in bases and all(b in pg_str_map or b == "CITEXT" for b in bases):
+                # citext only casts implicitly to text, so any other string arm resolves the
+                # pair to text (all-citext arms were handled above).
+                return _attach_coll("TEXT")
             if all(b in pg_str_map for b in bases):
                 str_kinds = [pg_str_map[b] for b in bases]
                 if str_kinds[0] == "TEXT":
@@ -2884,9 +3008,12 @@ class DialectBaseMixin(MixinHost):
 
         return self._normalize_dialect_type(raw_nonempty[0])
 
-    def _union_all_common_ctx(self, branch_specs: Sequence[ViewSpec]) -> Any:
+    def _union_all_common_ctx(self, branch_specs: Sequence[ViewSpec], arm_tree: Any = None) -> Any:
         """Build a compilation context whose `primary_schema` holds the widened
-        common column types across all `UNION ALL` branches (positional alignment)."""
+        common column types across all `UNION ALL` branches (positional alignment).
+
+        ``arm_tree`` is the set-operation tree over ``branch_specs`` indices (see
+        ``_set_operation_arm_tree``); without it the branches form one flat chain."""
         if not branch_specs:
             return self
         first_b = branch_specs[0]
@@ -2901,10 +3028,13 @@ class DialectBaseMixin(MixinHost):
         for col_i, fb_it in enumerate(first_b.select_items):
             col_b_types: List[str] = []
             col_b_exp_colls: List[Optional[str]] = []
+            col_b_ids: List[int] = []
             has_null = False
             has_str_lit = False
+            has_unmodelled_arm = False
+            has_modelled_arm = False
             all_not_null = True
-            for b_ctx, bs in zip(branch_ctxs, branch_specs):
+            for b_idx, (b_ctx, bs) in enumerate(zip(branch_ctxs, branch_specs)):
                 if col_i >= len(bs.select_items):
                     all_not_null = False
                     continue
@@ -2924,8 +3054,10 @@ class DialectBaseMixin(MixinHost):
                     src_low = _unquote_ident(bi_item.source_col, dialect=self.dialect).lower()
                     c_b = next((c for k, c in ts_b.columns.items() if k.lower() == src_low), None)
                 if c_b is not None:
+                    has_modelled_arm = True
                     col_b_types.append(c_b.data_type)
                     col_b_exp_colls.append(exp_c)
+                    col_b_ids.append(b_idx)
                     if not c_b.not_null:
                         all_not_null = False
                     continue
@@ -2946,11 +3078,34 @@ class DialectBaseMixin(MixinHost):
                             and b_ctx._infer_cte_or_subquery_col_type(bi_item.raw_expr) is None
                         ):
                             continue
-                col_b_types.append(b_ctx._infer_expr_storage_type(bi_item))
+                arm_t = b_ctx._infer_expr_storage_type_or_none(bi_item)
+                if arm_t is None and re.match(r"\s*ROW\s*\(", bi_item.raw_expr, flags=re.IGNORECASE):
+                    # Anonymous record arms are refused by the registration-time key-type probe
+                    # (`0A000`), which reports the precise reason.
+                    has_modelled_arm = True
+                    arm_t = "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
+                elif arm_t is None and self._pg_explicit_cast_target(bi_item.raw_expr) is not None:
+                    # `expr::some_type` has exactly the cast's target type, modelled or not.
+                    has_modelled_arm = True
+                    arm_t = self._pg_explicit_cast_target(bi_item.raw_expr) or "TEXT"
+                elif arm_t is None:
+                    has_unmodelled_arm = True
+                    arm_t = "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
+                else:
+                    has_modelled_arm = True
+                col_b_types.append(arm_t)
                 col_b_exp_colls.append(exp_c)
+                col_b_ids.append(b_idx)
+            if self.dialect == Dialect.POSTGRES and has_unmodelled_arm and not has_modelled_arm:
+                raise UnsupportedMaterializedViewError(
+                    "A PostgreSQL set-operation column whose arms all have result types the compiler does not model "
+                    f"(for example a jsonb/bytea/interval-valued expression; column {fb_it.alias!r}) cannot be typed "
+                    "without asking the server; cast the arms to an explicit type."
+                )
             if not col_b_types and has_str_lit:
                 col_b_types.append("TEXT")
                 col_b_exp_colls.append(None)
+                col_b_ids.append(0)
             if self.dialect == Dialect.SQLITE:
                 common_dt = "BLOB"
             elif col_b_types:
@@ -2958,6 +3113,8 @@ class DialectBaseMixin(MixinHost):
                     col_b_types,
                     has_null=has_null or (self.dialect == Dialect.POSTGRES and has_str_lit),
                     explicit_colls=col_b_exp_colls if self.dialect == Dialect.POSTGRES else None,
+                    arm_ids=col_b_ids,
+                    arm_tree=arm_tree,
                 )
             else:
                 common_dt = "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
@@ -3028,6 +3185,28 @@ class DialectBaseMixin(MixinHost):
         return result
 
     def _infer_expr_storage_type(self, item: SelectItem) -> str:
+        inferred = self._infer_expr_storage_type_or_none(item)
+        if inferred is None:
+            return "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
+        return inferred
+
+    def _pg_explicit_cast_target(self, raw_expr: str) -> Optional[str]:
+        """The target type of a PostgreSQL expression that is an explicit cast (`x::t`, `CAST(x AS t)`)."""
+        if self.dialect != Dialect.POSTGRES:
+            return None
+        try:
+            node = parse_sql_ast(raw_expr.strip(), dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return None
+        while isinstance(node, sqlglot_exp.Paren) and node.this is not None:
+            node = node.this
+        if isinstance(node, sqlglot_exp.Cast) and node.args.get("to") is not None:
+            return node.args["to"].sql(_sqlglot_dialect(self.dialect))
+        return None
+
+    def _infer_expr_storage_type_or_none(self, item: SelectItem) -> Optional[str]:
+        """Like ``_infer_expr_storage_type`` but ``None`` where the expression's type is not
+        modelled at all (the plain-string guess would be a guess)."""
         routed_type = self._exact_routing_storage_type(item)
         if routed_type is not None:
             return routed_type
@@ -3141,7 +3320,7 @@ class DialectBaseMixin(MixinHost):
                     if valid_cols and all("INT" in c.data_type.upper() for c in valid_cols):
                         return self._int_type()
                 return self._float_type()
-            return "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
+            return None
         if item.agg_func is None and item.raw_expr and self.dialect == Dialect.SQLITE:
             # A compound aggregate expression's SQLite storage class is chosen
             # per value at run time (COALESCE(SUM(int), 0) is INTEGER, with a

@@ -166,7 +166,10 @@ class Tier1ZSetMixin(MixinHost):
                     and next_t.kind == SQLTokenType.PUNCT
                     and next_t.text == "("
                 )
-                if not is_after_dot and not is_before_dot and not is_fn_call:
+                # The identifier after COLLATE names a collation, never a column
+                # (`c COLLATE "C"` must not become `rec.c COLLATE rec.c`).
+                is_collation_name = prev_t is not None and prev_t.text.upper() == "COLLATE"
+                if not is_after_dot and not is_before_dot and not is_fn_call and not is_collation_name:
                     w_low = t.unquoted.lower()
                     if w_low in col_map:
                         actual_c = col_map[w_low]
