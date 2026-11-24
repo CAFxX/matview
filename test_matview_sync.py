@@ -3018,6 +3018,10 @@ def _sqlean_statistical_projection_indices(select_sql: str) -> Optional[Set[int]
         return None
     if not isinstance(root, sqlglot_exp.Select) or root.args.get("with_") or root.args.get("with"):
         return None
+    # DISTINCT deduplicates over the statistical columns too: dropping them
+    # would change which rows the comparison sees, so it is not isolable.
+    if root.args.get("distinct"):
+        return None
     projections = list(root.expressions)
     if any(isinstance(p, sqlglot_exp.Star) or (isinstance(p, sqlglot_exp.Column) and isinstance(p.this, sqlglot_exp.Star))
            for p in projections):

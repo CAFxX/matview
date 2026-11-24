@@ -129,6 +129,62 @@ class SqleanStatisticalColumnExclusionTests(unittest.TestCase):
                 got = _live_reference_select(unisolable, unisolable.view_spec.raw_select_sql, Dialect.SQLITE)
                 self.assertIsInstance(got, str)
 
+    def test_verify_drops_statistical_columns_only_on_sqlean(self) -> None:
+        """Drives the real comparison (`_verify_external_db_mv`) with fake
+        cursors: a divergence confined to a statistical column is tolerated on
+        sqlean ONLY (stock SQLite engines compare VAR/STDDEV columns, within
+        their documented budget, so a larger divergence must fail there), while
+        a divergence in any other column fails on sqlean too."""
+        import os
+        from unittest import mock
+
+        from test_matview_sync import _verify_external_db_mv
+
+        class FakeCursor:
+            def __init__(self, mv_rows, live_rows):
+                self.mv_rows, self.live_rows, self.rows = mv_rows, live_rows, []
+                self.description = None
+
+            def execute(self, sql, params=None):
+                self.rows = self.mv_rows if sql.startswith("SELECT * FROM") else self.live_rows
+                return self
+
+            def fetchall(self):
+                return list(self.rows)
+
+        select = "SELECT g, SUM(w) AS s, VAR_POP(w) AS vp FROM t GROUP BY g"
+        stat_diverges = ([("a", 3, 1.0)], [("a", 3, 2.0)])
+        stat_null_vs_zero = ([("a", 3, None)], [("a", 3, 0.0)])
+        plain_diverges = ([("a", 3, 1.0)], [("a", 4, 1.0)])
+        engines = ("", "apsw", "sqlite3mc", "sqlcipher")
+
+        def fails(engine: str, rows) -> bool:
+            with mock.patch.dict(os.environ, {"SQLITE_COMPAT_ENGINE": engine}):
+                try:
+                    _verify_external_db_mv(FakeCursor(*rows), "mv", select, "ctx")
+                except AssertionError:
+                    return True
+                return False
+
+        for engine in engines:
+            with self.subTest(engine=engine):
+                self.assertTrue(fails(engine, stat_diverges))
+                self.assertTrue(fails(engine, stat_null_vs_zero))
+                self.assertTrue(fails(engine, plain_diverges))
+        self.assertFalse(fails("sqlean", stat_diverges))
+        self.assertFalse(fails("sqlean", stat_null_vs_zero))
+        self.assertTrue(fails("sqlean", plain_diverges))
+        # Row multiplicity is still compared on sqlean.
+        self.assertTrue(fails("sqlean", ([("a", 3, 1.0)], [("a", 3, 1.0), ("a", 3, 1.0)])))
+
+    def test_distinct_projection_is_not_isolable(self) -> None:
+        """DISTINCT deduplicates over the statistical columns as well, so
+        dropping them would change the rows compared: the view is excluded by
+        name instead."""
+        from test_matview_sync import _sqlean_statistical_projection_indices as idx
+
+        self.assertIsNone(idx("SELECT DISTINCT g, VAR_POP(w) FROM t GROUP BY g"))
+
 
 class PgCatalogTranspileTests(unittest.TestCase):
     """The SQLite emulation of PostgreSQL statement-level bodies must understand
