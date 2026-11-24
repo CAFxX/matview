@@ -324,6 +324,26 @@ MUTANTS = (
             "test_postgres_minmax_varchar_collation_name_and_numeric_group_rep_codegen"
         ),
     ),
+    Mutant(
+        name="pg-drop-partition-drift-ignored",
+        source_path="matview/manager.py",
+        original="                                if not tbl_exists or live_parts != recorded_parts:\n                                    status = _merge(status, \"partitions_changed\")",
+        replacement="                                if False:\n                                    status = _merge(status, \"partitions_changed\")",
+        target_test=(
+            "test_p1_manager_safety.TestPgPartitionDropAndTruncateTriggerDrift."
+            "test_pg_partition_drop_and_truncate_trigger_drift_detection"
+        ),
+    ),
+    Mutant(
+        name="pg-live-trigger-names-uses-information-schema",
+        source_path="matview/manager.py",
+        original="                \"SELECT t.tgname FROM pg_catalog.pg_trigger t \"",
+        replacement="                \"SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = current_schema(); -- \"",
+        target_test=(
+            "test_p1_manager_safety.TestPgPartitionDropAndTruncateTriggerDrift."
+            "test_pg_partition_drop_and_truncate_trigger_drift_detection"
+        ),
+    ),
 )
 
 

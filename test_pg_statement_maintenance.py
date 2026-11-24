@@ -313,8 +313,11 @@ def test_partition_detached_after_registration_is_reported_and_repaired(make_env
 def test_partition_created_or_dropped_after_registration(make_env) -> None:
     """CREATE TABLE ... PARTITION OF behaves like ATTACH (reported missing,
     repaired). DROP of a partition fires no trigger (DDL): the view keeps the
-    dropped rows until repair_view(), and no catalog or trigger residue is left."""
+    dropped rows until repair_view(), check_schema_drift() / sync_views()
+    report "partitions_changed" (and diff_views() reports REPLACE), and
+    repair_view() rebuilds with no catalog or trigger residue left."""
     env = _subpartition_env(make_env)
+    view_sqls = [f"CREATE VIEW {vd.name} AS {vd.select};" for vd in PART_VIEWS]
     env.execute("CREATE TABLE t_late PARTITION OF t FOR VALUES FROM (10) TO (20)")
     env.commit()
     drift = env.manager.check_schema_drift()
@@ -327,12 +330,25 @@ def test_partition_created_or_dropped_after_registration(make_env) -> None:
     env.check("direct write to the repaired new partition")
     env.execute("DROP TABLE t_hi")
     env.commit()
-    assert set(env.manager.check_schema_drift().values()) == {"ok"}
+    drift_drop = env.manager.check_schema_drift()
     env.commit()
+    assert {drift_drop[vd.name] for vd in PART_VIEWS} == {"partitions_changed"}, str(drift_drop)
+    sync_drop = env.manager.sync_views(view_sqls)
+    env.commit()
+    assert {sync_drop[vd.name] for vd in PART_VIEWS} == {"partitions_changed"}, str(sync_drop)
+    diff_drop = env.manager.diff_views(view_sqls)
+    env.commit()
+    assert {diff_drop[vd.name].status for vd in PART_VIEWS} == {"REPLACE"}, str(diff_drop)
     with pytest.raises(ViewMismatch):
         env.check("rows of a dropped partition (documented: DROP is DDL, repair_view() fixes it)")
-    env.manager.repair_view()
+    rep_drop = env.manager.repair_view()
     env.commit()
+    assert {rep_drop[vd.name] for vd in PART_VIEWS} == {"rebuilt"}, str(rep_drop)
+    assert set(env.manager.check_schema_drift().values()) == {"ok"}
+    env.commit()
+    diff_after = env.manager.diff_views(view_sqls)
+    env.commit()
+    assert {diff_after[vd.name].status for vd in PART_VIEWS} == {"NOOP"}, str(diff_after)
     env.check("after repair of a dropped partition")
     cur = env.conn.cursor()
     cur.execute("SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE '%%t_hi%%'")
@@ -3417,6 +3433,12 @@ def test_pg_dump_restore_fresh_oids_stays_ok_and_exact(make_env) -> None:
 
     assert env.manager.check_schema_drift() == {"v_part": "ok", "v_s3": "ok", "v_key": "ok"}
     env.commit()
+    assert {k: v.status for k, v in env.manager.diff_views(view_sqls).items()} == {
+        "v_part": "NOOP",
+        "v_s3": "NOOP",
+        "v_key": "NOOP",
+    }
+    env.commit()
     assert env.manager.sync_views(view_sqls) == {"v_part": "unchanged", "v_s3": "unchanged", "v_key": "unchanged"}
     env.commit()
     with pytest.raises(Exception, match="read-only"):
@@ -3521,6 +3543,12 @@ def test_pg_dump_restore_real_pg_dump_cli(make_env) -> None:
             dst_conn.commit()
             dmgr = MaterializedViewManager(dst_conn, dialect=Dialect.POSTGRES)
             assert dmgr.check_schema_drift() == {"v_part": "ok", "v_s3": "ok", "v_key": "ok"}
+            dst_conn.commit()
+            assert {k: v.status for k, v in dmgr.diff_views(view_sqls).items()} == {
+                "v_part": "NOOP",
+                "v_s3": "NOOP",
+                "v_key": "NOOP",
+            }
             dst_conn.commit()
             assert dmgr.sync_views(view_sqls) == {"v_part": "unchanged", "v_s3": "unchanged", "v_key": "unchanged"}
             dst_conn.commit()
@@ -3961,3 +3989,227 @@ def test_pg_numeric_group_key_representative_exactness(make_env) -> None:
         "UPDATE n_t2 SET num = 1.00000 WHERE id = 1",
     )
     _assert_exact_repr("after Stage 3 writable CTE scale update")
+
+
+def test_pg_drop_partition_drift_edge_cases_and_diff_views_noop(make_env) -> None:
+    """Native PostgreSQL verification of OID-independent partition-tree drift
+    detection and pg_catalog.pg_trigger-based diff_views() NOOP semantics across:
+    - clean single-table, joined, plain-view-over-partition, and quoted partitioned views
+    - leaf sub-partition DROP and intermediate sub-partitioned parent DROP CASCADE
+    - DETACH + DROP (eliminating orphaned triggers while stale rows remain)
+    - DETACH + manual drop of orphaned triggers
+    - partition RENAME
+    - cross-schema partition attach + repair + drop
+    - quoted/mixed-case/space partitioned table & partition names
+    - repair_view(rebuild_on_schema_drift=False) content repair updating partitions_json
+    - malformed catalog partitions_json fail-closed detection
+    - unrelated non-partitioned view remaining ok/NOOP throughout."""
+    import uuid
+
+    ext_schema = f"mv_ext_{uuid.uuid4().hex[:8]}"
+    env = make_env(
+        views=[],
+        schema_sql=[
+            "CREATE TABLE tp (id INT NOT NULL, g INT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (g, id)) PARTITION BY RANGE (g)",
+            "CREATE TABLE tp_lo PARTITION OF tp FOR VALUES FROM (0) TO (10) PARTITION BY LIST (g)",
+            "CREATE TABLE tp_lo_a PARTITION OF tp_lo FOR VALUES IN (1, 2)",
+            "CREATE TABLE tp_lo_b PARTITION OF tp_lo FOR VALUES IN (3, 4)",
+            "CREATE TABLE tp_mid PARTITION OF tp FOR VALUES FROM (10) TO (20)",
+            "CREATE TABLE tp_hi PARTITION OF tp FOR VALUES FROM (20) TO (30)",
+            "CREATE TABLE d_ref (g INT PRIMARY KEY, label TEXT NOT NULL)",
+            "CREATE TABLE unreg (id INT PRIMARY KEY, g INT NOT NULL, v BIGINT NOT NULL)",
+            'CREATE TABLE "My Part" (id INT NOT NULL, g INT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (g, id)) PARTITION BY RANGE (g)',
+            'CREATE TABLE "My Part Lo" PARTITION OF "My Part" FOR VALUES FROM (0) TO (10)',
+            'CREATE TABLE "My Part Hi" PARTITION OF "My Part" FOR VALUES FROM (10) TO (20)',
+        ],
+        seed=False,
+    )
+    conn = env.conn
+    mgr = env.manager
+
+    def _exec(*stmts: str) -> None:
+        with conn.cursor() as cur:
+            for st in stmts:
+                cur.execute(st)
+        conn.commit()
+
+    try:
+        _exec(
+            f'CREATE SCHEMA "{ext_schema}"',
+            "INSERT INTO d_ref VALUES (1, 'L1'), (3, 'L3'), (11, 'L11'), (21, 'L21'), (31, 'L31')",
+            "INSERT INTO tp VALUES (1, 1, 10), (2, 3, 20), (3, 11, 30), (4, 21, 40)",
+            "INSERT INTO unreg VALUES (1, 1, 100)",
+            'INSERT INTO "My Part" VALUES (1, 1, 5), (2, 11, 15)',
+            "CREATE VIEW pv_tp AS SELECT id, g, v FROM tp WHERE v > 0",
+        )
+
+        views = [
+            ("mv_tp", "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM tp GROUP BY g"),
+            ("mv_tp_join", "SELECT d_ref.label, SUM(tp.v) AS s FROM tp JOIN d_ref ON d_ref.g = tp.g GROUP BY d_ref.label"),
+            ("mv_pv_tp", "SELECT g, SUM(v) AS s FROM pv_tp GROUP BY g"),
+            ("mv_unreg", "SELECT g, SUM(v) AS s FROM unreg GROUP BY g"),
+            ("mv_qpart", 'SELECT g, SUM(v) AS s FROM "My Part" GROUP BY g'),
+        ]
+        view_sqls = [f"CREATE VIEW {vn} AS {sql};" for vn, sql in views]
+        for vsql in view_sqls:
+            mgr.register_view(vsql)
+
+        def _assert_exact(label: str) -> None:
+            with conn.cursor() as cur:
+                for vn, sql in views:
+                    cur.execute(f"SELECT * FROM {vn} ORDER BY 1")
+                    got = cur.fetchall()
+                    cur.execute(f"SELECT * FROM ({sql}) _q ORDER BY 1")
+                    exp = cur.fetchall()
+                    assert got == exp, f"{label} ({vn}): got={got} exp={exp}"
+            conn.commit()
+
+        # 1. Clean views: check_schema_drift == "ok" and diff_views == "NOOP" (TRUNCATE triggers visible!).
+        assert mgr.check_schema_drift() == {vn: "ok" for vn, _ in views}
+        assert {k: v.status for k, v in mgr.diff_views(view_sqls).items()} == {vn: "NOOP" for vn, _ in views}
+        _assert_exact("initial")
+
+        # 2. DETACH + DROP on tp_hi (eliminating orphaned triggers while stale rows remain):
+        #    DETACH alone reports triggers_orphaned; subsequent DROP reports partitions_changed!
+        _exec("ALTER TABLE tp DETACH PARTITION tp_hi")
+        d_det = mgr.check_schema_drift()
+        assert d_det["mv_tp"] == "triggers_orphaned"
+        assert d_det["mv_tp_join"] == "triggers_orphaned"
+        assert d_det["mv_pv_tp"] == "triggers_orphaned"
+        assert d_det["mv_unreg"] == "ok"
+        assert d_det["mv_qpart"] == "ok"
+        _exec("DROP TABLE tp_hi")
+        d_det_drop = mgr.check_schema_drift()
+        assert d_det_drop["mv_tp"] == "partitions_changed"
+        assert d_det_drop["mv_tp_join"] == "partitions_changed"
+        assert d_det_drop["mv_pv_tp"] == "partitions_changed"
+        assert d_det_drop["mv_unreg"] == "ok"
+        assert d_det_drop["mv_qpart"] == "ok"
+        diff_dd = mgr.diff_views(view_sqls)
+        assert diff_dd["mv_tp"].status == "REPLACE"
+        assert "partitions_changed" in diff_dd["mv_tp"].summary
+        assert diff_dd["mv_unreg"].status == "NOOP"
+        # repair_view(rebuild_on_schema_drift=False) on mv_tp repopulates and refreshes partitions_json!
+        assert mgr.repair_view("mv_tp", rebuild_on_schema_drift=False) == {"mv_tp": "repaired"}
+        assert mgr.check_schema_drift()["mv_tp"] == "ok"
+        # Default repair_view() rebuilds the remaining drifted views.
+        rep = mgr.repair_view()
+        assert rep["mv_tp_join"] == "rebuilt"
+        assert rep["mv_pv_tp"] == "rebuilt"
+        assert mgr.check_schema_drift() == {vn: "ok" for vn, _ in views}
+        _assert_exact("after detach+drop repair")
+
+        # 3. DETACH + manually dropping orphaned triggers on detached partition -> still partitions_changed!
+        _exec("ALTER TABLE tp DETACH PARTITION tp_mid")
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT tgname FROM pg_catalog.pg_trigger "
+                "WHERE tgrelid = 'tp_mid'::regclass AND NOT tgisinternal"
+            )
+            mid_trgs = [r[0] for r in cur.fetchall()]
+            assert mid_trgs
+            for tn in mid_trgs:
+                cur.execute(f'DROP TRIGGER "{tn}" ON tp_mid')
+        conn.commit()
+        d_manual = mgr.check_schema_drift()
+        assert d_manual["mv_tp"] == "partitions_changed"
+        assert d_manual["mv_tp_join"] == "partitions_changed"
+        assert d_manual["mv_pv_tp"] == "partitions_changed"
+        assert mgr.repair_view()["mv_tp"] == "rebuilt"
+        assert mgr.check_schema_drift() == {vn: "ok" for vn, _ in views}
+        _assert_exact("after detach+drop-triggers repair")
+
+        # 4. Drop leaf sub-partition (tp_lo_a) -> partitions_changed; then drop intermediate sub-partitioned parent (tp_lo CASCADE) -> partitions_changed.
+        _exec("DROP TABLE tp_lo_a")
+        assert mgr.check_schema_drift()["mv_tp"] == "partitions_changed"
+        mgr.repair_view()
+        assert mgr.check_schema_drift() == {vn: "ok" for vn, _ in views}
+        _assert_exact("after leaf sub-partition drop")
+
+        _exec("DROP TABLE tp_lo CASCADE")
+        assert mgr.check_schema_drift()["mv_tp"] == "partitions_changed"
+        mgr.repair_view()
+        assert mgr.check_schema_drift() == {vn: "ok" for vn, _ in views}
+        _assert_exact("after intermediate sub-partitioned parent drop")
+
+        # 5. Cross-schema partition attach -> triggers_missing -> repair -> drop -> partitions_changed.
+        _exec(
+            f'CREATE TABLE "{ext_schema}".tp_ext PARTITION OF tp FOR VALUES FROM (30) TO (40)',
+            f'INSERT INTO "{ext_schema}".tp_ext VALUES (5, 31, 55)',
+        )
+        assert mgr.check_schema_drift()["mv_tp"] == "triggers_missing"
+        mgr.repair_view()
+        assert mgr.check_schema_drift() == {vn: "ok" for vn, _ in views}
+        _assert_exact("after cross-schema partition attach + repair")
+        _exec(f'DROP TABLE "{ext_schema}".tp_ext')
+        assert mgr.check_schema_drift()["mv_tp"] == "partitions_changed"
+        mgr.repair_view()
+        assert mgr.check_schema_drift() == {vn: "ok" for vn, _ in views}
+        _assert_exact("after cross-schema partition drop")
+
+        # 6. Quoted/mixed-case/space partitioned table ("My Part"):
+        #    bound change (DETACH + re-ATTACH with wider bound keeping triggers intact so
+        #    ONLY partbound changed -> partitions_changed!), rename, and drop.
+        _exec(
+            'ALTER TABLE "My Part" DETACH PARTITION "My Part Hi"',
+            'ALTER TABLE "My Part" ATTACH PARTITION "My Part Hi" FOR VALUES FROM (10) TO (30)',
+        )
+        assert mgr.check_schema_drift()["mv_qpart"] == "partitions_changed"
+        assert mgr.check_schema_drift()["mv_unreg"] == "ok"
+        mgr.repair_view("mv_qpart")
+        assert mgr.check_schema_drift()["mv_qpart"] == "ok"
+
+        _exec('ALTER TABLE "My Part Hi" RENAME TO "My Part Hi Renamed"')
+        assert mgr.check_schema_drift()["mv_qpart"] == "partitions_changed"
+        assert mgr.check_schema_drift()["mv_unreg"] == "ok"
+        mgr.repair_view("mv_qpart")
+        assert mgr.check_schema_drift()["mv_qpart"] == "ok"
+        _exec('DROP TABLE "My Part Hi Renamed"')
+        assert mgr.check_schema_drift()["mv_qpart"] == "partitions_changed"
+        mgr.repair_view("mv_qpart")
+        assert mgr.check_schema_drift()["mv_qpart"] == "ok"
+        _assert_exact("after quoted partition bound-change/rename/drop")
+
+        # 7. Malformed AND empty '{}' partitions_json in catalog both fail closed as partitions_changed.
+        _exec(f"UPDATE {mgr.catalog_table} SET partitions_json = '{{not-json' WHERE view_name = 'mv_tp'")
+        assert mgr.check_schema_drift()["mv_tp"] == "partitions_changed"
+        assert mgr.repair_view("mv_tp") == {"mv_tp": "rebuilt"}
+        assert mgr.check_schema_drift()["mv_tp"] == "ok"
+
+        _exec(f"UPDATE {mgr.catalog_table} SET partitions_json = '{{}}' WHERE view_name = 'mv_tp'")
+        assert mgr.check_schema_drift()["mv_tp"] == "partitions_changed"
+        assert mgr.repair_view("mv_tp") == {"mv_tp": "rebuilt"}
+        assert mgr.check_schema_drift()["mv_tp"] == "ok"
+
+        # 8. Dropped single trigger on partitioned table AND dropped read-only trigger on reader view
+        #    both report REPLACE (with non-empty pending_ddls) in diff_views().
+        cat_now = mgr.get_catalog()
+        first_ai = next(t for t in cat_now["mv_tp"]["trigger_names"] if t.endswith("_ai"))
+        _exec(f'DROP TRIGGER "{first_ai}" ON tp')
+        diff_trig = mgr.diff_views(view_sqls)
+        assert diff_trig["mv_tp"].status == "REPLACE"
+        assert diff_trig["mv_tp"].pending_ddls
+        assert mgr.repair_view("mv_tp") == {"mv_tp": "rebuilt"}
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT tgname FROM pg_catalog.pg_trigger "
+                "WHERE tgrelid = 'mv_unreg'::regclass AND NOT tgisinternal"
+            )
+            ro_rows = [r[0] for r in cur.fetchall()]
+        conn.commit()
+        assert ro_rows
+        _exec(f'DROP TRIGGER "{ro_rows[0]}" ON mv_unreg')
+        diff_ro = mgr.diff_views(view_sqls)
+        assert diff_ro["mv_unreg"].status == "REPLACE"
+        assert diff_ro["mv_unreg"].pending_ddls
+        assert mgr.repair_view("mv_unreg") == {"mv_unreg": "rebuilt"}
+
+        assert mgr.check_schema_drift() == {vn: "ok" for vn, _ in views}
+        assert {k: v.status for k, v in mgr.diff_views(view_sqls).items()} == {vn: "NOOP" for vn, _ in views}
+        _assert_exact("after all drift repairs")
+    finally:
+        try:
+            _exec(f'DROP SCHEMA IF EXISTS "{ext_schema}" CASCADE')
+        except Exception:
+            conn.rollback()

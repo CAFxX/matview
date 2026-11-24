@@ -704,7 +704,8 @@ class MaterializedViewManager:
                     backfill_max_pk BIGINT DEFAULT NULL,
                     backfill_active INTEGER NOT NULL DEFAULT 0,
                     backfill_owner VARCHAR(64) DEFAULT NULL,
-                    accepted_limitations_json TEXT DEFAULT NULL
+                    accepted_limitations_json TEXT DEFAULT NULL,
+                    partitions_json TEXT DEFAULT NULL
                 );
                 """
             )
@@ -721,6 +722,7 @@ class MaterializedViewManager:
                 ("backfill_active", "backfill_active INTEGER NOT NULL DEFAULT 0"),
                 ("backfill_owner", "backfill_owner VARCHAR(64) DEFAULT NULL"),
                 ("accepted_limitations_json", "accepted_limitations_json TEXT DEFAULT NULL"),
+                ("partitions_json", "partitions_json TEXT DEFAULT NULL"),
             ):
                 try:
                     cur.execute(f"SELECT {col} FROM {self.catalog_table} WHERE 1 = 0")
@@ -986,12 +988,44 @@ class MaterializedViewManager:
                 cur,
                 f"SELECT view_name, accepted_limitations_json FROM {self.catalog_table}{lock_clause}",
             )
+            partition_rows = self._catalog_select(
+                cur,
+                f"SELECT view_name, partitions_json FROM {self.catalog_table}{lock_clause}",
+            )
         accepted_by_view: Dict[str, Any] = {}
         for arow in accepted_rows or ():
             try:
                 accepted_by_view[arow[0]] = None if arow[1] is None else json.loads(arow[1])
             except (TypeError, ValueError):
                 accepted_by_view[arow[0]] = {"definition": None, "codes": []}
+        partitions_by_view: Dict[str, Any] = {}
+        partitions_malformed_by_view: Dict[str, bool] = {}
+        for prow in partition_rows or ():
+            if prow[1] is None:
+                partitions_by_view[prow[0]] = None
+                partitions_malformed_by_view[prow[0]] = False
+                continue
+            try:
+                parsed_parts = json.loads(prow[1])
+                if not isinstance(parsed_parts, dict) or not all(
+                    isinstance(k, str)
+                    and isinstance(v, list)
+                    and all(
+                        isinstance(item, list)
+                        and len(item) == 3
+                        and all(isinstance(elem, str) for elem in item)
+                        for item in v
+                    )
+                    for k, v in parsed_parts.items()
+                ):
+                    partitions_by_view[prow[0]] = None
+                    partitions_malformed_by_view[prow[0]] = True
+                else:
+                    partitions_by_view[prow[0]] = parsed_parts
+                    partitions_malformed_by_view[prow[0]] = False
+            except (TypeError, ValueError):
+                partitions_by_view[prow[0]] = None
+                partitions_malformed_by_view[prow[0]] = True
         out: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             out[row[0]] = {
@@ -1028,6 +1062,8 @@ class MaterializedViewManager:
             out[row[0]]["accepted_limitations"] = codes
             out[row[0]]["accepted_definition"] = rec.get("definition") if isinstance(rec, dict) else None
             out[row[0]]["accepted_limitations_mismatch"] = mismatch
+            out[row[0]]["partitions"] = partitions_by_view.get(row[0])
+            out[row[0]]["partitions_malformed"] = partitions_malformed_by_view.get(row[0], False)
         return out
 
     def _compute_signature(self, plan: MaterializedViewPlan, schemas: Dict[str, TableSchema]) -> str:
@@ -2259,36 +2295,40 @@ class MaterializedViewManager:
                         view_name, view_sql, strategy, signature_hash, backing_table,
                         aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json,
                         backfill_cursor_pk, backfill_max_pk, backfill_active,
-                        accepted_limitations_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        accepted_limitations_json, partitions_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
-                catalog_insert_params = (
-                    plan.view_name,
-                    stored_view_sql,
-                    plan.strategy.value,
-                    sig,
-                    plan.backing_table_name,
-                    json.dumps(plan.auxiliary_table_names),
-                    json.dumps(plan.trigger_names),
-                    json.dumps(plan.function_names),
-                    json.dumps(plan.trigger_ddls),
-                    init_cursor,
-                    init_max,
-                    init_active,
-                    json.dumps({
-                        "definition": _definition_digest(
-                            plan.view_spec.original_select_sql or plan.view_spec.raw_select_sql
-                        ),
-                        "codes": sorted({lim.code for lim in plan.limitations}),
-                    }),
-                )
+                accepted_lim_json = json.dumps({
+                    "definition": _definition_digest(
+                        plan.view_spec.original_select_sql or plan.view_spec.raw_select_sql
+                    ),
+                    "codes": sorted({lim.code for lim in plan.limitations}),
+                })
+
+                def _make_catalog_params(parts_json: Optional[str]) -> Tuple[Any, ...]:
+                    return (
+                        plan.view_name,
+                        stored_view_sql,
+                        plan.strategy.value,
+                        sig,
+                        plan.backing_table_name,
+                        json.dumps(plan.auxiliary_table_names),
+                        json.dumps(plan.trigger_names),
+                        json.dumps(plan.function_names),
+                        json.dumps(plan.trigger_ddls),
+                        init_cursor,
+                        init_max,
+                        init_active,
+                        accepted_lim_json,
+                        parts_json,
+                    )
 
                 # On MySQL/MariaDB, CREATE TRIGGER commits implicitly. Insert and
                 # commit the pending-backfill catalog row (NULL, NULL, active=1)
                 # BEFORE installing triggers so triggers gate every write from the
                 # very first microsecond they exist (no ungated double-count window).
                 if self.dialect == Dialect.MYSQL and pending_backfill:
-                    self._execute_param(cur, catalog_insert_sql, catalog_insert_params)
+                    self._execute_param(cur, catalog_insert_sql, _make_catalog_params(None))
                     catalog_inserted = True
                     self._commit()
 
@@ -2299,7 +2339,22 @@ class MaterializedViewManager:
                         created_objects.append(obj)
 
                 if not catalog_inserted:
-                    self._execute_param(cur, catalog_insert_sql, catalog_insert_params)
+                    # On PostgreSQL, snapshot the source tables' partition trees
+                    # AFTER trigger installation (which holds SHARE ROW EXCLUSIVE
+                    # on the base tables and partitions) so the recorded partition
+                    # set matches both installed triggers and initial population.
+                    parts_snapshot = (
+                        self._pg_snapshot_partitions(
+                            cur,
+                            _postgres_base_table_lock_targets(
+                                plan, object_prefix=self.object_prefix
+                            ),
+                        )
+                        if self.dialect == Dialect.POSTGRES
+                        else None
+                    )
+                    parts_json = json.dumps(parts_snapshot) if parts_snapshot is not None else None
+                    self._execute_param(cur, catalog_insert_sql, _make_catalog_params(parts_json))
                     catalog_inserted = True
 
                 if populate:
@@ -2481,14 +2536,17 @@ class MaterializedViewManager:
         the connected database (supporting multi-view SQL files/strings as well).
         Returns a status map `{view_name: "created" | "updated" | "unchanged" |
         "backfill_incomplete" | "triggers_missing" | "triggers_disabled" |
-        "triggers_modified" | "triggers_out_of_order" | "triggers_orphaned" | "dropped"}`
+        "triggers_modified" | "triggers_out_of_order" | "triggers_orphaned" |
+        "partitions_changed" | "dropped"}`
         ("triggers_missing": maintenance triggers or helper functions of an unchanged view are gone;
         "triggers_disabled": a PostgreSQL maintenance trigger is disabled;
         "triggers_modified": a PostgreSQL maintenance/helper function body, `search_path`, or trigger
         definition was altered out of band; "triggers_out_of_order": a newer SQLite user trigger
         that writes a source table fires before the maintenance trigger, or a MySQL/MariaDB
         `PRECEDES` user trigger writes another join source first; "triggers_orphaned": a PostgreSQL
-        maintenance trigger is on a DETACHed partition; repair any of these with `repair_view()`);
+        maintenance trigger is on a DETACHed partition; "partitions_changed": a PostgreSQL source
+        table's partition set changed out of band, e.g. `DROP TABLE` on a partition; repair any of
+        these with `repair_view()`);
         "backfill_incomplete" means the definition
         is current but a pk-range backfill is running elsewhere or was interrupted
         (repair with `repair_view()`). ``accept_limitations`` behaves as in
@@ -2801,8 +2859,9 @@ class MaterializedViewManager:
         catalog: Dict[str, Dict[str, Any]],
         extra_ddls_by_view: Optional[Mapping[str, Sequence[str]]] = None,
     ) -> Dict[str, str]:
-        """``{view: "triggers_missing" | "triggers_disabled" | "triggers_modified" | "triggers_out_of_order" | "triggers_orphaned"}``
-        for views whose maintenance triggers or functions drifted.
+        """``{view: "triggers_missing" | "triggers_disabled" | "triggers_modified" | "triggers_out_of_order" | "triggers_orphaned" | "partitions_changed"}``
+        for views whose maintenance triggers, functions, or PostgreSQL source
+        partition sets drifted.
 
         "triggers_missing": a recorded trigger or helper function does not exist
         (PostgreSQL: on the source table or on one of its current partitions,
@@ -2817,7 +2876,11 @@ class MaterializedViewManager:
         table, or ``WHEN`` predicate. "triggers_orphaned"
         (PostgreSQL): a maintenance trigger function also fires for a table
         that is no longer in the source's partition tree (a DETACHed
-        partition, whose writes would still change the view). Never ends a
+        partition, whose writes would still change the view).
+        "partitions_changed" (PostgreSQL): a source table's live partition tree
+        differs from the partition snapshot recorded in ``partitions_json``
+        (e.g. ``DROP TABLE`` on a partition, ``DETACH`` followed by ``DROP``,
+        partition rename, or bound change). Never ends a
         caller transaction (savepoint-protected reads); when the trigger list
         cannot be read nothing is reported.
         """
@@ -3050,17 +3113,119 @@ class MaterializedViewManager:
                     break
         return out
 
+    def _pg_resolve_catalog_schema_meta(
+        self, cur: Any
+    ) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+        """Return ``(schema_oid, schema_name, current_user)`` for the catalog's schema."""
+        lit_cat = "'" + self.catalog_table.replace("'", "''") + "'"
+        meta_rows = self._catalog_select(
+            cur,
+            "SELECT c.relnamespace, n.nspname, current_user"
+            " FROM pg_catalog.pg_class c"
+            " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+            f" WHERE c.oid = pg_catalog.to_regclass({lit_cat})::oid",
+        )
+        if not meta_rows:
+            meta_rows = self._catalog_select(
+                cur,
+                "SELECT n.oid, n.nspname, current_user"
+                " FROM pg_catalog.pg_namespace n"
+                " WHERE n.nspname = pg_catalog.current_schema()",
+            )
+        if meta_rows:
+            return int(meta_rows[0][0]), str(meta_rows[0][1]), str(meta_rows[0][2])
+        return None, None, None
+
+    def _pg_query_table_partitions(
+        self,
+        cur: Any,
+        table_ref: str,
+        expected_schema_name: Optional[str],
+    ) -> Optional[Tuple[bool, List[List[str]]]]:
+        """Query the full recursive partition tree of PostgreSQL ``table_ref``
+        (a valid PostgreSQL SQL table reference, preserving any schema qualifier
+        and identifier quoting) using OID-independent
+        ``[schema_key, relname, partbound]`` triples.
+
+        Returns ``None`` if the metadata query could not run (e.g. non-PG mock),
+        ``(False, [])`` if ``to_regclass`` cannot resolve ``table_ref``, or
+        ``(True, sorted_partitions)`` when the table exists."""
+        lit_reg = "'" + table_ref.replace("'", "''") + "'"
+        rows = self._catalog_select(
+            cur,
+            f"WITH RECURSIVE __mv_root(relid) AS ("
+            f" SELECT pg_catalog.to_regclass({lit_reg})::oid"
+            f"), __mv_tree(relid, depth) AS ("
+            f" SELECT relid, 0 FROM __mv_root WHERE relid IS NOT NULL"
+            f" UNION"
+            f" SELECT i.inhrelid, __mv_tree.depth + 1"
+            f" FROM pg_catalog.pg_inherits i"
+            f" JOIN __mv_tree ON i.inhparent = __mv_tree.relid"
+            f") SELECT"
+            f" (SELECT relid IS NOT NULL FROM __mv_root),"
+            f" n.nspname,"
+            f" c.relname,"
+            f" COALESCE(pg_catalog.pg_get_expr(c.relpartbound, c.oid), '')"
+            f" FROM __mv_root r"
+            f" LEFT JOIN __mv_tree t ON t.depth > 0"
+            f" LEFT JOIN pg_catalog.pg_class c ON c.oid = t.relid"
+            f" LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+            f" ORDER BY 2 NULLS FIRST, 3 NULLS FIRST, 4 NULLS FIRST",
+        )
+        if rows is None:
+            return None
+        if not rows or not bool(rows[0][0]):
+            return (False, [])
+        parts: List[List[str]] = []
+        seen_parts: Set[Tuple[str, str, str]] = set()
+        for _, nsp, rel, bound in rows:
+            if rel is None:
+                continue
+            nsp_s = str(nsp or "")
+            schema_key = "" if (expected_schema_name and nsp_s == expected_schema_name) else nsp_s
+            triple = (schema_key, str(rel), str(bound or ""))
+            if triple not in seen_parts:
+                seen_parts.add(triple)
+                parts.append(list(triple))
+        parts.sort()
+        return (True, parts)
+
+    def _pg_snapshot_partitions(
+        self,
+        cur: Any,
+        table_refs: Sequence[str],
+        expected_schema_name: Optional[str] = None,
+    ) -> Optional[Dict[str, List[List[str]]]]:
+        """Capture an OID-independent snapshot of each referenced source table's
+        partition tree on PostgreSQL. Returns ``None`` if catalog queries fail
+        or any referenced source table cannot be resolved (never silently omits
+        an unresolved table into an incomplete snapshot)."""
+        if expected_schema_name is None:
+            _, expected_schema_name, _ = self._pg_resolve_catalog_schema_meta(cur)
+        unique_tables = sorted({str(t).strip() for t in table_refs if str(t).strip()})
+        snapshot: Dict[str, List[List[str]]] = {}
+        for tbl in unique_tables:
+            res = self._pg_query_table_partitions(cur, tbl, expected_schema_name)
+            if res is None:
+                return None
+            exists, parts = res
+            if not exists:
+                return None
+            snapshot[tbl] = parts
+        return snapshot
+
     def _pg_trigger_drift(
         self,
         catalog: Dict[str, Dict[str, Any]],
         extra_ddls_by_view: Optional[Mapping[str, Sequence[str]]] = None,
     ) -> Dict[str, str]:
-        # Priority: missing > disabled > modified > orphaned.
+        # Priority: missing > disabled > modified > orphaned > partitions_changed.
         _RANK = {
-            "triggers_orphaned": 1,
-            "triggers_modified": 2,
-            "triggers_disabled": 3,
-            "triggers_missing": 4,
+            "partitions_changed": 1,
+            "triggers_orphaned": 2,
+            "triggers_modified": 3,
+            "triggers_disabled": 4,
+            "triggers_missing": 5,
         }
 
         def _merge(cur_status: Optional[str], candidate: str) -> str:
@@ -3073,28 +3238,9 @@ class MaterializedViewManager:
             # Resolve the catalog's own schema (and current_user) once so we
             # reject cross-schema decoy functions and validate "$user" strictly
             # against current_user.
-            expected_schema_oid: Optional[int] = None
-            expected_schema_name: Optional[str] = None
-            pg_current_user: Optional[str] = None
-            lit_cat = "'" + self.catalog_table.replace("'", "''") + "'"
-            meta_rows = self._catalog_select(
-                cur,
-                f"SELECT c.relnamespace, n.nspname, current_user"
-                f" FROM pg_catalog.pg_class c"
-                f" JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
-                f" WHERE c.oid = pg_catalog.to_regclass({lit_cat})::oid",
+            expected_schema_oid, expected_schema_name, pg_current_user = (
+                self._pg_resolve_catalog_schema_meta(cur)
             )
-            if not meta_rows:
-                meta_rows = self._catalog_select(
-                    cur,
-                    "SELECT n.oid, n.nspname, current_user"
-                    " FROM pg_catalog.pg_namespace n"
-                    " WHERE n.nspname = pg_catalog.current_schema()",
-                )
-            if meta_rows:
-                expected_schema_oid = int(meta_rows[0][0])
-                expected_schema_name = str(meta_rows[0][1])
-                pg_current_user = str(meta_rows[0][2])
 
             for name, entry in catalog.items():
                 status: Optional[str] = None
@@ -3346,6 +3492,31 @@ class MaterializedViewManager:
                         )
                         if rows is not None and int(rows[0][0]) < len({n.lower() for n in names}):
                             status = "triggers_missing"
+                if status is None:
+                    # Detect out-of-band PostgreSQL partition drops / replacements
+                    # (e.g. DROP TABLE on a partition, DETACH + DROP, or bound changes)
+                    # by comparing each source table's live OID-independent partition
+                    # tree against the snapshot persisted in partitions_json.
+                    if entry.get("partitions_malformed"):
+                        status = _merge(status, "partitions_changed")
+                    elif isinstance(entry.get("partitions"), dict):
+                        if not entry["partitions"] and (
+                            expected_triggers
+                            or entry.get("trigger_ddls")
+                            or entry.get("trigger_names")
+                        ):
+                            status = _merge(status, "partitions_changed")
+                        else:
+                            for src_tbl, recorded_parts in entry["partitions"].items():
+                                part_res = self._pg_query_table_partitions(
+                                    cur, src_tbl, expected_schema_name
+                                )
+                                if part_res is None:
+                                    continue
+                                tbl_exists, live_parts = part_res
+                                if not tbl_exists or live_parts != recorded_parts:
+                                    status = _merge(status, "partitions_changed")
+                                    break
                 if status:
                     out[name] = status
         return out
@@ -3356,7 +3527,8 @@ class MaterializedViewManager:
         Inspects all registered views in `__matview_catalog` against the current live base
         table schemas and returns `{view_name: "ok" | "drifted" | "invalid" |
         "backfill_incomplete" | "triggers_missing" | "triggers_disabled" |
-        "triggers_modified" | "triggers_out_of_order" | "triggers_orphaned"}`;
+        "triggers_modified" | "triggers_out_of_order" | "triggers_orphaned" |
+        "partitions_changed"}`;
         "backfill_incomplete" (definition current, but a pk-range backfill is
         running elsewhere or was interrupted) is never "ok"; "triggers_missing"
         means maintenance triggers or helper functions recorded for the view do
@@ -3374,8 +3546,12 @@ class MaterializedViewManager:
         first; "triggers_orphaned" means a PostgreSQL maintenance trigger
         is on a table outside the source's partition tree, e.g. a DETACHed
         partition (its writes still change the view, and its rows are still in
-        the view). Repair any trigger/function drift with `repair_view()`, which
-        rebuilds the view.
+        the view); "partitions_changed" means a PostgreSQL source table's
+        partition tree changed out of band (e.g. `DROP TABLE` on a partition,
+        `DETACH` followed by `DROP`, or a partition rename/bound change; rows
+        of a dropped partition remain in the view until repaired). Repair any
+        trigger/function/partition drift with `repair_view()`, which rebuilds
+        the view.
         """
         schemas = self.fetch_schema()
         catalog = self.get_catalog()
@@ -3558,13 +3734,33 @@ class MaterializedViewManager:
                         # Explicit transaction so autocommit=True connections
                         # cannot commit the watermark/DELETE before repopulating.
                         cur.execute("START TRANSACTION;")
-                    self._execute_param(
-                        cur,
-                        f"UPDATE {self.catalog_table} SET backfill_cursor_pk = ?, "
-                        f"backfill_max_pk = ?, backfill_active = 0, backfill_owner = NULL "
-                        f"WHERE view_name = ?",
-                        (self._COMPLETED_MARKER_PK, self._COMPLETED_MARKER_PK, v_name),
+                    parts_snapshot = (
+                        self._pg_snapshot_partitions(cur, pg_lock_targets)
+                        if self.dialect == Dialect.POSTGRES
+                        else None
                     )
+                    if parts_snapshot is not None:
+                        self._execute_param(
+                            cur,
+                            f"UPDATE {self.catalog_table} SET backfill_cursor_pk = ?, "
+                            f"backfill_max_pk = ?, backfill_active = 0, backfill_owner = NULL, "
+                            f"partitions_json = ? "
+                            f"WHERE view_name = ?",
+                            (
+                                self._COMPLETED_MARKER_PK,
+                                self._COMPLETED_MARKER_PK,
+                                json.dumps(parts_snapshot),
+                                v_name,
+                            ),
+                        )
+                    else:
+                        self._execute_param(
+                            cur,
+                            f"UPDATE {self.catalog_table} SET backfill_cursor_pk = ?, "
+                            f"backfill_max_pk = ?, backfill_active = 0, backfill_owner = NULL "
+                            f"WHERE view_name = ?",
+                            (self._COMPLETED_MARKER_PK, self._COMPLETED_MARKER_PK, v_name),
+                        )
                     for aux_t in plan.auxiliary_table_names:
                         cur.execute(f"DELETE FROM {aux_t};")
                     for aux_ddl in plan.auxiliary_table_ddls:
@@ -4199,8 +4395,23 @@ class MaterializedViewManager:
                 "SELECT name FROM sqlite_master WHERE type = 'trigger';"
             )
         if self.dialect == Dialect.POSTGRES:
+            # Query pg_catalog.pg_trigger directly rather than
+            # information_schema.triggers, which omits AFTER TRUNCATE triggers,
+            # and scope by the trigger function's schema matching the catalog's
+            # schema (so triggers on cross-schema source tables are included
+            # while same-named triggers from another schema's installation are not).
+            lit_cat = "'" + self.catalog_table.replace("'", "''") + "'"
             return self._query_lower_name_set(
-                "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = current_schema();"
+                "SELECT t.tgname FROM pg_catalog.pg_trigger t "
+                "JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid "
+                "JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace "
+                "WHERE NOT t.tgisinternal "
+                "AND pn.nspname = COALESCE("
+                "  (SELECT cn.nspname FROM pg_catalog.pg_class cc "
+                "   JOIN pg_catalog.pg_namespace cn ON cn.oid = cc.relnamespace "
+                f"   WHERE cc.oid = pg_catalog.to_regclass({lit_cat})::oid),"
+                "  pg_catalog.current_schema()"
+                ");"
             )
         if self.dialect == Dialect.MYSQL:
             return self._query_lower_name_set(
@@ -4275,22 +4486,42 @@ class MaterializedViewManager:
             schemas=schemas,
         )
 
+        compiled_plans: List[MaterializedViewPlan] = []
         for v_spec in all_specs:
-            plan = generate_materialized_view(
-                schemas,
-                v_spec,
-                dialect=self.dialect,
-                ignore_limitations=effective_ignore,
-                accept_limitations=self._effective_accept(v_spec, catalog, accept_limitations),
-                object_prefix=self.object_prefix,
-                strict=effective_strict,
-                engine_version=self.engine_version,
-                pg_fillfactor=getattr(self, "pg_fillfactor", 80),
-                watermark_catalog_table=self.catalog_table if incremental_backfill else None,
-                repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
-                plain_views=plain_views,
-                current_schema=cur_schema,
+            compiled_plans.append(
+                generate_materialized_view(
+                    schemas,
+                    v_spec,
+                    dialect=self.dialect,
+                    ignore_limitations=effective_ignore,
+                    accept_limitations=self._effective_accept(v_spec, catalog, accept_limitations),
+                    object_prefix=self.object_prefix,
+                    strict=effective_strict,
+                    engine_version=self.engine_version,
+                    pg_fillfactor=getattr(self, "pg_fillfactor", 80),
+                    watermark_catalog_table=self.catalog_table if incremental_backfill else None,
+                    repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
+                    plain_views=plain_views,
+                    current_schema=cur_schema,
+                )
             )
+
+        pg_trigger_drift: Dict[str, str] = {}
+        if self.dialect == Dialect.POSTGRES and catalog:
+            matched_catalog: Dict[str, Dict[str, Any]] = {}
+            extra_ddls_by_view: Dict[str, Sequence[str]] = {}
+            for p in compiled_plans:
+                res_cat = self._resolve_catalog_name(p.view_name, catalog)
+                if res_cat in catalog:
+                    matched_catalog[res_cat] = catalog[res_cat]
+                    if p.readonly_trigger_ddls:
+                        extra_ddls_by_view[res_cat] = p.readonly_trigger_ddls
+            if matched_catalog:
+                pg_trigger_drift = self._pg_trigger_drift(
+                    matched_catalog, extra_ddls_by_view=extra_ddls_by_view
+                )
+
+        for plan in compiled_plans:
             v_name = plan.view_name
             desired_names.add(v_name)
             sig = self._compute_signature(plan, schemas)
@@ -4350,12 +4581,14 @@ class MaterializedViewManager:
                 trigs_match = (
                     True if live_triggers is None else cat_trigs_lower.issubset(live_triggers)
                 )
+                pg_drift_reason = pg_trigger_drift.get(resolved_cat_name)
 
                 is_clean_noop = (
                     cat_sig == sig
                     and backing_exists
                     and view_exists
                     and trigs_match
+                    and pg_drift_reason is None
                     and cat_strat == plan.strategy.value
                 )
 
@@ -4396,12 +4629,14 @@ class MaterializedViewManager:
                     )
                     strategy_changed = cat_strat != plan.strategy.value
                     backing_changed = cat_backing != plan.backing_table_name
+                    pg_drift_needs_replace = pg_drift_reason is not None
                     needs_replace = (
                         query_sql_changed
                         or strategy_changed
                         or backing_changed
                         or not backing_exists
                         or cat_sig != sig
+                        or pg_drift_needs_replace
                     )
 
                     status = "REPLACE" if needs_replace else "ALTER"
@@ -4455,7 +4690,16 @@ class MaterializedViewManager:
                     }
                     if needs_replace:
                         pending_ddls = plan.drop_statements() + plan.create_structure_statements() + plan.trigger_ddls
-                        summary = f"View '{v_name}' query, schema, or strategy changed; pending REPLACE."
+                        if pg_drift_needs_replace and not (
+                            query_sql_changed
+                            or strategy_changed
+                            or backing_changed
+                            or not backing_exists
+                            or cat_sig != sig
+                        ):
+                            summary = f"View '{v_name}' has {pg_drift_reason}; pending REPLACE."
+                        else:
+                            summary = f"View '{v_name}' query, schema, or strategy changed; pending REPLACE."
                     else:
                         trig_patterns = [
                             re.compile(rf"(?<![A-Za-z0-9_]){re.escape(t)}(?![A-Za-z0-9_])", re.IGNORECASE)

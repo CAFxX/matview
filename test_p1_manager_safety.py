@@ -1759,5 +1759,294 @@ class TestPlainViewAsSource(unittest.TestCase):
             eng.dispose()
 
 
+class TestPgPartitionDropAndTruncateTriggerDrift(unittest.TestCase):
+    """Offline verification of PostgreSQL partition-drop drift detection
+    (partitions_json comparison, priority vs triggers_missing/triggers_orphaned,
+    malformed catalog fail-closed, legacy NULL compatibility) and
+    _get_live_trigger_names() querying pg_catalog.pg_trigger so AFTER TRUNCATE
+    triggers are visible to diff_views()."""
+
+    def test_pg_partition_drop_and_truncate_trigger_drift_detection(self) -> None:
+        import json
+        from matview import generate_materialized_view, parse_table_schema
+        from matview.dialects.base import Dialect
+        from matview.manager import MaterializedViewManager
+
+        executed_sqls: list[str] = []
+        live_part_rows: dict[str, list[tuple[Any, ...]]] = {
+            "tp": [
+                (True, "app", "tp_hi", "FOR VALUES FROM (100) TO (200)"),
+                (True, "app", "tp_lo", "FOR VALUES FROM (0) TO (100)"),
+            ],
+            "tp_missing": [(False, None, None, "")],
+        }
+        trig_counts = {"missing": 0, "orphaned": 0, "disabled": 0}
+
+        class _FakePgCursor:
+            def __init__(self) -> None:
+                self._rows: list[tuple[Any, ...]] = []
+
+            def execute(self, sql: str, params: Any = None) -> None:
+                executed_sqls.append(sql)
+                s = " ".join(sql.split())
+                if "information_schema.triggers" in s:
+                    # PostgreSQL information_schema.triggers omits AFTER TRUNCATE triggers!
+                    self._rows = [("__matview_trg_v_ai",), ("__matview_trg_v_au",), ("__matview_trg_v_ad",)]
+                elif "FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_proc p" in s:
+                    self._rows = [
+                        ("__matview_trg_v_ai",),
+                        ("__matview_trg_v_au",),
+                        ("__matview_trg_v_ad",),
+                        ("__matview_trg_v_trunc",),
+                    ]
+                elif "SELECT c.relnamespace, n.nspname, current_user" in s:
+                    self._rows = [(16384, "app", "matview")]
+                elif "pg_catalog.pg_get_expr(c.relpartbound" in s:
+                    if "'tp_missing'" in s:
+                        self._rows = list(live_part_rows["tp_missing"])
+                    else:
+                        self._rows = list(live_part_rows["tp"])
+                elif "t.tgenabled NOT IN" in s:
+                    self._rows = [(trig_counts["missing"], trig_counts["orphaned"], trig_counts["disabled"])]
+                elif "SELECT count(DISTINCT lower(tgname))" in s:
+                    self._rows = [(1,)]
+                elif "SELECT t.tgtype," in s:
+                    self._rows = [
+                        (
+                            4,
+                            "",
+                            "__mv_n",
+                            False,
+                            False,
+                            False,
+                            False,
+                            "__matview_fn_v_ai",
+                            "BEGIN RETURN NULL; END;",
+                            "app",
+                            "plpgsql",
+                            False,
+                            "f",
+                            True,
+                            16384,
+                            "app",
+                            True,
+                        )
+                    ]
+                else:
+                    self._rows = []
+
+            def fetchall(self) -> list[tuple[Any, ...]]:
+                return list(self._rows)
+
+            def fetchone(self) -> Any:
+                return self._rows[0] if self._rows else None
+
+            def close(self) -> None:
+                pass
+
+        class _FakePgConn:
+            def cursor(self) -> _FakePgCursor:
+                return _FakePgCursor()
+
+            def commit(self) -> None:
+                pass
+
+            def rollback(self) -> None:
+                pass
+
+            def get_transaction_status(self) -> int:
+                return 0
+
+        mgr = MaterializedViewManager(
+            _FakePgConn(),
+            dialect=Dialect.POSTGRES,
+            skip_ensure_catalog=True,
+        )
+
+        # 1. _get_live_trigger_names() must query pg_catalog.pg_trigger so AFTER TRUNCATE triggers appear.
+        live_trigs = mgr._get_live_trigger_names()
+        self.assertIsNotNone(live_trigs)
+        assert live_trigs is not None
+        self.assertIn("__matview_trg_v_trunc", live_trigs)
+        self.assertTrue(any("pg_catalog.pg_trigger" in q for q in executed_sqls))
+        self.assertFalse(any("information_schema.triggers" in q for q in executed_sqls))
+
+        # 2. Matching partition snapshot -> no drift.
+        recorded_ok = {
+            "tp": [
+                ["", "tp_hi", "FOR VALUES FROM (100) TO (200)"],
+                ["", "tp_lo", "FOR VALUES FROM (0) TO (100)"],
+            ]
+        }
+        cat_ok = {
+            "v_ok": {"trigger_ddls": [], "trigger_names": [], "partitions": recorded_ok, "partitions_malformed": False},
+            "v_legacy": {"trigger_ddls": [], "trigger_names": [], "partitions": None, "partitions_malformed": False},
+        }
+        self.assertEqual(mgr._pg_trigger_drift(cat_ok), {})
+
+        # 3. Dropped partition -> partitions_changed.
+        live_part_rows["tp"] = [(True, "app", "tp_lo", "FOR VALUES FROM (0) TO (100)")]
+        self.assertEqual(mgr._pg_trigger_drift(cat_ok), {"v_ok": "partitions_changed"})
+
+        # 4. Altered partition bound (same partition names, different bound) -> partitions_changed.
+        live_part_rows["tp"] = [
+            (True, "app", "tp_hi", "FOR VALUES FROM (100) TO (300)"),
+            (True, "app", "tp_lo", "FOR VALUES FROM (0) TO (100)"),
+        ]
+        self.assertEqual(mgr._pg_trigger_drift(cat_ok), {"v_ok": "partitions_changed"})
+
+        # 5. Missing root table via to_regclass -> partitions_changed.
+        cat_missing_tbl = {
+            "v_gone": {
+                "trigger_ddls": [],
+                "trigger_names": [],
+                "partitions": {"tp_missing": []},
+                "partitions_malformed": False,
+            }
+        }
+        self.assertEqual(mgr._pg_trigger_drift(cat_missing_tbl), {"v_gone": "partitions_changed"})
+
+        # 6. Malformed partitions_json fails closed as partitions_changed.
+        cat_bad = {
+            "v_bad": {"trigger_ddls": [], "trigger_names": [], "partitions": None, "partitions_malformed": True}
+        }
+        self.assertEqual(mgr._pg_trigger_drift(cat_bad), {"v_bad": "partitions_changed"})
+
+        # 7. Empty {} partitions_json on a view with triggers fails closed as partitions_changed,
+        #    and _pg_snapshot_partitions returns None if any source table is unresolved.
+        cat_empty_dict = {
+            "v_empty": {
+                "trigger_ddls": [],
+                "trigger_names": ["__matview_trg_v_ai"],
+                "partitions": {},
+                "partitions_malformed": False,
+            }
+        }
+        self.assertEqual(mgr._pg_trigger_drift(cat_empty_dict), {"v_empty": "partitions_changed"})
+        with mgr._cursor() as cur:
+            self.assertIsNone(mgr._pg_snapshot_partitions(cur, ["tp", "tp_missing"]))
+
+        # 8. Higher-ranked trigger drift (triggers_orphaned / triggers_missing) still takes priority.
+        sample_fn_ddl = (
+            "CREATE OR REPLACE FUNCTION __matview_fn_v_ai() RETURNS TRIGGER LANGUAGE plpgsql "
+            "SET search_path FROM CURRENT AS $$BEGIN RETURN NULL; END;$$;"
+        )
+        sample_trg_ddl = (
+            "CREATE TRIGGER __matview_trg_v_ai AFTER INSERT ON tp "
+            "REFERENCING NEW TABLE AS __mv_n FOR EACH STATEMENT EXECUTE FUNCTION __matview_fn_v_ai();"
+        )
+        live_part_rows["tp"] = [(True, "app", "tp_lo", "FOR VALUES FROM (0) TO (100)")]
+        trig_counts.update({"missing": 0, "orphaned": 1, "disabled": 0})
+        cat_prio = {
+            "v_prio": {
+                "trigger_ddls": [sample_fn_ddl, sample_trg_ddl],
+                "trigger_names": ["__matview_trg_v_ai"],
+                "partitions": recorded_ok,
+                "partitions_malformed": False,
+            }
+        }
+        self.assertEqual(mgr._pg_trigger_drift(cat_prio), {"v_prio": "triggers_orphaned"})
+        trig_counts.update({"missing": 1, "orphaned": 0, "disabled": 0})
+        self.assertEqual(mgr._pg_trigger_drift(cat_prio), {"v_prio": "triggers_missing"})
+
+        # 9. _read_catalog() parsing of partitions_json (valid, NULL, malformed JSON, wrong shape, {}).
+        conn_sq = sqlite3.connect(":memory:")
+        try:
+            mgr_sq = MaterializedViewManager(conn_sq, dialect=Dialect.SQLITE)
+            conn_sq.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER);")
+            mgr_sq.register_view("CREATE VIEW v_valid AS SELECT id, v FROM s;")
+            mgr_sq.register_view("CREATE VIEW v_null AS SELECT id, v FROM s;")
+            mgr_sq.register_view("CREATE VIEW v_bad_json AS SELECT id, v FROM s;")
+            mgr_sq.register_view("CREATE VIEW v_bad_shape AS SELECT id, v FROM s;")
+            conn_sq.execute(
+                f"UPDATE {mgr_sq.catalog_table} SET partitions_json = ? WHERE view_name = 'v_valid'",
+                (json.dumps({"s": [["", "s_p1", "FOR VALUES FROM (0) TO (10)"]]}),),
+            )
+            conn_sq.execute(
+                f"UPDATE {mgr_sq.catalog_table} SET partitions_json = NULL WHERE view_name = 'v_null'"
+            )
+            conn_sq.execute(
+                f"UPDATE {mgr_sq.catalog_table} SET partitions_json = '{{broken' WHERE view_name = 'v_bad_json'"
+            )
+            conn_sq.execute(
+                f"UPDATE {mgr_sq.catalog_table} SET partitions_json = ? WHERE view_name = 'v_bad_shape'",
+                (json.dumps({"s": [["only_two_elems", "x"]]}),),
+            )
+            conn_sq.commit()
+            cat_sq = mgr_sq.get_catalog()
+            self.assertEqual(
+                cat_sq["v_valid"]["partitions"],
+                {"s": [["", "s_p1", "FOR VALUES FROM (0) TO (10)"]]},
+            )
+            self.assertFalse(cat_sq["v_valid"]["partitions_malformed"])
+            self.assertIsNone(cat_sq["v_null"]["partitions"])
+            self.assertFalse(cat_sq["v_null"]["partitions_malformed"])
+            self.assertTrue(cat_sq["v_bad_json"]["partitions_malformed"])
+            self.assertTrue(cat_sq["v_bad_shape"]["partitions_malformed"])
+        finally:
+            conn_sq.close()
+
+        # 10. diff_views() on PostgreSQL keys extra_ddls_by_view by resolved catalog name
+        #     and reports REPLACE for every PG drift reason (including triggers_missing).
+        schema_sql = "CREATE TABLE tp (id BIGINT PRIMARY KEY, v BIGINT NOT NULL);"
+        v_sql = "CREATE VIEW mv_pref AS SELECT id, v FROM tp;"
+        pref_mgr = MaterializedViewManager(
+            _FakePgConn(),
+            dialect=Dialect.POSTGRES,
+            object_prefix="custom_",
+            skip_ensure_catalog=True,
+        )
+        compiled = generate_materialized_view(
+            schema_sql,
+            v_sql,
+            dialect=Dialect.POSTGRES,
+            object_prefix="custom_",
+            repair_fence_catalog_table="custom_catalog",
+        )
+        sig = pref_mgr._compute_signature(compiled, parse_table_schema(schema_sql, dialect=Dialect.POSTGRES))
+        pref_cat = {
+            "custom_mv_pref": {
+                "view_name": "custom_mv_pref",
+                "view_sql": pref_mgr._serialize_view_sql_with_indexes(compiled),
+                "strategy": compiled.strategy.value,
+                "signature_hash": sig,
+                "backing_table": compiled.backing_table_name,
+                "aux_tables": list(compiled.auxiliary_table_names),
+                "trigger_names": list(compiled.trigger_names),
+                "function_names": list(compiled.function_names),
+                "trigger_ddls": list(compiled.trigger_ddls),
+                "accepted_limitations": [],
+                "partitions": {"tp": []},
+                "partitions_malformed": False,
+            }
+        }
+        seen_extra_keys: list[list[str]] = []
+        drift_to_return: dict[str, str] = {}
+        pref_mgr.fetch_schema = lambda extra_schema_sql=None: parse_table_schema(schema_sql, dialect=Dialect.POSTGRES)  # type: ignore[method-assign]
+        pref_mgr.get_catalog = lambda: pref_cat  # type: ignore[method-assign]
+        pref_mgr._fetch_plain_views = lambda **_kw: ({}, "app")  # type: ignore[method-assign]
+        pref_mgr._get_live_table_names = lambda: {compiled.backing_table_name.lower(), "mv_pref"}  # type: ignore[method-assign]
+        pref_mgr._get_live_trigger_names = lambda: {t.lower() for t in compiled.trigger_names}  # type: ignore[method-assign]
+
+        def _spy_pg_drift(cat_arg: Any, extra_ddls_by_view: Any = None) -> dict[str, str]:
+            seen_extra_keys.append(sorted(extra_ddls_by_view.keys()) if extra_ddls_by_view else [])
+            return dict(drift_to_return)
+
+        pref_mgr._pg_trigger_drift = _spy_pg_drift  # type: ignore[method-assign]
+
+        rep_clean = pref_mgr.diff_views(v_sql)
+        self.assertEqual(rep_clean["mv_pref"].status, "NOOP")
+        self.assertEqual(seen_extra_keys[-1], ["custom_mv_pref"])
+
+        for reason in ("partitions_changed", "triggers_orphaned", "triggers_disabled", "triggers_modified", "triggers_missing"):
+            drift_to_return = {"custom_mv_pref": reason}
+            if reason == "triggers_missing":
+                pref_mgr._get_live_trigger_names = lambda: set()  # type: ignore[method-assign]
+            rep_dr = pref_mgr.diff_views(v_sql)
+            self.assertEqual(rep_dr["mv_pref"].status, "REPLACE", reason)
+            self.assertTrue(rep_dr["mv_pref"].pending_ddls, reason)
+            self.assertIn(reason, rep_dr["mv_pref"].summary)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
