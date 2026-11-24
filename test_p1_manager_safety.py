@@ -2048,5 +2048,702 @@ class TestPgPartitionDropAndTruncateTriggerDrift(unittest.TestCase):
             self.assertIn(reason, rep_dr["mv_pref"].summary)
 
 
+class TestMultiEngineGeneratorUpgradeDrift(unittest.TestCase):
+    """Native multi-engine verification of generator-version and backing-DDL
+    upgrade drift detection (`check_schema_drift()` -> 'drifted', `diff_views()`
+    -> REPLACE) and engine-appropriate upgrade rebuilds:
+    - SQLite & PostgreSQL: atomic in-place `register_view()`, `sync_views()`,
+      `repair_view()`, stored `accepted_limitations` preservation, physical
+      backing-table recreation, repopulation, and atomic rollback on failure.
+    - MySQL & MariaDB: drift detection, fail-closed `UnsafeReplacementError` on
+      complete views (leaving old generation intact and maintained), explicit
+      `drop_view()` + `register_view()` upgrade, and in-place rebuild of
+      incomplete-backfill views preserving stored `accepted_limitations`."""
+
+    def _query_multiset(self, conn: Any, sql: str) -> Any:
+        from collections import Counter
+
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            return Counter(tuple(r) for r in rows)
+        finally:
+            cur.close()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+    def _assert_views_exact(
+        self, conn: Any, views: list[tuple[str, str]], step: str
+    ) -> None:
+        for vname, select_sql in views:
+            got = self._query_multiset(conn, f"SELECT * FROM {vname}")
+            exp = self._query_multiset(conn, select_sql)
+            self.assertEqual(got, exp, f"{step}: {vname} diverged from live view")
+
+    def _exec_commit(self, conn: Any, stmts: list[str]) -> None:
+        cur = conn.cursor()
+        try:
+            for s in stmts:
+                cur.execute(s)
+            conn.commit()
+        finally:
+            cur.close()
+
+    def _table_columns_lower(self, conn: Any, table_name: str) -> Set[str]:
+        cur = conn.cursor()
+        try:
+            cur.execute(f"SELECT * FROM {table_name} WHERE 1 = 0")
+            return {str(col[0]).lower() for col in (cur.description or ())}
+        finally:
+            cur.close()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _inject_legacy_column_ddl(backing_ddl: str) -> str:
+        """Insert a real defaulted column `__mv_legacy_v0 INT DEFAULT 0` into a
+        backing-table CREATE TABLE DDL so rebuild verification checks physical
+        table recreation (not just signature hash updates)."""
+        idx_pk = backing_ddl.upper().find("PRIMARY KEY")
+        if idx_pk != -1:
+            return (
+                backing_ddl[:idx_pk]
+                + "__mv_legacy_v0 INT DEFAULT 0,\n    "
+                + backing_ddl[idx_pk:]
+            )
+        idx_rp = backing_ddl.rfind(")")
+        assert idx_rp != -1, backing_ddl
+        return backing_ddl[:idx_rp] + ",\n    __mv_legacy_v0 INT DEFAULT 0" + backing_ddl[idx_rp:]
+
+    def _run_upgrade_drift_suite(
+        self,
+        raw_conn: Any,
+        dialect: Dialect,
+        *,
+        prefix: str,
+        object_prefix: str,
+        initial_accept: Optional[list[str]] = None,
+    ) -> None:
+        import dataclasses
+        import warnings
+        from unittest import mock
+        import matview.manager as manager_mod
+        from matview.engines import EngineLimitationError, EngineLimitationWarning
+        from matview.manager import UnsafeReplacementError
+
+        tracked = CursorTrackingConnection(raw_conn)
+        t_dims = f"{prefix}dims"
+        t_items = f"{prefix}items"
+        v_single = f"{prefix}v_single"
+        v_join = f"{prefix}v_join"
+        v_left = f"{prefix}v_left"
+        v_rep = f"{prefix}v_rep"
+        v_ddl = f"{prefix}v_ddl"
+        v_lim = f"{prefix}v_lim"
+        v_inc = f"{prefix}v_inc"
+
+        sel_single = f"SELECT grp, COUNT(*) AS cnt, SUM(qty) AS tot FROM {t_items} GROUP BY grp"
+        sel_join = (
+            f"SELECT d.label, COUNT(*) AS cnt, SUM(i.qty) AS tot "
+            f"FROM {t_dims} d JOIN {t_items} i ON i.grp = d.grp GROUP BY d.label"
+        )
+        sel_left = (
+            f"SELECT d.label, COUNT(i.id) AS cnt, COALESCE(SUM(i.qty), 0) AS tot "
+            f"FROM {t_dims} d LEFT JOIN {t_items} i ON i.grp = d.grp GROUP BY d.label"
+        )
+        sel_rep = f"SELECT grp, MIN(qty) AS mn, MAX(qty) AS mx FROM {t_items} GROUP BY grp"
+        sel_ddl = f"SELECT grp, COUNT(*) AS cnt FROM {t_items} GROUP BY grp"
+        sel_inc = f"SELECT grp, SUM(qty) AS tot FROM {t_items} GROUP BY grp"
+        # PostgreSQL float-SUM view to exercise stored `accepted_limitations`
+        # preservation across atomic upgrade rebuilds without ignore_limitations.
+        sel_lim = (
+            f"SELECT grp, SUM(CAST(qty AS DOUBLE PRECISION)) AS ftot FROM {t_items} GROUP BY grp"
+        )
+
+        sql_single = f"CREATE VIEW {v_single} AS {sel_single};"
+        sql_join = f"CREATE VIEW {v_join} AS {sel_join};"
+        sql_left = f"CREATE VIEW {v_left} AS {sel_left};"
+        sql_rep = f"CREATE VIEW {v_rep} AS {sel_rep};"
+        sql_ddl = f"CREATE VIEW {v_ddl} AS {sel_ddl};"
+        sql_inc = f"CREATE VIEW {v_inc} AS {sel_inc};"
+        sql_lim = f"CREATE VIEW {v_lim} AS {sel_lim};"
+
+        install_mgr: Optional[MaterializedViewManager] = None
+        upgrade_mgr: Optional[MaterializedViewManager] = None
+
+        try:
+            install_mgr = MaterializedViewManager(
+                tracked,
+                dialect=dialect,
+                object_prefix=object_prefix,
+                accept_limitations=initial_accept,
+            )
+            # Upgrade manager deliberately omits accept_limitations and
+            # ignore_limitations so drift checks and permitted rebuilds must
+            # honor stored accepted_limitations from the catalog.
+            upgrade_mgr = MaterializedViewManager(
+                tracked,
+                dialect=dialect,
+                object_prefix=object_prefix,
+            )
+
+            self._exec_commit(
+                tracked,
+                [
+                    f"CREATE TABLE {t_dims} (grp VARCHAR(16) PRIMARY KEY, label VARCHAR(32) NOT NULL)",
+                    f"CREATE TABLE {t_items} (id INT PRIMARY KEY, grp VARCHAR(16) NOT NULL, qty INT NOT NULL)",
+                    f"INSERT INTO {t_dims} VALUES ('a', 'alpha'), ('b', 'beta'), ('c', 'gamma')",
+                    f"INSERT INTO {t_items} VALUES (1, 'a', 10), (2, 'a', 25), (3, 'b', 7)",
+                ],
+            )
+            tracked.reset_tracking()
+
+            # 1. Install 3 view shapes under a simulated previous generator version.
+            with mock.patch.object(
+                manager_mod, "MATVIEW_GENERATOR_VERSION", "previous-generator"
+            ):
+                with warnings.catch_warnings(record=True) as caught_install:
+                    warnings.simplefilter("always", EngineLimitationWarning)
+                    for vsql in (sql_single, sql_join, sql_left):
+                        install_mgr.register_view(vsql)
+                if dialect == Dialect.MYSQL:
+                    self.assertTrue(
+                        any("MYSQL_NO_TRUNCATE_TRIGGER" in str(w.message) for w in caught_install),
+                        "expected EngineLimitationWarning for MYSQL_NO_TRUNCATE_TRIGGER on install",
+                    )
+                self.assertEqual(
+                    install_mgr.check_schema_drift(),
+                    {v_single: "ok", v_join: "ok", v_left: "ok"},
+                )
+                diff_old = install_mgr.diff_views([sql_single, sql_join, sql_left])
+                for vn in (v_single, v_join, v_left):
+                    self.assertEqual(diff_old[vn].status, "NOOP", vn)
+            self._assert_views_exact(
+                tracked,
+                [(v_single, sel_single), (v_join, sel_join), (v_left, sel_left)],
+                "after initial install under previous generator",
+            )
+            cat_old = upgrade_mgr.get_catalog()
+            old_sigs = {vn: cat_old[vn]["signature_hash"] for vn in (v_single, v_join, v_left)}
+            tracked.assert_zero_leaked("after initial install")
+
+            # 2. Under current MATVIEW_GENERATOR_VERSION, all 3 views must report
+            #    drifted in check_schema_drift() and REPLACE in diff_views().
+            with warnings.catch_warnings(record=True) as caught_diff:
+                warnings.simplefilter("always", EngineLimitationWarning)
+                self.assertEqual(
+                    upgrade_mgr.check_schema_drift(),
+                    {v_single: "drifted", v_join: "drifted", v_left: "drifted"},
+                )
+                diff_upg = upgrade_mgr.diff_views([sql_single, sql_join, sql_left])
+            if dialect == Dialect.MYSQL:
+                self.assertTrue(
+                    any("MYSQL_NO_TRUNCATE_TRIGGER" in str(w.message) for w in caught_diff),
+                    "expected stored MYSQL_NO_TRUNCATE_TRIGGER warning during upgrade diff",
+                )
+            for vn in (v_single, v_join, v_left):
+                self.assertEqual(diff_upg[vn].status, "REPLACE", vn)
+                self.assertTrue(diff_upg[vn].pending_ddls, vn)
+                self.assertNotEqual(diff_upg[vn].signature_hash, old_sigs[vn], vn)
+
+            real_gen = manager_mod.generate_materialized_view
+
+            def _gen_legacy_col_backing(*args: Any, **kwargs: Any) -> Any:
+                p = real_gen(*args, **kwargs)
+                return dataclasses.replace(
+                    p, backing_table_ddl=self._inject_legacy_column_ddl(p.backing_table_ddl)
+                )
+
+            if dialect in (Dialect.SQLITE, Dialect.POSTGRES):
+                # 3. SQLite / PostgreSQL (atomic transactional DDL):
+                #    Corrupt v_single backing store directly before upgrade so we
+                #    prove register_view() physically repopulates (not just updates
+                #    signature_hash).
+                backing_single = upgrade_mgr.get_catalog()[v_single]["backing_table"]
+                self._exec_commit(tracked, [f"UPDATE {backing_single} SET tot = -999999;"])
+
+                upgrade_mgr.register_view(sql_single)
+                self.assertEqual(
+                    upgrade_mgr.check_schema_drift(),
+                    {v_single: "ok", v_join: "drifted", v_left: "drifted"},
+                )
+                self.assertEqual(
+                    upgrade_mgr.get_catalog()[v_single]["signature_hash"],
+                    diff_upg[v_single].signature_hash,
+                )
+                self._exec_commit(
+                    tracked,
+                    [
+                        f"INSERT INTO {t_items} VALUES (4, 'c', 12)",
+                        f"UPDATE {t_items} SET qty = 30 WHERE id = 2",
+                    ],
+                )
+                self._assert_views_exact(
+                    tracked,
+                    [(v_single, sel_single)],
+                    "after register_view() upgrade rebuild + DML",
+                )
+
+                # 4. sync_views() leaves v_single unchanged and rebuilds remaining
+                #    drifted views cleanly; on PG also verify a view installed with
+                #    accept_limitations=['ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE']
+                #    rebuilds via upgrade_mgr (accept_limitations=None) preserving consent.
+                sync_views_sqls = [sql_single, sql_join, sql_left]
+                expected_sync = {v_single: "unchanged", v_join: "updated", v_left: "updated"}
+                expected_ok = {v_single: "ok", v_join: "ok", v_left: "ok"}
+                if dialect == Dialect.POSTGRES:
+                    pg_opt_mgr = MaterializedViewManager(
+                        tracked,
+                        dialect=dialect,
+                        object_prefix=object_prefix,
+                        accept_limitations=["ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"],
+                    )
+                    with mock.patch.object(
+                        manager_mod, "MATVIEW_GENERATOR_VERSION", "previous-generator"
+                    ):
+                        with warnings.catch_warnings(record=True) as caught_pg_lim:
+                            warnings.simplefilter("always", EngineLimitationWarning)
+                            pg_opt_mgr.register_view(sql_lim)
+                    self.assertTrue(
+                        any(
+                            "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE" in str(w.message)
+                            for w in caught_pg_lim
+                        ),
+                        "expected EngineLimitationWarning on PG float-SUM install",
+                    )
+                    self.assertEqual(upgrade_mgr.check_schema_drift()[v_lim], "drifted")
+                    old_sigs[v_lim] = upgrade_mgr.get_catalog()[v_lim]["signature_hash"]
+                    sync_views_sqls.append(sql_lim)
+                    expected_sync[v_lim] = "updated"
+                    expected_ok[v_lim] = "ok"
+
+                with warnings.catch_warnings(record=True) as caught_sync:
+                    warnings.simplefilter("always", EngineLimitationWarning)
+                    sync_res = upgrade_mgr.sync_views(sync_views_sqls)
+                if dialect == Dialect.POSTGRES:
+                    self.assertTrue(
+                        any(
+                            "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE" in str(w.message)
+                            for w in caught_sync
+                        ),
+                        "expected stored PG limitation warning during sync_views() rebuild",
+                    )
+                self.assertEqual(sync_res, expected_sync)
+                self.assertEqual(upgrade_mgr.check_schema_drift(), expected_ok)
+                cat_post = upgrade_mgr.get_catalog()
+                for vn in (v_join, v_left):
+                    self.assertEqual(cat_post[vn]["signature_hash"], diff_upg[vn].signature_hash, vn)
+                if dialect == Dialect.POSTGRES:
+                    self.assertNotEqual(cat_post[v_lim]["signature_hash"], old_sigs[v_lim])
+                diff_post = upgrade_mgr.diff_views(sync_views_sqls)
+                for vn in expected_ok:
+                    self.assertEqual(diff_post[vn].status, "NOOP", vn)
+                self._exec_commit(
+                    tracked,
+                    [
+                        f"INSERT INTO {t_dims} VALUES ('d', 'delta')",
+                        f"INSERT INTO {t_items} VALUES (5, 'd', 40)",
+                        f"UPDATE {t_items} SET grp = 'b', qty = 15 WHERE id = 1",
+                        f"DELETE FROM {t_items} WHERE id = 4",
+                    ],
+                )
+                self._assert_views_exact(
+                    tracked,
+                    [(v_single, sel_single), (v_join, sel_join), (v_left, sel_left)],
+                    "after sync_views() upgrade rebuild + DML",
+                )
+                tracked.assert_zero_leaked("after sync_views rebuild")
+
+                # 5. repair_view() rebuilds a generator-version-drifted view cleanly
+                #    (corrupting backing store first to prove physical repopulation).
+                with mock.patch.object(
+                    manager_mod, "MATVIEW_GENERATOR_VERSION", "previous-generator"
+                ):
+                    install_mgr.register_view(sql_rep)
+                    self.assertEqual(install_mgr.check_schema_drift()[v_rep], "ok")
+                old_rep_sig = upgrade_mgr.get_catalog()[v_rep]["signature_hash"]
+                backing_rep = upgrade_mgr.get_catalog()[v_rep]["backing_table"]
+                self._exec_commit(tracked, [f"UPDATE {backing_rep} SET mn = -888888;"])
+                self.assertEqual(upgrade_mgr.check_schema_drift()[v_rep], "drifted")
+                rep_res = upgrade_mgr.repair_view(v_rep)
+                self.assertEqual(rep_res, {v_rep: "rebuilt"})
+                self.assertEqual(upgrade_mgr.check_schema_drift()[v_rep], "ok")
+                self.assertNotEqual(
+                    upgrade_mgr.get_catalog()[v_rep]["signature_hash"], old_rep_sig
+                )
+                self._exec_commit(
+                    tracked,
+                    [
+                        f"DELETE FROM {t_items} WHERE id = 3",
+                        f"INSERT INTO {t_items} VALUES (6, 'a', 3)",
+                    ],
+                )
+                self._assert_views_exact(
+                    tracked,
+                    [(v_single, sel_single), (v_join, sel_join), (v_left, sel_left), (v_rep, sel_rep)],
+                    "after repair_view() upgrade rebuild + DML",
+                )
+
+                # 6. Backing-table DDL change alone (real physical extra column
+                #    `__mv_legacy_v0`, same view SQL & generator version): verify
+                #    drift detection and physical backing-table recreation.
+                with mock.patch.object(
+                    manager_mod, "generate_materialized_view", _gen_legacy_col_backing
+                ):
+                    install_mgr.register_view(sql_ddl)
+                backing_ddl = upgrade_mgr.get_catalog()[v_ddl]["backing_table"]
+                old_ddl_sig = upgrade_mgr.get_catalog()[v_ddl]["signature_hash"]
+                self.assertIn("__mv_legacy_v0", self._table_columns_lower(tracked, backing_ddl))
+                self.assertEqual(upgrade_mgr.check_schema_drift()[v_ddl], "drifted")
+                self.assertEqual(upgrade_mgr.diff_views([sql_ddl])[v_ddl].status, "REPLACE")
+                all_sqls = [*sync_views_sqls, sql_rep, sql_ddl]
+                ddl_sync = upgrade_mgr.sync_views(all_sqls)
+                self.assertEqual(ddl_sync[v_ddl], "updated")
+                for vn in (v_single, v_join, v_left, v_rep):
+                    self.assertEqual(ddl_sync[vn], "unchanged", vn)
+                self.assertEqual(upgrade_mgr.check_schema_drift()[v_ddl], "ok")
+                self.assertNotEqual(
+                    upgrade_mgr.get_catalog()[v_ddl]["signature_hash"], old_ddl_sig
+                )
+                self.assertNotIn("__mv_legacy_v0", self._table_columns_lower(tracked, backing_ddl))
+                self._exec_commit(tracked, [f"INSERT INTO {t_items} VALUES (7, 'b', 99)"])
+                self._assert_views_exact(
+                    tracked, [(v_ddl, sel_ddl)], "after backing-DDL drift rebuild + DML"
+                )
+
+                # 7. Atomic rollback on failed upgrade rebuild leaves the previously
+                #    published generation intact, drifted, queryable, and maintained.
+                with mock.patch.object(
+                    manager_mod, "MATVIEW_GENERATOR_VERSION", "previous-generator"
+                ):
+                    install_mgr.register_view(sql_single, force_rebuild=True)
+                self.assertEqual(upgrade_mgr.check_schema_drift()[v_single], "drifted")
+                pre_fail_sig = upgrade_mgr.get_catalog()[v_single]["signature_hash"]
+                backing_single = upgrade_mgr.get_catalog()[v_single]["backing_table"]
+
+                def _fail_populate_cursor(conn_arg: Any, *a: Any, **kw: Any) -> Any:
+                    real_c = conn_arg.cursor(*a, **kw)
+
+                    class _FailWrap(CursorTrackingWrapper):
+                        def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                            if (
+                                sql.lstrip().upper().startswith("INSERT INTO")
+                                and backing_single in sql
+                            ):
+                                raise RuntimeError("injected upgrade populate failure")
+                            return self._real_cursor.execute(sql, *args, **kwargs)
+
+                    return _FailWrap(real_c, tracked)
+
+                tracked.cursor_factory = _fail_populate_cursor
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "injected upgrade populate failure"):
+                        upgrade_mgr.register_view(sql_single)
+                finally:
+                    tracked.cursor_factory = None
+
+                self.assertEqual(upgrade_mgr.check_schema_drift()[v_single], "drifted")
+                self.assertEqual(
+                    upgrade_mgr.get_catalog()[v_single]["signature_hash"], pre_fail_sig
+                )
+                self._exec_commit(tracked, [f"INSERT INTO {t_items} VALUES (8, 'a', 5)"])
+                self._assert_views_exact(
+                    tracked,
+                    [(v_single, sel_single)],
+                    "old generation intact after failed upgrade rebuild rollback",
+                )
+                upgrade_mgr.register_view(sql_single)
+                self.assertEqual(upgrade_mgr.check_schema_drift()[v_single], "ok")
+                self.assertNotEqual(
+                    upgrade_mgr.get_catalog()[v_single]["signature_hash"], pre_fail_sig
+                )
+                self._assert_views_exact(
+                    tracked,
+                    [(v_single, sel_single)],
+                    "after retry upgrade rebuild",
+                )
+            else:
+                # 3. MySQL / MariaDB (non-atomic DDL): replacing a complete view in
+                #    place MUST fail closed with UnsafeReplacementError before
+                #    modifying anything; catalog signatures stay unchanged and the
+                #    old generation continues maintaining writes.
+                with mock.patch.object(
+                    manager_mod, "MATVIEW_GENERATOR_VERSION", "previous-generator"
+                ):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        install_mgr.register_view(sql_rep)
+                old_sigs[v_rep] = upgrade_mgr.get_catalog()[v_rep]["signature_hash"]
+
+                with mock.patch.object(
+                    manager_mod, "generate_materialized_view", _gen_legacy_col_backing
+                ):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        install_mgr.register_view(sql_ddl)
+                backing_ddl = upgrade_mgr.get_catalog()[v_ddl]["backing_table"]
+                old_sigs[v_ddl] = upgrade_mgr.get_catalog()[v_ddl]["signature_hash"]
+                self.assertIn("__mv_legacy_v0", self._table_columns_lower(tracked, backing_ddl))
+                self.assertEqual(
+                    upgrade_mgr.check_schema_drift(),
+                    {
+                        v_single: "drifted",
+                        v_join: "drifted",
+                        v_left: "drifted",
+                        v_rep: "drifted",
+                        v_ddl: "drifted",
+                    },
+                )
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                    with self.assertRaises(UnsafeReplacementError):
+                        upgrade_mgr.register_view(sql_single)
+                    with self.assertRaises(UnsafeReplacementError):
+                        upgrade_mgr.sync_views([sql_single, sql_join, sql_left, sql_rep, sql_ddl])
+                    with self.assertRaises(UnsafeReplacementError):
+                        upgrade_mgr.repair_view(v_rep)
+
+                # Refusals must not have altered catalog signatures or broken live maintenance.
+                cat_after_refusal = upgrade_mgr.get_catalog()
+                for vn, osig in old_sigs.items():
+                    self.assertEqual(cat_after_refusal[vn]["signature_hash"], osig, vn)
+                self._exec_commit(
+                    tracked,
+                    [
+                        f"INSERT INTO {t_items} VALUES (4, 'c', 12)",
+                        f"UPDATE {t_items} SET qty = 30 WHERE id = 2",
+                    ],
+                )
+                self._assert_views_exact(
+                    tracked,
+                    [
+                        (v_single, sel_single),
+                        (v_join, sel_join),
+                        (v_left, sel_left),
+                        (v_rep, sel_rep),
+                        (v_ddl, sel_ddl),
+                    ],
+                    "after UnsafeReplacementError refusals + DML",
+                )
+
+                # 4. Explicit MySQL/MariaDB upgrade path for complete views:
+                #    drop_view() clears stored consent (so upgrade_mgr without
+                #    accept_limitations refuses with EngineLimitationError), then
+                #    install_mgr.register_view() reinstalls cleanly with the new
+                #    signature and recreated backing table (dropping __mv_legacy_v0).
+                for vn, vsql in (
+                    (v_single, sql_single),
+                    (v_join, sql_join),
+                    (v_left, sql_left),
+                    (v_rep, sql_rep),
+                    (v_ddl, sql_ddl),
+                ):
+                    upgrade_mgr.drop_view(vn)
+                    if vn == v_single:
+                        with self.assertRaises(EngineLimitationError):
+                            upgrade_mgr.register_view(vsql)
+                    with warnings.catch_warnings(record=True) as caught_re:
+                        warnings.simplefilter("always", EngineLimitationWarning)
+                        install_mgr.register_view(vsql)
+                    self.assertTrue(
+                        any("MYSQL_NO_TRUNCATE_TRIGGER" in str(w.message) for w in caught_re),
+                        f"{vn}: expected MYSQL_NO_TRUNCATE_TRIGGER warning on reinstall",
+                    )
+                    self.assertNotEqual(
+                        upgrade_mgr.get_catalog()[vn]["signature_hash"], old_sigs[vn], vn
+                    )
+
+                self.assertEqual(
+                    upgrade_mgr.check_schema_drift(),
+                    {v_single: "ok", v_join: "ok", v_left: "ok", v_rep: "ok", v_ddl: "ok"},
+                )
+                self.assertNotIn("__mv_legacy_v0", self._table_columns_lower(tracked, backing_ddl))
+                diff_post = upgrade_mgr.diff_views(
+                    [sql_single, sql_join, sql_left, sql_rep, sql_ddl]
+                )
+                for vn in (v_single, v_join, v_left, v_rep, v_ddl):
+                    self.assertEqual(diff_post[vn].status, "NOOP", vn)
+                self._exec_commit(
+                    tracked,
+                    [
+                        f"INSERT INTO {t_dims} VALUES ('d', 'delta')",
+                        f"INSERT INTO {t_items} VALUES (5, 'd', 40)",
+                        f"UPDATE {t_items} SET grp = 'b', qty = 15 WHERE id = 1",
+                        f"DELETE FROM {t_items} WHERE id = 4",
+                    ],
+                )
+                self._assert_views_exact(
+                    tracked,
+                    [
+                        (v_single, sel_single),
+                        (v_join, sel_join),
+                        (v_left, sel_left),
+                        (v_rep, sel_rep),
+                        (v_ddl, sel_ddl),
+                    ],
+                    "after MySQL/MariaDB drop+register upgrade + DML",
+                )
+
+                # 5. Incomplete-backfill view drifted across generator upgrade CAN
+                #    be rebuilt in place on MySQL/MariaDB while preserving stored
+                #    accepted_limitations (upgrade_mgr has accept_limitations=None).
+                with mock.patch.object(
+                    manager_mod, "MATVIEW_GENERATOR_VERSION", "previous-generator"
+                ):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", EngineLimitationWarning)
+                        install_mgr.register_view(sql_inc, populate=False)
+                old_inc_sig = upgrade_mgr.get_catalog()[v_inc]["signature_hash"]
+                self.assertEqual(upgrade_mgr.check_schema_drift()[v_inc], "drifted")
+                with warnings.catch_warnings(record=True) as caught_inc:
+                    warnings.simplefilter("always", EngineLimitationWarning)
+                    upgrade_mgr.register_view(sql_inc, populate=True)
+                self.assertTrue(
+                    any("MYSQL_NO_TRUNCATE_TRIGGER" in str(w.message) for w in caught_inc),
+                    "expected stored MYSQL_NO_TRUNCATE_TRIGGER warning on incomplete-view rebuild",
+                )
+                self.assertEqual(upgrade_mgr.check_schema_drift()[v_inc], "ok")
+                self.assertNotEqual(
+                    upgrade_mgr.get_catalog()[v_inc]["signature_hash"], old_inc_sig
+                )
+                self._exec_commit(tracked, [f"INSERT INTO {t_items} VALUES (6, 'a', 9)"])
+                self._assert_views_exact(
+                    tracked,
+                    [(v_inc, sel_inc)],
+                    "after MySQL/MariaDB incomplete-backfill in-place upgrade + DML",
+                )
+
+            tracked.assert_zero_leaked("end of upgrade drift suite")
+        finally:
+            try:
+                tracked.rollback()
+            except Exception:
+                pass
+            if upgrade_mgr is not None:
+                for vn in (v_inc, v_lim, v_ddl, v_rep, v_left, v_join, v_single):
+                    try:
+                        upgrade_mgr.drop_view(vn)
+                    except Exception:
+                        try:
+                            tracked.rollback()
+                        except Exception:
+                            pass
+            cur = tracked.cursor()
+            try:
+                cat_tbl = upgrade_mgr.catalog_table if upgrade_mgr is not None else f"{object_prefix}catalog"
+                if dialect == Dialect.POSTGRES:
+                    cur.execute(f"DROP TABLE IF EXISTS {cat_tbl} CASCADE;")
+                    cur.execute(f"DROP TABLE IF EXISTS {t_items} CASCADE;")
+                    cur.execute(f"DROP TABLE IF EXISTS {t_dims} CASCADE;")
+                else:
+                    cur.execute(f"DROP TABLE IF EXISTS {cat_tbl};")
+                    cur.execute(f"DROP TABLE IF EXISTS {t_items};")
+                    cur.execute(f"DROP TABLE IF EXISTS {t_dims};")
+                tracked.commit()
+            finally:
+                cur.close()
+
+    def test_sqlite_generator_upgrade_drift_and_rebuild(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            ver = conn.execute("SELECT sqlite_version()").fetchone()[0]
+            self.assertTrue(ver, "expected non-empty SQLite version")
+            self._run_upgrade_drift_suite(
+                conn,
+                Dialect.SQLITE,
+                prefix="sq_upg_",
+                object_prefix="__mv_squpg_",
+            )
+        finally:
+            conn.close()
+
+    def test_native_postgres_generator_upgrade_drift_and_rebuild(self) -> None:
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN is not set; skipping native PostgreSQL upgrade drift test")
+
+        import uuid
+        import psycopg2
+
+        raw_conn = psycopg2.connect(dsn)
+        schema_name = f"mv_upg_{uuid.uuid4().hex[:8]}"
+        try:
+            cur = raw_conn.cursor()
+            try:
+                cur.execute("SHOW server_version;")
+                pg_ver = str(cur.fetchone()[0])
+                self.assertTrue(pg_ver and pg_ver[0].isdigit(), f"unexpected PG version: {pg_ver!r}")
+                cur.execute(f"CREATE SCHEMA {schema_name};")
+                cur.execute(f"SET search_path TO {schema_name};")
+                raw_conn.commit()
+            finally:
+                cur.close()
+            self._run_upgrade_drift_suite(
+                raw_conn,
+                Dialect.POSTGRES,
+                prefix="pg_upg_",
+                object_prefix="__mv_pgupg_",
+            )
+        finally:
+            try:
+                raw_conn.rollback()
+            except Exception:
+                pass
+            cur = raw_conn.cursor()
+            try:
+                cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE;")
+                raw_conn.commit()
+            finally:
+                cur.close()
+            raw_conn.close()
+
+    def test_native_mysql_or_mariadb_generator_upgrade_drift_and_rebuild(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; skipping native MySQL/MariaDB upgrade drift test")
+
+        import uuid
+        import pymysql
+        from urllib.parse import urlparse
+
+        parsed = urlparse(dsn)
+        raw_conn = pymysql.connect(
+            host=parsed.hostname or "127.0.0.1",
+            port=parsed.port or 3306,
+            user=parsed.username or "root",
+            password=parsed.password or "",
+            database=parsed.path.lstrip("/"),
+            autocommit=False,
+        )
+        tok = uuid.uuid4().hex[:6]
+        try:
+            cur = raw_conn.cursor()
+            try:
+                cur.execute("SELECT VERSION();")
+                ver_str = str(cur.fetchone()[0])
+                self.assertTrue(
+                    ver_str and ver_str[0].isdigit(),
+                    f"unexpected MySQL/MariaDB version: {ver_str!r}",
+                )
+            finally:
+                cur.close()
+            raw_conn.rollback()
+            self._run_upgrade_drift_suite(
+                raw_conn,
+                Dialect.MYSQL,
+                prefix=f"my_upg_{tok}_",
+                object_prefix=f"__mv_u{tok}_",
+                initial_accept=["MYSQL_NO_TRUNCATE_TRIGGER"],
+            )
+        finally:
+            raw_conn.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
