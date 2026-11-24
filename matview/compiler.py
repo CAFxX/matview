@@ -207,7 +207,9 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
         except Exception:
             pre_strategy = pre_mode = None  # surfaced by validation below
         if pre_strategy is not None and pre_mode is not None:
-            mode_limitations = tuple(stage5._order_sensitive_aggregate_limitations(pre_strategy, pre_mode))
+            mode_limitations = tuple(stage5._order_sensitive_aggregate_limitations(pre_strategy, pre_mode)) + tuple(
+                stage5._mariadb_peer_order_limitations()
+            )
             if mode_limitations:
                 limitations = limitations + mode_limitations
                 stage5 = stage5._with_context(stage5.context.with_updates(limitations=limitations))

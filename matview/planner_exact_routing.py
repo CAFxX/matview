@@ -38,7 +38,16 @@ from .aggregate_semantics import (
     iter_unordered_order_sensitive_calls,
 )
 from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, exact_fallback_message, relaxed_message
-from .engines import AggFunc, Dialect, MaintenanceStrategy, UnsupportedMaterializedViewError, _sqlglot_dialect
+from .engines import (
+    AggFunc,
+    Dialect,
+    EngineSubdialect,
+    LimitationSeverity,
+    MaintenanceStrategy,
+    TransparencyLimitation,
+    UnsupportedMaterializedViewError,
+    _sqlglot_dialect,
+)
 from .logical_ir import SelectItem
 from .native_functions import unclassified_calls
 from .sql_frontend import parse_sql_ast
@@ -87,6 +96,7 @@ FULL_REFRESH_COST = (
 # ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE).
 AGGREGATE_ORDER_OPT_IN = "AGGREGATE_ORDER_NOT_REPRODUCIBLE"
 ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE = "ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE"
+ORDER_SENSITIVE_RELAXED_FULL_REFRESH = "ORDER_SENSITIVE_RELAXED_FULL_REFRESH"
 
 # Window functions that give tied rows (peers) the same result.
 _PEER_DETERMINISTIC_WINDOW_FUNCS: Tuple[type, ...] = (
@@ -278,7 +288,9 @@ class ExactAggregateRoutingMixin(MixinHost):
         if not self.view.has_window_func:
             return []
         relaxed = AGGREGATE_ORDER_OPT_IN in set(self.accepted_limitations)
-        if relaxed and not include_relaxed:
+        if relaxed and not include_relaxed and not self._is_mariadb():
+            # (MariaDB: the opt-in accepts the full refresh, never the
+            # partition recompute: see _mariadb_peer_order_limitations.)
             return []
         sg_d = _sqlglot_dialect(self.dialect)
         out: List[str] = []
@@ -321,6 +333,39 @@ class ExactAggregateRoutingMixin(MixinHost):
                     continue
                 out.append(win.sql(dialect=sg_d))
         return out
+
+    def _is_mariadb(self) -> bool:
+        return self.dialect == Dialect.MYSQL and self.subdialect == EngineSubdialect.MARIADB
+
+    def _mariadb_peer_order_limitations(self) -> List[TransparencyLimitation]:
+        """MariaDB numbers and picks tied window peers differently in the
+        refresh's INSERT ... SELECT (inside the trigger) and in a later SELECT
+        of the same query (native, 11.8): for a window ORDER BY that is not
+        total no strategy reproduces the live view, so the view is refused
+        unless AGGREGATE_ORDER_NOT_REPRODUCIBLE accepts a best-effort full
+        refresh."""
+        if not self._is_mariadb():
+            return []
+        unordered = self._unordered_window_aggregates(include_relaxed=True)
+        if not unordered:
+            return []
+        return [
+            TransparencyLimitation(
+                code=AGGREGATE_ORDER_OPT_IN,
+                severity=LimitationSeverity.BLOCKER,
+                dialect=self.dialect,
+                affected_object=self.logical_view_name,
+                description=(
+                    "the peer order of tied rows in " + ", ".join(unordered) + " is implementation-dependent "
+                    "on MariaDB and cannot be reproduced (the refresh's INSERT ... SELECT and a later SELECT "
+                    "number and pick tied rows differently)"
+                ),
+                mitigation=(
+                    "make the window ORDER BY a total order (add the primary key), or accept "
+                    "AGGREGATE_ORDER_NOT_REPRODUCIBLE for a best-effort materialization (full refresh)"
+                ),
+            )
+        ]
 
     @staticmethod
     def _is_float_policy_aggregate(call: sqlglot_exp.Expr) -> bool:
@@ -410,6 +455,25 @@ class ExactAggregateRoutingMixin(MixinHost):
             )
         if self.view.has_cte or self.view.has_compound_set_op:
             return None  # these shapes are full-refresh already
+        if self._is_mariadb() and AGGREGATE_ORDER_OPT_IN in set(self.accepted_limitations):
+            peers = self._unordered_window_aggregates(include_relaxed=True)
+            if peers:
+                return ExactRoutingFallback(
+                    ORDER_SENSITIVE_RELAXED_FULL_REFRESH,
+                    Strategy.FULL_REFRESH,
+                    "",
+                    "",
+                    "",
+                    tuple(peers),
+                    relaxed_text=relaxed_message(
+                        Strategy.FULL_REFRESH,
+                        "the peer order of tied rows in " + ", ".join(peers) + " is implementation-dependent "
+                        "on MariaDB: the refresh can number or pick tied rows differently from a later read "
+                        "of the live view (the rows and their peer groups are the same). Cost: " + FULL_REFRESH_COST,
+                        "make the window ORDER BY a total order (add the primary key) for an exact, "
+                        "partition-scoped view.",
+                    ),
+                )
         unordered = self._unordered_order_sensitive_aggregates()
         if unordered:
             return ExactRoutingFallback(

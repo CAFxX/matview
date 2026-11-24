@@ -30,7 +30,7 @@ import uuid
 import warnings
 from typing import Any, Callable, List, Sequence, Tuple
 
-from matview_sync import MaintenanceStrategy, MaterializedViewManager, generate_materialized_view, parse_table_schema
+from matview_sync import EngineLimitationError, MaintenanceStrategy, MaterializedViewManager, generate_materialized_view, parse_table_schema
 
 T2 = MaintenanceStrategy.GROUP_SCOPED_DELTA
 T3 = MaintenanceStrategy.ATOMIC_QUERY_SYNC
@@ -64,33 +64,46 @@ def _canon(v: Any) -> Tuple[str, str]:
     return ("float", v.hex()) if isinstance(v, float) else (type(v).__name__, repr(v))
 
 
-def _drive(test: unittest.TestCase, engine: str, conn: Any, register: Callable[[str], Any], ph: str = "%s") -> None:
+def _drive(
+    test: unittest.TestCase, engine: str, conn: Any, register: Callable[..., Any], ph: str = "%s"
+) -> None:
     cur = conn.cursor()
     # Many ties on s within each partition g.
     rows = [(i, i % 3, i * 7 % 11, "ab"[i % 2]) for i in range(1, 19)]
     cur.executemany(f"INSERT INTO t (id, g, x, s) VALUES ({ph}, {ph}, {ph}, {ph})", rows)
     conn.commit()
+    ddl = ";\n".join(f"CREATE VIEW {n} AS {q}" for n, q, _ in VIEWS)
+    if engine == "mariadb":
+        # MariaDB numbers tied peers differently in the refresh's
+        # INSERT ... SELECT and in a later SELECT: no strategy is exact, so
+        # the default is a refusal naming the per-code opt-in...
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with test.assertRaisesRegex(EngineLimitationError, "AGGREGATE_ORDER_NOT_REPRODUCIBLE"):
+                register(f"CREATE VIEW {VIEWS[0][0]} AS {VIEWS[0][1]}")
+        conn.rollback()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        plan = register(";\n".join(f"CREATE VIEW {n} AS {q}" for n, q, _ in VIEWS))
+        # ... which accepts a best-effort full refresh (relaxed, announced).
+        accept = ["AGGREGATE_ORDER_NOT_REPRODUCIBLE"] if engine == "mariadb" else []
+        plan = register(ddl, accept_limitations=accept)
     for (name, _q, expected), sub in zip(VIEWS, list(plan.sub_plans) or [plan]):
         test.assertEqual(sub.strategy, expected, f"[{engine}] {name}")
         if expected == T3:
-            test.assertEqual(
-                [d.code for d in sub.strategy_diagnostics], ["ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"], f"[{engine}] {name}"
-            )
+            code = "ORDER_SENSITIVE_RELAXED_FULL_REFRESH" if engine == "mariadb" else "ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"
+            test.assertEqual([d.code for d in sub.strategy_diagnostics], [code], f"[{engine}] {name}")
+            if engine == "mariadb":
+                test.assertTrue(sub.strategy_diagnostics[0].message.startswith("relaxed result allowed: using strategy full refresh"))
     conn.commit()
 
     def compare(context: str) -> None:
         c = conn.cursor()
         for name, q, _ in VIEWS:
             if name == "w_ties" and engine == "mariadb":
-                # Named exclusion: MariaDB numbers and picks tied rows
-                # differently in the refresh's INSERT ... SELECT (inside the
-                # trigger) and in a later SELECT of the same query (native,
-                # 11.8): the full refresh cannot reproduce it either. Which
-                # peer gets which number is implementation-dependent in SQL;
-                # compare what it defines: the numbers each peer group gets.
+                # Named exclusion for the OPTED-IN case only
+                # (AGGREGATE_ORDER_NOT_REPRODUCIBLE, best effort): which peer
+                # gets which number is implementation-dependent; compare what
+                # SQL defines, the numbers each peer group gets.
                 c.execute(f"SELECT g, s, rn FROM {name}")
                 mv_rn = sorted(tuple(_canon(x) for x in r) for r in c.fetchall())
                 c.execute(f"SELECT g, s, rn FROM ({q}) AS live_q")
