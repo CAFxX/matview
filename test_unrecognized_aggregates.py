@@ -378,6 +378,98 @@ def _drive(test: unittest.TestCase, fx: _Fixture, register: Callable[[str], Any]
         fx.compare_all(test, f"seed {SEED} step {i} {op}")
 
 
+
+# ------------------------------------------------- join key total order
+# A join equality proves that each row of a determined table matches at most
+# one row of the other only when the comparison is no coarser than that
+# table's key uniqueness. A text key compared under a coarser collation
+# (SQLite: the left operand's NOCASE; MySQL/MariaDB: latin1_bin key against
+# a utf8mb4 case-insensitive column) matches 'a' and 'A': the aggregate's
+# ORDER BY is then not total and the view takes the exact full refresh.
+# Also pins the LEFT JOIN rule natively: the preserved side's key is not
+# bound when the aggregated arguments read the preserved side (unmatched
+# rows tie on the NULL-extended side's key).
+_JOIN_KEY_DDL = {
+    "sqlite": [
+        "CREATE TABLE kt (id TEXT NOT NULL PRIMARY KEY, x INTEGER)",
+        "CREATE TABLE ku (id INTEGER PRIMARY KEY, code TEXT COLLATE NOCASE, kid INTEGER, g INTEGER)",
+        "CREATE TABLE ki (id INTEGER PRIMARY KEY, uid INTEGER, x INTEGER)",
+    ],
+    "mysql": [
+        "CREATE TABLE kt (id VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL PRIMARY KEY, x INT)",
+        "CREATE TABLE ku (id INT PRIMARY KEY, code VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci, kid INT, g INT)",
+        "CREATE TABLE ki (id INT PRIMARY KEY, uid INT, x INT)",
+    ],
+    "postgres": [
+        "CREATE TABLE kt (id TEXT NOT NULL PRIMARY KEY, x INT)",
+        "CREATE TABLE ku (id INT PRIMARY KEY, code TEXT, kid INT, g INT)",
+        "CREATE TABLE ki (id INT PRIMARY KEY, uid INT, x INT)",
+    ],
+}
+
+
+def _join_key_views(engine: str) -> List[Tuple[str, str, MaintenanceStrategy]]:
+    if engine == "postgres":
+        agg = "STRING_AGG(({a})::text, ',' ORDER BY {o})"
+    elif engine == "sqlite":
+        agg = "group_concat({a}, ',' ORDER BY {o})"
+    else:
+        agg = "GROUP_CONCAT({a} ORDER BY {o} SEPARATOR ',')"
+    # The data keeps every live result deterministic (the oracle must be a
+    # function of the base tables): the trailing kt.x breaks the collation
+    # ties without being a key, and jk_left has one ku row per group (at most
+    # one unmatched row). The strategies pin the proof itself.
+    return [
+        # PostgreSQL: deterministic default collation, byte equality: total
+        ("jk_text", f"SELECT ku.g, {agg.format(a='kt.x', o='ku.id, kt.x')} AS a FROM ku JOIN kt ON ku.code = kt.id GROUP BY ku.g",
+         T2 if engine == "postgres" else T3),
+        ("jk_int", f"SELECT ku.g, {agg.format(a='ki.x', o='ku.id')} AS a FROM ku JOIN ki ON ku.kid = ki.id GROUP BY ku.g", T2),
+        ("jk_left", f"SELECT ku.id, {agg.format(a='ku.code', o='ki.id')} AS a FROM ku LEFT JOIN ki ON ki.uid = ku.id GROUP BY ku.id", T3),
+    ]
+
+
+_JOIN_KEY_STEPS = [
+    "INSERT INTO kt (id, x) VALUES ('a', 1), ('A', 2), ('b', 3), ('B', 4)",
+    "INSERT INTO ki (id, uid, x) VALUES (1, 1, 5), (2, 1, 6), (3, NULL, 7)",
+    "INSERT INTO ku (id, code, kid, g) VALUES (1, 'a', 1, 1), (2, 'B', 2, 1), (3, 'A', 3, 1), (4, 'z', 1, 1), (5, 'b', 2, 2)",
+    "UPDATE kt SET x = 9 WHERE id = 'A'",
+    "INSERT INTO ku (id, code, kid, g) VALUES (6, 'y', NULL, 1), (7, 'x', 3, 2)",
+    "UPDATE ku SET g = 2 WHERE id = 3",
+    "DELETE FROM kt WHERE id = 'a'",
+    "UPDATE ki SET uid = 4 WHERE id = 3",
+    "DELETE FROM ku WHERE id = 1",
+]
+
+
+def _join_key_check(test: unittest.TestCase, engine: str, conn: Any, register: Callable[[str], Any]) -> None:
+    my = engine not in ("sqlite", "postgres")
+    views = _join_key_views(engine)
+    ddls = _JOIN_KEY_DDL["mysql" if my else engine]
+    steps = _JOIN_KEY_STEPS
+    if my:
+        # MySQL/MariaDB DDL dominates the cost: only the collation case needs
+        # the native server; the other two are pinned on SQLite/PostgreSQL.
+        views, ddls = views[:1], ddls[:2]
+        steps = [st for st in steps if " ki " not in st]
+    cur = conn.cursor()
+    for ddl in ddls:
+        cur.execute(ddl)
+    conn.commit()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", MatviewDiagnosticWarning)
+        plan = register(";\n".join(f"CREATE VIEW {n} AS {sql}" for n, sql, _e in views))
+    for (name, _sql, expected), sub in zip(views, list(plan.sub_plans) or [plan]):
+        test.assertEqual(sub.strategy, expected, f"[{engine}] {name}")
+    conn.commit()
+    for i, step in enumerate(steps):
+        cur = conn.cursor()
+        cur.execute(step)
+        conn.commit()
+        cur = conn.cursor()
+        for name, sql, _e in views:
+            test.assertEqual(_snapshot(cur, f"SELECT * FROM {name}")[0], _snapshot(cur, sql)[0], f"[{engine}] {name} step {i}")
+        conn.commit()
+
 # ------------------------------------------------------------- engines
 _BASE_DDL = "CREATE TABLE {t} (id INTEGER PRIMARY KEY, g INTEGER, h INTEGER NOT NULL, v INTEGER, x {dbl}, s VARCHAR(8) NOT NULL, d NUMERIC(10, 2))"
 _U_DDL = "CREATE TABLE {u} (id INTEGER PRIMARY KEY, tid INTEGER NOT NULL, w INTEGER)"
@@ -409,6 +501,14 @@ class SqliteUnrecognizedAggregateTests(unittest.TestCase):
                 _drive(self, fx, mgr.register_view)
             finally:
                 conn.close()
+
+    @unittest.skipUnless(SQLITE_ORDERED_AGG, "ordered aggregates need SQLite 3.44+")
+    def test_join_key_collation(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            _join_key_check(self, "sqlite", conn, MaterializedViewManager(conn).register_view)
+        finally:
+            conn.close()
 
 
 def _native(env: str) -> Optional[str]:
@@ -450,6 +550,9 @@ class PostgresUnrecognizedAggregateTests(unittest.TestCase):
         self.conn.commit()
         mgr = MaterializedViewManager(self.conn)
         _drive(self, fx, mgr.register_view)
+
+    def test_join_key_collation(self) -> None:
+        _join_key_check(self, "postgres", self.conn, MaterializedViewManager(self.conn).register_view)
 
     def test_unknown_result_type_is_refused_with_cast_remedy(self) -> None:
         cur = self.conn.cursor()
@@ -507,6 +610,9 @@ class MysqlUnrecognizedAggregateTests(unittest.TestCase):
         # never enables a weaker result guarantee.
         mgr = MaterializedViewManager(self.conn, ignore_limitations=True)
         _drive(self, fx, mgr.register_view)
+
+    def test_join_key_collation(self) -> None:
+        _join_key_check(self, self.engine, self.conn, MaterializedViewManager(self.conn, ignore_limitations=True).register_view)
 
 
 class ConcurrentWritersTests(unittest.TestCase):
@@ -747,6 +853,22 @@ class OfflineRoutingTests(unittest.TestCase):
         ):
             plan = generate_materialized_view(schema, f"CREATE VIEW v AS SELECT d2.label, {expr} AS ids {join}", dialect="postgres")
             self.assertEqual(plan.strategy, expected, expr)
+
+    def test_positional_group_key_is_not_an_aggregate(self) -> None:
+        # GROUP BY 1 groups by the call itself: not an opaque (aggregate) call
+        # (PostgreSQL then refuses the anonymous record key with 0A000).
+        plan = self._plan("postgres", "SELECT ROW(g, v) AS r, COUNT(*) AS n FROM t GROUP BY 1")
+        self.assertNotEqual(plan.strategy, T3)
+        plan = self._plan("postgres", "SELECT g, CAST(app_udf(v) AS INT) AS r FROM t GROUP BY 1")
+        self.assertEqual(plan.strategy, T3)
+
+    def test_top_level_order_by_full_refresh_is_announced(self) -> None:
+        plan = self._plan("postgres", "SELECT g, MODE() WITHIN GROUP (ORDER BY v) AS a FROM t GROUP BY g ORDER BY g")
+        self.assertEqual(plan.strategy, T3)
+        self.assertEqual([d.code for d in plan.strategy_diagnostics], ["UNRECOGNIZED_AGGREGATE_FULL_REFRESH"])
+        reason = plan.diagnostics.fallback_reason if plan.diagnostics else ""
+        self.assertTrue((reason or "").startswith(f"{EXACT_LEAD} {Strategy.FULL_REFRESH.value}. Why: "), reason)
+        self.assertIn("ORDER BY/LIMIT", reason or "")
 
     def test_total_order_proof_edges(self) -> None:
         # Review findings (each reproduced offline before the fix).

@@ -2158,7 +2158,7 @@ class PlannerMixin(MixinHost):
         exact_fb = self._exact_full_refresh_fallback()
         if exact_fb is not None:
             return (sel, exact_fb.message())
-        if not self.view.group_by_cols and not self.view.has_window_func:
+        if self._routes_unrecognized_to_full_refresh():
             no_rule = self._unrecognized_aggregate_full_refresh_fallback()
             if no_rule is not None:
                 return (sel, no_rule.message())
