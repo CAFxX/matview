@@ -1386,6 +1386,19 @@ views, each key value is mapped to a canonical text by a per-view function
   `utf8mb4_0900_*` collation (MySQL's default), `utf8mb4_general_ci`,
   `utf8mb4_bin`, or `latin1_*` (see TODO.md, "Group keys follow the grouped
   expression's collation", for the incremental follow-ups).
+- SQLite: `VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP` (also with `DISTINCT`
+  or `FILTER`) are **usually not correctly rounded**: over ordinary two-decimal
+  data the stored double differs from the exact variance rounded once in the
+  last bits (measured: 3000 rows in 499 groups, `VAR_POP`/`VAR_SAMP`/
+  `STDDEV_SAMP(DISTINCT x)` differ in 363/368/286 groups, about 73%;
+  non-`DISTINCT` in 285/292/206). SQLite has no native variance aggregate, so
+  there is no engine "live view" for them: the result is matview's own
+  definition (shifted binary64 sums; `STDDEV` takes the square root of the
+  already rounded variance). This is the common case, not an edge case: it is
+  verified bit-for-bit only where no intermediate rounding occurs (dyadic
+  inputs with 0, 1, 2 or 4 distinct values), see
+  [Make SQLite VAR/STDDEV Correctly Rounded (exact against a rational reference)](TODO.md).
+  `BIT_*`/`BOOL_*` and the `NULL`/empty-group behaviour are exact.
 - PostgreSQL and MySQL/MariaDB: integer and `DECIMAL`/`NUMERIC` `SUM`/`AVG`
   (and PostgreSQL `VAR`/`STDDEV` of them, computed in `NUMERIC`) are
   maintained exactly (PostgreSQL sums of variable-scale `NUMERIC` are

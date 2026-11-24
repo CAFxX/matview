@@ -73,6 +73,11 @@ class Tier1SingleMixin(MixinHost):
             if (record_prefix or self._alg_mode in ("single", "distinct"))
             else arg_e
         )
+        if self.dialect == Dialect.SQLITE and item.agg_func in (AggFunc.BIT_AND, AggFunc.BIT_OR, AggFunc.BIT_XOR):
+            # SQLite's bitwise operators coerce their operands to INTEGER (TEXT 'abc' -> 0,
+            # REAL 2.5 -> 2); a group's first value is stored as the aggregate seed, so
+            # coerce it the same way instead of storing the raw value.
+            rewritten_arg = f"(({rewritten_arg}) & -1)"
         if item.filter_where:
             rewritten_f = (
                 self._rewrite_expr_for_record(item.filter_where, record_prefix)
@@ -117,7 +122,7 @@ class Tier1SingleMixin(MixinHost):
             if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
                 assert item.agg_func is not None
                 fn_s = item.agg_func.value
-                return f"{fn_s}({eff})"
+                return f"{fn_s}({dist}{eff})"
             cnt_e = f"COUNT({eff})"
             sum_e = f"SUM(1.0 * ({eff}))"
             m2_e = self._sqlite_m2_agg_sql(item, eff_override=eff)
@@ -132,21 +137,21 @@ class Tier1SingleMixin(MixinHost):
             if self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
                 assert item.agg_func is not None
                 if self.dialect == Dialect.MYSQL:
-                    return f"(CASE WHEN COUNT({eff}) = 0 THEN NULL ELSE {item.agg_func.value}({eff}) END)"
-                return f"{item.agg_func.value}({eff})"
+                    return f"(CASE WHEN COUNT({dist}{eff}) = 0 THEN NULL ELSE {item.agg_func.value}({dist}{eff}) END)"
+                return f"{item.agg_func.value}({dist}{eff})"
             if item.agg_func == AggFunc.BIT_AND:
-                return self._sqlite_bit_or_tree([f"MIN(({eff}) & {1 << b})" for b in range(63)])
+                return self._sqlite_bit_or_tree([f"(MIN((({eff}) >> {b}) & 1) << {b})" for b in range(64)])
             if item.agg_func == AggFunc.BIT_OR:
-                return self._sqlite_bit_or_tree([f"MAX(({eff}) & {1 << b})" for b in range(63)])
-            return self._sqlite_bit_or_tree([f"((SUM((({eff}) >> {b}) & 1) & 1) << {b})" for b in range(63)])
+                return self._sqlite_bit_or_tree([f"(MAX((({eff}) >> {b}) & 1) << {b})" for b in range(64)])
+            return self._sqlite_bit_or_tree([f"((SUM((({eff}) >> {b}) & 1) & 1) << {b})" for b in range(64)])
         if item.agg_func == AggFunc.BOOL_AND:
             if self.dialect == Dialect.POSTGRES:
-                return f"BOOL_AND({eff})"
-            return f"(CASE WHEN COUNT({eff}) = 0 THEN NULL WHEN MIN(CASE WHEN ({eff}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
+                return f"BOOL_AND({dist}{eff})"
+            return f"(CASE WHEN COUNT({eff}) = 0 THEN NULL WHEN MIN(CASE WHEN ({eff}) IS NULL THEN NULL WHEN ({eff}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
         if item.agg_func == AggFunc.BOOL_OR:
             if self.dialect == Dialect.POSTGRES:
-                return f"BOOL_OR({eff})"
-            return f"(CASE WHEN COUNT({eff}) = 0 THEN NULL WHEN MAX(CASE WHEN ({eff}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
+                return f"BOOL_OR({dist}{eff})"
+            return f"(CASE WHEN COUNT({eff}) = 0 THEN NULL WHEN MAX(CASE WHEN ({eff}) IS NULL THEN NULL WHEN ({eff}) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END)"
         return item.raw_expr
 
     # ------------------------------------------------------------------
@@ -223,6 +228,26 @@ class Tier1SingleMixin(MixinHost):
             return None
         return self._resolve_pk_range_column(allow_sqlite_rowid=True)
 
+    def _single_base_table_ref(self) -> Tuple[str, str]:
+        """Return ``(from_clause, table_ref)`` for single-table Tier 1 queries.
+
+        When the view aliases its sole base table (``FROM t AS a``), preserves
+        the alias in ``from_clause`` (``t AS a``) and returns ``a`` as
+        ``table_ref`` so unqualified and alias-qualified expressions both resolve.
+        """
+        q_base_t = self._q(self.view.base_table)
+        base_alias = (
+            self.view.joins[0].alias
+            if len(self.view.joins) == 1
+            and self.view.joins[0].alias
+            and self.view.joins[0].alias.lower() != self.view.base_table.lower()
+            else None
+        )
+        if base_alias:
+            q_alias = self._q(base_alias)
+            return (f"{q_base_t} AS {q_alias}", q_alias)
+        return (q_base_t, q_base_t)
+
     def _build_native_group_recompute(
         self,
         agg_sql: str,
@@ -237,16 +262,16 @@ class Tier1SingleMixin(MixinHost):
         """Native aggregate over the record's group, optionally restricted to the
         rows the triggers have already folded (rows inside an active backfill
         watermark range are excluded, exactly like the trigger WHERE guards)."""
-        q_base_t = self._q(self.view.base_table)
+        from_sql, q_ref = self._single_base_table_ref()
         conds: List[str] = []
         if self.view.where_clause:
-            conds.append(f"({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})")
+            conds.append(f"({self._rewrite_expr_for_record(self.view.where_clause, q_ref)})")
         for g_expr in self._effective_group_by_exprs:
             if record_prefix == self._backing_table_name():
                 rhs_g = f"{record_prefix}.{self._q(self._group_col_alias(g_expr))}"
             else:
                 rhs_g = self._rewrite_expr_for_record(g_expr, record_prefix)
-            lhs_g = self._rewrite_expr_for_record(g_expr, q_base_t)
+            lhs_g = self._rewrite_expr_for_record(g_expr, q_ref)
             is_nn = self._is_simple_col_ref(g_expr) and self._col_def(g_expr).not_null
             conds.append(self._null_safe_eq(f"({lhs_g})", f"({rhs_g})", is_nullable=not is_nn))
         if rows_filter:
@@ -258,13 +283,13 @@ class Tier1SingleMixin(MixinHost):
             conds.append(
                 f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
                 f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
-                f"AND (backfill_cursor_pk IS NULL OR ({q_base_t}.{q_pk} > backfill_cursor_pk AND {q_base_t}.{q_pk} <= backfill_max_pk)))"
+                f"AND (backfill_cursor_pk IS NULL OR ({q_ref}.{q_pk} > backfill_cursor_pk AND {q_ref}.{q_pk} <= backfill_max_pk)))"
             )
         where_part = f" WHERE {' AND '.join(conds)}" if conds else ""
         order_part = f" ORDER BY {order_by}" if order_by else ""
         limit_part = " LIMIT 1" if limit_one else ""
         lock_part = " LOCK IN SHARE MODE" if locking_read else ""
-        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part}{order_part}{limit_part}{lock_part})"
+        return f"(SELECT {agg_sql} FROM {from_sql}{where_part}{order_part}{limit_part}{lock_part})"
 
     def _key_spelling_refresh_stmts(self, mv_table: str, record_prefix: str = "OLD") -> List[str]:
         """SQLite/MySQL/MariaDB: keep the displayed spelling of a collation-sensitive
@@ -292,7 +317,9 @@ class Tier1SingleMixin(MixinHost):
         if not sensitive:
             return []
         grp_pred = self._group_match_predicate_tier1(mv_table, record_prefix)
-        q_base_t = self._q(self.view.base_table)
+        # The member rows are read through the view's own FROM (alias kept, see
+        # _single_base_table_ref), so their expressions are qualified the same way.
+        _, q_ref = self._single_base_table_ref()
         sqlite = self.dialect == Dialect.SQLITE
         old_es = [self._rewrite_expr_for_record(it.raw_expr, record_prefix) for it in sensitive]
         q_cols = [self._q(it.alias) for it in sensitive]
@@ -301,7 +328,7 @@ class Tier1SingleMixin(MixinHost):
             orig_item_map = getattr(self, "_uall_orig_item_map", {})
             sel_es = [orig_item_map.get(id(it), it).raw_expr for it in sensitive]
         else:
-            sel_es = [self._rewrite_expr_for_record(it.raw_expr, q_base_t) for it in sensitive]
+            sel_es = [self._rewrite_expr_for_record(it.raw_expr, q_ref) for it in sensitive]
         if sqlite:
             # Every spelling-sensitive column shows the leaving row's value (a NULL
             # shows NULL, which has no other spelling); at least one is text.
@@ -397,7 +424,8 @@ class Tier1SingleMixin(MixinHost):
                         f"typeof({old_val}) IN ('integer', 'real') "
                         f"AND typeof({mv_table}.{q_col}) = typeof({old_val})"
                     )
-                sel_e = self._rewrite_expr_for_record(item.raw_expr, self._q(self.view.base_table))
+                _, q_ref = self._single_base_table_ref()
+                sel_e = self._rewrite_expr_for_record(item.raw_expr, q_ref)
                 subq = self._build_native_group_recompute(
                     sel_e, mv_table, processed_only=True, limit_one=True
                 )
@@ -707,7 +735,7 @@ class Tier1SingleMixin(MixinHost):
         maintain). Bound with (cursor_pk, upper_pk), in that order."""
         if not self._pgmy_native_recompute_items():
             return None
-        q_base_t = self._q(self.view.base_table)
+        _, q_base_t = self._single_base_table_ref()
         q_pk = self._q(pk_col)
         if self.dialect == Dialect.POSTGRES:
             params = "(SELECT CAST(%s AS BIGINT) AS lo, CAST(%s AS BIGINT) AS hi) AS __mv_p"
@@ -2138,14 +2166,13 @@ class Tier1SingleMixin(MixinHost):
                 return f"(SELECT {u_agg_sql} FROM ({inner_u}) AS {u_alias}{w_u})"
 
             return self._pg_null_split_subquery(_u_sub, u_nullable) if u_nullable else _u_sub([])
-        base_t = self.view.base_table
-        q_base_t = self._q(base_t)
+        from_sql, q_ref = self._single_base_table_ref()
         conds: List[str] = []
         if self.view.where_clause:
-            conds.append(f"({self._rewrite_expr_for_record(self.view.where_clause, q_base_t)})")
+            conds.append(f"({self._rewrite_expr_for_record(self.view.where_clause, q_ref)})")
         nullable_keys: List[Tuple[str, str]] = []
         for g_expr in self._effective_group_by_exprs:
-            lhs_g = self._rewrite_expr_for_record(g_expr, q_base_t)
+            lhs_g = self._rewrite_expr_for_record(g_expr, q_ref)
             rhs_g = _group_record_expr(g_expr)
             is_nn = self._is_simple_col_ref(g_expr) and self._col_def(g_expr).not_null
             if self.dialect == Dialect.POSTGRES and not is_nn:
@@ -2169,7 +2196,7 @@ class Tier1SingleMixin(MixinHost):
             conds.append(
                 f"NOT EXISTS (SELECT 1 FROM {self.watermark_catalog_table} "
                 f"WHERE view_name = '{view_lit}' AND backfill_active = 1 "
-                f"AND (backfill_cursor_pk IS NULL OR ({q_base_t}.{q_pk} > backfill_cursor_pk AND {q_base_t}.{q_pk} <= backfill_max_pk)))"
+                f"AND (backfill_cursor_pk IS NULL OR ({q_ref}.{q_pk} > backfill_cursor_pk AND {q_ref}.{q_pk} <= backfill_max_pk)))"
             )
         # PostgreSQL order-sensitive aggregates (opt-in only) accumulate in
         # sequential-scan (ctid) order whatever access path the group filter uses.
@@ -2183,7 +2210,7 @@ class Tier1SingleMixin(MixinHost):
             # read against the statement's pre-lock read view unless LOCK IN SHARE
             # MODE forces a locking current read of committed base rows.
             lock_part = " LOCK IN SHARE MODE" if self.dialect == Dialect.MYSQL else ""
-            return f"(SELECT {agg_sql} FROM {q_base_t}{where_part}{lock_part})"
+            return f"(SELECT {agg_sql} FROM {from_sql}{where_part}{lock_part})"
 
         return self._pg_null_split_subquery(_sub, nullable_keys) if nullable_keys else _sub([])
 
@@ -2346,7 +2373,9 @@ class Tier1SingleMixin(MixinHost):
 
         def _plus_tcnt_expr(item: SelectItem) -> str:
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
-            if self.dialect == Dialect.POSTGRES:
+            if self.dialect in (Dialect.POSTGRES, Dialect.SQLITE):
+                # SQLite: plain truthiness (numeric coercion), the same predicate the
+                # initial population uses; ``!= 0`` would make non-numeric TEXT true.
                 return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) THEN 1 ELSE 0 END)"
             return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) != 0 THEN 1 ELSE 0 END)"
 
@@ -2444,9 +2473,10 @@ class Tier1SingleMixin(MixinHost):
             elif item.agg_func in (AggFunc.MIN, AggFunc.MAX, AggFunc.BIT_AND, AggFunc.BIT_OR, AggFunc.BIT_XOR):
                 insert_vals.append(f"({val_e})")
             elif item.agg_func in (AggFunc.BOOL_AND, AggFunc.BOOL_OR):
-                if self.dialect == Dialect.POSTGRES:
+                if self.dialect in (Dialect.POSTGRES, Dialect.SQLITE):
+                    t_l, f_l = ("TRUE", "FALSE") if self.dialect == Dialect.POSTGRES else ("1", "0")
                     insert_vals.append(
-                        f"(CASE WHEN ({val_e}) IS NULL THEN NULL WHEN ({val_e}) THEN TRUE ELSE FALSE END)"
+                        f"(CASE WHEN ({val_e}) IS NULL THEN NULL WHEN ({val_e}) THEN {t_l} ELSE {f_l} END)"
                     )
                 else:
                     insert_vals.append(
@@ -2807,7 +2837,9 @@ class Tier1SingleMixin(MixinHost):
 
         def _minus_tcnt_expr(item: SelectItem) -> str:
             val_e = self._effective_agg_value_expr(item, record_prefix=record_prefix)
-            if self.dialect == Dialect.POSTGRES:
+            if self.dialect in (Dialect.POSTGRES, Dialect.SQLITE):
+                # SQLite: plain truthiness (numeric coercion), the same predicate the
+                # initial population uses; ``!= 0`` would make non-numeric TEXT true.
                 return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) THEN 1 ELSE 0 END)"
             return f"(CASE WHEN ({val_e}) IS NOT NULL AND ({val_e}) != 0 THEN 1 ELSE 0 END)"
 
@@ -3144,7 +3176,7 @@ class Tier1SingleMixin(MixinHost):
             ),
             recompute_group_keys=lambda exprs: self._build_native_group_recompute(
                 ", ".join(
-                    f"{self._rewrite_expr_for_record(e, self._q(self.view.base_table))} AS __mv_l{idx}"
+                    f"{self._rewrite_expr_for_record(e, self._single_base_table_ref()[1])} AS __mv_l{idx}"
                     for idx, e in enumerate(exprs)
                 ),
                 mv_table,
