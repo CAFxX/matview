@@ -2126,7 +2126,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
 
     _TREE_SCHEMA = (
         "CREATE TABLE a (id INT PRIMARY KEY, s TEXT, i4 INT, i2 SMALLINT, r REAL, d DOUBLE PRECISION, n BIGINT, "
-        "nu NUMERIC(6,2), ci CITEXT, arrt TEXT[], e TEXT, c TEXT COLLATE \"C\");"
+        "nu NUMERIC(6,2), ci CITEXT, arrt TEXT[], e TEXT, c TEXT COLLATE \"C\", vc VARCHAR(5), ach CHAR(4)[], aci CITEXT[]);"
         "CREATE TABLE b (id INT PRIMARY KEY, z TEXT COLLATE \"POSIX\", e TEXT);"
     )
     # (view body, accepted?) -- accepted iff no arm reaches the final type through a lossy REAL pair.
@@ -2157,6 +2157,18 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         ("SELECT d AS v FROM a UNION ALL SELECT i4 FROM a UNION ALL SELECT r FROM a ORDER BY 1", True),
     ]
 
+    # A CTE / derived-table OUTPUT column may carry the name of a base-table column of another type:
+    # the arm is typed through the relation's own scope (DOUBLE PRECISION here), never from the table.
+    _SHADOW_VIEWS = [
+        "WITH u AS (SELECT d AS i2 FROM a) SELECT i4 AS w FROM a UNION ALL SELECT i2 FROM u",
+        "WITH u AS (SELECT d AS i2 FROM a) SELECT i4 AS w FROM a UNION ALL SELECT u.i2 FROM u",
+        "SELECT i4 AS w FROM a UNION ALL SELECT x.i2 FROM (SELECT d AS i2 FROM a) x",
+        "SELECT i4 AS w FROM a UNION ALL SELECT i2 FROM (SELECT d AS i2 FROM a) x",
+        "WITH u AS (SELECT d + 1 AS i2 FROM a) SELECT i4 AS w FROM a UNION ALL SELECT i2 FROM u",
+        "WITH u AS (SELECT d AS i2, id AS uid FROM a) SELECT i4 AS w FROM a UNION ALL SELECT u.i2 FROM u JOIN a p ON p.id = u.uid",
+        "WITH u AS (SELECT d AS i2 FROM a) SELECT i2 AS w FROM u UNION ALL SELECT i4 FROM a",
+    ]
+
     def test_postgres_set_operation_pairwise_tree_type_resolution_offline(self) -> None:
         """PostgreSQL resolves set-operation column types pairwise over the parse tree; only a
         lossy REAL intermediate (INTEGER/BIGINT/NUMERIC -> REAL -> DOUBLE PRECISION) is refused."""
@@ -2173,6 +2185,12 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                         generate_materialized_view(
                             self._TREE_SCHEMA, f"CREATE VIEW mv AS {body};", dialect="postgres:18"
                         )
+        for body in self._SHADOW_VIEWS:
+            with self.subTest(shadow=body):
+                plan = generate_materialized_view(
+                    self._TREE_SCHEMA, f"CREATE VIEW mv AS {body};", dialect="postgres:18"
+                )
+                self.assertRegex(plan.backing_table_ddl, r"\bw DOUBLE PRECISION\b")
         # The accepted nested form widens to the final type of the tree (DOUBLE PRECISION), not the
         # first nested SELECT's REAL.
         plan = generate_materialized_view(
@@ -2247,11 +2265,27 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         trigger_sql = "\n".join(str(t) for t in plan.trigger_ddls)
         self.assertNotRegex(trigger_sql, r"COLLATE\s+__mv_d\.")
         self.assertRegex(trigger_sql, r'__mv_d\.c COLLATE "C"')
+        # citext with char(n)/varchar (scalar or array) resolves to the other arm's type, not text: refused.
+        for sel in (
+            "SELECT ci AS v FROM a UNION ALL SELECT vc FROM a",
+            "SELECT vc AS v FROM a UNION SELECT ci FROM a",
+            "SELECT ach AS v FROM a UNION ALL (SELECT aci FROM a UNION ALL SELECT arrt FROM a)",
+        ):
+            with self.subTest(sel=sel), self.assertRaises(UnsupportedMaterializedViewError):
+                generate_materialized_view(schema, f"CREATE VIEW mv AS {sel};", dialect="postgres:18")
+        # An unmodelled arm named in a refusal is reported as assumed text, not as a bogus type.
+        with self.assertRaisesRegex(UnsupportedMaterializedViewError, r"could not be inferred"):
+            generate_materialized_view(
+                "CREATE TABLE a (id INT PRIMARY KEY, iv INTERVAL, i4 INT);",
+                "CREATE VIEW mv AS SELECT iv * 2 AS v FROM a UNION ALL SELECT i4 FROM a;",
+                dialect="postgres:18",
+            )
         # Clear refusals instead of raw parse/driver errors.
         for sel in (
             "(SELECT i4 AS v FROM a UNION ALL SELECT r FROM a) UNION ALL SELECT d FROM a",
             "SELECT * FROM (SELECT i4 AS x FROM a UNION SELECT i2 FROM a) q",
             "WITH u AS (SELECT i4 AS x FROM a UNION SELECT i2 FROM a) SELECT * FROM u",
+            "SELECT p.id, x.* FROM a p LEFT JOIN (SELECT s AS v0 FROM a UNION SELECT e FROM b) x ON x.v0 = p.s",
         ):
             with self.subTest(sel=sel), self.assertRaises(UnsupportedMaterializedViewError):
                 generate_materialized_view(schema, f"CREATE VIEW mv AS {sel};", dialect="postgres:18")
@@ -2285,7 +2319,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 ci_type = "TEXT"
             cur.execute(
                 f"CREATE TABLE {ta} (id INT PRIMARY KEY, s TEXT, i4 INT, i2 SMALLINT, r REAL, d DOUBLE PRECISION, "
-                f'n BIGINT, nu NUMERIC(6,2), ci {ci_type}, arrt TEXT[], e TEXT, c TEXT COLLATE "C")'
+                f'n BIGINT, nu NUMERIC(6,2), ci {ci_type}, arrt TEXT[], e TEXT, c TEXT COLLATE "C", vc VARCHAR(5))'
             )
             cur.execute(f'CREATE TABLE {tb} (id INT PRIMARY KEY, z TEXT COLLATE "POSIX", e TEXT)')
             cur.execute(
@@ -2297,9 +2331,10 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             conn.commit()
 
             def sub(body: str) -> str:
-                return re.sub(r"\bFROM a\b", f"FROM {ta}", re.sub(r"\bFROM b\b", f"FROM {tb}", body))
+                return re.sub(r"\b(FROM|JOIN) a\b", rf"\1 {ta}", re.sub(r"\b(FROM|JOIN) b\b", rf"\1 {tb}", body))
 
             accepted = [sub(b) for b, ok in self._TREE_VIEWS if ok]
+            accepted += [sub(b) for b in self._SHADOW_VIEWS]
             accepted += [
                 sub(b)
                 for b in (
@@ -2318,6 +2353,9 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 sub("SELECT to_jsonb(s) AS v FROM a UNION ALL SELECT to_jsonb(e) FROM b"),
                 sub("(SELECT i4 AS v FROM a UNION ALL SELECT r FROM a) UNION ALL SELECT d FROM a"),
             ]
+            refused.append(sub("SELECT p.id, x.* FROM a p LEFT JOIN (SELECT s AS v0 FROM a UNION SELECT e FROM b) x ON x.v0 = p.s"))
+            if ci_type == "CITEXT":
+                refused.append(sub("SELECT ci AS v FROM a UNION ALL SELECT vc FROM a"))
             if ci_type != "CITEXT":
                 accepted = [v for v in accepted if "ci" not in v.replace("nu", "")]
             mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)

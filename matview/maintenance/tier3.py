@@ -168,14 +168,6 @@ class Tier3Mixin(MixinHost):
                             dt = "VARCHAR(255)"
                         col_defs_sql.append(f"{self._q(fb_it.alias)} {dt}")
                     setop_star_done = True
-            if not setop_star_done and self.dialect == Dialect.POSTGRES:
-                star_ast = parse_sql_ast(self.view.raw_select_sql.strip(), dialect=self.dialect)
-                if not isinstance(star_ast, sqlglot_exp.SetOperation) and star_ast.find(sqlglot_exp.SetOperation) is not None:
-                    raise UnsupportedMaterializedViewError(
-                        "SELECT * over a CTE or derived table that is itself a set operation is not supported "
-                        "(the output columns would be taken from the base table, not from the set operation); "
-                        "list the columns explicitly."
-                    )
             if not setop_star_done:
                 for j in self.view.joins or []:
                     t_schema = self._schemas_lower.get(j.table_name.lower())

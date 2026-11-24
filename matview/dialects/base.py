@@ -2788,6 +2788,13 @@ class DialectBaseMixin(MixinHost):
             if "CITEXT" in bases and all(b in pg_str_map or b == "CITEXT" for b in bases):
                 # citext only casts implicitly to text, so any other string arm resolves the
                 # pair to text (all-citext arms were handled above).
+                if any(b != "CITEXT" and b != "TEXT" for b in bases):
+                    # Measured natively: citext with varchar/char(n) resolves to the other arm's
+                    # varchar/bpchar type (blank padding included), not to text; not modelled.
+                    raise UnsupportedMaterializedViewError(
+                        "PostgreSQL set operation mixing citext with char(n)/varchar/name arms is not supported "
+                        f"({', '.join(raw_nonempty)}); cast the arms to text explicitly."
+                    )
                 return _attach_coll("TEXT")
             if all(b in pg_str_map for b in bases):
                 str_kinds = [pg_str_map[b] for b in bases]
@@ -3033,6 +3040,7 @@ class DialectBaseMixin(MixinHost):
             has_str_lit = False
             has_unmodelled_arm = False
             has_modelled_arm = False
+            unmodelled_exprs: List[str] = []
             all_not_null = True
             for b_idx, (b_ctx, bs) in enumerate(zip(branch_ctxs, branch_specs)):
                 if col_i >= len(bs.select_items):
@@ -3050,7 +3058,16 @@ class DialectBaseMixin(MixinHost):
                 )
                 ts_b = self._schemas_lower.get(bs.base_table.lower())
                 c_b: Optional[ColumnDef] = None
-                if ts_b is not None and bi_item.source_col and _is_simple_column_expr(bi_item.raw_expr.strip(), dialect=self.dialect):
+                # An arm that reads through a CTE or derived table names that relation's OUTPUT
+                # columns, which may shadow a same-named base-table column of another type
+                # (`WITH u AS (SELECT d AS i2 FROM a) ... SELECT i2 FROM u`): never take the
+                # type from the base table there, resolve through the relation's scope instead.
+                if (
+                    ts_b is not None
+                    and bi_item.source_col
+                    and not (bs.has_cte or bs.has_subquery_in_from)
+                    and _is_simple_column_expr(bi_item.raw_expr.strip(), dialect=self.dialect)
+                ):
                     src_low = _unquote_ident(bi_item.source_col, dialect=self.dialect).lower()
                     c_b = next((c for k, c in ts_b.columns.items() if k.lower() == src_low), None)
                 if c_b is not None:
@@ -3090,6 +3107,7 @@ class DialectBaseMixin(MixinHost):
                     arm_t = self._pg_explicit_cast_target(bi_item.raw_expr) or "TEXT"
                 elif arm_t is None:
                     has_unmodelled_arm = True
+                    unmodelled_exprs.append(bi_item.raw_expr.strip())
                     arm_t = "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
                 else:
                     has_modelled_arm = True
@@ -3109,13 +3127,22 @@ class DialectBaseMixin(MixinHost):
             if self.dialect == Dialect.SQLITE:
                 common_dt = "BLOB"
             elif col_b_types:
-                common_dt = self._common_storage_type(
-                    col_b_types,
-                    has_null=has_null or (self.dialect == Dialect.POSTGRES and has_str_lit),
-                    explicit_colls=col_b_exp_colls if self.dialect == Dialect.POSTGRES else None,
-                    arm_ids=col_b_ids,
-                    arm_tree=arm_tree,
-                )
+                try:
+                    common_dt = self._common_storage_type(
+                        col_b_types,
+                        has_null=has_null or (self.dialect == Dialect.POSTGRES and has_str_lit),
+                        explicit_colls=col_b_exp_colls if self.dialect == Dialect.POSTGRES else None,
+                        arm_ids=col_b_ids,
+                        arm_tree=arm_tree,
+                    )
+                except UnsupportedMaterializedViewError as exc:
+                    if not unmodelled_exprs:
+                        raise
+                    # The type list names a guessed type for the unmodelled arm(s): say so.
+                    raise UnsupportedMaterializedViewError(
+                        f"{exc} (the result type of {', '.join(unmodelled_exprs)} could not be inferred and was "
+                        "assumed to be text; cast the arm(s) to an explicit type)"
+                    ) from exc
             else:
                 common_dt = "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
             merged_cols[fb_it.alias] = ColumnDef(
@@ -3308,6 +3335,14 @@ class DialectBaseMixin(MixinHost):
                     return self._int_type()
                 if any(fn in raw_u for fn in ("SUM(", "AVG(", "TOTAL(", "MIN(", "MAX(")):
                     return self._float_type()
+            if self.dialect == Dialect.POSTGRES and any(
+                (c_ref := self._lookup_col_def(m_ref.group(1))) is not None
+                and re.match(r"(?:INTERVAL|DATE|TIME)", c_ref.data_type.strip().upper())
+                for m_ref in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_.]*)\b", item.raw_expr)
+            ):
+                # Arithmetic over interval/date/time operands has a type the heuristics below
+                # (integer/float arithmetic) do not model.
+                return None
             if "%" in raw_u:
                 return self._int_type()
             if any(op in raw_u for op in ("*", "/", "+", "-")):

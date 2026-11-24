@@ -3075,6 +3075,31 @@ class PlannerMixin(MixinHost):
 
     def _compile_single_plan(self) -> MaterializedViewPlan:
         self._refuse_trigger_record_aliases()
+        if self.dialect == Dialect.POSTGRES and self.raw_view.raw_select_sql:
+            # `SELECT *` / `rel.*` over a CTE or derived table that is itself a set operation: the
+            # output columns would be expanded from the base tables, not from the set operation.
+            try:
+                star_ast = parse_sql_ast(self.raw_view.raw_select_sql.strip(), dialect=self.dialect)
+            except Exception:
+                star_ast = None
+            relation_nodes: List[Any] = []
+            if isinstance(star_ast, sqlglot_exp.Select):
+                for arg_key in ("from_", "from", "joins", "with_", "with"):
+                    arg_val = star_ast.args.get(arg_key)
+                    relation_nodes.extend(arg_val if isinstance(arg_val, list) else [arg_val])
+            if isinstance(star_ast, sqlglot_exp.Select) and any(
+                n is not None and n.find(sqlglot_exp.SetOperation) is not None for n in relation_nodes
+            ):
+                if any(
+                    isinstance(proj, sqlglot_exp.Star)
+                    or (isinstance(proj, sqlglot_exp.Column) and isinstance(proj.this, sqlglot_exp.Star))
+                    for proj in star_ast.expressions
+                ):
+                    raise UnsupportedMaterializedViewError(
+                        "SELECT * (or rel.*) over a CTE or derived table that is itself a set operation is not "
+                        "supported (the output columns would be taken from the base tables, not from the set "
+                        "operation); list the columns explicitly."
+                    )
         if self.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA:
             if self._alg_mode == "join":
                 raw = self._compile_tier1_join_algebraic()
