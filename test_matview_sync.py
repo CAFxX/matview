@@ -762,6 +762,11 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
             bytes(v) if isinstance(v, (bytes, bytearray)) else str(v).encode("utf-8")
         ).hexdigest(),
     )
+    _create_scalar("RIGHT", 2, lambda v, n: None if v is None else str(v)[-int(n):] if int(n) > 0 else "")
+    _create_scalar(
+        "REGEXP_SUBSTR", 2,
+        lambda v, pat: None if v is None else (lambda m: m.group(0) if m else None)(re.search(str(pat), str(v))),
+    )
     _create_scalar("PG_ROW_KEY", -1, lambda *args: "(" + ",".join("" if a is None else str(a) for a in args) + ")")
 
     class _VarPopAgg:

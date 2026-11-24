@@ -85,6 +85,7 @@ from .sql_frontend import (
 
 # Diagnostic code of the HAVING scalar-subquery-aggregate fallback.
 HAVING_SUBQUERY_AGGREGATE_FALLBACK = "HAVING_SUBQUERY_AGGREGATE_FALLBACK"
+COLLATION_KEY_FALLBACK = "COLLATION_KEY_FALLBACK"
 
 def _iter_agg_ast_nodes(root: sqlglot_exp.Expr, dialect: Dialect) -> List[sqlglot_exp.Expr]:
     """Return every aggregate call node in `root`, including PostgreSQL
@@ -1515,6 +1516,13 @@ class PlannerMixin(MixinHost):
     def _select_strategy_and_mode(self) -> Tuple[MaintenanceStrategy, str]:
         if self._exact_full_refresh_fallback() is not None:
             return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
+        strategy, mode = self._natural_strategy_and_mode()
+        if self._key_collation_fallback_reason(strategy, mode):
+            # Exact by construction; announced by _fallback_diagnostics.
+            return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
+        return strategy, mode
+
+    def _natural_strategy_and_mode(self) -> Tuple[MaintenanceStrategy, str]:
         win_part_keys = self._extract_window_partition_keys()
         if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_upsert:
             v = self.view
@@ -1866,6 +1874,10 @@ class PlannerMixin(MixinHost):
             if isinstance(node, sqlglot_exp.Column) and node.name:
                 key = f"{node.table.lower()}.{node.name.lower()}" if node.table else node.name.lower()
                 alias = expr_to_alias.get(key) or expr_to_alias.get(node.name.lower())
+                if self.dialect == Dialect.MYSQL:
+                    src = self._key_resolver_by_alias()(node)
+                    if src is not None and re.match(r"\s*(?:MEDIUM|LONG)(?:TEXT|BLOB)\b", src.data_type or "", re.I):
+                        return  # MySQL cannot index it (error 1170)
                 if alias and alias.lower() not in excluded_low and alias.lower() not in seen_low:
                     seen_low.add(alias.lower())
                     candidates.append(alias)
@@ -2267,8 +2279,14 @@ class PlannerMixin(MixinHost):
             raw_plan.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA
             and self._pgmy_native_recompute_items_for_plan()
         )
+        # A collation-sensitive text key refreshes its displayed spelling from the
+        # base rows of the group when the row supplying it leaves.
+        spelling_group_scan = (
+            raw_plan.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and self._key_spelling_refresh_needed()
+        )
         needs_base_group_scan = (
             raw_plan.strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA
+            or spelling_group_scan
             or sqlite_native_group_recompute
             or pgmy_native_group_recompute
             or any(
@@ -2297,6 +2315,8 @@ class PlannerMixin(MixinHost):
                 reason = "sqlite_native_sum_avg_group_recompute"
             elif pgmy_native_group_recompute:
                 reason = "native_order_sensitive_group_recompute"
+            elif spelling_group_scan:
+                reason = "group_key_spelling_refresh"
             else:
                 reason = "holistic_minmax_delete_recompute"
             minmax_needs = self._minmax_group_arg_index_needs(raw_plan, by_tbl, alias_map)
@@ -2705,7 +2725,7 @@ class PlannerMixin(MixinHost):
 
     def _fallback_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
         """Announced fallbacks of this plan (see matview.diagnostics)."""
-        routed = self._exact_routing_diagnostics(strategy)
+        routed = self._exact_routing_diagnostics(strategy) + self._collation_fallback_diagnostics(strategy)
         having = self.view.having_clause
         if not having or strategy != MaintenanceStrategy.GROUP_SCOPED_DELTA or not _has_subquery_aggregate(having, self.dialect):
             # (The HAVING-subquery note describes the group-scoped recompute;
@@ -2736,6 +2756,39 @@ class PlannerMixin(MixinHost):
                     "move the scalar-subquery condition out of HAVING (e.g. filter when reading the view).",
                 ),
                 details={"maintenance_strategy": strategy.value},
+            ),
+        )
+
+    def _collation_fallback_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
+        """The full-refresh fallback taken because a group/DISTINCT/set-operation key
+        has a collation matview cannot reproduce in its key text (see
+        ``_key_collation_fallback_reason``)."""
+        if strategy != MaintenanceStrategy.ATOMIC_QUERY_SYNC or self._exact_full_refresh_fallback() is not None:
+            return ()
+        nat_strategy, nat_mode = self._natural_strategy_and_mode()
+        reason = self._key_collation_fallback_reason(nat_strategy, nat_mode)
+        if not reason:
+            return ()
+        return (
+            Diagnostic(
+                code=COLLATION_KEY_FALLBACK,
+                severity=DiagnosticSeverity.INFO,
+                view=self.logical_view_name,
+                strategy=Strategy.FULL_REFRESH,
+                columns=(),
+                expressions=(reason,),
+                message=exact_fallback_message(
+                    Strategy.FULL_REFRESH,
+                    f"incremental maintenance cannot keep this key exact under its collation: {reason}.",
+                    "every write to a table the view reads recomputes the whole view from the original query "
+                    "(cost proportional to the size of the view query, on every engine).",
+                    "use a single-table GROUP BY over a plain base-table column (or an expression with an "
+                    "explicit COLLATE) whose collation is supported (SQLite BINARY/NOCASE/RTRIM; MySQL/MariaDB "
+                    "any single-level collation), keep DISTINCT/set-operation/join/DISTINCT-aggregate keys "
+                    "on byte-exact collations (SQLite BINARY; MySQL/MariaDB NO PAD binary), or fold the value "
+                    "explicitly.",
+                ),
+                details={"maintenance_strategy": strategy.value, "natural_strategy": nat_strategy.value, "natural_mode": nat_mode},
             ),
         )
 

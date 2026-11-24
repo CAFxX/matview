@@ -1698,6 +1698,96 @@ class Tier1JoinMixin(MixinHost):
                             f"    ) AS __mv_delta\n"
                             f"    WHERE {delta_pk_match} AND {val_guard};"
                         )
+            # SQLite/MySQL/MariaDB: a collation-sensitive text key shows a spelling some
+            # member row has. After the OLD row left, a group whose stored spelling no
+            # member has anymore takes a survivor's (all such columns from one row).
+            spelled_items = [
+                it
+                for it in work_items
+                if grp_exprs
+                and not it.is_aggregate
+                and self.dialect in (Dialect.SQLITE, Dialect.MYSQL)
+                and self._key_spelling_sensitive(self._key_class_for_key(it.raw_expr))
+            ]
+            if spelled_items:
+                lite = self.dialect == Dialect.SQLITE
+                sp_cols: List[str] = []
+                sp_sel: List[str] = []
+                for it in spelled_items:
+                    if self._q(it.alias) not in sp_cols:
+                        sp_cols.append(self._q(it.alias))
+                        sp_sel.append(self._qualify_join_expr(it.raw_expr))
+                base_conds: List[str] = [f"({qual_where})"] if qual_where else []
+                for g_raw, g_qual in zip(grp_exprs, qual_grp_exprs):
+                    mc = self._q(self._group_col_alias(g_raw))
+                    base_conds.append(self._null_safe_eq(f"({g_qual})", f"({mv_table}.{mc})", is_nullable=True))
+                order_sp = (
+                    ", ".join(f"({e}) COLLATE BINARY" if lite else f"CAST({e} AS BINARY)" for e in sp_sel)
+                    if len(sp_sel) > 1
+                    else None
+                )
+
+                def _sp_sub(agg: str, extra: Optional[str] = None, order: Optional[str] = None) -> str:
+                    conds = base_conds + ([f"({extra})"] if extra else [])
+                    w = f" WHERE {' AND '.join(conds)}" if conds else ""
+                    o = f" ORDER BY {order}" if order else ""
+                    return f"(SELECT {agg} FROM {full_from_sql}{w}{o} LIMIT 1)"
+
+                sp_member = _sp_sub(
+                    "1",
+                    " AND ".join(
+                        f"({e}) IS {mv_table}.{qc} COLLATE BINARY"
+                        if lite
+                        else f"CAST({e} AS BINARY) <=> CAST({mv_table}.{qc} AS BINARY)"
+                        for qc, e in zip(sp_cols, sp_sel)
+                    ),
+                )
+                sp_assign = ", ".join(
+                    f"{qc if lite else f'{mv_table}.{qc}'} = COALESCE({_sp_sub(e, None, order_sp)}, {mv_table}.{qc})"
+                    for qc, e in zip(sp_cols, sp_sel)
+                )
+                if one_row_old is not None:
+                    one_row_map_old = dict(zip(q_target_cols, one_row_old))
+                    direct_pk_match_old = " AND ".join(
+                        f"{mv_table}.{self._q(c)} = ({one_row_map_old[self._q(c)]})" for c in pk_cols
+                    )
+                    # Only a group whose stored spelling is the leaving row's can have gone stale.
+                    was_old = " AND ".join(
+                        f"{mv_table}.{qc} IS ({one_row_map_old[qc]}) COLLATE BINARY"
+                        if lite
+                        else f"CAST({mv_table}.{qc} AS BINARY) <=> CAST(({one_row_map_old[qc]}) AS BINARY)"
+                        for qc in sp_cols
+                    )
+                    where_parts = [f"({c})" for c in where_old_conds] + [direct_pk_match_old, was_old, f"{sp_member} IS NULL"]
+                    if lite:
+                        refresh_grp_stmts.append(
+                            f"UPDATE {mv_table}\n    SET {sp_assign}\n    FROM {from_old_eff}\n"
+                            f"    WHERE {' AND '.join(where_parts)};"
+                        )
+                    else:
+                        refresh_grp_stmts.append(
+                            f"UPDATE {mv_table}\n    INNER JOIN {from_old_eff} ON {direct_pk_match_old}\n"
+                            f"    SET {sp_assign}\n"
+                            f"    WHERE {' AND '.join(where_parts[:len(where_old_conds)] + where_parts[len(where_old_conds) + 1:])};"
+                        )
+                else:
+                    delta_sel = (
+                        f"SELECT {aliased_delta_old}\n"
+                        f"        FROM {from_old_eff}{where_old_eff}{grp_old_sql}{having_non_empty}"
+                    )
+                    if lite:
+                        refresh_grp_stmts.append(
+                            f"UPDATE {mv_table}\n    SET {sp_assign}\n"
+                            f"    FROM (\n        {delta_sel}\n    ) AS __mv_delta\n"
+                            f"    WHERE {delta_pk_match} AND {sp_member} IS NULL;"
+                        )
+                    else:
+                        refresh_grp_stmts.append(
+                            f"UPDATE {mv_table}\n"
+                            f"    INNER JOIN (\n        {delta_sel}\n    ) AS __mv_delta ON {delta_pk_match}"
+                            f" AND {sp_member} IS NULL\n"
+                            f"    SET {sp_assign};"
+                        )
             del_stmts = [minus_stmt] + ([del_zero_stmt] if del_zero_stmt else []) + refresh_grp_stmts
             trunc_stmts = [f"DELETE FROM {mv_table};"] + (
                 [initial_populate_sql] if not grp_exprs else []

@@ -1261,7 +1261,9 @@ class BackfillWatermarkCodegenTests(unittest.TestCase):
             (
                 "distinct_mysql84",
                 "mysql:8.4.0",
-                "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(32) NOT NULL, note TEXT);",
+                # NO PAD binary: equal values are byte-identical, so DISTINCT stays incremental
+                # (a collation-sensitive text key takes the announced full refresh instead).
+                "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(32) COLLATE utf8mb4_0900_bin NOT NULL, note TEXT);",
                 "CREATE VIEW v_my_dist AS SELECT DISTINCT grp FROM items;",
                 "OLD.id",
                 "NEW.id",
@@ -1361,6 +1363,9 @@ class BackfillWatermarkCodegenTests(unittest.TestCase):
         advances, while MySQL omits LOCK IN SHARE MODE to avoid catalog AB-BA deadlocks
         and MariaDB snapshot-isolation (1020) aborts."""
         ddl = "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(16) NOT NULL, val INT NOT NULL);"
+        # MySQL: a NO PAD binary key has no spelling variants, so the group key keeps no
+        # locking spelling-refresh read (that read is covered by its own test below).
+        mysql_ddl = "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(16) COLLATE utf8mb4_0900_bin NOT NULL, val INT NOT NULL);"
         views = (
             ("agg", "CREATE VIEW v_wm AS SELECT grp, SUM(val) AS s FROM items GROUP BY grp;"),
             ("proj", "CREATE VIEW v_wm_p AS SELECT id, grp, val FROM items WHERE val > 0;"),
@@ -1375,7 +1380,7 @@ class BackfillWatermarkCodegenTests(unittest.TestCase):
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", EngineLimitationWarning)
                         plan = generate_materialized_view(
-                            ddl,
+                            mysql_ddl if dialect == Dialect.MYSQL else ddl,
                             view_sql,
                             dialect=dialect,
                             engine_version=ver,
@@ -1389,6 +1394,28 @@ class BackfillWatermarkCodegenTests(unittest.TestCase):
                     else:
                         self.assertNotIn("FOR SHARE)", joined)
                         self.assertNotIn("LOCK IN SHARE MODE", joined)
+
+    def test_mysql_spelling_refresh_reads_base_rows_with_a_locking_read_only(self) -> None:
+        """A collation-sensitive MySQL text key refreshes its displayed spelling with a
+        locking read of the base rows (a consistent read would open a read view before
+        the group row is locked: MariaDB snapshot isolation fails later statements with
+        1020), and only there: the watermark guards stay non-locking."""
+        ddl = "CREATE TABLE items (id INT PRIMARY KEY, grp VARCHAR(16) NOT NULL, val INT NOT NULL);"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", EngineLimitationWarning)
+            plan = generate_materialized_view(
+                ddl,
+                "CREATE VIEW v_wm AS SELECT grp, SUM(val) AS s FROM items GROUP BY grp;",
+                dialect=Dialect.MYSQL,
+                engine_version="mysql:8.4.0",
+                watermark_catalog_table="__matview_catalog",
+                ignore_limitations=True,
+            )
+        for ddl_sql in plan.trigger_ddls:
+            for stmt in re.split(r";\s*\n", ddl_sql):
+                if "LOCK IN SHARE MODE" in stmt:
+                    self.assertTrue(stmt.lstrip().startswith("UPDATE __matview_store_v_wm"), stmt)
+                    self.assertIn("CAST(", stmt)  # the BINARY spelling comparison
 
 
 if __name__ == "__main__":
