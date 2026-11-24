@@ -651,6 +651,7 @@ class MaterializedViewManager:
         skip_ensure_catalog: bool = False,
         pg_fillfactor: Optional[int] = 80,
         sqlite_strict_backing: bool = False,
+        sqlite_without_rowid: bool = True,
         accept_limitations: Optional[Sequence[str]] = None,
     ) -> None:
         hint_d: Optional[Dialect] = None
@@ -720,6 +721,7 @@ class MaterializedViewManager:
         self.strict = strict
         self.pg_fillfactor = pg_fillfactor
         self.sqlite_strict_backing = sqlite_strict_backing
+        self.sqlite_without_rowid = sqlite_without_rowid
         self.catalog_table = (
             f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
         )
@@ -2382,6 +2384,7 @@ class MaterializedViewManager:
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=getattr(self, "pg_fillfactor", 80),
             sqlite_strict_backing=getattr(self, "sqlite_strict_backing", False),
+            sqlite_without_rowid=getattr(self, "sqlite_without_rowid", True),
             repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
             plain_views=plain_views,
             current_schema=current_schema,
@@ -4941,6 +4944,7 @@ class MaterializedViewManager:
                     engine_version=self.engine_version,
                     pg_fillfactor=getattr(self, "pg_fillfactor", 80),
                     sqlite_strict_backing=getattr(self, "sqlite_strict_backing", False),
+                    sqlite_without_rowid=getattr(self, "sqlite_without_rowid", True),
                     watermark_catalog_table=self.catalog_table if incremental_backfill else None,
                     repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
                     plain_views=plain_views,
@@ -5360,6 +5364,7 @@ def generate_materialized_view(
     watermark_catalog_table: Optional[str] = None,
     pg_fillfactor: Optional[int] = 80,
     sqlite_strict_backing: bool = False,
+    sqlite_without_rowid: bool = True,
     repair_fence_catalog_table: Optional[str] = None,
     plain_views: Optional[Mapping[str, str]] = None,
     current_schema: Optional[str] = None,
@@ -5452,6 +5457,7 @@ def generate_materialized_view(
         watermark_catalog_table=watermark_catalog_table,
         pg_fillfactor=pg_fillfactor,
         sqlite_strict_backing=sqlite_strict_backing,
+        sqlite_without_rowid=sqlite_without_rowid,
         repair_fence_catalog_table=repair_fence_catalog_table,
     )
     return compiler.compile()
@@ -5472,6 +5478,7 @@ def generate_materialized_views(
     watermark_catalog_table: Optional[str] = None,
     pg_fillfactor: Optional[int] = 80,
     sqlite_strict_backing: bool = False,
+    sqlite_without_rowid: bool = True,
     repair_fence_catalog_table: Optional[str] = None,
     plain_views: Optional[Mapping[str, str]] = None,
     current_schema: Optional[str] = None,
@@ -5529,6 +5536,7 @@ def generate_materialized_views(
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=pg_fillfactor,
             sqlite_strict_backing=sqlite_strict_backing,
+            sqlite_without_rowid=sqlite_without_rowid,
             repair_fence_catalog_table=repair_fence_catalog_table,
         )
         plans.append(comp._compile_single_plan())

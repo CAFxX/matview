@@ -252,8 +252,9 @@ python3 matview_sync.py diff --db app.db --view views.sql
 [NOOP] customer_sales
   Strategy: algebraic_delta (Tier 1 (single))
   Selection Reason: Tier 1 algebraic delta maintenance: single-table O(1) incremental aggregates.
-  Performance Notes (1):
+  Performance Notes (2):
     * sqlite_sum_total_avg_native_recompute_on_real: a group holding any non-INTEGER value (any value of a REAL-affinity column) is recomputed from the base table on every write (O(group rows) with a group-key index, O(table) without); integer-only groups keep the O(1) exact fold.
+    * sqlite_table_shape: __matview_store_customer_sales is WITHOUT ROWID on an estimated row width (32 bytes per TEXT/BLOB column, real value sizes are not known); if those values are hundreds of bytes or more it is slower this way: opt out with sqlite_without_rowid=False / --no-sqlite-without-rowid.
   Status: Up to date; no pending changes.
 
 ------------------------------------------------------------------------------
@@ -1125,14 +1126,23 @@ Requirements and behaviour:
   row, break-even around 150 and a loss from about 300, hence the threshold. A
   table that keeps its rowid is named, with the reason, in the registration
   `performance_notes` (`sqlite_table_shape: ... keeps its rowid: ...`).
+  The width estimate cannot see real value sizes: a table with unbounded
+  `TEXT`/`BLOB` columns holding values of hundreds of bytes or more can be
+  slower `WITHOUT ROWID` (an independent review measured +22% for a `GROUP BY` on
+  a 1000-byte `TEXT` key and +40% for a projection with two 1000-byte `TEXT`
+  columns; about +7%, within noise, at 2000 bytes). Such tables are named in the
+  registration notes; opt out with `sqlite_without_rowid=False` /
+  `--no-sqlite-without-rowid` (every table then keeps its rowid).
 - **STRICT backing tables (opt-in).** `MaterializedViewManager(...,
   sqlite_strict_backing=True)` / `--sqlite-strict-backing` declares a table
   STRICT only when every column's value type is fixed by the plan: no-affinity
   `BLOB` columns become `ANY` (same semantics), maintained counters and `COUNT`
-  outputs `INTEGER`, floating accumulators `REAL`. STRICT raises on a wrong-typed
-  value and an error in a maintenance trigger aborts the user's statement, so a
-  table with a column copied from a base table (whose plain column may hold any
-  storage class) stays non-STRICT and the registration notes say so. The
+  outputs `INTEGER`, `__mv_pk` `TEXT`. STRICT raises on a wrong-typed value and an
+  error in a maintenance trigger aborts the user's statement, so a table with a
+  column copied from a base table (whose plain column may hold any storage class)
+  or with a `SUM`/`AVG`/`VAR` accumulator (a REAL or INTEGER source column may
+  hold TEXT, which the aggregate folds in) stays non-STRICT, and the registration
+  notes say so. Tested with ill-typed source data. The
   results are identical; STRICT only guards the backing tables against
   out-of-band writes. It is **off by default** because it is a guard rail only
   and, on top of `WITHOUT ROWID`, added 0% to 5% statement time in the same
