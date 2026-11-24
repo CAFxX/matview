@@ -61,6 +61,10 @@ This document tracks all feature goals, architectural improvements, and verified
 
 ## P0 — Test Correctness & Coverage Gaps
 
+- [ ] **MySQL/MariaDB `MIN`/`MAX` over `TIME(n)` drop the fractional seconds** (pre-existing on master; found by the #262 review, reproduced natively on MySQL 8.4 and MariaDB 11.8): `CREATE TABLE t (id INT PRIMARY KEY, g INT, tm TIME(3))`, view `SELECT g, MAX(tm) AS m, MIN(tm) AS n FROM t GROUP BY g` (algebraic delta), `INSERT INTO t VALUES (1,1,'10:00:00.123'),(2,1,'09:00:00.5')`: the view returns `10:00:00`/`09:00:01` (MySQL rounds, MariaDB truncates) where the live view returns `10:00:00.123`/`09:00:00.500`. The backing column (or the extremum delta expression) loses the `TIME` precision; fix the type derivation and add a native differential over `TIME(n)`/`DATETIME(n)` extremes.
+- [ ] PostgreSQL `ROW(v, g)` select items get a `text` backing column (type OID 25) where the live view returns `record` (2249); the values compare equal as text but the result type differs (#262 review, LOW): store it as the server type, or refuse it explicitly.
+- [ ] Non-routing full-refresh reasons (e.g. `LIMIT or ORDER BY clause requires full query evaluation.` for `SELECT g, SUM(v) ... GROUP BY g ORDER BY g`) are not yet announced with the `exact result required: falling back to strategy ...` lead phrase; only the routed shapes (unrecognized/order-sensitive aggregates, grouping sets) are.
+
 The following seven items are the in-database bulk-maintenance roadmap. Decisions, measurements and rejected alternatives are in [docs/design-bulk-maintenance.md](docs/design-bulk-maintenance.md). There is one reviewable PR per stage. Stage 1 comes first. Stages 2 → 3 (PostgreSQL) and 4 → 5 → 6 (SQLite/MySQL/MariaDB) are independent tracks. Stage 7 comes last.
 
 - [ ] **Strategy ladder: replace refusals with fallbacks** (product principles in [AGENTS.md](AGENTS.md); the cost-class refusal of stage 5 in [docs/design-bulk-maintenance.md](docs/design-bulk-maintenance.md) is superseded by this initiative):

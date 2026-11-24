@@ -238,7 +238,6 @@ class ExactAggregateRoutingMixin(MixinHost):
                     isinstance(eq, sqlglot_exp.EQ)
                     and isinstance(eq.this, sqlglot_exp.Column)
                     and isinstance(eq.expression, sqlglot_exp.Column)
-                    and self._same_comparison_type(eq.this, eq.expression)
                 ):
                     equalities.append((eq.this, eq.expression, nullable))
         changed = True
@@ -256,30 +255,53 @@ class ExactAggregateRoutingMixin(MixinHost):
                             arg_owners is None or arg_owners != {nullable}
                         ):
                             continue  # preserved side from the NULL-extended side: see docstring
+                        if not self._equality_binds_key(mine, other):
+                            continue
                         bound.add(mine.name.lower())
                 if all(c in bound for c in pk):
                     determined.add(alias)
                     changed = True
         return all(alias in determined for alias, _n, _p in sources)
 
-    def _same_comparison_type(self, a: sqlglot_exp.Column, b: sqlglot_exp.Column) -> bool:
-        """Whether a join equality compares two columns of one type family
-        (MySQL compares VARCHAR with INT as floating point: '1' and '01' both
-        equal 1, so a key would not be bound to one row)."""
-        da = self._lookup_col_def(a.sql(dialect=_sqlglot_dialect(self.dialect)))
-        db = self._lookup_col_def(b.sql(dialect=_sqlglot_dialect(self.dialect)))
-        if da is None or db is None:
+    def _equality_binds_key(self, mine: sqlglot_exp.Column, other: sqlglot_exp.Column) -> bool:
+        """Whether ``mine = other`` matches at most one row per value of
+        ``other`` when ``mine`` is (part of) a unique key: the comparison must
+        be no coarser than the key's uniqueness. Collations decide that for
+        text, and the declared collation/charset is not known here (SQLite
+        uses the left operand's collation, e.g. NOCASE; MySQL/MariaDB default
+        collations are case-insensitive; a PostgreSQL COLLATE may be
+        nondeterministic), so only these equalities bind:
+
+        * integer = integer (no collation; MySQL compares VARCHAR with INT as
+          floating point, '1' and '01' both equal 1);
+        * SQLite: the bound key is the INTEGER PRIMARY KEY rowid alias, which
+          holds only integers (any value of ``other`` converts to at most one);
+        * PostgreSQL text/varchar = text/varchar without an explicit COLLATE
+          (the database default collation is deterministic: equality is byte
+          equality); citext and bpchar are excluded."""
+        d_mine = self._lookup_col_def(mine.sql(dialect=_sqlglot_dialect(self.dialect)))
+        d_other = self._lookup_col_def(other.sql(dialect=_sqlglot_dialect(self.dialect)))
+        if d_mine is None or d_other is None:
             return False
 
-        def family(t: str) -> str:
-            base = re.sub(r"\s*\(.*\)", "", t).strip().upper()
-            if re.search(r"INT|SERIAL", base):
-                return "int"
-            if re.search(r"CHAR|TEXT|STRING|CLOB", base):
-                return "text"
-            return base
+        def base(t: str) -> str:
+            return re.sub(r"\s*\(.*?\)", "", t).strip().upper()
 
-        return family(da.data_type) == family(db.data_type)
+        def is_int(t: str) -> bool:
+            b = base(t)
+            return bool(re.fullmatch(r"(?:TINY|SMALL|MEDIUM|BIG)?INT(?:EGER)?(?:\s+UNSIGNED)?|INT[248]|(?:SMALL|BIG)?SERIAL", b))
+
+        if self.dialect == Dialect.SQLITE:
+            return d_mine.is_rowid_alias
+        if is_int(d_mine.data_type) and is_int(d_other.data_type):
+            return True
+        if self.dialect == Dialect.POSTGRES:
+            pg_text = r"TEXT|VARCHAR|CHARACTER VARYING"
+            return all(
+                re.fullmatch(pg_text, base(d.data_type)) is not None and not re.search(r"\bCOLLATE\b", d.data_type, re.IGNORECASE)
+                for d in (d_mine, d_other)
+            )
+        return False
 
     def _unordered_order_sensitive_aggregates(self, *, include_relaxed: bool = False) -> List[str]:
         """SQL of order-sensitive aggregate calls whose result a group-scoped
@@ -379,9 +401,15 @@ class ExactAggregateRoutingMixin(MixinHost):
             g_ast = self._item_ast(g)
             if isinstance(g_ast, sqlglot_exp.Column):
                 group_names.add(g_ast.name.lower())
+        # GROUP BY 1 groups by the select item itself. (A GROUP BY name is
+        # not resolved to an output alias here: PostgreSQL prefers an input
+        # column of that name, so the item may still aggregate.)
+        grouped_items = {
+            int(g) - 1 for g in group_exprs if g.isdigit() and 1 <= int(g) <= len(v.select_items)
+        }
         out: List[SelectItem] = []
-        for it in v.select_items:
-            if it.is_aggregate or it.raw_expr.strip().lower() in group_exprs:
+        for idx, it in enumerate(v.select_items):
+            if it.is_aggregate or it.raw_expr.strip().lower() in group_exprs or idx in grouped_items:
                 continue
             node = self._item_ast(it.raw_expr)
             if node is None or node.find(sqlglot_exp.Window):
@@ -526,21 +554,40 @@ class ExactAggregateRoutingMixin(MixinHost):
         names = self._non_algebraic_aggregate_names()
         if not names:
             return None
+        if self.view.group_by_cols:
+            why = (
+                " have no algebraic delta rule and the view's top-level ORDER BY/LIMIT needs the "
+                "whole result, so its groups are not recomputed separately."
+            )
+            change = "drop the top-level ORDER BY/LIMIT (order when reading the view) to enable the group-scoped recompute."
+        else:
+            why = " have no algebraic delta rule and the view has no plain GROUP BY whose groups could be recomputed separately."
+            change = "no change is needed for an exact result."
         return ExactRoutingFallback(
             UNRECOGNIZED_AGGREGATE_FULL_REFRESH,
             Strategy.FULL_REFRESH,
-            "aggregate(s) " + ", ".join(names) + " have no algebraic delta rule and the view "
-            "has no plain GROUP BY whose groups could be recomputed separately.",
+            "aggregate(s) " + ", ".join(names) + why,
             FULL_REFRESH_COST,
-            "no change is needed for an exact result.",
+            change,
             tuple(names),
         )
+
+    def _routes_unrecognized_to_full_refresh(self) -> bool:
+        """Whether a view with aggregates lacking an algebraic rule reaches
+        the full refresh for its shape (no plain GROUP BY, or a top-level
+        ORDER BY/LIMIT over the groups) rather than for a fallback above."""
+        v = self.view
+        if v.has_window_func:
+            return False
+        if not v.group_by_cols:
+            return True
+        return v.has_limit_or_order and not v.has_cte and not v.has_compound_set_op
 
     def _exact_routing_fallback_for(self, strategy: MaintenanceStrategy) -> Optional[ExactRoutingFallback]:
         """The routing fallback announced for the selected strategy, if any."""
         if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC:
             fb = self._exact_full_refresh_fallback()
-            if fb is None and not self.view.group_by_cols and not self.view.has_window_func:
+            if fb is None and self._routes_unrecognized_to_full_refresh():
                 fb = self._unrecognized_aggregate_full_refresh_fallback()
             return fb
         if strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA:
