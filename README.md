@@ -1160,7 +1160,11 @@ observe depends on the engine:
     clustered-index next-key shared locks (`LOCK IN SHARE MODE`) on all
     referenced base tables in sorted order before clearing and repopulating the
     store — serializing with concurrent writers under all three isolation
-    levels regardless of `binlog_format`.
+    levels. The repair transaction itself does not rely on a particular
+    `binlog_format`; `READ COMMITTED` application writers still need row-based
+    logging whenever the binary log is enabled (a server rule, not a matview
+    option). The native tests run with binary logging disabled
+    (`--skip-log-bin`), so no `binlog_format` is exercised.
   - Applications must retry transient InnoDB lock/snapshot errors (`1213`,
     `1205`, and `1020` `ER_CHECKREAD` under MariaDB 11.6+
     `innodb_snapshot_isolation=ON`).

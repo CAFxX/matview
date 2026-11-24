@@ -148,25 +148,33 @@ _REPAIR_GUIDANCE = (
 
 
 def _is_postgres_cte_in_scope(
-    tbl_node: sqlglot_exp.Table, *, case_insensitive: bool = False
+    tbl_node: sqlglot_exp.Table,
+    *,
+    case_insensitive: bool = False,
+    mysql_strict: bool = False,
 ) -> bool:
     """Return True if an unqualified table node resolves to an enclosing CTE
     under PostgreSQL scoping rules (non-recursive WITH CTEs see only earlier
     CTEs; WITH RECURSIVE CTEs see every CTE in the same WITH clause).
 
-    Pass ``case_insensitive=True`` for MySQL/MariaDB where CTE names are always
-    compared case-insensitively even when backtick-quoted.
+    Pass ``case_insensitive=True`` for MariaDB (and MySQL with
+    ``lower_case_table_names``) where CTE names are compared case-insensitively
+    even when backtick-quoted.  Pass ``mysql_strict=True`` for the strictest MySQL
+    rules instead: names compare exactly (case-sensitive on ``lower_case_table_names=0``
+    servers, quoted or not) and a CTE sees only earlier siblings (plus itself under
+    ``WITH RECURSIVE``), never later ones.
     """
     if tbl_node.db or tbl_node.catalog:
         return False
     id_node = tbl_node.this
     if not isinstance(id_node, sqlglot_exp.Identifier):
         return False
-    target = (
-        id_node.name.lower()
-        if (case_insensitive or not id_node.quoted)
-        else id_node.name
-    )
+    def _key(ident: sqlglot_exp.Identifier) -> str:
+        if mysql_strict:
+            return ident.name
+        return ident.name.lower() if (case_insensitive or not ident.quoted) else ident.name
+
+    target = _key(id_node)
     prev_node: sqlglot_exp.Expr = tbl_node
     cur_node: Optional[sqlglot_exp.Expr] = tbl_node.parent
     cte_in_prev_with: Optional[sqlglot_exp.CTE] = None
@@ -181,6 +189,9 @@ def _is_postgres_cte_in_scope(
                     visible = ctes[: ctes.index(cte_in_prev_with)]
                 else:
                     visible = []
+            elif mysql_strict and cte_in_prev_with is not None and cte_in_prev_with in ctes:
+                # MySQL never resolves a forward sibling, even under WITH RECURSIVE.
+                visible = ctes[: ctes.index(cte_in_prev_with) + 1]
             else:
                 visible = ctes
             for cte in visible:
@@ -189,12 +200,7 @@ def _is_postgres_cte_in_scope(
                     alias_node.this, sqlglot_exp.Identifier
                 ):
                     cte_id = alias_node.this
-                    cte_key = (
-                        cte_id.name.lower()
-                        if (case_insensitive or not cte_id.quoted)
-                        else cte_id.name
-                    )
-                    if cte_key == target:
+                    if _key(cte_id) == target:
                         return True
         prev_node = cur_node
         cur_node = cur_node.parent
@@ -341,9 +347,18 @@ def _mysql_base_table_lock_stmts(
                     this_part = tbl_node.this
                     if not isinstance(this_part, sqlglot_exp.Identifier) or not this_part.name:
                         continue
-                    if _is_postgres_cte_in_scope(tbl_node, case_insensitive=True):
-                        continue
                     leaf_low = this_part.name.lower()
+                    # Skip a name only when it certainly is a CTE.  Servers differ (MySQL with
+                    # lower_case_table_names=0 compares CTE names case-sensitively and never
+                    # resolves forward siblings; MariaDB does neither), so a name that is a CTE
+                    # only under the looser rules but also names a real table is locked anyway
+                    # (an extra shared lock is harmless, a missing one is not).
+                    if _is_postgres_cte_in_scope(tbl_node, mysql_strict=True):
+                        continue
+                    if _is_postgres_cte_in_scope(tbl_node, case_insensitive=True) and (
+                        schemas is None or leaf_low not in schemas_lower
+                    ):
+                        continue
                     if leaf_low.startswith(internal_prefixes):
                         continue
                     db_part = tbl_node.args.get("db")
@@ -397,8 +412,11 @@ def _mysql_base_table_lock_stmts(
         if ts is not None and ts.pk_columns:
             stmts.append(f"SELECT COUNT(*) FROM {q_tbl} FORCE INDEX (PRIMARY) LOCK IN SHARE MODE;")
         elif ts is not None and ts.columns:
+            # Portable null counter (``ISNULL()`` is MySQL-only and breaks the offline
+            # SQLite-backed adapter that replays this statement).
             col_terms = " + ".join(
-                f"ISNULL({quote_sql_identifier(c, Dialect.MYSQL)})" for c in ts.columns
+                f"(CASE WHEN {quote_sql_identifier(c, Dialect.MYSQL)} IS NULL THEN 1 ELSE 0 END)"
+                for c in ts.columns
             )
             stmts.append(f"SELECT SUM({col_terms}) FROM {q_tbl} LOCK IN SHARE MODE;")
         else:
@@ -834,14 +852,17 @@ class MaterializedViewManager:
             # metadata lock (MDL_EXCLUSIVE) even when the table already exists,
             # which stalls behind any active writer whose trigger watermark read
             # holds MDL_SHARED_READ on the catalog table.
+            # MySQL/MariaDB only: on PostgreSQL the probe would resolve the catalog through
+            # search_path, while CREATE TABLE places a missing one in the first schema of it.
             catalog_exists = False
-            try:
-                cur.execute(f"SELECT 1 FROM {self.catalog_table} WHERE 1 = 0")
-                cur.fetchall()
-                self._commit()
-                catalog_exists = True
-            except Exception:
-                self._rollback()
+            if self.dialect == Dialect.MYSQL:
+                try:
+                    cur.execute(f"SELECT 1 FROM {self.catalog_table} WHERE 1 = 0")
+                    cur.fetchall()
+                    self._commit()
+                    catalog_exists = True
+                except Exception:
+                    self._rollback()
             if not catalog_exists:
                 cur.execute(
                     f"""
@@ -3860,7 +3881,15 @@ class MaterializedViewManager:
           transient InnoDB deadlock/lock-timeout/snapshot-conflict errors
           1213/1205/1020).
         - SQLite: writes are serialized database-wide.
+
+        On MySQL/MariaDB, raises ``TransactionOwnershipError`` (before any SQL)
+        on a connection with an open transaction: the repair rolls back its own
+        read snapshots there, which would otherwise discard the caller's
+        uncommitted work.  (PostgreSQL and SQLite repairs commit the open
+        transaction instead; see TODO.md.)
         """
+        if self.dialect == Dialect.MYSQL:
+            self._require_idle_connection("repair_view")
         catalog = self.get_catalog()
         if view_name:
             resolved = self._resolve_catalog_name(view_name, catalog)

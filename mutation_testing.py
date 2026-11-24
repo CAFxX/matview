@@ -425,6 +425,16 @@ MUTANTS = (
         ),
     ),
     Mutant(
+        name="mysql-lock-planner-skips-looser-cte-name-with-physical-table",
+        source_path="matview/manager.py",
+        original="                    if _is_postgres_cte_in_scope(tbl_node, mysql_strict=True):\n                        continue",
+        replacement="                    if _is_postgres_cte_in_scope(tbl_node, case_insensitive=True):\n                        continue",
+        target_test=(
+            "test_concurrent_backfill.TestMySqlRepairViewLockingOffline."
+            "test_mysql_lock_planner_locks_a_table_that_is_only_a_cte_under_looser_server_rules"
+        ),
+    ),
+    Mutant(
         name="mysql-recompute-subquery-skips-lock-in-share-mode",
         source_path="matview/maintenance/single.py",
         original="            lock_part = \" LOCK IN SHARE MODE\" if self.dialect == Dialect.MYSQL else \"\"",
