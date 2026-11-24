@@ -125,7 +125,12 @@ class TestPlanDiagnostics(unittest.TestCase):
             "SELECT customer_id, GROUP_CONCAT(status, ',' ORDER BY id) AS statuses "
             "FROM orders GROUP BY customer_id;"
         )
-        plan = generate_materialized_view(self.schemas, view_sql, dialect=Dialect.SQLITE)
+        # The ORDER BY must be a total order: on SQLite only a NOT NULL key or
+        # the INTEGER PRIMARY KEY rowid alias rules out tied NULL keys.
+        schemas = mv.parse_table_schema(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INT, status TEXT, amount INT, created_at TEXT);"
+        )
+        plan = generate_materialized_view(schemas, view_sql, dialect=Dialect.SQLITE)
         diag = plan.diagnostics
         self.assertEqual(diag.strategy, "group_scoped_delta")
         self.assertEqual(diag.tier, 2)
