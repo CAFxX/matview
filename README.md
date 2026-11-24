@@ -94,14 +94,14 @@ tables keep the view's output columns plus (names start with `__mv_`):
 
 | Column / table | When | Why it is needed |
 | --- | --- | --- |
-| `__mv_pk` (text) | Nullable group keys, join and set-operation views | The group's canonical key: `NULL` group keys compare equal in `GROUP BY` but not in a unique index; it is the `ON CONFLICT` / `UPSERT` target. A table whose key columns are `NOT NULL` is keyed by them instead (no surrogate). |
+| `__mv_pk` (text) | Group keys that can be `NULL`, and `UNION`/`INTERSECT`/`EXCEPT` views | The group's canonical key: `NULL` group keys compare equal in `GROUP BY` but not in a unique index; it is the `ON CONFLICT` / `UPSERT` target. A table whose key columns are `NOT NULL` is keyed by them instead (no surrogate). |
 | `__mv_global_id` | Aggregate without `GROUP BY` | One fixed row (a global aggregate returns a row even over no input). |
-| `__mv_row_count` | Grouped views without a projected `COUNT(*)` | Deletes the group when its last row is removed (reused as the `COUNT(*)` column when there is one). |
-| `__mv_cnt_<col>` | `SUM`/`AVG` of a nullable argument | `SUM` must be `NULL` (not 0) when the group has no non-NULL value; `AVG = sum / count`. |
+| `__mv_row_count` | Grouped views without a projected `COUNT(*)`; `DISTINCT`, `UNION`/`INTERSECT`/`EXCEPT` and `UNION ALL` projections | Multiplicity of the row or group: it is deleted when the count reaches zero (reused as the `COUNT(*)` column when there is one). |
+| `__mv_cnt_<col>` | `SUM`/`AVG` of a nullable argument, `BOOL_AND`/`BOOL_OR` | `SUM` must be `NULL` (not 0) when the group has no non-NULL value; `AVG = sum / count`. |
 | `__mv_sum_*`, `__mv_sum2_*` / `__mv_m2_*` | `AVG`, `VAR_*`, `STDDEV_*` | The accumulators from which the reader view derives the result without rescanning. |
 | `__mv_acnt_<col>`, `__mv_fold_dirty` (SQLite) | `SUM`/`TOTAL`/`AVG` | Count of non-INTEGER values per group: while zero the integer fold is exact, otherwise the group is recomputed (any SQLite column can hold `REAL`). Removable for STRICT `INTEGER` arguments (TODO). |
 | `__mv_tcnt_*` | `BOOL_AND` / `BOOL_OR` | Count of true values. |
-| `__mv_branch_id`, `__mv_pk_<n>` | `UNION ALL` / set operations | Which branch and which source key a row came from. |
+| `__mv_branch_id`, `__mv_pk_<n>` | Non-aggregate `UNION ALL` projections | Which branch and which source key a row came from (the table's primary key). Aggregates over `UNION ALL` are recomputed and add no such columns. |
 | `__matview_dist_*` / `__matview_aux_*` tables with `__ref_cnt` | `COUNT/SUM/AVG(DISTINCT ...)`, `DISTINCT` aggregates | Multiplicity of each distinct value per group. |
 | PostgreSQL `__matview_lock_*`, `__matview_stg_*` | Statement-level maintenance of joins | Serialisation of writers of one group; staging of transition rows. |
 | `__matview_catalog` | Always (one row per view) | Definitions, object names, signature, backfill state. |

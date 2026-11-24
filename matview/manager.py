@@ -728,6 +728,26 @@ class MaterializedViewManager:
                 """
             )
             self._commit()
+            # A catalog from another version of the generator (missing a column) would make every
+            # catalog read fail and look like "no catalog": fail loudly instead.
+            try:
+                cur.execute(f"SELECT {', '.join(self._CATALOG_COLUMNS)} FROM {self.catalog_table} WHERE 1 = 0")
+                cur.fetchall()
+                self._commit()
+            except Exception as exc:
+                self._rollback()
+                raise RuntimeError(
+                    f"the materialized-view catalog {self.catalog_table} does not have the expected columns "
+                    f"({', '.join(self._CATALOG_COLUMNS)}): it was created by another version of matview. "
+                    f"Drop the catalog and the materialized views it lists (the project does not migrate "
+                    f"catalogs) and register the views again. Cause: {exc}"
+                ) from exc
+
+    _CATALOG_COLUMNS: Tuple[str, ...] = (
+        "view_name", "view_sql", "strategy", "signature_hash", "backing_table", "aux_tables_json",
+        "trigger_names_json", "function_names_json", "trigger_ddls_json", "backfill_cursor_pk",
+        "backfill_max_pk", "backfill_active", "backfill_owner", "accepted_limitations_json", "partitions_json",
+    )
 
     def _commit(self) -> None:
         if hasattr(self.conn, "commit"):
