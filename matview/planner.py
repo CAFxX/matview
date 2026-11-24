@@ -2627,36 +2627,41 @@ class PlannerMixin(MixinHost):
             MaintenanceStrategy.GROUP_SCOPED_DELTA: Strategy.GROUP_SCOPED_RECOMPUTE,
             MaintenanceStrategy.ATOMIC_QUERY_SYNC: Strategy.FULL_REFRESH,
         }
-        plain: Dict[str, Any] = {}
-        for t in self.view.referenced_tables:
-            ts = self._schemas_lower.get(t.lower())
-            if ts is not None and ts.columns and not ts.strict:
-                plain[t] = ts
-        if not plain:
-            return ()
-        # (a) SUM / TOTAL / AVG arguments: a plain column may hold REAL or TEXT, so the
-        #     fold keeps a hidden non-integer counter and recomputes the group when one is seen.
-        agg_cols: Dict[str, Set[str]] = {t: set() for t in plain}
-        # The decomposed items: COALESCE(SUM(q), 0) maintains an elementary SUM(q); DISTINCT
-        # aggregates always recompute their group and never use the conditional counter.
-        for item in self._working_select_items if self._sqlite_exact_sum_enabled() else ():
-            if not (item.is_aggregate and not item.is_distinct and item.agg_func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG) and item.arg_expr):
-                continue
-            try:
-                names = {c.name.lower() for c in parse_sql_ast(item.arg_expr, dialect=self.dialect).find_all(sqlglot_exp.Column)}
-            except Exception:
-                names = set()
-            for t, ts in plain.items():
-                agg_cols[t].update(
-                    c for c in ts.columns if c.lower() in names and _sqlite_type_affinity(ts.columns[c].data_type) == "INTEGER"
-                )
-        # (b) no trusted integer watermark column on the primary table.
         ps = self.primary_schema
+        if ps is None or not ps.columns or ps.strict:
+            return ()
+        plain: Dict[str, Any] = {ps.name: ps}
+        # (a) The hidden non-integer counter (`__mv_acnt_*`, `__mv_fold_dirty`) exists only for a
+        #     single-table algebraic-delta view, and only an aggregate over a BARE integer-affinity column
+        #     can have its group recomputed because of a REAL/TEXT value that STRICT would have rejected
+        #     (an expression such as q * p or CASE ... can be non-integer whatever the table declares).
+        #     Items are the decomposed ones: COALESCE(SUM(q), 0) maintains an elementary SUM(q); DISTINCT
+        #     aggregates always recompute their group and never use the counter.
+        agg_cols: Dict[str, Set[str]] = {t: set() for t in plain}
+        if strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and self._alg_mode == "single" and self._sqlite_exact_sum_enabled():
+            for item in self._working_select_items:
+                if not (item.is_aggregate and not item.is_distinct and item.agg_func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG) and item.arg_expr):
+                    continue
+                try:
+                    node = parse_sql_ast(item.arg_expr, dialect=self.dialect)
+                except Exception:
+                    continue
+                while isinstance(node, sqlglot_exp.Paren):
+                    node = node.this
+                if not isinstance(node, sqlglot_exp.Column):
+                    continue
+                for c in ps.columns:
+                    if c.lower() == node.name.lower() and _sqlite_type_affinity(ps.columns[c].data_type) == "INTEGER":
+                        agg_cols[ps.name].add(c)
+        # (b) no trusted integer watermark column although the single primary key is an integer column
+        #     (only a plain WITHOUT ROWID table can be in this state), and an incremental backfill is requested.
         watermark_table = None
+        pk_defs = [c for c in ps.columns.values() if c.primary_key]
         if (
-            ps is not None
-            and not ps.strict
-            and ps.name in plain
+            (self.incremental_backfill or self.watermark_catalog_table is not None)  # a backfill will run
+            and len(pk_defs) == 1
+            and pk_defs[0].not_null
+            and self._is_strict_integer_type(pk_defs[0].data_type)
             and self._resolve_pk_range_column() is None
         ):
             watermark_table = ps.name
@@ -2674,7 +2679,7 @@ class PlannerMixin(MixinHost):
                 )
             if t == watermark_table:
                 reasons.append(
-                    "if an incremental backfill is used (--incremental-backfill / incremental_backfill=True): the primary key of this WITHOUT ROWID table is not a trusted "
+                    "incremental backfill: the integer primary key of this WITHOUT ROWID table is not a trusted "
                     "64-bit integer (it may hold REAL or TEXT), so no watermark column is available and the "
                     "backfill uses the slower group_key_batch mode (a STRICT NOT NULL integer key is trusted)"
                 )

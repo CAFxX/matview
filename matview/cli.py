@@ -7,8 +7,9 @@ import hashlib
 import json
 import re
 import sys
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
+from .diagnostics import DiagnosticSeverity
 from .connectivity import detect_engine_version, introspect_database_schemas
 from .engines import (
     DEFAULT_OBJECT_PREFIX,
@@ -34,6 +35,19 @@ from .sql_frontend import parse_table_schema
 EXIT_UNSAFE_REPLACEMENT = 3  # a published view cannot be replaced atomically here
 EXIT_TRANSACTION_OWNERSHIP = 4  # the connection's transaction state cannot be owned
 
+
+
+def _announce_recommendations(plan: Any, as_json: bool) -> None:
+    """Print the plan's NOTE diagnostics (recommendations) on stderr: they change no guarantee, so
+    they never affect the exit code or the generated script on stdout."""
+    notes = [d for d in getattr(plan, "strategy_diagnostics", ()) if d.severity == DiagnosticSeverity.NOTE]
+    if not notes:
+        return
+    if as_json:
+        print(json.dumps({"recommendations": [d.to_dict() for d in notes]}, indent=2, sort_keys=True), file=sys.stderr)
+    else:
+        for d in notes:
+            print(f"NOTE {d}", file=sys.stderr)
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
@@ -318,6 +332,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     indexes=args.indexes,
                     strict=args.strict,
                 )
+                _announce_recommendations(plan, args.json)
                 print(
                     plan.render_sql_script(
                         include_populate=not args.no_populate,
@@ -374,6 +389,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             strict=args.strict,
             engine_version=detected_ev,
         )
+        _announce_recommendations(plan, args.json)
         print(
             plan.render_sql_script(
                 include_populate=not args.no_populate,

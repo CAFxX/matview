@@ -85,27 +85,75 @@ class SqliteStrictDiagnosticsTests(unittest.TestCase):
             finally:
                 conn.close()
 
-    def test_watermark_note_on_plain_without_rowid_and_not_on_strict(self) -> None:
+    def test_watermark_note_only_for_integer_pk_without_rowid_with_incremental_backfill(self) -> None:
         view = "CREATE VIEW wv AS SELECT g, COUNT(*) AS c FROM w GROUP BY g;"
-        out: Dict[bool, Any] = {}
-        for strict in (False, True):
+        # (primary key declaration, STRICT?, incremental backfill requested?) -> note expected
+        cases = [
+            ("id INTEGER NOT NULL PRIMARY KEY", False, True, True),
+            ("id INTEGER NOT NULL PRIMARY KEY", True, True, False),  # STRICT: key is trusted, pk_range_fold
+            ("id INTEGER NOT NULL PRIMARY KEY", False, False, False),  # backfill not requested
+            ("id TEXT NOT NULL PRIMARY KEY", False, True, False),  # not an integer key: STRICT would not help
+            ("id INTEGER NOT NULL, k INTEGER NOT NULL, PRIMARY KEY (id, k)", False, True, False),  # composite
+        ]
+        for pk, strict, incremental, expected in cases:
             conn = sqlite3.connect(":memory:")
-            conn.execute(
-                "CREATE TABLE w (id INTEGER NOT NULL PRIMARY KEY, g TEXT) WITHOUT ROWID" + (", STRICT" if strict else "")
-            )
-            conn.execute("INSERT INTO w VALUES (1,'a'),(2,'b')")
+            conn.execute(f"CREATE TABLE w (g TEXT, {pk}) WITHOUT ROWID" + (", STRICT" if strict else ""))
             conn.commit()
             try:
-                plan = MaterializedViewManager(conn, dialect=Dialect.SQLITE).register_view(
-                    view, incremental_backfill=True
-                )
-                out[strict] = (_notes(plan), plan.incremental_backfill_spec.mode if plan.incremental_backfill_spec else None)
+                mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+                plan = mgr.register_view(view, incremental_backfill=incremental)
+                notes = _notes(plan)
+                self.assertEqual(len(notes), 1 if expected else 0, (pk, strict, incremental))
+                if expected:
+                    self.assertIn("group_key_batch", notes[0].message)
+                    self.assertEqual(plan.incremental_backfill_spec.mode, "group_key_batch")
             finally:
                 conn.close()
-        self.assertEqual(len(out[False][0]), 1)
-        self.assertIn("group_key_batch", out[False][0][0].message)
-        self.assertEqual(out[False][1], "group_key_batch")
-        self.assertEqual(out[True], ([], "pk_range_fold"))
+
+    def test_no_note_when_the_counter_cannot_be_what_strict_removes(self) -> None:
+        """The hidden non-integer counter exists only for a single-table algebraic-delta view, and only an
+        aggregate over a BARE integer column can be recomputed because of a REAL/TEXT value."""
+        silent = [
+            "SELECT g, SUM(CASE WHEN q > 1 THEN 1 ELSE 0 END) AS s FROM o GROUP BY g",  # integer by construction
+            "SELECT g, SUM(CAST(q AS INTEGER)) AS s FROM o GROUP BY g",
+            "SELECT g, SUM(q * p) AS s FROM o GROUP BY g",  # REAL p: dirty whatever the declaration
+            "SELECT g, SUM(q) AS s, GROUP_CONCAT(g) AS gc FROM o GROUP BY g",  # group-scoped recompute
+            "SELECT g, SUM(q) AS s FROM o GROUP BY g ORDER BY s LIMIT 1",  # full refresh
+            "SELECT g, SUM(q) AS s FROM o GROUP BY g UNION ALL SELECT g, SUM(q) FROM o GROUP BY g",
+            "SELECT g, SUM(DISTINCT q) AS s FROM o GROUP BY g",
+        ]
+        for select in silent:
+            conn = _conn(False)
+            try:
+                plan = MaterializedViewManager(conn, dialect=Dialect.SQLITE).register_view(f"CREATE VIEW sl AS {select};")
+                self.assertEqual(_notes(plan), [], select)
+            finally:
+                conn.close()
+
+    def test_cli_compile_prints_the_note_on_stderr_and_not_in_the_script(self) -> None:
+        import contextlib
+        import io
+        import os
+        import tempfile
+
+        from matview.cli import main
+
+        with tempfile.TemporaryDirectory() as d:
+            schema, views = os.path.join(d, "s.sql"), os.path.join(d, "v.sql")
+            with open(schema, "w") as fh:
+                fh.write("CREATE TABLE o (id INTEGER PRIMARY KEY, g TEXT, q INTEGER);")
+            with open(views, "w") as fh:
+                fh.write("CREATE VIEW sv AS SELECT g, SUM(q) AS s FROM o GROUP BY g;")
+            for as_json in (False, True):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = main(["--schema", schema, "--view", views, "--dialect", "sqlite"] + (["--json"] if as_json else []))
+                self.assertEqual(rc, 0)
+                self.assertNotIn(SQLITE_STRICT_RECOMMENDED, out.getvalue())
+                if as_json:
+                    self.assertEqual(json.loads(err.getvalue())["recommendations"][0]["code"], SQLITE_STRICT_RECOMMENDED)
+                else:
+                    self.assertIn(f"NOTE [{SQLITE_STRICT_RECOMMENDED}]", err.getvalue())
 
     def test_introspection_reads_strict_and_without_rowid_from_the_live_connection(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -132,7 +180,7 @@ class SqliteStrictDiagnosticsTests(unittest.TestCase):
                 conn.execute("DROP TABLE o")
                 conn.execute("ALTER TABLE o2 RENAME TO o")
                 conn.commit()
-                self.assertNotEqual(mgr.check_schema_drift()["sv"], "ok", f"to_strict={to_strict}")
+                self.assertEqual(mgr.check_schema_drift()["sv"], "drifted", f"to_strict={to_strict}")
                 mgr.repair_view("sv")
                 self.assertEqual(mgr.check_schema_drift(), {"sv": "ok"})
                 self.assertEqual(
