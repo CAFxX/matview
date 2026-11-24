@@ -1102,16 +1102,25 @@ class DialectBaseMixin(MixinHost):
         return s[0] + (1 if s[1] else 0) if s else None
 
     def _mysql_group_key_narrow_integer_type(self, expr: str) -> Optional[str]:
-        """MySQL's grouped narrow-integer arithmetic key has INT result metadata.
+        """MySQL's result type of an integer arithmetic expression used as a GROUP BY key.
 
-        MySQL 8.4/9.7 reports a plain projection such as s % 2 or s + s as
-        BIGINT, but the same expression selected as a GROUP BY key is INT.
-        This is distinct from MariaDB's display-length rule below. Keep the
-        inference deliberately narrow: only a direct group-key ADD of two
-        signed TINYINT/SMALLINT/MEDIUMINT columns, or MOD with a narrow signed
-        column on the left and a narrow column/small integer literal on the
-        right, is covered. Unsigned, multiplying, casted and unknown shapes
-        retain the ordinary expression inference.
+        MySQL 8.4/9.7 types an integer arithmetic expression as BIGINT in a
+        plain projection, but the same expression as a GROUP BY key is INT when
+        its display length is below 10 characters (the temporary-table field
+        rule, the same threshold MariaDB applies everywhere, see
+        `_mariadb_int_arithmetic_length`) and BIGINT otherwise. The group key
+        is matched by AST against the GROUP BY list (also through a select
+        alias or an ordinal). The length follows MariaDB's operator rules, but
+        only for the subset verified natively against both servers
+        (test_native_result_types.py::test_mysql_group_key_integer_type_matches_
+        the_length_model, a few thousand generated expressions): operands of
+        + and - must agree in signedness (a signed/unsigned mix differs), unary
+        minus applies to literals only, and % needs a leaf or signed left
+        operand. Anything else returns None (conservative BIGINT).
+
+        The result is plan dependent in the engine itself (BIGINT when a
+        matching generated-column index serves the GROUP BY, see TODO.md and
+        README "Engine exclusions"); the reader follows the plan without one.
         """
         if (
             self.dialect != Dialect.MYSQL
@@ -1121,63 +1130,88 @@ class DialectBaseMixin(MixinHost):
         ):
             return None
 
-        try:
-            root = parse_sql_ast(expr, dialect=self.dialect)
-        except sqlglot.errors.SqlglotError:
-            return None
+        sql_dialect = _sqlglot_dialect(self.dialect)
 
         def strip_parens(node: Any) -> Any:
             while node.__class__.__name__ == "Paren":
                 node = node.this
             return node
 
-        root = strip_parens(root)
-        kind = root.__class__.__name__
-        if kind not in ("Add", "Mod"):
-            return None
-
-        sql_dialect = _sqlglot_dialect(self.dialect)
-        root_sql = root.sql(dialect=sql_dialect)
-        for group_expr in self.view.group_by_cols:
+        def parse(text: str) -> Optional[Any]:
             try:
-                group_root = strip_parens(parse_sql_ast(group_expr, dialect=self.dialect))
+                return strip_parens(parse_sql_ast(text, dialect=self.dialect))
             except sqlglot.errors.SqlglotError:
-                continue
-            if group_root.sql(dialect=sql_dialect) != root_sql:
-                continue
+                return None
 
-            def narrow_signed_column(node: Any) -> bool:
-                node = strip_parens(node)
-                if node.__class__.__name__ != "Column":
-                    return False
-                col = self._lookup_col_def(node.sql(dialect=sql_dialect)) or self._lookup_col_def(node.name)
-                if col is None:
-                    return False
-                declared = re.sub(r"\s+", " ", col.data_type.strip().upper())
-                return re.fullmatch(
-                    r"(?:TINYINT|SMALLINT|MEDIUMINT)(?:\s*\(\s*\d+\s*\))?",
-                    declared,
-                ) is not None
-
-            def small_integer_literal(node: Any) -> bool:
-                node = strip_parens(node)
-                if node.__class__.__name__ == "Neg":
-                    node = strip_parens(node.this)
-                if node.__class__.__name__ != "Literal" or node.args.get("is_string"):
-                    return False
-                value = str(node.this)
-                return re.fullmatch(r"\d+", value) is not None and int(value) < 2 ** 31
-
-            left = root.this
-            right = root.expression
-            if kind == "Add" and narrow_signed_column(left) and narrow_signed_column(right):
-                return "INT"
-            if kind == "Mod" and narrow_signed_column(left) and (
-                narrow_signed_column(right) or small_integer_literal(right)
-            ):
-                return "INT"
+        root = parse(expr)
+        if root is None or root.__class__.__name__ not in ("Add", "Sub", "Mul", "Mod", "IntDiv"):
             return None
-        return None
+        root_sql = root.sql(dialect=sql_dialect)
+
+        def resolved_group_exprs() -> List[str]:
+            out: List[str] = []
+            items = list(self.view.select_items)
+            for g in self.view.group_by_cols:
+                g = g.strip()
+                if re.fullmatch(r"\d+", g) and 1 <= int(g) <= len(items):
+                    out.append(items[int(g) - 1].raw_expr)
+                    continue
+                aliased = [it for it in items if it.alias and it.alias.lower() == g.lower().strip('`"')]
+                out.append(aliased[0].raw_expr if aliased and not self._lookup_col_def(g) else g)
+            return out
+
+        if not any(
+            (gr := parse(g)) is not None and gr.sql(dialect=sql_dialect) == root_sql
+            for g in resolved_group_exprs()
+        ):
+            return None
+
+        def shape(node: Any, leaf_only: bool = False) -> Optional[Tuple[int, bool, bool, bool]]:
+            """(display digits, signed, is_leaf, is_literal) or None outside the verified subset."""
+            node = strip_parens(node)
+            kind = node.__class__.__name__
+            if kind == "Column":
+                c_def = self._lookup_col_def(node.sql(dialect=sql_dialect)) or self._lookup_col_def(node.name)
+                if c_def is None:
+                    return None
+                m = self._MARIADB_INT_COLUMN_RE.fullmatch(re.sub(r"\s+", " ", c_def.data_type.strip().upper()))
+                if m is None or "ZEROFILL" in c_def.data_type.upper():
+                    return None
+                signed_d, unsigned_d = self._MARIADB_INT_DIGITS[m.group(1)]
+                return (unsigned_d, False, True, False) if m.group(2) else (signed_d, True, True, False)
+            if kind == "Literal":
+                text = str(node.this)
+                if node.args.get("is_string") or not text.isdigit():
+                    return None
+                return (len(text), False, True, True)
+            if kind == "Neg":
+                inner = strip_parens(node.this)
+                lit = shape(inner) if inner.__class__.__name__ == "Literal" else None
+                return (lit[0], True, True, True) if lit else None
+            if leaf_only or kind not in ("Add", "Sub", "Mul", "Mod"):
+                return None
+            a, b = shape(node.this), shape(node.expression)
+            if a is None or b is None:
+                return None
+            if kind == "Mul":
+                return (a[0] + b[0], a[1] or b[1], False, False)
+            if kind == "Mod":
+                if not (a[2] or a[1]):  # unsigned non-leaf left operand: not verified
+                    return None
+                return (max(a[0], b[0]), a[1], False, False)
+            if a[1] != b[1] and not (a[3] or b[3]):
+                return None  # signed/unsigned column mix in + or -: not verified
+            return (max(a[0], b[0]) + 1, a[1] or b[1], False, False)
+
+        if root.__class__.__name__ == "IntDiv":
+            left, right = shape(root.this), shape(root.expression)
+            length = left[0] if left and right else None
+        else:
+            top = shape(root)
+            length = top[0] + (1 if top[1] else 0) if top else None
+        if length is None:
+            return None
+        return "BIGINT" if length >= 10 else "INT"
 
     def _infer_ast_expr_storage_type(self, expr: str) -> Optional[str]:
         """Infer storage type across dialects from AST nodes (CASE, COALESCE, arithmetic, scalars)."""
