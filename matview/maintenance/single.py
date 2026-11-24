@@ -1101,6 +1101,8 @@ class Tier1SingleMixin(MixinHost):
                     storage_type = "VARCHAR(255)"
                 if item.agg_func in (AggFunc.COUNT_STAR, AggFunc.COUNT_COL):
                     col_defs_sql.append(f"{self._q(item.alias)} {storage_type} NOT NULL DEFAULT 0")
+                    # A COUNT output only ever holds an integer: provable for STRICT backing tables.
+                    self._sqlite_provable_int_cols = frozenset(self._sqlite_provable_int_cols | {item.alias})
                 elif item.agg_func == AggFunc.TOTAL:
                     # SQLite TOTAL returns NULL when the floating-point sum is
                     # NaN (e.g. inf + -inf); NOT NULL would reject the write.

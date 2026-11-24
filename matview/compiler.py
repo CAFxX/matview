@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from .dialects import DialectMixin
 from .engines import (
@@ -38,6 +38,11 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
     `MaterializedViewPlan` via an immutable `CompilationContext` / `LogicalIR`.
     """
 
+    # SQLite table-option bookkeeping (see DialectMixin._create_table_ddl): output columns whose
+    # value type is provably INTEGER, and why each table has the shape it has (announced as performance notes).
+    _sqlite_provable_int_cols: FrozenSet[str] = frozenset()
+    _sqlite_table_shape_notes: Dict[str, str] = {}
+
     @classmethod
     def _from_context(cls, context: CompilationContext) -> "IncrementalViewCompiler":
         obj = cls.__new__(cls)
@@ -64,6 +69,7 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
         engine_version: Optional[EngineVersion | str] = None,
         watermark_catalog_table: Optional[str] = None,
         pg_fillfactor: Optional[int] = 80,
+        sqlite_strict_backing: bool = False,
         accept_limitations: Sequence[str] = (),
         repair_fence_catalog_table: Optional[str] = None,
     ) -> None:
@@ -79,6 +85,7 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
             engine_version=engine_version,
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=pg_fillfactor,
+            sqlite_strict_backing=sqlite_strict_backing,
             accept_limitations=accept_limitations,
             repair_fence_catalog_table=repair_fence_catalog_table,
         )
@@ -97,6 +104,7 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
         engine_version: Optional[EngineVersion | str] = None,
         watermark_catalog_table: Optional[str] = None,
         pg_fillfactor: Optional[int] = 80,
+        sqlite_strict_backing: bool = False,
         accept_limitations: Sequence[str] = (),
         repair_fence_catalog_table: Optional[str] = None,
     ) -> CompilationContext:
@@ -154,6 +162,7 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
             strict=strict,
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=pg_fillfactor,
+            sqlite_strict_backing=sqlite_strict_backing,
             limitations=(),
             strategy=MaintenanceStrategy.ATOMIC_QUERY_SYNC,
             alg_mode="single",
@@ -307,6 +316,10 @@ class IncrementalViewCompiler(PlannerMixin, ExactAggregateRoutingMixin, Maintena
     @property
     def pg_fillfactor(self) -> Optional[int]:
         return self._context.pg_fillfactor
+
+    @property
+    def sqlite_strict_backing(self) -> bool:
+        return self._context.sqlite_strict_backing
 
     @property
     def logical_view_name(self) -> str:

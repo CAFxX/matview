@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+    from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
     from . import key_collation
     from .compiler import IncrementalViewCompiler
@@ -57,6 +57,7 @@ class MixinHost:
             engine_version: Optional[EngineVersion | str] = None,
             watermark_catalog_table: Optional[str] = None,
             pg_fillfactor: Optional[int] = 80,
+            sqlite_strict_backing: bool = False,
             accept_limitations: Sequence[str] = (),
             repair_fence_catalog_table: Optional[str] = None,
         ) -> None: ...
@@ -104,6 +105,10 @@ class MixinHost:
         def object_prefix(self) -> str: ...
         @property
         def pg_fillfactor(self) -> Optional[int]: ...
+        @property
+        def sqlite_strict_backing(self) -> bool: ...
+        _sqlite_provable_int_cols: FrozenSet[str]
+        _sqlite_table_shape_notes: Dict[str, str]
         @property
         def primary_schema(self) -> Optional[TableSchema]: ...
         @property

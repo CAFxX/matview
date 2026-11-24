@@ -412,15 +412,19 @@ class TestSQLiteWithoutRowidAndReturning(unittest.TestCase):
         for aux_ddl in plan_dist.auxiliary_table_ddls:
             self.assertIn("WITHOUT ROWID", aux_ddl)
 
-    def test_sqlite_single_pk_backing_tables_do_not_emit_without_rowid(self):
-        """SQLite backing tables with single-column PK retain standard rowid B-tree."""
+    def test_sqlite_single_pk_backing_tables_emit_without_rowid(self):
+        """Single-column NOT NULL non-rowid-alias PK stores are WITHOUT ROWID (one b-tree per row instead of two);
+        a store keyed by a single `INTEGER PRIMARY KEY` already is its rowid and keeps it
+        (the full rule is table-driven in test_sqlite_table_shapes.py)."""
         schema_sql = "CREATE TABLE users (id INTEGER PRIMARY KEY, dept TEXT, score REAL);"
         schemas = parse_table_schema(schema_sql)
-
-        # View grouped by single column
         view_sql = "CREATE VIEW mv_users AS SELECT dept, SUM(score) AS total FROM users GROUP BY dept;"
         plan = generate_materialized_view(schemas, view_sql, dialect=Dialect.SQLITE)
-        self.assertNotIn("WITHOUT ROWID", plan.backing_table_ddl)
+        self.assertIn("WITHOUT ROWID", plan.backing_table_ddl)  # __mv_pk TEXT NOT NULL PRIMARY KEY
+        glob = generate_materialized_view(
+            schemas, "CREATE VIEW mv_glob AS SELECT COUNT(*) AS n FROM users;", dialect=Dialect.SQLITE
+        )
+        self.assertNotIn("WITHOUT ROWID", glob.backing_table_ddl)  # __mv_global_id INTEGER PRIMARY KEY
 
     def test_sqlite_live_without_rowid_dml_and_drift_check(self):
         """Live SQLite test: WITHOUT ROWID backing table maintains DML and passes check_schema_drift()."""

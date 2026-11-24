@@ -3645,6 +3645,7 @@ class MVTestRunner:
         dialect: Optional[Dialect] = None,
         incremental_backfill: bool = False,
         batch_size: int = 1000,
+        sqlite_strict_backing: bool = False,
     ) -> None:
         eff_dialect = dialect if dialect is not None else self.default_dialect
         if self.skips_emulated(eff_dialect, suite_name):
@@ -3698,6 +3699,7 @@ class MVTestRunner:
                             engine_version=engine_version,
                             incremental_backfill=incremental_backfill,
                             batch_size=batch_size,
+                            **({"sqlite_strict_backing": True} if sqlite_strict_backing else {}),
                         )
                     except UnsupportedMaterializedViewError as refusal:
                         if not (engine_version.sqlite_nonstandard_statistics and _STATISTICAL_CALL_RE.search(eff_v_ddl)):
@@ -9754,12 +9756,13 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
             )
             run_fuzz_batch(
                 f"Suite 12a (Differential Fuzzer seed={s_val} sc={sc_idx} - Default Engine"
-                f"{', STRICT sources' if use_strict else ''})",
+                f"{', STRICT sources + STRICT backing tables' if use_strict else ''})",
                 s_def,
                 v_def,
                 seed_def,
                 m_def,
                 dialect=runner.default_dialect,
+                sqlite_strict_backing=use_strict,
             )
 
             # 2. PostgreSQL dialect (statement-level maintenance, without and with incremental backfill)

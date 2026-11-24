@@ -112,6 +112,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX; --ignore-limitations does not cover them.",
     )
     parser.add_argument(
+        "--sqlite-strict-backing",
+        action="store_true",
+        help="SQLite: declare matview-owned backing/auxiliary tables STRICT where every column type is "
+        "provably fixed (opt-in guard rail: it costs a few percent of write time and changes no result).",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="Fail compilation if a view cannot use Tier 1 ALGEBRAIC_DELTA maintenance.",
@@ -191,6 +197,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     accept_limitations=args.accept_limitations or None,
                     object_prefix=args.object_prefix,
                     strict=args.strict,
+                    sqlite_strict_backing=args.sqlite_strict_backing,
                     engine_version=args.engine_version,
                 )
                 try:
@@ -236,6 +243,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     incremental_backfill=args.incremental_backfill,
                     batch_size=args.batch_size,
                     strict=args.strict,
+                    sqlite_strict_backing=args.sqlite_strict_backing,
                     engine_version=detected_ev,
                 )
                 diffs: Dict[str, ViewDiff] = {}
@@ -283,6 +291,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 accept_limitations=args.accept_limitations or None,
                 object_prefix=args.object_prefix,
                 strict=args.strict,
+                sqlite_strict_backing=args.sqlite_strict_backing,
                 engine_version=args.engine_version,
             )
             try:
@@ -319,6 +328,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 accept_limitations=args.accept_limitations or None,
                 object_prefix=args.object_prefix,
                 strict=args.strict,
+                sqlite_strict_backing=args.sqlite_strict_backing,
                 engine_version=args.engine_version,
             )
             try:
@@ -387,6 +397,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             incremental_backfill=args.incremental_backfill,
             batch_size=args.batch_size,
             strict=args.strict,
+            sqlite_strict_backing=args.sqlite_strict_backing,
             engine_version=detected_ev,
         )
         _announce_recommendations(plan, args.json)

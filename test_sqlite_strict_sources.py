@@ -100,13 +100,13 @@ def _rows(conn: sqlite3.Connection, sql: str) -> Counter:
 
 
 class SqliteStrictSourceTests(unittest.TestCase):
-    def _run(self, strict: bool) -> Tuple[int, int]:
+    def _run(self, strict: bool, strict_backing: bool = False) -> Tuple[int, int]:
         conn = sqlite3.connect(":memory:")
         try:
             for stmt in schema(strict) + SEED:
                 conn.execute(stmt)
             conn.commit()
-            mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+            mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE, sqlite_strict_backing=strict_backing)
             plans = {}
             for name, select in VIEWS:
                 plans[name] = mgr.register_view(f"CREATE VIEW sv_{name} AS {select};")
@@ -116,10 +116,17 @@ class SqliteStrictSourceTests(unittest.TestCase):
                 for name, select in lives.items():
                     got = _rows(conn, f"SELECT * FROM {plans[name].db_view_name}")
                     want = _rows(conn, select)
-                    self.assertEqual(got, want, f"strict={strict} view={name} stage={stage}")
+                    self.assertEqual(got, want, f"strict={strict} strict_backing={strict_backing} view={name} stage={stage}")
 
             check("initial")
             transitions = 1
+            shapes = [
+                str(r[0]) for r in conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name LIKE '\\_\\_matview\\_store\\_%' ESCAPE '\\'"
+                )
+            ]
+            self.assertTrue(any("WITHOUT ROWID" in d for d in shapes), "narrow keyed stores must be WITHOUT ROWID")
+            self.assertEqual(any("STRICT" in d.split(")")[-1] for d in shapes), strict_backing)
             for label, stmts, _ in DML:
                 # a rolled-back transaction leaves view == live view (state before the change),
                 # also checked inside the open transaction (maintenance sees uncommitted rows)
@@ -142,14 +149,21 @@ class SqliteStrictSourceTests(unittest.TestCase):
                     conn.rollback()
                     check("rejected: " + bad)
                     transitions += 1
+            # drift/repair understand every table shape (WITHOUT ROWID / STRICT backing); a rebuild is exact
+            self.assertEqual(set(mgr.check_schema_drift().values()), {"ok"})
+            if strict == strict_backing:  # the two extreme variants: a rebuild costs ~0.7 s
+                mgr.repair_view()
+                self.assertEqual(set(mgr.check_schema_drift().values()), {"ok"})
+                check("repair")
             return len(VIEWS), transitions
         finally:
             conn.close()
 
     @unittest.skipUnless(STRICT_OK, "STRICT tables need SQLite >= 3.37")
     def test_strict_and_plain_sources_match_live_views_exactly(self) -> None:
-        for strict in (False, True):
-            views, transitions = self._run(strict)
+        # source tables plain/STRICT x backing tables default/STRICT (opt-in): same schema factory and DML
+        for strict, strict_backing in ((False, False), (True, False), (False, True), (True, True)):
+            views, transitions = self._run(strict, strict_backing)
             self.assertEqual(views, len(VIEWS))
             self.assertGreaterEqual(transitions, 21)
 

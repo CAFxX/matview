@@ -347,6 +347,9 @@ jobs:
       - name: Test group keys follow the column collation (SQLite NOCASE/RTRIM/BINARY)
         run: python3 test_group_key_collation.py
 
+      - name: Test SQLite table shapes (WITHOUT ROWID rule, opt-in STRICT backing)
+        run: python3 test_sqlite_table_shapes.py
+
       - name: Test PostgreSQL/MySQL order-sensitive aggregate SQL-shape guards (offline)
         run: python3 test_pgmy_exact_float_aggregates.py
 

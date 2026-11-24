@@ -689,11 +689,15 @@ The existing differential-testing harness is useful, but its current headline co
 
 - [x] **Support and recommend STRICT source tables** (README "SQLite STRICT tables", `docs/design-sqlite-strict.md`, `test_sqlite_strict_sources.py`, STRICT scenarios in the SQLite fuzzer).
 - [ ] **STRICT-aware diagnostics and drift** (note per non-STRICT source with the affected columns, STRICT -> plain drift is `invalid`, `PRAGMA table_list` introspection).
-- [ ] **WITHOUT ROWID / STRICT backing and aux tables** (audit, measure, rule; opt-in `strict_backing_tables` unless <5% write cost).
+- [x] **WITHOUT ROWID / STRICT backing and aux tables** (rule + measurements in README; STRICT backing is opt-in `sqlite_strict_backing` / `--sqlite-strict-backing`; provable-column rule in `_sqlite_strict_columns`). Open: STRICT for tables with copied typed columns needs per-column provenance (a copy of a STRICT base column is provable); join/set-op COUNT outputs are not registered as provable integers yet.
 - [ ] **Audit every matview-owned column, index and implicit key on all engines** (hidden keys, counters, accumulators, InnoDB DB_ROW_ID, extra PG indexes; README "columns we add and why").
 - [ ] **Tier-1 efficiency from STRICT sources**, each only when provably exact (standing goal: no view needs tier 3, few tier 2, bulk writes tier 1 with <= 1 write per row, no no-op rewrites):
   - Drop the hidden "approximate count" column of SQLite `SUM`/`TOTAL`/`AVG` (`_sqlite_acnt_cols`, `maintenance/single.py`) when the argument is a bare STRICT `INTEGER`/`INT` column: every non-NULL value is an integer, so the pure integer fold is exact and the `typeof() <> 'integer'` dirty checks and group recompute fallback cannot trigger. (Not for REAL columns: a REAL fold still needs recompute; not for expressions: `a * b` can overflow into REAL.)
   - Audit the unchanged-row guards and comparison/collation guards for `typeof()`/affinity companions that a STRICT column type makes redundant (only where a guard is actually emitted today; none identified yet).
+
+## P1 addition: base-table DDL safety
+
+- [ ] **Document which DDL statements on base tables are SAFE for matview per engine, and make codegen allow the set of safe DDLs to be as large as possible without giving up performance.** (User request 2026-11-24.) Cover ADD COLUMN, RENAME (table/column), DROP of an unreferenced column, CREATE/DROP INDEX, type widening, defaults and CHECKs; avoid column-position dependencies and `SELECT *` in generated triggers (reference columns by name); classify schema drift as safe / needs-repair / invalid (today: `ok` / `drifted` / `invalid`); a DDL x engine native test matrix in the style of `test_native_dml_interactions.py`; a README section. Not started.
 
 ## P1 — Modular Architecture, Engine/Version Optimizations & Developer Experience
  

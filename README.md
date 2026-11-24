@@ -1109,6 +1109,36 @@ Requirements and behaviour:
   every cell exactly (type and bit pattern); half of the SQLite fuzzer scenarios
   declare their source tables STRICT.
 
+#### Tables matview creates on SQLite
+
+- **WITHOUT ROWID (default).** A matview-owned table is `WITHOUT ROWID` when it has
+  a `NOT NULL` primary key that is not already the rowid (a single `INTEGER PRIMARY
+  KEY` is), no `AUTOINCREMENT`, and narrow rows (estimated at most 128 bytes: 8 per
+  numeric column, 32 per `TEXT`/`BLOB`/`ANY` column, `n` for `VARCHAR(n)`). A rowid
+  table with such a key writes every row twice (table and key index); `WITHOUT
+  ROWID` writes it once. No SQL matview generates reads the rowid of its own
+  tables. Measured with `scripts/bench_bulk.py --sqlite` (SQLite 3.46, 20000 rows,
+  median of 3 runs, shared and busy machine, so differences under about 10% are
+  noise): grouped aggregate, MIN/MAX and DISTINCT views took 9% to 26% less
+  statement time in total, join and projection views were within noise; a
+  stand-alone row-width sweep shows the saving up to about 64 payload bytes per
+  row, break-even around 150 and a loss from about 300, hence the threshold. A
+  table that keeps its rowid is named, with the reason, in the registration
+  `performance_notes` (`sqlite_table_shape: ... keeps its rowid: ...`).
+- **STRICT backing tables (opt-in).** `MaterializedViewManager(...,
+  sqlite_strict_backing=True)` / `--sqlite-strict-backing` declares a table
+  STRICT only when every column's value type is fixed by the plan: no-affinity
+  `BLOB` columns become `ANY` (same semantics), maintained counters and `COUNT`
+  outputs `INTEGER`, floating accumulators `REAL`. STRICT raises on a wrong-typed
+  value and an error in a maintenance trigger aborts the user's statement, so a
+  table with a column copied from a base table (whose plain column may hold any
+  storage class) stays non-STRICT and the registration notes say so. The
+  results are identical; STRICT only guards the backing tables against
+  out-of-band writes. It is **off by default** because it is a guard rail only
+  and, on top of `WITHOUT ROWID`, added 0% to 5% statement time in the same
+  measurement (largest, 3% to 5%, for projection views; below the noise for most
+  others).
+
 ### Concurrency notes
 
 Maintenance runs in the writer's transaction, so what concurrent writers can

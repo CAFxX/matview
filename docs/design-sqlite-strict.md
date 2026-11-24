@@ -22,15 +22,18 @@ The project is unreleased: no migration or compatibility work anywhere below.
    STRICT -> plain as `invalid`. STRICT-ness comes from `PRAGMA table_list`
    (authoritative, 3.37+) with the `CREATE TABLE` text as the offline source.
 3. **Generated tables (PR 3).** Per table, never per view guess:
-   - `WITHOUT ROWID` for every backing/aux table whose rowid nothing needs
-     (decided by an audit of readers/triggers and by measurement; narrow rows
-     only, wide/unbounded TEXT-BLOB rows keep the rowid).
-   - `STRICT` only when every column type is *provably fixed* by plan inference
-     (COUNT -> INTEGER, a column copied from a STRICT source, ...). A wrong-typed
-     value raises inside a maintenance trigger and aborts the user's DML, so
-     everything not provable stays non-STRICT; `ANY` is used only where the live
-     view also has no affinity. Opt-in (`strict_backing_tables`) unless the
-     measured write cost is under 5%.
+   - `WITHOUT ROWID` by default for every matview-owned table with a NOT NULL
+     primary key that is not already the rowid, no AUTOINCREMENT and narrow rows
+     (estimate <= 128 bytes). Audit: no generated SQL reads a matview-owned rowid
+     (the `rowid` references in `maintenance/` are about *base* tables). Measured:
+     -9% to -26% statement time on aggregate/MIN-MAX/DISTINCT views, noise on
+     join/projection views, break-even near 150 payload bytes (README).
+   - `STRICT` opt-in (`sqlite_strict_backing`): only when every column type is
+     *provably fixed* by the plan (BLOB -> ANY, counters/COUNT -> INTEGER,
+     accumulators -> REAL). A wrong-typed value raises inside a maintenance trigger
+     and aborts the user's DML, so a table with a copied base column stays plain
+     (announced). Off by default: guard rail only, +0..5% write time on top of
+     WITHOUT ROWID (measured), no result change.
 4. **Minimal columns (PR 4).** Every matview-owned column/index/implicit key on
    every engine is justified (needed for exactness or O(1) maintenance) or removed.
 
