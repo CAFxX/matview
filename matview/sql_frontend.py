@@ -1325,6 +1325,13 @@ def parse_table_schema(
                         )
                     ):
                         data_type = f"{data_type} UNSIGNED"
+                    elif eff_dialect == Dialect.POSTGRES and not re.search(r"\bCOLLATE\b", data_type, re.IGNORECASE):
+                        for c in expr_item.constraints:
+                            if isinstance(c.kind, sqlglot_exp.CollateColumnConstraint):
+                                coll_sql = c.kind.sql(sg_d).strip()
+                                if coll_sql:
+                                    data_type = f"{data_type} {coll_sql}"
+                                break
                 else:
                     data_type = "TEXT"
                 is_pk = any(

@@ -304,6 +304,26 @@ MUTANTS = (
             "test_cte_shadowing_cycle_depth_and_registered_mv_refusal"
         ),
     ),
+    Mutant(
+        name="pg-minmax-drops-collation-on-varchar",
+        source_path="matview/dialects/base.py",
+        original="        m_coll = self._PG_COLLATE_TAIL_RE.search(s_raw)",
+        replacement="        m_coll = None",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_minmax_varchar_collation_name_and_numeric_group_rep_codegen"
+        ),
+    ),
+    Mutant(
+        name="pg-numeric-group-key-skips-rep-refresh",
+        source_path="matview/dialects/pg_statement.py",
+        original="        if (has_old or force_recompute_extremes) and spec.recompute_group_keys is not None and grp_exprs:",
+        replacement="        if False and (has_old or force_recompute_extremes) and spec.recompute_group_keys is not None and grp_exprs:",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_minmax_varchar_collation_name_and_numeric_group_rep_codegen"
+        ),
+    ),
 )
 
 

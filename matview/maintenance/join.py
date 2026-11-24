@@ -597,28 +597,52 @@ class Tier1JoinMixin(MixinHost):
             ),
         )
 
-        def _build_join_recompute_subquery(item: SelectItem) -> str:
-            alias_remap = {j.table_name.lower(): f"__mv_j_{j.alias}" for j in self.view.joins}
-            for j in self.view.joins:
-                alias_remap[j.alias.lower()] = f"__mv_j_{j.alias}"
+        def _build_join_subquery(select_sql_fn: Any, *, limit_one: bool = False) -> str:
+            alias_remap: Dict[str, str] = {}
+            for idx_j, j in enumerate(self.view.joins):
+                safe_a = f"__mv_j_{idx_j}"
+                eff_a = (j.alias or j.table_name).lower()
+                alias_remap[eff_a] = safe_a
+
+            sg_d = _sqlglot_dialect(self.dialect)
 
             def _remap_to_j(frag: str) -> str:
                 q_frag = self._qualify_join_expr(frag)
-                tokens = re.split(r"('(?:''|[^'])*')", q_frag)
-                out = []
-                for idx_t, tok in enumerate(tokens):
-                    if idx_t % 2 == 1:
-                        out.append(tok)
-                        continue
-                    mod = tok
-                    for old_a, new_a in sorted(alias_remap.items(), key=lambda x: len(x[0]), reverse=True):
-                        mod = re.sub(rf"\b{re.escape(old_a)}\s*\.", f"{new_a}.", mod, flags=re.IGNORECASE)
-                    out.append(mod)
+                try:
+                    toks = _tokenize_sql(q_frag, read=sg_d)
+                except Exception:
+                    return q_frag
+                if not toks:
+                    return q_frag
+                out: List[str] = []
+                cursor = 0
+                i_t = 0
+                n_t = len(toks)
+                while i_t < n_t:
+                    tk = toks[i_t]
+                    if (
+                        _is_word_or_ident_token(tk)
+                        and (i_t == 0 or toks[i_t - 1].token_type != SQLGlotTokenType.DOT)
+                        and i_t + 2 < n_t
+                        and toks[i_t + 1].token_type == SQLGlotTokenType.DOT
+                        and _is_word_or_ident_token(toks[i_t + 2])
+                    ):
+                        key_low = _unquote_ident(tk.text, dialect=self.dialect).lower()
+                        if key_low in alias_remap:
+                            if tk.start > cursor:
+                                out.append(q_frag[cursor : tk.start])
+                            out.append(alias_remap[key_low])
+                            cursor = tk.end + 1
+                            i_t += 2
+                            continue
+                    i_t += 1
+                if cursor < len(q_frag):
+                    out.append(q_frag[cursor:])
                 return "".join(out)
 
             j_parts: List[str] = []
             for idx, j in enumerate(self.view.joins):
-                tbl_s = f"{self._q(j.table_name)} AS __mv_j_{j.alias}"
+                tbl_s = f"{self._q(j.table_name)} AS __mv_j_{idx}"
                 if idx == 0:
                     j_parts.append(tbl_s)
                 else:
@@ -634,8 +658,18 @@ class Tier1JoinMixin(MixinHost):
                     self._null_safe_eq(f"({lhs_j})", f"{mv_table}.{mv_col}", is_nullable=True)
                 )
             w_sub = f" WHERE {' AND '.join(conds)}" if conds else ""
-            agg_e = _remap_to_j(self._sql_backfill_agg_expr(item))
-            return f"(SELECT {agg_e} FROM {' '.join(j_parts)}{w_sub})"
+            lim = " LIMIT 1" if limit_one else ""
+            sel_e = select_sql_fn(_remap_to_j)
+            return f"SELECT {sel_e} FROM {' '.join(j_parts)}{w_sub}{lim}"
+
+        def _build_join_recompute_subquery(item: SelectItem) -> str:
+            return f"({_build_join_subquery(lambda r: r(self._sql_backfill_agg_expr(item)))})"
+
+        def _build_join_group_keys_recompute(exprs: Sequence[str]) -> str:
+            return _build_join_subquery(
+                lambda r: ", ".join(f"{r(e)} AS __mv_l{idx}" for idx, e in enumerate(exprs)),
+                limit_one=True,
+            )
 
         plus_merge_assignments = self._build_tier1_chunk_merge_assignments(
             mv_table=mv_table,
@@ -878,6 +912,7 @@ class Tier1JoinMixin(MixinHost):
             value_key=_expr_key,
             recompute=_build_join_recompute_subquery,
             native_recompute=_join_needs_native_recompute,
+            recompute_group_keys=_build_join_group_keys_recompute,
         )
 
         def _pg_join_source(delta_alias: str) -> PgDeltaSource:

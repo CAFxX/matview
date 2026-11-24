@@ -3675,3 +3675,271 @@ def test_pg_plain_view_as_source_and_drift_repair(make_env) -> None:
     # Out-of-band DROP VIEW reports invalid.
     _run_stmts("DROP VIEW pv_cols")
     assert mgr.check_schema_drift()["mv_pv_cols"] == "invalid"
+
+
+def test_pg_minmax_varchar_collation_and_name_exactness(make_env) -> None:
+    """Native PostgreSQL verification of MIN/MAX result types (TEXT OID 25 for
+    VARCHAR/domain-over-VARCHAR/NAME, BPCHAR OID 1042 for CHAR) and collation
+    preservation across column collations, domain collations, explicit COLLATE
+    expressions, NAME intrinsic C collation, and window MIN/MAX."""
+    env = make_env(
+        views=[],
+        schema_sql=[
+            "CREATE DOMAIN d_vc AS VARCHAR(20)",
+            'CREATE DOMAIN d_vc_c AS VARCHAR(20) COLLATE "C"',
+            'CREATE DOMAIN d_ch_c AS CHAR(5) COLLATE "C"',
+            (
+                "CREATE TABLE t_mm ("
+                "id INT PRIMARY KEY, "
+                "g INT NOT NULL, "
+                "vc VARCHAR(20), "
+                'vc_c VARCHAR(20) COLLATE "C", '
+                "dvc d_vc, "
+                "dvcc d_vc_c, "
+                'ch_c CHAR(5) COLLATE "C", '
+                "dchc d_ch_c, "
+                "nm NAME"
+                ")"
+            ),
+        ],
+        seed=False,
+    )
+    conn = env.conn
+    mgr = env.manager
+
+    def _exec(*stmts: str) -> None:
+        with conn.cursor() as cur:
+            for st in stmts:
+                cur.execute(st)
+        conn.commit()
+
+    _exec(
+        "INSERT INTO t_mm VALUES "
+        "(1, 1, 'a', 'a', 'a', 'a', 'a', 'a', 'a'), "
+        "(2, 1, 'z', 'z', 'z', 'z', 'z', 'z', 'z')"
+    )
+
+    views = [
+        ("v_mm_vc", "SELECT g, MIN(vc) AS mn, MAX(vc) AS mx FROM t_mm GROUP BY g"),
+        ("v_mm_vcc", "SELECT g, MIN(vc_c) AS mn, MAX(vc_c) AS mx FROM t_mm GROUP BY g"),
+        ("v_mm_dvc", "SELECT g, MIN(dvc) AS mn, MAX(dvc) AS mx FROM t_mm GROUP BY g"),
+        ("v_mm_dvcc", "SELECT g, MIN(dvcc) AS mn, MAX(dvcc) AS mx FROM t_mm GROUP BY g"),
+        ("v_mm_chc", "SELECT g, MIN(ch_c) AS mn, MAX(ch_c) AS mx FROM t_mm GROUP BY g"),
+        ("v_mm_dchc", "SELECT g, MIN(dchc) AS mn, MAX(dchc) AS mx FROM t_mm GROUP BY g"),
+        ("v_mm_nm", "SELECT g, MIN(nm) AS mn, MAX(nm) AS mx FROM t_mm GROUP BY g"),
+        ("v_mm_expr_c", 'SELECT g, MIN(vc COLLATE "C") AS mn, MAX(vc COLLATE "C") AS mx FROM t_mm GROUP BY g'),
+        ("v_mm_override", 'SELECT g, MIN(vc_c COLLATE "POSIX") AS mn, MAX(vc_c COLLATE "POSIX") AS mx FROM t_mm GROUP BY g'),
+        ("v_mm_win_c", "SELECT id, MIN(vc_c) OVER (PARTITION BY g) AS mn FROM t_mm"),
+        ("v_proj_coll", 'SELECT id, vc COLLATE "C" AS vc_lit_c, ch_c COLLATE "POSIX" AS ch_lit_p FROM t_mm'),
+        ("v_mm_exprs", "SELECT g, MIN(UPPER(vc_c)) AS mu, MIN(vc_c || 'x') AS mc, MIN(CASE WHEN id > 0 THEN vc_c ELSE 'z' END) AS mcase FROM t_mm GROUP BY g"),
+        ("v_mm_coal_d", "SELECT g, COALESCE(MIN(DISTINCT vc_c), 'x') AS mn FROM t_mm GROUP BY g"),
+        ("v_mm_arr", "SELECT id, ARRAY[vc_c, vc_c] AS a FROM t_mm"),
+        ("v_mm_cte", 'WITH c AS (SELECT g, MIN(vc) AS mn, MIN(vc_c) AS mnc, MIN(vc COLLATE "C") AS mnx FROM t_mm GROUP BY g) SELECT g, mn, mnc, mnx FROM c'),
+    ]
+    for vn, sql in views:
+        mgr.register_view(f"CREATE VIEW {vn} AS {sql};")
+
+    # Verify catalog collations directly on backing tables (independent of DB LC_COLLATE).
+    expected_colls = [
+        ("v_mm_vcc", "mn", "C"),
+        ("v_mm_dvcc", "mn", "C"),
+        ("v_mm_chc", "mn", "C"),
+        ("v_mm_dchc", "mn", "C"),
+        ("v_mm_nm", "mn", "C"),
+        ("v_mm_expr_c", "mn", "C"),
+        ("v_mm_override", "mn", "POSIX"),
+        ("v_mm_win_c", "mn", "C"),
+        ("v_proj_coll", "vc_lit_c", "C"),
+        ("v_proj_coll", "ch_lit_p", "POSIX"),
+        ("v_mm_exprs", "mu", "C"),
+        ("v_mm_exprs", "mc", "C"),
+        ("v_mm_exprs", "mcase", "C"),
+        ("v_mm_coal_d", "mn", "C"),
+        ("v_mm_arr", "a", "C"),
+        ("v_mm_cte", "mnc", "C"),
+        ("v_mm_cte", "mnx", "C"),
+    ]
+    with conn.cursor() as cur:
+        for vn, col_name, exp_coll in expected_colls:
+            bt = mgr.get_catalog()[vn]["backing_table"]
+            cur.execute(
+                "SELECT co.collname FROM pg_attribute a "
+                "JOIN pg_collation co ON co.oid = a.attcollation "
+                "WHERE a.attrelid = %s::regclass AND a.attname = %s",
+                (bt, col_name),
+            )
+            row = cur.fetchone()
+            assert row is not None and row[0] == exp_coll, f"{vn}.{col_name}: got {row!r}, expected {exp_coll!r}"
+    conn.commit()
+
+    def _assert_all(step: str) -> None:
+        with conn.cursor() as cur:
+            for vn, sql in views:
+                cur.execute(f"SELECT * FROM {vn} ORDER BY 1")
+                mv_types = [(d.name, d.type_code) for d in cur.description]
+                mv_rows = cur.fetchall()
+                cur.execute(f"{sql} ORDER BY 1")
+                lv_types = [(d.name, d.type_code) for d in cur.description]
+                lv_rows = cur.fetchall()
+                assert mv_types == lv_types, f"{step} ({vn}) types: mv={mv_types} live={lv_types}"
+                assert mv_rows == lv_rows, f"{step} ({vn}) rows: mv={mv_rows} live={lv_rows}"
+        conn.commit()
+
+    _assert_all("initial")
+    # Insert 'B' and 'Z': under C/POSIX collation 'B' < 'Z' < 'a' < 'z',
+    # opposite to en_US.utf8 ('a' < 'B' < 'z' < 'Z').
+    _exec(
+        "INSERT INTO t_mm VALUES "
+        "(3, 1, 'B', 'B', 'B', 'B', 'B', 'B', 'B'), "
+        "(4, 1, 'Z', 'Z', 'Z', 'Z', 'Z', 'Z', 'Z')"
+    )
+    _assert_all("after insert B and Z")
+    # Delete the current C-collation min ('B') and max ('z') to exercise recompute.
+    _exec("DELETE FROM t_mm WHERE id IN (2, 3)")
+    _assert_all("after delete min/max")
+    # Update remaining value and insert NULLs.
+    _exec(
+        "UPDATE t_mm SET vc='A', vc_c='A', dvc='A', dvcc='A', ch_c='A', dchc='A', nm='A' WHERE id = 4",
+        "INSERT INTO t_mm VALUES (5, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+    )
+    _assert_all("after update and null group")
+
+
+def test_pg_numeric_group_key_representative_exactness(make_env) -> None:
+    """Native PostgreSQL verification that unconstrained NUMERIC (and domain
+    over NUMERIC) group keys never retain a ghost scale representative after
+    UPDATE or DELETE leaves only rows of another scale (e.g. 1.0 -> 1.00),
+    across single-table GROUP BY (nullable & NOT NULL), DISTINCT, JOIN,
+    UNION ALL GROUP BY, UNION, INTERSECT, EXCEPT, and NUMERIC PK projection."""
+    env = make_env(
+        views=[],
+        schema_sql=[
+            "CREATE DOMAIN d_num AS NUMERIC",
+            "CREATE TABLE n_t (id INT PRIMARY KEY, g INT NOT NULL, num NUMERIC, num_nn NUMERIC NOT NULL, dnum d_num, v INT NOT NULL)",
+            "CREATE TABLE n_t2 (id INT PRIMARY KEY, num NUMERIC, v INT NOT NULL)",
+            "CREATE TABLE n_d (g INT PRIMARY KEY, num NUMERIC, tag TEXT NOT NULL)",
+            "CREATE TABLE n_pk (k NUMERIC PRIMARY KEY, v INT NOT NULL)",
+            "CREATE TABLE n_pk2 (k NUMERIC PRIMARY KEY, v INT NOT NULL)",
+            "CREATE TABLE n_side (id INT PRIMARY KEY, side INT NOT NULL, num NUMERIC)",
+            "CREATE TABLE n_cont (id INT PRIMARY KEY, arr NUMERIC[], arr2 NUMERIC[][], nr NUMRANGE, nmr NUMMULTIRANGE, n1 NUMERIC, n2 NUMERIC)",
+            'CREATE TABLE "order" (id INT PRIMARY KEY, g INT NOT NULL, num NUMERIC)',
+            'CREATE TABLE "my dim" (g INT PRIMARY KEY, tag TEXT)',
+            'CREATE TABLE n_sp ("my key" NUMERIC PRIMARY KEY, v INT NOT NULL)',
+        ],
+        seed=False,
+    )
+    conn = env.conn
+    mgr = env.manager
+
+    def _exec(*stmts: str) -> None:
+        with conn.cursor() as cur:
+            for st in stmts:
+                cur.execute(st)
+        conn.commit()
+
+    _exec(
+        "INSERT INTO n_d VALUES (1, 1.0, 'd1'), (2, 2.0, 'd2')",
+        "INSERT INTO n_t VALUES (1, 1, 1.0, 1.0, 1.0, 10), (2, 1, 1.00, 1.00, 1.00, 20), (3, 2, NULL, 2.0, NULL, 30)",
+        "INSERT INTO n_t2 VALUES (1, 1.0, 5)",
+        "INSERT INTO n_pk VALUES (1.0, 100), (2.0, 200)",
+        "INSERT INTO n_pk2 VALUES (3.0, 300)",
+        "INSERT INTO n_side VALUES (1, 0, 1.0), (2, 0, 1.00), (3, 1, 1.00)",
+        "INSERT INTO n_cont VALUES "
+        "(1, ARRAY[1.0], ARRAY[ARRAY[1.0]], '[1.0,2.0)'::numrange, '{[1.0,2.0)}'::nummultirange, 1.0, 2.0), "
+        "(2, ARRAY[1.00], ARRAY[ARRAY[1.00]], '[1.00,2.00)'::numrange, '{[1.00,2.00)}'::nummultirange, 1.00, 2.00)",
+        'INSERT INTO "my dim" VALUES (1, \'a\')',
+        'INSERT INTO "order" VALUES (1, 1, 1.0), (2, 1, 1.00)',
+        'INSERT INTO n_sp VALUES (1.0, 7)',
+    )
+
+    views = [
+        ("v_n_grp", "SELECT num, COUNT(*) AS c, SUM(v) AS s FROM n_t GROUP BY num"),
+        ("v_n_alias_w", "SELECT t.num, COUNT(*) AS c FROM n_t AS t WHERE t.v > 0 GROUP BY t.num"),
+        ("v_n_nn", "SELECT num_nn, COUNT(*) AS c, SUM(v) AS s FROM n_t GROUP BY num_nn"),
+        ("v_n_dom", "SELECT dnum, COUNT(*) AS c, SUM(v) AS s FROM n_t GROUP BY dnum"),
+        ("v_n_expr", "SELECT num * 2 AS k2, COUNT(*) AS c FROM n_t GROUP BY num * 2"),
+        ("v_n_dist", "SELECT DISTINCT num FROM n_t"),
+        ("v_n_join", "SELECT n_t.num, COUNT(*) AS c, SUM(n_t.v) AS s FROM n_t JOIN n_d ON n_d.g = n_t.g GROUP BY n_t.num"),
+        (
+            "v_n_kw_join",
+            'SELECT "order".num, COUNT(*) AS c FROM "order" JOIN "my dim" ON "my dim".g = "order".g GROUP BY "order".num',
+        ),
+        (
+            "v_n_uall_agg",
+            "WITH u AS (SELECT num, v FROM n_t UNION ALL SELECT num, v FROM n_t2) SELECT num, SUM(v) AS s FROM u GROUP BY num",
+        ),
+        ("v_n_union", "SELECT num FROM n_t UNION SELECT num FROM n_d"),
+        ("v_n_inter", "SELECT num FROM n_t INTERSECT SELECT num FROM n_d"),
+        ("v_n_except", "SELECT num FROM n_t EXCEPT SELECT num FROM n_d WHERE g = 2"),
+        ("v_n_self_inter", "SELECT num FROM n_side WHERE side = 0 INTERSECT SELECT num FROM n_side WHERE side = 1"),
+        ("v_n_pk", "SELECT k, v FROM n_pk"),
+        ("v_n_uall_pk", "SELECT k, v FROM n_pk UNION ALL SELECT k, v FROM n_pk2"),
+        ("v_n_sp_pk", 'SELECT "my key", v FROM n_sp'),
+        ("v_n_arr", "SELECT arr, COUNT(*) AS c FROM n_cont GROUP BY arr"),
+        ("v_n_arr2", "SELECT arr2, COUNT(*) AS c FROM n_cont GROUP BY arr2"),
+        ("v_n_nr", "SELECT nr, COUNT(*) AS c FROM n_cont GROUP BY nr"),
+        ("v_n_nmr", "SELECT nmr, COUNT(*) AS c FROM n_cont GROUP BY nmr"),
+        ("v_n_multi", "SELECT n1, n2, COUNT(*) AS c FROM n_cont GROUP BY n1, n2"),
+        ("v_n_dup_proj", "SELECT n1 AS a, n1 AS b, COUNT(*) AS c FROM n_cont GROUP BY n1"),
+    ]
+    for vn, sql in views:
+        mgr.register_view(f"CREATE VIEW {vn} AS {sql};")
+
+    def _assert_exact_repr(step: str) -> None:
+        with conn.cursor() as cur:
+            for vn, sql in views:
+                cur.execute(f"SELECT * FROM {vn} ORDER BY 1 NULLS LAST")
+                mv_r = cur.fetchall()
+                cur.execute(f"{sql} ORDER BY 1 NULLS LAST")
+                lv_r = cur.fetchall()
+                assert repr(mv_r) == repr(lv_r), f"{step} ({vn}): mv={mv_r!r} live={lv_r!r}"
+        conn.commit()
+
+    # 1. Remove every 1.0 row across all tables so only 1.00 remains in group 1:
+    #    every view MUST now report Decimal('1.00') (and matching container scales),
+    #    including self-INTERSECT where branch 1 simultaneously inserts 1.0 while
+    #    branch 0 moves to 1.00!
+    _exec(
+        "DELETE FROM n_t WHERE id = 1",
+        "UPDATE n_t2 SET num = 1.00 WHERE id = 1",
+        "UPDATE n_d SET num = 1.00 WHERE g = 1",
+        "UPDATE n_pk SET k = 1.00 WHERE k = 1.0",
+        "UPDATE n_pk2 SET k = 3.00 WHERE k = 3.0",
+        "UPDATE n_side SET num = CASE WHEN id = 1 THEN 1.00 WHEN id = 3 THEN 1.0 END WHERE id IN (1, 3)",
+        "DELETE FROM n_cont WHERE id = 1",
+        'DELETE FROM "order" WHERE id = 1',
+        'UPDATE n_sp SET "my key" = 1.00 WHERE "my key" = 1.0',
+    )
+    _assert_exact_repr("after removing all 1.0 rows leaving only 1.00")
+
+    # 2. Single-row in-place scale UPDATE (1.00 -> 1.000, 2.0 -> 2.00) and non-key UPDATE.
+    _exec(
+        "UPDATE n_t SET num = 1.000, num_nn = 1.000, dnum = 1.000 WHERE id = 2",
+        "UPDATE n_t SET num_nn = 2.00, v = 35 WHERE id = 3",
+        "UPDATE n_t2 SET num = 1.000 WHERE id = 1",
+        "UPDATE n_d SET num = 1.000 WHERE g = 1",
+        "UPDATE n_pk SET k = 1.000 WHERE k = 1.00",
+        "UPDATE n_side SET num = 1.000 WHERE side = 0",
+        "UPDATE n_cont SET arr = ARRAY[1.000], arr2 = ARRAY[ARRAY[1.000]], "
+        "nr = '[1.000,2.000)'::numrange, nmr = '{[1.000,2.000)}'::nummultirange, n1 = 1.000, n2 = 2.000 WHERE id = 2",
+        'UPDATE "order" SET num = 1.000 WHERE id = 2',
+        'UPDATE n_sp SET "my key" = 1.000 WHERE "my key" = 1.00',
+    )
+    _assert_exact_repr("after in-place scale update to 1.000 / 2.00")
+
+    # 3. INTERSECT / EXCEPT branch-0 adoption: insert 3.0 into branch 1 first (n_d),
+    #    then insert 3.00 into branch 0 (n_t), AND single-statement self-INTERSECT
+    #    inserting both branch 1 (4.0) and branch 0 (4.00) simultaneously!
+    _exec("INSERT INTO n_d VALUES (3, 3.0, 'd3')")
+    _exec("INSERT INTO n_t VALUES (4, 3, 3.00, 3.00, 3.00, 40)")
+    _exec("INSERT INTO n_side VALUES (4, 1, 4.0)")
+    _exec("INSERT INTO n_side VALUES (5, 1, 4.0), (6, 0, 4.00)")
+    _assert_exact_repr("after branch-0 INTERSECT/EXCEPT adoption (3.00 and self-INTERSECT 4.00)")
+
+    # 4. Stage 3 multi-source writable CTE updating both n_d and n_t scale together.
+    _exec(
+        "WITH ud AS (UPDATE n_d SET tag = 'd1_cte', num = 1.00000 WHERE g = 1 RETURNING g) "
+        "UPDATE n_t SET num = 1.00000, num_nn = 1.00000, dnum = 1.00000 WHERE g IN (SELECT g FROM ud)",
+        "UPDATE n_t2 SET num = 1.00000 WHERE id = 1",
+    )
+    _assert_exact_repr("after Stage 3 writable CTE scale update")
