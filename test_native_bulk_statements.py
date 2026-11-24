@@ -1456,6 +1456,199 @@ def test_update_to_equal_but_not_identical_value(make_env, target: Target) -> No
         env.check(label)
 
 
+@pytest.mark.parametrize("target", _params(("postgres",)))
+def test_pg_statement_trigger_skips_unreferenced_updates_but_not_key_changes(make_env, target: Target) -> None:
+    """Unread-column UPDATEs avoid backing writes; source-key changes do not."""
+    vd = ViewDef("v_skip_unread", "SELECT id, g, v FROM t", ("postgres",))
+    vd_predicate = ViewDef("v_reads_w", "SELECT id, g, v FROM t WHERE w > 0", ("postgres",))
+    env = make_env(target, views=[vd])
+    env.register(vd_predicate)
+    env.views.append(vd_predicate)
+    backing = env.plans[vd.name].backing_table_name
+    q_backing = '"' + backing.replace('"', '""') + '"'
+    env.execute(
+        "CREATE FUNCTION __mv_test_reject_write() RETURNS trigger LANGUAGE plpgsql "
+        "AS 'BEGIN RAISE EXCEPTION ''unexpected materialized-view backing write''; END;'"
+    )
+    env.execute(
+        f"CREATE TRIGGER __mv_test_reject_write BEFORE INSERT OR UPDATE OR DELETE ON {q_backing} "
+        "FOR EACH ROW EXECUTE FUNCTION __mv_test_reject_write()"
+    )
+    env.commit()
+
+    # w is unread by v_skip_unread but is a predicate input to v_reads_w.
+    # The former must do zero backing writes while the latter is maintained.
+    env.execute("UPDATE t SET w = 0 WHERE id = 1")
+    env.commit()
+    env.check("unread-column skip preserves another view's predicate maintenance")
+
+    env.execute(f"DROP TRIGGER __mv_test_reject_write ON {q_backing}")
+    env.execute("DROP FUNCTION __mv_test_reject_write()")
+    env.commit()
+
+    # Referenced-value changes and source-key changes must both maintain.
+    env.execute("UPDATE t SET v = v + 1 WHERE id = 2")
+    env.commit()
+    env.check("referenced value update")
+    env.execute("UPDATE t SET id = id + 1000 WHERE id = 1")
+    env.commit()
+    env.check("source primary-key update")
+
+
+@pytest.mark.parametrize("target", _params(("postgres",)))
+@pytest.mark.parametrize(
+    "select",
+    [
+        "SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY g",
+        "SELECT g FROM t UNION SELECT g FROM d",
+        "SELECT id, g, v FROM t WHERE w > 0",
+    ],
+    ids=["minmax", "setop", "projection_predicate"],
+)
+def test_pg_unchanged_update_guard_shapes_stay_exact(make_env, target: Target, select: str) -> None:
+    """The guard shapes (MIN/MAX aggregate, set operation, projection): updates
+    of an unread column, no-op updates, predicate/value/key changes all match
+    the live view."""
+    vd = ViewDef("v_guard_shape", select, ("postgres",))
+    env = make_env(target, views=[vd])
+    env.check("initial")
+    for label, sql in (
+        ("unread column", "UPDATE t SET m = COALESCE(m, 0) + 1"),
+        ("no-op", "UPDATE t SET v = v"),
+        ("value change", "UPDATE t SET v = v + 3 WHERE id % 2 = 0"),
+        ("predicate column change", "UPDATE t SET w = COALESCE(w, 0) - 2 WHERE id % 3 = 0"),
+        ("group change", "UPDATE t SET g = COALESCE(g, 0) + 1 WHERE id % 5 = 0"),
+        ("primary-key change", "UPDATE t SET id = id + 1000 WHERE id % 7 = 0"),
+        ("NULL to value and back", "UPDATE t SET v = CASE WHEN v IS NULL THEN 5 ELSE NULL END WHERE id % 4 = 0"),
+    ):
+        env.execute(sql)
+        env.commit()
+        env.check(label)
+
+
+# NUMERIC without a scale keeps 1.0, 1.00 and 1.000 as distinct representations of
+# equal values; MIN/MAX and set operations return whichever the scan meets first,
+# and any UPDATE (even of an unread column) moves rows to new physical positions.
+TIE_SCHEMA = [
+    "CREATE TABLE t (id INT PRIMARY KEY, g INT, x NUMERIC, junk INT)",
+    "CREATE TABLE d (id INT PRIMARY KEY, x NUMERIC)",
+]
+_TIE_VIEWS = [
+    pytest.param("SELECT g, MIN(x) AS lo, MAX(x) AS hi FROM t GROUP BY g", id="minmax"),
+    pytest.param(
+        "SELECT x FROM t UNION SELECT x FROM d",
+        id="union",
+        marks=pytest.mark.xfail(strict=True, reason="pre-existing P0 on master: set operations over numeric representation ties (TODO.md)"),
+    ),
+    pytest.param(
+        "SELECT x FROM t INTERSECT SELECT x FROM d",
+        id="intersect",
+        marks=pytest.mark.xfail(strict=True, reason="pre-existing P0 on master: set operations over numeric representation ties (TODO.md)"),
+    ),
+]
+
+
+@pytest.mark.parametrize("target", _params(("postgres",)))
+@pytest.mark.parametrize("select", _TIE_VIEWS)
+def test_pg_numeric_representation_ties_after_unread_column_update(make_env, target: Target, select: str) -> None:
+    env = make_env(target, views=[], schema_sql=TIE_SCHEMA, seed=False)
+    env.execute("INSERT INTO t VALUES (1, 1, 1.0, 0), (2, 1, 1.00, 0), (3, 1, 1.000, 0)")
+    env.execute("INSERT INTO d VALUES (1, 1.00)")
+    env.commit()
+    vd = ViewDef("v_tie", select, ("postgres",))
+    env.register(vd)
+    env.views.append(vd)
+    env.check("initial")
+    for label, sql in (
+        ("no-WHERE unread update", "UPDATE t SET junk = junk + 1"),
+        ("one-row unread update", "UPDATE t SET junk = junk + 1 WHERE id = 1"),
+        ("another row", "UPDATE t SET junk = junk + 1 WHERE id = 2"),
+        ("two rows", "UPDATE t SET junk = junk + 1 WHERE id IN (1, 2)"),
+    ):
+        env.execute(sql)
+        env.commit()
+        env.check(label)
+
+
+# No index on the group key: the original query and the recomputation both read
+# the heap in physical order, so an UPDATE that rewrites rows is observable.
+ORDER_SCHEMA = ["CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT, s TEXT, x INT)"]
+_ORDER_DEPENDENT_VIEWS = (
+    # Group-scoped recompute: unordered STRING_AGG follows the scan order.
+    ViewDef("v_order_sagg", "SELECT g, STRING_AGG(s, ',') AS ss FROM t GROUP BY g", ("postgres",)),
+    # Group-scoped recompute: window ties are ordered by the scan order. Not
+    # exact on master either (TODO.md "Order-dependent results"): strict xfail
+    # below; it is NOT affected by the unchanged-update guard (none is emitted).
+    ViewDef("v_order_rn", "SELECT id, g, v, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t", ("postgres",)),
+    # Full recompute: LIMIT over ties picks rows by the scan order.
+    ViewDef("v_order_limit", "SELECT id, v FROM t ORDER BY v LIMIT 5", ("postgres",)),
+)
+
+
+@pytest.mark.parametrize("target", _params(("postgres",)))
+@pytest.mark.parametrize(
+    "vd",
+    [
+        pytest.param(vd, marks=pytest.mark.xfail(strict=True, reason="pre-existing: window tie assignment differs from the live query (TODO.md)"))
+        if vd.name == "v_order_rn" else vd
+        for vd in _ORDER_DEPENDENT_VIEWS
+    ],
+    ids=lambda vd: vd.name,
+)
+def test_pg_unread_column_update_reruns_physical_order_dependent_views(make_env, target: Target, vd: ViewDef) -> None:
+    """An UPDATE of a column the view does not read still moves the updated rows
+    to new physical positions, which changes the original query's result when it
+    depends on scan order. Such views must be maintained on every UPDATE; the
+    unchanged-update early exit is only for views independent of row order."""
+    env = make_env(target, views=[], schema_sql=ORDER_SCHEMA, seed=False)
+    env.execute(
+        "INSERT INTO t (id, g, v, s, x) SELECT i, i % 3, i % 4, 's' || i, 0 FROM generate_series(1, 30) i"
+    )
+    env.commit()
+    env.register(vd)
+    env.views.append(vd)
+    env.check("initial")
+    env.execute("UPDATE t SET x = x + 1 WHERE id % 2 = 0")
+    env.commit()
+    env.check("unread-column update")
+    env.execute("UPDATE t SET x = x + 1 WHERE id % 3 = 0")
+    env.commit()
+    env.check("second unread-column update")
+
+
+@pytest.mark.xfail(strict=True, reason="pre-existing P0: unordered ARRAY_AGG follows scan order (TODO.md; #254 routing)")
+@pytest.mark.parametrize("target", _params(("postgres",)))
+def test_pg_unordered_array_agg_matches_live_view(make_env, target: Target) -> None:
+    env = make_env(target, views=[], schema_sql=ORDER_SCHEMA, seed=False)
+    env.execute("INSERT INTO t (id, g, v, s, x) SELECT i, i % 3, i % 4, 's' || i, 0 FROM generate_series(1, 30) i")
+    env.commit()
+    vd = ViewDef("v_order_arr", "SELECT g, ARRAY_AGG(v) AS vs FROM t GROUP BY g", ("postgres",))
+    env.register(vd)
+    env.views.append(vd)
+    env.check("initial")
+    env.execute("UPDATE t SET v = v + 1 WHERE id % 2 = 0")
+    env.commit()
+    env.check("update")
+
+
+@pytest.mark.xfail(strict=True, reason="pre-existing P0: STABLE timestamptz expressions are evaluated with the writer session's TimeZone/DateStyle (TODO.md)")
+@pytest.mark.parametrize("target", _params(("postgres",)))
+@pytest.mark.parametrize("expr", ["CAST(ts AS DATE)", "CAST(ts AS TEXT)"])
+def test_pg_timestamptz_expression_independent_of_writer_session_settings(make_env, target: Target, expr: str) -> None:
+    """The live view is evaluated in the reader's session; the materialized
+    value was computed in the writer's session (TimeZone/DateStyle differ)."""
+    env = make_env(target, views=[], seed=False, schema_sql=["CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMPTZ)"])
+    vd = ViewDef("v_tstz", f"SELECT id, {expr} AS e FROM t", ("postgres",))
+    env.register(vd)
+    env.views.append(vd)
+    w = env.connect()
+    env.execute("SET TimeZone = 'Asia/Tokyo'", w)
+    env.execute("SET DateStyle = 'German'", w)
+    env.execute("INSERT INTO t (id, ts) VALUES (1, '2024-03-05 20:00:00+00')", w)
+    env.commit(w)
+    env.check("insert from a non-UTC, non-ISO session")
+
+
 # ---------------------------------------------------------------------------
 # PostgreSQL partitions
 # ---------------------------------------------------------------------------

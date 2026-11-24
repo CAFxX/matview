@@ -583,6 +583,181 @@ class DialectEmitMixin(MixinHost):
         eq = f"{old} IS {new} COLLATE BINARY" if is_nullable else f"{old} = {new} COLLATE BINARY"
         return f"({eq} AND typeof({old}) = typeof({new}) AND NOT (typeof({old}) = 'real' AND {old} = 0.0))"
 
+    def _pg_skip_unchanged_update_sql(self, base_t: str) -> Optional[str]:
+        """Build a fail-closed UPDATE fast path using OLD/NEW transition tables.
+
+        Rows are paired by the source primary key. A key change or a change to
+        any referenced column forces normal maintenance. Without a primary
+        key, complete column metadata, or a safely serializable built-in type,
+        this returns None and keeps the existing maintenance path.
+        """
+        schema = self._schemas_lower.get(base_t.lower())
+        if schema is None:
+            return None
+        pk_cols = list(schema.effective_pk_columns())
+        ref_cols = list(self._referenced_columns_for_table(base_t))
+        if not pk_cols or not ref_cols:
+            return None
+        columns_by_lower = {name.lower(): col for name, col in schema.columns.items()}
+        # JSON row serialization is compared as UTF-8 bytes (not text under a
+        # possibly nondeterministic collation). Restrict it to built-in types
+        # with stable output functions; custom types must use the safe fallback.
+        safe_types = {
+            "smallint", "int2", "integer", "int", "int4", "bigint", "int8",
+            "numeric", "decimal", "bool", "boolean", "date",
+            "timestamp", "timestamp without time zone", "timestamptz",
+            "timestamp with time zone", "time", "time without time zone",
+            "timetz", "time with time zone", "uuid", "bytea",
+            "text", "varchar", "character varying", "character", "char",
+            "bpchar", "name",
+        }
+        for name in dict.fromkeys([*pk_cols, *ref_cols]):
+            col = columns_by_lower.get(name.lower())
+            if col is None or col.generated_virtual:
+                return None
+            data_type = re.sub(r"\s*\([^)]*\)", "", col.data_type.strip().lower())
+            if data_type not in safe_types:
+                return None
+
+        compare_cols = list(dict.fromkeys([*pk_cols, *ref_cols]))
+        # PostgreSQL primary-key columns are NOT NULL. Ordinary equality is
+        # hash/merge joinable, which PostgreSQL requires for FULL OUTER JOIN.
+        q_pk_match = " AND ".join(
+            f"__mv_old.{self._q(name)} = __mv_new.{self._q(name)}"
+            for name in pk_cols
+        )
+        q_old_key = f"__mv_old.{self._q(pk_cols[0])}"
+        q_new_key = f"__mv_new.{self._q(pk_cols[0])}"
+        # Types whose `=` / IS DISTINCT FROM is exactly value identity (equal
+        # means the same stored and displayed value) are compared directly,
+        # which is far cheaper than serializing rows; every other column
+        # (numeric scale, collated text, bpchar padding, timetz zone...) is
+        # compared through its JSON text as UTF-8 bytes.
+        identity_types = self._PG_IDENTITY_EQ_TYPES
+        plain_cols: List[str] = []
+        json_cols: List[str] = []
+        for name in compare_cols:
+            col = columns_by_lower[name.lower()]
+            data_type = re.sub(r"\s*\([^)]*\)", "", col.data_type.strip().lower())
+            (plain_cols if data_type in identity_types else json_cols).append(name)
+        conds = [f"{q_old_key} IS NULL", f"{q_new_key} IS NULL"]
+        conds += [
+            f"__mv_old.{self._q(name)} IS DISTINCT FROM __mv_new.{self._q(name)}" for name in plain_cols
+        ]
+        if json_cols:
+            old_json = (
+                "pg_catalog.convert_to(pg_catalog.row_to_json(ROW("
+                + ", ".join(f"__mv_old.{self._q(name)}" for name in json_cols)
+                + "))::pg_catalog.text, 'UTF8')"
+            )
+            new_json = (
+                "pg_catalog.convert_to(pg_catalog.row_to_json(ROW("
+                + ", ".join(f"__mv_new.{self._q(name)}" for name in json_cols)
+                + "))::pg_catalog.text, 'UTF8')"
+            )
+            conds.append(f"{old_json} IS DISTINCT FROM {new_json}")
+        changed = " OR ".join(conds)
+        return (
+            "NOT EXISTS (SELECT 1 FROM __mv_old_rows AS __mv_old "
+            "FULL OUTER JOIN __mv_new_rows AS __mv_new ON "
+            f"{q_pk_match} WHERE {changed})"
+        )
+
+    # Types whose `=` / IS DISTINCT FROM is exactly value identity: equal values
+    # are the same stored and displayed value, so no two distinct representations
+    # tie (numeric 1.0 = 1.00, collated text, bpchar padding, timetz zones do).
+    _PG_IDENTITY_EQ_TYPES = frozenset({
+        "smallint", "int2", "integer", "int", "int4", "bigint", "int8",
+        "bool", "boolean", "date", "timestamp", "timestamp without time zone",
+        "timestamptz", "timestamp with time zone", "time", "time without time zone",
+        "uuid", "bytea",
+    })
+
+    _PG_SYSTEM_COLUMN_RE = re.compile(r"\b(?:ctid|xmin|xmax|cmin|cmax|tableoid)\b", re.IGNORECASE)
+
+    _PG_ORDER_DEPENDENT_AGGS = frozenset({
+        AggFunc.GROUP_CONCAT, AggFunc.STRING_AGG, AggFunc.JSON_GROUP_ARRAY, AggFunc.JSON_GROUP_OBJECT,
+        AggFunc.ARRAY_AGG, AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+    })
+
+    # Shape classes for which the unchanged-UPDATE guard was measured to pay off
+    # (interleaved A/B, same server and process, fresh tables per round; table in
+    # the PR description and README "Performance notes"): the guard costs a
+    # transition-table join, so it is emitted only where the maintenance body it
+    # skips is clearly more expensive.
+    #   projection (one backing row per source row): unread/no-op UPDATE 0.57-0.68x
+    #     bulk, single-row 244 us vs 10.9 ms; real-change UPDATE 1.0x
+    #   set operations (UNION/INTERSECT/EXCEPT): unread/no-op 0.54x bulk, real 0.54-0.93x
+    #   single-table aggregate with MIN/MAX (extreme recompute): unread/no-op 0.2-0.3x
+    #     bulk, single-row 234 us vs 17.7 ms; real-change UPDATE 0.97-1.1x
+    # Measured with NO benefit (cheap O(groups) upserts; the guard is as costly as
+    # the body, single-row +6..35%): SUM/COUNT/AVG/BOOL aggregates, join aggregates,
+    # UNION ALL aggregates, DISTINCT. Those get no guard.
+    # MIN/MAX and set operations pick ONE of several values that compare equal
+    # (numeric 1.0 vs 1.00, collated text): which one the original query returns
+    # depends on physical row order, which any UPDATE changes. They therefore get
+    # the guard only when every column the view reads from the table is of an
+    # identity type (no representation ties); projections keep their own values.
+    _PG_GUARD_PAYS_OFF_AGGS = frozenset({AggFunc.MIN, AggFunc.MAX})
+
+    def _pg_all_referenced_columns_identity_typed(self, base_t: str) -> bool:
+        schema = self._schemas_lower.get(base_t.lower())
+        if schema is None:
+            return False
+        columns = {name.lower(): col for name, col in schema.columns.items()}
+        for name in self._referenced_columns_for_table(base_t):
+            col = columns.get(name.lower())
+            if col is None:
+                return False
+            data_type = re.sub(r"\s*\([^)]*\)", "", col.data_type.strip().lower())
+            if data_type not in self._PG_IDENTITY_EQ_TYPES:
+                return False
+        return True
+
+    def _pg_update_guard_pays_off(self, base_t: str) -> bool:
+        """True for the view shapes where skipping an unchanged UPDATE was
+        measured to be faster than evaluating the guard (see the class table
+        above) and is exact; False means the guard would only add cost or could
+        change which of several equal values the original query returns."""
+        mode = getattr(self, "_alg_mode", None)
+        if mode == "projection":
+            return True
+        if mode == "setop" or (
+            mode == "single"
+            and any(getattr(i, "agg_func", None) in self._PG_GUARD_PAYS_OFF_AGGS for i in self._working_select_items)
+        ):
+            return self._pg_all_referenced_columns_identity_typed(base_t)
+        return False
+
+    def _pg_result_independent_of_physical_row_order(self) -> bool:
+        """True when the original query's result is a function of the multiset
+        of source-row values it reads, never of physical row order (ctid).
+
+        Fail closed: only incrementally maintained (algebraic delta) views
+        without an order-sensitive member qualify. Group-scoped and full
+        recomputation re-run the original query, whose result may depend on
+        scan order (unordered STRING_AGG/ARRAY_AGG, window ties, LIMIT ties), so
+        they must run on every UPDATE, also one that changes no referenced
+        column. Approximate SUM/AVG/statistical aggregates are order-sensitive
+        too (native recompute items, excluded here; float columns are also not
+        eligible for the guard itself).
+        """
+        if self.strategy != MaintenanceStrategy.ALGEBRAIC_DELTA:
+            return False
+        if self._PG_SYSTEM_COLUMN_RE.search(self.view.raw_select_sql or ""):
+            # ctid/xmin/... change on every UPDATE, whatever columns it sets.
+            return False
+        try:
+            if self._pgmy_native_recompute_items():
+                return False
+        except Exception:
+            return False
+        for item in self._working_select_items:
+            func = getattr(item, "agg_func", None)
+            if func in self._PG_ORDER_DEPENDENT_AGGS:
+                return False
+        return True
+
     def _emit_dialect_triggers_for_table(
         self,
         view_name: str,
@@ -614,12 +789,22 @@ class DialectEmitMixin(MixinHost):
                 raise AssertionError(
                     f"no set-based PostgreSQL statement-level bodies for view {self.logical_view_name!r} on {base_t!r}"
                 )
+            # An UPDATE that changes no referenced column still writes a new
+            # row version (new ctid, new physical position). Skipping the
+            # maintenance body is therefore exact only when the original query's
+            # result cannot depend on physical row order.
+            skip_update_sql = (
+                self._pg_skip_unchanged_update_sql(base_t)
+                if self._pg_result_independent_of_physical_row_order() and self._pg_update_guard_pays_off(base_t)
+                else None
+            )
             trunc_body = "\n".join(trunc_stmts or [f"DELETE FROM {self._backing_table_name()};"])
             return self._pg_emit_statement_triggers(
                 base_t,
                 {"INSERT": pg_ai_body, "UPDATE": pg_au_body, "DELETE": pg_ad_body},
                 trunc_body,
                 bracket=pg_bracket,
+                skip_update_sql=skip_update_sql,
             )
 
         log_vname = self.logical_view_name

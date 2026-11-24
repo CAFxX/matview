@@ -50,10 +50,32 @@ def _functions(plan: MaterializedViewPlan) -> dict:
     return out
 
 
-def _body(fn_ddl: str) -> str:
-    m = re.search(r"END IF;\n(.*)\n    RETURN NULL;\nEND;", fn_ddl, flags=re.S)
+_GUARD_RE = re.compile(r"\A    IF (NOT EXISTS \(.*?\)) THEN\n        RETURN NULL;\n    END IF;\n", re.S)
+# One early-exit statement may OR several conditions (empty transition table,
+# unchanged UPDATE): each `NOT EXISTS (...)` operand is one guard.
+_GUARD_SPLIT_RE = re.compile(r" OR (?=NOT EXISTS \()")
+
+
+def _guards_and_body(fn_ddl: str) -> "tuple[List[str], str]":
+    """Split a statement-trigger function into its leading early-exit guards
+    (``IF NOT EXISTS (<cond>) THEN RETURN NULL; END IF;``, returned as the
+    ``NOT EXISTS (...)`` conditions) and the maintenance body that follows."""
+    m = re.search(r"BEGIN\n(.*)\n    RETURN NULL;\nEND;", fn_ddl, flags=re.S)
     assert m, fn_ddl
-    return m.group(1)
+    rest = m.group(1) + "\n"
+    guards: List[str] = []
+    while True:
+        g = _GUARD_RE.match(rest)
+        if not g:
+            break
+        guards.extend(_GUARD_SPLIT_RE.split(g.group(1)))
+        rest = rest[g.end():]
+    return guards, rest.rstrip("\n")
+
+
+def _body(fn_ddl: str) -> str:
+    """The maintenance statements of a trigger function, without early exits."""
+    return _guards_and_body(fn_ddl)[1]
 
 
 SALES = """
@@ -92,7 +114,7 @@ class TestPGStatementLevelDDL(unittest.TestCase):
         for suffix, fn in _functions(plan).items():
             if suffix not in ("trunc", "bs", "reconcile"):
                 table = "__mv_old_rows" if suffix == "ad" else "__mv_new_rows"
-                self.assertIn(f"IF NOT EXISTS (SELECT 1 FROM {table}) THEN\n        RETURN NULL;", fn)
+                self.assertIn(f"IF NOT EXISTS (SELECT 1 FROM {table})", fn)
 
     def test_grouped_aggregate_signed_ordered_restricted(self) -> None:
         plan = self._plan(
@@ -122,6 +144,141 @@ class TestPGStatementLevelDDL(unittest.TestCase):
         self.assertNotIn("DELETE FROM", ai)
         self.assertNotIn("UPDATE __matview_store_v", ai)
         self.assertNotIn("__mv_old_rows", ai)
+
+    def _unchanged_guard(self, plan: MaterializedViewPlan, suffix: str = "au") -> Optional[str]:
+        """The UPDATE early exit that skips maintenance when the paired OLD/NEW
+        rows are equal in every column the view reads (None if absent)."""
+        guards, body = _guards_and_body(_functions(plan)[suffix])
+        # Every early exit precedes the first write of the maintenance body.
+        self.assertNotRegex("\n".join(guards), r"\b(INSERT|UPDATE|DELETE)\b")
+        found = [g for g in guards if "__mv_old_rows" in g and "__mv_new_rows" in g]
+        self.assertLessEqual(len(found), 1, guards)
+        return found[0] if found else None
+
+    @staticmethod
+    def _compared_columns(guard: str, alias: str) -> List[str]:
+        """Columns compared for `alias` (old/new): identity-typed columns by
+        direct IS DISTINCT FROM, the rest through one JSON-bytes comparison."""
+        pairs = re.findall(r"__mv_old\.(\w+) IS DISTINCT FROM __mv_new\.(\w+)", guard)
+        assert all(o == n for o, n in pairs), pairs
+        direct = [o for o, _ in pairs]
+        m = re.search(rf"row_to_json\(ROW\(((?:{alias}\.\w+(?:, )?)+)\)\)", guard)
+        return direct + (re.findall(rf"{alias}\.(\w+)", m.group(1)) if m else [])
+
+    def test_unchanged_update_guard_compares_exactly_the_referenced_columns(self) -> None:
+        # Reads region and amount; qty is unread. The PK (id) is always compared.
+        plan = self._plan("CREATE VIEW v AS SELECT region, amount FROM sales;")
+        guard = self._unchanged_guard(plan)
+        assert guard is not None
+        # OLD/NEW pairs are matched on the primary key; an unmatched row on
+        # either side (key change, insert/delete) counts as changed.
+        self.assertRegex(guard, r"FROM __mv_old_rows AS __mv_old FULL OUTER JOIN __mv_new_rows AS __mv_new ON __mv_old\.id = __mv_new\.id WHERE ")
+        self.assertIn("__mv_old.id IS NULL OR __mv_new.id IS NULL", guard)
+        old_cols = self._compared_columns(guard, "__mv_old")
+        self.assertEqual(old_cols, self._compared_columns(guard, "__mv_new"))
+        self.assertEqual(sorted(old_cols), ["amount", "id", "region"])  # not qty
+        # Identity-typed columns (id INT) are compared directly; numeric scale
+        # and (possibly collated) text are compared as JSON bytes, never as text.
+        self.assertIn("__mv_old.id IS DISTINCT FROM __mv_new.id", guard)
+        self.assertRegex(guard, r"convert_to\(pg_catalog\.row_to_json\(ROW\(__mv_old\.region, __mv_old\.amount\)\)")
+        self.assertNotIn("__mv_old.region IS DISTINCT FROM", guard)
+        self.assertNotIn("__mv_old.amount IS DISTINCT FROM", guard)
+        # Only UPDATE statements can pair rows: INSERT/DELETE bodies have no guard.
+        self.assertIsNone(self._unchanged_guard(plan, "ai"))
+        self.assertIsNone(self._unchanged_guard(plan, "ad"))
+
+    def test_unchanged_update_guard_absent_when_result_may_depend_on_physical_row_order(self) -> None:
+        # An UPDATE that changes no referenced column still rewrites rows to new
+        # physical positions, so views whose original query may observe scan
+        # order must be maintained on every UPDATE (group-scoped and full
+        # recompute, order-sensitive aggregates), while order-independent
+        # algebraic views keep the early exit.
+        schema = "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT, s TEXT, x INT);"
+        guarded = ["CREATE VIEW v AS SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY g;",
+                   "CREATE VIEW v AS SELECT id, g, v FROM t WHERE v > 0;"]
+        unguarded = {
+            "unordered STRING_AGG": "CREATE VIEW v AS SELECT g, STRING_AGG(s, ',') AS ss FROM t GROUP BY g;",
+            "unordered ARRAY_AGG": "CREATE VIEW v AS SELECT g, ARRAY_AGG(v) AS vs FROM t GROUP BY g;",
+            "window ties": "CREATE VIEW v AS SELECT id, g, v, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t;",
+            "LIMIT ties": "CREATE VIEW v AS SELECT id, v FROM t ORDER BY v LIMIT 5;",
+        }
+        for view in guarded:
+            self.assertIsNotNone(self._unchanged_guard(self._plan(view, schema)), view)
+        for name, view in unguarded.items():
+            plan = self._plan(view, schema)
+            self.assertIsNone(self._unchanged_guard(plan), name)
+            self.assertNotIn(MaintenanceStrategy.ALGEBRAIC_DELTA, (plan.strategy,), name)
+
+    def test_unchanged_update_guard_only_where_it_was_measured_to_pay_off(self) -> None:
+        # Cheap O(groups) maintenance bodies cost about as much as the guard
+        # (measured, see emitters._PG_GUARD_PAYS_OFF_MODES): no guard there.
+        schema = "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT, s TEXT, x INT); CREATE TABLE d (g INT PRIMARY KEY, name TEXT);"
+        for view in (
+            "CREATE VIEW v AS SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM t GROUP BY g;",
+            "CREATE VIEW v AS SELECT g, AVG(v) AS a FROM t GROUP BY g;",
+            "CREATE VIEW v AS SELECT d.name, SUM(t.v) AS sv FROM t JOIN d ON t.g = d.g GROUP BY d.name;",
+            "CREATE VIEW v AS SELECT DISTINCT g FROM t;",
+            "CREATE VIEW v AS SELECT g, SUM(v) AS sv FROM (SELECT g, v FROM t UNION ALL SELECT g, v FROM t) u GROUP BY g;",
+        ):
+            plan = self._plan(view, schema)
+            self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA, view)
+            self.assertIsNone(self._unchanged_guard(plan), view)
+        for view in (
+            "CREATE VIEW v AS SELECT id, g, v FROM t WHERE v > 0;",
+            "CREATE VIEW v AS SELECT g, MIN(v) AS lo FROM t GROUP BY g;",
+            "CREATE VIEW v AS SELECT g FROM t UNION SELECT g FROM d;",
+        ):
+            self.assertIsNotNone(self._unchanged_guard(self._plan(view, schema), "au"), view)
+
+    def test_unchanged_update_guard_needs_identity_types_where_equal_values_can_differ(self) -> None:
+        # MIN/MAX and set operations return ONE of several values that compare
+        # equal (numeric 1.0 vs 1.00, collated text); which one depends on
+        # physical row order, which every UPDATE changes: guard only when every
+        # column the view reads is an identity type.
+        schema = (
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT, x NUMERIC, s TEXT, n NUMERIC(10, 2), ts TIMESTAMPTZ);"
+            "CREATE TABLE d (id INT PRIMARY KEY, x NUMERIC, g INT);"
+        )
+        no_guard = [
+            "CREATE VIEW v AS SELECT g, MIN(x) AS lo, MAX(x) AS hi FROM t GROUP BY g;",
+            "CREATE VIEW v AS SELECT s, MIN(g) AS lo FROM t GROUP BY s;",  # text group key
+            "CREATE VIEW v AS SELECT g, MAX(s) AS hi FROM t GROUP BY g;",
+            "CREATE VIEW v AS SELECT x FROM t UNION SELECT x FROM d;",
+            "CREATE VIEW v AS SELECT x FROM t INTERSECT SELECT x FROM d;",
+            "CREATE VIEW v AS SELECT id, ctid::text AS c FROM t;",  # changes on every UPDATE
+        ]
+        for view in no_guard:
+            self.assertIsNone(self._unchanged_guard(self._plan(view, schema)), view)
+        # Projections keep every row's own value: numeric/text columns are fine.
+        self.assertIsNotNone(self._unchanged_guard(self._plan("CREATE VIEW v AS SELECT id, x, s FROM t;", schema)))
+        # Identity-typed MIN/MAX and set operations keep the guard.
+        for view in (
+            "CREATE VIEW v AS SELECT g, MIN(id) AS lo, MAX(ts) AS hi FROM t GROUP BY g;",
+            "CREATE VIEW v AS SELECT g FROM t UNION SELECT g FROM d;",
+        ):
+            self.assertIsNotNone(self._unchanged_guard(self._plan(view, schema)), view)
+        # MIN/MAX under a non-algebraic strategy (HAVING with an aggregate subquery
+        # is group-scoped recompute) never gets the guard.
+        plan = self._plan(
+            "CREATE VIEW v AS SELECT g, MIN(id) AS lo FROM t GROUP BY g HAVING MIN(id) > (SELECT AVG(id) FROM t);",
+            schema,
+        )
+        self.assertNotEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+        self.assertIsNone(self._unchanged_guard(plan))
+
+    def test_unchanged_update_guard_is_fail_closed(self) -> None:
+        # No primary key, a float column, or a non-built-in type: no guard.
+        no_pk = "CREATE TABLE s (region VARCHAR(32), amount NUMERIC(10, 2) NOT NULL);"
+        self.assertIsNone(self._unchanged_guard(self._plan("CREATE VIEW v AS SELECT region, amount FROM s;", no_pk)))
+        flt = "CREATE TABLE s (id INT PRIMARY KEY, amount DOUBLE PRECISION NOT NULL);"
+        self.assertIsNone(self._unchanged_guard(self._plan("CREATE VIEW v AS SELECT id, amount FROM s;", flt)))
+        arr = "CREATE TABLE s (id INT PRIMARY KEY, tags TEXT[] NOT NULL);"
+        self.assertIsNone(self._unchanged_guard(self._plan("CREATE VIEW v AS SELECT id, tags FROM s;", arr)))
+        # Composite primary keys pair on every key column.
+        comp = "CREATE TABLE s (a INT, b INT, amount NUMERIC(10, 2) NOT NULL, PRIMARY KEY (a, b));"
+        guard = self._unchanged_guard(self._plan("CREATE VIEW v AS SELECT a, b, amount FROM s;", comp))
+        assert guard is not None
+        self.assertIn("__mv_old.a = __mv_new.a AND __mv_old.b = __mv_new.b", guard)
 
     def test_expression_group_key_native_recompute_is_set_based(self) -> None:
         plan = self._plan(

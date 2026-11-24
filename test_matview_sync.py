@@ -2668,7 +2668,18 @@ class TranspiledConnectionAdapter:
                 # empty transition table; a SQLite row trigger always has
                 # its one row.
                 body = re.sub(
-                    r"\bIF\s+NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+__mv_(?:new|old)_rows\s*\)\s*THEN\s*RETURN\s+NULL;\s*END\s+IF;",
+                    r"\bIF\s+NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+__mv_(?:new|old)_rows\s*\)(?:\s+OR\s+NOT\s+EXISTS\b.*?)?\s*THEN\s*RETURN\s+NULL;\s*END\s+IF;",
+                    "",
+                    body,
+                    flags=re.I | re.S,
+                )
+                # The native PostgreSQL UPDATE fast path compares statement
+                # transition relations. This compatibility runner models each
+                # statement trigger as a SQLite row trigger, so it deliberately
+                # omits that PostgreSQL-only early return and exercises the
+                # ordinary maintenance body instead; native PG CI covers it.
+                body = re.sub(
+                    r"\bIF\s+NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+__mv_old_rows\b.*?\bTHEN\s+RETURN\s+NULL;\s*END\s+IF;",
                     "",
                     body,
                     flags=re.I | re.S,

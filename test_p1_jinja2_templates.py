@@ -211,7 +211,7 @@ class TestJinja2ProceduralTemplates(unittest.TestCase):
                    and "_trunc()" not in d and "(v anyelement)" not in d]
         self.assertEqual(len(fn_ddls), 3)
         for fn_ddl in fn_ddls:
-            self.assertRegex(fn_ddl, r"IF NOT EXISTS \(SELECT 1 FROM __mv_(new|old)_rows\) THEN\s+RETURN NULL;")
+            self.assertRegex(fn_ddl, r"IF NOT EXISTS \(SELECT 1 FROM __mv_(new|old)_rows\)(?: OR NOT EXISTS \(.*?\))? THEN\s+RETURN NULL;")
 
         # MySQL row triggers
         my_ts = ms.parse_table_schema(

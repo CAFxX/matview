@@ -1038,6 +1038,32 @@ observe depends on the engine:
 - On PostgreSQL a statement of N rows runs each view's maintenance once
   (see [PostgreSQL maintenance](#postgresql-maintenance)); on SQLite and
   MySQL/MariaDB maintenance runs once per row.
+- PostgreSQL skips the maintenance body of an `UPDATE` that changes no column the
+  view reads, but only where that was measured to pay off and is exact: views whose
+  result cannot depend on physical row order (never unordered `STRING_AGG`/`ARRAY_AGG`,
+  window or `LIMIT` ties, group-scoped or full recomputes) and whose body is
+  expensive relative to the check. Interleaved A/B on PostgreSQL 15/18 (same server
+  and process, fresh tables per round, 30k-50k rows, a loaded host: treat ratios
+  within about 15% as noise; guard time / no-guard time):
+
+  | view shape | unread-column / no-op UPDATE (bulk) | single-row unread | real-change UPDATE | guard |
+  | --- | --- | --- | --- | --- |
+  | projection (`SELECT id, g, v FROM t WHERE ...`) | 0.67-0.68x | 244 us vs 10.9 ms | 1.0x here; +5-10% in an independent run on a loaded host | yes |
+  | `MIN`/`MAX` aggregate (extreme recompute), identity-typed columns only | 0.29-0.32x (up to 0.15x independently) | 234 us vs 17.7 ms | 0.97-1.03x here; +10-25% bulk in an independent run on a loaded host | yes |
+  | set operation (`UNION`), identity-typed columns only | 0.54-0.58x | 1.06x | 0.54-0.93x | yes |
+  | `SUM`/`COUNT`/`AVG`/`BOOL_AND` aggregate | 0.97-1.17x | 0.94-1.04x | bulk 0.95-1.08x; single-row +27% (2.3x in one noisy run) | no |
+  | join aggregate, `UNION ALL` aggregate, `DISTINCT` | 0.85-1.07x | 1.04-1.31x | 1.02-1.29x | no |
+  | `COUNT(DISTINCT)` | 0.36-0.42x | 0.37x | single-row 1.07 ms vs 0.17 ms in the one measured run (not reproduced; unresolved) | no (not emitted until re-measured) |
+
+  The guard is emitted for the three "yes" shapes only
+  (`DialectEmitMixin._pg_update_guard_pays_off`). Trade-off: a statement that really
+  changes values pays the check without benefit (measured at 0-25% for bulk
+  `MIN`/`MAX`, host-load dependent), while unread-column and no-op statements get
+  3-7x faster. `MIN`/`MAX` and set operations return one of several values that
+  compare equal (numeric `1.0` vs `1.00`, collated text), chosen by physical row
+  order that every `UPDATE` changes, so they get the guard only when every column
+  the view reads is of an identity type (integers, boolean, date, timestamps, time,
+  uuid, bytea); views selecting system columns (`ctid`, `xmin`, ...) never do.
 - For large one-off loads see [Bulk changes](#bulk-changes); for large initial
   populations see [Initial population and backfill](#initial-population-and-backfill).
 

@@ -257,9 +257,15 @@ BEGIN
         RETURN NULL;
     END IF;
     /* __MV_BRACKET_END__ */
+{% if skip_update_sql %}
+    IF NOT EXISTS (SELECT 1 FROM {{ guard_table }}) OR {{ skip_update_sql }} THEN
+        RETURN NULL;
+    END IF;
+{% else %}
     IF NOT EXISTS (SELECT 1 FROM {{ guard_table }}) THEN
         RETURN NULL;
     END IF;
+{% endif %}
 {% if repair_fence_sql | default('') %}
     {{ repair_fence_sql }}
 {% endif %}
@@ -311,9 +317,15 @@ $$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
     "pg_statement_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
 RETURNS TRIGGER AS $$
 BEGIN
+{% if skip_update_sql %}
+    IF NOT EXISTS (SELECT 1 FROM {{ guard_table }}) OR {{ skip_update_sql }} THEN
+        RETURN NULL;
+    END IF;
+{% else %}
     IF NOT EXISTS (SELECT 1 FROM {{ guard_table }}) THEN
         RETURN NULL;
     END IF;
+{% endif %}
 {% if repair_fence_sql | default('') %}
     {{ repair_fence_sql }}
 {% endif %}

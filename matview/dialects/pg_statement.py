@@ -204,6 +204,7 @@ class PgStatementMaintenanceMixin(MixinHost):
         bodies: Mapping[str, str],
         trunc_body: str,
         bracket: Optional[PgStatementBracket] = None,
+        skip_update_sql: Optional[str] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         """Functions and statement triggers for one (view, source table) pair.
 
@@ -292,6 +293,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                         overlap_close_sql=overlap_close_sql,
                         body_sql=bodies[event].strip(),
                         repair_fence_sql=repair_fence_sql,
+                        skip_update_sql=(skip_update_sql or "") if event == "UPDATE" else "",
                     )
                 )
             else:
@@ -302,6 +304,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                         guard_table=guard_table[event],
                         body_sql=bodies[event].strip(),
                         repair_fence_sql=repair_fence_sql,
+                        skip_update_sql=(skip_update_sql or "") if event == "UPDATE" else "",
                     )
                 )
             ddls.append(
