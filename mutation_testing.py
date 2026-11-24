@@ -32,7 +32,11 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parent
 PACKAGE_DIR = "matview"
-COPIED_FILES: Tuple[str, ...] = ("matview_sync.py", "test_matview_sync.py")
+COPIED_FILES: Tuple[str, ...] = (
+    "matview_sync.py",
+    "test_matview_sync.py",
+    "test_native_statistical_aggregates.py",
+)
 TARGET_TEST = (
     "test_matview_sync.TestGeneratorAndManagerCodePaths."
     "test_25_join_aggregate_decrement_and_group_key_invariants"
@@ -502,6 +506,36 @@ MUTANTS = (
         target_test=(
             "test_sqlite_distinct_filtered_aggregates.TestDistinctAndFilteredStatBitBool."
             "test_exact_differential_deterministic_scenarios"
+        ),
+    ),
+    Mutant(
+        name="pg-union-array-skips-mixed-dimensions",
+        source_path="matview/dialects/base.py",
+        original="            if all(m is not None for m in arr_matches):\n                elems = [m.group(1).strip() for m in arr_matches if m is not None]",
+        replacement="            if all(m is not None for m in arr_matches) and len({m.group(2) for m in arr_matches if m is not None}) == 1:\n                elems = [m.group(1).strip() for m in arr_matches if m is not None]",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_cross_branch_union_array_scalar_and_collation_widening_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-union-drops-nondefault-collation-with-default-branch",
+        source_path="matview/dialects/base.py",
+        original="                nonempty_imp = [c for c in implicit_colls if c]\n                if nonempty_imp:",
+        replacement="                nonempty_imp = [c for c in implicit_colls if c]\n                if nonempty_imp and all(implicit_colls):",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_cross_branch_union_array_scalar_and_collation_widening_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-union-zset-skips-branch-cast",
+        source_path="matview/maintenance/zset.py",
+        original="                if col_i < len(col_types) and self._pg_branch_expr_needs_cast(it, b_ctx, col_types[col_i]):",
+        replacement="                if False and col_i < len(col_types) and self._pg_branch_expr_needs_cast(it, b_ctx, col_types[col_i]):",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_cross_branch_union_array_scalar_and_collation_widening_offline"
         ),
     ),
 )

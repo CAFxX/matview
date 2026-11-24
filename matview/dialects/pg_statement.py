@@ -1252,17 +1252,17 @@ class PgStatementMaintenanceMixin(MixinHost):
                         dcol = f"__mv_gd{r_idx}"
                         icol = f"__mv_gi{r_idx}"
                         rec_cols.append(
-                            f"pg_catalog.array_agg(DISTINCT ({k_expr})::pg_catalog.text) "
+                            f"pg_catalog.array_agg(DISTINCT ROW({k_expr})::pg_catalog.text) "
                             f"FILTER (WHERE {s} < 0 AND ({k_expr}) IS NOT NULL) AS {dcol}"
                         )
                         rec_cols.append(
-                            f"pg_catalog.array_agg(DISTINCT ({k_expr})::pg_catalog.text) "
+                            f"pg_catalog.array_agg(DISTINCT ROW({k_expr})::pg_catalog.text) "
                             f"FILTER (WHERE {s} > 0 AND ({k_expr}) IS NOT NULL) AS {icol}"
                         )
                         rep_conds.append(
                             f"({mv}.{col} IS NOT NULL AND "
-                            f"({mv}.{col})::pg_catalog.text = ANY(__mv_r.{dcol}) AND "
-                            f"NOT (({mv}.{col})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))"
+                            f"ROW({mv}.{col})::pg_catalog.text = ANY(__mv_r.{dcol}) AND "
+                            f"NOT (ROW({mv}.{col})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))"
                         )
                 any_rep_cond = "TRUE" if force_recompute_extremes else " OR ".join(rep_conds)
                 inner_lat = spec.recompute_group_keys([expr_sql for expr_sql, _, _ in rep_targets])
@@ -1409,27 +1409,6 @@ class PgStatementMaintenanceMixin(MixinHost):
         s = f"__mv_p.{SIGN}"
         for event in EVENTS:
             proj = self._pg_projection_sql(event, srcs, _columns, base_t=base_t)
-            if adopt_set and has_cnt0:
-                # For INTERSECT / EXCEPT with variable-scale numeric columns,
-                # pick a branch-0 representative when branch 0 contributes in
-                # this statement so a same-statement branch-1 row never shadows
-                # branch 0's display scale.
-                sel_val_cols: List[str] = ["__mv_p.__mv_k0"]
-                group_cols: List[str] = ["__mv_p.__mv_k0"]
-                for j, c in enumerate(value_cols):
-                    if c.lower() in adopt_set:
-                        sel_val_cols.append(
-                            f"COALESCE((pg_catalog.array_agg(__mv_p.__mv_c{j}) "
-                            f"FILTER (WHERE {s} > 0 AND __mv_p.__mv_n0 > 0))[1], "
-                            f"(pg_catalog.array_agg(__mv_p.__mv_c{j}))[1])"
-                        )
-                    else:
-                        sel_val_cols.append(f"__mv_p.__mv_c{j}")
-                        group_cols.append(f"__mv_p.__mv_c{j}")
-            else:
-                group_cols = ["__mv_p.__mv_k0"] + [f"__mv_p.__mv_c{j}" for j in range(len(value_cols))]
-                sel_val_cols = list(group_cols)
-            cnt_vals = [f"SUM({s} * __mv_p.__mv_n{j})" for j in range(len(count_cols))]
             sets = [f"{c} = {mv_table}.{c} + EXCLUDED.{c}" for c in q_cnts]
             if adopt_set and has_cnt0:
                 adopt_sets = [
@@ -1439,14 +1418,48 @@ class PgStatementMaintenanceMixin(MixinHost):
                     if c.lower() in adopt_set
                 ]
                 sets = adopt_sets + sets
-            stmts = [
-                f"INSERT INTO {mv_table} ({', '.join([q_key, *q_vals, *q_cnts])})\n"
-                f"    SELECT {', '.join(sel_val_cols + cnt_vals)}\n"
-                f"    FROM {proj}\n"
-                f"    GROUP BY {', '.join(group_cols)}\n"
-                f"    ORDER BY __mv_p.__mv_k0\n"
-                f"    ON CONFLICT ({q_key}) DO UPDATE SET {', '.join(sets)};"
-            ]
+                # For INTERSECT / EXCEPT with variable-representation columns
+                # (unconstrained NUMERIC/NUMERIC[]/BPCHAR/BPCHAR[]/NUMRANGE),
+                # use DISTINCT ON over a CTE instead of array_agg(...)[1] so
+                # array-typed columns keep their exact type and dimensionality
+                # while preferring branch-0 positive rows over branch-1 rows.
+                proj_cte_body = proj[: -len(" AS __mv_p")] if proj.endswith(" AS __mv_p") else f"({proj})"
+                cnt_aggs = [f"SUM({SIGN} * __mv_n{j}) AS __mv_sum_{j}" for j in range(len(count_cols))]
+                rep_cols = [f"__mv_c{j}" for j in range(len(value_cols))]
+                sel_cols = (
+                    ["__mv_g.__mv_k0"]
+                    + [f"__mv_rep.__mv_c{j}" for j in range(len(value_cols))]
+                    + [f"__mv_g.__mv_sum_{j}" for j in range(len(count_cols))]
+                )
+                stmts = [
+                    f"WITH __mv_p AS {proj_cte_body}\n"
+                    f"INSERT INTO {mv_table} ({', '.join([q_key, *q_vals, *q_cnts])})\n"
+                    f"    SELECT {', '.join(sel_cols)}\n"
+                    f"    FROM (\n"
+                    f"        SELECT __mv_k0, {', '.join(cnt_aggs)}\n"
+                    f"        FROM __mv_p\n"
+                    f"        GROUP BY __mv_k0\n"
+                    f"    ) AS __mv_g\n"
+                    f"    JOIN (\n"
+                    f"        SELECT DISTINCT ON (__mv_k0) __mv_k0, {', '.join(rep_cols)}\n"
+                    f"        FROM __mv_p\n"
+                    f"        ORDER BY __mv_k0, ({SIGN} > 0 AND __mv_n0 > 0) DESC, (__mv_n0 > 0) DESC\n"
+                    f"    ) AS __mv_rep ON __mv_rep.__mv_k0 = __mv_g.__mv_k0\n"
+                    f"    ORDER BY __mv_g.__mv_k0\n"
+                    f"    ON CONFLICT ({q_key}) DO UPDATE SET {', '.join(sets)};"
+                ]
+            else:
+                group_cols = ["__mv_p.__mv_k0"] + [f"__mv_p.__mv_c{j}" for j in range(len(value_cols))]
+                sel_val_cols = list(group_cols)
+                cnt_vals = [f"SUM({s} * __mv_p.__mv_n{j})" for j in range(len(count_cols))]
+                stmts = [
+                    f"INSERT INTO {mv_table} ({', '.join([q_key, *q_vals, *q_cnts])})\n"
+                    f"    SELECT {', '.join(sel_val_cols + cnt_vals)}\n"
+                    f"    FROM {proj}\n"
+                    f"    GROUP BY {', '.join(group_cols)}\n"
+                    f"    ORDER BY __mv_p.__mv_k0\n"
+                    f"    ON CONFLICT ({q_key}) DO UPDATE SET {', '.join(sets)};"
+                ]
             if event_has_old(event):
                 stmts.append(
                     f"DELETE FROM {mv_table}\n"
@@ -1464,17 +1477,17 @@ class PgStatementMaintenanceMixin(MixinHost):
                         dcol = f"__mv_vd{r_idx}"
                         icol = f"__mv_vi{r_idx}"
                         rec_cols.append(
-                            f"pg_catalog.array_agg(DISTINCT (__mv_p.__mv_c{j})::pg_catalog.text) "
+                            f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
                             f"FILTER (WHERE {s} < 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS NOT NULL) AS {dcol}"
                         )
                         rec_cols.append(
-                            f"pg_catalog.array_agg(DISTINCT (__mv_p.__mv_c{j})::pg_catalog.text) "
+                            f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
                             f"FILTER (WHERE {s} > 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS NOT NULL) AS {icol}"
                         )
                         rec_conds.append(
                             f"({mv_table}.{qc} IS NOT NULL AND "
-                            f"({mv_table}.{qc})::pg_catalog.text = ANY(__mv_r.{dcol}) AND "
-                            f"NOT (({mv_table}.{qc})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))"
+                            f"ROW({mv_table}.{qc})::pg_catalog.text = ANY(__mv_r.{dcol}) AND "
+                            f"NOT (ROW({mv_table}.{qc})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))"
                         )
                     if ref_targets:
                         any_cond = " OR ".join(rec_conds)
