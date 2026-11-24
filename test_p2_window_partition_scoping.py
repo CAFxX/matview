@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import sqlite3
 import unittest
 
@@ -1047,6 +1048,11 @@ class TestTier2OuterJoinGroupScoping(unittest.TestCase):
                         for t in tbls:
                             conn.exec_driver_sql(f"DROP TABLE IF EXISTS {t}")
                         for d in ddls:
+                            if dialect == ms.Dialect.MYSQL:
+                                # Byte-exact text keys: MySQL PAD SPACE UCA server defaults (CI:
+                                # utf8mb4_unicode_ci) make them an announced full refresh
+                                # (test_group_key_collation.py), not the group-scoped path tested here.
+                                d = re.sub(r"VARCHAR\((\d+)\)", r"VARCHAR(\1) COLLATE utf8mb4_bin", d)
                             conn.exec_driver_sql(d)
                         for s in seeds:
                             conn.exec_driver_sql(s)

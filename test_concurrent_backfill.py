@@ -31,6 +31,15 @@ from test_matview_sync import FLOAT_OPT_IN, _register_sqlite_compat_udfs, pin_na
 TRANSIENT_RETRIES = 25
 
 
+
+def _key_collation(engine: Dialect) -> str:
+    """MySQL/MariaDB text group-key columns of these concurrency fixtures declare a
+    byte-exact collation: under a PAD SPACE UCA server default (CI runs
+    utf8mb4_unicode_ci) MySQL groups text plan-dependently and matview maintains
+    such views by an announced full refresh, which has no incremental backfill to
+    race (see test_group_key_collation.py)."""
+    return " COLLATE utf8mb4_bin" if engine == Dialect.MYSQL else ""
+
 def _is_transient_lock_error(engine: Dialect, exc: BaseException) -> bool:
     """Match only engine-reported deadlock/serialization victims, independently
     of the implementation's own classifier."""
@@ -777,7 +786,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             cur.execute(
                 f"CREATE TABLE {table_name} ("
                 "id BIGINT PRIMARY KEY, "
-                "bucket VARCHAR(16) NOT NULL, "
+                f"bucket VARCHAR(16){_key_collation(engine)} NOT NULL, "
                 "amt BIGINT NOT NULL, "
                 "approx_amt DOUBLE PRECISION NOT NULL"
                 f"){engine_suffix};"
@@ -1302,7 +1311,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             cur.execute(
                 f"CREATE TABLE {table_name} ("
                 "id BIGINT PRIMARY KEY, "
-                "bucket VARCHAR(16) NOT NULL, "
+                f"bucket VARCHAR(16){_key_collation(engine)} NOT NULL, "
                 "amt BIGINT NOT NULL"
                 f"){engine_suffix};"
             )
@@ -1560,7 +1569,7 @@ class IndependentSessionBackfillTests(unittest.TestCase):
             engine_suffix = " ENGINE=InnoDB" if engine == Dialect.MYSQL else ""
             writer_cursor.execute(
                 f"CREATE TABLE {table_name} ("
-                "id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amount BIGINT NOT NULL"
+                f"id BIGINT PRIMARY KEY, grp VARCHAR(16){_key_collation(engine)} NOT NULL, amount BIGINT NOT NULL"
                 f"){engine_suffix};"
             )
             writer_cursor.executemany(
@@ -2127,7 +2136,7 @@ class InterruptedBackfillFailClosedTests(unittest.TestCase):
                 cur.execute(f'SET search_path TO "{schema}"')
                 other.cursor().execute(f'SET search_path TO "{schema}"')
                 other.commit()
-            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8){_key_collation(engine)} NOT NULL, amt BIGINT NOT NULL)")
             cur.executemany(f"INSERT INTO {table} VALUES (%s, %s, %s)", [(i, f"G{i % 3}", i) for i in range(1, 21)])
             conn.commit()
             manager = MaterializedViewManager(conn, dialect=engine)
@@ -2225,7 +2234,7 @@ class InterruptedBackfillFailClosedTests(unittest.TestCase):
             if engine == Dialect.POSTGRES:
                 cur.execute(f'CREATE SCHEMA "{schema}"')
                 cur.execute(f'SET search_path TO "{schema}"')
-            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8){_key_collation(engine)} NOT NULL, amt BIGINT NOT NULL)")
             cur.executemany(f"INSERT INTO {table} VALUES (%s, %s, %s)", [(i, f"G{i % 3}", i) for i in range(1, 21)])
             conn.commit()
             view_sql = f"CREATE VIEW {view} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM {table} GROUP BY g;"
@@ -2307,7 +2316,7 @@ class InterruptedBackfillFailClosedTests(unittest.TestCase):
             if engine == Dialect.POSTGRES:
                 cur.execute(f'CREATE SCHEMA "{schema}"')
                 cur.execute(f'SET search_path TO "{schema}"')
-            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8){_key_collation(engine)} NOT NULL, amt BIGINT NOT NULL)")
             cur.executemany(f"INSERT INTO {table} VALUES (%s, %s, %s)", [(i, f"G{i % 3}", i) for i in range(1, 41)])
             conn.commit()
             view_sql = f"CREATE VIEW {view} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM {table} GROUP BY g;"
@@ -2462,7 +2471,7 @@ class BackfillTakeoverOwnershipTests(unittest.TestCase):
             if engine == Dialect.POSTGRES:
                 cur.execute(f'CREATE SCHEMA "{schema}"')
                 cur.execute(f'SET search_path TO "{schema}"')
-            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+            cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8){_key_collation(engine)} NOT NULL, amt BIGINT NOT NULL)")
             cur.executemany(
                 f"INSERT INTO {table} VALUES ({ph}, {ph}, {ph})",
                 [(i, f"G{i % 3}", i) for i in range(1, self.ROWS + 1)],
@@ -2638,7 +2647,7 @@ class CatalogUpgradeTests(unittest.TestCase):
         if engine == Dialect.POSTGRES:
             cur.execute(f'CREATE SCHEMA "{schema}"')
             cur.execute(f'SET search_path TO "{schema}"')
-        cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)")
+        cur.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, g VARCHAR(8){_key_collation(engine)} NOT NULL, amt BIGINT NOT NULL)")
         cur.executemany(f"INSERT INTO {table} VALUES ({ph}, {ph}, {ph})", [(i, f"G{i % 3}", i) for i in range(1, 21)])
         admin.commit()
 
@@ -2798,7 +2807,7 @@ class NativeBackfillLockingTests(unittest.TestCase):
             cur.execute(f'SET search_path TO "{schema}"')
         engine_suffix = " ENGINE=InnoDB" if engine == Dialect.MYSQL else ""
         cur.execute(
-            f"CREATE TABLE {fx['table']} (id BIGINT PRIMARY KEY, g VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"
+            f"CREATE TABLE {fx['table']} (id BIGINT PRIMARY KEY, g VARCHAR(8){_key_collation(engine)} NOT NULL, amt BIGINT NOT NULL)"
             f"{engine_suffix}"
         )
         cur.executemany(

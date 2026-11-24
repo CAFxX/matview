@@ -188,8 +188,10 @@ SCHEMA = {
         "CONSTRAINT t_v_bound CHECK (v IS NULL OR v < 1000000))",
         "CREATE INDEX t_g_v ON t (g, v)",
     ],
+    # A byte-exact key collation: MySQL PAD SPACE UCA server defaults (CI: utf8mb4_unicode_ci)
+    # send text group keys to an announced full refresh (test_group_key_collation.py).
     "mysql": [
-        "CREATE TABLE d (g INT PRIMARY KEY, name VARCHAR(20) NOT NULL) ENGINE=InnoDB",
+        "CREATE TABLE d (g INT PRIMARY KEY, name VARCHAR(20) COLLATE utf8mb4_bin NOT NULL) ENGINE=InnoDB",
         "CREATE TABLE t (id INT PRIMARY KEY, g INT, v BIGINT, w INT, m DECIMAL(12,3), "
         "CONSTRAINT t_v_bound CHECK (v IS NULL OR v < 1000000)) ENGINE=InnoDB",
         "CREATE INDEX t_g_v ON t (g, v)",
