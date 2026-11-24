@@ -2607,7 +2607,9 @@ class PlannerMixin(MixinHost):
     _STRICT_REBUILD_HINT = (
         "SQLite cannot ALTER a table into STRICT: create the table with `CREATE TABLE <name> (...) STRICT` "
         "(`WITHOUT ROWID, STRICT` for a WITHOUT ROWID table), copy the rows with INSERT ... SELECT, drop "
-        "the old table, rename the new one (the 12-step rebuild procedure), then re-register the view. "
+        "the old table, rename the new one (follow the 12-step rebuild procedure of "
+        "sqlite.org/lang_altertable.html, with PRAGMA foreign_keys=OFF so cascades do not delete child "
+        "rows; the rebuild drops the maintenance triggers), then re-register the view. "
         "STRICT needs SQLite 3.37 or newer."
     )
 
