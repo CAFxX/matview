@@ -5364,6 +5364,36 @@ class TestMySqlRepairViewLockingOffline(unittest.TestCase):
             lock_stmts("SELECT a.id FROM __matview_store_v a JOIN base b ON a.id = b.id"),
             [lock("base")],
         )
+        # A table qualified with the CURRENT database is the very same table as the bare name: one
+        # probe, with the primary-key scan (a generic scan of the smallest secondary index would
+        # not block a writer that touches only non-indexed columns).
+        def lock_stmts_db(select_sql: str, **kw: Any) -> List[str]:
+            plan = SimpleNamespace(
+                sub_plans=None, view_spec=SimpleNamespace(raw_select_sql=select_sql, referenced_tables=())
+            )
+            return _mysql_base_table_lock_stmts(plan, schemas=schemas, current_db="appdb", **kw)
+
+        self.assertEqual(
+            lock_stmts_db("SELECT a.id FROM appdb.xt a JOIN xt b ON a.id = b.id"),
+            [lock("appdb.xt")],
+        )
+        # A table of another database is described by the per-database lookup; unknown keys fall back to
+        # the generic probe.
+        looked_up: List[Tuple[str, str]] = []
+
+        def foreign(db: str, name: str) -> Optional[TableSchema]:
+            looked_up.append((db, name))
+            return tbl(name) if db == "other" else None
+
+        self.assertEqual(
+            lock_stmts_db(
+                "SELECT a.id FROM xt a JOIN other.xt b ON a.id = b.id JOIN third.zz c ON c.id = a.id",
+                foreign_schema=foreign,
+            ),
+            [lock("xt"), lock("other.xt"), lock("third.zz", pk=False)],
+        )
+        self.assertEqual(sorted(looked_up), [("other", "xt"), ("third", "zz")])
+
         # The fallback path (no parsable SELECT) applies the same keying and filter.
         plan_fb = SimpleNamespace(
             sub_plans=None,
@@ -5652,6 +5682,99 @@ class TestMySqlIsolationLevelConcurrency(unittest.TestCase):
                 if mgr is not None:
                     try:
                         mgr.drop_view(v_rec)
+                    except Exception:
+                        admin.rollback()
+                c = admin.cursor()
+                c.execute(f"DROP TABLE IF EXISTS {tbl}")
+                admin.commit()
+                c.close()
+            except Exception:
+                pass
+            admin.close()
+
+    def test_native_mysql_repair_view_probes_self_qualified_table_through_primary_key(self) -> None:
+        """A view over `<current db>.t` must be probed like `t`: with a secondary index, a generic
+        `SELECT COUNT(*) ... LOCK IN SHARE MODE` scans (and locks) only that index and does not block
+        an uncommitted UPDATE of a non-indexed column, whereas the primary-key scan does."""
+        from test_avg_concurrent_maintenance import _session_id, _wait_until_lock_waiting
+
+        dsn = self._mysql_dsn()
+        tag = f"mqs_{uuid.uuid4().hex[:8]}"
+        tbl = f"t_{tag}"
+        v = f"v_{tag}"
+        admin = self._connect(dsn)
+        holder = self._connect(dsn)
+        rep_conn = self._connect(dsn)
+        monitor = self._connect(dsn)
+        mgr: Optional[MaterializedViewManager] = None
+        try:
+            cur = admin.cursor()
+            cur.execute("SELECT DATABASE()")
+            db = str(cur.fetchone()[0])
+            cur.execute(
+                f"CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, g VARCHAR(16) NOT NULL, a BIGINT NOT NULL, "
+                "KEY idx_g (g)) ENGINE=InnoDB"
+            )
+            cur.executemany(f"INSERT INTO {tbl} (id, g, a) VALUES (%s, %s, %s)", [(1, "g0", 10), (2, "g1", 20)])
+            admin.commit()
+            mgr = MaterializedViewManager(admin, dialect=Dialect.MYSQL)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                mgr.register_view(
+                    f"CREATE VIEW {v} AS SELECT g, COUNT(*) AS cnt, SUM(a) AS tot FROM `{db}`.{tbl} GROUP BY g;",
+                    accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                )
+            admin.commit()
+
+            hold_sid = _session_id(Dialect.MYSQL, holder)
+            rep_sid = _session_id(Dialect.MYSQL, rep_conn)
+            hcur = holder.cursor()
+            hcur.execute("START TRANSACTION")
+            hcur.execute(f"UPDATE {tbl} SET a = a + 1 WHERE id = 1")  # non-indexed column
+
+            rmgr = MaterializedViewManager(rep_conn, dialect=Dialect.MYSQL)
+            out: Dict[str, Any] = {}
+            done = threading.Event()
+
+            def _repair() -> None:
+                try:
+                    out["res"] = rmgr.repair_view(v)
+                except BaseException as exc:
+                    out["err"] = exc
+                finally:
+                    done.set()
+
+            th = threading.Thread(target=_repair, daemon=True)
+            th.start()
+            _wait_until_lock_waiting(Dialect.MYSQL, monitor, rep_sid, done, blocker_sid=hold_sid)
+            mcur = monitor.cursor()
+            mcur.execute("SELECT info FROM information_schema.processlist WHERE id = %s", (rep_sid,))
+            waiting_sql = str((mcur.fetchone() or ("",))[0] or "")
+            monitor.commit()
+            self.assertIn("FORCE INDEX (PRIMARY)", waiting_sql.upper(), waiting_sql)
+            self.assertIn("LOCK IN SHARE MODE", waiting_sql.upper(), waiting_sql)
+            holder.commit()
+            th.join(timeout=30.0)
+            self.assertFalse(th.is_alive(), "repair_view() hung")
+            self.assertNotIn("err", out, repr(out.get("err")))
+            self.assertEqual(out.get("res"), {v: "repaired"})
+            cur.execute(f"SELECT g, cnt, tot FROM {v} ORDER BY g")
+            got = [tuple(r) for r in cur.fetchall()]
+            cur.execute(f"SELECT g, COUNT(*), SUM(a) FROM {tbl} GROUP BY g ORDER BY g")
+            self.assertEqual(got, [tuple(r) for r in cur.fetchall()])
+            admin.commit()
+        finally:
+            for c_obj in (holder, rep_conn, monitor):
+                try:
+                    c_obj.rollback()
+                    c_obj.close()
+                except Exception:
+                    pass
+            try:
+                admin.rollback()
+                if mgr is not None:
+                    try:
+                        mgr.drop_view(v)
                     except Exception:
                         admin.rollback()
                 c = admin.cursor()
