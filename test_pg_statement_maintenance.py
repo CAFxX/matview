@@ -30,7 +30,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -421,6 +421,26 @@ def _per_statement_us(env: Env, sql_template: str, n: int) -> float:
     elapsed = time.perf_counter() - t0
     env.rollback()
     return elapsed / n * 1e6
+
+
+def _per_statement_rows(env: Env, sql_template: str, n: int) -> Dict[str, float]:
+    """Per-statement table access of ``n`` executions of ``sql_template``,
+    counted by the server (pg_stat_xact_user_tables of the open transaction):
+    sequential scans and rows read by them, and rows fetched through indexes,
+    summed over every user table (the base table and any maintenance table).
+    Deterministic for a fixed data set and plan, unlike elapsed time."""
+    cur = env.conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(seq_scan), 0), COALESCE(SUM(seq_tup_read), 0), "
+                "COALESCE(SUM(idx_tup_fetch), 0) FROM pg_stat_xact_user_tables")
+    before = cur.fetchone()
+    cur.execute(
+        "DO $$ BEGIN FOR i IN 1.." + str(n) + " LOOP EXECUTE format($q$" + sql_template + "$q$, i); END LOOP; END $$"
+    )
+    cur.execute("SELECT COALESCE(SUM(seq_scan), 0), COALESCE(SUM(seq_tup_read), 0), "
+                "COALESCE(SUM(idx_tup_fetch), 0) FROM pg_stat_xact_user_tables")
+    after = cur.fetchone()
+    env.rollback()
+    return {k: float(a - b) / n for k, a, b in zip(("seq_scan", "seq_tup_read", "idx_tup_fetch"), after, before)}
 
 
 def test_single_row_cost_does_not_grow_with_view_size(make_env) -> None:
@@ -1080,10 +1100,13 @@ def test_whole_view_recompute_excludes_group_writers(make_env) -> None:
 
 
 def test_group_scoped_single_row_cost_close_to_no_view(make_env) -> None:
-    """Group-scoped single-row maintenance against a no-view baseline on the
-    same table (100k rows, 10k groups, index on the group key): a table scan
-    per statement costs milliseconds, the per-group recompute tens to
-    hundreds of microseconds."""
+    """Group-scoped single-row maintenance touches only the affected group's
+    rows (100k rows, 10k groups of 10, index on the group key): a table scan
+    per statement reads ~100k rows, the per-group recompute a few dozen index
+    entries. Measured by the server's own per-statement row counters (see
+    _per_statement_rows), not by elapsed time, so the bound does not depend on
+    machine load: no sequential scan at all, and index fetches bounded by a
+    few groups' worth of rows, three orders of magnitude below a scan."""
     env = make_env(views=[], seed=False)
     env.execute("INSERT INTO t (id, g, v, w) SELECT i, i % 10000, i, i % 5 FROM generate_series(1, 100000) i")
     env.commit()
@@ -1091,20 +1114,25 @@ def test_group_scoped_single_row_cost_close_to_no_view(make_env) -> None:
     env.commit()
     stmts = ("INSERT INTO t (id, g, v) VALUES (1000000 + %1$s, mod(%1$s, 10000), 1)",
              "UPDATE t SET v = v + 1 WHERE id = %1$s", "DELETE FROM t WHERE id = %1$s")
-    base = [_per_statement_us(env, sql, 500) for sql in stmts]
+    base = [_per_statement_rows(env, sql, 200) for sql in stmts]
     results = {}
     for view in (V_WIN, V_STRAGG, ViewDef("v_rank", "SELECT id, g, RANK() OVER (PARTITION BY g ORDER BY v) AS r FROM t")):
         env.views = [view]
         env.register(view)
         env.execute("ANALYZE")
         env.commit()
-        results[view.name] = [_per_statement_us(env, sql, 500) for sql in stmts]
+        results[view.name] = [_per_statement_rows(env, sql, 200) for sql in stmts]
         env.manager.drop_view(view.name)
         env.commit()
-    print(f"group-scoped single-row us/stmt (ins, upd, del): none={base} {results}")
+    print(f"group-scoped single-row rows/stmt (ins, upd, del): none={base} {results}")
+    group_size = 10
     for name, costs in results.items():
-        for b, c in zip(base, costs):
-            assert c < 20 * b + 1000, (name, base, costs)
+        for sql, b, c in zip(stmts, base, costs):
+            assert c["seq_scan"] == 0 and c["seq_tup_read"] == 0, (name, sql, "sequential scan", c)
+            # Index entries read: the statement's own row plus the recompute of
+            # the old and new group (and their maintenance rows), nowhere near
+            # the table. 20 groups' worth is ~10x the measured cost.
+            assert c["idx_tup_fetch"] <= b["idx_tup_fetch"] + 20 * group_size, (name, sql, b, c)
 
 
 # ---------------------------------------------------------------------------
