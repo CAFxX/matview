@@ -1580,6 +1580,85 @@ class NativeMysqlStatisticsDefault(_ExactCase):
             fx.close()
 
 
+class NativeUnionAllMixedTypes(_ExactCase):
+    """Default mode, natively: a set operation in a derived table or CTE
+    whose branches mix integer/decimal and floating-point columns has the
+    COMMON type of all branches (live: float8/real, DOUBLE). The stored
+    columns must take that type, not the first branch's (regression: INT
+    first branch stored SUM/AVG as BIGINT/NUMERIC or DECIMAL while the live
+    view returned DOUBLE). Result column types and values (Python type and
+    exact value) are compared with the live view after every write."""
+
+    def _shapes(self, t: str, u: str) -> List[str]:
+        return [
+            f"SELECT g, SUM(x) AS s, AVG(x) AS a, COUNT(x) AS c FROM (SELECT g, k AS x FROM {t} UNION ALL SELECT g, f FROM {u}) q GROUP BY g",
+            f"SELECT g, SUM(x) AS s, AVG(x) AS a FROM (SELECT g, n AS x FROM {t} UNION ALL SELECT g, r FROM {u}) q GROUP BY g",
+            f"SELECT g, SUM(x) AS s, AVG(x) AS a FROM (SELECT g, f AS x FROM {t} UNION ALL SELECT g, k FROM {u}) q GROUP BY g",
+            f"SELECT g, SUM(x) AS s FROM (SELECT g, k AS x FROM {t} UNION ALL SELECT g, k * 2 FROM {u} "
+            f"UNION ALL SELECT g, f FROM {t}) q GROUP BY g",
+            f"SELECT g, SUM(x) AS s, AVG(x) AS a FROM (SELECT g, k AS x FROM {t} UNION ALL SELECT g, NULL FROM {u} "
+            f"UNION ALL SELECT g, f FROM {u}) q GROUP BY g",
+            f"WITH q AS (SELECT g, k AS x FROM {t} UNION ALL SELECT g, f FROM {u}) "
+            f"SELECT g, SUM(x) AS s, AVG(x) AS a FROM q GROUP BY g",
+            f"SELECT g, x FROM (SELECT g, k AS x FROM {t} UNION ALL SELECT g, f FROM {u}) q",
+        ]
+
+    def _q(self, conn: Any, sql: str) -> Tuple[List[Any], List[Tuple[Any, ...]]]:
+        cur = conn.cursor()
+        cur.execute(sql)
+        types = [d[1] for d in cur.description]
+        rows = sorted(
+            (tuple((type(v).__name__, _exact(v)) for v in r) for r in cur.fetchall()), key=repr
+        )
+        conn.commit()
+        return types, rows
+
+    def test_mixed_branch_types_match_live(self) -> None:
+        engines = _native_engines()
+        if not engines:
+            self.skipTest("set POSTGRES_DSN and/or MYSQL_DSN")
+        for engine, dsn in engines:
+            with self.subTest(engine=engine.value):
+                fx = _Fixture(engine, dsn)
+                try:
+                    pg = engine == Dialect.POSTGRES
+                    f_t, r_t = ("DOUBLE PRECISION", "REAL") if pg else ("DOUBLE", "FLOAT")
+                    n_t = "NUMERIC(10,2)" if pg else "DECIMAL(10,2)"
+                    cols = f"id BIGINT PRIMARY KEY, g INT, k INT, n {n_t}, f {f_t}, r {r_t}"
+                    t, u = fx.table("ua", cols), fx.table("ub", cols)
+                    plans = [(fx.register(sel, relaxed=False), sel) for sel in self._shapes(t, u)]
+                    rng = random.Random(280)
+                    vals = (1e16, -1e16, 1.5, 0.1, 0.2, 0.3, 2.5, None)
+                    cur = fx.conn.cursor()
+                    for step in range(30):
+                        tb = rng.choice((t, u))
+                        i = rng.randrange(1, 25)
+                        op = rng.random()
+                        try:
+                            if op < 0.55:
+                                cur.execute(
+                                    f"INSERT INTO {tb} VALUES (%s,%s,%s,%s,%s,%s)",
+                                    (i, rng.randrange(3), rng.randrange(-5, 9), rng.choice((1.25, -3.5, None)),
+                                     rng.choice(vals), rng.choice((1.5, 0.1, None))),
+                                )
+                            elif op < 0.8:
+                                cur.execute(f"UPDATE {tb} SET f = %s, k = %s, g = %s WHERE id = %s",
+                                            (rng.choice(vals), rng.randrange(-5, 9), rng.randrange(3), i))
+                            else:
+                                cur.execute(f"DELETE FROM {tb} WHERE id = %s", (i,))
+                            fx.conn.commit()
+                        except Exception:
+                            fx.conn.rollback()
+                            cur = fx.conn.cursor()
+                        for plan, sel in plans:
+                            self.assertEqual(
+                                self._q(fx.conn, f"SELECT * FROM {plan.view_name}"), self._q(fx.conn, sel),
+                                f"{engine.value} step {step}: {sel}",
+                            )
+                finally:
+                    fx.close()
+
+
 class NativeWindowExactTypes(_ExactCase):
     """Window SUM/AVG/COUNT of exact arguments keep the engine's result type
     (NUMERIC / DECIMAL), so they are compared exactly with no budget (stored

@@ -430,6 +430,16 @@ class DialectBaseMixin(MixinHost):
         except (sqlglot.errors.SqlglotError, AttributeError, TypeError, ValueError):
             return None
         if isinstance(node, sqlglot_exp.Column):
+            # A column of a multi-branch set operation (CTE or derived table)
+            # has the common type of all its branches, not the first one's.
+            try:
+                setop_t = self._setop_derived_col_type(
+                    parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect), node.name
+                )
+            except sqlglot.errors.SqlglotError:
+                setop_t = None
+            if setop_t is not None:
+                return ColumnDef(name=node.name, data_type=setop_t)
             resolved = self._resolve_cte_column_expression(node)
             if isinstance(resolved, sqlglot_exp.Column):
                 return self._lookup_col_def(resolved.sql())
@@ -736,6 +746,10 @@ class DialectBaseMixin(MixinHost):
                 column = self._lookup_col_def(node.sql())
                 if column:
                     return self._numeric_precision_scale_from_type(column.data_type)
+                # A multi-branch set-operation column: its common type.
+                setop_def = self._lookup_source_col_def(node.sql())
+                if setop_def is not None:
+                    return self._numeric_precision_scale_from_type(setop_def.data_type)
                 cte_expression = self._resolve_cte_column_expression(node)
                 return infer(cte_expression) if cte_expression is not None else None
             if kind == "Literal":
@@ -1463,6 +1477,101 @@ class DialectBaseMixin(MixinHost):
             if c_base:
                 return self._normalize_dialect_type(c_base.data_type)
 
+        return None
+
+    def _setop_derived_col_type(self, q_ast: Any, ident: str) -> Optional[str]:
+        """Common storage type of column ``ident`` of a multi-branch set
+        operation defined in a CTE or a derived table (subquery in FROM).
+        None when no such set operation defines it, or when a branch's
+        projection cannot be typed (the caller then falls back)."""
+        # Re-entrancy guard: typing a branch expression may resolve columns
+        # of the same set operation again (a recursive CTE refers to itself).
+        if getattr(self, "_setop_typing_active", False):
+            return None
+        sources: List[Tuple[Any, Any]] = []
+        for cte in q_ast.find_all(sqlglot_exp.CTE):
+            with_node = cte.parent
+            if isinstance(with_node, sqlglot_exp.With) and with_node.args.get("recursive"):
+                # A recursive CTE's type is its non-recursive term's (typed
+                # by the existing CTE path), not a union of both terms.
+                continue
+            sources.append((cte.this, cte.args.get("alias")))
+        for sub in q_ast.find_all(sqlglot_exp.Subquery):
+            if isinstance(sub.parent, sqlglot_exp.SetOperation):
+                continue
+            sources.append((sub.this, sub.args.get("alias")))
+        for body, table_alias in sources:
+            while isinstance(body, sqlglot_exp.Subquery):
+                body = body.this
+            if not isinstance(body, sqlglot_exp.SetOperation):
+                continue
+            branches: List[sqlglot_exp.Select] = []
+            stack: List[Any] = [body]
+            while stack:
+                cur_q = stack.pop()
+                if isinstance(cur_q, sqlglot_exp.Subquery):
+                    stack.append(cur_q.this)
+                elif isinstance(cur_q, sqlglot_exp.SetOperation):
+                    stack.append(cur_q.expression)
+                    stack.append(cur_q.this)
+                elif isinstance(cur_q, sqlglot_exp.Select):
+                    branches.append(cur_q)
+                else:
+                    return None
+            if len(branches) < 2:
+                continue
+            col_pos: Optional[int] = None
+            if isinstance(table_alias, sqlglot_exp.TableAlias) and table_alias.columns:
+                hdr_cols = [c.name.lower() for c in table_alias.columns]
+                if ident.lower() in hdr_cols:
+                    col_pos = hdr_cols.index(ident.lower())
+            if col_pos is None:
+                for p_i, proj in enumerate(branches[0].expressions):
+                    c_name = proj.alias or (proj.this.name if isinstance(proj, sqlglot_exp.Alias) else proj.name)
+                    if c_name.lower() == ident.lower():
+                        col_pos = p_i
+                        break
+            if col_pos is None:
+                continue
+            b_types: List[str] = []
+            has_null = False
+            for br in branches:
+                if col_pos >= len(br.expressions):
+                    return None
+                proj_e = br.expressions[col_pos]
+                src_e = proj_e.this if isinstance(proj_e, sqlglot_exp.Alias) else proj_e
+                while isinstance(src_e, sqlglot_exp.Paren):
+                    src_e = src_e.this
+                if isinstance(src_e, sqlglot_exp.Null):
+                    has_null = True
+                    continue
+                if isinstance(src_e, sqlglot_exp.Literal):
+                    if self.dialect == Dialect.POSTGRES and src_e.args.get("is_string"):
+                        b_types.append("TEXT")
+                    else:
+                        b_types.append(self._literal_storage_type(src_e))
+                    continue
+                if isinstance(src_e, sqlglot_exp.Column):
+                    c_src = self._lookup_col_def(src_e.sql().strip()) or self._lookup_col_def(src_e.name)
+                    if c_src is None:
+                        return None
+                    b_types.append(c_src.data_type)
+                    continue
+                if src_e.find(sqlglot_exp.AggFunc) is not None or src_e.find(sqlglot_exp.Select) is not None:
+                    return None
+                self._setop_typing_active = True
+                try:
+                    e_t = self._infer_expr_storage_type(
+                        SelectItem(raw_expr=src_e.sql(_sqlglot_dialect(self.dialect)), alias="", is_aggregate=False)
+                    )
+                finally:
+                    self._setop_typing_active = False
+                if not e_t:
+                    return None
+                b_types.append(e_t)
+            if not b_types:
+                return None
+            return self._common_storage_type(b_types, has_null=has_null)
         return None
 
     # MariaDB integer column display lengths (sign included when signed); the
