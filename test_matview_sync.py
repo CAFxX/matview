@@ -1456,7 +1456,7 @@ def _run_live_manager_lifecycle_check(conn, cur, dialect: Dialect) -> int:
             CREATE TABLE mgr_items (
                 id INT PRIMARY KEY,
                 grp VARCHAR(32) {grp_collation} NOT NULL,
-                tag VARCHAR(32),
+                tag VARCHAR(32) {grp_collation},
                 val INT NOT NULL
             );
             CREATE TABLE mgr_comp_items (

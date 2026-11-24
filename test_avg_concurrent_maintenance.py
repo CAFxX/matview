@@ -504,7 +504,7 @@ class NativeAvgInterleavingTests(unittest.TestCase):
             cur.execute(f'SET search_path TO "{schema}"')
         engine_suffix = " ENGINE=InnoDB" if engine == Dialect.MYSQL else ""
         cur.execute(
-            f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amt {amt_type})"
+            f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, grp VARCHAR(16){' COLLATE utf8mb4_bin' if engine == Dialect.MYSQL else ''} NOT NULL, amt {amt_type})"
             f"{engine_suffix}"
         )
         cur.executemany(f"INSERT INTO {table} (id, grp, amt) VALUES (%s, %s, %s)", SEED)
@@ -633,7 +633,7 @@ class NativeAvgInterleavingTests(unittest.TestCase):
                 writer.commit()
             engine_suffix = " ENGINE=InnoDB" if engine == Dialect.MYSQL else ""
             cur.execute(
-                f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amt {amt_type})"
+                f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, grp VARCHAR(16){' COLLATE utf8mb4_bin' if engine == Dialect.MYSQL else ''} NOT NULL, amt {amt_type})"
                 f"{engine_suffix}"
             )
             # One group so every chunk folds into the same backing row.
@@ -746,7 +746,7 @@ class NativeAvgExactnessTests(unittest.TestCase):
                 cur.execute(f'SET search_path TO "{schema}"')
             engine_suffix = " ENGINE=InnoDB" if engine == Dialect.MYSQL else ""
             cur.execute(
-                f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amt {amt_type})"
+                f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, grp VARCHAR(16){' COLLATE utf8mb4_bin' if engine == Dialect.MYSQL else ''} NOT NULL, amt {amt_type})"
                 f"{engine_suffix}"
             )
             conn.commit()

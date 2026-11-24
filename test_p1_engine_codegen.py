@@ -863,7 +863,7 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
                 cur.execute(f"DROP TABLE IF EXISTS {mgr.object_prefix}store_{vn};")
             cur.execute(f"DROP TABLE IF EXISTS {base_tbl};")
             cur.execute(
-                f"CREATE TABLE {base_tbl} (id INT PRIMARY KEY, grp VARCHAR(32) NOT NULL, val INT NOT NULL, note VARCHAR(32));"
+                f"CREATE TABLE {base_tbl} (id INT PRIMARY KEY, grp VARCHAR(32) COLLATE utf8mb4_bin NOT NULL, val INT NOT NULL, note VARCHAR(32));"
             )
             cur.executemany(
                 f"INSERT INTO {base_tbl} VALUES (%s, %s, %s, %s);",
