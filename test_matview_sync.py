@@ -750,6 +750,18 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
         conn.create_collation("utf8mb4_unicode_ci", lambda a, b: (a.lower() > b.lower()) - (a.lower() < b.lower()))
     except Exception:
         pass
+    # MySQL/MariaDB collation-aware group keys: WEIGHT_STRING / SHA2 emulation (the
+    # transpiled suites only need key equality, so the UTF-8 bytes stand in for the weights).
+    _create_scalar(
+        "WEIGHT_STRING", 1,
+        lambda v: None if v is None else (bytes(v) if isinstance(v, (bytes, bytearray)) else str(v).encode("utf-8")),
+    )
+    _create_scalar(
+        "SHA2", 2,
+        lambda v, bits: None if v is None else hashlib.sha256(
+            bytes(v) if isinstance(v, (bytes, bytearray)) else str(v).encode("utf-8")
+        ).hexdigest(),
+    )
     _create_scalar("PG_ROW_KEY", -1, lambda *args: "(" + ",".join("" if a is None else str(a) for a in args) + ")")
 
     class _VarPopAgg:

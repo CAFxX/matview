@@ -2381,6 +2381,124 @@ class DialectBaseMixin(MixinHost):
             f"AND CAST({e} AS INTEGER) = {e} THEN CAST({e} AS INTEGER) ELSE {e} END)"
         )
 
+    _EXPLICIT_COLLATE_RE = re.compile(
+        r"^(?P<inner>.*\S)\s+COLLATE\s+(?P<coll>\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)\s*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    @staticmethod
+    def _balanced_outer_parens(s: str) -> bool:
+        """True when the first ``(`` of ``s`` closes at its last character."""
+        depth = 0
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    return False
+        return depth == 0
+
+    def _group_key_collation(self, expr: str) -> Tuple[str, Optional[str]]:
+        """``(expression without COLLATE, collation)`` of a group-key expression:
+        the explicit trailing ``COLLATE x``, else the declared collation of a
+        plain column reference (also ``NEW.col``/``OLD.col``); ``None`` when the
+        engine default applies."""
+        if getattr(self, "_alg_mode", "single") in ("setop", "union_all_agg"):
+            # Set operations: the collation of an output column is decided across the
+            # branches (SQLite: the left-most branch's), so per-branch key folding
+            # could disagree between branches. Keys stay byte-exact there (see TODO.md).
+            return expr, None
+        m = self._EXPLICIT_COLLATE_RE.match(expr.strip())
+        if m:
+            return m.group("inner"), m.group("coll").strip('"`').upper()
+        bare = expr.strip()
+        while bare.startswith("(") and bare.endswith(")") and self._balanced_outer_parens(bare):
+            bare = bare[1:-1].strip()
+        col = self._lookup_col_def(re.sub(r"^(?:NEW|OLD)\.", "", bare, flags=re.IGNORECASE))
+        return expr, (col.effective_collation if col is not None else None)
+
+    _MYSQL_CHAR_TYPE_RE = re.compile(r"^\s*(?:NATIONAL\s+)?(?:N?CHAR|N?VARCHAR|TINYTEXT|TEXT|MEDIUMTEXT|LONGTEXT)\b", re.I)
+
+    def _mysql_collation_weight_expr(self, expr: str) -> Optional[str]:
+        """``WEIGHT_STRING(...)`` of a MySQL/MariaDB character group key under its
+        collation (None for keys that are not character data, e.g. numbers, binary
+        strings, ENUM, or expressions whose type is unknown).
+
+        Trailing spaces are insignificant under PAD SPACE collations (every
+        collation except the MySQL ``*_0900_*`` and MariaDB ``*_nopad_*`` families),
+        so they are trimmed first. A column whose collation is unknown (schema
+        given as text without the server's catalog) is assumed to use the server
+        default: NO PAD on MySQL, PAD SPACE on MariaDB."""
+        if getattr(self, "_alg_mode", "single") in ("setop", "union_all_agg"):
+            return None  # see _group_key_collation: set-operation keys stay byte-exact
+        inner, coll = self._group_key_collation(expr)
+        explicit = coll is not None and inner is not expr and inner.strip() != expr.strip()
+        bare = inner.strip()
+        while bare.startswith("(") and bare.endswith(")") and self._balanced_outer_parens(bare):
+            bare = bare[1:-1].strip()
+        col = self._lookup_col_def(re.sub(r"^(?:NEW|OLD)\.", "", bare, flags=re.IGNORECASE))
+        if col is not None:
+            if not self._MYSQL_CHAR_TYPE_RE.match(col.data_type or ""):
+                return None
+            if "BINARY" in (col.data_type or "").upper().split("CHARACTER SET")[0]:
+                return None
+        elif not explicit:
+            return None  # unknown type: keep the byte-exact key
+        name = (coll or "").upper()
+        if name in ("BINARY",):
+            return None
+        pad_space = not ("0900" in name or "NOPAD" in name)
+        if not name:
+            pad_space = self.subdialect == EngineSubdialect.MARIADB
+        arg = f"RTRIM({inner})" if pad_space else f"({inner})"
+        if explicit and coll:
+            arg = f"{arg} COLLATE {coll.lower()}"
+        return f"WEIGHT_STRING({arg})"
+
+    def _key_col_collate_suffix(self, expr: str, data_type: str = "") -> str:
+        """`` COLLATE x`` for a MySQL/MariaDB character backing key column whose
+        base column has a known collation (so the stored key compares like the
+        base column); SQLite: see ``_sqlite_key_collate_suffix``."""
+        if self.dialect == Dialect.SQLITE:
+            return self._sqlite_key_collate_suffix(expr)
+        if self.dialect != Dialect.MYSQL or "COLLATE" in data_type.upper():
+            return ""
+        _, coll = self._group_key_collation(expr)
+        col = self._lookup_col_def(re.sub(r"^(?:NEW|OLD)\.", "", expr.strip(), flags=re.IGNORECASE))
+        if col is None or not coll or not self._MYSQL_CHAR_TYPE_RE.match(col.data_type or ""):
+            return ""
+        return f" COLLATE {coll.lower()}"
+
+    def _sqlite_key_collate_suffix(self, expr: str) -> str:
+        """`` COLLATE NOCASE`` / `` COLLATE RTRIM`` for a backing group-key column
+        (so comparisons of the stored key use the grouped expression's collation,
+        also in the reader view); empty for BINARY, other engines or no collation."""
+        if self.dialect != Dialect.SQLITE:
+            return ""
+        _, coll = self._group_key_collation(expr)
+        return f" COLLATE {coll}" if coll in ("NOCASE", "RTRIM") else ""
+
+    def _sqlite_collation_folded(self, expr: str) -> str:
+        """``expr`` rewritten so that values equal under the group key's
+        collation have the same canonical key text: NOCASE folds ASCII case (what
+        the collation itself folds), RTRIM drops trailing spaces; BINARY keeps
+        the value. Other collations cannot be reproduced in a key text and are
+        refused explicitly."""
+        inner, coll = self._group_key_collation(expr)
+        if coll in (None, "BINARY"):
+            return inner
+        e = f"({inner})"
+        if coll == "NOCASE":
+            return f"(CASE WHEN typeof({e}) = 'text' THEN lower({e}) ELSE {e} END)"
+        if coll == "RTRIM":
+            return f"(CASE WHEN typeof({e}) = 'text' THEN rtrim({e}, ' ') ELSE {e} END)"
+        raise UnsupportedMaterializedViewError(
+            f"GROUP BY / DISTINCT key {inner.strip()} uses collation {coll}, which matview cannot reproduce in "
+            "its group-key text on SQLite (supported: BINARY, NOCASE, RTRIM); group by an expression "
+            "folded explicitly (for example lower(col)) instead."
+        )
+
     def _mysql_widened_minmax_type(self, arg_type: str) -> str:
         """MySQL's window MIN/MAX result type.
 
@@ -2871,7 +2989,9 @@ class DialectBaseMixin(MixinHost):
 
         cleaned_exprs = [_clean_pk_arg(e) for e in group_exprs]
         if self.dialect == Dialect.SQLITE:
-            return " || '|' || ".join(self._sqlite_canonical_pk_term(e) for e in cleaned_exprs)
+            return " || '|' || ".join(
+                self._sqlite_canonical_pk_term(self._sqlite_collation_folded(e)) for e in cleaned_exprs
+            )
         elif self.dialect == Dialect.POSTGRES:
             # Each member goes through the view's canonical-key-text function
             # (_pg_key_text_fn_ddl), so keys equal under their type's equality
@@ -2890,10 +3010,18 @@ class DialectBaseMixin(MixinHost):
                     pg_parts.append(f"{fn}({e})")
             return f"ROW({', '.join(pg_parts)})::TEXT"
         elif self.dialect == Dialect.MYSQL:
-            parts = [
-                f"IF({e} IS NULL, 'N', CONCAT('V', OCTET_LENGTH(CAST({e} AS CHAR CHARACTER SET utf8mb4)), ':', CAST({e} AS CHAR CHARACTER SET utf8mb4)))"
-                for e in cleaned_exprs
-            ]
+            parts = []
+            for e in cleaned_exprs:
+                weight = self._mysql_collation_weight_expr(e)
+                if weight is not None:
+                    # Character key under a (case-/accent-insensitive or PAD SPACE)
+                    # collation: values that compare equal must share one key text,
+                    # so the key is the digest of the collation's own weight string.
+                    parts.append(f"IF({e} IS NULL, 'N', CONCAT('W', SHA2({weight}, 256)))")
+                else:
+                    parts.append(
+                        f"IF({e} IS NULL, 'N', CONCAT('V', OCTET_LENGTH(CAST({e} AS CHAR CHARACTER SET utf8mb4)), ':', CAST({e} AS CHAR CHARACTER SET utf8mb4)))"
+                    )
             return f"CONCAT_WS('|', {', '.join(parts)}) COLLATE utf8mb4_bin"
         return " || '|' || ".join(self._sqlite_canonical_pk_term(e) for e in cleaned_exprs)
 

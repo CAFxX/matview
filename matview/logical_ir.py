@@ -36,6 +36,21 @@ class ColumnDef:
     # True only for a SQLite single-column INTEGER PRIMARY KEY (without DESC or
     # WITHOUT ROWID), which is SQLite's guaranteed 64-bit signed-integer rowid alias.
     is_rowid_alias: bool = False
+    # The column's declared collation (SQLite ``COLLATE NOCASE``, MySQL/MariaDB
+    # ``COLLATE utf8mb4_0900_ai_ci``, ...), upper-cased; None when none is declared
+    # (the engine's default applies: BINARY on SQLite).
+    collation: Optional[str] = None
+
+    @property
+    def effective_collation(self) -> Optional[str]:
+        """The declared collation: the explicit field, else the ``COLLATE x``
+        carried inside ``data_type`` (live MySQL/MariaDB/PostgreSQL introspection)."""
+        if self.collation:
+            return self.collation
+        m = re.search(
+            r'\bCOLLATE\s+(?:"[^"]+"\.)?("[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)', self.data_type or "", re.IGNORECASE
+        )
+        return m.group(1).strip('"`').upper() if m else None
 
 
 def _strip_single_quoted_ident(s: str) -> Optional[str]:

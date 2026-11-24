@@ -1264,6 +1264,16 @@ views, each key value is mapped to a canonical text by a per-view function
   floating-point sums depend on the order its plan visits rows, which leaves
   edge cases open: [Resolve SQLite SUM Overflow Edge Cases](TODO.md) and
   [Make SQLite Join SUM/TOTAL/AVG Recompute Visit Rows in the Original View's Order (or Reject)](TODO.md).
+- Group keys follow the grouped expression's collation: values the engine groups
+  together (SQLite `COLLATE NOCASE`/`RTRIM`, MySQL/MariaDB case-/accent-insensitive
+  and PAD SPACE collations, including the servers' defaults) share one group, and the
+  stored spelling is a spelling of a current member (SQL leaves which one open).
+  Exclusions: SQLite collations other than `BINARY`/`NOCASE`/`RTRIM` are refused;
+  set-operation views (`UNION`/`INTERSECT`/`EXCEPT`, `UNION ALL` aggregates) and,
+  on MySQL/MariaDB, non-column group expressions without an explicit `COLLATE` keep
+  byte-exact keys, so case variants still split there; the displayed spelling of a
+  MySQL/MariaDB group is not refreshed when its row leaves (see TODO.md,
+  "Group keys follow the grouped expression's collation").
 - PostgreSQL and MySQL/MariaDB: integer and `DECIMAL`/`NUMERIC` `SUM`/`AVG`
   (and PostgreSQL `VAR`/`STDDEV` of them, computed in `NUMERIC`) are
   maintained exactly (PostgreSQL sums of variable-scale `NUMERIC` are

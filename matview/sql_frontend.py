@@ -1362,6 +1362,7 @@ def parse_table_schema(
         col_items: List[Tuple[str, str, bool, bool, bool]] = []
         generated_cols_lower: Set[str] = set()
         generation_exprs_lower: Dict[str, str] = {}
+        declared_collations_lower: Dict[str, str] = {}
         all_pk_cols_lower: Set[str] = set(table_pk_cols)
         ordered_pk_cols: List[str] = list(table_pk_cols_order)
         for expr_item in schema_node.expressions:
@@ -1456,6 +1457,10 @@ def parse_table_schema(
                     for c in expr_item.constraints
                 )
                 for c in expr_item.constraints:
+                    if isinstance(c.kind, sqlglot_exp.CollateColumnConstraint) and c.kind.this is not None:
+                        declared_collations_lower[col_name.lower()] = (
+                            c.kind.this.name if hasattr(c.kind.this, "name") and c.kind.this.name else c.kind.this.sql()
+                        ).strip('"`\'').upper()
                     if isinstance(c.kind, sqlglot_exp.ComputedColumnConstraint):
                         generated_cols_lower.add(col_name.lower())
                         if c.kind.this is not None:
@@ -1497,6 +1502,7 @@ def parse_table_schema(
                 generated_virtual=col_name.lower() in pg_virtual_cols_lower,
                 generation_expr=generation_exprs_lower.get(col_name.lower()),
                 is_rowid_alias=is_rowid_alias,
+                collation=declared_collations_lower.get(col_name.lower()),
             )
 
         schemas[table_name] = TableSchema(
