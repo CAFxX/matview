@@ -327,7 +327,10 @@ def _mysql_base_table_lock_stmts(
     plans = sub_plans if sub_plans else [plan]
     internal_prefixes = tuple({p.lower() for p in (object_prefix, DEFAULT_OBJECT_PREFIX, "__mv_") if p})
     schemas_lower: Dict[str, TableSchema] = {k.lower(): v for k, v in (schemas or {}).items()}
-    # Map (table_lower, db_lower) -> (leaf_table_name, sql_table_ref)
+    # Map (db, table) exactly as written -> (leaf_table_name, sql_table_ref).  Never case-fold:
+    # with lower_case_table_names=0 `ca_x` and `CA_x` are different tables, and a (db, table)
+    # pair must keep its qualifier (`other.xt` is not `xt`).  On case-insensitive servers the
+    # worst case is a duplicate (harmless) shared lock on the same table.
     targets_by_key: Dict[Tuple[str, str], Tuple[str, str]] = {}
 
     for sp in plans:
@@ -362,8 +365,8 @@ def _mysql_base_table_lock_stmts(
                     if leaf_low.startswith(internal_prefixes):
                         continue
                     db_part = tbl_node.args.get("db")
-                    db_low = (
-                        db_part.name.lower()
+                    db_key = (
+                        db_part.name
                         if isinstance(db_part, sqlglot_exp.Identifier) and db_part.name
                         else ""
                     )
@@ -371,7 +374,7 @@ def _mysql_base_table_lock_stmts(
                         this=this_part.copy(),
                         db=db_part.copy() if isinstance(db_part, sqlglot_exp.Expr) else None,
                     )
-                    key = (leaf_low, db_low)
+                    key = (db_key, this_part.name)
                     if key not in targets_by_key:
                         targets_by_key[key] = (this_part.name, clean_tbl.sql(dialect="mysql"))
                     found_from_ast = True
@@ -396,15 +399,22 @@ def _mysql_base_table_lock_stmts(
                 leaf = parts[-1]
                 if leaf.lower().startswith(internal_prefixes):
                     continue
-                db_low = parts[-2].lower() if len(parts) >= 2 else ""
+                db_key = parts[-2] if len(parts) >= 2 else ""
                 q_ref = ".".join(quote_sql_identifier(p, Dialect.MYSQL) for p in parts)
-                key = (leaf.lower(), db_low)
+                key = (db_key, leaf)
                 if key not in targets_by_key:
                     targets_by_key[key] = (leaf, q_ref)
 
     stmts: List[str] = []
-    for _, (leaf_name, q_tbl) in sorted(targets_by_key.items()):
-        ts = schemas_lower.get(leaf_name.lower())
+    for (db_key, _), (leaf_name, q_tbl) in sorted(targets_by_key.items()):
+        # Schema metadata only describes the current database: a db-qualified table (or a name
+        # that is ambiguous between tables differing only in case) gets the generic probe.
+        ts: Optional[TableSchema] = None
+        if not db_key and schemas:
+            ts = schemas.get(leaf_name)
+            if ts is None:
+                same_name = [v for k, v in schemas.items() if k.lower() == leaf_name.lower()]
+                ts = same_name[0] if len(same_name) == 1 else None
         # Check `ts.pk_columns` (populated iff a genuine PRIMARY index exists),
         # NOT `c.primary_key`: MySQL/MariaDB information_schema.columns marks
         # the first UNIQUE NOT NULL index as COLUMN_KEY='PRI' even when no
@@ -3882,14 +3892,12 @@ class MaterializedViewManager:
           1213/1205/1020).
         - SQLite: writes are serialized database-wide.
 
-        On MySQL/MariaDB, raises ``TransactionOwnershipError`` (before any SQL)
-        on a connection with an open transaction: the repair rolls back its own
-        read snapshots there, which would otherwise discard the caller's
-        uncommitted work.  (PostgreSQL and SQLite repairs commit the open
-        transaction instead; see TODO.md.)
+        Raises ``TransactionOwnershipError`` (before any SQL, through
+        ``_manager_owned_operation``) on a connection with an open transaction
+        on every dialect, so the repair never commits or, on MySQL/MariaDB
+        where it rolls back its own read snapshots, discards the caller's
+        uncommitted work.
         """
-        if self.dialect == Dialect.MYSQL:
-            self._require_idle_connection("repair_view")
         catalog = self.get_catalog()
         if view_name:
             resolved = self._resolve_catalog_name(view_name, catalog)

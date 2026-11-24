@@ -435,6 +435,36 @@ MUTANTS = (
         ),
     ),
     Mutant(
+        name="mysql-lock-planner-dedup-drops-db-qualifier",
+        source_path="matview/manager.py",
+        original='                    key = (db_key, this_part.name)',
+        replacement='                    key = ("", this_part.name)',
+        target_test=(
+            "test_concurrent_backfill.TestMySqlRepairViewLockingOffline."
+            "test_mysql_lock_planner_dedups_by_exact_db_and_name_and_skips_internal_objects"
+        ),
+    ),
+    Mutant(
+        name="mysql-lock-planner-dedup-casefolds-table-name",
+        source_path="matview/manager.py",
+        original='                    key = (db_key, this_part.name)',
+        replacement='                    key = (db_key, this_part.name.lower())',
+        target_test=(
+            "test_concurrent_backfill.TestMySqlRepairViewLockingOffline."
+            "test_mysql_lock_planner_dedups_by_exact_db_and_name_and_skips_internal_objects"
+        ),
+    ),
+    Mutant(
+        name="mysql-lock-planner-locks-internal-objects",
+        source_path="matview/manager.py",
+        original='                    if leaf_low.startswith(internal_prefixes):\n                        continue',
+        replacement='                    if False and leaf_low.startswith(internal_prefixes):\n                        continue',
+        target_test=(
+            "test_concurrent_backfill.TestMySqlRepairViewLockingOffline."
+            "test_mysql_lock_planner_dedups_by_exact_db_and_name_and_skips_internal_objects"
+        ),
+    ),
+    Mutant(
         name="mysql-recompute-subquery-skips-lock-in-share-mode",
         source_path="matview/maintenance/single.py",
         original="            lock_part = \" LOCK IN SHARE MODE\" if self.dialect == Dialect.MYSQL else \"\"",

@@ -1165,10 +1165,15 @@ observe depends on the engine:
     logging whenever the binary log is enabled (a server rule, not a matview
     option). The native tests run with binary logging disabled
     (`--skip-log-bin`), so no `binlog_format` is exercised.
+  - Cost of the `READ COMMITTED` recompute locks: concurrent `READ COMMITTED`
+    writers on a `MIN`/`MAX`/`BIT_AND`/`BIT_OR` view now deadlock more often
+    (measured: 4 writers, about 300 commits: 15 retryable `1213` deadlocks,
+    against 1 before), in exchange for never reading a stale pre-lock statement
+    snapshot (the old behaviour silently left a stale minimum/maximum).
   - Applications must retry transient InnoDB lock/snapshot errors (`1213`,
     `1205`, and `1020` `ER_CHECKREAD` under MariaDB 11.6+
     `innodb_snapshot_isolation=ON`).
-  - Known `READ COMMITTED` exclusions: (1) two concurrent `READ COMMITTED`
+  - Known `READ COMMITTED` exclusions (silent: nothing rejects or announces them per view; tracked as P0 in TODO.md): (1) two concurrent `READ COMMITTED`
     transactions writing *different* base tables of a join view do not take
     partner-table shared locks and can miss each other's delta under
     `binlog_format=ROW`; (2) two concurrent `READ COMMITTED` writers racing on

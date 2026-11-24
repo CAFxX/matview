@@ -5317,6 +5317,66 @@ class TestMySqlRepairViewLockingOffline(unittest.TestCase):
             [lock("base")],
         )
 
+    def test_mysql_lock_planner_dedups_by_exact_db_and_name_and_skips_internal_objects(self) -> None:
+        """Tables are keyed by their exact (db, name): `other.xt` is not `xt`, and with
+        lower_case_table_names=0 `ca_x` and `CA_x` are two tables.  Internal objects are never locked."""
+        from types import SimpleNamespace
+
+        from matview.logical_ir import ColumnDef, TableSchema
+        from matview.manager import _mysql_base_table_lock_stmts
+
+        def tbl(name: str) -> TableSchema:
+            return TableSchema(
+                name=name,
+                columns={"id": ColumnDef(name="id", data_type="INT", not_null=True, primary_key=True)},
+                pk_columns=["id"],
+            )
+
+        schemas = {n: tbl(n) for n in ("xt", "ca_x", "CA_x", "base")}
+
+        def lock_stmts(select_sql: str) -> List[str]:
+            plan = SimpleNamespace(
+                sub_plans=None, view_spec=SimpleNamespace(raw_select_sql=select_sql, referenced_tables=())
+            )
+            return _mysql_base_table_lock_stmts(plan, schemas=schemas)
+
+        def lock(ref: str, pk: bool = True) -> str:
+            return f"SELECT COUNT(*) FROM {ref}{' FORCE INDEX (PRIMARY)' if pk else ''} LOCK IN SHARE MODE;"
+
+        # Same table name in two databases: both locked; the qualified one gets the generic probe
+        # because the schema metadata describes only the current database.
+        self.assertEqual(
+            lock_stmts("SELECT a.id FROM xt a JOIN other.xt b ON a.id = b.id"),
+            [lock("xt"), lock("other.xt", pk=False)],
+        )
+        # Names differing only in case are different tables on lower_case_table_names=0 servers.
+        self.assertEqual(
+            lock_stmts("SELECT a.id FROM ca_x a JOIN CA_x b ON a.id = b.id"),
+            [lock("CA_x"), lock("ca_x")],
+        )
+        # The same table referenced twice is locked once.
+        self.assertEqual(
+            lock_stmts("SELECT a.id FROM xt a JOIN xt b ON a.id = b.id"),
+            [lock("xt")],
+        )
+        # Internal objects (prefixed storage/aux tables) are never locked.
+        self.assertEqual(
+            lock_stmts("SELECT a.id FROM __matview_store_v a JOIN base b ON a.id = b.id"),
+            [lock("base")],
+        )
+        # The fallback path (no parsable SELECT) applies the same keying and filter.
+        plan_fb = SimpleNamespace(
+            sub_plans=None,
+            view_spec=SimpleNamespace(
+                raw_select_sql="",
+                referenced_tables=("xt", "other.xt", "__matview_store_v", "`CA_x`", "ca_x"),
+            ),
+        )
+        self.assertEqual(
+            _mysql_base_table_lock_stmts(plan_fb, schemas=schemas),
+            [lock("CA_x"), lock("ca_x"), lock("xt"), lock("other.xt", pk=False)],
+        )
+
     def test_mysql_minmax_and_bitwise_recompute_subqueries_emit_lock_in_share_mode(self) -> None:
         from matview_sync import generate_materialized_view, parse_table_schema
 
@@ -5582,6 +5642,114 @@ class TestMySqlIsolationLevelConcurrency(unittest.TestCase):
             admin.commit()
         finally:
             for c_obj in (sess_b, sess_a, monitor):
+                try:
+                    c_obj.rollback()
+                    c_obj.close()
+                except Exception:
+                    pass
+            try:
+                admin.rollback()
+                if mgr is not None:
+                    try:
+                        mgr.drop_view(v_rec)
+                    except Exception:
+                        admin.rollback()
+                c = admin.cursor()
+                c.execute(f"DROP TABLE IF EXISTS {tbl}")
+                admin.commit()
+                c.close()
+            except Exception:
+                pass
+            admin.close()
+
+    def test_native_mysql_read_committed_delete_recompute_sees_committed_delete(self) -> None:
+        """Deterministic READ COMMITTED interleaving over a delete-only MIN/MAX view: W1 deletes
+        the group's minimum (uncommitted, holding mv(g1)); W2 deletes two other rows, one in g1, and
+        blocks on mv(g1).  After W1 commits, W2's MIN/MAX recompute must read with LOCK IN SHARE MODE
+        (a current read): reading its statement snapshot would still contain W1's deleted row and
+        leave min=3 where the live view says 7."""
+        from test_avg_concurrent_maintenance import _session_id, _wait_until_lock_waiting
+
+        dsn = self._mysql_dsn()
+        tag = f"mrcd_{uuid.uuid4().hex[:8]}"
+        tbl = f"t_{tag}"
+        v_rec = f"v_rec_{tag}"
+        admin = self._connect(dsn)
+        w1 = self._connect(dsn)
+        w2 = self._connect(dsn)
+        monitor = self._connect(dsn)
+        mgr: Optional[MaterializedViewManager] = None
+        try:
+            cur = admin.cursor()
+            cur.execute(
+                f"CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, g VARCHAR(16) NOT NULL, a BIGINT NOT NULL, "
+                "KEY idx_g (g)) ENGINE=InnoDB"
+            )
+            cur.executemany(
+                f"INSERT INTO {tbl} (id, g, a) VALUES (%s, %s, %s)",
+                [(1, "g2", 1), (2, "g1", 5), (3, "g1", 3), (4, "g1", 7)],
+            )
+            admin.commit()
+            mgr = MaterializedViewManager(admin, dialect=Dialect.MYSQL)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                mgr.register_view(
+                    f"CREATE VIEW {v_rec} AS SELECT g, MIN(a) AS mn, MAX(a) AS mx, COUNT(*) AS cnt "
+                    f"FROM {tbl} GROUP BY g;",
+                    accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                )
+            admin.commit()
+
+            sid_1 = _session_id(Dialect.MYSQL, w1)
+            sid_2 = _session_id(Dialect.MYSQL, w2)
+            c1 = w1.cursor()
+            c1.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            c1.execute("START TRANSACTION")
+            c1.execute(f"DELETE FROM {tbl} WHERE id = 3")
+
+            w2_err: List[BaseException] = []
+            w2_done = threading.Event()
+
+            def _run_w2() -> None:
+                c2 = None
+                try:
+                    c2 = w2.cursor()
+                    c2.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    c2.execute("START TRANSACTION")
+                    c2.execute(f"DELETE FROM {tbl} WHERE id IN (1, 2)")
+                    w2.commit()
+                except BaseException as exc:
+                    w2_err.append(exc)
+                    try:
+                        w2.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    if c2 is not None:
+                        try:
+                            c2.close()
+                        except Exception:
+                            pass
+                    w2_done.set()
+
+            th = threading.Thread(target=_run_w2, daemon=True)
+            th.start()
+            _wait_until_lock_waiting(Dialect.MYSQL, monitor, sid_2, w2_done, blocker_sid=sid_1)
+            w1.commit()
+            c1.close()
+            th.join(timeout=30.0)
+            self.assertFalse(th.is_alive(), "W2 hung after W1 committed")
+            self.assertEqual(w2_err, [], f"W2 failed: {w2_err!r}")
+
+            cur.execute(f"SELECT g, mn, mx, cnt FROM {v_rec} ORDER BY g")
+            got = [tuple(r) for r in cur.fetchall()]
+            cur.execute(f"SELECT g, MIN(a), MAX(a), COUNT(*) FROM {tbl} GROUP BY g ORDER BY g")
+            exp = [tuple(r) for r in cur.fetchall()]
+            self.assertEqual(got, exp, f"READ COMMITTED stale recompute after a committed delete: {got!r} != {exp!r}")
+            self.assertEqual(got, [("g1", 7, 7, 1)])
+            admin.commit()
+        finally:
+            for c_obj in (w1, w2, monitor):
                 try:
                     c_obj.rollback()
                     c_obj.close()
