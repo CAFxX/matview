@@ -31,6 +31,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import warnings
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Dict
@@ -684,6 +685,100 @@ class TestCLICompileLimitationContract(unittest.TestCase):
                     self.assertRegex(
                         err, r"VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP|cannot reproduce exactly|ORDER_SENSITIVE_AGGREGATE"
                     )
+
+
+class TestCLIDropCommand(unittest.TestCase):
+    """Destructive CLI drop is explicit, previewable, and safe without a TTY."""
+
+    VIEW_SQL = "CREATE VIEW v_drop_cli AS SELECT customer_id, COUNT(*) AS c FROM orders GROUP BY customer_id;"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        conn = sqlite3.connect(self.tmp.name)
+        conn.execute("CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, amount INT);")
+        conn.commit()
+        MaterializedViewManager(conn, dialect=Dialect.SQLITE).register_view(self.VIEW_SQL)
+        conn.close()
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.tmp.name):
+            os.unlink(self.tmp.name)
+
+    def _registered(self) -> bool:
+        mgr = MaterializedViewManager(self.tmp.name, dialect=Dialect.SQLITE)
+        try:
+            return "v_drop_cli" in mgr.get_catalog()
+        finally:
+            mgr.conn.close()
+
+    def test_drop_requires_explicit_confirmation_without_tty(self) -> None:
+        err = io.StringIO()
+        with patch("sys.stdin", io.StringIO("")), redirect_stderr(err):
+            rc = cli_main(["drop", "--db", self.tmp.name, "--view", "v_drop_cli"])
+        self.assertEqual(rc, 2)
+        self.assertIn("pass --yes", err.getvalue())
+        self.assertTrue(self._registered())
+
+    def test_drop_dry_run_has_no_side_effects(self) -> None:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cli_main(["drop", "--db", self.tmp.name, "--view", "v_drop_cli", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Would drop materialized view 'v_drop_cli'.", out.getvalue())
+        self.assertTrue(self._registered())
+
+    def test_drop_yes_removes_registered_view(self) -> None:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cli_main(["drop", "--db", self.tmp.name, "--view", "__matview_v_drop_cli", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Dropped materialized view 'v_drop_cli'.", out.getvalue())
+        self.assertFalse(self._registered())
+
+    def test_drop_missing_view_and_missing_arguments(self) -> None:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            missing = cli_main(["drop", "--db", self.tmp.name, "--view", "not_registered", "--yes"])
+        self.assertEqual(missing, 1)
+        self.assertIn("is not registered", err.getvalue())
+        with redirect_stderr(io.StringIO()):
+            missing_args = cli_main(["drop", "--db", self.tmp.name])
+        self.assertEqual(missing_args, 2)
+
+    def test_drop_interactive_confirmation_and_decline(self) -> None:
+        class TTYInput(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        with patch("sys.stdin", TTYInput("no\n")):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = cli_main(["drop", "--db", self.tmp.name, "--view", "v_drop_cli"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Cancelled.", out.getvalue())
+        self.assertTrue(self._registered())
+
+    def test_drop_interactive_confirmation_accepts_yes(self) -> None:
+        class TTYInput(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        with patch("sys.stdin", TTYInput("yes\n")):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = cli_main(["drop", "--db", self.tmp.name, "--view", "v_drop_cli"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Dropped materialized view 'v_drop_cli'.", out.getvalue())
+        self.assertFalse(self._registered())
+
+    def test_drop_rejects_conflicting_confirmation_flags(self) -> None:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = cli_main(["drop", "--db", self.tmp.name, "--view", "v_drop_cli", "--yes", "--dry-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot be combined", err.getvalue())
+        self.assertTrue(self._registered())
 
 
 if __name__ == "__main__":
