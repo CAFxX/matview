@@ -1610,7 +1610,7 @@ class NativeUnionAllMixedTypes(_ExactCase):
             f"SELECT g, SUM(x) AS s, AVG(x) AS a, COUNT(x) AS c FROM (SELECT g, k AS x FROM {t} UNION ALL SELECT g, f FROM {u}) q GROUP BY g",
             f"SELECT g, SUM(x) AS s, AVG(x) AS a FROM (SELECT g, n AS x FROM {t} UNION ALL SELECT g, r FROM {u}) q GROUP BY g",
             f"SELECT g, SUM(x) AS s, AVG(x) AS a FROM (SELECT g, f AS x FROM {t} UNION ALL SELECT g, k FROM {u}) q GROUP BY g",
-            f"SELECT g, SUM(x) AS s FROM (SELECT g, k AS x FROM {t} UNION ALL SELECT g, k * 2 FROM {u} "
+            f"SELECT g, SUM(x) AS s FROM (SELECT g, k AS x FROM {t} UNION ALL SELECT g, k FROM {u} "
             f"UNION ALL SELECT g, f FROM {t}) q GROUP BY g",
             f"SELECT g, SUM(x) AS s, AVG(x) AS a FROM (SELECT g, k AS x FROM {t} UNION ALL SELECT g, NULL FROM {u} "
             f"UNION ALL SELECT g, f FROM {u}) q GROUP BY g",
@@ -1719,9 +1719,18 @@ class NativeSubqueryScopes(_ExactCase):
                     ]
                     plans = [(fx.register(v, relaxed=False, expect_diagnostic=True), v) for v in float_views]
                     plans += [(fx.register(v, relaxed=False), v) for v in exact_views]
-                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "derived table"):
+                    # A subquery in the projection whose aggregate reads a derived
+                    # table is typed by neither the typed-expression inference nor a
+                    # provable declared column: refused (server-derived types lift it).
+                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "projected subquery"):
                         fx.register(
                             f"SELECT g, (SELECT SUM(x) FROM (SELECT x FROM {u}) d) AS s FROM {t} GROUP BY g",
+                            relaxed=False,
+                        )
+                    fx.conn.rollback()
+                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "derived table"):
+                        fx.register(
+                            f"SELECT g, (SELECT SUM(x) FROM (SELECT x * 2 AS x FROM {u}) d) AS s FROM {t} GROUP BY g",
                             relaxed=False,
                         )
                     fx.conn.rollback()

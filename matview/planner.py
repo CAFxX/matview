@@ -22,6 +22,7 @@ from .diagnostics import (
     emit as emit_diagnostics,
     exact_fallback_message,
 )
+from .scope_resolver import BASE, CONFLICT, UNKNOWN, FloatAuditNode, ScopeResolver, norm_type
 from .engines import (
     AggFunc,
     Dialect,
@@ -265,8 +266,8 @@ class PlannerMixin(MixinHost):
             + self._mysql_group_index_limitations(strategy, alg_mode)
         )
 
-    def _window_order_sensitive_exprs(self) -> List[str]:
-        """Window SUM/AVG/VAR/STDDEV over arguments that are not provably
+    def _legacy_window_order_sensitive_exprs(self) -> List[str]:
+        """Legacy (unscoped) classification of window SUM/AVG/VAR/STDDEV over arguments that are not provably
         exact (their running value also accumulates in plan order)."""
         if not self.view.has_window_func:
             return []
@@ -314,156 +315,676 @@ class PlannerMixin(MixinHost):
 
     FLOAT_RELAXED_CODE = "FLOAT_REASSOCIATION_ALLOWED"
 
-    def _order_sensitive_float_items(self) -> List[Tuple[str, str]]:
-        """(column, expression) of every aggregate whose PostgreSQL/MySQL/
-        MariaDB result depends on the order the plan reads the rows: SUM/AVG/
-        TOTAL over approximate (or not provably exact) arguments and VAR/
-        STDDEV in DOUBLE (MySQL/MariaDB every type), plain or window."""
-        if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL):
-            return []
-        items = getattr(self, "_working_select_items", None) or self.view.select_items
-        # A UNION ALL of aggregate branches classifies its columns over the
-        # common type of all branches (a float in any branch makes it float).
-        uall_branches = getattr(self, "_union_all_branch_specs", None)
-        if not uall_branches and "UNION" in (self.view.raw_select_sql or "").upper():
-            meta = self._extract_union_all_agg_metadata()
-            if meta is not None:
-                uall_branches = tuple(meta[2])
-        check_ctx = self._union_all_common_ctx(uall_branches) if uall_branches else self
-        out: List[Tuple[str, str]] = [
-            (it.alias, it.raw_expr) for it in items
-            if it.is_aggregate and check_ctx._is_order_sensitive_aggregate(it)
-        ]
-        out += [("", e) for e in self._nested_order_sensitive_exprs() if all(e != x for _, x in out)]
-        windows = self._window_order_sensitive_exprs()
-        if windows:
-            norm = lambda t: re.sub(r"\s+", "", t).lower()  # noqa: E731
-            matched = set()
-            for it in self.view.select_items:
-                for w in windows:
-                    if norm(w) in norm(it.raw_expr) or norm(it.raw_expr) in norm(w):
-                        out.append((it.alias, it.raw_expr))
-                        matched.add(w)
-            out += [("", w) for w in windows if w not in matched]
-        return list(dict.fromkeys(out))
-
     _ORDER_SENSITIVE_FN_NAMES = frozenset({
         "SUM", "AVG", "TOTAL", "VARIANCE", "VARIANCE_POP", "VAR_POP", "VAR_SAMP", "STDDEV",
         "STDDEV_POP", "STDDEV_SAMP", "STD",
     })
     _STAT_FN_NAMES = frozenset({"VARIANCE", "VARIANCE_POP", "VAR_POP", "VAR_SAMP", "STDDEV", "STDDEV_POP",
                                 "STDDEV_SAMP", "STD"})
+    # Aggregate/window functions whose result type does not depend on their
+    # argument: they never need a provable argument column.
+    _ARG_TYPE_INDEPENDENT_FN_NAMES = frozenset({
+        "COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "PERCENT_RANK", "CUME_DIST",
+    })
 
-    def _nested_order_sensitive_exprs(self) -> List[str]:
-        """Order-sensitive float aggregates anywhere in the query outside the
-        top-level projection: CTEs, derived tables, scalar subqueries,
-        subqueries in WHERE/HAVING, set-operation branches. Arguments whose
-        type cannot be proven exact count as approximate."""
+    def _float_audit_nodes(self) -> List[FloatAuditNode]:
+        """Every aggregate / window function of the whole query, each with
+        the verdict of the ONE scope resolver (scope_resolver.ScopeResolver):
+        whether its argument columns are declared base-table columns of a
+        known type, whether its value reaches a stored column, and whether
+        the engine's result depends on the order rows are read.
+
+        Cached per compilation. Classification (order sensitivity), the
+        provability guard (_refuse_unprovable_float_refresh_types) and the
+        diagnostics all read this list; none resolves a column on its own."""
+        cached = getattr(self, "_float_audit_cache", None)
+        if cached is not None:
+            return cached
+        nodes: List[FloatAuditNode] = []
+        self._float_audit_cache = nodes
+        self._float_audit_recursive = False
+        if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL):
+            return nodes
         try:
             root = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
-            return []
+            return nodes
+        self._float_audit_recursive = any(w.args.get("recursive") for w in root.find_all(sqlglot_exp.With))
+        resolver = ScopeResolver(
+            root, self._schemas_lower,
+            common_type=lambda ts, has_null: self._common_storage_type(list(ts), has_null=has_null),
+            literal_type=lambda lit: self._literal_storage_type(lit),
+            expr_type=lambda e: self._float_double_expr_type(e),
+        )
+        self._float_resolver = resolver
+        self._float_root = root
         sg = _sqlglot_dialect(self.dialect)
-        top = root if isinstance(root, sqlglot_exp.Select) else None
-        top_exprs = {id(e) for e in (top.expressions if top is not None else [])}
-        out: List[str] = []
-        self._unprovable_projection_exprs: List[str] = []
         for node in root.walk():
-            if not isinstance(node, sqlglot_exp.Func) or isinstance(node.parent, sqlglot_exp.Window) or (
-                isinstance(node.parent, sqlglot_exp.Filter) and isinstance(node.parent.parent, sqlglot_exp.Window)
-            ):
+            window: Any = None
+            if isinstance(node, sqlglot_exp.Window):
+                window = node
+                fn: Any = node.this
+                if isinstance(fn, sqlglot_exp.Filter):
+                    fn = fn.this
+            elif isinstance(node, sqlglot_exp.Func):
+                up = node.parent
+                while isinstance(up, (sqlglot_exp.Dot, sqlglot_exp.Filter, sqlglot_exp.Column)):
+                    up = up.parent
+                if isinstance(up, sqlglot_exp.Window):
+                    continue  # the call of a window function: audited with its OVER clause
+                fn = node
+            else:
                 continue
-            names = {node.sql_name().upper(), str(getattr(node, "name", "") or "").upper()}
-            if not names & self._ORDER_SENSITIVE_FN_NAMES:
+            if fn is None:
                 continue
-            # Top-level projections are handled through the working items.
-            anc, nested = node.parent, False
-            while anc is not None:
-                if isinstance(anc, sqlglot_exp.Select) and anc is not top:
-                    nested = True
-                    break
-                if id(anc) in top_exprs:
-                    break
-                anc = anc.parent
-            if top is not None and not nested and anc is not None and id(anc) in top_exprs:
-                continue
-            if top is not None and not nested:
-                # Outside any nested SELECT and outside the projection: e.g.
-                # HAVING of the top-level query; treat like a nested use.
-                pass
-            fn_node: Any = node
-            unwrapped_pg = _unwrap_pg_catalog_agg_node(node, self.dialect)
+            unwrapped_pg = _unwrap_pg_catalog_agg_node(fn, self.dialect)
             if isinstance(unwrapped_pg, sqlglot_exp.Func):
-                fn_node = unwrapped_pg
-            arg = fn_node.this
+                fn = unwrapped_pg
+            if not isinstance(fn, sqlglot_exp.Func):
+                continue
+            names = {fn.sql_name().upper(), str(getattr(fn, "name", "") or "").upper()} - {""}
+            is_aggregate = isinstance(fn, sqlglot_exp.AggFunc) or bool(
+                names & (self._ORDER_SENSITIVE_FN_NAMES | {"MIN", "MAX"})
+            )
+            if window is None and not is_aggregate:
+                continue
+            if names & self._ARG_TYPE_INDEPENDENT_FN_NAMES:
+                continue
+            site = window if window is not None else node
+            status, per, reason = resolver.resolve_expr(fn)
+            ordered = bool(names & self._ORDER_SENSITIVE_FN_NAMES)
+            sensitive = False
+            arg: Any = fn.this
             if isinstance(arg, sqlglot_exp.Distinct):
                 arg = arg.expressions[0] if arg.expressions else None
-            elif isinstance(fn_node, sqlglot_exp.Anonymous):
-                # Anonymous calls (pg_catalog.sum(...)) keep the name in
-                # `this` and the arguments in `expressions`.
-                arg = fn_node.expressions[0] if fn_node.expressions else None
-            if arg is None:
-                arg_sql = ""
-            elif isinstance(arg, str):
-                arg_sql = arg
-            else:
-                # Resolve the argument's columns through their own scope
-                # chain (a subquery's FROM before the outer query): an inner
-                # u.x DOUBLE is never typed as an outer t.x INT. Unknown
-                # (derived table, CTE, ambiguous) counts as approximate.
-                arg_sql = self._scope_qualified_sql(arg) or ""
-                if not arg_sql and nested and top is not None:
-                    # Unknown type inside a subquery of the top-level
-                    # projection: that subquery's value is a stored column,
-                    # whose type the full refresh could not derive.
-                    a2 = node.parent
-                    while a2 is not None and id(a2) not in top_exprs:
-                        a2 = a2.parent
-                    if a2 is not None:
-                        self._unprovable_projection_exprs.append(node.sql(dialect=sg))
-            is_stat = bool(names & self._STAT_FN_NAMES)
-            exact = bool(arg_sql) and self._exact_numeric_precision_scale(arg_sql) is not None
-            if (is_stat and self.dialect == Dialect.MYSQL) or not exact:
-                out.append(node.sql(dialect=sg))
+            elif isinstance(fn, sqlglot_exp.Anonymous):
+                arg = fn.expressions[0] if fn.expressions else None
+            if ordered:
+                is_stat = bool(names & self._STAT_FN_NAMES)
+                exact = False
+                synthetic = any(r.table is None for _, r in per)  # a set-operation column (common type)
+                if (status == UNKNOWN or (status == BASE and synthetic)) and arg is not None and not isinstance(arg, str):
+                    # An argument that is not a provable base column (derived
+                    # table / CTE / window result ...): the classification the
+                    # view always had; the provability guard refuses the
+                    # views it would newly accept.
+                    exact = self._float_check_ctx()._exact_numeric_precision_scale(arg.sql(dialect=sg)) is not None
+                    if exact and status == UNKNOWN:
+                        # The legacy classification reads the derived column's
+                        # defining expression by NAME; it holds only if every
+                        # declared column that expression reads is exact.
+                        leaves = resolver.leaf_columns(arg)
+                        exact = leaves is not None and all(
+                            self._numeric_precision_scale_from_type(c.data_type) is not None for c in leaves
+                        )
+                elif status == BASE and arg is not None and not isinstance(arg, str):
+                    scoped = arg.copy()
+                    for orig, cp in zip(list(arg.find_all(sqlglot_exp.Column)), list(scoped.find_all(sqlglot_exp.Column))):
+                        res = next(r for c, r in per if c is orig)
+                        new = sqlglot_exp.column(orig.name, table=res.table)
+                        if cp is scoped:
+                            scoped = new
+                        else:
+                            cp.replace(new)
+                    exact = self._exact_numeric_precision_scale(scoped.sql(dialect=sg)) is not None
+                sensitive = (is_stat and self.dialect == Dialect.MYSQL) or not exact
+            nodes.append(FloatAuditNode(
+                site=site, fn_node=fn, sql=site.sql(dialect=sg), fn_sql=fn.sql(dialect=sg), is_window=window is not None,
+                reaches=self._float_node_reaches_output(site), final=self._float_node_is_final(site),
+                status=status, per=per, reason=reason, order_sensitive=sensitive,
+                compound_expr=self._float_node_compound_top(site),
+                derived_name=self._float_node_derived_name(site),
+                in_derived=self._float_node_in_derived(site),
+            ))
+        # A value computed inside a derived table / CTE / LATERAL reaches a
+        # stored column only through the outer references to its output column.
+        # Fail closed: a star anywhere, an unnamed or set-operation column, or
+        # any reaching reference by that name (COUNT arguments excepted, they
+        # never decide a type) keeps it reaching.
+        has_star = any(
+            not isinstance(st.parent, sqlglot_exp.Count) for st in root.find_all(sqlglot_exp.Star)
+        )
+        if not has_star:
+            referenced: Set[str] = set()
+            for col in root.find_all(sqlglot_exp.Column):
+                anc, in_count = col.parent, False
+                while anc is not None and not isinstance(anc, sqlglot_exp.Select):
+                    if isinstance(anc, sqlglot_exp.Count):
+                        in_count = True
+                        break
+                    anc = anc.parent
+                if not in_count and self._float_node_reaches_output(col):
+                    referenced.add((col.name or "").lower())
+            for n in nodes:
+                if n.derived_name is not None and n.derived_name not in referenced:
+                    n.reaches = False
+        return nodes
+
+    @staticmethod
+    def _float_node_in_derived(node: Any) -> bool:
+        """True when the node lies inside the body of a derived table, a CTE or
+        a LATERAL subquery (whose columns feed the enclosing query)."""
+        cur = node
+        while cur.parent is not None:
+            parent = cur.parent
+            if isinstance(parent, sqlglot_exp.CTE):
+                return True
+            if isinstance(cur, sqlglot_exp.Subquery) and isinstance(
+                parent, (sqlglot_exp.From, sqlglot_exp.Join, sqlglot_exp.Lateral)
+            ):
+                return True
+            cur = parent
+        return False
+
+    @staticmethod
+    def _float_node_derived_name(node: Any) -> Optional[str]:
+        """Output column name of the derived table / CTE / LATERAL projection
+        item that holds the node, or None (top-level, set-operation branch,
+        unnamed item, anywhere else)."""
+        cur = node
+        for _ in range(64):
+            child, parent = cur, cur.parent
+            while parent is not None and not isinstance(parent, sqlglot_exp.Select):
+                child, parent = parent, parent.parent
+            if parent is None or child.arg_key != "expressions":
+                return None
+            name = (child.alias_or_name or "").lower()
+            holder = parent.parent
+            if isinstance(holder, sqlglot_exp.CTE):
+                return name or None
+            if isinstance(holder, sqlglot_exp.Subquery):
+                up = holder.parent
+                if isinstance(up, (sqlglot_exp.From, sqlglot_exp.Join, sqlglot_exp.Lateral)) or (
+                    isinstance(up, sqlglot_exp.Select) and holder.arg_key in ("from_", "from")
+                ):
+                    return name or None
+                cur = holder  # a scalar subquery inside an expression: keep climbing
+                continue
+            return None
+        return None
+
+    @staticmethod
+    def _float_node_reaches_output(node: Any) -> bool:
+        """Whether the node's value can flow into a stored column. Only
+        WHERE/HAVING/GROUP/ORDER/ON/QUALIFY positions (also inside nested
+        subqueries) provably cannot; every projection, derived table, CTE
+        and LATERAL body is treated as reaching (fail closed)."""
+        child, parent = node, node.parent
+        while parent is not None:
+            if isinstance(parent, sqlglot_exp.Select):
+                if child.arg_key not in ("expressions", "from_", "from", "joins", "with_", "with"):
+                    return False
+            elif isinstance(parent, sqlglot_exp.Join):
+                if child.arg_key in ("on", "using"):
+                    return False
+            elif isinstance(parent, sqlglot_exp.CTE):
+                return True
+            child, parent = parent, parent.parent
+        return True
+
+    @staticmethod
+    def _float_node_compound_top(node: Any) -> Optional[Any]:
+        """The whole projection-item expression when the node sits inside a
+        larger expression of its select item (SUM(x) * 2, COALESCE(MAX(x), 0),
+        a + b); None for a bare call (optionally FILTERed / parenthesized)."""
+        cur = node
+        while cur.parent is not None and not isinstance(cur.parent, sqlglot_exp.Select):
+            parent = cur.parent
+            if isinstance(parent, sqlglot_exp.Alias):
+                return None
+            if not isinstance(parent, (sqlglot_exp.Filter, sqlglot_exp.Paren, sqlglot_exp.Dot, sqlglot_exp.Column)):
+                top = parent
+                while top.parent is not None and not isinstance(top.parent, (sqlglot_exp.Select, sqlglot_exp.Alias)):
+                    top = top.parent
+                return top
+            cur = parent
+        return None
+
+    @staticmethod
+    def _float_node_is_final(node: Any) -> bool:
+        """True for a node directly in the projection of a final SELECT: the
+        top-level query or a branch of a top-level set operation (not a
+        derived table, CTE, LATERAL or subquery)."""
+        child, parent = node, node.parent
+        while parent is not None and not isinstance(parent, sqlglot_exp.Select):
+            child, parent = parent, parent.parent
+        if parent is None or child.arg_key != "expressions":
+            return False
+        sel = parent
+        p = sel.parent
+        while p is not None:
+            if isinstance(p, sqlglot_exp.SetOperation) or (
+                isinstance(p, sqlglot_exp.Subquery) and isinstance(p.parent, sqlglot_exp.SetOperation)
+            ):
+                p = p.parent
+                continue
+            return False
+        return True
+
+    def _float_check_ctx(self) -> Any:
+        """The context that classifies top-level aggregates: the view, or for a
+        UNION ALL aggregate view the context over the branches' common types."""
+        key = id(getattr(self, "_working_select_items", None))
+        cached = getattr(self, "_float_check_ctx_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        branches = self._float_union_branch_specs()
+        ctx = self._union_all_common_ctx(branches) if branches else self
+        self._float_check_ctx_cache = (key, ctx)
+        return ctx
+
+    def _float_union_branch_specs(self) -> Optional[Sequence[Any]]:
+        """Per-branch view specs of a UNION ALL aggregate view (None otherwise)."""
+        key = id(getattr(self, "_working_select_items", None))
+        cached = getattr(self, "_float_branch_specs_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        uall_branches = getattr(self, "_union_all_branch_specs", None)
+        if not uall_branches and "UNION" in (self.view.raw_select_sql or "").upper():
+            meta = self._extract_union_all_agg_metadata()
+            if meta is not None:
+                uall_branches = tuple(meta[2])
+        result = uall_branches or None
+        self._float_branch_specs_cache = (key, result)
+        return result
+
+    def _order_sensitive_float_items(self) -> List[Tuple[str, str]]:
+        """(column, expression) of every aggregate whose PostgreSQL/MySQL/
+        MariaDB result depends on the order the plan reads the rows: SUM/AVG/
+        TOTAL over approximate (or not provably exact) arguments and VAR/
+        STDDEV in DOUBLE (MySQL/MariaDB every type), plain or window, at any
+        nesting level. An argument is exact only when the scope resolver
+        proves every column to be a declared base-table column of an exact
+        type; the legacy top-level classification (which can only add)
+        is kept for UNION ALL common types."""
+        if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL):
+            return []
+        items = getattr(self, "_working_select_items", None) or self.view.select_items
+        # A UNION ALL of aggregate branches classifies its columns over the
+        # common type of all branches (a float in any branch makes it float).
+        uall_branches = self._float_union_branch_specs()
+        check_ctx = self._union_all_common_ctx(uall_branches) if uall_branches else self
+        out: List[Tuple[str, str]] = [
+            (it.alias, it.raw_expr) for it in items
+            if it.is_aggregate and check_ctx._is_order_sensitive_aggregate(it)
+        ]
+        norm = lambda t: re.sub(r"\s+", "", t).lower()  # noqa: E731
+        # The resolver-based verdicts plus the legacy window classification
+        # (the union only ever classifies MORE aggregates as order-sensitive,
+        # never fewer than before the resolver).
+        found = [n.sql for n in self._float_audit_nodes() if n.order_sensitive]
+        found += self._legacy_window_order_sensitive_exprs()
+        for sql in dict.fromkeys(found):
+            owner = [it for it in self.view.select_items if norm(sql) in norm(it.raw_expr)]
+            if owner:
+                out += [(it.alias, it.raw_expr) for it in owner]
+            elif all(norm(sql) not in norm(x) for _, x in out):
+                out.append(("", sql))
         return list(dict.fromkeys(out))
 
-    def _refuse_unprovable_float_refresh_types(self) -> None:
-        """The exact full refresh stores the original query's result, so the
-        stored column types must equal the engine's result types. They are
-        derived from declared source columns; a recursive CTE's column type
-        is the engine's union of its anchor and recursive terms (an INT
-        anchor with a `v * 1.5` term is NUMERIC/DECIMAL), which is not
-        derived here, so such views are refused (fail-closed, as before the
-        refresh default). Server-derived result types are a TODO."""
-        try:
-            root = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
-        except sqlglot.errors.SqlglotError:
-            return
-        self._nested_order_sensitive_exprs()
-        unprovable = list(dict.fromkeys(getattr(self, "_unprovable_projection_exprs", [])))
-        if unprovable:
-            raise UnsupportedMaterializedViewError(
-                f"View '{self.logical_view_name}' projects a subquery with {', '.join(unprovable)} "
-                f"whose argument comes from a derived table, a CTE or an ambiguous reference: the "
-                f"exact full refresh cannot prove that column's result type from declared source "
-                f"columns, so it could store a different type than the original view. Aggregate "
-                f"a base-table column directly in the subquery."
-            )
-        recursive = [
-            w for w in root.find_all(sqlglot_exp.With) if w.args.get("recursive")
-        ]
-        if not recursive:
-            return
-        listed = ", ".join(dict.fromkeys(e for _, e in self._order_sensitive_float_items()))
-        raise UnsupportedMaterializedViewError(
-            f"View '{self.logical_view_name}' uses {listed} together with a recursive CTE: "
-            f"the exact full refresh cannot prove the result types of a recursive CTE's "
-            f"columns from the declared source columns (the engine unifies the anchor and "
-            f"recursive terms), so it would store a different type than the original view. "
-            f"CAST the recursive CTE's columns (or the aggregate's argument) to an explicit "
-            f"type in the anchor and recursive terms is not enough either; materialize the "
-            f"recursive CTE's result in a table, or accept FLOAT_REASSOCIATION_ALLOWED."
+    def _float_guard_applies(self, nodes: List[FloatAuditNode]) -> bool:
+        """The provability guard covers what the refresh default newly accepts:
+        views with an order-sensitive aggregate in a top-level projection or a
+        window function anywhere (before the default, the limitation refused
+        exactly those). An order-sensitive aggregate found only in a WHERE /
+        HAVING / ON subquery or an unreferenced derived table changes no stored
+        type: such a view keeps the type derivation it always had."""
+        items = getattr(self, "_working_select_items", None) or self.view.select_items
+        check_ctx = self._float_check_ctx()
+        legacy_top = any(it.is_aggregate and check_ctx._is_order_sensitive_aggregate(it) for it in items)
+        return (
+            legacy_top
+            or any(n.order_sensitive and (n.final or n.is_window or (n.reaches and not n.in_derived)) for n in nodes)
+            or bool(self._legacy_window_order_sensitive_exprs())
         )
+
+    def _refuse_unprovable_float_refresh_types(self) -> None:
+        """Fail closed. The exact full refresh stores the original query's
+        result, so each stored column type must equal the type the engine
+        gives the original query. Types are derived from declared base-table
+        columns; the single scope resolver (scope_resolver.py) proves that for
+        every aggregate or window function whose value reaches a stored column.
+        Anything not provable is refused, as before the refresh default: an
+        argument column that is not a declared base column (expression-valued
+        derived-table/CTE column, recursive CTE, window or subquery result,
+        USING/NATURAL-merged column of different types, ambiguous, shadowed or
+        unresolved), an aggregate nested in a derived table, CTE, LATERAL or
+        subquery projection, and an argument the legacy type derivation does not
+        resolve to the same declared type. Applies to the views the default newly
+        accepts (see _float_guard_applies). Server-derived result types would
+        lift this (TODO)."""
+        nodes = self._float_audit_nodes()
+        if not self._float_guard_applies(nodes):
+            return
+        problems: List[str] = []
+        checked_compound: Set[int] = set()
+        for n in nodes:
+            if not n.reaches:
+                continue
+            if n.status != BASE:
+                problems.append(f"{n.fn_sql}: {n.reason}")
+            elif n.in_derived:
+                problems.append(
+                    f"{n.fn_sql}: aggregate inside a derived table, CTE, LATERAL or subquery projection "
+                    f"whose result type is not provable from declared columns"
+                )
+            elif (
+                n.final
+                and isinstance(n.fn_node, (sqlglot_exp.Min, sqlglot_exp.Max))
+                and n.fn_node.this is not None
+                and not isinstance(n.fn_node.this, (sqlglot_exp.Column, sqlglot_exp.Star))
+                and self._float_expr_family(n.fn_node.this, self._float_resolver) is None
+            ):
+                problems.append(
+                    f"{n.fn_sql}: MIN/MAX over an expression whose result type is not provable "
+                    f"(MIN/MAX keep the expression's own type, which is typed by operand heuristics)"
+                )
+            elif n.compound_expr is not None and id(n.compound_expr) not in checked_compound:
+                checked_compound.add(id(n.compound_expr))
+                why = self._float_compound_problem(n.compound_expr)
+                if why:
+                    problems.append(why)
+        problems += self._float_projection_problems()
+        if problems:
+            listed = "; ".join(dict.fromkeys(problems))
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}' needs the exact full refresh (floating-point "
+                f"aggregates), which stores the original query's result; the stored column types "
+                f"cannot be proven from declared base-table columns for: {listed}. Aggregate base-table "
+                f"columns directly in the outermost SELECT (or UNION ALL branches), or accept "
+                f"FLOAT_REASSOCIATION_ALLOWED."
+            )
+        if self._float_audit_recursive:
+            listed = ", ".join(dict.fromkeys(e for _, e in self._order_sensitive_float_items()))
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}' uses {listed} together with a recursive CTE: "
+                f"the exact full refresh cannot prove the result types of a recursive CTE's "
+                f"columns from the declared source columns (the engine unifies the anchor and "
+                f"recursive terms), so it would store a different type than the original view. "
+                f"Materialize the recursive CTE's result in a table, or accept "
+                f"FLOAT_REASSOCIATION_ALLOWED."
+            )
+
+    _FLOAT_TYPE_RE = re.compile(r"\b(?:FLOAT|FLOAT4|FLOAT8|DOUBLE|REAL)\b")
+    _INT_TYPE_RE = re.compile(r"\b(?:TINYINT|SMALLINT|MEDIUMINT|INTEGER|INT|INT2|INT4|INT8|BIGINT)\b")
+    _PLAIN_INT_TYPE_RE = re.compile(
+        r"(?:TINYINT|SMALLINT|MEDIUMINT|INTEGER|INT|INT2|INT4|INT8|BIGINT)(?:\s*\(\d+\))?(?:\s+UNSIGNED)?"
+    )
+
+    def _float_expr_family(self, e: Any, resolver: ScopeResolver) -> Optional[str]:
+        """'float' or 'int' when the engine's result type of ``e`` is provably
+        a binary float / an integer from the declared column types of its base
+        columns alone (aggregate leaves, + - * /, COALESCE, CASE); None otherwise."""
+        def combine(*fams: Optional[str]) -> Optional[str]:
+            if any(f is None for f in fams):
+                return None
+            if "float" in fams:
+                return "float"
+            return "int" if all(f == "int" for f in fams) else None
+
+        if isinstance(e, (sqlglot_exp.Paren, sqlglot_exp.Neg, sqlglot_exp.Filter)):
+            return self._float_expr_family(e.this, resolver)
+        if isinstance(e, sqlglot_exp.Literal):
+            if e.args.get("is_string"):
+                return None
+            return "int" if re.fullmatch(r"\d+", str(e.this)) else "dec"
+        if isinstance(e, sqlglot_exp.Column):
+            res = resolver.resolve(e)
+            if not res.ok or res.column is None:
+                return None
+            t = norm_type(res.column.data_type)
+            if self._FLOAT_TYPE_RE.search(t) and "DECIMAL" not in t and "NUMERIC" not in t:
+                return "float"
+            if self._PLAIN_INT_TYPE_RE.fullmatch(t):
+                return "int"
+            return None
+        if isinstance(e, sqlglot_exp.Count):
+            return "int"
+        if isinstance(e, (sqlglot_exp.Min, sqlglot_exp.Max)):
+            return self._float_expr_family(e.this, resolver) if e.this is not None else None
+        if isinstance(e, (sqlglot_exp.Sum, sqlglot_exp.Avg)) or (
+            isinstance(e, sqlglot_exp.Func) and e.sql_name().upper() in self._STAT_FN_NAMES
+        ):
+            arg = e.this.expressions[0] if isinstance(e.this, sqlglot_exp.Distinct) and e.this.expressions else e.this
+            fam = self._float_expr_family(arg, resolver) if arg is not None else None
+            is_stat = e.sql_name().upper() in self._STAT_FN_NAMES
+            if fam == "float" or (is_stat and self.dialect == Dialect.MYSQL and fam is not None):
+                return "float"
+            return None
+        if isinstance(e, (sqlglot_exp.Add, sqlglot_exp.Sub, sqlglot_exp.Mul)):
+            return combine(self._float_expr_family(e.this, resolver), self._float_expr_family(e.expression, resolver))
+        if isinstance(e, sqlglot_exp.Div):
+            fam = combine(self._float_expr_family(e.this, resolver), self._float_expr_family(e.expression, resolver))
+            return "float" if fam == "float" else None
+        if isinstance(e, sqlglot_exp.Coalesce):
+            return combine(self._float_expr_family(e.this, resolver), *[self._float_expr_family(x, resolver) for x in e.expressions])
+        if isinstance(e, sqlglot_exp.Case):
+            branches = [i.args.get("true") for i in e.args.get("ifs") or []]
+            if e.args.get("default") is not None:
+                branches.append(e.args["default"])
+            return combine(*[self._float_expr_family(b, resolver) if b is not None else None for b in branches]) if branches else None
+        return None
+
+    def _float_double_expr_type(self, e: Any) -> Optional[str]:
+        """The engine type of an arithmetic expression that provably yields a
+        binary DOUBLE: it reads at least one DOUBLE-class base column (REAL /
+        FLOAT4 excluded on PostgreSQL, whose float4 arithmetic type is not
+        derived here) and combines only numeric columns and literals with
+        + - * /. None otherwise (not provable)."""
+        resolver: Optional[ScopeResolver] = getattr(self, "_float_resolver", None)
+        if resolver is None or self._float_expr_family(e, resolver) != "float":
+            return None
+        if any(isinstance(n, sqlglot_exp.AggFunc) for n in e.find_all(sqlglot_exp.AggFunc)):
+            return None
+        for col in e.find_all(sqlglot_exp.Column):
+            r = resolver.resolve(col)
+            t = norm_type(r.column.data_type) if r.ok and r.column is not None else ""
+            if self.dialect == Dialect.POSTGRES and re.search(r"\b(?:REAL|FLOAT4)\b", t):
+                return None
+        return self._float_type()
+
+    def _float_transparent_wrapper_ok(self, expr: Any, text: str) -> bool:
+        """``COALESCE(<aggregate>, <numeric literal>...)`` (or IFNULL) yields the
+        aggregate's own type: accepted when the aggregate is a bare call
+        (no FILTER) and the stored type of the wrapper equals the stored type
+        the derivation gives the aggregate alone."""
+        if not isinstance(expr, sqlglot_exp.Coalesce) or expr.find(sqlglot_exp.Filter) is not None:
+            return False
+        head = expr.this
+        while isinstance(head, sqlglot_exp.Paren):
+            head = head.this
+        if not isinstance(head, sqlglot_exp.AggFunc) or isinstance(head, sqlglot_exp.Count):
+            return False
+        for other in expr.expressions:
+            if not isinstance(other, sqlglot_exp.Literal) or other.args.get("is_string"):
+                return False
+        sg = _sqlglot_dialect(self.dialect)
+        agg_item = _parse_single_agg_expr(head.sql(dialect=sg), "", dialect=self.dialect)
+        if agg_item is None or agg_item.agg_func is None:
+            return False
+        stored = norm_type(self._infer_expr_storage_type(SelectItem(raw_expr=text, alias="", is_aggregate=True)) or "")
+        alone = norm_type(self._infer_expr_storage_type(agg_item) or "")
+        def shape(t: str) -> str:
+            # DECIMAL(32, 0) and DECIMAL(65, 0) hold the same exact values: compare the scale only.
+            m = re.fullmatch(r"(DECIMAL|NUMERIC)\s*\(\s*\d+\s*,\s*(\d+)\s*\)", t)
+            return f"{m.group(1)}/{m.group(2)}" if m else t
+
+        return bool(stored) and shape(stored) == shape(alone)
+
+    def _float_compound_problem(self, expr: Any) -> Optional[str]:
+        """A select item that wraps aggregates in a larger expression is typed
+        by operand heuristics. Accepted only when the independent family rule
+        (_float_expr_family) proves the engine's result is a binary float or an
+        integer AND the stored-type derivation agrees on that family."""
+        resolver: Optional[ScopeResolver] = getattr(self, "_float_resolver", None)
+        sg = _sqlglot_dialect(self.dialect)
+        text = expr.sql(dialect=sg)
+        fam = self._float_expr_family(expr, resolver) if resolver is not None else None
+        if fam is None and self._float_transparent_wrapper_ok(expr, text):
+            return None
+        if fam is None:
+            return (
+                f"{text}: aggregate inside a larger expression whose result type is not provable "
+                f"(project the aggregate itself, or combine only float/integer columns)"
+            )
+        stored = self._infer_expr_storage_type(
+            SelectItem(raw_expr=text, alias="", is_aggregate=True)
+        )
+        t = norm_type(stored or "")
+        got = "float" if (self._FLOAT_TYPE_RE.search(t) and "DECIMAL" not in t) else (
+            "int" if self._INT_TYPE_RE.search(t) else "other"
+        )
+        if got != fam:
+            return f"{text}: the stored-type derivation gives {stored or '?'} but the result is a binary {fam}"
+        return None
+
+    def _float_setop_problems(self, root: Any, resolver: ScopeResolver) -> List[str]:
+        """A top-level set operation stores the first branch's derived types:
+        every other branch must project, at each position, the same typed
+        shape (the same bare aggregate function over columns of the same
+        declared types, or a column of the same declared type)."""
+        if not isinstance(root, sqlglot_exp.SetOperation):
+            return []
+        branches: List[Any] = []
+
+        def flatten(n: Any) -> None:
+            if isinstance(n, sqlglot_exp.SetOperation):
+                flatten(n.this)
+                flatten(n.expression)
+            elif isinstance(n, sqlglot_exp.Subquery):
+                flatten(n.this)
+            else:
+                branches.append(n)
+
+        flatten(root)
+        sg = _sqlglot_dialect(self.dialect)
+
+        def signature(proj: Any) -> Any:
+            """The projection with every column replaced by its declared type:
+            equal signatures give equal result types."""
+            e = proj.this if isinstance(proj, sqlglot_exp.Alias) else proj
+            while isinstance(e, sqlglot_exp.Paren):
+                e = e.this
+            orig = list(e.find_all(sqlglot_exp.Column))
+            if not orig or isinstance(e, sqlglot_exp.Count):
+                return ("count",) if isinstance(e, sqlglot_exp.Count) else None
+            res = [resolver.resolve(c) for c in orig]
+            if not all(r.ok and r.column is not None for r in res):
+                return None
+            cp = e.copy()
+            for o, c, r in zip(orig, list(cp.find_all(sqlglot_exp.Column)), res):
+                new = sqlglot_exp.Var(this="<" + norm_type(r.column.data_type if r.column else "") + ">")
+                if c is cp:
+                    cp = new
+                else:
+                    c.replace(new)
+            return (cp.sql(dialect=sg),)
+
+        problems: List[str] = []
+        sigs: List[List[Any]] = []
+        for br in branches:
+            if not isinstance(br, sqlglot_exp.Select):
+                return [f"{root.sql(dialect=sg)[:60]}: a set operation over a non-SELECT branch"]
+            sigs.append([signature(p) for p in br.expressions])
+        width = {len(x) for x in sigs}
+        if len(width) != 1:
+            return ["a set operation whose branches project a different number of columns"]
+        for pos in range(next(iter(width))):
+            col_sigs = [x[pos] for x in sigs]
+            if any(sg_ is None for sg_ in col_sigs) or len(set(col_sigs)) != 1:
+                name = branches[0].expressions[pos].sql(dialect=sg)[:60]
+                problems.append(f"{name}: the set-operation branches do not project provably identical types at this position")
+        return problems
+
+    def _float_projection_problems(self) -> List[str]:
+        """The stored column types of the outermost projection. Every column
+        its items read must resolve to a declared base column; a scalar
+        subquery in the projection is typed from text heuristics and is
+        refused; a top-level set operation must project identical typed shapes
+        in every branch; and the stored type of every item (group keys, plain
+        columns, aggregates, compound expressions) must equal the type the same
+        derivation gives when its columns are PROVEN to have the resolver's
+        declared types (a same-named column of another table, a shadowed alias,
+        a name-based lookup that picks a different table: all disagree and are
+        refused)."""
+        resolver: Optional[ScopeResolver] = getattr(self, "_float_resolver", None)
+        root = getattr(self, "_float_root", None)
+        if resolver is None or root is None:
+            return []
+        sg = _sqlglot_dialect(self.dialect)
+        problems: List[str] = self._float_setop_problems(root, resolver)
+        top: Any = root
+        while isinstance(top, (sqlglot_exp.SetOperation, sqlglot_exp.Subquery)):
+            top = top.this
+        if not isinstance(top, sqlglot_exp.Select):
+            return problems
+        norm = lambda t: re.sub(r"\s+", "", t).lower()  # noqa: E731
+        proven: Dict[str, Any] = {}
+        for proj in top.expressions:
+            for col in proj.find_all(sqlglot_exp.Column):
+                if isinstance(col.this, sqlglot_exp.Star):
+                    problems.append(f"{col.sql()}: a star in the projection")
+                    continue
+                res = resolver.resolve(col)
+                if not res.ok or res.column is None:
+                    problems.append(f"{col.sql()}: {res.reason}")
+                    continue
+                key = norm(col.sql(dialect=sg))
+                prev = proven.get(key)
+                if prev is not None and norm_type(prev.data_type) != norm_type(res.column.data_type):
+                    problems.append(f"{col.sql()}: the same text names columns of different types")
+                proven[key] = res.column
+        if problems:
+            return problems
+        actual_ctx = self._float_check_ctx()  # the context that types the stored columns
+        ctx = actual_ctx.with_ir()
+        orig_col, orig_src = ctx._lookup_col_def, ctx._lookup_source_col_def
+
+        def proven_col(expr: Optional[str]) -> Optional[ColumnDef]:
+            return proven.get(norm(expr)) if expr and norm(expr) in proven else orig_col(expr)
+
+        def proven_src(expr: Optional[str]) -> Optional[ColumnDef]:
+            return proven.get(norm(expr)) if expr and norm(expr) in proven else orig_src(expr)
+
+        ctx._lookup_col_def = proven_col  # pyright: ignore[reportAttributeAccessIssue]  # instance override: derive types from the resolver-proven columns
+        ctx._lookup_source_col_def = proven_src  # pyright: ignore[reportAttributeAccessIssue]  # instance override: derive types from the resolver-proven columns
+        for it in getattr(self, "_working_select_items", None) or self.view.select_items:
+            if re.search(r"\(\s*SELECT\b", it.raw_expr, flags=re.IGNORECASE) and self._infer_ast_expr_storage_type(
+                _unwrap_outer_parens(it.raw_expr, dialect=self.dialect)
+            ) is None:
+                problems.append(
+                    f"{it.raw_expr[:70]}: the type of a projected subquery is not derived by the typed-expression inference"
+                )
+                continue
+            actual = norm_type(actual_ctx._infer_expr_storage_type(it) or "")
+            expected = norm_type(ctx._infer_expr_storage_type(it) or "")
+            if actual != expected:
+                problems.append(
+                    f"{it.raw_expr[:70]}: stored as {actual or '?'} but its declared column types give {expected or '?'}"
+                )
+        return problems
+
+    @staticmethod
+    def _float_projection_ancestor(node: Any) -> bool:
+        """True when the node lies inside a projection item of some SELECT."""
+        child, parent = node, node.parent
+        while parent is not None:
+            if isinstance(parent, sqlglot_exp.Select) and child.arg_key == "expressions":
+                return True
+            child, parent = parent, parent.parent
+        return False
+
+    def _refuse_conflicting_float_columns(self) -> None:
+        """A column that several joined sources define with different types
+        (USING/NATURAL-merged, ambiguous) has an engine-chosen common type no
+        classification or type derivation here reproduces: refuse, under every
+        maintenance mode (a first-table guess misclassified and mistyped it)."""
+        bad = [n for n in self._float_audit_nodes() if n.reaches and n.status == CONFLICT]
+        if bad:
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}': " + "; ".join(dict.fromkeys(f"{n.fn_sql}: {n.reason}" for n in bad))
+                + ". Qualify the column with its table (t.x) or CAST it to one explicit type."
+            )
 
     def _float_relaxed_requested(self) -> bool:
         return self.FLOAT_RELAXED_CODE in set(self.accepted_limitations)
@@ -1789,6 +2310,7 @@ class PlannerMixin(MixinHost):
         return self._effective_group_by_exprs
 
     def _select_strategy_and_mode(self) -> Tuple[MaintenanceStrategy, str]:
+        self._refuse_conflicting_float_columns()
         strategy, mode = self._select_strategy_and_mode_unchecked()
         if (
             strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC

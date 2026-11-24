@@ -5501,25 +5501,34 @@ def generate_materialized_view(
     else:
         view_spec = view_sql_or_spec
 
-    compiler = IncrementalViewCompiler(
-        schemas=schemas,
-        view_spec=view_spec,
-        dialect=eff_dialect,
-        ignore_limitations=ignore_limitations,
-        accept_limitations=accept_limitations,
-        silence_diagnostics=silence_diagnostics,
-        object_prefix=object_prefix,
-        incremental_backfill=incremental_backfill,
-        batch_size=batch_size,
-        strict=strict,
-        engine_version=resolved_ev,
-        watermark_catalog_table=watermark_catalog_table,
-        pg_fillfactor=pg_fillfactor,
-        sqlite_strict_backing=sqlite_strict_backing,
-        sqlite_without_rowid=sqlite_without_rowid,
-        repair_fence_catalog_table=repair_fence_catalog_table,
-    )
-    return compiler.compile()
+    try:
+        compiler = IncrementalViewCompiler(
+            schemas=schemas,
+            view_spec=view_spec,
+            dialect=eff_dialect,
+            ignore_limitations=ignore_limitations,
+            accept_limitations=accept_limitations,
+            silence_diagnostics=silence_diagnostics,
+            object_prefix=object_prefix,
+            incremental_backfill=incremental_backfill,
+            batch_size=batch_size,
+            strict=strict,
+            engine_version=resolved_ev,
+            watermark_catalog_table=watermark_catalog_table,
+            pg_fillfactor=pg_fillfactor,
+            sqlite_strict_backing=sqlite_strict_backing,
+            sqlite_without_rowid=sqlite_without_rowid,
+            repair_fence_catalog_table=repair_fence_catalog_table,
+        )
+        return compiler.compile()
+    except RecursionError as exc:
+        # Name-based column resolution that never terminates (for example a
+        # derived-table alias equal to an inner table alias): refuse clearly.
+        raise UnsupportedMaterializedViewError(
+            f"View '{view_spec.view_name}' could not be analyzed: resolving its columns recursed without end "
+            f"(typically a derived-table alias that equals an inner table alias, or mutually dependent CTE "
+            f"columns). Rename the aliases so every derived table, CTE and table alias is distinct."
+        ) from exc
 
 
 def generate_materialized_views(

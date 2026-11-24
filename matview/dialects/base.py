@@ -25,6 +25,7 @@ from ..engines import (
     _SQL_RESERVED_KEYWORDS,
     _sqlglot_dialect,
 )
+from ..scope_resolver import BASE as SCOPE_BASE, CONFLICT as SCOPE_CONFLICT, ScopeResolver
 from ..logical_ir import ColumnDef, JoinSpec, SelectItem, TableSchema, ViewSpec
 from ..sql_frontend import (
     _has_subquery_ast,
@@ -1291,7 +1292,16 @@ class DialectBaseMixin(MixinHost):
                         b_ids.append(branch_arm_ids[br_i])
                         continue
                     if isinstance(src_e, sqlglot_exp.Column) and not isinstance(src_e.this, sqlglot_exp.Star):
-                        c_src = br_ctx._lookup_col_def(br_expr_sql) or br_ctx._lookup_col_def(src_e.name)
+                        # The column's own scope chain first (scope_resolver); a provably
+                        # ambiguous column (conflicting types) is never guessed by name.
+                        scoped = ScopeResolver(q_ast, self._schemas_lower).resolve(src_e)
+                        if scoped.status == SCOPE_CONFLICT:
+                            continue
+                        c_src = (
+                            scoped.column
+                            if scoped.status == SCOPE_BASE and scoped.column is not None
+                            else br_ctx._lookup_col_def(br_expr_sql) or br_ctx._lookup_col_def(src_e.name)
+                        )
                         if c_src is not None:
                             b_types.append(c_src.data_type)
                             b_exp_colls.append(exp_c)
@@ -1491,6 +1501,18 @@ class DialectBaseMixin(MixinHost):
 
         return None
 
+    def _scoped_base_column(self, root: Any, col: Any) -> Optional[ColumnDef]:
+        """The declared base-table column ``col`` (a node of ``root``) resolves
+        to through its own scope chain (scope_resolver.ScopeResolver); a column
+        the resolver cannot prove falls back to the unscoped name lookup ONLY
+        when it is not provably ambiguous (never for a conflicting type)."""
+        res = ScopeResolver(root, self._schemas_lower).resolve(col)
+        if res.status == SCOPE_BASE and res.column is not None:
+            return res.column
+        if res.status == SCOPE_CONFLICT:
+            return None
+        return self._lookup_col_def(col.sql().strip()) or self._lookup_col_def(col.name)
+
     def _scope_sources(self, select: Any) -> List[Tuple[str, Optional[str]]]:
         """(name or alias, base table name | None) of a SELECT's FROM/JOIN
         sources. None marks a derived table, a CTE or anything else whose
@@ -1667,7 +1689,9 @@ class DialectBaseMixin(MixinHost):
                         b_types.append(self._literal_storage_type(src_e))
                     continue
                 if isinstance(src_e, sqlglot_exp.Column):
-                    c_src = self._lookup_col_def(src_e.sql().strip()) or self._lookup_col_def(src_e.name)
+                    # Resolved in the branch's own scope (a bare name must not
+                    # take the type of the same-named column of another table).
+                    c_src = self._scoped_base_column(q_ast, src_e)
                     if c_src is None:
                         return None
                     b_types.append(c_src.data_type)
