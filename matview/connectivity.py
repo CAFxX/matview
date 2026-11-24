@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -20,6 +21,7 @@ from .engines import (
     _extract_packaging_and_tuple,
     _extract_version_tuple,
     _read_mariadb_div_precision_increment,
+    _sqlite_exposes_sqlean_statistics,
     parse_engine_version,
 )
 from .logical_ir import ColumnDef, TableIndexDef, TableSchema
@@ -95,7 +97,10 @@ def detect_engine_version(
                 row = cur.fetchone()
                 if row and row[0]:
                     v_str = str(row[0])
-                    return parse_engine_version(f"sqlite:{v_str}", default_dialect=Dialect.SQLITE)
+                    detected = parse_engine_version(f"sqlite:{v_str}", default_dialect=Dialect.SQLITE)
+                    if _sqlite_exposes_sqlean_statistics(conn, cur):
+                        detected = dataclasses.replace(detected, sqlite_native_statistics=True)
+                    return detected
             except Exception:
                 pass
             return parse_engine_version("sqlite", default_dialect=Dialect.SQLITE)

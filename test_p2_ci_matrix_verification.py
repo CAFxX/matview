@@ -1037,8 +1037,8 @@ def deferred_workflow_errors(deferred: Dict[str, Any], requirements: str) -> Lis
         if line and ">=" not in line:
             errors.append(f"requirements.txt entry without a >= floor: {line!r}")
 
-    # No sweep row may fail silently: known divergences are named exclusions in
-    # the test oracle (and pinned by a strict canary), never allowed failures.
+    # No sweep row may fail silently: known divergences are refused by the
+    # product (and pinned by a strict native test), never allowed failures.
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
             continue
@@ -1046,7 +1046,7 @@ def deferred_workflow_errors(deferred: Dict[str, Any], requirements: str) -> Lis
             errors.append(f"ci-deferred.yml job {job_name} must not set continue-on-error: {job['continue-on-error']!r}")
         for row in ((job.get("strategy") or {}).get("matrix") or {}).get("include") or []:
             if "allow-failure" in row:
-                errors.append(f"ci-deferred.yml row {row.get('name')!r} must not be allow-failure; use a named oracle exclusion")
+                errors.append(f"ci-deferred.yml row {row.get('name')!r} must not be allow-failure; refuse the divergent shape in the product and pin it with a native test")
     for job in jobs.values():
         if not isinstance(job, dict):
             continue

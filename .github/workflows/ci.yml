@@ -82,7 +82,7 @@ name: CI — Multi-Engine Materialized View Tests
 # fuzz campaigns weekly; a failing scheduled run opens or updates one issue):
 # Python 3.13–3.14; PostgreSQL 16–17 and Percona PostgreSQL 18; MySQL 26.10
 # Innovation; MariaDB 11.4 and 13.0 rolling; Percona MySQL 8.4 and 9.7;
-# SQLite3MC and sqlean (sqlean's own VAR_*/STDDEV_* are a named exclusion: see
+# SQLite3MC and sqlean (sqlean's own VAR_*/STDDEV_* views are refused: see
 # ci-deferred.yml); minimum declared Python
 # dependency versions. Extensions without feature tests are excluded, not
 # deferred.

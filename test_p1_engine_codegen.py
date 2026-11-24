@@ -2225,5 +2225,95 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
                 self.assertIn(frag, probe_section, f"{vname}: missing {frag!r} in probe block")
 
 
+class TestSqleanStatisticsRefusal(unittest.TestCase):
+    """sqlean's `stats` extension defines its own VAR_*/STDDEV_* (a single-value
+    sample statistic is 0.0, streaming accumulation), which differ from the
+    engine-neutral exact definition matview maintains on SQLite. A view that
+    uses them on a connection that really exposes them is refused explicitly;
+    the global override does not bypass it; detection is never a guess."""
+
+    SCHEMA = "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT NOT NULL, v REAL)"
+
+    @staticmethod
+    def _flagged() -> EngineVersion:
+        import dataclasses
+
+        return dataclasses.replace(parse_engine_version("sqlite:3.50.4"), sqlite_native_statistics=True)
+
+    def test_every_statistical_spelling_is_refused_even_with_ignore_limitations(self) -> None:
+        from matview_sync import UnsupportedMaterializedViewError
+
+        schemas = parse_table_schema(self.SCHEMA)
+        for fn in ("VAR_POP", "VAR_SAMP", "VARIANCE", "STDDEV_POP", "STDDEV_SAMP", "STDDEV"):
+            for shape in (
+                f"SELECT g, {fn}(v) AS s FROM t GROUP BY g",
+                f"SELECT g, 1 + {fn}(v) AS s FROM t GROUP BY g",
+                f"SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING {fn}(v) > 1",
+                f"WITH c AS (SELECT g, {fn}(v) AS s FROM t GROUP BY g) SELECT g, s FROM c",
+            ):
+                with self.subTest(shape=shape):
+                    for ignore in (False, True):
+                        # VARIANCE/STDDEV are refused on every SQLite connection (their
+                        # sample/population meaning is engine-specific): another
+                        # message, same explicit refusal.
+                        pattern = "sqlean" if fn.startswith(("VAR_", "STDDEV_")) else "."
+                        with self.assertRaisesRegex(UnsupportedMaterializedViewError, pattern):
+                            generate_materialized_view(
+                                schemas, f"CREATE VIEW v AS {shape}", dialect=Dialect.SQLITE,
+                                engine_version=self._flagged(), ignore_limitations=ignore,
+                                accept_limitations=FLOAT_OPT_IN,
+                            )
+
+    def test_other_views_and_unflagged_connections_are_unaffected(self) -> None:
+        schemas = parse_table_schema(self.SCHEMA)
+        generate_materialized_view(
+            schemas, "CREATE VIEW v AS SELECT g, SUM(v) AS s, COUNT(*) AS c FROM t GROUP BY g",
+            dialect=Dialect.SQLITE, engine_version=self._flagged(),
+        )
+        generate_materialized_view(
+            schemas, "CREATE VIEW v AS SELECT g, VAR_POP(v) AS s FROM t GROUP BY g",
+            dialect=Dialect.SQLITE, engine_version=parse_engine_version("sqlite:3.50.4"),
+        )
+
+    def test_detection_needs_the_sqlean_driver_and_its_functions(self) -> None:
+        from matview.connectivity import detect_engine_version
+
+        stats = [("var_pop",), ("stddev_samp",), ("sum",)]
+
+        def make(module: str, functions):
+            class Cursor:
+                def __init__(self) -> None:
+                    self.rows = []
+
+                def execute(self, sql: str):
+                    if sql.startswith("SELECT sqlite_version"):
+                        self.rows = [("3.50.4",)]
+                    elif sql.startswith("PRAGMA function_list"):
+                        self.rows = list(functions)
+                    return self
+
+                def fetchone(self):
+                    return self.rows[0] if self.rows else None
+
+                def fetchall(self):
+                    return list(self.rows)
+
+            class Conn:
+                dialect = Dialect.SQLITE
+
+                def cursor(self):
+                    return Cursor()
+
+            Conn.__module__ = module
+            return Conn()
+
+        self.assertTrue(detect_engine_version(make("sqlean.dbapi2", stats)).sqlite_native_statistics)
+        # A UDF of the same name on another driver is the caller's own function.
+        self.assertFalse(detect_engine_version(make("apsw", stats)).sqlite_native_statistics)
+        self.assertFalse(detect_engine_version(make("sqlite3", stats)).sqlite_native_statistics)
+        # sqlean without its stats extension.
+        self.assertFalse(detect_engine_version(make("sqlean.dbapi2", [("sum",)])).sqlite_native_statistics)
+
+
 if __name__ == "__main__":
     unittest.main()
