@@ -365,6 +365,13 @@ def items_with_unmodelled_calls(spec: ViewSpec, dialect: Dialect) -> List[Select
     return out
 
 
+def query_has_unmodelled_calls(spec: ViewSpec, dialect: Dialect) -> bool:
+    """Whether any part of the view's query (CTEs and derived tables
+    included) calls a function sqlglot does not model."""
+    node = _parse(spec.raw_select_sql, dialect)
+    return node is not None and node.find(sqlglot_exp.Anonymous) is not None
+
+
 def probe_result_types(conn: Any, dialect: Dialect, select_sql: str) -> Dict[str, str]:
     """Output column -> native type of ``select_sql``, asked from the server
     without reading data; {} when the probe fails (the caller keeps the

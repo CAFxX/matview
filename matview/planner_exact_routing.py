@@ -606,7 +606,13 @@ class ExactAggregateRoutingMixin(MixinHost):
         if native_t is None:
             return None
         node = self._item_ast(item.raw_expr)
-        if node is None or (node.find(sqlglot_exp.Anonymous) is None and not self._has_unclassified_call(item)):
+        derived = self.view.has_cte or self.view.has_subquery_in_from
+        if node is None or (
+            node.find(sqlglot_exp.Anonymous) is None and not self._has_unclassified_call(item) and not derived
+        ):
+            # (A CTE / derived-table view's columns can carry an unmodelled
+            # call's result, e.g. WITH c AS (SELECT my_sum(x) AS a ...): the
+            # server-reported type of the original query is the live view's.)
             return None
         # Verbatim: the server's own spelling is valid DDL (PostgreSQL
         # format_type, MySQL SHOW COLUMNS) and keeps modifiers such as UNSIGNED.

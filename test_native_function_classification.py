@@ -71,7 +71,7 @@ def _drive(
         plan = register(";\n".join(f"CREATE VIEW {n} AS {sql}" for n, sql, _ in views))
     for (name, _sql, expected), sub in zip(views, list(plan.sub_plans) or [plan]):
         test.assertEqual(sub.strategy, expected, f"[{engine}] {name}")
-        if expected != T1 and " OVER " not in _sql.upper():  # the routing fallback is announced
+        if expected != T1 and " OVER " not in _sql.upper() and not _sql.upper().startswith("WITH "):  # the routing fallback is announced
             test.assertTrue(
                 any(d.message.startswith("exact result required: falling back to strategy") for d in sub.strategy_diagnostics),
                 f"[{engine}] {name}: {sub.strategy_diagnostics!r}",
@@ -324,6 +324,8 @@ class PostgresTests(unittest.TestCase):
                 ("v_filter", "SELECT g, isum(v) FILTER (WHERE v > 1) AS a FROM t GROUP BY g", T3),
                 ("v_compound", "SELECT g, COALESCE(isum(v), 0) + 1 AS a FROM t GROUP BY g", T3),
                 ("v_over_plain", "SELECT g, isum(v) AS a FROM pv_plain GROUP BY g", T3),
+                # A user aggregate's column carried through a CTE: server type.
+                ("v_cte_col", "WITH c AS (SELECT g, isum(v) AS a FROM t GROUP BY g) SELECT g, a FROM c", T3),
                 ("v_md5_ungrouped", "SELECT md5(v) AS a FROM t", T3),
                 ("v_md5_key", "SELECT g, md5(g) AS a, COUNT(*) AS n FROM t GROUP BY g", T3),
                 ("v_lower_user", "SELECT id, lower(v) AS a FROM t", T3),
