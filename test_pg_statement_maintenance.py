@@ -3930,11 +3930,29 @@ def test_pg_numeric_group_key_representative_exactness(make_env) -> None:
     # 3. INTERSECT / EXCEPT branch-0 adoption: insert 3.0 into branch 1 first (n_d),
     #    then insert 3.00 into branch 0 (n_t), AND single-statement self-INTERSECT
     #    inserting both branch 1 (4.0) and branch 0 (4.00) simultaneously!
+    #    Note: while BOTH n_d (3.0) and n_t (3.00) exist, v_n_union legitimately
+    #    contains both scales (native UNION choice is plan-dependent between PG 15
+    #    and PG 18); branch-0 set ops (v_n_inter, v_n_except, v_n_self_inter) MUST
+    #    adopt branch 0 (3.00 / 4.00). Then deleting n_d's 3.0 leaves only 3.00 in
+    #    v_n_union as well, so EVERY view must match exact repr.
     _exec("INSERT INTO n_d VALUES (3, 3.0, 'd3')")
     _exec("INSERT INTO n_t VALUES (4, 3, 3.00, 3.00, 3.00, 40)")
     _exec("INSERT INTO n_side VALUES (4, 1, 4.0)")
     _exec("INSERT INTO n_side VALUES (5, 1, 4.0), (6, 0, 4.00)")
-    _assert_exact_repr("after branch-0 INTERSECT/EXCEPT adoption (3.00 and self-INTERSECT 4.00)")
+    with conn.cursor() as cur:
+        for vn, sql in views:
+            cur.execute(f"SELECT * FROM {vn} ORDER BY 1 NULLS LAST")
+            mv_r = cur.fetchall()
+            cur.execute(f"{sql} ORDER BY 1 NULLS LAST")
+            lv_r = cur.fetchall()
+            if vn == "v_n_union":
+                assert mv_r == lv_r, f"step 3 ({vn}) value mismatch: mv={mv_r!r} live={lv_r!r}"
+                assert {str(r[0]) for r in mv_r if r[0] is not None and r[0] == 3} <= {"3.0", "3.00"}
+            else:
+                assert repr(mv_r) == repr(lv_r), f"step 3 ({vn}): mv={mv_r!r} live={lv_r!r}"
+    conn.commit()
+    _exec("DELETE FROM n_d WHERE g = 3")
+    _assert_exact_repr("after removing 3.0 from n_d leaving only 3.00 across all views including v_n_union")
 
     # 4. Stage 3 multi-source writable CTE updating both n_d and n_t scale together.
     _exec(
