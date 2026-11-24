@@ -344,6 +344,26 @@ MUTANTS = (
             "test_pg_partition_drop_and_truncate_trigger_drift_detection"
         ),
     ),
+    Mutant(
+        name="pg-expr-probe-skips-dedup-setop-output-cols",
+        source_path="matview/dialects/pg_statement.py",
+        original="        if has_dedup_setop:\n            resolved_cols: Optional[List[str]] = None",
+        replacement="        if False and has_dedup_setop:\n            resolved_cols: Optional[List[str]] = None",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_registration_expr_type_probing_complex_shapes_codegen"
+        ),
+    ),
+    Mutant(
+        name="pg-expr-probe-drops-with-prefix",
+        source_path="matview/dialects/pg_statement.py",
+        original="            prefix = raw_sql[toks[lo].start : toks[i].start].strip() + \"\\n\"",
+        replacement="            prefix = \"\"",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_registration_expr_type_probing_complex_shapes_codegen"
+        ),
+    ),
 )
 
 

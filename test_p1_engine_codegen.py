@@ -2149,6 +2149,81 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
         self.assertIn("__mv_gd1", widen_au)
         self.assertIn("LEFT JOIN LATERAL", widen_au)
 
+    def test_postgres_registration_expr_type_probing_complex_shapes_codegen(self) -> None:
+        """PostgreSQL _pg_collation_guard_ddl emits registration-time pg_typeof
+        probes for CTEs, compound set operations, FROM subqueries, JOIN ... USING,
+        GROUPING SETS, DISTINCT ON, named WINDOW clauses, and MIN/MAX."""
+        schema = parse_table_schema(
+            """
+            CREATE TABLE cp1 (id INT PRIMARY KEY, a INT, v INT);
+            CREATE TABLE cp2 (id INT PRIMARY KEY, b INT, w INT);
+            """,
+            dialect=Dialect.POSTGRES,
+        )
+        cases = [
+            (
+                "mv_cte_ni",
+                "CREATE VIEW mv_cte_ni AS WITH c AS (SELECT DISTINCT id, ROW(a, v) AS rk, v FROM cp1) "
+                "SELECT COUNT(*) AS n FROM c GROUP BY rk;",
+                ("WITH c AS", "FROM c\nWHERE false", ", true)"),
+            ),
+            (
+                "mv_sub_ni",
+                "CREATE VIEW mv_sub_ni AS SELECT COUNT(*) AS n "
+                "FROM (SELECT DISTINCT id, ROW(a, v) AS rk, v FROM cp1) AS sub GROUP BY rk;",
+                ("AS sub\nWHERE false", "(rk) AS __mv_k", ", true)"),
+            ),
+            (
+                "mv_using",
+                "CREATE VIEW mv_using AS SELECT COUNT(*) AS n "
+                "FROM cp1 JOIN cp2 USING (id) GROUP BY ROW(cp1.a, cp2.b);",
+                ("cp1 JOIN cp2 USING (id)", "ROW(cp1.a, cp2.b)", ", true)"),
+            ),
+            (
+                "mv_union",
+                "CREATE VIEW mv_union AS SELECT ROW(a, v) AS r FROM cp1 UNION SELECT ROW(b, w) AS r FROM cp2;",
+                ("AS __mv_v(__mv_c0)", "pg_typeof(q.__mv_c0)", ", true)"),
+            ),
+            (
+                "mv_uall_br",
+                "CREATE VIEW mv_uall_br AS SELECT COUNT(*) AS n FROM cp1 GROUP BY ROW(a, v) "
+                "UNION ALL SELECT COUNT(*) AS n FROM cp2 GROUP BY ROW(b, w);",
+                ("ROW(a, v)", "ROW(b, w)", ", true)"),
+            ),
+            (
+                "mv_gsets",
+                "CREATE VIEW mv_gsets AS SELECT COUNT(*) AS n FROM cp1 GROUP BY GROUPING SETS ((ROW(a, v)), ());",
+                ("ROW(a, v)", ", true)"),
+            ),
+            (
+                "mv_dston",
+                "CREATE VIEW mv_dston AS SELECT DISTINCT ON (1) ROW(a, v) AS r, id FROM cp1 ORDER BY 1, id;",
+                ("ROW(a, v)", ", true)"),
+            ),
+            (
+                "mv_named_win",
+                "CREATE VIEW mv_named_win AS SELECT id, SUM(v) OVER w AS s FROM cp1 WINDOW w AS (PARTITION BY ROW(a, v));",
+                ("ROW(a, v)", "FROM cp1\nWHERE false", ", true)"),
+            ),
+            (
+                "mv_cnt_dist",
+                "CREATE VIEW mv_cnt_dist AS SELECT a, COUNT(DISTINCT ROW(a, v)) AS c FROM cp1 GROUP BY a;",
+                ("ROW(a, v)", ", true)"),
+            ),
+            (
+                "mv_minmax",
+                "CREATE VIEW mv_minmax AS SELECT a, MIN(ROW(a, v)) AS m FROM cp1 GROUP BY a;",
+                ("ROW(a, v)", ", false)"),
+            ),
+        ]
+        for vname, view_sql, expected_fragments in cases:
+            plan = generate_materialized_view(schema, view_sql, dialect=Dialect.POSTGRES)
+            guards = [d for d in plan.trigger_ddls if "FOR probe_rec IN" in d]
+            self.assertEqual(len(guards), 1, f"{vname}: expected registration probe block in trigger_ddls")
+            probe_section = guards[0].split("FOR probe_rec IN", 1)[1].split("END LOOP;", 1)[0]
+            for frag in expected_fragments:
+                self.assertIn(frag, probe_section, f"{vname}: missing {frag!r} in probe block")
+
 
 if __name__ == "__main__":
     unittest.main()

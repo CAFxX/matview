@@ -1403,6 +1403,276 @@ def test_unsupported_key_type_fails_closed(make_env) -> None:
     assert _pgcode(excinfo_sh.value) == "0A000", repr(excinfo_sh.value)
     assert "mv_test_ci_comp" in str(excinfo_sh.value), str(excinfo_sh.value)
 
+    # 3. Registration-time expression-type probing across CTEs (incl. WITH RECURSIVE),
+    #    compound set operations (UNION / INTERSECT / EXCEPT / per-branch UNION ALL),
+    #    FROM subqueries, JOIN ... USING, NATURAL JOIN, GROUPING SETS, DISTINCT ON,
+    #    named WINDOW clauses, and MIN/MAX over constructed nondeterministic composites.
+    cur.execute("CREATE TABLE cp2 (id INT PRIMARY KEY, b INT, w INT)")
+    cur.execute("CREATE TYPE det_pair AS (a INT, v INT)")
+    env.conn.commit()
+
+    complex_rec_views = [
+        # Non-inlined CTE (SELECT DISTINCT prevents planner inlining)
+        ViewDef(
+            "v_cte_rec_grp",
+            "WITH c AS (SELECT DISTINCT id, ROW(a, v) AS rk, v FROM cp) SELECT COUNT(*) AS n FROM c GROUP BY rk",
+        ),
+        ViewDef(
+            "v_cte_rec_dst",
+            "WITH c AS (SELECT DISTINCT id, a, v FROM cp) SELECT DISTINCT ROW(a, v) AS rk FROM c",
+        ),
+        ViewDef(
+            "v_cte_rec_win",
+            "WITH c AS (SELECT DISTINCT id, ROW(a, v) AS rk, v FROM cp) SELECT id, SUM(v) OVER (PARTITION BY rk) AS s FROM c",
+        ),
+        ViewDef(
+            "v_rec_cte_grp",
+            "WITH RECURSIVE r(id, rk, v) AS (SELECT id, ROW(a, v), v FROM cp UNION ALL SELECT id, rk, v FROM r WHERE false) SELECT COUNT(*) AS n FROM r GROUP BY rk",
+        ),
+        # Non-inlined FROM subquery
+        ViewDef(
+            "v_sub_rec_grp",
+            "SELECT COUNT(*) AS n FROM (SELECT DISTINCT id, ROW(a, v) AS rk, v FROM cp) AS sub GROUP BY rk",
+        ),
+        ViewDef(
+            "v_sub_rec_dst",
+            "SELECT DISTINCT rk FROM (SELECT DISTINCT id, ROW(a, v) AS rk FROM cp) AS sub",
+        ),
+        ViewDef(
+            "v_sub_rec_win",
+            "SELECT id, SUM(v) OVER (PARTITION BY rk) AS s FROM (SELECT DISTINCT id, ROW(a, v) AS rk, v FROM cp) AS sub",
+        ),
+        # JOIN ... USING and NATURAL JOIN
+        ViewDef(
+            "v_using_rec_grp",
+            "SELECT COUNT(*) AS n FROM cp JOIN cp2 USING (id) GROUP BY ROW(cp.a, cp2.b)",
+        ),
+        ViewDef(
+            "v_using_rec_dst",
+            "SELECT DISTINCT ROW(cp.a, cp2.b) AS rk FROM cp JOIN cp2 USING (id)",
+        ),
+        ViewDef(
+            "v_using_rec_win",
+            "SELECT id, SUM(cp.v) OVER (PARTITION BY ROW(cp.a, cp2.b)) AS s FROM cp JOIN cp2 USING (id)",
+        ),
+        ViewDef(
+            "v_nat_rec_grp",
+            "SELECT COUNT(*) AS n FROM cp NATURAL JOIN cp2 GROUP BY ROW(cp.a, cp2.b)",
+        ),
+        # Compound set operations (UNION / INTERSECT / EXCEPT / WITH + UNION / per-branch UNION ALL)
+        ViewDef(
+            "v_union_rec",
+            "SELECT ROW(a, v) AS r FROM cp UNION SELECT ROW(b, w) AS r FROM cp2",
+        ),
+        ViewDef(
+            "v_intersect_rec",
+            "SELECT ROW(a, v) AS r FROM cp INTERSECT SELECT ROW(b, w) AS r FROM cp2",
+        ),
+        ViewDef(
+            "v_except_rec",
+            "SELECT ROW(a, v) AS r FROM cp EXCEPT SELECT ROW(b, w) AS r FROM cp2",
+        ),
+        ViewDef(
+            "v_cte_union_rec",
+            "WITH c AS (SELECT ROW(a, v) AS r FROM cp) SELECT r FROM c UNION SELECT ROW(b, w) AS r FROM cp2",
+        ),
+        ViewDef(
+            "v_uall_branch_rec",
+            "SELECT COUNT(*) AS n FROM cp GROUP BY ROW(a, v) UNION ALL SELECT COUNT(*) AS n FROM cp2 GROUP BY ROW(b, w)",
+        ),
+        # GROUPING SETS, DISTINCT ON (expr, ordinal, alias), named WINDOW, COUNT(DISTINCT ...),
+        # SEARCH/CYCLE recursive CTEs, UNION with */VALUES, parenthesized UNION ALL + ORDER BY,
+        # branch-local WITH, SELECT DISTINCT *, and LAG window over DISTINCT
+        ViewDef(
+            "v_gsets_rec",
+            "SELECT COUNT(*) AS n FROM cp GROUP BY GROUPING SETS ((ROW(a, v)), ())",
+        ),
+        ViewDef(
+            "v_dston_rec",
+            "SELECT DISTINCT ON (ROW(a, v)) id, a FROM cp ORDER BY ROW(a, v), id",
+        ),
+        ViewDef(
+            "v_dston_ord",
+            "SELECT DISTINCT ON (1) ROW(a, v) AS r, id FROM cp ORDER BY 1, id",
+        ),
+        ViewDef(
+            "v_dston_al",
+            "SELECT DISTINCT ON (r) ROW(a, v) AS r, id FROM cp ORDER BY r, id",
+        ),
+        ViewDef(
+            "v_named_win_rec",
+            "SELECT id, SUM(v) OVER w AS s FROM cp WINDOW w AS (PARTITION BY ROW(a, v))",
+        ),
+        ViewDef(
+            "v_cnt_dist_rec",
+            "SELECT a, COUNT(DISTINCT ROW(a, v)) AS c FROM cp GROUP BY a",
+        ),
+        ViewDef(
+            "v_cte_search_rec",
+            "WITH RECURSIVE r(id, rk, v) AS (SELECT id, ROW(a, v), v FROM cp UNION ALL SELECT id, rk, v FROM r WHERE false) SEARCH DEPTH FIRST BY id SET ord SELECT COUNT(*) AS n FROM r GROUP BY rk",
+        ),
+        ViewDef(
+            "v_cte_cycle_rec",
+            "WITH RECURSIVE r(id, rk, v) AS (SELECT id, ROW(a, v), v FROM cp UNION ALL SELECT id, rk, v FROM r WHERE false) CYCLE id SET is_cycle USING path SELECT COUNT(*) AS n FROM r GROUP BY rk",
+        ),
+        ViewDef(
+            "v_union_star_rec",
+            "WITH c AS (SELECT id, ROW(a, v) AS r FROM cp) SELECT * FROM c UNION SELECT id, ROW(b, w) AS r FROM cp2",
+        ),
+        ViewDef(
+            "v_values_union_rec",
+            "VALUES (ROW(1, 2)) UNION SELECT ROW(a, v) FROM cp",
+        ),
+        ViewDef(
+            "v_paren_uall_ord",
+            "SELECT COUNT(*) AS n FROM cp GROUP BY a UNION ALL (SELECT COUNT(*) AS n FROM cp2 GROUP BY ROW(b, w) LIMIT 5) ORDER BY n",
+        ),
+        ViewDef(
+            "v_branch_with_rec",
+            "SELECT COUNT(*) AS n FROM cp GROUP BY a UNION ALL (WITH c AS (SELECT DISTINCT id, ROW(b, w) AS rk FROM cp2) SELECT COUNT(*) AS n FROM c GROUP BY rk)",
+        ),
+        ViewDef(
+            "v_dist_star_cte",
+            "WITH c AS (SELECT DISTINCT id, ROW(a, v) AS r FROM cp) SELECT DISTINCT * FROM c",
+        ),
+        ViewDef(
+            "v_dist_lag_rec",
+            "SELECT DISTINCT a, LAG(ROW(a, v)) OVER (PARTITION BY a ORDER BY id) AS lv FROM cp",
+        ),
+    ]
+    for vd in complex_rec_views:
+        with pytest.raises(Exception) as excinfo:
+            env.register(vd)
+        env.conn.rollback()
+        assert _pgcode(excinfo.value) == "0A000", (vd.name, repr(excinfo.value))
+        assert "record" in str(excinfo.value).lower(), (vd.name, str(excinfo.value))
+
+    # Nested nondeterministic composite constructed via expression inside CTE,
+    # FROM subquery, JOIN ... USING, UNION, COUNT(DISTINCT ...), SELECT MIN/MAX,
+    # HAVING MIN/MAX, and CTE SELECT * alias shadowing (base table `cp` has NO
+    # nondeterministic-collation columns).
+    complex_nd_views = [
+        ViewDef(
+            "v_cte_nd_comp",
+            "WITH c AS (SELECT DISTINCT id, ROW(a, v::text)::ci_leaf AS cl FROM cp) SELECT COUNT(*) AS n FROM c GROUP BY cl",
+        ),
+        ViewDef(
+            "v_sub_nd_comp",
+            "SELECT COUNT(*) AS n FROM (SELECT DISTINCT id, ROW(a, v::text)::ci_leaf AS cl FROM cp) AS sub GROUP BY cl",
+        ),
+        ViewDef(
+            "v_using_nd_comp",
+            "SELECT COUNT(*) AS n FROM cp JOIN cp2 USING (id) GROUP BY ROW(cp.a, cp2.b::text)::ci_leaf",
+        ),
+        ViewDef(
+            "v_union_nd_comp",
+            "SELECT ROW(a, v::text)::ci_leaf AS cl FROM cp UNION SELECT ROW(b, w::text)::ci_leaf AS cl FROM cp2",
+        ),
+        ViewDef(
+            "v_minmax_nd_comp",
+            "SELECT a, MIN(ROW(a, v::text)::ci_leaf) AS m FROM cp GROUP BY a",
+        ),
+        ViewDef(
+            "v_having_min_nd_comp",
+            "SELECT a, COUNT(*) AS n FROM cp GROUP BY a HAVING MIN(ROW(a, v::text)::ci_leaf) IS NOT NULL",
+        ),
+        ViewDef(
+            "v_cnt_dist_nd_comp",
+            "SELECT a, COUNT(DISTINCT ROW(a, v::text)::ci_leaf) AS c FROM cp GROUP BY a",
+        ),
+        ViewDef(
+            "v_cte_star_shadow_nd",
+            "WITH c AS (SELECT DISTINCT id, ROW(a, v::text)::ci_leaf AS c1 FROM cp), c2 AS (SELECT * FROM c) "
+            "SELECT 'ok'::TEXT AS c1, COUNT(*) AS n FROM c2 GROUP BY c1",
+        ),
+    ]
+    for vd in complex_nd_views:
+        with pytest.raises(Exception) as excinfo:
+            env.register(vd)
+        env.conn.rollback()
+        assert _pgcode(excinfo.value) == "0A000", (vd.name, repr(excinfo.value))
+        assert "mv_test_ci_comp" in str(excinfo.value), (vd.name, str(excinfo.value))
+
+    # 4. Positive controls: deterministic named composite + adversarial valid PG
+    #    shapes (quoted "order" / 'for' in FROM/ON, IS DISTINCT FROM in SELECT,
+    #    FROM-less NULL/'foo', grouped window/DISTINCT ON aggregate exprs,
+    #    SELECT DISTINCT + named WINDOW, CTE SELECT * non-shadowing) MUST register
+    #    and maintain exact rows without false-positive 0A000 or syntax errors.
+    cur.execute('CREATE DOMAIN det_txt_dom AS TEXT COLLATE "C"')
+    cur.execute("CREATE TABLE cp_txt (id INT PRIMARY KEY, s TEXT, v INT, dt det_txt_dom)")
+    env.conn.commit()
+    ok_views = [
+        ViewDef(
+            "v_cte_det_ok",
+            "WITH c AS (SELECT DISTINCT id, ROW(a, v)::det_pair AS dk FROM cp) SELECT dk, COUNT(*) AS n FROM c GROUP BY dk",
+        ),
+        ViewDef(
+            "v_sub_det_ok",
+            "SELECT dk, COUNT(*) AS n FROM (SELECT DISTINCT id, ROW(a, v)::det_pair AS dk FROM cp) AS sub GROUP BY dk",
+        ),
+        ViewDef(
+            "v_using_det_ok",
+            "SELECT ROW(cp.a, cp2.b)::det_pair AS dk, COUNT(*) AS n FROM cp JOIN cp2 USING (id) GROUP BY ROW(cp.a, cp2.b)::det_pair",
+        ),
+        ViewDef(
+            "v_union_det_ok",
+            "SELECT ROW(a, v)::det_pair AS dk FROM cp UNION SELECT ROW(b, w)::det_pair AS dk FROM cp2",
+        ),
+        ViewDef(
+            "v_minmax_det_ok",
+            "SELECT v, MIN(dt) AS m FROM cp_txt GROUP BY v",
+        ),
+        ViewDef(
+            "v_from_kw_str_ok",
+            'SELECT "order".v, COUNT(*) AS n FROM cp_txt AS "order" JOIN cp ON cp.id = "order".id AND "order".s = \'for\' GROUP BY "order".v',
+        ),
+        ViewDef(
+            "v_is_dist_from_ok",
+            "WITH c AS (SELECT DISTINCT id, a, v FROM cp) SELECT a IS DISTINCT FROM v AS eq, COUNT(*) AS n FROM c GROUP BY a, a IS DISTINCT FROM v",
+        ),
+        ViewDef(
+            "v_fromless_lit_ok",
+            "SELECT a::text AS x FROM cp UNION ALL SELECT DISTINCT 'foo'",
+        ),
+        ViewDef(
+            "v_fromless_null_ok",
+            "SELECT a::text AS x FROM cp UNION ALL SELECT DISTINCT NULL",
+        ),
+        ViewDef(
+            "v_grp_win_agg_ok",
+            "SELECT a, COUNT(*) AS n, ROW_NUMBER() OVER (PARTITION BY a + COUNT(*) ORDER BY a) AS rn FROM cp GROUP BY a",
+        ),
+        ViewDef(
+            "v_grp_dston_agg_ok",
+            "SELECT DISTINCT ON (a + COUNT(*)) a, COUNT(*) AS n FROM cp GROUP BY a ORDER BY a + COUNT(*), a",
+        ),
+        ViewDef(
+            "v_dist_named_win_ok",
+            "SELECT DISTINCT a, ROW_NUMBER() OVER w AS rn FROM cp WINDOW w AS (PARTITION BY a ORDER BY id)",
+        ),
+        ViewDef(
+            "v_cte_star_nonshadow_ok",
+            "WITH c AS (SELECT DISTINCT * FROM cp) SELECT ROW(a, a)::det_pair AS a, COUNT(*) AS n FROM c GROUP BY a",
+        ),
+    ]
+    for vd in ok_views:
+        env.register(vd)
+    cur.execute("INSERT INTO cp VALUES (1, 10, 20), (2, 10, 20), (3, 30, 40)")
+    cur.execute("INSERT INTO cp2 VALUES (1, 10, 20), (3, 50, 60)")
+    cur.execute(
+        "INSERT INTO cp_txt VALUES "
+        "(1, 'for', 100, 'b'::det_txt_dom), "
+        "(2, 'other', 200, 'a'::det_txt_dom), "
+        "(3, 'for', 100, 'A'::det_txt_dom)"
+    )
+    env.conn.commit()
+    env.check("after insert")
+    cur.execute("UPDATE cp SET v = 25 WHERE id = 2")
+    cur.execute("DELETE FROM cp2 WHERE id = 1")
+    cur.execute("UPDATE cp_txt SET s = 'for', dt = 'c'::det_txt_dom WHERE id = 2")
+    env.conn.commit()
+    env.check("after update/delete")
+
 
 def test_composite_and_multirange_canonical_keys(make_env, monkeypatch) -> None:
     """Field-wise composite canonicalization and range-wise multirange
