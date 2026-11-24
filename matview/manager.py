@@ -53,6 +53,7 @@ from .engines import (
 )
 from .logical_ir import (
     GROUP_KEY_PLACEHOLDERS,
+    ColumnDef,
     MaterializedViewPlan,
     TableSchema,
     ViewDiff,
@@ -313,6 +314,8 @@ def _mysql_base_table_lock_stmts(
     *,
     schemas: Optional[Dict[str, TableSchema]] = None,
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
+    current_db: Optional[str] = None,
+    foreign_schema: Optional[Callable[[str, str], Optional[TableSchema]]] = None,
 ) -> List[str]:
     """Return deterministically ordered MySQL/MariaDB InnoDB shared-lock probe
     statements (`LOCK IN SHARE MODE`) for every base table referenced by ``plan``.
@@ -322,6 +325,13 @@ def _mysql_base_table_lock_stmts(
     locks over every row, gap, and supremum — serializing ``repair_view()`` with
     concurrent writers under ``READ COMMITTED``, ``REPEATABLE READ``, and
     ``SERIALIZABLE`` regardless of ``binlog_format`` (``ROW``/``MIXED``/``STATEMENT``).
+
+    ``schemas`` describes the current database ``current_db``: a table qualified with
+    that database is the same table as the unqualified one (same dedup key, same probe).
+    A table of another database is described by ``foreign_schema(db, table)`` when
+    given; only when its keys stay unknown does it get the generic probe, which scans
+    the smallest index and so does not lock every row (it can miss writers touching
+    only non-indexed columns).
     """
     sub_plans = list(getattr(plan, "sub_plans", None) or ())
     plans = sub_plans if sub_plans else [plan]
@@ -370,6 +380,8 @@ def _mysql_base_table_lock_stmts(
                         if isinstance(db_part, sqlglot_exp.Identifier) and db_part.name
                         else ""
                     )
+                    if current_db is not None and db_key == current_db:
+                        db_key = ""  # self-qualified: the very same table as the bare name
                     clean_tbl = sqlglot_exp.Table(
                         this=this_part.copy(),
                         db=db_part.copy() if isinstance(db_part, sqlglot_exp.Expr) else None,
@@ -400,6 +412,8 @@ def _mysql_base_table_lock_stmts(
                 if leaf.lower().startswith(internal_prefixes):
                     continue
                 db_key = parts[-2] if len(parts) >= 2 else ""
+                if current_db is not None and db_key == current_db:
+                    db_key = ""
                 q_ref = ".".join(quote_sql_identifier(p, Dialect.MYSQL) for p in parts)
                 key = (db_key, leaf)
                 if key not in targets_by_key:
@@ -407,10 +421,12 @@ def _mysql_base_table_lock_stmts(
 
     stmts: List[str] = []
     for (db_key, _), (leaf_name, q_tbl) in sorted(targets_by_key.items()):
-        # Schema metadata only describes the current database: a db-qualified table (or a name
-        # that is ambiguous between tables differing only in case) gets the generic probe.
+        # `schemas` only describes the current database; another database is looked up per table
+        # and a name that is ambiguous between tables differing only in case stays unknown.
         ts: Optional[TableSchema] = None
-        if not db_key and schemas:
+        if db_key:
+            ts = foreign_schema(db_key, leaf_name) if foreign_schema is not None else None
+        elif schemas:
             ts = schemas.get(leaf_name)
             if ts is None:
                 same_name = [v for k, v in schemas.items() if k.lower() == leaf_name.lower()]
@@ -3952,6 +3968,50 @@ class MaterializedViewManager:
                 results[v_name] = "repaired"
         return results
 
+    def _mysql_current_database(self) -> Optional[str]:
+        """The connection's default database (``None`` if unknown)."""
+        try:
+            with self._cursor() as cur:
+                cur.execute("SELECT DATABASE();")
+                row = cur.fetchone()
+            self._rollback()
+        except Exception:
+            self._rollback()
+            return None
+        return str(row[0]) if row and row[0] else None
+
+    def _mysql_foreign_table_keys(self, db: str, table: str) -> Optional[TableSchema]:
+        """Primary key and column names of ``db.table`` (a table of another database) from the
+        information schema, ``None`` when the table or its keys cannot be read."""
+        try:
+            with self._cursor() as cur:
+                self._execute_param(
+                    cur,
+                    "SELECT column_name FROM information_schema.statistics "
+                    "WHERE table_schema = ? AND table_name = ? AND index_name = 'PRIMARY' "
+                    "ORDER BY seq_in_index",
+                    (db, table),
+                )
+                pk_cols = [str(r[0]) for r in cur.fetchall()]
+                self._execute_param(
+                    cur,
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
+                    (db, table),
+                )
+                cols = [str(r[0]) for r in cur.fetchall()]
+            self._rollback()
+        except Exception:
+            self._rollback()
+            return None
+        if not cols:
+            return None
+        return TableSchema(
+            name=table,
+            columns={c: ColumnDef(name=c, data_type="", primary_key=c in pk_cols) for c in cols},
+            pk_columns=tuple(pk_cols),
+        )
+
     def _repair_view_contents(
         self,
         plan: Any,
@@ -3980,7 +4040,13 @@ class MaterializedViewManager:
         if self.dialect == Dialect.MYSQL and schemas is None:
             schemas = self.fetch_schema()
         mysql_lock_stmts = (
-            _mysql_base_table_lock_stmts(plan, schemas=schemas, object_prefix=self.object_prefix)
+            _mysql_base_table_lock_stmts(
+                plan,
+                schemas=schemas,
+                object_prefix=self.object_prefix,
+                current_db=self._mysql_current_database(),
+                foreign_schema=self._mysql_foreign_table_keys,
+            )
             if self.dialect == Dialect.MYSQL
             else []
         )

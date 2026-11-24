@@ -465,6 +465,26 @@ MUTANTS = (
         ),
     ),
     Mutant(
+        name="mysql-lock-planner-self-qualified-table-not-merged",
+        source_path="matview/manager.py",
+        original='                    if current_db is not None and db_key == current_db:',
+        replacement='                    if False and current_db is not None and db_key == current_db:',
+        target_test=(
+            "test_concurrent_backfill.TestMySqlRepairViewLockingOffline."
+            "test_mysql_lock_planner_dedups_by_exact_db_and_name_and_skips_internal_objects"
+        ),
+    ),
+    Mutant(
+        name="mysql-lock-planner-ignores-foreign-db-schema-lookup",
+        source_path="matview/manager.py",
+        original='            ts = foreign_schema(db_key, leaf_name) if foreign_schema is not None else None',
+        replacement='            ts = None',
+        target_test=(
+            "test_concurrent_backfill.TestMySqlRepairViewLockingOffline."
+            "test_mysql_lock_planner_dedups_by_exact_db_and_name_and_skips_internal_objects"
+        ),
+    ),
+    Mutant(
         name="mysql-recompute-subquery-skips-lock-in-share-mode",
         source_path="matview/maintenance/single.py",
         original="            lock_part = \" LOCK IN SHARE MODE\" if self.dialect == Dialect.MYSQL else \"\"",
