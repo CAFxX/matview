@@ -3200,6 +3200,8 @@ class MaterializedViewManager:
         partition tree on PostgreSQL. Returns ``None`` if catalog queries fail
         or any referenced source table cannot be resolved (never silently omits
         an unresolved table into an incomplete snapshot)."""
+        if not callable(getattr(cur, "fetchall", None)):
+            return None
         if expected_schema_name is None:
             _, expected_schema_name, _ = self._pg_resolve_catalog_schema_meta(cur)
         unique_tables = sorted({str(t).strip() for t in table_refs if str(t).strip()})
