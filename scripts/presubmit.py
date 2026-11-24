@@ -385,7 +385,7 @@ class Step:
     index: int
     name: str
     kind: str  # run | checkout | setup-python | upload-artifact
-    condition: str  # success | always | never (matrix condition false for this cell)
+    condition: str  # success | always | failure (only after a failed step) | never (matrix condition false for this cell)
     run: Optional[str] = None
     env: Dict[str, str] = dataclasses.field(default_factory=dict)  # merged workflow+job+step env
     python_version: Optional[str] = None
@@ -562,6 +562,8 @@ def build_jobs(workflow: Mapping[str, Any], job_ids: Sequence[str]) -> List[Job]
                     cond = "success"
                 elif _strip_expr(cond_raw) == "always()":
                     cond = "always"
+                elif _strip_expr(cond_raw) == "failure()":
+                    cond = "failure"
                 elif (mcond := _MATRIX_EQ_COND_RE.fullmatch(_strip_expr(cond_raw))) is not None:
                     if mcond.group(1) not in matrix:
                         raise PlanError(f"{job_id} step {sidx}: if: refers to missing matrix key {mcond.group(1)!r}")
@@ -1028,7 +1030,10 @@ class Executor:
                 if step.condition == "never":
                     res.steps.append(StepResult(step.name, "skipped", "step condition is false for this matrix cell"))
                     continue
-                if failed and step.condition != "always" and not self.opts.keep_going:
+                if step.condition == "failure" and not failed:
+                    res.steps.append(StepResult(step.name, "skipped", "runs only after a failed step"))
+                    continue
+                if failed and step.condition not in ("always", "failure") and not self.opts.keep_going:
                     res.steps.append(StepResult(step.name, "skipped", "previous step failed"))
                     continue
                 if selected_steps is not None and step.index not in selected_steps:
