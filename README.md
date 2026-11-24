@@ -786,8 +786,9 @@ protocol at all: run it with writes to the source tables stopped.
   [Concurrency notes](#concurrency-notes) for locking and isolation details).
 - Upgrades: a view's catalog signature includes a generator version, so after
   an upgrade that changes the generated maintenance SQL, `check_schema_drift()`
-  reports the view as `drifted` and `register_view()` / `sync_views()` rebuild
-  it, subject to the replacement rules above (tested on SQLite).
+  reports the view as `drifted` and `register_view()` / `sync_views()` /
+  `repair_view()` rebuild it, subject to the replacement rules above (tested
+  natively on SQLite, PostgreSQL, MySQL, and MariaDB).
 
 ### Bulk changes
 
