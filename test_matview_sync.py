@@ -2454,6 +2454,10 @@ class TranspiledConnectionAdapter:
                 return [(raw_v,)], 1
         if s_up == "SELECT SQLITE_VERSION()":
             raise sqlite3.OperationalError("function sqlite_version() does not exist")
+        if self.dialect == Dialect.POSTGRES and "PG_SUBSCRIPTION_REL" in s_up:
+            # Logical-replication subscription probe: SQLite has none (emulation,
+            # not evidence; native coverage is test_pg_logical_subscription.py).
+            return [(0,)], 1
         if self.dialect == Dialect.POSTGRES and s_up.startswith("SELECT TO_REGCLASS("):
             name = str((params or [None])[0])
             found = self._sq_conn.execute(

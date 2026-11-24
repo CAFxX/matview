@@ -13,7 +13,6 @@ import sqlite3
 import sys
 import time
 import uuid
-import warnings
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import sqlglot
@@ -1123,8 +1122,11 @@ class MaterializedViewManager:
                 affected.append(name)
         return sorted(affected)
 
-    def _catalog_select(self, cur: Any, sql: str) -> Optional[List[Any]]:
-        """Run one catalog read; None if it failed (e.g. no catalog yet).
+    def _catalog_select(
+        self, cur: Any, sql: str, errors: Optional[List[BaseException]] = None
+    ) -> Optional[List[Any]]:
+        """Run one catalog read; None if it failed (e.g. no catalog yet; the
+        exception is appended to ``errors`` when given).
 
         Never ends a transaction it does not own: inside an open transaction
         the read runs under a savepoint that is rolled back to on failure
@@ -1138,7 +1140,9 @@ class MaterializedViewManager:
             try:
                 cur.execute(sql)
                 rows = cur.fetchall()
-            except Exception:
+            except Exception as exc:
+                if errors is not None:
+                    errors.append(exc)
                 self._savepoint_rollback_and_release(cur, "__matview_catalog_read")
                 return None
             self._savepoint_release(cur, "__matview_catalog_read")
@@ -1146,9 +1150,11 @@ class MaterializedViewManager:
         try:
             cur.execute(sql)
             return cur.fetchall()
-        except Exception:
+        except Exception as exc:
             if state is None:
                 raise
+            if errors is not None:
+                errors.append(exc)
             self._rollback()
             return None
 
@@ -2951,11 +2957,13 @@ class MaterializedViewManager:
         The subscription apply worker fires only ROW-level triggers; matview's
         PostgreSQL maintenance triggers are statement-level, so replicated
         INSERT/UPDATE/DELETE would silently not be maintained. Returns the
-        offending tables; empty when none or when the catalog cannot be read.
+        offending tables; raises UnsupportedMaterializedViewError when the
+        catalog cannot be read (unknown is unsupported).
         """
         if self.dialect != Dialect.POSTGRES:
             return []
         found: List[str] = []
+        errors: List[BaseException] = []
         with self._cursor() as cur:
             for table in sorted({str(t) for t in tables}, key=str.lower):
                 lit = "'" + quote_sql_identifier(table, self.dialect, allow_qualified=True).replace("'", "''") + "'"
@@ -2969,19 +2977,17 @@ class MaterializedViewManager:
                     f" UNION ALL SELECT i.inhparent FROM pg_catalog.pg_inherits i JOIN __mv_up ON i.inhrelid = __mv_up.relid)"
                     f" SELECT count(*) FROM pg_catalog.pg_subscription_rel sr"
                     f" WHERE sr.srrelid IN (SELECT relid FROM __mv_down UNION SELECT relid FROM __mv_up)",
+                    errors,
                 )
                 if rows is None:
-                    # Cannot tell: the view is let through (the read may fail on a
-                    # mock or a restricted role), but never silently.
-                    if not getattr(self, "_subscription_probe_warned", False):
-                        self._subscription_probe_warned = True
-                        warnings.warn(
-                            "could not read pg_subscription_rel: logical-replication subscription targets "
-                            "cannot be detected (an unsupported configuration: replicated changes would not be maintained)",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
-                    continue
+                    # Unknown is unsupported: replicated changes to a subscription
+                    # target would silently not be maintained, so a failed probe
+                    # refuses instead of letting the view through.
+                    raise UnsupportedMaterializedViewError(
+                        f"cannot determine whether table '{table}' is a logical-replication subscription target "
+                        f"(reading pg_subscription_rel failed: {errors[-1] if errors else 'no result'}); "
+                        "views over subscription targets are unsupported, so the view is refused"
+                    )
                 if int(rows[0][0]) > 0:
                     found.append(table)
         return found

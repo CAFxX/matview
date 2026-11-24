@@ -182,3 +182,43 @@ def test_subscription_refusal_wiring_without_a_publisher(monkeypatch: pytest.Mon
         with conn.cursor() as c:
             c.execute(f"DROP SCHEMA IF EXISTS {ns} CASCADE")
         conn.close()
+
+
+@needs_postgres
+def test_unreadable_subscription_catalog_refuses_instead_of_letting_the_view_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unknown is unsupported: when pg_subscription_rel cannot be read (a real
+    failed read, simulated by making the probe statement fail) registration is
+    refused with the underlying error, not waved through."""
+    ns = f"lu_{uuid.uuid4().hex[:8]}"
+    conn = psycopg2.connect(SUB_DSN)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as c:
+            c.execute(f"CREATE SCHEMA {ns}")
+            c.execute(f"SET search_path = {ns}")
+            c.execute("CREATE TABLE tt (id INT PRIMARY KEY, g INT, v INT)")
+        conn.autocommit = False
+        manager = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
+        real = MaterializedViewManager._catalog_select
+
+        def failing(self, cur, sql, errors=None):
+            if "pg_subscription_rel" in sql:
+                # A genuinely failing statement, run through the real error path.
+                return real(self, cur, "SELECT count(*) FROM pg_catalog.pg_subscription_rel_does_not_exist", errors)
+            return real(self, cur, sql, errors)
+
+        monkeypatch.setattr(MaterializedViewManager, "_catalog_select", failing)
+        with pytest.raises(UnsupportedMaterializedViewError, match="cannot determine.*pg_subscription_rel_does_not_exist"):
+            manager.register_view(f"CREATE VIEW mv AS {VIEW.format(t='tt')};")
+        conn.rollback()
+        monkeypatch.undo()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            manager.register_view(f"CREATE VIEW mv AS {VIEW.format(t='tt')};")  # the probe works again
+        conn.commit()
+    finally:
+        conn.rollback()
+        conn.autocommit = True
+        with conn.cursor() as c:
+            c.execute(f"DROP SCHEMA IF EXISTS {ns} CASCADE")
+        conn.close()
