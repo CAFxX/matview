@@ -13,7 +13,15 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from ._host import MixinHost
-from .diagnostics import Diagnostic, DiagnosticSeverity, Strategy, emit as emit_diagnostics, exact_fallback_message
+from .diagnostics import (
+    NOTE_LEAD,
+    SQLITE_STRICT_RECOMMENDED,
+    Diagnostic,
+    DiagnosticSeverity,
+    Strategy,
+    emit as emit_diagnostics,
+    exact_fallback_message,
+)
 from .engines import (
     AggFunc,
     Dialect,
@@ -42,6 +50,7 @@ from .logical_ir import (
     ViewSpec,
 )
 from .sql_frontend import (
+    _sqlite_type_affinity,
     _FN_TO_AGG_ENUM,
     _SQL_EXPR_FUNCTIONS,
     _STATISTICAL_ALIAS_NAMES,
@@ -2595,6 +2604,96 @@ class PlannerMixin(MixinHost):
         except Exception:
             return False
 
+    _STRICT_REBUILD_HINT = (
+        "SQLite cannot ALTER a table into STRICT: create the table with `CREATE TABLE <name> (...) STRICT` "
+        "(`WITHOUT ROWID, STRICT` for a WITHOUT ROWID table), copy the rows with INSERT ... SELECT, drop "
+        "the old table, rename the new one (the 12-step rebuild procedure), then re-register the view. "
+        "STRICT needs SQLite 3.37 or newer."
+    )
+
+    def _sqlite_strict_notes(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
+        """NOTE (never a warning) when a non-STRICT SQLite source table costs this view something.
+
+        A plain SQLite column only has a type *affinity*: any storage class can be stored
+        in it, so matview must assume the worst. The note names the table and the columns
+        that matter for this view and what STRICT would change. It is a recommendation:
+        exactness never depends on it."""
+        if self.dialect != Dialect.SQLITE:
+            return ()
+        strategy_map = {
+            MaintenanceStrategy.ALGEBRAIC_DELTA: Strategy.ALGEBRAIC_DELTA,
+            MaintenanceStrategy.GROUP_SCOPED_DELTA: Strategy.GROUP_SCOPED_RECOMPUTE,
+            MaintenanceStrategy.ATOMIC_QUERY_SYNC: Strategy.FULL_REFRESH,
+        }
+        plain: Dict[str, Any] = {}
+        for t in self.view.referenced_tables:
+            ts = self._schemas_lower.get(t.lower())
+            if ts is not None and ts.columns and not ts.strict:
+                plain[t] = ts
+        if not plain:
+            return ()
+        # (a) SUM / TOTAL / AVG arguments: a plain column may hold REAL or TEXT, so the
+        #     fold keeps a hidden non-integer counter and recomputes the group when one is seen.
+        agg_cols: Dict[str, Set[str]] = {t: set() for t in plain}
+        for item in self.view.select_items if self._sqlite_exact_sum_enabled() else ():
+            if not (item.is_aggregate and item.agg_func in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG) and item.arg_expr):
+                continue
+            try:
+                names = {c.name.lower() for c in parse_sql_ast(item.arg_expr, dialect=self.dialect).find_all(sqlglot_exp.Column)}
+            except Exception:
+                names = set()
+            for t, ts in plain.items():
+                agg_cols[t].update(
+                    c for c in ts.columns if c.lower() in names and _sqlite_type_affinity(ts.columns[c].data_type) == "INTEGER"
+                )
+        # (b) no trusted integer watermark column on the primary table.
+        ps = self.primary_schema
+        watermark_table = None
+        if (
+            ps is not None
+            and not ps.strict
+            and ps.name in plain
+            and self._resolve_pk_range_column() is None
+        ):
+            watermark_table = ps.name
+        out: List[Diagnostic] = []
+        for t, ts in plain.items():
+            cols = tuple(sorted(agg_cols[t]))
+            reasons: List[str] = []
+            if cols:
+                typed = ", ".join(f"{c} {ts.columns[c].data_type}" for c in cols)
+                reasons.append(
+                    f"SUM/TOTAL/AVG over {typed}: these integer-affinity columns can also hold REAL or TEXT "
+                    f"values, so every group keeps a hidden non-integer counter and is recomputed from the "
+                    f"base table whenever such a value is stored; a STRICT INTEGER column can never hold one, "
+                    f"so those recomputes cannot happen (declare the columns INTEGER or INT)"
+                )
+            if t == watermark_table:
+                reasons.append(
+                    "an incremental backfill: the primary key of this WITHOUT ROWID table is not a trusted "
+                    "64-bit integer (it may hold REAL or TEXT), so no watermark column is available and the "
+                    "backfill uses the slower group_key_batch mode (a STRICT NOT NULL integer key is trusted)"
+                )
+            if not reasons:
+                continue
+            out.append(
+                Diagnostic(
+                    code=SQLITE_STRICT_RECOMMENDED,
+                    severity=DiagnosticSeverity.NOTE,
+                    view=self.logical_view_name,
+                    strategy=strategy_map[strategy],
+                    columns=cols,
+                    expressions=(),
+                    message=(
+                        f"{NOTE_LEAD} make source table {t} STRICT. Why: " + "; ".join(reasons) + ". "
+                        f"Cost without it: group recomputes (O(group rows)) when a non-integer value is stored, "
+                        f"never a wrong result. To change it: {self._STRICT_REBUILD_HINT}"
+                    ),
+                    details={"table": t, "columns": list(cols), "reasons": reasons},
+                )
+            )
+        return tuple(out)
+
     def _fallback_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
         """Announced fallbacks of this plan (see matview.diagnostics)."""
         routed = self._exact_routing_diagnostics(strategy)
@@ -2718,6 +2817,11 @@ class PlannerMixin(MixinHost):
             existing_base_indexes=existing_inv,
         )
         strategy_diagnostics = list(self._fallback_diagnostics(raw_plan.strategy))
+        strict_notes = self._sqlite_strict_notes(raw_plan.strategy)
+        strategy_diagnostics.extend(strict_notes)
+        if strict_notes and diagnostics is not None:
+            # CLI text and --json read recommendations from the plan diagnostics.
+            diagnostics.details["recommendations"] = [d.to_dict() for d in strict_notes]
         emit_diagnostics(strategy_diagnostics)
         return MaterializedViewPlan(
             dialect=raw_plan.dialect,

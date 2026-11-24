@@ -27,6 +27,7 @@ _LOG = logging.getLogger("matview")
 
 EXACT_LEAD = "exact result required: falling back to strategy"
 RELAXED_LEAD = "relaxed result allowed: using strategy"
+NOTE_LEAD = "recommendation:"
 
 
 class Strategy(str, Enum):
@@ -39,6 +40,7 @@ class Strategy(str, Enum):
 
 
 class DiagnosticSeverity(str, Enum):
+    NOTE = "note"  # recommendation: nothing about the result guarantee changed; never a Python warning
     INFO = "info"
     WARNING = "warning"
 
@@ -46,6 +48,7 @@ class DiagnosticSeverity(str, Enum):
 # Diagnostic codes (open registry).
 FLOAT_EXACT_REFRESH = "FLOAT_EXACT_REFRESH"
 FLOAT_RELAXED_MAINTENANCE = "FLOAT_RELAXED_MAINTENANCE"
+SQLITE_STRICT_RECOMMENDED = "SQLITE_STRICT_RECOMMENDED"
 
 
 @dataclass(frozen=True)
@@ -54,7 +57,9 @@ class Diagnostic:
 
     ``columns`` and ``expressions`` name the output columns and aggregate
     expressions that triggered it; ``strategy`` is the strategy in effect;
-    ``message`` starts with ``EXACT_LEAD`` or ``RELAXED_LEAD``."""
+    ``message`` starts with ``EXACT_LEAD`` or ``RELAXED_LEAD`` (a fallback or a
+    relaxed mode) or, for a ``NOTE`` (a recommendation that changes no
+    guarantee), with ``NOTE_LEAD``."""
 
     code: str
     severity: DiagnosticSeverity
@@ -95,12 +100,17 @@ def relaxed_message(strategy: Strategy, contract: str, remedy: str) -> str:
 
 def emit(diagnostics: Iterable[Diagnostic], silence: Sequence[str] = (), stacklevel: int = 3) -> None:
     """Emit each diagnostic as a MatviewDiagnosticWarning (and a WARNING
-    record on the ``matview`` logger) unless its code is in
+    record on the ``matview`` logger), except ``NOTE`` recommendations (an INFO
+    log record only), unless its code is in
     ``silence`` (the per-code suppression for applications that already
     decided; the global ``ignore_limitations`` never silences diagnostics)."""
     silenced = set(silence or ())
     for d in diagnostics:
-        if d.code not in silenced:
-            if _LOG.hasHandlers():  # no duplicate via logging's last-resort stderr handler
-                _LOG.warning("%s", d)
-            warnings.warn(MatviewDiagnosticWarning(d), stacklevel=stacklevel)
+        if d.code in silenced:
+            continue
+        if d.severity == DiagnosticSeverity.NOTE:
+            _LOG.info("%s", d)  # a recommendation is logged, never raised as a warning
+            continue
+        if _LOG.hasHandlers():  # no duplicate via logging's last-resort stderr handler
+            _LOG.warning("%s", d)
+        warnings.warn(MatviewDiagnosticWarning(d), stacklevel=stacklevel)

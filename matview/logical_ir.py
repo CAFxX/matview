@@ -676,6 +676,11 @@ class ViewDiff:
                 lines.append(f"  Limitations ({len(self.diagnostics.engine_limitations)}):")
                 for lim in self.diagnostics.engine_limitations:
                     lines.append(f"    * [{lim['code']}] {lim['description']}")
+            recs = list((self.diagnostics.details or {}).get("recommendations") or ())
+            if recs:
+                lines.append(f"  Recommendations ({len(recs)}):")
+                for rec in recs:
+                    lines.append(f"    * [{rec['code']}] {rec['message']}")
             perf_notes = list((self.diagnostics.details or {}).get("performance_notes") or ())
             if perf_notes:
                 lines.append(f"  Performance Notes ({len(perf_notes)}):")
