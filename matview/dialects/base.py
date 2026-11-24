@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 import sqlglot
 import sqlglot.errors
@@ -422,18 +422,20 @@ class DialectBaseMixin(MixinHost):
 
     def _lookup_source_col_def(self, expr: Optional[str]) -> Optional[ColumnDef]:
         """Resolve a column expression directly or through CTE/subquery projections."""
-        col = self._lookup_col_def(expr)
-        if col is not None or not expr:
-            return col
+        if not expr:
+            return None
         try:
             node = parse_sql_ast(expr, dialect=self.dialect)
         except (sqlglot.errors.SqlglotError, AttributeError, TypeError, ValueError):
-            return None
+            node = None
         if isinstance(node, sqlglot_exp.Column):
             resolved = self._resolve_cte_column_expression(node)
-            if isinstance(resolved, sqlglot_exp.Column):
-                return self._lookup_col_def(resolved.sql())
-        return None
+            if resolved is not None:
+                if isinstance(resolved, sqlglot_exp.Column):
+                    return self._lookup_col_def(resolved.sql())
+                # Derived/CTE expression shadows any same-named base column.
+                return None
+        return self._lookup_col_def(expr)
 
     def _sum_result_storage_type(self, item: SelectItem) -> str:
         """Preserve the engine's native SUM result type for direct numeric columns."""
@@ -589,11 +591,19 @@ class DialectBaseMixin(MixinHost):
             return None
 
         cte_queries: Dict[str, Any] = {}
+        cte_hdr_cols: Dict[str, List[str]] = {}
         for cte in query_ast.find_all(sqlglot_exp.CTE):
             cte_name = cte.alias
             if cte_name:
-                cte_queries[cte_name.lower()] = cte.this
+                cte_low = cte_name.lower()
+                cte_queries[cte_low] = cte.this
+                tbl_alias = cte.args.get("alias")
+                if isinstance(tbl_alias, sqlglot_exp.TableAlias) and tbl_alias.columns:
+                    cte_hdr_cols[cte_low] = [c.name.lower() for c in tbl_alias.columns]
+
         def unwrap_select(query: Any) -> Any:
+            while isinstance(query, sqlglot_exp.Subquery) and query.this is not None:
+                query = query.this
             while isinstance(query, sqlglot_exp.SetOperation):
                 query = query.this
             return query
@@ -638,6 +648,89 @@ class DialectBaseMixin(MixinHost):
                     col_n.replace(sqlglot_exp.column(col_n.name, table=actual_up))
             return copied
 
+        def _is_star_proj(proj: Any) -> bool:
+            return isinstance(proj, sqlglot_exp.Star) or (
+                isinstance(proj, sqlglot_exp.Column) and isinstance(proj.this, sqlglot_exp.Star)
+            )
+
+        def _set_operation_arms(node: Any) -> List[Any]:
+            while isinstance(node, sqlglot_exp.Subquery) and node.this is not None:
+                node = node.this
+            if isinstance(node, sqlglot_exp.SetOperation):
+                return _set_operation_arms(node.this) + _set_operation_arms(node.expression)
+            return [node]
+
+        def _arm_references_relation(arm: sqlglot_exp.Select, rel_low: str) -> bool:
+            from_c = arm.args.get("from_")
+            src = getattr(from_c, "this", None)
+            if isinstance(src, sqlglot_exp.Table) and (src.name or "").lower() == rel_low:
+                return True
+            for j in (arm.args.get("joins") or ()):
+                jt = getattr(j, "this", None)
+                if isinstance(jt, sqlglot_exp.Table) and (jt.name or "").lower() == rel_low:
+                    return True
+            return False
+
+        def _resolve_query_column(
+            query: Any,
+            name: str,
+            *,
+            owner_cte: Optional[str],
+            hdr_cols: Optional[List[str]],
+            seen: set[Tuple[str, str]],
+        ) -> Optional[Any]:
+            arms = _set_operation_arms(query)
+            if not arms or not all(isinstance(a, sqlglot_exp.Select) for a in arms):
+                return None
+            # For recursive CTEs, exclude self-referencing recursive arms so
+            # anchor-branch types are inferred without infinite recursion.
+            if owner_cte is not None and len(arms) > 1:
+                non_rec = [a for a in arms if not _arm_references_relation(a, owner_cte)]
+                if non_rec:
+                    arms = non_rec
+            col_idx: Optional[int] = None
+            target_low = name.lower()
+            if hdr_cols is not None:
+                if target_low in hdr_cols:
+                    col_idx = hdr_cols.index(target_low)
+            else:
+                for i_p, proj in enumerate(arms[0].expressions):
+                    if _is_star_proj(proj):
+                        return None
+                    out_n = proj.alias
+                    if not out_n and isinstance(proj, sqlglot_exp.Column):
+                        out_n = proj.name
+                    if out_n and out_n.lower() == target_low:
+                        col_idx = i_p
+                        break
+            if col_idx is None:
+                return None
+
+            arm_exprs: List[Any] = []
+            for arm in arms:
+                # Fail closed if any arm has fewer expressions or a wildcard
+                # before/at col_idx (otherwise a float arm could be silently skipped).
+                if col_idx >= len(arm.expressions):
+                    return None
+                if any(_is_star_proj(p) for p in arm.expressions[: col_idx + 1]):
+                    return None
+                proj = arm.expressions[col_idx]
+                arm_e = proj.this if isinstance(proj, sqlglot_exp.Alias) else proj
+                arm_aliases = select_table_aliases(arm)
+                arm_default = source_cte_name(arm)
+                if len(arms) == 1 and isinstance(arm_e, sqlglot_exp.Column):
+                    raw_up = arm_e.table.lower() if arm_e.table else arm_default
+                    actual_up = arm_aliases.get(raw_up, raw_up) if raw_up else None
+                    resolved = resolve(actual_up, arm_e.name, seen)
+                    if resolved is not None:
+                        return resolved
+                arm_exprs.append(bind_select_sources(arm_e, arm_aliases, arm_default))
+            if not arm_exprs:
+                return None
+            if len(arm_exprs) == 1:
+                return arm_exprs[0]
+            return sqlglot_exp.Coalesce(this=arm_exprs[0], expressions=arm_exprs[1:])
+
         root_select = unwrap_select(query_ast)
         if not isinstance(root_select, sqlglot_exp.Select):
             return None
@@ -652,28 +745,15 @@ class DialectBaseMixin(MixinHost):
             cte_query = cte_queries.get(relation)
             if cte_query is None:
                 return None
-            select = unwrap_select(cte_query)
-            if not isinstance(select, sqlglot_exp.Select):
-                return None
-            inner_aliases = select_table_aliases(select)
-            default_src = source_cte_name(select)
             next_seen = set(seen)
             next_seen.add(key)
-            for projection in select.expressions:
-                output_name = projection.alias
-                if not output_name and isinstance(projection, sqlglot_exp.Column):
-                    output_name = projection.name
-                if output_name.lower() != name.lower():
-                    continue
-                expression = projection.this if isinstance(projection, sqlglot_exp.Alias) else projection
-                if isinstance(expression, sqlglot_exp.Column):
-                    raw_up = expression.table.lower() if expression.table else default_src
-                    actual_up = inner_aliases.get(raw_up, raw_up) if raw_up else None
-                    resolved = resolve(actual_up, expression.name, next_seen)
-                    if resolved is not None:
-                        return resolved
-                return bind_select_sources(expression, inner_aliases, default_src)
-            return None
+            return _resolve_query_column(
+                cte_query,
+                name,
+                owner_cte=relation,
+                hdr_cols=cte_hdr_cols.get(relation),
+                seen=next_seen,
+            )
 
         root_aliases = select_table_aliases(root_select)
         raw_root_rel = column.table.lower() if column.table else source_cte_name(root_select)
@@ -682,46 +762,86 @@ class DialectBaseMixin(MixinHost):
         if resolved_cte is not None:
             return resolved_cte
 
-        # Resolve projected columns of derived tables as well as named CTEs.
-        # In particular, UNION/UNION ALL must merge the numeric types of every
-        # arm; looking only at the left-most SELECT can incorrectly turn an
-        # exact MySQL AVG argument into an approximate DOUBLE.
+        # Resolve projected columns of derived tables (FROM/JOIN subqueries)
+        # using the exact same positional SetOperation and alias-binding rules.
         from_clause = root_select.args.get("from_")
+        sub_sources: List[sqlglot_exp.Subquery] = []
         derived = getattr(from_clause, "this", None)
         if isinstance(derived, sqlglot_exp.Subquery):
-            derived_alias = derived.alias
+            sub_sources.append(derived)
+        for j in (root_select.args.get("joins") or ()):
+            jt = getattr(j, "this", None)
+            if isinstance(jt, sqlglot_exp.Subquery):
+                sub_sources.append(jt)
+        for sub_src in sub_sources:
+            derived_alias = sub_src.alias
             if not column.table or (derived_alias and derived_alias.lower() == column.table.lower()):
-                query = derived.this
-
-                def set_operation_arms(node: Any) -> List[Any]:
-                    if isinstance(node, sqlglot_exp.SetOperation):
-                        return set_operation_arms(node.this) + set_operation_arms(node.expression)
-                    return [node]
-
-                arms = set_operation_arms(query)
-                expressions: List[Any] = []
-                for arm in arms:
-                    if not isinstance(arm, sqlglot_exp.Select):
-                        continue
-                    for projection in arm.expressions:
-                        output_name = projection.alias
-                        if not output_name and isinstance(projection, sqlglot_exp.Column):
-                            output_name = projection.name
-                        if output_name.lower() == column.name.lower():
-                            expressions.append(
-                                projection.this if isinstance(projection, sqlglot_exp.Alias) else projection
-                            )
-                            break
-                if expressions:
-                    if len(expressions) == 1:
-                        return expressions[0]
-                    return sqlglot_exp.Coalesce(this=expressions[0], expressions=expressions[1:])
+                sub_hdr: Optional[List[str]] = None
+                ta = sub_src.args.get("alias")
+                if isinstance(ta, sqlglot_exp.TableAlias) and ta.columns:
+                    sub_hdr = [c.name.lower() for c in ta.columns]
+                res_sub = _resolve_query_column(
+                    sub_src.this,
+                    column.name,
+                    owner_cte=None,
+                    hdr_cols=sub_hdr,
+                    seen=set(),
+                )
+                if res_sub is not None:
+                    return res_sub
         return None
 
     def _exact_numeric_precision_scale(self, expr: str) -> Optional[Tuple[int, int]]:
-        """Infer exact numeric precision/scale for AVG arguments conservatively."""
+        """Infer exact numeric precision/scale for SUM/AVG/window arguments conservatively."""
         if not expr or not expr.strip():
             return None
+
+        div_inc = (
+            self.engine_version.mariadb_div_precision_increment
+            if self.dialect == Dialect.MYSQL
+            else 4
+        )
+        universal_int_fn_names = {
+            "LENGTH",
+            "CHAR_LENGTH",
+            "CHARACTER_LENGTH",
+            "OCTET_LENGTH",
+            "BIT_LENGTH",
+            "STRPOS",
+            "STR_POSITION",
+            "POSITION",
+            "ASCII",
+        }
+        # Note: TIME_TO_SEC is intentionally excluded because MariaDB returns
+        # DOUBLE (fractional microseconds) for TIME_TO_SEC().
+        mysql_int_fn_names = {
+            "INSTR",
+            "LOCATE",
+            "ORD",
+            "YEAR",
+            "MONTH",
+            "DAY",
+            "DAYOFMONTH",
+            "DAY_OF_MONTH",
+            "DAYOFWEEK",
+            "DAY_OF_WEEK",
+            "DAYOFYEAR",
+            "DAY_OF_YEAR",
+            "HOUR",
+            "MINUTE",
+            "SECOND",
+            "MICROSECOND",
+            "WEEK",
+            "WEEKDAY",
+            "YEARWEEK",
+            "QUARTER",
+            "DATEDIFF",
+            "TO_DAYS",
+            "TO_SECONDS",
+            "TIMESTAMPDIFF",
+            "PERIOD_DIFF",
+            "BIT_COUNT",
+        }
 
         def merge_types(values: Sequence[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
             if not values:
@@ -730,14 +850,111 @@ class DialectBaseMixin(MixinHost):
             integer_digits = max(value[0] - value[1] for value in values)
             return min(65, max(scale, integer_digits + scale)), scale
 
-        def infer(node: Any) -> Optional[Tuple[int, int]]:
+        def _extract_literal_int(node: Any) -> Optional[int]:
+            cur = node
+            neg = False
+            while cur is not None:
+                c_kind = cur.__class__.__name__
+                if c_kind == "Paren":
+                    cur = cur.this
+                elif c_kind == "Neg":
+                    neg = not neg
+                    cur = cur.this
+                elif c_kind in ("Pos", "Positive"):
+                    cur = cur.this
+                else:
+                    break
+            if cur is None or cur.__class__.__name__ != "Literal" or cur.args.get("is_string"):
+                return None
+            try:
+                v = int(str(cur.this))
+            except (TypeError, ValueError):
+                return None
+            return -v if neg else v
+
+        def _infer_agg_node(
+            fn_node: Any,
+            *,
+            in_window: bool,
+            seen_cols: FrozenSet[Tuple[str, str]],
+            depth: int,
+        ) -> Optional[Tuple[int, int]]:
+            unwrapped = _unwrap_pg_catalog_agg_node(fn_node, self.dialect)
+            if unwrapped is not None:
+                fn_node = unwrapped
+            if isinstance(fn_node, sqlglot_exp.Filter) and fn_node.this is not None:
+                fn_node = fn_node.this
+            f_kind = fn_node.__class__.__name__
+            if f_kind in ("Count", "RowNumber", "Rank", "DenseRank", "Ntile"):
+                return 19, 0
+            if f_kind in ("PercentRank", "CumeDist"):
+                return None
+            if f_kind in ("Lag", "Lead", "FirstValue", "LastValue", "NthValue"):
+                arg = fn_node.this
+                inner = infer(arg, seen_cols=seen_cols, depth=depth + 1) if arg is not None else None
+                if inner is None:
+                    return None
+                if f_kind in ("Lag", "Lead"):
+                    default_node = fn_node.args.get("default")
+                    if default_node is not None and not isinstance(default_node, sqlglot_exp.Null):
+                        def_t = infer(default_node, seen_cols=seen_cols, depth=depth + 1)
+                        if def_t is None:
+                            return None
+                        return merge_types([inner, def_t])
+                return inner
+            if f_kind in ("Sum", "Avg", "Min", "Max"):
+                arg = fn_node.this
+                if isinstance(arg, sqlglot_exp.Distinct):
+                    exprs = arg.expressions
+                    arg = exprs[0] if exprs else None
+                inner = infer(arg, seen_cols=seen_cols, depth=depth + 1) if arg is not None else None
+                if inner is None:
+                    return None
+                if f_kind == "Sum":
+                    return (65 if in_window else min(65, inner[0] + 22)), inner[1]
+                if f_kind == "Avg":
+                    scale = min(self._max_decimal_scale(), inner[1] + div_inc)
+                    prec = 65 if in_window else min(65, max(scale, inner[0] + div_inc))
+                    return prec, scale
+                return inner
+            if f_kind in ("BitwiseAndAgg", "BitwiseOrAgg", "BitwiseXorAgg"):
+                # On MySQL 8+, BIT_AND/BIT_OR/BIT_XOR over binary strings
+                # (VARBINARY/BINARY/BLOB) return VARBINARY, and SUM(VARBINARY)
+                # converts to DOUBLE; require an exact numeric argument on all engines.
+                arg = fn_node.this
+                inner = infer(arg, seen_cols=seen_cols, depth=depth + 1) if arg is not None else None
+                if inner is None:
+                    return None
+                if self.dialect == Dialect.MYSQL:
+                    return 20, 0
+                if inner[1] == 0:
+                    return inner[0], 0
+                return None
+            return None
+
+        def infer(
+            node: Any,
+            *,
+            seen_cols: FrozenSet[Tuple[str, str]] = frozenset(),
+            depth: int = 0,
+        ) -> Optional[Tuple[int, int]]:
+            if node is None or depth >= 16:
+                return None
             kind = node.__class__.__name__
             if kind == "Column":
+                col_key = ((node.table or "").lower(), (node.name or "").lower())
+                if col_key not in seen_cols:
+                    cte_expression = self._resolve_cte_column_expression(node)
+                    if cte_expression is not None:
+                        return infer(
+                            cte_expression,
+                            seen_cols=seen_cols | {col_key},
+                            depth=depth + 1,
+                        )
                 column = self._lookup_col_def(node.sql())
                 if column:
                     return self._numeric_precision_scale_from_type(column.data_type)
-                cte_expression = self._resolve_cte_column_expression(node)
-                return infer(cte_expression) if cte_expression is not None else None
+                return None
             if kind == "Literal":
                 if node.args.get("is_string"):
                     return None
@@ -748,25 +965,85 @@ class DialectBaseMixin(MixinHost):
                 scale = len(fraction) if dot else 0
                 precision = max(1, len((whole + fraction).lstrip("0")), scale)
                 return precision, min(self._max_decimal_scale(), scale)
-            if kind in ("Sum", "Min", "Max") and node.this is not None and not node.find(sqlglot_exp.Window):
-                # MySQL SUM over an exact argument is DECIMAL with the
-                # argument's scale (precision p + 22); MIN/MAX keep the type.
-                arg = node.this.this if isinstance(node.this, sqlglot_exp.Distinct) else node.this
-                if isinstance(node.this, sqlglot_exp.Distinct):
-                    exprs = node.this.expressions
-                    arg = exprs[0] if exprs else None
-                inner = infer(arg) if arg is not None else None
+            if kind == "Window":
+                return (
+                    _infer_agg_node(
+                        node.this,
+                        in_window=True,
+                        seen_cols=seen_cols,
+                        depth=depth,
+                    )
+                    if node.this is not None
+                    else None
+                )
+            if (
+                kind in ("Count", "Sum", "Avg", "Min", "Max", "BitwiseAndAgg", "BitwiseOrAgg", "BitwiseXorAgg", "Filter", "Dot")
+                and not node.find(sqlglot_exp.Window)
+            ):
+                res = _infer_agg_node(
+                    node,
+                    in_window=False,
+                    seen_cols=seen_cols,
+                    depth=depth,
+                )
+                if res is not None:
+                    return res
+            if kind in ("Paren", "Neg", "Pos", "Positive", "Abs"):
+                return infer(node.this, seen_cols=seen_cols, depth=depth + 1)
+            if self.dialect == Dialect.MYSQL:
+                if kind == "Or":
+                    # Guard PIPES_AS_CONCAT even when `||` sits inside a CTE/subquery.
+                    if "||" not in expr and "||" not in (self.view.raw_select_sql or ""):
+                        return 1, 0
+                    return None
+                if kind in (
+                    "EQ",
+                    "NEQ",
+                    "NullSafeEQ",
+                    "LT",
+                    "LTE",
+                    "GT",
+                    "GTE",
+                    "Is",
+                    "In",
+                    "Between",
+                    "Like",
+                    "ILike",
+                    "And",
+                    "Xor",
+                    "Not",
+                    "Exists",
+                    "Boolean",
+                ):
+                    return 1, 0
+            if kind == "BitwiseCount":
+                # MySQL 8+ BIT_COUNT(binary_str) can exceed 99 bits (e.g. UUID 128 bits).
+                return (19, 0) if self.dialect == Dialect.MYSQL else None
+            if kind == "BitwiseNot":
+                inner = infer(node.this, seen_cols=seen_cols, depth=depth + 1)
                 if inner is None:
                     return None
-                if kind == "Sum":
-                    return min(65, inner[0] + 22), inner[1]
-                return inner
-            if kind in ("Paren", "Neg", "Abs"):
-                return infer(node.this)
+                if self.dialect == Dialect.MYSQL:
+                    return 20, 0
+                return (inner[0], 0) if inner[1] == 0 else None
+            if kind in ("BitwiseAnd", "BitwiseOr", "BitwiseXor", "BitwiseLeftShift", "BitwiseRightShift"):
+                left = infer(node.this, seen_cols=seen_cols, depth=depth + 1)
+                right = infer(node.expression, seen_cols=seen_cols, depth=depth + 1)
+                if left is None or right is None:
+                    return None
+                if self.dialect == Dialect.MYSQL:
+                    return 20, 0
+                if left[1] == 0 and right[1] == 0:
+                    return (
+                        (left[0], 0)
+                        if kind in ("BitwiseLeftShift", "BitwiseRightShift")
+                        else (max(left[0], right[0]), 0)
+                    )
+                return None
             if kind in ("Floor", "Ceil", "Ceiling", "Sign"):
                 if node.this is None:
                     return None
-                value = infer(node.this)
+                value = infer(node.this, seen_cols=seen_cols, depth=depth + 1)
                 if value is None:
                     return None
                 if self.dialect == Dialect.POSTGRES:
@@ -783,7 +1060,8 @@ class DialectBaseMixin(MixinHost):
                 target = node.args.get("to")
                 return self._numeric_precision_scale_from_type(target.sql()) if target is not None else None
             if kind in ("Add", "Sub", "Mul", "Div", "Mod", "IntDiv"):
-                left, right = infer(node.this), infer(node.expression)
+                left = infer(node.this, seen_cols=seen_cols, depth=depth + 1)
+                right = infer(node.expression, seen_cols=seen_cols, depth=depth + 1)
                 if left is None or right is None:
                     return None
                 p1, s1 = left
@@ -802,8 +1080,15 @@ class DialectBaseMixin(MixinHost):
                     precision = max(p1 - s1, p2 - s2) + scale + 1
                 elif kind == "Mul":
                     scale, precision = s1 + s2, p1 + p2
+                elif kind == "Div" and self.dialect == Dialect.POSTGRES and s1 == 0 and s2 == 0:
+                    lt_s = self._infer_ast_expr_storage_type(node.this.sql(_sqlglot_dialect(self.dialect)))
+                    rt_s = self._infer_ast_expr_storage_type(node.expression.sql(_sqlglot_dialect(self.dialect)))
+                    if lt_s in ("SMALLINT", "INTEGER", "BIGINT") and rt_s in ("SMALLINT", "INTEGER", "BIGINT"):
+                        return max(p1, p2), 0
+                    scale = s1 + div_inc
+                    precision = (p1 - s1) + s2 + scale
                 else:
-                    scale = s1 + 4
+                    scale = s1 + div_inc
                     precision = (p1 - s1) + s2 + scale
                 scale = min(self._max_decimal_scale(), scale)
                 return min(65, max(scale, precision)), scale
@@ -816,25 +1101,25 @@ class DialectBaseMixin(MixinHost):
                     if isinstance(node.this, sqlglot_exp.Null):
                         if node.expression is None or isinstance(node.expression, sqlglot_exp.Null):
                             return None
-                        return infer(node.expression)
-                    left = infer(node.this)
+                        return infer(node.expression, seen_cols=seen_cols, depth=depth + 1)
+                    left = infer(node.this, seen_cols=seen_cols, depth=depth + 1)
                     if left is None:
                         return None
                     if node.expression is None or isinstance(node.expression, sqlglot_exp.Null):
                         return left
-                    right = infer(node.expression)
+                    right = infer(node.expression, seen_cols=seen_cols, depth=depth + 1)
                     if right is None:
                         return None
                     return merge_types([left, right])
                 if isinstance(node.this, sqlglot_exp.Null):
                     return None
-                return infer(node.this)
+                return infer(node.this, seen_cols=seen_cols, depth=depth + 1)
             if kind in ("Coalesce", "IfNull", "Greatest", "Least"):
                 values = []
                 for child in node.iter_expressions():
                     if isinstance(child, sqlglot_exp.Null):
                         continue
-                    inferred = infer(child)
+                    inferred = infer(child, seen_cols=seen_cols, depth=depth + 1)
                     if inferred is None:
                         return None
                     values.append(inferred)
@@ -845,7 +1130,7 @@ class DialectBaseMixin(MixinHost):
                     branch_node = node.args.get(branch_key)
                     if branch_node is None or isinstance(branch_node, sqlglot_exp.Null):
                         continue
-                    inferred = infer(branch_node)
+                    inferred = infer(branch_node, seen_cols=seen_cols, depth=depth + 1)
                     if inferred is None:
                         return None
                     branches.append(inferred)
@@ -855,13 +1140,13 @@ class DialectBaseMixin(MixinHost):
                 for branch in node.args.get("ifs") or ():
                     value = branch.args.get("true")
                     if value is not None and not isinstance(value, sqlglot_exp.Null):
-                        inferred = infer(value)
+                        inferred = infer(value, seen_cols=seen_cols, depth=depth + 1)
                         if inferred is None:
                             return None
                         branches.append(inferred)
                 default = node.args.get("default")
                 if default is not None and not isinstance(default, sqlglot_exp.Null):
-                    inferred = infer(default)
+                    inferred = infer(default, seen_cols=seen_cols, depth=depth + 1)
                     if inferred is None:
                         return None
                     branches.append(inferred)
@@ -869,7 +1154,7 @@ class DialectBaseMixin(MixinHost):
             if kind in ("Round", "Trunc"):
                 if node.this is None:
                     return None
-                value = infer(node.this)
+                value = infer(node.this, seen_cols=seen_cols, depth=depth + 1)
                 if value is None:
                     return None
                 scale_node = node.args.get("decimals") or node.expression
@@ -883,14 +1168,27 @@ class DialectBaseMixin(MixinHost):
                         return min(65, max(1, value[0] - value[1] + 1)), 0
                 if scale_node is None:
                     return min(65, max(1, value[0] - value[1] + 1)), 0
-                if scale_node.__class__.__name__ != "Literal":
+                lit_scale = _extract_literal_int(scale_node)
+                if lit_scale is None:
                     return value
-                try:
-                    requested_scale = max(0, int(scale_node.this))
-                except (TypeError, ValueError):
-                    return value
+                requested_scale = max(0, lit_scale)
+                if self.dialect == Dialect.MYSQL:
+                    # MySQL/MariaDB ROUND/TRUNCATE never increase scale beyond
+                    # the input's scale (e.g. ROUND(DECIMAL(10, 2), 5) keeps
+                    # scale 2, ROUND(INT, 2) keeps scale 0, ROUND(d, -1) is 0).
+                    requested_scale = min(requested_scale, value[1])
                 requested_scale = min(self._max_decimal_scale(), requested_scale)
                 return min(65, max(requested_scale, value[0] - value[1] + requested_scale + 1)), requested_scale
+            if isinstance(node, sqlglot_exp.Func):
+                fn_name = (
+                    node.name.upper()
+                    if isinstance(node, sqlglot_exp.Anonymous)
+                    else (node.sql_name() or kind).upper()
+                )
+                if fn_name in universal_int_fn_names:
+                    return (10, 0) if self.dialect == Dialect.POSTGRES else (19, 0)
+                if self.dialect == Dialect.MYSQL and fn_name in mysql_int_fn_names:
+                    return 19, 0
             return None
 
         try:
@@ -906,8 +1204,9 @@ class DialectBaseMixin(MixinHost):
             return "NUMERIC"
         if self.dialect == Dialect.MYSQL:
             precision, scale = exact_type
-            result_scale = min(self._max_decimal_scale(), max(4, scale + 4))
-            result_precision = min(65, precision + 4)
+            div_inc = self.engine_version.mariadb_div_precision_increment
+            result_scale = min(self._max_decimal_scale(), max(div_inc, scale + div_inc))
+            result_precision = min(65, precision + div_inc)
             return f"DECIMAL({max(result_precision, result_scale)}, {result_scale})"
         return self._float_type()
 
@@ -1141,8 +1440,28 @@ class DialectBaseMixin(MixinHost):
             return out_map
 
         def _infer_alias_expr_type(inner: Any, br_ctx: Any) -> Optional[str]:
-            if isinstance(inner, (sqlglot_exp.Count, sqlglot_exp.Window)):
+            if isinstance(inner, sqlglot_exp.Count):
                 return self._int_type()
+            if isinstance(inner, sqlglot_exp.Window):
+                win_sql = inner.sql(_sqlglot_dialect(self.dialect))
+                win_t = br_ctx._window_aggregate_storage_type(win_sql)
+                if win_t is not None:
+                    return win_t
+                ast_t = br_ctx._infer_ast_expr_storage_type(win_sql)
+                if ast_t is not None:
+                    return ast_t
+                win_fn = inner.this
+                if isinstance(win_fn, sqlglot_exp.Filter) and win_fn.this is not None:
+                    win_fn = win_fn.this
+                if win_fn is not None and win_fn.__class__.__name__ in (
+                    "RowNumber",
+                    "Rank",
+                    "DenseRank",
+                    "Ntile",
+                    "Count",
+                ):
+                    return self._int_type()
+                return None
             if isinstance(inner, sqlglot_exp.Sum):
                 arg_expr = inner.this.sql() if inner.this is not None else ""
                 sum_item = SelectItem(
@@ -1664,7 +1983,45 @@ class DialectBaseMixin(MixinHost):
             "DOUBLE PRECISION": 6,
         }
         str_fn_names = {"UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM", "SUBSTR", "SUBSTRING", "CONCAT", "CONCAT_WS", "REPLACE"}
-        int_fn_names = {"LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "INSTR", "STRPOS"}
+        int_fn_names = {
+            "LENGTH",
+            "CHAR_LENGTH",
+            "CHARACTER_LENGTH",
+            "OCTET_LENGTH",
+            "BIT_LENGTH",
+            "STRPOS",
+            "STR_POSITION",
+            "POSITION",
+            "ASCII",
+        }
+        mysql_int_fn_names = {
+            "INSTR",
+            "LOCATE",
+            "ORD",
+            "YEAR",
+            "MONTH",
+            "DAY",
+            "DAYOFMONTH",
+            "DAY_OF_MONTH",
+            "DAYOFWEEK",
+            "DAY_OF_WEEK",
+            "DAYOFYEAR",
+            "DAY_OF_YEAR",
+            "HOUR",
+            "MINUTE",
+            "SECOND",
+            "MICROSECOND",
+            "WEEK",
+            "WEEKDAY",
+            "YEARWEEK",
+            "QUARTER",
+            "DATEDIFF",
+            "TO_DAYS",
+            "TO_SECONDS",
+            "TIMESTAMPDIFF",
+            "PERIOD_DIFF",
+            "BIT_COUNT",
+        }
         agg_fn_names = {
             "COUNT", "SUM", "TOTAL", "AVG", "MIN", "MAX", "VAR_POP", "VAR_SAMP", "STDDEV_POP",
             "STDDEV_SAMP", "VARIANCE", "STDDEV", "STD", "BIT_AND", "BIT_OR", "BIT_XOR",
@@ -1851,9 +2208,14 @@ class DialectBaseMixin(MixinHost):
                 return None
             return max(known, key=lambda value: ranks[value])
 
+        active_infer_cols: Set[Tuple[str, str]] = set()
+        infer_depth = [0]
+
         def infer(node: Any) -> Optional[str]:
             if node is None:
                 return "UNKNOWN"
+            if infer_depth[0] >= 32:
+                return None
             kind = node.__class__.__name__
             if kind in ("Paren", "Collate"):
                 return infer(node.this)
@@ -1861,7 +2223,9 @@ class DialectBaseMixin(MixinHost):
                 return "UNKNOWN"
             if kind == "Boolean":
                 return "BOOLEAN"
-            if kind == "Or" and self.dialect == Dialect.MYSQL and "||" in expr:
+            if kind == "Or" and self.dialect == Dialect.MYSQL and (
+                "||" in expr or "||" in (self.view.raw_select_sql or "")
+            ):
                 # Under MySQL/MariaDB PIPES_AS_CONCAT, `||` is string concatenation
                 # even though sqlglot parses it as logical Or.
                 return None
@@ -1903,6 +2267,18 @@ class DialectBaseMixin(MixinHost):
                     return "DOUBLE PRECISION"
                 return None
             if kind == "Column":
+                col_key = ((node.table or "").lower(), (node.name or "").lower())
+                if col_key not in active_infer_cols:
+                    resolved_cte = self._resolve_cte_column_expression(node)
+                    if resolved_cte is not None and not isinstance(resolved_cte, sqlglot_exp.Column):
+                        # Derived-table / CTE expression shadows any same-named base column.
+                        active_infer_cols.add(col_key)
+                        infer_depth[0] += 1
+                        try:
+                            return infer(resolved_cte)
+                        finally:
+                            infer_depth[0] -= 1
+                            active_infer_cols.discard(col_key)
                 column = self._lookup_col_def(node.sql())
                 if column is None:
                     column = self._lookup_col_def(node.name)
@@ -1927,19 +2303,71 @@ class DialectBaseMixin(MixinHost):
                         return "NUMERIC"
                     return "DOUBLE PRECISION" if ("e" in value.lower() or self.dialect == Dialect.SQLITE) else "NUMERIC"
                 return None
-            if kind in ("Neg", "Positive"):
+            if kind in ("Neg", "Pos", "Positive"):
                 return infer(node.this)
+            if kind == "BitwiseCount":
+                return "BIGINT" if self.dialect == Dialect.MYSQL else None
+            if kind == "BitwiseNot":
+                inner_t = infer(node.this)
+                if self.dialect == Dialect.POSTGRES:
+                    if inner_t in ("SMALLINT", "INTEGER", "BIGINT"):
+                        return inner_t
+                    if inner_t is not None and (
+                        inner_t == "BIT" or inner_t == "BIT VARYING" or inner_t.startswith("BIT(")
+                    ):
+                        return inner_t
+                    return None
+                if self.dialect == Dialect.MYSQL:
+                    return "BIGINT UNSIGNED" if (inner_t in ranks or inner_t == "BIGINT UNSIGNED") else None
+                return "BIGINT" if inner_t in ranks else None
+            if kind in ("BitwiseAnd", "BitwiseOr", "BitwiseXor", "BitwiseLeftShift", "BitwiseRightShift"):
+                left_t, right_t = infer(node.this), infer(node.expression)
+                if left_t is None or right_t is None:
+                    return None
+                if self.dialect == Dialect.POSTGRES:
+                    if left_t in ("SMALLINT", "INTEGER", "BIGINT") and right_t in ("SMALLINT", "INTEGER", "BIGINT"):
+                        return (
+                            left_t
+                            if kind in ("BitwiseLeftShift", "BitwiseRightShift")
+                            else merge((left_t, right_t))
+                        )
+                    is_bit_l = left_t == "BIT" or left_t == "BIT VARYING" or left_t.startswith("BIT(")
+                    is_bit_r = right_t == "BIT" or right_t == "BIT VARYING" or right_t.startswith("BIT(")
+                    if kind in ("BitwiseLeftShift", "BitwiseRightShift") and is_bit_l and right_t in ("SMALLINT", "INTEGER", "BIGINT"):
+                        return left_t
+                    if kind in ("BitwiseAnd", "BitwiseOr", "BitwiseXor") and is_bit_l and is_bit_r:
+                        return merge((left_t, right_t))
+                    return None
+                if self.dialect == Dialect.MYSQL:
+                    ok_l = left_t in ranks or left_t == "BIGINT UNSIGNED"
+                    ok_r = right_t in ranks or right_t == "BIGINT UNSIGNED"
+                    return "BIGINT UNSIGNED" if (ok_l and ok_r) else None
+                return "BIGINT" if (left_t in ranks and right_t in ranks) else None
             if kind == "Window":
                 inner = node.this
+                if isinstance(inner, sqlglot_exp.Filter) and inner.this is not None:
+                    inner = inner.this
                 inner_kind = inner.__class__.__name__ if inner is not None else ""
                 if inner_kind in ("RowNumber", "Rank", "DenseRank", "Ntile", "Count"):
                     return "BIGINT"
                 if inner_kind in ("PercentRank", "CumeDist"):
                     return "DOUBLE PRECISION"
                 if inner is not None and inner_kind in ("Lag", "Lead", "FirstValue", "LastValue", "NthValue"):
-                    return infer(inner.this)
+                    base_t = infer(inner.this)
+                    if inner_kind in ("Lag", "Lead"):
+                        def_node = inner.args.get("default")
+                        if def_node is not None and not isinstance(def_node, sqlglot_exp.Null):
+                            def_t = infer(def_node)
+                            if base_t is None or def_t is None:
+                                return None
+                            return merge((base_t, def_t))
+                    return base_t
                 win_t = self._window_aggregate_storage_type(node.sql(_sqlglot_dialect(self.dialect)))
-                return canonical_type(win_t) if win_t else None
+                if win_t is not None:
+                    if self.dialect == Dialect.SQLITE and win_t.upper() == "BLOB":
+                        return "BLOB"
+                    return canonical_type(win_t)
+                return None
             if kind == "Cast":
                 target = node.args.get("to")
                 if target is None:
@@ -2102,18 +2530,13 @@ class DialectBaseMixin(MixinHost):
             if kind == "BitString" and self.dialect == Dialect.POSTGRES:
                 bits = str(node.this or "")
                 return f"BIT({len(bits)})" if bits else "BIT VARYING"
-            if kind in ("BitwiseAnd", "BitwiseOr", "BitwiseXor") and self.dialect == Dialect.POSTGRES:
-                left, right = infer(node.this), infer(node.expression)
-                if left is None or right is None:
-                    return None
-                return merge((left, right))
             if kind in ("Add", "Sub", "Mul", "Div", "Mod", "IntDiv"):
                 left, right = infer(node.this), infer(node.expression)
                 if left is None or right is None:
                     return None
                 merged = merge((left, right))
                 if kind == "Div" and merged in ("SMALLINT", "INTEGER", "BIGINT") and self.dialect != Dialect.POSTGRES:
-                    return "DOUBLE PRECISION"
+                    return "NUMERIC" if self.dialect == Dialect.MYSQL else "DOUBLE PRECISION"
                 if kind == "IntDiv":
                     # MySQL/MariaDB DIV: integer result (BIGINT on MySQL;
                     # MariaDB's width rule is applied below).
@@ -2136,40 +2559,6 @@ class DialectBaseMixin(MixinHost):
                 ):
                     return "DOUBLE PRECISION"
                 return merged
-            if kind == "Window" and self.dialect in (Dialect.POSTGRES, Dialect.MYSQL):
-                # Window SUM/AVG/COUNT keep the engine's native result type
-                # (stored as DOUBLE they lost the exact NUMERIC/DECIMAL value:
-                # PostgreSQL AVG(int) 53.3333333333333333 vs 53.333333333333336).
-                fn = node.this
-                if fn is None:
-                    return None
-                fn_kind = fn.__class__.__name__
-                if fn_kind == "Count":
-                    return "BIGINT"
-                if fn_kind in ("Sum", "Avg"):
-                    arg = fn.this
-                    if isinstance(arg, sqlglot_exp.Distinct):
-                        arg = arg.expressions[0] if arg.expressions else None
-                    arg_t = infer(arg) if arg is not None else None
-                    if arg_t in ("REAL", "DOUBLE PRECISION"):
-                        if self.dialect == Dialect.POSTGRES and fn_kind == "Sum":
-                            return arg_t
-                        return "DOUBLE PRECISION"
-                    if arg_t in ("SMALLINT", "INTEGER", "BIGINT", "NUMERIC"):
-                        if self.dialect == Dialect.MYSQL and arg is not None:
-                            ps = self._exact_numeric_precision_scale(
-                                arg.sql(dialect=_sqlglot_dialect(self.dialect))
-                            )
-                            if ps is None:
-                                return None
-                            scale = int(ps[1])
-                            if fn_kind == "Avg":
-                                scale += self.engine_version.mariadb_div_precision_increment
-                            return f"MYSQL_WINDOW_DECIMAL:{min(30, scale)}"
-                        if fn_kind == "Sum" and arg_t in ("SMALLINT", "INTEGER"):
-                            return "BIGINT"
-                        return "NUMERIC"
-                    return None
             if isinstance(node, (sqlglot_exp.Dot, sqlglot_exp.Column, sqlglot_exp.Filter)):
                 pg_cat_fn = _unwrap_pg_catalog_agg_node(node, self.dialect)
                 if pg_cat_fn is not None:
@@ -2212,15 +2601,29 @@ class DialectBaseMixin(MixinHost):
                         return "TEXT"
                     return None
             if isinstance(node, sqlglot_exp.Func):
-                fn_name = (node.sql_name() or kind).upper()
+                fn_name = (
+                    node.name.upper()
+                    if isinstance(node, sqlglot_exp.Anonymous)
+                    else (node.sql_name() or kind).upper()
+                )
                 if fn_name in str_fn_names:
                     return "TEXT"
                 if self.dialect == Dialect.POSTGRES and fn_name in self._PG_TEXT_FN_NAMES:
                     return "TEXT"
                 if fn_name in int_fn_names:
+                    return "INTEGER" if self.dialect == Dialect.POSTGRES else "BIGINT"
+                if self.dialect == Dialect.MYSQL and fn_name in mysql_int_fn_names:
                     return "BIGINT"
                 if fn_name in ("LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE"):
-                    return infer(node.this)
+                    base_t = infer(node.this)
+                    if fn_name in ("LAG", "LEAD"):
+                        def_node = node.args.get("default")
+                        if def_node is not None and not isinstance(def_node, sqlglot_exp.Null):
+                            def_t = infer(def_node)
+                            if base_t is None or def_t is None:
+                                return None
+                            return merge((base_t, def_t))
+                    return base_t
             return None
 
         inferred = infer(root)
@@ -2240,11 +2643,10 @@ class DialectBaseMixin(MixinHost):
                 return "BIGINT UNSIGNED" if unsigned else "BIGINT"
         if inferred is None or inferred == "UNKNOWN":
             return None
-        if inferred.startswith("MYSQL_WINDOW_DECIMAL:"):
-            # MySQL/MariaDB window SUM/AVG of exact arguments return DECIMAL
-            # with the argument's scale (AVG: plus div_precision_increment);
-            # 65 digits hold every such value.
-            return f"DECIMAL(65, {inferred.split(':', 1)[1]})"
+        if inferred == "BIGINT UNSIGNED" and self.dialect == Dialect.MYSQL:
+            return "BIGINT UNSIGNED"
+        if inferred == "BLOB" and self.dialect == Dialect.SQLITE:
+            return "BLOB"
         if inferred == "TEXT" and self.dialect == Dialect.POSTGRES:
             return self._pg_string_result_type(root) or "TEXT"
         if inferred == "NUMERIC":
