@@ -605,6 +605,32 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      - name: Test the logical-replication subscription refusal (PostgreSQL)
+        # A real publication/subscription needs wal_level=logical. It runs after
+        # the parallel suites (which keep the default wal_level): enable it and
+        # restart the server container; publisher and subscriber are then two
+        # databases of the same server (the subscription connects back to the
+        # server itself, with a pre-created slot).
+        env:
+          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
+          PG_LOGICAL_PUBLISHER_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_pub"
+          PG_LOGICAL_PUBLISHER_CONNINFO: "host=127.0.0.1 port=5432 dbname=matview_pub user=postgres password=password"
+        run: |
+          python3 - <<'PY'
+          import psycopg2
+          c = psycopg2.connect("postgresql://postgres:password@127.0.0.1:5432/matview_test")
+          c.autocommit = True
+          cur = c.cursor()
+          cur.execute("ALTER SYSTEM SET wal_level = 'logical'")
+          cur.execute("CREATE DATABASE matview_pub")
+          PY
+          docker restart postgres-srv
+          for i in $(seq 1 60); do
+            python3 -c "import psycopg2; psycopg2.connect('postgresql://postgres:password@127.0.0.1:5432/matview_pub').close()" 2>/dev/null && break
+            sleep 1
+          done
+          pytest -v -rxXs test_pg_logical_subscription.py
+
   # Both supported Oracle MySQL LTS series are required on every PR.
   mysql:
     needs: classify

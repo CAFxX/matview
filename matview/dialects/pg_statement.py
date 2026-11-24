@@ -4,8 +4,12 @@ Every maintained source table gets one ``AFTER INSERT``, one ``AFTER UPDATE``
 and one ``AFTER DELETE`` statement-level trigger with transition tables, plus
 an ``AFTER TRUNCATE`` trigger, on the table itself and on every partition
 (docs/design-bulk-maintenance.md, "PostgreSQL: statement-level
-transition-table triggers, the only mechanism"). The trigger functions are
-set-based; nothing iterates over transition rows.
+transition-table triggers, the only mechanism"). All maintenance triggers are
+``ENABLE ALWAYS``, so they also run under
+``session_replication_role = replica``. Logical-replication publications must
+exclude matview backing and auxiliary tables; otherwise both source changes and
+their derived writes would be applied on the subscriber. The trigger functions
+are set-based; nothing iterates over transition rows.
 
 The rules every body follows:
 
@@ -271,6 +275,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                     fn_name=fn_before,
                 )
             )
+            ddls.append(f"ALTER TABLE {q_base_t} ENABLE ALWAYS TRIGGER {trg_before};")
             installs.append((trg_before, "BEFORE", "INSERT OR UPDATE OR DELETE OR TRUNCATE", None, fn_before))
             trig_names.append(trg_before)
             fn_names.append(fn_before)
@@ -314,6 +319,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                     fn_name=fn,
                 )
             )
+            ddls.append(f"ALTER TABLE {q_base_t} ENABLE ALWAYS TRIGGER {trg};")
             installs.append((trg, "AFTER", event, referencing[event], fn))
             trig_names.append(trg)
             fn_names.append(fn)
@@ -342,6 +348,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                 )
             )
         ddls.append(render_procedural_sql("pg_truncate_trigger", trg_name=trg_trunc, q_base_t=q_base_t, fn_name=fn_trunc))
+        ddls.append(f"ALTER TABLE {q_base_t} ENABLE ALWAYS TRIGGER {trg_trunc};")
         installs.append((trg_trunc, "AFTER", "TRUNCATE", None, fn_trunc))
         trig_names.append(trg_trunc)
         fn_names.append(fn_trunc)
@@ -363,6 +370,9 @@ class PgStatementMaintenanceMixin(MixinHost):
                 f"FOR EACH STATEMENT EXECUTE FUNCTION {fn}()"
             )
             creates.append(f"        EXECUTE format('{stmt}', __mv_child);")
+            creates.append(
+                f"        EXECUTE format('ALTER TABLE %s ENABLE ALWAYS TRIGGER {trg}', __mv_child);"
+            )
         return render_procedural_sql(
             "pg_partition_trigger_install",
             reg=reg,

@@ -517,9 +517,12 @@ superseded by this roadmap.
   MySQL/MariaDB remain. They fail closed, but applications need to retry.
 - PostgreSQL single-row statements get about 6–10 µs slower. This is accepted
   for O(groups) bulk cost; stage 2 sets the budget.
-- `session_replication_role = replica`, `ALTER TABLE ... DISABLE TRIGGER`
-  and MySQL `TRUNCATE` still bypass triggers. They are tracked in "Close
-  Unsafe DML Paths That Bypass Trigger-Based Maintenance".
+- PostgreSQL maintenance triggers are `ENABLE ALWAYS`, so
+  `session_replication_role = replica` does not bypass them. Logical-replication
+  publications must exclude matview backing and auxiliary tables to avoid
+  applying derived writes twice. `ALTER TABLE ... DISABLE TRIGGER` and MySQL
+  `TRUNCATE` still bypass maintenance and remain tracked in "Close Unsafe DML
+  Paths That Bypass Trigger-Based Maintenance".
 - Rule 6 relies on the `BEFORE`/`AFTER STATEMENT` firing order traced in
   finding 3. That order was observed on PG 18 for a CTE, an FK cascade and a
   PL/pgSQL function only. Stage 3 must verify it natively on every supported

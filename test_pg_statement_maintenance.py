@@ -3506,6 +3506,9 @@ def test_pg_function_and_trigger_tampering_detected_and_repaired(make_env) -> No
         f"CREATE TRIGGER {part_ins_trg} AFTER INSERT ON tp_hi "
         f"REFERENCING NEW TABLE AS __mv_new FOR EACH STATEMENT EXECUTE FUNCTION __mv_test_noop();"
     )
+    # A recreated trigger is plain ENABLE (a different drift, triggers_disabled);
+    # keep ALWAYS so that only the modification under test is observed.
+    env.execute(f"ALTER TABLE tp_hi ENABLE ALWAYS TRIGGER {part_ins_trg};")
     env.commit()
     _expect_drift_and_repair("v_part", "triggers_modified", "repoint_leaf_partition_trigger", "INSERT INTO tp_hi VALUES (102, 2, 30)")
 
@@ -3523,6 +3526,7 @@ def test_pg_function_and_trigger_tampering_detected_and_repaired(make_env) -> No
         f"CREATE TRIGGER {part_ins_trg} AFTER INSERT ON tp_hi "
         f"REFERENCING NEW TABLE AS __mv_new FOR EACH STATEMENT WHEN (false) EXECUTE FUNCTION {part_ins_fn}();"
     )
+    env.execute(f"ALTER TABLE tp_hi ENABLE ALWAYS TRIGGER {part_ins_trg};")
     env.commit()
     _expect_drift_and_repair("v_part", "triggers_modified", "add_when_false_qual_on_partition", "INSERT INTO tp_hi VALUES (103, 2, 35)")
 
@@ -3537,6 +3541,7 @@ def test_pg_function_and_trigger_tampering_detected_and_repaired(make_env) -> No
         f"CREATE TRIGGER {s3_bs_trg} BEFORE INSERT OR UPDATE OF g OR DELETE OR TRUNCATE ON a "
         f"FOR EACH STATEMENT EXECUTE FUNCTION {s3_bs_fn}();"
     )
+    env.execute(f"ALTER TABLE a ENABLE ALWAYS TRIGGER {s3_bs_trg};")
     env.commit()
     _expect_drift_and_repair("v_s3", "triggers_modified", "update_of_col_filter_tgattr", "UPDATE a SET label = 'ONE' WHERE g = 1")
 
@@ -3564,6 +3569,7 @@ def test_pg_function_and_trigger_tampering_detected_and_repaired(make_env) -> No
             f'REFERENCING NEW TABLE AS __mv_new_rows FOR EACH STATEMENT '
             f'EXECUTE FUNCTION "{decoy_schema}"."{part_ins_fn}"();'
         )
+        cur.execute(f"ALTER TABLE tp_hi ENABLE ALWAYS TRIGGER {part_ins_trg};")
         env.commit()
         _expect_drift_and_repair("v_part", "triggers_modified", "cross_schema_decoy_fn", "INSERT INTO tp_hi VALUES (104, 2, 40)")
     finally:
@@ -3703,20 +3709,23 @@ def test_pg_dump_restore_fresh_oids_stays_ok_and_exact(make_env) -> None:
     )
     fn_defs = cur.fetchall()
     cur.execute(
-        "SELECT c.relname, t.tgname, pg_catalog.pg_get_triggerdef(t.oid)"
+        "SELECT c.relname, t.tgname, pg_catalog.pg_get_triggerdef(t.oid), t.tgenabled"
         " FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid"
         " WHERE c.relnamespace = %s::regnamespace AND NOT t.tgisinternal ORDER BY t.oid",
         (src_schema,),
     )
     trg_defs = cur.fetchall()
-    for relname, tgname, _ in trg_defs:
+    for relname, tgname, _, _ in trg_defs:
         cur.execute(f'DROP TRIGGER "{tgname}" ON "{src_schema}"."{relname}";')
     for _, proname, _, ident_args in fn_defs:
         cur.execute(f'DROP FUNCTION "{src_schema}"."{proname}"({ident_args});')
     for _, _, fdef, _ in fn_defs:
         cur.execute(fdef)
-    for _, _, tdef in trg_defs:
+    for relname, tgname, tdef, tgenabled in trg_defs:
         cur.execute(tdef)
+        if tgenabled == "A":
+            # pg_dump emits ALTER TABLE ... ENABLE ALWAYS TRIGGER for these.
+            cur.execute(f'ALTER TABLE "{src_schema}"."{relname}" ENABLE ALWAYS TRIGGER "{tgname}";')
     env.commit()
 
     cur.execute(

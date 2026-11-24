@@ -505,7 +505,7 @@ a local server with the default 0 skips the cell.
 | `fk_enforcement_off` | Writes with FK enforcement switched off (SET foreign_key_checks = 0 / PRAGMA foreign_keys = OFF) | exact | n/a | exact | exact | no referential action runs, so only the statement's own rows change; PostgreSQL has no such switch (see pg_session_replication_role) |
 | `mariadb_system_versioning` | System-versioned (temporal) source table: UPDATE/DELETE create history rows; DELETE HISTORY | n/a | n/a | n/a | exact | the view and its oracle read the current rows |
 | `pg_disable_trigger` | ALTER TABLE ... DISABLE TRIGGER USER/ALL on a source (as pg_restore --disable-triggers does) | n/a | limited | n/a | n/a | writes are not maintained while disabled; check_schema_drift() reports triggers_disabled (added here; it reported ok) and repair_view() rebuilds the views with enabled triggers |
-| `pg_session_replication_role` | Writes under session_replication_role = replica (logical-replication apply workers, some restore tools) | n/a | **WRONG** | n/a | n/a | ENABLE (origin) triggers do not fire; not detectable afterwards. A real subscription was not exercised: apply workers use this setting; TODO: Detect PostgreSQL Maintenance Triggers Disabled by `session_replication_role = replica` or `ALTER TABLE ... DISABLE TRIGGER` |
+| `pg_session_replication_role` | Writes under session_replication_role = replica (restore tools, COPY with replica role; NOT logical-replication apply workers) | n/a | exact | n/a | n/a | ENABLE ALWAYS statement-level maintenance triggers fire under the replica role. A logical-replication subscription apply worker fires only row-level triggers, so subscription targets are refused at registration and reported invalid by check_schema_drift() (test_pg_logical_subscription.py), not maintained |
 | `mysql_session_skip_flag` | An application session setting @__matview_skip_triggers (the bulk_changes() bypass flag) | n/a | n/a | exact | exact | the triggers skip maintenance only while the session also holds the per-connection named lock '__matview_bypass:<connection id>' that bulk_changes() takes for its block, so the flag alone (a stale pooled connection, copied code) is ignored; deliberately taking that lock remains a privileged escape hatch |
 | `ddl_add_unused_column` | Out-of-band ALTER TABLE ADD COLUMN on a source (column unused by the view) | exact | exact | exact | exact | maintenance continues exactly; check_schema_drift() reports drifted (the signature covers every column) |
 | `ddl_drop_used_column` | Out-of-band ALTER TABLE DROP COLUMN of a column the view uses | refused | refused | refused | refused | SQLite refuses the DDL (a trigger references the column); PostgreSQL/MySQL/MariaDB accept it, then every INSERT/UPDATE of the source fails in the maintenance trigger and check_schema_drift() reports invalid |
@@ -518,16 +518,33 @@ a local server with the default 0 skips the cell.
 | `two_phase_commit` | Two-phase commit: PREPARE TRANSACTION / COMMIT/ROLLBACK PREPARED; XA START ... XA COMMIT/ROLLBACK | n/a | exact | exact | exact | PostgreSQL needs max_prepared_transactions > 0 (enabled in PostgreSQL 15/18 CI, where the cell fails instead of skipping if it is 0; local servers with the default 0 skip this cell) |
 | `statement_fails_midway` | An upsert failing on its third row (CHECK) inside a multi-statement transaction, then more statements | exact | exact | exact | exact | twin; PostgreSQL continues after ROLLBACK TO SAVEPOINT, the others after the statement-level rollback |
 
-Counts per product (exact, limited, refused, WRONG, n/a): sqlite 34/7/1/2/21; postgres 38/2/2/2/21; mysql 31/3/5/0/26; mariadb 31/4/5/1/24.
+Counts per product (exact, limited, refused, WRONG, n/a): sqlite 34/7/1/2/21; postgres 39/2/2/1/21; mysql 31/3/5/0/26; mariadb 31/4/5/1/24.
 <!-- END GENERATED: dml-matrix -->
 
-Not covered by the matrix: a real logical-replication subscription (its apply
-workers write with `session_replication_role = replica`, the cell's setting),
-MySQL/MariaDB replication appliers, running `pg_restore` itself (cell
-`pg_disable_trigger` uses the `ALTER TABLE ... DISABLE TRIGGER` it issues),
-server-side `LOAD DATA INFILE`, binary `COPY`, concurrent sessions (see
-[Concurrency notes](#concurrency-notes)) and PostgreSQL partitions and
-inheritance (`test_pg_statement_maintenance.py`).
+Not covered by the matrix: MySQL/MariaDB replication appliers, running
+`pg_restore` itself (cell `pg_disable_trigger` uses the
+`ALTER TABLE ... DISABLE TRIGGER` it issues), server-side `LOAD DATA INFILE`,
+binary `COPY`, concurrent sessions (see [Concurrency notes](#concurrency-notes))
+and PostgreSQL partitions and inheritance (`test_pg_statement_maintenance.py`).
+
+PostgreSQL maintenance triggers are `ENABLE ALWAYS` and therefore run for writes
+under `session_replication_role = replica`. Caveats:
+
+- **Logical-replication subscribers are an unsupported configuration.** The
+  subscription apply worker fires only row-level triggers, while matview's
+  PostgreSQL triggers are statement-level (transition tables), so replicated
+  INSERT/UPDATE/DELETE would silently not be maintained (the initial table sync
+  and TRUNCATE are, which makes the staleness easy to miss; `ENABLE ALWAYS` does
+  not help). Registration (and `repair_view()`) of a view over a table that is
+  a subscription target, or whose partition or partitioned ancestor is one, is
+  refused with `UnsupportedMaterializedViewError`, and `check_schema_drift()`
+  reports such a view as `invalid`. There is no relaxed mode. Maintain the
+  view on the publisher instead. Native test: `test_pg_logical_subscription.py`
+  (needs a publisher with `wal_level = logical`; the wiring test runs everywhere).
+- `pg_restore --data-only --disable-triggers` into an existing schema runs
+  `ALTER TABLE ... DISABLE TRIGGER` and then `ENABLE TRIGGER`, which resets the
+  maintenance triggers to plain `ENABLE` (origin mode): `check_schema_drift()`
+  reports `triggers_disabled`; run `repair_view()`.
 
 ## Engine support
 
@@ -1610,7 +1627,6 @@ Correctness gaps (the materialized view can differ from the original view):
 - [Race-Free Recomputation for the Remaining Recomputed Aggregates (stale snapshot after a row-lock wait)](TODO.md) (MySQL/MariaDB untested; PostgreSQL closed)
 - [Bulk maintenance stage 3: Exact PostgreSQL Maintenance When One Query Modifies Several Sources of a View](TODO.md) (writable CTE or FK cascade into two sources of a join view)
 - [Serialize Concurrent Writers of Different Sources of a PostgreSQL Join View](TODO.md)
-- [Detect PostgreSQL Maintenance Triggers Disabled by `session_replication_role = replica` or `ALTER TABLE ... DISABLE TRIGGER`](TODO.md)
 - [Fail-Closed Incremental Backfill (no silent missing or double-counted rows after a failed backfill)](TODO.md) (remaining known exclusions)
 - [Fix Pre-Existing SQLite Divergences Found by the Exact SUM/TOTAL/AVG Differential](TODO.md) (storage-class changes for `MIN`/`MAX`/group keys, `LEFT JOIN` group moves, primary-key updates during backfill)
 - [Model MySQL/MariaDB Result Nullability, DECIMAL Precision and String Length](TODO.md) (result metadata only; values match)

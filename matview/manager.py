@@ -13,7 +13,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import sqlglot
 import sqlglot.errors
@@ -122,6 +122,8 @@ from .sql_frontend import (
 #     SERIALIZABLE snapshots against repair_view(), rebuild, and backfill via
 #     SELECT ... FOR SHARE on the view's catalog row (raising 40001 on stale
 #     or missing catalog visibility; zero locks under READ COMMITTED).
+# 16: PostgreSQL source-table maintenance triggers are ENABLE ALWAYS (they fire
+#     under session_replication_role = replica); drift requires tgenabled = 'A'.
 MATVIEW_GENERATOR_VERSION = "16"
 
 
@@ -2369,6 +2371,11 @@ class MaterializedViewManager:
             plain_views=plain_views,
             current_schema=current_schema,
         )
+        if self.dialect == Dialect.POSTGRES:
+            # Every path that installs, replaces, repairs or re-validates a view
+            # compiles it here: a subscription target is refused at registration,
+            # refused by repair_view() and reported "invalid" by check_schema_drift().
+            self._refuse_subscription_targets(plan.view_name, plan.view_spec.referenced_tables)
         return plan
 
     def _classify_native_functions(
@@ -2796,7 +2803,7 @@ class MaterializedViewManager:
         "triggers_modified" | "triggers_out_of_order" | "triggers_orphaned" |
         "partitions_changed" | "dropped"}`
         ("triggers_missing": maintenance triggers or helper functions of an unchanged view are gone;
-        "triggers_disabled": a PostgreSQL maintenance trigger is disabled;
+        "triggers_disabled": a PostgreSQL maintenance trigger is not ENABLE ALWAYS (disabled, ENABLE REPLICA or plain ENABLE);
         "triggers_modified": a PostgreSQL maintenance/helper function body, `search_path`, or trigger
         definition was altered out of band; "triggers_out_of_order": a newer SQLite user trigger
         that writes a source table fires before the maintenance trigger, or a MySQL/MariaDB
@@ -2929,6 +2936,49 @@ class MaterializedViewManager:
         """Registered views whose maintenance triggers or functions are not
         exactly where and how they must be (see ``_views_trigger_drift``)."""
         return set(self._views_trigger_drift(catalog, extra_ddls_by_view=extra_ddls_by_view))
+
+    def _pg_subscription_targets(self, tables: Iterable[str]) -> List[str]:
+        """The given source tables that are logical-replication subscription
+        targets on this PostgreSQL server (the table itself, any partition below
+        it, or any partitioned ancestor appears in ``pg_subscription_rel``).
+
+        The subscription apply worker fires only ROW-level triggers; matview's
+        PostgreSQL maintenance triggers are statement-level, so replicated
+        INSERT/UPDATE/DELETE would silently not be maintained. Returns the
+        offending tables; empty when none or when the catalog cannot be read.
+        """
+        if self.dialect != Dialect.POSTGRES:
+            return []
+        found: List[str] = []
+        with self._cursor() as cur:
+            for table in sorted({str(t) for t in tables}, key=str.lower):
+                lit = "'" + quote_sql_identifier(table, self.dialect, allow_qualified=True).replace("'", "''") + "'"
+                rows = self._catalog_select(
+                    cur,
+                    f"WITH RECURSIVE __mv_down(relid) AS ("
+                    f" SELECT pg_catalog.to_regclass({lit})::oid"
+                    f" UNION ALL SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN __mv_down ON i.inhparent = __mv_down.relid),"
+                    f" __mv_up(relid) AS ("
+                    f" SELECT pg_catalog.to_regclass({lit})::oid"
+                    f" UNION ALL SELECT i.inhparent FROM pg_catalog.pg_inherits i JOIN __mv_up ON i.inhrelid = __mv_up.relid)"
+                    f" SELECT count(*) FROM pg_catalog.pg_subscription_rel sr"
+                    f" WHERE sr.srrelid IN (SELECT relid FROM __mv_down UNION SELECT relid FROM __mv_up)",
+                )
+                if rows is not None and int(rows[0][0]) > 0:
+                    found.append(table)
+        return found
+
+    def _refuse_subscription_targets(self, view_name: str, tables: Iterable[str]) -> None:
+        targets = self._pg_subscription_targets(tables)
+        if targets:
+            raise UnsupportedMaterializedViewError(
+                f"View '{view_name}' reads table(s) {', '.join(sorted(targets))} that are logical-replication "
+                "subscription targets. The subscription apply worker fires only row-level triggers, while "
+                "PostgreSQL maintenance triggers are statement-level, so replicated INSERT/UPDATE/DELETE would "
+                "not be maintained and the view would silently go stale. Logical-replication subscribers are an "
+                "unsupported configuration (no relaxed mode exists): maintain the view on the publisher, or "
+                "materialize from a table that is not a subscription target."
+            )
 
     _PG_IDENT_PAT = r'(?:"(?:""|[^"])+"|[A-Za-z_][A-Za-z0-9_$]*)'
     _PG_CREATE_TRIGGER_RE = re.compile(
@@ -3123,9 +3173,10 @@ class MaterializedViewManager:
         "triggers_missing": a recorded trigger or helper function does not exist
         (PostgreSQL: on the source table or on one of its current partitions,
         e.g. one attached or created after registration). "triggers_disabled"
-        (PostgreSQL): a maintenance trigger exists but does not fire for
-        ordinary sessions (``ALTER TABLE ... DISABLE TRIGGER`` or ``ENABLE
-        REPLICA TRIGGER``). "triggers_modified" (PostgreSQL): a maintenance or
+        (PostgreSQL): a source-table maintenance trigger is not ``ENABLE
+        ALWAYS``: disabled, ``ENABLE REPLICA`` (not fired for ordinary
+        sessions) or plain ``ENABLE`` (not fired under
+        ``session_replication_role = replica``). "triggers_modified" (PostgreSQL): a maintenance or
         helper function's body, language, security mode, or ``search_path``
         configuration was modified out of band (e.g. ``CREATE OR REPLACE
         FUNCTION`` or ``ALTER FUNCTION ... RESET search_path``), or a trigger
@@ -3522,6 +3573,7 @@ class MaterializedViewManager:
                     checked_trig_names.add(trg)
                     lit_t = "'" + table.replace("'", "''") + "'"
                     lit_n = "'" + trg.replace("'", "''") + "'"
+                    enabled_mode = "O" if exp_tgtype & 64 else "A"  # tgtype bit 64: INSTEAD OF
                     rows = self._catalog_select(
                         cur,
                         f"WITH RECURSIVE __mv_tree(relid) AS ("
@@ -3538,11 +3590,14 @@ class MaterializedViewManager:
                         f" (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgfoid IN (SELECT tgfoid FROM __mv_fn)"
                         f"  AND NOT t.tgisinternal"
                         f"  AND t.tgrelid NOT IN (SELECT relid FROM __mv_tree WHERE relid IS NOT NULL)),"
-                        # ALTER TABLE ... DISABLE TRIGGER ('D') or ENABLE REPLICA
-                        # TRIGGER ('R'): the trigger does not fire for ordinary
-                        # sessions, so their writes are not maintained.
+                        # Source-table maintenance triggers must be ENABLE ALWAYS
+                        # ('A') to also fire under session_replication_role =
+                        # replica; ordinary ENABLE ('O') is insufficient, and
+                        # DISABLE ('D') / ENABLE REPLICA ('R') do not fire for
+                        # ordinary sessions at all. The read-only INSTEAD OF
+                        # triggers on the reader view stay ordinary ('O').
                         f" (SELECT count(*) FROM pg_catalog.pg_trigger t JOIN __mv_tree ON t.tgrelid = __mv_tree.relid"
-                        f"  WHERE NOT t.tgisinternal AND t.tgname = {lit_n} AND t.tgenabled NOT IN ('O', 'A'))",
+                        f"  WHERE NOT t.tgisinternal AND t.tgname = {lit_n} AND t.tgenabled NOT IN ('{enabled_mode}'))",
                     )
                     if rows is None:
                         continue
@@ -3794,8 +3849,10 @@ class MaterializedViewManager:
         means maintenance triggers or helper functions recorded for the view do
         not exist, also on a PostgreSQL partition attached or created later
         (writes are not maintained); "triggers_disabled" means a PostgreSQL
-        maintenance trigger was disabled (`ALTER TABLE ... DISABLE TRIGGER`, as
-        `pg_restore --disable-triggers` does; writes are not maintained);
+        maintenance trigger is not ENABLE ALWAYS: disabled or ENABLE REPLICA
+        (writes are not maintained) or plain ENABLE (writes under
+        `session_replication_role = replica` are not maintained;
+        `pg_restore --disable-triggers` leaves triggers in this state);
         "triggers_modified" means a PostgreSQL maintenance/helper function body,
         `search_path`, or trigger definition was modified out of band (e.g.
         `CREATE OR REPLACE FUNCTION` or `ALTER FUNCTION ... RESET search_path`);
@@ -3806,7 +3863,10 @@ class MaterializedViewManager:
         first; "triggers_orphaned" means a PostgreSQL maintenance trigger
         is on a table outside the source's partition tree, e.g. a DETACHed
         partition (its writes still change the view, and its rows are still in
-        the view); "partitions_changed" means a PostgreSQL source table's
+        the view); "invalid" is also reported for a PostgreSQL view whose source is
+        (or became) a logical-replication subscription target: replicated row changes
+        are not maintained and no repair exists (unsupported configuration,
+        `repair_view()` refuses); "partitions_changed" means a PostgreSQL source table's
         partition tree changed out of band (e.g. `DROP TABLE` on a partition,
         `DETACH` followed by `DROP`, or a partition rename/bound change; rows
         of a dropped partition remain in the view until repaired). Repair any
