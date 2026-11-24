@@ -34,10 +34,18 @@ name: CI — Deferred Compatibility Sweep
 #   13.1. Release candidates are not support claims.
 # - SQLite3MC and sqlean are periodic SQLite-build smoke checks. The current
 #   suite does not verify cipher correctness or sqlean-specific extension APIs.
-#   The sqlean row is allowed to fail (continue-on-error, with a warning
-#   annotation): sqlean's bundled stats extension defines VAR_*/STDDEV_* with
-#   different semantics from matview's SQLite maintenance (see TODO.md, "sqlean
-#   Native Statistical Aggregates"). Remove allow-failure when that is resolved.
+#   Both rows must pass: no row is allowed to fail. sqlean's bundled stats
+#   extension defines its own VAR_*/STDDEV_* (a single-row sample statistic is
+#   0.0, not NULL; streaming accumulation), which are not the SQL-standard
+#   statistics matview maintains on SQLite. That divergence is a NAMED exclusion
+#   in the test oracle (test_matview_sync.NO_LIVE_SQLEAN_STATISTICAL_AGGREGATE):
+#   only the statistical output columns of a view are dropped from the
+#   differential on sqlean (a view whose statistics cannot be isolated to output
+#   columns is excluded by name); every other column, row multiplicity and
+#   result type is compared exactly. SqleanStatisticalDivergenceCanary pins the
+#   divergence and FAILS this lane when it disappears or changes, which is the
+#   cue to remove the exclusion. See TODO.md, "sqlean Native Statistical
+#   Aggregates".
 # - Minimum declared Python dependency versions are tested on Python 3.11 against
 #   live PostgreSQL and MySQL. The pins are derived from requirements.txt at run
 #   time (every `>=` floor becomes `==`), so the lane cannot drift from the
@@ -105,9 +113,6 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # Only rows marked allow-failure (see the policy comment above) may fail
-    # without failing the sweep; their failure still raises a warning.
-    continue-on-error: ${{ matrix.allow-failure == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -120,7 +125,6 @@ jobs:
             kind: sqlite
             sqlite-engine: sqlean
             driver-package: sqlean.py
-            allow-failure: true
           - name: "PostgreSQL 16"
             kind: postgres
             image: postgres:16
@@ -246,16 +250,6 @@ jobs:
           MYSQL_DSN: ${{ matrix.kind == 'mysql' && 'mysql://root:password@127.0.0.1:3306/matview_test' || '' }}
           SQLITE_COMPAT_ENGINE: ${{ matrix.sqlite-engine || '' }}
         run: python3 test_matview_sync.py
-
-      - name: Flag an allowed failure
-        if: ${{ failure() && matrix.allow-failure == true }}
-        env:
-          LABEL: ${{ matrix.name }}
-        run: |
-          msg="$LABEL failed but is allowed to fail (known divergence, see TODO.md and the ci-deferred.yml policy comment); it does not fail the sweep."
-          echo "::warning title=Allowed failure: $LABEL::$msg"
-          echo "### Allowed failure: $LABEL" >> "$GITHUB_STEP_SUMMARY"
-          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
 
   dependency-minimum:
     name: Minimum declared dependencies / ${{ matrix.name }}

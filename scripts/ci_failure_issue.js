@@ -54,11 +54,13 @@ async function issuesDisabled(core, title, body) {
   const msg = `${title}: GitHub Issues are disabled for this repository, so no issue was opened. ` +
     "Enable Issues (Settings > General > Features) to get one tracked issue per failing workflow; " +
     "the full report is in this job's summary.";
+  // An error annotation and the full report in the summary; the failing jobs
+  // this job reports on already keep the run red, so this job does not fail
+  // on top of them merely because there is nowhere to open an issue.
   core.error(msg);
   if (core.summary) {
     await core.summary.addHeading(title, 2).addRaw(body, true).write();
   }
-  core.setFailed(msg);
   return null;
 }
 
@@ -104,7 +106,7 @@ module.exports = async function reportFailure({ github, context, core }, opts) {
 
   // Issues can be disabled in the repository settings (the API then answers
   // 410 Gone). Never let the failure signal disappear: put the report in the
-  // job summary, annotate the run, and fail this job so the run stays red.
+  // job summary and annotate the run (the failing jobs keep the run red).
   if (context.payload && context.payload.repository && context.payload.repository.has_issues === false) {
     return issuesDisabled(core, title, body);
   }
