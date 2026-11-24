@@ -1037,17 +1037,16 @@ def deferred_workflow_errors(deferred: Dict[str, Any], requirements: str) -> Lis
         if line and ">=" not in line:
             errors.append(f"requirements.txt entry without a >= floor: {line!r}")
 
-    # Allowed failures are explicit, warned about, and limited to documented rows.
-    sweep = jobs.get("compatibility-sweep") or {}
-    rows = ((sweep.get("strategy") or {}).get("matrix") or {}).get("include") or []
-    allowed = sorted(str(r.get("name")) for r in rows if r.get("allow-failure") is True)
-    if allowed != ["sqlean SQLite"]:
-        errors.append(f"ci-deferred.yml allow-failure rows must be exactly the documented sqlean row, got {allowed}")
-    if "matrix.allow-failure == true" not in str(sweep.get("continue-on-error", "")):
-        errors.append("ci-deferred.yml compatibility-sweep continue-on-error must be driven by matrix.allow-failure")
-    if not any("failure()" in str(s.get("if", "")) and "::warning" in str(s.get("run", ""))
-               for s in sweep.get("steps") or []):
-        errors.append("ci-deferred.yml compatibility-sweep must emit a warning for an allowed failure")
+    # No sweep row may fail silently: known divergences are named exclusions in
+    # the test oracle (and pinned by a strict canary), never allowed failures.
+    for job_name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        if job.get("continue-on-error") not in (None, False):
+            errors.append(f"ci-deferred.yml job {job_name} must not set continue-on-error: {job['continue-on-error']!r}")
+        for row in ((job.get("strategy") or {}).get("matrix") or {}).get("include") or []:
+            if "allow-failure" in row:
+                errors.append(f"ci-deferred.yml row {row.get('name')!r} must not be allow-failure; use a named oracle exclusion")
     for job in jobs.values():
         if not isinstance(job, dict):
             continue
@@ -1121,10 +1120,11 @@ class TestWorkflowHygiene(unittest.TestCase):
             if "min-requirements.txt" in str(st.get("run", "")):
                 st["run"] = 'pip install "sqlglot==25.0.0"'
         wf["jobs"]["compatibility-sweep"]["strategy"]["matrix"]["include"][-1]["allow-failure"] = True
+        wf["jobs"]["compatibility-sweep"]["continue-on-error"] = "${{ matrix.allow-failure == true }}"
         wf["jobs"]["compatibility-sweep"]["strategy"]["matrix"]["include"][0]["image"] = "mariadb:13.1-rc"
         del wf["jobs"]["report-failure"]
         errors = deferred_workflow_errors(wf, self.requirements + "\nnewdep\n")
-        for needle in ("schedules", "APSW SQLite", "derive its exact pins", "hand-copy", "allow-failure rows",
+        for needle in ("schedules", "APSW SQLite", "derive its exact pins", "hand-copy", "must not be allow-failure", "must not set continue-on-error",
                        "pre-release", "issue-reporting", "'newdep'"):
             self.assertTrue(any(needle in e for e in errors), (needle, errors))
 
@@ -1206,17 +1206,18 @@ report({ github, context, core }, { title: "T", label: "L", labelDescription: "d
         self.assertEqual(res["calls"][-1][1], 5)
         self.assertIn("No report artifact was found", res["calls"][-1][2])
 
-    def test_disabled_issues_fail_the_job_with_the_report_in_the_summary(self) -> None:
+    def test_disabled_issues_annotate_and_summarize_without_failing_the_reporter(self) -> None:
         # Payload says so (no API write attempted) ...
         res = self._run({"open": [], "labelExists": True, "dir": "/nonexistent", "hasIssues": False})
         kinds = [c[0] for c in res["calls"]]
-        self.assertEqual(kinds, ["error", "summary", "setFailed"])
+        self.assertEqual(kinds, ["error", "summary"])
         self.assertIn("Issues are disabled", res["calls"][0][1])
         self.assertIn("https://gh/o/r/actions/runs/7", res["calls"][1][1])
         self.assertIsNone(res["n"])
         # ... or the API answers 410 Gone.
         res = self._run({"open": [], "labelExists": True, "dir": "/nonexistent", "issuesGone": True})
-        self.assertEqual([c[0] for c in res["calls"]][-3:], ["error", "summary", "setFailed"])
+        self.assertEqual([c[0] for c in res["calls"]][-2:], ["error", "summary"])
+        self.assertNotIn("setFailed", [c[0] for c in res["calls"]])
 
     def test_other_titles_do_not_deduplicate(self) -> None:
         res = self._run({"open": [{"number": 5, "title": "other"}], "labelExists": True, "dir": "/nonexistent"})

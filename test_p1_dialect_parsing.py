@@ -241,6 +241,23 @@ class DialectAwareParsingTests(unittest.TestCase):
         ast_my = parse_sql_ast(my_expr, dialect=Dialect.MYSQL)
         self.assertEqual(ast_my.sql("mysql"), "SELECT `k` FROM `t`")
 
+    def test_mysql_statistical_aggregate_names_round_trip_with_their_native_semantics(self) -> None:
+        """The product relies on sqlglot to spell MySQL/MariaDB statistics. At
+        sqlglot 30.23.0 (the former declared floor) VAR_POP was generated as the
+        non-existent MySQL function VARIANCE_POP and MySQL VARIANCE (population
+        variance) was parsed as the sample variance, so the minimum-dependency
+        lane compiled a view the server could not run or that meant something
+        else. Every MySQL spelling must keep its name and population/sample kind."""
+        expected = {
+            "VAR_POP": "VAR_POP", "VARIANCE": "VAR_POP", "STD": "STDDEV_POP", "STDDEV": "STDDEV_POP",
+            "STDDEV_POP": "STDDEV_POP", "VAR_SAMP": "VAR_SAMP", "STDDEV_SAMP": "STDDEV_SAMP",
+        }
+        for spelling, native in expected.items():
+            with self.subTest(spelling=spelling):
+                ast = parse_sql_ast(f"SELECT {spelling}(a) FROM t", dialect=Dialect.MYSQL)
+                self.assertEqual(ast.sql("mysql"), f"SELECT {native}(a) FROM t")
+                self.assertEqual(ast.sql("postgres"), f"SELECT {native}(a) FROM t")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

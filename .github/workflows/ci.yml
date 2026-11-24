@@ -53,13 +53,14 @@ name: CI — Multi-Engine Materialized View Tests
 #   campaigns stay in ci-deferred.yml (weekly schedule).
 #
 # Dependency and environment dimensions:
-# - requirements.txt declares packaging>=23.0, sqlglot>=30.23.0, jinja2>=3.1.0,
+# - requirements.txt declares packaging>=23.0, sqlglot>=30.24.0, jinja2>=3.1.0,
 #   sqlalchemy>=2.0.0, psycopg2-binary>=2.9.9 and cryptography>=41.0.0 for Python
 #   <3.15, pymysql>=1.1.0, hypothesis>=6.100, and pytest>=8.0. PR jobs resolve the
 #   newest compatible releases; ci-deferred.yml derives exact pins from these
 #   floors and tests them nightly on Python 3.11 against live PostgreSQL and MySQL.
-#   sqlglot 30.22 and older fail (e.g. no TokenType.NATIONAL_RAW_STRING; before
-#   25.2 no exp.SetOperation). requirements-dev.txt (PyYAML, pyright) is installed
+#   sqlglot 30.23 and older fail (30.23 emits VAR_POP as the non-existent MySQL
+#   function VARIANCE_POP and parses MySQL VARIANCE as the sample variance; before
+#   30.23 no TokenType.NATIONAL_RAW_STRING; before 25.2 no exp.SetOperation). requirements-dev.txt (PyYAML, pyright) is installed
 #   only by the SQLite jobs: PyYAML for scripts/test_presubmit.py, pyright for the
 #   static type check, which runs once (the oldest-Python SQLite cell) against
 #   pythonVersion 3.11 in pyrightconfig.json and fails the required gate.
@@ -81,7 +82,8 @@ name: CI — Multi-Engine Materialized View Tests
 # fuzz campaigns weekly; a failing scheduled run opens or updates one issue):
 # Python 3.13–3.14; PostgreSQL 16–17 and Percona PostgreSQL 18; MySQL 26.10
 # Innovation; MariaDB 11.4 and 13.0 rolling; Percona MySQL 8.4 and 9.7;
-# SQLite3MC and sqlean (allowed to fail: see TODO.md); minimum declared Python
+# SQLite3MC and sqlean (sqlean's own VAR_*/STDDEV_* are a named exclusion: see
+# ci-deferred.yml); minimum declared Python
 # dependency versions. Extensions without feature tests are excluded, not
 # deferred.
 #

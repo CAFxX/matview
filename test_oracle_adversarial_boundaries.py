@@ -76,6 +76,81 @@ class NoLiveStatisticsExclusionTests(unittest.TestCase):
                 self.assertIsInstance(_live_reference_select(stat, stat.view_spec.raw_select_sql, Dialect.SQLITE), str)
 
 
+class SqleanStatisticalColumnExclusionTests(unittest.TestCase):
+    """sqlean defines its own VAR_*/STDDEV_* (not the SQL-standard statistics
+    matview maintains on SQLite). On sqlean only the statistical OUTPUT columns
+    of a single SELECT are excluded from the differential; a statistic anywhere
+    that could change the rows returned excludes the view by name; nothing else
+    is excluded. (The divergence itself is pinned by
+    test_matview_sync.SqleanStatisticalDivergenceCanary.)"""
+
+    def test_statistical_projection_indices(self) -> None:
+        from test_matview_sync import _sqlean_statistical_projection_indices as idx
+
+        self.assertEqual(idx("SELECT g, SUM(w) FROM t GROUP BY g"), set())
+        self.assertEqual(idx("SELECT g, VAR_POP(w) AS vp, SUM(w) FROM t GROUP BY g"), {1})
+        self.assertEqual(
+            idx("SELECT STDDEV_SAMP(w), g, COALESCE(VARIANCE(w), 0) + 1 FROM t GROUP BY g"), {0, 2}
+        )
+        self.assertEqual(idx("SELECT g, VAR_POP(w) OVER (PARTITION BY g) FROM t"), {1})
+        # Anything that can change which rows the view returns is not isolable.
+        for sql in (
+            "SELECT g, SUM(w) FROM t GROUP BY g HAVING VAR_POP(w) > 1",
+            "SELECT g, VAR_POP(w) AS vp FROM t GROUP BY g HAVING vp > 1",
+            "SELECT g, VAR_POP(w) AS vp FROM t GROUP BY g ORDER BY vp",
+            "SELECT g FROM t WHERE w > (SELECT STDDEV_POP(w) FROM t)",
+            "SELECT g, vp FROM (SELECT g, VAR_POP(w) AS vp FROM t GROUP BY g) AS d",
+            "WITH c AS (SELECT g, VAR_POP(w) AS vp FROM t GROUP BY g) SELECT g, vp FROM c",
+            "SELECT g, VAR_POP(w) FROM t GROUP BY g UNION ALL SELECT g, 0 FROM t",
+            "SELECT *, VAR_POP(w) FROM t",
+        ):
+            with self.subTest(sql=sql):
+                self.assertIsNone(idx(sql))
+
+    def test_only_sqlean_excludes_and_only_unisolable_views_by_name(self) -> None:
+        import os
+        from unittest import mock
+
+        from test_matview_sync import NO_LIVE_SQLEAN_STATISTICAL_AGGREGATE, NoLiveView, _live_reference_select
+
+        schema = parse_table_schema("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, w INTEGER)")
+        isolable = generate_materialized_view(schema, "CREATE VIEW v AS SELECT g, VAR_POP(w) AS vp FROM t GROUP BY g")
+        sql = "CREATE VIEW v2 AS SELECT g FROM t GROUP BY g HAVING STDDEV_SAMP(w) > 1"
+        unisolable = generate_materialized_view(schema, sql)
+        with mock.patch.dict(os.environ, {"SQLITE_COMPAT_ENGINE": "sqlean"}):
+            self.assertIsInstance(
+                _live_reference_select(isolable, isolable.view_spec.raw_select_sql, Dialect.SQLITE), str
+            )
+            ref = _live_reference_select(unisolable, unisolable.view_spec.raw_select_sql, Dialect.SQLITE)
+            self.assertIsInstance(ref, NoLiveView)
+            self.assertEqual(ref.reason, NO_LIVE_SQLEAN_STATISTICAL_AGGREGATE)
+        for engine in ("", "apsw", "sqlite3mc", "sqlcipher"):
+            with mock.patch.dict(os.environ, {"SQLITE_COMPAT_ENGINE": engine}):
+                got = _live_reference_select(unisolable, unisolable.view_spec.raw_select_sql, Dialect.SQLITE)
+                self.assertIsInstance(got, str)
+
+
+class PgCatalogTranspileTests(unittest.TestCase):
+    """The SQLite emulation of PostgreSQL statement-level bodies must understand
+    the schema-qualified spellings the planner emits (`pg_catalog.text`,
+    `pg_catalog.octet_length`): the scale-3 fuzz seed 20261106 failed on SQLite,
+    APSW and (through the transpiled batch) MySQL 8.4 with a syntax error on a
+    UNION ALL key `ROW(...)::pg_catalog.text`."""
+
+    def test_row_key_and_catalog_names_run_on_sqlite(self) -> None:
+        from test_matview_sync import _transpile_pg_expr_to_sqlite
+
+        sql = _transpile_pg_expr_to_sqlite(
+            "SELECT ROW(('V:' || pg_catalog.octet_length(CAST('B0' AS pg_catalog.text)) || ':' || "
+            "CAST('B0' AS pg_catalog.text)), (x)::pg_catalog.text)::pg_catalog.text FROM (SELECT 'abc' AS x)"
+        )
+        self.assertNotIn("pg_catalog", sql)
+        self.assertNotIn("ROW(", sql.upper())
+        conn = sqlite3.connect(":memory:")
+        conn.create_function("PG_ROW_KEY", -1, lambda *a: "(" + ",".join(map(str, a)) + ")")
+        self.assertEqual(conn.execute(sql).fetchall(), [("(V:2:B0,abc)",)])
+
+
 class SqliteStatisticsExactReferenceTests(unittest.TestCase):
     """SQLite VAR/STDDEV maintenance against exact references: the variance
     over the exact row values in rational arithmetic (fractions.Fraction),

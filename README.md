@@ -522,9 +522,15 @@ Support levels used here:
   `test_native_dml_interactions.py` cover them.
 - Best-effort: SQLite3 Multiple Ciphers and sqlean run the main suite nightly as
   SQLite builds; cipher and extension functionality is not tested. The sqlean
-  lane is allowed to fail: sqlean's own `VAR_*`/`STDDEV_*` functions differ
-  from matview's SQLite results (a single-value sample statistic is `0.0` in
-  sqlean and NULL in the MV; rounding also differs), see
+  lane must pass, with one named exclusion: sqlean's own `VAR_*`/`STDDEV_*`
+  functions differ from matview's SQLite results (a single-value sample
+  statistic is `0.0` in sqlean and NULL in the MV; rounding also differs), so
+  on sqlean the statistical output columns are not compared (every other
+  column, the row multiset and the result types still are). A canary test fails
+  that lane when the divergence disappears or changes. matview does NOT
+  reproduce sqlean's statistics: a view using `VAR_*`/`STDDEV_*` on a connection
+  with sqlean's stats extension enabled returns the SQL-standard value from the
+  materialized view and sqlean's value from the original view, see
   [sqlean Native Statistical Aggregates (MVs Diverge From sqlean's Own VAR/STDDEV)](TODO.md). Products not
   listed in the matrix (for example other PostgreSQL or MySQL forks) are
   untested.
