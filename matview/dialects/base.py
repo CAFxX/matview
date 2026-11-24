@@ -11,6 +11,7 @@ import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
+from .. import key_collation
 from .._host import MixinHost
 from ..engines import (
     AggFunc,
@@ -2386,89 +2387,167 @@ class DialectBaseMixin(MixinHost):
         re.IGNORECASE | re.DOTALL,
     )
 
-    @staticmethod
-    def _balanced_outer_parens(s: str) -> bool:
-        """True when the first ``(`` of ``s`` closes at its last character."""
-        depth = 0
-        for i, ch in enumerate(s):
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0 and i != len(s) - 1:
-                    return False
-        return depth == 0
+    # --- group-key collation (see matview/key_collation.py) -------------------
 
-    def _group_key_collation(self, expr: str) -> Tuple[str, Optional[str]]:
-        """``(expression without COLLATE, collation)`` of a group-key expression:
-        the explicit trailing ``COLLATE x``, else the declared collation of a
-        plain column reference (also ``NEW.col``/``OLD.col``); ``None`` when the
-        engine default applies."""
-        if getattr(self, "_alg_mode", "single") in ("setop", "union_all_agg"):
-            # Set operations: the collation of an output column is decided across the
-            # branches (SQLite: the left-most branch's), so per-branch key folding
-            # could disagree between branches. Keys stay byte-exact there (see TODO.md).
-            return expr, None
+    def _key_tables(self) -> List[TableSchema]:
+        tables: List[TableSchema] = []
+        seen: Set[str] = set()
+        if self.primary_schema is not None:
+            tables.append(self.primary_schema)
+            seen.add(self.primary_schema.name.lower())
+        for t_name in self.view.referenced_tables:
+            ts = self._schemas_lower.get(t_name.lower())
+            if ts is not None and ts.name.lower() not in seen:
+                tables.append(ts)
+                seen.add(ts.name.lower())
+        return tables
+
+    def _key_col_signature(self, c: ColumnDef) -> Tuple[Any, ...]:
+        if self.dialect == Dialect.MYSQL:
+            return (key_collation.mysql_column_is_character(c), (c.effective_collation or "").upper())
+        return ((c.effective_collation or "BINARY").upper(),)
+
+    def _key_resolver_by_name(self, tables: Optional[Sequence[TableSchema]] = None) -> key_collation.ColumnResolver:
+        """Resolve a column by its bare name over the view's tables. This is what the
+        key text sees (trigger bodies carry ``NEW.col``/``OLD.col``/table-qualified
+        references), so a name declared differently by several tables is ambiguous."""
+        tbls = list(tables) if tables is not None else self._key_tables()
+
+        def resolve(col: sqlglot_exp.Column) -> Optional[ColumnDef]:
+            name = (col.name or "").lower()
+            if (
+                tables is None
+                and getattr(self, "_alg_mode", "single") == "union_all_agg"
+                and not getattr(self, "_uall_orig_item_map", None)
+            ):
+                # The outer query of a UNION ALL aggregate names subquery columns.
+                return self._uall_alias_column(name)
+            found = [c for ts in tbls for c in ts.columns.values() if c.name.lower() == name]
+            if not found or len({self._key_col_signature(c) for c in found}) != 1:
+                return None
+            return found[0]
+
+        return resolve
+
+    def _uall_alias_column(self, name: str) -> Optional[ColumnDef]:
+        """The declared column behind a UNION ALL subquery column ``name`` (the outer
+        GROUP BY of a UNION ALL aggregate names it): the first branch's plain-column
+        projection of that name; None when a branch projects an expression."""
+        cache: Dict[str, Optional[ColumnDef]] = self.__dict__.setdefault("_uall_alias_cache", {})
+        if name in cache:
+            return cache[name]
+        found: Optional[ColumnDef] = None
+        try:
+            meta = self._extract_union_all_agg_metadata()
+        except Exception:
+            meta = None
+        if meta is not None and meta[2]:
+            bs = meta[2][0]
+            src = next((it for it in bs.select_items if it.alias.lower() == name), None)
+            if src is not None:
+                try:
+                    node = parse_sql_ast(src.raw_expr, dialect=self.dialect)
+                except sqlglot.errors.SqlglotError:
+                    node = None
+                if isinstance(node, sqlglot_exp.Column):
+                    found = self._key_resolver_by_alias(bs)(node)
+        cache[name] = found
+        return found
+
+    def _key_resolver_by_alias(self, spec: Optional[ViewSpec] = None) -> key_collation.ColumnResolver:
+        """Resolve a column the way the original view does: through its table alias."""
+        v = spec or self.view
+        by_alias: Dict[str, TableSchema] = {}
+        for j in v.joins:
+            ts = self._schemas_lower.get(j.table_name.lower())
+            if ts is not None:
+                by_alias[j.alias.lower()] = ts
+                by_alias.setdefault(j.table_name.lower(), ts)
+        all_tables = list({id(ts): ts for ts in by_alias.values()}.values())
+        by_name = self._key_resolver_by_name(all_tables)
+
+        def resolve(col: sqlglot_exp.Column) -> Optional[ColumnDef]:
+            qual = (col.table or "").lower()
+            if qual:
+                ts = by_alias.get(qual)
+                if ts is None:
+                    return None
+                for c in ts.columns.values():
+                    if c.name.lower() == (col.name or "").lower():
+                        return c
+                return None
+            return by_name(col)
+
+        return resolve
+
+    def _classify_key(self, expr: str, resolve: Optional[key_collation.ColumnResolver] = None) -> key_collation.KeyClass:
+        res = resolve if resolve is not None else self._key_resolver_by_name()
+        if self.dialect == Dialect.SQLITE:
+            return key_collation.classify_sqlite_key(expr, res)
+        return key_collation.classify_mysql_key(expr, res, self.dialect)
+
+    def _key_class_for_key(self, expr: str) -> key_collation.KeyClass:
+        """Classification used while emitting key text. An expression the planner
+        did not route to a full refresh must be derivable; anything else is refused
+        here rather than keyed byte-exactly (which would silently split groups)."""
+        cls = self._classify_key(expr)
+        if cls.kind == key_collation.KeyKind.UNKNOWN:
+            if cls.missing_column:
+                # Internal (hidden/aux) column: never a user-collated value.
+                return key_collation.KeyClass(
+                    key_collation.KeyKind.TEXT if self.dialect == Dialect.SQLITE else key_collation.KeyKind.PLAIN,
+                    "BINARY" if self.dialect == Dialect.SQLITE else None,
+                )
+            raise UnsupportedMaterializedViewError(
+                f"cannot derive the comparison collation of key expression {expr.strip()}: {cls.reason}"
+            )
+        return cls
+
+    def _group_key_collation(self, expr: str, strict: bool = False) -> Tuple[str, Optional[str]]:
+        """``(expression without a trailing COLLATE, collation)`` of a group-key
+        expression: the collation the engine compares it under (SQLite: derived;
+        MySQL/MariaDB: the declared collation of the character column it derives
+        from, a hint); ``None`` when no collation applies. With ``strict`` an
+        expression whose collation cannot be derived is refused (key text); without,
+        it has no collation (storage declarations of non-key columns)."""
+        if strict:
+            cls = self._key_class_for_key(expr)
+        else:
+            cls = self._classify_key(expr)
+            if cls.kind == key_collation.KeyKind.UNKNOWN:
+                return expr, None
+        coll = cls.collation if cls.kind == key_collation.KeyKind.TEXT else None
+        inner = expr
         m = self._EXPLICIT_COLLATE_RE.match(expr.strip())
         if m:
-            return m.group("inner"), m.group("coll").strip('"`').upper()
-        bare = expr.strip()
-        while bare.startswith("(") and bare.endswith(")") and self._balanced_outer_parens(bare):
-            bare = bare[1:-1].strip()
-        col = self._lookup_col_def(re.sub(r"^(?:NEW|OLD)\.", "", bare, flags=re.IGNORECASE))
-        return expr, (col.effective_collation if col is not None else None)
+            try:
+                root = parse_sql_ast(expr.strip(), dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                root = None
+            if isinstance(root, sqlglot_exp.Collate):
+                inner = m.group("inner")
+        return inner, coll
 
-    _MYSQL_CHAR_TYPE_RE = re.compile(r"^\s*(?:NATIONAL\s+)?(?:N?CHAR|N?VARCHAR|TINYTEXT|TEXT|MEDIUMTEXT|LONGTEXT)\b", re.I)
-
-    def _mysql_collation_weight_expr(self, expr: str) -> Optional[str]:
-        """``WEIGHT_STRING(...)`` of a MySQL/MariaDB character group key under its
-        collation (None for keys that are not character data, e.g. numbers, binary
-        strings, ENUM, or expressions whose type is unknown).
-
-        Trailing spaces are insignificant under PAD SPACE collations (every
-        collation except the MySQL ``*_0900_*`` and MariaDB ``*_nopad_*`` families),
-        so they are trimmed first. A column whose collation is unknown (schema
-        given as text without the server's catalog) is assumed to use the server
-        default: NO PAD on MySQL, PAD SPACE on MariaDB."""
-        if getattr(self, "_alg_mode", "single") in ("setop", "union_all_agg"):
-            return None  # see _group_key_collation: set-operation keys stay byte-exact
-        inner, coll = self._group_key_collation(expr)
-        explicit = coll is not None and inner is not expr and inner.strip() != expr.strip()
-        bare = inner.strip()
-        while bare.startswith("(") and bare.endswith(")") and self._balanced_outer_parens(bare):
-            bare = bare[1:-1].strip()
-        col = self._lookup_col_def(re.sub(r"^(?:NEW|OLD)\.", "", bare, flags=re.IGNORECASE))
-        if col is not None:
-            if not self._MYSQL_CHAR_TYPE_RE.match(col.data_type or ""):
-                return None
-            if "BINARY" in (col.data_type or "").upper().split("CHARACTER SET")[0]:
-                return None
-        elif not explicit:
-            return None  # unknown type: keep the byte-exact key
-        name = (coll or "").upper()
-        if name in ("BINARY",):
+    def _key_collation_refusal(self, cls: key_collation.KeyClass) -> Optional[str]:
+        """Why a classified key cannot be keyed exactly, or None when it can."""
+        if cls.kind == key_collation.KeyKind.UNKNOWN:
+            return cls.reason or "its collation cannot be derived"
+        if cls.kind != key_collation.KeyKind.TEXT:
             return None
-        pad_space = not ("0900" in name or "NOPAD" in name)
-        if not name:
-            pad_space = self.subdialect == EngineSubdialect.MARIADB
-        arg = f"RTRIM({inner})" if pad_space else f"({inner})"
-        if explicit and coll:
-            arg = f"{arg} COLLATE {coll.lower()}"
-        return f"WEIGHT_STRING({arg})"
-
-    def _key_col_collate_suffix(self, expr: str, data_type: str = "") -> str:
-        """`` COLLATE x`` for a MySQL/MariaDB character backing key column whose
-        base column has a known collation (so the stored key compares like the
-        base column); SQLite: see ``_sqlite_key_collate_suffix``."""
+        name = (cls.collation or "").upper()
         if self.dialect == Dialect.SQLITE:
-            return self._sqlite_key_collate_suffix(expr)
-        if self.dialect != Dialect.MYSQL or "COLLATE" in data_type.upper():
-            return ""
-        _, coll = self._group_key_collation(expr)
-        col = self._lookup_col_def(re.sub(r"^(?:NEW|OLD)\.", "", expr.strip(), flags=re.IGNORECASE))
-        if col is None or not coll or not self._MYSQL_CHAR_TYPE_RE.match(col.data_type or ""):
-            return ""
-        return f" COLLATE {coll.lower()}"
+            if name not in ("BINARY", "NOCASE", "RTRIM"):
+                return (
+                    f"it compares under collation {name}, which matview cannot reproduce in its group-key text "
+                    "(supported: BINARY, NOCASE, RTRIM)"
+                )
+            return None
+        if self.dialect == Dialect.MYSQL and key_collation.mysql_collation_has_unsound_weights(name):
+            return (
+                f"it compares under collation {name}, a multi-level collation whose equality is not a function of "
+                "its weight string (or whose pad weights cannot be normalised)"
+            )
+        return None
 
     def _sqlite_key_collate_suffix(self, expr: str) -> str:
         """`` COLLATE NOCASE`` / `` COLLATE RTRIM`` for a backing group-key column
@@ -2479,13 +2558,64 @@ class DialectBaseMixin(MixinHost):
         _, coll = self._group_key_collation(expr)
         return f" COLLATE {coll}" if coll in ("NOCASE", "RTRIM") else ""
 
+    def _key_col_collate_suffix(self, expr: str, data_type: str = "") -> str:
+        """`` COLLATE x`` for a MySQL/MariaDB character backing key column whose
+        grouped expression derives from a character column with a known collation
+        (so the stored key compares like the base expression); SQLite: see
+        ``_sqlite_key_collate_suffix``."""
+        if self.dialect == Dialect.SQLITE:
+            return self._sqlite_key_collate_suffix(expr)
+        if self.dialect != Dialect.MYSQL or "COLLATE" in data_type.upper():
+            return ""
+        _, coll = self._group_key_collation(expr)
+        dt = data_type.upper()
+        if not coll or coll == "BINARY" or not ("CHAR" in dt or "TEXT" in dt) or "CHARACTER SET" in dt:
+            return ""
+        charset = coll.lower().split("_", 1)[0]
+        return f" CHARACTER SET {charset} COLLATE {coll.lower()}"
+
+    def _mysql_text_key_part(self, expr: str) -> Optional[str]:
+        """Key text of a MySQL/MariaDB character-valued expression: a digest of the
+        server's own ``WEIGHT_STRING`` of the expression, which is what its grouping
+        comparison uses (any case-/accent-insensitive collation merges variants
+        into one weight string). Under a PAD SPACE collation trailing pad weights are
+        insignificant, so trailing units equal to the weight of a space (under the
+        expression's own collation; NBSP and other characters weighing like a space
+        included) are removed first. Whether the collation pads is asked of the
+        server: ``' ' = ''`` holds under PAD SPACE only. None for expressions that
+        are not character-valued."""
+        cls = self._key_class_for_key(expr)
+        if cls.kind != key_collation.KeyKind.TEXT:
+            return None
+        why = self._key_collation_refusal(cls)
+        if why:
+            raise UnsupportedMaterializedViewError(f"cannot key {expr.strip()}: {why}")
+        spc = f"RIGHT(CONCAT({expr}, ' '), 1)"
+        w = f"HEX(WEIGHT_STRING({expr}))"
+        if self.subdialect != EngineSubdialect.MARIADB:
+            # MySQL's GROUP BY / DISTINCT / UNION treat only trailing U+0020 as
+            # insignificant padding (NBSP and other characters weighing like a space
+            # are significant there, although ``=`` pads by weight).
+            padded = f"HEX(WEIGHT_STRING(RTRIM({expr})))"
+        else:
+            # MariaDB pads by weight (``'a'`` = ``'a'`` + NBSP, ideographic space, ...
+            # under the UCA collations): drop the trailing weight units equal to the
+            # weight of a space. The unit is the weight string of one space under the
+            # expression's own collation; the aligned prefix before the trailing run
+            # of units is kept.
+            p = f"HEX(WEIGHT_STRING({spc}))"
+            padded = (
+                f"COALESCE(REGEXP_SUBSTR({w}, CONCAT('^(?:[0-9A-F]{{', LENGTH({p}), '}})*?(?=(?:', {p}, ')*$)')), '')"
+            )
+        return f"IF({expr} IS NULL, 'N', CONCAT('W', SHA2(IF({spc} = '', {padded}, {w}), 256)))"
+
     def _sqlite_collation_folded(self, expr: str) -> str:
         """``expr`` rewritten so that values equal under the group key's
         collation have the same canonical key text: NOCASE folds ASCII case (what
         the collation itself folds), RTRIM drops trailing spaces; BINARY keeps
-        the value. Other collations cannot be reproduced in a key text and are
-        refused explicitly."""
-        inner, coll = self._group_key_collation(expr)
+        the value. Other collations cannot be reproduced in a key text on SQLite
+        (the planner routes those views to a full refresh instead)."""
+        inner, coll = self._group_key_collation(expr, strict=True)
         if coll in (None, "BINARY"):
             return inner
         e = f"({inner})"
@@ -2495,9 +2625,147 @@ class DialectBaseMixin(MixinHost):
             return f"(CASE WHEN typeof({e}) = 'text' THEN rtrim({e}, ' ') ELSE {e} END)"
         raise UnsupportedMaterializedViewError(
             f"GROUP BY / DISTINCT key {inner.strip()} uses collation {coll}, which matview cannot reproduce in "
-            "its group-key text on SQLite (supported: BINARY, NOCASE, RTRIM); group by an expression "
-            "folded explicitly (for example lower(col)) instead."
+            "its group-key text on SQLite (supported: BINARY, NOCASE, RTRIM)."
         )
+
+    def _key_spelling_sensitive(self, cls: key_collation.KeyClass) -> bool:
+        """True when distinct spellings can compare equal under the key's collation."""
+        if cls.kind != key_collation.KeyKind.TEXT:
+            return False
+        if self.dialect == Dialect.SQLITE:
+            return (cls.collation or "BINARY") in ("NOCASE", "RTRIM")
+        return key_collation.mysql_collation_has_spelling_variants(cls.collation)
+
+    def _key_spelling_refresh_needed(self) -> bool:
+        """True when a displayed group key is spelling-sensitive (its spelling is
+        refreshed from the group's base rows when the supplying row leaves)."""
+        if self.dialect not in (Dialect.SQLITE, Dialect.MYSQL) or not self._effective_group_by_exprs:
+            return False
+        try:
+            return any(
+                self._key_spelling_sensitive(self._key_class_for_key(it.raw_expr))
+                for it in self._working_select_items
+                if not it.is_aggregate
+            )
+        except UnsupportedMaterializedViewError:
+            return False
+
+    def _key_collation_fallback_reason(self, strategy: MaintenanceStrategy, mode: str) -> Optional[str]:
+        """Why the view cannot keep its collation-sensitive keys exact under the
+        maintenance ``mode`` the planner picked, or None when it can. A reason sends
+        the view to the full refresh of the original query (exact by construction)
+        with an announced diagnostic instead of a key text that could split or
+        merge groups differently from the engine.
+
+        Collation-sensitive expressions: GROUP BY / window PARTITION BY keys, the
+        columns of DISTINCT and of de-duplicating set operations (per output column
+        across all branches), and DISTINCT aggregate arguments. Each must derive an
+        exactly known collation (``matview.key_collation``), the by-name resolution
+        used while the key text is emitted must agree with the alias-aware one of the
+        original view, and the branches of a set operation / UNION ALL aggregate
+        must agree per column."""
+        if self.dialect not in (Dialect.SQLITE, Dialect.MYSQL) or strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC:
+            return None
+        v = self.view
+        # (label, [(expr, alias-aware resolver, by-name resolver) per branch])
+        positions: List[Tuple[str, List[Tuple[str, key_collation.ColumnResolver, key_collation.ColumnResolver]]]] = []
+        # DISTINCT aggregate arguments: their value store carries the argument's
+        # collation, so no displayed spelling is involved.
+        argument_labels: Set[str] = set()
+        proper = self._key_resolver_by_alias()
+        byname = self._key_resolver_by_name()
+        if mode in ("single", "join", "window_partition"):
+            scope = self._tier2_scope_exprs() if mode == "window_partition" else tuple(self._effective_group_by_exprs)
+            for g in scope:
+                positions.append((f"group key {g.strip()}", [(g, proper, byname)]))
+            for it in self._working_select_items:
+                if it.is_aggregate and it.is_distinct and it.arg_expr:
+                    label = f"DISTINCT aggregate argument {it.arg_expr.strip()}"
+                    argument_labels.add(label)
+                    positions.append((label, [(it.arg_expr, proper, byname)]))
+        elif mode == "distinct":
+            for it in v.select_items:
+                if not it.is_aggregate:
+                    positions.append((f"DISTINCT column {it.raw_expr.strip()}", [(it.raw_expr, proper, byname)]))
+        elif mode == "setop":
+            branches = self._parse_setop_branches()
+            if branches and branches[0][0].upper() != "UNION ALL":
+                width = len(branches[0][1].select_items)
+                for i in range(width):
+                    items = []
+                    for _, bs in branches:
+                        if len(bs.select_items) != width:
+                            return "the branches of the set operation differ in column count"
+                        items.append((bs.select_items[i].raw_expr, self._key_resolver_by_alias(bs), byname))
+                    positions.append((f"set-operation column {i + 1} ({items[0][0].strip()})", items))
+        elif mode == "union_all_agg":
+            meta = self._extract_union_all_agg_metadata()
+            if meta is None:
+                return None
+            for g in self._effective_group_by_exprs:
+                try:
+                    g_ast = parse_sql_ast(g, dialect=self.dialect)
+                except sqlglot.errors.SqlglotError:
+                    return f"group key {g.strip()} cannot be parsed"
+                if not isinstance(g_ast, sqlglot_exp.Column):
+                    return f"group key {g.strip()} is an expression over the UNION ALL subquery"
+                items = []
+                for bs in meta[2]:
+                    src = next((it for it in bs.select_items if it.alias.lower() == (g_ast.name or "").lower()), None)
+                    ts = self._schemas_lower.get(bs.base_table.lower())
+                    if src is None or ts is None:
+                        return f"group key {g.strip()} is not a plain column of every UNION ALL branch"
+                    try:
+                        src_node = parse_sql_ast(src.raw_expr, dialect=self.dialect)
+                    except sqlglot.errors.SqlglotError:
+                        src_node = None
+                    if not isinstance(src_node, sqlglot_exp.Column):
+                        return f"group key {g.strip()} is an expression ({src.raw_expr.strip()}) in a UNION ALL branch"
+                    items.append((src.raw_expr, self._key_resolver_by_alias(bs), self._key_resolver_by_name([ts])))
+                positions.append((f"group key {g.strip()}", items))
+        for label, items in positions:
+            classes: List[key_collation.KeyClass] = []
+            for expr, res_proper, res_name in items:
+                cp = self._classify_key(expr, res_proper)
+                cn = self._classify_key(expr, res_name)
+                why = self._key_collation_refusal(cp)
+                if why:
+                    return f"{label}: {why}"
+                if self.dialect == Dialect.MYSQL and label not in argument_labels:
+                    try:
+                        key_node = parse_sql_ast(expr, dialect=self.dialect)
+                    except sqlglot.errors.SqlglotError:
+                        key_node = None
+                    key_col = res_proper(key_node) if isinstance(key_node, sqlglot_exp.Column) else None
+                    if key_col is not None and re.match(r"\s*(?:MEDIUM|LONG)(?:TEXT|BLOB)\b", key_col.data_type or "", re.I):
+                        return (
+                            f"{label}: MySQL/MariaDB cannot index a {key_col.data_type.strip()} column "
+                            "(error 1170), and the group key is stored in an indexed backing column"
+                        )
+                if (cp.kind, cp.collation) != (cn.kind, cn.collation):
+                    return f"{label}: a column name is declared differently by several tables of the view"
+                if label not in argument_labels and self._key_spelling_sensitive(cp) and not (
+                    strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA
+                    or (strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and mode in ("single", "join", "union_all_agg"))
+                ):
+                    return (
+                        f"{label}: values equal under its collation can be spelled differently, and the "
+                        f"displayed spelling must stay one some member row has, which this maintenance mode "
+                        f"({mode}) does not keep up when the row supplying it leaves"
+                    )
+                classes.append(cp)
+            if len(classes) > 1:
+                first = classes[0]
+                if self.dialect == Dialect.SQLITE:
+                    same = all(c.collation == first.collation for c in classes)
+                    if not (same or first.collation == "BINARY"):
+                        return f"{label}: its branches compare under different collations"
+                else:
+                    same = all(c.kind == first.kind and (c.kind != key_collation.KeyKind.TEXT or (
+                        c.collation == first.collation)) for c in classes)
+                    if not same:
+                        return f"{label}: its branches compare under different collations"
+        return None
 
     def _mysql_widened_minmax_type(self, arg_type: str) -> str:
         """MySQL's window MIN/MAX result type.
@@ -2975,7 +3243,7 @@ class DialectBaseMixin(MixinHost):
             return "VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
         return "TEXT"
 
-    def _canonical_group_pk_expr(self, group_exprs: Sequence[str]) -> str:
+    def _canonical_group_pk_expr(self, group_exprs: Sequence[str], *, collation_aware: bool = True) -> str:
         def _clean_pk_arg(e: str) -> str:
             s = e.strip()
             if not s:
@@ -2990,7 +3258,8 @@ class DialectBaseMixin(MixinHost):
         cleaned_exprs = [_clean_pk_arg(e) for e in group_exprs]
         if self.dialect == Dialect.SQLITE:
             return " || '|' || ".join(
-                self._sqlite_canonical_pk_term(self._sqlite_collation_folded(e)) for e in cleaned_exprs
+                self._sqlite_canonical_pk_term(self._sqlite_collation_folded(e) if collation_aware else e)
+                for e in cleaned_exprs
             )
         elif self.dialect == Dialect.POSTGRES:
             # Each member goes through the view's canonical-key-text function
@@ -3012,12 +3281,11 @@ class DialectBaseMixin(MixinHost):
         elif self.dialect == Dialect.MYSQL:
             parts = []
             for e in cleaned_exprs:
-                weight = self._mysql_collation_weight_expr(e)
-                if weight is not None:
-                    # Character key under a (case-/accent-insensitive or PAD SPACE)
-                    # collation: values that compare equal must share one key text,
-                    # so the key is the digest of the collation's own weight string.
-                    parts.append(f"IF({e} IS NULL, 'N', CONCAT('W', SHA2({weight}, 256)))")
+                # Character key: values that compare equal under the expression's
+                # collation must share one key text (see _mysql_text_key_part).
+                text_part = self._mysql_text_key_part(e) if collation_aware else None
+                if text_part is not None:
+                    parts.append(text_part)
                 else:
                     parts.append(
                         f"IF({e} IS NULL, 'N', CONCAT('V', OCTET_LENGTH(CAST({e} AS CHAR CHARACTER SET utf8mb4)), ':', CAST({e} AS CHAR CHARACTER SET utf8mb4)))"

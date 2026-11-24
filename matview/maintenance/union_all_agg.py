@@ -604,7 +604,7 @@ class Tier1UnionAllAggMixin(MixinHost):
                 w_old_b = branch_ctx._rewrite_expr_for_record(comb_w, "OLD") if comb_w else None
                 refresh_grp_b = branch_ctx._sqlite_refresh_group_keys_stmts(
                     mv_table, record_prefix="OLD"
-                )
+                ) + branch_ctx._key_spelling_refresh_stmts(mv_table, record_prefix="OLD")
 
                 # PostgreSQL order-sensitive aggregates (approximate SUM/AVG,
                 # VAR/STDDEV): recompute the locked group over the UNION ALL in

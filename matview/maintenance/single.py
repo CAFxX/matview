@@ -11,6 +11,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 from sqlglot.errors import SqlglotError
 
+from .. import key_collation
 from .._host import MixinHost
 from ..dialects.base import DialectBaseMixin
 from ..dialects.pg_statement import SIGN, PgAggregateSpec, PgDeltaSource
@@ -230,6 +231,7 @@ class Tier1SingleMixin(MixinHost):
         rows_filter: Optional[str] = None,
         limit_one: bool = False,
         locking_read: bool = False,
+        order_by: Optional[str] = None,
     ) -> str:
         """Native aggregate over the record's group, optionally restricted to the
         rows the triggers have already folded (rows inside an active backfill
@@ -258,9 +260,91 @@ class Tier1SingleMixin(MixinHost):
                 f"AND (backfill_cursor_pk IS NULL OR ({q_base_t}.{q_pk} > backfill_cursor_pk AND {q_base_t}.{q_pk} <= backfill_max_pk)))"
             )
         where_part = f" WHERE {' AND '.join(conds)}" if conds else ""
+        order_part = f" ORDER BY {order_by}" if order_by else ""
         limit_part = " LIMIT 1" if limit_one else ""
         lock_part = " LOCK IN SHARE MODE" if locking_read else ""
-        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part}{limit_part}{lock_part})"
+        return f"(SELECT {agg_sql} FROM {q_base_t}{where_part}{order_part}{limit_part}{lock_part})"
+
+    def _key_spelling_refresh_stmts(self, mv_table: str, record_prefix: str = "OLD") -> List[str]:
+        """SQLite/MySQL/MariaDB: keep the displayed spelling of a collation-sensitive
+        character group key one some member row currently has. Values equal under
+        the key's collation (``'a'``/``'A'``, ``'a'``/``'a '``) share one group; SQL
+        leaves open which spelling the group shows, but not that it shows one no
+        row has. When the row that supplied the stored spelling leaves the group
+        (DELETE, or an UPDATE that changes the value) and no remaining member
+        spells it that way, take a survivor's spelling (all spelling-sensitive key
+        columns together, from one row, so the shown values stay a row's own). A
+        statement that finds a member with the stored spelling writes nothing."""
+        if self.dialect not in (Dialect.SQLITE, Dialect.MYSQL) or not self._effective_group_by_exprs:
+            return []
+        alg_mode = getattr(self, "_alg_mode", "single")
+        if alg_mode not in ("single", "union_all_agg"):
+            return []
+        sensitive: List[SelectItem] = []
+        seen_cols: Set[str] = set()
+        for item in self._working_select_items:
+            if item.is_aggregate or self._q(item.alias) in seen_cols:
+                continue
+            seen_cols.add(self._q(item.alias))
+            if self._key_spelling_sensitive(self._key_class_for_key(item.raw_expr)):
+                sensitive.append(item)
+        if not sensitive:
+            return []
+        grp_pred = self._group_match_predicate_tier1(mv_table, record_prefix)
+        q_base_t = self._q(self.view.base_table)
+        sqlite = self.dialect == Dialect.SQLITE
+        old_es = [self._rewrite_expr_for_record(it.raw_expr, record_prefix) for it in sensitive]
+        q_cols = [self._q(it.alias) for it in sensitive]
+        if alg_mode == "union_all_agg":
+            # The members are the rows of the whole UNION ALL (every branch table).
+            orig_item_map = getattr(self, "_uall_orig_item_map", {})
+            sel_es = [orig_item_map.get(id(it), it).raw_expr for it in sensitive]
+        else:
+            sel_es = [self._rewrite_expr_for_record(it.raw_expr, q_base_t) for it in sensitive]
+        if sqlite:
+            same_old = " AND ".join(
+                f"{mv_table}.{qc} IS ({o}) COLLATE BINARY AND typeof({o}) = 'text'" for qc, o in zip(q_cols, old_es)
+            )
+            is_member = " AND ".join(f"({e}) IS {mv_table}.{qc} COLLATE BINARY" for qc, e in zip(q_cols, sel_es))
+            order = ", ".join(f"({e}) COLLATE BINARY" for e in sel_es) if len(sel_es) > 1 else None
+        else:
+            same_old = " AND ".join(
+                f"CAST({mv_table}.{qc} AS BINARY) <=> CAST({o} AS BINARY)" for qc, o in zip(q_cols, old_es)
+            ) + " AND " + " AND ".join(f"{o} IS NOT NULL" for o in old_es)
+            is_member = " AND ".join(
+                f"CAST({e} AS BINARY) <=> CAST({mv_table}.{qc} AS BINARY)" for qc, e in zip(q_cols, sel_es)
+            )
+            order = ", ".join(f"CAST({e} AS BINARY)" for e in sel_es) if len(sel_es) > 1 else None
+        lock = not sqlite and alg_mode == "single"
+
+        def _members(agg: str, rows_filter: Optional[str], order_by: Optional[str]) -> str:
+            if alg_mode == "union_all_agg":
+                u_conds: List[str] = []
+                if self.view.where_clause:
+                    u_conds.append(f"({self.view.where_clause})")
+                orig_grps = getattr(self, "_uall_orig_grp_exprs", self._effective_group_by_exprs)
+                for orig_g, branch_g in zip(orig_grps, self._effective_group_by_exprs):
+                    rhs_g = f"{mv_table}.{self._q(self._group_col_alias(branch_g))}"
+                    u_conds.append(self._null_safe_eq(f"({orig_g})", f"({rhs_g})", is_nullable=True))
+                if rows_filter:
+                    u_conds.append(f"({rows_filter})")
+                inner_u = getattr(self, "_union_all_inner_sql", "")
+                u_alias = getattr(self, "_union_all_sub_alias", "__mv_u")
+                w_u = f" WHERE {' AND '.join(u_conds)}" if u_conds else ""
+                o_u = f" ORDER BY {order_by}" if order_by else ""
+                return f"(SELECT {agg} FROM ({inner_u}) AS {u_alias}{w_u}{o_u} LIMIT 1)"
+            return self._build_native_group_recompute(
+                agg, mv_table, processed_only=True, rows_filter=rows_filter, limit_one=True,
+                locking_read=lock, order_by=order_by,
+            )
+
+        assigns = [f"{qc} = COALESCE({_members(e, None, order)}, {mv_table}.{qc})" for qc, e in zip(q_cols, sel_es)]
+        member = _members("1", is_member, None)
+        return [
+            f"UPDATE {mv_table}\n"
+            f"    SET {', '.join(assigns)}\n"
+            f"    WHERE ({grp_pred}) AND {same_old} AND {member} IS NULL;"
+        ]
 
     def _sqlite_refresh_group_keys_stmts(
         self, mv_table: str, record_prefix: str = "OLD"
@@ -287,23 +371,8 @@ class Tier1SingleMixin(MixinHost):
                 continue
             seen_cols.add(q_col)
             old_val = self._rewrite_expr_for_record(item.raw_expr, record_prefix)
-            key_inner, key_coll = self._group_key_collation(item.raw_expr)
-            if mode != "union_all_agg" and key_coll in ("NOCASE", "RTRIM"):
-                # Values that differ only by case (NOCASE) or trailing spaces (RTRIM)
-                # share one group; the stored spelling must stay one of the members'
-                # spellings: when the row that supplied it leaves, take a survivor's.
-                inner_old = self._rewrite_expr_for_record(key_inner, record_prefix)
-                sel_e = self._rewrite_expr_for_record(item.raw_expr, self._q(self.view.base_table))
-                subq = self._build_native_group_recompute(
-                    sel_e, mv_table, processed_only=True, limit_one=True
-                )
-                stmts.append(
-                    f"UPDATE {mv_table}\n"
-                    f"    SET {q_col} = COALESCE({subq}, {mv_table}.{q_col})\n"
-                    f"    WHERE ({grp_pred}) AND typeof({inner_old}) = 'text' "
-                    f"AND {mv_table}.{q_col} IS ({inner_old}) COLLATE BINARY;"
-                )
-                continue
+            if mode != "union_all_agg" and self._key_spelling_sensitive(self._key_class_for_key(item.raw_expr)):
+                continue  # refreshed together with the other spelling-sensitive keys: _key_spelling_refresh_stmts
             if mode != "union_all_agg":
                 c_def = self._lookup_col_def(item.raw_expr)
                 if c_def is not None:
@@ -913,7 +982,7 @@ class Tier1SingleMixin(MixinHost):
                 if self.dialect == Dialect.SQLITE:
                     # BLOB (no affinity) preserves SQLite's exact storage classes
                     # in __val so e.g. TEXT '-0' and INTEGER 0 remain distinct.
-                    val_dt = "BLOB"
+                    val_dt = "BLOB" + self._sqlite_key_collate_suffix(item.arg_expr or "")
                 else:
                     c_arg = self._lookup_col_def(item.arg_expr)
                     if c_arg:
@@ -927,6 +996,9 @@ class Tier1SingleMixin(MixinHost):
                         val_dt = self._infer_expr_storage_type(fake_val)
                     if self.dialect == Dialect.MYSQL and val_dt.upper() == "TEXT":
                         val_dt = "VARCHAR(255)"
+                    if self.dialect == Dialect.MYSQL:
+                        # DISTINCT compares under the argument's collation: so must the store
+                        val_dt = val_dt + self._key_col_collate_suffix(item.arg_expr or "", val_dt)
                 distinct_aux_tables[ekey] = (aux_tbl, item, val_dt)
 
         group_mv_cols: List[str] = []
@@ -1156,7 +1228,7 @@ class Tier1SingleMixin(MixinHost):
                 for g_expr in grp_exprs:
                     mc = self._group_col_alias(g_expr)
                     if self.dialect == Dialect.SQLITE:
-                        dt = "BLOB"
+                        dt = "BLOB" + self._sqlite_key_collate_suffix(g_expr)
                     else:
                         c_def = self._lookup_col_def(g_expr)
                         if c_def:
@@ -1166,6 +1238,8 @@ class Tier1SingleMixin(MixinHost):
                             dt = self._infer_expr_storage_type(fake_grp)
                         if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT":
                             dt = "VARCHAR(255)"
+                        if self.dialect == Dialect.MYSQL:
+                            dt = dt + self._key_col_collate_suffix(g_expr, dt)
                     aux_col_defs.append(f"{self._q(mc)} {dt} NOT NULL")
                     aux_pk.append(self._q(mc))
                 aux_pk.append(self._q("__val"))
@@ -3369,7 +3443,9 @@ class Tier1SingleMixin(MixinHost):
         # trigger have run (for UPDATE: after both the OLD and the NEW step).
         recompute_new = self._sqlite_recompute_dirty_stmt(mv_table, "NEW", col_sum_map, expr_key_fn)
         recompute_old = self._sqlite_recompute_dirty_stmt(mv_table, "OLD", col_sum_map, expr_key_fn)
-        refresh_grp_old = self._sqlite_refresh_group_keys_stmts(mv_table, record_prefix="OLD")
+        refresh_grp_old = self._sqlite_refresh_group_keys_stmts(
+            mv_table, record_prefix="OLD"
+        ) + self._key_spelling_refresh_stmts(mv_table, record_prefix="OLD")
         if recompute_new is None and recompute_old is None:
             # PostgreSQL/MySQL order-sensitive aggregates: a separate statement
             # after the fold statements, which locked the group row(s).

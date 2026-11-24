@@ -35,6 +35,7 @@ from matview_sync import (
     IncrementalViewCompiler,
     MaterializedViewManager,
     TableSchema,
+    UnsupportedMaterializedViewError,
     generate_materialized_view,
     parse_view_definition,
 )
@@ -1008,15 +1009,34 @@ class TestFinding7CollationAndGroupPk(unittest.TestCase):
         self.assertTrue(pk_expr.endswith("COLLATE utf8mb4_bin"))
         self.assertNotIn("WEIGHT_STRING", pk_expr)
         self.assertNotIn("WEIGHT_STRING", compiler._canonical_group_pk_expr(["blobby"]))
-        # Unknown collation: the server default (NO PAD on MySQL); PAD SPACE collations trim.
-        self.assertIn("SHA2(WEIGHT_STRING((txt)), 256)", compiler._canonical_group_pk_expr(["txt"]))
-        self.assertIn("SHA2(WEIGHT_STRING(RTRIM(txtbin)), 256)", compiler._canonical_group_pk_expr(["txtbin"]))
-        self.assertIn("SHA2(WEIGHT_STRING((txtnp)), 256)", compiler._canonical_group_pk_expr(["txtnp"]))
-        # An explicit COLLATE decides the weights.
+        # Character keys: the digest of the server's own weight string of the expression
+        # (no collation name is needed: the server derives it); whether the collation pads
+        # is asked of the server (' ' = '' holds under PAD SPACE only), and MySQL, whose
+        # GROUP BY pads U+0020 only, trims exactly that.
+        for col in ("txt", "txtbin", "txtnp"):
+            e = compiler._canonical_group_pk_expr([col])
+            self.assertIn("CONCAT('W', SHA2(", e)
+            self.assertIn(f"HEX(WEIGHT_STRING({col}))", e)
+            self.assertIn(f"RIGHT(CONCAT({col}, ' '), 1) = ''", e)
+            self.assertIn(f"HEX(WEIGHT_STRING(RTRIM({col})))", e)
+        # An explicit COLLATE is part of the expression the weights are taken of.
         self.assertIn(
-            "WEIGHT_STRING(RTRIM(txt) COLLATE utf8mb4_general_ci)",
+            "HEX(WEIGHT_STRING(txt COLLATE utf8mb4_general_ci))",
             compiler._canonical_group_pk_expr(["txt COLLATE utf8mb4_general_ci"]),
         )
+        # Expressions over character columns are character-valued (the key follows the
+        # server's collation of the whole expression); numeric functions are not.
+        self.assertIn("WEIGHT_STRING(LOWER(txt))", compiler._canonical_group_pk_expr(["LOWER(txt)"]))
+        self.assertIn("WEIGHT_STRING(CONCAT(txt, 'x'))", compiler._canonical_group_pk_expr(["CONCAT(txt, 'x')"]))
+        self.assertNotIn("WEIGHT_STRING", compiler._canonical_group_pk_expr(["LENGTH(txt)"]))
+        # MariaDB pads by weight: trailing weight units equal to a space's are dropped.
+        maria = IncrementalViewCompiler(schema_map, v, dialect="mariadb:11.8", ignore_limitations=True)
+        e = maria._canonical_group_pk_expr(["txt"])
+        self.assertIn("REGEXP_SUBSTR(HEX(WEIGHT_STRING(txt))", e)
+        self.assertNotIn("RTRIM", e)
+        # An expression whose character collation cannot be derived is refused, not keyed byte-exactly.
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            compiler._canonical_group_pk_expr(["JSON_EXTRACT(txt, '$.a')"])
 
     def test_canonical_pk_preserves_case_and_accents(self) -> None:
         """Verify that case-variants and accent-variants produce distinct PK tokens."""

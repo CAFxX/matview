@@ -152,7 +152,9 @@ class TestJinja2ProceduralTemplates(unittest.TestCase):
 
         # MySQL 8.4 vs MariaDB 10.11 procedure templates (PK-range WHILE + offset REPEAT)
         my_ts = ms.parse_table_schema(
-            "CREATE TABLE items (id BIGINT PRIMARY KEY, cat VARCHAR(32), val INT); "
+            # NO PAD binary: equal values are byte-identical, so DISTINCT stays incremental
+            # (a collation-sensitive text key takes the announced full refresh instead).
+            "CREATE TABLE items (id BIGINT PRIMARY KEY, cat VARCHAR(32) COLLATE utf8mb4_0900_bin, val INT); "
             "CREATE TABLE cats (id BIGINT PRIMARY KEY, name VARCHAR(32));",
             dialect="mysql",
         )

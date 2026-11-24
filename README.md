@@ -1267,13 +1267,20 @@ views, each key value is mapped to a canonical text by a per-view function
 - Group keys follow the grouped expression's collation: values the engine groups
   together (SQLite `COLLATE NOCASE`/`RTRIM`, MySQL/MariaDB case-/accent-insensitive
   and PAD SPACE collations, including the servers' defaults) share one group, and the
-  stored spelling is a spelling of a current member (SQL leaves which one open).
-  Exclusions: SQLite collations other than `BINARY`/`NOCASE`/`RTRIM` are refused;
-  set-operation views (`UNION`/`INTERSECT`/`EXCEPT`, `UNION ALL` aggregates) and,
-  on MySQL/MariaDB, non-column group expressions without an explicit `COLLATE` keep
-  byte-exact keys, so case variants still split there; the displayed spelling of a
-  MySQL/MariaDB group is not refreshed when its row leaves (see TODO.md,
-  "Group keys follow the grouped expression's collation").
+  displayed spelling is a spelling of a current member (SQL leaves which one open).
+  The collation of an expression is derived from the engine's rules (SQLite: columns,
+  explicit `COLLATE`, `CAST`/unary `+`/parentheses; MySQL/MariaDB: the server's own
+  `WEIGHT_STRING` of any character-valued expression, pad-normalised per engine).
+  Shapes whose key cannot be kept exact incrementally run as a full refresh of the
+  original query (exact by construction) with the announced diagnostic
+  `COLLATION_KEY_FALLBACK` (`exact result required: falling back to strategy full
+  refresh of the original query`): `DISTINCT` and de-duplicating set operations over
+  collation-sensitive text columns (their displayed spelling is not refreshed
+  incrementally), SQLite user-registered collations, expressions whose character
+  collation is not known, UNION ALL aggregates keyed by an expression, MariaDB's
+  multi-level `uca1400_*_ai_cs/_as_ci/_as_cs` collations, and MEDIUMTEXT/LONGTEXT group
+  columns on MySQL/MariaDB (see TODO.md, "Group keys follow the grouped expression's
+  collation", for the incremental follow-ups).
 - PostgreSQL and MySQL/MariaDB: integer and `DECIMAL`/`NUMERIC` `SUM`/`AVG`
   (and PostgreSQL `VAR`/`STDDEV` of them, computed in `NUMERIC`) are
   maintained exactly (PostgreSQL sums of variable-scale `NUMERIC` are

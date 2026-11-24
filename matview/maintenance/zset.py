@@ -235,7 +235,9 @@ class Tier1ZSetMixin(MixinHost):
                         f"ELSE 'V:' || pg_catalog.octet_length(({s})::pg_catalog.text) || ':' || ({s})::pg_catalog.text END)"
                     )
             return f"ROW({', '.join(pg_terms)})::pg_catalog.text"
-        return self._canonical_group_pk_expr(exprs)
+        # MySQL/MariaDB: a bag keeps every row's exact bytes (case variants stay
+        # distinct rows), so no collation-aware key.
+        return self._canonical_group_pk_expr(exprs, collation_aware=False)
 
     def _resolve_setop_pk_info(
         self, branches: Optional[List[Tuple[str, ViewSpec]]] = None
