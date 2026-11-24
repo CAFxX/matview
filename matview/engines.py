@@ -43,6 +43,11 @@ class EngineVersion:
     # parse/prepare time. Capture it as a literal: MariaDB forbids system-variable
     # references in CREATE VIEW definitions.
     mariadb_div_precision_increment: int = field(default=4, compare=False)
+    # True when the connection really exposes sqlean's own VAR_*/STDDEV_*
+    # (stats extension): detected from the driver module and PRAGMA
+    # function_list, never assumed. Their results differ from the
+    # engine-neutral exact definition matview maintains on SQLite.
+    sqlite_native_statistics: bool = field(default=False, compare=False)
     packaging_version: Optional[Version] = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
@@ -455,6 +460,28 @@ def parse_engine_version(
         pv, ver = _extract_packaging_and_tuple(s, def_ver, require_valid=True)
 
     return EngineVersion(target_d, target_sub, ver, s, packaging_version=pv)
+
+
+SQLEAN_STATISTICAL_FUNCTIONS = frozenset(
+    {"var_pop", "var_samp", "variance", "stddev_pop", "stddev_samp", "stddev"}
+)
+
+
+def _sqlite_exposes_sqlean_statistics(conn: Any, cur: Any) -> bool:
+    """Whether a sqlean connection defines sqlean's statistical aggregates.
+
+    Requires both the sqlean driver (the module of the connection class) and the
+    functions in ``PRAGMA function_list``: a Python/APSW UDF registered under the
+    same name on another driver is the caller's own definition, not sqlean's.
+    """
+    if not type(conn).__module__.lower().startswith("sqlean"):
+        return False
+    try:
+        cur.execute("PRAGMA function_list;")
+        names = {str(row[0]).lower() for row in cur.fetchall()}
+    except Exception:
+        return False
+    return bool(names & SQLEAN_STATISTICAL_FUNCTIONS)
 
 
 def _read_mariadb_div_precision_increment(cur: Any) -> int:

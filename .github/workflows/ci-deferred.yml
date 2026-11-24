@@ -36,16 +36,15 @@ name: CI — Deferred Compatibility Sweep
 #   suite does not verify cipher correctness or sqlean-specific extension APIs.
 #   Both rows must pass: no row is allowed to fail. sqlean's bundled stats
 #   extension defines its own VAR_*/STDDEV_* (a single-row sample statistic is
-#   0.0, not NULL; streaming accumulation), which are not the SQL-standard
-#   statistics matview maintains on SQLite. That divergence is a NAMED exclusion
-#   in the test oracle (test_matview_sync.NO_LIVE_SQLEAN_STATISTICAL_AGGREGATE):
-#   only the statistical output columns of a view are dropped from the
-#   differential on sqlean (a view whose statistics cannot be isolated to output
-#   columns is excluded by name); every other column, row multiplicity and
-#   result type is compared exactly. SqleanStatisticalDivergenceCanary pins the
-#   divergence and FAILS this lane when it disappears or changes, which is the
-#   cue to remove the exclusion. See TODO.md, "sqlean Native Statistical
-#   Aggregates".
+#   0.0, not NULL; streaming accumulation), which differ from the engine-neutral
+#   exact definition matview maintains on SQLite. A view using them on a
+#   connection that really exposes them (sqlean driver + PRAGMA function_list)
+#   is REFUSED at registration, not bypassable by ignore_limitations. The lane
+#   verifies the refusal natively (the harness skips such views after asserting
+#   the refusal and that the override does not bypass it) and
+#   SqleanStatisticsRefusalNativeTests pins the divergence behind it, so the
+#   lane FAILS when sqlean aligns with the standard (drop the refusal then).
+#   See TODO.md, "sqlean Native Statistical Aggregates".
 # - Minimum declared Python dependency versions are tested on Python 3.11 against
 #   live PostgreSQL and MySQL. The pins are derived from requirements.txt at run
 #   time (every `>=` floor becomes `==`), so the lane cannot drift from the

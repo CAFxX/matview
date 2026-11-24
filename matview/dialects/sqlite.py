@@ -41,6 +41,46 @@ from .templates import render_procedural_sql
 
 
 class SQLiteDialectMixin(MixinHost):
+    def _enforce_sqlean_statistics_refusal(self) -> None:
+        """Refuse VAR_*/STDDEV_* (and VARIANCE/STDDEV) on a connection that
+        exposes sqlean's own statistical functions.
+
+        The original view would call sqlean's `stats` aggregates, whose results
+        differ from the engine-neutral exact definition matview maintains (a
+        single-value sample statistic is 0.0 instead of NULL; streaming
+        accumulation rounds differently), so the materialized view could not
+        equal it. Not bypassable by ignore_limitations (no relaxed guarantee
+        covers it).
+        """
+        if self.dialect != Dialect.SQLITE or not self.engine_version.sqlite_native_statistics:
+            return
+        from ..engines import UnsupportedMaterializedViewError, SQLEAN_STATISTICAL_FUNCTIONS
+
+        try:
+            root = sqlglot.parse_one(self.raw_view.raw_select_sql, read="sqlite")
+        except sqlglot.errors.SqlglotError:
+            return
+        calls: List[str] = []
+        stat_classes = (
+            sqlglot_exp.Variance, sqlglot_exp.VariancePop, sqlglot_exp.Stddev,
+            sqlglot_exp.StddevPop, sqlglot_exp.StddevSamp,
+        )
+        for node in root.walk():
+            if isinstance(node, stat_classes) or (
+                isinstance(node, sqlglot_exp.Anonymous) and node.name.lower() in SQLEAN_STATISTICAL_FUNCTIONS
+            ):
+                calls.append(node.sql(dialect="sqlite"))
+        if calls:
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}' uses {', '.join(dict.fromkeys(calls))} on a sqlean "
+                "connection that exposes sqlean's own statistics functions: they differ from the "
+                "engine-neutral exact definition (a single-value sample statistic is 0.0 instead of "
+                "NULL; streaming accumulation rounds differently), so VAR/STDDEV over sqlean `stats` "
+                "functions cannot be reproduced exactly by the materialized view. Use a connection "
+                "without sqlean's stats extension (matview then maintains the exact aggregate itself), "
+                "or CAST the argument to an exact type and compute the statistic outside the view."
+            )
+
     def _sqlite_m2_agg_sql(
         self,
         item: SelectItem,

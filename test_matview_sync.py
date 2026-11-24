@@ -54,6 +54,7 @@ from matview_sync import (
     MaterializedViewManager,
     MaterializedViewPlan,
     StrictCompilationError,
+    UnsupportedMaterializedViewError,
     TableSchema,
     ViewIndexSpec,
     ViewSpec,
@@ -1072,15 +1073,6 @@ def _result_representation_mismatches(
     return out
 
 
-_SQLEAN_STAT_COLUMN_EXCLUSIONS: Set[str] = set()
-
-
-def _statistical_exclusion_note(view_name: str) -> None:
-    if view_name not in _SQLEAN_STAT_COLUMN_EXCLUSIONS:
-        _SQLEAN_STAT_COLUMN_EXCLUSIONS.add(view_name)
-        print(f"  [EXCLUDED COLUMNS] {view_name}: statistical columns, sqlean's own VAR_*/STDDEV_* differ")
-
-
 def _verify_external_db_mv(cur, mv_name: str, select_sql: Any, context: str = "") -> None:
     if isinstance(select_sql, NoLiveView):
         if select_sql.view_name not in NO_LIVE_VIEW_EXCLUSIONS:
@@ -1118,26 +1110,6 @@ def _verify_external_db_mv(cur, mv_name: str, select_sql: Any, context: str = ""
             VALUE_NOT_COMPARED if index in excluded else policy
             for index, policy in enumerate(column_policies)
         )
-    if _engine_has_nonstandard_variance_aggregate(Dialect.SQLITE) and _cursor_flavor(cur) == "sqlite":
-        stat_columns = _sqlean_statistical_projection_indices(select_sql) or set()
-        if stat_columns:
-            # Named sqlean exclusion (NO_LIVE_SQLEAN_STATISTICAL_AGGREGATE): drop
-            # the statistical output columns from both sides; the remaining
-            # columns, row multiplicity and result types are compared as usual.
-            def _without(rows: List[Tuple[Any, ...]]) -> List[Tuple[Any, ...]]:
-                return [tuple(v for i, v in enumerate(row) if i not in stat_columns) for row in rows]
-
-            def _without_description(description: Any) -> Any:
-                if description is None:
-                    return None
-                return tuple(d for i, d in enumerate(description) if i not in stat_columns)
-
-            mv_rows, live_rows = _without(mv_rows), _without(live_rows)
-            mv_description = _without_description(mv_description)
-            live_description = _without_description(live_description)
-            if column_policies is not None:
-                column_policies = tuple(p for i, p in enumerate(column_policies) if i not in stat_columns)
-            _statistical_exclusion_note(mv_name)
     if not _rows_equal(
         mv_rows, live_rows, column_tolerances=column_policies
     ):
@@ -1918,13 +1890,20 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
                 return [tuple(r) for r in (c.fetchall() or [])]
             return _CompatCursorAdapter(_exec, _query)
 
-        return _CompatConnectionAdapter(
+        adapter = _CompatConnectionAdapter(
             _make_sqlean_cursor,
             raw_conn.close,
             commit_fn=lambda: raw_conn.execute("COMMIT;") if getattr(raw_conn, "in_transaction", False) else (raw_conn.commit() if hasattr(raw_conn, "commit") else None),
             rollback_fn=lambda: raw_conn.execute("ROLLBACK;") if getattr(raw_conn, "in_transaction", False) else (raw_conn.rollback() if hasattr(raw_conn, "rollback") else None),
             in_tx_fn=lambda: getattr(raw_conn, "in_transaction", False),
         )
+        # Native detection on the real sqlean connection (module + PRAGMA
+        # function_list); the adapter itself is not a sqlean object. Its
+        # `engine_version` attribute is what detect_engine_version reads.
+        detected = detect_engine_version(raw_conn)
+        assert detected.sqlite_native_statistics, "sqlean stats extension not detected"
+        setattr(adapter, "engine_version", detected)
+        return adapter
 
     elif eng == "libsql":
         try:
@@ -2970,13 +2949,6 @@ def _engine_has_no_variance_aggregate(dialect: Dialect) -> bool:
     return dialect == Dialect.SQLITE and _sqlite_compat_engine() == "libsql"
 
 
-def _engine_has_nonstandard_variance_aggregate(dialect: Dialect) -> bool:
-    """sqlean's bundled stats extension defines its own VAR_*/STDDEV_* (see
-    NO_LIVE_SQLEAN_STATISTICAL_AGGREGATE), so on sqlean the original view is
-    not the SQL-standard statistic the maintained value follows."""
-    return dialect == Dialect.SQLITE and _sqlite_compat_engine() == "sqlean"
-
-
 class NoLiveView:
     """Named differential exclusion: the view has no live view on this engine,
     so there is nothing to compare its contents with."""
@@ -2989,68 +2961,10 @@ class NoLiveView:
 NO_LIVE_STATISTICAL_AGGREGATE = (
     "libSQL has no native statistical aggregate: no live view exists to compare against"
 )
-NO_LIVE_SQLEAN_STATISTICAL_AGGREGATE = (
-    "sqlean's own VAR_*/STDDEV_* (stats extension) are not the SQL-standard statistics matview "
-    "maintains on SQLite (a single-row sample statistic is 0.0, not NULL; streaming accumulation "
-    "rounds differently), and the view's statistics cannot be isolated to top-level output "
-    "columns; the divergence is pinned by SqleanStatisticalDivergenceCanary"
-)
 _STATISTICAL_CALL_RE = re.compile(r"(?i)\b(?:VAR_POP|VAR_SAMP|VARIANCE|STDDEV_POP|STDDEV_SAMP|STDDEV|STD)\s*\(")
 # Views excluded from the differential by NoLiveView, with their reason
 # (printed when first seen and asserted by the oracle tests).
 NO_LIVE_VIEW_EXCLUSIONS: Dict[str, str] = {}
-
-
-def _sqlean_statistical_projection_indices(select_sql: str) -> Optional[Set[int]]:
-    """Output positions of a single SELECT whose expression calls a statistical
-    aggregate (VAR_*/STDDEV_*/VARIANCE/STD); empty when there is none; None when
-    a statistic occurs anywhere that could change which rows the view returns or
-    their number (set operation, CTE, derived table, WHERE/GROUP BY/HAVING/ORDER
-    BY, or a reference to a statistical output alias there) or the projection
-    list is not statically known. Used only to name the sqlean exclusion: those
-    output columns are not compared (sqlean defines its own VAR_*/STDDEV_*), every
-    other column, the row multiset and the result types still are."""
-    if not _STATISTICAL_CALL_RE.search(select_sql):
-        return set()
-    try:
-        root = sqlglot.parse_one(select_sql)
-    except sqlglot.errors.ParseError:
-        return None
-    if not isinstance(root, sqlglot_exp.Select) or root.args.get("with_") or root.args.get("with"):
-        return None
-    # DISTINCT deduplicates over the statistical columns too: dropping them
-    # would change which rows the comparison sees, so it is not isolable.
-    if root.args.get("distinct"):
-        return None
-    projections = list(root.expressions)
-    if any(isinstance(p, sqlglot_exp.Star) or (isinstance(p, sqlglot_exp.Column) and isinstance(p.this, sqlglot_exp.Star))
-           for p in projections):
-        return None
-    indices: Set[int] = set()
-    aliases: Set[str] = set()
-    for node in root.walk():
-        if not isinstance(node, sqlglot_exp.Func):
-            continue
-        names = {node.sql_name().upper(), str(getattr(node, "name", "") or "").upper()}
-        if not names & _STAT_FUNCTIONS:
-            continue
-        cur = node
-        while cur.parent is not None and cur.parent is not root:
-            cur = cur.parent
-        position = next((i for i, p in enumerate(projections) if p is cur), None)
-        if position is None:
-            return None
-        indices.add(position)
-        if projections[position].alias:
-            aliases.add(projections[position].alias.lower())
-    for clause in ("where", "group", "having", "order", "qualify", "joins", "from_", "from"):
-        part = root.args.get(clause)
-        if part is None:
-            continue
-        for col in (part if isinstance(part, list) else [part]):
-            if any(c.name.lower() in aliases for c in col.find_all(sqlglot_exp.Column)):
-                return None
-    return indices
 
 
 def _live_reference_select(plan: Any, raw_select_sql: str, dialect: Dialect) -> Any:
@@ -3061,17 +2975,9 @@ def _live_reference_select(plan: Any, raw_select_sql: str, dialect: Dialect) -> 
     differential by name (NoLiveView, NO_LIVE_STATISTICAL_AGGREGATE); its
     maintenance is tested against exact (Fraction) references in
     test_oracle_adversarial_boundaries.SqliteStatisticsExactReferenceTests.
-    On sqlean, whose own VAR_*/STDDEV_* are not the SQL-standard statistics,
-    only the statistical output columns are excluded (see
-    _verify_external_db_mv); a view whose statistics cannot be isolated to
-    output columns is excluded by name (NO_LIVE_SQLEAN_STATISTICAL_AGGREGATE)."""
+    (On sqlean such views are refused at registration; see run_batch.)"""
     if _engine_has_no_variance_aggregate(dialect) and _STATISTICAL_CALL_RE.search(raw_select_sql):
         return NoLiveView(plan.view_name, NO_LIVE_STATISTICAL_AGGREGATE)
-    if (
-        _engine_has_nonstandard_variance_aggregate(dialect)
-        and _sqlean_statistical_projection_indices(raw_select_sql) is None
-    ):
-        return NoLiveView(plan.view_name, NO_LIVE_SQLEAN_STATISTICAL_AGGREGATE)
     return _rewrite_live_reference_select_for_dialect(raw_select_sql, dialect)
 
 
@@ -3480,6 +3386,7 @@ class MVTestRunner:
         self.total_assertions: int = 0
         self.supported_plans: int = 0
         self.limitation_override_plans: int = 0
+        self.sqlean_statistics_refusals: int = 0
         self.pg_dsn: Optional[str] = os.environ.get("POSTGRES_DSN")
         self.mysql_dsn: Optional[str] = os.environ.get("MYSQL_DSN")
         self.sqlite_compat_engine: Optional[str] = os.environ.get("SQLITE_COMPAT_ENGINE")
@@ -3639,14 +3546,34 @@ class MVTestRunner:
                 for v_idx, (v_name, v_ddl) in enumerate(chunk):
                     eff_v_ddl = _adapt_view_ddl_for_dialect(v_ddl, eff_dialect)
                     schema_source: Any = conn if (v_idx % 2 == 1) else eff_schema
-                    plan, used_override, limitation_codes = _compile_plan_for_test(
-                        schema_source,
-                        eff_v_ddl,
-                        dialect=eff_dialect,
-                        engine_version=engine_version,
-                        incremental_backfill=incremental_backfill,
-                        batch_size=batch_size,
-                    )
+                    try:
+                        plan, used_override, limitation_codes = _compile_plan_for_test(
+                            schema_source,
+                            eff_v_ddl,
+                            dialect=eff_dialect,
+                            engine_version=engine_version,
+                            incremental_backfill=incremental_backfill,
+                            batch_size=batch_size,
+                        )
+                    except UnsupportedMaterializedViewError as refusal:
+                        if not (engine_version.sqlite_native_statistics and _STATISTICAL_CALL_RE.search(eff_v_ddl)):
+                            raise
+                        # sqlean's own VAR_*/STDDEV_*: refused explicitly, and
+                        # not bypassable by the global override.
+                        self.sqlean_statistics_refusals += 1
+                        assert "sqlean" in str(refusal), refusal
+                        try:
+                            generate_materialized_view(
+                                schema_source, eff_v_ddl, dialect=eff_dialect,
+                                engine_version=engine_version, ignore_limitations=True,
+                                accept_limitations=FLOAT_OPT_IN,
+                            )
+                        except UnsupportedMaterializedViewError:
+                            pass
+                        else:
+                            raise AssertionError(f"ignore_limitations bypassed the sqlean statistics refusal of {v_name}")
+                        print(f"  [REFUSED] {v_name} [{engine_label}]: sqlean statistics functions")
+                        continue
                     if used_override:
                         batch_overrides += 1
                         self.limitation_override_plans += 1
@@ -4990,42 +4917,60 @@ def run_suite_11_live_engine_50_view_battery_across_all_dialects(runner: MVTestR
 
 @unittest.skipUnless(
     _sqlite_compat_engine() == "sqlean",
-    "pins the sqlean-only statistical divergence; runs in the SQLITE_COMPAT_ENGINE=sqlean lane",
+    "native sqlean test; runs in the SQLITE_COMPAT_ENGINE=sqlean lane",
 )
-class SqleanStatisticalDivergenceCanary(unittest.TestCase):
-    """Strict guard for the named sqlean exclusion
-    (NO_LIVE_SQLEAN_STATISTICAL_AGGREGATE).
+class SqleanStatisticsRefusalNativeTests(unittest.TestCase):
+    """Native sqlean connection (stats extension enabled): VAR_*/STDDEV_* views
+    are refused explicitly, and sqlean's own statistics still diverge from the
+    engine-neutral exact definition.
 
-    The differential drops the statistical output columns on sqlean because
-    sqlean's own VAR_*/STDDEV_* (stats extension) are not the statistics
-    matview maintains on SQLite. This test pins that divergence on minimal
-    cases, so it FAILS when it disappears or changes -- sqlean aligning with
-    the SQL standard, or matview becoming exact against sqlean -- which means
-    the exclusion must be removed, not kept silently."""
+    The second half is the strict canary behind the refusal: it FAILS when the
+    divergence disappears or changes (sqlean aligning with the SQL standard), the
+    cue to drop the refusal (or, long term, to reproduce sqlean's algorithm)."""
 
-    def test_sqlean_statistics_still_diverge_from_the_maintained_view(self) -> None:
+    @staticmethod
+    def _connect() -> Any:
         import sqlean  # type: ignore
 
         sqlean.extensions.enable_all()
         conn = sqlean.connect(":memory:", isolation_level=None)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT NOT NULL, v REAL)")
-        mgr = _matview_sync_module.MaterializedViewManager(conn, dialect=Dialect.SQLITE)
-        mgr.register_view(
-            "CREATE VIEW sv AS SELECT g, VAR_POP(v) AS vp, STDDEV_SAMP(v) AS ss FROM t GROUP BY g;"
-        )
-        for row in [(1, "a", 0.1), (2, "a", 0.2), (3, "a", 0.5), (4, "b", 1.0), (5, "b", 2.0)]:
+        return conn
+
+    def test_registration_refuses_sqlean_statistics_and_accepts_the_rest(self) -> None:
+        conn = self._connect()
+        self.assertTrue(detect_engine_version(conn).sqlite_native_statistics)
+        mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        for fn in ("VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP"):
+            for ignore in (False, True):
+                with self.subTest(fn=fn, ignore_limitations=ignore):
+                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "sqlean"):
+                        mgr.register_view(
+                            f"CREATE VIEW sv_{fn.lower()} AS SELECT g, {fn}(v) AS s FROM t GROUP BY g;",
+                            ignore_limitations=ignore,
+                        )
+        # Nothing was created by the refused registrations; other views work.
+        mgr.register_view("CREATE VIEW sv_sum AS SELECT g, SUM(v) AS s FROM t GROUP BY g;")
+        conn.execute("INSERT INTO t VALUES (1, 'a', 0.5)")
+        self.assertEqual(conn.execute("SELECT g, s FROM sv_sum").fetchall(), [("a", 0.5)])
+
+    def test_sqlean_statistics_still_diverge_from_the_exact_definition(self) -> None:
+        from fractions import Fraction
+
+        conn = self._connect()
+        for row in [(1, "a", 0.1), (2, "a", 0.2), (3, "a", 0.5), (4, "b", 1.0)]:
             conn.execute("INSERT INTO t VALUES (?, ?, ?)", row)
-        conn.execute("DELETE FROM t WHERE id = 5")
-        live = conn.execute("SELECT g, VAR_POP(v), STDDEV_SAMP(v) FROM t GROUP BY g ORDER BY g").fetchall()
-        mv = conn.execute("SELECT g, vp, ss FROM sv ORDER BY g").fetchall()
-        # sqlean's own results (the engine side of the divergence).
-        self.assertEqual(live, [("a", 0.02888888888888889, 0.20816659994661327), ("b", 0.0, 0.0)])
-        # (a) a sample statistic of one value is NULL in the SQL standard, which
-        # the maintained view follows; sqlean returns 0.0.
-        self.assertIsNone(mv[1][2])
-        # (b) the accumulated float results differ.
-        self.assertNotEqual(mv[0][1], live[0][1])
-        self.assertNotEqual(mv, live)
+        live = dict(
+            (g, (vp, ss))
+            for g, vp, ss in conn.execute("SELECT g, VAR_POP(v), STDDEV_SAMP(v) FROM t GROUP BY g")
+        )
+        # (a) a sample statistic of one value is NULL in the SQL standard.
+        self.assertEqual(live["b"], (0.0, 0.0))
+        # (b) the streaming accumulation is not the correctly rounded variance.
+        values = [Fraction(0.1), Fraction(0.2), Fraction(0.5)]
+        mean = sum(values) / 3
+        exact = float(sum((x - mean) ** 2 for x in values) / 3)
+        self.assertNotEqual(live["a"][0], exact)
 
 
 class TestGeneratorAndManagerCodePaths(unittest.TestCase):
@@ -5478,7 +5423,9 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
                     muts[:12],
                     dialect=dialect,
                 )
-        self.assertGreaterEqual(local_runner.total_views, 72)
+        # Views refused by name (sqlean's own statistics) are generated and
+        # checked for the refusal, but not installed.
+        self.assertGreaterEqual(local_runner.total_views + local_runner.sqlean_statistics_refusals, 72)
 
     def test_10_fuzz_regression_corpus_invariants(self) -> None:
         """
@@ -10034,7 +9981,7 @@ def _run_all_tests() -> None:
     # Run unit tests for generator & manager API
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
-        for case in (TestGeneratorAndManagerCodePaths, SqleanStatisticalDivergenceCanary)
+        for case in (TestGeneratorAndManagerCodePaths, SqleanStatisticsRefusalNativeTests)
     )
     res = unittest.TextTestRunner(verbosity=2).run(suite)
     if not res.wasSuccessful():
