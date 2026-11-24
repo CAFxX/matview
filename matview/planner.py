@@ -2561,7 +2561,7 @@ class PlannerMixin(MixinHost):
                 "existing_base_indexes_used": list(existing_base_indexes_used),
                 "recommended_base_indexes": list(recommended_base_indexes),
                 "base_index_recommendations": list(base_index_recommendations),
-                "performance_notes": self._performance_notes() + self._minmax_index_notes(base_index_recommendations) + self._minmax_unindexable_notes(),
+                "performance_notes": self._performance_notes() + self._minmax_index_notes(base_index_recommendations) + self._minmax_unindexable_notes() + self._sqlite_table_shape_notes_list(),
             },
         )
 
@@ -2792,6 +2792,12 @@ class PlannerMixin(MixinHost):
             ),
         )
 
+    def _sqlite_table_shape_notes_list(self) -> List[str]:
+        """Which matview-owned SQLite tables keep their rowid / are not STRICT, and why."""
+        if self.dialect != Dialect.SQLITE:
+            return []
+        return [f"sqlite_table_shape: {n}" for n in self._sqlite_table_shape_notes.values()]
+
     def _performance_notes(self) -> List[str]:
         """Documented maintenance cost classes that are not O(1) per write."""
         notes: List[str] = []
@@ -2964,6 +2970,7 @@ class PlannerMixin(MixinHost):
                 engine_version=self.engine_version,
                 watermark_catalog_table=self.watermark_catalog_table,
                 pg_fillfactor=getattr(self, "pg_fillfactor", 80),
+                sqlite_strict_backing=self.sqlite_strict_backing,
                 repair_fence_catalog_table=self.repair_fence_catalog_table,
             )
             sub_plans.append(sub_comp._compile_single_plan())

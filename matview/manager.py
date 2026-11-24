@@ -126,7 +126,10 @@ from .sql_frontend import (
 #     base-table locking (#301).
 # 17: PostgreSQL source-table maintenance triggers are ENABLE ALWAYS (they fire
 #     under session_replication_role = replica); drift requires tgenabled = 'A'.
-MATVIEW_GENERATOR_VERSION = "17"
+# 18: SQLite matview-owned tables are WITHOUT ROWID whenever they have a NOT NULL
+#     non-rowid PRIMARY KEY and narrow rows (not only composite keys), and may be
+#     STRICT (opt-in sqlite_strict_backing).
+MATVIEW_GENERATOR_VERSION = "18"
 
 
 def _definition_digest(select_sql: str) -> str:
@@ -647,6 +650,7 @@ class MaterializedViewManager:
         engine_version: Optional[EngineVersion | str] = None,
         skip_ensure_catalog: bool = False,
         pg_fillfactor: Optional[int] = 80,
+        sqlite_strict_backing: bool = False,
         accept_limitations: Optional[Sequence[str]] = None,
     ) -> None:
         hint_d: Optional[Dialect] = None
@@ -715,6 +719,7 @@ class MaterializedViewManager:
         self.object_prefix = object_prefix
         self.strict = strict
         self.pg_fillfactor = pg_fillfactor
+        self.sqlite_strict_backing = sqlite_strict_backing
         self.catalog_table = (
             f"{self.object_prefix}catalog" if self.object_prefix else "matview_catalog"
         )
@@ -2376,6 +2381,7 @@ class MaterializedViewManager:
             engine_version=self.engine_version,
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=getattr(self, "pg_fillfactor", 80),
+            sqlite_strict_backing=getattr(self, "sqlite_strict_backing", False),
             repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
             plain_views=plain_views,
             current_schema=current_schema,
@@ -4934,6 +4940,7 @@ class MaterializedViewManager:
                     strict=effective_strict,
                     engine_version=self.engine_version,
                     pg_fillfactor=getattr(self, "pg_fillfactor", 80),
+                    sqlite_strict_backing=getattr(self, "sqlite_strict_backing", False),
                     watermark_catalog_table=self.catalog_table if incremental_backfill else None,
                     repair_fence_catalog_table=self.catalog_table if self.dialect == Dialect.POSTGRES else None,
                     plain_views=plain_views,
@@ -5352,6 +5359,7 @@ def generate_materialized_view(
     engine_version: Optional[EngineVersion | str] = None,
     watermark_catalog_table: Optional[str] = None,
     pg_fillfactor: Optional[int] = 80,
+    sqlite_strict_backing: bool = False,
     repair_fence_catalog_table: Optional[str] = None,
     plain_views: Optional[Mapping[str, str]] = None,
     current_schema: Optional[str] = None,
@@ -5443,6 +5451,7 @@ def generate_materialized_view(
         engine_version=resolved_ev,
         watermark_catalog_table=watermark_catalog_table,
         pg_fillfactor=pg_fillfactor,
+        sqlite_strict_backing=sqlite_strict_backing,
         repair_fence_catalog_table=repair_fence_catalog_table,
     )
     return compiler.compile()
@@ -5462,6 +5471,7 @@ def generate_materialized_views(
     engine_version: Optional[EngineVersion | str] = None,
     watermark_catalog_table: Optional[str] = None,
     pg_fillfactor: Optional[int] = 80,
+    sqlite_strict_backing: bool = False,
     repair_fence_catalog_table: Optional[str] = None,
     plain_views: Optional[Mapping[str, str]] = None,
     current_schema: Optional[str] = None,
@@ -5518,6 +5528,7 @@ def generate_materialized_views(
             engine_version=resolved_ev,
             watermark_catalog_table=watermark_catalog_table,
             pg_fillfactor=pg_fillfactor,
+            sqlite_strict_backing=sqlite_strict_backing,
             repair_fence_catalog_table=repair_fence_catalog_table,
         )
         plans.append(comp._compile_single_plan())

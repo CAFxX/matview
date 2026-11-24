@@ -103,6 +103,161 @@ class DialectBaseMixin(MixinHost):
             return idx_name[: max_chars - len(suffix)] + suffix
         return idx_name
 
+    # --- SQLite table options: WITHOUT ROWID / STRICT ------------------------------
+    # A rowid table with a non-alias PRIMARY KEY stores each row twice (table b-tree and
+    # PK index) and pays two b-tree writes per row; WITHOUT ROWID stores it once, in the
+    # PK b-tree. It loses for wide rows (SQLite documents roughly 1/20 of a page) and
+    # needs a PRIMARY KEY. No SQL matview generates reads the rowid of a matview-owned
+    # table (docs/design-sqlite-strict.md), so the rule is structural and performance
+    # driven. Measured (scripts/bench_bulk.py, sqlite3 3.46, 20k rows): grouped
+    # aggregates -9% to -26% total statement time, join/projection views within noise;
+    # a stand-alone row-width sweep shows WITHOUT ROWID winning to ~64 payload bytes,
+    # even around 150 and losing from ~300.
+    _SQLITE_WOR_MAX_ROW_BYTES = 128
+    _SQLITE_UNBOUNDED_BYTES = 32  # TEXT / BLOB / ANY / unknown declared types
+    _SQLITE_FIXED_TYPES = frozenset(
+        {"INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "REAL", "DOUBLE", "FLOAT",
+         "NUMERIC", "DECIMAL", "BOOLEAN", "DATE", "DATETIME", "TIMESTAMP"}
+    )
+    # Columns whose value type is fixed by construction (counters maintained by +/-1
+    # arithmetic): the only INTEGER columns that may be STRICT without provenance.
+    _SQLITE_STRICT_COUNTER_RE = re.compile(
+        r"^__mv_(row_count|cnt_.*|acnt_.*|tcnt_.*|fold_dirty|ref_cnt|global_id|branch_id)$|^__ref_cnt$", re.IGNORECASE
+    )
+
+    # A column definition: name (double-quoted, backquoted -- doubled quotes escape -- or
+    # bare), base type, optional (n[, m]) and the rest of the definition.
+    _SQLITE_COL_DEF_RE = re.compile(
+        r'^("((?:""|[^"])+)"|`((?:``|[^`])+)`|([A-Za-z0-9_]+))\s+([A-Za-z]+)(\s*\([^)]*\))?(.*)$', re.DOTALL
+    )
+
+    @staticmethod
+    def _sqlite_col_def_name(cm: "re.Match[str]") -> str:
+        if cm.group(2) is not None:
+            return cm.group(2).replace('""', '"')
+        if cm.group(3) is not None:
+            return cm.group(3).replace("``", "`")
+        return cm.group(4)
+
+    @classmethod
+    def _sqlite_parse_col_defs(
+        cls, col_defs_sql: Sequence[str]
+    ) -> Tuple[List[Tuple[str, str, str]], List[str], bool]:
+        """(columns as (name, declared base type, rest), primary key columns, has AUTOINCREMENT)."""
+        cols: List[Tuple[str, str, str]] = []
+        pks: List[str] = []
+        autoinc = False
+        for line in col_defs_sql:
+            line_s = line.strip()
+            m = re.match(r"^PRIMARY\s+KEY\s*\(([^)]+)\)", line_s, flags=re.IGNORECASE)
+            if m:
+                pks = [
+                    _strip_outer_ident_quotes(c.strip())
+                    for c in _split_top_level(m.group(1), ",", dialect=Dialect.SQLITE)
+                    if c.strip()
+                ]
+                continue
+            if re.match(r"^(CONSTRAINT|UNIQUE|CHECK|FOREIGN)\b", line_s, flags=re.IGNORECASE):
+                continue
+            if "AUTOINCREMENT" in line_s.upper():
+                autoinc = True
+            cm = cls._SQLITE_COL_DEF_RE.match(line_s)
+            if not cm:
+                continue
+            name = cls._sqlite_col_def_name(cm)
+            cols.append((name, cm.group(5).upper(), (cm.group(6) or "") + cm.group(7)))
+            if not pks and re.search(r"\bPRIMARY\s+KEY\b", cm.group(7), flags=re.IGNORECASE):
+                pks = [name]
+        return cols, pks, autoinc
+
+    def _sqlite_row_width_estimate(self, cols: Sequence[Tuple[str, str, str]]) -> int:
+        width = 0
+        for _name, base, rest in cols:
+            if base in self._SQLITE_FIXED_TYPES:
+                width += 8
+                continue
+            n = re.match(r"\s*\(\s*(\d+)", rest)
+            if n and base in ("VARCHAR", "CHAR"):
+                width += min(int(n.group(1)), 4 * self._SQLITE_UNBOUNDED_BYTES)
+            else:
+                width += self._SQLITE_UNBOUNDED_BYTES
+        return width
+
+    def _sqlite_rowid_reason(
+        self,
+        cols: Sequence[Tuple[str, str, str]],
+        pks: Sequence[str],
+        autoinc: bool,
+        pk_cols: Optional[Sequence[str]] = None,
+    ) -> str:
+        """Why the table keeps its rowid, or "" when it can be WITHOUT ROWID: it needs a NOT NULL
+        PRIMARY KEY that is not already the rowid (a single `INTEGER PRIMARY KEY` is the rowid, so
+        there is no second b-tree to save), no AUTOINCREMENT and narrow rows."""
+        if pk_cols:
+            pks = list(pk_cols)
+        if not pks:
+            return "it has no PRIMARY KEY"
+        if autoinc:
+            return "it uses AUTOINCREMENT"
+        by_name = {c[0].lower(): c for c in cols}
+        pk_defs = [by_name.get(p.lower()) for p in pks]
+        if any(d is None or "NOT NULL" not in d[2].upper() for d in pk_defs):
+            return "a PRIMARY KEY column is nullable"
+        first = pk_defs[0]
+        if len(pks) == 1 and first is not None and first[1] == "INTEGER":
+            return "its INTEGER PRIMARY KEY already is the rowid"
+        width = self._sqlite_row_width_estimate(cols)
+        if width > self._SQLITE_WOR_MAX_ROW_BYTES:
+            return (
+                f"its rows are wide (estimated {width} bytes > {self._SQLITE_WOR_MAX_ROW_BYTES}: "
+                f"WITHOUT ROWID loses on wide rows)"
+            )
+        return ""
+
+    def _sqlite_strict_columns(
+        self, col_defs_sql: Sequence[str], cols: Sequence[Tuple[str, str, str]]
+    ) -> Tuple[Optional[List[str]], List[str]]:
+        """STRICT column definitions, or (None, reasons) when any column's value type is not provable.
+
+        STRICT raises on a wrong-typed value, and an error inside a maintenance trigger aborts
+        the user's DML, so a column is only declared with a STRICT type when the plan fixes the
+        type of every value it will ever hold: BLOB (no affinity, any value) -> ANY (same
+        semantics); maintained counters and COUNT outputs -> INTEGER; `__mv_*` floating
+        accumulators -> REAL; `__mv_pk` -> TEXT. A column copied from a base table keeps its
+        declared affinity type (a plain base column may hold any storage class), so a table with
+        one is not STRICT."""
+        provable_ints = {n.lower() for n in getattr(self, "_sqlite_provable_int_cols", ())}
+        by_name = {c[0]: c for c in cols}
+        out: List[str] = []
+        reasons: List[str] = []
+        for line in col_defs_sql:
+            line_s = line.strip()
+            cm = self._SQLITE_COL_DEF_RE.match(line_s)
+            name = self._sqlite_col_def_name(cm) if cm else ""
+            if not cm or name not in by_name:
+                out.append(line)  # PRIMARY KEY (...) and other table constraints
+                continue
+            base = cm.group(5).upper()
+            rest = (cm.group(6) or "") + cm.group(7)
+            low = name.lower()
+            new_t = None
+            if base == "BLOB" and not cm.group(6):
+                new_t = "ANY"
+            elif base in ("INT", "INTEGER", "BIGINT") and (
+                self._SQLITE_STRICT_COUNTER_RE.match(name) or low in provable_ints
+            ):
+                new_t = "INTEGER"
+            elif base in ("REAL", "DOUBLE") and low.startswith("__mv_"):
+                new_t = "REAL"
+            elif base == "TEXT" and low == "__mv_pk":
+                new_t = "TEXT"
+            if new_t is None:
+                reasons.append(f"{name} {base}")
+                out.append(line)
+                continue
+            out.append(f"{cm.group(1)} {new_t}{rest}")
+        return (None, reasons) if reasons else (out, [])
+
     def _create_table_ddl(
         self,
         table_name: str,
@@ -114,46 +269,34 @@ class DialectBaseMixin(MixinHost):
         if is_backing_store and self.dialect == Dialect.POSTGRES and self.pg_fillfactor is not None:
             fillfactor_tail = f" WITH (fillfactor = {self.pg_fillfactor})"
 
-        without_rowid_tail = ""
+        table_options: List[str] = []
         if self.dialect == Dialect.SQLITE:
-            effective_pks: List[str] = list(pk_cols) if pk_cols else []
-            if not effective_pks:
-                for line in col_defs_sql:
-                    m = re.search(r"PRIMARY\s+KEY\s*\(([^)]+)\)", line, flags=re.IGNORECASE)
-                    if m:
-                        effective_pks = [
-                            _strip_outer_ident_quotes(c)
-                            for c in _split_top_level(m.group(1), ",", dialect=self.dialect)
-                            if c.strip()
-                        ]
-                        break
-            if len(effective_pks) >= 2:
-                pk_set = {p.lower() for p in effective_pks}
-                found_nn: Set[str] = set()
-                has_autoincrement = False
-                for line in col_defs_sql:
-                    line_s = line.strip()
-                    if re.match(r"^PRIMARY\s+KEY\b", line_s, flags=re.IGNORECASE):
-                        continue
-                    if "AUTOINCREMENT" in line_s.upper():
-                        has_autoincrement = True
-                    col_match = re.match(r'^("((?:""|[^"])+)"|`((?:``|[^`])+)`|([A-Za-z0-9_]+))\s+(.*)$', line_s)
-                    if col_match:
-                        if col_match.group(2) is not None:
-                            col_ident = col_match.group(2).replace('""', '"').lower()
-                        elif col_match.group(3) is not None:
-                            col_ident = col_match.group(3).replace("``", "`").lower()
-                        else:
-                            col_ident = col_match.group(4).lower()
-                        if col_ident in pk_set:
-                            rest = col_match.group(5).upper()
-                            if "NOT NULL" in rest:
-                                found_nn.add(col_ident)
-                if len(found_nn) == len(pk_set) and not has_autoincrement:
-                    without_rowid_tail = " WITHOUT ROWID"
+            cols, pks, autoinc = self._sqlite_parse_col_defs(col_defs_sql)
+            rowid_reason = self._sqlite_rowid_reason(cols, pks, autoinc, pk_cols)
+            if rowid_reason:
+                notes = dict(self._sqlite_table_shape_notes)
+                notes[table_name] = f"{table_name} keeps its rowid: {rowid_reason}."
+                self._sqlite_table_shape_notes = notes
+            else:
+                table_options.append("WITHOUT ROWID")
+            if self.sqlite_strict_backing:
+                strict_cols, reasons = self._sqlite_strict_columns(col_defs_sql, cols)
+                if strict_cols is not None:
+                    col_defs_sql = strict_cols
+                    table_options.append("STRICT")
+                else:
+                    notes = dict(self._sqlite_table_shape_notes)
+                    notes[table_name + "#strict"] = (
+                        f"{table_name} is not STRICT although strict backing tables were requested: the value "
+                        f"type of column(s) {', '.join(reasons)} is not fixed by the plan (a column copied from a "
+                        f"base table keeps that table's affinity, which can hold any storage class)."
+                    )
+                    self._sqlite_table_shape_notes = notes
+            self._sqlite_provable_int_cols = frozenset()
 
         cols_joined = ",\n    ".join(col_defs_sql)
-        return f"CREATE TABLE {table_name} (\n    {cols_joined}\n){fillfactor_tail}{without_rowid_tail};"
+        options_tail = (" " + ", ".join(table_options)) if table_options else ""
+        return f"CREATE TABLE {table_name} (\n    {cols_joined}\n){fillfactor_tail}{options_tail};"
 
 
     def _is_known_single_ident(self, raw: str) -> bool:

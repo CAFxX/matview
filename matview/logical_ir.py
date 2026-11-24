@@ -861,6 +861,8 @@ class CompilationContext:
     # PostgreSQL catalog table used to fence pre-repair REPEATABLE READ /
     # SERIALIZABLE snapshots inside statement-level maintenance triggers.
     repair_fence_catalog_table: Optional[str] = None
+    # SQLite: opt in to STRICT backing/auxiliary tables where every column type is provable.
+    sqlite_strict_backing: bool = False
 
     def with_ir(self, **ir_changes: Any) -> "CompilationContext":
         return replace(self, ir=self.ir.with_updates(**ir_changes))
