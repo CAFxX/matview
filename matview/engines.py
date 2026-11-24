@@ -52,6 +52,10 @@ class EngineVersion:
     # connection (`probe_sqlite_nonstandard_statistics`), never by guessing from
     # the driver, and independently of any pinned engine version.
     sqlite_nonstandard_statistics: frozenset[str] = field(default_factory=frozenset, compare=False)
+    # True when a connection was given but could not be probed (no usable
+    # cursor, a stub): a view using VAR_*/STDDEV_* is then refused rather than
+    # assumed to be exact.
+    sqlite_statistics_unprobed: bool = field(default=False, compare=False)
     packaging_version: Optional[Version] = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
@@ -482,7 +486,12 @@ _SQLITE_STATISTICS_EXPECTED = {
 
 
 def probe_sqlite_nonstandard_statistics(conn: Any) -> frozenset[str]:
-    """Statistical aggregates the SQLite connection defines that do not match
+    """Names flagged by ``probe_sqlite_statistics`` (see there)."""
+    return probe_sqlite_statistics(conn)[0]
+
+
+def probe_sqlite_statistics(conn: Any) -> Tuple[frozenset[str], bool]:
+    """``(flagged names, probed)``. Statistical aggregates the SQLite connection defines that do not match
     the exact definition (see ``_SQLITE_STATISTICS_EXPECTED``).
 
     Behavioural: each of ``var_pop``/``var_samp``/``stddev_pop``/``stddev_samp``
@@ -493,11 +502,15 @@ def probe_sqlite_nonstandard_statistics(conn: Any) -> frozenset[str]:
     maintains the materialized view could not equal the view. A function that
     errors is treated as non-standard. An unconditional probe: it does not depend
     on the driver class, proxies, or on a pinned engine version.
+
+    ``probed`` is False when the connection could not be probed (no usable
+    cursor, e.g. a foreign thread, or a stub that does not return SQL results):
+    the caller must not read "nothing flagged" as "conforming".
     """
     try:
         cur = conn.cursor()
     except Exception:
-        return frozenset()
+        return frozenset(), False
     found = set()
     try:
         for name, (expected_many, expected_one) in _SQLITE_STATISTICS_EXPECTED.items():
@@ -515,8 +528,8 @@ def probe_sqlite_nonstandard_statistics(conn: Any) -> frozenset[str]:
                 found.add(name)
                 continue
             if not all(isinstance(r, (tuple, list)) and len(r) == 1 for r in (many, one)):
-                # Not a SQL result (a stub/mock connection): nothing to probe.
-                return frozenset()
+                # Not a SQL result (a stub/mock connection): cannot be probed.
+                return frozenset(found), False
             # An aggregate over no row still yields one row; no row at all means
             # a scalar function of that name.
             got = (many[0], one[0], none[0] if isinstance(none, (tuple, list)) and len(none) == 1 else "<no row>")
@@ -531,18 +544,23 @@ def probe_sqlite_nonstandard_statistics(conn: Any) -> frozenset[str]:
                 close()
             except Exception:
                 pass
-    return frozenset(found)
+    return frozenset(found), True
 
 
 def with_probed_sqlite_statistics(conn: Any, version: EngineVersion) -> EngineVersion:
-    """``version`` with ``sqlite_nonstandard_statistics`` filled in from a probe
-    of ``conn`` (SQLite only; other dialects are returned unchanged)."""
+    """``version`` with ``sqlite_nonstandard_statistics`` (and, when the
+    connection cannot be probed, ``sqlite_statistics_unprobed``) filled in from a
+    probe of ``conn`` (SQLite only; other dialects are returned unchanged)."""
     if version.dialect != Dialect.SQLITE:
         return version
-    probed = probe_sqlite_nonstandard_statistics(conn) | version.sqlite_nonstandard_statistics
-    if probed == version.sqlite_nonstandard_statistics:
+    flagged, probed = probe_sqlite_statistics(conn)
+    flagged = flagged | version.sqlite_nonstandard_statistics
+    unprobed = version.sqlite_statistics_unprobed or not probed
+    if flagged == version.sqlite_nonstandard_statistics and unprobed == version.sqlite_statistics_unprobed:
         return version
-    return dataclasses.replace(version, sqlite_nonstandard_statistics=probed)
+    return dataclasses.replace(
+        version, sqlite_nonstandard_statistics=flagged, sqlite_statistics_unprobed=unprobed
+    )
 
 
 def _read_mariadb_div_precision_increment(cur: Any) -> int:

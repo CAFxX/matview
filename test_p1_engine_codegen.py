@@ -2225,6 +2225,12 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
                 self.assertIn(frag, probe_section, f"{vname}: missing {frag!r} in probe block")
 
 
+def detect_version_for(conn):
+    from matview.connectivity import detect_engine_version
+
+    return detect_engine_version(conn, "sqlite")
+
+
 class TestNonstandardSqliteStatisticsRefusal(unittest.TestCase):
     """SQLite has no built-in VAR_*/STDDEV_*. A connection that defines them
     (sqlean's `stats` extension, a loaded extension, an application-defined
@@ -2381,6 +2387,106 @@ class TestNonstandardSqliteStatisticsRefusal(unittest.TestCase):
             schemas, "CREATE VIEW v AS SELECT g, SUM(v) AS s FROM t GROUP BY g",
             dialect=Dialect.SQLITE, engine_version=all_flagged,
         )
+
+    def test_probe_checks_every_result_aspect(self) -> None:
+        """Conforming everywhere except one aspect: the empty-set result (an
+        aggregate that yields 0.0 for no row, as sqlean's do; a Python UDF
+        cannot, so a scripted connection supplies it) and the result type (an
+        integer where the exact definition is a float)."""
+        from matview.engines import probe_sqlite_nonstandard_statistics as probe
+
+        class Scripted:
+            def __init__(self, many, one, none) -> None:
+                self.answers = {"many": many, "one": one, "none": none}
+
+            def cursor(self):
+                answers = self.answers
+
+                class Cursor:
+                    row = None
+
+                    def execute(self, sql):
+                        if sql.endswith("WHERE 0"):
+                            key = "none"
+                        elif "UNION ALL" in sql:
+                            key = "many"
+                        else:
+                            key = "one"
+                        self.row = (answers[key],)
+
+                    def fetchone(self):
+                        return self.row
+
+                return Cursor()
+
+        exact = {"var_pop": (2.0, 0.0), "var_samp": (2.5, None), "stddev_pop": (math.sqrt(2.0), 0.0),
+                 "stddev_samp": (math.sqrt(2.5), None)}
+
+        def run(name, many, one, none):
+            conn = Scripted(many, one, none)
+            # Only `name` is defined: the others report no such function.
+            cur_factory = conn.cursor
+
+            class OnlyOne:
+                def cursor(self):
+                    cur = cur_factory()
+                    inner = cur.execute
+
+                    def execute(sql):
+                        called = sql.split("(")[0].split()[-1]
+                        if called != name:
+                            raise sqlite3.OperationalError(f"no such function: {called}")
+                        inner(sql)
+
+                    cur.execute = execute
+                    return cur
+
+            return probe(OnlyOne())
+
+        many, one = exact["var_samp"]
+        self.assertEqual(run("var_samp", many, one, None), frozenset())
+        self.assertEqual(run("var_samp", many, one, 0.0), frozenset({"var_samp"}))  # empty set
+        self.assertEqual(run("var_samp", 2, one, None), frozenset({"var_samp"}))  # int, not float
+        self.assertEqual(run("var_pop", 2.0, 0, None), frozenset({"var_pop"}))
+
+    def test_unprobeable_connection_is_not_assumed_exact(self) -> None:
+        """A connection whose cursor cannot be obtained (another thread, a
+        stub) cannot be probed: views using VAR_*/STDDEV_* are refused with that
+        reason, other views are unaffected."""
+        import threading
+
+        from matview_sync import UnsupportedMaterializedViewError
+
+        holder = {}
+        thread = threading.Thread(target=lambda: holder.setdefault("conn", sqlite3.connect(":memory:")))
+        thread.start()
+        thread.join()
+        foreign = holder["conn"]  # created in another thread: cursor() raises here
+        with self.assertRaises(Exception):
+            foreign.cursor()
+        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "could not be probed"):
+            generate_materialized_view(
+                parse_table_schema(self.SCHEMA), "CREATE VIEW v AS SELECT g, VAR_POP(v) AS s FROM t GROUP BY g",
+                dialect=Dialect.SQLITE,
+                engine_version=detect_version_for(foreign),
+            )
+        generate_materialized_view(
+            parse_table_schema(self.SCHEMA), "CREATE VIEW v AS SELECT g, SUM(v) AS s FROM t GROUP BY g",
+            dialect=Dialect.SQLITE, engine_version=detect_version_for(foreign),
+        )
+
+    def test_message_names_only_the_functions_the_view_uses(self) -> None:
+        from matview_sync import UnsupportedMaterializedViewError
+
+        conn = self._connect(False)
+        with self.assertRaises(UnsupportedMaterializedViewError) as ctx:
+            generate_materialized_view(
+                conn, "CREATE VIEW v AS SELECT g, var_pop(v) AS s FROM t GROUP BY g", ignore_limitations=True
+            )
+        message = str(ctx.exception)
+        self.assertIn("defines var_pop ", message)
+        for other in ("var_samp", "stddev_pop", "stddev_samp"):
+            self.assertNotIn(other, message.replace("stats_" + other, ""))
 
 
 if __name__ == "__main__":

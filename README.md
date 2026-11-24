@@ -528,7 +528,10 @@ Support levels used here:
   engine-neutral exact definition (a single-value sample statistic is `0.0` in
   sqlean and NULL in matview; rounding also differs), so a view using them on a
   connection that really exposes them (detected by probing the functions on known values, whatever the driver)
-  is refused at registration, and `ignore_limitations` does not bypass it. See
+  is refused at registration, and `ignore_limitations` does not bypass it (so is a
+  connection that cannot be probed, for a view that uses them). "Accepted" means
+  "conforms on the probe inputs" (exactly representable values), not "bit-exact":
+  SQLite VAR/STDDEV maintenance is not yet bit-exact on arbitrary data. See
   [sqlean Native Statistical Aggregates (MVs Diverge From sqlean's Own VAR/STDDEV)](TODO.md). Products not
   listed in the matrix (for example other PostgreSQL or MySQL forks) are
   untested.
