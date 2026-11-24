@@ -810,3 +810,21 @@ The existing differential-testing harness is useful, but its current headline co
   I would like the generator to support also modern NewSQL engines (CockroachDB, TiDB, YugabyteDB, Spanner, etc.) where possible (using PostgreSQL-compatible trigger generation on YugabyteDB/CockroachDB and delta-log/change-stream batch maintenance on engines without general row triggers like TiDB and Cloud Spanner).
 - [ ] **ORM & Migration Framework Integrations**:
   Provide first-class integration helpers for SQLAlchemy, Alembic, and Django ORM migrations.
+
+## Minimal columns audit: removable matview-owned columns, indexes and keys
+
+Source: read-only audit of the generated DDL on all engines (2026-11-24; offline DDL for PostgreSQL/MySQL/MariaDB, live for SQLite; nothing here was measured natively except the SQLite rowid work in the STRICT/WITHOUT ROWID PR; sizes below are from the DDL, not from benchmarks). Standing goal: <= 1 write per materialized row, no no-op rewrites. Each item needs a native differential run on PG15/18, MySQL 8.4/9.7, MariaDB 10.11/11.8/12.3 (and SQLite) before it lands, plus a mutation check that no reader of the removed object was missed.
+
+- [x] SQLite: `WITHOUT ROWID` for every NOT NULL non-rowid-alias key with narrow rows (measured; done in the SQLite STRICT/WITHOUT ROWID codegen PR).
+- [x] Catalog: removed the `ALTER TABLE ... ADD COLUMN` probe loop (6 `SELECT` + commit per manager construction) and merged the three catalog reads of `_read_catalog` into one statement (unreleased: no catalogs from older versions).
+- [ ] PostgreSQL/MySQL/MariaDB: `__mv_cnt_<col>` of natively recomputed float `SUM`/`AVG` is written by every trigger and never read (one extra column write per row, 8 bytes). Drop (`single.py` item set gated by `_pgmy_native_recompute_item`; PG backfill INSERT lists write it too).
+- [ ] PostgreSQL: aux (`COUNT/SUM(DISTINCT)`) index on `__val` alone (`planner.py` `_index_ddls`): every aux access is by the (group, `__val`) primary-key prefix; `test_p2_index_intelligence.py` asserts it exists (update). One index write per aux row insert/delete.
+- [ ] PostgreSQL 15+: nullable single group key keeps `__mv_pk` as the conflict target and also a `UNIQUE ... NULLS NOT DISTINCT` index on the group column that no statement uses (two unique indexes per row). Drop the index first (low risk); dropping `__mv_pk` itself is a larger change.
+- [ ] PostgreSQL: `__grp` / trailing `__g<n>` group-column indexes: not used by maintenance on join aggregates with `__mv_pk`; read-optimisation only. Decide drop vs keep by measurement.
+- [ ] PostgreSQL: derive `AVG` in the reader view as MySQL/SQLite already do (removes the stored `a` column write and one hidden sum per AVG); needs bit-identical NUMERIC scale evidence.
+- [ ] Join / `UNION ALL` aggregates: `__mv_cnt_<col>` over a NOT NULL argument equals the row count `n` (the reuse exists only for `_alg_mode == "single"`, `single.py`). Reuse `n`; exclude outer joins.
+- [ ] `UNION ALL` with only non-null branch keys: `__mv_row_count` is always 0 or 1 and the minus UPDATE + clean DELETE collapses to one DELETE (`zset.py`); prove same-key UPDATE ordering first.
+- [ ] MySQL/MariaDB tier-2 (group-scoped) aggregate stores and window stores have no PRIMARY KEY, i.e. InnoDB's hidden 6-byte DB_ROW_ID clustered key; when the group columns are NOT NULL the GROUP BY key is a natural PRIMARY KEY (replaces the `__grp` index and the hidden id; also better for replication and online DDL). Tier-3 `atomic_query_sync` stores (delete + insert everything) legitimately have none.
+- [ ] MySQL/MariaDB: `__mv_pk VARCHAR(512) utf8mb4_bin` is copied into every secondary-index entry (up to 2 KB per `__grp` entry); evaluate a hash key or dropping the secondary index.
+- [ ] PostgreSQL aux tables take no fillfactor although `__ref_cnt` is updated in place (tuning, not removal).
+- [ ] SQLite: `__mv_acnt_*` + `__mv_fold_dirty` + partial index for STRICT `INTEGER` arguments (see the STRICT initiative).

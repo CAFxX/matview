@@ -728,32 +728,6 @@ class MaterializedViewManager:
                 """
             )
             self._commit()
-            # Catalogs created by older versions lack some columns. Probe each
-            # column with a plain read and only ALTER when it is missing: on
-            # PostgreSQL ALTER TABLE takes ACCESS EXCLUSIVE even when ADD
-            # COLUMN then fails, so an unconditional ALTER on every manager
-            # construction queued behind any open writer transaction (whose
-            # triggers read the catalog) and stalled every other writer.
-            for col, col_ddl in (
-                ("backfill_cursor_pk", "backfill_cursor_pk BIGINT DEFAULT NULL"),
-                ("backfill_max_pk", "backfill_max_pk BIGINT DEFAULT NULL"),
-                ("backfill_active", "backfill_active INTEGER NOT NULL DEFAULT 0"),
-                ("backfill_owner", "backfill_owner VARCHAR(64) DEFAULT NULL"),
-                ("accepted_limitations_json", "accepted_limitations_json TEXT DEFAULT NULL"),
-                ("partitions_json", "partitions_json TEXT DEFAULT NULL"),
-            ):
-                try:
-                    cur.execute(f"SELECT {col} FROM {self.catalog_table} WHERE 1 = 0")
-                    cur.fetchall()
-                    self._commit()
-                    continue
-                except Exception:
-                    self._rollback()
-                try:
-                    cur.execute(f"ALTER TABLE {self.catalog_table} ADD COLUMN {col_ddl};")
-                    self._commit()
-                except Exception:
-                    self._rollback()
 
     def _commit(self) -> None:
         if hasattr(self.conn, "commit"):
@@ -981,35 +955,24 @@ class MaterializedViewManager:
         With ``required`` an unreadable catalog raises instead of reading as
         empty (callers that suspend maintenance must know every view)."""
         with self._cursor() as cur:
+            # One statement reads every catalog column this method needs (the catalog is
+            # created with all of them: there are no catalogs from older versions).
             rows = self._catalog_select(
                 cur,
                 f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
                 f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json, "
-                f"backfill_cursor_pk, backfill_max_pk, backfill_active "
+                f"backfill_cursor_pk, backfill_max_pk, backfill_active, "
+                f"accepted_limitations_json, partitions_json "
                 f"FROM {self.catalog_table}{lock_clause}",
             )
-            has_wm_cols = rows is not None
             if rows is None:
-                rows = self._catalog_select(
-                    cur,
-                    f"SELECT view_name, view_sql, strategy, signature_hash, backing_table, "
-                    f"aux_tables_json, trigger_names_json, function_names_json, trigger_ddls_json "
-                    f"FROM {self.catalog_table}{lock_clause}",
-                )
-                if rows is None:
-                    if required:
-                        raise RuntimeError(
-                            f"the materialized-view catalog {self.catalog_table} could not be read"
-                        )
-                    return {}
-            accepted_rows = self._catalog_select(
-                cur,
-                f"SELECT view_name, accepted_limitations_json FROM {self.catalog_table}{lock_clause}",
-            )
-            partition_rows = self._catalog_select(
-                cur,
-                f"SELECT view_name, partitions_json FROM {self.catalog_table}{lock_clause}",
-            )
+                if required:
+                    raise RuntimeError(
+                        f"the materialized-view catalog {self.catalog_table} could not be read"
+                    )
+                return {}
+        accepted_rows = [(r[0], r[12]) for r in rows]
+        partition_rows = [(r[0], r[13]) for r in rows]
         accepted_by_view: Dict[str, Any] = {}
         for arow in accepted_rows or ():
             try:
@@ -1056,9 +1019,9 @@ class MaterializedViewManager:
                 "trigger_names": json.loads(row[6]),
                 "function_names": json.loads(row[7]),
                 "trigger_ddls": json.loads(row[8]),
-                "backfill_cursor_pk": row[9] if has_wm_cols and len(row) > 9 else None,
-                "backfill_max_pk": row[10] if has_wm_cols and len(row) > 10 else None,
-                "backfill_active": int(row[11]) if has_wm_cols and len(row) > 11 and row[11] is not None else 0,
+                "backfill_cursor_pk": row[9],
+                "backfill_max_pk": row[10],
+                "backfill_active": int(row[11]) if row[11] is not None else 0,
             }
             # Limitation codes overridden when the view was installed, bound
             # to the definition they were accepted for. A record that does not
