@@ -121,7 +121,7 @@ from .sql_frontend import (
 #     SERIALIZABLE snapshots against repair_view(), rebuild, and backfill via
 #     SELECT ... FOR SHARE on the view's catalog row (raising 40001 on stale
 #     or missing catalog visibility; zero locks under READ COMMITTED).
-MATVIEW_GENERATOR_VERSION = "15"
+MATVIEW_GENERATOR_VERSION = "16"
 
 
 def _definition_digest(select_sql: str) -> str:
@@ -147,16 +147,26 @@ _REPAIR_GUIDANCE = (
 )
 
 
-def _is_postgres_cte_in_scope(tbl_node: sqlglot_exp.Table) -> bool:
+def _is_postgres_cte_in_scope(
+    tbl_node: sqlglot_exp.Table, *, case_insensitive: bool = False
+) -> bool:
     """Return True if an unqualified table node resolves to an enclosing CTE
     under PostgreSQL scoping rules (non-recursive WITH CTEs see only earlier
-    CTEs; WITH RECURSIVE CTEs see every CTE in the same WITH clause)."""
+    CTEs; WITH RECURSIVE CTEs see every CTE in the same WITH clause).
+
+    Pass ``case_insensitive=True`` for MySQL/MariaDB where CTE names are always
+    compared case-insensitively even when backtick-quoted.
+    """
     if tbl_node.db or tbl_node.catalog:
         return False
     id_node = tbl_node.this
     if not isinstance(id_node, sqlglot_exp.Identifier):
         return False
-    target = id_node.name if id_node.quoted else id_node.name.lower()
+    target = (
+        id_node.name.lower()
+        if (case_insensitive or not id_node.quoted)
+        else id_node.name
+    )
     prev_node: sqlglot_exp.Expr = tbl_node
     cur_node: Optional[sqlglot_exp.Expr] = tbl_node.parent
     cte_in_prev_with: Optional[sqlglot_exp.CTE] = None
@@ -179,7 +189,11 @@ def _is_postgres_cte_in_scope(tbl_node: sqlglot_exp.Table) -> bool:
                     alias_node.this, sqlglot_exp.Identifier
                 ):
                     cte_id = alias_node.this
-                    cte_key = cte_id.name if cte_id.quoted else cte_id.name.lower()
+                    cte_key = (
+                        cte_id.name.lower()
+                        if (case_insensitive or not cte_id.quoted)
+                        else cte_id.name
+                    )
                     if cte_key == target:
                         return True
         prev_node = cur_node
@@ -286,6 +300,110 @@ def _postgres_base_table_lock_targets(
                     targets_by_key[key] = sql_ref
 
     return [sql_ref for _, sql_ref in sorted(targets_by_key.items())]
+
+
+def _mysql_base_table_lock_stmts(
+    plan: Any,
+    *,
+    schemas: Optional[Dict[str, TableSchema]] = None,
+    object_prefix: str = DEFAULT_OBJECT_PREFIX,
+) -> List[str]:
+    """Return deterministically ordered MySQL/MariaDB InnoDB shared-lock probe
+    statements (`LOCK IN SHARE MODE`) for every base table referenced by ``plan``.
+
+    Under a transaction-local ``REPEATABLE READ`` snapshot, scanning each base
+    table's clustered index with ``LOCK IN SHARE MODE`` acquires next-key shared
+    locks over every row, gap, and supremum — serializing ``repair_view()`` with
+    concurrent writers under ``READ COMMITTED``, ``REPEATABLE READ``, and
+    ``SERIALIZABLE`` regardless of ``binlog_format`` (``ROW``/``MIXED``/``STATEMENT``).
+    """
+    sub_plans = list(getattr(plan, "sub_plans", None) or ())
+    plans = sub_plans if sub_plans else [plan]
+    internal_prefixes = tuple({p.lower() for p in (object_prefix, DEFAULT_OBJECT_PREFIX, "__mv_") if p})
+    schemas_lower: Dict[str, TableSchema] = {k.lower(): v for k, v in (schemas or {}).items()}
+    # Map (table_lower, db_lower) -> (leaf_table_name, sql_table_ref)
+    targets_by_key: Dict[Tuple[str, str], Tuple[str, str]] = {}
+
+    for sp in plans:
+        vs = getattr(sp, "view_spec", None)
+        if vs is None:
+            continue
+        raw_select = getattr(vs, "raw_select_sql", None) or ""
+        found_from_ast = False
+        if raw_select.strip():
+            try:
+                ast_node = parse_sql_ast(raw_select, dialect=Dialect.MYSQL)
+                if isinstance(ast_node, sqlglot_exp.Create) and isinstance(
+                    ast_node.expression, sqlglot_exp.Expr
+                ):
+                    ast_node = ast_node.expression
+                for tbl_node in ast_node.find_all(sqlglot_exp.Table):
+                    this_part = tbl_node.this
+                    if not isinstance(this_part, sqlglot_exp.Identifier) or not this_part.name:
+                        continue
+                    if _is_postgres_cte_in_scope(tbl_node, case_insensitive=True):
+                        continue
+                    leaf_low = this_part.name.lower()
+                    if leaf_low.startswith(internal_prefixes):
+                        continue
+                    db_part = tbl_node.args.get("db")
+                    db_low = (
+                        db_part.name.lower()
+                        if isinstance(db_part, sqlglot_exp.Identifier) and db_part.name
+                        else ""
+                    )
+                    clean_tbl = sqlglot_exp.Table(
+                        this=this_part.copy(),
+                        db=db_part.copy() if isinstance(db_part, sqlglot_exp.Expr) else None,
+                    )
+                    key = (leaf_low, db_low)
+                    if key not in targets_by_key:
+                        targets_by_key[key] = (this_part.name, clean_tbl.sql(dialect="mysql"))
+                    found_from_ast = True
+            except sqlglot.errors.SqlglotError:
+                pass
+
+        if not found_from_ast:
+            for ref_t in getattr(vs, "referenced_tables", ()) or ():
+                ref_s = str(ref_t).strip()
+                if not ref_s:
+                    continue
+                parts: List[str] = []
+                for raw_p in ref_s.split("."):
+                    sp_p = raw_p.strip()
+                    if not sp_p:
+                        continue
+                    if len(sp_p) >= 2 and sp_p[0] == "`" and sp_p[-1] == "`":
+                        sp_p = sp_p[1:-1].replace("``", "`")
+                    parts.append(sp_p)
+                if not parts:
+                    continue
+                leaf = parts[-1]
+                if leaf.lower().startswith(internal_prefixes):
+                    continue
+                db_low = parts[-2].lower() if len(parts) >= 2 else ""
+                q_ref = ".".join(quote_sql_identifier(p, Dialect.MYSQL) for p in parts)
+                key = (leaf.lower(), db_low)
+                if key not in targets_by_key:
+                    targets_by_key[key] = (leaf, q_ref)
+
+    stmts: List[str] = []
+    for _, (leaf_name, q_tbl) in sorted(targets_by_key.items()):
+        ts = schemas_lower.get(leaf_name.lower())
+        # Check `ts.pk_columns` (populated iff a genuine PRIMARY index exists),
+        # NOT `c.primary_key`: MySQL/MariaDB information_schema.columns marks
+        # the first UNIQUE NOT NULL index as COLUMN_KEY='PRI' even when no
+        # PRIMARY index exists, where FORCE INDEX (PRIMARY) raises Error 1176.
+        if ts is not None and ts.pk_columns:
+            stmts.append(f"SELECT COUNT(*) FROM {q_tbl} FORCE INDEX (PRIMARY) LOCK IN SHARE MODE;")
+        elif ts is not None and ts.columns:
+            col_terms = " + ".join(
+                f"ISNULL({quote_sql_identifier(c, Dialect.MYSQL)})" for c in ts.columns
+            )
+            stmts.append(f"SELECT SUM({col_terms}) FROM {q_tbl} LOCK IN SHARE MODE;")
+        else:
+            stmts.append(f"SELECT COUNT(*) FROM {q_tbl} LOCK IN SHARE MODE;")
+    return stmts
 
 
 class BackfillInterruptedError(RuntimeError):
@@ -711,28 +829,42 @@ class MaterializedViewManager:
                     cur.execute("SET SESSION collation_connection = @@collation_database;")
                 except Exception:
                     pass
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {self.catalog_table} (
-                    view_name VARCHAR(255) NOT NULL PRIMARY KEY,
-                    view_sql TEXT NOT NULL,
-                    strategy VARCHAR(64) NOT NULL,
-                    signature_hash VARCHAR(64) NOT NULL,
-                    backing_table VARCHAR(255) NOT NULL,
-                    aux_tables_json TEXT NOT NULL,
-                    trigger_names_json TEXT NOT NULL,
-                    function_names_json TEXT NOT NULL,
-                    trigger_ddls_json TEXT NOT NULL,
-                    backfill_cursor_pk BIGINT DEFAULT NULL,
-                    backfill_max_pk BIGINT DEFAULT NULL,
-                    backfill_active INTEGER NOT NULL DEFAULT 0,
-                    backfill_owner VARCHAR(64) DEFAULT NULL,
-                    accepted_limitations_json TEXT DEFAULT NULL,
-                    partitions_json TEXT DEFAULT NULL
-                );
-                """
-            )
-            self._commit()
+            # Probe the catalog table with a plain read before issuing DDL:
+            # on MySQL/MariaDB, CREATE TABLE IF NOT EXISTS requests an exclusive
+            # metadata lock (MDL_EXCLUSIVE) even when the table already exists,
+            # which stalls behind any active writer whose trigger watermark read
+            # holds MDL_SHARED_READ on the catalog table.
+            catalog_exists = False
+            try:
+                cur.execute(f"SELECT 1 FROM {self.catalog_table} WHERE 1 = 0")
+                cur.fetchall()
+                self._commit()
+                catalog_exists = True
+            except Exception:
+                self._rollback()
+            if not catalog_exists:
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {self.catalog_table} (
+                        view_name VARCHAR(255) NOT NULL PRIMARY KEY,
+                        view_sql TEXT NOT NULL,
+                        strategy VARCHAR(64) NOT NULL,
+                        signature_hash VARCHAR(64) NOT NULL,
+                        backing_table VARCHAR(255) NOT NULL,
+                        aux_tables_json TEXT NOT NULL,
+                        trigger_names_json TEXT NOT NULL,
+                        function_names_json TEXT NOT NULL,
+                        trigger_ddls_json TEXT NOT NULL,
+                        backfill_cursor_pk BIGINT DEFAULT NULL,
+                        backfill_max_pk BIGINT DEFAULT NULL,
+                        backfill_active INTEGER NOT NULL DEFAULT 0,
+                        backfill_owner VARCHAR(64) DEFAULT NULL,
+                        accepted_limitations_json TEXT DEFAULT NULL,
+                        partitions_json TEXT DEFAULT NULL
+                    );
+                    """
+                )
+                self._commit()
             # A catalog from another version of the generator (missing a column) would make every
             # catalog read fail and look like "no catalog": fail loudly instead.
             try:
@@ -3717,10 +3849,16 @@ class MaterializedViewManager:
             rebuilds via `register_view(..., force_rebuild=True)`, whose
             `DROP`/`CREATE TRIGGER` DDL serializes writers (`ACCESS EXCLUSIVE`
             / `SHARE ROW EXCLUSIVE`, which also blocks readers while running).
-        - MySQL/MariaDB (InnoDB, REPEATABLE READ): the repopulating
-          INSERT ... SELECT takes shared locks on the base rows it reads, so
-          writers serialize with the repair (verified natively with
-          concurrent writers; other isolation levels are untested).
+        - MySQL/MariaDB (InnoDB, `READ COMMITTED`, `REPEATABLE READ`, and
+          `SERIALIZABLE`): `_repair_view_contents()` runs in a transaction-local
+          `REPEATABLE READ` transaction (without altering the session's own
+          `transaction_isolation`) and acquires clustered-index next-key shared
+          locks (`LOCK IN SHARE MODE`) on all referenced base tables in
+          deterministic sorted order before clearing and repopulating the
+          backing store, serializing with concurrent writers under all three
+          isolation levels regardless of `binlog_format` (with bounded retry on
+          transient InnoDB deadlock/lock-timeout/snapshot-conflict errors
+          1213/1205/1020).
         - SQLite: writes are serialized database-wide.
         """
         catalog = self.get_catalog()
@@ -3773,11 +3911,17 @@ class MaterializedViewManager:
                 )
                 results[v_name] = "rebuilt"
             else:
-                self._repair_view_contents(plan, v_name)
+                self._repair_view_contents(plan, v_name, schemas=schemas)
                 results[v_name] = "repaired"
         return results
 
-    def _repair_view_contents(self, plan: Any, v_name: str) -> None:
+    def _repair_view_contents(
+        self,
+        plan: Any,
+        v_name: str,
+        *,
+        schemas: Optional[Dict[str, TableSchema]] = None,
+    ) -> None:
         """Repopulate one view from scratch in a single transaction.
 
         The watermark is taken over first, in the same transaction as the
@@ -3796,8 +3940,21 @@ class MaterializedViewManager:
             if self.dialect == Dialect.POSTGRES
             else []
         )
+        if self.dialect == Dialect.MYSQL and schemas is None:
+            schemas = self.fetch_schema()
+        mysql_lock_stmts = (
+            _mysql_base_table_lock_stmts(plan, schemas=schemas, object_prefix=self.object_prefix)
+            if self.dialect == Dialect.MYSQL
+            else []
+        )
         attempt = 0
         while True:
+            if self.dialect == Dialect.MYSQL:
+                # Close any read-only snapshot left by get_catalog()/fetch_schema()
+                # before opening the repair cursor so transaction-local REPEATABLE
+                # READ applies cleanly without altering the session's own
+                # transaction_isolation.
+                self._rollback()
             with self._cursor() as cur:
                 try:
                     if self.dialect == Dialect.POSTGRES:
@@ -3812,8 +3969,10 @@ class MaterializedViewManager:
                                 f"LOCK TABLE {', '.join(pg_lock_targets)} IN SHARE MODE;"
                             )
                     elif self.dialect == Dialect.MYSQL:
-                        # Explicit transaction so autocommit=True connections
-                        # cannot commit the watermark/DELETE before repopulating.
+                        # Explicit START TRANSACTION prevents autocommit=True from
+                        # splitting the catalog update, base-table locks, DELETE,
+                        # and INSERT repopulation across separate transactions.
+                        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
                         cur.execute("START TRANSACTION;")
                     parts_snapshot = (
                         self._pg_snapshot_partitions(cur, pg_lock_targets)
@@ -3842,6 +4001,11 @@ class MaterializedViewManager:
                             f"WHERE view_name = ?",
                             (self._COMPLETED_MARKER_PK, self._COMPLETED_MARKER_PK, v_name),
                         )
+                    if self.dialect == Dialect.MYSQL and mysql_lock_stmts:
+                        for lock_sql in mysql_lock_stmts:
+                            cur.execute(lock_sql)
+                            if callable(getattr(cur, "fetchall", None)):
+                                cur.fetchall()
                     for aux_t in plan.auxiliary_table_names:
                         cur.execute(f"DELETE FROM {aux_t};")
                     for aux_ddl in plan.auxiliary_table_ddls:
@@ -3858,6 +4022,7 @@ class MaterializedViewManager:
                         self._is_transient_lock_error(exc)
                         or self._is_lock_timeout_error(exc)
                         or self._is_concurrent_group_insert_error(exc)
+                        or self._is_snapshot_row_changed_error(exc)
                     ):
                         raise
             attempt += 1

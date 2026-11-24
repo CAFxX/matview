@@ -2176,7 +2176,12 @@ class Tier1SingleMixin(MixinHost):
         def _sub(key_conds: List[str]) -> str:
             all_c = conds + key_conds
             where_part = f" WHERE {' AND '.join(all_c)}" if all_c else ""
-            return f"(SELECT {agg_sql} FROM {q_base_t}{where_part})"
+            # Under MySQL/MariaDB READ COMMITTED with binlog_format=ROW, a scalar
+            # recompute subquery inside UPDATE executes as a non-locking consistent
+            # read against the statement's pre-lock read view unless LOCK IN SHARE
+            # MODE forces a locking current read of committed base rows.
+            lock_part = " LOCK IN SHARE MODE" if self.dialect == Dialect.MYSQL else ""
+            return f"(SELECT {agg_sql} FROM {q_base_t}{where_part}{lock_part})"
 
         return self._pg_null_split_subquery(_sub, nullable_keys) if nullable_keys else _sub([])
 

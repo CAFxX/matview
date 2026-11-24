@@ -414,6 +414,26 @@ MUTANTS = (
             "test_dotted_base_tables_and_special_char_user_indexes"
         ),
     ),
+    Mutant(
+        name="mysql-repair-skips-repeatable-read-base-locks",
+        source_path="matview/manager.py",
+        original="                    if self.dialect == Dialect.MYSQL and mysql_lock_stmts:",
+        replacement="                    if False and self.dialect == Dialect.MYSQL and mysql_lock_stmts:",
+        target_test=(
+            "test_concurrent_backfill.TestMySqlRepairViewLockingOffline."
+            "test_mysql_repair_view_contents_sets_repeatable_read_locks_base_tables_and_retries_on_deadlock"
+        ),
+    ),
+    Mutant(
+        name="mysql-recompute-subquery-skips-lock-in-share-mode",
+        source_path="matview/maintenance/single.py",
+        original="            lock_part = \" LOCK IN SHARE MODE\" if self.dialect == Dialect.MYSQL else \"\"",
+        replacement="            lock_part = \"\"",
+        target_test=(
+            "test_concurrent_backfill.TestMySqlRepairViewLockingOffline."
+            "test_mysql_minmax_and_bitwise_recompute_subqueries_emit_lock_in_share_mode"
+        ),
+    ),
 )
 
 
