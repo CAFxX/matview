@@ -48,9 +48,11 @@ from .engines import (
     UnsupportedMaterializedViewError,
     _sqlglot_dialect,
     parse_engine_version,
+    with_probed_mysql_collation,
     with_probed_sqlite_statistics,
 )
 from .logical_ir import (
+    GROUP_KEY_PLACEHOLDERS,
     MaterializedViewPlan,
     TableSchema,
     ViewDiff,
@@ -524,9 +526,12 @@ class MaterializedViewManager:
         if engine_version is not None:
             # A pinned version skips detection, not the probe of the connection's
             # statistical functions (they decide what the original view returns).
-            self.engine_version: EngineVersion = with_probed_sqlite_statistics(
-                unwrap_dbapi_connection(self.conn)[0],
-                parse_engine_version(engine_version, default_dialect=hint_d),
+            _raw_conn = unwrap_dbapi_connection(self.conn)[0]
+            self.engine_version: EngineVersion = with_probed_mysql_collation(
+                _raw_conn,
+                with_probed_sqlite_statistics(
+                    _raw_conn, parse_engine_version(engine_version, default_dialect=hint_d)
+                ),
             )
         else:
             self.engine_version = detect_engine_version(self.conn, hint_dialect=hint_d)
@@ -2061,7 +2066,7 @@ class MaterializedViewManager:
                 batch_keys = all_keys[i : i + batch_size]
                 placeholders = ", ".join(ph for _ in batch_keys)
                 for tmpl in spec.chunk_sql_templates:
-                    sql = tmpl.format(placeholders=placeholders)
+                    sql = tmpl.replace(GROUP_KEY_PLACEHOLDERS, placeholders)
                     cur.execute(sql, tuple(batch_keys))
                 if not snapshot_isolation:
                     self._commit()
@@ -4974,7 +4979,8 @@ def _resolve_dialect_and_engine_version(
     resolved = _resolve_dialect_and_engine_version_unprobed(schema_sql_or_dict, dialect, engine_version)
     if hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
         # Explicit versions skip detection but not the probe of the connection.
-        resolved = with_probed_sqlite_statistics(unwrap_dbapi_connection(schema_sql_or_dict)[0], resolved)
+        _raw = unwrap_dbapi_connection(schema_sql_or_dict)[0]
+        resolved = with_probed_mysql_collation(_raw, with_probed_sqlite_statistics(_raw, resolved))
     return resolved
 
 

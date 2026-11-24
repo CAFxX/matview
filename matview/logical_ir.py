@@ -277,6 +277,13 @@ class ViewSpec:
     functions_classified: bool = False
 
 
+# Marks where a ``group_key_batch`` chunk template takes its ``?, ?, ...`` key
+# placeholders. A literal token (replaced with ``str.replace``) rather than a
+# ``str.format`` field: the generated SQL itself contains braces and quotes
+# (regular-expression quantifiers in the MariaDB key text, JSON, string literals).
+GROUP_KEY_PLACEHOLDERS = "/*matview:group-key-placeholders*/"
+
+
 @dataclass(frozen=True)
 class IncrementalBackfillSpec:
     mode: str  # "pk_range_fold", "group_key_batch", "offset_batch"

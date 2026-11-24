@@ -57,6 +57,10 @@ class EngineVersion:
     # assumed to be exact.
     sqlite_statistics_unprobed: bool = field(default=False, compare=False)
     packaging_version: Optional[Version] = field(default=None, compare=False)
+    # MySQL: the session's ``collation_connection`` (lower case), the collation of a
+    # character value that derives from no column (``CAST(x AS CHAR)``, ``HEX(x)``,
+    # ``DATE_FORMAT(...)``); None when no connection was probed.
+    mysql_connection_collation: Optional[str] = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if self.packaging_version is None:
@@ -561,6 +565,36 @@ def with_probed_sqlite_statistics(conn: Any, version: EngineVersion) -> EngineVe
     return dataclasses.replace(
         version, sqlite_nonstandard_statistics=flagged, sqlite_statistics_unprobed=unprobed
     )
+
+
+def with_probed_mysql_collation(conn: Any, version: EngineVersion) -> EngineVersion:
+    """``version`` with ``mysql_connection_collation`` read from ``conn`` (MySQL and
+    MariaDB only, when not already known); other versions are returned unchanged."""
+    if version.dialect != Dialect.MYSQL or version.mysql_connection_collation is not None:
+        return version
+    try:
+        cur = conn.cursor()
+    except Exception:
+        return version
+    try:
+        found = _read_mysql_connection_collation(cur)
+    finally:
+        close_fn = getattr(cur, "close", None)
+        if callable(close_fn):
+            close_fn()
+    return version if found is None else dataclasses.replace(version, mysql_connection_collation=found)
+
+
+def _read_mysql_connection_collation(cur: Any) -> Optional[str]:
+    """The session ``collation_connection`` (lower case), or None when unreadable."""
+    try:
+        cur.execute("SELECT @@SESSION.collation_connection;")
+        row = cur.fetchone()
+        if row and row[0]:
+            return str(row[0]).strip().lower()
+    except Exception:
+        pass
+    return None
 
 
 def _read_mariadb_div_precision_increment(cur: Any) -> int:

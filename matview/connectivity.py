@@ -21,6 +21,7 @@ from .engines import (
     _extract_packaging_and_tuple,
     _extract_version_tuple,
     _read_mariadb_div_precision_increment,
+    _read_mysql_connection_collation,
     with_probed_sqlite_statistics,
     parse_engine_version,
 )
@@ -151,10 +152,14 @@ def _detect_engine_version(
                         ver = _extract_version_tuple(v_str, (11, 4, 0))
                         div_increment = _read_mariadb_div_precision_increment(cur)
                         return EngineVersion(
-                            Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str, div_increment
+                            Dialect.MYSQL, EngineSubdialect.MARIADB, ver, v_str, div_increment,
+                            mysql_connection_collation=_read_mysql_connection_collation(cur),
                         )
                     ver = _extract_version_tuple(v_str, (8, 0, 0))
-                    return EngineVersion(Dialect.MYSQL, EngineSubdialect.MYSQL, ver, v_str)
+                    return EngineVersion(
+                        Dialect.MYSQL, EngineSubdialect.MYSQL, ver, v_str,
+                        mysql_connection_collation=_read_mysql_connection_collation(cur),
+                    )
             except Exception:
                 pass
             return parse_engine_version(
@@ -195,6 +200,7 @@ def _detect_engine_version(
                         v_str,
                         div_increment,
                         packaging_version=pkg_v,
+                        mysql_connection_collation=_read_mysql_connection_collation(cur),
                     )
                 pkg_v, ver = _extract_packaging_and_tuple(v_str, (8, 0, 0))
                 return EngineVersion(
@@ -203,6 +209,7 @@ def _detect_engine_version(
                     ver,
                     v_str,
                     packaging_version=pkg_v,
+                    mysql_connection_collation=_read_mysql_connection_collation(cur),
                 )
         except Exception:
             pass

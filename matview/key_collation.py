@@ -206,10 +206,14 @@ def _combine(parts: "list[KeyClass]") -> KeyClass:
     for p in parts:
         if p.kind == KeyKind.UNKNOWN:
             return p
-    for p in parts:
-        if p.kind == KeyKind.TEXT:
-            return p
-    return KeyClass(KeyKind.PLAIN)
+    texts = [p for p in parts if p.kind == KeyKind.TEXT]
+    if not texts:
+        return KeyClass(KeyKind.PLAIN)
+    named = {(p.collation or "").upper() for p in texts if p.collation}
+    if len(named) > 1:
+        # The server picks the comparison collation by coercibility at run time.
+        return _unknown(f"its operands have different collations ({', '.join(sorted(named))})")
+    return texts[0] if texts[0].collation or not named else KeyClass(KeyKind.TEXT, next(iter(named)))
 
 
 def _mysql_derive(node: E.Expr, resolve: ColumnResolver) -> KeyClass:
@@ -288,3 +292,40 @@ def mysql_collation_has_spelling_variants(name: Optional[str]) -> bool:
     binary collations); True for every other, and for an unknown, collation."""
     n = (name or "").lower()
     return not (n == "binary" or (n.endswith("_bin") and ("0900" in n or "nopad" in n)))
+
+
+# MySQL (not MariaDB) PAD SPACE collations whose GROUP BY / DISTINCT equality is the
+# same in every execution plan. Measured natively on MySQL 8.4 and 9.7 over every
+# collation of the utf8mb4, utf8mb3, latin1, ascii, ucs2, utf16 and utf32 character
+# sets (plus the single-byte character sets, see below): ``'a' = 'a' || c`` for a
+# character c other than U+0020 that weighs like a space (NBSP and the other
+# Unicode spaces under the UCA collations ``unicode_ci``, ``unicode_520_ci`` and
+# the language collations) is TRUE, but GROUP BY / DISTINCT pad only U+0020 when
+# they use a temporary table and pad by weight when they walk an index (or run
+# COUNT(DISTINCT)). The original view is then plan-dependent: no key text can
+# reproduce it. Every other measured PAD SPACE collation (``*_bin``,
+# ``*_general_ci``, ``*_general_mysql500_ci``, ``*_tolower_ci``, ``latin1_*``,
+# ``ascii_*``) has no such character; every NO PAD collation (``utf8mb4_0900_*``)
+# does not pad at all.
+_MYSQL_PAD_STABLE_CHARSETS = frozenset({"utf8mb4", "utf8mb3", "utf8", "ucs2", "utf16", "utf32", "latin1", "ascii"})
+_MYSQL_PAD_STABLE_SUFFIXES = ("_bin", "_general_ci", "_general_mysql500_ci", "_tolower_ci")
+
+
+def mysql_collation_is_plan_dependent(name: Optional[str]) -> bool:
+    """True when a MySQL PAD SPACE collation may group (and de-duplicate) the same
+    values differently depending on the execution plan, so that the original view
+    itself has no single result (see above). False for NO PAD collations and for the
+    measured PAD SPACE collations whose only pad character is U+0020. A collation
+    that was not measured is plan-dependent (refused, never guessed); ``None`` (no
+    collation known, an offline plan) is not."""
+    if not name:
+        return False
+    n = name.strip().lower()
+    if n == "binary" or "0900" in n:
+        return False
+    charset = n.split("_", 1)[0]
+    if charset in _MYSQL_PAD_STABLE_CHARSETS and (
+        n.endswith(_MYSQL_PAD_STABLE_SUFFIXES) or charset in ("latin1", "ascii")
+    ):
+        return False
+    return True
