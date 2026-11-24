@@ -761,9 +761,12 @@ protocol at all: run it with writes to the source tables stopped.
   `search_path`, or trigger definition altered out of band),
   `triggers_out_of_order` (SQLite: a user trigger created after registration
   that writes a source table or uses `RAISE(FAIL)`/`RAISE(IGNORE)` fires before
-  the maintenance trigger, because SQLite fires the newest trigger first) or
+  the maintenance trigger, because SQLite fires the newest trigger first),
   `triggers_orphaned` when maintenance triggers are gone, disabled, modified,
-  preceded or on a detached partition (`repair_view()` rebuilds them).
+  preceded or on a detached partition, or `partitions_changed` when a
+  PostgreSQL source table's partition tree changed out of band (e.g. `DROP` of
+  a partition, `DETACH` followed by `DROP`, or partition rename/bound change;
+  `repair_view()` rebuilds them).
   MySQL/MariaDB also report `triggers_out_of_order` for a multi-source view
   when a user trigger on one source, placed before the maintenance trigger
   with `PRECEDES`, writes another source. There `repair_view()` only
@@ -1062,8 +1065,11 @@ transition tables, its only mechanism: one `AFTER INSERT`, `AFTER UPDATE` and
   leaves the detached rows in the view and the maintenance triggers on the
   detached table (its writes still change the view): `check_schema_drift()`
   reports `"triggers_orphaned"` and `repair_view()` rebuilds the view.
-  `DROP` of a partition fires no trigger and is not detected: the view keeps
-  the dropped rows until `repair_view()`.
+  `DROP` of a partition fires no trigger (DDL), so the view keeps the dropped
+  rows until `repair_view()`, and `check_schema_drift()` / `sync_views()`
+  report `"partitions_changed"` (`diff_views()` reports `REPLACE`) by
+  comparing the live partition tree against the OID-independent partition
+  snapshot persisted in the catalog.
 - `TRUNCATE` of a source (or of one partition) recomputes the view.
 - The trigger functions run with the `search_path` of their creation
   (`SET search_path FROM CURRENT`), so a writer's own `search_path` cannot
