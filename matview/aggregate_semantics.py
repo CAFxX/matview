@@ -173,7 +173,7 @@ def aggregate_order_keys(call: exp.Expr) -> Optional[List[exp.Expr]]:
 
 def has_total_input_order(
     call: exp.Expr,
-    covers_every_primary_key: Callable[[Sequence[exp.Expr]], bool],
+    covers_every_primary_key: Callable[[Sequence[exp.Expr], exp.Expr], bool],
 ) -> bool:
     """Whether an order-sensitive call is fed its rows in one total order.
 
@@ -187,12 +187,12 @@ def has_total_input_order(
     keys = aggregate_order_keys(call)
     if not keys:
         return False
-    return covers_every_primary_key(keys)
+    return covers_every_primary_key(keys, call)
 
 
 def iter_unordered_order_sensitive_calls(
     root: exp.Expr,
-    covers_every_primary_key: Callable[[Sequence[exp.Expr]], bool],
+    covers_every_primary_key: Callable[[Sequence[exp.Expr], exp.Expr], bool],
     extra_names: frozenset[str] = frozenset(),
 ) -> Iterator[exp.Expr]:
     """Order-sensitive aggregate calls in ``root`` without a total input order."""
