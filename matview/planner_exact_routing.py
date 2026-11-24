@@ -88,6 +88,17 @@ FULL_REFRESH_COST = (
 AGGREGATE_ORDER_OPT_IN = "AGGREGATE_ORDER_NOT_REPRODUCIBLE"
 ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE = "ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE"
 
+# Column types whose DISTINCT values are exactly their ORDER BY values (see
+# _distinct_ordered_by_itself): exact numerics, date/time and booleans.
+_DISTINCT_TOTAL_TYPES = frozenset(
+    {
+        "SMALLINT", "INT2", "INTEGER", "INT", "INT4", "BIGINT", "INT8", "TINYINT", "MEDIUMINT",
+        "SMALLINT UNSIGNED", "INT UNSIGNED", "INTEGER UNSIGNED", "BIGINT UNSIGNED", "TINYINT UNSIGNED",
+        "MEDIUMINT UNSIGNED", "NUMERIC", "DECIMAL", "DATE", "TIMESTAMP", "DATETIME", "TIME",
+        "TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ", "BOOLEAN", "BOOL", "YEAR",
+    }
+)
+
 # Window functions that give tied rows (peers) the same result.
 _PEER_DETERMINISTIC_WINDOW_FUNCS: Tuple[type, ...] = (
     sqlglot_exp.Rank, sqlglot_exp.DenseRank, sqlglot_exp.PercentRank, sqlglot_exp.CumeDist,
@@ -251,11 +262,41 @@ class ExactAggregateRoutingMixin(MixinHost):
                 name = call_name(call, sg_d)
                 if name in _ALGEBRAIC_AGGREGATE_NAMES:
                     continue
+                if self._distinct_ordered_by_itself(call):
+                    continue
                 if relaxed and not include_relaxed:
                     continue  # per-code opt-in: the group recompute
                 out.append(call.sql(dialect=sg_d))
         out.extend(self._unordered_window_aggregates(include_relaxed=include_relaxed))
         return out
+
+    def _distinct_ordered_by_itself(self, call: sqlglot_exp.Expr) -> bool:
+        """``AGG(DISTINCT c ORDER BY c)``: the elements are the distinct
+        values of ``c`` in ``c`` order, a function of the group's rows, when
+        no two distinct values compare equal and no two equal values differ.
+        That holds for exact numeric, date/time and boolean columns on every
+        engine. It does not hold for floats (-0.0 and 0.0 are DISTINCT-equal
+        but print differently) nor for character columns: MySQL/MariaDB's
+        default collations are case- (and on MariaDB trailing-space-)
+        insensitive, so 'b' and 'B' are one DISTINCT value whose
+        representative is plan-dependent; PostgreSQL columns can use a
+        nondeterministic collation the offline schema does not record."""
+        keys = aggregate_order_keys(call)
+        if not keys or len(keys) != 1 or not isinstance(keys[0], sqlglot_exp.Column):
+            return False
+        distinct = call.find(sqlglot_exp.Distinct)
+        if distinct is None or len(distinct.expressions) != 1:
+            return False
+        arg = distinct.expressions[0]
+        if not isinstance(arg, sqlglot_exp.Column) or arg.name.lower() != keys[0].name.lower() or (
+            (arg.table or "").lower() != (keys[0].table or "").lower()
+        ):
+            return False
+        c_def = self._lookup_col_def(arg.sql(dialect=_sqlglot_dialect(self.dialect)))
+        if c_def is None:
+            return False
+        t = re.sub(r"\s*\(.*\)", "", c_def.data_type).strip().upper()
+        return t in _DISTINCT_TOTAL_TYPES
 
     def _unordered_window_aggregates(self, *, include_relaxed: bool = False) -> List[str]:
         """Window functions whose result depends on the order of rows that

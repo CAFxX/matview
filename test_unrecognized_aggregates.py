@@ -121,7 +121,8 @@ PG_CASES: List[Case] = [
     _grouped("regr_count", "REGR_COUNT(x, v)", T2),
     _grouped("covar_pop", "COVAR_POP(v, id)", T3),
     _grouped("array_agg_ordered", "ARRAY_AGG(v ORDER BY v, id)", T2),
-    _grouped("array_agg_unordered", "ARRAY_AGG(v)", T3),  # no inner ORDER BY: plan-dependent order
+    _grouped("array_agg_unordered", "ARRAY_AGG(v)", T3),
+    _grouped("array_agg_distinct_self_ordered", "ARRAY_AGG(DISTINCT v ORDER BY v)", T2),  # no inner ORDER BY: plan-dependent order
     _grouped("string_agg_ordered", "STRING_AGG(s, ',' ORDER BY id)", T2),
     _grouped("string_agg_unordered", "STRING_AGG(s, ',')", T3),
     _grouped("string_agg_partial_order", "STRING_AGG(CAST(v AS TEXT), ',' ORDER BY s)", T3),
@@ -168,7 +169,8 @@ MY_CASES: List[Case] = [
     # group recompute returned 'c,c,a,c' where the live view returned
     # 'c,a,c,c' on MariaDB 11.8): exact full refresh.
     _grouped("group_concat_unordered", "GROUP_CONCAT(s)", T3, skip_type_code=("a",)),
-    _grouped("group_concat_distinct", "GROUP_CONCAT(DISTINCT v ORDER BY v)", T3, skip_type_code=("a",)),  # DISTINCT: not a total order
+    _grouped("group_concat_distinct", "GROUP_CONCAT(DISTINCT v ORDER BY v)", T2, skip_type_code=("a",)),  # DISTINCT integer ordered by itself: total
+    _grouped("group_concat_distinct_text", "GROUP_CONCAT(DISTINCT s ORDER BY s)", T3, skip_type_code=("a",)),  # 'b'/'B' tie under the collation
     # An ORDER BY with ties leaves the tied rows in plan order (native
     # mismatches before the fix on MariaDB 11.8 and MySQL 8.4).
     _grouped("group_concat_partial_order", "GROUP_CONCAT(v ORDER BY s)", T3, skip_type_code=("a",)),
@@ -697,6 +699,23 @@ class OfflineRoutingTests(unittest.TestCase):
                     self.assertEqual(plan.strategy, expected, (dialect, shape))
                     if expected == T3:
                         self.assertEqual([d.code for d in plan.strategy_diagnostics], ["ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"], shape)
+
+    def test_distinct_ordered_by_itself(self) -> None:
+        # AGG(DISTINCT c ORDER BY c) is a total order when distinct values
+        # print distinctly: exact numerics/dates (all engines); not floats
+        # (-0.0/0.0) nor character columns (collations: MySQL/MariaDB 'b'/'B';
+        # PostgreSQL nondeterministic collations are not visible offline).
+        for dialect, expr, expected in (
+            ("postgres", "ARRAY_AGG(DISTINCT v ORDER BY v)", T2),
+            ("postgres", "ARRAY_AGG(DISTINCT x ORDER BY x)", T3),
+            ("postgres", "STRING_AGG(DISTINCT s, ',' ORDER BY s)", T3),
+            ("postgres", "ARRAY_AGG(DISTINCT v ORDER BY id)", T3),
+            ("mysql", "GROUP_CONCAT(DISTINCT v ORDER BY v)", T2),
+            ("mysql", "GROUP_CONCAT(DISTINCT s ORDER BY s)", T3),
+            ("sqlite", "group_concat(DISTINCT v ORDER BY v)", T2),
+        ):
+            plan = self._plan(dialect, f"SELECT g, {expr} AS a FROM t GROUP BY g")
+            self.assertEqual(plan.strategy, expected, (dialect, expr))
 
     def test_window_aggregates_need_a_total_window_order(self) -> None:
         for expr, expected in (
