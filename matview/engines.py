@@ -523,6 +523,9 @@ class TransparencyLimitation:
 # ``ignore_limitations`` does not.
 PER_CODE_OPT_IN_LIMITATIONS = frozenset({
     "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+    # Element order of string/array/JSON aggregates without a total ORDER BY
+    # (accepting it keeps the group-scoped recompute, announced as relaxed).
+    "AGGREGATE_ORDER_NOT_REPRODUCIBLE",
     "ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE",
     "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
 })
