@@ -332,6 +332,7 @@ class DriftTests(unittest.TestCase):
             return {j.matrix["python-version"]: j.steps[3].condition for j in jobs}
 
         self.assertEqual(conditions("matrix.python-version == '3.15'"), {"3.11": "never", "3.15": "success"})
+        self.assertEqual(conditions("failure()"), {"3.11": "failure", "3.15": "failure"})
         # GitHub expression braces and case-insensitive string comparison.
         self.assertEqual(conditions("${{ matrix.python-version == '3.11' }}"), {"3.11": "success", "3.15": "never"})
         self.assertEqual(conditions("matrix.python-version == '3.11 '"), {"3.11": "never", "3.15": "never"})
