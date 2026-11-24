@@ -384,9 +384,17 @@ class PlannerMixin(MixinHost):
                 # Outside any nested SELECT and outside the projection: e.g.
                 # HAVING of the top-level query; treat like a nested use.
                 pass
-            arg = node.this
+            fn_node: Any = node
+            unwrapped_pg = _unwrap_pg_catalog_agg_node(node, self.dialect)
+            if isinstance(unwrapped_pg, sqlglot_exp.Func):
+                fn_node = unwrapped_pg
+            arg = fn_node.this
             if isinstance(arg, sqlglot_exp.Distinct):
                 arg = arg.expressions[0] if arg.expressions else None
+            elif isinstance(fn_node, sqlglot_exp.Anonymous):
+                # Anonymous calls (pg_catalog.sum(...)) keep the name in
+                # `this` and the arguments in `expressions`.
+                arg = fn_node.expressions[0] if fn_node.expressions else None
             if arg is None:
                 arg_sql = ""
             elif isinstance(arg, str):

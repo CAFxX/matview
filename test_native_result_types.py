@@ -1236,22 +1236,25 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         self.assertRegex(p_uagg.backing_table_ddl, r"\bbx BIGINT\b")
         self.assertRegex(p_uagg.backing_table_ddl, r"\bmnx1 BIGINT\b")
 
-        # Float branch in UNION ALL agg must trigger ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE by default,
-        # and widen SUM/AVG/VAR_POP to DOUBLE PRECISION when explicitly accepted.
-        float_uagg_sql = (
-            "CREATE VIEW v_uf AS WITH u AS (SELECT k, x FROM a UNION ALL SELECT k, f FROM b) "
-            "SELECT k, SUM(x) AS sx, AVG(x) AS ax, VAR_POP(x) AS vp FROM u GROUP BY k;"
+        # A float branch in a UNION ALL agg makes SUM/AVG/VAR_POP floating point
+        # (DOUBLE PRECISION): the exact full refresh by default, and the
+        # relaxed incremental mode under the explicit per-code opt-in.
+        float_uagg_body = (
+            "WITH u AS (SELECT k, x FROM a UNION ALL SELECT k, f FROM b) "
+            "SELECT k, SUM(x) AS sx, AVG(x) AS ax, VAR_POP(x) AS vp FROM u GROUP BY k"
         )
-        with self.assertRaises(EngineLimitationError):
-            generate_materialized_view(pg_schema, float_uagg_sql, dialect="postgres:18")
+        float_uagg_sql = f"CREATE VIEW v_uf AS {float_uagg_body};"
+        _assert_exact_float_refresh(self, pg_schema, float_uagg_body, "postgres:18")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", EngineLimitationWarning)
+            warnings.simplefilter("ignore", MatviewDiagnosticWarning)
             p_uf = generate_materialized_view(
                 pg_schema,
                 float_uagg_sql,
                 dialect="postgres:18",
-                accept_limitations=("ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",),
+                accept_limitations=FLOAT_OPT_IN,
             )
+        self.assertNotEqual(p_uf.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
         self.assertRegex(p_uf.backing_table_ddl, r"\bsx DOUBLE PRECISION\b")
         self.assertRegex(p_uf.backing_table_ddl, r"\bax DOUBLE PRECISION\b")
         self.assertRegex(p_uf.backing_table_ddl, r"\bvp DOUBLE PRECISION\b")
@@ -1372,13 +1375,10 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 dialect="postgres:18",
             )
 
-        # pg_catalog.<agg>(...) OVER (...) on DOUBLE must still raise EngineLimitationError.
-        with self.assertRaises(EngineLimitationError):
-            generate_materialized_view(
-                pg_schema,
-                "CREATE VIEW v_win_pgcat AS SELECT id, pg_catalog.sum(f) OVER (PARTITION BY g) AS s FROM t;",
-                dialect="postgres:18",
-            )
+        # pg_catalog.<agg>(...) OVER (...) on DOUBLE is still classified as floating point.
+        _assert_exact_float_refresh(
+            self, pg_schema, "SELECT id, pg_catalog.sum(f) OVER (PARTITION BY g) AS s FROM t", "postgres:18"
+        )
 
         # Non-decomposed Tier 3 pg_catalog.<agg>(...) preserves exact result types.
         p_t3_pgcat = generate_materialized_view(
