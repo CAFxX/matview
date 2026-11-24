@@ -950,20 +950,28 @@ On SQLite, registration adds a **note** (code `SQLITE_STRICT_RECOMMENDED`,
 severity `note`, message starting `recommendation:`) when a non-STRICT source
 table costs the view something that STRICT would remove:
 
-- `SUM`/`TOTAL`/`AVG` over an integer-affinity column: the column can also hold
-  `REAL` or `TEXT`, so every group keeps a hidden non-integer counter and is
-  recomputed from the base table whenever such a value is stored. A STRICT
-  `INTEGER` column can never hold one, so those recomputes cannot happen.
-- A `WITHOUT ROWID` table whose integer primary key is only an affinity: it has
-  no trusted watermark column, so an incremental backfill uses the slower
-  `group_key_batch` mode (a STRICT `NOT NULL` integer key is trusted).
+- `SUM`/`TOTAL`/`AVG` of a bare integer-affinity column in a single-table
+  `algebraic_delta` view: the column can also hold `REAL` or `TEXT`, so every
+  group keeps a hidden non-integer counter and is recomputed from the base table
+  whenever such a value is stored. A STRICT `INTEGER` column can never hold one,
+  so those recomputes cannot happen. No note for expressions (`SUM(q * p)`,
+  `CASE`, `CAST`), `DISTINCT` aggregates, or views maintained by the group-scoped
+  or full-refresh strategies: STRICT changes nothing there.
+- A `WITHOUT ROWID` table with a single integer primary key that is only an
+  affinity, when an incremental backfill is requested: it has no trusted
+  watermark column, so the backfill uses the slower `group_key_batch` mode (a
+  STRICT `NOT NULL` integer key is trusted). No note for text or composite keys
+  (STRICT would not change the mode).
 
 A note names the table and the columns, the cost, the `CREATE TABLE ... STRICT`
 hint and the rebuild requirement (SQLite cannot `ALTER` a table into STRICT).
 It is a recommendation, not a fallback: the result is exact either way, so it
 is never a Python warning. It is kept in `plan.strategy_diagnostics`, logged
-at INFO on the `matview` logger, and shown by `matview diff` as
-`Recommendations` (text) and `diagnostics.details.recommendations` (`--json`).
+at INFO on the `matview` logger, shown by `matview diff` as `Recommendations`
+(text) and `diagnostics.details.recommendations` (`--json`), and printed on
+stderr by the compile and `--apply` commands (`NOTE [code] ...`, or a
+`recommendations` JSON object with `--json`); exit codes and the script on
+stdout are unaffected.
 No note is produced for a view that does not depend on the table's types.
 
 `check_schema_drift()` reports a source table that was rebuilt as STRICT or as
