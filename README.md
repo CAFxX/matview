@@ -1148,10 +1148,28 @@ observe depends on the engine:
   do not block each other and `READ COMMITTED` writers take no catalog lock
   from the repair fence (verified natively; standalone CLI SQL without a
   catalog table does not emit the catalog fence).
-- MySQL/MariaDB (InnoDB, default `REPEATABLE READ`): the repopulating
-  `INSERT ... SELECT` of `repair_view()` takes shared locks on the rows it reads,
-  so writers serialize with it (verified natively with concurrent writers).
-  Other isolation levels are untested.
+- MySQL/MariaDB (InnoDB, `READ COMMITTED`, `REPEATABLE READ`, and
+  `SERIALIZABLE`):
+  - Single-table algebraic triggers update backing rows under InnoDB row locks,
+    and single-table recomputed aggregates (`MIN`/`MAX`/`BIT_AND`/`BIT_OR`,
+    variance/stddev, and opted-in float aggregates) read current committed rows
+    with `LOCK IN SHARE MODE` (so `READ COMMITTED` with `binlog_format=ROW`
+    does not read a stale pre-lock statement snapshot).
+  - `repair_view()` runs in a transaction-local `REPEATABLE READ` transaction
+    (preserving the session's own isolation level) that acquires
+    clustered-index next-key shared locks (`LOCK IN SHARE MODE`) on all
+    referenced base tables in sorted order before clearing and repopulating the
+    store — serializing with concurrent writers under all three isolation
+    levels regardless of `binlog_format`.
+  - Applications must retry transient InnoDB lock/snapshot errors (`1213`,
+    `1205`, and `1020` `ER_CHECKREAD` under MariaDB 11.6+
+    `innodb_snapshot_isolation=ON`).
+  - Known `READ COMMITTED` exclusions: (1) two concurrent `READ COMMITTED`
+    transactions writing *different* base tables of a join view do not take
+    partner-table shared locks and can miss each other's delta under
+    `binlog_format=ROW`; (2) two concurrent `READ COMMITTED` writers racing on
+    an initially empty keyless Tier 3 backing store (`DELETE` locks zero rows
+    without gap locks) can duplicate rows until `repair_view()`.
 
 ### Performance notes
 

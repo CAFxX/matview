@@ -6,6 +6,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -5181,6 +5182,849 @@ class FailClosedBackfillConcurrencyTests(unittest.TestCase):
                 cleanup.cursor().execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
             finally:
                 cleanup.close()
+
+
+class TestMySqlRepairViewLockingOffline(unittest.TestCase):
+    """Offline structural checks for MySQL/MariaDB repair_view() isolation-level,
+    clustered-index shared-lock ordering, and READ COMMITTED recompute locks."""
+
+    def test_mysql_base_table_lock_stmts_sorts_dedups_and_handles_pk_and_keyless_tables(self) -> None:
+        from matview.logical_ir import ColumnDef, TableSchema
+        from matview.manager import _mysql_base_table_lock_stmts
+        from matview_sync import generate_materialized_view, parse_table_schema
+
+        schema = parse_table_schema(
+            """
+            CREATE TABLE z_tbl (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL);
+            CREATE TABLE a_tbl (id INT PRIMARY KEY, z_id INT NOT NULL, w INT NOT NULL);
+            CREATE TABLE no_pk_tbl (g INT, x INT);
+            """,
+            dialect=Dialect.MYSQL,
+        )
+        # Simulate MySQL information_schema.columns COLUMN_KEY='PRI' on a UNIQUE NOT NULL
+        # table that has no PRIMARY index (pk_columns is empty while c.primary_key is True).
+        schema["uq_only_tbl"] = TableSchema(
+            name="uq_only_tbl",
+            columns={
+                "id": ColumnDef(name="id", data_type="INT", not_null=True, primary_key=True),
+                "g": ColumnDef(name="g", data_type="INT", not_null=False, primary_key=False),
+            },
+            pk_columns=[],
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", EngineLimitationWarning)
+            plan_join = generate_materialized_view(
+                schema,
+                "CREATE VIEW v_mj AS "
+                "WITH `MyCTE` AS (SELECT z.g, a.w FROM z_tbl z JOIN a_tbl a ON a.z_id = z.id) "
+                "SELECT g, SUM(w) AS s FROM mycte GROUP BY g;",
+                dialect=Dialect.MYSQL,
+                ignore_limitations=True,
+            )
+            plan_keyless = generate_materialized_view(
+                schema,
+                "CREATE VIEW v_mk AS SELECT g, COUNT(*) AS cnt FROM no_pk_tbl GROUP BY g;",
+                dialect=Dialect.MYSQL,
+                ignore_limitations=True,
+            )
+            plan_uq_only = generate_materialized_view(
+                schema,
+                "CREATE VIEW v_muq AS SELECT g, COUNT(*) AS cnt FROM uq_only_tbl GROUP BY g;",
+                dialect=Dialect.MYSQL,
+                ignore_limitations=True,
+            )
+
+        stmts_join = _mysql_base_table_lock_stmts(plan_join, schemas=schema)
+        self.assertEqual(
+            stmts_join,
+            [
+                "SELECT COUNT(*) FROM a_tbl FORCE INDEX (PRIMARY) LOCK IN SHARE MODE;",
+                "SELECT COUNT(*) FROM z_tbl FORCE INDEX (PRIMARY) LOCK IN SHARE MODE;",
+            ],
+        )
+
+        stmts_keyless = _mysql_base_table_lock_stmts(plan_keyless, schemas=schema)
+        self.assertEqual(
+            stmts_keyless,
+            ["SELECT SUM(ISNULL(g) + ISNULL(x)) FROM no_pk_tbl LOCK IN SHARE MODE;"],
+        )
+
+        # UNIQUE NOT NULL table without PRIMARY index must NOT emit FORCE INDEX (PRIMARY)
+        # (which raises MySQL Error 1176).
+        stmts_uq = _mysql_base_table_lock_stmts(plan_uq_only, schemas=schema)
+        self.assertEqual(
+            stmts_uq,
+            ["SELECT SUM(ISNULL(id) + ISNULL(g)) FROM uq_only_tbl LOCK IN SHARE MODE;"],
+        )
+
+    def test_mysql_minmax_and_bitwise_recompute_subqueries_emit_lock_in_share_mode(self) -> None:
+        from matview_sync import generate_materialized_view, parse_table_schema
+
+        schema_my = parse_table_schema(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, amt BIGINT, KEY idx_g (g));",
+            dialect=Dialect.MYSQL,
+        )
+        schema_pg = parse_table_schema(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, amt BIGINT);",
+            dialect=Dialect.POSTGRES,
+        )
+        view_sql = (
+            "CREATE VIEW v_rec AS "
+            "SELECT g, MIN(amt) AS mn, MAX(amt) AS mx, BIT_AND(amt) AS ba, BIT_OR(amt) AS bo "
+            "FROM t GROUP BY g;"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", EngineLimitationWarning)
+            plan_my = generate_materialized_view(
+                schema_my, view_sql, dialect=Dialect.MYSQL, ignore_limitations=True
+            )
+            plan_pg = generate_materialized_view(
+                schema_pg, view_sql, dialect=Dialect.POSTGRES, ignore_limitations=True
+            )
+
+        del_triggers_my = "\n".join(plan_my.trigger_ddls)
+        for agg in ("MIN(amt)", "MAX(amt)", "BIT_AND(amt)", "BIT_OR(amt)"):
+            self.assertRegex(
+                del_triggers_my,
+                rf"\(SELECT [^\n;]*{re.escape(agg)}[^\n;]*FROM t WHERE \(t\.g\) = \(OLD\.g\) LOCK IN SHARE MODE\)",
+            )
+        self.assertNotIn("LOCK IN SHARE MODE", "\n".join(plan_pg.trigger_ddls))
+
+    def test_mysql_repair_view_contents_sets_repeatable_read_locks_base_tables_and_retries_on_deadlock(self) -> None:
+        from matview_sync import generate_materialized_view, parse_table_schema
+
+        schema = parse_table_schema(
+            """
+            CREATE TABLE z_tbl (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL);
+            CREATE TABLE a_tbl (id INT PRIMARY KEY, z_id INT NOT NULL, w INT NOT NULL);
+            """,
+            dialect=Dialect.MYSQL,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", EngineLimitationWarning)
+            plan = generate_materialized_view(
+                schema,
+                "CREATE VIEW v_mj AS SELECT z.g, SUM(a.w) AS s FROM z_tbl z JOIN a_tbl a ON a.z_id = z.id GROUP BY z.g;",
+                dialect=Dialect.MYSQL,
+                ignore_limitations=True,
+            )
+
+        executed: List[str] = []
+        fail_count = {"n": 0}
+
+        class _MySqlTransientError(Exception):
+            pass
+
+        class _FakeCursor:
+            def execute(self, sql: str, params: Any = None) -> None:
+                executed.append(sql.strip())
+                if sql.strip().startswith(f"DELETE FROM {plan.backing_table_name}"):
+                    if fail_count["n"] == 0:
+                        fail_count["n"] += 1
+                        raise _MySqlTransientError(1213, "Deadlock found when trying to get lock")
+                    if fail_count["n"] == 1:
+                        fail_count["n"] += 1
+                        raise _MySqlTransientError(1020, "Record has changed since last read in table")
+
+            def fetchall(self) -> List[Tuple[Any, ...]]:
+                return [(0,)]
+
+            def close(self) -> None:
+                pass
+
+        class _FakeMySqlConn:
+            def cursor(self) -> _FakeCursor:
+                return _FakeCursor()
+
+            def commit(self) -> None:
+                executed.append("COMMIT")
+
+            def rollback(self) -> None:
+                executed.append("ROLLBACK")
+
+        mgr = MaterializedViewManager(
+            _FakeMySqlConn(),
+            dialect=Dialect.MYSQL,
+            engine_version="mariadb 11.8.0",
+            skip_ensure_catalog=True,
+        )
+        sleeps: List[float] = []
+        mgr._backfill_sleep = sleeps.append
+        mgr._repair_view_contents(plan, plan.view_name, schemas=schema)
+
+        self.assertEqual(len(sleeps), 2)
+        set_tx_indices = [
+            i for i, s in enumerate(executed) if s == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;"
+        ]
+        self.assertEqual(len(set_tx_indices), 3, repr(executed))
+        attempts = [
+            executed[set_tx_indices[0] : set_tx_indices[1]],
+            executed[set_tx_indices[1] : set_tx_indices[2]],
+            executed[set_tx_indices[2] :],
+        ]
+        lock_a = "SELECT COUNT(*) FROM a_tbl FORCE INDEX (PRIMARY) LOCK IN SHARE MODE;"
+        lock_z = "SELECT COUNT(*) FROM z_tbl FORCE INDEX (PRIMARY) LOCK IN SHARE MODE;"
+        for att in attempts:
+            self.assertIn("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;", att)
+            self.assertIn("START TRANSACTION;", att)
+            self.assertIn(lock_a, att, repr(att))
+            self.assertIn(lock_z, att, repr(att))
+            idx_set = att.index("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+            idx_start = att.index("START TRANSACTION;")
+            idx_cat = next(i for i, s in enumerate(att) if s.startswith("UPDATE __matview_catalog SET backfill_cursor_pk"))
+            idx_lock_a = att.index(lock_a)
+            idx_lock_z = att.index(lock_z)
+            idx_del = next(i for i, s in enumerate(att) if s.startswith(f"DELETE FROM {plan.backing_table_name}"))
+            self.assertLess(idx_set, idx_start)
+            self.assertLess(idx_start, idx_cat)
+            self.assertLess(idx_cat, idx_lock_a)
+            self.assertLess(idx_lock_a, idx_lock_z)
+            self.assertLess(idx_lock_z, idx_del)
+        self.assertEqual(attempts[2][-1], "COMMIT")
+
+
+class TestMySqlIsolationLevelConcurrency(unittest.TestCase):
+    """Native MySQL/MariaDB concurrency verification under non-default InnoDB
+    isolation levels (READ COMMITTED and SERIALIZABLE): algebraic aggregates,
+    recomputed aggregates (MIN/MAX/BIT_AND/BIT_OR with group index), and
+    repair_view() racing concurrent writers across algebraic, recomputed,
+    keyless Tier 3, UNIQUE NOT NULL (no PK), and join views."""
+
+    @staticmethod
+    def _mysql_dsn() -> str:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            raise unittest.SkipTest("MYSQL_DSN not set")
+        return dsn
+
+    @staticmethod
+    def _connect(dsn: str) -> Any:
+        return IndependentSessionBackfillTests._connect_native(Dialect.MYSQL, dsn)
+
+    @staticmethod
+    def _is_retryable_mysql_lock_err(exc: BaseException) -> bool:
+        args = getattr(exc, "args", ())
+        code = args[0] if args and isinstance(args[0], int) else None
+        return code in {1020, 1205, 1213}
+
+    @staticmethod
+    def _iso_token(iso: str) -> str:
+        return iso.upper().replace(" ", "-")
+
+    @staticmethod
+    def _read_session_isolation(cur: Any) -> str:
+        """Read the MySQL/MariaDB session isolation level compatibly across
+        MySQL 8.4/9.7 (`transaction_isolation`) and MariaDB 10.11 (`tx_isolation`)."""
+        cur.execute(
+            "SHOW SESSION VARIABLES WHERE Variable_name IN ('transaction_isolation', 'tx_isolation')"
+        )
+        rows = cur.fetchall()
+        assert rows, "could not read MySQL/MariaDB session isolation level"
+        return str(rows[0][1]).upper()
+
+    def test_native_mysql_read_committed_minmax_bitwise_no_stale_snapshot(self) -> None:
+        """Deterministic 2-session READ COMMITTED interleaving: Session B inserts
+        a new row into group g0 and holds the X-lock on mv(g0); Session A deletes
+        the old minimum in g0 and blocks on mv(g0) (verified via engine lock-wait
+        evidence). Once Session B commits, Session A's recompute subqueries MUST
+        use LOCK IN SHARE MODE (current read) so they see Session B's committed
+        row instead of reading a stale pre-lock statement snapshot."""
+        from test_avg_concurrent_maintenance import _session_id, _wait_until_lock_waiting
+
+        dsn = self._mysql_dsn()
+        tag = f"mrcm_{uuid.uuid4().hex[:8]}"
+        tbl = f"t_{tag}"
+        v_rec = f"v_rec_{tag}"
+        admin = self._connect(dsn)
+        sess_b = self._connect(dsn)
+        sess_a = self._connect(dsn)
+        monitor = self._connect(dsn)
+        mgr: Optional[MaterializedViewManager] = None
+        try:
+            cur = admin.cursor()
+            cur.execute(
+                f"CREATE TABLE {tbl} ("
+                "  id BIGINT PRIMARY KEY, "
+                "  g VARCHAR(16) NOT NULL, "
+                "  amt BIGINT NOT NULL, "
+                "  KEY idx_g (g)"
+                ") ENGINE=InnoDB"
+            )
+            cur.executemany(
+                f"INSERT INTO {tbl} (id, g, amt) VALUES (%s, %s, %s)",
+                [(1, "g0", 100), (10, "g0", 50)],
+            )
+            admin.commit()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.MYSQL)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                mgr.register_view(
+                    f"CREATE VIEW {v_rec} AS "
+                    f"SELECT g, MIN(amt) AS mn, MAX(amt) AS mx, BIT_AND(amt) AS ba, BIT_OR(amt) AS bo "
+                    f"FROM {tbl} GROUP BY g;",
+                    accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                )
+            admin.commit()
+
+            sid_b = _session_id(Dialect.MYSQL, sess_b)
+            sid_a = _session_id(Dialect.MYSQL, sess_a)
+
+            cur_b = sess_b.cursor()
+            cur_b.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            self.assertEqual(self._read_session_isolation(cur_b), "READ-COMMITTED")
+            cur_b.execute("START TRANSACTION")
+            cur_b.execute(f"INSERT INTO {tbl} (id, g, amt) VALUES (11, 'g0', 75)")
+
+            a_err: List[BaseException] = []
+            a_done = threading.Event()
+
+            def _run_a() -> None:
+                cur_a = None
+                try:
+                    cur_a = sess_a.cursor()
+                    cur_a.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    cur_a.execute("START TRANSACTION")
+                    cur_a.execute(f"DELETE FROM {tbl} WHERE id = 10")
+                    sess_a.commit()
+                except BaseException as exc:
+                    a_err.append(exc)
+                    try:
+                        sess_a.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    if cur_a is not None:
+                        try:
+                            cur_a.close()
+                        except Exception:
+                            pass
+                    a_done.set()
+
+            th_a = threading.Thread(target=_run_a, daemon=True)
+            th_a.start()
+            _wait_until_lock_waiting(Dialect.MYSQL, monitor, sid_a, a_done, blocker_sid=sid_b)
+
+            sess_b.commit()
+            cur_b.close()
+            th_a.join(timeout=30.0)
+            self.assertFalse(th_a.is_alive(), "Session A hung after Session B committed")
+            self.assertEqual(a_err, [], f"Session A failed: {a_err!r}")
+
+            cur.execute(f"SELECT g, mn, mx, ba, bo FROM {v_rec} ORDER BY g")
+            got = [tuple(r) for r in cur.fetchall()]
+            cur.execute(
+                f"SELECT g, MIN(amt), MAX(amt), BIT_AND(amt), BIT_OR(amt) FROM {tbl} GROUP BY g ORDER BY g"
+            )
+            exp = [tuple(r) for r in cur.fetchall()]
+            self.assertEqual(got, exp, f"READ COMMITTED stale snapshot in MIN/MAX/BIT_AND/BIT_OR: {got!r} != {exp!r}")
+            self.assertEqual(got, [("g0", 75, 100, 100 & 75, 100 | 75)])
+            admin.commit()
+        finally:
+            for c_obj in (sess_b, sess_a, monitor):
+                try:
+                    c_obj.rollback()
+                    c_obj.close()
+                except Exception:
+                    pass
+            try:
+                admin.rollback()
+                if mgr is not None:
+                    try:
+                        mgr.drop_view(v_rec)
+                    except Exception:
+                        admin.rollback()
+                c = admin.cursor()
+                c.execute(f"DROP TABLE IF EXISTS {tbl}")
+                admin.commit()
+                c.close()
+            except Exception:
+                pass
+            admin.close()
+
+    def test_native_mysql_read_committed_and_serializable_algebraic_and_recomputed_writers(self) -> None:
+        dsn = self._mysql_dsn()
+        tag = f"miso_{uuid.uuid4().hex[:8]}"
+        tbl = f"t_{tag}"
+        v_alg = f"v_alg_{tag}"
+        v_rec = f"v_rec_{tag}"
+        admin = self._connect(dsn)
+        mgr: Optional[MaterializedViewManager] = None
+        try:
+            cur = admin.cursor()
+            cur.execute("SELECT VERSION()")
+            ver_row = cur.fetchone()
+            self.assertIsNotNone(ver_row)
+            assert ver_row is not None
+            self.assertTrue(len(str(ver_row[0])) > 0)
+
+            cur.execute(
+                f"CREATE TABLE {tbl} ("
+                "  id BIGINT PRIMARY KEY, "
+                "  g VARCHAR(16) NOT NULL, "
+                "  amt BIGINT NULL, "
+                "  KEY idx_g (g)"
+                ") ENGINE=InnoDB"
+            )
+            cur.executemany(
+                f"INSERT INTO {tbl} (id, g, amt) VALUES (%s, %s, %s)",
+                [(1, "g0", 100), (2, "g1", 200), (3, "g2", 300)],
+            )
+            admin.commit()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.MYSQL)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                mgr.register_view(
+                    f"CREATE VIEW {v_alg} AS "
+                    f"SELECT g, COUNT(*) AS cnt, COUNT(amt) AS vcnt, SUM(amt) AS tot, AVG(amt) AS avg_amt "
+                    f"FROM {tbl} GROUP BY g;",
+                    accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                )
+                mgr.register_view(
+                    f"CREATE VIEW {v_rec} AS "
+                    f"SELECT g, MIN(amt) AS mn, MAX(amt) AS mx, BIT_AND(amt) AS ba, BIT_OR(amt) AS bo "
+                    f"FROM {tbl} GROUP BY g;",
+                    accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                )
+            admin.commit()
+
+            worker_count = 4
+            tx_per_worker = 14
+            for iso_idx, iso in enumerate(("READ COMMITTED", "SERIALIZABLE")):
+                with self.subTest(isolation_level=iso):
+                    start = threading.Barrier(worker_count)
+                    errors: List[BaseException] = []
+                    completed: List[int] = []
+                    lock = threading.Lock()
+
+                    def _worker(wid: int) -> None:
+                        wconn = None
+                        wcur = None
+                        try:
+                            wconn = self._connect(dsn)
+                            wcur = wconn.cursor()
+                            wcur.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {iso}")
+                            got_iso = self._read_session_isolation(wcur)
+                            self.assertEqual(got_iso, self._iso_token(iso))
+                            wconn.commit()
+                            start.wait(timeout=30.0)
+                            for seq in range(tx_per_worker):
+                                row_id = (iso_idx + 1) * 100000 + wid * 1000 + seq + 10
+                                src_g = f"g{wid % 3}"
+                                dst_g = f"g{(wid + seq) % 3}"
+                                val = None if seq % 7 == 0 else ((wid + 1) * 50 + seq * 3)
+                                for attempt in range(20):
+                                    try:
+                                        wcur.execute("START TRANSACTION")
+                                        wcur.execute(
+                                            f"INSERT INTO {tbl} (id, g, amt) VALUES (%s, %s, %s)",
+                                            (row_id, src_g, val),
+                                        )
+                                        # Update both group and value (exercising MIN/MAX/BIT_AND/BIT_OR recomputes).
+                                        new_val = None if seq % 11 == 0 else ((val or 17) ^ 5)
+                                        wcur.execute(
+                                            f"UPDATE {tbl} SET g = %s, amt = %s WHERE id = %s",
+                                            (dst_g, new_val, row_id),
+                                        )
+                                        if seq % 4 == 0:
+                                            wcur.execute(f"DELETE FROM {tbl} WHERE id = %s", (row_id,))
+                                        if seq % 9 == 0:
+                                            wconn.rollback()
+                                        else:
+                                            wconn.commit()
+                                        break
+                                    except BaseException as exc:
+                                        try:
+                                            wconn.rollback()
+                                        except Exception:
+                                            pass
+                                        if not self._is_retryable_mysql_lock_err(exc) or attempt == 19:
+                                            raise
+                                        time.sleep(min(0.15, 0.005 * (attempt + 1)) + 0.002 * ((wid + seq) % 5))
+                            with lock:
+                                completed.append(wid)
+                        except BaseException as exc:
+                            start.abort()
+                            with lock:
+                                errors.append(exc)
+                        finally:
+                            if wcur is not None:
+                                try:
+                                    wcur.close()
+                                except Exception:
+                                    pass
+                            if wconn is not None:
+                                try:
+                                    wconn.rollback()
+                                    wconn.close()
+                                except Exception:
+                                    pass
+
+                    threads = [threading.Thread(target=_worker, args=(i,), daemon=True) for i in range(worker_count)]
+                    for th in threads:
+                        th.start()
+                    for th in threads:
+                        th.join(timeout=90.0)
+                    self.assertFalse([th.name for th in threads if th.is_alive()], f"MySQL {iso} workers hung")
+                    self.assertEqual(errors, [], f"MySQL {iso} worker errors: {errors!r}")
+                    self.assertEqual(sorted(completed), list(range(worker_count)))
+
+                    cur.execute(f"SELECT g, cnt, vcnt, tot, avg_amt FROM {v_alg} ORDER BY g")
+                    got_alg = [tuple(r) for r in cur.fetchall()]
+                    cur.execute(
+                        f"SELECT g, COUNT(*), COUNT(amt), SUM(amt), AVG(amt) FROM {tbl} GROUP BY g ORDER BY g"
+                    )
+                    exp_alg = [tuple(r) for r in cur.fetchall()]
+                    self.assertEqual(got_alg, exp_alg, f"MySQL {iso} algebraic mismatch")
+
+                    cur.execute(f"SELECT g, mn, mx, ba, bo FROM {v_rec} ORDER BY g")
+                    got_rec = [tuple(r) for r in cur.fetchall()]
+                    cur.execute(
+                        f"SELECT g, MIN(amt), MAX(amt), BIT_AND(amt), BIT_OR(amt) FROM {tbl} GROUP BY g ORDER BY g"
+                    )
+                    exp_rec = [tuple(r) for r in cur.fetchall()]
+                    self.assertEqual(got_rec, exp_rec, f"MySQL {iso} recomputed aggregate mismatch")
+                    admin.commit()
+        finally:
+            try:
+                admin.rollback()
+                if mgr is not None:
+                    for vn in (v_alg, v_rec):
+                        try:
+                            mgr.drop_view(vn)
+                        except Exception:
+                            admin.rollback()
+                c = admin.cursor()
+                c.execute(f"DROP TABLE IF EXISTS {tbl}")
+                admin.commit()
+                c.close()
+            except Exception:
+                pass
+            admin.close()
+
+    def test_native_mysql_repair_view_under_read_committed_and_serializable_writers(self) -> None:
+        from test_avg_concurrent_maintenance import _session_id, _wait_until_lock_waiting
+
+        dsn = self._mysql_dsn()
+        tag = f"mrep_{uuid.uuid4().hex[:8]}"
+        tbl = f"t_{tag}"
+        dim = f"d_{tag}"
+        uq_tbl = f"uq_{tag}"
+        v_alg = f"v_alg_{tag}"
+        v_rec = f"v_rec_{tag}"
+        v_t3 = f"v_t3_{tag}"
+        v_join = f"v_jn_{tag}"
+        v_uq = f"v_uq_{tag}"
+        admin = self._connect(dsn)
+        monitor = self._connect(dsn)
+        mgr: Optional[MaterializedViewManager] = None
+        try:
+            cur = admin.cursor()
+            cur.execute("SELECT VERSION()")
+            ver_row = cur.fetchone()
+            self.assertIsNotNone(ver_row)
+            assert ver_row is not None
+            self.assertTrue(len(str(ver_row[0])) > 0)
+
+            cur.execute(
+                f"CREATE TABLE {tbl} ("
+                "  id BIGINT PRIMARY KEY, "
+                "  g VARCHAR(16) NOT NULL, "
+                "  amt BIGINT NOT NULL, "
+                "  KEY idx_g (g)"
+                ") ENGINE=InnoDB"
+            )
+            cur.execute(
+                f"CREATE TABLE {dim} ("
+                "  g VARCHAR(16) PRIMARY KEY, "
+                "  label VARCHAR(16) NOT NULL"
+                ") ENGINE=InnoDB"
+            )
+            cur.execute(
+                f"CREATE TABLE {uq_tbl} ("
+                "  id BIGINT NOT NULL, "
+                "  g VARCHAR(16) NOT NULL, "
+                "  amt BIGINT NOT NULL, "
+                "  UNIQUE KEY uq_id (id)"
+                ") ENGINE=InnoDB"
+            )
+            cur.executemany(
+                f"INSERT INTO {dim} (g, label) VALUES (%s, %s)",
+                [("g0", "L0"), ("g1", "L1"), ("g2", "L2"), ("new_rc", "LRC"), ("new_ser", "LSER")],
+            )
+            cur.executemany(
+                f"INSERT INTO {tbl} (id, g, amt) VALUES (%s, %s, %s)",
+                [(1, "g0", 10), (2, "g1", 20), (3, "g2", 30)],
+            )
+            cur.executemany(
+                f"INSERT INTO {uq_tbl} (id, g, amt) VALUES (%s, %s, %s)",
+                [(1, "g0", 11), (2, "g1", 22)],
+            )
+            admin.commit()
+
+            mgr = MaterializedViewManager(admin, dialect=Dialect.MYSQL)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                mgr.register_view(
+                    f"CREATE VIEW {v_alg} AS SELECT g, COUNT(*) AS cnt, SUM(amt) AS tot FROM {tbl} GROUP BY g;",
+                    accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                )
+                mgr.register_view(
+                    f"CREATE VIEW {v_rec} AS SELECT g, MIN(amt) AS mn, MAX(amt) AS mx FROM {tbl} GROUP BY g;",
+                    accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                )
+                # Keyless Tier 3 view (triggers do not read __matview_catalog):
+                # exercises base-table LOCK IN SHARE MODE wait cleanly under both
+                # READ COMMITTED and SERIALIZABLE, and prevents duplicate rows on repair.
+                mgr.register_view(
+                    f"CREATE VIEW {v_t3} AS SELECT g, COUNT(*) AS cnt, SUM(amt) AS tot FROM {tbl} GROUP BY g ORDER BY g LIMIT 100;",
+                    accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                )
+                mgr.register_view(
+                    f"CREATE VIEW {v_join} AS "
+                    f"SELECT d.label, COUNT(*) AS cnt, SUM(t.amt) AS tot "
+                    f"FROM {tbl} t JOIN {dim} d ON d.g = t.g GROUP BY d.label;",
+                    accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                )
+                # UNIQUE NOT NULL table without PRIMARY KEY: repair_view() must not
+                # emit FORCE INDEX (PRIMARY) (Error 1176).
+                mgr.register_view(
+                    f"CREATE VIEW {v_uq} AS SELECT g, COUNT(*) AS cnt, SUM(amt) AS tot FROM {uq_tbl} GROUP BY g;",
+                    accept_limitations=("MYSQL_NO_TRUNCATE_TRIGGER",),
+                )
+            admin.commit()
+
+            def _assert_all_exact(step: str) -> None:
+                checks = [
+                    (v_alg, f"SELECT g, cnt, tot FROM {v_alg} ORDER BY g",
+                     f"SELECT g, COUNT(*), SUM(amt) FROM {tbl} GROUP BY g ORDER BY g"),
+                    (v_rec, f"SELECT g, mn, mx FROM {v_rec} ORDER BY g",
+                     f"SELECT g, MIN(amt), MAX(amt) FROM {tbl} GROUP BY g ORDER BY g"),
+                    (v_t3, f"SELECT g, cnt, tot FROM {v_t3} ORDER BY g",
+                     f"SELECT g, COUNT(*), SUM(amt) FROM {tbl} GROUP BY g ORDER BY g LIMIT 100"),
+                    (v_join, f"SELECT label, cnt, tot FROM {v_join} ORDER BY label",
+                     f"SELECT d.label, COUNT(*), SUM(t.amt) FROM {tbl} t JOIN {dim} d ON d.g = t.g GROUP BY d.label ORDER BY d.label"),
+                    (v_uq, f"SELECT g, cnt, tot FROM {v_uq} ORDER BY g",
+                     f"SELECT g, COUNT(*), SUM(amt) FROM {uq_tbl} GROUP BY g ORDER BY g"),
+                ]
+                for vn, mv_q, live_q in checks:
+                    cur.execute(mv_q)
+                    got = [tuple(r) for r in cur.fetchall()]
+                    cur.execute(live_q)
+                    exp = [tuple(r) for r in cur.fetchall()]
+                    self.assertEqual(got, exp, f"MySQL {step} mismatch on {vn}: {got!r} != {exp!r}")
+                admin.commit()
+
+            for iso_idx, iso in enumerate(("READ COMMITTED", "SERIALIZABLE")):
+                with self.subTest(isolation_level=iso):
+                    # 1. Deterministic in-flight writer holding X-lock on a brand-new group
+                    #    and updating a non-indexed column: repair_view(v_t3) must enter a
+                    #    positive InnoDB lock wait attributed to w_hold on the base-table
+                    #    LOCK IN SHARE MODE scan (not __matview_catalog), must preserve the
+                    #    repairer session's own isolation level, and must reflect all writes.
+                    w_hold = self._connect(dsn)
+                    rep_conn = self._connect(dsn)
+                    try:
+                        wh_sid = _session_id(Dialect.MYSQL, w_hold)
+                        rep_sid = _session_id(Dialect.MYSQL, rep_conn)
+
+                        rcur = rep_conn.cursor()
+                        rcur.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {iso}")
+                        rep_conn.commit()
+
+                        wh_cur = w_hold.cursor()
+                        wh_cur.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {iso}")
+                        wh_cur.execute("START TRANSACTION")
+                        new_grp = "new_rc" if iso_idx == 0 else "new_ser"
+                        hold_id = 500 + iso_idx
+                        wh_cur.execute(
+                            f"INSERT INTO {tbl} (id, g, amt) VALUES (%s, %s, %s)",
+                            (hold_id, new_grp, 500),
+                        )
+
+                        # Also verifies _ensure_catalog() does not stall on MDL_EXCLUSIVE
+                        # while w_hold holds MDL_SHARED_READ on __matview_catalog.
+                        rmgr = MaterializedViewManager(rep_conn, dialect=Dialect.MYSQL)
+                        rep_out: Dict[str, Any] = {}
+                        rep_done = threading.Event()
+
+                        def _do_repair() -> None:
+                            try:
+                                rep_out["res"] = rmgr.repair_view(v_t3)
+                            except BaseException as exc:
+                                rep_out["err"] = exc
+                            finally:
+                                rep_done.set()
+
+                        rth = threading.Thread(target=_do_repair, daemon=True)
+                        rth.start()
+                        _wait_until_lock_waiting(
+                            Dialect.MYSQL, monitor, rep_sid, rep_done, blocker_sid=wh_sid
+                        )
+
+                        # Execute a second write on the held row (non-indexed column) and commit;
+                        # must not deadlock with repair_view() waiting on base_t.
+                        wh_cur.execute(f"UPDATE {tbl} SET amt = amt + 25 WHERE id = %s", (hold_id,))
+                        w_hold.commit()
+                        wh_cur.close()
+
+                        rth.join(timeout=30.0)
+                        self.assertFalse(rth.is_alive(), f"repair_view() hung under {iso}")
+                        self.assertNotIn("err", rep_out, repr(rep_out.get("err")))
+                        self.assertEqual(rep_out.get("res"), {v_t3: "repaired"})
+
+                        # Also verify repair_view() on UNIQUE NOT NULL (no PK) table succeeds cleanly.
+                        self.assertEqual(rmgr.repair_view(v_uq), {v_uq: "repaired"})
+
+                        # Session isolation level must be preserved (SET TRANSACTION is tx-local).
+                        self.assertEqual(self._read_session_isolation(rcur), self._iso_token(iso))
+                        rep_conn.commit()
+                        rcur.close()
+                    finally:
+                        for c_obj in (w_hold, rep_conn):
+                            try:
+                                c_obj.rollback()
+                                c_obj.close()
+                            except Exception:
+                                pass
+                    _assert_all_exact(f"{iso} in-flight writer")
+
+                    # 2. Concurrent multi-writer stress racing repeated repair_view() across
+                    #    algebraic, recomputed, keyless Tier 3, and join views.
+                    stop_writers = threading.Event()
+                    writer_ready = threading.Barrier(3)
+                    errors: List[BaseException] = []
+                    err_lock = threading.Lock()
+                    repairs_done = {"count": 0}
+
+                    def _stress_writer(wid: int) -> None:
+                        wconn = None
+                        wcur = None
+                        try:
+                            wconn = self._connect(dsn)
+                            wcur = wconn.cursor()
+                            wcur.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {iso}")
+                            wconn.commit()
+                            writer_ready.wait(timeout=20.0)
+                            seq = 0
+                            while not stop_writers.is_set() and seq < 20:
+                                rid = (iso_idx + 1) * 50000 + wid * 500 + seq + 1
+                                grp = f"g{(wid + seq) % 3}"
+                                for attempt in range(20):
+                                    try:
+                                        wcur.execute("START TRANSACTION")
+                                        wcur.execute(
+                                            f"INSERT INTO {tbl} (id, g, amt) VALUES (%s, %s, %s)",
+                                            (rid, grp, (wid + 1) * 10 + seq),
+                                        )
+                                        wcur.execute(
+                                            f"UPDATE {tbl} SET amt = amt + 3 WHERE id = %s",
+                                            (rid,),
+                                        )
+                                        if seq % 5 == 0:
+                                            wcur.execute(f"DELETE FROM {tbl} WHERE id = %s", (rid,))
+                                        if seq % 7 == 0:
+                                            wconn.rollback()
+                                        else:
+                                            wconn.commit()
+                                        break
+                                    except BaseException as exc:
+                                        try:
+                                            wconn.rollback()
+                                        except Exception:
+                                            pass
+                                        if not self._is_retryable_mysql_lock_err(exc) or attempt == 19:
+                                            raise
+                                        time.sleep(min(0.1, 0.005 * (attempt + 1)))
+                                seq += 1
+                        except BaseException as exc:
+                            writer_ready.abort()
+                            with err_lock:
+                                errors.append(exc)
+                        finally:
+                            if wcur is not None:
+                                try:
+                                    wcur.close()
+                                except Exception:
+                                    pass
+                            if wconn is not None:
+                                try:
+                                    wconn.rollback()
+                                    wconn.close()
+                                except Exception:
+                                    pass
+
+                    def _repair_runner() -> None:
+                        rconn = None
+                        rc = None
+                        try:
+                            rconn = self._connect(dsn)
+                            rc = rconn.cursor()
+                            rc.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {iso}")
+                            rconn.commit()
+                            rm = MaterializedViewManager(rconn, dialect=Dialect.MYSQL)
+                            writer_ready.wait(timeout=20.0)
+                            for target_v in (v_alg, v_rec, v_t3, v_join, v_t3, v_rec):
+                                res = rm.repair_view(target_v)
+                                self.assertEqual(res, {target_v: "repaired"})
+                                repairs_done["count"] += 1
+                            self.assertEqual(self._read_session_isolation(rc), self._iso_token(iso))
+                            rconn.commit()
+                        except BaseException as exc:
+                            writer_ready.abort()
+                            with err_lock:
+                                errors.append(exc)
+                        finally:
+                            stop_writers.set()
+                            if rc is not None:
+                                try:
+                                    rc.close()
+                                except Exception:
+                                    pass
+                            if rconn is not None:
+                                try:
+                                    rconn.rollback()
+                                    rconn.close()
+                                except Exception:
+                                    pass
+
+                    ths = [
+                        threading.Thread(target=_stress_writer, args=(0,), daemon=True),
+                        threading.Thread(target=_stress_writer, args=(1,), daemon=True),
+                        threading.Thread(target=_repair_runner, daemon=True),
+                    ]
+                    for th in ths:
+                        th.start()
+                    for th in ths:
+                        th.join(timeout=90.0)
+                    self.assertFalse([th.name for th in ths if th.is_alive()], f"MySQL {iso} repair stress hung")
+                    self.assertEqual(errors, [], f"MySQL {iso} repair stress errors: {errors!r}")
+                    self.assertEqual(repairs_done["count"], 6)
+                    _assert_all_exact(f"{iso} repair stress")
+        finally:
+            try:
+                monitor.rollback()
+                monitor.close()
+            except Exception:
+                pass
+            try:
+                admin.rollback()
+                if mgr is not None:
+                    for vn in (v_alg, v_rec, v_t3, v_join, v_uq):
+                        try:
+                            mgr.drop_view(vn)
+                        except Exception:
+                            admin.rollback()
+                c = admin.cursor()
+                c.execute(f"DROP TABLE IF EXISTS {tbl}")
+                c.execute(f"DROP TABLE IF EXISTS {dim}")
+                c.execute(f"DROP TABLE IF EXISTS {uq_tbl}")
+                admin.commit()
+                c.close()
+            except Exception:
+                pass
+            admin.close()
 
 
 if __name__ == "__main__":
