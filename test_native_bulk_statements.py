@@ -79,6 +79,7 @@ from matview import (
     EngineLimitationError,
     EngineLimitationWarning,
     MaterializedViewManager,
+    UnsupportedMaterializedViewError,
 )
 
 LOCK_WAIT_TIMEOUT_S = 30.0
@@ -1451,6 +1452,117 @@ def test_update_to_equal_but_not_identical_value(make_env, target: Target) -> No
         env.register(vd)
     env.check("registration")
     for label, sql in steps:
+        env.execute(sql)
+        env.commit()
+        env.check(label)
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL pre-existing exactness gaps (strict xfail: each fails on master)
+# ---------------------------------------------------------------------------
+# These record bugs found while reviewing the (closed) unchanged-UPDATE guard
+# (#286). Each is a documented P0 in TODO.md; when the fix lands the strict xfail
+# flips to XPASS and the marker must be removed.
+
+# NUMERIC without a scale keeps 1.0, 1.00 and 1.000 as distinct representations of
+# equal values; set operations return whichever the scan meets first, and any
+# UPDATE (even of an unread column) moves rows to new physical positions.
+TIE_SCHEMA = [
+    "CREATE TABLE t (id INT PRIMARY KEY, g INT, x NUMERIC, junk INT)",
+    "CREATE TABLE d (id INT PRIMARY KEY, x NUMERIC)",
+]
+
+
+@known_defect("pre-existing P0 on master: set operations over numeric representation ties (TODO.md)")
+@pytest.mark.parametrize("target", _params(("postgres",)))
+@pytest.mark.parametrize(
+    "select",
+    ["SELECT x FROM t UNION SELECT x FROM d", "SELECT x FROM t INTERSECT SELECT x FROM d"],
+    ids=["union", "intersect"],
+)
+def test_pg_numeric_representation_ties_after_unread_column_update(make_env, target: Target, select: str) -> None:
+    env = make_env(target, views=[], schema_sql=TIE_SCHEMA, seed=False)
+    env.execute("INSERT INTO t VALUES (1, 1, 1.0, 0), (2, 1, 1.00, 0), (3, 1, 1.000, 0)")
+    env.execute("INSERT INTO d VALUES (1, 1.00)")
+    env.commit()
+    vd = ViewDef("v_tie", select, ("postgres",))
+    env.register(vd)
+    env.views.append(vd)
+    env.check("initial")
+    for label, sql in (
+        ("no-WHERE unread update", "UPDATE t SET junk = junk + 1"),
+        ("one-row unread update", "UPDATE t SET junk = junk + 1 WHERE id = 1"),
+        ("another row", "UPDATE t SET junk = junk + 1 WHERE id = 2"),
+        ("two rows", "UPDATE t SET junk = junk + 1 WHERE id IN (1, 2)"),
+    ):
+        env.execute(sql)
+        env.commit()
+        env.check(label)
+
+
+# No index on the group key: the original query and the recomputation both read
+# the heap in physical order, so an UPDATE that rewrites rows is observable.
+ORDER_SCHEMA = ["CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT, s TEXT, x INT)"]
+
+
+@known_defect("pre-existing P0: window tie assignment differs from the live query (TODO.md)")
+@pytest.mark.parametrize("target", _params(("postgres",)))
+def test_pg_window_ties_unread_column_update_matches_live_view(make_env, target: Target) -> None:
+    """ROW_NUMBER() over ties in the ORDER BY key is assigned in scan order."""
+    env = make_env(target, views=[], schema_sql=ORDER_SCHEMA, seed=False)
+    env.execute("INSERT INTO t (id, g, v, s, x) SELECT i, i % 3, i % 4, 's' || i, 0 FROM generate_series(1, 30) i")
+    env.commit()
+    vd = ViewDef("v_order_rn", "SELECT id, g, v, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t", ("postgres",))
+    env.register(vd)
+    env.views.append(vd)
+    env.check("initial")
+    env.execute("UPDATE t SET x = x + 1 WHERE id % 2 = 0")
+    env.commit()
+    env.check("unread-column update")
+    env.execute("UPDATE t SET x = x + 1 WHERE id % 3 = 0")
+    env.commit()
+    env.check("second unread-column update")
+
+
+@known_defect("pre-existing P0: STABLE timestamptz expressions are evaluated with the writer session's TimeZone/DateStyle (TODO.md)")
+@pytest.mark.parametrize("target", _params(("postgres",)))
+@pytest.mark.parametrize("expr", ["CAST(ts AS DATE)", "CAST(ts AS TEXT)"])
+def test_pg_timestamptz_expression_independent_of_writer_session_settings(make_env, target: Target, expr: str) -> None:
+    """The live view is evaluated in the reader's session; the materialized
+    value was computed in the writer's session (TimeZone/DateStyle differ)."""
+    env = make_env(target, views=[], seed=False, schema_sql=["CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMPTZ)"])
+    vd = ViewDef("v_tstz", f"SELECT id, {expr} AS e FROM t", ("postgres",))
+    env.register(vd)
+    env.views.append(vd)
+    w = env.connect()
+    env.execute("SET TimeZone = 'Asia/Tokyo'", w)
+    env.execute("SET DateStyle = 'German'", w)
+    env.execute("INSERT INTO t (id, ts) VALUES (1, '2024-03-05 20:00:00+00')", w)
+    env.commit(w)
+    env.check("insert from a non-UTC, non-ISO session")
+
+
+@known_defect("pre-existing P0: whole-row and system-column references are registered but base-table writes then fail (TODO.md)", raises=Exception)
+@pytest.mark.parametrize("target", _params(("postgres",)))
+@pytest.mark.parametrize("expr", ["to_jsonb(t)::text", "(t).junk", "ctid::text"])
+def test_pg_whole_row_and_system_column_refs_are_refused_or_maintained(make_env, target: Target, expr: str) -> None:
+    """A view must either be refused at registration or stay equal to the live
+    view; on master registration succeeds and the next UPDATE of the base table
+    raises UndefinedColumn."""
+    env = make_env(target, views=[], schema_sql=["CREATE TABLE t (id INT PRIMARY KEY, g INT, junk INT)"], seed=False)
+    env.execute("INSERT INTO t SELECT i, i % 3, 0 FROM generate_series(1, 9) i")
+    env.commit()
+    vd = ViewDef("v_whole_row", f"SELECT id, {expr} AS e FROM t", ("postgres",))
+    try:
+        env.register(vd)
+    except UnsupportedMaterializedViewError:
+        return  # an explicit refusal satisfies the contract
+    env.views.append(vd)
+    env.check("initial")
+    for label, sql in (
+        ("unread-column update", "UPDATE t SET junk = junk + 1 WHERE id % 2 = 0"),
+        ("group update", "UPDATE t SET g = g + 1 WHERE id = 3"),
+    ):
         env.execute(sql)
         env.commit()
         env.check(label)
