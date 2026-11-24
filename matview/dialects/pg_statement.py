@@ -1765,11 +1765,6 @@ class PgStatementMaintenanceMixin(MixinHost):
         raw_sql = self.view.raw_select_sql.strip().rstrip(";").strip()
         if not raw_sql:
             return []
-        if self._view_has_grouping_sets():
-            # ROLLUP/CUBE/GROUPING SETS views use the full refresh, which keys
-            # nothing by the grouping expressions (and those are not
-            # expressions: probing "GROUPING SETS (...)" is a syntax error).
-            return []
         try:
             toks = _tokenize_sql(raw_sql, read="postgres")
         except sqlglot.errors.SqlglotError:
