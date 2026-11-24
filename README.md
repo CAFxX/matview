@@ -1430,6 +1430,10 @@ views, each key value is mapped to a canonical text by a per-view function
   column, alone or wrapped (for example `COALESCE(STDDEV_POP(x), 0)`):
   MariaDB rounds such results to fixed decimals that a stored `DOUBLE` does
   not reproduce. Remedy: `CAST(x AS DOUBLE)` (then refreshed exactly).
+  An out-of-band `ALTER TABLE` that changes such an argument column from
+  `DOUBLE` to `DOUBLE(M,D)` after registration leaves the MariaDB view wrong
+  until it is dropped or redefined: `check_schema_drift()` reports it
+  `invalid` and `repair_view()` refuses it (the general schema-drift contract).
   Cost, stated in a registration diagnostic:
 
   | Engine | Full refresh cost | Concurrency |
