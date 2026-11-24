@@ -78,7 +78,13 @@ class Tier3Mixin(MixinHost):
             known_t = set(self._schemas_lower.keys())
             expanded_bs: List[ViewSpec] = []
             for bi, b_sql in enumerate(b_sqls):
-                b_clean = _unwrap_outer_parens(b_sql.strip(), dialect=self.dialect)
+                b_raw = b_sql.strip()
+                if bi > 0:
+                    # The token splitter leaves a set-operator quantifier (``EXCEPT ALL``,
+                    # ``INTERSECT DISTINCT``, ``UNION DISTINCT``) at the head of the next arm.
+                    # Only the arm's column types matter here (ops are not consulted), so drop it.
+                    b_raw = re.sub(r"^(?:ALL|DISTINCT)\s+(?=\(|SELECT\b|WITH\b|VALUES\b|TABLE\b)", "", b_raw, flags=re.IGNORECASE)
+                b_clean = _unwrap_outer_parens(b_raw, dialect=self.dialect)
                 if with_prefix and not re.match(r"^\s*WITH\b", b_clean, flags=re.IGNORECASE):
                     b_clean = f"{with_prefix}{b_clean}"
                 bs = _parse_single_create_view_stmt(

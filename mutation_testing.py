@@ -529,6 +529,36 @@ MUTANTS = (
         ),
     ),
     Mutant(
+        name="pg-tier3-setop-quantifier-left-on-arm",
+        source_path="matview/maintenance/tier3.py",
+        original="                if bi > 0:\n                    # The token splitter leaves",
+        replacement="                if False and bi > 0:\n                    # The token splitter leaves",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_set_operation_quantifiers_nested_collation_and_arm_chain_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-union-nested-explicit-collation-ignored",
+        source_path="matview/dialects/base.py",
+        original="        coll, explicit = self._infer_pg_expr_collation_and_strength(expr)\n        return coll if explicit else None",
+        replacement="        coll, explicit = self._infer_pg_expr_collation_and_strength(expr)\n        return None",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_set_operation_quantifiers_nested_collation_and_arm_chain_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-union-arm-chain-through-real-not-refused",
+        source_path="matview/dialects/base.py",
+        original="            if len(raw_nonempty) >= 3:\n                # PostgreSQL resolves a chain",
+        replacement="            if False and len(raw_nonempty) >= 3:\n                # PostgreSQL resolves a chain",
+        target_test=(
+            "test_native_result_types.SetopCommonTypesPgCatalogAndNameTests."
+            "test_postgres_set_operation_quantifiers_nested_collation_and_arm_chain_offline"
+        ),
+    ),
+    Mutant(
         name="pg-union-zset-skips-branch-cast",
         source_path="matview/maintenance/zset.py",
         original="                if col_i < len(col_types) and self._pg_branch_expr_needs_cast(it, b_ctx, col_types[col_i]):",

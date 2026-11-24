@@ -1220,12 +1220,12 @@ class DialectBaseMixin(MixinHost):
                 return None
 
             next_seen = seen_ctes | ({owner_cte_name} if owner_cte_name else set())
-            added_active = False
+            added_active: Optional[str] = None
             if owner_cte_name and owner_cte_name not in active_ctes:
                 if not hasattr(self, active_ctes_attr):
                     setattr(self, active_ctes_attr, active_ctes)
                 active_ctes.add(owner_cte_name)
-                added_active = True
+                added_active = owner_cte_name
             try:
                 b_types: List[str] = []
                 b_exp_colls: List[Optional[str]] = []
@@ -1256,7 +1256,7 @@ class DialectBaseMixin(MixinHost):
                         continue
                     br_ctx = _branch_scoped_ctx(br)
                     br_expr_sql = src_e.sql(sg_d).strip()
-                    exp_c = self._extract_pg_explicit_collation(br_expr_sql) if self.dialect == Dialect.POSTGRES else None
+                    exp_c = self._infer_pg_explicit_expr_collation(br_expr_sql) if self.dialect == Dialect.POSTGRES else None
                     # First handle aggregates/windows inside the branch projection.
                     agg_t = _infer_alias_expr_type(src_e, br_ctx)
                     if agg_t is not None:
@@ -1320,8 +1320,8 @@ class DialectBaseMixin(MixinHost):
                     return self._normalize_dialect_type(t0)
                 return None
             finally:
-                if added_active:
-                    active_ctes.discard(owner_cte_name)  # type: ignore[arg-type]
+                if added_active is not None:
+                    active_ctes.discard(added_active)
 
         def _cte_hdr_cols(cte_node: sqlglot_exp.CTE) -> Optional[List[str]]:
             table_alias = cte_node.args.get("alias")
@@ -2458,6 +2458,27 @@ class DialectBaseMixin(MixinHost):
             return "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
 
         if self.dialect == Dialect.POSTGRES:
+            if len(raw_nonempty) >= 3:
+                # PostgreSQL resolves a chain of set operations pairwise, converting each
+                # arm through every intermediate common type.  Pairing an exact numeric arm
+                # with REAL before a DOUBLE PRECISION arm joins (16777217 -> REAL -> DOUBLE
+                # PRECISION) therefore differs from one direct conversion, and neither the
+                # population casts nor the trigger key casts model the intermediate step.
+                # The arm tree is not known here, so reject the whole class explicitly.
+                bases = {
+                    re.sub(r"\s*\([^)]*\)", "", re.sub(r"\s+", " ", self._pg_split_type_and_collation(t)[0].upper())).strip()
+                    for t in raw_nonempty
+                }
+                if (
+                    bases & {"REAL", "FLOAT4"}
+                    and bases & {"DOUBLE PRECISION", "FLOAT8", "FLOAT"}
+                    and bases & {"SMALLINT", "INT2", "INTEGER", "INT", "INT4", "BIGINT", "INT8", "NUMERIC", "DECIMAL", "DEC"}
+                ):
+                    raise UnsupportedMaterializedViewError(
+                        "PostgreSQL set operations over three or more arms mixing an exact numeric type, REAL and "
+                        "DOUBLE PRECISION convert arms through intermediate common types, which the "
+                        "incremental maintenance does not model; use a two-arm set operation or cast the arms explicitly."
+                    )
             def _pg_norm_branch_type(raw_t: str) -> str:
                 t_part, c_tail = self._pg_split_type_and_collation(raw_t)
                 # Preserve unbounded CHARACTER VARYING / VARCHAR (do not let
@@ -2893,7 +2914,7 @@ class DialectBaseMixin(MixinHost):
                     all_not_null = False
                     continue
                 exp_c = (
-                    self._extract_pg_explicit_collation(bi_item.raw_expr)
+                    self._infer_pg_explicit_expr_collation(bi_item.raw_expr)
                     if self.dialect == Dialect.POSTGRES
                     else None
                 )
@@ -3836,6 +3857,16 @@ class DialectBaseMixin(MixinHost):
         return None
 
     def _infer_pg_expr_collation(self, expr: Optional[str]) -> Optional[str]:
+        """The collation clause of :meth:`_infer_pg_expr_collation_and_strength`."""
+        return self._infer_pg_expr_collation_and_strength(expr)[0]
+
+    def _infer_pg_explicit_expr_collation(self, expr: Optional[str]) -> Optional[str]:
+        """The result collation of ``expr`` when it derives from an explicit ``COLLATE``
+        (also through string functions, ``||``, ``CASE``, ``COALESCE`` ...), else ``None``."""
+        coll, explicit = self._infer_pg_expr_collation_and_strength(expr)
+        return coll if explicit else None
+
+    def _infer_pg_expr_collation_and_strength(self, expr: Optional[str]) -> Tuple[Optional[str], bool]:
         """Infer the PostgreSQL result collation clause (``' COLLATE <coll>'``)
         of an expression when it carries an explicit ``COLLATE`` or a consistent
         non-default implicit column collation (propagated through string
@@ -3843,11 +3874,11 @@ class DialectBaseMixin(MixinHost):
         Returns ``None`` when the expression resolves to the database default
         collation or when multiple non-default collations conflict."""
         if self.dialect != Dialect.POSTGRES or not expr or not expr.strip():
-            return None
+            return None, False
         try:
             root = parse_sql_ast(expr, dialect=self.dialect)
         except sqlglot.errors.SqlglotError:
-            return None
+            return None, False
 
         def _norm_coll_key(coll_clause: str) -> str:
             # Normalize pg_catalog."C" vs "C" for consistency comparison.
@@ -3949,8 +3980,7 @@ class DialectBaseMixin(MixinHost):
                     return _merge_children(list(node.iter_expressions()))
             return None, False
 
-        coll_val, _ = _walk(root)
-        return coll_val
+        return _walk(root)
 
     @classmethod
     def _pg_type_supports_collation(cls, data_type: str) -> bool:
