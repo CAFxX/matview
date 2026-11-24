@@ -779,7 +779,7 @@ class TestUpgradeFromPreviousGenerator(ExactAssertions):
             conn.execute(ddl)
         # The fixture's catalog predates later catalog columns; the manager reads the current layout only.
         cols = {r[1] for r in conn.execute("PRAGMA table_info(__matview_catalog)")}
-        for col in ("accepted_limitations_json", "partitions_json"):
+        for col in ("backfill_owner", "accepted_limitations_json", "partitions_json"):
             if col not in cols:
                 conn.execute(f"ALTER TABLE __matview_catalog ADD COLUMN {col} TEXT DEFAULT NULL")
         conn.executemany(

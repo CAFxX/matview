@@ -191,6 +191,27 @@ class TestManagerCursorSafety(unittest.TestCase):
         self.assertIn("mv_dept_sales", catalog)
         self.tracked_conn.assert_zero_leaked("get_catalog must close cursor")
 
+    def test_catalog_from_another_version_fails_loudly(self) -> None:
+        """A catalog missing a column must not read as "no catalog" (get_catalog() == {}, drift {} and
+        drop_view() False while triggers remain): constructing the manager refuses it."""
+        for missing in ("partitions_json", "backfill_owner", "accepted_limitations_json", "backfill_active"):
+            conn = sqlite3.connect(":memory:")
+            try:
+                cols = [
+                    "view_name VARCHAR(255) NOT NULL PRIMARY KEY", "view_sql TEXT NOT NULL", "strategy VARCHAR(64) NOT NULL",
+                    "signature_hash VARCHAR(64) NOT NULL", "backing_table VARCHAR(255) NOT NULL",
+                    "aux_tables_json TEXT NOT NULL", "trigger_names_json TEXT NOT NULL",
+                    "function_names_json TEXT NOT NULL", "trigger_ddls_json TEXT NOT NULL",
+                    "backfill_cursor_pk BIGINT", "backfill_max_pk BIGINT", "backfill_active INTEGER NOT NULL DEFAULT 0",
+                    "backfill_owner VARCHAR(64)", "accepted_limitations_json TEXT", "partitions_json TEXT",
+                ]
+                conn.execute(f"CREATE TABLE __matview_catalog ({', '.join(c for c in cols if not c.startswith(missing))})")
+                conn.commit()
+                with self.assertRaisesRegex(RuntimeError, "does not have the expected columns"):
+                    MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+            finally:
+                conn.close()
+
     def test_check_schema_drift_and_repair_zero_leaks(self) -> None:
         manager = MaterializedViewManager(self.tracked_conn, dialect=Dialect.SQLITE)
         view_sql = "CREATE VIEW mv_drift_test AS SELECT dept, SUM(amt) as tot FROM sales GROUP BY dept;"
