@@ -1901,7 +1901,7 @@ def _open_sqlite_compat_connection(engine_spec: str, db_path: str) -> _CompatCon
         # function_list); the adapter itself is not a sqlean object. Its
         # `engine_version` attribute is what detect_engine_version reads.
         detected = detect_engine_version(raw_conn)
-        assert detected.sqlite_native_statistics, "sqlean stats extension not detected"
+        assert detected.sqlite_nonstandard_statistics, "sqlean stats extension not detected"
         setattr(adapter, "engine_version", detected)
         return adapter
 
@@ -3556,12 +3556,13 @@ class MVTestRunner:
                             batch_size=batch_size,
                         )
                     except UnsupportedMaterializedViewError as refusal:
-                        if not (engine_version.sqlite_native_statistics and _STATISTICAL_CALL_RE.search(eff_v_ddl)):
+                        if not (engine_version.sqlite_nonstandard_statistics and _STATISTICAL_CALL_RE.search(eff_v_ddl)):
                             raise
-                        # sqlean's own VAR_*/STDDEV_*: refused explicitly, and
-                        # not bypassable by the global override.
+                        # The connection's own VAR_*/STDDEV_* (sqlean's stats) differ from
+                        # the exact definition: refused explicitly, and not bypassable
+                        # by the global override.
                         self.sqlean_statistics_refusals += 1
-                        assert "sqlean" in str(refusal), refusal
+                        assert "this SQLite connection defines" in str(refusal), refusal
                         try:
                             generate_materialized_view(
                                 schema_source, eff_v_ddl, dialect=eff_dialect,
@@ -4939,20 +4940,47 @@ class SqleanStatisticsRefusalNativeTests(unittest.TestCase):
 
     def test_registration_refuses_sqlean_statistics_and_accepts_the_rest(self) -> None:
         conn = self._connect()
-        self.assertTrue(detect_engine_version(conn).sqlite_native_statistics)
+        self.assertEqual(
+            detect_engine_version(conn).sqlite_nonstandard_statistics,
+            frozenset({"var_pop", "var_samp", "stddev_pop", "stddev_samp"}),
+        )
+        for kwargs in ({"dialect": Dialect.SQLITE}, {"engine_version": "sqlite:3.50.4"}):
+            mgr = MaterializedViewManager(conn, **kwargs)
+            for fn in ("VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP"):
+                for ignore in (False, True):
+                    with self.subTest(fn=fn, ignore_limitations=ignore, pinned=sorted(kwargs)):
+                        with self.assertRaisesRegex(UnsupportedMaterializedViewError, rf"{fn}\(v\).*stats_"):
+                            mgr.register_view(
+                                f"CREATE VIEW sv_{fn.lower()} AS SELECT g, {fn}(v) AS s FROM t GROUP BY g;",
+                                ignore_limitations=ignore,
+                            )
         mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
-        for fn in ("VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP"):
-            for ignore in (False, True):
-                with self.subTest(fn=fn, ignore_limitations=ignore):
-                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "sqlean"):
-                        mgr.register_view(
-                            f"CREATE VIEW sv_{fn.lower()} AS SELECT g, {fn}(v) AS s FROM t GROUP BY g;",
-                            ignore_limitations=ignore,
-                        )
         # Nothing was created by the refused registrations; other views work.
         mgr.register_view("CREATE VIEW sv_sum AS SELECT g, SUM(v) AS s FROM t GROUP BY g;")
         conn.execute("INSERT INTO t VALUES (1, 'a', 0.5)")
         self.assertEqual(conn.execute("SELECT g, s FROM sv_sum").fetchall(), [("a", 0.5)])
+
+    def test_sqlean_stats_prefixed_functions_are_maintained_equal_to_the_view(self) -> None:
+        """The working alternative named by the refusal: sqlean's `stats_*`
+        names are not refused, and the maintained view equals the original one
+        through INSERT/UPDATE/DELETE (native recompute with the connection's own
+        function; writers must have the extension loaded, like the reader)."""
+        conn = self._connect()
+        mgr = MaterializedViewManager(conn, dialect=Dialect.SQLITE)
+        for fn in ("stats_var_pop", "stats_var_samp", "stats_stddev_pop", "stats_stddev_samp"):
+            mgr.register_view(f"CREATE VIEW sv_{fn} AS SELECT g, {fn}(v) AS s FROM t GROUP BY g;")
+        steps = [
+            ("INSERT INTO t VALUES (?, ?, ?)", row)
+            for row in [(1, "a", 0.1), (2, "a", 0.2), (3, "a", 0.5), (4, "b", 1.0), (5, "b", 2.0)]
+        ] + [("UPDATE t SET v = 0.7 WHERE id = ?", (1,)), ("DELETE FROM t WHERE id = ?", (5,))]
+        for sql, params in steps:
+            conn.execute(sql, params)
+            for fn in ("stats_var_pop", "stats_var_samp", "stats_stddev_pop", "stats_stddev_samp"):
+                self.assertEqual(
+                    conn.execute(f"SELECT g, s FROM sv_{fn} ORDER BY g").fetchall(),
+                    conn.execute(f"SELECT g, {fn}(v) FROM t GROUP BY g ORDER BY g").fetchall(),
+                    (fn, sql, params),
+                )
 
     def test_sqlean_statistics_still_diverge_from_the_exact_definition(self) -> None:
         from fractions import Fraction
@@ -4966,6 +4994,10 @@ class SqleanStatisticsRefusalNativeTests(unittest.TestCase):
         )
         # (a) a sample statistic of one value is NULL in the SQL standard.
         self.assertEqual(live["b"], (0.0, 0.0))
+        # (a') ... and so is a statistic of no value.
+        self.assertEqual(
+            conn.execute("SELECT VAR_POP(v), STDDEV_SAMP(v) FROM t WHERE 0").fetchone(), (0.0, 0.0)
+        )
         # (b) the streaming accumulation is not the correctly rounded variance.
         values = [Fraction(0.1), Fraction(0.2), Fraction(0.5)]
         mean = sum(values) / 3

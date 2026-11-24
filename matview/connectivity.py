@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import dataclasses
 import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -21,13 +20,24 @@ from .engines import (
     _extract_packaging_and_tuple,
     _extract_version_tuple,
     _read_mariadb_div_precision_increment,
-    _sqlite_exposes_sqlean_statistics,
+    with_probed_sqlite_statistics,
     parse_engine_version,
 )
 from .logical_ir import ColumnDef, TableIndexDef, TableSchema
 from .sql_frontend import _strip_sql_comments, parse_table_index_def, parse_table_schema
 
 def detect_engine_version(
+    conn: Any,
+    hint_dialect: Optional[Dialect | str | EngineVersion] = None,
+) -> EngineVersion:
+    """Detect the engine of ``conn`` (see ``_detect_engine_version``) and, on SQLite,
+    probe the connection for statistical aggregates that differ from the exact
+    definition, whatever path (attribute, hint, pinned version) produced the
+    version."""
+    return with_probed_sqlite_statistics(unwrap_dbapi_connection(conn)[0], _detect_engine_version(conn, hint_dialect))
+
+
+def _detect_engine_version(
     conn: Any,
     hint_dialect: Optional[Dialect | str | EngineVersion] = None,
 ) -> EngineVersion:
@@ -40,7 +50,7 @@ def detect_engine_version(
 
     unwrapped_conn, _, _, sa_dialect = unwrap_dbapi_connection(conn)
     if unwrapped_conn is not conn:
-        return detect_engine_version(
+        return _detect_engine_version(
             unwrapped_conn,
             hint_dialect=hint_dialect if hint_dialect is not None else sa_dialect,
         )
@@ -97,10 +107,7 @@ def detect_engine_version(
                 row = cur.fetchone()
                 if row and row[0]:
                     v_str = str(row[0])
-                    detected = parse_engine_version(f"sqlite:{v_str}", default_dialect=Dialect.SQLITE)
-                    if _sqlite_exposes_sqlean_statistics(conn, cur):
-                        detected = dataclasses.replace(detected, sqlite_native_statistics=True)
-                    return detected
+                    return parse_engine_version(f"sqlite:{v_str}", default_dialect=Dialect.SQLITE)
             except Exception:
                 pass
             return parse_engine_version("sqlite", default_dialect=Dialect.SQLITE)
@@ -801,7 +808,7 @@ def introspect_schemas_with_sqlalchemy(
     elif isinstance(dialect, str):
         eff_dialect = parse_engine_version(dialect).dialect
     else:
-        eff_dialect = detect_engine_version(bind_or_conn).dialect
+        eff_dialect = _detect_engine_version(bind_or_conn).dialect
 
     catalog_table = f"{object_prefix}catalog" if object_prefix else "matview_catalog"
     owned_engine: Optional[_SAEngine] = None
@@ -1133,7 +1140,7 @@ def introspect_database_schemas(
     from `conn` when `dialect` is omitted.
     """
     if dialect is None:
-        dialect = detect_engine_version(conn).dialect
+        dialect = _detect_engine_version(conn).dialect
     elif isinstance(dialect, EngineVersion):
         dialect = dialect.dialect
     elif isinstance(dialect, str):
@@ -1544,7 +1551,7 @@ def introspect_plain_views(
     PostgreSQL native ``MATERIALIZED VIEW``s (``relkind = 'm'``) are excluded.
     """
     if dialect is None:
-        eff_dialect = detect_engine_version(conn).dialect
+        eff_dialect = _detect_engine_version(conn).dialect
     elif isinstance(dialect, EngineVersion):
         eff_dialect = dialect.dialect
     elif isinstance(dialect, str):

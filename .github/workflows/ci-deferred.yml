@@ -38,7 +38,7 @@ name: CI — Deferred Compatibility Sweep
 #   extension defines its own VAR_*/STDDEV_* (a single-row sample statistic is
 #   0.0, not NULL; streaming accumulation), which differ from the engine-neutral
 #   exact definition matview maintains on SQLite. A view using them on a
-#   connection that really exposes them (sqlean driver + PRAGMA function_list)
+#   connection that really exposes them (detected by probing the functions on known values)
 #   is REFUSED at registration, not bypassable by ignore_limitations. The lane
 #   verifies the refusal natively (the harness skips such views after asserting
 #   the refusal and that the override does not bypass it) and

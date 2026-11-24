@@ -48,6 +48,7 @@ from .engines import (
     UnsupportedMaterializedViewError,
     _sqlglot_dialect,
     parse_engine_version,
+    with_probed_sqlite_statistics,
 )
 from .logical_ir import (
     MaterializedViewPlan,
@@ -521,7 +522,12 @@ class MaterializedViewManager:
             owns_connection = True
 
         if engine_version is not None:
-            self.engine_version: EngineVersion = parse_engine_version(engine_version, default_dialect=hint_d)
+            # A pinned version skips detection, not the probe of the connection's
+            # statistical functions (they decide what the original view returns).
+            self.engine_version: EngineVersion = with_probed_sqlite_statistics(
+                unwrap_dbapi_connection(self.conn)[0],
+                parse_engine_version(engine_version, default_dialect=hint_d),
+            )
         else:
             self.engine_version = detect_engine_version(self.conn, hint_dialect=hint_d)
 
@@ -4951,7 +4957,7 @@ class MaterializedViewManager:
 # -----------------------------------------------------------------------------
 
 
-def _resolve_dialect_and_engine_version(
+def _resolve_dialect_and_engine_version_unprobed(
     schema_sql_or_dict: Any,
     dialect: Optional[Dialect | str | EngineVersion],
     engine_version: Optional[EngineVersion | str],
@@ -4975,6 +4981,18 @@ def _resolve_dialect_and_engine_version(
     if is_conn:
         return detect_engine_version(schema_sql_or_dict, hint_dialect=dialect)
     return parse_engine_version(dialect or Dialect.SQLITE)
+
+
+def _resolve_dialect_and_engine_version(
+    schema_sql_or_dict: Any,
+    dialect: Optional[Dialect | str | EngineVersion],
+    engine_version: Optional[EngineVersion | str],
+) -> EngineVersion:
+    resolved = _resolve_dialect_and_engine_version_unprobed(schema_sql_or_dict, dialect, engine_version)
+    if hasattr(schema_sql_or_dict, "cursor") or isinstance(schema_sql_or_dict, sqlite3.Connection):
+        # Explicit versions skip detection but not the probe of the connection.
+        resolved = with_probed_sqlite_statistics(unwrap_dbapi_connection(schema_sql_or_dict)[0], resolved)
+    return resolved
 
 
 def generate_materialized_view(

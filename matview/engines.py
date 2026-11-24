@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import dataclasses
 import functools
+import math
 import re
 import sqlite3
 from typing import Any, Optional, Sequence, Tuple, Union
@@ -43,11 +45,13 @@ class EngineVersion:
     # parse/prepare time. Capture it as a literal: MariaDB forbids system-variable
     # references in CREATE VIEW definitions.
     mariadb_div_precision_increment: int = field(default=4, compare=False)
-    # True when the connection really exposes sqlean's own VAR_*/STDDEV_*
-    # (stats extension): detected from the driver module and PRAGMA
-    # function_list, never assumed. Their results differ from the
-    # engine-neutral exact definition matview maintains on SQLite.
-    sqlite_native_statistics: bool = field(default=False, compare=False)
+    # Names (lower case) of VAR_*/STDDEV_* aggregates the SQLite connection
+    # defines (sqlean's `stats` extension, a loaded extension, an
+    # application-defined function) whose results do NOT match the
+    # engine-neutral exact definition matview maintains. Found by probing the
+    # connection (`probe_sqlite_nonstandard_statistics`), never by guessing from
+    # the driver, and independently of any pinned engine version.
+    sqlite_nonstandard_statistics: frozenset[str] = field(default_factory=frozenset, compare=False)
     packaging_version: Optional[Version] = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
@@ -462,26 +466,83 @@ def parse_engine_version(
     return EngineVersion(target_d, target_sub, ver, s, packaging_version=pv)
 
 
-SQLEAN_STATISTICAL_FUNCTIONS = frozenset(
-    {"var_pop", "var_samp", "variance", "stddev_pop", "stddev_samp", "stddev"}
-)
+SQLITE_STATISTICAL_FUNCTIONS: Tuple[str, ...] = ("var_pop", "var_samp", "stddev_pop", "stddev_samp")
+
+# name -> (aggregate over 1..5, over one row, over no row): the exact definition
+# (population variance of 1..5 is 2, sample variance 2.5, both exactly
+# representable; a sample statistic of one value is NULL, a population one is 0;
+# nothing aggregated is NULL). sqlean's stats, for one, return 0.0 for the
+# statistic of one value (sample) and of no value.
+_SQLITE_STATISTICS_EXPECTED = {
+    "var_pop": (2.0, 0.0),
+    "var_samp": (2.5, None),
+    "stddev_pop": (math.sqrt(2.0), 0.0),
+    "stddev_samp": (math.sqrt(2.5), None),
+}
 
 
-def _sqlite_exposes_sqlean_statistics(conn: Any, cur: Any) -> bool:
-    """Whether a sqlean connection defines sqlean's statistical aggregates.
+def probe_sqlite_nonstandard_statistics(conn: Any) -> frozenset[str]:
+    """Statistical aggregates the SQLite connection defines that do not match
+    the exact definition (see ``_SQLITE_STATISTICS_EXPECTED``).
 
-    Requires both the sqlean driver (the module of the connection class) and the
-    functions in ``PRAGMA function_list``: a Python/APSW UDF registered under the
-    same name on another driver is the caller's own definition, not sqlean's.
+    Behavioural: each of ``var_pop``/``var_samp``/``stddev_pop``/``stddev_samp``
+    is evaluated on known values through the connection. SQLite has none built
+    in, so a function that exists was supplied by the connection (sqlean's
+    stats, a loaded extension, an application-defined function) and is what the
+    ORIGINAL view would call; if it differs from the definition matview
+    maintains the materialized view could not equal the view. A function that
+    errors is treated as non-standard. An unconditional probe: it does not depend
+    on the driver class, proxies, or on a pinned engine version.
     """
-    if not type(conn).__module__.lower().startswith("sqlean"):
-        return False
     try:
-        cur.execute("PRAGMA function_list;")
-        names = {str(row[0]).lower() for row in cur.fetchall()}
+        cur = conn.cursor()
     except Exception:
-        return False
-    return bool(names & SQLEAN_STATISTICAL_FUNCTIONS)
+        return frozenset()
+    found = set()
+    try:
+        for name, (expected_many, expected_one) in _SQLITE_STATISTICS_EXPECTED.items():
+            try:
+                cur.execute(f"SELECT {name}(x) FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3 "
+                            "UNION ALL SELECT 4 UNION ALL SELECT 5)")
+                many = cur.fetchone()
+                cur.execute(f"SELECT {name}(x) FROM (SELECT 1 AS x)")
+                one = cur.fetchone()
+                cur.execute(f"SELECT {name}(x) FROM (SELECT 1 AS x) WHERE 0")
+                none = cur.fetchone()
+            except Exception as exc:
+                if "no such function" in str(exc).lower():
+                    continue
+                found.add(name)
+                continue
+            if not all(isinstance(r, (tuple, list)) and len(r) == 1 for r in (many, one)):
+                # Not a SQL result (a stub/mock connection): nothing to probe.
+                return frozenset()
+            # An aggregate over no row still yields one row; no row at all means
+            # a scalar function of that name.
+            got = (many[0], one[0], none[0] if isinstance(none, (tuple, list)) and len(none) == 1 else "<no row>")
+            if got != (expected_many, expected_one, None) or not all(
+                isinstance(v, float) or v is None for v in got
+            ):
+                found.add(name)
+    finally:
+        close = getattr(cur, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+    return frozenset(found)
+
+
+def with_probed_sqlite_statistics(conn: Any, version: EngineVersion) -> EngineVersion:
+    """``version`` with ``sqlite_nonstandard_statistics`` filled in from a probe
+    of ``conn`` (SQLite only; other dialects are returned unchanged)."""
+    if version.dialect != Dialect.SQLITE:
+        return version
+    probed = probe_sqlite_nonstandard_statistics(conn) | version.sqlite_nonstandard_statistics
+    if probed == version.sqlite_nonstandard_statistics:
+        return version
+    return dataclasses.replace(version, sqlite_nonstandard_statistics=probed)
 
 
 def _read_mariadb_div_precision_increment(cur: Any) -> int:

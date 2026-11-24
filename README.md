@@ -527,7 +527,7 @@ Support levels used here:
   lane must pass. sqlean's own `VAR_*`/`STDDEV_*` functions differ from the
   engine-neutral exact definition (a single-value sample statistic is `0.0` in
   sqlean and NULL in matview; rounding also differs), so a view using them on a
-  connection that really exposes them (sqlean driver and `PRAGMA function_list`)
+  connection that really exposes them (detected by probing the functions on known values, whatever the driver)
   is refused at registration, and `ignore_limitations` does not bypass it. See
   [sqlean Native Statistical Aggregates (MVs Diverge From sqlean's Own VAR/STDDEV)](TODO.md). Products not
   listed in the matrix (for example other PostgreSQL or MySQL forks) are
