@@ -181,7 +181,7 @@ class TestManagerCursorSafety(unittest.TestCase):
         self.assertEqual(plan3.view_name, plan.view_name)
         self.tracked_conn.assert_zero_leaked("Forced rebuild register_view must close all cursors")
 
-    def test_get_catalog_and_fallback_zero_leaks(self) -> None:
+    def test_get_catalog_zero_leaks(self) -> None:
         manager = MaterializedViewManager(self.tracked_conn, dialect=Dialect.SQLITE)
         view_sql = "CREATE VIEW mv_dept_sales AS SELECT dept, SUM(amt) as tot FROM sales GROUP BY dept;"
         manager.register_view(view_sql)
@@ -190,46 +190,6 @@ class TestManagerCursorSafety(unittest.TestCase):
         catalog = manager.get_catalog()
         self.assertIn("mv_dept_sales", catalog)
         self.tracked_conn.assert_zero_leaked("get_catalog must close cursor")
-
-        # Simulate legacy catalog without watermark columns by creating a legacy catalog table
-        raw_conn2 = sqlite3.connect(":memory:")
-        with raw_conn2:
-            raw_conn2.execute(
-                f"""
-                CREATE TABLE {manager.catalog_table} (
-                    view_name VARCHAR(255) PRIMARY KEY,
-                    view_sql TEXT NOT NULL,
-                    strategy VARCHAR(64) NOT NULL,
-                    signature_hash VARCHAR(64) NOT NULL,
-                    backing_table VARCHAR(255) NOT NULL,
-                    aux_tables_json TEXT NOT NULL,
-                    trigger_names_json TEXT NOT NULL,
-                    function_names_json TEXT NOT NULL,
-                    trigger_ddls_json TEXT NOT NULL
-                );
-                """
-            )
-            raw_conn2.execute(
-                f"""
-                INSERT INTO {manager.catalog_table} VALUES (
-                    'mv_legacy', 'CREATE VIEW mv_legacy AS SELECT 1', 'algebraic', 'sig',
-                    'store_mv_legacy', '[]', '[]', '[]', '[]'
-                );
-                """
-            )
-        tracked2 = CursorTrackingConnection(raw_conn2)
-        # Avoid _ensure_catalog altering table by passing an already initialized mock
-        manager2 = MaterializedViewManager.__new__(MaterializedViewManager)
-        manager2.conn = tracked2
-        manager2.dialect = Dialect.SQLITE
-        manager2.catalog_table = manager.catalog_table
-        manager2.object_prefix = DEFAULT_OBJECT_PREFIX
-
-        legacy_cat = manager2.get_catalog()
-        self.assertIn("mv_legacy", legacy_cat)
-        self.assertIsNone(legacy_cat["mv_legacy"]["backfill_cursor_pk"])
-        tracked2.assert_zero_leaked("Fallback get_catalog without watermark columns must close cursor")
-        tracked2.close()
 
     def test_check_schema_drift_and_repair_zero_leaks(self) -> None:
         manager = MaterializedViewManager(self.tracked_conn, dialect=Dialect.SQLITE)

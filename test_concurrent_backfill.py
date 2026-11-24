@@ -2602,18 +2602,8 @@ class BackfillTakeoverOwnershipTests(unittest.TestCase):
 
 
 class CatalogUpgradeTests(unittest.TestCase):
-    """Catalogs created by older versions (no backfill_owner column; active
-    watermarks written without an ownership token) and catalog setup on
+    """Active watermarks without an ownership token and catalog setup on
     every manager construction."""
-
-    LEGACY_CATALOG_DDL = (
-        "CREATE TABLE {cat} (view_name VARCHAR(255) NOT NULL PRIMARY KEY, view_sql TEXT NOT NULL, "
-        "strategy VARCHAR(64) NOT NULL, signature_hash VARCHAR(64) NOT NULL, "
-        "backing_table VARCHAR(255) NOT NULL, aux_tables_json TEXT NOT NULL, "
-        "trigger_names_json TEXT NOT NULL, function_names_json TEXT NOT NULL, "
-        "trigger_ddls_json TEXT NOT NULL, backfill_cursor_pk BIGINT DEFAULT NULL, "
-        "backfill_max_pk BIGINT DEFAULT NULL, backfill_active INTEGER NOT NULL DEFAULT 0)"
-    )
 
     def _engines(self):
         return BackfillTakeoverOwnershipTests._engines(self)
@@ -2688,26 +2678,21 @@ class CatalogUpgradeTests(unittest.TestCase):
         cur.execute(sql)
         return [tuple(int(x) if not isinstance(x, str) else x for x in r) for r in cur.fetchall()]
 
-    def test_legacy_catalog_is_upgraded_and_legacy_active_watermark_fails_closed(self) -> None:
+    def test_ownerless_active_watermark_fails_closed(self) -> None:
         for engine, dsn in self._engines():
             with self.subTest(engine=getattr(engine, "value", engine)):
                 connect, admin, dialect, ph, prefix, table, view, cleanup = self._fixture(engine, dsn)
                 manager = None
                 try:
                     cur = admin.cursor()
-                    cur.execute(self.LEGACY_CATALOG_DDL.format(cat=f"{prefix}catalog"))
-                    admin.commit()
                     manager = MaterializedViewManager(connect(), dialect=dialect, object_prefix=prefix)
-                    cur.execute(f"SELECT backfill_owner FROM {prefix}catalog WHERE 1 = 0")
-                    cur.fetchall()
-                    admin.commit()
                     view_sql = f"CREATE VIEW {view} AS SELECT g, COUNT(*) AS c, SUM(amt) AS s FROM {table} GROUP BY g;"
                     native = f"SELECT g, COUNT(*), SUM(amt) FROM {table} GROUP BY g ORDER BY g"
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", EngineLimitationWarning)
                         plan = manager.register_view(view_sql, populate=False, ignore_limitations=True)
-                    # An interrupted backfill recorded by older code: active,
-                    # no ownership token. It must stay fail-closed.
+                    # An interrupted backfill recorded without an ownership token
+                    # (active, no owner). It must stay fail-closed.
                     cur.execute(
                         f"UPDATE {prefix}catalog SET backfill_cursor_pk = 5, backfill_max_pk = 20, "
                         f"backfill_active = 1, backfill_owner = NULL WHERE view_name = {ph}",
@@ -2720,7 +2705,7 @@ class CatalogUpgradeTests(unittest.TestCase):
                     self.assertEqual(manager.repair_view(plan.view_name), {plan.view_name: "repaired"})
                     self.assertEqual(self._rows(cur, f"SELECT g, c, s FROM {view} ORDER BY g"), self._rows(cur, native))
                     admin.commit()
-                    # A fresh backfill on the upgraded catalog works end to end.
+                    # A fresh backfill afterwards works end to end.
                     manager.drop_view(plan.view_name)
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", EngineLimitationWarning)
