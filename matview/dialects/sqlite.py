@@ -41,45 +41,62 @@ from .templates import render_procedural_sql
 
 
 class SQLiteDialectMixin(MixinHost):
-    def _enforce_sqlean_statistics_refusal(self) -> None:
-        """Refuse VAR_*/STDDEV_* (and VARIANCE/STDDEV) on a connection that
-        exposes sqlean's own statistical functions.
+    def _enforce_nonstandard_statistics_refusal(self) -> None:
+        """Refuse VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP when the connection
+        defines that function and its results differ from the exact definition.
 
-        The original view would call sqlean's `stats` aggregates, whose results
-        differ from the engine-neutral exact definition matview maintains (a
-        single-value sample statistic is 0.0 instead of NULL; streaming
-        accumulation rounds differently), so the materialized view could not
-        equal it. Not bypassable by ignore_limitations (no relaxed guarantee
-        covers it).
+        SQLite has no built-in statistical aggregates, so such a function was
+        supplied by the connection (sqlean's `stats` extension, a loaded
+        extension, an application-defined function) and is what the original
+        view would call. matview maintains the exact definition (a sample
+        statistic of one value is NULL, a population one is 0; correctly
+        accumulated), which that function does not reproduce (probed
+        behaviourally, see probe_sqlite_nonstandard_statistics), so the
+        materialized view could not equal the view. Not bypassable by
+        ignore_limitations (no relaxed guarantee covers it).
         """
-        if self.dialect != Dialect.SQLITE or not self.engine_version.sqlite_native_statistics:
+        flagged = self.engine_version.sqlite_nonstandard_statistics
+        if self.dialect != Dialect.SQLITE or not flagged:
             return
-        from ..engines import UnsupportedMaterializedViewError, SQLEAN_STATISTICAL_FUNCTIONS
+        from ..engines import UnsupportedMaterializedViewError
 
         try:
             root = sqlglot.parse_one(self.raw_view.raw_select_sql, read="sqlite")
         except sqlglot.errors.SqlglotError:
             return
-        calls: List[str] = []
-        stat_classes = (
-            sqlglot_exp.Variance, sqlglot_exp.VariancePop, sqlglot_exp.Stddev,
-            sqlglot_exp.StddevPop, sqlglot_exp.StddevSamp,
-        )
+        canonical = {
+            sqlglot_exp.Variance: "var_samp", sqlglot_exp.VariancePop: "var_pop",
+            sqlglot_exp.StddevPop: "stddev_pop", sqlglot_exp.StddevSamp: "stddev_samp",
+        }
+        used: Set[str] = set()
         for node in root.walk():
-            if isinstance(node, stat_classes) or (
-                isinstance(node, sqlglot_exp.Anonymous) and node.name.lower() in SQLEAN_STATISTICAL_FUNCTIONS
-            ):
-                calls.append(node.sql(dialect="sqlite"))
-        if calls:
-            raise UnsupportedMaterializedViewError(
-                f"View '{self.logical_view_name}' uses {', '.join(dict.fromkeys(calls))} on a sqlean "
-                "connection that exposes sqlean's own statistics functions: they differ from the "
-                "engine-neutral exact definition (a single-value sample statistic is 0.0 instead of "
-                "NULL; streaming accumulation rounds differently), so VAR/STDDEV over sqlean `stats` "
-                "functions cannot be reproduced exactly by the materialized view. Use a connection "
-                "without sqlean's stats extension (matview then maintains the exact aggregate itself), "
-                "or CAST the argument to an exact type and compute the statistic outside the view."
-            )
+            name = canonical.get(type(node))
+            if name is None and isinstance(node, sqlglot_exp.Anonymous):
+                name = node.name.lower()
+            if name in flagged:
+                used.add(name)
+        if not used:
+            return
+        # The user's own spelling and arguments, from the source text.
+        source = self.raw_view.raw_select_sql
+        calls: List[str] = []
+        for m in re.finditer(r"\b(%s)\s*\(" % "|".join(sorted(used)), source, flags=re.IGNORECASE):
+            depth, end = 1, m.end()
+            while end < len(source) and depth:
+                depth += {"(": 1, ")": -1}.get(source[end], 0)
+                end += 1
+            calls.append(source[m.start():end])
+        shown = ", ".join(dict.fromkeys(calls)) or ", ".join(sorted(used))
+        raise UnsupportedMaterializedViewError(
+            f"View '{self.logical_view_name}' uses {shown}, but this SQLite connection defines "
+            f"{', '.join(sorted(flagged))} (SQLite has none built in: sqlean's stats extension, a loaded "
+            "extension or an application-defined function) with results that differ from the exact "
+            "definition matview maintains (e.g. a sample statistic of one value is NULL there, 0.0 in "
+            "sqlean), so the materialized view could not equal the original view. Use the connection's "
+            "own differently named functions (sqlean: stats_var_pop, stats_var_samp, stats_stddev_pop, "
+            "stats_stddev_samp), or a connection that does not define var_pop/var_samp/stddev_pop/"
+            "stddev_samp, on which matview maintains the exact aggregate itself."
+        )
 
     def _sqlite_m2_agg_sql(
         self,

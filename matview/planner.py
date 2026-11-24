@@ -2775,7 +2775,7 @@ class PlannerMixin(MixinHost):
             self._enforce_mariadb_statistical_exactness(raw.reader_view_ddl or "")
             self._enforce_mysql_minmax_typing()
         elif self.dialect == Dialect.SQLITE:
-            self._enforce_sqlean_statistics_refusal()
+            self._enforce_nonstandard_statistics_refusal()
         return self._finalize_plan_backfill(raw)
 
     def compile(self) -> MaterializedViewPlan:
