@@ -9561,6 +9561,46 @@ def _sqlite_supports_strict(compat_engine: Optional[str] = None) -> bool:
         return False
 
 
+def select_seed_shard(seeds: Sequence[int], shard: str) -> List[int]:
+    """Seeds of shard ``"i/n"`` (``seeds[i::n]``); every seed when ``shard`` is empty.
+
+    CI runs Suite 12 of one campaign as n parallel processes, one per shard: the
+    shards partition the seed list, so together they run exactly the campaign.
+    """
+    if not shard:
+        return list(seeds)
+    m = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", shard)
+    if not m or not 0 <= int(m.group(1)) < int(m.group(2)):
+        raise ValueError(f"seed shard must be 'i/n' with 0 <= i < n, not {shard!r}")
+    i, n = int(m.group(1)), int(m.group(2))
+    return list(seeds)[i::n]
+
+
+def parse_suite_selection(spec: str) -> List[str]:
+    """Parse ``--suites`` (e.g. ``"1,3-5,unit"``) into suite keys in canonical order.
+
+    Keys are ``"1"``..``"13"`` (the combinatorial and fuzz suites) and ``"unit"`` (the
+    generator/manager unittest classes). An unknown or empty selection is an error, so
+    a typo can never silently run nothing or everything.
+    """
+    known = [str(i) for i in range(1, 14)] + ["unit"]
+    chosen = set()
+    for part in (p.strip() for p in spec.split(",")):
+        if not part:
+            raise ValueError(f"empty element in --suites {spec!r}")
+        m = re.fullmatch(r"(\d+)-(\d+)", part)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if not (1 <= lo <= hi <= 13):
+                raise ValueError(f"bad suite range {part!r} in --suites {spec!r}")
+            chosen.update(str(i) for i in range(lo, hi + 1))
+        elif part in known:
+            chosen.add(part)
+        else:
+            raise ValueError(f"unknown suite {part!r} in --suites {spec!r} (known: 1-13, unit)")
+    return [k for k in known if k in chosen]
+
+
 def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
     """
     Suite 12: Extensive Multi-Order-of-Magnitude Differential Random SQL Fuzzer.
@@ -9574,7 +9614,10 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
     """
     config = fuzz_campaign_config()
     scale = config["scale"]
-    seeds = config["seeds"]
+    seed_shard = os.environ.get("MATVIEW_SUITE12_SEED_SHARD", "")
+    seeds = select_seed_shard(config["seeds"], seed_shard)
+    if not seeds:
+        raise ValueError(f"Suite 12 seed shard {seed_shard!r} selects none of the seeds {config['seeds']}")
     num_scenarios = config["scenarios_per_seed"]
     views_count = config["views_per_schema"]
     mutations_count = config["mutations_per_scenario"]
@@ -9591,6 +9634,7 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
         "default_dialect": runner.default_dialect.value,
         "scale": scale,
         "seeds": seeds,
+        "seed_shard": os.environ.get("MATVIEW_SUITE12_SEED_SHARD") or None,
         "random_seeds": config["random_seeds"],
         "scenarios_per_seed": num_scenarios,
         "views_per_schema": views_count,
@@ -9634,8 +9678,9 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
             record["status"] = "passed"
             write_manifest()
 
+    shard_note = f" (seed shard {seed_shard} of {config['seeds']})" if seed_shard else ""
     print(
-        f"  [FUZZ CONFIG] scale={scale}, seeds={seeds} ({len(seeds)} seeds x {num_scenarios} schemas x {views_count} views x {mutations_count} mutations)"
+        f"  [FUZZ CONFIG] scale={scale}, seeds={seeds}{shard_note} ({len(seeds)} seeds x {num_scenarios} schemas x {views_count} views x {mutations_count} mutations)"
     )
 
     current_seed = None
@@ -10092,12 +10137,19 @@ def _run_all_tests() -> None:
     runner = MVTestRunner(honor_emulated_skip=True)
 
     fuzz_only = False
+    selected: Optional[List[str]] = None
     args = list(sys.argv[1:])
     idx = 0
     while idx < len(args):
         arg = args[idx]
         if arg == "--fuzz":
             fuzz_only = True
+        elif arg == "--suites" and idx + 1 < len(args):
+            selected = parse_suite_selection(args[idx + 1])
+            idx += 1
+        elif arg == "--seed-shard" and idx + 1 < len(args):
+            os.environ["MATVIEW_SUITE12_SEED_SHARD"] = args[idx + 1]
+            idx += 1
         elif arg == "--fuzz-scale" and idx + 1 < len(args):
             os.environ["MATVIEW_FUZZ_SCALE"] = args[idx + 1]
             idx += 1
@@ -10113,7 +10165,11 @@ def _run_all_tests() -> None:
         elif arg == "--fuzz-mutations" and idx + 1 < len(args):
             os.environ["MATVIEW_FUZZ_MUTATIONS"] = args[idx + 1]
             idx += 1
+        else:
+            raise SystemExit(f"test_matview_sync.py: unknown or incomplete argument {arg!r}")
         idx += 1
+    if os.environ.get("MATVIEW_SUITE12_SEED_SHARD"):
+        select_seed_shard([0], os.environ["MATVIEW_SUITE12_SEED_SHARD"])  # validate early
 
     if fuzz_only:
         print("=" * 84)
@@ -10131,25 +10187,37 @@ def _run_all_tests() -> None:
     print("RUNNING EXHAUSTIVE COMBINATORIAL & TRANSACTIONAL MATERIALIZED VIEW TEST SUITE")
     print("=" * 84)
 
-    run_suite_1_single_table_algebraic(runner)
-    run_suite_2_holistic_and_having(runner)
-    run_suite_3_distinct_aggregates(runner)
-    run_suite_4_ungrouped_aggregates(runner)
-    run_suite_5_joins(runner)
-    run_suite_6_subqueries(runner)
-    run_suite_7_set_operations(runner)
-    run_suite_8_ctes_windows_topn(runner)
-    run_suite_9_cross_dialect_execution(runner)
-    run_suite_10_torture_dml_and_transactions(runner)
-    run_suite_11_live_engine_50_view_battery_across_all_dialects(runner)
-    run_suite_12_differential_random_fuzzer(runner)
-    run_suite_13_fuzz_regression_corpus(runner)
+    suite_runners: List[Tuple[str, Callable[[MVTestRunner], None]]] = [
+        ("1", run_suite_1_single_table_algebraic),
+        ("2", run_suite_2_holistic_and_having),
+        ("3", run_suite_3_distinct_aggregates),
+        ("4", run_suite_4_ungrouped_aggregates),
+        ("5", run_suite_5_joins),
+        ("6", run_suite_6_subqueries),
+        ("7", run_suite_7_set_operations),
+        ("8", run_suite_8_ctes_windows_topn),
+        ("9", run_suite_9_cross_dialect_execution),
+        ("10", run_suite_10_torture_dml_and_transactions),
+        ("11", run_suite_11_live_engine_50_view_battery_across_all_dialects),
+        ("12", run_suite_12_differential_random_fuzzer),
+        ("13", run_suite_13_fuzz_regression_corpus),
+    ]
+    if selected is not None:
+        print(f"SELECTED SUITES: {', '.join(selected)}")
+    for key, suite_fn in suite_runners:
+        if selected is None or key in selected:
+            suite_fn(runner)
 
     print("-" * 84)
     if runner.skip_emulated_backends:
         print(f"SKIPPED {runner.skipped_emulated_batches} emulated-backend batches (MATVIEW_EMULATED_BACKENDS=skip)")
     print(f"COMBINATORIAL & TRANSACTIONAL SUITES PASSED: {runner.total_views} views, {runner.total_assertions} live SQL assertions!")
     print("-" * 84)
+
+    if selected is not None and "unit" not in selected:
+        elapsed = time.time() - t0
+        print(f"SELECTED SUITES PASSED in {elapsed:.2f}s ({runner.total_views} views, {runner.total_assertions} assertions)")
+        return
 
     # Run unit tests for generator & manager API
     suite = unittest.TestSuite(
