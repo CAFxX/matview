@@ -831,7 +831,7 @@ class OfflineRoutingTests(unittest.TestCase):
             sch = parse_table_schema(self.SCHEMA if dialect == "postgres" else self.SCHEMA.replace("DOUBLE PRECISION", "DOUBLE"), dialect=dialect)
             float_only = generate_materialized_view(
                 sch, f"CREATE VIEW mv AS {select}", dialect=dialect, ignore_limitations=True,
-                accept_limitations=["ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"],
+                accept_limitations=["FLOAT_REASSOCIATION_ALLOWED"],
             )
             self.assertEqual(float_only.strategy, T3, ("the float code must not relax element order", select))
             with warnings.catch_warnings(record=True) as caught:

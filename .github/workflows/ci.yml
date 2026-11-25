@@ -356,6 +356,9 @@ jobs:
       - name: Test PostgreSQL/MySQL order-sensitive aggregate SQL-shape guards (offline)
         run: python3 test_pgmy_exact_float_aggregates.py
 
+      - name: Test fail-closed provability of the exact float refresh (offline)
+        run: python3 test_float_refresh_fail_closed.py
+
       - name: Test MIN/MAX (group, arg) index recommendation (SQLite + offline)
         run: python3 test_minmax_group_arg_index.py
 
@@ -587,6 +590,7 @@ jobs:
             --task "python3 test_matview_sync.py --suites 2-8" \
             --task "python3 test_matview_sync.py --suites 9-11,13,unit" \
             --task "python3 test_native_statistical_aggregates.py" \
+            --task "python3 test_float_refresh_fail_closed.py" \
             --task "python3 test_p1_manager_safety.py" \
             --task "python3 test_p1_sqlalchemy_integration.py" \
             --task "python3 test_native_result_types.py" \
@@ -600,6 +604,7 @@ jobs:
             --serial "python3 test_minmax_group_arg_index.py" \
             --serial "python3 test_unrecognized_aggregates.py" \
             --serial "python3 test_avg_concurrent_maintenance.py" \
+            --serial "python3 test_pgmy_exact_float_aggregates.py" \
             --serial "pytest -v -rxXs test_native_bulk_statements.py" \
             --serial "pytest -v -rxXs -s test_pg_statement_maintenance.py" \
             --serial "python3 test_registration_replacement.py" \
@@ -722,6 +727,7 @@ jobs:
             --task "python3 test_matview_sync.py --suites 1" \
             --task "python3 test_matview_sync.py --suites 9-11,13,unit" \
             --task "python3 test_native_statistical_aggregates.py" \
+            --task "python3 test_float_refresh_fail_closed.py" \
             --task "python3 test_native_result_types.py" \
             --task "python3 test_group_key_collation.py" \
             --task "pytest -v -rxXs test_native_dml_interactions.py" \
@@ -735,6 +741,7 @@ jobs:
             --serial "python3 test_minmax_group_arg_index.py" \
             --serial "python3 test_unrecognized_aggregates.py" \
             --serial "python3 test_avg_concurrent_maintenance.py" \
+            --serial "python3 test_pgmy_exact_float_aggregates.py" \
             --serial "pytest -v -rxXs test_native_bulk_statements.py" \
             --serial "python3 test_registration_replacement.py" \
             --serial "python3 test_registration_lifecycle.py" \
@@ -863,6 +870,7 @@ jobs:
             --task "python3 test_matview_sync.py --suites 1" \
             --task "python3 test_matview_sync.py --suites 9-11,13,unit" \
             --task "python3 test_native_statistical_aggregates.py" \
+            --task "python3 test_float_refresh_fail_closed.py" \
             --task "python3 test_native_result_types.py" \
             --task "python3 test_group_key_collation.py" \
             --task "pytest -v -rxXs test_native_dml_interactions.py" \
@@ -876,6 +884,7 @@ jobs:
             --serial "python3 test_minmax_group_arg_index.py" \
             --serial "python3 test_unrecognized_aggregates.py" \
             --serial "python3 test_avg_concurrent_maintenance.py" \
+            --serial "python3 test_pgmy_exact_float_aggregates.py" \
             --serial "pytest -v -rxXs test_native_bulk_statements.py" \
             --serial "python3 test_registration_replacement.py" \
             --serial "python3 test_registration_lifecycle.py" \

@@ -45,6 +45,7 @@ from .engines import (
     EngineSubdialect,
     EngineVersion,
     MaintenanceStrategy,
+    PER_CODE_OPT_IN_LIMITATIONS,
     UnsupportedMaterializedViewError,
     _sqlglot_dialect,
     parse_engine_version,
@@ -139,7 +140,9 @@ MATVIEW_GENERATOR_VERSION = "19"
 
 def _definition_digest(select_sql: str) -> str:
     """Digest of a view's SELECT (comments and whitespace normalized), used to
-    bind accepted limitation codes to the definition they were accepted for."""
+    bind accepted limitation codes to the definition they were accepted for.
+    A plain hash, not a MAC: it prevents accidental reuse of an acceptance for
+    another definition; anyone who can write the catalog can recompute it."""
     norm = re.sub(r"\s+", " ", _strip_sql_comments(select_sql or "")).strip().rstrip(";").strip()
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
@@ -611,7 +614,7 @@ class MaterializedViewManager:
       - Maintain a persistent metadata registry (`__matview_catalog`) of installed MVs
       - Safely create, diff, update, or drop materialized views (`register_view`, `sync_views`, `drop_view`)
       - Enforce transparency limitation checks unless `ignore_limitations=True`
-        (per-code limitations such as ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE
+        (per-code limitations such as FLOAT_REASSOCIATION_ALLOWED
         only with `accept_limitations=[code, ...]`, stored with each view)
       - Perform incremental (chunked/batched) initial backfills (`backfill_incrementally`)
       - Execute high-throughput multi-statement bulk changes (`bulk_changes`)
@@ -658,6 +661,7 @@ class MaterializedViewManager:
         sqlite_strict_backing: bool = False,
         sqlite_without_rowid: bool = True,
         accept_limitations: Optional[Sequence[str]] = None,
+        silence_diagnostics: Optional[Sequence[str]] = None,
     ) -> None:
         hint_d: Optional[Dialect] = None
         if isinstance(dialect, Dialect):
@@ -722,6 +726,8 @@ class MaterializedViewManager:
         self.accept_limitations: Tuple[str, ...] = tuple(
             sorted({str(c).strip() for c in (accept_limitations or ()) if str(c).strip()})
         )
+        # Diagnostic codes not emitted as warnings (still in plan.strategy_diagnostics).
+        self.silence_diagnostics: Tuple[str, ...] = tuple(silence_diagnostics or ())
         self.object_prefix = object_prefix
         self.strict = strict
         self.pg_fillfactor = pg_fillfactor
@@ -2383,6 +2389,7 @@ class MaterializedViewManager:
             dialect=self.dialect,
             ignore_limitations=ignore,
             accept_limitations=accept,
+            silence_diagnostics=getattr(self, "silence_diagnostics", ()),
             object_prefix=self.object_prefix,
             strict=strict,
             engine_version=self.engine_version,
@@ -2477,7 +2484,7 @@ class MaterializedViewManager:
         exclude_views: Sequence[str] = (),
     ) -> MaterializedViewPlan:
         """Recompile an installed view under exactly the limitation codes it
-        was installed with (plus the manager's accept_limitations); never a
+        was installed with (not the manager's current defaults); never a
         blanket override."""
         if plain_views is None:
             excl = list(exclude_views) if exclude_views else [entry["view_name"]]
@@ -2492,7 +2499,50 @@ class MaterializedViewManager:
         )
 
     def _stored_accept(self, entry: Dict[str, Any]) -> Tuple[str, ...]:
-        return tuple(sorted(set(entry.get("accepted_limitations") or ()) | set(self.accept_limitations)))
+        # The per-code result contract (weaker result guarantees such as
+        # FLOAT_REASSOCIATION_ALLOWED) is the one the view was installed
+        # under, never widened by this manager's current defaults: a manager
+        # created with accept_limitations must not reconstruct, check or
+        # repair an exact view as relaxed. Other accepted engine limitations
+        # (e.g. MYSQL_FK_CASCADE_NO_TRIGGER) keep coming from both.
+        manager_codes = {c for c in self.accept_limitations if c not in PER_CODE_OPT_IN_LIMITATIONS}
+        return tuple(sorted(set(entry.get("accepted_limitations") or ()) | manager_codes))
+
+    @_manager_read_operation
+    def get_diagnostics(self, view_name: Optional[str] = None) -> Dict[str, List[Any]]:
+        """Strategy diagnostics (matview.diagnostics.Diagnostic) of installed
+        views, reconstructed from their stored definitions and accepted
+        limitation codes: ``{view_name: [Diagnostic, ...]}``. Not emitted as
+        warnings. A view that no longer compiles, or whose installed strategy
+        differs from the recompiled one, maps to an empty list (see
+        check_schema_drift; repair_view rebuilds it)."""
+        import warnings as _warnings
+
+        schemas = self.fetch_schema()
+        catalog = self.get_catalog()
+        names = [self._resolve_catalog_name(view_name, catalog)] if view_name else list(catalog)
+        out: Dict[str, List[Any]] = {}
+        for name in names:
+            entry = catalog.get(name)
+            if entry is None:
+                raise KeyError(f"View {view_name!r} is not registered in {self.catalog_table}")
+            try:
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore")
+                    plan = self._stored_plan(schemas, entry)
+            except Exception:
+                out[name] = []
+                continue
+            if plan.strategy.value != entry.get("strategy"):
+                # The installed view is not what its stored definition and
+                # acceptance compile to now (drifted, or its acceptance record
+                # changed): its recompiled diagnostics would describe a plan
+                # that is not installed. Report nothing until repair_view()
+                # rebuilds it (check_schema_drift reports the state).
+                out[name] = []
+                continue
+            out[name] = list(plan.strategy_diagnostics)
+        return out
 
     def _register_single_view_spec(
         self,
@@ -2808,6 +2858,7 @@ class MaterializedViewManager:
             index_names=[n for sp in sub_plans for n in sp.index_names],
             user_indexes=p0.user_indexes,
             sub_plans=sub_plans,
+            strategy_diagnostics=[d for sp in sub_plans for d in sp.strategy_diagnostics],
         )
 
     @_manager_owned_operation("sync_views")
@@ -5373,6 +5424,8 @@ def generate_materialized_view(
     repair_fence_catalog_table: Optional[str] = None,
     plain_views: Optional[Mapping[str, str]] = None,
     current_schema: Optional[str] = None,
+    *,
+    silence_diagnostics: Sequence[str] = (),
 ) -> MaterializedViewPlan:
     """
     Compiles a `CREATE VIEW` SQL definition (or multi-view SQL script) and base table schema
@@ -5448,24 +5501,34 @@ def generate_materialized_view(
     else:
         view_spec = view_sql_or_spec
 
-    compiler = IncrementalViewCompiler(
-        schemas=schemas,
-        view_spec=view_spec,
-        dialect=eff_dialect,
-        ignore_limitations=ignore_limitations,
-        accept_limitations=accept_limitations,
-        object_prefix=object_prefix,
-        incremental_backfill=incremental_backfill,
-        batch_size=batch_size,
-        strict=strict,
-        engine_version=resolved_ev,
-        watermark_catalog_table=watermark_catalog_table,
-        pg_fillfactor=pg_fillfactor,
-        sqlite_strict_backing=sqlite_strict_backing,
-        sqlite_without_rowid=sqlite_without_rowid,
-        repair_fence_catalog_table=repair_fence_catalog_table,
-    )
-    return compiler.compile()
+    try:
+        compiler = IncrementalViewCompiler(
+            schemas=schemas,
+            view_spec=view_spec,
+            dialect=eff_dialect,
+            ignore_limitations=ignore_limitations,
+            accept_limitations=accept_limitations,
+            silence_diagnostics=silence_diagnostics,
+            object_prefix=object_prefix,
+            incremental_backfill=incremental_backfill,
+            batch_size=batch_size,
+            strict=strict,
+            engine_version=resolved_ev,
+            watermark_catalog_table=watermark_catalog_table,
+            pg_fillfactor=pg_fillfactor,
+            sqlite_strict_backing=sqlite_strict_backing,
+            sqlite_without_rowid=sqlite_without_rowid,
+            repair_fence_catalog_table=repair_fence_catalog_table,
+        )
+        return compiler.compile()
+    except RecursionError as exc:
+        # Name-based column resolution that never terminates (for example a
+        # derived-table alias equal to an inner table alias): refuse clearly.
+        raise UnsupportedMaterializedViewError(
+            f"View '{view_spec.view_name}' could not be analyzed: resolving its columns recursed without end "
+            f"(typically a derived-table alias that equals an inner table alias, or mutually dependent CTE "
+            f"columns). Rename the aliases so every derived table, CTE and table alias is distinct."
+        ) from exc
 
 
 def generate_materialized_views(
@@ -5487,6 +5550,8 @@ def generate_materialized_views(
     repair_fence_catalog_table: Optional[str] = None,
     plain_views: Optional[Mapping[str, str]] = None,
     current_schema: Optional[str] = None,
+    *,
+    silence_diagnostics: Sequence[str] = (),
 ) -> List[MaterializedViewPlan]:
     """
     Compiles one or more `CREATE VIEW` SQL definitions (including multi-view SQL scripts)
@@ -5533,6 +5598,7 @@ def generate_materialized_views(
             dialect=eff_dialect,
             ignore_limitations=ignore_limitations,
             accept_limitations=accept_limitations,
+            silence_diagnostics=silence_diagnostics,
             object_prefix=object_prefix,
             incremental_backfill=incremental_backfill,
             batch_size=batch_size,
@@ -5561,6 +5627,8 @@ def install_materialized_view_sqlite(
     object_prefix: str = DEFAULT_OBJECT_PREFIX,
     indexes: Optional[Sequence[ViewIndexSpec | str | Sequence[str] | Dict[str, Any]]] = None,
     strict: bool = False,
+    *,
+    silence_diagnostics: Sequence[str] = (),
 ) -> MaterializedViewPlan:
     """Installs one or more materialized views directly into a live SQLite connection."""
     mgr = MaterializedViewManager(
@@ -5568,6 +5636,7 @@ def install_materialized_view_sqlite(
         dialect=Dialect.SQLITE,
         ignore_limitations=ignore_limitations,
         accept_limitations=accept_limitations,
+        silence_diagnostics=silence_diagnostics,
         object_prefix=object_prefix,
         strict=strict,
     )

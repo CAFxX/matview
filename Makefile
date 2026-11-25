@@ -63,7 +63,8 @@ REGRESSION_TESTS = \
 	test_native_function_classification.py \
 	test_group_key_collation.py \
 	test_sqlite_table_shapes.py \
-	test_sqlite_distinct_filtered_aggregates.py
+	test_sqlite_distinct_filtered_aggregates.py \
+	test_float_refresh_fail_closed.py
 
 test:
 	$(PYTHON) test_matview_sync.py

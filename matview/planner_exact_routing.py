@@ -84,7 +84,7 @@ FULL_REFRESH_COST = (
 
 # Per-code opt-in that accepts a non-reproducible element order of string /
 # array / JSON aggregates (separate from the floating-point policy's
-# ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE).
+# FLOAT_REASSOCIATION_ALLOWED).
 AGGREGATE_ORDER_OPT_IN = "AGGREGATE_ORDER_NOT_REPRODUCIBLE"
 ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE = "ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE"
 
@@ -320,7 +320,7 @@ class ExactAggregateRoutingMixin(MixinHost):
           element order is whatever the engine's plan reads, and a recompute
           restricted to one group reads through another plan (observed on
           MariaDB 11.8). With an ORDER BY they keep their strategy.
-          ``accept_limitations=['ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE']``
+          ``accept_limitations=['FLOAT_REASSOCIATION_ALLOWED']``
           relaxes this (``include_relaxed`` lists them anyway);
         * other order-sensitive aggregates without a total aggregate-level
           ORDER BY (one covering every source primary key)."""
@@ -391,7 +391,7 @@ class ExactAggregateRoutingMixin(MixinHost):
     @staticmethod
     def _is_float_policy_aggregate(call: sqlglot_exp.Expr) -> bool:
         """SUM/AVG/VAR/STDDEV are governed by the floating-point policy
-        (ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE), not by this routing."""
+        (FLOAT_REASSOCIATION_ALLOWED), not by this routing."""
         return isinstance(
             call,
             (

@@ -22,6 +22,7 @@ from .diagnostics import (
     emit as emit_diagnostics,
     exact_fallback_message,
 )
+from .scope_resolver import BASE, CONFLICT, UNKNOWN, FloatAuditNode, ScopeResolver, norm_type
 from .engines import (
     AggFunc,
     Dialect,
@@ -50,6 +51,7 @@ from .logical_ir import (
     ViewSpec,
 )
 from .sql_frontend import (
+    _set_operation_arm_tree,
     _sqlite_type_affinity,
     _FN_TO_AGG_ENUM,
     _SQL_EXPR_FUNCTIONS,
@@ -265,8 +267,8 @@ class PlannerMixin(MixinHost):
             + self._mysql_group_index_limitations(strategy, alg_mode)
         )
 
-    def _window_order_sensitive_exprs(self) -> List[str]:
-        """Window SUM/AVG/VAR/STDDEV over arguments that are not provably
+    def _legacy_window_order_sensitive_exprs(self) -> List[str]:
+        """Legacy (unscoped) classification of window SUM/AVG/VAR/STDDEV over arguments that are not provably
         exact (their running value also accumulates in plan order)."""
         if not self.view.has_window_func:
             return []
@@ -280,6 +282,10 @@ class PlannerMixin(MixinHost):
         sg = _sqlglot_dialect(self.dialect)
         for w in root.find_all(sqlglot_exp.Window):
             fn = w.this
+            if isinstance(fn, sqlglot_exp.Filter):
+                # SUM(x) FILTER (WHERE ...) OVER (...): the aggregate is
+                # inside the FILTER node.
+                fn = fn.this
             if fn is not None:
                 unwrapped_pg = _unwrap_pg_catalog_agg_node(fn, self.dialect)
                 if unwrapped_pg is not None:
@@ -298,63 +304,835 @@ class PlannerMixin(MixinHost):
                 arg = arg.expressions[0] if arg.expressions else None
             elif isinstance(fn, sqlglot_exp.Anonymous) and getattr(fn, "expressions", None):
                 arg = fn.expressions[0]
-            arg_sql = arg.sql(dialect=sg) if arg is not None else ""
+            if arg is None:
+                arg_sql = ""
+            elif isinstance(arg, str):
+                arg_sql = arg
+            else:
+                arg_sql = arg.sql(dialect=sg)
             if self._exact_numeric_precision_scale(arg_sql) is None or fname not in ("SUM", "AVG"):
                 out.append(w.sql(dialect=sg))
         return out
 
-    def _order_sensitive_shape_limitations(
-        self, strategy: MaintenanceStrategy, alg_mode: str
-    ) -> List[TransparencyLimitation]:
-        """PostgreSQL/MySQL/MariaDB refuse floating-point order-sensitive
-        aggregates by default, whatever the shape.
+    FLOAT_RELAXED_CODE = "FLOAT_REASSOCIATION_ALLOWED"
 
-        SUM/AVG over approximate (or not provably exact) arguments accumulate
-        in binary floating point in the order the engine reads the rows, and
-        VAR/STDDEV use the engine's streaming algorithm (MySQL/MariaDB in
-        DOUBLE for every argument type). That order is chosen by the plan of
-        the original view and is not a function of the data: an index or range
-        scan for a WHERE clause, sort-based grouping, parallel aggregation and
-        the join order all change it (measured natively: PostgreSQL ungrouped
-        `SUM(x) WHERE y < 10` with an index on y and MySQL 8.4 / MariaDB 10.11
-        grouped views with an index on the WHERE column: original view 1.5,
-        any fixed recompute order 2.0; PostgreSQL parallel aggregation makes
-        the original view itself nondeterministic). No maintained value can
-        equal the original view under every plan, so these views are only
-        installed with an explicit per-code opt-in (``accept_limitations``),
-        which gives best-effort maintenance: race-free, and equal to the
-        original view when it evaluates in the recompute's order.
-        """
+    _ORDER_SENSITIVE_FN_NAMES = frozenset({
+        "SUM", "AVG", "TOTAL", "VARIANCE", "VARIANCE_POP", "VAR_POP", "VAR_SAMP", "STDDEV",
+        "STDDEV_POP", "STDDEV_SAMP", "STD",
+    })
+    _STAT_FN_NAMES = frozenset({"VARIANCE", "VARIANCE_POP", "VAR_POP", "VAR_SAMP", "STDDEV", "STDDEV_POP",
+                                "STDDEV_SAMP", "STD"})
+    # Aggregate/window functions whose result type does not depend on their
+    # argument: they never need a provable argument column.
+    _ARG_TYPE_INDEPENDENT_FN_NAMES = frozenset({
+        "COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "PERCENT_RANK", "CUME_DIST",
+    })
+
+    def _float_audit_nodes(self) -> List[FloatAuditNode]:
+        """Every aggregate / window function of the whole query, each with
+        the verdict of the ONE scope resolver (scope_resolver.ScopeResolver):
+        whether its argument columns are declared base-table columns of a
+        known type, whether its value reaches a stored column, and whether
+        the engine's result depends on the order rows are read.
+
+        Cached per compilation. Classification (order sensitivity), the
+        provability guard (_refuse_unprovable_float_refresh_types) and the
+        diagnostics all read this list; none resolves a column on its own."""
+        cached = getattr(self, "_float_audit_cache", None)
+        if cached is not None:
+            return cached
+        nodes: List[FloatAuditNode] = []
+        self._float_audit_cache = nodes
         if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL):
-            return []
-        uall_branches = self._union_all_branch_specs
-        if alg_mode == "union_all_agg" and not uall_branches:
+            return nodes
+        try:
+            root = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
+        except sqlglot.errors.SqlglotError:
+            return nodes
+        resolver = ScopeResolver(
+            root, self._schemas_lower,
+            common_type=lambda ts, has_null: self._common_storage_type(list(ts), has_null=has_null),
+            literal_type=lambda lit: self._literal_storage_type(lit),
+            expr_type=lambda e: self._float_double_expr_type(e),
+        )
+        self._float_resolver = resolver
+        self._float_root = root
+        sg = _sqlglot_dialect(self.dialect)
+        for node in root.walk():
+            window: Any = None
+            if isinstance(node, sqlglot_exp.Window):
+                window = node
+                fn: Any = node.this
+                if isinstance(fn, sqlglot_exp.Filter):
+                    fn = fn.this
+            elif isinstance(node, sqlglot_exp.Func):
+                up = node.parent
+                while isinstance(up, (sqlglot_exp.Dot, sqlglot_exp.Filter, sqlglot_exp.Column)):
+                    up = up.parent
+                if isinstance(up, sqlglot_exp.Window):
+                    continue  # the call of a window function: audited with its OVER clause
+                fn = node
+            else:
+                continue
+            if fn is None:
+                continue
+            unwrapped_pg = _unwrap_pg_catalog_agg_node(fn, self.dialect)
+            if isinstance(unwrapped_pg, sqlglot_exp.Func):
+                fn = unwrapped_pg
+            if not isinstance(fn, sqlglot_exp.Func):
+                continue
+            names = {fn.sql_name().upper(), str(getattr(fn, "name", "") or "").upper()} - {""}
+            is_aggregate = isinstance(fn, sqlglot_exp.AggFunc) or bool(
+                names & (self._ORDER_SENSITIVE_FN_NAMES | {"MIN", "MAX"})
+            )
+            if window is None and not is_aggregate:
+                continue
+            if names & self._ARG_TYPE_INDEPENDENT_FN_NAMES:
+                continue
+            site = window if window is not None else node
+            status, per, reason = resolver.resolve_expr(fn)
+            ordered = bool(names & self._ORDER_SENSITIVE_FN_NAMES)
+            sensitive = False
+            arg: Any = fn.this
+            if isinstance(arg, sqlglot_exp.Distinct):
+                arg = arg.expressions[0] if arg.expressions else None
+            elif isinstance(fn, sqlglot_exp.Anonymous):
+                arg = fn.expressions[0] if fn.expressions else None
+            if ordered:
+                is_stat = bool(names & self._STAT_FN_NAMES)
+                exact = False
+                synthetic = any(r.table is None for _, r in per)  # a set-operation column (common type)
+                if (status == UNKNOWN or (status == BASE and synthetic)) and arg is not None and not isinstance(arg, str):
+                    # An argument that is not a provable base column (derived
+                    # table / CTE / window result ...): the classification the
+                    # view always had; the provability guard refuses the
+                    # views it would newly accept.
+                    exact = self._float_check_ctx()._exact_numeric_precision_scale(arg.sql(dialect=sg)) is not None
+                    if exact and status == UNKNOWN:
+                        # The legacy classification reads the derived column's
+                        # defining expression by NAME; it holds only if every
+                        # declared column that expression reads is exact.
+                        leaves = resolver.leaf_columns(arg)
+                        exact = leaves is not None and all(
+                            self._numeric_precision_scale_from_type(c.data_type) is not None for c in leaves
+                        )
+                elif status == BASE and arg is not None and not isinstance(arg, str):
+                    scoped = arg.copy()
+                    for orig, cp in zip(list(arg.find_all(sqlglot_exp.Column)), list(scoped.find_all(sqlglot_exp.Column))):
+                        res = next(r for c, r in per if c is orig)
+                        new = sqlglot_exp.column(orig.name, table=res.table)
+                        if cp is scoped:
+                            scoped = new
+                        else:
+                            cp.replace(new)
+                    exact = self._exact_numeric_precision_scale(scoped.sql(dialect=sg)) is not None
+                sensitive = (is_stat and self.dialect == Dialect.MYSQL) or not exact
+            nodes.append(FloatAuditNode(
+                site=site, fn_node=fn, sql=site.sql(dialect=sg), fn_sql=fn.sql(dialect=sg), is_window=window is not None,
+                reaches=self._float_node_reaches_output(site), final=self._float_node_is_final(site),
+                status=status, per=per, reason=reason, order_sensitive=sensitive,
+                compound_expr=self._float_node_compound_top(site),
+                derived_name=self._float_node_derived_name(site),
+                in_derived=self._float_node_in_derived(site),
+            ))
+        # A value computed inside a derived table / CTE / LATERAL reaches a
+        # stored column only through the outer references to its output column.
+        # Fail closed: a star anywhere, an unnamed or set-operation column, or
+        # any reaching reference by that name (COUNT arguments excepted, they
+        # never decide a type) keeps it reaching.
+        has_star = any(
+            not isinstance(st.parent, sqlglot_exp.Count) for st in root.find_all(sqlglot_exp.Star)
+        )
+        if not has_star:
+            referenced: Set[str] = set()
+            for col in root.find_all(sqlglot_exp.Column):
+                anc, in_count = col.parent, False
+                while anc is not None and not isinstance(anc, sqlglot_exp.Select):
+                    if isinstance(anc, sqlglot_exp.Count):
+                        in_count = True
+                        break
+                    anc = anc.parent
+                if not in_count and self._float_node_reaches_output(col):
+                    referenced.add((col.name or "").lower())
+            for n in nodes:
+                if n.derived_name is not None and n.derived_name not in referenced:
+                    n.reaches = False
+        return nodes
+
+    @staticmethod
+    def _float_node_in_derived(node: Any) -> bool:
+        """True when the node lies inside the body of a derived table, a CTE or
+        a LATERAL subquery (whose columns feed the enclosing query)."""
+        cur = node
+        while cur.parent is not None:
+            parent = cur.parent
+            if isinstance(parent, sqlglot_exp.CTE):
+                return True
+            if isinstance(cur, sqlglot_exp.Subquery) and isinstance(
+                parent, (sqlglot_exp.From, sqlglot_exp.Join, sqlglot_exp.Lateral)
+            ):
+                return True
+            cur = parent
+        return False
+
+    @staticmethod
+    def _float_node_derived_name(node: Any) -> Optional[str]:
+        """Output column name of the derived table / CTE / LATERAL projection
+        item that holds the node, or None (top-level, set-operation branch,
+        unnamed item, anywhere else)."""
+        cur = node
+        for _ in range(64):
+            child, parent = cur, cur.parent
+            while parent is not None and not isinstance(parent, sqlglot_exp.Select):
+                child, parent = parent, parent.parent
+            if parent is None or child.arg_key != "expressions":
+                return None
+            name = (child.alias_or_name or "").lower()
+            holder = parent.parent
+            if isinstance(holder, sqlglot_exp.CTE):
+                return name or None
+            if isinstance(holder, sqlglot_exp.Subquery):
+                up = holder.parent
+                if isinstance(up, (sqlglot_exp.From, sqlglot_exp.Join, sqlglot_exp.Lateral)) or (
+                    isinstance(up, sqlglot_exp.Select) and holder.arg_key in ("from_", "from")
+                ):
+                    return name or None
+                cur = holder  # a scalar subquery inside an expression: keep climbing
+                continue
+            return None
+        return None
+
+    @staticmethod
+    def _float_node_reaches_output(node: Any) -> bool:
+        """Whether the node's value can flow into a stored column. Only
+        WHERE/HAVING/GROUP/ORDER/ON/QUALIFY positions (also inside nested
+        subqueries) provably cannot; every projection, derived table, CTE
+        and LATERAL body is treated as reaching (fail closed)."""
+        child, parent = node, node.parent
+        while parent is not None:
+            if isinstance(parent, sqlglot_exp.Select):
+                if child.arg_key not in ("expressions", "from_", "from", "joins", "with_", "with"):
+                    return False
+            elif isinstance(parent, sqlglot_exp.Join):
+                if child.arg_key in ("on", "using"):
+                    return False
+            elif isinstance(parent, sqlglot_exp.CTE):
+                return True
+            child, parent = parent, parent.parent
+        return True
+
+    @staticmethod
+    def _float_node_compound_top(node: Any) -> Optional[Any]:
+        """The whole projection-item expression when the node sits inside a
+        larger expression of its select item (SUM(x) * 2, COALESCE(MAX(x), 0),
+        a + b); None for a bare call (optionally FILTERed / parenthesized)."""
+        cur = node
+        while cur.parent is not None and not isinstance(cur.parent, sqlglot_exp.Select):
+            parent = cur.parent
+            if isinstance(parent, sqlglot_exp.Alias):
+                return None
+            if not isinstance(parent, (sqlglot_exp.Filter, sqlglot_exp.Paren, sqlglot_exp.Dot, sqlglot_exp.Column)):
+                top = parent
+                while top.parent is not None and not isinstance(top.parent, (sqlglot_exp.Select, sqlglot_exp.Alias)):
+                    top = top.parent
+                return top
+            cur = parent
+        return None
+
+    @staticmethod
+    def _float_node_is_final(node: Any) -> bool:
+        """True for a node directly in the projection of a final SELECT: the
+        top-level query or a branch of a top-level set operation (not a
+        derived table, CTE, LATERAL or subquery)."""
+        child, parent = node, node.parent
+        while parent is not None and not isinstance(parent, sqlglot_exp.Select):
+            child, parent = parent, parent.parent
+        if parent is None or child.arg_key != "expressions":
+            return False
+        sel = parent
+        p = sel.parent
+        while p is not None:
+            if isinstance(p, sqlglot_exp.SetOperation) or (
+                isinstance(p, sqlglot_exp.Subquery) and isinstance(p.parent, sqlglot_exp.SetOperation)
+            ):
+                p = p.parent
+                continue
+            return False
+        return True
+
+    def _float_check_ctx(self) -> Any:
+        """The context that classifies top-level aggregates: the view, or for a
+        UNION ALL aggregate view the context over the branches' common types."""
+        key = id(getattr(self, "_working_select_items", None))
+        cached = getattr(self, "_float_check_ctx_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        branches = self._float_union_branch_specs()
+        ctx = self._union_all_common_ctx(branches, self._float_union_arm_tree(branches)) if branches else self
+        self._float_check_ctx_cache = (key, ctx)
+        return ctx
+
+    def _float_union_arm_tree(self, branches: Sequence[Any]) -> Any:
+        """The set-operation tree over ``branches`` (PostgreSQL resolves the
+        common type pairwise along it, see ``_set_operation_arm_tree``), or
+        None (one flat chain) when the view's arms do not match the branches."""
+        try:
+            leaves, tree = _set_operation_arm_tree(parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect))
+        except sqlglot.errors.SqlglotError:
+            return None
+        return tree if len(leaves) == len(branches) else None
+
+    def _float_union_branch_specs(self) -> Optional[Sequence[Any]]:
+        """Per-branch view specs of a UNION ALL aggregate view (None otherwise)."""
+        key = id(getattr(self, "_working_select_items", None))
+        cached = getattr(self, "_float_branch_specs_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        uall_branches = getattr(self, "_union_all_branch_specs", None)
+        if not uall_branches and "UNION" in (self.view.raw_select_sql or "").upper():
             meta = self._extract_union_all_agg_metadata()
             if meta is not None:
                 uall_branches = tuple(meta[2])
-        check_ctx = self._union_all_common_ctx(uall_branches) if uall_branches else self
-        items = [
-            it.raw_expr for it in self._working_select_items
-            if it.is_aggregate and check_ctx._is_order_sensitive_aggregate(it)
-        ]
-        items += self._window_order_sensitive_exprs()
-        if not items:
+        result = uall_branches or None
+        self._float_branch_specs_cache = (key, result)
+        return result
+
+    def _order_sensitive_float_items(self) -> List[Tuple[str, str]]:
+        """(column, expression) of every aggregate whose PostgreSQL/MySQL/
+        MariaDB result depends on the order the plan reads the rows: SUM/AVG/
+        TOTAL over approximate (or not provably exact) arguments and VAR/
+        STDDEV in DOUBLE (MySQL/MariaDB every type), plain or window, at any
+        nesting level. An argument is exact only when the scope resolver
+        proves every column to be a declared base-table column of an exact
+        type; the legacy top-level classification (which can only add)
+        is kept for UNION ALL common types."""
+        if self.dialect not in (Dialect.POSTGRES, Dialect.MYSQL):
             return []
-        order = (
-            "sequential-scan (ctid) order" if self.dialect == Dialect.POSTGRES
-            else "primary-key order"
+        items = getattr(self, "_working_select_items", None) or self.view.select_items
+        # A UNION ALL of aggregate branches classifies its columns over the
+        # common type of all branches (a float in any branch makes it float).
+        uall_branches = self._float_union_branch_specs()
+        check_ctx: Any = self
+        if uall_branches:
+            try:
+                check_ctx = self._union_all_common_ctx(uall_branches, self._float_union_arm_tree(uall_branches))
+            except UnsupportedMaterializedViewError:
+                # No modelled common type (e.g. a lossy REAL set-operation chain,
+                # refused for the incremental strategies): classify conservatively,
+                # every SUM/TOTAL/AVG/VAR/STDDEV as floating point (exact full
+                # refresh, or that refusal when the refresh is typed by the same
+                # model). Other aggregates (MIN/MAX, COUNT) are never order-sensitive.
+                check_ctx = None
+        out: List[Tuple[str, str]] = [
+            (it.alias, it.raw_expr) for it in items
+            if it.is_aggregate and (
+                it.agg_func in (
+                    AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG,
+                    AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                )
+                if check_ctx is None
+                else check_ctx._is_order_sensitive_aggregate(it)
+            )
+        ]
+        norm = lambda t: re.sub(r"\s+", "", t).lower()  # noqa: E731
+        # The resolver-based verdicts plus the legacy window classification
+        # (the union only ever classifies MORE aggregates as order-sensitive,
+        # never fewer than before the resolver).
+        found = [n.sql for n in self._float_audit_nodes() if n.order_sensitive]
+        found += self._legacy_window_order_sensitive_exprs()
+        for sql in dict.fromkeys(found):
+            owner = [it for it in self.view.select_items if norm(sql) in norm(it.raw_expr)]
+            if owner:
+                out += [(it.alias, it.raw_expr) for it in owner]
+            elif all(norm(sql) not in norm(x) for _, x in out):
+                out.append(("", sql))
+        return list(dict.fromkeys(out))
+
+    def _float_guard_applies(self, nodes: List[FloatAuditNode]) -> bool:
+        """The provability guard covers what the refresh default newly accepts:
+        views with an order-sensitive aggregate in a top-level projection or a
+        window function anywhere (before the default, the limitation refused
+        exactly those). An order-sensitive aggregate found only in a WHERE /
+        HAVING / ON subquery or an unreferenced derived table changes no stored
+        type: such a view keeps the type derivation it always had."""
+        items = getattr(self, "_working_select_items", None) or self.view.select_items
+        check_ctx = self._float_check_ctx()
+        legacy_top = any(it.is_aggregate and check_ctx._is_order_sensitive_aggregate(it) for it in items)
+        return (
+            legacy_top
+            or any(n.order_sensitive and (n.final or n.is_window or (n.reaches and not n.in_derived)) for n in nodes)
+            or bool(self._legacy_window_order_sensitive_exprs())
         )
-        listed = ", ".join(dict.fromkeys(items))
+
+    def _table_instances(self, node: Any, root: Any, depth: int = 0) -> int:
+        """How many table instances are read TOGETHER to produce the rows of
+        ``node``: a join or a subquery adds them up, the branches of a set
+        operation are read one after the other (the largest branch counts), a
+        non-recursive CTE reference counts its body, a recursive self-reference
+        counts one."""
+        ctes: Dict[str, Any] = {}
+        for c in root.find_all(sqlglot_exp.CTE):
+            if c.alias:
+                ctes[c.alias.lower()] = c
+        active: Set[int] = set()
+
+        def cnt(n: Any, d: int) -> int:
+            if d > 64:
+                return 99
+            if isinstance(n, sqlglot_exp.SetOperation):
+                return max(cnt(n.this, d + 1), cnt(n.expression, d + 1))
+            if isinstance(n, (sqlglot_exp.With, sqlglot_exp.CTE)):
+                return 0  # a CTE body counts where it is referenced
+            if isinstance(n, sqlglot_exp.Table):
+                cte = ctes.get(n.name.lower()) if n.name and not n.args.get("db") else None
+                if cte is None or id(cte) in active:
+                    return 1
+                active.add(id(cte))
+                try:
+                    return max(1, cnt(cte.this, d + 1))
+                finally:
+                    active.discard(id(cte))
+            return sum(cnt(c, d + 1) for c in n.iter_expressions())
+
+        return cnt(node, depth)
+
+    def _refuse_plan_dependent_float_order(self) -> None:
+        """MySQL/MariaDB: the full refresh runs inside the maintenance
+        statement and a later read of the original view can choose another join
+        order (measured on MySQL 8.4: the refresh gave ...001, SELECT / CTAS /
+        INSERT..SELECT ...002 for `SUM(tb.x) FROM ta JOIN tb USING (g, x)`; and a
+        MariaDB window SUM over a join returned different LIVE values across
+        runs). A floating-point sum over rows read through a multi-table plan
+        is therefore not exact by construction: refused under the exact
+        default (the relaxed opt-in remains). A single-table query reads its
+        rows in one fixed order and stays exact. PostgreSQL keeps the full
+        refresh (no mismatch found; the plan-dependence is documented)."""
+        n_tables = self._plan_dependent_float_tables()
+        if n_tables:
+            listed = ", ".join(dict.fromkeys(e for _, e in self._order_sensitive_float_items()))
+            engine = "MariaDB" if self.subdialect == EngineSubdialect.MARIADB else "MySQL"
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}' sums floating-point values ({listed}) over a query that "
+                f"reads {n_tables} table instances (a join, a subquery or a derived table over other tables): "
+                f"on {engine} the full refresh runs inside the maintenance statement and a later read of the "
+                f"view can use another join order, so the two floating-point results can differ in the last "
+                f"bits; it cannot be exact by construction. Aggregate a single table (materialize the join "
+                f"first) or accept FLOAT_REASSOCIATION_ALLOWED (relaxed, announced)."
+            )
+
+    def _plan_dependent_float_tables(self) -> int:
+        """MySQL/MariaDB: the number of table instances an order-sensitive
+        float aggregate reads together when it is 2 or more (its result then
+        depends on the join order the plan picks), else 0."""
+        if self.dialect != Dialect.MYSQL:
+            return 0
+        self._float_audit_nodes()
+        root = getattr(self, "_float_root", None)
+        if root is None:
+            return 0
+        scopes: List[Any] = []
+        for n in self._float_audit_nodes():
+            if n.order_sensitive:
+                sel = n.site
+                while sel is not None and not isinstance(sel, sqlglot_exp.Select):
+                    sel = sel.parent
+                scopes.append(sel if sel is not None else root)
+        if not scopes and self._order_sensitive_float_items():
+            scopes = [root]
+        return max([n for n in (self._table_instances(sc, root) for sc in scopes) if n >= 2], default=0)
+
+    def _refuse_unprovable_float_refresh_types(self) -> None:
+        """Fail closed. The exact full refresh stores the original query's
+        result, so each stored column type must equal the type the engine
+        gives the original query. Types are derived from declared base-table
+        columns; the single scope resolver (scope_resolver.py) proves that for
+        every aggregate or window function whose value reaches a stored column.
+        Anything not provable is refused, as before the refresh default: an
+        argument column that is not a declared base column (expression-valued
+        derived-table/CTE column, recursive CTE, window or subquery result,
+        USING/NATURAL-merged column of different types, ambiguous, shadowed or
+        unresolved), an aggregate nested in a derived table, CTE, LATERAL or
+        subquery projection, and an argument the legacy type derivation does not
+        resolve to the same declared type. Applies to the views the default newly
+        accepts (see _float_guard_applies). Server-derived result types would
+        lift this (TODO)."""
+        nodes = self._float_audit_nodes()
+        if not self._float_guard_applies(nodes):
+            return
+        problems: List[str] = []
+        checked_compound: Set[int] = set()
+        for n in nodes:
+            if not n.reaches:
+                continue
+            if n.status != BASE:
+                problems.append(f"{n.fn_sql}: {n.reason}")
+            elif n.in_derived:
+                problems.append(
+                    f"{n.fn_sql}: aggregate inside a derived table, CTE, LATERAL or subquery projection "
+                    f"whose result type is not provable from declared columns"
+                )
+            elif (
+                n.final
+                and isinstance(n.fn_node, (sqlglot_exp.Min, sqlglot_exp.Max))
+                and n.fn_node.this is not None
+                and not isinstance(n.fn_node.this, (sqlglot_exp.Column, sqlglot_exp.Star))
+                and self._float_expr_family(n.fn_node.this, self._float_resolver) is None
+            ):
+                problems.append(
+                    f"{n.fn_sql}: MIN/MAX over an expression whose result type is not provable "
+                    f"(MIN/MAX keep the expression's own type, which is typed by operand heuristics)"
+                )
+            elif n.compound_expr is not None and id(n.compound_expr) not in checked_compound:
+                checked_compound.add(id(n.compound_expr))
+                why = self._float_compound_problem(n.compound_expr)
+                if why:
+                    problems.append(why)
+        problems += self._float_projection_problems()
+        if problems:
+            listed = "; ".join(dict.fromkeys(problems))
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}' needs the exact full refresh (floating-point "
+                f"aggregates), which stores the original query's result; the stored column types "
+                f"cannot be proven from declared base-table columns for: {listed}. Aggregate base-table "
+                f"columns directly in the outermost SELECT (or UNION ALL branches), or accept "
+                f"FLOAT_REASSOCIATION_ALLOWED."
+            )
+
+    _FLOAT_TYPE_RE = re.compile(r"\b(?:FLOAT|FLOAT4|FLOAT8|DOUBLE|REAL)\b")
+    _INT_TYPE_RE = re.compile(r"\b(?:TINYINT|SMALLINT|MEDIUMINT|INTEGER|INT|INT2|INT4|INT8|BIGINT)\b")
+    _PLAIN_INT_TYPE_RE = re.compile(
+        r"(?:TINYINT|SMALLINT|MEDIUMINT|INTEGER|INT|INT2|INT4|INT8|BIGINT)(?:\s*\(\d+\))?(?:\s+UNSIGNED)?"
+    )
+
+    def _float_expr_family(self, e: Any, resolver: ScopeResolver) -> Optional[str]:
+        """'float' or 'int' when the engine's result type of ``e`` is provably
+        a binary float / an integer from the declared column types of its base
+        columns alone (aggregate leaves, + - * /, COALESCE, CASE); None otherwise."""
+        def combine(*fams: Optional[str]) -> Optional[str]:
+            if any(f is None for f in fams):
+                return None
+            if "float" in fams:
+                return "float"
+            return "int" if all(f == "int" for f in fams) else None
+
+        if isinstance(e, (sqlglot_exp.Paren, sqlglot_exp.Neg, sqlglot_exp.Filter)):
+            return self._float_expr_family(e.this, resolver)
+        if isinstance(e, sqlglot_exp.Literal):
+            if e.args.get("is_string"):
+                return None
+            return "int" if re.fullmatch(r"\d+", str(e.this)) else "dec"
+        if isinstance(e, sqlglot_exp.Column):
+            res = resolver.resolve(e)
+            if not res.ok or res.column is None:
+                return None
+            t = norm_type(res.column.data_type)
+            if self._FLOAT_TYPE_RE.search(t) and "DECIMAL" not in t and "NUMERIC" not in t:
+                return "float"
+            if self._PLAIN_INT_TYPE_RE.fullmatch(t):
+                return "int"
+            return None
+        if isinstance(e, sqlglot_exp.Count):
+            return "int"
+        if isinstance(e, (sqlglot_exp.Min, sqlglot_exp.Max)):
+            return self._float_expr_family(e.this, resolver) if e.this is not None else None
+        if isinstance(e, (sqlglot_exp.Sum, sqlglot_exp.Avg)) or (
+            isinstance(e, sqlglot_exp.Func) and e.sql_name().upper() in self._STAT_FN_NAMES
+        ):
+            arg = e.this.expressions[0] if isinstance(e.this, sqlglot_exp.Distinct) and e.this.expressions else e.this
+            fam = self._float_expr_family(arg, resolver) if arg is not None else None
+            is_stat = e.sql_name().upper() in self._STAT_FN_NAMES
+            if fam == "float" or (is_stat and self.dialect == Dialect.MYSQL and fam is not None):
+                return "float"
+            return None
+        if isinstance(e, (sqlglot_exp.Add, sqlglot_exp.Sub, sqlglot_exp.Mul)):
+            return combine(self._float_expr_family(e.this, resolver), self._float_expr_family(e.expression, resolver))
+        if isinstance(e, sqlglot_exp.Div):
+            fam = combine(self._float_expr_family(e.this, resolver), self._float_expr_family(e.expression, resolver))
+            return "float" if fam == "float" else None
+        if isinstance(e, sqlglot_exp.Coalesce):
+            return combine(self._float_expr_family(e.this, resolver), *[self._float_expr_family(x, resolver) for x in e.expressions])
+        if isinstance(e, sqlglot_exp.Case):
+            branches = [i.args.get("true") for i in e.args.get("ifs") or []]
+            if e.args.get("default") is not None:
+                branches.append(e.args["default"])
+            return combine(*[self._float_expr_family(b, resolver) if b is not None else None for b in branches]) if branches else None
+        return None
+
+    def _float_double_expr_type(self, e: Any) -> Optional[str]:
+        """The engine type of an arithmetic expression that provably yields a
+        binary DOUBLE: it reads at least one DOUBLE-class base column (REAL /
+        FLOAT4 excluded on PostgreSQL, whose float4 arithmetic type is not
+        derived here) and combines only numeric columns and literals with
+        + - * /. None otherwise (not provable)."""
+        resolver: Optional[ScopeResolver] = getattr(self, "_float_resolver", None)
+        if resolver is None or self._float_expr_family(e, resolver) != "float":
+            return None
+        if any(isinstance(n, sqlglot_exp.AggFunc) for n in e.find_all(sqlglot_exp.AggFunc)):
+            return None
+        for col in e.find_all(sqlglot_exp.Column):
+            r = resolver.resolve(col)
+            t = norm_type(r.column.data_type) if r.ok and r.column is not None else ""
+            if self.dialect == Dialect.POSTGRES and re.search(r"\b(?:REAL|FLOAT4)\b", t):
+                return None
+        return self._float_type()
+
+    def _float_transparent_wrapper_ok(self, expr: Any, text: str) -> bool:
+        """``COALESCE(<aggregate>, <numeric literal>...)`` (or IFNULL) yields the
+        aggregate's own type: accepted when the aggregate is a bare call
+        (no FILTER) and the stored type of the wrapper equals the stored type
+        the derivation gives the aggregate alone."""
+        if not isinstance(expr, sqlglot_exp.Coalesce) or expr.find(sqlglot_exp.Filter) is not None:
+            return False
+        head = expr.this
+        while isinstance(head, sqlglot_exp.Paren):
+            head = head.this
+        if not isinstance(head, sqlglot_exp.AggFunc) or isinstance(head, sqlglot_exp.Count):
+            return False
+        for other in expr.expressions:
+            if not isinstance(other, sqlglot_exp.Literal) or other.args.get("is_string"):
+                return False
+        sg = _sqlglot_dialect(self.dialect)
+        agg_item = _parse_single_agg_expr(head.sql(dialect=sg), "", dialect=self.dialect)
+        if agg_item is None or agg_item.agg_func is None:
+            return False
+        stored = norm_type(self._infer_expr_storage_type(SelectItem(raw_expr=text, alias="", is_aggregate=True)) or "")
+        alone = norm_type(self._infer_expr_storage_type(agg_item) or "")
+        def shape(t: str) -> str:
+            # DECIMAL(32, 0) and DECIMAL(65, 0) hold the same exact values: compare the scale only.
+            m = re.fullmatch(r"(DECIMAL|NUMERIC)\s*\(\s*\d+\s*,\s*(\d+)\s*\)", t)
+            return f"{m.group(1)}/{m.group(2)}" if m else t
+
+        return bool(stored) and shape(stored) == shape(alone)
+
+    def _float_compound_problem(self, expr: Any) -> Optional[str]:
+        """A select item that wraps aggregates in a larger expression is typed
+        by operand heuristics. Accepted only when the independent family rule
+        (_float_expr_family) proves the engine's result is a binary float or an
+        integer AND the stored-type derivation agrees on that family."""
+        resolver: Optional[ScopeResolver] = getattr(self, "_float_resolver", None)
+        sg = _sqlglot_dialect(self.dialect)
+        text = expr.sql(dialect=sg)
+        fam = self._float_expr_family(expr, resolver) if resolver is not None else None
+        if fam is None and self._float_transparent_wrapper_ok(expr, text):
+            return None
+        if fam is None:
+            return (
+                f"{text}: aggregate inside a larger expression whose result type is not provable "
+                f"(project the aggregate itself, or combine only float/integer columns)"
+            )
+        stored = self._infer_expr_storage_type(
+            SelectItem(raw_expr=text, alias="", is_aggregate=True)
+        )
+        t = norm_type(stored or "")
+        got = "float" if (self._FLOAT_TYPE_RE.search(t) and "DECIMAL" not in t) else (
+            "int" if self._INT_TYPE_RE.search(t) else "other"
+        )
+        if got != fam:
+            return f"{text}: the stored-type derivation gives {stored or '?'} but the result is a binary {fam}"
+        return None
+
+    def _float_setop_problems(self, root: Any, resolver: ScopeResolver) -> List[str]:
+        """A top-level set operation stores the first branch's derived types:
+        every other branch must project, at each position, the same typed
+        shape (the same bare aggregate function over columns of the same
+        declared types, or a column of the same declared type)."""
+        if not isinstance(root, sqlglot_exp.SetOperation):
+            return []
+        branches: List[Any] = []
+
+        def flatten(n: Any) -> None:
+            if isinstance(n, sqlglot_exp.SetOperation):
+                flatten(n.this)
+                flatten(n.expression)
+            elif isinstance(n, sqlglot_exp.Subquery):
+                flatten(n.this)
+            else:
+                branches.append(n)
+
+        flatten(root)
+        sg = _sqlglot_dialect(self.dialect)
+
+        def signature(proj: Any) -> Any:
+            """The projection with every column replaced by its declared type:
+            equal signatures give equal result types."""
+            e = proj.this if isinstance(proj, sqlglot_exp.Alias) else proj
+            while isinstance(e, sqlglot_exp.Paren):
+                e = e.this
+            orig = list(e.find_all(sqlglot_exp.Column))
+            if not orig or isinstance(e, sqlglot_exp.Count):
+                return ("count",) if isinstance(e, sqlglot_exp.Count) else None
+            res = [resolver.resolve(c) for c in orig]
+            if not all(r.ok and r.column is not None for r in res):
+                return None
+            cp = e.copy()
+            for o, c, r in zip(orig, list(cp.find_all(sqlglot_exp.Column)), res):
+                new = sqlglot_exp.Var(this="<" + norm_type(r.column.data_type if r.column else "") + ">")
+                if c is cp:
+                    cp = new
+                else:
+                    c.replace(new)
+            return (cp.sql(dialect=sg),)
+
+        problems: List[str] = []
+        sigs: List[List[Any]] = []
+        for br in branches:
+            if not isinstance(br, sqlglot_exp.Select):
+                return [f"{root.sql(dialect=sg)[:60]}: a set operation over a non-SELECT branch"]
+            sigs.append([signature(p) for p in br.expressions])
+        width = {len(x) for x in sigs}
+        if len(width) != 1:
+            return ["a set operation whose branches project a different number of columns"]
+        for pos in range(next(iter(width))):
+            col_sigs = [x[pos] for x in sigs]
+            if any(sg_ is None for sg_ in col_sigs) or len(set(col_sigs)) != 1:
+                name = branches[0].expressions[pos].sql(dialect=sg)[:60]
+                problems.append(f"{name}: the set-operation branches do not project provably identical types at this position")
+        return problems
+
+    def _float_projection_problems(self) -> List[str]:
+        """The stored column types of the outermost projection. Every column
+        its items read must resolve to a declared base column; a scalar
+        subquery in the projection is typed from text heuristics and is
+        refused; a top-level set operation must project identical typed shapes
+        in every branch; and the stored type of every item (group keys, plain
+        columns, aggregates, compound expressions) must equal the type the same
+        derivation gives when its columns are PROVEN to have the resolver's
+        declared types (a same-named column of another table, a shadowed alias,
+        a name-based lookup that picks a different table: all disagree and are
+        refused)."""
+        resolver: Optional[ScopeResolver] = getattr(self, "_float_resolver", None)
+        root = getattr(self, "_float_root", None)
+        if resolver is None or root is None:
+            return []
+        sg = _sqlglot_dialect(self.dialect)
+        problems: List[str] = self._float_setop_problems(root, resolver)
+        top: Any = root
+        while isinstance(top, (sqlglot_exp.SetOperation, sqlglot_exp.Subquery)):
+            top = top.this
+        if not isinstance(top, sqlglot_exp.Select):
+            return problems
+        norm = lambda t: re.sub(r"\s+", "", t).lower()  # noqa: E731
+        proven: Dict[str, Any] = {}
+        for proj in top.expressions:
+            for col in proj.find_all(sqlglot_exp.Column):
+                if isinstance(col.this, sqlglot_exp.Star):
+                    problems.append(f"{col.sql()}: a star in the projection")
+                    continue
+                res = resolver.resolve(col)
+                if not res.ok or res.column is None:
+                    problems.append(f"{col.sql()}: {res.reason}")
+                    continue
+                key = norm(col.sql(dialect=sg))
+                prev = proven.get(key)
+                if prev is not None and norm_type(prev.data_type) != norm_type(res.column.data_type):
+                    problems.append(f"{col.sql()}: the same text names columns of different types")
+                proven[key] = res.column
+        if problems:
+            return problems
+        actual_ctx = self._float_check_ctx()  # the context that types the stored columns
+        ctx = actual_ctx.with_ir()
+        orig_col, orig_src = ctx._lookup_col_def, ctx._lookup_source_col_def
+
+        def proven_col(expr: Optional[str]) -> Optional[ColumnDef]:
+            return proven.get(norm(expr)) if expr and norm(expr) in proven else orig_col(expr)
+
+        def proven_src(expr: Optional[str]) -> Optional[ColumnDef]:
+            return proven.get(norm(expr)) if expr and norm(expr) in proven else orig_src(expr)
+
+        ctx._lookup_col_def = proven_col  # pyright: ignore[reportAttributeAccessIssue]  # instance override: derive types from the resolver-proven columns
+        ctx._lookup_source_col_def = proven_src  # pyright: ignore[reportAttributeAccessIssue]  # instance override: derive types from the resolver-proven columns
+        for it in getattr(self, "_working_select_items", None) or self.view.select_items:
+            if re.search(r"\(\s*SELECT\b", it.raw_expr, flags=re.IGNORECASE) and self._infer_ast_expr_storage_type(
+                _unwrap_outer_parens(it.raw_expr, dialect=self.dialect)
+            ) is None:
+                problems.append(
+                    f"{it.raw_expr[:70]}: the type of a projected subquery is not derived by the typed-expression inference"
+                )
+                continue
+            actual = norm_type(actual_ctx._infer_expr_storage_type(it) or "")
+            expected = norm_type(ctx._infer_expr_storage_type(it) or "")
+            if actual != expected:
+                problems.append(
+                    f"{it.raw_expr[:70]}: stored as {actual or '?'} but its declared column types give {expected or '?'}"
+                )
+        return problems
+
+    @staticmethod
+    def _float_projection_ancestor(node: Any) -> bool:
+        """True when the node lies inside a projection item of some SELECT."""
+        child, parent = node, node.parent
+        while parent is not None:
+            if isinstance(parent, sqlglot_exp.Select) and child.arg_key == "expressions":
+                return True
+            child, parent = parent, parent.parent
+        return False
+
+    def _refuse_conflicting_float_columns(self) -> None:
+        """A column that several joined sources define with different types
+        (USING/NATURAL-merged, ambiguous) has an engine-chosen common type no
+        classification or type derivation here reproduces: refuse, under every
+        maintenance mode (a first-table guess misclassified and mistyped it)."""
+        bad = [n for n in self._float_audit_nodes() if n.reaches and n.status == CONFLICT]
+        if bad:
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}': " + "; ".join(dict.fromkeys(f"{n.fn_sql}: {n.reason}" for n in bad))
+                + ". Qualify the column with its table (t.x) or CAST it to one explicit type."
+            )
+
+    def _float_relaxed_requested(self) -> bool:
+        return self.FLOAT_RELAXED_CODE in set(self.accepted_limitations)
+
+    def _float_refresh_required(self) -> bool:
+        """Default (exact) mode: a view with an order-sensitive float
+        aggregate is maintained by a full refresh of its original query."""
+        return bool(self._order_sensitive_float_items()) and not self._float_relaxed_requested()
+
+    def _order_sensitive_shape_limitations(
+        self, strategy: MaintenanceStrategy, alg_mode: str
+    ) -> List[TransparencyLimitation]:
+        """Limitations of the RELAXED mode for floating-point order-sensitive
+        aggregates on PostgreSQL/MySQL/MariaDB.
+
+        By default such a view is exact: it is maintained by a full refresh of
+        its original query (see _float_refresh_required and
+        _float_strategy_diagnostics), and no limitation applies. Only with the
+        explicit per-code opt-in FLOAT_REASSOCIATION_ALLOWED does the planner
+        use incremental maintenance whose float result may differ from the
+        original view with no fixed error bound (the original view accumulates in
+        its plan's row order); shapes whose incremental maintenance is not
+        the race-free post-lock recompute also need
+        ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE."""
+        items = self._order_sensitive_float_items()
+        if not items or not self._float_relaxed_requested():
+            return []
+        listed = ", ".join(dict.fromkeys(e for _, e in items))
+        if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC:
+            plan_tables = self._plan_dependent_float_tables()
+            if not plan_tables:
+                # Maintained by a full refresh in every mode: exact.
+                return []
+            # MySQL/MariaDB full refresh over 2+ table instances: relaxed (the
+            # exact default refuses it), so the accepted code is recorded.
+            return [
+                TransparencyLimitation(
+                    code=self.FLOAT_RELAXED_CODE,
+                    severity=LimitationSeverity.BLOCKER,
+                    dialect=self.dialect,
+                    affected_object=self.logical_view_name,
+                    description=(
+                        f"Relaxed result allowed for {listed}: full refresh over {plan_tables} table instances on a BEST-EFFORT "
+                        f"basis; a "
+                        f"later read of the view can use another join order, so the floating-point result may differ "
+                        f"from the original view in the last bits (no fixed error bound)."
+                    ),
+                    mitigation="Remove FLOAT_REASSOCIATION_ALLOWED (the exact default refuses this view) or aggregate a single table.",
+                )
+            ]
         lims: List[TransparencyLimitation] = []
         recomputed = strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and (
             alg_mode == "single" or (alg_mode == "union_all_agg" and self.dialect == Dialect.POSTGRES)
         )
         if not recomputed:
-            # Only single-table algebraic views (and PostgreSQL UNION ALL
-            # aggregates) recompute the order-sensitive aggregate race-free
-            # after locking; join folds, MySQL/MariaDB UNION ALL folds and
-            # group-scoped / atomic re-evaluation (joins, window functions)
-            # are neither drift-free nor verified race-free.
             lims.append(
                 TransparencyLimitation(
                     code="ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE",
@@ -362,40 +1140,135 @@ class PlannerMixin(MixinHost):
                     dialect=self.dialect,
                     affected_object=self.logical_view_name,
                     description=(
-                        f"Aggregate(s) {listed} in a {strategy.value}/{alg_mode} view are maintained by "
-                        f"folding deltas or by re-evaluating the group without the lock-then-recompute "
-                        f"protocol of single-table views: rounding can accumulate across writes and "
-                        f"concurrent writers are not verified to be serialized. With accept_limitations=['ORDER_SENSITIVE_AGGREGATE_"
-                        f"NO_RACE_FREE_RECOMPUTE'] values can drift from the original view until "
-                        f"repair_view()."
+                        f"Relaxed mode: aggregate(s) {listed} in a {strategy.value}/{alg_mode} view are "
+                        f"maintained by folding deltas or by re-evaluating the group without the "
+                        f"lock-then-recompute protocol of single-table views: rounding can accumulate "
+                        f"across writes (not only in the last digits) and concurrent writers are not "
+                        f"verified to be serialized, until repair_view()."
                     ),
                     mitigation=(
-                        "Aggregate an exact type (integer/DECIMAL/NUMERIC), materialize the aggregate over "
-                        "a single table, or accept the code explicitly."
+                        "Use the default (exact full refresh), aggregate an exact type, or accept the code "
+                        "explicitly."
                     ),
                 )
             )
+        order = "sequential-scan (ctid) order" if self.dialect == Dialect.POSTGRES else "primary-key order"
         return lims + [
             TransparencyLimitation(
-                code="ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+                code=self.FLOAT_RELAXED_CODE,
                 severity=LimitationSeverity.BLOCKER,
                 dialect=self.dialect,
                 affected_object=self.logical_view_name,
                 description=(
-                    f"Aggregate(s) {listed} accumulate in floating point in the order the original "
-                    f"view's plan reads the rows (index and range scans, sort-based grouping, "
-                    f"parallel aggregation, join order), so no maintained value equals the original "
-                    f"view under every plan. With accept_limitations=['ORDER_SENSITIVE_AGGREGATE_"
-                    f"NOT_REPRODUCIBLE'] the view is maintained on a BEST-EFFORT basis: race-free "
-                    f"native recompute in {order}, equal to the original view only when it "
-                    f"evaluates in that order."
+                    f"Relaxed result allowed for {listed}: maintained incrementally on a BEST-EFFORT basis (race-free native "
+                    f"recompute in {order} where available); the floating-point result may differ from "
+                    f"the original view, with no fixed error bound (1e16 + 1.5 - 1e16: 2.0 vs 1.5), because the original view accumulates in its "
+                    f"plan's row order."
                 ),
-                mitigation=(
-                    "Aggregate an exact type (integer/DECIMAL/NUMERIC), or accept the code explicitly "
-                    "(accept_limitations / --accept-limitation)."
-                ),
+                mitigation="Remove FLOAT_REASSOCIATION_ALLOWED to get the exact default (full refresh).",
             )
         ]
+
+    def _float_strategy_diagnostics(self, strategy: MaintenanceStrategy, alg_mode: str) -> List[Any]:
+        """Diagnostics for floating-point order-sensitive aggregates (see
+        matview.diagnostics): which strategy is in effect, why, its cost and
+        how to change it."""
+        from .diagnostics import (
+            FLOAT_EXACT_REFRESH,
+            FLOAT_RELAXED_MAINTENANCE,
+            Diagnostic,
+            DiagnosticSeverity,
+            Strategy,
+            exact_fallback_message,
+            relaxed_message,
+        )
+
+        items = self._order_sensitive_float_items()
+        if not items:
+            return []
+        cols = tuple(c for c, _ in items if c)
+        exprs = tuple(dict.fromkeys(e for _, e in items))
+        reason = (
+            f"{', '.join(exprs)} accumulate(s) in floating point, and floating-point addition is not "
+            f"associative: adding and subtracting deltas (or recomputing in another row order) can "
+            f"differ from the original view (1e16 + 1.5 - 1e16 gives 2.0, the view returns 1.5). The refresh evaluates the "
+            f"original query itself, so it equals a later read of the view when that read uses the same plan; a "
+            f"different plan (another join order, parallel aggregation) can change the last bits of a floating-point sum."
+        )
+        if self.dialect == Dialect.POSTGRES:
+            cost = (
+                "on PostgreSQL, the cost of evaluating the view's query (O(source rows) for one "
+                "table; a join can process the product of its inputs) per writing statement "
+                "(statement-level triggers re-run the whole view query once per INSERT/UPDATE/DELETE "
+                "statement); the refresh locks the whole view, so all writers of the view serialize "
+                "(writers of different groups wait for each other) and under REPEATABLE READ a "
+                "concurrent second writer fails with a serialization error (40001)."
+            )
+        else:
+            cost = (
+                f"on {'MariaDB' if self.subdialect == EngineSubdialect.MARIADB else 'MySQL'}, the cost "
+                f"of evaluating the view's query per written ROW (row triggers re-run the whole view query "
+                f"for every inserted, updated or deleted row); the refresh locks every row of the view, "
+                f"so all writers of the view serialize and concurrent writers deadlock often (error "
+                f"1213, retryable; measured with 4 single-write writers: MySQL 8.4 285/600 "
+                f"transactions, MariaDB 138/600)."
+            )
+        plan_tables = (
+            self._plan_dependent_float_tables()
+            if self._float_relaxed_requested() and strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC
+            else 0
+        )
+        if plan_tables:
+            # Relaxed route that still re-runs the query: the exact default
+            # refuses it on MySQL/MariaDB (plan-dependent float order), so the
+            # opt-in result is relaxed, not exact, and must be announced so.
+            engine = "MariaDB" if self.subdialect == EngineSubdialect.MARIADB else "MySQL"
+            msg = relaxed_message(
+                Strategy.FULL_REFRESH,
+                f"{', '.join(exprs)} sum(s) floating-point values over {plan_tables} table instances read together; "
+                f"on {engine} the refresh runs inside the maintenance statement and a later read of the view can use "
+                f"another join order, so the floating-point result may differ from the live view in the last bits "
+                f"(no fixed error bound). Cost: {cost}",
+                "remove FLOAT_REASSOCIATION_ALLOWED to have the view refused under the exact default, or aggregate a "
+                "single table (materialize the join first) to get the exact full refresh.",
+            )
+            return [Diagnostic(
+                code=FLOAT_RELAXED_MAINTENANCE, severity=DiagnosticSeverity.WARNING,
+                view=self.logical_view_name, strategy=Strategy.FULL_REFRESH, columns=cols, expressions=exprs,
+                message=msg, details={"dialect": self.dialect.value, "cost": cost, "table_instances": plan_tables},
+            )]
+        if self._float_relaxed_requested() and strategy != MaintenanceStrategy.ATOMIC_QUERY_SYNC:
+            if strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and alg_mode in ("single", "union_all_agg"):
+                strat = Strategy.ALGEBRAIC_DELTA_NATIVE_RECOMPUTE
+            elif strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA:
+                strat = Strategy.GROUP_SCOPED_RECOMPUTE
+            else:
+                strat = Strategy.ALGEBRAIC_DELTA
+            msg = relaxed_message(
+                strat,
+                "the floating-point result may differ from the live view with no fixed error bound (it is "
+                "accumulated in another row order than the original view's plan).",
+                "remove FLOAT_REASSOCIATION_ALLOWED from accept_limitations / --accept-limitation.",
+            )
+            return [Diagnostic(
+                code=FLOAT_RELAXED_MAINTENANCE, severity=DiagnosticSeverity.WARNING,
+                view=self.logical_view_name, strategy=strat, columns=cols, expressions=exprs, message=msg,
+                details={"dialect": self.dialect.value},
+            )]
+        msg = exact_fallback_message(
+            Strategy.FULL_REFRESH,
+            reason,
+            cost,
+            "store the values as DECIMAL/NUMERIC or integers (exact, fast incremental maintenance), or "
+            "accept a relaxed result with accept_limitations=['FLOAT_REASSOCIATION_ALLOWED'] / "
+            "--accept-limitation FLOAT_REASSOCIATION_ALLOWED (fast incremental maintenance, may differ "
+            "from the live view, with no fixed error bound).",
+        )
+        return [Diagnostic(
+            code=FLOAT_EXACT_REFRESH, severity=DiagnosticSeverity.WARNING,
+            view=self.logical_view_name, strategy=Strategy.FULL_REFRESH, columns=cols, expressions=exprs,
+            message=msg, details={"dialect": self.dialect.value, "cost": cost},
+        )]
 
     def _mysql_group_index_limitations(
         self, strategy: MaintenanceStrategy, alg_mode: str
@@ -1575,7 +2448,32 @@ class PlannerMixin(MixinHost):
         return self._effective_group_by_exprs
 
     def _select_strategy_and_mode(self) -> Tuple[MaintenanceStrategy, str]:
+        self._refuse_conflicting_float_columns()
+        strategy, mode = self._select_strategy_and_mode_unchecked()
+        if (
+            strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC
+            and self._float_relaxed_requested()
+            and self._order_sensitive_float_items()
+        ):
+            # Relaxed mode that still ends in a full refresh stores the
+            # original query's result with the same derived column types:
+            # the same type-provability guard applies.
+            self._refuse_unprovable_float_refresh_types()
+        return strategy, mode
+
+    def _select_strategy_and_mode_unchecked(self) -> Tuple[MaintenanceStrategy, str]:
         if self._exact_full_refresh_fallback() is not None:
+            return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
+        if self._float_refresh_required():
+            # Exact default for floating-point order-sensitive aggregates:
+            # re-run the view's own query (full refresh). A scoped refresh is
+            # only equivalent when restricting the query to the affected
+            # groups provably cannot change the row order of the remaining
+            # rows; no shape is proven yet (a WHERE + index plan restricted
+            # to one group reorders rows: measured 1.5 vs 2.0), so every
+            # shape uses the full refresh.
+            self._refuse_plan_dependent_float_order()
+            self._refuse_unprovable_float_refresh_types()
             return MaintenanceStrategy.ATOMIC_QUERY_SYNC, "single"
         strategy, mode = self._natural_strategy_and_mode()
         if self._key_collation_fallback_reason(strategy, mode):
@@ -2787,9 +3685,13 @@ class PlannerMixin(MixinHost):
     def _fallback_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
         """Announced fallbacks of this plan (see matview.diagnostics)."""
         routed = self._exact_routing_diagnostics(strategy) + self._collation_fallback_diagnostics(strategy)
-        if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC and not routed:
+        if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC and not routed and not self._order_sensitive_float_items():
             # Every full refresh is announced; a routing or collation fallback
-            # already names its specific reason (and is not repeated here).
+            # already names its specific reason (and is not repeated here), and
+            # so does the floating-point strategy diagnostic
+            # (FLOAT_EXACT_REFRESH / FLOAT_RELAXED_MAINTENANCE, see
+            # _float_strategy_diagnostics) of a view with order-sensitive
+            # float aggregates.
             return (self._full_refresh_diagnostic(strategy),)
         having = self.view.having_clause
         if not having or strategy != MaintenanceStrategy.GROUP_SCOPED_DELTA or not _has_subquery_aggregate(having, self.dialect):
@@ -3122,7 +4024,11 @@ class PlannerMixin(MixinHost):
             self._enforce_mysql_minmax_typing()
         elif self.dialect == Dialect.SQLITE:
             self._enforce_nonstandard_statistics_refusal()
-        return self._finalize_plan_backfill(raw)
+        plan = self._finalize_plan_backfill(raw)
+        diags = list(getattr(getattr(self, "_context", None), "strategy_diagnostics", ()) or ())
+        if diags:
+            plan = replace(plan, strategy_diagnostics=[*plan.strategy_diagnostics, *diags])
+        return plan
 
     def compile(self) -> MaterializedViewPlan:
         first_plan = self._compile_single_plan()
@@ -3137,6 +4043,7 @@ class PlannerMixin(MixinHost):
                 dialect=self.dialect,
                 ignore_limitations=self.ignore_limitations,
                 accept_limitations=self.accepted_limitations,
+                silence_diagnostics=getattr(getattr(self, "_context", None), "silence_diagnostics", ()),
                 object_prefix=self.object_prefix,
                 incremental_backfill=self.incremental_backfill,
                 batch_size=self.batch_size,

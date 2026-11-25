@@ -2272,7 +2272,7 @@ class TestMultiEngineGeneratorUpgradeDrift(unittest.TestCase):
 
                 # 4. sync_views() leaves v_single unchanged and rebuilds remaining
                 #    drifted views cleanly; on PG also verify a view installed with
-                #    accept_limitations=['ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE']
+                #    accept_limitations=['FLOAT_REASSOCIATION_ALLOWED']
                 #    rebuilds via upgrade_mgr (accept_limitations=None) preserving consent.
                 sync_views_sqls = [sql_single, sql_join, sql_left]
                 expected_sync = {v_single: "unchanged", v_join: "updated", v_left: "updated"}
@@ -2282,7 +2282,7 @@ class TestMultiEngineGeneratorUpgradeDrift(unittest.TestCase):
                         tracked,
                         dialect=dialect,
                         object_prefix=object_prefix,
-                        accept_limitations=["ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"],
+                        accept_limitations=["FLOAT_REASSOCIATION_ALLOWED"],
                     )
                     with mock.patch.object(
                         manager_mod, "MATVIEW_GENERATOR_VERSION", "previous-generator"
@@ -2292,7 +2292,7 @@ class TestMultiEngineGeneratorUpgradeDrift(unittest.TestCase):
                             pg_opt_mgr.register_view(sql_lim)
                     self.assertTrue(
                         any(
-                            "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE" in str(w.message)
+                            "FLOAT_REASSOCIATION_ALLOWED" in str(w.message)
                             for w in caught_pg_lim
                         ),
                         "expected EngineLimitationWarning on PG float-SUM install",
@@ -2309,7 +2309,7 @@ class TestMultiEngineGeneratorUpgradeDrift(unittest.TestCase):
                 if dialect == Dialect.POSTGRES:
                     self.assertTrue(
                         any(
-                            "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE" in str(w.message)
+                            "FLOAT_REASSOCIATION_ALLOWED" in str(w.message)
                             for w in caught_sync
                         ),
                         "expected stored PG limitation warning during sync_views() rebuild",

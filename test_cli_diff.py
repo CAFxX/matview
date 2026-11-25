@@ -663,16 +663,21 @@ class TestCLICompileLimitationContract(unittest.TestCase):
                     self.assertIn(code, str(lims[0].message))
 
     def test_unsupported_statistics_are_rejected_even_with_override(self) -> None:
-        for dialect, view, extras in (
-            ("sqlite", "CREATE VIEW v AS SELECT grp, VARIANCE(val) AS v FROM t GROUP BY grp;", ([], ["--ignore-limitations"])),
-            ("postgres:15", "CREATE VIEW v AS SELECT grp, STD(val) AS s FROM t GROUP BY grp;", ([], ["--ignore-limitations"])),
+        stat_unsupported = r"VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP"
+        mariadb_refusal = r"on MariaDB, whose result the materialized view cannot reproduce exactly"
+        for dialect, view, extras, expected in (
+            ("sqlite", "CREATE VIEW v AS SELECT grp, VARIANCE(val) AS v FROM t GROUP BY grp;", ([], ["--ignore-limitations"]),
+             stat_unsupported),
+            ("postgres:15", "CREATE VIEW v AS SELECT grp, STD(val) AS s FROM t GROUP BY grp;", ([], ["--ignore-limitations"]),
+             stat_unsupported),
             # MariaDB statistics it cannot reproduce exactly: the override (needed
             # for every MySQL-family view) must not get past the refusal.
             ("mariadb:10.11", "CREATE VIEW v AS SELECT grp, VAR_SAMP(val) * 2 AS v2 FROM t GROUP BY grp;",
              (["--ignore-limitations"],
               # Past the order-sensitivity opt-in too: MariaDB's own refusal must hold.
-              ["--ignore-limitations", "--accept-limitation", "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
-               "--accept-limitation", "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX"])),
+              ["--ignore-limitations", "--accept-limitation", "FLOAT_REASSOCIATION_ALLOWED",
+               "--accept-limitation", "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX"]),
+             mariadb_refusal),
         ):
             for extra in extras:
                 with self.subTest(dialect=dialect, extra=extra):
@@ -681,9 +686,10 @@ class TestCLICompileLimitationContract(unittest.TestCase):
                     )
                     self.assertEqual(rc, 2)
                     self.assertEqual(out, "")
-                    self.assertRegex(
-                        err, r"VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP|cannot reproduce exactly|ORDER_SENSITIVE_AGGREGATE"
-                    )
+                    self.assertRegex(err, expected)
+                    # Never a limitation refusal standing in for the
+                    # statistics refusal.
+                    self.assertNotIn("ORDER_SENSITIVE_AGGREGATE", err)
 
 
 if __name__ == "__main__":

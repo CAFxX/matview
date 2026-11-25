@@ -661,7 +661,12 @@ class ViewDiff:
             "pending_changes": self.pending_changes,
             "pending_ddls": list(self.pending_ddls),
             "summary": self.summary,
+            "strategy_diagnostics": [d.to_dict() for d in self.strategy_diagnostics()],
         }
+
+    def strategy_diagnostics(self) -> List[Any]:
+        plan = getattr(self, "plan", None)
+        return list(getattr(plan, "strategy_diagnostics", None) or [])
 
     def __getitem__(self, key: str) -> Any:
         return self.to_dict()[key]
@@ -686,6 +691,8 @@ class ViewDiff:
 
     def render_text(self) -> str:
         lines: List[str] = [f"[{self.status}] {self.view_name}"]
+        for d in self.strategy_diagnostics():
+            lines.append(f"  Diagnostic [{d.code}]: {d.message}")
         if self.diagnostics:
             tier_str = f"Tier {self.diagnostics.tier}"
             mode_str = f" ({self.diagnostics.algebraic_mode})" if self.diagnostics.algebraic_mode else ""
@@ -770,6 +777,8 @@ class ViewDiffReport(dict):
     def to_dict(self) -> Dict[str, Any]:
         return {
             "views": {name: diff.to_dict() for name, diff in self.items()},
+            # Strategy diagnostics of every view (matview.diagnostics).
+            "diagnostics": [d.to_dict() for diff in self.values() for d in diff.strategy_diagnostics()],
             "summary": {
                 "total_views": len(self),
                 "has_changes": self.has_changes,
@@ -865,6 +874,9 @@ class CompilationContext:
     sqlite_strict_backing: bool = False
     # SQLite: WITHOUT ROWID for narrow NOT NULL-keyed tables (default); False keeps every rowid.
     sqlite_without_rowid: bool = True
+    # Strategy diagnostics of this view, and the codes not to emit as warnings.
+    strategy_diagnostics: Tuple[Any, ...] = ()
+    silence_diagnostics: Tuple[str, ...] = ()
 
     def with_ir(self, **ir_changes: Any) -> "CompilationContext":
         return replace(self, ir=self.ir.with_updates(**ir_changes))

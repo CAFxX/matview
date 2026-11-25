@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, 
 import warnings
 
 from matview_sync import (
+    UnsupportedMaterializedViewError,
     BackfillInterruptedError,
     UnsafeReplacementError,
     DEFAULT_OBJECT_PREFIX,
@@ -78,7 +79,7 @@ import matview_sync as _matview_sync_module
 # than float exactness. Views compiled with it have their order-sensitive
 # columns excluded from value comparison (see _ORDER_SENSITIVE_OPT_IN_VIEWS).
 FLOAT_OPT_IN = (
-    "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+    "FLOAT_REASSOCIATION_ALLOWED",
     "ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE",
     "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
 )
@@ -107,14 +108,14 @@ def pin_native_plan(cur: Any, dialect: Any) -> None:
 
 
 def _record_opt_in(plans: Any) -> Any:
-    """Note views whose plan carries ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE
+    """Note views whose plan carries FLOAT_REASSOCIATION_ALLOWED
     (they could only compile with the explicit acceptance)."""
     seq = plans if isinstance(plans, (list, tuple)) else [plans]
     for plan in seq:
         for sub in (getattr(plan, "sub_plans", None) or [plan]):
             # View names repeat across suites and engines: the latest
             # compilation of a name decides.
-            if any(l.code == "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE" for l in sub.limitations):
+            if any(l.code == "FLOAT_REASSOCIATION_ALLOWED" for l in sub.limitations):
                 _ORDER_SENSITIVE_OPT_IN_VIEWS.add(sub.view_name.lower())
             else:
                 _ORDER_SENSITIVE_OPT_IN_VIEWS.discard(sub.view_name.lower())
@@ -222,7 +223,7 @@ class NumericTolerance:
 @dataclass(frozen=True)
 class ValueNotCompared(NumericTolerance):
     """Column policy for best-effort columns of views installed under an
-    explicit per-code opt-in (ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE):
+    explicit per-code opt-in (FLOAT_REASSOCIATION_ALLOWED):
     the library does not claim their float values equal the original view,
     so when both values are floats only NULL-ness and the float type are
     compared -- never the value under some error budget. Non-float values in
@@ -345,7 +346,7 @@ def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
 # columns have no budget on any engine (SQLite folds only provably exact
 # integer sums and recomputes everything else natively). On PostgreSQL/MySQL/
 # MariaDB floating-point SUM/AVG/VAR/STDDEV are refused by default
-# (ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE: the original view's value
+# (FLOAT_REASSOCIATION_ALLOWED: the original view's value
 # depends on its plan); views the battery installs under the explicit per-code
 # opt-in have exactly those columns excluded from value comparison
 # (ValueNotCompared: NULL-ness and type only), never compared under a budget.
@@ -357,7 +358,7 @@ def _values_equal(a: Any, b: Any, tol: float | NumericTolerance) -> bool:
 # engine's own aggregate on both sides and are compared exactly.
 _SQLITE_STATISTICAL_TOLERANCE = NumericTolerance(absolute=1e-12, relative=1e-13, max_ulps=64)
 # Views installed only under the per-code opt-in for
-# ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE: their order-sensitive aggregate
+# FLOAT_REASSOCIATION_ALLOWED: their order-sensitive aggregate
 # columns are excluded from value comparison by name (VALUE_NOT_COMPARED).
 _ORDER_SENSITIVE_OPT_IN_VIEWS: Set[str] = set()
 _ORDER_SENSITIVE_FUNCTIONS = frozenset({
@@ -3256,10 +3257,27 @@ def _compile_plan_for_test(
                 )
         with warnings.catch_warnings(record=True) as emitted:
             warnings.simplefilter("always", EngineLimitationWarning)
-            plan = generate_materialized_view(
-                schema_source, view_ddl, ignore_limitations=True,
-                accept_limitations=per_code, **options
-            )
+            try:
+                plan = generate_materialized_view(
+                    schema_source, view_ddl, ignore_limitations=True,
+                    accept_limitations=per_code, **options
+                )
+            except UnsupportedMaterializedViewError as refusal:
+                # Documented, non-bypassable MariaDB statistics refusal of the
+                # exact full refresh (fixed-decimal VAR/STDDEV results cannot
+                # be reproduced from a stored double): the relaxed incremental
+                # mode is the maintenance this view is offered, as before the
+                # refresh default. Anything else propagates.
+                if "on MariaDB" not in str(refusal) and "table instances" not in str(refusal):
+                    raise
+                del emitted[:]
+                plan = generate_materialized_view(
+                    schema_source, view_ddl, ignore_limitations=True,
+                    accept_limitations=sorted(set(per_code) | set(FLOAT_OPT_IN)), **options
+                )
+                expected_codes = set(expected_codes) | (
+                    {lim.code for lim in plan.limitations} & set(FLOAT_OPT_IN)
+                )
         limitation_warnings = [
             warning for warning in emitted
             if issubclass(warning.category, EngineLimitationWarning)
@@ -3284,11 +3302,28 @@ def _compile_plan_for_test(
                 "Override warning omitted limitation codes: "
                 + ", ".join(sorted(missing_warning_codes))
             )
-        if "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE" in expected_codes:
+        if "FLOAT_REASSOCIATION_ALLOWED" in expected_codes:
             if "BEST-EFFORT" not in warning_text:
                 raise AssertionError("Opt-in warning does not state the best-effort contract")
             _ORDER_SENSITIVE_OPT_IN_VIEWS.add(plan.view_name.lower())
         return plan, True, tuple(sorted(expected_codes))
+    except UnsupportedMaterializedViewError as refusal:
+        # MySQL/MariaDB refuse a floating-point sum over a multi-table query under
+        # the exact default (a later read can use another join order); the relaxed
+        # per-code opt-in is the maintenance such a view is offered.
+        if "table instances" not in str(refusal):
+            raise
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter("always", EngineLimitationWarning)
+            plan = generate_materialized_view(
+                schema_source, view_ddl, ignore_limitations=True,
+                accept_limitations=sorted(FLOAT_OPT_IN), **options
+            )
+        relaxed_codes = {lim.code for lim in plan.limitations} & set(FLOAT_OPT_IN)
+        if "FLOAT_REASSOCIATION_ALLOWED" not in relaxed_codes:
+            raise AssertionError(f"relaxed plan lacks FLOAT_REASSOCIATION_ALLOWED: {sorted(relaxed_codes)}") from refusal
+        _ORDER_SENSITIVE_OPT_IN_VIEWS.add(plan.view_name.lower())
+        return plan, True, tuple(sorted(relaxed_codes))
 
 
 # Views installed together on one live MySQL/MariaDB database (run_batch and
@@ -6080,15 +6115,15 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "--engine-version", "postgres:17.2",
             "--ignore-limitations",
         ])
-        # SUM over DOUBLE PRECISION: --ignore-limitations alone does not
-        # accept ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE.
-        self.assertNotEqual(rc_ev, 0)
+        # SUM over DOUBLE PRECISION: exact by default (full refresh);
+        # --accept-limitation FLOAT_REASSOCIATION_ALLOWED selects the relaxed mode.
+        self.assertEqual(rc_ev, 0)
         rc_ev = cli_main([
             "--schema", schema,
             "--view", view_sql,
             "--engine-version", "postgres:17.2",
             "--ignore-limitations",
-            "--accept-limitation", "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+            "--accept-limitation", "FLOAT_REASSOCIATION_ALLOWED",
         ])
         self.assertEqual(rc_ev, 0)
         rc_maria = cli_main([
@@ -6096,7 +6131,7 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
             "--view", view_sql,
             "--dialect", "mariadb:11.4",
             "--ignore-limitations",
-            "--accept-limitation", "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE",
+            "--accept-limitation", "FLOAT_REASSOCIATION_ALLOWED",
             "--accept-limitation", "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX",
         ])
         self.assertEqual(rc_maria, 0)
@@ -7174,15 +7209,19 @@ class TestGeneratorAndManagerCodePaths(unittest.TestCase):
         JOIN measurements AS m ON m.category_id = c.id
         GROUP BY c.label;
         """
-        # Approximate join aggregates are rejected by default (accumulation
-        # order of a join is plan-dependent); the opt-in still recomputes them.
-        with self.assertRaisesRegex(EngineLimitationError, "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"):
-            generate_materialized_view(join_schema, join_view, dialect="postgres")
-        # The global override does not accept per-code limitations; join
-        # aggregates are additionally not recomputed race-free.
+        # Approximate join aggregates are exact by default (full refresh of
+        # the original query); the relaxed mode needs both per-code
+        # acceptances (join aggregates are not recomputed race-free).
+        self.assertEqual(
+            generate_materialized_view(join_schema, join_view, dialect="postgres").strategy,
+            MaintenanceStrategy.ATOMIC_QUERY_SYNC,
+        )
         with self.assertRaisesRegex(EngineLimitationError, "ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE"):
-            generate_materialized_view(join_schema, join_view, dialect="postgres", ignore_limitations=True)
-        with self.assertWarnsRegex(EngineLimitationWarning, "ORDER_SENSITIVE_AGGREGATE_NOT_REPRODUCIBLE"):
+            generate_materialized_view(
+                join_schema, join_view, dialect="postgres", ignore_limitations=True,
+                accept_limitations=["FLOAT_REASSOCIATION_ALLOWED"],
+            )
+        with self.assertWarnsRegex(EngineLimitationWarning, "FLOAT_REASSOCIATION_ALLOWED"):
             joined = generate_materialized_view(
                 join_schema, join_view, dialect="postgres", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
             )

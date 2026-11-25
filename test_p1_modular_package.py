@@ -279,14 +279,18 @@ for name in matview.__all__:
 
                 self.assertEqual(exit_code, 0, stderr.getvalue())
                 # The CLI announces each NOTE-severity recommendation of the plan on
-                # stderr as "NOTE <diagnostic>", in plan order, and nothing else.
+                # stderr as "NOTE [code] view <view>: <message>" (README), in plan
+                # order, and nothing else.
                 # Derive the expectation from the API plan's own diagnostics so new
                 # recommendations do not need a hard-coded list here.
                 api_notes = [
                     d for d in api_plan.strategy_diagnostics if d.severity == DiagnosticSeverity.NOTE
                 ]
                 saw_notes = saw_notes or bool(api_notes)
-                self.assertEqual(stderr.getvalue(), "".join(f"NOTE {d}\n" for d in api_notes))
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "".join(f"NOTE [{d.code}] view {d.view}: {d.message}\n" for d in api_notes),
+                )
                 self.assertEqual(
                     [(w.category, str(w.message)) for w in cli_warnings],
                     [(w.category, str(w.message)) for w in api_warnings],

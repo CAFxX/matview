@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from matview import MaterializedViewManager, key_collation
+from matview.diagnostics import MatviewDiagnosticWarning
 from matview_sync import Dialect, MaintenanceStrategy
 
 # (declared column collation, spellings of one logical key, a different key)
@@ -982,7 +983,10 @@ class TestMysqlGroupKeyCollation(unittest.TestCase):
                 warnings.simplefilter("always")
                 for name in shapes:
                     mgr.register_view(f"CREATE VIEW gk_v_{name} AS {_NATIVE_SHAPES[name][0]};")
-            diag = {str(w.message).split("view ")[1].split(":")[0] for w in caught if "COLLATION_KEY_FALLBACK" in str(w.message)}
+            diag = {
+                w.message.diagnostic.view for w in caught
+                if isinstance(w.message, MatviewDiagnosticWarning) and w.message.diagnostic.code == "COLLATION_KEY_FALLBACK"
+            }
             tag = coll or "server default"
             if fallbacks is None:  # server default collation: the rule is proven by the premise test
                 cur.execute("SELECT @@collation_database")
