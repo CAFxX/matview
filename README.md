@@ -1538,7 +1538,8 @@ green run is not proof of a green GitHub run; `--help` and the stamp's
   Opening issues requires GitHub Issues to be enabled for the repository; while
   they are disabled, the reporting job fails instead, with the full report in
   its job summary, so a failure is never silent.
-- Every CI job has a `timeout-minutes` limit (25 minutes for PR-gate jobs).
+- Every CI job has a `timeout-minutes` limit (25 minutes for PR-gate jobs; the
+  MariaDB/`mysql-compat` jobs temporarily have 40).
 
 ### Executable documentation
 
