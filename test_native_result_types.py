@@ -2546,14 +2546,16 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         (UNCLASSIFIED_FUNCTION_FULL_REFRESH). Every backing column must then have the type the
         server reports for the live view: a CTE set-operation column the server widens
         (SMALLINT/BIGINT -> BIGINT) and SUM over it (NUMERIC) were typed statically from the
-        first arm (registration failed with "smallint out of range", SUM read back as int)."""
+        first arm (registration failed with "smallint out of range", SUM read back as int).
+        The server type keeps a non-default collation and unwraps a domain (a NOT NULL
+        domain column through an outer join holds NULLs)."""
         import os
 
         dsn = os.environ.get("POSTGRES_DSN")
         if not dsn:
             self.skipTest("POSTGRES_DSN not set")
         tag = f"shmx_{uuid.uuid4().hex[:8]}"
-        ta, tb = f"a_{tag}", f"b_{tag}"
+        ta, tb, tc, dom = f"a_{tag}", f"b_{tag}", f"c_{tag}", f"pos_{tag}"
         conn = _connect(Dialect.POSTGRES, dsn)
         cur = conn.cursor()
         created_citext = False
@@ -2572,12 +2574,17 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             cur.execute(f"CREATE TABLE {tb} (id INT PRIMARY KEY, k BIGINT NOT NULL, y BIGINT)")
             cur.execute(f"INSERT INTO {ta} VALUES (1, 1, 10), (2, 2, 20)")
             cur.execute(f"INSERT INTO {tb} VALUES (1, 5000000000, 10000000000), (2, 2, 30000000000)")
+            cur.execute(f"CREATE DOMAIN {dom} AS INT NOT NULL CHECK (VALUE > 0)")
+            cur.execute(f'CREATE TABLE {tc} (id INT PRIMARY KEY, n TEXT COLLATE "C", dv {dom})')
+            cur.execute(f"INSERT INTO {tc} VALUES (1, 'b', 7), (3, 'B', 9)")
             conn.commit()
             mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
             specs = [
                 f"WITH u AS (SELECT k, x FROM {ta} UNION ALL SELECT k, y FROM {tb}) "
                 f"SELECT k, MIN(x) AS mnx, MAX(x) AS mxx, SUM(x) AS sx FROM u GROUP BY k",
                 f"SELECT MAX(v) AS m, SUM(v) AS s FROM (SELECT x AS v FROM {ta} UNION ALL SELECT y FROM {tb}) q",
+                f"SELECT n, MIN(id) AS m FROM {tc} GROUP BY n",
+                f"SELECT a.id, c.dv, MAX(a.x) AS m FROM {ta} a LEFT JOIN {tc} c ON c.id = a.id GROUP BY a.id, c.dv",
             ]
             pairs = []
             for idx, sel in enumerate(specs):
@@ -2593,6 +2600,21 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 cur.execute(f"CREATE VIEW {lv} AS {sel}")
                 conn.commit()
                 pairs.append((sel, mv, lv))
+
+            def collations(name: str) -> List[Tuple[str, str]]:
+                cur.execute(
+                    "SELECT a.attname, COALESCE(co.collname, '-') FROM pg_catalog.pg_attribute a "
+                    "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+                    "LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation "
+                    "WHERE c.relname = %s AND pg_catalog.pg_table_is_visible(c.oid) AND a.attnum > 0 "
+                    "AND NOT a.attisdropped ORDER BY a.attnum",
+                    (name,),
+                )
+                return [(str(r[0]), str(r[1])) for r in cur.fetchall()]
+
+            for sel, mv, lv in pairs:
+                self.assertEqual(collations(mv), collations(lv), f"collations: {sel}")
+            conn.commit()
 
             def check(step: str) -> None:
                 for sel, mv, lv in pairs:
@@ -2610,6 +2632,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             cur.execute(f"INSERT INTO {tb} VALUES (3, 9000000000, 40000000000)")
             cur.execute(f"UPDATE {tb} SET y = 50000000000 WHERE id = 1")
             cur.execute(f"DELETE FROM {ta} WHERE id = 1")
+            cur.execute(f"INSERT INTO {tc} VALUES (2, 'a', 3)")
             conn.commit()
             check("after_dml")
         finally:
@@ -2619,10 +2642,11 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                     MaterializedViewManager(conn, dialect=Dialect.POSTGRES).drop_view(mv)
                 except Exception:
                     conn.rollback()
-            for idx in range(2):
+            for idx in range(4):
                 cur.execute(f"DROP VIEW IF EXISTS lv{idx}_{tag} CASCADE")
-            for tbl in (ta, tb):
+            for tbl in (ta, tb, tc):
                 cur.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+            cur.execute(f"DROP DOMAIN IF EXISTS {dom}")
             if created_citext:
                 cur.execute("DROP EXTENSION IF EXISTS citext")
             conn.commit()
