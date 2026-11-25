@@ -1256,6 +1256,225 @@ class TestEmulatedBackendSkip(unittest.TestCase):
         with patch.dict(os.environ, {"MATVIEW_EMULATED_BACKENDS": "sometimes"}, clear=False):
             with self.assertRaises(ValueError):
                 MVTestRunner()
+_SUITE_KEYS = [str(i) for i in range(1, 14)] + ["unit"]
+
+
+def matview_sync_partition_errors(workflow: Dict[str, Any]) -> List[str]:
+    """Every gate job that runs test_matview_sync.py must run every suite exactly once.
+
+    A job either runs it unsharded (no ``--suites``) or as ``--suites`` shards that
+    partition suites 1-13 + unit; Suite 12 may be split further by ``--seed-shard i/n``
+    shards that together cover i = 0..n-1 exactly once. ``--fuzz`` runs (the
+    extended/deferred campaigns) are not shards and are ignored here.
+    """
+    from test_matview_sync import parse_suite_selection
+
+    errors: List[str] = []
+    for jid, job in (workflow.get("jobs") or {}).items():
+        calls: List[str] = []
+        for step in job.get("steps") or []:
+            calls += re.findall(r"test_matview_sync\.py((?: --[\w-]+(?: [^\s\"\\]+)?)*)", str(step.get("run") or ""))
+        calls = [c for c in calls if "--fuzz" not in c]
+        if not calls:
+            continue
+        counts = {k: 0 for k in _SUITE_KEYS}
+        seed_shards: Dict[int, List[int]] = {}
+        for call in calls:
+            m = re.search(r"--suites (\S+)", call)
+            keys = parse_suite_selection(m.group(1)) if m else list(_SUITE_KEYS)
+            sm = re.search(r"--seed-shard (\d+)/(\d+)", call)
+            if sm:
+                if keys != ["12"]:
+                    errors.append(f"{jid}: --seed-shard must select only Suite 12: {call!r}")
+                seed_shards.setdefault(int(sm.group(2)), []).append(int(sm.group(1)))
+                continue
+            for k in keys:
+                counts[k] += 1
+        for n, idx in seed_shards.items():
+            if sorted(idx) != list(range(n)):
+                errors.append(f"{jid}: Suite 12 seed shards of /{n} are {sorted(idx)}, not 0..{n - 1}")
+            counts["12"] += 1
+        if len(seed_shards) > 1:
+            errors.append(f"{jid}: Suite 12 split with several shard counts {sorted(seed_shards)}")
+        for k, c in counts.items():
+            if c != 1:
+                errors.append(f"{jid}: suite {k} runs {c} times (must be exactly once)")
+    return errors
+
+
+class TestMatviewSyncSharding(unittest.TestCase):
+    """CI shards test_matview_sync.py across parallel processes: no suite lost or doubled."""
+
+    def test_ci_shards_partition_every_suite(self) -> None:
+        self.assertEqual(matview_sync_partition_errors(_all_workflows()["ci.yml"]), [])
+
+    def test_partition_check_detects_missing_doubled_and_bad_seed_shards(self) -> None:
+        def wf(*runs: str) -> Dict[str, Any]:
+            return {"jobs": {"j": {"steps": [{"run": r} for r in runs]}}}
+
+        ok = wf('x --task "python3 test_matview_sync.py --suites 1-11,13,unit" --task '
+                '"python3 test_matview_sync.py --suites 12 --seed-shard 0/2" '
+                '--task "python3 test_matview_sync.py --suites 12 --seed-shard 1/2"')
+        self.assertEqual(matview_sync_partition_errors(ok), [])
+        self.assertEqual(matview_sync_partition_errors(wf("python3 test_matview_sync.py")), [])
+        self.assertTrue(any("suite 5 runs 0" in e for e in matview_sync_partition_errors(
+            wf("python3 test_matview_sync.py --suites 1-4,6-13,unit"))))
+        self.assertTrue(any("suite 3 runs 2" in e for e in matview_sync_partition_errors(
+            wf("python3 test_matview_sync.py --suites 1-13,unit", "python3 test_matview_sync.py --suites 3"))))
+        self.assertTrue(any("not 0..1" in e for e in matview_sync_partition_errors(
+            wf("python3 test_matview_sync.py --suites 1-11,13,unit",
+               "python3 test_matview_sync.py --suites 12 --seed-shard 0/2"))))
+
+    def test_seed_shards_partition_the_seed_list(self) -> None:
+        from test_matview_sync import select_seed_shard
+
+        seeds = [20261106, 1337, 424242, 992138513, 7]
+        self.assertEqual(select_seed_shard(seeds, ""), seeds)
+        for n in range(1, 7):
+            parts = [select_seed_shard(seeds, f"{i}/{n}") for i in range(n)]
+            self.assertEqual(sorted(x for part in parts for x in part), sorted(seeds))
+        for bad in ("2/2", "1", "a/b", "-1/2"):
+            with self.assertRaises(ValueError):
+                select_seed_shard(seeds, bad)
+
+    def test_suite_selection_rejects_typos(self) -> None:
+        from test_matview_sync import parse_suite_selection
+
+        self.assertEqual(parse_suite_selection("unit,13,2-3"), ["2", "3", "13", "unit"])
+        for bad in ("", "0", "14", "3-1", "units", "1,,2"):
+            with self.assertRaises(ValueError):
+                parse_suite_selection(bad)
+
+
+class TestCiParallelRunner(unittest.TestCase):
+    """scripts/ci_parallel.py: failures propagate, tasks are never retried, setup retries are bounded."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        import ci_parallel
+
+        cls.cp = ci_parallel
+
+    def _main(self, *args: str) -> Tuple[int, str]:
+        buf = io.StringIO()
+        env = {k: v for k, v in os.environ.items() if k not in ("POSTGRES_DSN", "MYSQL_DSN", "GITHUB_ACTIONS")}
+        with patch.dict(os.environ, env, clear=True), patch("sys.stdout", buf):
+            rc = self.cp.main(list(args))
+        return rc, buf.getvalue()
+
+    def test_all_tasks_run_and_a_failure_fails_the_run_without_retry(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "count"
+            py = sys.executable
+            rc, out = self._main(
+                "--jobs", "2",
+                "--task", f"{py} -c \"print('alpha-out')\"",
+                "--task", f"{py} -c \"open('{counter}', 'a').write('x'); raise SystemExit(3)\"",
+                "--serial", f"{py} -c \"import os; print('tmp-is-private', os.environ['TMPDIR'] != '{tmp}')\"",
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(counter.read_text(), "x", "a failing task must run exactly once (never retried)")
+        self.assertIn("alpha-out", out)
+        self.assertIn("tmp-is-private True", out)
+        self.assertIn("FAILED (exit 3)", out)
+        rc, _ = self._main("--jobs", "3", "--task", f"{sys.executable} -c pass")
+        self.assertEqual(rc, 0)
+
+    def test_each_task_gets_its_own_fuzz_manifest(self) -> None:
+        py = sys.executable
+        rc, out = self._main("--jobs", "2",
+                             "--task", f"{py} -c \"import os; print('M=' + os.environ['MATVIEW_FUZZ_MANIFEST'])\"",
+                             "--task", f"{py} -c \"import os; print('M=' + os.environ['MATVIEW_FUZZ_MANIFEST'])\"")
+        self.assertEqual(rc, 0)
+        manifests = re.findall(r"M=(fuzz-campaign\S+\.json)", out)
+        self.assertEqual(len(set(manifests)), 2, manifests)
+
+    def test_setup_retries_only_transient_errors_and_are_bounded(self) -> None:
+        calls: List[int] = []
+
+        def deadlock() -> None:
+            calls.append(1)
+            raise RuntimeError("(1213, 'Deadlock found when trying to get lock')")
+
+        with patch.object(self.cp.time, "sleep"), patch("sys.stdout", io.StringIO()) as out:
+            with self.assertRaises(RuntimeError):
+                self.cp.with_setup_retries("CREATE DATABASE x", deadlock)
+        self.assertEqual(len(calls), self.cp.SETUP_ATTEMPTS)
+        self.assertEqual(out.getvalue().count("RETRY CREATE DATABASE x"), self.cp.SETUP_ATTEMPTS - 1)
+
+        calls.clear()
+
+        def syntax_error() -> None:
+            calls.append(1)
+            raise RuntimeError("(1064, 'You have an error in your SQL syntax')")
+
+        with self.assertRaises(RuntimeError):
+            self.cp.with_setup_retries("CREATE DATABASE x", syntax_error)
+        self.assertEqual(len(calls), 1, "a non-transient error must not be retried")
+
+    def test_one_at_a_time_tasks_never_overlap_while_others_fill_slots(self) -> None:
+        import threading
+        import time
+
+        tasks = [self.cp.Task(i, ("heavy" if i < 3 else "light") + str(i), False) for i in range(9)]
+        active: List[str] = []
+        peak = {"heavy": 0, "all": 0}
+        guard = threading.Lock()
+
+        def run(task: Any) -> None:
+            with guard:
+                active.append(task.command)
+                peak["heavy"] = max(peak["heavy"], sum(a.startswith("heavy") for a in active))
+                peak["all"] = max(peak["all"], len(active))
+            time.sleep(0.02)
+            with guard:
+                active.remove(task.command)
+            task.rc = 0
+
+        self.cp.run_parallel_phase(tasks, 3, lambda t: t.command.startswith("heavy"), run)
+        self.assertEqual(peak["heavy"], 1)
+        self.assertEqual(peak["all"], 3)
+        self.assertTrue(all(t.rc == 0 for t in tasks), "every task must run")
+
+    def test_a_hung_task_is_killed_and_its_partial_output_kept(self) -> None:
+        py = sys.executable
+        rc, out = self._main("--jobs", "1", "--task-timeout", "1",
+                             "--task", f"{py} -c \"import time; print('partial-out', flush=True); time.sleep(30)\"")
+        self.assertEqual(rc, 1)
+        self.assertIn("partial-out", out)
+        self.assertIn("TIMEOUT: killed after 1s", out)
+
+    def test_every_workflow_invocation_parses(self) -> None:
+        """Each `scripts/ci_parallel.py` step, read as bash reads it, is a valid runner command line."""
+        import shlex
+
+        seen = 0
+        for fname, wf in _all_workflows().items():
+            for jid, job in (wf.get("jobs") or {}).items():
+                for step in job.get("steps") or []:
+                    run = str(step.get("run") or "")
+                    if "ci_parallel.py" not in run:
+                        continue
+                    seen += 1
+                    words = shlex.split(run.replace("\\\n", " "), comments=True)
+                    args = words[words.index("scripts/ci_parallel.py") + 1:]
+                    with patch("sys.stderr", io.StringIO()) as err:
+                        try:
+                            parsed = self.cp.build_parser().parse_args(args)
+                        except SystemExit:
+                            self.fail(f"{fname} {jid}: ci_parallel arguments do not parse: {err.getvalue()}")
+                    for cmd in parsed.task + parsed.serial:
+                        self.assertRegex(cmd, r"^(python3|pytest) ", f"{fname} {jid}: odd task {cmd!r}")
+        self.assertGreater(seen, 0)
+
+    def test_task_dsn_names_the_task_database_only(self) -> None:
+        self.assertEqual(self.cp._replace_db("postgresql://u:p@127.0.0.1:5432/matview_test", "mvw_task03"),
+                         "postgresql://u:p@127.0.0.1:5432/mvw_task03")
+        self.assertEqual(self.cp._replace_db("mysql://root:pw@127.0.0.1:3306/matview_test", "mvw_task00"),
+                         "mysql://root:pw@127.0.0.1:3306/mvw_task00")
 
 
 if __name__ == "__main__":

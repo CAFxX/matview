@@ -100,6 +100,21 @@ name: CI — Multi-Engine Materialized View Tests
 # The PR gate therefore no longer runs them on Python 3.12, which is not a
 # declared stdlib-SQLite gate dimension; ci-deferred.yml's live jobs (3.12,
 # no skip) still run them nightly.
+#
+# In-job parallelism (owner budget: every job within 15 minutes): the sqlite
+# and postgres jobs run test_matview_sync.py as shards (--suites, Suite 12
+# split by --seed-shard; test_p2_ci_matrix_verification.py checks that the
+# shards run every suite exactly once), the postgres job together with its
+# test modules, through scripts/ci_parallel.py. Each task gets its own database
+# on the job's server (created and dropped by the runner; the step DSN names
+# only the server), its own TMPDIR and its own fuzz manifest. Modules that use
+# threads, lock waits, server-wide caches or timing assertions run --serial,
+# alone, after the parallel phase. The runner never retries a task; it retries
+# only its own database create/drop on transient errors. The mysql and
+# mysql-compat jobs stay serial until their server memory is bounded: one
+# full-suite fuzz batch spikes MySQL/MariaDB memory by ~4 GB and the server's
+# RSS ratchets up across batches (measured: MariaDB 11.8 is OOM-killed at a
+# 7 GiB cap even with one full-suite shard at a time).
 
 # A new push to a pull request supersedes (cancels) that PR's older run; the
 # group is keyed on the PR number. Every other event (push to master,
@@ -251,10 +266,16 @@ jobs:
       - name: Verify SQLite runtime feature boundaries
         run: python3 test_sqlite_runtime_boundaries.py
 
-      - name: Run full test suite (SQLite + cross-dialect transpiled suites)
+      - name: Run full test suite (SQLite + cross-dialect transpiled suites) in parallel shards
         env:
           MATVIEW_FUZZ_TARGET: "SQLite / Python ${{ matrix.python-version }}"
-        run: python3 test_matview_sync.py
+        run: |
+          python3 scripts/ci_parallel.py --jobs 4 \
+            --task "python3 test_matview_sync.py --suites 12 --seed-shard 0/2" \
+            --task "python3 test_matview_sync.py --suites 12 --seed-shard 1/2" \
+            --task "python3 test_matview_sync.py --suites 1" \
+            --task "python3 test_matview_sync.py --suites 2-8" \
+            --task "python3 test_matview_sync.py --suites 9-11,13,unit"
       - name: Verify curated mutation sensitivity
         run: python3 mutation_testing.py
       - name: Archive fuzz campaign manifest
@@ -262,7 +283,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: fuzz-campaign.json
+          path: fuzz-campaign*.json
           if-no-files-found: ignore
           retention-days: 30
 
@@ -542,120 +563,48 @@ jobs:
           EXPECTED_PG_MAJOR: ${{ matrix.pg-version }}
         run: python3 verify_engine_matrix.py
 
-      - name: Run full test suite + live PostgreSQL ${{ matrix.pg-version }} integration tests
+      - name: Run the full test suite + live PostgreSQL ${{ matrix.pg-version }} modules in parallel (one database per task)
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
           MATVIEW_FUZZ_TARGET: "PostgreSQL ${{ matrix.pg-version }}"
           MATVIEW_EMULATED_BACKENDS: skip
-        run: python3 test_matview_sync.py
-      - name: Archive fuzz campaign manifest
+        run: |
+          python3 scripts/ci_parallel.py --jobs 3 \
+            --task "python3 test_matview_sync.py --suites 12 --seed-shard 0/2" \
+            --task "python3 test_matview_sync.py --suites 12 --seed-shard 1/2" \
+            --task "python3 test_matview_sync.py --suites 1" \
+            --task "python3 test_matview_sync.py --suites 2-8" \
+            --task "python3 test_matview_sync.py --suites 9-11,13,unit" \
+            --task "python3 test_native_statistical_aggregates.py" \
+            --task "python3 test_p1_manager_safety.py" \
+            --task "python3 test_p1_sqlalchemy_integration.py" \
+            --task "python3 test_native_result_types.py" \
+            --task "pytest -v -rxXs test_native_dml_interactions.py" \
+            --task "python3 test_query_ast_materialization.py" \
+            --task "python3 test_native_function_classification.py" \
+            --task "python3 test_p1_pg_transition_vectorization.py" \
+            --task "python3 test_p2_index_intelligence.py" \
+            --task "python3 test_p2_window_partition_scoping.py" \
+            --serial "python3 test_concurrent_backfill.py" \
+            --serial "python3 test_minmax_group_arg_index.py" \
+            --serial "python3 test_unrecognized_aggregates.py" \
+            --serial "python3 test_avg_concurrent_maintenance.py" \
+            --serial "pytest -v -rxXs test_native_bulk_statements.py" \
+            --serial "pytest -v -rxXs -s test_pg_statement_maintenance.py" \
+            --serial "python3 test_registration_replacement.py" \
+            --serial "python3 test_registration_lifecycle.py" \
+            --serial "python3 test_bulk_changes_safety.py" \
+            --serial "python3 test_p1_engine_codegen.py"
+
+      - name: Archive fuzz campaign manifests
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: fuzz-campaign.json
+          path: fuzz-campaign*.json
           if-no-files-found: ignore
           retention-days: 30
 
-      - name: Test independent-session PostgreSQL backfill concurrency
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_concurrent_backfill.py
-
-      - name: Test native expression and aggregate result types (PostgreSQL)
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_native_result_types.py
-
-      - name: Test native VAR/STDDEV semantics and result types (PostgreSQL)
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_native_statistical_aggregates.py
-
-      - name: Test PostgreSQL MIN/MAX extreme deletes with the (group, arg) index
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_minmax_group_arg_index.py
-
-      - name: Test exact PostgreSQL routing of aggregates without an algebraic rule
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_unrecognized_aggregates.py
-
-      - name: Test PostgreSQL catalog classification of user-defined functions
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_native_function_classification.py
-
-      - name: Test concurrent AVG maintenance on PostgreSQL
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_avg_concurrent_maintenance.py
-
-      - name: Differentially test native bulk statements on PostgreSQL
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: pytest -v -rxXs test_native_bulk_statements.py
-
-      - name: Differentially test the DML and trigger interaction matrix on PostgreSQL
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: pytest -v -rxXs test_native_dml_interactions.py
-
-      - name: Test PostgreSQL statement-level maintenance contract
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: pytest -v -rxXs -s test_pg_statement_maintenance.py
-
-      - name: Test atomic MV replacement (PostgreSQL)
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_registration_replacement.py
-
-      - name: Test lifecycle transaction ownership (PostgreSQL)
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_registration_lifecycle.py
-
-      - name: Test fail-closed bulk_changes transaction ownership (PostgreSQL)
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_bulk_changes_safety.py
-
-      - name: Differentially test generated SELECT materialized views on PostgreSQL
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_query_ast_materialization.py
-
-      - name: Test manager cursor leak and rollback safety on PostgreSQL
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_p1_manager_safety.py
-
-      - name: Test native PostgreSQL codegen execution
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_p1_engine_codegen.py
-
-      - name: Test PostgreSQL statement transition-table vectorization
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_p1_pg_transition_vectorization.py
-
-      - name: Test SQLAlchemy connectivity & introspection on PostgreSQL
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_p1_sqlalchemy_integration.py
-
-      - name: Test P2 index introspection on PostgreSQL
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_p2_index_intelligence.py
-
-      - name: Test P2 partition-scoped Tier 2 window maintenance on PostgreSQL
-        env:
-          POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
-        run: python3 test_p2_window_partition_scoping.py
   # Both supported Oracle MySQL LTS series are required on every PR.
   mysql:
     needs: classify
