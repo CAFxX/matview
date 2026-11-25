@@ -2208,11 +2208,20 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             "SELECT ARRAY[s] AS v FROM a INTERSECT ALL SELECT string_to_array(e, 'b') FROM a",
             "SELECT arrt AS v FROM a UNION ALL SELECT ARRAY[ci] FROM a",
             "SELECT ARRAY[ci] AS v FROM a UNION ALL SELECT arrt FROM a",
-            "SELECT arrt AS v FROM a UNION SELECT regexp_split_to_array(e, 'b') FROM a",
         ):
             with self.subTest(sel=sel):
                 plan = generate_materialized_view(schema, f"CREATE VIEW mv AS {sel};", dialect="postgres:18")
                 self.assertRegex(plan.backing_table_ddl, r"\bv TEXT\[\]")
+        # A function sqlglot does not model (regexp_split_to_array) as a de-duplicating set
+        # operation arm: its type is not derived, and the server is asked only for the view's
+        # output columns, not for an arm's, so it is refused (exact routing), offline and
+        # natively (TODO.md: ask the server for set-operation types).
+        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "without asking the server"):
+            generate_materialized_view(
+                schema,
+                "CREATE VIEW mv AS SELECT arrt AS v FROM a UNION SELECT regexp_split_to_array(e, 'b') FROM a;",
+                dialect="postgres:18",
+            )
         # citext only casts implicitly to text: any other string arm resolves to text.
         plan = generate_materialized_view(
             schema, "CREATE VIEW mv AS SELECT ci AS v FROM a UNION ALL SELECT s FROM a;", dialect="postgres:18"
@@ -2305,15 +2314,19 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         cur = conn.cursor()
         mv_names: List[str] = []
         lv_names: List[str] = []
+        created_citext = False
         try:
             cur.execute("SELECT VERSION()")
             ver_row = cur.fetchone()
             assert ver_row is not None
             self.assertIn("PostgreSQL", str(ver_row[0]))
+            cur.execute("SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'citext'")
+            had_citext = cur.fetchone() is not None
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS citext")
                 conn.commit()
                 ci_type = "CITEXT"
+                created_citext = not had_citext
             except Exception:
                 conn.rollback()
                 ci_type = "TEXT"
@@ -2352,6 +2365,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             refused = [sub(b) for b, ok in self._TREE_VIEWS if not ok] + [
                 sub("SELECT to_jsonb(s) AS v FROM a UNION ALL SELECT to_jsonb(e) FROM b"),
                 sub("(SELECT i4 AS v FROM a UNION ALL SELECT r FROM a) UNION ALL SELECT d FROM a"),
+                sub("SELECT arrt AS v FROM a UNION SELECT regexp_split_to_array(e, 'b') FROM a"),
             ]
             refused.append(sub("SELECT p.id, x.* FROM a p LEFT JOIN (SELECT s AS v0 FROM a UNION SELECT e FROM b) x ON x.v0 = p.s"))
             if ci_type == "CITEXT":
@@ -2444,6 +2458,10 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 cur.execute(f"DROP VIEW IF EXISTS {lv} CASCADE")
             for tbl in (ta, tb):
                 cur.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+            if created_citext:
+                # Leave the database as found: citext's min/max(citext) change how every
+                # later min()/max() view is classified.
+                cur.execute("DROP EXTENSION IF EXISTS citext")
             conn.commit()
             conn.close()
 
@@ -2519,6 +2537,94 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 cur.execute(f"DROP VIEW IF EXISTS lv_{label}_{tag} CASCADE")
             for tbl in (ta, tb, tn):
                 cur.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+            conn.commit()
+            conn.close()
+
+    def test_native_postgres_minmax_shadowed_by_user_aggregate_full_refresh_types(self) -> None:
+        """A user-defined aggregate overloading MIN/MAX (citext's min/max(citext)) makes every
+        min()/max() call unclassifiable, so the view is a full refresh of the original query
+        (UNCLASSIFIED_FUNCTION_FULL_REFRESH). Every backing column must then have the type the
+        server reports for the live view: a CTE set-operation column the server widens
+        (SMALLINT/BIGINT -> BIGINT) and SUM over it (NUMERIC) were typed statically from the
+        first arm (registration failed with "smallint out of range", SUM read back as int)."""
+        import os
+
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN not set")
+        tag = f"shmx_{uuid.uuid4().hex[:8]}"
+        ta, tb = f"a_{tag}", f"b_{tag}"
+        conn = _connect(Dialect.POSTGRES, dsn)
+        cur = conn.cursor()
+        created_citext = False
+        names: List[str] = []
+        try:
+            cur.execute("SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'citext'")
+            if cur.fetchone() is None:
+                try:
+                    cur.execute("CREATE EXTENSION citext")
+                    conn.commit()
+                    created_citext = True
+                except Exception:
+                    conn.rollback()
+                    self.skipTest("the citext extension is not available")
+            cur.execute(f"CREATE TABLE {ta} (id INT PRIMARY KEY, k SMALLINT NOT NULL, x SMALLINT)")
+            cur.execute(f"CREATE TABLE {tb} (id INT PRIMARY KEY, k BIGINT NOT NULL, y BIGINT)")
+            cur.execute(f"INSERT INTO {ta} VALUES (1, 1, 10), (2, 2, 20)")
+            cur.execute(f"INSERT INTO {tb} VALUES (1, 5000000000, 10000000000), (2, 2, 30000000000)")
+            conn.commit()
+            mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
+            specs = [
+                f"WITH u AS (SELECT k, x FROM {ta} UNION ALL SELECT k, y FROM {tb}) "
+                f"SELECT k, MIN(x) AS mnx, MAX(x) AS mxx, SUM(x) AS sx FROM u GROUP BY k",
+                f"SELECT MAX(v) AS m, SUM(v) AS s FROM (SELECT x AS v FROM {ta} UNION ALL SELECT y FROM {tb}) q",
+            ]
+            pairs = []
+            for idx, sel in enumerate(specs):
+                mv, lv = f"mv{idx}_{tag}", f"lv{idx}_{tag}"
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    plan = mgr.register_view(f"CREATE VIEW {mv} AS {sel};")
+                conn.commit()
+                names.append(mv)
+                self.assertEqual(
+                    [d.code for d in plan.strategy_diagnostics], ["UNCLASSIFIED_FUNCTION_FULL_REFRESH"], sel
+                )
+                cur.execute(f"CREATE VIEW {lv} AS {sel}")
+                conn.commit()
+                pairs.append((sel, mv, lv))
+
+            def check(step: str) -> None:
+                for sel, mv, lv in pairs:
+                    cur.execute(f"SELECT * FROM {mv}")
+                    got = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    da = _description(cur)
+                    cur.execute(f"SELECT * FROM {lv}")
+                    exp = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    db = _description(cur)
+                    conn.commit()
+                    self.assertEqual(got, exp, f"{step}: {sel}")
+                    self.assertEqual(_metadata_mismatches(Dialect.POSTGRES, da, db), [], f"{step} metadata: {sel}")
+
+            check("initial")
+            cur.execute(f"INSERT INTO {tb} VALUES (3, 9000000000, 40000000000)")
+            cur.execute(f"UPDATE {tb} SET y = 50000000000 WHERE id = 1")
+            cur.execute(f"DELETE FROM {ta} WHERE id = 1")
+            conn.commit()
+            check("after_dml")
+        finally:
+            conn.rollback()
+            for mv in names:
+                try:
+                    MaterializedViewManager(conn, dialect=Dialect.POSTGRES).drop_view(mv)
+                except Exception:
+                    conn.rollback()
+            for idx in range(2):
+                cur.execute(f"DROP VIEW IF EXISTS lv{idx}_{tag} CASCADE")
+            for tbl in (ta, tb):
+                cur.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+            if created_citext:
+                cur.execute("DROP EXTENSION IF EXISTS citext")
             conn.commit()
             conn.close()
 

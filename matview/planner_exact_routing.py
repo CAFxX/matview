@@ -725,7 +725,15 @@ class ExactAggregateRoutingMixin(MixinHost):
         if native_t is None:
             return None
         node = self._item_ast(item.raw_expr)
-        if node is None or (node.find(sqlglot_exp.Anonymous) is None and not self._has_unclassified_call(item)):
+        # PostgreSQL: an unclassified call forces the full refresh of the original query, which
+        # stores what the server computes, so every column takes the server-reported type
+        # (format_type, typmod included); the static inference can differ (a CTE set-operation
+        # column the server widens, SUM over it). MySQL/MariaDB result metadata is not exact
+        # enough (lengths, collations) to replace the static types of modelled items.
+        all_server = self.dialect == Dialect.POSTGRES and bool(self.view.unclassified_functions)
+        if not all_server and (
+            node is None or (node.find(sqlglot_exp.Anonymous) is None and not self._has_unclassified_call(item))
+        ):
             return None
         # Verbatim: the server's own spelling is valid DDL (PostgreSQL
         # format_type, MySQL SHOW COLUMNS) and keeps modifiers such as UNSIGNED.
