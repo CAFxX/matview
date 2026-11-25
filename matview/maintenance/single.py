@@ -590,7 +590,8 @@ class Tier1SingleMixin(MixinHost):
         if func is None or func not in (AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG, *self._PGMY_STAT_FUNCS):
             return agg_sql
         eff = self._effective_agg_value_expr(item, record_prefix=None)
-        order = f" ORDER BY {self._q(self.view.base_table)}.ctid"
+        # Qualified like the recompute that embeds it (its FROM keeps the view's alias).
+        order = f" ORDER BY {self._single_base_table_ref()[1]}.ctid"
         if func == AggFunc.TOTAL:
             return f"COALESCE(1.0 * SUM({eff}{order}), 0.0)"
         return f"{func.value}({eff}{order})"
@@ -918,8 +919,9 @@ class Tier1SingleMixin(MixinHost):
 
         The chunk statements run with (cursor_pk, upper_pk) bound; ``?2`` is the
         chunk's upper bound. Rows above the claimed backfill range are folded
-        by the triggers (see the trigger watermark guard)."""
-        q_base_t = self._q(self.view.base_table)
+        by the triggers (see the trigger watermark guard). Qualified like the
+        group recompute that embeds it (its FROM keeps the view's alias)."""
+        q_base_t = self._single_base_table_ref()[1]
         q_pk = self._quote_pk_range_col(pk_col)
         cond = f"{q_base_t}.{q_pk} <= ?2"
         if self.watermark_catalog_table:

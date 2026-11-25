@@ -733,6 +733,33 @@ class TestDistinctAndFilteredStatBitBool(unittest.TestCase):
         finally:
             env.close()
 
+    def test_aliased_base_table_incremental_backfill(self) -> None:
+        """The backfill chunk filter is qualified like the group recompute that
+        embeds it (`FROM t AS a`): a bare `t.id` failed the backfill with
+        "no such column"."""
+        for views in (
+            {"mv_al_sum": "SELECT a.g, SUM(a.x) AS s, COUNT(*) AS c FROM tc AS a GROUP BY a.g"},
+            {"mv_al_var": "SELECT a.g, VAR_POP(DISTINCT a.x) AS v, COUNT(*) AS c FROM tc AS a GROUP BY a.g"},
+        ):
+            env = _Env(views, seed_rows=False)
+            try:
+                for conn in (env.mv, env.live):
+                    conn.executemany(
+                        # Dyadic values: VAR/STDDEV are exact only without intermediate rounding
+                        # (known defect, test_known_defect_float_statistics_are_not_correctly_rounded).
+                        "INSERT INTO tc VALUES (?, ?, ?)", [(i, "abc"[i % 3], i * 0.25) for i in range(1, 9)]
+                    )
+                    conn.commit()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    for name, select_sql in views.items():
+                        env.mgr.register_view(f"CREATE VIEW {name} AS {select_sql};", incremental_backfill=True)
+                env.check(self, "after backfill")
+                env.apply([("INSERT INTO tc VALUES (20, 'a', 2.5)", ()), ("DELETE FROM tc WHERE id = 1", ())])
+                env.check(self, "after DML")
+            finally:
+                env.close()
+
     def test_maintenance_strategy_per_shape(self) -> None:
         """The strategy actually chosen is part of the contract (tier standing
         order: never worse than recorded here). Grouped DISTINCT/FILTER
