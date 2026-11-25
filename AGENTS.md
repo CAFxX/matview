@@ -28,6 +28,13 @@ These refine, and never weaken, the semantic-equivalence invariant above.
 
 Roadmap: the "Strategy ladder: replace refusals with fallbacks" initiative in `TODO.md`.
 
+## User README
+
+- Treat `README.md` as concise documentation for people evaluating or using matview: explain what it does, what it supports, how to install it, and how to get useful work done.
+- Include only information that helps a user decide whether matview fits or use it correctly: core capabilities, short working examples, essential configuration, and material limitations. Keep it accurate to the current released interface.
+- Do not put contributor/agent instructions, development or CI procedures, implementation internals, design rationale, exhaustive matrices, benchmarks, project history, or roadmap/TODO inventories in the README. Put those in the appropriate contributor, developer, or project-tracking documents.
+- Keep the README focused and proportionate. Prefer links to maintained detailed documentation over duplicating it; add a section only when it answers a real user question.
+
 ## Testing standards
 
 - Design tests from the documented behavior and supported SQL/engine contract, not from the implementation's current code paths. Avoid tautological tests that reproduce the implementation's assumptions.
