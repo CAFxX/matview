@@ -1092,7 +1092,8 @@ class PlannerMixin(MixinHost):
                     dialect=self.dialect,
                     affected_object=self.logical_view_name,
                     description=(
-                        f"Relaxed result allowed for {listed}: full refresh over {plan_tables} table instances; a "
+                        f"Relaxed result allowed for {listed}: full refresh over {plan_tables} table instances on a BEST-EFFORT "
+                        f"basis; a "
                         f"later read of the view can use another join order, so the floating-point result may differ "
                         f"from the original view in the last bits (no fixed error bound)."
                     ),
