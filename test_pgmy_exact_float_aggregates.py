@@ -430,6 +430,36 @@ class NativeSequentialExactness(_ExactCase):
         finally:
             fx.close()
 
+    def test_postgres_aliased_base_table_ctid_order(self) -> None:
+        """The ctid order pinning the float recompute is qualified like the
+        recompute's FROM, which keeps the view's alias (`FROM t AS a`): a bare
+        `t.ctid` is an invalid FROM-clause reference there and the view went
+        stale after the first write."""
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN not set")
+        fx = _Fixture(Dialect.POSTGRES, dsn)
+        try:
+            t = fx.table("al", "id BIGINT PRIMARY KEY, g INT, f DOUBLE PRECISION", group_index="g")
+            cur = fx.conn.cursor()
+            for i in range(1, 9):
+                cur.execute(f"INSERT INTO {t} (id, g, f) VALUES (%s, %s, %s)", (i, i % 3, i * 0.1))
+            fx.conn.commit()
+            live = f"SELECT a.g, SUM(a.f) AS s, COUNT(*) AS c FROM {t} AS a GROUP BY a.g"
+            plan = fx.register(live)
+            self.assertViewExact(fx.conn, plan, live, "initial")
+            for step in (
+                f"INSERT INTO {t} (id, g, f) VALUES (10, 1, 0.1), (11, 2, 0.2)",
+                f"UPDATE {t} SET f = f * 3 WHERE id <= 5",
+                f"DELETE FROM {t} WHERE id = 2",
+                f"UPDATE {t} SET g = 2 WHERE id = 1",
+            ):
+                cur.execute(step)
+                fx.conn.commit()
+                self.assertViewExact(fx.conn, plan, live, step)
+        finally:
+            fx.close()
+
     def test_postgres_numeric_display_scale(self) -> None:
         """PostgreSQL SUM over values of different display scales returns the
         largest scale of the rows present; a fold would remember the scale of
