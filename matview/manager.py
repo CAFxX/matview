@@ -122,9 +122,11 @@ from .sql_frontend import (
 #     SERIALIZABLE snapshots against repair_view(), rebuild, and backfill via
 #     SELECT ... FOR SHARE on the view's catalog row (raising 40001 on stale
 #     or missing catalog visibility; zero locks under READ COMMITTED).
-# 16: PostgreSQL source-table maintenance triggers are ENABLE ALWAYS (they fire
+# 16: MySQL/MariaDB READ COMMITTED/SERIALIZABLE maintenance and repair_view()
+#     base-table locking (#301).
+# 17: PostgreSQL source-table maintenance triggers are ENABLE ALWAYS (they fire
 #     under session_replication_role = replica); drift requires tgenabled = 'A'.
-MATVIEW_GENERATOR_VERSION = "16"
+MATVIEW_GENERATOR_VERSION = "17"
 
 
 def _definition_digest(select_sql: str) -> str:
