@@ -2205,9 +2205,9 @@ class PlannerMixin(MixinHost):
             return (sel, "Compound set operation does not satisfy Tier 1 algebraic delta requirements.")
         if self.view.has_subquery_in_from:
             return (sel, "Subquery in FROM clause cannot be maintained incrementally.")
-        if self.view.where_clause and _has_subquery_ast(self.view.where_clause):
+        if self.view.where_clause and _has_subquery_ast(self.view.where_clause, dialect=self.dialect):
             return (sel, "Correlated or scalar subquery in WHERE clause requires atomic refresh.")
-        if any(_has_subquery_ast(it.raw_expr) for it in self.view.select_items):
+        if any(_has_subquery_ast(it.raw_expr, dialect=self.dialect) for it in self.view.select_items):
             return (sel, "Subquery in SELECT list requires atomic refresh.")
         if not any(it.is_aggregate for it in self.view.select_items):
             return (sel, "Non-aggregate projection lacks a primary key on base table for incremental delta tracking.")
