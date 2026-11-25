@@ -317,13 +317,20 @@ class TestSqlAlchemyConnectivityAndIntrospection(unittest.TestCase):
             dialect=ms.Dialect.SQLITE,
         )
         self.assertIn("c BLOB", sq_plan.backing_table_ddl)
-        my_plan = ms.generate_materialized_view(
-            "CREATE TABLE t (id INT PRIMARY KEY, x INT);",
-            "CREATE VIEW v_my_cast AS SELECT id, CAST(x AS UNSIGNED) AS c FROM t;",
-            dialect=ms.Dialect.MYSQL,
-            ignore_limitations=True,
-        )
-        self.assertNotIn("c BIGINT", my_plan.backing_table_ddl)
+        # CAST(... AS UNSIGNED) is MySQL-family syntax. The live view's column is a
+        # nullable BIGINT UNSIGNED (verified natively: information_schema.COLUMNS
+        # reports `bigint unsigned` on MySQL 8.4 and `bigint(20) unsigned` on
+        # MariaDB 10.11 for this exact view), so the backing column must match.
+        for engine_version in (None, "mariadb:10.11"):
+            with self.subTest(engine_version=engine_version):
+                my_plan = ms.generate_materialized_view(
+                    "CREATE TABLE t (id INT PRIMARY KEY, x INT);",
+                    "CREATE VIEW v_my_cast AS SELECT id, CAST(x AS UNSIGNED) AS c FROM t;",
+                    dialect=ms.Dialect.MYSQL,
+                    engine_version=engine_version,
+                    ignore_limitations=True,
+                )
+                self.assertIn("\n    c BIGINT UNSIGNED,\n", my_plan.backing_table_ddl)
 
         # PostgreSQL BIT(n) / BIT VARYING SQLAlchemy formatting and BIT_AND/BIT_OR codegen.
         self.assertEqual(_format_sa_column_type(sa_pg.BIT(length=4), ms.Dialect.POSTGRES), "BIT(4)")
