@@ -399,12 +399,34 @@ def probe_result_types(conn: Any, dialect: Dialect, select_sql: str) -> Dict[str
                     cur.execute(f"SAVEPOINT {name}")
                 try:
                     cur.execute(f"CREATE TEMPORARY VIEW {name} AS {body}")
+                    # A domain is reported as its base type (domains are unwrapped like
+                    # the static inference does: a NOT NULL domain would reject the NULLs
+                    # an outer join produces), a non-default collation is appended (the
+                    # live view compares and sorts with it), and a pseudo-type (`record`)
+                    # is left out (it is not a valid column type; the static rules decide).
                     cur.execute(
-                        "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) FROM pg_catalog.pg_attribute a "
-                        "WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                        "WITH RECURSIVE d(attnum, attname, typid, typmod, coll, depth) AS ("
+                        "  SELECT a.attnum, a.attname, a.atttypid, a.atttypmod, a.attcollation, 0 "
+                        "  FROM pg_catalog.pg_attribute a "
+                        "  WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped "
+                        "  UNION ALL "
+                        "  SELECT d.attnum, d.attname, t.typbasetype, t.typtypmod, d.coll, d.depth + 1 "
+                        "  FROM d JOIN pg_catalog.pg_type t ON t.oid = d.typid WHERE t.typtype = 'd'"
+                        ") "
+                        "SELECT d.attname, pg_catalog.format_type(d.typid, d.typmod), "
+                        "       CASE WHEN d.coll <> 0 AND d.coll <> bt.typcollation THEN "
+                        "         CASE WHEN cn.nspname = 'pg_catalog' THEN pg_catalog.quote_ident(co.collname) "
+                        "              ELSE pg_catalog.quote_ident(cn.nspname) || '.' || pg_catalog.quote_ident(co.collname) END "
+                        "       END "
+                        "FROM d JOIN pg_catalog.pg_type bt ON bt.oid = d.typid "
+                        "LEFT JOIN pg_catalog.pg_collation co ON co.oid = d.coll "
+                        "LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace "
+                        "WHERE bt.typtype <> 'd' AND bt.typtype <> 'p' ORDER BY d.attnum",
                         (f"pg_temp.{name}",),
                     )
-                    rows = list(cur.fetchall())
+                    rows = [
+                        (r[0], f"{r[1]} COLLATE {r[2]}" if r[2] else r[1]) for r in cur.fetchall()
+                    ]
                     cur.execute(f"DROP VIEW pg_temp.{name}")
                 except Exception:
                     if savepoint:
