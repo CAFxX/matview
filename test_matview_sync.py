@@ -3403,7 +3403,7 @@ import unittest
 
 
 class MVTestRunner:
-    def __init__(self) -> None:
+    def __init__(self, *, honor_emulated_skip: bool = False) -> None:
         self.total_views: int = 0
         self.total_assertions: int = 0
         self.supported_plans: int = 0
@@ -3419,15 +3419,17 @@ class MVTestRunner:
         else:
             self.default_dialect = Dialect.SQLITE
         # MATVIEW_EMULATED_BACKENDS=skip (CI live-engine jobs only): skip every
-        # batch whose dialect has no live backend in this process, i.e. the
+        # Suite 1-13 batch whose dialect has no live backend in this process, i.e. the
         # in-memory SQLite and transpiled PostgreSQL/MySQL executions. Those
         # are engine-independent emulation (not native coverage) and run
         # unchanged in the SQLite jobs, which leave this unset. Generation is
         # not skipped, so fuzz seeds and scenario streams stay identical.
+        # Only the suite runner of _run_all_tests honours it: the unittest classes
+        # build their own runners and assert batch counts across all dialects.
         mode = os.environ.get("MATVIEW_EMULATED_BACKENDS", "run").strip().lower()
         if mode not in ("run", "skip"):
             raise ValueError(f"MATVIEW_EMULATED_BACKENDS must be 'run' or 'skip', not {mode!r}")
-        self.skip_emulated_backends: bool = mode == "skip"
+        self.skip_emulated_backends: bool = honor_emulated_skip and mode == "skip"
         self.skipped_emulated_batches: int = 0
         if self.skip_emulated_backends and not (self.pg_dsn or self.mysql_dsn or self.sqlite_compat_engine):
             raise ValueError(
@@ -10048,7 +10050,7 @@ def run_suite_13_fuzz_regression_corpus(runner: MVTestRunner) -> None:
 
 def _run_all_tests() -> None:
     t0 = time.time()
-    runner = MVTestRunner()
+    runner = MVTestRunner(honor_emulated_skip=True)
 
     fuzz_only = False
     args = list(sys.argv[1:])
