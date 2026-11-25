@@ -51,6 +51,7 @@ from .logical_ir import (
     ViewSpec,
 )
 from .sql_frontend import (
+    _set_operation_arm_tree,
     _sqlite_type_affinity,
     _FN_TO_AGG_ENUM,
     _SQL_EXPR_FUNCTIONS,
@@ -567,9 +568,19 @@ class PlannerMixin(MixinHost):
         if cached is not None and cached[0] == key:
             return cached[1]
         branches = self._float_union_branch_specs()
-        ctx = self._union_all_common_ctx(branches) if branches else self
+        ctx = self._union_all_common_ctx(branches, self._float_union_arm_tree(branches)) if branches else self
         self._float_check_ctx_cache = (key, ctx)
         return ctx
+
+    def _float_union_arm_tree(self, branches: Sequence[Any]) -> Any:
+        """The set-operation tree over ``branches`` (PostgreSQL resolves the
+        common type pairwise along it, see ``_set_operation_arm_tree``), or
+        None (one flat chain) when the view's arms do not match the branches."""
+        try:
+            leaves, tree = _set_operation_arm_tree(parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect))
+        except sqlglot.errors.SqlglotError:
+            return None
+        return tree if len(leaves) == len(branches) else None
 
     def _float_union_branch_specs(self) -> Optional[Sequence[Any]]:
         """Per-branch view specs of a UNION ALL aggregate view (None otherwise)."""
@@ -601,10 +612,27 @@ class PlannerMixin(MixinHost):
         # A UNION ALL of aggregate branches classifies its columns over the
         # common type of all branches (a float in any branch makes it float).
         uall_branches = self._float_union_branch_specs()
-        check_ctx = self._union_all_common_ctx(uall_branches) if uall_branches else self
+        check_ctx: Any = self
+        if uall_branches:
+            try:
+                check_ctx = self._union_all_common_ctx(uall_branches, self._float_union_arm_tree(uall_branches))
+            except UnsupportedMaterializedViewError:
+                # No modelled common type (e.g. a lossy REAL set-operation chain,
+                # refused for the incremental strategies): classify conservatively,
+                # every SUM/TOTAL/AVG/VAR/STDDEV as floating point (exact full
+                # refresh, or that refusal when the refresh is typed by the same
+                # model). Other aggregates (MIN/MAX, COUNT) are never order-sensitive.
+                check_ctx = None
         out: List[Tuple[str, str]] = [
             (it.alias, it.raw_expr) for it in items
-            if it.is_aggregate and check_ctx._is_order_sensitive_aggregate(it)
+            if it.is_aggregate and (
+                it.agg_func in (
+                    AggFunc.SUM, AggFunc.TOTAL, AggFunc.AVG,
+                    AggFunc.VAR_POP, AggFunc.VAR_SAMP, AggFunc.STDDEV_POP, AggFunc.STDDEV_SAMP,
+                )
+                if check_ctx is None
+                else check_ctx._is_order_sensitive_aggregate(it)
+            )
         ]
         norm = lambda t: re.sub(r"\s+", "", t).lower()  # noqa: E731
         # The resolver-based verdicts plus the legacy window classification
@@ -3657,9 +3685,13 @@ class PlannerMixin(MixinHost):
     def _fallback_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:
         """Announced fallbacks of this plan (see matview.diagnostics)."""
         routed = self._exact_routing_diagnostics(strategy) + self._collation_fallback_diagnostics(strategy)
-        if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC and not routed:
+        if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC and not routed and not self._order_sensitive_float_items():
             # Every full refresh is announced; a routing or collation fallback
-            # already names its specific reason (and is not repeated here).
+            # already names its specific reason (and is not repeated here), and
+            # so does the floating-point strategy diagnostic
+            # (FLOAT_EXACT_REFRESH / FLOAT_RELAXED_MAINTENANCE, see
+            # _float_strategy_diagnostics) of a view with order-sensitive
+            # float aggregates.
             return (self._full_refresh_diagnostic(strategy),)
         having = self.view.having_clause
         if not having or strategy != MaintenanceStrategy.GROUP_SCOPED_DELTA or not _has_subquery_aggregate(having, self.dialect):

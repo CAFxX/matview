@@ -189,8 +189,6 @@ _REFUSED: List[Tuple[str, str, str]] = [
     ("shadowed_scalar_subquery_derived_expression",
      "SELECT g, (SELECT SUM(x) FROM (SELECT x * 2 AS x FROM tb) d) AS q FROM ta GROUP BY g",
      "derived table or CTE column x is an expression"),
-    ("key_typed_by_the_wrong_table", "SELECT d.k AS k, SUM(a.y) AS s FROM ta a JOIN (SELECT g AS k FROM te) d ON a.g = d.k GROUP BY d.k",
-     "stored as"),
     ("minmax_decimal_integer_expression",
      "SELECT t.g AS g, MIN(c.x + c.y) AS m, SUM(t.y) AS s FROM ta t JOIN tc c ON t.g = c.g GROUP BY t.g",
      "MIN/MAX over an expression"),
@@ -244,16 +242,40 @@ class OfflinePlanDecisions(unittest.TestCase):
                     if kind == "pg" or label in _TYPE_REASON_ON_MYSQL:
                         self.assertIn(fragment, str(ctx.exception))
 
-    def test_alias_cycle_is_a_clear_refusal_not_a_recursion_error(self) -> None:
+    def test_alias_cycle_never_recurses_and_types_by_scope(self) -> None:
         # A derived-table alias equal to an inner table alias (u) used to recurse
         # without end in the name-based column resolution (an exact view, no float).
+        # The scoped set-operation/derived-table typing resolves each column in
+        # its own scope: the view compiles (full refresh) with the scope-proven
+        # types (k: tb.g INT; a0: MAX(ta.x), INTEGER on PostgreSQL), never a
+        # RecursionError; a refusal would also be acceptable, a wrong type is not.
         select = ("SELECT u.k AS k, MAX(u.a0) AS a0 FROM ta d LEFT JOIN "
                   "(SELECT b.g AS k, MAX(u.x) AS a0 FROM tb b JOIN ta u ON b.g = u.g GROUP BY b.g) u "
                   "ON d.g = u.k GROUP BY u.k")
         for kind in _SCHEMAS:
             with self.subTest(engine=kind):
-                with self.assertRaisesRegex(UnsupportedMaterializedViewError, "recursed without end"):
-                    _plan(kind, select)
+                plan = _plan(kind, select)
+                self.assertEqual(plan.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
+                cols = re.findall(r"^\s+(\w+) ([A-Z]+)", plan.backing_table_ddl, flags=re.M)
+                self.assertEqual(cols[0], ("k", "INT"))
+                if kind == "pg":
+                    self.assertEqual(cols[1], ("a0", "INT"))
+
+    def test_derived_key_is_typed_by_its_own_table(self) -> None:
+        # d.k is te.g (BIGINT), not the joined ta.g (INT): stored as BIGINT on
+        # PostgreSQL (exact float refresh); MySQL/MariaDB refuse the 2-table
+        # float sum (plan-dependent order) before typing matters.
+        select = "SELECT d.k AS k, SUM(a.y) AS s FROM ta a JOIN (SELECT g AS k FROM te) d ON a.g = d.k GROUP BY d.k"
+        for kind in _SCHEMAS:
+            with self.subTest(engine=kind):
+                if kind != "pg":
+                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "table instances"):
+                        _plan(kind, select)
+                    continue
+                plan = _plan(kind, select)
+                self.assertEqual([d.code for d in plan.strategy_diagnostics], [FLOAT_EXACT_REFRESH])
+                cols = re.findall(r"^\s+(\w+) ([A-Z ]+?)[,\n]", plan.backing_table_ddl, flags=re.M)
+                self.assertEqual(cols, [("k", "BIGINT"), ("s", "DOUBLE PRECISION")])
 
     def test_provable_shapes_use_the_announced_full_refresh(self) -> None:
         for kind in _SCHEMAS:

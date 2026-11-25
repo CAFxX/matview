@@ -2154,7 +2154,8 @@ class OfflineDefaultExactRefresh(unittest.TestCase):
                     warnings.simplefilter("ignore")
                     plan = generate_materialized_view(schema, f"CREATE VIEW v AS {self_ref};", dialect=dialect,
                                                       ignore_limitations=True)
-                self.assertEqual(plan.strategy_diagnostics, [])
+                # Exact (no float diagnostic); the full refresh itself is announced.
+                self.assertEqual([d.code for d in plan.strategy_diagnostics], ["FULL_REFRESH_FALLBACK"])
 
     def test_default_is_full_refresh_with_diagnostic(self) -> None:
         for dialect, version, types in _ENGINES:
@@ -2293,12 +2294,13 @@ class OfflineDefaultExactRefresh(unittest.TestCase):
                             self.assertEqual(d.code, FLOAT_RELAXED_MAINTENANCE)
                             self.assertTrue(str(d).startswith(RELAXED_LEAD))
                         self.assertTrue(any(expr in e for e in d.expressions), d.expressions)
-            # Exact nested aggregates: no diagnostic.
+            # Exact nested aggregates: no floating-point diagnostic.
             plan = generate_materialized_view(
                 parsed, "CREATE VIEW v AS WITH c AS (SELECT g, SUM(k) AS s FROM t GROUP BY g) SELECT g, s FROM c;",
                 dialect=dialect, engine_version=version, ignore_limitations=True,
             )
-            self.assertEqual(plan.strategy_diagnostics, [])
+            # Exact (no float diagnostic); the full refresh itself is announced.
+            self.assertEqual([d.code for d in plan.strategy_diagnostics], ["FULL_REFRESH_FALLBACK"])
 
     def test_sqlite_has_no_diagnostic(self) -> None:
         parsed = parse_table_schema(_SHAPE_SCHEMA.format(ty="REAL"), dialect=Dialect.SQLITE)
