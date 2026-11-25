@@ -17,6 +17,7 @@ from pathlib import Path
 
 import matview
 import matview_sync as ms
+from matview.diagnostics import DiagnosticSeverity
 
 
 class TestModularPackageArchitecture(unittest.TestCase):
@@ -222,6 +223,7 @@ for name in matview.__all__:
             ("postgres:18.0", True, False, False),
             ("mysql:8.4.0", False, True, True),
         )
+        saw_notes = False
         for engine_spec, incremental, no_populate, ignore_limitations in cases:
             with self.subTest(
                 engine=engine_spec,
@@ -276,7 +278,15 @@ for name in matview.__all__:
                         exit_code = matview.main(argv)
 
                 self.assertEqual(exit_code, 0, stderr.getvalue())
-                self.assertEqual(stderr.getvalue(), "")
+                # The CLI announces each NOTE-severity recommendation of the plan on
+                # stderr as "NOTE <diagnostic>", in plan order, and nothing else.
+                # Derive the expectation from the API plan's own diagnostics so new
+                # recommendations do not need a hard-coded list here.
+                api_notes = [
+                    d for d in api_plan.strategy_diagnostics if d.severity == DiagnosticSeverity.NOTE
+                ]
+                saw_notes = saw_notes or bool(api_notes)
+                self.assertEqual(stderr.getvalue(), "".join(f"NOTE {d}\n" for d in api_notes))
                 self.assertEqual(
                     [(w.category, str(w.message)) for w in cli_warnings],
                     [(w.category, str(w.message)) for w in api_warnings],
@@ -285,6 +295,9 @@ for name in matview.__all__:
                 # CLI output is print(plan.render_sql_script(...)), so include
                 # exactly the one newline added by print().
                 self.assertEqual(stdout.getvalue(), expected_sql + "\n")
+        # Keep the stderr comparison non-vacuous: at least one case (today the
+        # non-STRICT SQLite source) must exercise the NOTE announcement path.
+        self.assertTrue(saw_notes, "no case produced a NOTE recommendation")
 
     def test_cli_entrypoints_help(self) -> None:
         r1 = subprocess.run(
