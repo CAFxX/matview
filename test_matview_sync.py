@@ -3275,6 +3275,12 @@ def _compile_plan_for_test(
         return plan, True, tuple(sorted(expected_codes))
 
 
+# Views installed together on one live MySQL/MariaDB database (run_batch and
+# the 50-view battery): per-statement trigger memory grows with the square of
+# the views on a table there (see the comment in _open_backend_session).
+_MYSQL_VIEWS_PER_TABLE = 16
+
+
 def _run_unified_50_view_battery(
     conn: Any,
     cur: Any,
@@ -3283,13 +3289,36 @@ def _run_unified_50_view_battery(
     inc_mode: bool = False,
     label: str = "",
     reset_sql: Optional[str] = None,
+    views: Optional[slice] = None,
 ) -> Tuple[int, int]:
     """
     Single unified runner for the 50-view x 35-state verification battery across
     SQLite, PostgreSQL, and MySQL (used identically for both in-memory transpiled
-    runs and live external database servers).
+    runs and live external database servers). `views` selects the views
+    installed together on one fresh copy of the schema; by default MySQL runs
+    every view in chunks of `_MYSQL_VIEWS_PER_TABLE` (each after `reset_sql`),
+    the others all at once.
     """
     schema, view_specs = _get_live_engine_50_view_battery(dialect)
+    if views is None and dialect == Dialect.MYSQL and reset_sql:
+        # MySQL and MariaDB hold every trigger of a table parsed once per open
+        # TABLE instance, and a statement opens one instance per trigger that
+        # reads the table, so all 50 views on `orders` cost O(50^2) parsed
+        # trigger bodies per DML statement (MariaDB 11.8: 0.1 GB -> 5.6 GB RSS,
+        # which got the server OOM-killed later in the 7 GB CI job). Every view
+        # still sees every DML step, on a fresh schema per chunk; the product
+        # limit is tracked in TODO.md ("Share Float-Recompute Triggers Per
+        # Table on MySQL/MariaDB").
+        totals = (0, 0)
+        for start in range(0, len(view_specs), _MYSQL_VIEWS_PER_TABLE):
+            v_cnt, c_cnt = _run_unified_50_view_battery(
+                conn, cur, dialect, inc_mode=inc_mode, label=label, reset_sql=reset_sql,
+                views=slice(start, start + _MYSQL_VIEWS_PER_TABLE),
+            )
+            totals = (totals[0] + v_cnt, totals[1] + c_cnt)
+        return totals
+    if views is not None:
+        view_specs = view_specs[views]
     if reset_sql:
         for r_st in [st.strip() for st in reset_sql.split(";") if st.strip()]:
             cur.execute(r_st + ";")
@@ -3522,7 +3551,7 @@ class MVTestRunner:
                     "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci; "
                     "SET SESSION collation_connection = @@collation_database;"
                 )
-                # 25 views per database at a time: MySQL parses every trigger of
+                # 16 views per database at a time: MySQL parses every trigger of
                 # a table once per table instance a statement opens, and each
                 # trigger that reads the source table (the recompute of the
                 # battery's opted-in float aggregates, and MIN/MAX/VAR) opens
@@ -3531,12 +3560,15 @@ class MVTestRunner:
                 # after one UPDATE over 10 / 20 float SUM views: 106.7 / 405.0
                 # MiB vs 4.6 / 9.3 for exact sums; the full suite at 50 views per
                 # database exceeded 10 GiB server memory). See TODO.md "Share
-                # Float-Recompute Triggers Per Table on MySQL/MariaDB".
+                # Float-Recompute Triggers Per Table on MySQL/MariaDB". MariaDB's
+                # parsed triggers are larger: at 25 views Suite 1 alone took a
+                # MariaDB 11.8 server from 0.1 to 3.0 GiB RSS, and the job's
+                # retained memory then reached the runner's 7 GiB (OOM kill).
                 return (
                     my_conn,
                     my_conn.cursor(),
                     reset_sql,
-                    25,
+                    _MYSQL_VIEWS_PER_TABLE,
                     "LIVE MYSQL",
                     my_conn.close,
                 )

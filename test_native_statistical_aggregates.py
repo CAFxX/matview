@@ -452,6 +452,20 @@ _DML = [
 ]
 
 
+# Views registered on one base table at a time. MySQL and MariaDB parse and
+# keep every trigger of a table once per open TABLE instance, and a statement
+# opens one instance of the base table per trigger that reads it (each
+# trigger is its own stored program, with its own prelocked tables). With V
+# views on one table a single DML statement therefore holds about
+# (triggers) x (instances) = O(V^2) parsed trigger bodies: 5/10/20 DOUBLE
+# views here cost +42/+172/+694 MB on MariaDB 11.8 for one UPDATE, and all
+# ~45 views on one table took the server to 2.3 GB RSS, enough (with the rest
+# of the job) to get it OOM-killed on a 7 GB CI runner. Chunks keep every view
+# and DML step, each on a fresh table; the product limit is tracked in TODO.md
+# ("Share Float-Recompute Triggers Per Table on MySQL/MariaDB").
+_VIEWS_PER_TABLE = 16
+
+
 class NativeStatisticalAggregateTests(unittest.TestCase):
     """MV vs native live view for every function, shape, type and DML step."""
 
@@ -542,7 +556,7 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
         self.assertEqual(mv_rows, live_rows, f"{label}: materialized rows != native view rows")
         self.assertEqual(_metadata_mismatches(engine, mv_desc, live_desc), [], f"{label}: result metadata")
 
-    def _run(self, engine: Dialect, dsn: str, col_type: str) -> None:
+    def _run(self, engine: Dialect, dsn: str, col_type: str, chunk: slice) -> None:
         conn = _connect(engine, dsn)
         version = self._server(engine, conn)
         is_mariadb = "mariadb" in version.lower()
@@ -567,7 +581,7 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
             manager = MaterializedViewManager(conn, dialect=engine)
             pairs: List[Tuple[str, str, str]] = []
             refused: List[str] = []
-            for name, select in self._views(engine, t):
+            for name, select in self._views(engine, t)[chunk]:
                 mv, live = f"mv_{name}_{tag}", f"live_{name}_{tag}"
                 cur.execute(f"CREATE VIEW {live} AS {select}")
                 conn.commit()
@@ -673,9 +687,12 @@ class NativeStatisticalAggregateTests(unittest.TestCase):
                 if engine == Dialect.POSTGRES
                 else ["INT", "DOUBLE", "DECIMAL(12,3)"]
             )
+            # One fresh base table per chunk of views: see _VIEWS_PER_TABLE.
+            total = len(self._views(engine, "t"))
             for col_type in types:
-                with self.subTest(engine=engine.value, type=col_type):
-                    self._run(engine, dsn, col_type)
+                for start in range(0, total, _VIEWS_PER_TABLE):
+                    with self.subTest(engine=engine.value, type=col_type, views=f"{start}:{start + _VIEWS_PER_TABLE}"):
+                        self._run(engine, dsn, col_type, slice(start, start + _VIEWS_PER_TABLE))
 
 
 # Every statistic spelling x every wrapper of a second copy of the same call
