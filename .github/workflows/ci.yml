@@ -666,121 +666,64 @@ jobs:
           MATVIEW_CI_ACTUAL_IMAGE: mysql:${{ matrix.mysql-version }}
         run: python3 verify_engine_matrix.py
 
-      - name: Run full test suite + live MySQL ${{ matrix.mysql-version }} integration tests
+      # Same layout as the postgres job: every task gets its own database.
+      # Server memory is bounded by the native suites installing at most 16
+      # views per base table (MySQL/MariaDB per-statement trigger memory grows
+      # with the square of the views on a table; TODO.md "Share Float-Recompute
+      # Triggers Per Table on MySQL/MariaDB"): 3 workers peak at ~3.2 GiB on
+      # MariaDB 11.8 under a 7 GiB container cap.
+      - name: Run the full test suite + live MySQL ${{ matrix.mysql-version }} modules in parallel (one database per task)
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
           MATVIEW_FUZZ_TARGET: "MySQL ${{ matrix.mysql-version }}"
           MATVIEW_EMULATED_BACKENDS: skip
-        run: python3 test_matview_sync.py
-      - name: Archive fuzz campaign manifest
+        run: |
+          python3 scripts/ci_parallel.py --jobs 3 \
+            --task "python3 test_matview_sync.py --suites 2-8" \
+            --task "python3 test_matview_sync.py --suites 12 --seed-shard 0/2" \
+            --task "python3 test_matview_sync.py --suites 12 --seed-shard 1/2" \
+            --task "python3 test_matview_sync.py --suites 1" \
+            --task "python3 test_matview_sync.py --suites 9-11,13,unit" \
+            --task "python3 test_native_statistical_aggregates.py" \
+            --task "python3 test_native_result_types.py" \
+            --task "python3 test_group_key_collation.py" \
+            --task "pytest -v -rxXs test_native_dml_interactions.py" \
+            --task "python3 test_query_ast_materialization.py" \
+            --task "python3 test_native_function_classification.py" \
+            --task "python3 test_p1_manager_safety.py" \
+            --task "python3 test_p1_sqlalchemy_integration.py" \
+            --task "python3 test_p2_index_intelligence.py" \
+            --task "python3 test_p2_window_partition_scoping.py" \
+            --serial "python3 test_concurrent_backfill.py" \
+            --serial "python3 test_minmax_group_arg_index.py" \
+            --serial "python3 test_unrecognized_aggregates.py" \
+            --serial "python3 test_avg_concurrent_maintenance.py" \
+            --serial "pytest -v -rxXs test_native_bulk_statements.py" \
+            --serial "python3 test_registration_replacement.py" \
+            --serial "python3 test_registration_lifecycle.py" \
+            --serial "python3 test_bulk_changes_safety.py" \
+            --serial "python3 test_p1_engine_codegen.py"
+      - name: Archive fuzz campaign manifests
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: fuzz-campaign.json
+          path: fuzz-campaign*.json
           if-no-files-found: ignore
           retention-days: 30
-
-      - name: Test independent-session MySQL backfill concurrency
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_concurrent_backfill.py
-
-      - name: Test group keys follow the column collation (native MySQL/MariaDB)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_group_key_collation.py
-
-      - name: Test native expression and aggregate result types (MySQL)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_native_result_types.py
-
-      - name: Test native VAR/STDDEV semantics and result types (MySQL)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_native_statistical_aggregates.py
-
-      - name: Test MySQL MIN/MAX extreme deletes with the (group, arg) index
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_minmax_group_arg_index.py
-
-      - name: Test exact MySQL routing of aggregates without an algebraic rule
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_unrecognized_aggregates.py
-
-      - name: Test MySQL catalog classification of user-defined functions
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_native_function_classification.py
-
-      - name: Test concurrent AVG maintenance on MySQL
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_avg_concurrent_maintenance.py
-
-      - name: Differentially test native bulk statements on MySQL
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: pytest -v -rxXs test_native_bulk_statements.py
-
-      - name: Differentially test the DML and trigger interaction matrix on MySQL
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: pytest -v -rxXs test_native_dml_interactions.py
-
-      - name: Test atomic MV replacement (MySQL)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_registration_replacement.py
-
-      - name: Test lifecycle transaction ownership (MySQL)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_registration_lifecycle.py
-
-      - name: Test fail-closed bulk_changes transaction ownership (MySQL)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_bulk_changes_safety.py
-
-      - name: Differentially test generated SELECT materialized views on MySQL
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_query_ast_materialization.py
-
-      - name: Test manager cursor leak and rollback safety on MySQL
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_p1_manager_safety.py
-
-      - name: Test SQLAlchemy connectivity & introspection on MySQL
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_p1_sqlalchemy_integration.py
-
-      - name: Test native MySQL codegen execution
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_p1_engine_codegen.py
-
-      - name: Test P2 index introspection on MySQL
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_p2_index_intelligence.py
-
-      - name: Test P2 partition-scoped Tier 2 window maintenance on MySQL
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_p2_window_partition_scoping.py
 
       # A "Lost connection" in a test is a client-side symptom: keep the server's own
       # log (a crash, an out-of-memory kill or a restart shows up here) with the run.
       - name: Dump the database server log on failure
         if: failure()
-        run: docker logs --tail 120 mysql-srv
+        run: |
+          # OOMKilled=true (exit 137) proves a kernel OOM kill of the server.
+          docker inspect -f 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}' mysql-srv
+          docker stats --no-stream mysql-srv || true
+          free -m || true
+          # A host-wide OOM kill (no container limit) is logged by the kernel.
+          sudo dmesg | grep -iE "out of memory|killed process" | tail -5 || true
+          docker logs --tail 120 mysql-srv
 
   # Representative LTS boundaries for MariaDB: oldest, previous, newest LTS.
   mysql-compat:
@@ -814,7 +757,12 @@ jobs:
           MYSQL_IMAGE: ${{ matrix.image }}
         run: |
           docker pull "$MYSQL_IMAGE"
+          # jemalloc (shipped in the MariaDB images) returns freed memory to the
+          # OS; with glibc malloc the server keeps the peak of every trigger-heavy
+          # statement and three parallel tasks reached 4.9+ GiB on MariaDB 11.8
+          # vs 3.2 GiB peak with jemalloc. Allocator only: no SQL semantics.
           docker run -d --name mysql-compat-srv \
+            -e LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
             -e MYSQL_ROOT_PASSWORD=password \
             -e MARIADB_ROOT_PASSWORD=password \
             -e MYSQL_DATABASE=matview_test \
@@ -829,7 +777,9 @@ jobs:
           for i in $(seq 1 60); do
             if docker exec mysql-compat-srv sh -c "mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent || mariadb-admin ping -h 127.0.0.1 -uroot -ppassword --silent" 2>/dev/null; then
               echo "${{ matrix.label }} is ready!"
-              exit 0
+              malloc=$(docker exec mysql-compat-srv mariadb -h 127.0.0.1 -uroot -ppassword -N -e "SELECT @@version_malloc_library")
+              echo "malloc library: $malloc"
+              case "$malloc" in jemalloc*) exit 0 ;; *) echo "expected jemalloc"; exit 1 ;; esac
             fi
             sleep 2
           done
@@ -857,119 +807,62 @@ jobs:
           MATVIEW_CI_ACTUAL_IMAGE: ${{ matrix.image }}
         run: python3 verify_engine_matrix.py
 
-      - name: Run full test suite + live ${{ matrix.label }} integration tests
+      # Same layout as the postgres job: every task gets its own database.
+      # Server memory is bounded by the native suites installing at most 16
+      # views per base table (MySQL/MariaDB per-statement trigger memory grows
+      # with the square of the views on a table; TODO.md "Share Float-Recompute
+      # Triggers Per Table on MySQL/MariaDB"): 3 workers peak at ~3.2 GiB on
+      # MariaDB 11.8 under a 7 GiB container cap.
+      - name: Run the full test suite + live ${{ matrix.label }} modules in parallel (one database per task)
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
           MATVIEW_FUZZ_TARGET: "${{ matrix.label }}"
           MATVIEW_EMULATED_BACKENDS: skip
-        run: python3 test_matview_sync.py
-      - name: Archive fuzz campaign manifest
+        run: |
+          python3 scripts/ci_parallel.py --jobs 3 \
+            --task "python3 test_matview_sync.py --suites 2-8" \
+            --task "python3 test_matview_sync.py --suites 12 --seed-shard 0/2" \
+            --task "python3 test_matview_sync.py --suites 12 --seed-shard 1/2" \
+            --task "python3 test_matview_sync.py --suites 1" \
+            --task "python3 test_matview_sync.py --suites 9-11,13,unit" \
+            --task "python3 test_native_statistical_aggregates.py" \
+            --task "python3 test_native_result_types.py" \
+            --task "python3 test_group_key_collation.py" \
+            --task "pytest -v -rxXs test_native_dml_interactions.py" \
+            --task "python3 test_query_ast_materialization.py" \
+            --task "python3 test_native_function_classification.py" \
+            --task "python3 test_p1_manager_safety.py" \
+            --task "python3 test_p1_sqlalchemy_integration.py" \
+            --task "python3 test_p2_index_intelligence.py" \
+            --task "python3 test_p2_window_partition_scoping.py" \
+            --serial "python3 test_concurrent_backfill.py" \
+            --serial "python3 test_minmax_group_arg_index.py" \
+            --serial "python3 test_unrecognized_aggregates.py" \
+            --serial "python3 test_avg_concurrent_maintenance.py" \
+            --serial "pytest -v -rxXs test_native_bulk_statements.py" \
+            --serial "python3 test_registration_replacement.py" \
+            --serial "python3 test_registration_lifecycle.py" \
+            --serial "python3 test_bulk_changes_safety.py" \
+            --serial "python3 test_p1_engine_codegen.py"
+      - name: Archive fuzz campaign manifests
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-campaign-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: fuzz-campaign.json
+          path: fuzz-campaign*.json
           if-no-files-found: ignore
           retention-days: 30
 
-      - name: Test independent-session MariaDB backfill concurrency
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_concurrent_backfill.py
-
-      - name: Test group keys follow the column collation (native MySQL/MariaDB)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_group_key_collation.py
-
-      - name: Test native expression and aggregate result types (MariaDB)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_native_result_types.py
-
-      - name: Test native VAR/STDDEV semantics and result types (MariaDB)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_native_statistical_aggregates.py
-
-      - name: Test MariaDB MIN/MAX extreme deletes with the (group, arg) index
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_minmax_group_arg_index.py
-
-      - name: Test exact MariaDB routing of aggregates without an algebraic rule
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_unrecognized_aggregates.py
-
-      - name: Test MariaDB catalog classification of user-defined functions
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_native_function_classification.py
-
-      - name: Test concurrent AVG maintenance on MariaDB
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_avg_concurrent_maintenance.py
-
-      - name: Differentially test native bulk statements on MariaDB
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: pytest -v -rxXs test_native_bulk_statements.py
-
-      - name: Differentially test the DML and trigger interaction matrix on MariaDB
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: pytest -v -rxXs test_native_dml_interactions.py
-
-      - name: Test atomic MV replacement (MariaDB)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_registration_replacement.py
-
-      - name: Test lifecycle transaction ownership (MariaDB)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_registration_lifecycle.py
-
-      - name: Test fail-closed bulk_changes transaction ownership (MariaDB)
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_bulk_changes_safety.py
-
-      - name: Differentially test generated SELECT materialized views on MariaDB
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_query_ast_materialization.py
-
-      - name: Test manager cursor leak and rollback safety on MariaDB
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_p1_manager_safety.py
-
-      - name: Test SQLAlchemy connectivity & introspection on MariaDB
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_p1_sqlalchemy_integration.py
-
-      - name: Test native MariaDB codegen execution
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_p1_engine_codegen.py
-
-      - name: Test P2 index introspection on MariaDB
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_p2_index_intelligence.py
-
-      - name: Test P2 partition-scoped Tier 2 window maintenance on MariaDB
-        env:
-          MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
-        run: python3 test_p2_window_partition_scoping.py
-
       - name: Dump the database server log on failure
         if: failure()
-        run: docker logs --tail 120 mysql-compat-srv
+        run: |
+          # OOMKilled=true (exit 137) proves a kernel OOM kill of the server.
+          docker inspect -f 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}' mysql-compat-srv
+          docker stats --no-stream mysql-compat-srv || true
+          free -m || true
+          # A host-wide OOM kill (no container limit) is logged by the kernel.
+          sudo dmesg | grep -iE "out of memory|killed process" | tail -5 || true
+          docker logs --tail 120 mysql-compat-srv
 
   # Stable branch-protection check. Only the required PR gate is aggregated;
   # scheduled/deferred compatibility jobs live in the separate workflow.

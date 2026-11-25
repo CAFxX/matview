@@ -426,7 +426,12 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
 
 
 class NativeResultTypeTests(unittest.TestCase):
-    def _run(self, engine: Dialect, dsn: str) -> List[str]:
+    # Views registered on one base table at a time: per-statement trigger
+    # memory grows quadratically with the views on a table on MySQL/MariaDB
+    # (see test_native_statistical_aggregates._VIEWS_PER_TABLE).
+    VIEWS_PER_TABLE = 16
+
+    def _run(self, engine: Dialect, dsn: str, chunk: slice) -> List[str]:
         conn = _connect(engine, dsn)
         cur = conn.cursor()
         cur.execute("SELECT VERSION()")
@@ -450,7 +455,7 @@ class NativeResultTypeTests(unittest.TestCase):
             conn.commit()
             manager = MaterializedViewManager(conn, dialect=engine)
             pairs = []
-            for name, select in _views(engine, t):
+            for name, select in _views(engine, t)[chunk]:
                 mv, live = f"mv_{name}_{tag}", f"live_{name}_{tag}"
                 cur.execute(f"CREATE VIEW {live} AS {select}")
                 conn.commit()
@@ -752,9 +757,11 @@ class NativeResultTypeTests(unittest.TestCase):
         if not engines:
             self.skipTest("set POSTGRES_DSN and/or MYSQL_DSN for native result-type tests")
         for engine, dsn in engines:
-            with self.subTest(engine=engine.value):
-                failures = self._run(engine, dsn)
-                self.assertEqual(failures, [], "\n".join(failures))
+            total, step = len(_views(engine, "t")), self.VIEWS_PER_TABLE
+            for start in range(0, total, step):
+                with self.subTest(engine=engine.value, views=f"{start}:{start + step}"):
+                    failures = self._run(engine, dsn, slice(start, start + step))
+                    self.assertEqual(failures, [], "\n".join(failures))
 
 
 _INT_FAMILY = [
@@ -959,77 +966,82 @@ class MinMaxContextTypingTests(unittest.TestCase):
         if not engines:
             self.skipTest("set MYSQL_DSN")
         for engine, dsn in engines:
-            conn = _connect(engine, dsn)
-            cur = conn.cursor()
-            cur.execute("SELECT VERSION()")
-            mariadb = "mariadb" in str(cur.fetchone()[0]).lower()
-            conn.commit()
-            tag = uuid.uuid4().hex[:8]
-            t = f"mc_{tag}"
-            failures: List[str] = []
-            try:
-                cur.execute(_MINMAX_CONTEXT_TABLE.format(t=t))
-                cur.execute(
-                    f"INSERT INTO {t} VALUES (1, 1, -3, 200, 7, 5, 5, 4000000000, 9, 2001, b'101', 1), "
-                    f"(2, 1, 4, 3, -2, 1, -8, 1, -7, 1999, b'1', 0), "
-                    f"(3, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
-                )
-                conn.commit()
-                manager = MaterializedViewManager(conn, dialect=engine)
-                pairs = []
-                for n, (col, ctx, sql_t) in enumerate(_minmax_context_views()):
-                    sql = sql_t.format(c=col, t=t)
-                    refused = _minmax_refused(mariadb, col, ctx)
-                    mv, live = f"mv{n}_{tag}", f"lv{n}_{tag}"
+            # One fresh table per chunk of views (see NativeResultTypeTests.VIEWS_PER_TABLE).
+            all_views = list(enumerate(_minmax_context_views()))
+            per_table = NativeResultTypeTests.VIEWS_PER_TABLE
+            for start in range(0, len(all_views), per_table):
+                with self.subTest(views=f"{start}:{start + per_table}"):
+                    conn = _connect(engine, dsn)
+                    cur = conn.cursor()
+                    cur.execute("SELECT VERSION()")
+                    mariadb = "mariadb" in str(cur.fetchone()[0]).lower()
+                    conn.commit()
+                    tag = uuid.uuid4().hex[:8]
+                    t = f"mc_{tag}"
+                    failures: List[str] = []
                     try:
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", EngineLimitationWarning)
-                            manager.register_view(f"CREATE VIEW {mv} AS {sql};", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
-                    except UnsupportedMaterializedViewError:
+                        cur.execute(_MINMAX_CONTEXT_TABLE.format(t=t))
+                        cur.execute(
+                            f"INSERT INTO {t} VALUES (1, 1, -3, 200, 7, 5, 5, 4000000000, 9, 2001, b'101', 1), "
+                            f"(2, 1, 4, 3, -2, 1, -8, 1, -7, 1999, b'1', 0), "
+                            f"(3, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
+                        )
+                        conn.commit()
+                        manager = MaterializedViewManager(conn, dialect=engine)
+                        pairs = []
+                        for n, (col, ctx, sql_t) in all_views[start:start + per_table]:
+                            sql = sql_t.format(c=col, t=t)
+                            refused = _minmax_refused(mariadb, col, ctx)
+                            mv, live = f"mv{n}_{tag}", f"lv{n}_{tag}"
+                            try:
+                                with warnings.catch_warnings():
+                                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                                    manager.register_view(f"CREATE VIEW {mv} AS {sql};", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN)
+                            except UnsupportedMaterializedViewError:
+                                conn.rollback()
+                                if not refused:
+                                    failures.append(f"unexpected refusal: {sql}")
+                                continue
+                            conn.commit()
+                            if refused:
+                                failures.append(f"not refused: {sql}")
+                            cur.execute(f"CREATE VIEW {live} AS {sql}")
+                            conn.commit()
+                            pairs.append((sql, mv, live))
+                        for step, stmt in (
+                            ("initial", None),
+                            ("insert", f"INSERT INTO {t} VALUES (4, 2, 0, 0, 0, 0, 0, 0, 0, 2000, b'0', 1), "
+                                       f"(5, 1, 100, 250, 30000, 16000000, 2000000000, 4294967295, 5, 2155, b'1111', 0)"),
+                            ("update", f"UPDATE {t} SET g = 2 WHERE id = 1"),
+                            ("delete", f"DELETE FROM {t} WHERE id = 2"),
+                        ):
+                            if stmt:
+                                cur.execute(stmt)
+                                conn.commit()
+                            for sql, mv, live in pairs:
+                                cur.execute(f"SELECT * FROM {mv}")
+                                a = sorted((tuple(_exact(x) for x in r) for r in cur.fetchall()), key=repr)
+                                da = _description(cur)
+                                cur.execute(f"SELECT * FROM {live}")
+                                b = sorted((tuple(_exact(x) for x in r) for r in cur.fetchall()), key=repr)
+                                db = _description(cur)
+                                conn.commit()
+                                if a != b:
+                                    failures.append(f"{step} {sql}: rows {a[:3]} != {b[:3]}")
+                                meta = _metadata_mismatches(engine, da, db)
+                                if meta:
+                                    failures.append(f"{step} {sql}: {meta}")
+                    finally:
                         conn.rollback()
-                        if not refused:
-                            failures.append(f"unexpected refusal: {sql}")
-                        continue
-                    conn.commit()
-                    if refused:
-                        failures.append(f"not refused: {sql}")
-                    cur.execute(f"CREATE VIEW {live} AS {sql}")
-                    conn.commit()
-                    pairs.append((sql, mv, live))
-                for step, stmt in (
-                    ("initial", None),
-                    ("insert", f"INSERT INTO {t} VALUES (4, 2, 0, 0, 0, 0, 0, 0, 0, 2000, b'0', 1), "
-                               f"(5, 1, 100, 250, 30000, 16000000, 2000000000, 4294967295, 5, 2155, b'1111', 0)"),
-                    ("update", f"UPDATE {t} SET g = 2 WHERE id = 1"),
-                    ("delete", f"DELETE FROM {t} WHERE id = 2"),
-                ):
-                    if stmt:
-                        cur.execute(stmt)
+                        cur.execute(
+                            "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
+                            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE %s", (f"%{tag}%",),
+                        )
+                        for name, kind in sorted(cur.fetchall(), key=lambda o: o[1] != "VIEW"):
+                            cur.execute(f"DROP {'VIEW' if kind == 'VIEW' else 'TABLE'} IF EXISTS `{name}`")
                         conn.commit()
-                    for sql, mv, live in pairs:
-                        cur.execute(f"SELECT * FROM {mv}")
-                        a = sorted((tuple(_exact(x) for x in r) for r in cur.fetchall()), key=repr)
-                        da = _description(cur)
-                        cur.execute(f"SELECT * FROM {live}")
-                        b = sorted((tuple(_exact(x) for x in r) for r in cur.fetchall()), key=repr)
-                        db = _description(cur)
-                        conn.commit()
-                        if a != b:
-                            failures.append(f"{step} {sql}: rows {a[:3]} != {b[:3]}")
-                        meta = _metadata_mismatches(engine, da, db)
-                        if meta:
-                            failures.append(f"{step} {sql}: {meta}")
-            finally:
-                conn.rollback()
-                cur.execute(
-                    "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
-                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE %s", (f"%{tag}%",),
-                )
-                for name, kind in sorted(cur.fetchall(), key=lambda o: o[1] != "VIEW"):
-                    cur.execute(f"DROP {'VIEW' if kind == 'VIEW' else 'TABLE'} IF EXISTS `{name}`")
-                conn.commit()
-                conn.close()
-            self.assertEqual(failures, [], "\n".join(failures))
+                        conn.close()
+                    self.assertEqual(failures, [], "\n".join(failures))
 
 
 class MySQLBitWindowVersionGateTests(unittest.TestCase):
@@ -1068,10 +1080,14 @@ class NativeMySQLIntegerMinMaxTests(unittest.TestCase):
         if not engines:
             self.skipTest("set MYSQL_DSN for the MySQL integer MIN/MAX matrix")
         for engine, dsn in engines:
-            failures = self._run(engine, dsn)
-            self.assertEqual(failures, [], "\n".join(failures))
+            # Three or four views per type on one fresh table per type group
+            # (see NativeResultTypeTests.VIEWS_PER_TABLE).
+            for start in range(0, len(_INT_FAMILY), 4):
+                with self.subTest(types=_INT_FAMILY[start:start + 4]):
+                    failures = self._run(engine, dsn, range(start, min(start + 4, len(_INT_FAMILY))))
+                    self.assertEqual(failures, [], "\n".join(failures))
 
-    def _run(self, engine: Dialect, dsn: str) -> List[str]:
+    def _run(self, engine: Dialect, dsn: str, type_indexes: range) -> List[str]:
         conn = _connect(engine, dsn)
         cur = conn.cursor()
         cur.execute("SELECT VERSION()")
@@ -1101,7 +1117,8 @@ class NativeMySQLIntegerMinMaxTests(unittest.TestCase):
             conn.commit()
             manager = MaterializedViewManager(conn, dialect=engine)
             pairs = []
-            for i, ty in enumerate(_INT_FAMILY):
+            for i in type_indexes:
+                ty = _INT_FAMILY[i]
                 for kind, select in (
                     ("winmin", f"SELECT id, MIN(c{i}) OVER (PARTITION BY g) AS r FROM {t}"),
                     ("winmax", f"SELECT id, MAX(c{i}) OVER (PARTITION BY g) AS r FROM {t}"),

@@ -78,6 +78,8 @@ services:
   mariadb1011:
     image: mariadb:10.11
     environment:
+      # Same allocator as the CI gate (ci.yml mysql-compat job): jemalloc returns freed memory.
+      LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
       MYSQL_ROOT_PASSWORD: password
       MARIADB_ROOT_PASSWORD: password
       MYSQL_DATABASE: matview_test
@@ -99,6 +101,8 @@ services:
   mariadb118:
     image: mariadb:11.8
     environment:
+      # Same allocator as the CI gate (ci.yml mysql-compat job): jemalloc returns freed memory.
+      LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
       MYSQL_ROOT_PASSWORD: password
       MARIADB_ROOT_PASSWORD: password
       MYSQL_DATABASE: matview_test
@@ -120,6 +124,8 @@ services:
   mariadb123:
     image: mariadb:12.3
     environment:
+      # Same allocator as the CI gate (ci.yml mysql-compat job): jemalloc returns freed memory.
+      LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
       MYSQL_ROOT_PASSWORD: password
       MARIADB_ROOT_PASSWORD: password
       MYSQL_DATABASE: matview_test
