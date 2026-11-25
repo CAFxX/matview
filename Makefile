@@ -62,7 +62,8 @@ REGRESSION_TESTS = \
 	test_sqlite_strict_diagnostics.py \
 	test_native_function_classification.py \
 	test_group_key_collation.py \
-	test_sqlite_table_shapes.py
+	test_sqlite_table_shapes.py \
+	test_sqlite_distinct_filtered_aggregates.py
 
 test:
 	$(PYTHON) test_matview_sync.py
