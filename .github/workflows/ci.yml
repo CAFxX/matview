@@ -89,13 +89,22 @@ name: CI — Multi-Engine Materialized View Tests
 #
 # Extended exploration (ci-extended.yml, not a merge gate): random-seed scale-2
 # fuzz on SQLite (Python 3.12), PostgreSQL 18, MySQL 8.4 and MariaDB 12.3.
+#
+# Emulated backends run once per Python version, not once per engine: the
+# SQLite jobs run every test_matview_sync.py batch, including the in-memory
+# SQLite and the transpiled PostgreSQL/MySQL executions. The live-engine jobs
+# (sqlite-compat, postgres, mysql, mysql-compat) set
+# MATVIEW_EMULATED_BACKENDS=skip, so they run only the batches whose dialect
+# executes natively on their server; the skipped batches are engine-independent
+# emulation (not native coverage) that the SQLite jobs already run unchanged.
 
-# Keep only the newest run for a given workflow + source branch. Using the
-# same branch key for push and pull_request events also deduplicates those
-# event types when both apply to the same ref.
+# A new push to a pull request supersedes (cancels) that PR's older run; the
+# group is keyed on the PR number. Every other event (push to master,
+# merge_group, workflow_dispatch) gets a group of its own (keyed on the run
+# id), so trunk runs are never cancelled or replaced by a later trunk push.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
   push:
@@ -115,6 +124,8 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # The CI success job reads this run's job timings for the duration report.
+  actions: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -214,6 +225,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
 
       - name: Install Python dependencies
         run: |
@@ -430,6 +443,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
 
       - name: Install Python dependencies and SQLite driver
         env:
@@ -452,6 +467,7 @@ jobs:
         env:
           SQLITE_COMPAT_ENGINE: ${{ matrix.engine }}
           MATVIEW_FUZZ_TARGET: "${{ matrix.label }} / Python ${{ matrix.python-version }}"
+          MATVIEW_EMULATED_BACKENDS: skip
         run: python3 test_matview_sync.py
 
       - name: Test manager cursor leak and rollback safety
@@ -494,12 +510,12 @@ jobs:
             -p 5432:5432 \
             "$POSTGRES_IMAGE" \
             -c max_prepared_transactions=10
-          for i in $(seq 1 60); do
+          for i in $(seq 1 120); do
             if docker exec postgres-srv pg_isready -h 127.0.0.1 -U postgres -d matview_test; then
               echo "PostgreSQL ${{ matrix.pg-version }} is ready!"
               exit 0
             fi
-            sleep 2
+            sleep 1
           done
           docker logs postgres-srv
           exit 1
@@ -511,6 +527,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
 
       - name: Install Python dependencies
         run: |
@@ -527,6 +545,7 @@ jobs:
         env:
           POSTGRES_DSN: "postgresql://postgres:password@127.0.0.1:5432/matview_test"
           MATVIEW_FUZZ_TARGET: "PostgreSQL ${{ matrix.pg-version }}"
+          MATVIEW_EMULATED_BACKENDS: skip
         run: python3 test_matview_sync.py
       - name: Archive fuzz campaign manifest
         if: always()
@@ -680,6 +699,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
 
       - name: Install Python dependencies
         run: |
@@ -699,6 +720,7 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
           MATVIEW_FUZZ_TARGET: "MySQL ${{ matrix.mysql-version }}"
+          MATVIEW_EMULATED_BACKENDS: skip
         run: python3 test_matview_sync.py
       - name: Archive fuzz campaign manifest
         if: always()
@@ -868,6 +890,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
 
       - name: Install Python dependencies
         run: |
@@ -887,6 +911,7 @@ jobs:
         env:
           MYSQL_DSN: "mysql://root:password@127.0.0.1:3306/matview_test"
           MATVIEW_FUZZ_TARGET: "${{ matrix.label }}"
+          MATVIEW_EMULATED_BACKENDS: skip
         run: python3 test_matview_sync.py
       - name: Archive fuzz campaign manifest
         if: always()
@@ -1043,3 +1068,42 @@ jobs:
           else:
               print("All required CI jobs succeeded.")
           PY
+
+      # Owner budget: every CI job should finish within 15 minutes. Report each
+      # job's duration and warn (annotation, not a failure: runner speed varies)
+      # on every job over budget. Runs after the gate verdict, never changes it.
+      - name: Report job durations against the 15-minute budget
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOBS_URL: ${{ github.api_url }}/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100
+          BUDGET_MINUTES: "15"
+        run: |
+          python3 - <<'DURATIONS'
+          import datetime, json, os, urllib.request
+
+          req = urllib.request.Request(os.environ["JOBS_URL"], headers={
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+          })
+          jobs = json.load(urllib.request.urlopen(req, timeout=30))["jobs"]
+          budget = float(os.environ["BUDGET_MINUTES"])
+          ts = lambda v: datetime.datetime.fromisoformat(v.replace("Z", "+00:00"))
+          rows = []
+          for job in jobs:
+              if job.get("started_at") and job.get("completed_at") and job.get("conclusion") != "skipped":
+                  queued = (ts(job["started_at"]) - ts(job["created_at"])).total_seconds() / 60
+                  ran = (ts(job["completed_at"]) - ts(job["started_at"])).total_seconds() / 60
+                  rows.append((ran, queued, job["name"]))
+          lines = ["| job | ran (min) | queued (min) |", "|---|---:|---:|"]
+          for ran, queued, name in sorted(rows, reverse=True):
+              flag = " (over budget)" if ran > budget else ""
+              lines.append(f"| {name}{flag} | {ran:.1f} | {queued:.1f} |")
+              if ran > budget:
+                  print(f"::warning::{name} took {ran:.1f} min (budget {budget:.0f} min)")
+          lines.append(f"\nRunner minutes (completed jobs): {sum(r for r, _, _ in rows):.1f}")
+          print("\n".join(lines))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("### Job durations (budget %.0f min)\n\n" % budget + "\n".join(lines) + "\n")
+          DURATIONS
