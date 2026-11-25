@@ -751,10 +751,15 @@ class TestPlanOffline(unittest.TestCase):
                         if GROUP_KEY_PLACEHOLDERS in tmpl:
                             self.assertEqual(rendered.count("?, ?, ?"), tmpl.count(GROUP_KEY_PLACEHOLDERS))
         self.assertGreater(seen, 20)
-        # The MariaDB group key text really does contain braces (a regex quantifier):
+        # Group key text carries the grouped expression verbatim, braces included:
         # the reason str.format cannot be used on generated SQL.
-        spec = self._plan("mariadb:11.8", self.SCHEMAS["mariadb:11.8"], self.BACKFILL_VIEWS[0]).incremental_backfill_spec
-        self.assertTrue(any("{" in t for t in spec.chunk_sql_templates))  # type: ignore[union-attr]
+        view = "SELECT CONCAT(g, '{0}') AS k, COUNT(DISTINCT n) AS c FROM t GROUP BY CONCAT(g, '{0}')"
+        spec = self._plan("mariadb:11.8", self.SCHEMAS["mariadb:11.8"], view).incremental_backfill_spec
+        self.assertEqual(spec.mode, "group_key_batch")  # type: ignore[union-attr]
+        braced = [t for t in spec.chunk_sql_templates if "'{0}'" in t and GROUP_KEY_PLACEHOLDERS in t]  # type: ignore[union-attr]
+        self.assertTrue(braced)
+        for tmpl in braced:
+            self.assertIn("'{0}'", tmpl.replace(GROUP_KEY_PLACEHOLDERS, "?, ?, ?"))
 
     def test_reserved_backfill_token_in_a_view_is_refused(self) -> None:
         from matview.logical_ir import GROUP_KEY_PLACEHOLDERS

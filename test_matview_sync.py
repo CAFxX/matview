@@ -763,6 +763,15 @@ def _register_sqlite_compat_udfs(conn: sqlite3.Connection, dialect: Dialect = Di
         ).hexdigest(),
     )
     _create_scalar("RIGHT", 2, lambda v, n: None if v is None else str(v)[-int(n):] if int(n) > 0 else "")
+    def _trim_trailing(v: Any, rem: Any) -> Any:
+        if v is None or rem is None:
+            return None
+        v, rem = str(v), str(rem)
+        while rem and v.endswith(rem):
+            v = v[: -len(rem)]
+        return v
+
+    _create_scalar("MV_TRIM_TRAILING", 2, _trim_trailing)
     _create_scalar(
         "REGEXP_SUBSTR", 2,
         lambda v, pat: None if v is None else (lambda m: m.group(0) if m else None)(re.search(str(pat), str(v))),
@@ -945,8 +954,38 @@ def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     return s
 
 
+def _rewrite_mysql_trim_trailing(sql: str) -> str:
+    """``TRIM(TRAILING rem FROM str)`` (no SQLite syntax) as ``MV_TRIM_TRAILING(str, rem)``,
+    which removes repeated trailing occurrences of ``rem`` like MySQL/MariaDB do. The
+    arguments may nest parentheses and quoted strings."""
+    pat = re.compile(r"\bTRIM\s*\(\s*TRAILING\s+", re.IGNORECASE)
+    while True:
+        m = pat.search(sql)
+        if not m:
+            return sql
+        depth, i, quote, split = 1, m.end(), "", -1
+        while i < len(sql) and depth:
+            ch = sql[i]
+            if quote:
+                if ch == quote:
+                    quote = ""
+            elif ch in "'\"`":
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif depth == 1 and split < 0 and re.match(r"\sFROM\s", sql[i:i + 6], re.IGNORECASE):
+                split = i
+            i += 1
+        if depth or split < 0:
+            raise ValueError(f"cannot emulate TRIM(TRAILING ...) in: {sql[m.start():m.start() + 120]}")
+        rem, src = sql[m.end():split].strip(), sql[split + 5:i - 1].strip()
+        sql = f"{sql[:m.start()]}MV_TRIM_TRAILING({src}, {rem}){sql[i:]}"
+
+
 def _transpile_mysql_expr_to_sqlite(sql: str, pk_cols: Sequence[str] = ("__mv_pk",)) -> str:
-    s = _strip_row_locking_clause(sql)
+    s = _rewrite_mysql_trim_trailing(_strip_row_locking_clause(sql))
     s = re.sub(r"\bCREATE\s+ALGORITHM\s*=\s*\w+\s+VIEW\b", "CREATE VIEW", s, flags=re.IGNORECASE)
     s = re.sub(r"\bBIGINT\s+UNSIGNED\b", "INTEGER", s, flags=re.IGNORECASE)
     s = s.replace("18446744073709551615", "-1")
