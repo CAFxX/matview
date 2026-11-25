@@ -54,6 +54,7 @@ REGRESSION_TESTS = \
 	test_p2_window_partition_scoping.py \
 	test_pgmy_exact_float_aggregates.py \
 	test_pg_statement_maintenance.py \
+	test_pg_logical_subscription.py \
 	test_readme_examples.py \
 	test_schema_graph_minimizer.py \
 	test_unrecognized_aggregates.py \
@@ -73,7 +74,7 @@ test:
 test-regressions:
 	@set -e; for test in $(REGRESSION_TESTS); do \
 		case "$$test" in \
-			test_native_bulk_statements.py|test_native_dml_interactions.py|test_p1_hypothesis_stateful.py|test_pg_statement_maintenance.py) \
+			test_native_bulk_statements.py|test_native_dml_interactions.py|test_p1_hypothesis_stateful.py|test_pg_statement_maintenance.py|test_pg_logical_subscription.py) \
 				$(PYTHON) -m pytest -v "$$test" ;; \
 			*) $(PYTHON) "$$test" ;; \
 		esac; \
