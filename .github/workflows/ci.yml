@@ -90,13 +90,16 @@ name: CI — Multi-Engine Materialized View Tests
 # Extended exploration (ci-extended.yml, not a merge gate): random-seed scale-2
 # fuzz on SQLite (Python 3.12), PostgreSQL 18, MySQL 8.4 and MariaDB 12.3.
 #
-# Emulated backends run once per Python version, not once per engine: the
-# SQLite jobs run every test_matview_sync.py batch, including the in-memory
-# SQLite and the transpiled PostgreSQL/MySQL executions. The live-engine jobs
-# (sqlite-compat, postgres, mysql, mysql-compat) set
-# MATVIEW_EMULATED_BACKENDS=skip, so they run only the batches whose dialect
-# executes natively on their server; the skipped batches are engine-independent
-# emulation (not native coverage) that the SQLite jobs already run unchanged.
+# Emulated backends run in the SQLite jobs, not once per engine: the SQLite
+# jobs (Python 3.11 and 3.15) run every test_matview_sync.py batch, including
+# the in-memory SQLite and the transpiled PostgreSQL/MySQL executions. The
+# live-engine jobs (sqlite-compat, postgres, mysql, mysql-compat) set
+# MATVIEW_EMULATED_BACKENDS=skip, so Suites 1-13 run only the batches whose
+# dialect executes natively on their server (the unittest classes ignore it);
+# the skipped batches are engine-independent emulation, not native coverage.
+# The PR gate therefore no longer runs them on Python 3.12, which is not a
+# declared stdlib-SQLite gate dimension; ci-deferred.yml's live jobs (3.12,
+# no skip) still run them nightly.
 
 # A new push to a pull request supersedes (cancels) that PR's older run; the
 # group is keyed on the PR number. Every other event (push to master,
@@ -124,8 +127,6 @@ on:
 permissions:
   contents: read
   pull-requests: read
-  # The CI success job reads this run's job timings for the duration report.
-  actions: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -1026,6 +1027,11 @@ jobs:
   ci-success:
     name: CI success
     if: ${{ always() }}
+    # actions: read only here: the duration report lists this run's jobs.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
     needs:
       - classify
       - docs-only

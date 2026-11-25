@@ -1230,5 +1230,33 @@ report({ github, context, core }, { title: "T", label: "L", labelDescription: "d
 
 
 
+class TestEmulatedBackendSkip(unittest.TestCase):
+    """MATVIEW_EMULATED_BACKENDS=skip (live CI jobs): suites skip emulated batches only."""
+
+    def test_skip_applies_to_the_suite_runner_only_and_needs_a_live_backend(self) -> None:
+        from test_matview_sync import Dialect, MVTestRunner
+
+        live = {"MATVIEW_EMULATED_BACKENDS": "skip", "SQLITE_COMPAT_ENGINE": "sqlite3"}
+        with patch.dict(os.environ, live, clear=False):
+            os.environ.pop("POSTGRES_DSN", None)
+            os.environ.pop("MYSQL_DSN", None)
+            # The unittest classes build runners that must keep running every dialect.
+            self.assertFalse(MVTestRunner().skip_emulated_backends)
+            suite_runner = MVTestRunner(honor_emulated_skip=True)
+            with patch("sys.stdout", io.StringIO()):
+                self.assertFalse(suite_runner.skips_emulated(Dialect.SQLITE, "s"))
+                self.assertTrue(suite_runner.skips_emulated(Dialect.POSTGRES, "s"))
+                self.assertTrue(suite_runner.skips_emulated(Dialect.MYSQL, "s"))
+            self.assertEqual(suite_runner.skipped_emulated_batches, 2)
+        with patch.dict(os.environ, {"MATVIEW_EMULATED_BACKENDS": "skip"}, clear=False):
+            for k in ("POSTGRES_DSN", "MYSQL_DSN", "SQLITE_COMPAT_ENGINE"):
+                os.environ.pop(k, None)
+            with self.assertRaises(ValueError):
+                MVTestRunner(honor_emulated_skip=True)
+        with patch.dict(os.environ, {"MATVIEW_EMULATED_BACKENDS": "sometimes"}, clear=False):
+            with self.assertRaises(ValueError):
+                MVTestRunner()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
