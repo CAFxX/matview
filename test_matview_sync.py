@@ -3457,6 +3457,37 @@ class MVTestRunner:
             self.default_dialect = Dialect.MYSQL
         else:
             self.default_dialect = Dialect.SQLITE
+        # MATVIEW_EMULATED_BACKENDS=skip (CI live-engine jobs only): skip every
+        # batch whose dialect has no live backend in this process, i.e. the
+        # in-memory SQLite and transpiled PostgreSQL/MySQL executions. Those
+        # are engine-independent emulation (not native coverage) and run
+        # unchanged in the SQLite jobs, which leave this unset. Generation is
+        # not skipped, so fuzz seeds and scenario streams stay identical.
+        mode = os.environ.get("MATVIEW_EMULATED_BACKENDS", "run").strip().lower()
+        if mode not in ("run", "skip"):
+            raise ValueError(f"MATVIEW_EMULATED_BACKENDS must be 'run' or 'skip', not {mode!r}")
+        self.skip_emulated_backends: bool = mode == "skip"
+        self.skipped_emulated_batches: int = 0
+        if self.skip_emulated_backends and not (self.pg_dsn or self.mysql_dsn or self.sqlite_compat_engine):
+            raise ValueError(
+                "MATVIEW_EMULATED_BACKENDS=skip requires a live backend (POSTGRES_DSN, MYSQL_DSN "
+                "or SQLITE_COMPAT_ENGINE); without one it would skip every batch"
+            )
+
+    def has_live_backend(self, dialect: Dialect) -> bool:
+        if dialect == Dialect.POSTGRES:
+            return bool(self.pg_dsn)
+        if dialect == Dialect.MYSQL:
+            return bool(self.mysql_dsn)
+        return dialect == Dialect.SQLITE and bool(self.sqlite_compat_engine)
+
+    def skips_emulated(self, dialect: Dialect, what: str) -> bool:
+        """True (and reports it) when `what` would run on an emulated backend that this job skips."""
+        if not self.skip_emulated_backends or self.has_live_backend(dialect):
+            return False
+        self.skipped_emulated_batches += 1
+        print(f"  [SKIP] {what} [emulated {dialect.value.upper()}]: MATVIEW_EMULATED_BACKENDS=skip (runs in the SQLite jobs)")
+        return True
 
     def _open_backend_session(
         self, dialect: Dialect, suite_tag: str = "batch"
@@ -3566,6 +3597,8 @@ class MVTestRunner:
         batch_size: int = 1000,
     ) -> None:
         eff_dialect = dialect if dialect is not None else self.default_dialect
+        if self.skips_emulated(eff_dialect, suite_name):
+            return
         eff_schema = _adapt_suite_schema_for_dialect(schema_sql, eff_dialect)
         eff_muts = [
             (lbl, _adapt_mutation_for_dialect(msql, eff_dialect))
@@ -4949,6 +4982,8 @@ def run_suite_11_live_engine_50_view_battery_across_all_dialects(runner: MVTestR
         (Dialect.MYSQL, [False, True]),
     ]
     for dialect, mode_list in dialect_configs:
+        if runner.skips_emulated(dialect, f"Suite 11 (Unified 50-View Battery and Manager Lifecycle {dialect.value.upper()})"):
+            continue
         conn, cur, reset_sql, _, engine_label, close_fn = runner._open_backend_session(
             dialect, suite_tag=f"s11_{dialect.value}"
         )
@@ -9580,6 +9615,10 @@ def run_suite_12_differential_random_fuzzer(runner: MVTestRunner) -> None:
             "status": "running",
         }
         manifest["runs"].append(record)
+        if runner.skips_emulated(dialect, suite_name):
+            record["status"] = "skipped-emulated"
+            write_manifest()
+            return
         write_manifest()
         try:
             runner.run_batch(suite_name, schema_sql, views, seed_sqls, mutations, **kwargs)
@@ -10105,6 +10144,8 @@ def _run_all_tests() -> None:
     run_suite_13_fuzz_regression_corpus(runner)
 
     print("-" * 84)
+    if runner.skip_emulated_backends:
+        print(f"SKIPPED {runner.skipped_emulated_batches} emulated-backend batches (MATVIEW_EMULATED_BACKENDS=skip)")
     print(f"COMBINATORIAL & TRANSACTIONAL SUITES PASSED: {runner.total_views} views, {runner.total_assertions} live SQL assertions!")
     print("-" * 84)
 
