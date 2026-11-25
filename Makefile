@@ -55,7 +55,12 @@ REGRESSION_TESTS = \
 	test_pgmy_exact_float_aggregates.py \
 	test_pg_statement_maintenance.py \
 	test_readme_examples.py \
-	test_schema_graph_minimizer.py
+	test_schema_graph_minimizer.py \
+	test_unrecognized_aggregates.py \
+	test_sqlite_strict_sources.py \
+	test_sqlite_strict_diagnostics.py \
+	test_native_function_classification.py \
+	test_group_key_collation.py
 
 test:
 	$(PYTHON) test_matview_sync.py
