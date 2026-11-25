@@ -2358,12 +2358,26 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 refused.append(sub("SELECT ci AS v FROM a UNION ALL SELECT vc FROM a"))
             if ci_type != "CITEXT":
                 accepted = [v for v in accepted if "ci" not in v.replace("nu", "")]
+            # citext defines the aggregate max(citext), so MAX is overloaded by a user-defined
+            # aggregate: the catalog classification routes every max() view to the exact full
+            # refresh of the original query (UNCLASSIFIED_FUNCTION_FULL_REFRESH), whose column
+            # type is the server-reported one. PostgreSQL itself then evaluates the lossy REAL
+            # chain, so the refusal (which guards the incremental casts) does not apply.
+            shadowed_max = [v for v in refused if "max(v)" in v] if ci_type == "CITEXT" else []
+            self.assertEqual(len(shadowed_max), 1 if ci_type == "CITEXT" else 0, refused)
+            refused = [v for v in refused if v not in shadowed_max]
+            accepted += shadowed_max
             mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
             pairs = []
             for idx, sel in enumerate(accepted):
                 mv, lv = f"mv{idx}_{tag}", f"lv{idx}_{tag}"
-                mgr.register_view(f"CREATE VIEW {mv} AS {sel};")
+                plan = mgr.register_view(f"CREATE VIEW {mv} AS {sel};")
                 conn.commit()
+                if sel in shadowed_max:
+                    self.assertEqual(plan.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC, sel)
+                    self.assertEqual(
+                        [d.code for d in plan.strategy_diagnostics], ["UNCLASSIFIED_FUNCTION_FULL_REFRESH"], sel
+                    )
                 mv_names.append(mv)
                 cur.execute(f"CREATE VIEW {lv} AS {sel}")
                 conn.commit()
@@ -2400,6 +2414,9 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 f"DELETE FROM {tb} WHERE id = 1",
                 f"INSERT INTO {tb} VALUES (3,'zz','xbb')",
                 f"DELETE FROM {ta} WHERE id = 1",
+                # The maximum now comes from the INTEGER arm, which PostgreSQL converts through
+                # REAL (16777221 -> 16777220): a max() view must show the rounded value.
+                f"UPDATE {ta} SET r = 0, d = 0",
             ):
                 cur.execute(dml)
                 conn.commit()
