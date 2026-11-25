@@ -141,7 +141,15 @@ class _Fixture:
         which GROUP BY is plan-dependent, so such a key forces the exact full
         refresh (COLLATION_KEY_FALLBACK) whatever the float opt-in; the relaxed
         incremental paths are exercised with a byte-exact key instead."""
-        return "VARCHAR(16) COLLATE utf8mb4_bin" if self.engine == Dialect.MYSQL else "VARCHAR(16)"
+        if self.engine != Dialect.MYSQL:
+            return "VARCHAR(16)"
+        cur = self.conn.cursor()
+        cur.execute("SELECT VERSION()")
+        is_mariadb = "mariadb" in str(cur.fetchone()[0]).lower()
+        self.conn.commit()
+        # MariaDB keeps its default collation: its utf8mb4_unicode_ci keys take the
+        # relaxed incremental path (reproducible collation key), so they stay covered.
+        return "VARCHAR(16)" if is_mariadb else "VARCHAR(16) COLLATE utf8mb4_bin"
 
     def table(self, name: str, cols: str, group_index: Optional[str] = None) -> str:
         t = f"{name}_{self.suffix}"
@@ -1926,7 +1934,8 @@ class NativeMysqlCollationFallbackDominatesRelaxed(_ExactCase):
             if is_mariadb:
                 # The fallback is MySQL's: MariaDB groups utf8mb4_unicode_ci keys
                 # through a reproducible collation key, so the relaxed incremental
-                # path applies there (covered by the other relaxed tests).
+                # path applies there (covered by the race/prelock/backfill tests,
+                # which keep MariaDB's default collation, see grp_text).
                 self.skipTest("MySQL-only collation fallback (PAD SPACE UCA grouping is plan-dependent on MySQL)")
             t = fx.table(
                 "cf", "id BIGINT PRIMARY KEY, grp VARCHAR(16) COLLATE utf8mb4_unicode_ci NOT NULL, amt DOUBLE",

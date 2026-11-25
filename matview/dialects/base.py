@@ -1293,10 +1293,15 @@ class DialectBaseMixin(MixinHost):
                         continue
                     if isinstance(src_e, sqlglot_exp.Column) and not isinstance(src_e.this, sqlglot_exp.Star):
                         # The column's own scope chain first (scope_resolver); a provably
-                        # ambiguous column (conflicting types) is never guessed by name.
+                        # ambiguous column (conflicting types, e.g. a USING/NATURAL merged
+                        # column of differently typed tables) is refused, never guessed.
                         scoped = ScopeResolver(q_ast, self._schemas_lower).resolve(src_e)
                         if scoped.status == SCOPE_CONFLICT:
-                            continue
+                            raise UnsupportedMaterializedViewError(
+                                f"The type of set-operation column {ident} cannot be derived: its arm reads "
+                                f"{src_e.sql(sg_d)}, which resolves to columns of different types ({scoped.reason}); "
+                                "cast the arm to an explicit type."
+                            )
                         c_src = (
                             scoped.column
                             if scoped.status == SCOPE_BASE and scoped.column is not None

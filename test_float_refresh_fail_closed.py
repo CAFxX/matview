@@ -261,6 +261,15 @@ class OfflinePlanDecisions(unittest.TestCase):
                 if kind == "pg":
                     self.assertEqual(cols[1], ("a0", "INT"))
 
+    def test_set_operation_arm_over_a_conflicting_using_column_is_refused(self) -> None:
+        # ta.x INTEGER and tb.x DOUBLE PRECISION merged by USING: PostgreSQL types
+        # the merged column double precision; the arm must not be skipped (typing
+        # k from the other arm, INT, would round 1.5 to 2 and merge groups).
+        select = ("SELECT k, COUNT(*) AS c FROM (SELECT x AS k FROM ta FULL JOIN tb USING (x) "
+                  "UNION ALL SELECT x FROM ta) d GROUP BY k")
+        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "different types"):
+            _plan("pg", select)
+
     def test_derived_key_is_typed_by_its_own_table(self) -> None:
         # d.k is te.g (BIGINT), not the joined ta.g (INT): stored as BIGINT on
         # PostgreSQL (exact float refresh); MySQL/MariaDB refuse the 2-table
