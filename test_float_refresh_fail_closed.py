@@ -46,7 +46,7 @@ from matview_sync import (
     generate_materialized_view,
     parse_table_schema,
 )
-from matview.diagnostics import FLOAT_EXACT_REFRESH
+from matview.diagnostics import EXACT_LEAD, FLOAT_EXACT_REFRESH, FLOAT_RELAXED_MAINTENANCE, RELAXED_LEAD
 from matview.scope_resolver import BASE, CONFLICT, UNKNOWN, ScopeResolver
 from test_avg_concurrent_maintenance import _connect, _native_engines
 
@@ -290,6 +290,45 @@ class OfflinePlanDecisions(unittest.TestCase):
                 self.assertTrue(plan.strategy_diagnostics)
         # PostgreSQL keeps the announced full refresh.
         self.assertEqual(_plan("pg", select).strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
+
+    def test_relaxed_full_refresh_over_joins_is_announced_relaxed_not_exact(self) -> None:
+        # Under the opt-in these MySQL/MariaDB shapes still re-run the query, but
+        # their float result depends on the join order (measured: MV ...0001p+55,
+        # live ...0002p+55 at step 16): the announcement must be the relaxed one.
+        shapes = [
+            "SELECT ta.g AS g, SUM(tb.x) AS s FROM ta JOIN tb USING (g, x) GROUP BY ta.g",
+            "SELECT d.g AS g, SUM(d.x) AS s FROM (SELECT ta.g AS g, tb.x AS x FROM ta JOIN tb ON ta.g = tb.g) d GROUP BY d.g",
+            "SELECT ta.g AS g, SUM(tb.x) AS s FROM ta JOIN tb ON ta.g = tb.g GROUP BY ta.g "
+            "UNION ALL SELECT g, SUM(y) AS s FROM ta GROUP BY g",
+        ]
+        opt_in = ("FLOAT_REASSOCIATION_ALLOWED", "ORDER_SENSITIVE_AGGREGATE_NO_RACE_FREE_RECOMPUTE",
+                  "MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX")
+        for kind in _SCHEMAS:
+            dialect, version, ddl = _SCHEMAS[kind]
+            for select in shapes:
+                with self.subTest(engine=kind, select=select):
+                    if kind == "pg":
+                        plan = _plan(kind, select)
+                        (d,) = plan.strategy_diagnostics
+                        self.assertEqual(d.code, FLOAT_EXACT_REFRESH)
+                        self.assertTrue(d.message.startswith(EXACT_LEAD), d.message)
+                        continue
+                    with self.assertRaisesRegex(UnsupportedMaterializedViewError, "table instances"):
+                        _plan(kind, select)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        plan = generate_materialized_view(
+                            parse_table_schema(ddl, dialect=dialect), f"CREATE VIEW v AS {select};",
+                            dialect=dialect, engine_version=version, ignore_limitations=True,
+                            accept_limitations=opt_in,
+                        )
+                    codes = [d.code for d in plan.strategy_diagnostics]
+                    self.assertEqual(codes, [FLOAT_RELAXED_MAINTENANCE], [str(d) for d in plan.strategy_diagnostics])
+                    msg = plan.strategy_diagnostics[0].message
+                    self.assertTrue(msg.startswith(RELAXED_LEAD), msg)
+                    self.assertNotIn(EXACT_LEAD, msg)
+                    self.assertIn("table instances", msg)
+                    self.assertIn("FLOAT_REASSOCIATION_ALLOWED", {lim.code for lim in plan.limitations})
 
     def test_single_table_float_sums_stay_exact_by_full_refresh_on_every_engine(self) -> None:
         for kind in _SCHEMAS:

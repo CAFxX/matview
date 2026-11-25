@@ -679,14 +679,29 @@ class PlannerMixin(MixinHost):
         default (the relaxed opt-in remains). A single-table query reads its
         rows in one fixed order and stays exact. PostgreSQL keeps the full
         refresh (no mismatch found; the plan-dependence is documented)."""
+        n_tables = self._plan_dependent_float_tables()
+        if n_tables:
+            listed = ", ".join(dict.fromkeys(e for _, e in self._order_sensitive_float_items()))
+            engine = "MariaDB" if self.subdialect == EngineSubdialect.MARIADB else "MySQL"
+            raise UnsupportedMaterializedViewError(
+                f"View '{self.logical_view_name}' sums floating-point values ({listed}) over a query that "
+                f"reads {n_tables} table instances (a join, a subquery or a derived table over other tables): "
+                f"on {engine} the full refresh runs inside the maintenance statement and a later read of the "
+                f"view can use another join order, so the two floating-point results can differ in the last "
+                f"bits; it cannot be exact by construction. Aggregate a single table (materialize the join "
+                f"first) or accept FLOAT_REASSOCIATION_ALLOWED (relaxed, announced)."
+            )
+
+    def _plan_dependent_float_tables(self) -> int:
+        """MySQL/MariaDB: the number of table instances an order-sensitive
+        float aggregate reads together when it is 2 or more (its result then
+        depends on the join order the plan picks), else 0."""
         if self.dialect != Dialect.MYSQL:
-            return
+            return 0
+        self._float_audit_nodes()
         root = getattr(self, "_float_root", None)
         if root is None:
-            self._float_audit_nodes()
-            root = getattr(self, "_float_root", None)
-        if root is None:
-            return
+            return 0
         scopes: List[Any] = []
         for n in self._float_audit_nodes():
             if n.order_sensitive:
@@ -696,19 +711,7 @@ class PlannerMixin(MixinHost):
                 scopes.append(sel if sel is not None else root)
         if not scopes and self._order_sensitive_float_items():
             scopes = [root]
-        listed = ", ".join(dict.fromkeys(e for _, e in self._order_sensitive_float_items()))
-        for scope in scopes:
-            n_tables = self._table_instances(scope, root)
-            if n_tables >= 2:
-                engine = "MariaDB" if self.subdialect == EngineSubdialect.MARIADB else "MySQL"
-                raise UnsupportedMaterializedViewError(
-                    f"View '{self.logical_view_name}' sums floating-point values ({listed}) over a query that "
-                    f"reads {n_tables} table instances (a join, a subquery or a derived table over other tables): "
-                    f"on {engine} the full refresh runs inside the maintenance statement and a later read of the "
-                    f"view can use another join order, so the two floating-point results can differ in the last "
-                    f"bits; it cannot be exact by construction. Aggregate a single table (materialize the join "
-                    f"first) or accept FLOAT_REASSOCIATION_ALLOWED (relaxed, announced)."
-                )
+        return max([n for n in (self._table_instances(sc, root) for sc in scopes) if n >= 2], default=0)
 
     def _refuse_unprovable_float_refresh_types(self) -> None:
         """Fail closed. The exact full refresh stores the original query's
@@ -1074,10 +1077,28 @@ class PlannerMixin(MixinHost):
         items = self._order_sensitive_float_items()
         if not items or not self._float_relaxed_requested():
             return []
-        if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC:
-            # This shape is maintained by a full refresh in every mode: exact.
-            return []
         listed = ", ".join(dict.fromkeys(e for _, e in items))
+        if strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC:
+            plan_tables = self._plan_dependent_float_tables()
+            if not plan_tables:
+                # Maintained by a full refresh in every mode: exact.
+                return []
+            # MySQL/MariaDB full refresh over 2+ table instances: relaxed (the
+            # exact default refuses it), so the accepted code is recorded.
+            return [
+                TransparencyLimitation(
+                    code=self.FLOAT_RELAXED_CODE,
+                    severity=LimitationSeverity.BLOCKER,
+                    dialect=self.dialect,
+                    affected_object=self.logical_view_name,
+                    description=(
+                        f"Relaxed result allowed for {listed}: full refresh over {plan_tables} table instances; a "
+                        f"later read of the view can use another join order, so the floating-point result may differ "
+                        f"from the original view in the last bits (no fixed error bound)."
+                    ),
+                    mitigation="Remove FLOAT_REASSOCIATION_ALLOWED (the exact default refuses this view) or aggregate a single table.",
+                )
+            ]
         lims: List[TransparencyLimitation] = []
         recomputed = strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and (
             alg_mode == "single" or (alg_mode == "union_all_agg" and self.dialect == Dialect.POSTGRES)
@@ -1163,6 +1184,30 @@ class PlannerMixin(MixinHost):
                 f"1213, retryable; measured with 4 single-write writers: MySQL 8.4 285/600 "
                 f"transactions, MariaDB 138/600)."
             )
+        plan_tables = (
+            self._plan_dependent_float_tables()
+            if self._float_relaxed_requested() and strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC
+            else 0
+        )
+        if plan_tables:
+            # Relaxed route that still re-runs the query: the exact default
+            # refuses it on MySQL/MariaDB (plan-dependent float order), so the
+            # opt-in result is relaxed, not exact, and must be announced so.
+            engine = "MariaDB" if self.subdialect == EngineSubdialect.MARIADB else "MySQL"
+            msg = relaxed_message(
+                Strategy.FULL_REFRESH,
+                f"{', '.join(exprs)} sum(s) floating-point values over {plan_tables} table instances read together; "
+                f"on {engine} the refresh runs inside the maintenance statement and a later read of the view can use "
+                f"another join order, so the floating-point result may differ from the live view in the last bits "
+                f"(no fixed error bound). Cost: {cost}",
+                "remove FLOAT_REASSOCIATION_ALLOWED to have the view refused under the exact default, or aggregate a "
+                "single table (materialize the join first) to get the exact full refresh.",
+            )
+            return [Diagnostic(
+                code=FLOAT_RELAXED_MAINTENANCE, severity=DiagnosticSeverity.WARNING,
+                view=self.logical_view_name, strategy=Strategy.FULL_REFRESH, columns=cols, expressions=exprs,
+                message=msg, details={"dialect": self.dialect.value, "cost": cost, "table_instances": plan_tables},
+            )]
         if self._float_relaxed_requested() and strategy != MaintenanceStrategy.ATOMIC_QUERY_SYNC:
             if strategy == MaintenanceStrategy.ALGEBRAIC_DELTA and alg_mode in ("single", "union_all_agg"):
                 strat = Strategy.ALGEBRAIC_DELTA_NATIVE_RECOMPUTE
