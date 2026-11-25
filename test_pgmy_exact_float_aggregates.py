@@ -134,6 +134,15 @@ class _Fixture:
             s.commit()
         return s
 
+    def grp_text(self) -> str:
+        """A text group-key column type that incremental maintenance supports.
+
+        MySQL's default utf8mb4_unicode_ci is a PAD SPACE UCA collation under
+        which GROUP BY is plan-dependent, so such a key forces the exact full
+        refresh (COLLATION_KEY_FALLBACK) whatever the float opt-in; the relaxed
+        incremental paths are exercised with a byte-exact key instead."""
+        return "VARCHAR(16) COLLATE utf8mb4_bin" if self.engine == Dialect.MYSQL else "VARCHAR(16)"
+
     def table(self, name: str, cols: str, group_index: Optional[str] = None) -> str:
         t = f"{name}_{self.suffix}"
         engine_suffix = " ENGINE=InnoDB" if self.engine == Dialect.MYSQL else ""
@@ -737,7 +746,7 @@ class NativeInterleavings(_ExactCase):
         fx = _Fixture(engine, dsn, tt)
         sessions: List[Any] = []
         try:
-            t = fx.table("race", f"id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amt {col_type}", group_index="grp")
+            t = fx.table("race", f"id BIGINT PRIMARY KEY, grp {fx.grp_text()} NOT NULL, amt {col_type}", group_index="grp")
             fx.conn.cursor().executemany(f"INSERT INTO {t} (id, grp, amt) VALUES (%s, %s, %s)", FLOAT_SEED)
             fx.conn.commit()
             live = self.VIEW.format(t=t)
@@ -887,7 +896,7 @@ class NativeMysqlPrelock(_ExactCase):
         fx = _Fixture(Dialect.MYSQL, dsn)
         sessions: List[Any] = []
         try:
-            t = fx.table("pl", "id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amt DOUBLE", group_index="grp")
+            t = fx.table("pl", f"id BIGINT PRIMARY KEY, grp {fx.grp_text()} NOT NULL, amt DOUBLE", group_index="grp")
             fx.conn.cursor().executemany(f"INSERT INTO {t} VALUES (%s, %s, %s)", [(1, "G1", 0.1), (2, "G2", 0.2)])
             fx.conn.commit()
             live = f"SELECT grp, COUNT(*) AS c, SUM(amt) AS s, AVG(amt) AS a FROM {t} GROUP BY grp"
@@ -982,7 +991,7 @@ class NativeBackfill(_ExactCase):
         fx = _Fixture(engine, dsn)
         writer = monitor = None
         try:
-            t = fx.table("bfw", f"id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amt {col_type}", group_index="grp")
+            t = fx.table("bfw", f"id BIGINT PRIMARY KEY, grp {fx.grp_text()} NOT NULL, amt {col_type}", group_index="grp")
             fx.conn.cursor().executemany(
                 f"INSERT INTO {t} (id, grp, amt) VALUES (%s, %s, %s)",
                 [(i, "G", (0.1 * i) if i % 3 else 1e7 * (-1) ** i) for i in range(1, 13)],
@@ -1894,6 +1903,56 @@ class NativeMysqlGroupIndexRecognition(_ExactCase):
                     self.assertEqual("MYSQL_GROUP_RECOMPUTE_REQUIRES_GROUP_INDEX" in {l.code for l in plan.limitations}, refused)
                 finally:
                     fx.close()
+
+
+class NativeMysqlCollationFallbackDominatesRelaxed(_ExactCase):
+    """A group key whose collation incremental maintenance cannot reproduce
+    (MySQL's default utf8mb4_unicode_ci: PAD SPACE UCA, plan-dependent
+    grouping) forces the exact full refresh of the original query
+    (COLLATION_KEY_FALLBACK) even with the float opt-in: the opt-in only
+    permits a cheaper strategy, it never overrides another exactness reason.
+    The result stays equal to the live view after every transition."""
+
+    def test_relaxed_opt_in_with_pad_space_uca_key_is_an_exact_full_refresh(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN not set")
+        fx = _Fixture(Dialect.MYSQL, dsn)
+        try:
+            t = fx.table(
+                "cf", "id BIGINT PRIMARY KEY, grp VARCHAR(16) COLLATE utf8mb4_unicode_ci NOT NULL, amt DOUBLE",
+                group_index="grp",
+            )
+            fx.conn.cursor().executemany(
+                f"INSERT INTO {t} VALUES (%s, %s, %s)", [(1, "G1", 1e16), (2, "G1", 1.5), (3, "G2", 0.1)]
+            )
+            fx.conn.commit()
+            live = f"SELECT grp, COUNT(*) AS c, SUM(amt) AS s, AVG(amt) AS a FROM {t} GROUP BY grp"
+            fx.manager = MaterializedViewManager(fx.conn, dialect=Dialect.MYSQL)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                plan = fx.manager.register_view(
+                    f"CREATE VIEW vcf_{fx.suffix} AS {live};", ignore_limitations=True, accept_limitations=FLOAT_OPT_IN
+                )
+            fx.conn.commit()
+            fx.plans.append(plan)
+            self.assertEqual(plan.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
+            codes = {d.code for d in plan.strategy_diagnostics}
+            self.assertIn("COLLATION_KEY_FALLBACK", codes)
+            self.assertNotIn(FLOAT_RELAXED_MAINTENANCE, codes)
+            self.assertViewExact(fx.conn, plan, live, "populate")
+            cur = fx.conn.cursor()
+            for i, stmt in enumerate((
+                f"INSERT INTO {t} VALUES (4, 'G1', -1e16)",
+                f"UPDATE {t} SET amt = amt * 3 WHERE grp = 'G2'",
+                f"DELETE FROM {t} WHERE id = 1",
+                f"UPDATE {t} SET grp = 'G2' WHERE id = 2",
+            )):
+                cur.execute(stmt)
+                fx.conn.commit()
+                self.assertViewExact(fx.conn, plan, live, f"step {i}")
+        finally:
+            fx.close()
 
 
 class NativeRepairNeverBypasses(_ExactCase):

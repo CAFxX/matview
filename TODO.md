@@ -742,6 +742,8 @@ The existing differential-testing harness is useful, but its current headline co
 - [ ] **PostgreSQL STABLE Timestamptz Expressions Are Evaluated in the Writer's Session (pre-existing, P0)**:
   - `CAST(ts AS DATE)` / `CAST(ts AS TEXT)` over a `TIMESTAMPTZ` column are computed in the writing session (`TimeZone`, `DateStyle`) while the original view is evaluated in the reader's session, so the materialized value differs when the writer uses a non-UTC `TimeZone` or a non-ISO `DateStyle`. Verified on master (PostgreSQL 18). Repro (strict xfail): `test_native_bulk_statements.py::test_pg_timestamptz_expression_independent_of_writer_session_settings[CAST(ts AS DATE)|CAST(ts AS TEXT)]`. Fix: refuse STABLE/session-dependent expressions (or evaluate them at read time); never freeze a session-dependent value.
 
+- [ ] Diagnostics (LOW, found rebasing #255 onto the MySQL collation-key fallback): with `FLOAT_REASSOCIATION_ALLOWED` accepted, a view forced to the full refresh by another exactness reason (e.g. `COLLATION_KEY_FALLBACK` for a MySQL PAD SPACE UCA group key) still gets `FLOAT_EXACT_REFRESH`, whose "to change it" hint tells the user to accept the opt-in they already accepted. The result is exact (pinned by `test_pgmy_exact_float_aggregates.NativeMysqlCollationFallbackDominatesRelaxed`); the hint should name the dominating reason instead.
+
 ## SQLite STRICT, rowid and minimal-columns initiative
 
 - [x] **Support and recommend STRICT source tables** (README "SQLite STRICT tables", `docs/design-sqlite-strict.md`, `test_sqlite_strict_sources.py`, STRICT scenarios in the SQLite fuzzer).
