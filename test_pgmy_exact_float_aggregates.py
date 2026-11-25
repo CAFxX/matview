@@ -1919,6 +1919,15 @@ class NativeMysqlCollationFallbackDominatesRelaxed(_ExactCase):
             self.skipTest("MYSQL_DSN not set")
         fx = _Fixture(Dialect.MYSQL, dsn)
         try:
+            cur = fx.conn.cursor()
+            cur.execute("SELECT VERSION()")
+            is_mariadb = "mariadb" in str(cur.fetchone()[0]).lower()
+            fx.conn.commit()
+            if is_mariadb:
+                # The fallback is MySQL's: MariaDB groups utf8mb4_unicode_ci keys
+                # through a reproducible collation key, so the relaxed incremental
+                # path applies there (covered by the other relaxed tests).
+                self.skipTest("MySQL-only collation fallback (PAD SPACE UCA grouping is plan-dependent on MySQL)")
             t = fx.table(
                 "cf", "id BIGINT PRIMARY KEY, grp VARCHAR(16) COLLATE utf8mb4_unicode_ci NOT NULL, amt DOUBLE",
                 group_index="grp",
