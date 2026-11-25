@@ -760,6 +760,8 @@ class TestPlanOffline(unittest.TestCase):
         self.assertTrue(braced)
         for tmpl in braced:
             self.assertIn("'{0}'", tmpl.replace(GROUP_KEY_PLACEHOLDERS, "?, ?, ?"))
+            with self.assertRaises((IndexError, KeyError, ValueError)):
+                tmpl.format(placeholders="?, ?, ?")
 
     def test_reserved_backfill_token_in_a_view_is_refused(self) -> None:
         from matview.logical_ir import GROUP_KEY_PLACEHOLDERS
