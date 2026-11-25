@@ -1029,10 +1029,19 @@ class TestFinding7CollationAndGroupPk(unittest.TestCase):
         self.assertIn("WEIGHT_STRING(LOWER(txt))", compiler._canonical_group_pk_expr(["LOWER(txt)"]))
         self.assertIn("WEIGHT_STRING(CONCAT(txt, 'x'))", compiler._canonical_group_pk_expr(["CONCAT(txt, 'x')"]))
         self.assertNotIn("WEIGHT_STRING", compiler._canonical_group_pk_expr(["LENGTH(txt)"]))
-        # MariaDB pads by weight: trailing weight units equal to a space's are dropped.
+        # MariaDB pads by weight: trailing weight units equal to a space's are dropped
+        # (under PAD SPACE only, asked of the server), with one weight string of the
+        # value and no regular expression (each extra item makes every MariaDB
+        # trigger's first execution heavier).
         maria = IncrementalViewCompiler(schema_map, v, dialect="mariadb:11.8", ignore_limitations=True)
         e = maria._canonical_group_pk_expr(["txt"])
-        self.assertIn("REGEXP_SUBSTR(HEX(WEIGHT_STRING(txt))", e)
+        self.assertIn(
+            "TRIM(TRAILING IF(RIGHT(CONCAT(txt, ' '), 1) = '', HEX(WEIGHT_STRING(RIGHT(CONCAT(txt, ' '), 1))), 'G') "
+            "FROM HEX(WEIGHT_STRING(txt)))",
+            e,
+        )
+        self.assertEqual(e.count("WEIGHT_STRING(txt)"), 1)
+        self.assertNotIn("REGEXP", e)
         self.assertNotIn("RTRIM", e)
         # An expression whose character collation cannot be derived is refused, not keyed byte-exactly.
         with self.assertRaises(UnsupportedMaterializedViewError):

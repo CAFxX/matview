@@ -2613,12 +2613,20 @@ class DialectBaseMixin(MixinHost):
             # MariaDB pads by weight (``'a'`` = ``'a'`` + NBSP, ideographic space, ...
             # under the UCA collations): drop the trailing weight units equal to the
             # weight of a space. The unit is the weight string of one space under the
-            # expression's own collation; the aligned prefix before the trailing run
-            # of units is kept.
-            p = f"HEX(WEIGHT_STRING({spc}))"
-            padded = (
-                f"COALESCE(REGEXP_SUBSTR({w}, CONCAT('^(?:[0-9A-F]{{', LENGTH({p}), '}})*?(?=(?:', {p}, ')*$)')), '')"
-            )
+            # expression's own collation, trimmed from the end (for collations with
+            # uniform weight units this is the aligned prefix before the trailing run;
+            # unlike the anchored regular expression used before, it never maps a
+            # weight string that is not a whole number of units to '').
+            # ``TRIM(TRAILING unit ...)`` under PAD SPACE, and a unit that never
+            # occurs in a hex string ('G') under NO PAD, keeps the expression to one
+            # weight string of the value and one of the space with a single
+            # comparison: every extra item in a MariaDB trigger statement costs
+            # memory and time on each trigger's first execution, and the previous
+            # form (a row-dependent REGEXP_SUBSTR pattern plus a second weight string
+            # under an IF) made the MariaDB CI jobs about 1.3-1.45x slower. An empty
+            # unit trims nothing, so the weight string is then kept whole.
+            unit = f"IF({spc} = '', HEX(WEIGHT_STRING({spc})), 'G')"
+            return f"IF({expr} IS NULL, 'N', CONCAT('W', SHA2(TRIM(TRAILING {unit} FROM {w}), 256)))"
         return f"IF({expr} IS NULL, 'N', CONCAT('W', SHA2(IF({spc} = '', {padded}, {w}), 256)))"
 
     def _sqlite_collation_folded(self, expr: str) -> str:
