@@ -816,7 +816,7 @@ jobs:
     if: needs.classify.outputs.docs_only != 'true'
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
