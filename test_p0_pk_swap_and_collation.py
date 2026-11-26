@@ -777,6 +777,8 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
             plan = compiler._finalize_plan_backfill(raw_plan)
 
             cur.execute(plan.backing_table_ddl)
+            for aux_ddl in plan.auxiliary_table_ddls:
+                cur.execute(aux_ddl)
             for idx_ddl in plan.index_ddls:
                 cur.execute(idx_ddl)
             assert plan.reader_view_ddl is not None
@@ -841,6 +843,10 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
             comp_const = IncrementalViewCompiler(num_schemas, v_const, dialect=Dialect.POSTGRES)
             plan_const = comp_const._finalize_plan_backfill(comp_const._compile_tier1_zset_projection())
             cur.execute(plan_const.backing_table_ddl)
+            for aux_ddl in plan_const.auxiliary_table_ddls:
+                cur.execute(aux_ddl)
+            for idx_ddl in plan_const.index_ddls:
+                cur.execute(idx_ddl)
             assert plan_const.reader_view_ddl is not None
             cur.execute(plan_const.reader_view_ddl)
             for ro_ddl in plan_const.readonly_trigger_ddls:
@@ -862,8 +868,9 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
                     "INSERT INTO pg_bag_const_mv VALUES (5, 'hello', NULL, TRUE, 1.5, '1', '0', 'x');"
                 )
 
-            # Schema-qualified reader view + INSTEAD OF trigger execute cleanly on PostgreSQL.
+            # Literal-dot reader view name + INSTEAD OF trigger execute cleanly on PostgreSQL.
             from dataclasses import replace as dc_replace
+            cur.execute('DROP VIEW IF EXISTS "mv_bag_sch.pg_bag_sq_v" CASCADE;')
             v_sq = dc_replace(v_const, view_name="mv_bag_sch.pg_bag_sq_v")
             comp_sq = IncrementalViewCompiler(num_schemas, v_sq, dialect=Dialect.POSTGRES)
             sq_view_ddl, sq_ro_trigs, _, _ = comp_sq._build_readonly_view_and_triggers(
@@ -875,18 +882,21 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
             cur.execute(sq_view_ddl)
             for ro_ddl in sq_ro_trigs:
                 cur.execute(ro_ddl)
-            cur.execute("SELECT COUNT(*) FROM mv_bag_sch.pg_bag_sq_v;")
+            cur.execute('SELECT COUNT(*) FROM "mv_bag_sch.pg_bag_sq_v";')
             self.assertEqual(cur.fetchone()[0], 3)
             with self.assertRaises(Exception):
                 cur.execute(
-                    "INSERT INTO mv_bag_sch.pg_bag_sq_v VALUES (5, 'hello', NULL, TRUE, 1.5, '1', '0', 'x');"
+                    'INSERT INTO "mv_bag_sch.pg_bag_sq_v" VALUES (5, \'hello\', NULL, TRUE, 1.5, \'1\', \'0\', \'x\');'
                 )
         finally:
+            cur.execute('DROP VIEW IF EXISTS "mv_bag_sch.pg_bag_sq_v" CASCADE;')
             cur.execute("DROP SCHEMA IF EXISTS mv_bag_sch CASCADE;")
             cur.execute("DROP VIEW IF EXISTS pg_bag_const_mv CASCADE;")
             cur.execute("DROP VIEW IF EXISTS pg_bag_mv CASCADE;")
             cur.execute("DROP TABLE IF EXISTS __matview_store_pg_bag_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS __matview_stg_pg_bag_mv__pg_bag_logs CASCADE;")
             cur.execute("DROP TABLE IF EXISTS __matview_store_pg_bag_const_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS __matview_stg_pg_bag_const_mv__pg_bag_num CASCADE;")
             cur.execute("DROP TABLE IF EXISTS pg_bag_num CASCADE;")
             cur.execute("DROP TABLE IF EXISTS pg_bag_logs CASCADE;")
             cur.close()
