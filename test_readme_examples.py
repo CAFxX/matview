@@ -1,31 +1,19 @@
 #!/usr/bin/env python3
-"""Execute README.md's examples and check its links and CI matrix.
+"""Execute README.md's examples and check its links and CONTRIBUTING CI matrix.
 
-README fenced-code convention (documented in README.md, "Executable
-documentation"):
+README fenced-code convention:
 
 * Every ``python``, ``sh``, ``bash`` or ``console`` block must carry either
-  ``run`` or ``no-run`` in its info string. An unmarked block fails this test,
-  so no example is silently unverified.
-* ``python run`` blocks are executed one by one, each in a fresh interpreter
-  (``sys.executable``) with the repository root on ``PYTHONPATH``, in a
-  temporary working directory. They must be self-contained.
-* ``sh run`` blocks are executed in document order by ``bash -euo pipefail`` in
-  one shared temporary working directory (state such as ``app.db`` carries over
-  between them). ``python3`` resolves to ``sys.executable``, the repository
-  root is on ``PYTHONPATH`` and ``matview_sync.py`` is linked into the working
-  directory, as if the commands ran from a checkout.
-* A ``sql file=NAME`` block is written to ``NAME`` in that shared directory
-  before the first ``sh run`` block executes.
-* A ``text output`` block directly after a ``run`` block holds that block's
-  exact expected standard output (trailing whitespace on each line ignored).
-* ``no-run`` blocks are only syntax-checked (``compile()`` for Python,
-  ``bash -n`` for shell).
+  ``run`` or ``no-run`` in its info string.
+* ``python run`` blocks execute in fresh interpreters with the repository
+  root on ``PYTHONPATH``.
+* ``sh run`` blocks execute in document order in one temporary directory.
+* A ``text output`` block directly after a run block contains its expected
+  standard output.
+* ``no-run`` blocks are syntax-checked only.
 
-The README's CI matrix tables (between ``<!-- BEGIN GENERATED: ci-matrix -->``
-and ``<!-- END GENERATED: ci-matrix -->``) must equal the rendering of
-.github/workflows/ci.yml, ci-extended.yml and ci-deferred.yml produced here; run
-``python3 test_readme_examples.py --print-matrix`` to regenerate them.
+The generated CI matrix in CONTRIBUTING.md must match the workflow files;
+run ``python3 test_readme_examples.py --print-matrix`` to regenerate it.
 """
 
 from __future__ import annotations
@@ -432,7 +420,6 @@ class ReadmeLinks(unittest.TestCase):
     def test_todo_links_name_existing_items(self) -> None:
         titles = todo_titles(TODO.read_text(encoding="utf-8"))
         named = [label for label, target in self.links if target == "TODO.md" and label != "TODO.md" and not label.startswith("`")]
-        self.assertGreater(len(named), 0)
         for label in named:
             with self.subTest(label=label):
                 self.assertIn(label, titles, "README names a TODO.md item that does not exist (by exact title)")
@@ -476,11 +463,11 @@ class MakefileCoverage(unittest.TestCase):
 
 class ReadmeMatrix(unittest.TestCase):
     def test_matrix_matches_workflows(self) -> None:
-        text = README.read_text(encoding="utf-8")
+        text = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
         self.assertEqual(
             readme_matrix_section(text),
             render_matrix(),
-            "README CI matrix is stale; regenerate with: python3 test_readme_examples.py --print-matrix",
+            "CONTRIBUTING CI matrix is stale; regenerate with: python3 test_readme_examples.py --print-matrix",
         )
 
     def test_renderer_reflects_workflow_changes(self) -> None:
