@@ -165,6 +165,18 @@ def _exact(v: Any) -> Tuple[str, Any]:
         return ("float", v.hex())
     if isinstance(v, (bytes, bytearray, memoryview)):
         return ("bytes", bytes(v))
+    if isinstance(v, list):
+        return ("list", tuple(_exact(x) for x in v))
+    if hasattr(v, "lower") and hasattr(v, "upper") and hasattr(v, "lower_inc"):
+        return (
+            "range",
+            type(v).__name__,
+            _exact(v.lower),
+            _exact(v.upper),
+            v.lower_inc,
+            v.upper_inc,
+            getattr(v, "isempty", False),
+        )
     return (type(v).__name__, v)
 
 
@@ -1470,12 +1482,17 @@ TIE_SCHEMA = [
 ]
 
 
-@known_defect("pre-existing P0 on master: set operations over numeric representation ties (TODO.md)")
 @pytest.mark.parametrize("target", _params(("postgres",)))
 @pytest.mark.parametrize(
     "select",
-    ["SELECT x FROM t UNION SELECT x FROM d", "SELECT x FROM t INTERSECT SELECT x FROM d"],
-    ids=["union", "intersect"],
+    [
+        "SELECT x FROM t UNION SELECT x FROM d",
+        "SELECT x FROM t INTERSECT SELECT x FROM d",
+        "SELECT x FROM t EXCEPT SELECT x FROM d WHERE id = 99",
+        "SELECT DISTINCT x FROM t",
+        "SELECT x, COUNT(*) AS c FROM t GROUP BY x",
+    ],
+    ids=["union", "intersect", "except", "distinct", "group_by"],
 )
 def test_pg_numeric_representation_ties_after_unread_column_update(make_env, target: Target, select: str) -> None:
     env = make_env(target, views=[], schema_sql=TIE_SCHEMA, seed=False)
@@ -1491,10 +1508,158 @@ def test_pg_numeric_representation_ties_after_unread_column_update(make_env, tar
         ("one-row unread update", "UPDATE t SET junk = junk + 1 WHERE id = 1"),
         ("another row", "UPDATE t SET junk = junk + 1 WHERE id = 2"),
         ("two rows", "UPDATE t SET junk = junk + 1 WHERE id IN (1, 2)"),
+        ("delete current winner", "DELETE FROM t WHERE id = 3"),
+        ("insert different scale into branch 0", "INSERT INTO t VALUES (4, 1, 1.0000, 0)"),
     ):
         env.execute(sql)
         env.commit()
         env.check(label)
+
+
+@pytest.mark.parametrize("target", _params(("postgres",)))
+def test_pg_numeric_union_branch0_insert_overrides_branch1_rep(make_env, target: Target) -> None:
+    """When UNION initially gets its representative from branch 1 (branch 0 empty),
+    a subsequent INSERT into branch 0 with a different NUMERIC scale adopts
+    branch 0's scan-order representative to match the live UNION."""
+    env = make_env(target, views=[], schema_sql=TIE_SCHEMA, seed=False)
+    env.execute("INSERT INTO d VALUES (1, 1.00)")
+    env.commit()
+    vd = ViewDef("v_tie_b0", "SELECT x FROM t UNION SELECT x FROM d", ("postgres",))
+    env.register(vd)
+    env.views.append(vd)
+    env.check("initial (branch 1 only)")
+    env.execute("INSERT INTO t VALUES (1, 1, 1.0, 0)")
+    env.commit()
+    env.check("after branch 0 insert")
+    env.execute("INSERT INTO t VALUES (2, 1, 1.000, 0)")
+    env.commit()
+    env.check("after second branch 0 insert")
+    env.execute("UPDATE t SET junk = junk + 1 WHERE id = 1")
+    env.commit()
+    env.check("after branch 0 unread update")
+    env.execute("DELETE FROM t")
+    env.commit()
+    env.check("after deleting branch 0 (falls back to branch 1)")
+
+
+@pytest.mark.parametrize("target", _params(("postgres",)))
+def test_pg_numeric_representation_ties_complex_shapes(make_env, target: Target) -> None:
+    """Exercise representation-tie refresh across multi-column set ops (with NULLs),
+    DOMAIN over NUMERIC, widened NUMERIC(10, 2) / NUMERIC(10, 3), widened INT / NUMERIC,
+    unconstrained BPCHAR, widened CHAR(2) / CHAR(4), NUMRANGE, NUMERIC[] (including
+    NULL elements), self-UNION with cross-branch shared keys, EXCEPT with active
+    branch-1 hiding/revealing, JOIN GROUP BY, GROUP BY + MIN/MAX combined recompute,
+    UNION ALL + GROUP BY, branch-1-only updates, multi-row mixed-scale single-statement
+    INSERT, and VACUUM-freed slot INSERT."""
+    schema = [
+        "CREATE DOMAIN pos_num AS NUMERIC CHECK (VALUE > 0)",
+        "CREATE TABLE a (id INT PRIMARY KEY, g INT, iv INT, x NUMERIC, y NUMERIC, p pos_num, "
+        "n2 NUMERIC(10, 2), ch BPCHAR, ch2 CHAR(2), nr NUMRANGE, na NUMERIC[], junk INT)",
+        "CREATE TABLE b (id INT PRIMARY KEY, g INT, x NUMERIC, y NUMERIC, p pos_num, "
+        "n3 NUMERIC(10, 3), ch BPCHAR, ch4 CHAR(4), nr NUMRANGE, na NUMERIC[], junk INT)",
+        "CREATE TABLE dj (g INT PRIMARY KEY, tag TEXT)",
+    ]
+    env = make_env(target, views=[], schema_sql=schema, seed=False)
+    env.execute("INSERT INTO dj VALUES (1, 'g1'), (2, 'g2')")
+    env.execute(
+        "INSERT INTO a VALUES "
+        "(1, 1, 1, 1.0, 2.0, 3.0, 4.00, 'ab  ', 'ab', '[1.0,2.0)', ARRAY[1.0, NULL], 10), "
+        "(2, 1, 1, 1.00, 2.00, 3.00, 4.00, 'ab', 'ab', '[1.00,2.00)', ARRAY[1.00, NULL], 20), "
+        "(3, 2, 1, 1.000, 5.0, 3.000, 4.00, 'ab ', 'ab', '[1.000,2.000)', ARRAY[1.000, NULL], 30), "
+        "(4, 2, 2, NULL, 5.0, 3.0, 4.00, 'ab', 'ab', '[1.0,2.0)', ARRAY[1.0, NULL], 40), "
+        "(5, 2, 2, NULL, 5.00, 3.00, 4.00, 'ab  ', 'ab', '[1.00,2.00)', ARRAY[1.00, NULL], 50)"
+    )
+    env.execute(
+        "INSERT INTO b VALUES "
+        "(1, 1, 1.00, 2.00, 3.00, 4.000, 'ab', 'ab  ', '[1.00,2.00)', ARRAY[1.00, NULL], 0), "
+        "(2, 1, 9.0, 9.0, 9.0, 9.000, 'zz  ', 'zz  ', '[9.0,10.0)', ARRAY[9.0], 0), "
+        "(3, 1, 9.00, 9.00, 9.00, 9.000, 'zz', 'zz  ', '[9.00,10.00)', ARRAY[9.00], 0)"
+    )
+    # Seed extra disjoint rows in b so b stays larger than a after ANALYZE / VACUUM a;
+    # otherwise PostgreSQL 18's HashSetOp Intersect can swap b ahead of a and emit
+    # branch 1's representation (inherently plan-dependent).
+    env.execute(
+        "INSERT INTO b SELECT 100 + i, 99, (100 + i)::numeric, (100 + i)::numeric, "
+        "(100 + i)::pos_num, (100 + i)::numeric(10,3), 'p' || i, 'p' || i, "
+        "numrange(100 + i, 101 + i), ARRAY[(100 + i)::numeric], 0 "
+        "FROM generate_series(1, 12) i"
+    )
+    # Analyze so PostgreSQL's planner uses HashAggregate/HashSetOp (heap-scan order)
+    # rather than unstable-quicksort Unique->Sort on filtered branches like v_self_u.
+    env.execute("ANALYZE a")
+    env.execute("ANALYZE b")
+    env.execute("ANALYZE dj")
+    env.commit()
+    views = [
+        ViewDef("v_xy_u", "SELECT x, y FROM a UNION SELECT x, y FROM b", ("postgres",)),
+        ViewDef("v_xy_i", "SELECT x, y FROM a INTERSECT SELECT x, y FROM b", ("postgres",)),
+        ViewDef("v_dom_u", "SELECT p FROM a UNION SELECT p FROM b", ("postgres",)),
+        ViewDef("v_widen_u", "SELECT n2 AS n FROM a UNION SELECT n3 AS n FROM b", ("postgres",)),
+        ViewDef("v_widen_i", "SELECT n2 AS n FROM a INTERSECT SELECT n3 AS n FROM b", ("postgres",)),
+        ViewDef("v_int_num_u", "SELECT iv AS n FROM a UNION SELECT x AS n FROM b", ("postgres",)),
+        ViewDef("v_bpchar_u", "SELECT ch FROM a UNION SELECT ch FROM b", ("postgres",)),
+        ViewDef("v_char_widen_u", "SELECT ch2 AS ch FROM a UNION SELECT ch4 AS ch FROM b", ("postgres",)),
+        ViewDef("v_nr_u", "SELECT nr FROM a UNION SELECT nr FROM b", ("postgres",)),
+        ViewDef("v_na_u", "SELECT na FROM a UNION SELECT na FROM b", ("postgres",)),
+        ViewDef("v_self_u", "SELECT x FROM a WHERE g = 1 UNION SELECT x FROM a WHERE g = 2", ("postgres",)),
+        ViewDef("v_exc_active", "SELECT x FROM a EXCEPT SELECT x FROM b", ("postgres",)),
+        ViewDef(
+            "v_join_g",
+            "SELECT a.x, COUNT(*) AS c FROM a JOIN dj ON a.g = dj.g GROUP BY a.x",
+            ("postgres",),
+        ),
+        ViewDef(
+            "v_grp_mm",
+            "SELECT x, MIN(junk) AS mn, MAX(junk) AS mx FROM a GROUP BY x",
+            ("postgres",),
+        ),
+        ViewDef(
+            "v_uall_g",
+            "WITH u AS (SELECT x, junk FROM a UNION ALL SELECT x, junk FROM b) SELECT x, COUNT(*) AS c FROM u GROUP BY x",
+            ("postgres",),
+        ),
+    ]
+    for vd in views:
+        env.register(vd)
+        env.views.append(vd)
+    env.check("initial complex shapes")
+
+    for label, sql in (
+        ("unread update row 1 of a (also updates MIN/MAX)", "UPDATE a SET junk = junk + 100 WHERE id = 1"),
+        ("unread update row 4 of a (NULL x, variable y)", "UPDATE a SET junk = junk + 1 WHERE id = 4"),
+        ("unread update branch-1-only key (x=9) and join rhs", "UPDATE b SET junk = junk + 1 WHERE id = 2"),
+        ("branch-1 DELETE reveals branch-0 EXCEPT winner", "DELETE FROM b WHERE id = 1"),
+        ("branch-1 INSERT re-hides EXCEPT key", "INSERT INTO b VALUES (4, 1, 1.0000, 2.0000, 3.0000, 4.000, 'ab ', 'ab  ', '[1.0000,2.0000)', ARRAY[1.0000, NULL], 0)"),
+        ("branch-0 unread update moves self-UNION shared key", "UPDATE a SET junk = junk + 1 WHERE id = 2"),
+        (
+            "multi-row mixed-scale single-statement INSERT",
+            "INSERT INTO a VALUES "
+            "(10, 1, 7, 7.0, 7.0, 7.0, 7.00, 'cd  ', 'cd', '[7.0,8.0)', ARRAY[7.0], 1), "
+            "(11, 1, 7, 7.000, 7.000, 7.000, 7.00, 'cd', 'cd', '[7.000,8.000)', ARRAY[7.000], 2)",
+        ),
+        (
+            "branch-0 INSERT overriding branch-1 key (x=9)",
+            "INSERT INTO a VALUES (12, 1, 9, 9.000, 9.000, 9.000, 9.00, 'zz ', 'zz', '[9.000,10.000)', ARRAY[9.000], 3)",
+        ),
+        ("DELETE first winner in a", "DELETE FROM a WHERE id = 3"),
+    ):
+        env.execute(sql)
+        env.commit()
+        env.check(label)
+
+    # Free an early heap slot with VACUUM, then INSERT a different-scale tie that
+    # PostgreSQL can place before surviving rows on page 0.
+    env.conn.commit()
+    env.conn.autocommit = True
+    try:
+        env.execute("VACUUM a")
+    finally:
+        env.conn.autocommit = False
+    env.execute(
+        "INSERT INTO a VALUES (13, 1, 1, 1.0000, 2.0000, 3.0000, 4.00, 'ab ', 'ab', '[1.0000,2.0000)', ARRAY[1.0000, NULL], 5)"
+    )
+    env.commit()
+    env.check("INSERT into VACUUM-freed earlier heap slot")
 
 
 # No index on the group key: the original query and the recomputation both read
