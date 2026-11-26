@@ -384,6 +384,13 @@ def items_with_unmodelled_calls(spec: ViewSpec, dialect: Dialect) -> List[Select
     return out
 
 
+def query_has_unmodelled_call(spec: ViewSpec, dialect: Dialect) -> bool:
+    """True when any expression in the view query (including CTEs, derived
+    tables, or set-op branches) calls a function sqlglot does not model."""
+    node = _parse(spec.raw_select_sql, dialect)
+    return node is not None and node.find(sqlglot_exp.Anonymous) is not None
+
+
 def probe_result_types(conn: Any, dialect: Dialect, select_sql: str) -> Dict[str, str]:
     """Output column -> native type of ``select_sql``, asked from the server
     without reading data; {} when the probe fails (the caller keeps the
@@ -402,8 +409,9 @@ def probe_result_types(conn: Any, dialect: Dialect, select_sql: str) -> Dict[str
                     # A domain is reported as its base type (domains are unwrapped like
                     # the static inference does: a NOT NULL domain would reject the NULLs
                     # an outer join produces), a non-default collation is appended (the
-                    # live view compares and sorts with it), and a pseudo-type (`record`)
-                    # is left out (it is not a valid column type; the static rules decide).
+                    # live view compares and sorts with it), and a pseudo-type (such as
+                    # `void` or `record[]`, which PostgreSQL may allow in a view but not
+                    # in a backing table) is detected and refused explicitly.
                     cur.execute(
                         "WITH RECURSIVE d(attnum, attname, typid, typmod, coll, depth) AS ("
                         "  SELECT a.attnum, a.attname, a.atttypid, a.atttypmod, a.attcollation, 0 "
@@ -417,21 +425,34 @@ def probe_result_types(conn: Any, dialect: Dialect, select_sql: str) -> Dict[str
                         "       CASE WHEN d.coll <> 0 AND d.coll <> bt.typcollation THEN "
                         "         CASE WHEN cn.nspname = 'pg_catalog' THEN pg_catalog.quote_ident(co.collname) "
                         "              ELSE pg_catalog.quote_ident(cn.nspname) || '.' || pg_catalog.quote_ident(co.collname) END "
-                        "       END "
+                        "       END, "
+                        "       (bt.typtype = 'p' OR (et.oid IS NOT NULL AND et.typtype = 'p')) "
                         "FROM d JOIN pg_catalog.pg_type bt ON bt.oid = d.typid "
+                        "LEFT JOIN pg_catalog.pg_type et ON et.oid = bt.typelem AND bt.typelem <> 0 AND bt.typlen = -1 "
                         "LEFT JOIN pg_catalog.pg_collation co ON co.oid = d.coll "
                         "LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace "
-                        "WHERE bt.typtype <> 'd' AND bt.typtype <> 'p' ORDER BY d.attnum",
+                        "WHERE bt.typtype <> 'd' ORDER BY d.attnum",
                         (f"pg_temp.{name}",),
                     )
-                    rows = [
-                        (r[0], f"{r[1]} COLLATE {r[2]}" if r[2] else r[1]) for r in cur.fetchall()
-                    ]
+                    fetched = cur.fetchall()
                     cur.execute(f"DROP VIEW pg_temp.{name}")
+                    for r in fetched:
+                        if r[3]:
+                            raise UnsupportedMaterializedViewError(
+                                f"PostgreSQL materialized view column {str(r[0])!r} has pseudo-type "
+                                f"{str(r[1])}; PostgreSQL does not allow pseudo-type columns in tables. "
+                                f"Cast the expression to a named composite type or to TEXT."
+                            )
+                    rows = [
+                        (r[0], f"{r[1]} COLLATE {r[2]}" if r[2] else r[1]) for r in fetched
+                    ]
                 except Exception as exc:
                     if savepoint:
                         cur.execute(f"ROLLBACK TO SAVEPOINT {name}")
-                    if getattr(exc, "pgcode", None) == "42P16" and "pseudo-type" in str(exc).lower():
+                    if isinstance(exc, UnsupportedMaterializedViewError):
+                        raise
+                    pgcode = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+                    if pgcode == "42P16" and "pseudo-type" in str(exc).lower():
                         raise UnsupportedMaterializedViewError(
                             f"PostgreSQL view output has a pseudo-type column ({str(exc).strip()}); "
                             f"PostgreSQL does not allow pseudo-type columns in tables or views. "

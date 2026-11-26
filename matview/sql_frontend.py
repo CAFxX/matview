@@ -1838,6 +1838,7 @@ def _unwrap_outer_parens(
             break
         depth = 0
         closes_at_end = False
+        has_top_level_comma = False
         for idx, tk in enumerate(toks):
             if tk.token_type == SQLGlotTokenType.L_PAREN:
                 depth += 1
@@ -1846,7 +1847,9 @@ def _unwrap_outer_parens(
                 if depth == 0:
                     closes_at_end = (idx == len(toks) - 1)
                     break
-        if closes_at_end:
+            elif tk.token_type == SQLGlotTokenType.COMMA and depth == 1:
+                has_top_level_comma = True
+        if closes_at_end and not has_top_level_comma:
             s = s[1:-1].strip()
         else:
             break

@@ -3434,24 +3434,72 @@ class PostgresPseudotypeOutputRefusalTests(unittest.TestCase):
     must refuse them explicitly instead of silently storing a ``TEXT`` column."""
 
     def test_postgres_row_and_pseudotype_outputs_refused_offline(self) -> None:
-        schema = "CREATE TABLE t (id INT PRIMARY KEY, g INT, v TEXT);"
+        from matview.sql_frontend import _unwrap_outer_parens
+
+        self.assertEqual(_unwrap_outer_parens("(SUM(id), COUNT(*))", dialect=Dialect.POSTGRES), "(SUM(id), COUNT(*))")
+        self.assertEqual(_unwrap_outer_parens("((SUM(id), COUNT(*)))", dialect=Dialect.POSTGRES), "(SUM(id), COUNT(*))")
+        self.assertEqual(_unwrap_outer_parens("((a + b))", dialect=Dialect.POSTGRES), "a + b")
+
+        schema = (
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT, v TEXT);"
+            "CREATE TABLE nopk (g INT, v TEXT);"
+        )
         refused = (
             "SELECT id, ROW(v, g) AS r FROM t",
+            "SELECT id, ROW(v) AS r FROM t",
             "SELECT id, (v, g) AS r FROM t",
+            "SELECT id, ((v, g)) AS r FROM t",
             "SELECT id, ROW() AS r FROM t",
             "SELECT id, ARRAY[ROW(v, g)] AS r FROM t",
+            "SELECT id, ARRAY[ROW(v, g)] || ARRAY[ROW('a', 1)] AS r FROM t",
+            "SELECT id, ARRAY[ROW(v, g)] || ROW('a', 1) AS r FROM t",
+            "SELECT id, ROW('a', 1) || ARRAY[ROW(v, g)] AS r FROM t",
+            "SELECT id, ARRAY_PREPEND(ROW('a', 1), ARRAY[ROW(v, g)]) AS r FROM t",
             "SELECT id, COALESCE(ROW(v, g), ROW('a', 1)) AS r FROM t",
             "SELECT id, CASE WHEN g > 0 THEN ROW(v, g) ELSE NULL END AS r FROM t",
             "SELECT id, NULLIF(ROW(v, g), ROW('a', 1)) AS r FROM t",
             "SELECT g, MIN(ROW(v, g)) AS r FROM t GROUP BY g",
             "SELECT g, MAX(ROW(v, g)) AS r FROM t GROUP BY g",
             "SELECT g, ARRAY_AGG(ROW(v, g) ORDER BY id) AS r FROM t GROUP BY g",
+            "SELECT g, COALESCE(MIN(ROW(v, g)), ROW('a', 1)) AS r FROM t GROUP BY g",
+            "SELECT g, CASE WHEN COUNT(*) > 0 THEN MIN(ROW(v, g)) ELSE NULL END AS r FROM t GROUP BY g",
+            "SELECT g, COALESCE(pg_catalog.min(ROW(v, g)), ROW('a', 1)) AS r FROM t GROUP BY g",
+            "SELECT g, COALESCE(ARRAY_AGG(ROW(v, g) ORDER BY id), ARRAY[ROW('a', 1)]) AS r FROM t GROUP BY g",
+            "SELECT g, (SUM(id), COUNT(*)) AS r FROM t GROUP BY g",
+            "SELECT g, ((SUM(id), COUNT(*))) AS r FROM t GROUP BY g",
+            "SELECT g, (g, COUNT(*)) AS r FROM t GROUP BY g",
             "SELECT id, LAG(ROW(v, g)) OVER (PARTITION BY g ORDER BY id) AS r FROM t",
+            "SELECT id, MIN(ROW(v, g)) OVER (PARTITION BY g) AS r FROM t",
+            "SELECT id, MAX(ROW(v, g)) OVER () AS r FROM t",
+            "SELECT id, ARRAY_AGG(ROW(v, g)) OVER (PARTITION BY g) AS r FROM t",
+            "SELECT id, ANY_VALUE(ROW(v, g)) OVER (PARTITION BY g) AS r FROM t",
+            "SELECT id, (SELECT ROW(v, g) FROM t t2 WHERE t2.id = t.id) AS r FROM t",
+            "SELECT id, (SELECT MIN(ROW(v, g)) FROM t) AS r FROM t",
+            "SELECT DISTINCT ON (g) ROW(v, g) AS r, id FROM t ORDER BY g, id",
             "SELECT id, CAST(v AS record) AS r FROM t",
             "SELECT id, CAST(v AS record[]) AS r FROM t",
+            "SELECT id, CAST(v AS _record) AS r FROM t",
+            'SELECT id, CAST(v AS "record") AS r FROM t',
+            'SELECT id, CAST(v AS "record"[]) AS r FROM t',
+            'SELECT id, CAST(v AS pg_catalog."record") AS r FROM t',
+            'SELECT id, CAST(v AS "pg_catalog"."record") AS r FROM t',
             "SELECT id, CAST(v AS pg_catalog.record) AS r FROM t",
+            "SELECT id, CAST(v AS void) AS r FROM t",
+            'SELECT id, CAST(v AS "void") AS r FROM t',
+            "SELECT id, CAST(v AS pg_ddl_command) AS r FROM t",
             "WITH c AS (SELECT id, ROW(v, g) AS rk FROM t) SELECT id, rk FROM c",
+            "WITH c AS (SELECT DISTINCT id, ROW(v, g) AS rk FROM t) SELECT * FROM c",
+            "WITH c AS (SELECT DISTINCT id, ROW(v, g) AS rk FROM t) SELECT DISTINCT * FROM c",
+            "WITH c AS (SELECT g, MIN(ROW(v, g)) AS rk FROM t GROUP BY g) SELECT g, rk FROM c",
+            "WITH c AS (SELECT g, ARRAY_AGG(ROW(v, g) ORDER BY id) AS rk FROM t GROUP BY g) SELECT g, rk FROM c",
             "SELECT NULL AS r FROM t UNION SELECT ROW(v, g) AS r FROM t",
+            "WITH c AS (SELECT id, ROW(v, g) AS rk FROM t) SELECT id, NULL AS r FROM t UNION SELECT id, rk AS r FROM c",
+            "SELECT id, NULL AS r FROM t UNION SELECT id, ROW(v, g) AS r FROM t ORDER BY id LIMIT 5",
+            "SELECT id, NULL AS r FROM t UNION SELECT id, NULL AS r FROM t UNION ALL SELECT id, ROW(v, g) AS r FROM t",
+            "SELECT g, NULL AS r FROM nopk UNION ALL SELECT g, ROW(v, g) AS r FROM nopk",
+            "SELECT t.id, NULL AS r FROM t JOIN t t2 ON t.id = t2.id UNION SELECT id, ROW(v, g) AS r FROM t",
+            "SELECT id, NULL AS r FROM t UNION ALL SELECT id, LAG(ROW(v, g)) OVER (ORDER BY id) AS r FROM t",
+            "SELECT id, NULL AS r FROM t UNION SELECT * FROM (SELECT id, ROW(v, g) AS r FROM t) s",
         )
         for sel in refused:
             with self.subTest(refused=sel):
@@ -3459,21 +3507,30 @@ class PostgresPseudotypeOutputRefusalTests(unittest.TestCase):
                     warnings.simplefilter("ignore")
                     with self.assertRaises(UnsupportedMaterializedViewError) as ctx:
                         generate_materialized_view(schema, f"CREATE VIEW v AS {sel};", dialect="postgres:18")
-                self.assertIn("record", str(ctx.exception).lower())
                 self.assertIn("pseudo-type", str(ctx.exception).lower())
 
-        # Valid casts and boolean comparisons over ROW(...) must remain supported
-        # with their exact PostgreSQL storage types.
+        # Valid casts, custom types, schema-qualified `row()`, non-output ROW()
+        # in GROUP BY / COUNT(DISTINCT), and boolean comparisons over ROW(...)
+        # must remain supported with their exact PostgreSQL storage types.
         allowed = (
             ("SELECT id, ROW(v, g)::my_pair AS r FROM t", "r my_pair"),
+            ("SELECT id, (v, g)::my_pair AS r FROM t", "r my_pair"),
+            ("SELECT id, CASE WHEN g > 0 THEN v::my_pair ELSE v::MY_PAIR END AS r FROM t", "r MY_PAIR"),
             ("SELECT id, ROW(v, g)::text AS r FROM t", "r TEXT"),
             ("SELECT id, (ROW(v, g) = ROW('a', 1)) AS r FROM t", "r BOOLEAN"),
+            ("SELECT id, ((v, g) IN (('a', 1), ('b', 2))) AS r FROM t", "r BOOLEAN"),
             ("SELECT id, ROW(v, g) IS NULL AS r FROM t", "r BOOLEAN"),
             ("SELECT id, NULL AS r FROM t", "r TEXT"),
+            ("SELECT id, my_schema.row(v) AS r FROM t", "r TEXT"),
+            ("SELECT g, COUNT(DISTINCT ROW(v, g)) AS r FROM t GROUP BY g", "r BIGINT"),
+            ("SELECT COUNT(*) AS r FROM t GROUP BY ROW(v, g)", "r BIGINT"),
+            ('SELECT id, v::"RECORD" AS r FROM t', 'r "RECORD"'),
         )
         for sel, exp_col_ddl in allowed:
             with self.subTest(allowed=sel):
-                plan = generate_materialized_view(schema, f"CREATE VIEW v AS {sel};", dialect="postgres:18")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    plan = generate_materialized_view(schema, f"CREATE VIEW v AS {sel};", dialect="postgres:18")
                 self.assertIn(exp_col_ddl, plan.backing_table_ddl)
 
     def test_native_postgres_row_and_pseudotype_outputs_refused_and_named_composite_exact(self) -> None:
@@ -3486,37 +3543,50 @@ class PostgresPseudotypeOutputRefusalTests(unittest.TestCase):
         t = f"t_{tag}"
         pair_t = f"pair_{tag}"
         fn_rec = f"mk_rec_{tag}"
+        fn_void = f"mk_void_{tag}"
         conn = _connect(Dialect.POSTGRES, dsn)
         cur = conn.cursor()
         created_mvs: List[str] = []
         created_lvs: List[str] = []
         try:
+            cur.execute("SHOW server_version_num")
+            pg_ver = int(cur.fetchone()[0])
             cur.execute(f"CREATE TYPE {pair_t} AS (v text, g int)")
             cur.execute(f"CREATE TABLE {t} (id INT PRIMARY KEY, g INT, v TEXT)")
             cur.execute(
                 f"CREATE FUNCTION {fn_rec}(int) RETURNS record LANGUAGE sql IMMUTABLE "
                 f"AS $$ SELECT ROW($1, 'x') $$"
             )
+            cur.execute(
+                f"CREATE FUNCTION {fn_void}(int) RETURNS void LANGUAGE sql IMMUTABLE "
+                f"AS $$ SELECT NULL::void $$"
+            )
             cur.execute(f"INSERT INTO {t} VALUES (1, 10, 'a'), (2, 20, 'b'), (3, NULL, NULL)")
             conn.commit()
 
             mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
-            for idx, bad_sel in enumerate(
-                (
-                    f"SELECT id, ROW(v, g) AS r FROM {t}",
-                    f"SELECT id, (v, g) AS r FROM {t}",
-                    f"SELECT id, ARRAY[ROW(v, g)] AS r FROM {t}",
-                    f"SELECT g, MIN(ROW(v, g)) AS r FROM {t} GROUP BY g",
-                    f"SELECT g, MIN(ROW(v, g)::{pair_t}) AS r FROM {t} GROUP BY g",
-                    f"SELECT id, {fn_rec}(id) AS r FROM {t}",
-                    f"SELECT id, COALESCE({fn_rec}(id), NULL) AS r FROM {t}",
-                )
-            ):
+            bad_sels: List[str] = [
+                f"SELECT id, ROW(v, g) AS r FROM {t}",
+                f"SELECT id, (v, g) AS r FROM {t}",
+                f"SELECT id, ARRAY[ROW(v, g)] AS r FROM {t}",
+                f"SELECT g, MIN(ROW(v, g)) AS r FROM {t} GROUP BY g",
+                f"SELECT id, {fn_rec}(id) AS r FROM {t}",
+                f"SELECT id, COALESCE({fn_rec}(id), NULL) AS r FROM {t}",
+                f"WITH c AS (SELECT id, {fn_rec}(id) AS r FROM {t}) SELECT id, r FROM c",
+                f"SELECT id, {fn_void}(id) AS r FROM {t}",
+                f"SELECT id, public.{fn_void}(id) AS r FROM {t}",
+                f"WITH c AS (SELECT id, {fn_void}(id) AS r FROM {t}) SELECT id, r FROM c",
+                f"SELECT id, pg_catalog.pg_sleep(0) AS r FROM {t}",
+            ]
+            # MIN(composite) -> record was added in PostgreSQL 18.
+            if pg_ver >= 180000:
+                bad_sels.append(f"SELECT g, MIN(ROW(v, g)::{pair_t}) AS r FROM {t} GROUP BY g")
+            for idx, bad_sel in enumerate(bad_sels):
                 with self.subTest(refused_native=bad_sel):
                     with self.assertRaises(UnsupportedMaterializedViewError) as ctx:
                         mgr.register_view(f"CREATE VIEW mv_bad_{idx}_{tag} AS {bad_sel};")
                     conn.rollback()
-                    self.assertIn("record", str(ctx.exception).lower())
+                    self.assertIn("pseudo-type", str(ctx.exception).lower())
 
             good_specs = [
                 ("named_comp", f"SELECT id, ROW(v, g)::{pair_t} AS r FROM {t}"),
@@ -3571,6 +3641,7 @@ class PostgresPseudotypeOutputRefusalTests(unittest.TestCase):
                 cur.execute(f"DROP VIEW IF EXISTS {lv}")
             cur.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
             cur.execute(f"DROP FUNCTION IF EXISTS {fn_rec}(int)")
+            cur.execute(f"DROP FUNCTION IF EXISTS {fn_void}(int)")
             cur.execute(f"DROP TYPE IF EXISTS {pair_t}")
             conn.commit()
             conn.close()

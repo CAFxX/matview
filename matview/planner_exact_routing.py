@@ -830,6 +830,8 @@ class ExactAggregateRoutingMixin(MixinHost):
         node = self._item_ast(item.raw_expr)
         while isinstance(node, sqlglot_exp.Paren):
             node = node.this
+        if isinstance(node, sqlglot_exp.Dot) and isinstance(node.expression, sqlglot_exp.Anonymous):
+            node = node.expression
         if not isinstance(node, sqlglot_exp.Anonymous):
             return None
         native_t = dict(self.view.native_scalar_types).get(f"{str(node.name).upper()}/{len(node.expressions)}")
