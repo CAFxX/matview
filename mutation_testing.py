@@ -675,6 +675,26 @@ MUTANTS = (
             "test_postgres_reentrant_nested_trigger_bracket_codegen"
         ),
     ),
+    Mutant(
+        name="sqlite-var-pop-misclassified-as-unrecognized",
+        source_path="matview/planner_exact_routing.py",
+        original='        "VAR_POP", "VARIANCE", "VARIANCE_POP", "VAR_SAMP", "VARIANCE_SAMP",',
+        replacement='        "VAR_POP", "VARIANCE", "VAR_SAMP",',
+        target_test=(
+            "test_sqlite_distinct_filtered_aggregates.TestDistinctAndFilteredStatBitBool."
+            "test_distinct_group_recompute_diagnostics_consistent_across_aggregates_and_dialects"
+        ),
+    ),
+    Mutant(
+        name="distinct-group-recompute-fallback-omitted",
+        source_path="matview/planner_exact_routing.py",
+        original="            return (\n                self._unrecognized_aggregate_group_fallback()\n                or self._distinct_aggregate_group_fallback()\n            )",
+        replacement="            return self._unrecognized_aggregate_group_fallback()",
+        target_test=(
+            "test_sqlite_distinct_filtered_aggregates.TestDistinctAndFilteredStatBitBool."
+            "test_distinct_group_recompute_diagnostics_consistent_across_aggregates_and_dialects"
+        ),
+    ),
 )
 
 

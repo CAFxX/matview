@@ -2220,9 +2220,9 @@ class PlannerMixin(MixinHost):
                 "Window functions require recomputing sibling rows within the affected PARTITION BY partition rather than single-row O(1) deltas.",
             )
         sel = "Tier 2 group-scoped delta maintenance: recomputes only the affected GROUP BY groups."
-        unrecognized = self._unrecognized_aggregate_group_fallback()
-        if unrecognized is not None:
-            return (sel, unrecognized.message())
+        routing = self._exact_routing_fallback_for(MaintenanceStrategy.GROUP_SCOPED_DELTA)
+        if routing is not None:
+            return (sel, routing.message())
         if self.dialect == Dialect.SQLITE and not self.engine_version.supports_sqlite_upsert:
             return (sel, "SQLite version lacks UPSERT (INSERT ... ON CONFLICT) required for Tier 1 algebraic delta maintenance.")
 
@@ -2236,9 +2236,6 @@ class PlannerMixin(MixinHost):
             if it.is_aggregate and it.agg_func not in allowed_aggs:
                 fn_name = it.agg_func.value if it.agg_func is not None else str(it.raw_expr)
                 return (sel, f"Holistic aggregate function '{fn_name}' cannot be maintained algebraically with O(1) deltas.")
-            if it.is_aggregate and it.is_distinct:
-                fn_name = it.agg_func.value if it.agg_func is not None else str(it.raw_expr)
-                return (sel, f"DISTINCT aggregate expression '{fn_name}' requires group-scoped recomputation.")
 
         for j in self.view.joins:
             if j.join_type not in ("FROM", "INNER JOIN", "CROSS JOIN"):

@@ -45,6 +45,7 @@ from .sql_frontend import parse_sql_ast
 
 # Diagnostic codes (matview.diagnostics registry is open).
 UNRECOGNIZED_AGGREGATE_GROUP_RECOMPUTE = "UNRECOGNIZED_AGGREGATE_GROUP_RECOMPUTE"
+DISTINCT_AGGREGATE_GROUP_RECOMPUTE = "DISTINCT_AGGREGATE_GROUP_RECOMPUTE"
 UNRECOGNIZED_AGGREGATE_FULL_REFRESH = "UNRECOGNIZED_AGGREGATE_FULL_REFRESH"
 ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH = "ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"
 OPAQUE_AGGREGATE_FULL_REFRESH = "OPAQUE_AGGREGATE_FULL_REFRESH"
@@ -100,11 +101,15 @@ _WINDOW_ONLY_FUNCS: Tuple[type, ...] = (
 # Aggregates with an algebraic delta rule (the decomposition targets).
 _ALGEBRAIC_AGGREGATE_NAMES = frozenset(
     {
-        "COUNT", "SUM", "TOTAL", "AVG", "MIN", "MAX", "VAR_POP", "VARIANCE", "VAR_SAMP",
-        "STDDEV_POP", "STDDEV", "STD", "STDDEV_SAMP", "BIT_AND", "BIT_OR", "BIT_XOR",
+        "COUNT", "SUM", "TOTAL", "AVG", "MIN", "MAX",
+        "VAR_POP", "VARIANCE", "VARIANCE_POP", "VAR_SAMP", "VARIANCE_SAMP",
+        "STDDEV_POP", "STDDEV", "STD", "STDDEV_SAMP",
+        "BIT_AND", "BIT_OR", "BIT_XOR",
         "BOOL_AND", "EVERY", "BOOL_OR",
     }
 )
+# DISTINCT aggregates supported algebraically on a single table without FILTER.
+_ALGEBRAIC_SINGLE_TABLE_DISTINCT_NAMES = frozenset({"COUNT", "SUM", "TOTAL", "AVG"})
 # Recognized (AggFunc) aggregates without an algebraic rule, as sqlglot
 # renders them per dialect; their storage types are inferred by the dialect.
 _RECOGNIZED_HOLISTIC_NAMES = frozenset({"GROUP_CONCAT", "STRING_AGG", "JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT", "ARRAY_AGG"})
@@ -609,6 +614,81 @@ class ExactAggregateRoutingMixin(MixinHost):
             tuple(names),
         )
 
+    def _distinct_group_recompute_calls(self) -> List[str]:
+        """Formatted DISTINCT aggregate calls (SELECT list and HAVING) that
+        cannot be maintained algebraically in this query shape and therefore
+        trigger group-scoped recomputation."""
+        sg_d = _sqlglot_dialect(self.dialect)
+        exprs = [it.raw_expr for it in self.view.select_items]
+        if self.view.having_clause:
+            exprs.append(self.view.having_clause)
+        is_multi_table = len(self.view.joins) > 1
+        extra_names = self._native_aggregate_names() | _ALGEBRAIC_AGGREGATE_NAMES
+        calls_out: Set[str] = set()
+        for raw in exprs:
+            ast = self._item_ast(raw)
+            if ast is None:
+                continue
+            for call in aggregate_calls(ast, extra_names):
+                dist_node: Optional[sqlglot_exp.Distinct] = None
+                if isinstance(call.this, sqlglot_exp.Distinct):
+                    dist_node = call.this
+                else:
+                    for arg_e in (call.expressions or ()):
+                        if isinstance(arg_e, sqlglot_exp.Distinct):
+                            dist_node = arg_e
+                            break
+                if dist_node is None:
+                    continue
+                is_filt = isinstance(call.parent, sqlglot_exp.Filter)
+                if isinstance(call, sqlglot_exp.VariancePop):
+                    disp_name = "VAR_POP"
+                elif isinstance(call, sqlglot_exp.Variance):
+                    disp_name = "VAR_SAMP"
+                elif isinstance(call, sqlglot_exp.LogicalAnd):
+                    disp_name = "BOOL_AND"
+                elif isinstance(call, sqlglot_exp.LogicalOr):
+                    disp_name = "BOOL_OR"
+                else:
+                    disp_name = call_name(call, sg_d)
+                if (
+                    not is_multi_table
+                    and not is_filt
+                    and disp_name in _ALGEBRAIC_SINGLE_TABLE_DISTINCT_NAMES
+                ):
+                    continue
+                if dist_node.expressions:
+                    arg_sql = ", ".join(a.sql(dialect=sg_d) for a in dist_node.expressions)
+                elif dist_node.this is not None:
+                    arg_sql = dist_node.this.sql(dialect=sg_d)
+                else:
+                    arg_sql = ""
+                rendered = f"{disp_name}(DISTINCT {arg_sql})"
+                if is_filt and call.parent is not None:
+                    filt_cond = call.parent.args.get("expression")
+                    if isinstance(filt_cond, sqlglot_exp.Expr):
+                        rendered = f"{rendered} FILTER ({filt_cond.sql(dialect=sg_d)})"
+                calls_out.add(rendered)
+        return sorted(calls_out)
+
+    def _distinct_aggregate_group_fallback(self) -> Optional[ExactRoutingFallback]:
+        """Announcement for a group-scoped recompute chosen because of
+        DISTINCT aggregates that have no algebraic delta rule in this shape."""
+        calls = self._distinct_group_recompute_calls()
+        if not calls:
+            return None
+        return ExactRoutingFallback(
+            DISTINCT_AGGREGATE_GROUP_RECOMPUTE,
+            Strategy.GROUP_SCOPED_RECOMPUTE,
+            "DISTINCT aggregate(s) " + ", ".join(calls) + " have no algebraic delta rule in "
+            "this query shape; each affected group is recomputed with the view's original "
+            "aggregate.",
+            GROUP_RECOMPUTE_COST,
+            "create the indexes listed in recommended_base_indexes to keep the recompute "
+            "O(rows in the group).",
+            tuple(calls),
+        )
+
     def _unrecognized_aggregate_full_refresh_fallback(self) -> Optional[ExactRoutingFallback]:
         """Announcement for an ungrouped view (or a shape outside the group
         recompute) with aggregates that have no algebraic delta rule."""
@@ -654,7 +734,10 @@ class ExactAggregateRoutingMixin(MixinHost):
         if strategy == MaintenanceStrategy.GROUP_SCOPED_DELTA:
             if self._alg_mode == "window_partition":
                 return self._relaxed_order_announcement()
-            return self._unrecognized_aggregate_group_fallback()
+            return (
+                self._unrecognized_aggregate_group_fallback()
+                or self._distinct_aggregate_group_fallback()
+            )
         return None
 
     def _exact_routing_diagnostics(self, strategy: MaintenanceStrategy) -> Tuple[Diagnostic, ...]:

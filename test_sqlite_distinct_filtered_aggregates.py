@@ -771,11 +771,11 @@ class TestDistinctAndFilteredStatBitBool(unittest.TestCase):
         DISTINCT VAR/STDDEV/BIT maintenance tiers) that must shrink, never
         grow, and that is announced at registration (never silent)."""
         tier3 = {
-            # A global aggregate without an algebraic rule is announced by the exact
-            # routing (UNRECOGNIZED_AGGREGATE_FULL_REFRESH); FULL_REFRESH_FALLBACK only
-            # announces full refreshes that no more specific diagnostic names.
-            "mv_glob": "no plain GROUP BY",
-            "mv_filt_glob": "no plain GROUP BY",
+            # Global DISTINCT statistical/bitwise aggregates are known algebraic
+            # families that cannot be folded without GROUP BY; they take
+            # FULL_REFRESH_FALLBACK (never a misnamed UNRECOGNIZED_AGGREGATE_FULL_REFRESH).
+            "mv_glob": "global aggregate (no GROUP BY)",
+            "mv_filt_glob": "global aggregate (no GROUP BY)",
             "mv_cte": "uses a CTE",
             "mv_cte_all": "uses a CTE",
             "mv_cte_every": "uses a CTE",
@@ -783,7 +783,7 @@ class TestDistinctAndFilteredStatBitBool(unittest.TestCase):
             "mv_corr_whr": "correlated) scalar subquery",
             "mv_nested_from": "derived table",
         }
-        codes = {n: "UNRECOGNIZED_AGGREGATE_FULL_REFRESH" for n in ("mv_glob", "mv_filt_glob")}
+        codes: Dict[str, str] = {}
         # Cheaper is fine (the set may shrink); a new Tier 3 fallback must fail.
         got = {n for n, p in self.env.plans.items() if p.strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC}
         self.assertLessEqual(got, set(tier3), "new Tier 3 (atomic_query_sync) fallback")
@@ -801,8 +801,6 @@ class TestDistinctAndFilteredStatBitBool(unittest.TestCase):
             self.assertIn("To change it:", diags[0].message, name)
             self.assertIn("Cost:", diags[0].message, name)
         # Emitted at registration as Python warnings carrying the Diagnostic, once per fallback view.
-        # The other announcements are master's exact-routing notes on Tier 2 plans
-        # (group-scoped recompute); a full refresh is never announced for them.
         full = [(d.view, d.code) for d in self.env.diagnostics if d.strategy == DiagnosticStrategy.FULL_REFRESH]
         self.assertEqual(sorted(full), sorted((n, codes.get(n, "FULL_REFRESH_FALLBACK")) for n in got))
         for d in self.env.diagnostics:
@@ -811,23 +809,101 @@ class TestDistinctAndFilteredStatBitBool(unittest.TestCase):
             self.assertEqual(d.strategy, DiagnosticStrategy.GROUP_SCOPED_RECOMPUTE, d.view)
             self.assertEqual(self.env.plans[d.view].strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA, d.view)
             self.assertTrue(d.message.startswith("exact result required: falling back to strategy "), d.message)
-        for name in ("mv_grp", "mv_filt", "mv_lj", "mv_alias", "mv_having", "mv_expr_g", "mv_ord_g"):
-            self.assertIn(
-                self.env.plans[name].strategy,
-                (MaintenanceStrategy.GROUP_SCOPED_DELTA, MaintenanceStrategy.ALGEBRAIC_DELTA),
-                name,
-            )
-            # Never a full-refresh announcement; a Tier 2 plan may carry the routing
-            # note (TODO.md: announce every DISTINCT group recompute consistently).
+        # Every Tier 2 grouped DISTINCT view is announced consistently with
+        # DISTINCT_AGGREGATE_GROUP_RECOMPUTE (never misnamed UNRECOGNIZED_AGGREGATE_GROUP_RECOMPUTE,
+        # never silent).
+        group_lead = "exact result required: falling back to strategy group-scoped recompute. "
+        for name in ("mv_grp", "mv_filt", "mv_lj", "mv_lj_all", "mv_alias", "mv_having", "mv_expr_g", "mv_ord_g"):
+            plan = self.env.plans[name]
+            self.assertEqual(plan.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA, name)
             self.assertEqual(
-                [d.strategy for d in self.env.plans[name].strategy_diagnostics
-                 if d.strategy != DiagnosticStrategy.GROUP_SCOPED_RECOMPUTE],
-                [],
-                name,
+                [d.code for d in plan.strategy_diagnostics],
+                ["DISTINCT_AGGREGATE_GROUP_RECOMPUTE"],
+                f"{name}: {plan.strategy_diagnostics!r}",
             )
+            diag = plan.strategy_diagnostics[0]
+            self.assertEqual(diag.strategy, DiagnosticStrategy.GROUP_SCOPED_RECOMPUTE, name)
+            self.assertTrue(diag.message.startswith(group_lead), diag.message)
+            self.assertNotIn("VARIANCE_POP", diag.message, name)
+            self.assertTrue(diag.expressions, name)
         for name in ("mv_t1_bit_bool", "mv_t1_glob_filt"):
             self.assertEqual(self.env.plans[name].strategy, MaintenanceStrategy.ALGEBRAIC_DELTA, name)
             self.assertEqual(self.env.plans[name].strategy_diagnostics, [], name)
+
+    def test_distinct_group_recompute_diagnostics_consistent_across_aggregates_and_dialects(self) -> None:
+        """Every grouped DISTINCT aggregate routed to group-scoped recompute gets
+        DISTINCT_AGGREGATE_GROUP_RECOMPUTE naming the DISTINCT calls -- never
+        misnamed UNRECOGNIZED_AGGREGATE_GROUP_RECOMPUTE and never silent."""
+        from matview_sync import generate_materialized_view
+
+        sqlite_cases = [
+            ("SELECT g, VAR_POP(DISTINCT x) AS r FROM t GROUP BY g", ("VAR_POP(DISTINCT x)",)),
+            ("SELECT g, VARIANCE_POP(DISTINCT x) AS r FROM t GROUP BY g", ("VAR_POP(DISTINCT x)",)),
+            ("SELECT g, VAR_SAMP(DISTINCT x) AS r FROM t GROUP BY g", ("VAR_SAMP(DISTINCT x)",)),
+            ("SELECT g, VARIANCE_SAMP(DISTINCT x) AS r FROM t GROUP BY g", ("VAR_SAMP(DISTINCT x)",)),
+            ("SELECT g, STDDEV_POP(DISTINCT x) AS r FROM t GROUP BY g", ("STDDEV_POP(DISTINCT x)",)),
+            ("SELECT g, STDDEV_SAMP(DISTINCT x) AS r FROM t GROUP BY g", ("STDDEV_SAMP(DISTINCT x)",)),
+            ("SELECT g, BIT_AND(DISTINCT b) AS r FROM t GROUP BY g", ("BIT_AND(DISTINCT b)",)),
+            ("SELECT g, BIT_OR(DISTINCT b) AS r FROM t GROUP BY g", ("BIT_OR(DISTINCT b)",)),
+            ("SELECT g, BIT_XOR(DISTINCT b) AS r FROM t GROUP BY g", ("BIT_XOR(DISTINCT b)",)),
+            ("SELECT g, BOOL_AND(DISTINCT flag) AS r FROM t GROUP BY g", ("BOOL_AND(DISTINCT flag)",)),
+            ("SELECT g, BOOL_OR(DISTINCT flag) AS r FROM t GROUP BY g", ("BOOL_OR(DISTINCT flag)",)),
+            ("SELECT g, MIN(DISTINCT x) AS r FROM t GROUP BY g", ("MIN(DISTINCT x)",)),
+            ("SELECT g, COUNT(DISTINCT x) FILTER (WHERE active = 1) AS r FROM t GROUP BY g", ("COUNT(DISTINCT x) FILTER (WHERE active = 1)",)),
+            ("SELECT g, SUM(x) AS s FROM t GROUP BY g HAVING VAR_POP(DISTINCT x) > 0", ("VAR_POP(DISTINCT x)",)),
+            ("SELECT d.g, COUNT(DISTINCT t.x) AS r FROM d JOIN t ON d.g = t.g GROUP BY d.g", ("COUNT(DISTINCT t.x)",)),
+            (
+                "SELECT g, VAR_POP(DISTINCT x) AS vp, STDDEV_SAMP(DISTINCT x) AS ss, BIT_XOR(DISTINCT b) AS bx FROM t GROUP BY g",
+                ("BIT_XOR(DISTINCT b)", "STDDEV_SAMP(DISTINCT x)", "VAR_POP(DISTINCT x)"),
+            ),
+        ]
+        for sel, exp_exprs in sqlite_cases:
+            with self.subTest(dialect="sqlite", sel=sel):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", MatviewDiagnosticWarning)
+                    plan = generate_materialized_view(SCHEMA, f"CREATE VIEW v AS {sel};", dialect=Dialect.SQLITE)
+                self.assertEqual(plan.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA)
+                self.assertEqual([d.code for d in plan.strategy_diagnostics], ["DISTINCT_AGGREGATE_GROUP_RECOMPUTE"])
+                self.assertEqual(plan.strategy_diagnostics[0].expressions, exp_exprs)
+                self.assertIsNotNone(plan.diagnostics)
+                assert plan.diagnostics is not None
+                self.assertEqual(plan.diagnostics.fallback_reason, plan.strategy_diagnostics[0].message)
+                for e in exp_exprs:
+                    self.assertIn(e, plan.strategy_diagnostics[0].message)
+                self.assertNotIn("VARIANCE_POP", plan.strategy_diagnostics[0].message)
+                self.assertNotIn("VARIANCE(", plan.strategy_diagnostics[0].message)
+
+        # Single-table COUNT(DISTINCT)/SUM(DISTINCT) stay Tier 1 algebraic with no fallback diagnostic.
+        for sel in (
+            "SELECT g, COUNT(DISTINCT x) AS c FROM t GROUP BY g",
+            "SELECT g, SUM(DISTINCT x) AS s FROM t GROUP BY g",
+        ):
+            with self.subTest(dialect="sqlite_tier1", sel=sel):
+                plan = generate_materialized_view(SCHEMA, f"CREATE VIEW v AS {sel};", dialect=Dialect.SQLITE)
+                self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+                self.assertEqual(plan.strategy_diagnostics, [])
+
+        # PostgreSQL & MySQL grouped DISTINCT non-algebraic shapes also announce DISTINCT_AGGREGATE_GROUP_RECOMPUTE.
+        pg_schema = "CREATE TABLE t (id INT PRIMARY KEY, g INT, x INT, b INT, active INT);"
+        for dialect, sel, exp_exprs in (
+            (Dialect.POSTGRES, "SELECT g, MIN(DISTINCT x) AS r FROM t GROUP BY g", ("MIN(DISTINCT x)",)),
+            (Dialect.POSTGRES, "SELECT g, BIT_XOR(DISTINCT b) AS r FROM t GROUP BY g", ("BIT_XOR(DISTINCT b)",)),
+            (Dialect.POSTGRES, "SELECT g, COUNT(DISTINCT x) FILTER (WHERE active = 1) AS r FROM t GROUP BY g", ("COUNT(DISTINCT x) FILTER (WHERE active = 1)",)),
+            ("mysql:8.4", "SELECT g, MIN(DISTINCT x) AS r FROM t GROUP BY g", ("MIN(DISTINCT x)",)),
+            ("mysql:8.4", "SELECT g, BIT_XOR(DISTINCT b) AS r FROM t GROUP BY g", ("BIT_XOR(DISTINCT b)",)),
+        ):
+            with self.subTest(dialect=dialect, sel=sel):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    plan = generate_materialized_view(
+                        pg_schema,
+                        f"CREATE VIEW v AS {sel};",
+                        dialect=dialect,
+                        ignore_limitations=True,
+                    )
+                self.assertEqual(plan.strategy, MaintenanceStrategy.GROUP_SCOPED_DELTA)
+                self.assertEqual([d.code for d in plan.strategy_diagnostics], ["DISTINCT_AGGREGATE_GROUP_RECOMPUTE"])
+                self.assertEqual(plan.strategy_diagnostics[0].expressions, exp_exprs)
 
     def test_known_defect_float_statistics_are_not_correctly_rounded(self) -> None:
         """TODO.md "Make SQLite VAR/STDDEV Correctly Rounded": over decimal inputs
