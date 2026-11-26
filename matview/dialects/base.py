@@ -311,6 +311,62 @@ class DialectBaseMixin(MixinHost):
             self._sqlite_table_shape_notes = notes
             self._sqlite_provable_int_cols = frozenset()
 
+        if self.dialect == Dialect.MYSQL:
+            pk_cols_lower = {
+                _unquote_ident(c, dialect=self.dialect).lower()
+                for c in (pk_cols or ())
+            }
+            for line in col_defs_sql:
+                m_pk = re.match(r"^\s*PRIMARY\s+KEY\s*\(([^)]+)\)", line, flags=re.IGNORECASE)
+                if m_pk:
+                    for part in m_pk.group(1).split(","):
+                        pk_cols_lower.add(_unquote_ident(part.strip(), dialect=self.dialect).lower())
+            normalized_defs: List[str] = []
+            for line in col_defs_sql:
+                m_ts = re.match(
+                    r"^(\s*(`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_]*)\s+TIMESTAMP(?:\s*\(\s*(\d+)\s*\))?)(?=\s|$)(.*)$",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                if m_ts:
+                    head, col_raw, fsp_s, tail = (
+                        m_ts.group(1),
+                        m_ts.group(2),
+                        m_ts.group(3),
+                        m_ts.group(4),
+                    )
+                    tail_up = tail.upper()
+                    is_generated = bool(re.search(r"\bGENERATED\b|\bAS\s*\(", tail_up))
+                    if (
+                        not is_generated
+                        and not re.search(r"\bDEFAULT\b", tail_up)
+                        and not re.search(r"\bON\s+UPDATE\b", tail_up)
+                    ):
+                        col_low = _unquote_ident(col_raw, dialect=self.dialect).lower()
+                        is_pk_col = col_low in pk_cols_lower or bool(
+                            re.search(r"\bPRIMARY\s+KEY\b", tail_up)
+                        )
+                        cur_ts = (
+                            f"CURRENT_TIMESTAMP({fsp_s})"
+                            if fsp_s and int(fsp_s) > 0
+                            else "CURRENT_TIMESTAMP"
+                        )
+                        if re.search(r"\bNOT\s+NULL\b", tail_up):
+                            tail_fixed = re.sub(
+                                r"\bNOT\s+NULL\b",
+                                f"NOT NULL DEFAULT {cur_ts}",
+                                tail,
+                                count=1,
+                                flags=re.IGNORECASE,
+                            )
+                            line = f"{head}{tail_fixed}"
+                        elif is_pk_col:
+                            line = f"{head} NOT NULL DEFAULT {cur_ts}{tail}"
+                        elif not re.search(r"\bNULL\b", tail_up):
+                            line = f"{head} NULL DEFAULT NULL{tail}"
+                normalized_defs.append(line)
+            col_defs_sql = normalized_defs
+
         cols_joined = ",\n    ".join(col_defs_sql)
         options_tail = (" " + ", ".join(table_options)) if table_options else ""
         return f"CREATE TABLE {table_name} (\n    {cols_joined}\n){fillfactor_tail}{options_tail};"
@@ -2103,7 +2159,16 @@ class DialectBaseMixin(MixinHost):
             # server collation): the clause does not change the family.
             bare = re.sub(r"\s+(?:COLLATE|CHARACTER\s+SET|CHARSET)\s+\S+", "", data_type.upper())
             bare = re.sub(r"\s+ZEROFILL\b", "", bare)
-            upper = re.sub(r"\s*\(.*\)\s*$", "", bare).strip()
+            if self.dialect == Dialect.MYSQL:
+                m_my_temp = re.fullmatch(
+                    r"(TIME|DATETIME|TIMESTAMP)(?:\s*\(\s*(\d+)\s*\))?",
+                    bare.strip(),
+                )
+                if m_my_temp:
+                    t_name = m_my_temp.group(1)
+                    fsp_n = int(m_my_temp.group(2)) if m_my_temp.group(2) is not None else 0
+                    return f"{t_name}({fsp_n})" if fsp_n > 0 else t_name
+            upper = re.sub(r"\s+", " ", re.sub(r"\s*\([^)]*\)", "", bare)).strip()
             if self.dialect == Dialect.MYSQL and upper in ("UNSIGNED", "UNSIGNED INTEGER", "UBIGINT"):
                 # CAST(x AS UNSIGNED [INTEGER]) is a BIGINT UNSIGNED (MySQL and MariaDB).
                 return "BIGINT UNSIGNED"
@@ -2200,6 +2265,34 @@ class DialectBaseMixin(MixinHost):
                         return f"{merged_e}[]"
                     if all(s == stripped[0] for s in stripped):
                         return f"{stripped[0]}[]"
+                if self.dialect == Dialect.MYSQL:
+                    my_temps: List[Optional[Tuple[str, int]]] = []
+                    for v in known:
+                        m_tp = re.fullmatch(
+                            r"(DATE|TIME|DATETIME|TIMESTAMP)(?:\s*\(\s*(\d+)\s*\))?",
+                            v,
+                        )
+                        my_temps.append(
+                            (m_tp.group(1), int(m_tp.group(2)) if m_tp.group(2) is not None else 0)
+                            if m_tp
+                            else None
+                        )
+                    if all(tp is not None for tp in my_temps):
+                        tp_list = [tp for tp in my_temps if tp is not None]
+                        kinds = {k for k, _ in tp_list}
+                        max_fsp = max(f for _, f in tp_list)
+                        if kinds == {"TIME"}:
+                            return f"TIME({max_fsp})" if max_fsp > 0 else "TIME"
+                        if kinds == {"TIMESTAMP"}:
+                            return f"TIMESTAMP({max_fsp})" if max_fsp > 0 else "TIMESTAMP"
+                        if kinds <= {"DATE", "DATETIME", "TIMESTAMP"}:
+                            return f"DATETIME({max_fsp})" if max_fsp > 0 else "DATETIME"
+                        # Mixing TIME with DATE/DATETIME/TIMESTAMP widens to VARCHAR on MySQL/MariaDB.
+                        return "VARCHAR(255)"
+                    if any(tp is not None for tp in my_temps):
+                        # Mixing a temporal type with a string/numeric value widens to VARCHAR
+                        # (do not fall through to the first-argument COALESCE heuristic).
+                        return "VARCHAR(255)"
                 if self.dialect == Dialect.POSTGRES and all(
                     v in ("BIT", "BIT VARYING", '"bit"', 'pg_catalog."bit"') or v.startswith("BIT(")
                     for v in known
@@ -2248,7 +2341,8 @@ class DialectBaseMixin(MixinHost):
             ):
                 return "BOOLEAN"
             if kind == "Abs":
-                return infer(node.this)
+                arg_t = infer(node.this)
+                return arg_t if arg_t in ranks else None
             if kind in ("Floor", "Ceil", "Ceiling", "Sign") and self.dialect == Dialect.POSTGRES:
                 arg_t = infer(node.this)
                 if arg_t == "NUMERIC":
@@ -2304,7 +2398,8 @@ class DialectBaseMixin(MixinHost):
                     return "DOUBLE PRECISION" if ("e" in value.lower() or self.dialect == Dialect.SQLITE) else "NUMERIC"
                 return None
             if kind in ("Neg", "Pos", "Positive"):
-                return infer(node.this)
+                arg_t = infer(node.this)
+                return arg_t if arg_t in ranks else None
             if kind == "BitwiseCount":
                 return "BIGINT" if self.dialect == Dialect.MYSQL else None
             if kind == "BitwiseNot":
@@ -2377,6 +2472,24 @@ class DialectBaseMixin(MixinHost):
                     if self.dialect == Dialect.POSTGRES
                     else target.sql()
                 )
+                if (
+                    self.dialect == Dialect.MYSQL
+                    and isinstance(node.this, sqlglot_exp.Literal)
+                    and node.this.args.get("is_string")
+                    and not getattr(target, "expressions", None)
+                ):
+                    lit_s = str(node.this.this)
+                    m_tl = re.search(
+                        rf"\b(TIME|TIMESTAMP|DATETIME)\s*'{re.escape(lit_s)}'",
+                        expr,
+                        flags=re.IGNORECASE,
+                    )
+                    if m_tl:
+                        kw = m_tl.group(1).upper()
+                        base_tl = "TIME" if kw == "TIME" else "DATETIME"
+                        m_frac = re.search(r"\.(\d+)", lit_s)
+                        fsp_tl = min(len(m_frac.group(1)), 6) if m_frac else 0
+                        return f"{base_tl}({fsp_tl})" if fsp_tl > 0 else base_tl
                 return canonical_type(target_sql)
             if kind == "Array" and self.dialect == Dialect.POSTGRES:
                 ch_nodes = list(node.expressions or ())
@@ -2532,7 +2645,7 @@ class DialectBaseMixin(MixinHost):
                 return f"BIT({len(bits)})" if bits else "BIT VARYING"
             if kind in ("Add", "Sub", "Mul", "Div", "Mod", "IntDiv"):
                 left, right = infer(node.this), infer(node.expression)
-                if left is None or right is None:
+                if left not in ranks or right not in ranks:
                     return None
                 merged = merge((left, right))
                 if kind == "Div" and merged in ("SMALLINT", "INTEGER", "BIGINT") and self.dialect != Dialect.POSTGRES:
@@ -3406,12 +3519,23 @@ class DialectBaseMixin(MixinHost):
                 return int(m_f.group(1)) if m_f else 0
 
             base_temps = [re.sub(r"\s*\([^)]*\)\s*$", "", s).strip() for s in stripped]
+            if all(bt == "TIMESTAMP" for bt in base_temps):
+                max_fsp = max(_fsp(s) for s in stripped)
+                return f"TIMESTAMP({max_fsp})" if max_fsp > 0 else "TIMESTAMP"
             if all(bt in ("DATE", "DATETIME", "TIMESTAMP") for bt in base_temps):
                 max_fsp = max(_fsp(s) for s in stripped)
                 return f"DATETIME({max_fsp})" if max_fsp > 0 else "DATETIME"
             if all(bt == "TIME" for bt in base_temps):
                 max_fsp = max(_fsp(s) for s in stripped)
                 return f"TIME({max_fsp})" if max_fsp > 0 else "TIME"
+            if any(bt in ("DATE", "TIME", "DATETIME", "TIMESTAMP") for bt in base_temps):
+                # Mixed TIME + DATE/DATETIME/TIMESTAMP or temporal + string/numeric widens to VARCHAR/TEXT.
+                s_present = [si for si in str_infos if si is not None]
+                if any(tag == "text" for tag, _ in s_present):
+                    top_text = max((lvl for tag, lvl in s_present if tag == "text"), default=2)
+                    return {1: "TINYTEXT", 2: "TEXT", 3: "MEDIUMTEXT", 4: "LONGTEXT"}[top_text]
+                max_len = max((n for _, n in s_present), default=255)
+                return f"VARCHAR({max(max_len, 255)})"
 
             return self._normalize_dialect_type(raw_nonempty[0])
 

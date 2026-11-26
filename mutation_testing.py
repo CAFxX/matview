@@ -695,6 +695,46 @@ MUTANTS = (
             "test_distinct_group_recompute_diagnostics_consistent_across_aggregates_and_dialects"
         ),
     ),
+    Mutant(
+        name="mysql-sa-format-drops-temporal-fsp",
+        source_path="matview/connectivity.py",
+        original='    elif dialect == Dialect.MYSQL and raw_str in ("TIME", "DATETIME", "TIMESTAMP"):\n        # SQLAlchemy prints MySQL TIME(fsp=n)/DATETIME(fsp=n)/TIMESTAMP(fsp=n)\n        # without their fractional-seconds precision, silently truncating or\n        # rounding sub-second values in backing columns and MIN/MAX deltas.\n        fsp = getattr(col_type, "fsp", None)\n        if fsp is not None and int(fsp) > 0:\n            raw_str = f"{raw_str}({int(fsp)})"',
+        replacement='    elif False and dialect == Dialect.MYSQL and raw_str in ("TIME", "DATETIME", "TIMESTAMP"):\n        fsp = getattr(col_type, "fsp", None)\n        if fsp is not None and int(fsp) > 0:\n            raw_str = f"{raw_str}({int(fsp)})"',
+        target_test=(
+            "test_native_result_types.MySQLPlannedResultTypeTests."
+            "test_temporal_precision_introspection_and_expression_types"
+        ),
+    ),
+    Mutant(
+        name="mysql-dbapi-introspect-drops-temporal-fsp",
+        source_path="matview/connectivity.py",
+        original='                "INT", "INTEGER", "SMALLINT", "MEDIUMINT", "BIGINT", "FLOAT", "DOUBLE", "REAL",\n                "TIME", "DATETIME", "TIMESTAMP", "BIT", "BINARY", "VARBINARY",',
+        replacement='                "INT", "INTEGER", "SMALLINT", "MEDIUMINT", "BIGINT", "FLOAT", "DOUBLE", "REAL",',
+        target_test=(
+            "test_native_result_types.MySQLPlannedResultTypeTests."
+            "test_temporal_precision_introspection_and_expression_types"
+        ),
+    ),
+    Mutant(
+        name="mysql-ast-expr-drops-temporal-fsp",
+        source_path="matview/dialects/base.py",
+        original='            if self.dialect == Dialect.MYSQL:\n                m_my_temp = re.fullmatch(\n                    r"(TIME|DATETIME|TIMESTAMP)(?:\\s*\\(\\s*(\\d+)\\s*\\))?",\n                    bare.strip(),\n                )',
+        replacement='            if False and self.dialect == Dialect.MYSQL:\n                m_my_temp = re.fullmatch(\n                    r"(TIME|DATETIME|TIMESTAMP)(?:\\s*\\(\\s*(\\d+)\\s*\\))?",\n                    bare.strip(),\n                )',
+        target_test=(
+            "test_native_result_types.MySQLPlannedResultTypeTests."
+            "test_temporal_precision_introspection_and_expression_types"
+        ),
+    ),
+    Mutant(
+        name="mysql-backing-timestamp-omits-explicit-null",
+        source_path="matview/dialects/base.py",
+        original='                        elif not re.search(r"\\bNULL\\b", tail_up):\n                            line = f"{head} NULL DEFAULT NULL{tail}"',
+        replacement='                        elif False and not re.search(r"\\bNULL\\b", tail_up):\n                            line = f"{head} NULL DEFAULT NULL{tail}"',
+        target_test=(
+            "test_native_result_types.MySQLPlannedResultTypeTests."
+            "test_temporal_precision_introspection_and_expression_types"
+        ),
+    ),
 )
 
 

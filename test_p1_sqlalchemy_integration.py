@@ -214,6 +214,64 @@ class TestSqlAlchemyConnectivityAndIntrospection(unittest.TestCase):
             "TIMESTAMP WITH TIME ZONE[]",
         )
         self.assertEqual(
+            _format_sa_column_type(sa_pg.TIMESTAMP(precision=3), ms.Dialect.POSTGRES),
+            "TIMESTAMP(3)",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.TIMESTAMP(precision=0), ms.Dialect.POSTGRES),
+            "TIMESTAMP(0)",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.TIMESTAMP(timezone=True, precision=3), ms.Dialect.POSTGRES),
+            "TIMESTAMP(3) WITH TIME ZONE",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.TIME(precision=3), ms.Dialect.POSTGRES),
+            "TIME(3)",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.TIME(timezone=True, precision=0), ms.Dialect.POSTGRES),
+            "TIME(0) WITH TIME ZONE",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.INTERVAL(precision=3), ms.Dialect.POSTGRES),
+            "INTERVAL(3)",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.INTERVAL(fields="year to month"), ms.Dialect.POSTGRES),
+            "INTERVAL YEAR TO MONTH",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.INTERVAL(precision=3, fields="day to second"), ms.Dialect.POSTGRES),
+            "INTERVAL DAY TO SECOND(3)",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.INTERVAL(precision=0, fields="hour to second"), ms.Dialect.POSTGRES),
+            "INTERVAL HOUR TO SECOND(0)",
+        )
+        from sqlalchemy.dialects import mysql as sa_mysql
+
+        self.assertEqual(
+            _format_sa_column_type(sa_mysql.TIME(fsp=3), ms.Dialect.MYSQL),
+            "TIME(3)",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_mysql.TIME(fsp=0), ms.Dialect.MYSQL),
+            "TIME",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_mysql.TIME(), ms.Dialect.MYSQL),
+            "TIME",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_mysql.DATETIME(fsp=6), ms.Dialect.MYSQL),
+            "DATETIME(6)",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_mysql.TIMESTAMP(fsp=4), ms.Dialect.MYSQL),
+            "TIMESTAMP(4)",
+        )
+        self.assertEqual(
             _format_sa_column_type(sa_pg.ARRAY(sa_pg.TEXT(collation="C")), ms.Dialect.POSTGRES),
             'TEXT[] COLLATE "C"',
         )

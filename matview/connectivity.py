@@ -557,9 +557,19 @@ def _format_sa_column_type(
         raw_str = "BPCHAR"
     elif dialect == Dialect.POSTGRES and raw_str.startswith("VARCHAR") and not getattr(col_type, "length", None):
         raw_str = "VARCHAR"
-    elif dialect == Dialect.POSTGRES and getattr(col_type, "timezone", False) and raw_str in ("TIMESTAMP", "TIME"):
-        # SQLAlchemy prints TIMESTAMP(timezone=True) as plain TIMESTAMP.
-        raw_str = f"{raw_str} WITH TIME ZONE"
+    elif dialect == Dialect.POSTGRES and raw_str in ("TIMESTAMP", "TIME"):
+        # SQLAlchemy prints TIMESTAMP(precision=p, timezone=True) as plain
+        # TIMESTAMP and TIME(precision=p, timezone=True) as plain TIME.
+        # Preserve explicit precision (including 0, since PG defaults to 6)
+        # and timezone modifier.
+        prec_str = f"({int(precision)})" if precision is not None else ""
+        tz_str = " WITH TIME ZONE" if getattr(col_type, "timezone", False) else ""
+        raw_str = f"{raw_str}{prec_str}{tz_str}"
+    elif dialect == Dialect.POSTGRES and raw_str == "INTERVAL":
+        fields = getattr(col_type, "fields", None)
+        fields_str = f" {str(fields).strip().upper()}" if fields else ""
+        prec_str = f"({int(precision)})" if precision is not None else ""
+        raw_str = f"INTERVAL{fields_str}{prec_str}"
     elif dialect == Dialect.POSTGRES and raw_str == "BIT":
         # SQLAlchemy's PostgreSQL BIT prints as bare "BIT" without its width or
         # VARYING modifier; bare BIT in DDL means BIT(1).
@@ -568,6 +578,13 @@ def _format_sa_column_type(
             raw_str = f"BIT VARYING({int(bit_len)})" if bit_len is not None else "BIT VARYING"
         elif bit_len is not None:
             raw_str = f"BIT({int(bit_len)})"
+    elif dialect == Dialect.MYSQL and raw_str in ("TIME", "DATETIME", "TIMESTAMP"):
+        # SQLAlchemy prints MySQL TIME(fsp=n)/DATETIME(fsp=n)/TIMESTAMP(fsp=n)
+        # without their fractional-seconds precision, silently truncating or
+        # rounding sub-second values in backing columns and MIN/MAX deltas.
+        fsp = getattr(col_type, "fsp", None)
+        if fsp is not None and int(fsp) > 0:
+            raw_str = f"{raw_str}({int(fsp)})"
     elif dialect == Dialect.MYSQL and raw_str == "BIT" and getattr(col_type, "length", None):
         # SQLAlchemy's MySQL BIT prints without its width; the width decides
         # MySQL's MIN/MAX result types (BIT(1..9) vs BIT(10..64)).
@@ -637,6 +654,16 @@ WHERE pg_catalog.pg_table_is_visible(cl.oid)
       OR co.oid IS NOT NULL
       OR (u.base_oid = 'pg_catalog.bpchar'::pg_catalog.regtype AND a.atttypmod = -1 AND u.base_mod = -1)
       OR u.base_oid = 'pg_catalog.name'::pg_catalog.regtype
+      OR (
+          u.base_oid IN (
+              'pg_catalog.time'::pg_catalog.regtype,
+              'pg_catalog.timetz'::pg_catalog.regtype,
+              'pg_catalog.timestamp'::pg_catalog.regtype,
+              'pg_catalog.timestamptz'::pg_catalog.regtype,
+              'pg_catalog.interval'::pg_catalog.regtype
+          )
+          AND (a.atttypmod <> -1 OR u.base_mod <> -1)
+      )
   )
   AND a.attnum > 0
   AND NOT a.attisdropped
@@ -1409,15 +1436,21 @@ def introspect_database_schemas(
             ):
                 continue
             dt_up = d_type.upper()
-            # information_schema.DATA_TYPE drops numeric precision/scale and
-            # integer signedness. COLUMN_TYPE is the native declaration (for
-            # example DECIMAL(20,12)); retain it for every numeric family so AVG
-            # and expression result types match the live server metadata.
+            # information_schema.DATA_TYPE drops numeric precision/scale, integer
+            # signedness, temporal fractional-seconds precision (TIME(n)/
+            # DATETIME(n)/TIMESTAMP(n)), bit/binary widths, and ENUM/SET members.
+            # COLUMN_TYPE is the native declaration (for example DECIMAL(20,12),
+            # time(3), bit(8)); retain it so backing columns and aggregates match
+            # the live server metadata and preserve fractional seconds.
             if dt_up in (
                 "VARCHAR", "CHAR", "TINYINT", "DECIMAL", "NUMERIC", "DEC", "FIXED",
                 "INT", "INTEGER", "SMALLINT", "MEDIUMINT", "BIGINT", "FLOAT", "DOUBLE", "REAL",
+                "TIME", "DATETIME", "TIMESTAMP", "BIT", "BINARY", "VARBINARY",
             ) and col_type:
                 dt_up = col_type.upper()
+            elif dt_up in ("ENUM", "SET") and col_type and "(" in col_type:
+                # Preserve exact member literal casing inside ENUM(...)/SET(...).
+                dt_up = f"{dt_up}{col_type[col_type.index('('):]}"
             is_pk = col_key.upper() == "PRI"
             coll_name = _dec(row[6]) if len(row) > 6 and row[6] is not None else None
             grouped_my.setdefault(t_name, {})[c_name] = ColumnDef(
