@@ -12,7 +12,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from .._host import MixinHost
-from ..dialects.pg_statement import SIGN, PgAggregateSpec, PgDeltaSource
+from ..dialects.pg_statement import SIGN, PgAggregateSpec, PgDeltaSource, PgStatementBracket
 from ..engines import (
     AggFunc,
     Dialect,
@@ -390,10 +390,17 @@ class Tier1UnionAllAggMixin(MixinHost):
             f"SELECT {', '.join(select_exprs)} FROM (\n{inner_u_sql}\n) AS {u_alias}{w_sql}{g_sql};"
         )
 
-        # Group branches by base table and generate per-branch delta statements
-        by_table: Dict[str, List[ViewSpec]] = {}
+        # Group branches by canonical base table (case-insensitive) and generate per-branch delta statements
+        by_table_lower: Dict[str, Tuple[str, List[ViewSpec]]] = {}
         for bs in branch_specs:
-            by_table.setdefault(bs.base_table, []).append(bs)
+            t_low = bs.base_table.lower()
+            if t_low not in by_table_lower:
+                canon_name = self._schemas_lower[t_low].name if t_low in self._schemas_lower else bs.base_table
+                by_table_lower[t_low] = (canon_name, [])
+            by_table_lower[t_low][1].append(bs)
+        by_table: Dict[str, List[ViewSpec]] = {
+            canon_name: b_items for canon_name, b_items in by_table_lower.values()
+        }
 
         orig_view = self.view
         orig_work_items = list(self._working_select_items)
@@ -403,9 +410,62 @@ class Tier1UnionAllAggMixin(MixinHost):
         trigger_ddls: List[str] = []
         trig_names: List[str] = []
         fn_names: List[str] = []
+        aux_ddls: List[str] = []
+        aux_names: List[str] = []
+
+        pg_spec: Optional[PgAggregateSpec] = None
+        pg_reconcile_fn: Optional[str] = None
+        pg_stg_info: Dict[str, Tuple[str, List[str]]] = {}
+        pg_reconcile_sources: List[PgDeltaSource] = []
+        pg_trunc_cleanup = ""
+        if self.dialect == Dialect.POSTGRES:
+            def _uall_recompute_group_keys(exprs: Sequence[str]) -> str:
+                u_conds: List[str] = []
+                if self.view.where_clause:
+                    u_conds.append(f"({self.view.where_clause})")
+                for og in orig_grp_exprs:
+                    rhs_g = f"{mv_table}.{self._q(self._group_col_alias(og))}"
+                    u_conds.append(self._null_safe_eq(f"({og})", f"({rhs_g})", is_nullable=True))
+                w_u = f" WHERE {' AND '.join(u_conds)}" if u_conds else ""
+                sel_cols = ", ".join(f"({e}) AS __mv_l{idx}" for idx, e in enumerate(exprs))
+                return f"SELECT {sel_cols} FROM ({inner_u_sql}) AS {u_alias}{w_u} LIMIT 1"
+
+            pg_spec = PgAggregateSpec(
+                mv_table=mv_table,
+                row_count_col=row_count_col,
+                items=orig_work_items,
+                grp_exprs=orig_grp_exprs,
+                has_nullable_grp=has_nullable_grp,
+                pk_cols=pk_cols,
+                nonnull_map=col_nonnull_count_map,
+                sum_map=col_sum_map,
+                sum2_map=col_sum2_map,
+                tcnt_map=col_true_cnt_map,
+                distinct_aux={},
+                value_key=_expr_key,
+                recompute=lambda it: self._build_recompute_subquery_raw(it, mv_table),
+                native_recompute=lambda it: (
+                    merged_ctx._requires_native_avg_recompute(it) or merged_ctx._pgmy_native_recompute_item(it)
+                ),
+                recompute_group_keys=_uall_recompute_group_keys,
+                has_variable_numeric_scale=merged_ctx._pg_expr_has_variable_numeric_scale,
+            )
+            pg_reconcile_fn = self._pg_reconcile_fn_name()
+            for st_base_t in by_table:
+                stg_cols = self._pg_stage_cols_for_table(st_base_t)
+                stg_tbl, stg_ddl, stg_idx, stg_idx_ddl = self._pg_join_stage_table_ddls(st_base_t, stg_cols)
+                pg_stg_info[st_base_t] = (stg_tbl, stg_cols)
+                aux_ddls.append(stg_ddl)
+                aux_names.append(stg_tbl)
+                index_ddls.append(stg_idx_ddl)
+                index_names.append(stg_idx)
+            pg_trunc_cleanup = "\n        ".join(
+                f"DELETE FROM {stg_tbl} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_blk.__mv_bseq;"
+                for stg_tbl, _ in pg_stg_info.values()
+            )
 
         pg_group_aliases = {self._group_col_alias(g).lower() for g in orig_grp_exprs}
-        for base_t, b_list in by_table.items():
+        for ref_idx, (base_t, b_list) in enumerate(by_table.items()):
             ts = self._schemas_lower[base_t.lower()]
             pg_sources: List[PgDeltaSource] = []
             ins_all: List[str] = []
@@ -651,39 +711,31 @@ class Tier1UnionAllAggMixin(MixinHost):
 
             trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
             pg_bodies: Dict[str, Optional[str]] = {"INSERT": None, "UPDATE": None, "DELETE": None}
+            pg_bracket: Optional[PgStatementBracket] = None
             if self.dialect == Dialect.POSTGRES:
-                def _uall_recompute_group_keys(exprs: Sequence[str]) -> str:
-                    u_conds: List[str] = []
-                    if self.view.where_clause:
-                        u_conds.append(f"({self.view.where_clause})")
-                    for og in orig_grp_exprs:
-                        rhs_g = f"{mv_table}.{self._q(self._group_col_alias(og))}"
-                        u_conds.append(self._null_safe_eq(f"({og})", f"({rhs_g})", is_nullable=True))
-                    w_u = f" WHERE {' AND '.join(u_conds)}" if u_conds else ""
-                    sel_cols = ", ".join(f"({e}) AS __mv_l{idx}" for idx, e in enumerate(exprs))
-                    return f"SELECT {sel_cols} FROM ({inner_u_sql}) AS {u_alias}{w_u} LIMIT 1"
-
-                spec = PgAggregateSpec(
-                    mv_table=mv_table,
-                    row_count_col=row_count_col,
-                    items=orig_work_items,
-                    grp_exprs=orig_grp_exprs,
-                    has_nullable_grp=has_nullable_grp,
-                    pk_cols=pk_cols,
-                    nonnull_map=col_nonnull_count_map,
-                    sum_map=col_sum_map,
-                    sum2_map=col_sum2_map,
-                    tcnt_map=col_true_cnt_map,
-                    distinct_aux={},
-                    value_key=_expr_key,
-                    recompute=lambda it: self._build_recompute_subquery_raw(it, mv_table),
-                    native_recompute=lambda it: (
-                        merged_ctx._requires_native_avg_recompute(it) or merged_ctx._pgmy_native_recompute_item(it)
-                    ),
-                    recompute_group_keys=_uall_recompute_group_keys,
-                    has_variable_numeric_scale=merged_ctx._pg_expr_has_variable_numeric_scale,
+                assert pg_spec is not None and pg_reconcile_fn is not None
+                pg_bodies.update(self._pg_aggregate_bodies(pg_spec, pg_sources, base_t=base_t))
+                stg_tbl, stg_cols = pg_stg_info[base_t]
+                staged_sel = self._pg_staged_rows_select(stg_tbl)
+                for src in pg_sources:
+                    pg_reconcile_sources.append(
+                        PgDeltaSource(
+                            from_sql=lambda _signed, s=staged_sel: f"(\n        {s}\n        ) AS __mv_d",
+                            sign=src.sign,
+                            where=src.where,
+                            keys=src.keys,
+                            values=src.values,
+                            extras=src.extras,
+                        )
+                    )
+                src_bit = (1 << ref_idx) if ref_idx < 60 else ((1 << 60) | (1 << 61))
+                pg_bracket = PgStatementBracket(
+                    lock_table=mv_table,
+                    source_bit=src_bit,
+                    reconcile_fn=pg_reconcile_fn,
+                    stage_sqls=self._pg_stage_sqls_for_table(base_t, stg_tbl, stg_cols),
+                    trunc_cleanup_sql=pg_trunc_cleanup,
                 )
-                pg_bodies.update(self._pg_aggregate_bodies(spec, pg_sources, base_t=base_t))
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
                 view_name=view_name,
                 base_t=base_t,
@@ -696,10 +748,21 @@ class Tier1UnionAllAggMixin(MixinHost):
                 pg_ai_body=pg_bodies["INSERT"],
                 pg_ad_body=pg_bodies["DELETE"],
                 pg_au_body=pg_bodies["UPDATE"],
+                pg_bracket=pg_bracket,
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)
             fn_names.extend(f_ns)
+
+        if self.dialect == Dialect.POSTGRES and pg_spec is not None and pg_reconcile_fn is not None:
+            reconcile_body = self._pg_aggregate_body(
+                pg_spec, pg_reconcile_sources, "UPDATE", force_recompute_extremes=True
+            )
+            reconcile_ddl = self._pg_reconcile_fn_ddl(
+                pg_reconcile_fn, mv_table, [st for st, _ in pg_stg_info.values()], reconcile_body
+            )
+            trigger_ddls = [reconcile_ddl, *trigger_ddls]
+            fn_names = [pg_reconcile_fn, *fn_names]
 
         inc_spec = IncrementalBackfillSpec(
             mode="offset_batch",
@@ -711,7 +774,8 @@ class Tier1UnionAllAggMixin(MixinHost):
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=[],
+            auxiliary_table_ddls=aux_ddls,
+            auxiliary_table_names=aux_names,
             index_ddls=index_ddls,
             initial_populate_sqls=[initial_populate_sql],
             trigger_ddls=trigger_ddls,

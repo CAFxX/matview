@@ -4665,3 +4665,598 @@ def test_pg_dotted_base_tables_and_special_char_user_indexes(make_env):
     for vn in expected_ok:
         assert mgr.drop_view(vn) is True
 
+
+def test_pg_nested_user_triggers_and_self_reentrancy(make_env) -> None:
+    """Native PostgreSQL verification of re-entrant / nested same-table and
+    cross-table DML across all maintenance strategies:
+    - AFTER INSERT / UPDATE / DELETE FOR EACH ROW user triggers mutating the
+      just-written row (aggregated column, group key, WHERE column, deleting it)
+    - Multi-depth recursive user trigger chains (depth 3)
+    - BEFORE ROW user trigger executing nested DML on the same source table
+    - Alphabetically-earlier AFTER STATEMENT user trigger mutating the source
+    - Self-referencing FK ON DELETE CASCADE & ON UPDATE CASCADE/SET NULL
+    - SAVEPOINT / EXCEPTION rollback inside a nested trigger
+    - All strategies: Tier 1 algebraic (grouped, global, MIN/MAX, AVG,
+      COUNT(DISTINCT), WHERE-crossing), DISTINCT, native-PK & bag projections,
+      UNION / INTERSECT / EXCEPT / UNION ALL, UNION ALL aggregate, Stage 3 join,
+      Tier 2 group-scoped (STRING_AGG, partitioned window), Tier 2 global window,
+      Tier 3 LIMIT
+    - Zero staging-table writes on the non-nested fast path
+    - Concurrent READ COMMITTED & REPEATABLE READ writers with nested triggers
+    - Manager drift / diff_views / repair_view parity
+    """
+    import threading
+    import psycopg2
+
+    env = make_env(
+        views=[],
+        schema_sql=[
+            "CREATE TABLE nt_src ("
+            "  id INT PRIMARY KEY,"
+            "  parent_id INT REFERENCES nt_src(id) ON DELETE CASCADE ON UPDATE CASCADE,"
+            "  g INT,"
+            "  v BIGINT,"
+            "  w INT"
+            ")",
+            "CREATE TABLE nt_aux (id INT PRIMARY KEY, g INT, v BIGINT)",
+            "CREATE TABLE nt_str (code TEXT PRIMARY KEY, g INT, v BIGINT)",
+            "CREATE TABLE nt_dim (g INT PRIMARY KEY, label TEXT NOT NULL)",
+            "CREATE TABLE nt_bag (g INT, v INT)",
+            "CREATE TABLE nt_num (id INT PRIMARY KEY, g NUMERIC, v NUMERIC)",
+            'CREATE TABLE nt_sp (id INT PRIMARY KEY, "grp.id" INT, "unit.price" INT, "a.b" INT)',
+            "CREATE TABLE nt_part (id INT NOT NULL, g INT NOT NULL, v BIGINT, PRIMARY KEY (g, id)) PARTITION BY LIST (g)",
+            "CREATE TABLE nt_part_1 PARTITION OF nt_part FOR VALUES IN (1)",
+            "CREATE TABLE nt_part_2 PARTITION OF nt_part FOR VALUES IN (2)",
+        ],
+        seed=False,
+    )
+    conn = env.conn
+    mgr = env.manager
+
+    def _exec(sql: str) -> None:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+    def _query(sql: str):
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return cur.fetchall()
+
+    _exec(
+        """
+        INSERT INTO nt_dim VALUES (1, 'one'), (2, 'two'), (3, 'three'), (7, 'seven'), (8, 'eight');
+        INSERT INTO nt_src VALUES
+            (1, NULL, 1, 10, 1),
+            (2, 1,    1, 20, 2),
+            (3, NULL, 2, 30, 1),
+            (4, NULL, NULL, 40, 2);
+        INSERT INTO nt_aux VALUES (101, 1, 5), (102, 2, 15);
+        INSERT INTO nt_str VALUES ('s1', 1, 10), ('s2', 2, 30);
+        INSERT INTO nt_bag VALUES (1, 10), (1, 10), (2, 20);
+        INSERT INTO nt_num VALUES (1, 1.0, 10.0), (2, 1.00, 20.00);
+        INSERT INTO nt_sp VALUES (1, 1, 10, 100);
+        INSERT INTO nt_part VALUES (1, 1, 10), (2, 2, 20);
+        """
+    )
+
+    views = [
+        (
+            "mv_nt_alg",
+            "SELECT g, COUNT(*) AS c, SUM(v) AS s, MIN(v) AS lo, MAX(v) AS hi, "
+            "AVG(v) AS av, COUNT(DISTINCT w) AS dw FROM nt_src GROUP BY g",
+        ),
+        (
+            "mv_nt_glob",
+            "SELECT COUNT(*) AS c, SUM(v) AS s, MIN(v) AS lo, MAX(v) AS hi FROM nt_src",
+        ),
+        (
+            "mv_nt_filt",
+            "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM nt_src WHERE v >= 15 GROUP BY g",
+        ),
+        ("mv_nt_dist", "SELECT DISTINCT g, w FROM nt_src"),
+        ("mv_nt_pk", "SELECT id, g, v FROM nt_src WHERE v > 0"),
+        ("mv_nt_bag", "SELECT g, v FROM nt_bag"),
+        ("mv_nt_union", "SELECT g, v FROM nt_src UNION SELECT g, v FROM nt_aux"),
+        ("mv_nt_intersect", "SELECT g, v FROM nt_src INTERSECT SELECT g, v FROM nt_aux"),
+        ("mv_nt_except", "SELECT g, v FROM nt_src EXCEPT SELECT g, v FROM nt_aux"),
+        ("mv_nt_uall", "SELECT g, v FROM nt_src UNION ALL SELECT g, v FROM nt_aux"),
+        ("mv_nt_uall_mix", "SELECT g, v FROM nt_src UNION ALL SELECT g, v FROM nt_str"),
+        (
+            "mv_nt_uagg",
+            "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM ("
+            "SELECT g, v FROM nt_src UNION ALL SELECT g, v FROM nt_aux"
+            ") AS u GROUP BY g",
+        ),
+        (
+            "mv_nt_join",
+            "SELECT d.label, COUNT(*) AS c, SUM(s.v) AS sv "
+            "FROM nt_src s JOIN nt_dim d ON d.g = s.g GROUP BY d.label",
+        ),
+        (
+            "mv_nt_t2g",
+            "SELECT g, STRING_AGG(CAST(id AS TEXT) || ':' || COALESCE(CAST(v AS TEXT), 'N'), ',' ORDER BY id) AS sv "
+            "FROM nt_src GROUP BY g",
+        ),
+        (
+            "mv_nt_t2pwin",
+            "SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v DESC NULLS LAST, id ASC) AS rn FROM nt_src",
+        ),
+        (
+            "mv_nt_t2w",
+            "SELECT id, g, SUM(v) OVER (ORDER BY id) AS rs FROM nt_src",
+        ),
+        (
+            "mv_nt_t3",
+            "SELECT id, g, v FROM nt_src ORDER BY v DESC NULLS LAST, id ASC LIMIT 5",
+        ),
+        (
+            "mv_nt_num",
+            "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM nt_num GROUP BY g",
+        ),
+        (
+            "mv_nt_sp",
+            'SELECT "grp.id", SUM("unit.price") AS sa, SUM("a.b") AS sab FROM nt_sp GROUP BY "grp.id"',
+        ),
+        (
+            "mv_nt_part",
+            "SELECT g, COUNT(*) AS c, SUM(v) AS s FROM nt_part GROUP BY g",
+        ),
+    ]
+    view_sqls = [f"CREATE VIEW {vn} AS {sel};" for vn, sel in views]
+
+    for sql in view_sqls:
+        mgr.register_view(sql)
+    conn.commit()
+
+    def _assert_all_exact(label: str) -> None:
+        for vn, sel in views:
+            got = sorted(_query(f"SELECT * FROM {vn}"), key=lambda r: tuple((x is None, str(x)) for x in r))
+            exp = sorted(_query(sel), key=lambda r: tuple((x is None, str(x)) for x in r))
+            assert got == exp, f"{label} mismatch on {vn}: got={got!r}, exp={exp!r}"
+        # Every staging table must be empty after transaction commit.
+        cat = mgr.get_catalog()
+        for vn, entry in cat.items():
+            for aux in entry.get("aux_tables", []):
+                if "_stg_" in aux:
+                    n_stg = _query(f"SELECT COUNT(*) FROM {aux}")[0][0]
+                    assert n_stg == 0, f"{label}: leftover staged rows in {aux}: {n_stg}"
+
+    _assert_all_exact("initial")
+
+    # 1. Non-nested fast path (including single-event ON CONFLICT DO UPDATE pure insert):
+    #    verify zero staging-table inserts occur using transaction-local pg_stat_xact_user_tables
+    #    before commit so delayed cumulative stats cannot mask staging writes.
+    stg_alg = next(
+        a for a in mgr.get_catalog()["mv_nt_alg"]["aux_tables"] if "_stg_" in a
+    )
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO nt_src VALUES (10, NULL, 1, 100, 3)")
+        cur.execute("UPDATE nt_src SET v = 105 WHERE id = 10")
+        cur.execute(
+            "INSERT INTO nt_src VALUES (11, NULL, 1, 50, 4) "
+            "ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v"
+        )
+        cur.execute("DELETE FROM nt_src WHERE id IN (10, 11)")
+        cur.execute(
+            "SELECT n_tup_ins FROM pg_stat_xact_user_tables WHERE relid = %s::regclass",
+            (stg_alg,),
+        )
+        row_xact = cur.fetchone()
+        n_ins_fast = row_xact[0] if row_xact is not None else 0
+    conn.commit()
+    assert n_ins_fast == 0, f"non-nested fast path must not write to staging table {stg_alg}, got {n_ins_fast}"
+    _assert_all_exact("non-nested fast path")
+
+    # 2. AFTER INSERT FOR EACH ROW user triggers:
+    #    - id 900..909: bumps v += 1000 (existing group & brand-new group!)
+    #    - id 910..919: changes group key g -> 8 and flips w
+    #    - id 920..929: immediately deletes the just-inserted row (brand-new group nets to 0!)
+    #    - id 930..939: sets v = NULL (brand-new group where non-NULL count nets to 0 -> SUM must be NULL!)
+    #    - id 940..949: multi-depth recursion (inserts child id+1, which updates v)
+    #    - id 950..959: subtransaction SAVEPOINT / EXCEPTION rollback inside user trigger
+    _exec(
+        """
+        CREATE OR REPLACE FUNCTION nt_user_ai_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.id BETWEEN 900 AND 909 THEN
+                UPDATE nt_src SET v = v + 1000 WHERE id = NEW.id;
+            ELSIF NEW.id BETWEEN 910 AND 919 THEN
+                UPDATE nt_src SET g = 8, w = COALESCE(w, 0) + 5 WHERE id = NEW.id;
+            ELSIF NEW.id BETWEEN 920 AND 929 THEN
+                DELETE FROM nt_src WHERE id = NEW.id;
+            ELSIF NEW.id BETWEEN 930 AND 939 THEN
+                UPDATE nt_src SET v = NULL WHERE id = NEW.id;
+            ELSIF NEW.id = 940 THEN
+                INSERT INTO nt_src VALUES (941, 940, 7, 50, 9);
+            ELSIF NEW.id = 941 THEN
+                UPDATE nt_src SET v = v + 250 WHERE id = 941;
+            ELSIF NEW.id = 950 THEN
+                BEGIN
+                    UPDATE nt_src SET v = v + 5000 WHERE id = NEW.id;
+                    RAISE EXCEPTION 'deliberate nested subxact abort';
+                EXCEPTION WHEN OTHERS THEN
+                    UPDATE nt_src SET v = v + 77 WHERE id = NEW.id;
+                END;
+            ELSIF NEW.id = 951 THEN
+                -- Pure rollback: the ONLY nested write rolls back via subtransaction
+                -- so __mv_re and staging rows both roll back cleanly.
+                BEGIN
+                    UPDATE nt_src SET v = v + 9999 WHERE id = NEW.id;
+                    RAISE EXCEPTION 'pure rollback nested subxact';
+                EXCEPTION WHEN OTHERS THEN
+                    NULL;
+                END;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER nt_user_ai AFTER INSERT ON nt_src FOR EACH ROW EXECUTE FUNCTION nt_user_ai_fn();
+        """
+    )
+    _exec(
+        "INSERT INTO nt_src VALUES "
+        "(900, NULL, 1, 10, 1), (901, NULL, 7, 5, 4), "
+        "(910, NULL, 3, 25, 1), "
+        "(920, NULL, 99, 50, 5), "
+        "(930, NULL, 88, 12, 2), "
+        "(940, NULL, 7, 30, 3), "
+        "(950, NULL, 2, 10, 1), "
+        "(951, NULL, 1, 15, 2)"
+    )
+    _assert_all_exact("after AFTER INSERT row triggers (bump, group-move, self-delete, null-sum, recursion, savepoint)")
+    _exec("DROP TRIGGER nt_user_ai ON nt_src")
+
+    # 2b. AFTER UPDATE and AFTER DELETE row triggers mutating nt_src.
+    _exec(
+        """
+        CREATE OR REPLACE FUNCTION nt_user_au_ad_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF pg_trigger_depth() = 1 THEN
+                IF TG_OP = 'UPDATE' AND NEW.id = 900 THEN
+                    UPDATE nt_src SET v = v + 50 WHERE id = 901;
+                ELSIF TG_OP = 'DELETE' AND OLD.id = 951 THEN
+                    INSERT INTO nt_src VALUES (952, NULL, 1, 222, 4);
+                END IF;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER nt_user_au AFTER UPDATE ON nt_src FOR EACH ROW EXECUTE FUNCTION nt_user_au_ad_fn();
+        CREATE TRIGGER nt_user_ad AFTER DELETE ON nt_src FOR EACH ROW EXECUTE FUNCTION nt_user_au_ad_fn();
+        UPDATE nt_src SET v = v + 1 WHERE id = 900;
+        DELETE FROM nt_src WHERE id = 951;
+        """
+    )
+    _assert_all_exact("after AFTER UPDATE and AFTER DELETE nested row triggers")
+    _exec("DROP TRIGGER nt_user_au ON nt_src; DROP TRIGGER nt_user_ad ON nt_src;")
+
+    # 3. Bag table AFTER INSERT row trigger updating the just-inserted row (duplicate multiplicity!)
+    _exec(
+        """
+        CREATE OR REPLACE FUNCTION nt_bag_ai_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.v = 77 THEN
+                UPDATE nt_bag SET v = 78 WHERE g = NEW.g AND v = 77;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER nt_bag_ai AFTER INSERT ON nt_bag FOR EACH ROW EXECUTE FUNCTION nt_bag_ai_fn();
+        INSERT INTO nt_bag VALUES (3, 77), (3, 77), (1, 10);
+        """
+    )
+    _assert_all_exact("bag table nested AFTER INSERT trigger")
+    _exec("DROP TRIGGER nt_bag_ai ON nt_bag")
+
+    # 4a. BEFORE ROW trigger executing nested DML (isolated)
+    _exec(
+        """
+        CREATE OR REPLACE FUNCTION nt_before_row_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF pg_trigger_depth() = 1 AND NEW.id = 960 THEN
+                INSERT INTO nt_src VALUES (961, NULL, 7, 111, 8);
+                INSERT INTO nt_aux VALUES (961, 7, 111);
+            END IF;
+            RETURN NEW;
+        END;
+        $$;
+        CREATE TRIGGER nt_before_row BEFORE INSERT ON nt_src FOR EACH ROW EXECUTE FUNCTION nt_before_row_fn();
+        INSERT INTO nt_src VALUES (960, NULL, 7, 200, 8);
+        """
+    )
+    _assert_all_exact("BEFORE ROW nested DML (isolated)")
+    _exec("DROP TRIGGER nt_before_row ON nt_src;")
+
+    # 4b. Truly alphabetically-earlier AFTER STATEMENT trigger ("000_after_stmt": ASCII '0'=48 < '_'=95)
+    #     run in isolation so it genuinely fires BEFORE __matview_trg_*!
+    _exec(
+        """
+        CREATE OR REPLACE FUNCTION nt_000_after_stmt_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF pg_trigger_depth() = 1 THEN
+                UPDATE nt_src SET v = v + 3 WHERE id = 962;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER "000_after_stmt" AFTER INSERT ON nt_src FOR EACH STATEMENT EXECUTE FUNCTION nt_000_after_stmt_fn();
+        INSERT INTO nt_src VALUES (962, NULL, 88, 200, 8);
+        """
+    )
+    _assert_all_exact('isolated alphabetically-earlier "000_after_stmt" AFTER STATEMENT trigger')
+    _exec('DROP TRIGGER "000_after_stmt" ON nt_src;')
+
+    # 4c. INSERT ... ON CONFLICT DO UPDATE (both 1-row and 0-row upsert),
+    #     mixed-case/case-differing/dotted columns, variable-scale NUMERIC,
+    #     partitioned table (parent -> child partition nested write), and nested TRUNCATE.
+    _exec(
+        "INSERT INTO nt_src VALUES (962, NULL, 88, 500, 9) "
+        "ON CONFLICT (id) DO UPDATE SET v = nt_src.v + EXCLUDED.v"
+    )
+    _exec(
+        "INSERT INTO nt_src SELECT 9999, NULL, 1, 1, 1 WHERE FALSE "
+        "ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v"
+    )
+    _assert_all_exact("1-row and 0-row INSERT ... ON CONFLICT DO UPDATE")
+
+    _exec(
+        """
+        CREATE OR REPLACE FUNCTION nt_sp_ai_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF pg_trigger_depth() = 1 THEN
+                UPDATE nt_sp SET "unit.price" = "unit.price" + 5, "a.b" = "a.b" + 1 WHERE id = NEW.id;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER nt_sp_ai AFTER INSERT ON nt_sp FOR EACH ROW EXECUTE FUNCTION nt_sp_ai_fn();
+        INSERT INTO nt_sp VALUES (2, 1, 20, 200), (3, 9, 30, 300);
+        DROP TRIGGER nt_sp_ai ON nt_sp;
+
+        CREATE OR REPLACE FUNCTION nt_num_ai_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF pg_trigger_depth() = 1 THEN
+                UPDATE nt_num SET g = 1.000, v = 30.000 WHERE id = NEW.id;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER nt_num_ai AFTER INSERT ON nt_num FOR EACH ROW EXECUTE FUNCTION nt_num_ai_fn();
+        INSERT INTO nt_num VALUES (3, 1.0, 5.0);
+        DROP TRIGGER nt_num_ai ON nt_num;
+
+        CREATE OR REPLACE FUNCTION nt_part_ai_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF pg_trigger_depth() = 1 THEN
+                UPDATE nt_part_2 SET v = v + 50 WHERE g = 2 AND id = 2;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER nt_part_ai AFTER INSERT ON nt_part FOR EACH ROW EXECUTE FUNCTION nt_part_ai_fn();
+        INSERT INTO nt_part VALUES (10, 1, 100);
+        DROP TRIGGER nt_part_ai ON nt_part;
+
+        CREATE OR REPLACE FUNCTION nt_str_trunc_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF pg_trigger_depth() = 1 THEN
+                INSERT INTO nt_str VALUES ('s_pre', 7, 77);
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER nt_str_bt BEFORE TRUNCATE ON nt_str FOR EACH STATEMENT EXECUTE FUNCTION nt_str_trunc_fn();
+        TRUNCATE nt_str;
+        DROP TRIGGER nt_str_bt ON nt_str;
+        INSERT INTO nt_str VALUES ('s3', 1, 10);
+        """
+    )
+    _assert_all_exact("mixed-case/dotted cols, variable-scale NUMERIC, partitioned nested write, nested TRUNCATE")
+
+    # 5. Self-referencing FK ON UPDATE CASCADE & ON DELETE CASCADE
+    _exec("UPDATE nt_src SET id = 1001, v = v + 5 WHERE id = 1")
+    _assert_all_exact("self-referencing FK ON UPDATE CASCADE")
+    _exec("DELETE FROM nt_src WHERE id = 1001")
+    _assert_all_exact("self-referencing FK ON DELETE CASCADE")
+
+    # 6. Concurrent READ COMMITTED & REPEATABLE READ writers with an active nested user trigger.
+    _exec(
+        """
+        CREATE OR REPLACE FUNCTION nt_conc_ai_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.id >= 2000 AND NEW.id < 3000 THEN
+                UPDATE nt_src SET v = v + 100 WHERE id = NEW.id;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER nt_conc_ai AFTER INSERT ON nt_src FOR EACH ROW EXECUTE FUNCTION nt_conc_ai_fn();
+        """
+    )
+    dsn = os.environ["POSTGRES_DSN"]
+    search_path = _query("SHOW search_path")[0][0]
+    errors: List[BaseException] = []
+    worker_conns: List[Any] = []
+    worker_conns_lock = threading.Lock()
+    barrier = threading.Barrier(2)
+
+    def _worker(wid: int, iso: str) -> None:
+        c = psycopg2.connect(dsn)
+        with worker_conns_lock:
+            worker_conns.append(c)
+        try:
+            with c.cursor() as cur:
+                cur.execute(f"SET search_path TO {search_path}")
+                cur.execute("SET lock_timeout = '10s'")
+                cur.execute("SET statement_timeout = '20s'")
+            c.commit()
+            for step in range(4):
+                row_id = 2000 + wid * 100 + step
+                grp = 1 if (step % 2 == 0) else 2
+                for _attempt in range(12):
+                    try:
+                        with c.cursor() as cur:
+                            cur.execute(f"SET TRANSACTION ISOLATION LEVEL {iso}")
+                            if step == 0 and _attempt == 0:
+                                barrier.wait(timeout=10)
+                            cur.execute(
+                                "INSERT INTO nt_src (id, parent_id, g, v, w) VALUES (%s, NULL, %s, %s, %s)",
+                                (row_id, grp, 10 + step, wid),
+                            )
+                        c.commit()
+                        break
+                    except psycopg2.Error as exc:
+                        c.rollback()
+                        if exc.pgcode in ("40001", "40P01"):
+                            continue
+                        raise
+                else:
+                    raise AssertionError(
+                        f"worker {wid} ({iso}) exhausted 12 retries on row_id={row_id}"
+                    )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+        finally:
+            c.close()
+
+    t1 = threading.Thread(target=_worker, args=(1, "READ COMMITTED"))
+    t2 = threading.Thread(target=_worker, args=(2, "REPEATABLE READ"))
+    try:
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+        if t1.is_alive() or t2.is_alive():
+            with worker_conns_lock:
+                for wc in worker_conns:
+                    try:
+                        wc.cancel()
+                    except Exception:
+                        pass
+            t1.join(timeout=5)
+            t2.join(timeout=5)
+            raise AssertionError(
+                f"concurrent nested-trigger workers did not finish: t1.alive={t1.is_alive()}, t2.alive={t2.is_alive()}"
+            )
+    finally:
+        if t1.is_alive() or t2.is_alive():
+            with worker_conns_lock:
+                for wc in worker_conns:
+                    try:
+                        wc.cancel()
+                    except Exception:
+                        pass
+            t1.join(timeout=5)
+            t2.join(timeout=5)
+    assert not errors, f"concurrent nested-trigger writer errors: {errors!r}"
+    committed_rows = _query("SELECT COUNT(*) FROM nt_src WHERE id >= 2000 AND id < 3000")[0][0]
+    assert committed_rows == 8, f"expected all 8 concurrent worker rows committed, got {committed_rows}"
+    _assert_all_exact("after concurrent RC/RR writers with nested user triggers")
+    _exec("DROP TRIGGER nt_conc_ai ON nt_src")
+
+    # 6b. Regression tests for CodeRabbit edge cases under nested triggers:
+    #     - BEFORE DELETE FOR EACH STATEMENT user trigger inserts 1 row AND runs a 0-row
+    #       nested UPDATE before outer 0-row DELETE (sentinel __mv_re=2 must not downgrade to 1);
+    #     - Unbounded VARCHAR column preserves OID 1043 (pg_typeof(v) = 'character varying')
+    #       in both Tier 2 group-bucket and Z-set counted projection staging;
+    #     - Mixed-type UNION / INTERSECT (INT vs DOUBLE PRECISION) casts staged values before
+    #       key hashing so integer 1 and double precision 1 share one canonical key;
+    #     - Unreferenced source columns named __mv_s, __mv_bseq, and space-padded " v "
+    #       never collide with staging SQL or lose verbatim quoting.
+    _exec(
+        """
+        CREATE TABLE nt_edge_vc (
+            id INT PRIMARY KEY,
+            v VARCHAR,
+            __mv_s INT DEFAULT 0,
+            __mv_bseq INT DEFAULT 0,
+            " v " INT DEFAULT 0
+        );
+        CREATE TABLE nt_mix_i (id INT PRIMARY KEY, x INT);
+        CREATE TABLE nt_mix_f (id INT PRIMARY KEY, x DOUBLE PRECISION);
+        INSERT INTO nt_mix_f VALUES (1, 1.0);
+        """
+    )
+    edge_views = [
+        (
+            "mv_edge_t2_vc",
+            "SELECT pg_typeof(v)::text AS tp, COUNT(DISTINCT id) AS dc FROM nt_edge_vc GROUP BY pg_typeof(v)::text",
+        ),
+        (
+            "mv_edge_cnt_vc",
+            "SELECT DISTINCT pg_typeof(v)::text AS tp, v FROM nt_edge_vc",
+        ),
+        (
+            "mv_edge_space_col",
+            'SELECT id, " v " AS sv FROM nt_edge_vc',
+        ),
+        (
+            "mv_edge_mix_union",
+            "SELECT x FROM nt_mix_i UNION SELECT x FROM nt_mix_f",
+        ),
+        (
+            "mv_edge_mix_inter",
+            "SELECT x FROM nt_mix_i INTERSECT SELECT x FROM nt_mix_f",
+        ),
+    ]
+    for evn, esel in edge_views:
+        mgr.register_view(f"CREATE VIEW {evn} AS {esel};")
+    conn.commit()
+
+    def _assert_edge_exact(lbl: str) -> None:
+        for evn, esel in edge_views:
+            got = sorted(_query(f"SELECT * FROM {evn}"), key=lambda r: tuple((x is None, str(x)) for x in r))
+            exp = sorted(_query(esel), key=lambda r: tuple((x is None, str(x)) for x in r))
+            assert got == exp, f"{lbl} mismatch on {evn}: got={got!r}, exp={exp!r}"
+
+    # BEFORE DELETE FOR EACH STATEMENT trigger sorting after __matview_trg_* ('z' > '_')
+    # inserts a row, then runs a 0-row nested UPDATE, while outer DELETE matches 0 rows.
+    _exec(
+        """
+        CREATE OR REPLACE FUNCTION nt_z_before_del_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF pg_trigger_depth() = 1 THEN
+                INSERT INTO nt_edge_vc (id, v, __mv_s, __mv_bseq, " v ") VALUES (1, 'alpha', 7, 8, 42);
+                UPDATE nt_edge_vc SET v = 'noop' WHERE id = -999;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER zzz_before_del BEFORE DELETE ON nt_edge_vc FOR EACH STATEMENT EXECUTE FUNCTION nt_z_before_del_fn();
+        CREATE OR REPLACE FUNCTION nt_vc_ai_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF pg_trigger_depth() = 1 THEN
+                UPDATE nt_edge_vc SET v = v || '!', " v " = " v " + 1 WHERE id = NEW.id;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER nt_vc_ai AFTER INSERT ON nt_edge_vc FOR EACH ROW EXECUTE FUNCTION nt_vc_ai_fn();
+        CREATE OR REPLACE FUNCTION nt_mix_au_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF pg_trigger_depth() = 1 THEN
+                INSERT INTO nt_mix_i VALUES (1, 1) ON CONFLICT (id) DO NOTHING;
+            END IF;
+            RETURN NULL;
+        END;
+        $$;
+        CREATE TRIGGER nt_mix_au AFTER UPDATE ON nt_mix_f FOR EACH ROW EXECUTE FUNCTION nt_mix_au_fn();
+        """
+    )
+    _exec("DELETE FROM nt_edge_vc WHERE FALSE")
+    _assert_edge_exact("after 0-row DELETE with BEFORE trigger insert + 0-row nested UPDATE")
+    _exec('INSERT INTO nt_edge_vc (id, v, __mv_s, __mv_bseq, " v ") VALUES (2, \'beta\', 1, 2, 99)')
+    _assert_edge_exact("after nested trigger on VARCHAR + __mv_s + __mv_bseq + space-padded col")
+    _exec("UPDATE nt_mix_f SET x = 1.0 WHERE id = 1")
+    _assert_edge_exact("after nested trigger on mixed INT/DOUBLE UNION and INTERSECT")
+    conn.commit()
+    for evn, _ in edge_views:
+        mgr.drop_view(evn)
+    conn.commit()
+
+    # 7. Manager drift, diff_views NOOP, and repair_view parity.
+    assert mgr.check_schema_drift() == {vn: "ok" for vn, _ in views}
+    assert {k: v.status for k, v in mgr.diff_views(view_sqls).items()} == {vn: "NOOP" for vn, _ in views}
+    assert mgr.repair_view("mv_nt_alg") == {"mv_nt_alg": "repaired"}
+    _assert_all_exact("after repair_view")

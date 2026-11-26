@@ -1349,7 +1349,12 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             "CREATE VIEW v_gv AS SELECT v_explicit, SUM(v_default) AS s, COUNT(*) AS c FROM gv GROUP BY v_explicit;",
             dialect=Dialect.POSTGRES,
         )
-        fn_ddls = [d for d in plan.trigger_ddls if "CREATE OR REPLACE FUNCTION __matview_fn_sync_" in d and "_trunc" not in d]
+        fn_ddls = [
+            d for d in plan.trigger_ddls
+            if "CREATE OR REPLACE FUNCTION __matview_fn_sync_" in d
+            and "_trunc" not in d.splitlines()[0]
+            and "_bs()" not in d.splitlines()[0]
+        ]
         self.assertEqual(len(fn_ddls), 3)
         for fn in fn_ddls:
             self.assertNotIn("__mv_n.*", fn)
@@ -1834,7 +1839,11 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             dialect=Dialect.POSTGRES,
             repair_fence_catalog_table="__matview_catalog",
         )
-        fn_ddls = [d for d in fenced.trigger_ddls if d.lstrip().startswith("CREATE OR REPLACE FUNCTION")]
+        fn_ddls = [
+            d for d in fenced.trigger_ddls
+            if d.lstrip().startswith("CREATE OR REPLACE FUNCTION")
+            and not any(s in d.splitlines()[0] for s in ("_bs()", "_reconcile()"))
+        ]
         self.assertEqual(len(fn_ddls), 4)
         for fn in fn_ddls:
             self.assertIn("__MV_REPAIR_FENCE_START__", fn)
@@ -1881,7 +1890,11 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             object_prefix="custom_mv_",
             repair_fence_catalog_table="custom_mv_catalog",
         )
-        quoted_fns = [d for d in fenced_quoted.trigger_ddls if d.lstrip().startswith("CREATE OR REPLACE FUNCTION")]
+        quoted_fns = [
+            d for d in fenced_quoted.trigger_ddls
+            if d.lstrip().startswith("CREATE OR REPLACE FUNCTION")
+            and not any(s in d.splitlines()[0] for s in ("_bs()", "_reconcile()"))
+        ]
         self.assertTrue(quoted_fns)
         for fn in quoted_fns:
             self.assertIn("PERFORM 1 FROM custom_mv_catalog WHERE view_name = 'v''s fence' FOR SHARE;", fn)
@@ -2271,6 +2284,171 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
                         f"ALTER TABLE %s ENABLE ALWAYS TRIGGER {trigger_name}",
                         partition_install_sql,
                     )
+
+    def test_postgres_reentrant_nested_trigger_bracket_codegen(self) -> None:
+        schema = """
+        CREATE TABLE t (
+            id INT PRIMARY KEY,
+            g INT,
+            v BIGINT,
+            w INT
+        );
+        CREATE TABLE t_npk (
+            g INT,
+            v INT
+        );
+        CREATE TABLE u (
+            id INT PRIMARY KEY,
+            g INT,
+            v BIGINT
+        );
+        CREATE TABLE u_str (
+            code TEXT PRIMARY KEY,
+            g INT,
+            v BIGINT
+        );
+        """
+        # 1. Single-table algebraic aggregate with COUNT(DISTINCT) and MIN/MAX:
+        #    distinct aux stays auxiliary_table_names[0], staging table is appended,
+        #    bracket tracks __mv_re, and reconcile forces extreme recompute.
+        p_alg = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_alg AS SELECT g, COUNT(*) AS c, SUM(v) AS s, MIN(v) AS lo, COUNT(DISTINCT w) AS dw FROM t GROUP BY g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(len(p_alg.auxiliary_table_names), 2)
+        self.assertTrue(p_alg.auxiliary_table_names[0].startswith("__matview_dist_"))
+        self.assertEqual(p_alg.auxiliary_table_names[1], "__matview_stg_v_alg__t")
+        alg_sql = "\n".join(p_alg.trigger_ddls)
+        self.assertIn("__mv_re := GREATEST(__mv_re, 1);", alg_sql)
+        self.assertIn(
+            "__mv_overlap BOOLEAN := ((__mv_m & (__mv_m - 1)) <> 0) OR (__mv_re >= 2) OR (__mv_re <> 0 AND __mv_nd > 0);",
+            alg_sql,
+        )
+        self.assertIn("PERFORM __matview_fn_s3_v_alg_reconcile();", alg_sql)
+        self.assertIn("INSERT INTO __matview_stg_v_alg__t", alg_sql)
+        rec_alg = next(d for d in p_alg.trigger_ddls if "__matview_fn_s3_v_alg_reconcile()" in d.splitlines()[0])
+        self.assertIn("SELECT MIN(", rec_alg)
+        self.assertIn("DELETE FROM __matview_stg_v_alg__t", rec_alg)
+
+        # 2. Single-table Tier 2 group-scoped (with buckets) appends staging table after lock table;
+        #    Tier 2 global window (without buckets) and Tier 3 use overlap_refresh_sql with no staging table.
+        p_t2g = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_t2g AS SELECT g, STRING_AGG(CAST(id AS TEXT), ',' ORDER BY id) AS ids FROM t GROUP BY g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(p_t2g.auxiliary_table_names, ["__matview_lock_v_t2g", "__matview_stg_v_t2g__t"])
+        self.assertIn("PERFORM __matview_fn_s3_v_t2g_reconcile();", "\n".join(p_t2g.trigger_ddls))
+
+        p_t2w = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_t2w AS SELECT id, SUM(v) OVER (ORDER BY id) AS rs FROM t;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(p_t2w.auxiliary_table_names, ["__matview_lock_v_t2w"])
+        self.assertIn("__mv_re <> 0", "\n".join(p_t2w.trigger_ddls))
+
+        p_t3 = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_t3 AS SELECT id, v FROM t ORDER BY v DESC LIMIT 5;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(p_t3.auxiliary_table_names, ["__matview_lock_v_t3"])
+        self.assertIn("__mv_re <> 0", "\n".join(p_t3.trigger_ddls))
+
+        # 3. Native-PK projection, DISTINCT, UNION/EXCEPT/UNION ALL, and UNION ALL agg
+        #    all emit per-source staging tables and a shared reconcile function.
+        for vname, vsql, exp_aux in (
+            ("v_pk", "CREATE VIEW v_pk AS SELECT id, g, v FROM t WHERE v > 0;", ["__matview_stg_v_pk__t"]),
+            ("v_dst", "CREATE VIEW v_dst AS SELECT DISTINCT g, v FROM t;", ["__matview_stg_v_dst__t"]),
+            ("v_u", "CREATE VIEW v_u AS SELECT g, v FROM t UNION SELECT g, v FROM u;", ["__matview_stg_v_u__t", "__matview_stg_v_u__u"]),
+            ("v_ex", "CREATE VIEW v_ex AS SELECT g, v FROM t EXCEPT SELECT g, v FROM u;", ["__matview_stg_v_ex__t", "__matview_stg_v_ex__u"]),
+            ("v_ua", "CREATE VIEW v_ua AS SELECT g, v FROM t UNION ALL SELECT g, v FROM u;", ["__matview_stg_v_ua__t", "__matview_stg_v_ua__u"]),
+            ("v_uam", "CREATE VIEW v_uam AS SELECT g, v FROM t UNION ALL SELECT g, v FROM u_str;", ["__matview_stg_v_uam__t", "__matview_stg_v_uam__u_str"]),
+            (
+                "v_uagg",
+                "CREATE VIEW v_uagg AS SELECT g, SUM(v) AS s, COUNT(*) AS c FROM (SELECT g, v FROM t UNION ALL SELECT g, v FROM u) AS x GROUP BY g;",
+                ["__matview_stg_v_uagg__t", "__matview_stg_v_uagg__u"],
+            ),
+        ):
+            plan = generate_materialized_view(schema, vsql, dialect=Dialect.POSTGRES)
+            self.assertEqual(plan.auxiliary_table_names, exp_aux, vname)
+            all_tr = "\n".join(plan.trigger_ddls)
+            self.assertIn(f"PERFORM __matview_fn_s3_{vname}_reconcile();", all_tr, vname)
+            self.assertIn("__mv_re <> 0", all_tr, vname)
+
+        # Keyless bag projection uses Tier 3 overlap refresh bracket.
+        p_bag = generate_materialized_view(
+            schema, "CREATE VIEW v_bag AS SELECT g, v FROM t_npk;", dialect=Dialect.POSTGRES
+        )
+        self.assertEqual(p_bag.auxiliary_table_names, ["__matview_lock_v_bag"])
+        bag_tr = "\n".join(p_bag.trigger_ddls)
+        self.assertIn("__mv_re <> 0", bag_tr)
+        self.assertIn("ELSIF __mv_dirty THEN", bag_tr)
+
+        # 4. COUNT(*) stages zero user columns (only metadata __mv_tx/__mv_seq/__mv_s);
+        #    mixed-case, case-differing ("val"/"Val"), and dotted ("a.b") columns are
+        #    preserved and properly quoted in staging DDL and staging INSERTs;
+        #    staging metadata column name collision fails closed.
+        special_schema = """
+        CREATE TABLE t_sp (
+            id INT PRIMARY KEY,
+            "Grp" INT,
+            "Amount" INT,
+            "a.b" INT,
+            "val" INT,
+            "Val" INT,
+            wide_blob TEXT
+        );
+        CREATE TABLE t_meta (
+            id INT PRIMARY KEY,
+            __mv_tx INT,
+            v INT
+        );
+        """
+        p_cnt = generate_materialized_view(
+            special_schema, "CREATE VIEW v_cnt AS SELECT COUNT(*) AS c FROM t_sp;", dialect=Dialect.POSTGRES
+        )
+        stg_cnt_ddl = next(d for d in p_cnt.auxiliary_table_ddls if "__matview_stg_v_cnt__t_sp" in d)
+        self.assertNotIn("wide_blob", stg_cnt_ddl)
+        self.assertNotIn("Amount", stg_cnt_ddl)
+
+        p_sp = generate_materialized_view(
+            special_schema,
+            'CREATE VIEW v_sp AS SELECT "Grp", SUM("Amount") AS sa, SUM("a.b") AS sab, SUM("val") AS sv1, SUM("Val") AS sv2 FROM t_sp GROUP BY "Grp";',
+            dialect=Dialect.POSTGRES,
+        )
+        stg_sp_ddl = next(d for d in p_sp.auxiliary_table_ddls if "__matview_stg_v_sp__t_sp" in d)
+        for col_q in ('"Grp"', '"Amount"', '"a.b"', '"val" INT', '"Val"'):
+            self.assertIn(col_q, stg_sp_ddl)
+        self.assertNotIn("wide_blob", stg_sp_ddl)
+        sp_tr = "\n".join(p_sp.trigger_ddls)
+        self.assertIn('__mv_n."Amount"', sp_tr)
+        self.assertIn('__mv_n."a.b"', sp_tr)
+        self.assertIn('__mv_n."Val"', sp_tr)
+        self.assertIn("__mv_blk.__mv_bseq", sp_tr)
+        self.assertIn("1::smallint", sp_tr)
+
+        from matview.engines import UnsupportedMaterializedViewError
+
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            generate_materialized_view(
+                special_schema,
+                "CREATE VIEW v_meta AS SELECT __mv_tx, SUM(v) AS s FROM t_meta GROUP BY __mv_tx;",
+                dialect=Dialect.POSTGRES,
+            )
+
+        # 5. Case-insensitive table reference deduplication in UNION ALL aggregate
+        #    emits one staging table (not duplicate __t and __T).
+        p_uagg_ci = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_uagg_ci AS SELECT g, SUM(v) AS s FROM ("
+            "SELECT g, v FROM t WHERE w > 0 UNION ALL SELECT g, v FROM T WHERE w <= 0"
+            ") AS x GROUP BY g;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertEqual(p_uagg_ci.auxiliary_table_names, ["__matview_stg_v_uagg_ci__t"])
 
 
 def detect_version_for(conn):

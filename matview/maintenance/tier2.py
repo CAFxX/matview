@@ -12,6 +12,7 @@ from sqlglot import exp as sqlglot_exp
 from sqlglot import TokenType as SQLGlotTokenType
 
 from .._host import MixinHost
+from ..dialects.pg_statement import PgStatementBracket
 from ..engines import (
     AggFunc,
     Dialect,
@@ -767,6 +768,7 @@ class Tier2Mixin(MixinHost):
         group_col_types: Optional[Dict[str, str]] = None,
         uses_group_buckets: bool = False,
         pg_bracket_source_bit: Optional[int] = None,
+        pg_bracket_override: Optional[PgStatementBracket] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         q_target_cols = [self._q(c) for c in target_cols]
         cols_csv = ", ".join(q_target_cols)
@@ -849,11 +851,9 @@ class Tier2Mixin(MixinHost):
         pg_ai_body: Optional[str] = None
         pg_ad_body: Optional[str] = None
         pg_au_body: Optional[str] = None
-        pg_bracket: Optional[Any] = None
+        pg_bracket: Optional[PgStatementBracket] = None
         pg_trunc_stmts = full_refresh
         if self.dialect == Dialect.POSTGRES:
-            from ..dialects.pg_statement import PgStatementBracket
-
             pg_bodies = self._pg_group_scoped_bodies(
                 base_t, mv_table, cols_csv, src_cols_csv, group_mv_cols, source_query_sql,
                 can_push_down, full_refresh, group_col_types or {},
@@ -863,7 +863,9 @@ class Tier2Mixin(MixinHost):
             # TRUNCATE recomputes everything: lock all buckets when group-scoped
             # writers exist, otherwise only row 0.
             pg_trunc_stmts = [self._pg_view_lock_stmt(all_buckets=uses_group_buckets), *full_refresh]
-            if pg_bracket_source_bit is not None:
+            if pg_bracket_override is not None:
+                pg_bracket = pg_bracket_override
+            elif pg_bracket_source_bit is not None:
                 pg_bracket = PgStatementBracket(
                     lock_table=self._pg_view_lock_table(),
                     source_bit=pg_bracket_source_bit,
@@ -1021,6 +1023,104 @@ class Tier2Mixin(MixinHost):
         from_sql = "(\n        " + "\n        UNION ALL\n        ".join(key_branches) + "\n        ) AS __mv_kk"
         return from_sql, [f"__mv_kk.__mv_k{i}" for i in range(len(group_mv_cols))]
 
+    def _pg_group_scoped_body_for_signed(
+        self,
+        base_t: str,
+        mv_table: str,
+        cols_csv: str,
+        src_cols_csv: str,
+        group_mv_cols: List[Tuple[str, str]],
+        source_query_sql: str,
+        can_push_down: bool,
+        full_refresh: List[str],
+        signed_sql: str,
+        group_col_types: Optional[Dict[str, str]] = None,
+        uses_group_buckets: bool = False,
+    ) -> str:
+        """Build one PostgreSQL group-scoped recompute body for a given signed-rows SELECT."""
+        refresh = "\n".join([self._pg_view_lock_stmt(all_buckets=uses_group_buckets), *full_refresh])
+        lock_t = self._pg_view_lock_table()
+        col_types_map = group_col_types or {}
+        src_lhs_push: Optional[List[str]] = None
+        if len(self.view.joins) > 1:
+            jq_pg, uq_pg, sb_pg, _, _, _ = self._tier2_join_graph_info()
+            _, outer_aliases_pg = self._tier2_raw_join_metadata()
+            qual_list = [
+                self._tier2_ast_qualify_outer(g, jq_pg, uq_pg, sb_pg, outer_aliases_pg)
+                for g, _ in group_mv_cols
+            ]
+            if all(q is not None for q in qual_list):
+                src_lhs_push = [f"({q})" for q in qual_list if q is not None]
+        else:
+            src_lhs_push = [f"({g})" for g, _ in group_mv_cols]
+        if can_push_down and src_lhs_push is None:
+            return refresh
+
+        key_uses_in = [
+            ("[]" in dt or dt.strip().upper() in ("ARRAY", "USER-DEFINED"))
+            for dt in (col_types_map.get(mv_c.lower(), "") for _g, mv_c in group_mv_cols)
+        ]
+
+        got = self._pg_group_scope_keys(base_t, group_mv_cols, signed_sql)
+        if got is None:
+            return refresh
+        from_sql, keys = got
+        n = len(keys)
+        sel = ", ".join(f"{k} AS __mv_k{i}" for i, k in enumerate(keys))
+        kset = f"(SELECT DISTINCT {sel} FROM {from_sql}) AS __mv_kset"
+        kcols = [f"__mv_kset.__mv_k{i}" for i in range(n)]
+        no_null = " AND ".join(f"{k} IS DISTINCT FROM NULL" for k in kcols)
+        any_null = " OR ".join(f"{k} IS NOT DISTINCT FROM NULL" for k in kcols)
+        if len(self.view.joins) > 1:
+            stmts = [self._pg_view_lock_stmt()]
+        else:
+            canon = self._canonical_group_pk_expr(kcols)
+            stmts = [
+                f"INSERT INTO {lock_t} (__mv_id, __mv_n)\n"
+                f"    SELECT DISTINCT {self._pg_group_lock_id_sql(canon)}, 1 FROM {kset}\n"
+                f"    ORDER BY 1\n"
+                f"    ON CONFLICT (__mv_id) DO UPDATE SET __mv_n = {lock_t}.__mv_n + 1;"
+            ]
+
+        def _match_nonnull(lhs: List[str]) -> str:
+            conds = [
+                (
+                    f"{l} IN (SELECT __mv_kset.__mv_k{i} FROM {kset} WHERE {no_null})"
+                    if key_uses_in[i]
+                    else f"{l} = ANY (ARRAY(SELECT __mv_kset.__mv_k{i} FROM {kset} WHERE {no_null}))"
+                )
+                for i, l in enumerate(lhs)
+            ]
+            if n > 1:
+                conds.append(f"({', '.join(lhs)}) IN (SELECT {', '.join(kcols)} FROM {kset} WHERE {no_null})")
+            return " AND ".join(conds)
+
+        def _match_null(lhs: List[str]) -> str:
+            eq = " AND ".join(
+                f"({l} = {k} OR ({l} IS NOT DISTINCT FROM NULL AND {k} IS NOT DISTINCT FROM NULL))"
+                for l, k in zip(lhs, kcols)
+            )
+            return (
+                f"EXISTS (SELECT 1 FROM {kset} WHERE {any_null})\n"
+                f"    AND EXISTS (SELECT 1 FROM {kset} WHERE ({any_null}) AND {eq})"
+            )
+
+        mv_lhs = [f"{mv_table}.{self._q(mv_c)}" for _g, mv_c in group_mv_cols]
+        src_lhs_out = [f"__mv_src.{self._q(mv_c)}" for _g, mv_c in group_mv_cols]
+        for match in (_match_nonnull, _match_null):
+            stmts.append(f"DELETE FROM {mv_table}\n    WHERE {match(mv_lhs)};")
+        for match in (_match_nonnull, _match_null):
+            if can_push_down and src_lhs_push is not None:
+                q = self._inject_where_into_source_query(source_query_sql, match(src_lhs_push))
+                stmts.append(f"INSERT INTO {mv_table} ({cols_csv})\n    {q};")
+            else:
+                stmts.append(
+                    f"INSERT INTO {mv_table} ({cols_csv})\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    WHERE {match(src_lhs_out)};"
+                )
+        return "\n".join(stmts)
+
     def _pg_group_scoped_bodies(
         self,
         base_t: str,
@@ -1052,97 +1152,22 @@ class Tier2Mixin(MixinHost):
            separate statement for keys with a NULL part, guarded so it does no
            work when there is none.
         """
-        bodies: Dict[str, str] = {}
-        refresh = "\n".join([self._pg_view_lock_stmt(all_buckets=uses_group_buckets), *full_refresh])
-        lock_t = self._pg_view_lock_table()
-        col_types_map = group_col_types or {}
-        src_lhs_push: Optional[List[str]] = None
-        if len(self.view.joins) > 1:
-            jq_pg, uq_pg, sb_pg, _, _, _ = self._tier2_join_graph_info()
-            _, outer_aliases_pg = self._tier2_raw_join_metadata()
-            qual_list = [
-                self._tier2_ast_qualify_outer(g, jq_pg, uq_pg, sb_pg, outer_aliases_pg)
-                for g, _ in group_mv_cols
-            ]
-            if all(q is not None for q in qual_list):
-                src_lhs_push = [f"({q})" for q in qual_list if q is not None]
-        else:
-            src_lhs_push = [f"({g})" for g, _ in group_mv_cols]
-        if can_push_down and src_lhs_push is None:
-            return {event: refresh for event in ("INSERT", "UPDATE", "DELETE")}
-
-        key_uses_in = [
-            ("[]" in dt or dt.strip().upper() in ("ARRAY", "USER-DEFINED"))
-            for dt in (col_types_map.get(mv_c.lower(), "") for _g, mv_c in group_mv_cols)
-        ]
-
-        for event in ("INSERT", "UPDATE", "DELETE"):
-            got = self._pg_group_scope_keys(base_t, group_mv_cols, self._pg_signed_rows_sql(event, base_t))
-            if got is None:
-                bodies[event] = refresh
-                continue
-            from_sql, keys = got
-            n = len(keys)
-            sel = ", ".join(f"{k} AS __mv_k{i}" for i, k in enumerate(keys))
-            kset = f"(SELECT DISTINCT {sel} FROM {from_sql}) AS __mv_kset"
-            kcols = [f"__mv_kset.__mv_k{i}" for i in range(n)]
-            no_null = " AND ".join(f"{k} IS DISTINCT FROM NULL" for k in kcols)
-            any_null = " OR ".join(f"{k} IS NOT DISTINCT FROM NULL" for k in kcols)
-            if len(self.view.joins) > 1:
-                # Multi-source join view: acquire the per-view lock row exclusively
-                # before evaluating kset against other sources, so concurrent writers
-                # to different sources serialize and never compute an empty/stale kset
-                # before the other source commits (while still keeping DELETE/INSERT
-                # scoped to the affected groups in kset).
-                stmts = [self._pg_view_lock_stmt()]
-            else:
-                canon = self._canonical_group_pk_expr(kcols)
-                stmts = [
-                    f"INSERT INTO {lock_t} (__mv_id, __mv_n)\n"
-                    f"    SELECT DISTINCT {self._pg_group_lock_id_sql(canon)}, 1 FROM {kset}\n"
-                    f"    ORDER BY 1\n"
-                    f"    ON CONFLICT (__mv_id) DO UPDATE SET __mv_n = {lock_t}.__mv_n + 1;"
-                ]
-
-            def _match_nonnull(lhs: List[str]) -> str:
-                conds = [
-                    (
-                        f"{l} IN (SELECT __mv_kset.__mv_k{i} FROM {kset} WHERE {no_null})"
-                        if key_uses_in[i]
-                        else f"{l} = ANY (ARRAY(SELECT __mv_kset.__mv_k{i} FROM {kset} WHERE {no_null}))"
-                    )
-                    for i, l in enumerate(lhs)
-                ]
-                if n > 1:
-                    conds.append(f"({', '.join(lhs)}) IN (SELECT {', '.join(kcols)} FROM {kset} WHERE {no_null})")
-                return " AND ".join(conds)
-
-            def _match_null(lhs: List[str]) -> str:
-                eq = " AND ".join(
-                    f"({l} = {k} OR ({l} IS NOT DISTINCT FROM NULL AND {k} IS NOT DISTINCT FROM NULL))"
-                    for l, k in zip(lhs, kcols)
-                )
-                return (
-                    f"EXISTS (SELECT 1 FROM {kset} WHERE {any_null})\n"
-                    f"    AND EXISTS (SELECT 1 FROM {kset} WHERE ({any_null}) AND {eq})"
-                )
-
-            mv_lhs = [f"{mv_table}.{self._q(mv_c)}" for _g, mv_c in group_mv_cols]
-            src_lhs_out = [f"__mv_src.{self._q(mv_c)}" for _g, mv_c in group_mv_cols]
-            for match in (_match_nonnull, _match_null):
-                stmts.append(f"DELETE FROM {mv_table}\n    WHERE {match(mv_lhs)};")
-            for match in (_match_nonnull, _match_null):
-                if can_push_down and src_lhs_push is not None:
-                    q = self._inject_where_into_source_query(source_query_sql, match(src_lhs_push))
-                    stmts.append(f"INSERT INTO {mv_table} ({cols_csv})\n    {q};")
-                else:
-                    stmts.append(
-                        f"INSERT INTO {mv_table} ({cols_csv})\n"
-                        f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
-                        f"    WHERE {match(src_lhs_out)};"
-                    )
-            bodies[event] = "\n".join(stmts)
-        return bodies
+        return {
+            event: self._pg_group_scoped_body_for_signed(
+                base_t,
+                mv_table,
+                cols_csv,
+                src_cols_csv,
+                group_mv_cols,
+                source_query_sql,
+                can_push_down,
+                full_refresh,
+                self._pg_signed_rows_sql(event, base_t),
+                group_col_types=group_col_types,
+                uses_group_buckets=uses_group_buckets,
+            )
+            for event in ("INSERT", "UPDATE", "DELETE")
+        }
 
     def _tier2_norm_expr(self, expr: str) -> str:
         """Canonicalize an expression via sqlglot AST for matching GROUP BY keys
@@ -1290,11 +1315,67 @@ class Tier2Mixin(MixinHost):
         trigger_ddls: List[str] = []
         trig_names: List[str] = []
         fn_names: List[str] = []
-        pg_multi_source = self.dialect == Dialect.POSTGRES and len(self.view.referenced_tables) >= 2
+        aux_ddls: List[str] = (
+            self._pg_view_lock_ddls(with_group_buckets=uses_group_buckets)
+            if self.dialect == Dialect.POSTGRES
+            else []
+        )
+        aux_names: List[str] = [self._pg_view_lock_table()] if self.dialect == Dialect.POSTGRES else []
+        pg_reconcile_ddl: Optional[str] = None
+        pg_reconcile_fn: Optional[str] = None
+        single_pg_bracket: Optional[PgStatementBracket] = None
+        if self.dialect == Dialect.POSTGRES and len(self.view.referenced_tables) == 1 and uses_group_buckets:
+            ref_t = self.view.referenced_tables[0]
+            stg_cols = self._pg_stage_cols_for_table(ref_t)
+            stg_tbl, stg_ddl, stg_idx, stg_idx_ddl = self._pg_join_stage_table_ddls(ref_t, stg_cols)
+            aux_ddls = [aux_ddls[0], stg_ddl, *aux_ddls[1:]]
+            aux_names.append(stg_tbl)
+            index_ddls.append(stg_idx_ddl)
+            index_names.append(stg_idx)
+
+            src_cols_csv_t2 = ", ".join(f"__mv_src.{self._q(c)}" for c in target_cols)
+            full_refresh_t2 = [
+                f"DELETE FROM {mv_table};",
+                f"INSERT INTO {mv_table} ({cols_csv})\n"
+                f"    SELECT {src_cols_csv_t2} FROM (\n{source_query_sql}\n    ) AS __mv_src;",
+            ]
+            reconcile_body = self._pg_group_scoped_body_for_signed(
+                ref_t,
+                mv_table,
+                cols_csv,
+                src_cols_csv_t2,
+                group_mv_cols,
+                source_query_sql,
+                self._can_push_down_group_filter_into_where(),
+                full_refresh_t2,
+                self._pg_staged_rows_select(stg_tbl),
+                group_col_types=col_types_by_lower,
+                uses_group_buckets=True,
+            )
+            pg_reconcile_fn = self._pg_reconcile_fn_name()
+            pg_reconcile_ddl = self._pg_reconcile_fn_ddl(
+                pg_reconcile_fn, self._pg_view_lock_table(), [stg_tbl], reconcile_body
+            )
+            single_pg_bracket = PgStatementBracket(
+                lock_table=self._pg_view_lock_table(),
+                source_bit=1,
+                reconcile_fn=pg_reconcile_fn,
+                stage_sqls=self._pg_stage_sqls_for_table(ref_t, stg_tbl, stg_cols),
+                trunc_cleanup_sql=(
+                    f"DELETE FROM {stg_tbl} "
+                    f"WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_blk.__mv_bseq;"
+                ),
+            )
+
+        pg_is_pg = self.dialect == Dialect.POSTGRES
         for ref_idx, ref_table in enumerate(self.view.referenced_tables):
             src_bit: Optional[int] = None
-            if pg_multi_source:
-                src_bit = (1 << ref_idx) if ref_idx < 60 else ((1 << 60) | (1 << 61))
+            bracket_override: Optional[PgStatementBracket] = None
+            if pg_is_pg:
+                if single_pg_bracket is not None:
+                    bracket_override = single_pg_bracket
+                else:
+                    src_bit = (1 << ref_idx) if ref_idx < 60 else ((1 << 60) | (1 << 61))
             t_ddls, t_ns, f_ns = self._build_tier2_triggers_for_table(
                 view_name=view_name,
                 mv_table=mv_table,
@@ -1305,10 +1386,14 @@ class Tier2Mixin(MixinHost):
                 group_col_types=col_types_by_lower,
                 uses_group_buckets=uses_group_buckets,
                 pg_bracket_source_bit=src_bit,
+                pg_bracket_override=bracket_override,
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)
             fn_names.extend(f_ns)
+        if pg_reconcile_ddl and pg_reconcile_fn:
+            trigger_ddls = [pg_reconcile_ddl, *trigger_ddls]
+            fn_names = [pg_reconcile_fn, *fn_names]
 
         return MaterializedViewPlan(
             dialect=self.dialect,
@@ -1316,12 +1401,8 @@ class Tier2Mixin(MixinHost):
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=(
-                self._pg_view_lock_ddls(with_group_buckets=uses_group_buckets)
-                if self.dialect == Dialect.POSTGRES
-                else []
-            ),
-            auxiliary_table_names=[self._pg_view_lock_table()] if self.dialect == Dialect.POSTGRES else [],
+            auxiliary_table_ddls=aux_ddls,
+            auxiliary_table_names=aux_names,
             index_ddls=index_ddls,
             initial_populate_sqls=[initial_populate_sql],
             trigger_ddls=trigger_ddls,

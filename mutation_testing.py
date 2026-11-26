@@ -655,6 +655,26 @@ MUTANTS = (
             "test_exact_window_expression_types_and_fail_closed_offline"
         ),
     ),
+    Mutant(
+        name="pg-bracket-omits-reentrant-flag",
+        source_path="matview/dialects/templates.py",
+        original="    __mv_overlap BOOLEAN := ((__mv_m & (__mv_m - 1)) <> 0) OR (__mv_re >= 2) OR (__mv_re <> 0 AND __mv_nd > 0);",
+        replacement="    __mv_overlap BOOLEAN := (__mv_m & (__mv_m - 1)) <> 0;",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_reentrant_nested_trigger_bracket_codegen"
+        ),
+    ),
+    Mutant(
+        name="pg-single-table-omits-reentrant-bracket",
+        source_path="matview/maintenance/single.py",
+        original="            pg_bracket = PgStatementBracket(\n                lock_table=mv_table,\n                source_bit=1,",
+        replacement="            pg_bracket = None\n            if False:\n                pg_bracket = PgStatementBracket(\n                lock_table=mv_table,\n                source_bit=1,",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_reentrant_nested_trigger_bracket_codegen"
+        ),
+    ),
 )
 
 

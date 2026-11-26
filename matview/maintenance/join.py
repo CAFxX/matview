@@ -1068,7 +1068,7 @@ class Tier1JoinMixin(MixinHost):
                                         st = stg_table_by_idx[j_idx]
                                         tbl_sql = (
                                             f"(SELECT * FROM {st} "
-                                            f"WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_bseq) "
+                                            f"WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_blk.__mv_bseq) "
                                             f"AS {self._q(jj.alias)}"
                                         )
                                     else:
@@ -1123,29 +1123,14 @@ class Tier1JoinMixin(MixinHost):
                 fn_names.append(reconcile_fn)
 
                 trunc_cleanup_sql = "\n".join(
-                    f"DELETE FROM {st} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_bseq;"
+                    f"DELETE FROM {st} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_blk.__mv_bseq;"
                     for st in all_stg_tables
                 )
                 for idx, jj in enumerate(self.view.joins):
                     st = stg_table_by_idx[idx]
-                    q_cols = [self._q(c) for c in staged_cols_by_idx[idx]]
-                    ins_cols = ["__mv_tx", "__mv_seq", SIGN, *q_cols]
-                    sel_cols = [
-                        "pg_catalog.txid_current()",
-                        "__mv_bseq",
-                        f"__mv_src.{SIGN}",
-                        *[f"__mv_src.{c}" for c in q_cols],
-                    ]
-                    stage_sqls = {
-                        ev: (
-                            f"INSERT INTO {st} ({', '.join(ins_cols)})\n"
-                            f"            SELECT {', '.join(sel_cols)}\n"
-                            f"            FROM (\n"
-                            f"            {self._pg_signed_rows_sql(ev, jj.table_name)}\n"
-                            f"            ) AS __mv_src;"
-                        )
-                        for ev in PG_EVENTS
-                    }
+                    stage_sqls = self._pg_stage_sqls_for_table(
+                        jj.table_name, st, staged_cols_by_idx[idx]
+                    )
                     pg_brackets_by_idx[idx] = PgStatementBracket(
                         lock_table=pg_lock_tbl,
                         source_bit=1 << idx,

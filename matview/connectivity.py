@@ -556,7 +556,7 @@ def _format_sa_column_type(
         # (same result type as CHAR(n)).
         raw_str = "BPCHAR"
     elif dialect == Dialect.POSTGRES and raw_str.startswith("VARCHAR") and not getattr(col_type, "length", None):
-        raw_str = "TEXT"
+        raw_str = "VARCHAR"
     elif dialect == Dialect.POSTGRES and getattr(col_type, "timezone", False) and raw_str in ("TIMESTAMP", "TIME"):
         # SQLAlchemy prints TIMESTAMP(timezone=True) as plain TIMESTAMP.
         raw_str = f"{raw_str} WITH TIME ZONE"
@@ -1323,7 +1323,7 @@ def introspect_database_schemas(
                     if dt_up in ("CHARACTER VARYING", "VARCHAR") and char_len:
                         dt_up = f"VARCHAR({int(char_len)})"
                     elif dt_up == "CHARACTER VARYING":
-                        dt_up = "TEXT"
+                        dt_up = "VARCHAR"
                     elif dt_up == "BIT" and char_len:
                         dt_up = f"BIT({int(char_len)})"
                     elif dt_up == "BIT VARYING" and char_len:

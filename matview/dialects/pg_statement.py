@@ -57,7 +57,7 @@ import hashlib
 import itertools
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .._host import MixinHost
 from ..engines import AggFunc, UnsupportedMaterializedViewError
@@ -385,6 +385,12 @@ class PgStatementMaintenanceMixin(MixinHost):
         p = self.object_prefix if self.object_prefix else "__matview_"
         return self._bounded_ident(f"{p}stg_", f"{self.logical_view_name}__{base_t}")
 
+    @staticmethod
+    def _pg_quote_raw_col(name: str) -> str:
+        """Quote a raw PostgreSQL catalog column name verbatim without trimming
+        whitespace or stripping outer quotes, preserving exact case and spaces."""
+        return '"' + name.replace('"', '""') + '"'
+
     def _pg_join_stage_table_ddls(
         self, base_t: str, col_names: Sequence[str]
     ) -> Tuple[str, str, str, str]:
@@ -398,12 +404,20 @@ class PgStatementMaintenanceMixin(MixinHost):
             "__mv_seq INTEGER NOT NULL",
             f"{SIGN} SMALLINT NOT NULL",
         ]
+        reserved_meta = {"__mv_tx", "__mv_seq", SIGN.lower()}
         if ts is not None:
             cols_by_lower = {c.lower(): c_def for c, c_def in ts.columns.items()}
+            seen_cols: Set[str] = set()
             for cn in col_names:
-                c_def = cols_by_lower.get(cn.lower())
-                if c_def is None:
+                c_def = ts.columns.get(cn) or cols_by_lower.get(cn.lower())
+                if c_def is None or c_def.name in seen_cols:
                     continue
+                if c_def.name.lower() in reserved_meta:
+                    raise UnsupportedMaterializedViewError(
+                        f"Source table '{base_t}' column '{c_def.name}' collides with internal "
+                        f"PostgreSQL staging metadata column name; rename the column or exclude it from the view."
+                    )
+                seen_cols.add(c_def.name)
                 raw_dt = (c_def.data_type or "TEXT").strip()
                 m_coll = re.search(
                     r"(\s+COLLATE\s+(?:(?:\"[^\"]+\"|\S+)\.)?(?:\"[^\"]+\"|\S+))\s*$",
@@ -418,13 +432,16 @@ class PgStatementMaintenanceMixin(MixinHost):
                     coll_tail = ""
                 dt_up = base_dt.upper()
                 if dt_up in ("CHARACTER VARYING", "VARCHAR"):
-                    ddl_dt = f"TEXT{coll_tail}"
+                    # Keep unbounded VARCHAR (OID 1043) instead of TEXT (OID 25)
+                    # so type-observing expressions (e.g. pg_typeof(v)) on staged
+                    # rows match the native source table.
+                    ddl_dt = f"VARCHAR{coll_tail}"
                 elif dt_up in ("CHAR", "CHARACTER"):
                     # Unbounded CHAR means CHAR(1) in PostgreSQL DDL; BPCHAR keeps full length.
                     ddl_dt = f"BPCHAR{coll_tail}"
                 else:
                     ddl_dt = f"{self._normalize_dialect_type(base_dt)}{coll_tail}"
-                col_defs.append(f"{self._q(c_def.name)} {ddl_dt}")
+                col_defs.append(f"{self._pg_quote_raw_col(c_def.name)} {ddl_dt}")
         create_tbl = (
             f"CREATE TABLE {stg_tbl} (\n    "
             + ",\n    ".join(col_defs)
@@ -437,6 +454,109 @@ class PgStatementMaintenanceMixin(MixinHost):
         p = self.object_prefix if self.object_prefix else "__matview_"
         return self._bounded_ident(f"{p}fn_s3_", self.logical_view_name, "_reconcile")
 
+    @staticmethod
+    def _pg_staged_rows_select(stg_tbl: str) -> str:
+        return f"SELECT * FROM {stg_tbl} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_blk.__mv_bseq"
+
+    def _pg_stage_cols_for_table(
+        self, base_t: str, extra_cols: Sequence[str] = ()
+    ) -> List[str]:
+        from sqlglot import exp as sqlglot_exp
+        from ..sql_frontend import parse_sql_ast
+
+        ts = self._schemas_lower.get(base_t.lower())
+        if ts is None:
+            return []
+        ref_cols: List[str]
+        try:
+            q_ast = parse_sql_ast(self.view.raw_select_sql, dialect=self.dialect)
+            has_non_count_star = any(
+                not isinstance(st.parent, sqlglot_exp.Count)
+                for st in q_ast.find_all(sqlglot_exp.Star)
+            )
+            if has_non_count_star:
+                ref_cols = list(ts.columns.keys())
+            else:
+                cols_in_ast = {c.name.lower() for c in q_ast.find_all(sqlglot_exp.Column)}
+                ref_cols = [c for c in ts.columns if c.lower() in cols_in_ast]
+        except Exception:
+            ref_cols = list(ts.columns.keys())
+
+        cols_by_low = {c.lower(): (c, c_def) for c, c_def in ts.columns.items()}
+        out: List[str] = []
+        seen: Set[str] = set()
+        for cn in [*ref_cols, *extra_cols]:
+            if not cn:
+                continue
+            exact_def = ts.columns.get(cn)
+            if exact_def is not None:
+                actual_c, c_def = cn, exact_def
+            else:
+                entry = cols_by_low.get(cn.lower())
+                if entry is None:
+                    continue
+                actual_c, c_def = entry
+            if actual_c in seen:
+                continue
+            if c_def.generated_virtual and not (c_def.generation_expr and c_def.generation_expr.strip()):
+                continue
+            seen.add(actual_c)
+            out.append(actual_c)
+        return out
+
+    def _pg_stage_sqls_for_table(
+        self, base_t: str, stg_tbl: str, col_names: Sequence[str]
+    ) -> Dict[str, str]:
+        ts = self._schemas_lower.get(base_t.lower())
+        cols_by_lower = {c.lower(): c_def for c, c_def in ts.columns.items()} if ts is not None else {}
+        q_cols = [self._pg_quote_raw_col(c) for c in col_names]
+        ins_cols = ["__mv_tx", "__mv_seq", SIGN, *q_cols]
+
+        def _branch_select(sign: int, rec: str, tbl: str) -> str:
+            exprs = [
+                "pg_catalog.txid_current()",
+                "__mv_blk.__mv_bseq",
+                f"{sign}::smallint",
+            ]
+            for cn, q_c in zip(col_names, q_cols):
+                c_def = (ts.columns.get(cn) or cols_by_lower.get(cn.lower())) if ts is not None else None
+                if c_def is not None and c_def.generated_virtual and c_def.generation_expr and ts is not None:
+                    rewritten = self._pg_rewrite_vgen_expr(c_def.generation_expr, ts, rec)
+                    dt_raw = (c_def.data_type or "").strip()
+                    m_coll = re.search(
+                        r"(\s+COLLATE\s+(?:(?:\"[^\"]+\"|\S+)\.)?(?:\"[^\"]+\"|\S+))\s*$",
+                        dt_raw,
+                        re.IGNORECASE,
+                    )
+                    if m_coll:
+                        base_dt = dt_raw[: m_coll.start()].strip()
+                        coll_tail = m_coll.group(1)
+                    else:
+                        base_dt = dt_raw
+                        coll_tail = ""
+                    if base_dt and base_dt.upper() not in ("NULL", "USER-DEFINED", "ARRAY"):
+                        exprs.append(f"CAST(({rewritten}) AS {base_dt}){coll_tail}")
+                    else:
+                        exprs.append(f"({rewritten}){coll_tail}")
+                else:
+                    exprs.append(f"{rec}.{q_c}")
+            return f"SELECT {', '.join(exprs)} FROM {tbl} AS {rec}"
+
+        out: Dict[str, str] = {}
+        for ev in EVENTS:
+            if ev == "INSERT":
+                body = _branch_select(1, "__mv_n", PG_NEW_TABLE)
+            elif ev == "DELETE":
+                body = _branch_select(-1, "__mv_o", PG_OLD_TABLE)
+            else:
+                body = (
+                    f"{_branch_select(-1, '__mv_o', PG_OLD_TABLE)}\n"
+                    f"            UNION ALL\n"
+                    f"            {_branch_select(1, '__mv_n', PG_NEW_TABLE)}"
+                )
+            out[ev] = f"INSERT INTO {stg_tbl} ({', '.join(ins_cols)})\n            {body};"
+        return out
+
     def _pg_reconcile_fn_ddl(
         self,
         fn_name: str,
@@ -446,11 +566,11 @@ class PgStatementMaintenanceMixin(MixinHost):
     ) -> str:
         lock_reg = "'" + lock_table.replace("'", "''") + "'"
         any_staged = " OR ".join(
-            f"EXISTS (SELECT 1 FROM {st} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_bseq)"
+            f"EXISTS (SELECT 1 FROM {st} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_blk.__mv_bseq)"
             for st in stage_tables
         )
         cleanup = "\n    ".join(
-            f"DELETE FROM {st} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_bseq;"
+            f"DELETE FROM {st} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_blk.__mv_bseq;"
             for st in stage_tables
         )
         return render_procedural_sql(
@@ -1362,6 +1482,76 @@ class PgStatementMaintenanceMixin(MixinHost):
             bodies[event] = "\n".join(stmts)
         return bodies
 
+    def _pg_keyed_rows_reconcile_body(
+        self,
+        mv_table: str,
+        branches: Sequence[Tuple[str, str, Sequence[str], Sequence[str], Optional[Tuple[str, str]], Sequence[str], Mapping[str, str], Optional[str], Optional[str]]],
+        *,
+        count_col: Optional[str] = None,
+        refresh_key_cols: Sequence[str] = (),
+    ) -> str:
+        """Reconcile native-PK keyed rows against live base tables for touched PKs in staging tables.
+
+        Each branch tuple is ``(base_t, stg_tbl, src_pk_cols, mv_pk_cols,
+        const_prefix_or_none, value_cols, values_map, where_sql, del_wm_sql)``
+        where ``values_map`` and ``where_sql`` reference record alias ``__mv_d``
+        and ``const_prefix_or_none`` is ``(mv_col, sql_literal)`` for UNION ALL
+        ``__mv_src_id`` branches.
+        """
+        q = self._q
+        q_refresh_keys = [q(c) for c in refresh_key_cols]
+        stmts: List[str] = []
+        for (
+            base_t,
+            stg_tbl,
+            src_pk_cols,
+            mv_pk_cols,
+            const_prefix,
+            value_cols,
+            values_map,
+            where_sql,
+            del_wm_sql,
+        ) in branches:
+            q_src_pks = [self._pg_quote_raw_col(c) for c in src_pk_cols]
+            q_mv_pks = [q(c) for c in mv_pk_cols]
+            q_vals = [q(c) for c in value_cols]
+            stg_wm = f" AND ({del_wm_sql})" if del_wm_sql else ""
+            stg_pks_subq = (
+                f"SELECT {', '.join(f'__mv_d.{c}' for c in q_src_pks)} "
+                f"FROM {stg_tbl} AS __mv_d "
+                f"WHERE __mv_d.__mv_tx = pg_catalog.txid_current() AND __mv_d.__mv_seq = __mv_blk.__mv_bseq{stg_wm}"
+            )
+            if const_prefix is not None:
+                p_col, p_lit = const_prefix
+                del_mv_refs = [f"{mv_table}.{c}" for c in q_mv_pks[1:]]
+                del_cond = f"{mv_table}.{q(p_col)} = {p_lit} AND {self._pg_key_match(del_mv_refs, stg_pks_subq)}"
+            else:
+                del_mv_refs = [f"{mv_table}.{c}" for c in q_mv_pks]
+                del_cond = self._pg_key_match(del_mv_refs, stg_pks_subq)
+            stmts.append(f"DELETE FROM {mv_table}\n    WHERE {del_cond};")
+
+            src_refs = [f"__mv_d.{c}" for c in q_src_pks]
+            ins_where = self._pg_key_match(src_refs, stg_pks_subq)
+            if where_sql:
+                ins_where = f"({ins_where}) AND ({where_sql})"
+            cols = q_mv_pks + q_vals + ([q(count_col)] if count_col else [])
+            key_exprs = ([const_prefix[1]] if const_prefix is not None else []) + src_refs
+            val_exprs = key_exprs + [values_map[c] for c in value_cols] + (["1"] if count_col else [])
+            sets = [f"{c} = EXCLUDED.{c}" for c in q_refresh_keys] + [f"{c} = EXCLUDED.{c}" for c in q_vals]
+            if count_col:
+                sets.append(f"{q(count_col)} = 1")
+            conflict = f"DO UPDATE SET {', '.join(sets)}" if sets else "DO NOTHING"
+            ord_cols = ", ".join(src_refs)
+            stmts.append(
+                f"INSERT INTO {mv_table} ({', '.join(cols)})\n"
+                f"    SELECT {', '.join(val_exprs)}\n"
+                f"    FROM {q(base_t)} AS __mv_d\n"
+                f"    WHERE {ins_where}\n"
+                f"    ORDER BY {ord_cols}\n"
+                f"    ON CONFLICT ({', '.join(q_mv_pks)}) {conflict};"
+            )
+        return "\n".join(stmts)
+
     # ------------------------------------------------------------------
     # Counted rows (DISTINCT-like Z-sets: UNION, INTERSECT, EXCEPT, bags)
     # ------------------------------------------------------------------
@@ -1379,7 +1569,41 @@ class PgStatementMaintenanceMixin(MixinHost):
         surviving_cond: Optional[str] = None,
         adopt_on_cnt0_cols: Sequence[str] = (),
     ) -> Dict[str, str]:
-        """Bodies for a backing table with one row per distinct value tuple.
+        return {
+            event: self._pg_counted_rows_body(
+                mv_table,
+                key_col,
+                value_cols,
+                count_cols,
+                sources,
+                empty_condition,
+                event,
+                base_t=base_t,
+                recompute_val_col_names=recompute_val_col_names,
+                recompute_val_row_sql=recompute_val_row_sql,
+                surviving_cond=surviving_cond,
+                adopt_on_cnt0_cols=adopt_on_cnt0_cols,
+            )
+            for event in EVENTS
+        }
+
+    def _pg_counted_rows_body(
+        self,
+        mv_table: str,
+        key_col: str,
+        value_cols: Sequence[str],
+        count_cols: Sequence[str],
+        sources: Sequence[Tuple[PgDeltaSource, Mapping[str, str]]],
+        empty_condition: str,
+        event: str,
+        base_t: Optional[str] = None,
+        recompute_val_col_names: Sequence[str] = (),
+        recompute_val_row_sql: Optional[str] = None,
+        surviving_cond: Optional[str] = None,
+        adopt_on_cnt0_cols: Sequence[str] = (),
+        force_recompute_vals: bool = False,
+    ) -> str:
+        """Body for a backing table with one row per distinct value tuple.
 
         ``key_col`` is the canonical key of the value tuple (``keys[0]`` of
         each source); ``values`` give the value columns. Each source also
@@ -1405,106 +1629,111 @@ class PgStatementMaintenanceMixin(MixinHost):
             cols += [f"{contrib[c]} AS __mv_n{j}" for j, c in enumerate(count_cols)]
             return cols
 
-        bodies: Dict[str, str] = {}
         s = f"__mv_p.{SIGN}"
-        for event in EVENTS:
-            proj = self._pg_projection_sql(event, srcs, _columns, base_t=base_t)
-            sets = [f"{c} = {mv_table}.{c} + EXCLUDED.{c}" for c in q_cnts]
-            if adopt_set and has_cnt0:
-                adopt_sets = [
-                    f"{qc} = CASE WHEN {mv_table}.__mv_cnt_0 <= 0 AND EXCLUDED.__mv_cnt_0 > 0 "
-                    f"THEN EXCLUDED.{qc} ELSE {mv_table}.{qc} END"
-                    for c, qc in zip(value_cols, q_vals)
-                    if c.lower() in adopt_set
+        proj = self._pg_projection_sql(event, srcs, _columns, base_t=base_t)
+        sets = [f"{c} = {mv_table}.{c} + EXCLUDED.{c}" for c in q_cnts]
+        if adopt_set and has_cnt0:
+            adopt_sets = [
+                f"{qc} = CASE WHEN {mv_table}.__mv_cnt_0 <= 0 AND EXCLUDED.__mv_cnt_0 > 0 "
+                f"THEN EXCLUDED.{qc} ELSE {mv_table}.{qc} END"
+                for c, qc in zip(value_cols, q_vals)
+                if c.lower() in adopt_set
+            ]
+            sets = adopt_sets + sets
+            # For INTERSECT / EXCEPT with variable-representation columns
+            # (unconstrained NUMERIC/NUMERIC[]/BPCHAR/BPCHAR[]/NUMRANGE),
+            # use DISTINCT ON over a CTE instead of array_agg(...)[1] so
+            # array-typed columns keep their exact type and dimensionality
+            # while preferring branch-0 positive rows over branch-1 rows.
+            proj_cte_body = proj[: -len(" AS __mv_p")] if proj.endswith(" AS __mv_p") else f"({proj})"
+            cnt_aggs = [f"SUM({SIGN} * __mv_n{j}) AS __mv_sum_{j}" for j in range(len(count_cols))]
+            rep_cols = [f"__mv_c{j}" for j in range(len(value_cols))]
+            sel_cols = (
+                ["__mv_g.__mv_k0"]
+                + [f"__mv_rep.__mv_c{j}" for j in range(len(value_cols))]
+                + [f"__mv_g.__mv_sum_{j}" for j in range(len(count_cols))]
+            )
+            stmts = [
+                f"WITH __mv_p AS {proj_cte_body}\n"
+                f"INSERT INTO {mv_table} ({', '.join([q_key, *q_vals, *q_cnts])})\n"
+                f"    SELECT {', '.join(sel_cols)}\n"
+                f"    FROM (\n"
+                f"        SELECT __mv_k0, {', '.join(cnt_aggs)}\n"
+                f"        FROM __mv_p\n"
+                f"        GROUP BY __mv_k0\n"
+                f"    ) AS __mv_g\n"
+                f"    JOIN (\n"
+                f"        SELECT DISTINCT ON (__mv_k0) __mv_k0, {', '.join(rep_cols)}\n"
+                f"        FROM __mv_p\n"
+                f"        ORDER BY __mv_k0, ({SIGN} > 0 AND __mv_n0 > 0) DESC, (__mv_n0 > 0) DESC\n"
+                f"    ) AS __mv_rep ON __mv_rep.__mv_k0 = __mv_g.__mv_k0\n"
+                f"    ORDER BY __mv_g.__mv_k0\n"
+                f"    ON CONFLICT ({q_key}) DO UPDATE SET {', '.join(sets)};"
+            ]
+        else:
+            group_cols = ["__mv_p.__mv_k0"] + [f"__mv_p.__mv_c{j}" for j in range(len(value_cols))]
+            sel_val_cols = list(group_cols)
+            cnt_vals = [f"SUM({s} * __mv_p.__mv_n{j})" for j in range(len(count_cols))]
+            stmts = [
+                f"INSERT INTO {mv_table} ({', '.join([q_key, *q_vals, *q_cnts])})\n"
+                f"    SELECT {', '.join(sel_val_cols + cnt_vals)}\n"
+                f"    FROM {proj}\n"
+                f"    GROUP BY {', '.join(group_cols)}\n"
+                f"    ORDER BY __mv_p.__mv_k0\n"
+                f"    ON CONFLICT ({q_key}) DO UPDATE SET {', '.join(sets)};"
+            ]
+        if event_has_old(event) or force_recompute_vals:
+            del_filter = "" if force_recompute_vals else f" WHERE {s} < 0"
+            stmts.append(
+                f"DELETE FROM {mv_table}\n"
+                f"    WHERE {mv_table}.{q_key} IN (SELECT __mv_p.__mv_k0 FROM {proj}{del_filter})\n"
+                f"    AND {empty_condition};"
+            )
+            if recompute_set and recompute_val_row_sql:
+                branch0_filter = " AND __mv_p.__mv_n0 > 0" if has_cnt0 else ""
+                ref_targets: List[Tuple[int, str]] = [
+                    (j, q_vals[j]) for j, c in enumerate(value_cols) if c.lower() in recompute_set
                 ]
-                sets = adopt_sets + sets
-                # For INTERSECT / EXCEPT with variable-representation columns
-                # (unconstrained NUMERIC/NUMERIC[]/BPCHAR/BPCHAR[]/NUMRANGE),
-                # use DISTINCT ON over a CTE instead of array_agg(...)[1] so
-                # array-typed columns keep their exact type and dimensionality
-                # while preferring branch-0 positive rows over branch-1 rows.
-                proj_cte_body = proj[: -len(" AS __mv_p")] if proj.endswith(" AS __mv_p") else f"({proj})"
-                cnt_aggs = [f"SUM({SIGN} * __mv_n{j}) AS __mv_sum_{j}" for j in range(len(count_cols))]
-                rep_cols = [f"__mv_c{j}" for j in range(len(value_cols))]
-                sel_cols = (
-                    ["__mv_g.__mv_k0"]
-                    + [f"__mv_rep.__mv_c{j}" for j in range(len(value_cols))]
-                    + [f"__mv_g.__mv_sum_{j}" for j in range(len(count_cols))]
-                )
-                stmts = [
-                    f"WITH __mv_p AS {proj_cte_body}\n"
-                    f"INSERT INTO {mv_table} ({', '.join([q_key, *q_vals, *q_cnts])})\n"
-                    f"    SELECT {', '.join(sel_cols)}\n"
-                    f"    FROM (\n"
-                    f"        SELECT __mv_k0, {', '.join(cnt_aggs)}\n"
-                    f"        FROM __mv_p\n"
-                    f"        GROUP BY __mv_k0\n"
-                    f"    ) AS __mv_g\n"
-                    f"    JOIN (\n"
-                    f"        SELECT DISTINCT ON (__mv_k0) __mv_k0, {', '.join(rep_cols)}\n"
-                    f"        FROM __mv_p\n"
-                    f"        ORDER BY __mv_k0, ({SIGN} > 0 AND __mv_n0 > 0) DESC, (__mv_n0 > 0) DESC\n"
-                    f"    ) AS __mv_rep ON __mv_rep.__mv_k0 = __mv_g.__mv_k0\n"
-                    f"    ORDER BY __mv_g.__mv_k0\n"
-                    f"    ON CONFLICT ({q_key}) DO UPDATE SET {', '.join(sets)};"
-                ]
-            else:
-                group_cols = ["__mv_p.__mv_k0"] + [f"__mv_p.__mv_c{j}" for j in range(len(value_cols))]
-                sel_val_cols = list(group_cols)
-                cnt_vals = [f"SUM({s} * __mv_p.__mv_n{j})" for j in range(len(count_cols))]
-                stmts = [
-                    f"INSERT INTO {mv_table} ({', '.join([q_key, *q_vals, *q_cnts])})\n"
-                    f"    SELECT {', '.join(sel_val_cols + cnt_vals)}\n"
-                    f"    FROM {proj}\n"
-                    f"    GROUP BY {', '.join(group_cols)}\n"
-                    f"    ORDER BY __mv_p.__mv_k0\n"
-                    f"    ON CONFLICT ({q_key}) DO UPDATE SET {', '.join(sets)};"
-                ]
-            if event_has_old(event):
-                stmts.append(
-                    f"DELETE FROM {mv_table}\n"
-                    f"    WHERE {mv_table}.{q_key} IN (SELECT __mv_p.__mv_k0 FROM {proj} WHERE {s} < 0)\n"
-                    f"    AND {empty_condition};"
-                )
-                if recompute_set and recompute_val_row_sql:
-                    branch0_filter = " AND __mv_p.__mv_n0 > 0" if has_cnt0 else ""
-                    ref_targets: List[Tuple[int, str]] = [
-                        (j, q_vals[j]) for j, c in enumerate(value_cols) if c.lower() in recompute_set
-                    ]
-                    rec_cols: List[str] = []
-                    rec_conds: List[str] = []
-                    for r_idx, (j, qc) in enumerate(ref_targets):
-                        dcol = f"__mv_vd{r_idx}"
-                        icol = f"__mv_vi{r_idx}"
-                        rec_cols.append(
-                            f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
-                            f"FILTER (WHERE {s} < 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS NOT NULL) AS {dcol}"
+                if ref_targets:
+                    if len(ref_targets) == 1:
+                        qc = ref_targets[0][1]
+                        set_clause = f"{qc} = COALESCE(({recompute_val_row_sql}), {mv_table}.{qc})"
+                    else:
+                        lhs_cols = ", ".join(qc for _, qc in ref_targets)
+                        sel_cols = ", ".join(
+                            f"COALESCE(__mv_l.__mv_l{r_idx}, {mv_table}.{qc})"
+                            for r_idx, (_, qc) in enumerate(ref_targets)
                         )
-                        rec_cols.append(
-                            f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
-                            f"FILTER (WHERE {s} > 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS NOT NULL) AS {icol}"
+                        set_clause = (
+                            f"({lhs_cols}) = (SELECT {sel_cols} FROM (SELECT 1) AS __mv_1 "
+                            f"LEFT JOIN LATERAL ({recompute_val_row_sql}) AS __mv_l ON TRUE)"
                         )
-                        rec_conds.append(
-                            f"({mv_table}.{qc} IS NOT NULL AND "
-                            f"ROW({mv_table}.{qc})::pg_catalog.text = ANY(__mv_r.{dcol}) AND "
-                            f"NOT (ROW({mv_table}.{qc})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))"
+                    surv = f" AND ({surviving_cond})" if surviving_cond else ""
+                    if force_recompute_vals:
+                        stmts.append(
+                            f"UPDATE {mv_table} SET {set_clause}\n"
+                            f"    WHERE {mv_table}.{q_key} IN (SELECT __mv_p.__mv_k0 FROM {proj}){surv};"
                         )
-                    if ref_targets:
+                    else:
+                        rec_cols: List[str] = []
+                        rec_conds: List[str] = []
+                        for r_idx, (j, qc) in enumerate(ref_targets):
+                            dcol = f"__mv_vd{r_idx}"
+                            icol = f"__mv_vi{r_idx}"
+                            rec_cols.append(
+                                f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
+                                f"FILTER (WHERE {s} < 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS NOT NULL) AS {dcol}"
+                            )
+                            rec_cols.append(
+                                f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
+                                f"FILTER (WHERE {s} > 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS NOT NULL) AS {icol}"
+                            )
+                            rec_conds.append(
+                                f"({mv_table}.{qc} IS NOT NULL AND "
+                                f"ROW({mv_table}.{qc})::pg_catalog.text = ANY(__mv_r.{dcol}) AND "
+                                f"NOT (ROW({mv_table}.{qc})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))"
+                            )
                         any_cond = " OR ".join(rec_conds)
-                        if len(ref_targets) == 1:
-                            qc = ref_targets[0][1]
-                            set_clause = f"{qc} = COALESCE(({recompute_val_row_sql}), {mv_table}.{qc})"
-                        else:
-                            lhs_cols = ", ".join(qc for _, qc in ref_targets)
-                            sel_cols = ", ".join(
-                                f"COALESCE(__mv_l.__mv_l{r_idx}, {mv_table}.{qc})"
-                                for r_idx, (_, qc) in enumerate(ref_targets)
-                            )
-                            set_clause = (
-                                f"({lhs_cols}) = (SELECT {sel_cols} FROM (SELECT 1) AS __mv_1 "
-                                f"LEFT JOIN LATERAL ({recompute_val_row_sql}) AS __mv_l ON TRUE)"
-                            )
-                        surv = f" AND ({surviving_cond})" if surviving_cond else ""
                         stmts.append(
                             f"UPDATE {mv_table} SET {set_clause}\n"
                             f"    FROM (\n"
@@ -1514,8 +1743,7 @@ class PgStatementMaintenanceMixin(MixinHost):
                             f"    ) AS __mv_r\n"
                             f"    WHERE {mv_table}.{q_key} = __mv_r.__mv_key0{surv} AND ({any_cond});"
                         )
-            bodies[event] = "\n".join(stmts)
-        return bodies
+        return "\n".join(stmts)
 
     # ------------------------------------------------------------------
     # Recompute strategies (group-scoped and full)

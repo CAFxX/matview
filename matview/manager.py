@@ -134,7 +134,11 @@ from .sql_frontend import (
 #     widening, branch-expression casts before canonical key hashing, BPCHAR
 #     surviving-representative refresh via ROW(...)::pg_catalog.text, and
 #     DISTINCT ON branch-0 representative selection for array INTERSECT/EXCEPT).
-MATVIEW_GENERATOR_VERSION = "19"
+# 20: PostgreSQL statement-level BEFORE/AFTER re-entrancy bracket reconciles
+#     nested same-table DML (user AFTER/BEFORE ROW triggers, alphabetically-
+#     earlier AFTER STATEMENT triggers, and self-referencing FK cascades)
+#     without double-counting or dropping new groups.
+MATVIEW_GENERATOR_VERSION = "20"
 
 
 def _definition_digest(select_sql: str) -> str:
