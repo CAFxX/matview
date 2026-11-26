@@ -140,7 +140,11 @@ from .sql_frontend import (
 #     nested same-table DML (user AFTER/BEFORE ROW triggers, alphabetically-
 #     earlier AFTER STATEMENT triggers, and self-referencing FK cascades)
 #     without double-counting or dropping new groups.
-MATVIEW_GENERATOR_VERSION = "21"
+# 21: MariaDB UPDATE IGNORE maintenance guards for nullable UNIQUE keys,
+#     keyless FK tables, partitioned tables, and TIMESTAMP(n) identity checks.
+# 22: PostgreSQL representation-tie refresh for set operations, DISTINCT, and
+#     GROUP BY on ctid-moving UPDATEs and different-representation INSERTs.
+MATVIEW_GENERATOR_VERSION = "22"
 
 
 def _definition_digest(select_sql: str) -> str:

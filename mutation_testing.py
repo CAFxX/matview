@@ -329,6 +329,79 @@ MUTANTS = (
         ),
     ),
     Mutant(
+        name="pg-agg-group-update-skips-same-scale-ctid-move",
+        source_path="matview/dialects/pg_statement.py",
+        original=(
+            "                        rep_conds.append(\n"
+            "                            f\"({mv}.{col} IS DISTINCT FROM NULL AND (\"\n"
+            "                            f\"ROW({mv}.{col})::pg_catalog.text = ANY(__mv_r.{dcol}) OR \"\n"
+            "                            f\"(__mv_r.{icol} IS NOT NULL AND \"\n"
+            "                            f\"NOT (ARRAY[ROW({mv}.{col})::pg_catalog.text] @> __mv_r.{icol}))))\"\n"
+            "                        )"
+        ),
+        replacement=(
+            "                        rep_conds.append(\n"
+            "                            f\"({mv}.{col} IS DISTINCT FROM NULL AND \"\n"
+            "                            f\"ROW({mv}.{col})::pg_catalog.text = ANY(__mv_r.{dcol}) AND \"\n"
+            "                            f\"NOT (ROW({mv}.{col})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))\"\n"
+            "                        )"
+        ),
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_minmax_varchar_collation_name_and_numeric_group_rep_codegen"
+        ),
+    ),
+    Mutant(
+        name="pg-agg-group-insert-skips-diff-scale-rep-refresh",
+        source_path="matview/dialects/pg_statement.py",
+        original="        elif not has_old and not force_recompute_extremes and spec.recompute_group_keys is not None and grp_exprs:",
+        replacement="        elif False and not has_old and not force_recompute_extremes and spec.recompute_group_keys is not None and grp_exprs:",
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_minmax_varchar_collation_name_and_numeric_group_rep_codegen"
+        ),
+    ),
+    Mutant(
+        name="pg-counted-rows-update-skips-same-scale-ctid-move",
+        source_path="matview/dialects/pg_statement.py",
+        original=(
+            "                        rec_conds.append(\n"
+            "                            f\"({mv_table}.{qc} IS DISTINCT FROM NULL AND (\"\n"
+            "                            f\"ROW({mv_table}.{qc})::pg_catalog.text = ANY(__mv_r.{dcol}) OR \"\n"
+            "                            f\"(__mv_r.{icol} IS NOT NULL AND \"\n"
+            "                            f\"NOT (ARRAY[ROW({mv_table}.{qc})::pg_catalog.text] @> __mv_r.{icol}))))\"\n"
+            "                        )"
+        ),
+        replacement=(
+            "                        rec_conds.append(\n"
+            "                            f\"({mv_table}.{qc} IS DISTINCT FROM NULL AND \"\n"
+            "                            f\"ROW({mv_table}.{qc})::pg_catalog.text = ANY(__mv_r.{dcol}) AND \"\n"
+            "                            f\"NOT (ROW({mv_table}.{qc})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))\"\n"
+            "                        )"
+        ),
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_minmax_varchar_collation_name_and_numeric_group_rep_codegen"
+        ),
+    ),
+    Mutant(
+        name="pg-counted-rows-insert-skips-diff-scale-rep-refresh",
+        source_path="matview/dialects/pg_statement.py",
+        original=(
+            "                        ins_conds.append(\n"
+            "                            f\"({mv_table}.{qc} IS DISTINCT FROM NULL AND __mv_r.{icol} IS NOT NULL AND \"\n"
+            "                            f\"NOT (ARRAY[ROW({mv_table}.{qc})::pg_catalog.text] @> __mv_r.{icol}))\"\n"
+            "                        )"
+        ),
+        replacement=(
+            "                        ins_conds.append(\"FALSE\")"
+        ),
+        target_test=(
+            "test_p1_engine_codegen.TestNativeEngineCodegenExecution."
+            "test_postgres_minmax_varchar_collation_name_and_numeric_group_rep_codegen"
+        ),
+    ),
+    Mutant(
         name="pg-drop-partition-drift-ignored",
         source_path="matview/manager.py",
         original="                                if not tbl_exists or live_parts != recorded_parts:\n                                    status = _merge(status, \"partitions_changed\")",

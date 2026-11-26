@@ -1373,16 +1373,22 @@ class PgStatementMaintenanceMixin(MixinHost):
                         icol = f"__mv_gi{r_idx}"
                         rec_cols.append(
                             f"pg_catalog.array_agg(DISTINCT ROW({k_expr})::pg_catalog.text) "
-                            f"FILTER (WHERE {s} < 0 AND ({k_expr}) IS NOT NULL) AS {dcol}"
+                            f"FILTER (WHERE {s} < 0 AND ({k_expr}) IS DISTINCT FROM NULL) AS {dcol}"
                         )
                         rec_cols.append(
                             f"pg_catalog.array_agg(DISTINCT ROW({k_expr})::pg_catalog.text) "
-                            f"FILTER (WHERE {s} > 0 AND ({k_expr}) IS NOT NULL) AS {icol}"
+                            f"FILTER (WHERE {s} > 0 AND ({k_expr}) IS DISTINCT FROM NULL) AS {icol}"
                         )
+                        # Refresh whenever a row with the stored representation was
+                        # deleted OR updated (an UPDATE writes a new tuple version
+                        # at a new ctid, changing scan-order tie winners even when
+                        # the key's scale did not change), OR when an inserted/new
+                        # row carries a different representation for the same group.
                         rep_conds.append(
-                            f"({mv}.{col} IS NOT NULL AND "
-                            f"ROW({mv}.{col})::pg_catalog.text = ANY(__mv_r.{dcol}) AND "
-                            f"NOT (ROW({mv}.{col})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))"
+                            f"({mv}.{col} IS DISTINCT FROM NULL AND ("
+                            f"ROW({mv}.{col})::pg_catalog.text = ANY(__mv_r.{dcol}) OR "
+                            f"(__mv_r.{icol} IS NOT NULL AND "
+                            f"NOT (ARRAY[ROW({mv}.{col})::pg_catalog.text] @> __mv_r.{icol}))))"
                         )
                 any_rep_cond = "TRUE" if force_recompute_extremes else " OR ".join(rep_conds)
                 inner_lat = spec.recompute_group_keys([expr_sql for expr_sql, _, _ in rep_targets])
@@ -1405,6 +1411,54 @@ class PgStatementMaintenanceMixin(MixinHost):
                         f"LEFT JOIN LATERAL ({inner_lat}) AS __mv_l ON ({any_rep_cond}))"
                     )
                 rec_conds.append(any_rep_cond)
+        elif not has_old and not force_recompute_extremes and spec.recompute_group_keys is not None and grp_exprs:
+            # INSERT: refresh only when an inserted row introduces a different
+            # representation for an already-existing group (e.g. INSERT into a
+            # VACUUM-freed earlier heap slot or branch-0 of a UNION ALL GROUP BY).
+            var_scale_check = spec.has_variable_numeric_scale or self._pg_expr_has_variable_numeric_scale
+            rep_targets_ins: List[Tuple[str, str, str]] = []
+            seen_rep_ins: set = set()
+            for g_idx, g_expr in enumerate(grp_exprs):
+                if var_scale_check(g_expr):
+                    mc = self._group_col_alias(g_expr)
+                    if mc.lower() not in seen_rep_ins:
+                        seen_rep_ins.add(mc.lower())
+                        rep_targets_ins.append((g_expr, q(mc), keys[g_idx]))
+            for it in items:
+                if not it.is_aggregate and it.alias.lower() in extra_of_alias:
+                    if it.alias.lower() not in seen_rep_ins and var_scale_check(it.raw_expr):
+                        seen_rep_ins.add(it.alias.lower())
+                        rep_targets_ins.append((it.raw_expr, q(it.alias), f"__mv_p.{extra_of_alias[it.alias.lower()]}"))
+            if rep_targets_ins:
+                ins_rep_conds: List[str] = []
+                for r_idx, (_g_expr, col, k_expr) in enumerate(rep_targets_ins):
+                    icol = f"__mv_gi{r_idx}"
+                    rec_cols.append(
+                        f"pg_catalog.array_agg(DISTINCT ROW({k_expr})::pg_catalog.text) "
+                        f"FILTER (WHERE {s} > 0 AND ({k_expr}) IS DISTINCT FROM NULL) AS {icol}"
+                    )
+                    ins_rep_conds.append(
+                        f"({mv}.{col} IS DISTINCT FROM NULL AND __mv_r.{icol} IS NOT NULL AND "
+                        f"NOT (ARRAY[ROW({mv}.{col})::pg_catalog.text] @> __mv_r.{icol}))"
+                    )
+                any_ins_rep_cond = " OR ".join(ins_rep_conds)
+                inner_lat = spec.recompute_group_keys([expr_sql for expr_sql, _, _ in rep_targets_ins])
+                if len(rep_targets_ins) == 1:
+                    col = rep_targets_ins[0][1]
+                    rec_assigns.append(
+                        f"{col} = CASE WHEN {any_ins_rep_cond} THEN COALESCE(({inner_lat}), {mv}.{col}) ELSE {mv}.{col} END"
+                    )
+                else:
+                    lhs_cols = ", ".join(col for _, col, _ in rep_targets_ins)
+                    sel_cols = ", ".join(
+                        f"COALESCE(__mv_l.__mv_l{r_idx}, {mv}.{col})"
+                        for r_idx, (_, col, _) in enumerate(rep_targets_ins)
+                    )
+                    rec_assigns.append(
+                        f"({lhs_cols}) = (SELECT {sel_cols} FROM (SELECT 1) AS __mv_1 "
+                        f"LEFT JOIN LATERAL ({inner_lat}) AS __mv_l ON ({any_ins_rep_cond}))"
+                    )
+                rec_conds.append(any_ins_rep_cond)
         if rec_assigns:
             key_cols = [f"{e} AS __mv_key{i}" for i, e in enumerate(pk_exprs)]
             rec_group = f"\n        GROUP BY {', '.join(group_by)}" if group_by else "\n        GROUP BY 1"
@@ -1689,60 +1743,94 @@ class PgStatementMaintenanceMixin(MixinHost):
                 f"    WHERE {mv_table}.{q_key} IN (SELECT __mv_p.__mv_k0 FROM {proj}{del_filter})\n"
                 f"    AND {empty_condition};"
             )
-            if recompute_set and recompute_val_row_sql:
-                branch0_filter = " AND __mv_p.__mv_n0 > 0" if has_cnt0 else ""
-                ref_targets: List[Tuple[int, str]] = [
-                    (j, q_vals[j]) for j, c in enumerate(value_cols) if c.lower() in recompute_set
-                ]
-                if ref_targets:
-                    if len(ref_targets) == 1:
-                        qc = ref_targets[0][1]
-                        set_clause = f"{qc} = COALESCE(({recompute_val_row_sql}), {mv_table}.{qc})"
-                    else:
-                        lhs_cols = ", ".join(qc for _, qc in ref_targets)
-                        sel_cols = ", ".join(
-                            f"COALESCE(__mv_l.__mv_l{r_idx}, {mv_table}.{qc})"
-                            for r_idx, (_, qc) in enumerate(ref_targets)
+        if recompute_set and recompute_val_row_sql:
+            branch0_filter = " AND __mv_p.__mv_n0 > 0" if has_cnt0 else ""
+            ref_targets: List[Tuple[int, str]] = [
+                (j, q_vals[j]) for j, c in enumerate(value_cols) if c.lower() in recompute_set
+            ]
+            if ref_targets:
+                if len(ref_targets) == 1:
+                    qc = ref_targets[0][1]
+                    set_clause = f"{qc} = COALESCE(({recompute_val_row_sql}), {mv_table}.{qc})"
+                else:
+                    lhs_cols = ", ".join(qc for _, qc in ref_targets)
+                    sel_cols = ", ".join(
+                        f"COALESCE(__mv_l.__mv_l{r_idx}, {mv_table}.{qc})"
+                        for r_idx, (_, qc) in enumerate(ref_targets)
+                    )
+                    set_clause = (
+                        f"({lhs_cols}) = (SELECT {sel_cols} FROM (SELECT 1) AS __mv_1 "
+                        f"LEFT JOIN LATERAL ({recompute_val_row_sql}) AS __mv_l ON TRUE)"
+                    )
+                surv = f" AND ({surviving_cond})" if surviving_cond else ""
+                if force_recompute_vals:
+                    stmts.append(
+                        f"UPDATE {mv_table} SET {set_clause}\n"
+                        f"    WHERE {mv_table}.{q_key} IN (SELECT __mv_p.__mv_k0 FROM {proj}){surv};"
+                    )
+                elif event_has_old(event):
+                    rec_cols: List[str] = []
+                    rec_conds: List[str] = []
+                    for r_idx, (j, qc) in enumerate(ref_targets):
+                        dcol = f"__mv_vd{r_idx}"
+                        icol = f"__mv_vi{r_idx}"
+                        rec_cols.append(
+                            f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
+                            f"FILTER (WHERE {s} < 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS DISTINCT FROM NULL) AS {dcol}"
                         )
-                        set_clause = (
-                            f"({lhs_cols}) = (SELECT {sel_cols} FROM (SELECT 1) AS __mv_1 "
-                            f"LEFT JOIN LATERAL ({recompute_val_row_sql}) AS __mv_l ON TRUE)"
+                        rec_cols.append(
+                            f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
+                            f"FILTER (WHERE {s} > 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS DISTINCT FROM NULL) AS {icol}"
                         )
-                    surv = f" AND ({surviving_cond})" if surviving_cond else ""
-                    if force_recompute_vals:
-                        stmts.append(
-                            f"UPDATE {mv_table} SET {set_clause}\n"
-                            f"    WHERE {mv_table}.{q_key} IN (SELECT __mv_p.__mv_k0 FROM {proj}){surv};"
+                        # Refresh whenever a row with the stored representation was
+                        # deleted OR updated (an UPDATE moves the tuple to a new
+                        # physical ctid, changing scan-order tie winners even when
+                        # its scale stayed the same), OR when an inserted/updated
+                        # row carries a different representation for the same key.
+                        rec_conds.append(
+                            f"({mv_table}.{qc} IS DISTINCT FROM NULL AND ("
+                            f"ROW({mv_table}.{qc})::pg_catalog.text = ANY(__mv_r.{dcol}) OR "
+                            f"(__mv_r.{icol} IS NOT NULL AND "
+                            f"NOT (ARRAY[ROW({mv_table}.{qc})::pg_catalog.text] @> __mv_r.{icol}))))"
                         )
-                    else:
-                        rec_cols: List[str] = []
-                        rec_conds: List[str] = []
-                        for r_idx, (j, qc) in enumerate(ref_targets):
-                            dcol = f"__mv_vd{r_idx}"
-                            icol = f"__mv_vi{r_idx}"
-                            rec_cols.append(
-                                f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
-                                f"FILTER (WHERE {s} < 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS NOT NULL) AS {dcol}"
-                            )
-                            rec_cols.append(
-                                f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
-                                f"FILTER (WHERE {s} > 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS NOT NULL) AS {icol}"
-                            )
-                            rec_conds.append(
-                                f"({mv_table}.{qc} IS NOT NULL AND "
-                                f"ROW({mv_table}.{qc})::pg_catalog.text = ANY(__mv_r.{dcol}) AND "
-                                f"NOT (ROW({mv_table}.{qc})::pg_catalog.text = ANY(COALESCE(__mv_r.{icol}, ARRAY[]::pg_catalog.text[]))))"
-                            )
-                        any_cond = " OR ".join(rec_conds)
-                        stmts.append(
-                            f"UPDATE {mv_table} SET {set_clause}\n"
-                            f"    FROM (\n"
-                            f"        SELECT __mv_p.__mv_k0 AS __mv_key0, {', '.join(rec_cols)}\n"
-                            f"        FROM {proj}\n"
-                            f"        GROUP BY __mv_p.__mv_k0\n"
-                            f"    ) AS __mv_r\n"
-                            f"    WHERE {mv_table}.{q_key} = __mv_r.__mv_key0{surv} AND ({any_cond});"
+                    any_cond = " OR ".join(rec_conds)
+                    stmts.append(
+                        f"UPDATE {mv_table} SET {set_clause}\n"
+                        f"    FROM (\n"
+                        f"        SELECT __mv_p.__mv_k0 AS __mv_key0, {', '.join(rec_cols)}\n"
+                        f"        FROM {proj}\n"
+                        f"        GROUP BY __mv_p.__mv_k0\n"
+                        f"    ) AS __mv_r\n"
+                        f"    WHERE {mv_table}.{q_key} = __mv_r.__mv_key0{surv} AND ({any_cond});"
+                    )
+                else:
+                    # INSERT: refresh only when an inserted row introduces a
+                    # different representation for an already-existing key (for
+                    # example, INSERT into branch 0 of a UNION when branch 1
+                    # previously supplied the representative, or into a freed
+                    # earlier heap slot).
+                    ins_cols: List[str] = []
+                    ins_conds: List[str] = []
+                    for r_idx, (j, qc) in enumerate(ref_targets):
+                        icol = f"__mv_vi{r_idx}"
+                        ins_cols.append(
+                            f"pg_catalog.array_agg(DISTINCT ROW(__mv_p.__mv_c{j})::pg_catalog.text) "
+                            f"FILTER (WHERE {s} > 0{branch0_filter} AND (__mv_p.__mv_c{j}) IS DISTINCT FROM NULL) AS {icol}"
                         )
+                        ins_conds.append(
+                            f"({mv_table}.{qc} IS DISTINCT FROM NULL AND __mv_r.{icol} IS NOT NULL AND "
+                            f"NOT (ARRAY[ROW({mv_table}.{qc})::pg_catalog.text] @> __mv_r.{icol}))"
+                        )
+                    any_ins_cond = " OR ".join(ins_conds)
+                    stmts.append(
+                        f"UPDATE {mv_table} SET {set_clause}\n"
+                        f"    FROM (\n"
+                        f"        SELECT __mv_p.__mv_k0 AS __mv_key0, {', '.join(ins_cols)}\n"
+                        f"        FROM {proj}\n"
+                        f"        GROUP BY __mv_p.__mv_k0\n"
+                        f"    ) AS __mv_r\n"
+                        f"    WHERE {mv_table}.{q_key} = __mv_r.__mv_key0{surv} AND ({any_ins_cond});"
+                    )
         return "\n".join(stmts)
 
     # ------------------------------------------------------------------

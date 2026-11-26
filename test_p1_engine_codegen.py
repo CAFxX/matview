@@ -1998,8 +1998,10 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
         )
         self.assertRegex(p_proj_coll.backing_table_ddl, r'\bvc_lit_c\s+VARCHAR\s+COLLATE\s+"C"')
 
-        # 2. Unconstrained NUMERIC group key emits representative refresh on UPDATE/DELETE,
-        #    while fixed-scale NUMERIC(10, 2) and INT do not.
+        # 2. Unconstrained NUMERIC group key emits representative refresh on UPDATE/DELETE
+        #    (without excluding same-scale UPDATEs whose physical ctid moves) and on INSERT
+        #    (when a different representation is inserted), while fixed-scale NUMERIC(10, 2)
+        #    and INT do not.
         p_num = generate_materialized_view(
             schema,
             "CREATE VIEW mv_num AS SELECT num, COUNT(*) AS c FROM items GROUP BY num;",
@@ -2011,6 +2013,10 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
         self.assertIn("__mv_gd0", num_au)
         self.assertIn("__mv_gd0", num_ad)
         self.assertNotIn("__mv_gd0", num_ai)
+        self.assertIn("@> __mv_r.__mv_gi0", num_au)
+        self.assertNotIn("AND NOT (ROW(", num_au)
+        self.assertIn("__mv_gi0", num_ai)
+        self.assertIn("@> __mv_r.__mv_gi0", num_ai)
 
         p_num_nn = generate_materialized_view(
             schema,
@@ -2025,6 +2031,7 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             dialect=Dialect.POSTGRES,
         )
         self.assertNotIn("__mv_gd0", "\n".join(p_fixed.trigger_ddls))
+        self.assertNotIn("__mv_gi0", "\n".join(p_fixed.trigger_ddls))
 
         p_int = generate_materialized_view(
             schema,
@@ -2032,6 +2039,7 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             dialect=Dialect.POSTGRES,
         )
         self.assertNotIn("__mv_gd0", "\n".join(p_int.trigger_ddls))
+        self.assertNotIn("__mv_gi0", "\n".join(p_int.trigger_ddls))
 
         # 3. Adversarial regressions: ARRAY[vc_c, vc_c], COALESCE(MIN(DISTINCT vc_c), 'x'),
         #    COALESCE(vc_c, 'long'), CTE MIN(vc_c), non-decomposed MIN(vc) COLLATE "C",
@@ -2146,7 +2154,22 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             'CREATE VIEW mv_sp_un AS SELECT "my num" FROM t_sp UNION SELECT "my num" FROM t_sp2;',
             dialect=Dialect.POSTGRES,
         )
-        self.assertIn("__mv_vd0", "\n".join(t for t in p_sp_un.trigger_ddls if "_au()" in t))
+        sp_un_au = "\n".join(t for t in p_sp_un.trigger_ddls if "_au()" in t)
+        sp_un_ai = "\n".join(t for t in p_sp_un.trigger_ddls if "_ai()" in t)
+        self.assertIn("__mv_vd0", sp_un_au)
+        self.assertIn("@> __mv_r.__mv_vi0", sp_un_au)
+        self.assertNotIn("AND NOT (ROW(", sp_un_au)
+        self.assertIn("__mv_vi0", sp_un_ai)
+        self.assertIn("@> __mv_r.__mv_vi0", sp_un_ai)
+        self.assertNotIn("__mv_vd0", sp_un_ai)
+
+        p_int_un = generate_materialized_view(
+            adv_schema,
+            "CREATE VIEW mv_int_un AS SELECT num FROM t_int UNION SELECT v AS num FROM t_sp2;",
+            dialect=Dialect.POSTGRES,
+        )
+        self.assertNotIn("__mv_vd0", "\n".join(p_int_un.trigger_ddls))
+        self.assertNotIn("__mv_vi0", "\n".join(p_int_un.trigger_ddls))
 
         # Multi-column variable-scale GROUP BY emits correlated single-row LATERAL refresh.
         p_multi = generate_materialized_view(
