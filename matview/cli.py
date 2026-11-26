@@ -1,4 +1,4 @@
-"""CLI entrypoint for compiling, applying, diffing, checking drift, and repairing materialized views."""
+"""CLI entrypoint for compiling, applying, diffing, dropping, and maintaining materialized views."""
 
 from __future__ import annotations
 
@@ -165,18 +165,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Report DROP for registered views absent from declared view definitions.",
     )
 
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm a destructive command without an interactive prompt (required in non-interactive use).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the effect of a destructive command without changing the database.",
+    )
+
     raw_argv: List[str] = list(sys.argv[1:]) if argv is None else list(argv)
-    is_diff_subcmd = False
-    filtered_argv: List[str] = []
-    for a in raw_argv:
-        if a == "diff" and not is_diff_subcmd and not filtered_argv:
-            is_diff_subcmd = True
-        else:
-            filtered_argv.append(a)
+    command = raw_argv[0] if raw_argv and raw_argv[0] in ("diff", "drop") else None
+    filtered_argv = raw_argv[1:] if command else raw_argv
 
     args = parser.parse_args(filtered_argv)
-    if is_diff_subcmd:
+    if command == "diff":
         args.diff = True
+    args.drop = command == "drop"
 
     def _read_sql_arg(val: str) -> str:
         if "\n" not in val and not re.match(r"^\s*CREATE\b", val, flags=re.IGNORECASE):
@@ -188,6 +195,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return val
 
     try:
+        if args.drop:
+            if not args.db or not args.view:
+                print("ERROR: matview drop requires --db and --view <registered_view_name>.", file=sys.stderr)
+                return 2
+            if args.dry_run and args.yes:
+                print("ERROR: --yes cannot be combined with --dry-run.", file=sys.stderr)
+                return 2
+            mgr = MaterializedViewManager(
+                args.db,
+                dialect=args.dialect,
+                ignore_limitations=args.ignore_limitations,
+                accept_limitations=args.accept_limitations or None,
+                object_prefix=args.object_prefix,
+                strict=args.strict,
+                engine_version=args.engine_version,
+            )
+            try:
+                catalog = mgr.get_catalog()
+                resolved_view = mgr._resolve_catalog_name(args.view, catalog)
+                if resolved_view not in catalog:
+                    print(f"ERROR: materialized view '{args.view}' is not registered.", file=sys.stderr)
+                    return 1
+                if args.dry_run:
+                    print(f"Would drop materialized view '{resolved_view}'.")
+                    return 0
+                if not args.yes:
+                    if not sys.stdin.isatty():
+                        print("ERROR: refusing to drop a materialized view non-interactively; pass --yes to confirm or --dry-run to inspect.", file=sys.stderr)
+                        return 2
+                    answer = input(f"Drop materialized view '{resolved_view}'? [y/N] ")
+                    if answer.strip().lower() not in ("y", "yes"):
+                        print("Cancelled.")
+                        return 0
+                if not mgr.drop_view(resolved_view):
+                    print(f"ERROR: materialized view '{resolved_view}' was not dropped.", file=sys.stderr)
+                    return 1
+                print(f"Dropped materialized view '{resolved_view}'.")
+                return 0
+            finally:
+                try:
+                    mgr.conn.close()
+                except Exception:
+                    pass
+
         if args.diff:
             if not args.db and not args.schema:
                 print("ERROR: matview diff requires --db (or --schema).", file=sys.stderr)

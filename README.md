@@ -302,12 +302,14 @@ Main options (`python3 matview_sync.py --help` lists all):
 | `--ignore-limitations` | Install despite detected limitations (see below). |
 | `--check-drift`, `--repair` | Report or repair registered views in `--db`. |
 | `diff` (or `--diff`) with `--json`, `--exit-code`, `--prune-removed` | Show what registering `--view` would change, without changing anything. |
+| `drop --db <dsn> --view <name> [--yes|--dry-run]` | Drop one registered materialized view; require interactive confirmation or explicit `--yes`, or preview with `--dry-run`. |
 
-Exit codes: 0 success; 1 drift found (`--check-drift` without `--repair`) or
-changes pending (`diff --exit-code`); 2 usage, compilation or limitation error;
-3 a published view cannot be replaced safely (`UnsafeReplacementError`);
-4 the connection's transaction cannot be owned (`TransactionOwnershipError`).
-The CLI has no drop command; use `MaterializedViewManager.drop_view()`.
+Exit codes: 0 success (including a declined interactive confirmation); 1 drift found
+(`--check-drift` without `--repair`), changes pending (`diff --exit-code`), or a
+requested drop target is not registered; 2 usage, compilation, limitation, or
+missing non-interactive drop confirmation error; 3 a published view cannot be
+replaced safely (`UnsafeReplacementError`); 4 the connection's transaction
+cannot be owned (`TransactionOwnershipError`).
 
 ## Supported SQL and refusals
 
