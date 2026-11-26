@@ -2317,7 +2317,7 @@ class DialectBaseMixin(MixinHost):
             if upper in ("DATE", "DATETIME", "TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITHOUT TIME ZONE"):
                 return upper
             if self.dialect == Dialect.POSTGRES and (
-                upper in ("TIME", "TIMETZ", "TIME WITH TIME ZONE", "TIME WITHOUT TIME ZONE", "INET", "CIDR")
+                upper in ("TIME", "TIMETZ", "TIME WITH TIME ZONE", "TIME WITHOUT TIME ZONE", "INET", "CIDR", "JSON", "JSONB", "XML", "UUID", "BYTEA")
                 or upper.startswith("INTERVAL")
             ):
                 return "INTERVAL" if upper.startswith("INTERVAL") else upper
@@ -2629,7 +2629,7 @@ class DialectBaseMixin(MixinHost):
                 if win_t is not None:
                     if self.dialect == Dialect.SQLITE and win_t.upper() == "BLOB":
                         return "BLOB"
-                    return canonical_type(win_t)
+                    return canonical_type(win_t) or win_t
                 return None
             if kind == "Cast":
                 target = node.args.get("to")
@@ -2752,8 +2752,24 @@ class DialectBaseMixin(MixinHost):
                         return stripped_elem
                     return canonical_type(stripped_elem) or stripped_elem
                 return None
+            def _is_pg_untyped_str_lit(n: Any) -> bool:
+                if self.dialect != Dialect.POSTGRES or n is None:
+                    return False
+                u = n
+                while isinstance(u, sqlglot_exp.Paren) and u.this is not None:
+                    u = u.this
+                return isinstance(u, sqlglot_exp.Literal) and bool(u.args.get("is_string"))
+
             if kind in ("Coalesce", "IfNull"):
-                vals = [infer(ch) for ch in node.iter_expressions()]
+                ch_list = list(node.iter_expressions())
+                vals = [infer(ch) for ch in ch_list]
+                if self.dialect == Dialect.POSTGRES:
+                    typed_vals = [
+                        v for ch, v in zip(ch_list, vals)
+                        if not _is_pg_untyped_str_lit(ch) and v != "UNKNOWN"
+                    ]
+                    if typed_vals:
+                        return merge(typed_vals)
                 return merge(vals)
             if kind in ("Greatest", "Least"):
                 vals = [infer(ch) for ch in node.iter_expressions()]
@@ -2799,6 +2815,7 @@ class DialectBaseMixin(MixinHost):
                 return merge((t_br, f_br))
             if kind == "Case":
                 branches: List[Optional[str]] = []
+                branch_nodes: List[Any] = []
                 default = node.args.get("default")
                 if self.dialect == Dialect.POSTGRES and default is not None:
                     # PostgreSQL transformCaseExpr resolves ELSE before THEN branches.
@@ -2806,6 +2823,7 @@ class DialectBaseMixin(MixinHost):
                     if inferred is None:
                         return None
                     branches.append(inferred)
+                    branch_nodes.append(default)
                 for branch in node.args.get("ifs") or ():
                     value = branch.args.get("true")
                     if value is not None:
@@ -2813,11 +2831,20 @@ class DialectBaseMixin(MixinHost):
                         if inferred is None:
                             return None
                         branches.append(inferred)
+                        branch_nodes.append(value)
                 if self.dialect != Dialect.POSTGRES and default is not None:
                     inferred = infer(default)
                     if inferred is None:
                         return None
                     branches.append(inferred)
+                    branch_nodes.append(default)
+                if self.dialect == Dialect.POSTGRES:
+                    typed_branches = [
+                        b for n_br, b in zip(branch_nodes, branches)
+                        if not _is_pg_untyped_str_lit(n_br) and b != "UNKNOWN"
+                    ]
+                    if typed_branches:
+                        return merge(typed_branches)
                 return merge(branches)
             if kind == "BitString" and self.dialect == Dialect.POSTGRES:
                 bits = str(node.this or "")
@@ -2907,7 +2934,19 @@ class DialectBaseMixin(MixinHost):
                                 self._infer_expr_storage_type_or_none(agg_item)
                                 or self._infer_expr_storage_type(agg_item)
                             )
-                            return canonical_type(agg_t)
+                            return canonical_type(agg_t) or agg_t
+                        if self.dialect == Dialect.POSTGRES:
+                            routed_agg_t = self._aggregate_call_storage_type(pg_cat_fn)
+                            if routed_agg_t is not None:
+                                return canonical_type(routed_agg_t) or routed_agg_t
+                if (
+                    self.dialect == Dialect.POSTGRES
+                    and isinstance(node, sqlglot_exp.Filter)
+                    and isinstance(node.this, sqlglot_exp.Expr)
+                ):
+                    routed_flt_t = self._aggregate_call_storage_type(node.this)
+                    if routed_flt_t is not None:
+                        return canonical_type(routed_flt_t) or routed_flt_t
                 if (
                     self.dialect == Dialect.POSTGRES
                     and isinstance(node, sqlglot_exp.Dot)
@@ -2928,13 +2967,38 @@ class DialectBaseMixin(MixinHost):
                 agg_item = _parse_single_agg_expr(
                     node.sql(_sqlglot_dialect(self.dialect)), "__agg", dialect=self.dialect
                 )
-                if agg_item is None or agg_item.agg_func is None:
-                    return None
-                agg_t = (
-                    self._infer_expr_storage_type_or_none(agg_item)
-                    or self._infer_expr_storage_type(agg_item)
+                if agg_item is not None and agg_item.agg_func is not None:
+                    agg_t = (
+                        self._infer_expr_storage_type_or_none(agg_item)
+                        or self._infer_expr_storage_type(agg_item)
+                    )
+                    return canonical_type(agg_t) or agg_t
+                if self.dialect == Dialect.POSTGRES:
+                    routed_agg_t = self._aggregate_call_storage_type(node)
+                    if routed_agg_t is not None:
+                        return canonical_type(routed_agg_t) or routed_agg_t
+                return None
+            if (
+                self.dialect == Dialect.POSTGRES
+                and kind == "Anonymous"
+                and node.name.upper() in (
+                    "JSONB_AGG",
+                    "JSON_AGG_STRICT",
+                    "JSONB_AGG_STRICT",
+                    "JSON_OBJECT_AGG_STRICT",
+                    "JSONB_OBJECT_AGG_STRICT",
+                    "JSON_OBJECT_AGG_UNIQUE",
+                    "JSONB_OBJECT_AGG_UNIQUE",
+                    "JSON_OBJECT_AGG_UNIQUE_STRICT",
+                    "JSONB_OBJECT_AGG_UNIQUE_STRICT",
+                    "XMLAGG",
+                    "RANGE_AGG",
+                    "RANGE_INTERSECT_AGG",
                 )
-                return canonical_type(agg_t)
+            ):
+                routed_agg_t = self._aggregate_call_storage_type(node)
+                if routed_agg_t is not None:
+                    return canonical_type(routed_agg_t) or routed_agg_t
             if self.dialect == Dialect.POSTGRES:
                 pg_tstz = ("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE")
                 pg_ts = ("TIMESTAMP", "TIMESTAMP WITHOUT TIME ZONE")
@@ -3013,6 +3077,10 @@ class DialectBaseMixin(MixinHost):
                     kind == "Anonymous" and node.name.upper() in ("REGEXP_SPLIT_TO_ARRAY", "STRING_TO_ARRAY")
                 ):
                     return "TEXT[]"
+                if kind in ("ArraySize", "ArrayPosition"):
+                    return "INTEGER"
+                if kind == "ArrayToString":
+                    return "TEXT"
                 if kind in ("ArrayConcat", "ArrayAppend", "ArrayPrepend", "ArrayRemove", "ArrayReplace") and node.this is not None:
                     arr_t = infer(node.this)
                     return arr_t if arr_t is not None and arr_t.endswith("[]") else None
@@ -4041,9 +4109,22 @@ class DialectBaseMixin(MixinHost):
             return None
         if not isinstance(node, sqlglot_exp.Window) or node.this is None:
             return None
+        inner_node = node.this
+        if isinstance(inner_node, sqlglot_exp.Filter) and inner_node.this is not None:
+            inner_node = inner_node.this
+        if (
+            self.dialect == Dialect.POSTGRES
+            and isinstance(inner_node, sqlglot_exp.Dot)
+            and isinstance(inner_node.this, (sqlglot_exp.Identifier, sqlglot_exp.Column))
+            and inner_node.this.name.lower() == "pg_catalog"
+            and isinstance(inner_node.expression, sqlglot_exp.Expr)
+        ):
+            inner_node = inner_node.expression
         inner_sql = node.this.sql(_sqlglot_dialect(self.dialect))
         agg_item = _parse_single_agg_expr(inner_sql, "__w", dialect=self.dialect)
         if agg_item is None or agg_item.agg_func is None:
+            if self.dialect == Dialect.POSTGRES and isinstance(inner_node, sqlglot_exp.Expr):
+                return self._aggregate_call_storage_type(inner_node)
             return None
         result_raw = self._infer_expr_storage_type_or_none(agg_item)
         if result_raw is not None and self.dialect == Dialect.POSTGRES and self._is_pg_pseudotype(result_raw):
@@ -4230,6 +4311,24 @@ class DialectBaseMixin(MixinHost):
                         base_no_coll = self._PG_COLLATE_TAIL_RE.sub("", compound_t).strip()
                         return f"{base_no_coll}{comp_coll}"
                 return compound_t
+            if self.dialect == Dialect.POSTGRES:
+                try:
+                    comp_ast = parse_sql_ast(unwrapped_raw, dialect=self.dialect)
+                except sqlglot.errors.SqlglotError:
+                    comp_ast = None
+                has_array_agg_call = comp_ast is not None and (
+                    comp_ast.find(sqlglot_exp.ArrayAgg) is not None
+                    or any(
+                        isinstance(a, sqlglot_exp.Anonymous) and a.name.upper() == "ARRAY_AGG"
+                        for a in comp_ast.find_all(sqlglot_exp.Anonymous)
+                    )
+                )
+                if has_array_agg_call:
+                    raise UnsupportedMaterializedViewError(
+                        f"Cannot determine the native result type of {item.raw_expr!r} (column {item.alias!r}) "
+                        f"on postgres; storing it with a guessed type would change the view's "
+                        f"result. Wrap the expression in an explicit CAST(... AS <type>)."
+                    )
         if item.agg_func in (
             AggFunc.BIT_AND,
             AggFunc.BIT_OR,
@@ -4269,6 +4368,39 @@ class DialectBaseMixin(MixinHost):
             AggFunc.STDDEV_SAMP,
         ):
             return self._statistical_result_storage_type(item)
+        if item.agg_func == AggFunc.ARRAY_AGG and self.dialect == Dialect.POSTGRES:
+            try:
+                arr_node: Optional[sqlglot_exp.Expr] = parse_sql_ast(item.raw_expr, dialect=self.dialect)
+            except sqlglot.errors.SqlglotError:
+                arr_node = None
+            if arr_node is not None:
+                while isinstance(arr_node, (sqlglot_exp.Paren, sqlglot_exp.Filter)) and arr_node.this is not None:
+                    arr_node = arr_node.this
+                if (
+                    isinstance(arr_node, sqlglot_exp.Column)
+                    and not isinstance(arr_node.this, sqlglot_exp.Identifier)
+                    and isinstance(arr_node.this, sqlglot_exp.Expr)
+                    and (arr_node.table or "").lower() == "pg_catalog"
+                ):
+                    arr_node = arr_node.this
+                    while isinstance(arr_node, (sqlglot_exp.Paren, sqlglot_exp.Filter)) and arr_node.this is not None:
+                        arr_node = arr_node.this
+                if (
+                    isinstance(arr_node, sqlglot_exp.Dot)
+                    and isinstance(arr_node.this, (sqlglot_exp.Identifier, sqlglot_exp.Column))
+                    and arr_node.this.name.lower() == "pg_catalog"
+                    and isinstance(arr_node.expression, sqlglot_exp.Expr)
+                ):
+                    arr_node = arr_node.expression
+                if isinstance(arr_node, sqlglot_exp.Expr):
+                    arr_t = self._aggregate_call_storage_type(arr_node)
+                    if arr_t is not None:
+                        return arr_t
+            raise UnsupportedMaterializedViewError(
+                f"Cannot determine the native result type of {item.raw_expr!r} (column {item.alias!r}) "
+                f"on postgres; storing it with a guessed type would change the view's "
+                f"result. Wrap the expression in an explicit CAST(... AS <type>)."
+            )
         if item.agg_func in (
             AggFunc.GROUP_CONCAT,
             AggFunc.STRING_AGG,
@@ -5007,8 +5139,16 @@ class DialectBaseMixin(MixinHost):
                     return _extract_from_dt(c_def.data_type), False
                 cte_t = self._infer_cte_or_subquery_col_type(node.sql()) or self._infer_cte_or_subquery_col_type(node.name)
                 return _extract_from_dt(cte_t), False
-            if isinstance(node, (sqlglot_exp.Min, sqlglot_exp.Max)):
+            if isinstance(node, (sqlglot_exp.Min, sqlglot_exp.Max, sqlglot_exp.Filter, sqlglot_exp.Bracket)):
                 return _walk(node.this)
+            if isinstance(node, sqlglot_exp.ArrayAgg):
+                elem_a: Any = node.this
+                while isinstance(elem_a, (sqlglot_exp.Paren, sqlglot_exp.Order, sqlglot_exp.Ordered, sqlglot_exp.Distinct)):
+                    exprs_a = elem_a.expressions if isinstance(elem_a, sqlglot_exp.Distinct) else [elem_a.this]
+                    elem_a = exprs_a[0] if exprs_a else None
+                return _walk(elem_a)
+            if isinstance(node, sqlglot_exp.ArrayToString):
+                return _merge_children(list(node.iter_expressions()))
             if isinstance(node, sqlglot_exp.Distinct):
                 return _merge_children(list(node.iter_expressions()))
             if isinstance(node, sqlglot_exp.Window):
@@ -5052,6 +5192,38 @@ class DialectBaseMixin(MixinHost):
             return None, False
 
         return _walk(root)
+
+    def _pg_offset_order_expr(self, col_name: str, col_type: str, pos: int) -> str:
+        """Order-by key for offset-batch backfill. PostgreSQL types without a
+        default btree ordering operator (json, xml, geometric types, xid, and
+        arrays thereof) cannot appear bare in ORDER BY; cast via ROW(...)::text."""
+        if self.dialect != Dialect.POSTGRES or not col_type:
+            return str(pos)
+        clean = self._PG_COLLATE_TAIL_RE.sub("", col_type.strip()).strip()
+        clean = re.sub(r"(?:\[\])+$", "", clean).strip()
+        base = re.sub(r"\s*\([^)]*\)", "", re.sub(r"\s+", " ", clean.upper())).strip()
+        base = re.sub(r"^PG_CATALOG\.", "", base)
+        if base in (
+            "JSON",
+            "XML",
+            "POINT",
+            "LINE",
+            "LSEG",
+            "BOX",
+            "PATH",
+            "POLYGON",
+            "CIRCLE",
+            "XID",
+            "CID",
+            "JSONPATH",
+            "TXID_SNAPSHOT",
+            "PG_SNAPSHOT",
+            "ACLITEM",
+            "REFCURSOR",
+            "GTSVECTOR",
+        ):
+            return f"ROW(__mv_init.{self._q(col_name)})::pg_catalog.text"
+        return str(pos)
 
     @classmethod
     def _pg_type_supports_collation(cls, data_type: str) -> bool:

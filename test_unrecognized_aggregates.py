@@ -577,6 +577,169 @@ class PostgresUnrecognizedAggregateTests(unittest.TestCase):
         self.conn.commit()
         self.assertEqual(mv, live)
 
+    def test_pg_json_agg_and_array_agg_full_differential(self) -> None:
+        """Native PostgreSQL differential tests for json_agg/jsonb_agg/json_object_agg
+        and array_agg: unaliased output column names (including pg_catalog.-qualified
+        FILTER calls) and Tier 2 derived-table binding, compound expressions
+        (array_length, array_to_string, array_position, subscript, CASE, COALESCE,
+        md5(string_agg(...))), window json_agg/jsonb_agg/array_agg and COALESCE over
+        windows, CTEs, collation preservation on ARRAY_AGG(col COLLATE "C"),
+        array_to_string(array_agg(col)), and (array_agg(col))[1], unordered
+        ARRAY_AGG/JSON_AGG through unread-column UPDATEs, JOIN GROUP BY, HAVING,
+        FILTER, ROLLBACK, DB-API schema-introspection fallback fidelity under custom
+        raw-string JSON loaders, and incremental_backfill=True over non-btree
+        JSON/XML/POINT/JSON[] columns."""
+        from matview.connectivity import introspect_database_schemas
+
+        cur = self.conn.cursor()
+        cur.execute("CREATE TABLE ja_d (g INT PRIMARY KEY, tag TEXT NOT NULL)")
+        cur.execute(
+            'CREATE TABLE ja_t ('
+            'id INT PRIMARY KEY, g INT REFERENCES ja_d(g), k TEXT, x INT, '
+            'c VARCHAR(10) COLLATE "C", ch CHAR(10), amt NUMERIC(10, 2), '
+            'junk INT NOT NULL DEFAULT 0'
+            ")"
+        )
+        cur.execute(
+            "CREATE TABLE ja_nb ("
+            "id INT PRIMARY KEY, g INT, xv XML, pt POINT, ja JSON[]"
+            ")"
+        )
+        cur.execute("INSERT INTO ja_d VALUES (1, 'one'), (2, 'two')")
+        cur.execute(
+            "INSERT INTO ja_t VALUES "
+            "(1, 1, 'a', 10, 'ab', 'x', 1.25, 0), "
+            "(2, 1, 'b', 20, 'cd', 'y', 2.50, 0), "
+            "(3, 2, 'c', NULL, NULL, 'z', 3.75, 0)"
+        )
+        cur.execute(
+            "INSERT INTO ja_nb VALUES "
+            "(1, 1, '<a/>'::xml, '(1,2)'::point, ARRAY['1'::json, '2'::json]), "
+            "(2, 2, '<b/>'::xml, '(3,4)'::point, ARRAY['\"k\"'::json])"
+        )
+        self.conn.commit()
+
+        # Verify the PostgreSQL DB-API schema-introspection fallback (triggered when
+        # psycopg2.extras.register_default_json(..., loads=lambda s: s) is installed
+        # on the connection) preserves CHAR(10), NUMERIC(10, 2), COLLATE "C", and FKs.
+        schemas = introspect_database_schemas(self.conn, Dialect.POSTGRES)
+        self.assertIn("ja_t", schemas)
+        self.assertIn("ja_d", schemas)
+        self.assertTrue(schemas["ja_t"].has_foreign_keys)
+        self.assertTrue(schemas["ja_d"].has_foreign_keys)
+        self.assertRegex(schemas["ja_t"].columns["ch"].data_type.upper(), r"^(?:CHAR|CHARACTER)\(10\)$")
+        self.assertEqual(schemas["ja_t"].columns["amt"].data_type.upper(), "NUMERIC(10, 2)")
+        self.assertRegex(schemas["ja_t"].columns["c"].data_type, r'COLLATE\s+(?:pg_catalog\.)?"C"')
+        self.conn.commit()
+
+        mgr = MaterializedViewManager(self.conn)
+        specs: List[Tuple[str, str, MaintenanceStrategy, Dict[str, Any]]] = [
+            ("v_ja_noalias", "SELECT g, json_agg(x) FROM ja_t GROUP BY g", T3, {}),
+            ("v_ja_ord_noalias", "SELECT g, json_agg(x ORDER BY id) FROM ja_t GROUP BY g", T2, {}),
+            ("v_jb_ord", "SELECT g, jsonb_agg(x ORDER BY id) AS jb FROM ja_t GROUP BY g", T2, {}),
+            ("v_joa_ord", "SELECT g, json_object_agg(k, x ORDER BY id) AS jo FROM ja_t GROUP BY g", T2, {}),
+            ("v_pgcat_flt", "SELECT g, pg_catalog.json_agg(x ORDER BY id) FILTER (WHERE x IS NOT NULL) FROM ja_t GROUP BY g", T2, {}),
+            ("v_aa_noalias", "SELECT g, array_agg(x ORDER BY id) FROM ja_t GROUP BY g", T2, {}),
+            ("v_aa_unord", "SELECT g, array_agg(x) AS aa FROM ja_t GROUP BY g", T3, {}),
+            ("v_aa_len", "SELECT g, array_length(array_agg(x ORDER BY id), 1) AS al FROM ja_t GROUP BY g", T2, {}),
+            ("v_aa_str", "SELECT g, array_to_string(array_agg(x ORDER BY id), ',') AS s FROM ja_t GROUP BY g", T2, {}),
+            ("v_aa_pos", "SELECT g, array_position(array_agg(x ORDER BY id), 20) AS p FROM ja_t GROUP BY g", T2, {}),
+            ("v_aa_coal", "SELECT g, COALESCE(array_agg(x ORDER BY id), ARRAY[]::int[]) AS aa FROM ja_t GROUP BY g", T2, {}),
+            ("v_ja_coal", "SELECT g, COALESCE(json_agg(x ORDER BY id), '[]'::json) AS ja FROM ja_t GROUP BY g", T2, {}),
+            ("v_ja_coal_null", "SELECT g, COALESCE(NULL, json_agg(x ORDER BY id)) AS ja FROM ja_t GROUP BY g", T2, {}),
+            ("v_aa_case", "SELECT g, CASE WHEN g > 0 THEN array_agg(x ORDER BY id) END AS aa FROM ja_t GROUP BY g", T2, {}),
+            ("v_ja_case", "SELECT g, CASE WHEN g > 0 THEN json_agg(x ORDER BY id) END AS ja FROM ja_t GROUP BY g", T2, {}),
+            ("v_ja_win", "SELECT id, g, json_agg(x) OVER (PARTITION BY g) AS jw FROM ja_t", T3, {}),
+            ("v_ja_win_coal", "SELECT id, g, COALESCE(json_agg(x) OVER (PARTITION BY g), '[]') AS jw FROM ja_t", T3, {}),
+            ("v_jb_win", "SELECT id, g, jsonb_agg(x) OVER (PARTITION BY g) AS jbw FROM ja_t", T3, {}),
+            ("v_aa_win", "SELECT id, g, array_agg(x) OVER (PARTITION BY g) AS aw FROM ja_t", T3, {}),
+            ("v_aa_coll", "SELECT g, array_agg(c ORDER BY id) AS aa FROM ja_t GROUP BY g", T2, {}),
+            ("v_aa_str_coll", "SELECT g, array_to_string(array_agg(c ORDER BY id), ',') AS s FROM ja_t GROUP BY g", T2, {}),
+            ("v_aa_sub_coll", "SELECT g, (array_agg(c ORDER BY id))[1] AS first_c FROM ja_t GROUP BY g", T2, {}),
+            (
+                "v_cte_ja_aa",
+                "WITH q AS (SELECT g, array_agg(x ORDER BY id) AS aa, json_agg(x ORDER BY id) AS ja FROM ja_t GROUP BY g) "
+                "SELECT g, aa, ja FROM q",
+                T3,
+                {},
+            ),
+            (
+                "v_join_ja",
+                "SELECT d.tag, json_agg(t.x ORDER BY t.id) AS ja, array_agg(t.x ORDER BY t.id) AS aa "
+                "FROM ja_t t JOIN ja_d d ON d.g = t.g GROUP BY d.tag HAVING COUNT(*) > 0",
+                T2,
+                {},
+            ),
+            (
+                "v_ja_flt",
+                "SELECT g, json_agg(x ORDER BY id) FILTER (WHERE x IS NOT NULL) AS jf FROM ja_t GROUP BY g",
+                T2,
+                {},
+            ),
+            ("v_md5_sagg", "SELECT g, md5(string_agg(k, ',' ORDER BY id)) AS h FROM ja_t GROUP BY g", T2, {}),
+            ("v_ja_bf_t3", "SELECT g, json_agg(x) AS ja FROM ja_t GROUP BY g", T3, {"incremental_backfill": True, "batch_size": 1}),
+            ("v_ja_bf_t2", "SELECT g, json_agg(x ORDER BY id) AS ja FROM ja_t GROUP BY g", T2, {"incremental_backfill": True, "batch_size": 1}),
+            (
+                "v_nb_bf_t3",
+                "SELECT id, xv, pt, ja FROM ja_nb ORDER BY id LIMIT 10",
+                T3,
+                {"incremental_backfill": True, "batch_size": 1},
+            ),
+        ]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", MatviewDiagnosticWarning)
+            for name, sql, expected_strat, kw in specs:
+                plan = mgr.register_view(f"CREATE VIEW {name} AS {sql};", **kw)
+                self.assertEqual(plan.strategy, expected_strat, name)
+
+        # Verify exact column collation matches live PostgreSQL ("C") across
+        # ARRAY_AGG, array_to_string(array_agg(...)), and (array_agg(...))[1].
+        cur = self.conn.cursor()
+        for vname, cname in (("v_aa_coll", "aa"), ("v_aa_str_coll", "s"), ("v_aa_sub_coll", "first_c")):
+            cur.execute(
+                "SELECT co.collname FROM pg_catalog.pg_attribute a "
+                "LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation "
+                "WHERE a.attrelid = %s::regclass AND a.attname = %s",
+                (vname, cname),
+            )
+            self.assertEqual(cur.fetchone()[0], "C", (vname, cname))
+        self.conn.commit()
+
+        def _assert_all(step: str) -> None:
+            c = self.conn.cursor()
+            for name, sql, _strat, _kw in specs:
+                c.execute(f"SELECT * FROM {name}")
+                mv_desc = [(str(d[0]).lower(), d[1]) for d in c.description]
+                mv_rows = sorted(c.fetchall(), key=repr)
+                c.execute(sql)
+                lv_desc = [(str(d[0]).lower(), d[1]) for d in c.description]
+                lv_rows = sorted(c.fetchall(), key=repr)
+                self.assertEqual(mv_desc, lv_desc, f"{name} @ {step}: column name/OID mismatch")
+                self.assertEqual(mv_rows, lv_rows, f"{name} @ {step}: row mismatch")
+            self.conn.commit()
+
+        _assert_all("initial")
+        for label, dml in (
+            ("insert new row", "INSERT INTO ja_t VALUES (4, 1, 'd', 30, 'ef', 'w', 4.00, 0)"),
+            ("unread column update (moves ctid)", "UPDATE ja_t SET junk = junk + 1 WHERE id IN (1, 2)"),
+            ("move row across groups", "UPDATE ja_t SET g = 2, x = 25 WHERE id = 2"),
+            ("update join dimension", "UPDATE ja_d SET tag = 'ONE' WHERE g = 1"),
+            ("delete row", "DELETE FROM ja_t WHERE id = 4"),
+            ("delete entire group", "DELETE FROM ja_t WHERE g = 1"),
+            ("insert non-btree row", "INSERT INTO ja_nb VALUES (3, 1, '<c/>'::xml, '(5,6)'::point, ARRAY['true'::json])"),
+        ):
+            cur = self.conn.cursor()
+            cur.execute(dml)
+            self.conn.commit()
+            _assert_all(label)
+
+        # Verify transaction rollback leaves every materialized view equal to live.
+        cur = self.conn.cursor()
+        cur.execute("INSERT INTO ja_t VALUES (99, 2, 'z', 999, 'zz', 'q', 9.99, 0)")
+        self.conn.rollback()
+        _assert_all("after rollback")
+
 
 @unittest.skipUnless(_native("MYSQL_DSN"), "MYSQL_DSN not set")
 class MysqlUnrecognizedAggregateTests(unittest.TestCase):
@@ -983,6 +1146,169 @@ class OfflineRoutingTests(unittest.TestCase):
     def test_compound_with_unrecognized_aggregate_on_mysql_is_refused_not_guessed(self) -> None:
         with self.assertRaisesRegex(UnsupportedMaterializedViewError, "CAST"):
             self._plan("mysql", "SELECT g, COUNT(*) + JSON_LENGTH(JSON_ARRAYAGG(v)) AS a FROM t GROUP BY g")
+
+    def test_pg_json_and_array_agg_types_aliases_windows_and_backfill(self) -> None:
+        # 1. Unaliased PostgreSQL json_agg / array_agg use PostgreSQL's default
+        #    function column name, bind Tier 2 derived-table columns positionally,
+        #    and deduplicate repeated unaliased calls cleanly.
+        p_ja_u = self._plan("postgres", "SELECT g, json_agg(v) FROM t GROUP BY g")
+        self.assertEqual(p_ja_u.user_columns, ["g", "json_agg"])
+        self.assertRegex(p_ja_u.backing_table_ddl, r"\bjson_agg\s+JSON\b")
+        self.assertIn("ROW(__mv_init.json_agg)::pg_catalog.text", p_ja_u.incremental_backfill_spec.offset_insert_template or "")
+
+        p_ja_o = self._plan("postgres", "SELECT g, json_agg(v ORDER BY id) FROM t GROUP BY g")
+        self.assertEqual(p_ja_o.strategy, T2)
+        self.assertEqual(p_ja_o.user_columns, ["g", "json_agg"])
+        self.assertIn("AS __mv_init (g, json_agg)", p_ja_o.initial_populate_sqls[0])
+        self.assertIn("ROW(__mv_init.json_agg)::pg_catalog.text", p_ja_o.incremental_backfill_spec.offset_insert_template or "")
+
+        p_aa_o = self._plan("postgres", "SELECT g, array_agg(v ORDER BY id) FROM t GROUP BY g")
+        self.assertEqual(p_aa_o.strategy, T2)
+        self.assertEqual(p_aa_o.user_columns, ["g", "array_agg"])
+        self.assertRegex(p_aa_o.backing_table_ddl, r"\barray_agg\s+INT\[\](?:\s|,|$)")
+        self.assertIn("AS __mv_init (g, array_agg)", p_aa_o.initial_populate_sqls[0])
+
+        p_dup = self._plan("postgres", "SELECT g, json_agg(v ORDER BY id), json_agg(x ORDER BY id) FROM t GROUP BY g")
+        self.assertEqual(p_dup.user_columns, ["g", "json_agg", "col_2"])
+
+        # Colliding later explicit aliases & reserved col_k names never duplicate.
+        p_col_later = self._plan("postgres", "SELECT g, json_agg(v ORDER BY id), g AS json_agg FROM t GROUP BY g")
+        self.assertEqual(p_col_later.user_columns, ["g", "col_1", "json_agg"])
+        p_col_k = self._plan(
+            "postgres",
+            "SELECT g, json_agg(v ORDER BY id), json_agg(x ORDER BY id), g AS col_2 FROM t GROUP BY g",
+        )
+        self.assertEqual(p_col_k.user_columns, ["g", "json_agg", "col_3", "col_2"])
+
+        # Infix operators that inherit from sqlglot_exp.Func must NOT steal
+        # PostgreSQL's default function column name; pg_catalog.-qualified FILTER
+        # calls, comments, and quoted function names resolve cleanly.
+        p_op = self._plan("postgres", "SELECT id, lower(s) ~ 'a', lower(s) FROM t")
+        self.assertEqual(p_op.user_columns, ["id", "col_1", "lower"])
+        p_pgcat = self._plan(
+            "postgres",
+            "SELECT g, pg_catalog.json_agg(v ORDER BY id) FILTER (WHERE v > 0), /* c */ array_agg(v ORDER BY id) FROM t GROUP BY g",
+        )
+        self.assertEqual(p_pgcat.user_columns, ["g", "json_agg", "array_agg"])
+        self.assertRegex(p_pgcat.backing_table_ddl, r"\bjson_agg\s+JSON\b")
+        self.assertRegex(p_pgcat.backing_table_ddl, r"\barray_agg\s+INT\[\](?:\s|,|$)")
+        p_pgcat_aa = self._plan("postgres", "SELECT g, pg_catalog.array_agg(v ORDER BY id) AS aa FROM t GROUP BY g")
+        self.assertRegex(p_pgcat_aa.backing_table_ddl, r"\baa\s+INT\[\](?:\s|,|$)")
+        p_dp = self._plan("postgres", "SELECT id, date_part('day', INTERVAL '3 days') FROM t")
+        self.assertEqual(p_dp.user_columns, ["id", "date_part"])
+        p_quoted_fn = self._plan("postgres", 'SELECT g, "json_agg"(v ORDER BY id) FROM t GROUP BY g')
+        self.assertEqual(p_quoted_fn.user_columns, ["g", "json_agg"])
+
+        # 2. Compound expressions over ARRAY_AGG / JSON_AGG / STRING_AGG keep exact
+        #    PostgreSQL types instead of falling through to DOUBLE PRECISION.
+        for expr, expected_re in (
+            ("array_length(array_agg(v ORDER BY id), 1)", r"\ba\s+INTEGER\b"),
+            ("array_to_string(array_agg(v ORDER BY id), ',')", r"\ba\s+TEXT\b"),
+            ("array_position(array_agg(v ORDER BY id), 1)", r"\ba\s+INTEGER\b"),
+            ("COALESCE(json_agg(v ORDER BY id), '[]'::json)", r"\ba\s+JSON\b"),
+            ("COALESCE(NULL, json_agg(v ORDER BY id))", r"\ba\s+JSON\b"),
+            ("COALESCE('[]', json_agg(v ORDER BY id))", r"\ba\s+JSON\b"),
+            ("CASE WHEN g > 0 THEN array_agg(v ORDER BY id) END", r"\ba\s+(?:INT|INTEGER)\[\](?:\s|,|$)"),
+            ("CASE WHEN g > 0 THEN json_agg(v ORDER BY id) END", r"\ba\s+JSON\b"),
+            ("md5(string_agg(s, ',' ORDER BY id))", r"\ba\s+TEXT\b"),
+        ):
+            plan = self._plan("postgres", f"SELECT g, {expr} AS a FROM t GROUP BY g")
+            self.assertRegex(plan.backing_table_ddl, expected_re, f"{expr}: {plan.backing_table_ddl}")
+
+        # COALESCE(json_agg(...), json_col) resolves to JSON; mismatched JSON vs JSONB refuses.
+        json_col_schema = parse_table_schema(
+            "CREATE TABLE tj (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, j JSON);",
+            dialect="postgres",
+        )
+        p_jcol = generate_materialized_view(
+            json_col_schema,
+            "CREATE VIEW mv AS SELECT g, COALESCE(json_agg(v ORDER BY id), j) AS a FROM tj GROUP BY g, j",
+            dialect="postgres",
+        )
+        self.assertRegex(p_jcol.backing_table_ddl, r"\ba\s+JSON\b")
+        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "CAST"):
+            self._plan("postgres", "SELECT g, COALESCE(json_agg(v ORDER BY id), '[]'::jsonb) AS a FROM t GROUP BY g")
+
+        # 3. Window json_agg / jsonb_agg / array_agg (including pg_catalog.-qualified
+        #    and COALESCE/CASE with untyped string literals) preserve JSON / JSONB / INT[].
+        p_jw = self._plan("postgres", "SELECT id, g, json_agg(v) OVER (PARTITION BY g) AS jw FROM t")
+        self.assertRegex(p_jw.backing_table_ddl, r"\bjw\s+JSON\b")
+        p_pg_jw = self._plan("postgres", "SELECT id, g, pg_catalog.json_agg(v) OVER (PARTITION BY g) AS jw FROM t")
+        self.assertRegex(p_pg_jw.backing_table_ddl, r"\bjw\s+JSON\b")
+        p_jbw = self._plan("postgres", "SELECT id, g, jsonb_agg(v) OVER (PARTITION BY g) AS jbw FROM t")
+        self.assertRegex(p_jbw.backing_table_ddl, r"\bjbw\s+JSONB\b")
+        p_jwc = self._plan("postgres", "SELECT id, g, COALESCE(json_agg(v) OVER (PARTITION BY g), '[]'::json) AS jw FROM t")
+        self.assertRegex(p_jwc.backing_table_ddl, r"\bjw\s+JSON\b")
+        p_jwc_untyped = self._plan("postgres", "SELECT id, g, COALESCE(json_agg(v) OVER (PARTITION BY g), '[]') AS jw FROM t")
+        self.assertRegex(p_jwc_untyped.backing_table_ddl, r"\bjw\s+JSON\b")
+        p_jw_case = self._plan(
+            "postgres",
+            "SELECT id, g, CASE WHEN g > 0 THEN json_agg(v) OVER (PARTITION BY g) ELSE '[]' END AS jw FROM t",
+        )
+        self.assertRegex(p_jw_case.backing_table_ddl, r"\bjw\s+JSON\b")
+
+        # 4. CTE projecting array_agg and json_agg propagates both types cleanly.
+        p_cte = self._plan(
+            "postgres",
+            "WITH q AS (SELECT g, array_agg(v ORDER BY id) AS aa, json_agg(v ORDER BY id) AS ja FROM t GROUP BY g) "
+            "SELECT g, aa, ja FROM q",
+        )
+        self.assertRegex(p_cte.backing_table_ddl, r"\baa\s+(?:INT|INTEGER)\[\](?:\s|,|$)")
+        self.assertRegex(p_cte.backing_table_ddl, r"\bja\s+JSON\b")
+
+        # 5. ARRAY_AGG over a collated column preserves COLLATE "C" after [], and
+        #    array_to_string / subscript over ARRAY_AGG propagate COLLATE "C".
+        coll_schema = parse_table_schema(
+            'CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, s VARCHAR(8) COLLATE "C");',
+            dialect="postgres",
+        )
+        p_coll = generate_materialized_view(
+            coll_schema,
+            "CREATE VIEW mv AS SELECT g, ARRAY_AGG(s ORDER BY id) AS a FROM t GROUP BY g",
+            dialect="postgres",
+        )
+        self.assertNotIn('COLLATE "C"[]', p_coll.backing_table_ddl)
+        self.assertRegex(p_coll.backing_table_ddl, r'\ba\s+VARCHAR\[\]\s+COLLATE\s+"C"')
+        p_coll_str = generate_materialized_view(
+            coll_schema,
+            "CREATE VIEW mv AS SELECT g, array_to_string(array_agg(s ORDER BY id), ',') AS a FROM t GROUP BY g",
+            dialect="postgres",
+        )
+        self.assertRegex(p_coll_str.backing_table_ddl, r'\ba\s+TEXT\s+COLLATE\s+"C"')
+        p_coll_sub = generate_materialized_view(
+            coll_schema,
+            "CREATE VIEW mv AS SELECT g, (array_agg(s ORDER BY id))[1] AS a FROM t GROUP BY g",
+            dialect="postgres",
+        )
+        self.assertRegex(p_coll_sub.backing_table_ddl, r'\ba\s+VARCHAR\s+COLLATE\s+"C"')
+
+        # 6. Non-btree types (XML, POINT, JSON[], JSONPATH) use ROW(...)::pg_catalog.text
+        #    in offset_batch ORDER BY.
+        nb_schema = parse_table_schema(
+            "CREATE TABLE nb (id INTEGER PRIMARY KEY, xv XML, pt POINT, ja JSON[], jp JSONPATH);",
+            dialect="postgres",
+        )
+        p_nb = generate_materialized_view(
+            nb_schema,
+            "CREATE VIEW mv AS SELECT id, xv, pt, ja, jp FROM nb ORDER BY id LIMIT 10",
+            dialect="postgres",
+        )
+        offset_tpl = p_nb.incremental_backfill_spec.offset_insert_template or ""
+        for col in ("xv", "pt", "ja", "jp"):
+            self.assertIn(f"ROW(__mv_init.{col})::pg_catalog.text", offset_tpl)
+
+        # 7. Offline unmodelled compound over ARRAY_AGG refuses with CAST hint
+        #    rather than silently guessing DOUBLE PRECISION (checked via AST, not
+        #    string literals containing 'array_agg(').
+        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "CAST"):
+            self._plan("postgres", "SELECT g, array_dims(array_agg(v ORDER BY id)) AS a FROM t GROUP BY g")
+        with self.assertRaisesRegex(UnsupportedMaterializedViewError, "CAST"):
+            self._plan("postgres", "SELECT g, COALESCE(array_agg(v ORDER BY id), ARRAY['x']) AS a FROM t GROUP BY g")
+        p_lit = self._plan(
+            "postgres",
+            "SELECT g, CASE WHEN s = 'array_agg(' THEN 1 ELSE 0 END AS a FROM t GROUP BY g, s",
+        )
+        self.assertRegex(p_lit.backing_table_ddl, r"\ba\s+(?:INTEGER|INT|BIGINT)\b")
 
 
 if __name__ == "__main__":

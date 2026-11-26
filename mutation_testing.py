@@ -969,6 +969,66 @@ MUTANTS = (
         ),
     ),
     Mutant(
+        name="pg-unaliased-fn-colname-disabled",
+        source_path="matview/sql_frontend.py",
+        original="                _pg_default_function_col_name(inner_node, expr)\n                if dialect == Dialect.POSTGRES and isinstance(inner_node, sqlglot_exp.Expr)\n                else None",
+        replacement="                None",
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_pg_json_and_array_agg_types_aliases_windows_and_backfill"
+        ),
+    ),
+    Mutant(
+        name="pg-window-json-agg-falls-back-to-text",
+        source_path="matview/dialects/base.py",
+        original="            if self.dialect == Dialect.POSTGRES and isinstance(inner_node, sqlglot_exp.Expr):\n                return self._aggregate_call_storage_type(inner_node)",
+        replacement="            if False and self.dialect == Dialect.POSTGRES and isinstance(inner_node, sqlglot_exp.Expr):\n                return self._aggregate_call_storage_type(inner_node)",
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_pg_json_and_array_agg_types_aliases_windows_and_backfill"
+        ),
+    ),
+    Mutant(
+        name="pg-array-length-and-to-string-type-omitted",
+        source_path="matview/dialects/base.py",
+        original='                if kind in ("ArraySize", "ArrayPosition"):\n                    return "INTEGER"\n                if kind == "ArrayToString":\n                    return "TEXT"',
+        replacement='                if kind in ("ArraySize", "ArrayPosition", "ArrayToString"):\n                    return "DOUBLE PRECISION"',
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_pg_json_and_array_agg_types_aliases_windows_and_backfill"
+        ),
+    ),
+    Mutant(
+        name="pg-array-agg-unmodelled-compound-guesses-float",
+        source_path="matview/dialects/base.py",
+        original="                if has_array_agg_call:",
+        replacement="                if False and has_array_agg_call:",
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_pg_json_and_array_agg_types_aliases_windows_and_backfill"
+        ),
+    ),
+    Mutant(
+        name="pg-array-agg-collation-dropped",
+        source_path="matview/planner_exact_routing.py",
+        original="            if first is not None and self._pg_type_supports_collation(arr_t):",
+        replacement="            if False and first is not None and self._pg_type_supports_collation(arr_t):",
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_pg_json_and_array_agg_types_aliases_windows_and_backfill"
+        ),
+    ),
+    Mutant(
+        name="pg-json-offset-backfill-order-by-uncast",
+        source_path="matview/dialects/base.py",
+        original='        if base in (\n            "JSON",\n            "XML",\n            "POINT",',
+        replacement='        if False and base in (\n            "JSON",\n            "XML",\n            "POINT",',
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_pg_json_and_array_agg_types_aliases_windows_and_backfill"
+        ),
+    ),
+    Mutant(
         name="mariadb-nullable-unique-skips-before-count",
         source_path="matview/dialects/emitters.py",
         original="            if not mysql_prelock and not bu_count_stmt:\n                return [trig_ins, trig_del, trig_upd], t_names, []",
