@@ -1693,9 +1693,10 @@ class Tier1SingleMixin(MixinHost):
             group_sql = ""
             having_sql = ""
 
+        sel_kw = self._mysql_groupby_select_keyword()
         main_backfill_sql = (
             f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
-            f"SELECT {', '.join(select_exprs)}\n"
+            f"{sel_kw} {', '.join(select_exprs)}\n"
             f"FROM {q_base_t}{where_sql}{group_sql}{having_sql};"
         )
         stmts.append(main_backfill_sql)
@@ -1734,7 +1735,7 @@ class Tier1SingleMixin(MixinHost):
                     chunk_upsert_sql = (
                         f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
                         f"SELECT * FROM (\n"
-                        f"    SELECT {', '.join(aliased_select_exprs)}\n"
+                        f"    {sel_kw} {', '.join(aliased_select_exprs)}\n"
                         f"    FROM {q_base_t}\n"
                         f"    WHERE {chunk_where}{group_sql}{having_sql}\n"
                         f") AS __mv_src\n"
@@ -1744,7 +1745,7 @@ class Tier1SingleMixin(MixinHost):
                 else:
                     chunk_upsert_sql = (
                         f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
-                        f"SELECT {', '.join(select_exprs)}\n"
+                        f"{sel_kw} {', '.join(select_exprs)}\n"
                         f"FROM {q_base_t}\n"
                         f"WHERE {chunk_where}{group_sql}{having_sql}\n"
                         f"ON DUPLICATE KEY UPDATE\n"

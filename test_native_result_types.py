@@ -470,6 +470,7 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
                     "tm3": ColumnDef(name="tm3", data_type="TIME(3)"),
                     "tmtz3": ColumnDef(name="tmtz3", data_type="TIME(3) WITH TIME ZONE"),
                     "iv3": ColumnDef(name="iv3", data_type="INTERVAL DAY TO SECOND(3)"),
+                    "iv_lbl": ColumnDef(name="iv_lbl", data_type="interval_label"),
                 },
                 pk_columns=("id",),
             )
@@ -484,7 +485,10 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
             "NULLIF(tstz3, tstz4) AS nf_tstz, "
             "GREATEST(ts3, tstz3) AS gr_ts, "
             "ARRAY[ts3, tstz3] AS arr_ts, "
-            "ARRAY[tstz3, tstz4] AS arr_tstz "
+            "ARRAY[tstz3, tstz4] AS arr_tstz, "
+            "-iv3 AS neg_iv, "
+            "iv3 + iv3 AS add_iv, "
+            "iv3 - iv3 AS sub_iv "
             "FROM t_pg;",
             dialect="postgres:18",
         )
@@ -496,6 +500,9 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
         self.assertIn("gr_ts TIMESTAMP WITH TIME ZONE", pg_proj.backing_table_ddl)
         self.assertIn("arr_ts TIMESTAMP WITH TIME ZONE[]", pg_proj.backing_table_ddl)
         self.assertIn("arr_tstz TIMESTAMP WITH TIME ZONE[]", pg_proj.backing_table_ddl)
+        self.assertIn("neg_iv INTERVAL", pg_proj.backing_table_ddl)
+        self.assertIn("add_iv INTERVAL", pg_proj.backing_table_ddl)
+        self.assertIn("sub_iv INTERVAL", pg_proj.backing_table_ddl)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", MatviewDiagnosticWarning)
             pg_poly = generate_materialized_view(
@@ -503,13 +510,15 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
                 "CREATE VIEW v_pg_poly AS SELECT g, "
                 "ARRAY_AGG(tstz3 ORDER BY id) AS a_tstz, "
                 "MODE() WITHIN GROUP (ORDER BY tmtz3) AS m_tmtz, "
-                "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY iv3) AS p_iv "
+                "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY iv3) AS p_iv, "
+                "ARRAY_AGG(iv_lbl ORDER BY id) AS a_ivlbl "
                 "FROM t_pg GROUP BY g;",
                 dialect="postgres:18",
             )
         self.assertIn("a_tstz TIMESTAMP WITH TIME ZONE[]", pg_poly.backing_table_ddl)
         self.assertIn("m_tmtz TIME WITH TIME ZONE", pg_poly.backing_table_ddl)
         self.assertIn("p_iv INTERVAL", pg_poly.backing_table_ddl)
+        self.assertIn("a_ivlbl interval_label[]", pg_poly.backing_table_ddl)
         self.assertNotIn("TIMESTAMP(3) WITH TIME ZONE[]", pg_poly.backing_table_ddl)
         self.assertNotIn("TIME(3) WITH TIME ZONE", pg_poly.backing_table_ddl)
 
@@ -570,7 +579,7 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
         schema = (
             "CREATE TABLE t (id INT PRIMARY KEY, g INT, tm TIME(3), tm6 TIME(6), "
             "dt DATETIME(3), dt6 DATETIME(6), ts TIMESTAMP(4) NULL, ts_nn TIMESTAMP(3) NOT NULL, "
-            "d DATE, s VARCHAR(20));"
+            "d DATE, s VARCHAR(20), s500 VARCHAR(500), txt TEXT);"
         )
         for dialect in ("mysql:8.4", "mysql:9.7", "mariadb:11.8"):
             with warnings.catch_warnings():
@@ -587,11 +596,14 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
                     "CREATE VIEW v AS SELECT id, COALESCE(tm, tm6) AS c_tm, "
                     "COALESCE(dt, dt6) AS c_dt, COALESCE(dt, d) AS c_dtd, "
                     "COALESCE(tm, TIME '00:00:00.123456') AS c_tlit, "
-                    "COALESCE(tm, s) AS c_tms, COALESCE(tm, dt6) AS c_tmdt, "
+                    "COALESCE(tm, s) AS c_tms, COALESCE(s500, dt) AS c_s500dt, "
+                    "COALESCE(txt, dt) AS c_txtdt, COALESCE(tm, dt6) AS c_tmdt, "
+                    "COALESCE(tm, d) AS c_tmd, "
                     "CASE WHEN g = 1 THEN tm ELSE tm6 END AS k_tm, "
                     "CASE WHEN g = 1 THEN dt ELSE ts END AS k_dt, "
                     "CASE WHEN g = 1 THEN tm ELSE NULL END AS kn_tm, "
                     "CAST(tm AS TIME(5)) AS ct_tm, CAST(dt AS DATETIME(5)) AS ct_dt, "
+                    "ABS(CAST(id AS UNSIGNED)) AS abs_u, "
                     "tm + tm6 AS add_tm, ABS(tm) AS abs_tm, -tm AS neg_tm FROM t;",
                     dialect=dialect,
                     ignore_limitations=True,
@@ -613,9 +625,10 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
                 p_union = generate_materialized_view(
                     schema,
                     "CREATE VIEW v AS WITH u AS ("
-                    "SELECT g, tm AS tv, ts AS tsv, tm AS mix_td, tm AS mix_ts FROM t UNION ALL "
-                    "SELECT g, tm6 AS tv, ts_nn AS tsv, dt6 AS mix_td, s AS mix_ts FROM t"
-                    ") SELECT g, MAX(tv) AS m_tv, MIN(tsv) AS n_tsv, MAX(mix_td) AS m_td, MAX(mix_ts) AS m_ts FROM u GROUP BY g;",
+                    "SELECT g, tm AS tv, ts AS tsv, tm AS mix_td, tm AS mix_ts, s500 AS mix_s500 FROM t UNION ALL "
+                    "SELECT g, tm6 AS tv, ts_nn AS tsv, dt6 AS mix_td, s AS mix_ts, dt AS mix_s500 FROM t"
+                    ") SELECT g, MAX(tv) AS m_tv, MIN(tsv) AS n_tsv, MAX(mix_td) AS m_td, "
+                    "MAX(mix_ts) AS m_ts, MAX(mix_s500) AS m_s500 FROM u GROUP BY g;",
                     dialect=dialect,
                     ignore_limitations=True,
                 )
@@ -637,18 +650,23 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
                 self.assertIn("n_tm TIME(3)", p_mm.backing_table_ddl)
                 self.assertIn("m_dt DATETIME(6)", p_mm.backing_table_ddl)
                 self.assertIn("n_ts TIMESTAMP(4) NULL DEFAULT NULL", p_mm.backing_table_ddl)
+                self.assertIn("SELECT SQL_BIG_RESULT", p_mm.full_populate_sqls[0])
 
                 self.assertIn("c_tm TIME(6)", p_expr.backing_table_ddl)
                 self.assertIn("c_dt DATETIME(6)", p_expr.backing_table_ddl)
                 self.assertIn("c_dtd DATETIME(3)", p_expr.backing_table_ddl)
                 self.assertIn("c_tlit TIME(6)", p_expr.backing_table_ddl)
                 self.assertIn("c_tms VARCHAR(255)", p_expr.backing_table_ddl)
-                self.assertIn("c_tmdt VARCHAR(255)", p_expr.backing_table_ddl)
+                self.assertIn("c_s500dt VARCHAR(500)", p_expr.backing_table_ddl)
+                self.assertIn("c_txtdt MEDIUMTEXT", p_expr.backing_table_ddl)
+                self.assertIn("c_tmdt DATETIME(6)", p_expr.backing_table_ddl)
+                self.assertIn("c_tmd DATETIME(3)", p_expr.backing_table_ddl)
                 self.assertIn("k_tm TIME(6)", p_expr.backing_table_ddl)
                 self.assertIn("k_dt DATETIME(4)", p_expr.backing_table_ddl)
                 self.assertIn("kn_tm TIME(3)", p_expr.backing_table_ddl)
                 self.assertIn("ct_tm TIME(5)", p_expr.backing_table_ddl)
                 self.assertIn("ct_dt DATETIME(5)", p_expr.backing_table_ddl)
+                self.assertIn("abs_u BIGINT UNSIGNED", p_expr.backing_table_ddl)
                 # Arithmetic / ABS / unary negation on TIME must never stay TIME.
                 self.assertNotIn("add_tm TIME", p_expr.backing_table_ddl)
                 self.assertNotIn("abs_tm TIME", p_expr.backing_table_ddl)
@@ -663,8 +681,10 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
 
                 self.assertIn("m_tv TIME(6)", p_union.backing_table_ddl)
                 self.assertIn("n_tsv TIMESTAMP(4) NULL DEFAULT NULL", p_union.backing_table_ddl)
-                self.assertIn("m_td VARCHAR(255)", p_union.backing_table_ddl)
+                self.assertIn("m_td DATETIME(6)", p_union.backing_table_ddl)
                 self.assertIn("m_ts VARCHAR(255)", p_union.backing_table_ddl)
+                self.assertIn("m_s500 VARCHAR(500)", p_union.backing_table_ddl)
+                self.assertIn("SELECT SQL_BIG_RESULT", p_union.full_populate_sqls[0])
 
                 self.assertIn("ts_nn TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)", p_grp_ts.backing_table_ddl)
                 self.assertIn("ts TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)", p_pk_ts.backing_table_ddl)
@@ -2995,6 +3015,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             (
                 "temporal_proj_exprs",
                 f"SELECT id, COALESCE(tm, tm6) AS c_tm, COALESCE(ts, ts_nn) AS c_ts, "
+                f"COALESCE(tm, dt6) AS c_tmdt, COALESCE(s500, dt) AS c_s500dt, "
                 f"CASE WHEN g = 1 THEN dt ELSE ts END AS k_dt, "
                 f"CASE WHEN g = 1 THEN ts ELSE ts_nn END AS k_ts, "
                 f"CAST(tm AS TIME(5)) AS ct_tm, CAST(dt AS DATETIME(5)) AS ct_dt FROM {t}",
@@ -3019,23 +3040,25 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 f"SELECT tm, dt6, COUNT(*) AS c FROM {t} GROUP BY tm, dt6",
             ),
         ]
+        long_s = "x" * 300
         try:
             cur.execute(
                 f"CREATE TABLE {t} ("
                 "id INT PRIMARY KEY, g INT, tm TIME(3), tm6 TIME(6), "
                 "dt DATETIME(3), dt6 DATETIME(6), ts TIMESTAMP(4) NULL, "
-                "ts_nn TIMESTAMP(3) NOT NULL DEFAULT '2026-01-01 00:00:00.000'"
+                "ts_nn TIMESTAMP(3) NOT NULL DEFAULT '2026-01-01 00:00:00.000', "
+                "s500 VARCHAR(500)"
                 ") ENGINE=InnoDB"
             )
             cur.execute(
                 f"INSERT INTO {t} VALUES "
-                "(1, 1, '10:00:00.123', '10:00:00.123456', '2026-03-01 10:00:00.123', '2026-03-01 10:00:00.123456', '2026-03-01 10:00:00.1234', '2026-03-01 08:00:00.250'), "
-                "(2, 1, '09:00:00.500', '09:00:00.500001', '2026-03-01 09:00:00.500', '2026-03-01 09:00:00.500001', '2026-03-01 09:00:00.5001', '2026-03-01 08:00:00.250'), "
-                "(3, 2, '-01:02:03.456', '-01:02:03.456789', '2026-02-28 23:59:59.999', '2026-02-28 23:59:59.999999', NULL, '2026-03-01 09:00:00.750'), "
-                "(4, 3, NULL, NULL, NULL, NULL, NULL, '2026-03-01 09:00:00.750'), "
+                f"(1, 1, '10:00:00.123', '10:00:00.123456', '2026-03-01 10:00:00.123', '2026-03-01 10:00:00.123456', '2026-03-01 10:00:00.1234', '2026-03-01 08:00:00.250', '{long_s}'), "
+                "(2, 1, '09:00:00.500', '09:00:00.500001', '2026-03-01 09:00:00.500', '2026-03-01 09:00:00.500001', '2026-03-01 09:00:00.5001', '2026-03-01 08:00:00.250', 'short'), "
+                "(3, 2, '-01:02:03.456', '-01:02:03.456789', '2026-02-28 23:59:59.999', '2026-02-28 23:59:59.999999', NULL, '2026-03-01 09:00:00.750', NULL), "
+                "(4, 3, NULL, NULL, NULL, NULL, NULL, '2026-03-01 09:00:00.750', NULL), "
                 # tm/dt NULL while tm6/dt6 carry 6-digit fractional values so COALESCE(tm, tm6)
                 # and COALESCE(dt, dt6) actually exercise sub-millisecond fallback precision.
-                "(7, 1, NULL, '10:30:00.654321', NULL, '2026-03-01 08:30:00.111222', NULL, '2026-03-01 08:00:00.250')"
+                "(7, 1, NULL, '10:30:00.654321', NULL, '2026-03-01 08:30:00.111222', NULL, '2026-03-01 08:00:00.250', 'mid')"
             )
             conn.commit()
 
@@ -3085,7 +3108,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             # verifying MariaDB does not mutate ts_nn via implicit ON UPDATE CURRENT_TIMESTAMP).
             cur.execute(
                 f"INSERT INTO {t} VALUES "
-                "(5, 1, '09:30:00.001', '09:30:00.000001', '2026-03-01 09:30:00.001', '2026-03-01 09:30:00.000001', '2026-03-01 09:30:00.9999', '2026-03-01 08:00:00.250')"
+                "(5, 1, '09:30:00.001', '09:30:00.000001', '2026-03-01 09:30:00.001', '2026-03-01 09:30:00.000001', '2026-03-01 09:30:00.9999', '2026-03-01 08:00:00.250', 'ins5')"
             )
             conn.commit()
             check("after_insert_non_extreme")
@@ -3093,7 +3116,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             # Insert a new high extreme and update an extreme down (triggers extreme recompute).
             cur.execute(
                 f"INSERT INTO {t} VALUES "
-                "(6, 1, '12:34:56.789', '12:34:56.789012', '2026-03-01 12:34:56.789', '2026-03-01 12:34:56.789012', '2026-03-01 12:34:56.7891', '2026-03-01 12:00:00.005')"
+                "(6, 1, '12:34:56.789', '12:34:56.789012', '2026-03-01 12:34:56.789', '2026-03-01 12:34:56.789012', '2026-03-01 12:34:56.7891', '2026-03-01 12:00:00.005', 'ins6')"
             )
             cur.execute(
                 f"UPDATE {t} SET tm = '08:00:00.999', dt6 = '2026-03-01 08:00:00.999999', ts = '2026-03-01 08:00:00.9999' WHERE id = 6"
@@ -3104,7 +3127,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             # Rolled-back write must leave every view unchanged.
             cur.execute(
                 f"INSERT INTO {t} VALUES "
-                "(99, 1, '23:59:59.999', '23:59:59.999999', '2026-12-31 23:59:59.999', '2026-12-31 23:59:59.999999', '2026-12-31 23:59:59.9999', '2026-12-31 23:59:59.999')"
+                "(99, 1, '23:59:59.999', '23:59:59.999999', '2026-12-31 23:59:59.999', '2026-12-31 23:59:59.999999', '2026-12-31 23:59:59.9999', '2026-12-31 23:59:59.999', 'rb99')"
             )
             conn.rollback()
             check("after_rollback")
@@ -3115,11 +3138,13 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             conn.commit()
             check("after_extreme_delete_and_null_group")
 
-            # Verify check_schema_drift reports every registered view as "ok".
+            # Verify check_schema_drift reports every view we registered as "ok"
+            # (other tests sharing the database may leave unrelated catalog entries).
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", EngineLimitationWarning)
                 drift = mgr.check_schema_drift()
-            self.assertEqual(drift, {mv: "ok" for _, mv, _ in pairs}, f"Unexpected schema drift: {drift}")
+            own_drift = {mv: drift.get(mv) for _, mv, _ in pairs}
+            self.assertEqual(own_drift, {mv: "ok" for _, mv, _ in pairs}, f"Unexpected schema drift: {own_drift}")
         finally:
             conn.rollback()
             for label, _ in specs:

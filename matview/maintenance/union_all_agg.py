@@ -385,9 +385,10 @@ class Tier1UnionAllAggMixin(MixinHost):
         grp_for_q = self._group_by_exprs_for_query(grp_exprs, include_canonical_pk=has_nullable_grp)
         g_sql = f"\nGROUP BY {', '.join(grp_for_q)}" if grp_for_q else ""
 
+        sel_kw = merged_ctx._mysql_groupby_select_keyword()
         initial_populate_sql = (
             f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
-            f"SELECT {', '.join(select_exprs)} FROM (\n{inner_u_sql}\n) AS {u_alias}{w_sql}{g_sql};"
+            f"{sel_kw} {', '.join(select_exprs)} FROM (\n{inner_u_sql}\n) AS {u_alias}{w_sql}{g_sql};"
         )
 
         # Group branches by canonical base table (case-insensitive) and generate per-branch delta statements

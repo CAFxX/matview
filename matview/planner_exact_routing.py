@@ -996,7 +996,7 @@ def _pg_drop_typmod(type_sql: str) -> str:
     s = re.sub(r"\s+", " ", type_sql.strip())
     m_arr = re.match(r"^(.*?)((?:\[\])+)$", s)
     elem, dims = (m_arr.group(1).strip(), m_arr.group(2)) if m_arr else (s, "")
-    if elem.upper().startswith("INTERVAL"):
+    if re.match(r"INTERVAL(?![\w$])", elem, flags=re.IGNORECASE):
         return "INTERVAL" + dims
     m = re.fullmatch(
         r"([A-Za-z_][A-Za-z0-9_ ]*?)\s*\([^)]*\)(\s+WITH(?:OUT)?\s+TIME\s+ZONE)?",

@@ -1447,7 +1447,8 @@ def introspect_database_schemas(
                 "INT", "INTEGER", "SMALLINT", "MEDIUMINT", "BIGINT", "FLOAT", "DOUBLE", "REAL",
                 "TIME", "DATETIME", "TIMESTAMP", "BIT", "BINARY", "VARBINARY",
             ) and col_type:
-                dt_up = col_type.upper()
+                # MariaDB appends `/* mariadb-5.3 */` comments to some temporal COLUMN_TYPE values.
+                dt_up = re.sub(r"\s*/\*.*?\*/", "", col_type).strip().upper()
             elif dt_up in ("ENUM", "SET") and col_type and "(" in col_type:
                 # Preserve exact member literal casing inside ENUM(...)/SET(...).
                 dt_up = f"{dt_up}{col_type[col_type.index('('):]}"
