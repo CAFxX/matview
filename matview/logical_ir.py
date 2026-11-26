@@ -159,6 +159,8 @@ class TableSchema:
     name: str
     columns: Dict[str, ColumnDef]
     fk_cascade_actions: Tuple[str, ...] = ()
+    has_foreign_keys: bool = False
+    is_partitioned: bool = False
     has_on_conflict_replace: bool = False
     indexes: Tuple[TableIndexDef, ...] = ()
     pk_columns: Tuple[str, ...] = ()

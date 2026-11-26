@@ -536,27 +536,55 @@ class DialectEmitMixin(MixinHost):
 
 
     @staticmethod
-    def _mariadb_row_key(t_schema: Any) -> Optional[Tuple[List[str], bool]]:
-        """Columns that identify one row of the table (for the MariaDB
-        ignored-update guard) and whether any of them is nullable: the
-        primary key, else a UNIQUE key on NOT NULL columns, else a nullable
-        UNIQUE key; None without any (no duplicate-key skip is possible)."""
+    def _mariadb_row_keys(t_schema: Any) -> Tuple[Optional[List[str]], List[List[str]], bool]:
+        """Classify keys on a MariaDB base table for the ignored-update guard.
+
+        Returns ``(nonnull_key, nullable_uniques, has_nonkey_skip)``:
+        - ``nonnull_key``: primary key or an all-NOT NULL UNIQUE key (uniquely
+          identifies every row; O(1) keyed count-zero check in ``AFTER UPDATE``
+          suffices).
+        - ``nullable_uniques``: all UNIQUE keys with at least one nullable
+          column (empty when ``nonnull_key`` is present).
+        - ``has_nonkey_skip``: whether the table participates in a foreign key
+          constraint (outgoing or incoming) or is partitioned, both of which
+          can cause MariaDB's ``UPDATE IGNORE`` to skip a row (FK violation or
+          ``ER_NO_PARTITION_FOR_GIVEN_VALUE``) while still firing
+          ``AFTER UPDATE``, even without a duplicate unique key.
+        """
         pk = list(t_schema.effective_pk_columns())
         if pk:
-            return pk, False
-        uniques = [
-            list(idx.columns) for idx in t_schema.indexes
-            if idx.unique and not idx.where_clause and idx.columns
-            and all(c in t_schema.columns for c in idx.columns)
-        ]
+            return pk, [], False
+        cols_by_low = {c.lower(): c_def for c, c_def in t_schema.columns.items()}
+        uniques: List[List[str]] = []
+        for idx in t_schema.indexes:
+            if not (idx.unique and not idx.where_clause and idx.columns):
+                continue
+            resolved: List[str] = []
+            for c in idx.columns:
+                c_def = cols_by_low.get(c.lower())
+                if c_def is None:
+                    resolved = []
+                    break
+                resolved.append(c_def.name)
+            if resolved:
+                uniques.append(resolved)
         for cols in uniques:
-            if all(t_schema.columns[c].not_null for c in cols):
-                return cols, False
-        if uniques:
-            return uniques[0], True
-        return None
+            if all(cols_by_low[c.lower()].not_null for c in cols):
+                return cols, [], False
+        has_nonkey_skip = bool(
+            getattr(t_schema, "has_foreign_keys", False)
+            or getattr(t_schema, "fk_cascade_actions", ())
+            or getattr(t_schema, "is_partitioned", False)
+        )
+        return None, uniques, has_nonkey_skip
 
-    def _identical_row_values_sql(self, old: str, new: str, is_nullable: bool) -> str:
+    def _identical_row_values_sql(
+        self,
+        old: str,
+        new: str,
+        is_nullable: bool,
+        col_type: Optional[str] = None,
+    ) -> str:
         """True only when the OLD and NEW values are identical, not merely equal.
 
         Equality is not identity: under a case-insensitive or PAD SPACE
@@ -569,6 +597,16 @@ class DialectEmitMixin(MixinHost):
             # maintenance (bulk stage 2); keep their existing comparison.
             return self._null_safe_eq(old, new, is_nullable=is_nullable)
         if self.dialect == Dialect.MYSQL:
+            if col_type:
+                dt_head = col_type.strip().upper().split("(", 1)[0].split()[0]
+                if dt_head in ("TIMESTAMP", "DATETIME", "TIME", "DATE", "YEAR"):
+                    # Temporal columns have no collation or trailing-space padding,
+                    # so `<=>` is exact representation identity. Omitting
+                    # `CAST(... AS BINARY)` also avoids a MariaDB optimizer
+                    # constant-propagation bug where combining `c.ts <=> OLD.ts`
+                    # with `CAST(c.ts AS BINARY) <=> CAST(OLD.ts AS BINARY)` drops
+                    # fractional seconds on TIMESTAMP(n) and evaluates to FALSE.
+                    return f"({old} <=> {new})"
             # CAST(... AS BINARY) prints a FLOAT with about 6 significant
             # digits, so two different FLOAT values (0.8 and 0.8 * 1.0000001)
             # print alike: also require the values themselves to be equal
@@ -678,8 +716,11 @@ class DialectEmitMixin(MixinHost):
             for c_name in ref_cols:
                 c_def = schema_cols_by_lower.get(c_name.lower())
                 is_null = not (c_def.not_null if c_def else False)
+                c_dt = c_def.data_type if c_def else None
                 qc = self._q(c_name)
-                unchanged_conds.append(self._identical_row_values_sql(f"OLD.{qc}", f"NEW.{qc}", is_null))
+                unchanged_conds.append(
+                    self._identical_row_values_sql(f"OLD.{qc}", f"NEW.{qc}", is_null, col_type=c_dt)
+                )
             for rowid_alias in implicit_rowid_aliases:
                 unchanged_conds.append(f"OLD.{rowid_alias} = NEW.{rowid_alias}")
         changed_guard = f"NOT ({' AND '.join(unchanged_conds)})" if unchanged_conds else None
@@ -813,44 +854,126 @@ class DialectEmitMixin(MixinHost):
             )
 
             # MariaDB fires AFTER UPDATE for a row whose UPDATE IGNORE was
-            # skipped on a duplicate key (the row keeps its OLD values; MySQL
-            # does not fire). Apply the change only when the row is no longer
-            # in its OLD state: compared with OLD, which is read from storage,
-            # so the comparison is exact for every type.
+            # skipped on a duplicate key or foreign-key violation (the row keeps
+            # its OLD values; MySQL does not fire). Apply the change only when
+            # the row is no longer in its OLD state: compared with OLD, which is
+            # read from storage, so the comparison is exact for every type.
             # (Without the changed-column guard, the update maintenance
             # recomputes from the table and is idempotent; no guard is added.)
-            # Only a table with a primary or unique key can skip a row on a
-            # duplicate key, and only such a key identifies the row: without
-            # one, an identical twin row would look "still OLD" and a real
-            # update would be skipped.
-            row_key = self._mariadb_row_key(t_schema) if t_schema is not None else None
-            if self.engine_version.is_mariadb and row_key is not None and ref_cols and changed_guard:
-                key_cols, nullable_key = row_key
-                cmp_cols = list(dict.fromkeys([*key_cols, *ref_cols]))
-                # Key lookup by equality; then identity, as in the changed
-                # guard (a case-only change under a case-insensitive
-                # collation is a change).
-                still_old = " AND ".join(
-                    [f"__mv_cur.{self._q(c)} <=> OLD.{self._q(c)}" for c in key_cols]
-                    + [self._identical_row_values_sql(f"__mv_cur.{self._q(c)}", f"OLD.{self._q(c)}", True)
-                       for c in cmp_cols]
+            # - All row-identity comparisons live inside `SUM(IF(<cmp>, 1, 0))`
+            #   in the SELECT list rather than in WHERE: MariaDB's WHERE-clause
+            #   optimizer has two bugs with trigger `OLD` references — (1) combining
+            #   a key equality with `c.ts <=> OLD.ts` on TIMESTAMP(n) evaluates to
+            #   FALSE via cond_equal truncation, and (2) `c.u <=> OLD.u` on a
+            #   nullable UNIQUE index when `OLD.u IS NULL` is mis-optimized as a
+            #   single-row const lookup. Keeping only non-NULL key `=` (or single-
+            #   column `IS NULL`) in WHERE preserves index access while avoiding
+            #   both optimizer bugs.
+            # - With a PK or all-NOT NULL UNIQUE key, every row is uniquely
+            #   identified, so an O(1) keyed count=0 check in AFTER UPDATE suffices.
+            # - With only nullable UNIQUE key(s) or a keyless FK table, rows
+            #   whose every unique key contains NULL (or keyless rows) can have
+            #   identical twins. For those rows, a BEFORE UPDATE trigger records
+            #   the pre-update count of rows identical to OLD into a per-(view,
+            #   table) session variable, and AFTER UPDATE applies only when that
+            #   count strictly decreased (under LOCK IN SHARE MODE, preventing
+            #   stale snapshot views and blocking concurrent twin inserts under
+            #   REPEATABLE READ).
+            def _cmp_old_expr(cmp_cols: Sequence[str]) -> str:
+                parts: List[str] = []
+                for c in cmp_cols:
+                    cd = schema_cols_by_lower.get(c.lower())
+                    parts.append(
+                        self._identical_row_values_sql(
+                            f"__mv_cur.{self._q(c)}",
+                            f"OLD.{self._q(c)}",
+                            True,
+                            col_type=(cd.data_type if cd is not None else None),
+                        )
+                    )
+                return " AND ".join(parts)
+
+            def _keyed_count_zero_expr(key_cols: Sequence[str], cmp_cols: Sequence[str]) -> str:
+                key_where = " AND ".join(f"__mv_cur.{self._q(c)} = OLD.{self._q(c)}" for c in key_cols)
+                return (
+                    f"(SELECT COALESCE(SUM(IF({_cmp_old_expr(cmp_cols)}, 1, 0)), 0) "
+                    f"FROM {q_base_t} AS __mv_cur WHERE {key_where} LOCK IN SHARE MODE) = 0"
                 )
-                # A locking read: a consistent (snapshot) read here would open
-                # the statement's read view before the maintenance statements
-                # lock the backing rows, and MariaDB's snapshot isolation
-                # (innodb_snapshot_isolation) then fails them with 1020 when a
-                # concurrent writer committed in between (CI, MariaDB 11.8/12.3:
-                # test_avg_concurrent_maintenance). The row is the one this
-                # statement just wrote and already holds locked; a trigger may
-                # not take FOR UPDATE on its own table (1442), LOCK IN SHARE
-                # MODE reads the latest version without a read view.
-                applied = f"NOT EXISTS (SELECT 1 FROM {q_base_t} AS __mv_cur WHERE {still_old} LOCK IN SHARE MODE)"
-                if nullable_key:
-                    # A NULL in a UNIQUE key is never a duplicate, so rows
-                    # with a NULL key part can be twins: apply those.
-                    applied = "(" + " OR ".join(f"OLD.{self._q(c)} IS NULL" for c in key_cols) + f" OR {applied})"
-            else:
-                applied = None
+
+            def _dedup_cols_ci(cols: Sequence[str]) -> List[str]:
+                out_cols: List[str] = []
+                seen_low: Set[str] = set()
+                for c in cols:
+                    cl = c.lower()
+                    if cl not in seen_low:
+                        seen_low.add(cl)
+                        out_cols.append(c)
+                return out_cols
+
+            applied: Optional[str] = None
+            bu_count_stmt: Optional[str] = None
+            if self.engine_version.is_mariadb and t_schema is not None and ref_cols and changed_guard:
+                nonnull_key, nullable_uniques, has_nonkey_skip = self._mariadb_row_keys(t_schema)
+                if nonnull_key is not None:
+                    cmp_cols = _dedup_cols_ci([*nonnull_key, *ref_cols])
+                    # A locking read: a consistent (snapshot) read here would open
+                    # the statement's read view before the maintenance statements
+                    # lock the backing rows, and MariaDB's snapshot isolation
+                    # (innodb_snapshot_isolation) then fails them with 1020 when a
+                    # concurrent writer committed in between (CI, MariaDB 11.8/12.3:
+                    # test_avg_concurrent_maintenance). The row is the one this
+                    # statement just wrote and already holds locked; a trigger may
+                    # not take FOR UPDATE on its own table (1442), LOCK IN SHARE
+                    # MODE reads the latest version without a read view.
+                    applied = _keyed_count_zero_expr(nonnull_key, cmp_cols)
+                elif nullable_uniques or has_nonkey_skip:
+                    all_uq_cols = _dedup_cols_ci([c for cols in nullable_uniques for c in cols])
+                    cmp_cols = _dedup_cols_ci([*all_uq_cols, *ref_cols])
+                    var_hash = hashlib.sha256(f"{p}|{log_vname}|{base_t}".encode("utf-8")).hexdigest()[:12]
+                    bu_count_var = f"@__mv_oc_{var_hash}"
+                    cmp_old_unkeyed = _cmp_old_expr(cmp_cols)
+                    # Only emit single-column `IS NULL` index filters in WHERE
+                    # (never `c.u <=> OLD.u` on a UNIQUE index when OLD.u is NULL).
+                    single_null_filters = [
+                        f"__mv_cur.{self._q(uq[0])} IS NULL"
+                        for uq in nullable_uniques
+                        if len(uq) == 1
+                    ]
+                    unkeyed_where = f" WHERE {' AND '.join(single_null_filters)}" if single_null_filters else ""
+                    unkeyed_count_sql = (
+                        f"SELECT COALESCE(SUM(IF({cmp_old_unkeyed}, 1, 0)), 0) "
+                        f"FROM {q_base_t} AS __mv_cur{unkeyed_where} LOCK IN SHARE MODE"
+                    )
+                    bu_select = (
+                        f"SELECT COALESCE(SUM(IF({cmp_old_unkeyed}, 1, 0)), 0) INTO {bu_count_var} "
+                        f"FROM {q_base_t} AS __mv_cur{unkeyed_where} LOCK IN SHARE MODE;"
+                    )
+                    after_count_lt = f"({unkeyed_count_sql}) < {bu_count_var}"
+                    if nullable_uniques:
+                        old_unkeyed = " AND ".join(
+                            "(" + " OR ".join(f"OLD.{self._q(c)} IS NULL" for c in uq) + ")"
+                            for uq in nullable_uniques
+                        )
+                        bu_count_stmt = f"IF ({old_unkeyed}) THEN\n        {bu_select}\n    END IF;"
+                        when_clauses: List[str] = []
+                        for uq in nullable_uniques:
+                            k_not_null = " AND ".join(f"OLD.{self._q(c)} IS NOT NULL" for c in uq)
+                            uq_cmp = _dedup_cols_ci([*uq, *ref_cols])
+                            when_clauses.append(
+                                f"WHEN {k_not_null} THEN {_keyed_count_zero_expr(uq, uq_cmp)}"
+                            )
+                        if not has_nonkey_skip:
+                            new_all_have_null = " AND ".join(
+                                "(" + " OR ".join(f"NEW.{self._q(c)} IS NULL" for c in uq) + ")"
+                                for uq in nullable_uniques
+                            )
+                            else_expr = f"(({new_all_have_null}) OR {after_count_lt})"
+                        else:
+                            else_expr = after_count_lt
+                        applied = "(CASE " + " ".join(when_clauses) + f" ELSE {else_expr} END)"
+                    else:
+                        bu_count_stmt = bu_select
+                        applied = after_count_lt
             upd_guard_open = f"IF ({changed_guard}) THEN\n    " if changed_guard else ""
             upd_guard_close = "\n    END IF;" if changed_guard else ""
             # The ignored-row check nests inside the changed-row guard (it runs
@@ -901,8 +1024,17 @@ class DialectEmitMixin(MixinHost):
                 body=f"{after_guard_open}{upd_inner}{after_guard_close}",
             )
             t_names = [t_ai_name, t_ad_name, t_au_name]
-            if not mysql_prelock:
+            if not mysql_prelock and not bu_count_stmt:
                 return [trig_ins, trig_del, trig_upd], t_names, []
+
+            t_bu_name = self._bounded_ident(f"{p}trg_", stem, "_bu")
+            if not mysql_prelock:
+                assert bu_count_stmt is not None
+                trig_bu = render_procedural_sql(
+                    "mysql_row_trigger", trg_name=t_bu_name, timing="BEFORE", event="UPDATE",
+                    q_base_t=q_base_t, body=bu_count_stmt,
+                )
+                return [trig_bu, trig_ins, trig_del, trig_upd], [t_bu_name, *t_names], []
 
             # Lock the affected existing group rows before the base row is
             # written (see _mysql_group_prelock).
@@ -917,9 +1049,15 @@ class DialectEmitMixin(MixinHost):
                 f"IF ({mysql_prelock['new_first']}) THEN\n    {g_new}\n    {g_old}\n"
                 f"    ELSE\n    {g_old}\n    {g_new}\n    END IF;"
             )
+            # Keep prelock (mv_table) before bu_count_stmt (base_t) to preserve
+            # the mv_table -> base_t lock ordering, and keep bu_count_stmt
+            # outside changed_guard so user BEFORE UPDATE triggers mutating NEW
+            # still see the pre-update OLD count.
+            bu_full_body = f"{upd_guard_open}{bu_body}{upd_guard_close}"
+            if bu_count_stmt:
+                bu_full_body = f"{bu_full_body}\n    {bu_count_stmt}"
             t_bi_name = self._bounded_ident(f"{p}trg_", stem, "_bi")
             t_bd_name = self._bounded_ident(f"{p}trg_", stem, "_bd")
-            t_bu_name = self._bounded_ident(f"{p}trg_", stem, "_bu")
             trig_bi = render_procedural_sql(
                 "mysql_row_trigger", trg_name=t_bi_name, timing="BEFORE", event="INSERT",
                 q_base_t=q_base_t, body=g_new,
@@ -930,7 +1068,7 @@ class DialectEmitMixin(MixinHost):
             )
             trig_bu = render_procedural_sql(
                 "mysql_row_trigger", trg_name=t_bu_name, timing="BEFORE", event="UPDATE",
-                q_base_t=q_base_t, body=f"{upd_guard_open}{bu_body}{upd_guard_close}",
+                q_base_t=q_base_t, body=bu_full_body,
             )
             return (
                 [trig_bi, trig_bd, trig_bu, trig_ins, trig_del, trig_upd],

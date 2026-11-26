@@ -1087,16 +1087,22 @@ def parse_table_index_def(
     )
     cols_out: List[str] = []
     for c in col_exprs:
-        if isinstance(c, sqlglot_exp.Ordered):
-            inner = c.this
-            if isinstance(inner, (sqlglot_exp.Identifier, sqlglot_exp.Column)) and inner.name:
-                cols_out.append(inner.name)
-            elif inner is not None:
-                cols_out.append(inner.sql(dialect=sg_d))
-        elif isinstance(c, (sqlglot_exp.Identifier, sqlglot_exp.Column)) and c.name:
-            cols_out.append(c.name)
-        else:
-            cols_out.append(c.sql(dialect=sg_d))
+        inner = c.this if isinstance(c, sqlglot_exp.Ordered) else c
+        if isinstance(inner, (sqlglot_exp.Identifier, sqlglot_exp.Column)) and inner.name:
+            cols_out.append(inner.name)
+        elif (
+            eff_dialect == Dialect.MYSQL
+            and isinstance(inner, sqlglot_exp.Anonymous)
+            and len(inner.expressions) == 1
+            and isinstance(inner.expressions[0], sqlglot_exp.Literal)
+            and not inner.expressions[0].is_string
+            and str(inner.expressions[0].this).isdigit()
+            and inner.name
+        ):
+            # MySQL/MariaDB index prefix length syntax: `CREATE UNIQUE INDEX ... ON t (u(5))`
+            cols_out.append(inner.name)
+        elif inner is not None:
+            cols_out.append(inner.sql(dialect=sg_d))
     where_n = params.args.get("where") if params is not None else None
     where_s = (
         where_n.this.sql(dialect=sg_d)
@@ -1232,6 +1238,7 @@ def parse_table_schema(
     sg_d = _sqlglot_dialect(eff_dialect)
     schemas: Dict[str, TableSchema] = {}
     pending_indexes: Dict[str, List[TableIndexDef]] = {}
+    fk_tables: Set[str] = set()
     for raw_stmt in _split_top_level(clean, ";", dialect=eff_dialect):
         raw_stmt_s = raw_stmt.strip()
         if not raw_stmt_s:
@@ -1334,7 +1341,20 @@ def parse_table_schema(
                     if act_full not in fk_cascades:
                         fk_cascades.append(act_full)
 
+        has_fk = False
+        for _fk_node in stmt_ast.find_all(sqlglot_exp.ForeignKey):
+            has_fk = True
+            fk_tables.add(table_name.lower())
         for ref_node in stmt_ast.find_all(sqlglot_exp.Reference):
+            has_fk = True
+            fk_tables.add(table_name.lower())
+            ref_target = ref_node.this
+            if isinstance(ref_target, sqlglot_exp.Schema):
+                ref_target = ref_target.this
+            if isinstance(ref_target, sqlglot_exp.Table) and ref_target.name:
+                fk_tables.add(ref_target.name.lower())
+            elif isinstance(ref_target, sqlglot_exp.Identifier) and ref_target.name:
+                fk_tables.add(ref_target.name.lower())
             for opt in (ref_node.args.get("options") or []):
                 opt_s = str(opt).strip().upper()
                 if opt_s in (
@@ -1378,6 +1398,7 @@ def parse_table_schema(
 
         without_rowid = False
         strict = False
+        is_partitioned = bool(re.search(r"\bPARTITION\s+BY\b", _strip_sql_comments(raw_stmt_s), re.IGNORECASE))
         if eff_dialect == Dialect.SQLITE:
             stripped_stmt = _strip_sql_comments(raw_stmt_s)
             rparen_idx = stripped_stmt.rfind(")")
@@ -1534,6 +1555,8 @@ def parse_table_schema(
             name=table_name,
             columns=cols,
             fk_cascade_actions=tuple(sorted(fk_cascades)),
+            has_foreign_keys=has_fk or bool(fk_cascades),
+            is_partitioned=is_partitioned,
             has_on_conflict_replace=has_on_conflict_replace,
             indexes=tuple(inline_indexes),
             pk_columns=tuple(ordered_pk_cols),
@@ -1556,12 +1579,29 @@ def parse_table_schema(
                 name=existing.name,
                 columns=existing.columns,
                 fk_cascade_actions=existing.fk_cascade_actions,
+                has_foreign_keys=existing.has_foreign_keys,
+                is_partitioned=existing.is_partitioned,
                 has_on_conflict_replace=existing.has_on_conflict_replace,
                 indexes=tuple(merged),
                 pk_columns=existing.pk_columns,
                 without_rowid=existing.without_rowid,
                 strict=existing.strict,
             )
+    if fk_tables:
+        for tbl_key, existing in list(schemas.items()):
+            if tbl_key.lower() in fk_tables and not existing.has_foreign_keys:
+                schemas[tbl_key] = TableSchema(
+                    name=existing.name,
+                    columns=existing.columns,
+                    fk_cascade_actions=existing.fk_cascade_actions,
+                    has_foreign_keys=True,
+                    is_partitioned=existing.is_partitioned,
+                    has_on_conflict_replace=existing.has_on_conflict_replace,
+                    indexes=existing.indexes,
+                    pk_columns=existing.pk_columns,
+                    without_rowid=existing.without_rowid,
+                    strict=existing.strict,
+                )
     return schemas
 
 

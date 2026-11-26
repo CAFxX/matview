@@ -665,11 +665,11 @@ _KEY_SHAPES_SCHEMA = {"mysql": [
 @cell("mysql_update_ignore_key_shapes", AREA_A,
       "UPDATE / UPDATE IGNORE on tables without a key and with identical duplicate rows, with only a UNIQUE NOT "
       "NULL key, with only a nullable UNIQUE key (NULL twins) and with a composite primary key",
-      "the MariaDB ignored-update guard needs a key that identifies the row: a table without one cannot skip a "
-      "row on a duplicate key and gets no guard (an identical twin made a real update look skipped); rows with "
-      "a NULL in a nullable UNIQUE key are always applied. MariaDB limitation: wrong when the only key is a "
-      "nullable UNIQUE key and an IGNORE-skipped row has a NULL key (cell mariadb_update_ignore_null_unique_key)",
-      mysql=EXACT, mariadb=LIMITED)
+      "the MariaDB ignored-update guard uses O(1) keyed count-zero checks for PK / UNIQUE NOT NULL / non-NULL "
+      "nullable UNIQUE rows, and pairs BEFORE/AFTER UPDATE OLD-count checks for rows with NULL in every "
+      "nullable UNIQUE key (or keyless FK / partitioned tables); an unpartitioned table without any key or FK "
+      "cannot skip a row on a duplicate key, FK, or partition violation and gets no guard",
+      mysql=EXACT, mariadb=EXACT)
 def _update_ignore_key_shapes(ctx: Ctx) -> None:
     env = ctx.fresh(_KEY_SHAPES_SCHEMA,
                     [ViewDef("v_nk", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nk GROUP BY g"),
@@ -695,17 +695,71 @@ def _update_ignore_key_shapes(ctx: Ctx) -> None:
 
 
 @cell("mariadb_update_ignore_null_unique_key", AREA_A,
-      "UPDATE IGNORE skipping rows whose only key is a nullable UNIQUE key and whose key is NULL",
-      "rows with a NULL key can be identical twins, so the MariaDB ignored-update guard applies them and the "
-      "skipped update reaches the view (also with two nullable UNIQUE keys); MySQL fires no trigger for them",
-      todo="Exact Maintenance Under MariaDB UPDATE IGNORE (AFTER UPDATE Triggers Fire for Ignored Rows)",
-      mysql=EXACT, mariadb=WRONG)
+      "UPDATE IGNORE skipping rows whose only key is nullable UNIQUE key(s) with NULL values (single, multi, "
+      "composite), keyless foreign-key tables, or partitioned tables (no matching partition)",
+      "MariaDB's BEFORE/AFTER UPDATE OLD-count guard compares exact storage-level OLD row counts so skipped "
+      "NULL-key twins (including mixed statements colliding with an identical just-updated row, two nullable "
+      "UNIQUE keys, composite nullable UNIQUE keys, keyless FK tables, and keyless or nullable-UNIQUE "
+      "partitioned tables) are suppressed while applied updates and user BEFORE UPDATE mutations remain exact; "
+      "MySQL fires no trigger for skipped rows",
+      mysql=EXACT, mariadb=EXACT)
 def _mariadb_null_unique(ctx: Ctx) -> None:
-    env = ctx.fresh({"mysql": ["CREATE TABLE nu (u INT UNIQUE, g INT, v INT) ENGINE=InnoDB"]},
-                    [ViewDef("v_nu", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nu GROUP BY g")],
-                    ["INSERT INTO nu VALUES (NULL, 1, 5), (NULL, 1, 5), (1, 1, 5), (2, 2, 7)"])
-    env.execute("UPDATE IGNORE nu SET u = 2, v = 9 WHERE u IS NULL")
-    ctx.commit_check("UPDATE IGNORE skipping NULL-key rows", env)
+    env = ctx.fresh({
+        "mysql": [
+            "CREATE TABLE nu (u INT UNIQUE, g INT, v INT) ENGINE=InnoDB",
+            "CREATE TABLE nu2 (u1 INT UNIQUE, u2 INT UNIQUE, g INT, v INT) ENGINE=InnoDB",
+            "CREATE TABLE nuc (a INT, b INT, g INT, v INT, UNIQUE (a, b)) ENGINE=InnoDB",
+            "CREATE TABLE nupar (id INT PRIMARY KEY) ENGINE=InnoDB",
+            "CREATE TABLE nuchd (pid INT, g INT, v INT, FOREIGN KEY (pid) REFERENCES nupar(id)) ENGINE=InnoDB",
+            "CREATE TABLE nup1 (g INT, v INT) ENGINE=InnoDB "
+            "PARTITION BY RANGE (g) (PARTITION p0 VALUES LESS THAN (10))",
+            "CREATE TABLE nup2 (u INT, g INT, v INT, UNIQUE (u, g)) ENGINE=InnoDB "
+            "PARTITION BY RANGE (g) (PARTITION p0 VALUES LESS THAN (10))",
+        ],
+    }, [
+        ViewDef("v_nu", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nu GROUP BY g"),
+        ViewDef("v_nu_mm", "SELECT g, MIN(v) AS mn, MAX(v) AS mx FROM nu GROUP BY g"),
+        ViewDef("v_nu_p", "SELECT g, v FROM nu WHERE v > 0"),
+        ViewDef("v_nu2", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nu2 GROUP BY g"),
+        ViewDef("v_nuc", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nuc GROUP BY g"),
+        ViewDef("v_nuchd", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nuchd GROUP BY g"),
+        ViewDef("v_nup1", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nup1 GROUP BY g"),
+        ViewDef("v_nup2", "SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nup2 GROUP BY g"),
+    ], [
+        "INSERT INTO nu VALUES (NULL, 1, 5), (NULL, 1, 5), (NULL, 1, 5), (1, 1, 5), (2, 2, 7)",
+        "INSERT INTO nu2 VALUES (NULL, NULL, 1, 5), (NULL, NULL, 1, 5), (1, NULL, 1, 5), (2, 20, 2, 7)",
+        "INSERT INTO nuc VALUES (1, NULL, 1, 5), (1, NULL, 1, 5), (1, 2, 2, 7)",
+        "INSERT INTO nupar VALUES (1)",
+        "INSERT INTO nuchd VALUES (1, 1, 5), (1, 1, 5)",
+        "INSERT INTO nup1 VALUES (1, 5), (1, 5)",
+        "INSERT INTO nup2 VALUES (NULL, 1, 5), (NULL, 1, 5)",
+    ])
+    for sql in [
+        # All NULL twins collide with existing u = 2
+        "UPDATE IGNORE nu SET u = 2, v = 9 WHERE u IS NULL",
+        # Mixed: first NULL twin succeeds -> (10, 1, 9); remaining twins collide with identical (10, 1, 9)!
+        "UPDATE IGNORE nu SET u = 10, v = 9 WHERE u IS NULL",
+        # Remaining NULL twin updated in place (keeps u IS NULL)
+        "UPDATE nu SET v = 6 WHERE u IS NULL LIMIT 1",
+        # Two nullable UNIQUE keys: both NULL colliding on u1, one non-NULL colliding on u2, mixed u1 = 10
+        "UPDATE IGNORE nu2 SET u1 = 2, v = 9 WHERE u1 IS NULL AND u2 IS NULL",
+        "UPDATE IGNORE nu2 SET u2 = 20, v = 9 WHERE u1 = 1",
+        "UPDATE IGNORE nu2 SET u1 = 10, v = 8 WHERE u1 IS NULL AND u2 IS NULL",
+        # Composite nullable UNIQUE key: (1, NULL) twins collide on (1, 2), then mixed (1, 3)
+        "UPDATE IGNORE nuc SET b = 2, v = 9 WHERE a = 1 AND b IS NULL",
+        "UPDATE IGNORE nuc SET b = 3, v = 8 WHERE a = 1 AND b IS NULL",
+        # Keyless table with FK: UPDATE IGNORE fails FK check on identical twins
+        "UPDATE IGNORE nuchd SET pid = 999, v = 9",
+        "UPDATE nuchd SET v = 6 WHERE g = 1 LIMIT 1",
+        # Keyless and nullable-UNIQUE partitioned tables: UPDATE IGNORE hits no matching partition
+        "UPDATE IGNORE nup1 SET g = 100, v = 9",
+        "UPDATE nup1 SET v = 6 WHERE g = 1 LIMIT 1",
+        "UPDATE IGNORE nup2 SET g = 100, v = 9 WHERE u IS NULL",
+        "UPDATE nup2 SET v = 6 WHERE u IS NULL LIMIT 1",
+    ]:
+        env.execute(sql)
+        ctx.check(sql + " (in transaction)", env, end_tx=False)
+    ctx.commit_check("UPDATE IGNORE skipping NULL-key, keyless-FK, and partitioned rows", env)
 
 
 @cell("mysql_insert_ignore_data_errors", AREA_A,

@@ -140,7 +140,7 @@ from .sql_frontend import (
 #     nested same-table DML (user AFTER/BEFORE ROW triggers, alphabetically-
 #     earlier AFTER STATEMENT triggers, and self-referencing FK cascades)
 #     without double-counting or dropping new groups.
-MATVIEW_GENERATOR_VERSION = "20"
+MATVIEW_GENERATOR_VERSION = "21"
 
 
 def _definition_digest(select_sql: str) -> str:
@@ -1310,6 +1310,22 @@ class MaterializedViewManager:
                     h.update(
                         f"{ts.name}:fk:{','.join(sorted(set(ts.fk_cascade_actions)))}".encode("utf-8")
                     )
+                if (
+                    self.dialect == Dialect.MYSQL
+                    and self.subdialect == EngineSubdialect.MARIADB
+                    and not ts.effective_pk_columns()
+                ):
+                    if ts.has_foreign_keys:
+                        h.update(f"{ts.name}:mariadb_has_fk".encode("utf-8"))
+                    if ts.is_partitioned:
+                        h.update(f"{ts.name}:mariadb_partitioned".encode("utf-8"))
+                    uq_sigs = sorted(
+                        ",".join(c.lower() for c in idx.columns)
+                        for idx in ts.indexes
+                        if idx.unique and not idx.where_clause and idx.columns
+                    )
+                    if uq_sigs:
+                        h.update(f"{ts.name}:mariadb_uqs:{';'.join(uq_sigs)}".encode("utf-8"))
                 if ts.without_rowid:
                     h.update(f"{ts.name}:without_rowid".encode("utf-8"))
                 if ts.strict:
