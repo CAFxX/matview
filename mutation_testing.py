@@ -788,8 +788,8 @@ MUTANTS = (
     Mutant(
         name="pg-whole-row-star-arg-not-refused",
         source_path="matview/dialects/postgres.py",
-        original="                        if tbl_key in in_scope_rels:\n                            raise UnsupportedMaterializedViewError(\n                                f\"PostgreSQL materialized view references whole-row value \"",
-        replacement="                        if False and tbl_key in in_scope_rels:\n                            raise UnsupportedMaterializedViewError(\n                                f\"PostgreSQL materialized view references whole-row value \"",
+        original="                        if any(tbl_key in rels for rels, _ in scope_stack):\n                            raise UnsupportedMaterializedViewError(\n                                f\"PostgreSQL materialized view references whole-row value \"",
+        replacement="                        if False and any(tbl_key in rels for rels, _ in scope_stack):\n                            raise UnsupportedMaterializedViewError(\n                                f\"PostgreSQL materialized view references whole-row value \"",
         target_test=(
             "test_native_result_types.PostgresWholeRowAndSystemColumnRefusalTests."
             "test_postgres_whole_row_and_system_columns_refused_offline"
@@ -800,6 +800,26 @@ MUTANTS = (
         source_path="matview/dialects/postgres.py",
         original="                    if _is_sys_col_ident(col_ident):\n                        tbl_key = _ident_key(tbl_id)",
         replacement="                    if False and _is_sys_col_ident(col_ident):\n                        tbl_key = _ident_key(tbl_id)",
+        target_test=(
+            "test_native_result_types.PostgresWholeRowAndSystemColumnRefusalTests."
+            "test_postgres_whole_row_and_system_columns_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-lateral-source-skips-whole-row-walk",
+        source_path="matview/dialects/postgres.py",
+        original="                # Bare table-valued expression (e.g. `UNNEST(...)`, `LATERAL jsonb_each(...)`).\n                _walk_expr(src, query_node, cur_stack, local_ctes, set())",
+        replacement="                # Bare table-valued expression (e.g. `UNNEST(...)`, `LATERAL jsonb_each(...)`).\n                pass",
+        target_test=(
+            "test_native_result_types.PostgresWholeRowAndSystemColumnRefusalTests."
+            "test_postgres_whole_row_and_system_columns_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-inner-scope-syscol-masked-by-outer-cte",
+        source_path="matview/dialects/postgres.py",
+        original="                        for rels, bases in reversed(scope_stack):\n                            if any(_has_user_col(cs, col_ident) for cs in rels.values()):",
+        replacement="                        for rels, bases in scope_stack:\n                            if any(_has_user_col(cs, col_ident) for cs in rels.values()):",
         target_test=(
             "test_native_result_types.PostgresWholeRowAndSystemColumnRefusalTests."
             "test_postgres_whole_row_and_system_columns_refused_offline"
