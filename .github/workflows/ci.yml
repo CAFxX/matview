@@ -594,12 +594,14 @@ jobs:
             --task "python3 test_query_ast_materialization.py" \
             --task "python3 test_native_function_classification.py" \
             --task "python3 test_p1_pg_transition_vectorization.py" \
+            --task "python3 test_p0_pk_swap_and_collation.py" \
             --task "python3 test_p2_index_intelligence.py" \
             --task "python3 test_p2_window_partition_scoping.py" \
             --serial "python3 test_concurrent_backfill.py" \
             --serial "python3 test_minmax_group_arg_index.py" \
             --serial "python3 test_unrecognized_aggregates.py" \
             --serial "python3 test_avg_concurrent_maintenance.py" \
+            --serial "python3 test_pgmy_exact_float_aggregates.py" \
             --serial "pytest -v -rxXs test_native_bulk_statements.py" \
             --serial "pytest -v -rxXs -s test_pg_statement_maintenance.py" \
             --serial "python3 test_registration_replacement.py" \
@@ -735,6 +737,7 @@ jobs:
             --serial "python3 test_minmax_group_arg_index.py" \
             --serial "python3 test_unrecognized_aggregates.py" \
             --serial "python3 test_avg_concurrent_maintenance.py" \
+            --serial "python3 test_pgmy_exact_float_aggregates.py" \
             --serial "pytest -v -rxXs test_native_bulk_statements.py" \
             --serial "python3 test_registration_replacement.py" \
             --serial "python3 test_registration_lifecycle.py" \
@@ -876,6 +879,7 @@ jobs:
             --serial "python3 test_minmax_group_arg_index.py" \
             --serial "python3 test_unrecognized_aggregates.py" \
             --serial "python3 test_avg_concurrent_maintenance.py" \
+            --serial "python3 test_pgmy_exact_float_aggregates.py" \
             --serial "pytest -v -rxXs test_native_bulk_statements.py" \
             --serial "python3 test_registration_replacement.py" \
             --serial "python3 test_registration_lifecycle.py" \
