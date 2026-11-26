@@ -210,8 +210,11 @@ class TestJinja2ProceduralTemplates(unittest.TestCase):
         self.assertNotIn("FOR NEW IN SELECT * FROM __mv_new_rows LOOP", pg_sql)
         self.assertIn("DO $mv_install$", pg_sql)
         fn_ddls = [d for d in pg_plan.trigger_ddls if d.startswith("CREATE OR REPLACE FUNCTION")
-                   and "_trunc()" not in d and "(v anyelement)" not in d]
+                   and "_trunc()" not in d.splitlines()[0] and "(v anyelement)" not in d.splitlines()[0]
+                   and "_bs()" not in d.splitlines()[0] and "_reconcile()" not in d.splitlines()[0]]
         self.assertEqual(len(fn_ddls), 3)
+        self.assertTrue(any("_bs()" in d.splitlines()[0] for d in pg_plan.trigger_ddls))
+        self.assertTrue(any("_reconcile()" in d.splitlines()[0] for d in pg_plan.trigger_ddls))
         for fn_ddl in fn_ddls:
             self.assertRegex(fn_ddl, r"IF NOT EXISTS \(SELECT 1 FROM __mv_(new|old)_rows\) THEN\s+RETURN NULL;")
 
