@@ -591,9 +591,10 @@ class Tier1JoinMixin(MixinHost):
         group_sql = f"\nGROUP BY {', '.join(qual_grp_for_q)}" if qual_grp_for_q else ""
 
         q_target_cols = [self._q(c) for c in target_cols]
+        sel_kw = self._mysql_groupby_select_keyword()
         initial_populate_sql = (
             f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
-            f"SELECT {', '.join(select_exprs)}\n"
+            f"{sel_kw} {', '.join(select_exprs)}\n"
             f"FROM {full_from_sql}{where_sql}{group_sql};"
         )
         inc_spec = IncrementalBackfillSpec(
@@ -601,7 +602,7 @@ class Tier1JoinMixin(MixinHost):
             offset_insert_template=(
                 f"INSERT INTO {mv_table} ({', '.join(q_target_cols)})\n"
                 f"SELECT {', '.join(q_target_cols)}\n"
-                f"FROM (\nSELECT {', '.join(f'{ex} AS {col}' for col, ex in zip(q_target_cols, select_exprs))}\n"
+                f"FROM (\n{sel_kw} {', '.join(f'{ex} AS {col}' for col, ex in zip(q_target_cols, select_exprs))}\n"
                 f"FROM {full_from_sql}{where_sql}{group_sql}\n) AS __mv_init\n"
                 f"LIMIT ? OFFSET ?;"
             ),

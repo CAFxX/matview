@@ -1287,6 +1287,7 @@ class Tier2Mixin(MixinHost):
             source_query_sql = f"{raw_q[:tok_from.start].rstrip()}, {extra_sel} {raw_q[tok_from.start:]}"
         else:
             source_query_sql = raw_q
+        source_query_sql = self._mysql_inject_big_result_if_needed(source_query_sql)
 
         q_target_cols = [self._q(c) for c in target_cols]
         cols_csv = ", ".join(q_target_cols)

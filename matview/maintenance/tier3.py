@@ -240,6 +240,7 @@ class Tier3Mixin(MixinHost):
         )
 
         raw_query = self._rewrite_sqlite_total_in_sql(self.view.raw_select_sql.strip().rstrip(";"))
+        raw_query = self._mysql_inject_big_result_if_needed(raw_query)
         q_user_columns = [self._q(c) for c in user_columns]
         cols_csv = ", ".join(q_user_columns)
         initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"

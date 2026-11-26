@@ -27,6 +27,7 @@ from ..engines import (
 )
 from ..logical_ir import ColumnDef, JoinSpec, SelectItem, TableSchema, ViewSpec
 from ..sql_frontend import (
+    _find_top_level_token,
     _has_subquery_ast,
     _is_simple_column_expr,
     _is_untyped_null_expr,
@@ -1418,6 +1419,54 @@ class DialectBaseMixin(MixinHost):
                 return "VARCHAR(191)"
         return dt
 
+    def _mysql_has_timestamp_minmax_groupby(self) -> bool:
+        """Return True on MySQL/MariaDB when the view groups rows and computes
+        MIN/MAX over a TIMESTAMP[(fsp)] expression.
+
+        MySQL 8.4/9.x's internal TempTable hash-aggregation path raises Error 1292
+        ("Incorrect datetime value: '0000-00-00 00:00:00[.0000]'") during
+        strict-mode INSERT ... SELECT ... GROUP BY when a group holds NULLs for
+        MIN/MAX over a TIMESTAMP column. Adding SQL_BIG_RESULT selects sort-based
+        streaming GROUP BY, avoiding the broken TempTable path while remaining
+        standard, DST-exact syntax on both MySQL and MariaDB.
+        """
+        if self.dialect != Dialect.MYSQL:
+            return False
+        has_grp = bool(self._effective_group_by_exprs or self.view.group_by_cols)
+        if not has_grp and not re.search(r"\bGROUP\s+BY\b", self.view.raw_select_sql or "", flags=re.IGNORECASE):
+            return False
+        items = list(self._working_select_items) or list(self.view.select_items)
+        for it in items:
+            if it.is_aggregate and it.agg_func in (AggFunc.MIN, AggFunc.MAX):
+                dt = self._infer_expr_storage_type_or_none(it) or ""
+                if re.match(r"^\s*TIMESTAMP(?:\s*\(\s*\d+\s*\))?\b", dt, flags=re.IGNORECASE):
+                    return True
+        if self.strategy == MaintenanceStrategy.ATOMIC_QUERY_SYNC and re.search(
+            r"\b(?:MIN|MAX)\s*\(", self.view.raw_select_sql or "", flags=re.IGNORECASE
+        ):
+            for tbl in self.view.referenced_tables:
+                ts = self._schemas_lower.get(tbl.lower())
+                if ts is None:
+                    continue
+                for col in ts.columns.values():
+                    if re.match(r"^\s*TIMESTAMP(?:\s*\(\s*\d+\s*\))?\b", col.data_type, flags=re.IGNORECASE):
+                        return True
+        return False
+
+    def _mysql_groupby_select_keyword(self) -> str:
+        return "SELECT SQL_BIG_RESULT" if self._mysql_has_timestamp_minmax_groupby() else "SELECT"
+
+    def _mysql_inject_big_result_if_needed(self, sql: str) -> str:
+        if not self._mysql_has_timestamp_minmax_groupby():
+            return sql
+        tok_sel = _find_top_level_token(sql, (SQLGlotTokenType.SELECT,), dialect=self.dialect)
+        if tok_sel is None:
+            return sql
+        tail = sql[tok_sel.end:]
+        if re.match(r"^\s*SQL_BIG_RESULT\b", tail, flags=re.IGNORECASE):
+            return sql
+        return f"{sql[:tok_sel.end]} SQL_BIG_RESULT{tail}"
+
     def _infer_cte_or_subquery_col_type(
         self,
         col_name: str,
@@ -2168,6 +2217,15 @@ class DialectBaseMixin(MixinHost):
                     t_name = m_my_temp.group(1)
                     fsp_n = int(m_my_temp.group(2)) if m_my_temp.group(2) is not None else 0
                     return f"{t_name}({fsp_n})" if fsp_n > 0 else t_name
+                m_my_str = re.fullmatch(
+                    r"(VARCHAR|CHAR|CHARACTER VARYING|CHARACTER|NVARCHAR|NCHAR)\s*\(\s*(\d+)\s*\)",
+                    bare.strip(),
+                )
+                if m_my_str:
+                    base_s = "CHAR" if m_my_str.group(1) in ("CHAR", "CHARACTER", "NCHAR") else "VARCHAR"
+                    return f"{base_s}({int(m_my_str.group(2))})"
+                if bare.strip() in ("TINYTEXT", "MEDIUMTEXT", "LONGTEXT"):
+                    return bare.strip()
             upper = re.sub(r"\s+", " ", re.sub(r"\s*\([^)]*\)", "", bare)).strip()
             if self.dialect == Dialect.MYSQL and upper in ("UNSIGNED", "UNSIGNED INTEGER", "UBIGINT"):
                 # CAST(x AS UNSIGNED [INTEGER]) is a BIGINT UNSIGNED (MySQL and MariaDB).
@@ -2266,6 +2324,30 @@ class DialectBaseMixin(MixinHost):
                     if all(s == stripped[0] for s in stripped):
                         return f"{stripped[0]}[]"
                 if self.dialect == Dialect.MYSQL:
+                    def _my_str_w(v: str) -> Optional[Tuple[str, int]]:
+                        if v in ("TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT"):
+                            return ("text", {"TINYTEXT": 1, "TEXT": 2, "MEDIUMTEXT": 3, "LONGTEXT": 4}[v])
+                        m_vc = re.fullmatch(r"(VARCHAR|CHAR)\((\d+)\)", v)
+                        if m_vc:
+                            return (m_vc.group(1).lower(), int(m_vc.group(2)))
+                        return None
+
+                    my_strs = [_my_str_w(v) for v in known]
+                    if all(si is not None for si in my_strs):
+                        s_only = [si for si in my_strs if si is not None]
+                        if any(tag == "text" for tag, _ in s_only):
+                            top_txt = max(lvl for tag, lvl in s_only if tag == "text")
+                            max_vc = max((n for tag, n in s_only if tag != "text"), default=0)
+                            if max_vc > 63 and top_txt < 2:
+                                top_txt = 2
+                            if top_txt == 2 and all(v == "TEXT" for v in known):
+                                return "TEXT"
+                            return {1: "TINYTEXT", 2: "TEXT", 3: "MEDIUMTEXT", 4: "LONGTEXT"}[top_txt]
+                        max_w = max(n for _, n in s_only)
+                        if all(tag == "char" for tag, _ in s_only) and len({n for _, n in s_only}) == 1:
+                            return f"CHAR({max_w})"
+                        return f"VARCHAR({max_w})"
+
                     my_temps: List[Optional[Tuple[str, int]]] = []
                     for v in known:
                         m_tp = re.fullmatch(
@@ -2285,14 +2367,23 @@ class DialectBaseMixin(MixinHost):
                             return f"TIME({max_fsp})" if max_fsp > 0 else "TIME"
                         if kinds == {"TIMESTAMP"}:
                             return f"TIMESTAMP({max_fsp})" if max_fsp > 0 else "TIMESTAMP"
-                        if kinds <= {"DATE", "DATETIME", "TIMESTAMP"}:
-                            return f"DATETIME({max_fsp})" if max_fsp > 0 else "DATETIME"
-                        # Mixing TIME with DATE/DATETIME/TIMESTAMP widens to VARCHAR on MySQL/MariaDB.
-                        return "VARCHAR(255)"
+                        if kinds == {"DATE"}:
+                            return "DATE"
+                        # MySQL and MariaDB merge any mixed temporal kinds (including TIME +
+                        # DATE/DATETIME/TIMESTAMP) to DATETIME with the maximum precision.
+                        return f"DATETIME({max_fsp})" if max_fsp > 0 else "DATETIME"
                     if any(tp is not None for tp in my_temps):
-                        # Mixing a temporal type with a string/numeric value widens to VARCHAR
-                        # (do not fall through to the first-argument COALESCE heuristic).
-                        return "VARCHAR(255)"
+                        # Mixing a temporal type with a string/numeric value widens to VARCHAR/TEXT
+                        # while keeping at least the widest declared string operand width.
+                        s_present = [si for si in my_strs if si is not None]
+                        if any(tag == "text" for tag, _ in s_present):
+                            top_txt = max(lvl for tag, lvl in s_present if tag == "text")
+                            # MySQL/MariaDB widen TEXT + temporal to MEDIUMTEXT (and TINYTEXT to TEXT).
+                            if top_txt < 3:
+                                top_txt += 1
+                            return {1: "TINYTEXT", 2: "TEXT", 3: "MEDIUMTEXT", 4: "LONGTEXT"}[top_txt]
+                        max_w = max((n for _, n in s_present), default=255)
+                        return f"VARCHAR({max(max_w, 255)})"
                 if self.dialect == Dialect.POSTGRES and all(
                     v in ("BIT", "BIT VARYING", '"bit"', 'pg_catalog."bit"') or v.startswith("BIT(")
                     for v in known
@@ -2342,7 +2433,7 @@ class DialectBaseMixin(MixinHost):
                 return "BOOLEAN"
             if kind == "Abs":
                 arg_t = infer(node.this)
-                return arg_t if arg_t in ranks else None
+                return arg_t if arg_t in ranks or arg_t == "BIGINT UNSIGNED" else None
             if kind in ("Floor", "Ceil", "Ceiling", "Sign") and self.dialect == Dialect.POSTGRES:
                 arg_t = infer(node.this)
                 if arg_t == "NUMERIC":
@@ -2399,7 +2490,13 @@ class DialectBaseMixin(MixinHost):
                 return None
             if kind in ("Neg", "Pos", "Positive"):
                 arg_t = infer(node.this)
-                return arg_t if arg_t in ranks else None
+                if arg_t in ranks:
+                    return arg_t
+                if self.dialect == Dialect.POSTGRES and arg_t is not None and re.match(
+                    r"INTERVAL(?![\w$])", arg_t, flags=re.IGNORECASE
+                ):
+                    return arg_t
+                return None
             if kind == "BitwiseCount":
                 return "BIGINT" if self.dialect == Dialect.MYSQL else None
             if kind == "BitwiseNot":
@@ -2645,6 +2742,8 @@ class DialectBaseMixin(MixinHost):
                 return f"BIT({len(bits)})" if bits else "BIT VARYING"
             if kind in ("Add", "Sub", "Mul", "Div", "Mod", "IntDiv"):
                 left, right = infer(node.this), infer(node.expression)
+                if self.dialect == Dialect.POSTGRES and kind in ("Add", "Sub") and left == "INTERVAL" and right == "INTERVAL":
+                    return "INTERVAL"
                 if left not in ranks or right not in ranks:
                     return None
                 merged = merge((left, right))
@@ -3522,17 +3621,21 @@ class DialectBaseMixin(MixinHost):
             if all(bt == "TIMESTAMP" for bt in base_temps):
                 max_fsp = max(_fsp(s) for s in stripped)
                 return f"TIMESTAMP({max_fsp})" if max_fsp > 0 else "TIMESTAMP"
-            if all(bt in ("DATE", "DATETIME", "TIMESTAMP") for bt in base_temps):
-                max_fsp = max(_fsp(s) for s in stripped)
-                return f"DATETIME({max_fsp})" if max_fsp > 0 else "DATETIME"
             if all(bt == "TIME" for bt in base_temps):
                 max_fsp = max(_fsp(s) for s in stripped)
                 return f"TIME({max_fsp})" if max_fsp > 0 else "TIME"
+            if all(bt == "DATE" for bt in base_temps):
+                return "DATE"
+            if all(bt in ("DATE", "TIME", "DATETIME", "TIMESTAMP") for bt in base_temps):
+                max_fsp = max(_fsp(s) for s in stripped)
+                return f"DATETIME({max_fsp})" if max_fsp > 0 else "DATETIME"
             if any(bt in ("DATE", "TIME", "DATETIME", "TIMESTAMP") for bt in base_temps):
-                # Mixed TIME + DATE/DATETIME/TIMESTAMP or temporal + string/numeric widens to VARCHAR/TEXT.
+                # Mixed temporal + string/numeric widens to VARCHAR/TEXT.
                 s_present = [si for si in str_infos if si is not None]
                 if any(tag == "text" for tag, _ in s_present):
                     top_text = max((lvl for tag, lvl in s_present if tag == "text"), default=2)
+                    if top_text < 3:
+                        top_text += 1
                     return {1: "TINYTEXT", 2: "TEXT", 3: "MEDIUMTEXT", 4: "LONGTEXT"}[top_text]
                 max_len = max((n for _, n in s_present), default=255)
                 return f"VARCHAR({max(max_len, 255)})"

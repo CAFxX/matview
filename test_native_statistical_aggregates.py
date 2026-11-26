@@ -422,7 +422,8 @@ def _normalize_mysql_column_type(column_type: str) -> str:
     signedness and collation are compared unchanged; nullability, DECIMAL
     precision and string lengths are documented unmodelled gaps (above).
     """
-    t = re.sub(r"^(tinyint|smallint|mediumint|int|bigint)\(\d+\)", r"\1", column_type)
+    t = re.sub(r"\s*/\*\s*mariadb-[^*]*\*/", "", column_type).strip()
+    t = re.sub(r"^(tinyint|smallint|mediumint|int|bigint)\(\d+\)", r"\1", t)
     t = re.sub(r"^(float|double)\(\d+,(\d+)\)", r"\1(*,\2)", t)
     # Documented unmodelled gaps (test_matview_sync.MYSQL_UNMODELLED_METADATA):
     # DECIMAL precision (the scale is kept) and string lengths.
