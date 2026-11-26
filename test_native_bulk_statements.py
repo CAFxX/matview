@@ -1539,30 +1539,75 @@ def test_pg_timestamptz_expression_independent_of_writer_session_settings(make_e
     env.check("insert from a non-UTC, non-ISO session")
 
 
-@known_defect("pre-existing P0: whole-row and system-column references are registered but base-table writes then fail (TODO.md)", raises=Exception)
 @pytest.mark.parametrize("target", _params(("postgres",)))
-@pytest.mark.parametrize("expr", ["to_jsonb(t)::text", "(t).junk", "ctid::text"])
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "to_jsonb(t)::text",
+        "to_jsonb(t.*)::text",
+        "(t).junk",
+        "((t)).junk",
+        "junk(t)",
+        "t::text",
+        "ctid::text",
+        "t.ctid::text",
+        "xmin::text",
+        "xmax::text",
+        "cmin::text",
+        "cmax::text",
+        "tableoid::regclass::text",
+    ],
+)
 def test_pg_whole_row_and_system_column_refs_are_refused_or_maintained(make_env, target: Target, expr: str) -> None:
-    """A view must either be refused at registration or stay equal to the live
-    view; on master registration succeeds and the next UPDATE of the base table
-    raises UndefinedColumn."""
+    """Whole-row references and PostgreSQL system columns must be refused at
+    registration (never installed in a broken state that fails later base-table
+    UPDATEs with UndefinedColumn)."""
     env = make_env(target, views=[], schema_sql=["CREATE TABLE t (id INT PRIMARY KEY, g INT, junk INT)"], seed=False)
     env.execute("INSERT INTO t SELECT i, i % 3, 0 FROM generate_series(1, 9) i")
     env.commit()
     vd = ViewDef("v_whole_row", f"SELECT id, {expr} AS e FROM t", ("postgres",))
-    try:
+    with pytest.raises(UnsupportedMaterializedViewError):
         env.register(vd)
-    except UnsupportedMaterializedViewError:
-        return  # an explicit refusal satisfies the contract
-    env.views.append(vd)
+    env.conn.rollback()
+    # Base-table writes remain completely healthy after the refused registration.
+    env.execute("UPDATE t SET junk = junk + 1 WHERE id % 2 = 0")
+    env.commit()
+
+
+@pytest.mark.parametrize("target", _params(("postgres",)))
+def test_pg_whole_row_and_system_column_positive_controls(make_env, target: Target) -> None:
+    """Column named like its table, CTE alias named `ctid`, composite column
+    field access, and ORDER BY output alias matching the table name must remain
+    supported and exact."""
+    env = make_env(
+        target,
+        views=[],
+        schema_sql=[
+            "CREATE TYPE pair_wr AS (a INT, b TEXT)",
+            "CREATE TABLE t (id INT PRIMARY KEY, t INT, g INT, p pair_wr)",
+        ],
+        seed=False,
+    )
+    env.execute(
+        "INSERT INTO t VALUES (1, 10, 1, ROW(1, 'x')::pair_wr), "
+        "(2, 20, 1, ROW(2, 'y')::pair_wr), (3, 30, 2, ROW(3, 'z')::pair_wr)"
+    )
+    env.commit()
+    views = [
+        ViewDef("v_same_col", "SELECT id, t, to_jsonb(t)::text AS jt FROM t", ("postgres",)),
+        ViewDef("v_cte_ctid", "WITH c AS (SELECT id, g AS ctid FROM t) SELECT id, ctid AS val FROM c", ("postgres",)),
+        ViewDef("v_comp_field", "SELECT id, (p).b AS lbl FROM t", ("postgres",)),
+        ViewDef("v_ord_alias", "SELECT id AS t FROM t ORDER BY t", ("postgres",)),
+    ]
+    for vd in views:
+        env.register(vd)
+        env.views.append(vd)
     env.check("initial")
-    for label, sql in (
-        ("unread-column update", "UPDATE t SET junk = junk + 1 WHERE id % 2 = 0"),
-        ("group update", "UPDATE t SET g = g + 1 WHERE id = 3"),
-    ):
-        env.execute(sql)
-        env.commit()
-        env.check(label)
+    env.execute("UPDATE t SET t = t + 1, p = ROW(9, 'w')::pair_wr WHERE id = 1")
+    env.execute("INSERT INTO t VALUES (4, 40, 2, ROW(4, 'q')::pair_wr)")
+    env.execute("DELETE FROM t WHERE id = 2")
+    env.commit()
+    env.check("after dml")
 
 
 # ---------------------------------------------------------------------------

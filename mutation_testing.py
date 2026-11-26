@@ -775,6 +775,36 @@ MUTANTS = (
             "test_postgres_row_and_pseudotype_outputs_refused_offline"
         ),
     ),
+    Mutant(
+        name="pg-whole-row-and-syscol-guard-omitted",
+        source_path="matview/planner.py",
+        original="        if self.dialect == Dialect.POSTGRES:\n            self._enforce_pg_no_whole_row_or_system_columns()",
+        replacement="        if False and self.dialect == Dialect.POSTGRES:\n            self._enforce_pg_no_whole_row_or_system_columns()",
+        target_test=(
+            "test_native_result_types.PostgresWholeRowAndSystemColumnRefusalTests."
+            "test_postgres_whole_row_and_system_columns_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-whole-row-star-arg-not-refused",
+        source_path="matview/dialects/postgres.py",
+        original="                        if tbl_key in in_scope_rels:\n                            raise UnsupportedMaterializedViewError(\n                                f\"PostgreSQL materialized view references whole-row value \"",
+        replacement="                        if False and tbl_key in in_scope_rels:\n                            raise UnsupportedMaterializedViewError(\n                                f\"PostgreSQL materialized view references whole-row value \"",
+        target_test=(
+            "test_native_result_types.PostgresWholeRowAndSystemColumnRefusalTests."
+            "test_postgres_whole_row_and_system_columns_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-qualified-system-col-not-refused",
+        source_path="matview/dialects/postgres.py",
+        original="                    if _is_sys_col_ident(col_ident):\n                        tbl_key = _ident_key(tbl_id)",
+        replacement="                    if False and _is_sys_col_ident(col_ident):\n                        tbl_key = _ident_key(tbl_id)",
+        target_test=(
+            "test_native_result_types.PostgresWholeRowAndSystemColumnRefusalTests."
+            "test_postgres_whole_row_and_system_columns_refused_offline"
+        ),
+    ),
 )
 
 

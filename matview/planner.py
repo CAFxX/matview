@@ -1647,6 +1647,9 @@ class PlannerMixin(MixinHost):
                     f"Base table {t_name!r} referenced by view {self.logical_view_name!r} was not found in schema."
                 )
 
+        if self.dialect == Dialect.POSTGRES:
+            self._enforce_pg_no_whole_row_or_system_columns()
+
         if (
             len(v.joins) == 1
             and not v.has_cte

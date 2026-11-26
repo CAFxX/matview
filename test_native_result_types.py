@@ -3647,5 +3647,85 @@ class PostgresPseudotypeOutputRefusalTests(unittest.TestCase):
             conn.close()
 
 
+class PostgresWholeRowAndSystemColumnRefusalTests(unittest.TestCase):
+    """PostgreSQL whole-row references and system columns must be refused
+    explicitly at compilation/registration across all query clauses."""
+
+    def test_postgres_whole_row_and_system_columns_refused_offline(self) -> None:
+        schema = (
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT, junk INT);"
+            "CREATE TABLE t2 (id INT PRIMARY KEY, x INT);"
+        )
+        refused = (
+            ("whole-row", "SELECT id, to_jsonb(t)::text AS e FROM t"),
+            ("whole-row", "SELECT id, to_jsonb(t.*)::text AS e FROM t"),
+            ("whole-row", "SELECT id, row_to_json(t)::text AS e FROM t"),
+            ("whole-row", "SELECT id, (t).junk AS e FROM t"),
+            ("whole-row", "SELECT id, ((t)).junk AS e FROM t"),
+            ("whole-row", "SELECT id, (t).* FROM t"),
+            ("whole-row", "SELECT id, junk(t) AS e FROM t"),
+            ("whole-row", "SELECT id, t::text AS e FROM t"),
+            ("whole-row", "SELECT id, t IS NULL AS e FROM t"),
+            ("whole-row", "SELECT t FROM t"),
+            ("whole-row", "SELECT COUNT(t.*) AS c FROM t"),
+            ("whole-row", "SELECT a.id FROM t a WHERE (a).junk > 0"),
+            ("whole-row", "SELECT id FROM t WHERE to_jsonb(t)::text <> ''"),
+            ("whole-row", "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING COUNT(to_jsonb(t)) > 0"),
+            ("whole-row", "SELECT id, (SELECT to_jsonb(t)::text) AS e FROM t"),
+            ("whole-row", "WITH c AS (SELECT id, to_jsonb(t)::text AS e FROM t) SELECT id, e FROM c"),
+            ("whole-row", "WITH c AS (SELECT id, g FROM t) SELECT id, to_jsonb(c)::text AS e FROM c"),
+            ("whole-row", "SELECT id, to_jsonb(s)::text AS e FROM (SELECT id, g FROM t) s"),
+            ("system column", "SELECT id, ctid FROM t"),
+            ("system column", "SELECT id, ctid::text AS e FROM t"),
+            ("system column", "SELECT g, COUNT(ctid) AS c FROM t GROUP BY g"),
+            ("system column", "SELECT COUNT(*) AS c FROM t GROUP BY ctid"),
+            ("system column", "SELECT id, t.ctid::text AS e FROM t"),
+            ("system column", "SELECT id, public.t.ctid::text AS e FROM public.t"),
+            ("system column", 'SELECT id, "ctid"::text AS e FROM t'),
+            ("system column", "SELECT id, xmin::text AS e FROM t"),
+            ("system column", "SELECT id, xmax::text AS e FROM t"),
+            ("system column", "SELECT id, cmin::text AS e FROM t"),
+            ("system column", "SELECT id, cmax::text AS e FROM t"),
+            ("system column", "SELECT id, tableoid::regclass::text AS e FROM t"),
+            ("system column", "SELECT a.id FROM t a WHERE a.ctid > '(0,0)'"),
+            ("system column", "SELECT id, ROW_NUMBER() OVER (ORDER BY ctid) AS rn FROM t"),
+            ("system column", "SELECT a.id FROM t a JOIN t2 b ON a.id = b.id AND a.xmin::text <> ''"),
+            ("system column", "WITH c AS (SELECT id, ctid FROM t) SELECT id FROM c"),
+            ("system column", "SELECT id FROM t UNION SELECT id FROM t WHERE xmax::text <> ''"),
+        )
+        for expected_phrase, sel in refused:
+            with self.subTest(refused=sel):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with self.assertRaises(UnsupportedMaterializedViewError) as ctx:
+                        generate_materialized_view(schema, f"CREATE VIEW v AS {sel};", dialect="postgres:18")
+                self.assertIn(expected_phrase, str(ctx.exception).lower())
+
+        # Positive controls must remain allowed.
+        pos_schema = (
+            'CREATE TABLE t (id INT PRIMARY KEY, t INT, g INT, "CTID" INT, p my_pair);'
+            "CREATE TABLE t2 (id INT PRIMARY KEY, g INT);"
+        )
+        allowed = (
+            "SELECT * FROM t",
+            "SELECT t.* FROM t",
+            "SELECT id, t, to_jsonb(t)::text AS jt FROM t",
+            'SELECT id, "CTID" AS c FROM t',
+            "SELECT id, (p).a AS pa FROM t",
+            "SELECT COUNT(*) AS c FROM t",
+            "SELECT id AS t2 FROM t2 ORDER BY t2",
+            "SELECT id AS t FROM t ORDER BY t",
+            "WITH c AS (SELECT id, g AS ctid FROM t) SELECT id, ctid FROM c",
+            "WITH c AS (SELECT id, g AS ctid FROM t) SELECT c.id, c.ctid FROM c",
+            "SELECT t.id, t2.g FROM t JOIN t2 USING (id)",
+        )
+        for sel in allowed:
+            with self.subTest(allowed=sel):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    plan = generate_materialized_view(pos_schema, f"CREATE VIEW v AS {sel};", dialect="postgres:18")
+                self.assertTrue(plan.backing_table_ddl)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
