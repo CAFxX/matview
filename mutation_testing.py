@@ -825,6 +825,76 @@ MUTANTS = (
             "test_postgres_whole_row_and_system_columns_refused_offline"
         ),
     ),
+    Mutant(
+        name="pg-stable-expr-guard-omitted",
+        source_path="matview/planner.py",
+        original="            self._enforce_pg_no_stable_or_session_dependent_exprs()",
+        replacement="            pass",
+        target_test=(
+            "test_native_result_types.PostgresStableAndSessionDependentExprRefusalTests."
+            "test_postgres_stable_and_session_dependent_exprs_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-timestamptz-to-date-cast-not-refused",
+        source_path="matview/dialects/postgres.py",
+        original='            if src_type == "TIMESTAMPTZ" and dst_type in ("DATE", "TIMESTAMP", "TIME", "TIMETZ"):',
+        replacement='            if src_type == "TIMESTAMPTZ" and dst_type in ("TIMESTAMP", "TIME", "TIMETZ"):',
+        target_test=(
+            "test_native_result_types.PostgresStableAndSessionDependentExprRefusalTests."
+            "test_postgres_stable_and_session_dependent_exprs_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-timestamptz-to-text-cast-not-refused",
+        source_path="matview/dialects/postgres.py",
+        original='            if dst_type == "STRING" and _pg_type_has_session_output(src_type, for_json=False):',
+        replacement='            if False and dst_type == "STRING" and _pg_type_has_session_output(src_type, for_json=False):',
+        target_test=(
+            "test_native_result_types.PostgresStableAndSessionDependentExprRefusalTests."
+            "test_postgres_stable_and_session_dependent_exprs_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-date-trunc-2arg-timestamptz-not-refused",
+        source_path="matview/dialects/postgres.py",
+        original='                if x_t == "TIMESTAMPTZ" and zone_arg is None:',
+        replacement='                if False and x_t == "TIMESTAMPTZ" and zone_arg is None:',
+        target_test=(
+            "test_native_result_types.PostgresStableAndSessionDependentExprRefusalTests."
+            "test_postgres_stable_and_session_dependent_exprs_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-mixed-tz-coercion-not-refused",
+        source_path="matview/dialects/postgres.py",
+        original='            if "TIMESTAMPTZ" in present and (present & {"TIMESTAMP", "DATE"}):',
+        replacement='            if False and "TIMESTAMPTZ" in present and (present & {"TIMESTAMP", "DATE"}):',
+        target_test=(
+            "test_native_result_types.PostgresStableAndSessionDependentExprRefusalTests."
+            "test_postgres_stable_and_session_dependent_exprs_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-array-cast-unwrap-omitted",
+        source_path="matview/dialects/postgres.py",
+        original='            while src_type.startswith("ARRAY:") and dst_type.startswith("ARRAY:"):',
+        replacement='            while False and src_type.startswith("ARRAY:") and dst_type.startswith("ARRAY:"):',
+        target_test=(
+            "test_native_result_types.PostgresStableAndSessionDependentExprRefusalTests."
+            "test_postgres_stable_and_session_dependent_exprs_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-date-trunc-on-date-not-refused",
+        source_path="matview/dialects/postgres.py",
+        original='                if x_t == "DATE":\n                    _refuse(\n                        node,\n                        "DATE_TRUNC on DATE implicitly casts DATE to TIMESTAMPTZ using session TimeZone",',
+        replacement='                if False and x_t == "DATE":\n                    _refuse(\n                        node,\n                        "DATE_TRUNC on DATE implicitly casts DATE to TIMESTAMPTZ using session TimeZone",',
+        target_test=(
+            "test_native_result_types.PostgresStableAndSessionDependentExprRefusalTests."
+            "test_postgres_stable_and_session_dependent_exprs_refused_offline"
+        ),
+    ),
 )
 
 

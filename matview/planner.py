@@ -1649,6 +1649,7 @@ class PlannerMixin(MixinHost):
 
         if self.dialect == Dialect.POSTGRES:
             self._enforce_pg_no_whole_row_or_system_columns()
+            self._enforce_pg_no_stable_or_session_dependent_exprs()
 
         if (
             len(v.joins) == 1

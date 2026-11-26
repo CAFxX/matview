@@ -2824,8 +2824,45 @@ class DialectBaseMixin(MixinHost):
                 return f"BIT({len(bits)})" if bits else "BIT VARYING"
             if kind in ("Add", "Sub", "Mul", "Div", "Mod", "IntDiv"):
                 left, right = infer(node.this), infer(node.expression)
-                if self.dialect == Dialect.POSTGRES and kind in ("Add", "Sub") and left == "INTERVAL" and right == "INTERVAL":
-                    return "INTERVAL"
+                if self.dialect == Dialect.POSTGRES and kind in ("Add", "Sub"):
+                    pg_tstz = ("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE")
+                    pg_ts = ("TIMESTAMP", "TIMESTAMP WITHOUT TIME ZONE")
+                    pg_tm = ("TIME", "TIME WITHOUT TIME ZONE")
+                    pg_tmtz = ("TIMETZ", "TIME WITH TIME ZONE")
+                    if left == "INTERVAL" and right == "INTERVAL":
+                        return "INTERVAL"
+                    if kind == "Sub":
+                        if (left in pg_tstz and right in pg_tstz) or (left in pg_ts and right in pg_ts) or (
+                            left in pg_tm and right in pg_tm
+                        ):
+                            return "INTERVAL"
+                        if left == "DATE" and right == "DATE":
+                            return "INTEGER"
+                        if left == "DATE" and right in ("SMALLINT", "INTEGER"):
+                            return "DATE"
+                        if (left == "DATE" or left in pg_ts) and right == "INTERVAL":
+                            return "TIMESTAMP"
+                        if left in pg_tm and right == "INTERVAL":
+                            return "TIME"
+                        if left in pg_tmtz and right == "INTERVAL":
+                            return "TIME WITH TIME ZONE"
+                    else:
+                        if (left == "DATE" and right in ("SMALLINT", "INTEGER")) or (
+                            right == "DATE" and left in ("SMALLINT", "INTEGER")
+                        ):
+                            return "DATE"
+                        if (left == "DATE" and right in pg_tm) or (right == "DATE" and left in pg_tm):
+                            return "TIMESTAMP"
+                        if (left == "DATE" and right in pg_tmtz) or (right == "DATE" and left in pg_tmtz):
+                            return "TIMESTAMP WITH TIME ZONE"
+                        if ((left == "DATE" or left in pg_ts) and right == "INTERVAL") or (
+                            (right == "DATE" or right in pg_ts) and left == "INTERVAL"
+                        ):
+                            return "TIMESTAMP"
+                        if (left in pg_tm and right == "INTERVAL") or (right in pg_tm and left == "INTERVAL"):
+                            return "TIME"
+                        if (left in pg_tmtz and right == "INTERVAL") or (right in pg_tmtz and left == "INTERVAL"):
+                            return "TIME WITH TIME ZONE"
                 if left not in ranks or right not in ranks:
                     return None
                 merged = merge((left, right))
@@ -2899,6 +2936,46 @@ class DialectBaseMixin(MixinHost):
                 )
                 return canonical_type(agg_t)
             if self.dialect == Dialect.POSTGRES:
+                pg_tstz = ("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE")
+                pg_ts = ("TIMESTAMP", "TIMESTAMP WITHOUT TIME ZONE")
+                pg_tmtz = ("TIMETZ", "TIME WITH TIME ZONE")
+                if kind == "Interval":
+                    return "INTERVAL"
+                if kind == "TimestampTrunc":
+                    arg_t = infer(node.this)
+                    if arg_t in pg_tstz:
+                        return "TIMESTAMP WITH TIME ZONE"
+                    if arg_t in pg_ts:
+                        return "TIMESTAMP"
+                    if arg_t == "INTERVAL":
+                        return "INTERVAL"
+                    return None
+                if kind == "AtTimeZone":
+                    arg_t = infer(node.this)
+                    if arg_t in pg_tstz:
+                        return "TIMESTAMP"
+                    if arg_t in pg_ts:
+                        return "TIMESTAMP WITH TIME ZONE"
+                    if arg_t in pg_tmtz:
+                        return "TIME WITH TIME ZONE"
+                    return None
+                if kind == "DateAdd":
+                    arg_t = infer(node.this)
+                    if arg_t in pg_tstz:
+                        return "TIMESTAMP WITH TIME ZONE"
+                    if arg_t in pg_ts:
+                        return "TIMESTAMP"
+                    return None
+                if kind == "UnixToTime":
+                    return "TIMESTAMP WITH TIME ZONE"
+                if kind == "Extract":
+                    has_dp = bool(re.search(r"\bdate_part\s*\(", expr, flags=re.IGNORECASE))
+                    has_ex = bool(re.search(r"\bextract\s*\(", expr, flags=re.IGNORECASE))
+                    if has_dp and not has_ex:
+                        return "DOUBLE PRECISION"
+                    if has_ex and not has_dp:
+                        return "NUMERIC" if self.engine_version.at_least((14, 0, 0)) else "DOUBLE PRECISION"
+                    return None
                 if kind == "Tuple":
                     return "RECORD"
                 if kind == "Subquery" and isinstance(node.this, sqlglot_exp.Select) and len(node.this.expressions or ()) == 1:
