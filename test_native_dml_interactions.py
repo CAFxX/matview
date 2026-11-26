@@ -1045,12 +1045,13 @@ def _sqlite_benign_trigger(ctx: Ctx) -> None:
 
 @cell("user_after_trigger_writes_same_table", AREA_B,
       "User AFTER row trigger that updates the same row and inserts/deletes other rows of the source",
-      "SQLite: Stage 4's same-group in-place UPDATE trigger avoids transiently deleting the group when a newer user "
-      "AFTER INSERT trigger updates a non-group column on an existing group (still wrong if the user trigger changes "
-      "a group key or updates an aggregated column of a brand-new group before INSERT maintenance runs — same-row "
-      "updates before outer AFTER STATEMENT also affect PostgreSQL); check_schema_drift() therefore still reports "
-      "triggers_out_of_order for such a newer self-writing trigger and repair_view() puts the maintenance triggers "
-      "first. MySQL/MariaDB forbid a trigger writing its own table (error 1442)",
+      "PostgreSQL: exact via the re-entrant statement bracket (nested DML stages its signed delta and reconciles "
+      "at the outermost closing trigger). SQLite: Stage 4's same-group in-place UPDATE trigger avoids transiently "
+      "deleting the group when a newer user AFTER INSERT trigger updates a non-group column on an existing group "
+      "(still wrong if the user trigger changes a group key or updates an aggregated column of a brand-new group "
+      "before INSERT maintenance runs); check_schema_drift() therefore still reports triggers_out_of_order for "
+      "such a newer self-writing trigger and repair_view() puts the maintenance triggers first. MySQL/MariaDB "
+      "forbid a trigger writing its own table (error 1442)",
       sqlite=EXACT, postgres=EXACT)
 def _after_writes_same(ctx: Ctx) -> None:
     env = ctx.env
@@ -1084,17 +1085,13 @@ def _after_writes_same(ctx: Ctx) -> None:
         env.commit()
 
 
-PG_SELF_UPDATE_TODO = ("PostgreSQL: AFTER ROW User Trigger Writing the Aggregated Column of the Just-Written Row "
-                       "(no detection)")
-
-
 @cell("user_after_trigger_updates_aggregated_column", AREA_B,
       "User AFTER row trigger that updates an aggregated column of the row the statement just inserted",
-      "PostgreSQL: the row trigger's UPDATE is maintained (its own statement triggers) before the INSERT's "
-      "statement-level maintenance, which then adds the row from its transition table; the view is silently wrong "
-      "and nothing reports it. SQLite: same divergence while the user trigger fires first; check_schema_drift() "
-      "reports triggers_out_of_order and repair_view() puts the maintenance triggers first",
-      todo=PG_SELF_UPDATE_TODO, sqlite=LIMITED, postgres=WRONG)
+      "PostgreSQL: exact via the re-entrant statement bracket (nested DML sets the bracket re-entry flag, stages "
+      "signed transition rows, and reconciles the net delta at the outermost closing trigger). SQLite: diverges "
+      "while the user trigger fires first; check_schema_drift() reports triggers_out_of_order and repair_view() "
+      "puts the maintenance triggers first",
+      sqlite=LIMITED, postgres=EXACT)
 def _after_updates_aggregated(ctx: Ctx) -> None:
     env = ctx.fresh(BASE_SCHEMA, [V_AGG], _base_seed())
     if ctx.family == "postgres":

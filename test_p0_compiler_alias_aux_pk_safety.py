@@ -159,7 +159,7 @@ class TestCompilerAliasAuxPkSafety(unittest.TestCase):
             plan = generate_materialized_view(
                 schema_sql, view_sql, dialect=dialect, ignore_limitations=(dialect == Dialect.MYSQL), accept_limitations=FLOAT_OPT_IN
             )
-            aux_ddls = [d for d in plan.auxiliary_table_ddls if "dist_" in d]
+            aux_ddls = [d for d in plan.auxiliary_table_ddls if "dist_" in d and "_stg_" not in d]
             self.assertEqual(len(aux_ddls), 2, f"expected 2 distinct aux tables: {plan.auxiliary_table_ddls}")
             int_aux = next(d for d in aux_ddls if "dc_int" in d)
             flt_aux = next(d for d in aux_ddls if "ds_float" in d)

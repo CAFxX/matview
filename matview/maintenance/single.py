@@ -14,7 +14,7 @@ from sqlglot.errors import SqlglotError
 from .. import key_collation
 from .._host import MixinHost
 from ..dialects.base import DialectBaseMixin
-from ..dialects.pg_statement import SIGN, PgAggregateSpec, PgDeltaSource
+from ..dialects.pg_statement import SIGN, PgAggregateSpec, PgDeltaSource, PgStatementBracket
 from ..engines import (
     AggFunc,
     Dialect,
@@ -1392,6 +1392,60 @@ class Tier1SingleMixin(MixinHost):
             expr_key_fn=_expr_key,
         )
 
+        pg_reconcile_ddl: Optional[str] = None
+        pg_reconcile_fn: Optional[str] = None
+        pg_bracket: Optional[PgStatementBracket] = None
+        if self.dialect == Dialect.POSTGRES:
+            wm_pk_col = self._watermark_pk_column()
+            stg_cols = self._pg_stage_cols_for_table(
+                self.view.base_table,
+                extra_cols=[wm_pk_col] if wm_pk_col else (),
+            )
+            stg_tbl, stg_ddl, stg_idx, stg_idx_ddl = self._pg_join_stage_table_ddls(
+                self.view.base_table, stg_cols
+            )
+            aux_ddls.append(stg_ddl)
+            aux_names.append(stg_tbl)
+            index_ddls.append(stg_idx_ddl)
+            index_names.append(stg_idx)
+
+            pg_spec, pg_source = self._pg_single_table_aggregate_spec_and_source(
+                mv_table=mv_table,
+                row_count_col=row_count_col,
+                col_nonnull_count_map=col_nonnull_count_map,
+                col_sum_map=col_sum_map,
+                col_sum2_map=col_sum2_map,
+                col_true_cnt_map=col_true_cnt_map,
+                distinct_aux_tables=distinct_aux_tables,
+                expr_key_fn=_expr_key,
+            )
+            pg_reconcile_fn = self._pg_reconcile_fn_name()
+            staged_sel = self._pg_staged_rows_select(stg_tbl)
+            reconcile_source = PgDeltaSource(
+                from_sql=lambda _signed, s=staged_sel: f"(\n        {s}\n        ) AS __mv_d",
+                sign=pg_source.sign,
+                where=pg_source.where,
+                keys=pg_source.keys,
+                values=pg_source.values,
+                extras=pg_source.extras,
+            )
+            reconcile_body = self._pg_aggregate_body(
+                pg_spec, [reconcile_source], "UPDATE", force_recompute_extremes=True
+            )
+            pg_reconcile_ddl = self._pg_reconcile_fn_ddl(
+                pg_reconcile_fn, mv_table, [stg_tbl], reconcile_body
+            )
+            pg_bracket = PgStatementBracket(
+                lock_table=mv_table,
+                source_bit=1,
+                reconcile_fn=pg_reconcile_fn,
+                stage_sqls=self._pg_stage_sqls_for_table(self.view.base_table, stg_tbl, stg_cols),
+                trunc_cleanup_sql=(
+                    f"DELETE FROM {stg_tbl} "
+                    f"WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_blk.__mv_bseq;"
+                ),
+            )
+
         trigger_ddls, trig_names, fn_names = self._build_tier1_triggers(
             view_name=view_name,
             mv_table=mv_table,
@@ -1404,7 +1458,11 @@ class Tier1SingleMixin(MixinHost):
             distinct_aux_tables=distinct_aux_tables,
             expr_key_fn=_expr_key,
             initial_populate_sqls=initial_populate_sqls,
+            pg_bracket=pg_bracket,
         )
+        if pg_reconcile_ddl and pg_reconcile_fn:
+            trigger_ddls = [pg_reconcile_ddl, *trigger_ddls]
+            fn_names = [pg_reconcile_fn, *fn_names]
 
         return MaterializedViewPlan(
             dialect=self.dialect,
@@ -3114,7 +3172,7 @@ class Tier1SingleMixin(MixinHost):
         return stmt
 
 
-    def _pg_single_table_aggregate_bodies(
+    def _pg_single_table_aggregate_spec_and_source(
         self,
         mv_table: str,
         row_count_col: str,
@@ -3124,8 +3182,8 @@ class Tier1SingleMixin(MixinHost):
         col_true_cnt_map: Dict[str, str],
         distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
         expr_key_fn: Callable[[SelectItem], str],
-    ) -> Dict[str, str]:
-        """PostgreSQL statement-level bodies of a single-table aggregate view."""
+    ) -> Tuple[PgAggregateSpec, PgDeltaSource]:
+        """Build the PostgreSQL ``(PgAggregateSpec, PgDeltaSource)`` for a single-table aggregate view."""
         rec = "__mv_d"
         work_items = list(self._working_select_items)
         grp_exprs = list(self._effective_group_by_exprs)
@@ -3185,6 +3243,30 @@ class Tier1SingleMixin(MixinHost):
                 processed_only=True,
                 limit_one=True,
             )[1:-1],
+        )
+        return spec, source
+
+    def _pg_single_table_aggregate_bodies(
+        self,
+        mv_table: str,
+        row_count_col: str,
+        col_nonnull_count_map: Dict[str, str],
+        col_sum_map: Dict[str, str],
+        col_sum2_map: Dict[str, str],
+        col_true_cnt_map: Dict[str, str],
+        distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
+        expr_key_fn: Callable[[SelectItem], str],
+    ) -> Dict[str, str]:
+        """PostgreSQL statement-level bodies of a single-table aggregate view."""
+        spec, source = self._pg_single_table_aggregate_spec_and_source(
+            mv_table=mv_table,
+            row_count_col=row_count_col,
+            col_nonnull_count_map=col_nonnull_count_map,
+            col_sum_map=col_sum_map,
+            col_sum2_map=col_sum2_map,
+            col_true_cnt_map=col_true_cnt_map,
+            distinct_aux_tables=distinct_aux_tables,
+            expr_key_fn=expr_key_fn,
         )
         return self._pg_aggregate_bodies(spec, [source], base_t=self.view.base_table)
 
@@ -3450,6 +3532,7 @@ class Tier1SingleMixin(MixinHost):
         distinct_aux_tables: Dict[str, Tuple[str, SelectItem, str]],
         expr_key_fn: Callable[[SelectItem], str],
         initial_populate_sqls: Optional[Sequence[str]] = None,
+        pg_bracket: Optional[PgStatementBracket] = None,
     ) -> Tuple[List[str], List[str], List[str]]:
         plus_new_stmts = self._build_plus_delta_statements(
             mv_table,
@@ -3599,5 +3682,6 @@ class Tier1SingleMixin(MixinHost):
             pg_ai_body=pg_ai_body,
             pg_ad_body=pg_ad_body,
             pg_au_body=pg_au_body,
+            pg_bracket=pg_bracket,
         )
 

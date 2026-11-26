@@ -1531,10 +1531,12 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         self.assertRegex(p_un.backing_table_ddl, r"\bdt TIMESTAMP\b")
         self.assertRegex(p_un.backing_table_ddl, r"\barr SMALLINT\[\]")
         self.assertRegex(p_un.backing_table_ddl, r"\bs BPCHAR\b")
-        trig_sql_un = "\n".join(p_un.trigger_ddls)
-        self.assertIn("CAST((__mv_d.d) AS TIMESTAMP)", trig_sql_un)
-        self.assertIn("CAST(('{1,2}') AS SMALLINT[])", trig_sql_un)
-        self.assertIn("CAST((__mv_d.vc20) AS BPCHAR)", trig_sql_un)
+        reconcile_sql_un = "\n".join(d for d in p_un.trigger_ddls if "_reconcile()" in d.splitlines()[0])
+        direct_trig_sql_un = "\n".join(d for d in p_un.trigger_ddls if "_reconcile()" not in d.splitlines()[0])
+        for label_un, sql_part in (("direct", direct_trig_sql_un), ("reconcile", reconcile_sql_un)):
+            self.assertIn("CAST((__mv_d.d) AS TIMESTAMP)", sql_part, label_un)
+            self.assertIn("CAST(('{1,2}') AS SMALLINT[])", sql_part, label_un)
+            self.assertIn("CAST((__mv_d.vc20) AS BPCHAR)", sql_part, label_un)
 
         # 3. CTE / derived-subquery UNION widening must not be short-circuited by branch-0 aliases,
         #    and UNION ALL GROUP BY must cast widened branch columns.

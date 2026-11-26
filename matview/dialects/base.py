@@ -4972,10 +4972,15 @@ class DialectBaseMixin(MixinHost):
                 if q_unq in quals_lower:
                     if tk.start > cursor:
                         out.append(expr[cursor:tk.start])
+                    q_actual = (
+                        '"' + actual_c.replace('"', '""') + '"'
+                        if self.dialect == Dialect.POSTGRES and actual_c != actual_c.strip()
+                        else self._q(actual_c)
+                    )
                     if record_prefix:
-                        out.append(f"{record_prefix}.{self._q(actual_c)}")
+                        out.append(f"{record_prefix}.{q_actual}")
                     else:
-                        out.append(f"{self._q(tk.text)}.{self._q(actual_c)}")
+                        out.append(f"{self._q(tk.text)}.{q_actual}")
                     cursor = toks[i + 2].end + 1
                     i += 3
                     continue
@@ -4991,12 +4996,17 @@ class DialectBaseMixin(MixinHost):
                     w_low = tk.text.lower()
                     if w_low in col_names_lower:
                         actual_c = col_names_lower[w_low]
+                        q_actual = (
+                            '"' + actual_c.replace('"', '""') + '"'
+                            if self.dialect == Dialect.POSTGRES and actual_c != actual_c.strip()
+                            else self._q(actual_c)
+                        )
                         if tk.start > cursor:
                             out.append(expr[cursor:tk.start])
                         if record_prefix:
-                            out.append(f"{record_prefix}.{self._q(actual_c)}")
+                            out.append(f"{record_prefix}.{q_actual}")
                         else:
-                            out.append(self._q(actual_c))
+                            out.append(q_actual)
                         cursor = tk.end + 1
                         i += 1
                         continue

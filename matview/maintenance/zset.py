@@ -11,7 +11,7 @@ import sqlglot.errors
 from sqlglot import exp as sqlglot_exp
 
 from .._host import MixinHost
-from ..dialects.pg_statement import SIGN, PgDeltaSource
+from ..dialects.pg_statement import SIGN, PgDeltaSource, PgStatementBracket
 from ..engines import (
     AggFunc,
     Dialect,
@@ -499,8 +499,95 @@ class Tier1ZSetMixin(MixinHost):
         trigger_ddls: List[str] = []
         trig_names: List[str] = []
         fn_names: List[str] = []
+        aux_ddls: List[str] = []
+        aux_names: List[str] = []
 
-        for base_t, b_list in by_table_branches.items():
+        pg_reconcile_fn: Optional[str] = None
+        pg_stg_info: Dict[str, Tuple[str, List[str]]] = {}
+        pg_trunc_cleanup = ""
+        pg_recompute_val_col_names: List[str] = []
+        pg_recompute_val_row_sql: Optional[str] = None
+        pg_surv_cond: Optional[str] = None
+        pg_adopt_cnt0: List[str] = []
+        pg_refresh_key_cols: List[str] = []
+        pg_keyed_reconcile_branches: List[
+            Tuple[
+                str,
+                str,
+                Sequence[str],
+                Sequence[str],
+                Optional[Tuple[str, str]],
+                Sequence[str],
+                Mapping[str, str],
+                Optional[str],
+                Optional[str],
+            ]
+        ] = []
+        pg_nonnative_uall_stmts: List[str] = []
+        pg_counted_reconcile_sources: List[Tuple[PgDeltaSource, Dict[str, str]]] = []
+
+        if self.dialect == Dialect.POSTGRES:
+            if op_type == "UNION ALL" and use_native_uall_pk:
+                pg_refresh_key_cols = [
+                    pk_c
+                    for pk_c, dt_i in zip(uall_pk_cols[1:], uall_pk_col_types)
+                    if self._pg_type_has_variable_numeric_scale(dt_i)
+                ]
+            elif op_type in ("UNION", "INTERSECT", "EXCEPT") and u_parts:
+                var_cols: List[str] = []
+                for c in user_columns:
+                    mc = merged_cols.get(c)
+                    if mc is not None:
+                        is_var = self._pg_type_has_variable_numeric_scale(mc.data_type)
+                    else:
+                        is_var = merged_ctx._pg_expr_has_variable_numeric_scale(self._q(c))
+                    if is_var:
+                        var_cols.append(c)
+                if var_cols:
+                    surv_src = "\n    UNION ALL\n".join(u_parts) if op_type == "UNION" else u_parts[0]
+                    pg_surv_cond = (
+                        f"{mv_table}.__mv_row_count > 0"
+                        if op_type == "UNION"
+                        else f"{mv_table}.__mv_cnt_0 > 0"
+                    )
+                    match_all = " AND ".join(
+                        f"__mv_u.{self._q(c)} IS NOT DISTINCT FROM {mv_table}.{self._q(c)}"
+                        for c in user_columns
+                    )
+                    sel_var = ", ".join(
+                        f"__mv_u.{self._q(c)} AS __mv_l{idx}" for idx, c in enumerate(var_cols)
+                    )
+                    pg_recompute_val_col_names = list(var_cols)
+                    pg_recompute_val_row_sql = (
+                        f"SELECT {sel_var} FROM (\n{surv_src}\n    ) AS __mv_u WHERE {match_all} LIMIT 1"
+                    )
+                    if op_type in ("INTERSECT", "EXCEPT"):
+                        pg_adopt_cnt0 = list(var_cols)
+
+            pg_reconcile_fn = self._pg_reconcile_fn_name()
+            for st_base_t in by_table_branches:
+                st_ts = self._schemas_lower[st_base_t.lower()]
+                extra_cols: List[str] = []
+                if op_type == "UNION ALL":
+                    st_pks = [c for c in st_ts.columns.values() if c.primary_key]
+                    extra_cols = (
+                        [c.name for c in st_pks]
+                        if self._table_pk_is_nonnull(st_pks)
+                        else list(st_ts.columns.keys())
+                    )
+                stg_cols = self._pg_stage_cols_for_table(st_base_t, extra_cols=extra_cols)
+                stg_tbl, stg_ddl, stg_idx, stg_idx_ddl = self._pg_join_stage_table_ddls(st_base_t, stg_cols)
+                pg_stg_info[st_base_t] = (stg_tbl, stg_cols)
+                aux_ddls.append(stg_ddl)
+                aux_names.append(stg_tbl)
+                index_ddls.append(stg_idx_ddl)
+                index_names.append(stg_idx)
+            pg_trunc_cleanup = "\n        ".join(
+                f"DELETE FROM {stg_tbl} WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_blk.__mv_bseq;"
+                for stg_tbl, _ in pg_stg_info.values()
+            )
+
+        for ref_idx, (base_t, b_list) in enumerate(by_table_branches.items()):
             ts = self._schemas_lower[base_t.lower()]
             ins_stmts: List[str] = []
             del_stmts: List[str] = []
@@ -727,49 +814,10 @@ class Tier1ZSetMixin(MixinHost):
             pg_ai_body: Optional[str] = None
             pg_ad_body: Optional[str] = None
             pg_au_body: Optional[str] = None
+            pg_bracket: Optional[PgStatementBracket] = None
 
             if self.dialect == Dialect.POSTGRES:
-                pg_recompute_val_col_names: List[str] = []
-                pg_recompute_val_row_sql: Optional[str] = None
-                pg_surv_cond: Optional[str] = None
-                pg_adopt_cnt0: List[str] = []
-                pg_refresh_key_cols: List[str] = []
-                if op_type == "UNION ALL" and use_native_uall_pk:
-                    pg_refresh_key_cols = [
-                        pk_c
-                        for pk_c, dt_i in zip(uall_pk_cols[1:], uall_pk_col_types)
-                        if self._pg_type_has_variable_numeric_scale(dt_i)
-                    ]
-                elif op_type in ("UNION", "INTERSECT", "EXCEPT") and u_parts:
-                    var_cols: List[str] = []
-                    for c in user_columns:
-                        mc = merged_cols.get(c)
-                        if mc is not None:
-                            is_var = self._pg_type_has_variable_numeric_scale(mc.data_type)
-                        else:
-                            is_var = merged_ctx._pg_expr_has_variable_numeric_scale(self._q(c))
-                        if is_var:
-                            var_cols.append(c)
-                    if var_cols:
-                        surv_src = "\n    UNION ALL\n".join(u_parts) if op_type == "UNION" else u_parts[0]
-                        pg_surv_cond = (
-                            f"{mv_table}.__mv_row_count > 0"
-                            if op_type == "UNION"
-                            else f"{mv_table}.__mv_cnt_0 > 0"
-                        )
-                        match_all = " AND ".join(
-                            f"__mv_u.{self._q(c)} IS NOT DISTINCT FROM {mv_table}.{self._q(c)}"
-                            for c in user_columns
-                        )
-                        sel_var = ", ".join(
-                            f"__mv_u.{self._q(c)} AS __mv_l{idx}" for idx, c in enumerate(var_cols)
-                        )
-                        pg_recompute_val_col_names = list(var_cols)
-                        pg_recompute_val_row_sql = (
-                            f"SELECT {sel_var} FROM (\n{surv_src}\n    ) AS __mv_u WHERE {match_all} LIMIT 1"
-                        )
-                        if op_type in ("INTERSECT", "EXCEPT"):
-                            pg_adopt_cnt0 = list(var_cols)
+                assert pg_reconcile_fn is not None
                 pg_bodies = self._pg_setop_bodies(
                     op_type,
                     b_list,
@@ -785,6 +833,116 @@ class Tier1ZSetMixin(MixinHost):
                     adopt_on_cnt0_cols=pg_adopt_cnt0,
                 )
                 pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
+
+                stg_tbl, stg_cols = pg_stg_info[base_t]
+                staged_sel = self._pg_staged_rows_select(stg_tbl)
+                rec = "__mv_d"
+                for b_idx, bs in b_list:
+                    b_ctx = self.with_ir(primary_schema=ts, view=bs)
+                    b_alias = bs.joins[0].alias if bs.joins else base_t
+                    b_where = self._rewrite_branch_expr(bs.where_clause, ts, b_alias, rec) if bs.where_clause else None
+                    b_vals: List[str] = []
+                    for col_i, it in enumerate(bs.select_items):
+                        val_expr = self._rewrite_branch_expr(it.raw_expr, ts, b_alias, rec)
+                        if col_i < len(merged_col_types) and self._pg_branch_expr_needs_cast(it, b_ctx, merged_col_types[col_i]):
+                            val_expr = self._pg_cast_expr_to_type(val_expr, merged_col_types[col_i])
+                        b_vals.append(val_expr)
+                    b_values = dict(zip(user_columns, b_vals))
+                    b_pk_defs = [c for c in ts.columns.values() if c.primary_key]
+                    b_pk_names = [c.name for c in b_pk_defs]
+                    if op_type == "UNION ALL":
+                        if use_native_uall_pk:
+                            pg_keyed_reconcile_branches.append((
+                                base_t,
+                                stg_tbl,
+                                b_pk_names,
+                                uall_pk_cols,
+                                ("__mv_branch_id", str(b_idx)),
+                                user_columns,
+                                b_values,
+                                b_where,
+                                None,
+                            ))
+                        elif self._table_pk_is_nonnull(b_pk_defs):
+                            pk_expr_d = self._projection_row_pk_expr(
+                                [f"'B{b_idx}'", *[f"{rec}.{self._pg_quote_raw_col(c)}" for c in b_pk_names]]
+                            )
+                            q_src_pks = [self._pg_quote_raw_col(c) for c in b_pk_names]
+                            stg_pks_subq = (
+                                f"SELECT {', '.join(f'{rec}.{c}' for c in q_src_pks)} "
+                                f"FROM {stg_tbl} AS {rec} "
+                                f"WHERE {rec}.__mv_tx = pg_catalog.txid_current() AND {rec}.__mv_seq = __mv_blk.__mv_bseq"
+                            )
+                            pg_nonnative_uall_stmts.append(
+                                f"DELETE FROM {mv_table}\n"
+                                f"    WHERE {mv_table}.__mv_pk IN (\n"
+                                f"        SELECT {pk_expr_d} FROM {stg_tbl} AS {rec}\n"
+                                f"        WHERE {rec}.__mv_tx = pg_catalog.txid_current() AND {rec}.__mv_seq = __mv_blk.__mv_bseq\n"
+                                f"    );"
+                            )
+                            src_refs = [f"{rec}.{c}" for c in q_src_pks]
+                            ins_where = self._pg_key_match(src_refs, stg_pks_subq)
+                            if b_where:
+                                ins_where = f"({ins_where}) AND ({b_where})"
+                            upd_set = ", ".join(
+                                [f"{self._q(c)} = EXCLUDED.{self._q(c)}" for c in user_columns]
+                                + ["__mv_row_count = 1"]
+                            )
+                            pg_nonnative_uall_stmts.append(
+                                f"INSERT INTO {mv_table} (__mv_pk, {', '.join(q_user_columns)}, __mv_row_count)\n"
+                                f"    SELECT {pk_expr_d}, {', '.join(b_vals)}, 1\n"
+                                f"    FROM {self._q(base_t)} AS {rec}\n"
+                                f"    WHERE {ins_where}\n"
+                                f"    ORDER BY {', '.join(src_refs)}\n"
+                                f"    ON CONFLICT (__mv_pk) DO UPDATE SET {upd_set};"
+                            )
+                        else:
+                            b_hash_cols = [
+                                c
+                                for c, c_def in ts.columns.items()
+                                if not (c_def.generated_virtual and not (c_def.generation_expr and c_def.generation_expr.strip()))
+                            ]
+                            pg_counted_reconcile_sources.append((
+                                PgDeltaSource(
+                                    from_sql=lambda _signed, s=staged_sel: f"(\n        {s}\n        ) AS __mv_d",
+                                    sign=f"{rec}.{SIGN}",
+                                    where=b_where,
+                                    keys=[self._projection_row_pk_expr([f"'B{b_idx}'", *[f"{rec}.{self._pg_quote_raw_col(c)}" for c in b_hash_cols]])],
+                                    values=b_values,
+                                ),
+                                {"__mv_row_count": "1"},
+                            ))
+                    elif op_type == "UNION":
+                        pg_counted_reconcile_sources.append((
+                            PgDeltaSource(
+                                from_sql=lambda _signed, s=staged_sel: f"(\n        {s}\n        ) AS __mv_d",
+                                sign=f"{rec}.{SIGN}",
+                                where=b_where,
+                                keys=[self._canonical_group_pk_expr(b_vals)],
+                                values=b_values,
+                            ),
+                            {"__mv_row_count": "1"},
+                        ))
+                    else:
+                        pg_counted_reconcile_sources.append((
+                            PgDeltaSource(
+                                from_sql=lambda _signed, s=staged_sel: f"(\n        {s}\n        ) AS __mv_d",
+                                sign=f"{rec}.{SIGN}",
+                                where=b_where,
+                                keys=[self._canonical_group_pk_expr(b_vals)],
+                                values=b_values,
+                            ),
+                            {"__mv_cnt_0": "1" if b_idx == 0 else "0", "__mv_cnt_1": "1" if b_idx == 1 else "0"},
+                        ))
+
+                src_bit = (1 << ref_idx) if ref_idx < 60 else ((1 << 60) | (1 << 61))
+                pg_bracket = PgStatementBracket(
+                    lock_table=mv_table,
+                    source_bit=src_bit,
+                    reconcile_fn=pg_reconcile_fn,
+                    stage_sqls=self._pg_stage_sqls_for_table(base_t, stg_tbl, stg_cols),
+                    trunc_cleanup_sql=pg_trunc_cleanup,
+                )
 
             uall_upd_keys: Optional[List[str]] = None
             if op_type == "UNION ALL":
@@ -808,10 +966,80 @@ class Tier1ZSetMixin(MixinHost):
                 pg_ai_body=pg_ai_body,
                 pg_ad_body=pg_ad_body,
                 pg_au_body=pg_au_body,
+                pg_bracket=pg_bracket,
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)
             fn_names.extend(f_ns)
+
+        if self.dialect == Dialect.POSTGRES and pg_reconcile_fn is not None:
+            reconcile_parts: List[str] = []
+            if op_type == "UNION ALL":
+                if use_native_uall_pk:
+                    reconcile_parts.append(
+                        self._pg_keyed_rows_reconcile_body(
+                            mv_table,
+                            pg_keyed_reconcile_branches,
+                            count_col="__mv_row_count",
+                            refresh_key_cols=pg_refresh_key_cols,
+                        )
+                    )
+                else:
+                    reconcile_parts.extend(pg_nonnative_uall_stmts)
+                    if pg_counted_reconcile_sources:
+                        reconcile_parts.append(
+                            self._pg_counted_rows_body(
+                                mv_table,
+                                "__mv_pk",
+                                user_columns,
+                                ["__mv_row_count"],
+                                pg_counted_reconcile_sources,
+                                f"{mv_table}.__mv_row_count <= 0",
+                                event="UPDATE",
+                                force_recompute_vals=True,
+                            )
+                        )
+            elif op_type == "UNION":
+                reconcile_parts.append(
+                    self._pg_counted_rows_body(
+                        mv_table,
+                        "__mv_pk",
+                        user_columns,
+                        ["__mv_row_count"],
+                        pg_counted_reconcile_sources,
+                        f"{mv_table}.__mv_row_count <= 0",
+                        event="UPDATE",
+                        recompute_val_col_names=pg_recompute_val_col_names,
+                        recompute_val_row_sql=pg_recompute_val_row_sql,
+                        surviving_cond=pg_surv_cond,
+                        force_recompute_vals=True,
+                    )
+                )
+            else:
+                reconcile_parts.append(
+                    self._pg_counted_rows_body(
+                        mv_table,
+                        "__mv_pk",
+                        user_columns,
+                        ["__mv_cnt_0", "__mv_cnt_1"],
+                        pg_counted_reconcile_sources,
+                        f"{mv_table}.__mv_cnt_0 <= 0 AND {mv_table}.__mv_cnt_1 <= 0",
+                        event="UPDATE",
+                        recompute_val_col_names=pg_recompute_val_col_names,
+                        recompute_val_row_sql=pg_recompute_val_row_sql,
+                        surviving_cond=pg_surv_cond,
+                        adopt_on_cnt0_cols=pg_adopt_cnt0,
+                        force_recompute_vals=True,
+                    )
+                )
+            reconcile_ddl = self._pg_reconcile_fn_ddl(
+                pg_reconcile_fn,
+                mv_table,
+                [st for st, _ in pg_stg_info.values()],
+                "\n".join(reconcile_parts),
+            )
+            trigger_ddls = [reconcile_ddl, *trigger_ddls]
+            fn_names = [pg_reconcile_fn, *fn_names]
 
         inc_spec = IncrementalBackfillSpec(
             mode="offset_batch",
@@ -823,7 +1051,8 @@ class Tier1ZSetMixin(MixinHost):
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=[],
+            auxiliary_table_ddls=aux_ddls,
+            auxiliary_table_names=aux_names,
             index_ddls=index_ddls,
             initial_populate_sqls=initial_populate_sqls,
             trigger_ddls=trigger_ddls,
@@ -1323,6 +1552,11 @@ class Tier1ZSetMixin(MixinHost):
         pg_ai_body: Optional[str] = None
         pg_ad_body: Optional[str] = None
         pg_au_body: Optional[str] = None
+        pg_bracket: Optional[PgStatementBracket] = None
+        pg_reconcile_ddl: Optional[str] = None
+        pg_reconcile_fn: Optional[str] = None
+        aux_ddls: List[str] = []
+        aux_names: List[str] = []
 
         trunc_stmts = [f"DELETE FROM {mv_table};"]
         if self.dialect == Dialect.POSTGRES:
@@ -1338,6 +1572,19 @@ class Tier1ZSetMixin(MixinHost):
             def _pg_from(signed: str) -> str:
                 return f"(\n        {signed}\n        ) AS {rec}"
 
+            extra_stg_cols: List[str] = list(
+                pk_names if uses_native_pk else pk_hash_cols  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
+            )
+            if wm_pk_col:
+                extra_stg_cols.append(wm_pk_col)
+            stg_cols = self._pg_stage_cols_for_table(base_t, extra_cols=extra_stg_cols)
+            stg_tbl, stg_ddl, stg_idx, stg_idx_ddl = self._pg_join_stage_table_ddls(base_t, stg_cols)
+            aux_ddls.append(stg_ddl)
+            aux_names.append(stg_tbl)
+            index_ddls.append(stg_idx_ddl)
+            index_names.append(stg_idx)
+
+            pg_reconcile_fn = self._pg_reconcile_fn_name()
             if uses_native_pk:
                 pk_col_lower = {c.lower() for c in mv_pk_cols}
                 for hid_col, src_col, _dt in hidden_pk_defs:
@@ -1366,6 +1613,21 @@ class Tier1ZSetMixin(MixinHost):
                     base_t=self.view.base_table,
                     refresh_key_cols=pg_refresh_pk,
                 )
+                reconcile_body = self._pg_keyed_rows_reconcile_body(
+                    mv_table,
+                    [(
+                        base_t,
+                        stg_tbl,
+                        pk_names,
+                        mv_pk_cols,
+                        None,
+                        value_cols,
+                        pg_values,
+                        pg_where,
+                        pg_wm,
+                    )],
+                    refresh_key_cols=pg_refresh_pk,
+                )
             else:
                 pg_bodies = self._pg_counted_rows_bodies(
                     mv_table,
@@ -1385,7 +1647,40 @@ class Tier1ZSetMixin(MixinHost):
                     f"{mv_table}.__mv_row_count <= 0",
                     base_t=self.view.base_table,
                 )
+                staged_sel = self._pg_staged_rows_select(stg_tbl)
+                reconcile_body = self._pg_counted_rows_body(
+                    mv_table,
+                    "__mv_pk",
+                    user_columns,
+                    ["__mv_row_count"],
+                    [(
+                        PgDeltaSource(
+                            from_sql=lambda _signed, s=staged_sel: f"(\n        {s}\n        ) AS __mv_d",
+                            sign=f"{rec}.{SIGN}",
+                            where=pg_where,
+                            keys=[self._projection_row_pk_expr([f"{rec}.{self._q(c)}" for c in pk_hash_cols])],  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
+                            values=pg_values,
+                        ),
+                        {"__mv_row_count": "1"},
+                    )],
+                    f"{mv_table}.__mv_row_count <= 0",
+                    event="UPDATE",
+                    force_recompute_vals=True,
+                )
             pg_ai_body, pg_au_body, pg_ad_body = pg_bodies["INSERT"], pg_bodies["UPDATE"], pg_bodies["DELETE"]
+            pg_reconcile_ddl = self._pg_reconcile_fn_ddl(
+                pg_reconcile_fn, mv_table, [stg_tbl], reconcile_body
+            )
+            pg_bracket = PgStatementBracket(
+                lock_table=mv_table,
+                source_bit=1,
+                reconcile_fn=pg_reconcile_fn,
+                stage_sqls=self._pg_stage_sqls_for_table(base_t, stg_tbl, stg_cols),
+                trunc_cleanup_sql=(
+                    f"DELETE FROM {stg_tbl} "
+                    f"WHERE __mv_tx = pg_catalog.txid_current() AND __mv_seq = __mv_blk.__mv_bseq;"
+                ),
+            )
             trunc_stmts = [f"DELETE FROM {mv_table};", initial_populate_sql]
 
         upd_key_cols = list(pk_names if uses_native_pk else pk_hash_cols)  # pyright: ignore[reportPossiblyUnboundVariable]  # bound in the non-native-PK branch at the same uses_native_pk guard
@@ -1410,7 +1705,11 @@ class Tier1ZSetMixin(MixinHost):
             pg_ai_body=pg_ai_body,
             pg_ad_body=pg_ad_body,
             pg_au_body=pg_au_body,
+            pg_bracket=pg_bracket,
         )
+        if pg_reconcile_ddl and pg_reconcile_fn:
+            trigger_ddls = [pg_reconcile_ddl, *trigger_ddls]
+            fn_names = [pg_reconcile_fn, *fn_names]
 
         if wm_pk_col and chunk_upsert_sql:
             inc_spec = IncrementalBackfillSpec(
@@ -1429,7 +1728,8 @@ class Tier1ZSetMixin(MixinHost):
             view_spec=self.view,
             backing_table_name=mv_table,
             backing_table_ddl=backing_table_ddl,
-            auxiliary_table_ddls=[],
+            auxiliary_table_ddls=aux_ddls,
+            auxiliary_table_names=aux_names,
             index_ddls=index_ddls,
             initial_populate_sqls=[initial_populate_sql],
             trigger_ddls=trigger_ddls,

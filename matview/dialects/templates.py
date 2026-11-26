@@ -188,24 +188,27 @@ FOR EACH STATEMENT EXECUTE FUNCTION {{ fn_name }}();""",
 RETURNS TRIGGER AS $$
 DECLARE
     __mv_guc pg_catalog.text := 'matview.s3_' || {{ lock_reg }}::pg_catalog.regclass::pg_catalog.oid::pg_catalog.text;
-    __mv_raw pg_catalog.text := COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0');
+    __mv_raw pg_catalog.text := COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0:0');
     __mv_d INT := pg_catalog.split_part(__mv_raw, ':', 1)::int;
     __mv_m BIGINT := pg_catalog.split_part(__mv_raw, ':', 2)::bigint;
     __mv_bseq INT := pg_catalog.split_part(__mv_raw, ':', 3)::int;
     __mv_tr INT := pg_catalog.split_part(__mv_raw, ':', 4)::int;
+    __mv_re INT := COALESCE(NULLIF(pg_catalog.split_part(__mv_raw, ':', 5), ''), '0')::int;
 BEGIN
     IF __mv_d = 0 THEN
         __mv_bseq := __mv_bseq + 1;
         __mv_m := {{ src_bit }}::bigint;
         __mv_tr := CASE WHEN TG_OP = 'TRUNCATE' THEN 1 ELSE 0 END;
+        __mv_re := 0;
     ELSE
         __mv_m := __mv_m | {{ src_bit }}::bigint;
+        __mv_re := GREATEST(__mv_re, 1);
         IF TG_OP = 'TRUNCATE' THEN
             __mv_tr := 1;
         END IF;
     END IF;
     __mv_d := __mv_d + 1;
-    PERFORM pg_catalog.set_config(__mv_guc, __mv_d::pg_catalog.text || ':' || __mv_m::pg_catalog.text || ':' || __mv_bseq::pg_catalog.text || ':' || __mv_tr::pg_catalog.text, true);
+    PERFORM pg_catalog.set_config(__mv_guc, __mv_d::pg_catalog.text || ':' || __mv_m::pg_catalog.text || ':' || __mv_bseq::pg_catalog.text || ':' || __mv_tr::pg_catalog.text || ':' || __mv_re::pg_catalog.text, true);
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
@@ -214,24 +217,31 @@ BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON {{ q_base_t }}
 FOR EACH STATEMENT EXECUTE FUNCTION {{ fn_name }}();""",
     "pg_bracketed_statement_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
 RETURNS TRIGGER AS $$
+<<__mv_blk>>
 DECLARE
     __mv_guc pg_catalog.text := 'matview.s3_' || {{ lock_reg }}::pg_catalog.regclass::pg_catalog.oid::pg_catalog.text;
-    __mv_raw pg_catalog.text := COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0');
+    __mv_raw pg_catalog.text := COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0:0');
     __mv_d INT := pg_catalog.split_part(__mv_raw, ':', 1)::int;
     __mv_m BIGINT := pg_catalog.split_part(__mv_raw, ':', 2)::bigint;
     __mv_bseq INT := pg_catalog.split_part(__mv_raw, ':', 3)::int;
     __mv_tr INT := pg_catalog.split_part(__mv_raw, ':', 4)::int;
+    __mv_re INT := COALESCE(NULLIF(pg_catalog.split_part(__mv_raw, ':', 5), ''), '0')::int;
     __mv_nd INT := GREATEST(__mv_d - 1, 0);
-    __mv_overlap BOOLEAN := (__mv_m & (__mv_m - 1)) <> 0;
+    __mv_dirty BOOLEAN := (__mv_re >= 2);
+    __mv_overlap BOOLEAN := ((__mv_m & (__mv_m - 1)) <> 0) OR (__mv_re >= 2) OR (__mv_re <> 0 AND __mv_nd > 0);
 BEGIN
     /* __MV_BRACKET_START__ */
     IF __mv_nd = 0 THEN
-        PERFORM pg_catalog.set_config(__mv_guc, '0:0:' || __mv_bseq::pg_catalog.text || ':0', true);
+        PERFORM pg_catalog.set_config(__mv_guc, '0:0:' || __mv_bseq::pg_catalog.text || ':0:0', true);
     ELSE
-        PERFORM pg_catalog.set_config(__mv_guc, __mv_nd::pg_catalog.text || ':' || __mv_m::pg_catalog.text || ':' || __mv_bseq::pg_catalog.text || ':' || __mv_tr::pg_catalog.text, true);
+        PERFORM pg_catalog.set_config(__mv_guc, __mv_nd::pg_catalog.text || ':' || __mv_m::pg_catalog.text || ':' || __mv_bseq::pg_catalog.text || ':' || __mv_tr::pg_catalog.text || ':' || __mv_re::pg_catalog.text, true);
     END IF;
     IF __mv_overlap OR __mv_tr <> 0 THEN
         IF __mv_tr = 0 AND EXISTS (SELECT 1 FROM {{ guard_table }}) THEN
+            __mv_dirty := TRUE;
+            IF __mv_nd > 0 AND __mv_re < 2 THEN
+                PERFORM pg_catalog.set_config(__mv_guc, __mv_nd::pg_catalog.text || ':' || __mv_m::pg_catalog.text || ':' || __mv_bseq::pg_catalog.text || ':' || __mv_tr::pg_catalog.text || ':2', true);
+            END IF;
 {% if repair_fence_sql | default('') %}
             {{ repair_fence_sql }}
 {% endif %}
@@ -250,7 +260,7 @@ BEGIN
 {% endif %}
             IF __mv_tr <> 0 THEN
                 {{ trunc_refresh_sql }}
-            ELSE
+            ELSIF __mv_dirty THEN
                 {{ overlap_close_sql }}
             END IF;
         END IF;
@@ -269,22 +279,24 @@ END;
 $$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
     "pg_bracketed_truncate_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
 RETURNS TRIGGER AS $$
+<<__mv_blk>>
 DECLARE
     __mv_guc pg_catalog.text := 'matview.s3_' || {{ lock_reg }}::pg_catalog.regclass::pg_catalog.oid::pg_catalog.text;
-    __mv_raw pg_catalog.text := COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0');
+    __mv_raw pg_catalog.text := COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0:0');
     __mv_d INT := pg_catalog.split_part(__mv_raw, ':', 1)::int;
     __mv_m BIGINT := pg_catalog.split_part(__mv_raw, ':', 2)::bigint;
     __mv_bseq INT := pg_catalog.split_part(__mv_raw, ':', 3)::int;
+    __mv_re INT := COALESCE(NULLIF(pg_catalog.split_part(__mv_raw, ':', 5), ''), '0')::int;
     __mv_nd INT := GREATEST(__mv_d - 1, 0);
 BEGIN
 {% if repair_fence_sql | default('') %}
     {{ repair_fence_sql }}
 {% endif %}
     IF __mv_nd = 0 THEN
-        PERFORM pg_catalog.set_config(__mv_guc, '0:0:' || __mv_bseq::pg_catalog.text || ':0', true);
+        PERFORM pg_catalog.set_config(__mv_guc, '0:0:' || __mv_bseq::pg_catalog.text || ':0:0', true);
         {{ trunc_refresh_sql }}
     ELSE
-        PERFORM pg_catalog.set_config(__mv_guc, __mv_nd::pg_catalog.text || ':' || __mv_m::pg_catalog.text || ':' || __mv_bseq::pg_catalog.text || ':1', true);
+        PERFORM pg_catalog.set_config(__mv_guc, __mv_nd::pg_catalog.text || ':' || __mv_m::pg_catalog.text || ':' || __mv_bseq::pg_catalog.text || ':1:' || __mv_re::pg_catalog.text, true);
 {% if overlap_lock_sql %}
         {{ overlap_lock_sql }}
 {% endif %}
@@ -294,9 +306,10 @@ END;
 $$ LANGUAGE plpgsql SET search_path FROM CURRENT;""",
     "pg_reconcile_function": """CREATE OR REPLACE FUNCTION {{ fn_name }}()
 RETURNS VOID AS $$
+<<__mv_blk>>
 DECLARE
     __mv_guc pg_catalog.text := 'matview.s3_' || {{ lock_reg }}::pg_catalog.regclass::pg_catalog.oid::pg_catalog.text;
-    __mv_bseq INT := pg_catalog.split_part(COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0'), ':', 3)::int;
+    __mv_bseq INT := pg_catalog.split_part(COALESCE(NULLIF(pg_catalog.current_setting(__mv_guc, true), ''), '0:0:0:0:0'), ':', 3)::int;
 BEGIN
     IF pg_catalog.txid_current_if_assigned() IS NULL THEN
         RETURN;

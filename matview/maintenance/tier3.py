@@ -10,6 +10,7 @@ import sqlglot
 from sqlglot import exp as sqlglot_exp
 
 from .._host import MixinHost
+from ..dialects.pg_statement import PgStatementBracket
 from ..engines import (
     AggFunc,
     Dialect,
@@ -266,7 +267,16 @@ class Tier3Mixin(MixinHost):
         # PostgreSQL: one per-view lock row serializes the full recompute;
         # the DELETE/INSERT run after it (fresh READ COMMITTED snapshot).
         pg_refresh = "\n".join([self._pg_view_lock_stmt(), *refresh_stmts]) if is_pg else None
-        for ref_table in self.view.referenced_tables:
+        pg_lock_tbl = self._pg_view_lock_table() if is_pg else ""
+        for ref_idx, ref_table in enumerate(self.view.referenced_tables):
+            pg_bracket = None
+            if is_pg:
+                src_bit = (1 << ref_idx) if ref_idx < 60 else ((1 << 60) | (1 << 61))
+                pg_bracket = PgStatementBracket(
+                    lock_table=pg_lock_tbl,
+                    source_bit=src_bit,
+                    overlap_refresh_sql=pg_refresh or "",
+                )
             t_ddls, t_ns, f_ns = self._emit_dialect_triggers_for_table(
                 view_name=view_name,
                 base_t=ref_table,
@@ -278,6 +288,7 @@ class Tier3Mixin(MixinHost):
                 pg_ai_body=pg_refresh,
                 pg_ad_body=pg_refresh,
                 pg_au_body=pg_refresh,
+                pg_bracket=pg_bracket,
             )
             trigger_ddls.extend(t_ddls)
             trig_names.extend(t_ns)

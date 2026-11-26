@@ -51,7 +51,13 @@ def _functions(plan: MaterializedViewPlan) -> dict:
 
 
 def _body(fn_ddl: str) -> str:
-    m = re.search(r"END IF;\n(.*)\n    RETURN NULL;\nEND;", fn_ddl, flags=re.S)
+    stripped = re.sub(
+        r"/\*\s*__MV_BRACKET_START__\s*\*/.*?/\*\s*__MV_BRACKET_END__\s*\*/",
+        "",
+        fn_ddl,
+        flags=re.S,
+    )
+    m = re.search(r"END IF;\n(.*)\n    RETURN NULL;\nEND;", stripped, flags=re.S)
     assert m, fn_ddl
     return m.group(1)
 
