@@ -603,6 +603,7 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
                     "CASE WHEN g = 1 THEN dt ELSE ts END AS k_dt, "
                     "CASE WHEN g = 1 THEN tm ELSE NULL END AS kn_tm, "
                     "CAST(tm AS TIME(5)) AS ct_tm, CAST(dt AS DATETIME(5)) AS ct_dt, "
+                    "CAST(s AS CHAR(191)) AS ct_ch191, "
                     "ABS(CAST(id AS UNSIGNED)) AS abs_u, "
                     "tm + tm6 AS add_tm, ABS(tm) AS abs_tm, -tm AS neg_tm FROM t;",
                     dialect=dialect,
@@ -666,6 +667,7 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
                 self.assertIn("kn_tm TIME(3)", p_expr.backing_table_ddl)
                 self.assertIn("ct_tm TIME(5)", p_expr.backing_table_ddl)
                 self.assertIn("ct_dt DATETIME(5)", p_expr.backing_table_ddl)
+                self.assertIn("ct_ch191 VARCHAR(191)", p_expr.backing_table_ddl)
                 self.assertIn("abs_u BIGINT UNSIGNED", p_expr.backing_table_ddl)
                 # Arithmetic / ABS / unary negation on TIME must never stay TIME.
                 self.assertNotIn("add_tm TIME", p_expr.backing_table_ddl)

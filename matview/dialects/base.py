@@ -2587,7 +2587,12 @@ class DialectBaseMixin(MixinHost):
                         m_frac = re.search(r"\.(\d+)", lit_s)
                         fsp_tl = min(len(m_frac.group(1)), 6) if m_frac else 0
                         return f"{base_tl}({fsp_tl})" if fsp_tl > 0 else base_tl
-                return canonical_type(target_sql)
+                canon = canonical_type(target_sql)
+                if self.dialect == Dialect.MYSQL and canon is not None and canon.startswith("CHAR("):
+                    # MySQL/MariaDB CAST(x AS CHAR(N)) / NCHAR(N) produces VARCHAR(N)
+                    # (wire type_code 253 = VAR_STRING), not fixed-length CHAR(N) (254).
+                    return "VARCHAR" + canon[4:]
+                return canon
             if kind == "Array" and self.dialect == Dialect.POSTGRES:
                 ch_nodes = list(node.expressions or ())
                 if not ch_nodes:
