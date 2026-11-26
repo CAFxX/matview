@@ -26,6 +26,7 @@ from .native_functions import (
     classify as classify_native_functions,
     items_with_unmodelled_calls,
     probe_result_types,
+    query_has_unmodelled_call,
     overridden_modelled_functions,
     unclassified_calls,
 )
@@ -2444,7 +2445,13 @@ class MaterializedViewManager:
         if (
             not spec.additional_views
             and not unclassified_calls(spec, self.dialect)
-            and (self.dialect == Dialect.SQLITE or not items_with_unmodelled_calls(spec, self.dialect))
+            and (
+                self.dialect == Dialect.SQLITE
+                or (
+                    not items_with_unmodelled_calls(spec, self.dialect)
+                    and not (self.dialect == Dialect.POSTGRES and query_has_unmodelled_call(spec, self.dialect))
+                )
+            )
         ):
             return self._with_server_result_types(spec) if spec.unclassified_functions else view
         is_mariadb = self.subdialect == EngineSubdialect.MARIADB
@@ -2464,7 +2471,11 @@ class MaterializedViewManager:
         additional = tuple(self._with_server_result_types(a) for a in spec.additional_views)
         if additional != spec.additional_views:
             spec = replace(spec, additional_views=additional)
-        if self.dialect == Dialect.SQLITE or not (items_with_unmodelled_calls(spec, self.dialect) or spec.unclassified_functions):
+        if self.dialect == Dialect.SQLITE or not (
+            items_with_unmodelled_calls(spec, self.dialect)
+            or spec.unclassified_functions
+            or (self.dialect == Dialect.POSTGRES and query_has_unmodelled_call(spec, self.dialect))
+        ):
             return spec
         types = probe_result_types(self.conn, self.dialect, spec.raw_select_sql)
         if not types:

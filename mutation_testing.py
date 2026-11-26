@@ -755,6 +755,26 @@ MUTANTS = (
             "test_postgres_row_and_pseudotype_outputs_refused_offline"
         ),
     ),
+    Mutant(
+        name="sql-frontend-unwrap-parens-strips-tuple",
+        source_path="matview/sql_frontend.py",
+        original="        if closes_at_end and not has_top_level_comma:",
+        replacement="        if closes_at_end:",
+        target_test=(
+            "test_native_result_types.PostgresPseudotypeOutputRefusalTests."
+            "test_postgres_row_and_pseudotype_outputs_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-setop-pseudotype-output-not-refused",
+        source_path="matview/dialects/postgres.py",
+        original="            if isinstance(q_node, sqlglot_exp.SetOperation):",
+        replacement="            if False and isinstance(q_node, sqlglot_exp.SetOperation):",
+        target_test=(
+            "test_native_result_types.PostgresPseudotypeOutputRefusalTests."
+            "test_postgres_row_and_pseudotype_outputs_refused_offline"
+        ),
+    ),
 )
 
 

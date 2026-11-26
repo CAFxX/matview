@@ -1588,6 +1588,11 @@ def test_unsupported_key_type_fails_closed(make_env) -> None:
         "v_intersect_rec",
         "v_except_rec",
         "v_cte_union_rec",
+        "v_dston_ord",
+        "v_dston_al",
+        "v_union_star_rec",
+        "v_values_union_rec",
+        "v_dist_star_cte",
         "v_dist_lag_rec",
     })
     for vd in complex_rec_views:

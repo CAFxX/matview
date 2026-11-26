@@ -56,6 +56,7 @@ class DialectBaseMixin(MixinHost):
     _PG_PSEUDOTYPE_BASE_NAMES: FrozenSet[str] = frozenset(
         {
             "RECORD",
+            "_RECORD",
             "VOID",
             "ANY",
             "ANYELEMENT",
@@ -74,6 +75,7 @@ class DialectBaseMixin(MixinHost):
             "TRIGGER",
             "EVENT_TRIGGER",
             "OPAQUE",
+            "PG_DDL_COMMAND",
             "LANGUAGE_HANDLER",
             "FDW_HANDLER",
             "TABLE_AM_HANDLER",
@@ -85,16 +87,29 @@ class DialectBaseMixin(MixinHost):
     @classmethod
     def _is_pg_pseudotype(cls, data_type: Optional[str]) -> bool:
         """True when ``data_type`` names a PostgreSQL pseudo-type (such as
-        ``record``, ``record[]``, or ``void``) that PostgreSQL forbids as a
-        table or view column."""
+        ``record``, ``record[]``, ``_record``, or ``void``) that PostgreSQL
+        forbids as a table or view column."""
         if not data_type:
             return False
         s = re.sub(r"\s+COLLATE\s+.*$", "", data_type.strip(), flags=re.IGNORECASE).strip()
         s = re.sub(r"(?:\[\])+$", "", s).strip()
+        # Strip optional pg_catalog. or "pg_catalog". schema prefix (quoted
+        # "PG_CATALOG" is a distinct schema, not the built-in catalog).
+        if s.startswith('"pg_catalog".'):
+            s = s[len('"pg_catalog".'):].strip()
+        else:
+            s = re.sub(r"^pg_catalog\.", "", s, flags=re.IGNORECASE).strip()
+        s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+        if s.startswith('"') and s.endswith('"') and len(s) >= 2:
+            inner = s[1:-1]
+            # Built-in PostgreSQL pseudo-types are all lowercase identifiers:
+            # `"record"` / `"any"` / `"void"` name the pseudo-type, whereas
+            # `"RECORD"` (uppercase quoted) is a distinct user identifier.
+            if '"' in inner or inner != inner.lower():
+                return False
+            return inner.upper() in cls._PG_PSEUDOTYPE_BASE_NAMES
         if '"' in s:
             return False
-        s = re.sub(r"^pg_catalog\.", "", s, flags=re.IGNORECASE).strip()
-        s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
         return s.upper() in cls._PG_PSEUDOTYPE_BASE_NAMES
 
     def _bounded_ident(self, prefix: str, stem: str, suffix: str = "", max_len: int = 62) -> str:
@@ -1573,6 +1588,8 @@ class DialectBaseMixin(MixinHost):
                 joins=br_joins,
                 referenced_tables=tuple(t.name for t in br_tables),
                 select_items=(),
+                native_scalar_types=self.view.native_scalar_types,
+                native_aggregates=self.view.native_aggregates,
             )
             return self.with_ir(primary_schema=ts_primary, view=br_view)
 
@@ -1628,7 +1645,7 @@ class DialectBaseMixin(MixinHost):
                     inner.sql(_sqlglot_dialect(self.dialect)), ident, dialect=self.dialect
                 )
                 if agg_item is not None and agg_item.agg_func is not None:
-                    return br_ctx._infer_expr_storage_type(agg_item)
+                    return br_ctx._infer_expr_storage_type_or_none(agg_item) or br_ctx._infer_expr_storage_type(agg_item)
                 c_arg = br_ctx._lookup_col_def(
                     inner.this.sql().strip() if isinstance(inner.this, sqlglot_exp.Expr) else None
                 )
@@ -1646,7 +1663,7 @@ class DialectBaseMixin(MixinHost):
                     inner.sql(_sqlglot_dialect(self.dialect)), ident, dialect=self.dialect
                 )
                 if agg_item is not None and agg_item.agg_func is not None:
-                    return br_ctx._infer_expr_storage_type(agg_item)
+                    return br_ctx._infer_expr_storage_type_or_none(agg_item) or br_ctx._infer_expr_storage_type(agg_item)
             if isinstance(inner, (sqlglot_exp.AggFunc, sqlglot_exp.Func, sqlglot_exp.Anonymous)):
                 fn_up = (inner.sql_name().upper() if hasattr(inner, "sql_name") else "") or inner.name.upper()
                 if fn_up in ("COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "BIT_AND", "BIT_OR", "BIT_XOR", "BITWISEANDAGG", "BITWISEORAGG", "BITWISEXORAGG", "BOOL_AND", "BOOL_OR", "LOGICALAND", "LOGICALOR"):
@@ -2313,7 +2330,7 @@ class DialectBaseMixin(MixinHost):
             if not known:
                 return None
             if any(value not in ranks for value in known):
-                if all(value == known[0] for value in known):
+                if all(value.lower() == known[0].lower() for value in known):
                     return known[0]
                 if self.dialect == Dialect.POSTGRES and all(
                     value in ("TEXT", "VARCHAR", "BPCHAR", "NAME") for value in known
@@ -2590,8 +2607,16 @@ class DialectBaseMixin(MixinHost):
                     return "BIGINT"
                 if inner_kind in ("PercentRank", "CumeDist"):
                     return "DOUBLE PRECISION"
-                if inner is not None and inner_kind in ("Lag", "Lead", "FirstValue", "LastValue", "NthValue"):
-                    base_t = infer(inner.this)
+                if inner is not None and (
+                    inner_kind in ("Lag", "Lead", "FirstValue", "LastValue", "NthValue", "AnyValue")
+                    or (inner_kind == "Anonymous" and inner.name.upper() == "ANY_VALUE")
+                ):
+                    arg_n = (
+                        inner.expressions[0]
+                        if inner_kind == "Anonymous" and inner.expressions
+                        else inner.this
+                    )
+                    base_t = infer(arg_n)
                     if inner_kind in ("Lag", "Lead"):
                         def_node = inner.args.get("default")
                         if def_node is not None and not isinstance(def_node, sqlglot_exp.Null):
@@ -2633,6 +2658,8 @@ class DialectBaseMixin(MixinHost):
                         m_frac = re.search(r"\.(\d+)", lit_s)
                         fsp_tl = min(len(m_frac.group(1)), 6) if m_frac else 0
                         return f"{base_tl}({fsp_tl})" if fsp_tl > 0 else base_tl
+                if target_sql.strip().upper() == "UNKNOWN":
+                    return None
                 canon = canonical_type(target_sql)
                 if self.dialect == Dialect.MYSQL and canon is not None and canon.startswith("CHAR("):
                     # MySQL/MariaDB CAST(x AS CHAR(N)) / NCHAR(N) produces VARCHAR(N)
@@ -2839,7 +2866,22 @@ class DialectBaseMixin(MixinHost):
                             node.sql(_sqlglot_dialect(self.dialect)), "__agg", dialect=self.dialect
                         )
                         if agg_item is not None and agg_item.agg_func is not None:
-                            return canonical_type(self._infer_expr_storage_type(agg_item))
+                            agg_t = (
+                                self._infer_expr_storage_type_or_none(agg_item)
+                                or self._infer_expr_storage_type(agg_item)
+                            )
+                            return canonical_type(agg_t)
+                if (
+                    self.dialect == Dialect.POSTGRES
+                    and isinstance(node, sqlglot_exp.Dot)
+                    and isinstance(node.expression, sqlglot_exp.Anonymous)
+                    and self.view.native_scalar_types
+                ):
+                    native_st = dict(self.view.native_scalar_types).get(
+                        f"{str(node.expression.name).upper()}/{len(node.expression.expressions)}"
+                    )
+                    if native_st is not None and self._is_pg_pseudotype(native_st):
+                        return canonical_type(native_st)
             if isinstance(node, sqlglot_exp.AggFunc) or (
                 kind == "Anonymous" and node.name.upper() in agg_fn_names
             ):
@@ -2851,10 +2893,33 @@ class DialectBaseMixin(MixinHost):
                 )
                 if agg_item is None or agg_item.agg_func is None:
                     return None
-                return canonical_type(self._infer_expr_storage_type(agg_item))
+                agg_t = (
+                    self._infer_expr_storage_type_or_none(agg_item)
+                    or self._infer_expr_storage_type(agg_item)
+                )
+                return canonical_type(agg_t)
             if self.dialect == Dialect.POSTGRES:
                 if kind == "Tuple":
                     return "RECORD"
+                if kind == "Subquery" and isinstance(node.this, sqlglot_exp.Select) and len(node.this.expressions or ()) == 1:
+                    sub_sel = node.this
+                    sub_proj = sub_sel.expressions[0]
+                    sub_inner = sub_proj.this if isinstance(sub_proj, sqlglot_exp.Alias) else sub_proj
+                    if isinstance(sub_inner, sqlglot_exp.Expr):
+                        infer_depth[0] += 1
+                        try:
+                            return infer(sub_inner)
+                        finally:
+                            infer_depth[0] -= 1
+                if kind == "Select" and len(node.expressions or ()) == 1:
+                    sub_proj = node.expressions[0]
+                    sub_inner = sub_proj.this if isinstance(sub_proj, sqlglot_exp.Alias) else sub_proj
+                    if isinstance(sub_inner, sqlglot_exp.Expr):
+                        infer_depth[0] += 1
+                        try:
+                            return infer(sub_inner)
+                        finally:
+                            infer_depth[0] -= 1
                 if (
                     kind == "Anonymous"
                     and node.name.upper() == "ROW"
@@ -2871,13 +2936,19 @@ class DialectBaseMixin(MixinHost):
                     kind == "Anonymous" and node.name.upper() in ("REGEXP_SPLIT_TO_ARRAY", "STRING_TO_ARRAY")
                 ):
                     return "TEXT[]"
-                if kind in ("ArrayConcat", "ArrayAppend", "ArrayRemove", "ArrayReplace") and node.this is not None:
+                if kind in ("ArrayConcat", "ArrayAppend", "ArrayPrepend", "ArrayRemove", "ArrayReplace") and node.this is not None:
                     arr_t = infer(node.this)
                     return arr_t if arr_t is not None and arr_t.endswith("[]") else None
                 if kind == "DPipe":
-                    # `a || b`: text when either operand is text (anynonarray || text and
-                    # text || anynonarray); bytea, array and jsonb concatenation stay unknown.
+                    # `a || b`: array concatenation preserves/merges the array type;
+                    # text concatenation returns TEXT; bytea/jsonb stay unknown.
                     l_t, r_t = infer(node.this), infer(node.expression)
+                    if l_t is not None and l_t.endswith("[]") and r_t is not None and r_t.endswith("[]"):
+                        return merge((l_t, r_t))
+                    if l_t is not None and l_t.endswith("[]") and r_t != "TEXT":
+                        return l_t
+                    if r_t is not None and r_t.endswith("[]") and l_t != "TEXT":
+                        return r_t
                     if l_t == "TEXT" or r_t == "TEXT":
                         return "TEXT"
                     return None
@@ -3794,12 +3865,15 @@ class DialectBaseMixin(MixinHost):
                         ):
                             continue
                 arm_t = b_ctx._infer_expr_storage_type_or_none(bi_item)
-                if arm_t is None and re.match(r"\s*ROW\s*\(", bi_item.raw_expr, flags=re.IGNORECASE):
-                    # Anonymous record arms are refused by the registration-time key-type probe
-                    # (`0A000`), which reports the precise reason.
-                    has_modelled_arm = True
-                    arm_t = "VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT"
-                elif arm_t is None and self._pg_explicit_cast_target(bi_item.raw_expr) is not None:
+                if self.dialect == Dialect.POSTGRES and self._is_pg_pseudotype(arm_t):
+                    assert arm_t is not None
+                    raise UnsupportedMaterializedViewError(
+                        f"PostgreSQL materialized view column {fb_it.alias!r} ({bi_item.raw_expr!r}) has pseudo-type "
+                        f"{arm_t.lower()}; PostgreSQL does not allow pseudo-type columns in tables or views. "
+                        f"Cast the expression to a named composite type (for example CAST(... AS my_type)) "
+                        f"or to TEXT."
+                    )
+                if arm_t is None and self._pg_explicit_cast_target(bi_item.raw_expr) is not None:
                     # `expr::some_type` has exactly the cast's target type, modelled or not.
                     has_modelled_arm = True
                     arm_t = self._pg_explicit_cast_target(bi_item.raw_expr) or "TEXT"
@@ -3894,7 +3968,10 @@ class DialectBaseMixin(MixinHost):
         agg_item = _parse_single_agg_expr(inner_sql, "__w", dialect=self.dialect)
         if agg_item is None or agg_item.agg_func is None:
             return None
-        result = self._infer_expr_storage_type(agg_item)
+        result_raw = self._infer_expr_storage_type_or_none(agg_item)
+        if result_raw is not None and self.dialect == Dialect.POSTGRES and self._is_pg_pseudotype(result_raw):
+            return result_raw
+        result = result_raw if result_raw is not None else ("VARCHAR(255)" if self.dialect == Dialect.MYSQL else "TEXT")
         if agg_item.agg_func in (AggFunc.MIN, AggFunc.MAX) and self.dialect == Dialect.MYSQL and result:
             string_type = self._mysql_window_minmax_string_type(result)
             if string_type is not None:
