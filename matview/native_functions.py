@@ -428,9 +428,15 @@ def probe_result_types(conn: Any, dialect: Dialect, select_sql: str) -> Dict[str
                         (r[0], f"{r[1]} COLLATE {r[2]}" if r[2] else r[1]) for r in cur.fetchall()
                     ]
                     cur.execute(f"DROP VIEW pg_temp.{name}")
-                except Exception:
+                except Exception as exc:
                     if savepoint:
                         cur.execute(f"ROLLBACK TO SAVEPOINT {name}")
+                    if getattr(exc, "pgcode", None) == "42P16" and "pseudo-type" in str(exc).lower():
+                        raise UnsupportedMaterializedViewError(
+                            f"PostgreSQL view output has a pseudo-type column ({str(exc).strip()}); "
+                            f"PostgreSQL does not allow pseudo-type columns in tables or views. "
+                            f"Cast the expression to a named composite type or to TEXT."
+                        ) from exc
                     raise
                 finally:
                     if savepoint:
@@ -456,6 +462,8 @@ def probe_result_types(conn: Any, dialect: Dialect, select_sql: str) -> Dict[str
             if typ is not None:
                 out[str(d[0]).lower()] = typ
         return out
+    except UnsupportedMaterializedViewError:
+        raise
     except Exception:
         return {}
 

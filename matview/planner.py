@@ -3099,6 +3099,8 @@ class PlannerMixin(MixinHost):
                         "supported (the output columns would be taken from the base tables, not from the set "
                         "operation); list the columns explicitly."
                     )
+        if self.dialect == Dialect.POSTGRES:
+            self._enforce_pg_no_pseudotype_outputs()
         if self.strategy == MaintenanceStrategy.ALGEBRAIC_DELTA:
             if self._alg_mode == "join":
                 raw = self._compile_tier1_join_algebraic()

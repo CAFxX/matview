@@ -17,6 +17,7 @@ from ..engines import (
     EngineSubdialect,
     EngineVersion,
     MaintenanceStrategy,
+    UnsupportedMaterializedViewError,
     _SIMPLE_IDENT_RE,
     _SQL_RESERVED_KEYWORDS,
     _sqlglot_dialect,
@@ -42,6 +43,51 @@ class PostgresDialectMixin(MixinHost):
         if self.dialect != Dialect.POSTGRES:
             return None
         return self._infer_ast_expr_storage_type(expr)
+
+    def _enforce_pg_no_pseudotype_outputs(self) -> None:
+        """Refuse PostgreSQL views whose output select items evaluate to a
+        pseudo-type (such as anonymous ``record`` from ``ROW(v, g)`` or
+        ``(v, g)``, ``record[]`` from ``ARRAY[ROW(...)]``, or ``void``).
+
+        PostgreSQL forbids pseudo-type columns in tables and views; silently
+        falling back to a ``TEXT`` backing column would change the result type
+        from ``record`` (OID 2249) to ``text`` (OID 25).
+        """
+        if self.dialect != Dialect.POSTGRES:
+            return
+
+        def _raise_for(alias: str, raw_expr: str, dt: str) -> None:
+            raise UnsupportedMaterializedViewError(
+                f"PostgreSQL materialized view column {alias!r} ({raw_expr!r}) has pseudo-type "
+                f"{dt.lower()}; PostgreSQL does not allow pseudo-type columns in tables or views. "
+                f"Cast the expression to a named composite type (for example CAST(... AS my_type)) "
+                f"or to TEXT."
+            )
+
+        for item in self.view.select_items:
+            inferred = self._infer_expr_storage_type_or_none(item)
+            if self._is_pg_pseudotype(inferred):
+                assert inferred is not None
+                _raise_for(item.alias, item.raw_expr, inferred)
+
+        if self.view.has_compound_set_op:
+            branches = self._parse_setop_branches()
+            if branches:
+                for _op, br_spec in branches:
+                    br_ctx = self.with_ir(
+                        primary_schema=self._schemas_lower.get(br_spec.base_table.lower()),
+                        view=br_spec,
+                    )
+                    for idx, br_item in enumerate(br_spec.select_items):
+                        br_dt = br_ctx._infer_expr_storage_type_or_none(br_item)
+                        if self._is_pg_pseudotype(br_dt):
+                            assert br_dt is not None
+                            out_alias = (
+                                self.view.select_items[idx].alias
+                                if idx < len(self.view.select_items)
+                                else br_item.alias
+                            )
+                            _raise_for(out_alias, br_item.raw_expr, br_dt)
 
 
 

@@ -868,9 +868,8 @@ class OfflineRoutingTests(unittest.TestCase):
             self.assertEqual(plan.strategy, expected, expr)
 
     def test_positional_group_key_is_not_an_aggregate(self) -> None:
-        # GROUP BY 1 groups by the call itself: not an opaque (aggregate) call
-        # (PostgreSQL then refuses the anonymous record key with 0A000).
-        plan = self._plan("postgres", "SELECT ROW(g, v) AS r, COUNT(*) AS n FROM t GROUP BY 1")
+        # GROUP BY 1 groups by the call itself: not an opaque (aggregate) call.
+        plan = self._plan("postgres", "SELECT ROW(g, v)::text AS r, COUNT(*) AS n FROM t GROUP BY 1")
         self.assertNotEqual(plan.strategy, T3)
         plan = self._plan("postgres", "SELECT g, CAST(app_udf(v) AS INT) AS r FROM t GROUP BY 1")
         self.assertEqual(plan.strategy, T3)

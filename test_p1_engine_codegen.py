@@ -2199,7 +2199,7 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             ),
             (
                 "mv_union",
-                "CREATE VIEW mv_union AS SELECT ROW(a, v) AS r FROM cp1 UNION SELECT ROW(b, w) AS r FROM cp2;",
+                "CREATE VIEW mv_union AS SELECT ROW(a, v)::pair_t AS r FROM cp1 UNION SELECT ROW(b, w)::pair_t AS r FROM cp2;",
                 ("AS __mv_v(__mv_c0)", "pg_typeof(q.__mv_c0)", ", true)"),
             ),
             (
@@ -2215,8 +2215,8 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             ),
             (
                 "mv_dston",
-                "CREATE VIEW mv_dston AS SELECT DISTINCT ON (1) ROW(a, v) AS r, id FROM cp1 ORDER BY 1, id;",
-                ("ROW(a, v)", ", true)"),
+                "CREATE VIEW mv_dston AS SELECT DISTINCT ON (1) ROW(a, v)::pair_t AS r, id FROM cp1 ORDER BY 1, id;",
+                ("CAST(ROW(a, v) AS pair_t)", ", true)"),
             ),
             (
                 "mv_named_win",
@@ -2230,8 +2230,8 @@ class TestNativeEngineCodegenExecution(unittest.TestCase):
             ),
             (
                 "mv_minmax",
-                "CREATE VIEW mv_minmax AS SELECT a, MIN(ROW(a, v)) AS m FROM cp1 GROUP BY a;",
-                ("ROW(a, v)", ", false)"),
+                "CREATE VIEW mv_minmax AS SELECT a, MIN(ROW(a, v)::pair_t)::TEXT AS m FROM cp1 GROUP BY a;",
+                ("CAST(ROW(a, v) AS pair_t)", ", false)"),
             ),
         ]
         for vname, view_sql, expected_fragments in cases:
