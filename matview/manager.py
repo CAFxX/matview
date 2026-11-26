@@ -144,7 +144,11 @@ from .sql_frontend import (
 #     keyless FK tables, partitioned tables, and TIMESTAMP(n) identity checks.
 # 22: PostgreSQL representation-tie refresh for set operations, DISTINCT, and
 #     GROUP BY on ctid-moving UPDATEs and different-representation INSERTs.
-MATVIEW_GENERATOR_VERSION = "22"
+# 23: PostgreSQL json_agg/array_agg materialization: default function output
+#     column names, positional Tier 2/3 derived-table column bindings, exact
+#     array/json expression/window/CTE/collation typing, and ROW(...)::text
+#     ordering for non-btree offset-batch backfill columns.
+MATVIEW_GENERATOR_VERSION = "23"
 
 
 def _definition_digest(select_sql: str) -> str:

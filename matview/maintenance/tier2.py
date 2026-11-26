@@ -773,6 +773,7 @@ class Tier2Mixin(MixinHost):
         q_target_cols = [self._q(c) for c in target_cols]
         cols_csv = ", ".join(q_target_cols)
         src_cols_csv = ", ".join(f"__mv_src.{self._q(c)}" for c in target_cols)
+        pg_alias_list = f" ({cols_csv})" if self.dialect == Dialect.POSTGRES else ""
 
         pred_mv_old = self._group_scope_predicate_for_table(
             base_t, group_mv_cols, mv_table, "OLD"
@@ -785,7 +786,7 @@ class Tier2Mixin(MixinHost):
         full_refresh = [
             f"DELETE FROM {mv_table};",
             f"INSERT INTO {mv_table} ({cols_csv})\n"
-            f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src;",
+            f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src{pg_alias_list};",
         ]
 
         if pred_mv_old and pred_mv_new:
@@ -825,19 +826,19 @@ class Tier2Mixin(MixinHost):
                 ins_stmts = [
                     f"DELETE FROM {mv_table} WHERE {pred_mv_new};",
                     f"INSERT INTO {mv_table} ({cols_csv})\n"
-                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src{pg_alias_list}\n"
                     f"    WHERE {pred_src_new};",
                 ]
                 del_stmts = [
                     f"DELETE FROM {mv_table} WHERE {pred_mv_old};",
                     f"INSERT INTO {mv_table} ({cols_csv})\n"
-                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src{pg_alias_list}\n"
                     f"    WHERE {pred_src_old};",
                 ]
                 upd_coalesced_stmts = [
                     f"DELETE FROM {mv_table} WHERE ({pred_mv_old}) OR ({pred_mv_new});",
                     f"INSERT INTO {mv_table} ({cols_csv})\n"
-                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src{pg_alias_list}\n"
                     f"    WHERE ({pred_src_old}) OR ({pred_src_new});",
                 ]
             upd_old_stmts = []
@@ -1116,7 +1117,7 @@ class Tier2Mixin(MixinHost):
             else:
                 stmts.append(
                     f"INSERT INTO {mv_table} ({cols_csv})\n"
-                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src\n"
+                    f"    SELECT {src_cols_csv} FROM (\n{source_query_sql}\n    ) AS __mv_src ({cols_csv})\n"
                     f"    WHERE {match(src_lhs_out)};"
                 )
         return "\n".join(stmts)
@@ -1291,16 +1292,20 @@ class Tier2Mixin(MixinHost):
 
         q_target_cols = [self._q(c) for c in target_cols]
         cols_csv = ", ".join(q_target_cols)
+        pg_alias_list = f" ({cols_csv})" if self.dialect == Dialect.POSTGRES else ""
         initial_populate_sql = (
             f"INSERT INTO {mv_table} ({cols_csv})\n"
-            f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init;"
+            f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init{pg_alias_list};"
         )
-        ord_t2 = ", ".join(str(k) for k in range(1, len(target_cols) + 1))
+        ord_t2 = ", ".join(
+            self._pg_offset_order_expr(c, col_types_by_lower.get(c.lower(), ""), k)
+            for k, c in enumerate(target_cols, start=1)
+        )
         inc_spec = IncrementalBackfillSpec(
             mode="offset_batch",
             offset_insert_template=(
                 f"INSERT INTO {mv_table} ({cols_csv})\n"
-                f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init\n"
+                f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init{pg_alias_list}\n"
                 f"ORDER BY {ord_t2}\n"
                 f"LIMIT ? OFFSET ?;"
             ),
@@ -1338,7 +1343,7 @@ class Tier2Mixin(MixinHost):
             full_refresh_t2 = [
                 f"DELETE FROM {mv_table};",
                 f"INSERT INTO {mv_table} ({cols_csv})\n"
-                f"    SELECT {src_cols_csv_t2} FROM (\n{source_query_sql}\n    ) AS __mv_src;",
+                f"    SELECT {src_cols_csv_t2} FROM (\n{source_query_sql}\n    ) AS __mv_src{pg_alias_list};",
             ]
             reconcile_body = self._pg_group_scoped_body_for_signed(
                 ref_t,

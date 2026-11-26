@@ -1264,13 +1264,21 @@ def introspect_database_schemas(
     catalog_table = f"{object_prefix}catalog" if object_prefix else "matview_catalog"
 
     if _can_use_sqlalchemy_inspector(conn):
-        schemas = introspect_schemas_with_sqlalchemy(
-            conn,
-            dialect=dialect,
-            object_prefix=object_prefix,
-        )
-        schemas.pop(catalog_table, None)
-        return schemas
+        try:
+            schemas = introspect_schemas_with_sqlalchemy(
+                conn,
+                dialect=dialect,
+                object_prefix=object_prefix,
+            )
+            schemas.pop(catalog_table, None)
+            return schemas
+        except TypeError:
+            # SQLAlchemy's PostgreSQL reflection parses column-collation metadata
+            # via json_build_object(); raw psycopg2 connections with a custom JSON
+            # loader returning str raise TypeError here. Fall back cleanly to
+            # direct DB-API pg_catalog introspection when a DB-API cursor exists.
+            if dialect != Dialect.POSTGRES or not hasattr(conn, "cursor"):
+                raise
 
     if dialect == Dialect.SQLITE:
         schemas = introspect_sqlite_schemas(conn, object_prefix=object_prefix)
@@ -1347,18 +1355,24 @@ def introspect_database_schemas(
             # unlike information_schema.referential_constraints) and fail closed
             # rather than silently swallowing FK metadata query errors.
             fk_by_table: Dict[str, List[str]] = {}
+            fk_tables_pg: Set[str] = set()
             cur.execute(
                 """
-                SELECT c.relname, con.confdeltype, con.confupdtype
+                SELECT c.relname, con.confdeltype, con.confupdtype, rc.relname
                 FROM pg_catalog.pg_constraint con
                 JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                LEFT JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid
+                LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace
                 WHERE con.contype = 'f'
-                  AND n.nspname = current_schema()
+                  AND (n.nspname = current_schema() OR rn.nspname = current_schema())
                 """
             )
             for fk_r in (cur.fetchall() or []):
                 t_low = str(fk_r[0]).lower()
+                fk_tables_pg.add(t_low)
+                if len(fk_r) > 3 and fk_r[3]:
+                    fk_tables_pg.add(str(fk_r[3]).lower())
                 del_r = _norm_pg_fk_action(fk_r[1])
                 upd_r = _norm_pg_fk_action(fk_r[2])
                 acts = fk_by_table.setdefault(t_low, [])
@@ -1375,7 +1389,8 @@ def introspect_database_schemas(
             pg_gen_cols = _pg_introspect_generated_columns(conn)
             cur.execute(
                 """
-                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.character_maximum_length
+                SELECT c.table_name, c.column_name, c.data_type, c.is_nullable,
+                       c.character_maximum_length, c.numeric_precision, c.numeric_scale
                 FROM information_schema.columns c
                 JOIN information_schema.tables t
                   ON c.table_schema = t.table_schema AND c.table_name = t.table_name
@@ -1395,6 +1410,8 @@ def introspect_database_schemas(
                     row[3],
                     row[4],
                 )
+                num_prec = row[5] if len(row) > 5 else None
+                num_scale = row[6] if len(row) > 6 else None
                 if t_name == catalog_table or (
                     object_prefix and t_name.startswith(object_prefix)
                 ):
@@ -1408,6 +1425,13 @@ def introspect_database_schemas(
                         dt_up = f"VARCHAR({int(char_len)})"
                     elif dt_up == "CHARACTER VARYING":
                         dt_up = "VARCHAR"
+                    elif dt_up in ("CHARACTER", "CHAR") and char_len:
+                        dt_up = f"CHAR({int(char_len)})"
+                    elif dt_up in ("NUMERIC", "DECIMAL") and num_prec is not None:
+                        if num_scale is not None:
+                            dt_up = f"NUMERIC({int(num_prec)}, {int(num_scale)})"
+                        else:
+                            dt_up = f"NUMERIC({int(num_prec)})"
                     elif dt_up == "BIT" and char_len:
                         dt_up = f"BIT({int(char_len)})"
                     elif dt_up == "BIT VARYING" and char_len:
@@ -1432,6 +1456,7 @@ def introspect_database_schemas(
                     fk_cascade_actions=tuple(sorted(fk_by_table.get(t_name.lower(), ()))),
                     indexes=tuple(pg_idx_by_table.get(t_name.lower(), ())),
                     pk_columns=tuple(pk_order_by_table.get(t_name.lower(), ())),
+                    has_foreign_keys=(t_name.lower() in fk_tables_pg),
                 )
             return schemas
         # MySQL / MariaDB

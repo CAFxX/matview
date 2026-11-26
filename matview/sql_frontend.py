@@ -2119,6 +2119,108 @@ def _contains_aggregate_call(
     return False
 
 
+_PG_NON_FN_HEADS = frozenset({
+    "cast",
+    "case",
+    "exists",
+    "trim",
+    "position",
+    "overlay",
+    "substring",
+    "row",
+    "array",
+})
+
+
+def _pg_default_function_col_name(node: sqlglot_exp.Expr, raw_expr: str) -> Optional[str]:
+    """Return PostgreSQL's default output column name (FigureColname) for an
+    unaliased function call such as ``json_agg(x)`` or ``array_agg(x ORDER BY id)``."""
+    cur: Any = node
+    while True:
+        if isinstance(
+            cur,
+            (
+                sqlglot_exp.Paren,
+                sqlglot_exp.Filter,
+                sqlglot_exp.WithinGroup,
+                sqlglot_exp.Window,
+                sqlglot_exp.Collate,
+                sqlglot_exp.Bracket,
+            ),
+        ):
+            cur = cur.this
+            continue
+        if isinstance(cur, sqlglot_exp.Cast):
+            cur = cur.this
+            continue
+        # Schema-qualified calls with FILTER / WITHIN GROUP (e.g.
+        # `pg_catalog.json_agg(x) FILTER (WHERE ...)`) parse as
+        # Column(this=Filter(...), table=Identifier('pg_catalog')).
+        if (
+            isinstance(cur, sqlglot_exp.Column)
+            and not isinstance(cur.this, sqlglot_exp.Identifier)
+            and isinstance(cur.this, sqlglot_exp.Expr)
+        ):
+            cur = cur.this
+            continue
+        if isinstance(cur, sqlglot_exp.Dot) and isinstance(cur.expression, sqlglot_exp.Expr):
+            cur = cur.expression
+            continue
+        break
+    if isinstance(cur, sqlglot_exp.Column) and isinstance(cur.this, sqlglot_exp.Identifier) and cur.name:
+        return cur.name
+    if not isinstance(cur, sqlglot_exp.Func):
+        return None
+    # Reject binary/predicate/operator nodes that inherit from sqlglot_exp.Func
+    # (e.g. JSONExtract `->`, RegexpLike `~`, ArrayOverlaps `&&`, ArrayContainsAll `@>`).
+    if isinstance(
+        cur,
+        (
+            sqlglot_exp.Binary,
+            sqlglot_exp.Predicate,
+            sqlglot_exp.Cast,
+            sqlglot_exp.TryCast,
+            sqlglot_exp.Case,
+            sqlglot_exp.Exists,
+            sqlglot_exp.Array,
+        ),
+    ):
+        return None
+    try:
+        toks = _tokenize_sql(_unwrap_outer_parens(raw_expr, dialect=Dialect.POSTGRES), read="postgres")
+    except sqlglot.errors.SqlglotError:
+        toks = []
+    if isinstance(cur, sqlglot_exp.Extract):
+        if toks and toks[0].text.lower() == "date_part":
+            return "date_part"
+        return None
+    # Scan past any leading `schema.` qualifier to the function identifier token
+    # immediately preceding `(`. Using sqlglot's tokenizer skips leading comments
+    # and preserves case for quoted identifiers like `"MyAgg"(x)`.
+    fn_tok = None
+    i = 0
+    while i < len(toks) and toks[i].token_type == SQLGlotTokenType.L_PAREN:
+        i += 1
+    if i + 2 < len(toks) and toks[i + 1].token_type == SQLGlotTokenType.DOT and toks[i + 2].text != "(":
+        if i + 3 < len(toks) and toks[i + 3].token_type == SQLGlotTokenType.L_PAREN:
+            fn_tok = toks[i + 2]
+    elif i + 1 < len(toks) and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN:
+        fn_tok = toks[i]
+    if fn_tok is not None:
+        raw_tok = raw_expr[fn_tok.start : fn_tok.end + 1] if 0 <= fn_tok.start <= fn_tok.end < len(raw_expr) else ""
+        if len(raw_tok) >= 2 and raw_tok[0] == '"' and raw_tok[-1] == '"':
+            unq = raw_tok[1:-1].replace('""', '"')
+            return unq if unq else None
+        fn_low = fn_tok.text.lower()
+        if fn_low in _PG_NON_FN_HEADS:
+            return None
+        if re.fullmatch(r"[a-z_][a-z0-9_$]*", fn_low):
+            return fn_low
+    if isinstance(cur, sqlglot_exp.Anonymous) and cur.name:
+        return cur.name.lower()
+    return None
+
+
 def _parse_select_item(
     raw_item: str,
     idx: int,
@@ -2146,10 +2248,15 @@ def _parse_select_item(
     else:
         inner_node = proj_ast
         expr = s
-        if isinstance(inner_node, sqlglot_exp.Column) and not isinstance(inner_node.this, sqlglot_exp.Star):
+        if isinstance(inner_node, sqlglot_exp.Column) and isinstance(inner_node.this, sqlglot_exp.Identifier) and inner_node.name:
             alias = inner_node.name
         else:
-            alias = f"col_{idx}"
+            pg_fn_alias = (
+                _pg_default_function_col_name(inner_node, expr)
+                if dialect == Dialect.POSTGRES and isinstance(inner_node, sqlglot_exp.Expr)
+                else None
+            )
+            alias = pg_fn_alias if pg_fn_alias else f"col_{idx}"
 
     parsed_agg = _parse_single_agg_expr(expr, alias, dialect=dialect)
     if parsed_agg is not None:
@@ -2166,7 +2273,7 @@ def _parse_select_item(
 
     src_col = (
         inner_node.name
-        if isinstance(inner_node, sqlglot_exp.Column) and not isinstance(inner_node.this, sqlglot_exp.Star)
+        if isinstance(inner_node, sqlglot_exp.Column) and isinstance(inner_node.this, sqlglot_exp.Identifier) and inner_node.name
         else None
     )
     return SelectItem(
@@ -3160,6 +3267,36 @@ def _parse_single_create_view_stmt(
         _parse_select_item(raw_p, idx, dialect=dialect)
         for idx, raw_p in enumerate(raw_proj_items)
     ]
+    if dialect == Dialect.POSTGRES and len(select_items) > 1:
+        # Avoid colliding backing-table column names when an unaliased
+        # PostgreSQL function call shares its default name with an explicit
+        # alias, a base column, or another unaliased call in the SELECT list.
+        is_unaliased_fn_flags = [
+            (
+                it.source_col is None
+                and raw_p.strip() == it.raw_expr.strip()
+                and it.alias != f"col_{idx}"
+            )
+            for idx, (raw_p, it) in enumerate(zip(raw_proj_items, select_items))
+        ]
+        reserved: Set[str] = {
+            it.alias.lower()
+            for it, is_u in zip(select_items, is_unaliased_fn_flags)
+            if not is_u
+        }
+        seen_aliases: Set[str] = set()
+        deduped_items: List[SelectItem] = []
+        for idx, (it, is_u) in enumerate(zip(select_items, is_unaliased_fn_flags)):
+            al_low = it.alias.lower()
+            if is_u and (al_low in seen_aliases or al_low in reserved):
+                cand_k = idx
+                while f"col_{cand_k}" in seen_aliases or f"col_{cand_k}" in reserved:
+                    cand_k += 1
+                it = replace(it, alias=f"col_{cand_k}")
+                al_low = it.alias.lower()
+            seen_aliases.add(al_low)
+            deduped_items.append(it)
+        select_items = deduped_items
 
     from_clause = _slice_fb_clause(from_tok_i)
     where_raw = _slice_fb_clause(where_tok_i)

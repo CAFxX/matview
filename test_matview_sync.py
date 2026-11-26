@@ -916,6 +916,14 @@ def _transpile_pg_expr_to_sqlite(sql: str) -> str:
     # order; SQLite has no ctid (and visits a table in rowid order).
     s = re.sub(r"\s+ORDER\s+BY\s+(?:[A-Za-z0-9_]+|\"[^\"]+\")\.ctid\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+WITH\s*\([^)]*fillfactor[^)]*\)", "", s, flags=re.IGNORECASE)
+    # SQLite does not support PostgreSQL derived-table column alias lists
+    # (`AS __mv_init (c1, c2)` / `AS __mv_src (c1, c2)`).
+    s = re.sub(
+        r'\bAS\s+(__mv_(?:init|src))\s*\((?:[^()"]+|"(?:""|[^"])*")+\)',
+        r"AS \1",
+        s,
+        flags=re.IGNORECASE,
+    )
     s = re.sub(
         r"\bFROM\s+generate_series\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s+AS\s+([A-Za-z0-9_]+)\b",
         r"FROM (WITH RECURSIVE __mv_gs(\3) AS (SELECT \1 UNION ALL SELECT \3 + 1 FROM __mv_gs WHERE \3 < \2) SELECT \3 FROM __mv_gs) AS \3",

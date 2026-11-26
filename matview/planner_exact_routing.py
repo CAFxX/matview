@@ -851,6 +851,24 @@ class ExactAggregateRoutingMixin(MixinHost):
         while isinstance(node, (sqlglot_exp.Paren, sqlglot_exp.Filter)):
             # AGG(...) FILTER (WHERE ...) has the aggregate's type.
             node = node.this
+        if (
+            self.dialect == Dialect.POSTGRES
+            and isinstance(node, sqlglot_exp.Column)
+            and not isinstance(node.this, sqlglot_exp.Identifier)
+            and isinstance(node.this, sqlglot_exp.Expr)
+            and (node.table or "").lower() == "pg_catalog"
+        ):
+            node = node.this
+            while isinstance(node, (sqlglot_exp.Paren, sqlglot_exp.Filter)):
+                node = node.this
+        if (
+            self.dialect == Dialect.POSTGRES
+            and isinstance(node, sqlglot_exp.Dot)
+            and isinstance(node.this, (sqlglot_exp.Identifier, sqlglot_exp.Column))
+            and node.this.name.lower() == "pg_catalog"
+            and isinstance(node.expression, sqlglot_exp.Expr)
+        ):
+            node = node.expression
         if node is None:
             return None
         if isinstance(node, sqlglot_exp.Cast):
@@ -862,15 +880,49 @@ class ExactAggregateRoutingMixin(MixinHost):
             self.dialect == Dialect.POSTGRES
             and isinstance(node, sqlglot_exp.Coalesce)
             and isinstance(node.this, sqlglot_exp.Expr)
-            and all(
-                isinstance(e, sqlglot_exp.Null) or (isinstance(e, sqlglot_exp.Literal) and e.is_string)
-                for e in node.expressions
-            )
         ):
-            # PostgreSQL: an untyped literal fallback adopts the first
-            # argument's type. Other fallbacks resolve a common type that is
-            # not modelled here.
-            return self._routed_expr_storage_type(node.this, allow_aggregate=allow_aggregate)
+            # PostgreSQL: untyped string literals and NULLs adopt the common type
+            # of the typed arguments; all typed arguments must resolve to the same
+            # canonical type (e.g. COALESCE(NULL, json_agg(x), '[]'::json) -> JSON).
+            def _norm_pg_t(dt_s: str) -> str:
+                s_c = re.sub(r"\s+COLLATE\s+.*$", "", dt_s, flags=re.IGNORECASE).strip().upper()
+                return {
+                    "INT": "INTEGER",
+                    "INT4": "INTEGER",
+                    "INT2": "SMALLINT",
+                    "INT8": "BIGINT",
+                    "FLOAT4": "REAL",
+                    "FLOAT8": "DOUBLE PRECISION",
+                    "BOOL": "BOOLEAN",
+                    "DECIMAL": "NUMERIC",
+                    "DEC": "NUMERIC",
+                    "INT[]": "INTEGER[]",
+                    "INT4[]": "INTEGER[]",
+                }.get(s_c, s_c)
+
+            resolved_args: List[str] = []
+            ok_all = True
+            for e in [node.this, *list(node.expressions or ())]:
+                if not isinstance(e, sqlglot_exp.Expr):
+                    continue
+                if isinstance(e, sqlglot_exp.Null) or (isinstance(e, sqlglot_exp.Literal) and e.is_string):
+                    continue
+                et = self._routed_expr_storage_type(e, allow_aggregate=allow_aggregate)
+                if et is None:
+                    e_sql = e.sql(dialect="postgres")
+                    c_def = self._lookup_col_def(e_sql)
+                    if c_def is not None:
+                        et = self._normalize_dialect_type(c_def.data_type)
+                    else:
+                        et = self._infer_ast_expr_storage_type(e_sql)
+                if et is None:
+                    ok_all = False
+                    break
+                resolved_args.append(et)
+            if ok_all and resolved_args:
+                norms = {_norm_pg_t(t) for t in resolved_args}
+                if len(norms) == 1:
+                    return resolved_args[0]
         if isinstance(node, sqlglot_exp.Case):
             results = [i.args.get("true") for i in node.args.get("ifs") or ()] + [node.args.get("default")]
             types = {
@@ -912,6 +964,14 @@ class ExactAggregateRoutingMixin(MixinHost):
         return arg_t
 
     def _aggregate_call_storage_type(self, call: sqlglot_exp.Expr) -> Optional[str]:
+        if (
+            self.dialect == Dialect.POSTGRES
+            and isinstance(call, sqlglot_exp.Dot)
+            and isinstance(call.this, (sqlglot_exp.Identifier, sqlglot_exp.Column))
+            and call.this.name.lower() == "pg_catalog"
+            and isinstance(call.expression, sqlglot_exp.Expr)
+        ):
+            call = call.expression
         name = call_name(call, _sqlglot_dialect(self.dialect))
         native = dict(self.view.native_aggregates)
         if isinstance(call, sqlglot_exp.Anonymous) and name in native:
@@ -984,7 +1044,18 @@ class ExactAggregateRoutingMixin(MixinHost):
             arg_t = self._arg_storage_type(first)
             if not arg_t:
                 return None
-            return arg_t if arg_t.endswith("[]") else arg_t + "[]"
+            arr_t = arg_t if arg_t.endswith("[]") else arg_t + "[]"
+            if first is not None and self._pg_type_supports_collation(arr_t):
+                elem_node: Optional[sqlglot_exp.Expr] = first
+                while isinstance(elem_node, (sqlglot_exp.Paren, sqlglot_exp.Order, sqlglot_exp.Ordered, sqlglot_exp.Distinct)):
+                    exprs = elem_node.expressions if isinstance(elem_node, sqlglot_exp.Distinct) else [elem_node.this]
+                    nxt = exprs[0] if exprs else None
+                    elem_node = nxt if isinstance(nxt, sqlglot_exp.Expr) else None
+                if elem_node is not None:
+                    coll = self._infer_pg_expr_collation(elem_node.sql(dialect="postgres"))
+                    if coll:
+                        arr_t = f"{arr_t}{coll}"
+            return arr_t
         return None
 
 
