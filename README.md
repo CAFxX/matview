@@ -270,12 +270,13 @@ grep -c "CREATE TRIGGER" install.sql
 ```
 
 ```text output
-9
+11
 ```
 
-(On PostgreSQL: four statement-level maintenance triggers, the read-only
-trigger of the reader view, and the same four inside the `DO` block that
-installs them on every partition.)
+(On PostgreSQL: five statement-level maintenance triggers — the `BEFORE`
+bracket trigger plus the four `AFTER` triggers — the read-only trigger of the
+reader view, and the same five inside the `DO` block that installs them on
+every partition.)
 
 ```sh no-run
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f install.sql
