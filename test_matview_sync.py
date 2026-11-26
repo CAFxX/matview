@@ -2504,15 +2504,17 @@ class TranspiledConnectionAdapter:
             # lookup (PRECEDES placement): the emulation keeps no trigger
             # order, so report none.
             return [], 0
+        if "INFORMATION_SCHEMA.PARTITIONS" in s_up:
+            return [], 0
         if "INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS" in s_up:
             schemas = introspect_sqlite_schemas(self._sq_conn)
             rows = []
             for t_name, ts in schemas.items():
                 for act in ts.fk_cascade_actions:
                     if act.startswith("ON DELETE "):
-                        rows.append((t_name, act[len("ON DELETE ") :], "NO ACTION"))
+                        rows.append(("main", t_name, "main", "", act[len("ON DELETE ") :], "NO ACTION", "main"))
                     elif act.startswith("ON UPDATE "):
-                        rows.append((t_name, "NO ACTION", act[len("ON UPDATE ") :]))
+                        rows.append(("main", t_name, "main", "", "NO ACTION", act[len("ON UPDATE ") :], "main"))
             return rows, len(rows)
         if "PG_CATALOG.PG_CONSTRAINT" in s_up:
             schemas = introspect_sqlite_schemas(self._sq_conn)
@@ -2844,8 +2846,7 @@ class TranspiledConnectionAdapter:
                 # trigger quirk and SQLite no locking reads, so drop the guard
                 # and its END IF (the one closing just before the outer guard's).
                 m_ign = re.search(
-                    r"IF\s+[^\n]*?NOT\s+EXISTS\s*\(SELECT\s+1\s+FROM\s+\S+\s+AS\s+__mv_cur\s+WHERE\s+[^\n]*?"
-                    r"LOCK\s+IN\s+SHARE\s+MODE\)\)?\s+THEN\s*",
+                    r"IF\s+[^\n]*?\bAS\s+__mv_cur\b[^\n]*?LOCK\s+IN\s+SHARE\s+MODE[^\n]*?\s+THEN\s*",
                     body,
                     flags=re.I,
                 )

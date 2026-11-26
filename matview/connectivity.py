@@ -1454,14 +1454,24 @@ def introspect_database_schemas(
             """
         )
         for fk_r in (cur.fetchall() or []):
-            c_schema_low = _dec(fk_r[0]).lower()
-            t_low = _dec(fk_r[1]).lower()
-            u_schema_low = _dec(fk_r[2]).lower()
-            ref_low = _dec(fk_r[3]).lower()
-            del_r = _dec(fk_r[4]).upper()
-            upd_r = _dec(fk_r[5]).upper()
-            cur_db_low = _dec(fk_r[6]).lower()
-            if c_schema_low == cur_db_low and t_low:
+            if len(fk_r) >= 7:
+                c_schema_low = _dec(fk_r[0]).lower()
+                t_low = _dec(fk_r[1]).lower()
+                u_schema_low = _dec(fk_r[2]).lower()
+                ref_low = _dec(fk_r[3]).lower()
+                del_r = _dec(fk_r[4]).upper()
+                upd_r = _dec(fk_r[5]).upper()
+                cur_db_low = _dec(fk_r[6]).lower()
+                is_local_child = (c_schema_low == cur_db_low)
+                is_local_parent = (u_schema_low == cur_db_low)
+            else:
+                t_low = _dec(fk_r[0]).lower()
+                ref_low = ""
+                del_r = _dec(fk_r[1]).upper() if len(fk_r) > 1 else ""
+                upd_r = _dec(fk_r[2]).upper() if len(fk_r) > 2 else ""
+                is_local_child = True
+                is_local_parent = False
+            if is_local_child and t_low:
                 fk_tables_my.add(t_low)
                 acts = fk_by_table_my.setdefault(t_low, [])
                 if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
@@ -1472,7 +1482,7 @@ def introspect_database_schemas(
                     a_str = f"ON UPDATE {upd_r}"
                     if a_str not in acts:
                         acts.append(a_str)
-            if u_schema_low == cur_db_low and ref_low:
+            if is_local_parent and ref_low:
                 fk_tables_my.add(ref_low)
 
         partitioned_tables_my: Set[str] = set()
