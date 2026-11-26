@@ -59,6 +59,7 @@ from matview_sync import (
     Dialect,
     EngineLimitationError,
     EngineLimitationWarning,
+    MaintenanceStrategy,
     MaterializedViewManager,
     UnsupportedMaterializedViewError,
     generate_materialized_view,
@@ -723,11 +724,13 @@ class NativeInterleavings(_ExactCase):
         fx = _Fixture(engine, dsn, tt)
         sessions: List[Any] = []
         try:
-            t = fx.table("race", f"id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amt {col_type}", group_index="grp")
+            coll = " COLLATE utf8mb4_bin" if engine == Dialect.MYSQL else ""
+            t = fx.table("race", f"id BIGINT PRIMARY KEY, grp VARCHAR(16){coll} NOT NULL, amt {col_type}", group_index="grp")
             fx.conn.cursor().executemany(f"INSERT INTO {t} (id, grp, amt) VALUES (%s, %s, %s)", FLOAT_SEED)
             fx.conn.commit()
             live = self.VIEW.format(t=t)
             plan = fx.register(live)
+            self.assertNotEqual(plan.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
             s1, s2, monitor = fx.session(), fx.session(), fx.session()
             sessions = [s1, s2, monitor]
             for s in (s1, s2):
@@ -867,11 +870,12 @@ class NativeMysqlPrelock(_ExactCase):
         fx = _Fixture(Dialect.MYSQL, dsn)
         sessions: List[Any] = []
         try:
-            t = fx.table("pl", "id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amt DOUBLE", group_index="grp")
+            t = fx.table("pl", "id BIGINT PRIMARY KEY, grp VARCHAR(16) COLLATE utf8mb4_bin NOT NULL, amt DOUBLE", group_index="grp")
             fx.conn.cursor().executemany(f"INSERT INTO {t} VALUES (%s, %s, %s)", [(1, "G1", 0.1), (2, "G2", 0.2)])
             fx.conn.commit()
             live = f"SELECT grp, COUNT(*) AS c, SUM(amt) AS s, AVG(amt) AS a FROM {t} GROUP BY grp"
             plan = fx.register(live)
+            self.assertNotEqual(plan.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
             s1, s2, monitor = fx.session(), fx.session(), fx.session()
             sessions = [s1, s2, monitor]
             sid1, sid2 = _session_id(Dialect.MYSQL, s1), _session_id(Dialect.MYSQL, s2)
@@ -961,8 +965,10 @@ class NativeBackfill(_ExactCase):
     def _run(self, engine: Dialect, dsn: str, col_type: str) -> None:
         fx = _Fixture(engine, dsn)
         writer = monitor = None
+        helper_thread: Optional[threading.Thread] = None
         try:
-            t = fx.table("bfw", f"id BIGINT PRIMARY KEY, grp VARCHAR(16) NOT NULL, amt {col_type}", group_index="grp")
+            coll = " COLLATE utf8mb4_bin" if engine == Dialect.MYSQL else ""
+            t = fx.table("bfw", f"id BIGINT PRIMARY KEY, grp VARCHAR(16){coll} NOT NULL, amt {col_type}", group_index="grp")
             fx.conn.cursor().executemany(
                 f"INSERT INTO {t} (id, grp, amt) VALUES (%s, %s, %s)",
                 [(i, "G", (0.1 * i) if i % 3 else 1e7 * (-1) ** i) for i in range(1, 13)],
@@ -971,6 +977,7 @@ class NativeBackfill(_ExactCase):
             backfill_sid = _session_id(engine, fx.conn)
             live = f"SELECT grp, COUNT(*) AS c, SUM(amt) AS s, AVG(amt) AS a, STDDEV_SAMP(amt) AS ss FROM {t} GROUP BY grp"
             plan = fx.register(live, populate=False)
+            self.assertNotEqual(plan.strategy, MaintenanceStrategy.ATOMIC_QUERY_SYNC)
             writer, monitor = fx.session(), fx.session()
             writer_sid = _session_id(engine, writer)
             interleaved = threading.Event()
@@ -986,6 +993,7 @@ class NativeBackfill(_ExactCase):
                     writer.commit()
 
             def on_progress(batch_idx: int, _done: int) -> None:
+                nonlocal helper_thread
                 if batch_idx != 2:
                     return
                 # A writer above the backfill range updates the group row and
@@ -993,14 +1001,19 @@ class NativeBackfill(_ExactCase):
                 writer.cursor().execute(
                     f"INSERT INTO {t} (id, grp, amt) VALUES (%s, %s, %s)", (10_000, "G", 0.3)
                 )
-                threading.Thread(target=commit_when_chunk_waits, daemon=True).start()
+                helper_thread = threading.Thread(target=commit_when_chunk_waits, daemon=True)
+                helper_thread.start()
 
             fx.manager.backfill_incrementally(plan, batch_size=4, on_progress=on_progress, snapshot_isolation=False)
+            if helper_thread is not None:
+                helper_thread.join(timeout=10)
             if helper_errors:
                 raise helper_errors[0]
             self.assertTrue(interleaved.is_set())
             self.assertViewExact(fx.conn, plan, live, f"{engine.value} {col_type} backfill+writer")
         finally:
+            if helper_thread is not None and helper_thread.is_alive():
+                helper_thread.join(timeout=5)
             for s in (writer, monitor):
                 if s is not None:
                     try:
@@ -1357,7 +1370,8 @@ class NativeWindowExactTypes(_ExactCase):
             with self.subTest(engine=engine.value):
                 fx = _Fixture(engine, dsn)
                 try:
-                    t = fx.table("w", "id INT PRIMARY KEY, team VARCHAR(10), score INT, n NUMERIC(10,2), b BIGINT")
+                    coll = " COLLATE utf8mb4_bin" if engine == Dialect.MYSQL else ""
+                    t = fx.table("w", f"id INT PRIMARY KEY, team VARCHAR(10){coll}, score INT, n NUMERIC(10,2), b BIGINT")
                     cur = fx.conn.cursor()
                     cur.execute(
                         f"INSERT INTO {t} VALUES (1,'a',50,1.25,9007199254740993),(2,'a',80,2.5,1),"
@@ -1390,9 +1404,10 @@ class NativeWindowExactTypes(_ExactCase):
             with self.subTest(engine=engine.value):
                 fx = _Fixture(engine, dsn)
                 try:
+                    coll = " COLLATE utf8mb4_bin" if engine == Dialect.MYSQL else ""
                     t = fx.table(
                         "we",
-                        "id INT PRIMARY KEY, team VARCHAR(10), score INT, n NUMERIC(10, 2), dt DATE",
+                        f"id INT PRIMARY KEY, team VARCHAR(10){coll}, score INT, n NUMERIC(10, 2), dt DATE",
                     )
                     cur = fx.conn.cursor()
                     cur.execute(

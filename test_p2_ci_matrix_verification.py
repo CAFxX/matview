@@ -988,15 +988,67 @@ LIVE_JOB_NON_LIVE_MODULES: Dict[str, str] = {
 }
 
 
-def _job_run_text(workflow: Dict[str, Any], job_id: str) -> str:
+def _strip_shell_comments(run_script: str) -> str:
+    """Drop `#` shell comments (outside quotes) so commented-out invocations do
+    not satisfy workflow command inventories."""
+    out_lines: List[str] = []
+    for line in run_script.splitlines():
+        in_sq = False
+        in_dq = False
+        esc = False
+        cut = len(line)
+        for idx, ch in enumerate(line):
+            if esc:
+                esc = False
+                continue
+            if ch == "\\" and not in_sq:
+                esc = True
+                continue
+            if ch == "'" and not in_dq:
+                in_sq = not in_sq
+            elif ch == '"' and not in_sq:
+                in_dq = not in_dq
+            elif ch == "#" and not in_sq and not in_dq and (idx == 0 or line[idx - 1].isspace()):
+                cut = idx
+                break
+        out_lines.append(line[:cut])
+    return "\n".join(out_lines)
+
+
+def _job_run_text(
+    workflow: Dict[str, Any],
+    job_id: str,
+    *,
+    required_env: Optional[str] = None,
+) -> str:
     job = (workflow.get("jobs") or {}).get(job_id)
     if not isinstance(job, dict):
         return ""
-    return "\n".join(
-        str(step.get("run", ""))
-        for step in job.get("steps") or []
-        if isinstance(step, dict)
-    )
+    wf_env = workflow.get("env") if isinstance(workflow.get("env"), dict) else {}
+    job_env = job.get("env") if isinstance(job.get("env"), dict) else {}
+    parts: List[str] = []
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        cond = str(step.get("if") or "").lower()
+        if "failure()" in cond or "cancelled()" in cond:
+            continue
+        raw_run = str(step.get("run", ""))
+        if not raw_run:
+            continue
+        clean_run = _strip_shell_comments(raw_run)
+        if required_env is not None:
+            step_env = step.get("env") if isinstance(step.get("env"), dict) else {}
+            has_env = (
+                required_env in wf_env
+                or required_env in job_env
+                or required_env in step_env
+                or bool(re.search(rf"(?:^|\s){re.escape(required_env)}=", clean_run, flags=re.MULTILINE))
+            )
+            if not has_env:
+                continue
+        parts.append(clean_run)
+    return "\n".join(parts)
 
 
 def _module_in_commands(rel: str, commands: str) -> bool:
@@ -1004,9 +1056,16 @@ def _module_in_commands(rel: str, commands: str) -> bool:
     return bool(re.search(rf"(?<![\w/.-]){re.escape(rel)}\b|-m unittest\b[^\n]*\b{re.escape(module)}\b", commands))
 
 
-def _live_engine_requirements(path: Path) -> Tuple[bool, bool, bool]:
+_SQLITE_COMPAT_DRIVER_MODULES = frozenset({"apsw", "sqlcipher3", "libsql", "libsql_experimental"})
+_SHARED_NATIVE_ENGINE_HELPER_MODULES = frozenset(
+    {"test_avg_concurrent_maintenance", "test_native_statistical_aggregates"}
+)
+
+
+def _live_engine_requirements(path: Path) -> Tuple[bool, bool, bool, bool]:
     """Inspect a test file's AST (excluding docstrings) to determine whether it
-    contains live PostgreSQL, live MySQL/MariaDB, or SQLite-compat tests."""
+    contains live PostgreSQL, live MySQL/MariaDB, SQLite-compat env-driven, or
+    direct SQLite-compat driver-import tests."""
     import ast
 
     source = path.read_text(encoding="utf-8")
@@ -1024,40 +1083,70 @@ def _live_engine_requirements(path: Path) -> Tuple[bool, bool, bool]:
                 docstring_nodes.add(id(body[0].value))
 
     consts: set[str] = set()
-    imports_bulk_targets = False
+    bulk_aliases: set[str] = set()
+    native_helper_aliases: set[str] = set()
+    uses_shared_pg_my = False
+    uses_sc_driver = False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                bound = alias.asname or top
+                if top == "test_native_bulk_statements":
+                    bulk_aliases.add(bound)
+                if top in _SHARED_NATIVE_ENGINE_HELPER_MODULES:
+                    native_helper_aliases.add(bound)
+                if top in _SQLITE_COMPAT_DRIVER_MODULES:
+                    uses_sc_driver = True
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top = node.module.split(".")[0]
+            if top == "test_native_bulk_statements":
+                if any(alias.name in ("TARGETS", "_targets", "*") for alias in node.names):
+                    uses_shared_pg_my = True
+            if top in _SHARED_NATIVE_ENGINE_HELPER_MODULES:
+                if any(alias.name in ("_native_engines", "*") for alias in node.names):
+                    uses_shared_pg_my = True
+            if top in _SQLITE_COMPAT_DRIVER_MODULES:
+                uses_sc_driver = True
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstring_nodes:
             if node.value in ("POSTGRES_DSN", "MYSQL_DSN", "SQLITE_COMPAT_ENGINE"):
                 consts.add(node.value)
-        elif isinstance(node, ast.ImportFrom) and node.module == "test_native_bulk_statements":
-            if any(alias.name == "TARGETS" for alias in node.names):
-                imports_bulk_targets = True
-        elif isinstance(node, ast.Attribute) and node.attr == "TARGETS":
-            if isinstance(node.value, ast.Name) and node.value.id in ("test_native_bulk_statements", "h"):
-                imports_bulk_targets = True
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id in bulk_aliases and node.attr in ("TARGETS", "_targets"):
+                uses_shared_pg_my = True
+            if node.value.id in native_helper_aliases and node.attr == "_native_engines":
+                uses_shared_pg_my = True
 
-    uses_pg = "POSTGRES_DSN" in consts or imports_bulk_targets
-    uses_my = "MYSQL_DSN" in consts or imports_bulk_targets
-    uses_sc = "SQLITE_COMPAT_ENGINE" in consts
-    return uses_pg, uses_my, uses_sc
+    uses_pg = "POSTGRES_DSN" in consts or uses_shared_pg_my
+    uses_my = "MYSQL_DSN" in consts or uses_shared_pg_my
+    uses_sc_env = "SQLITE_COMPAT_ENGINE" in consts
+    return uses_pg, uses_my, uses_sc_env, uses_sc_driver
 
 
 def live_job_module_errors(
     workflows: Dict[str, Dict[str, Any]],
     root: Path = REPO_ROOT,
+    *,
+    non_live_modules: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Verify every test module with live PostgreSQL, MySQL/MariaDB, or
-    SQLite-compat tests is executed by the matching live CI job(s) in ci.yml,
-    and that mysql and mysql-compat execute the same live test modules."""
+    SQLite-compat tests is executed by the matching live CI job(s) in ci.yml
+    with the required engine environment variable, and that mysql and
+    mysql-compat execute the same live test modules."""
     ci = workflows.get("ci.yml") or {}
-    pg_cmds = _job_run_text(ci, "postgres")
-    my_cmds = _job_run_text(ci, "mysql")
-    mc_cmds = _job_run_text(ci, "mysql-compat")
-    sc_cmds = _job_run_text(ci, "sqlite-compat")
+    pg_cmds = _job_run_text(ci, "postgres", required_env="POSTGRES_DSN")
+    my_cmds = _job_run_text(ci, "mysql", required_env="MYSQL_DSN")
+    mc_cmds = _job_run_text(ci, "mysql-compat", required_env="MYSQL_DSN")
+    sc_env_cmds = _job_run_text(ci, "sqlite-compat", required_env="SQLITE_COMPAT_ENGINE")
+    sc_any_cmds = _job_run_text(ci, "sqlite-compat")
 
+    allowlist = LIVE_JOB_NON_LIVE_MODULES if non_live_modules is None else non_live_modules
     errors: List[str] = []
-    if root == REPO_ROOT:
-        for rel in sorted(LIVE_JOB_NON_LIVE_MODULES):
+    if root == REPO_ROOT or non_live_modules is not None:
+        for rel in sorted(allowlist):
             if not (root / rel).exists():
                 errors.append(f"LIVE_JOB_NON_LIVE_MODULES references missing file {rel!r}")
 
@@ -1069,17 +1158,19 @@ def live_job_module_errors(
             mysql_modules.add(rel)
         if _module_in_commands(rel, mc_cmds):
             mariadb_modules.add(rel)
-        if rel in LIVE_JOB_NON_LIVE_MODULES:
+        if rel in allowlist:
             continue
-        uses_pg, uses_my, uses_sc = _live_engine_requirements(path)
+        uses_pg, uses_my, uses_sc_env, uses_sc_driver = _live_engine_requirements(path)
         if uses_pg and not _module_in_commands(rel, pg_cmds):
-            errors.append(f"{rel}: uses POSTGRES_DSN/TARGETS but is not run by ci.yml job 'postgres'")
+            errors.append(f"{rel}: uses live PostgreSQL (POSTGRES_DSN/shared helper) but is not run with POSTGRES_DSN by ci.yml job 'postgres'")
         if uses_my and not _module_in_commands(rel, my_cmds):
-            errors.append(f"{rel}: uses MYSQL_DSN/TARGETS but is not run by ci.yml job 'mysql'")
+            errors.append(f"{rel}: uses live MySQL/MariaDB (MYSQL_DSN/shared helper) but is not run with MYSQL_DSN by ci.yml job 'mysql'")
         if uses_my and not _module_in_commands(rel, mc_cmds):
-            errors.append(f"{rel}: uses MYSQL_DSN/TARGETS but is not run by ci.yml job 'mysql-compat'")
-        if uses_sc and not _module_in_commands(rel, sc_cmds):
-            errors.append(f"{rel}: uses SQLITE_COMPAT_ENGINE but is not run by ci.yml job 'sqlite-compat'")
+            errors.append(f"{rel}: uses live MySQL/MariaDB (MYSQL_DSN/shared helper) but is not run with MYSQL_DSN by ci.yml job 'mysql-compat'")
+        if uses_sc_env and not _module_in_commands(rel, sc_env_cmds):
+            errors.append(f"{rel}: uses SQLITE_COMPAT_ENGINE but is not run with SQLITE_COMPAT_ENGINE by ci.yml job 'sqlite-compat'")
+        elif uses_sc_driver and not _module_in_commands(rel, sc_any_cmds):
+            errors.append(f"{rel}: imports a SQLite-compat driver directly but is not run by ci.yml job 'sqlite-compat'")
 
     only_mysql = sorted(mysql_modules - mariadb_modules)
     only_mariadb = sorted(mariadb_modules - mysql_modules)
@@ -1228,26 +1319,61 @@ class TestWorkflowHygiene(unittest.TestCase):
         wfs = copy.deepcopy(self.workflows)
         for st in wfs["ci.yml"]["jobs"]["postgres"]["steps"]:
             if "run" in st:
-                st["run"] = str(st["run"]).replace("test_p0_pk_swap_and_collation.py", "test_removed_placeholder.py")
+                st["run"] = str(st["run"]).replace(
+                    '--task "python3 test_p0_pk_swap_and_collation.py"',
+                    '# --task "python3 test_p0_pk_swap_and_collation.py"',
+                )
         for st in wfs["ci.yml"]["jobs"]["mysql-compat"]["steps"]:
             if "run" in st:
                 st["run"] = str(st["run"]).replace("test_group_key_collation.py", "test_removed_placeholder.py")
+        for st in wfs["ci.yml"]["jobs"]["mysql"]["steps"]:
+            if "run" in st:
+                st["run"] = str(st["run"]).replace("test_native_result_types.py", "test_removed_placeholder.py")
+        # Remove SQLITE_COMPAT_ENGINE from the step running test_sqlite_distinct_filtered_aggregates.py.
+        for st in wfs["ci.yml"]["jobs"]["sqlite-compat"]["steps"]:
+            if "test_sqlite_distinct_filtered_aggregates.py" in str(st.get("run", "")):
+                st.pop("env", None)
         errors = live_job_module_errors(wfs)
         self.assertTrue(any("test_p0_pk_swap_and_collation.py" in e and "'postgres'" in e for e in errors), errors)
         self.assertTrue(any("test_group_key_collation.py" in e and "'mysql-compat'" in e for e in errors), errors)
         self.assertTrue(any("absent from 'mysql-compat'" in e for e in errors), errors)
+        self.assertTrue(any("absent from 'mysql'" in e for e in errors), errors)
+        self.assertTrue(
+            any("test_sqlite_distinct_filtered_aggregates.py" in e and "'sqlite-compat'" in e for e in errors),
+            errors,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             (tmp_path / "test_new_pg.py").write_text('import os\nDSN = os.environ.get("POSTGRES_DSN")\n')
             (tmp_path / "test_new_my.py").write_text('import os\nDSN = os.environ.get("MYSQL_DSN")\n')
             (tmp_path / "test_new_sc.py").write_text('import os\nENG = os.environ.get("SQLITE_COMPAT_ENGINE")\n')
-            (tmp_path / "test_new_doc_only.py").write_text('"""Mentions POSTGRES_DSN and MYSQL_DSN only in docstring."""\n')
-            tmp_errors = live_job_module_errors(self.workflows, tmp_path)
+            (tmp_path / "test_new_apsw.py").write_text("import apsw\n")
+            (tmp_path / "test_new_bulk_alias.py").write_text(
+                "import test_native_bulk_statements as bulk\nT = bulk.TARGETS\n"
+            )
+            (tmp_path / "test_new_native_helper.py").write_text(
+                "from test_avg_concurrent_maintenance import _native_engines\n"
+            )
+            (tmp_path / "test_new_doc_only.py").write_text(
+                '"""Mentions POSTGRES_DSN and MYSQL_DSN only in module docstring."""\n'
+                'class C:\n    """POSTGRES_DSN"""\n    def f(self):\n        """MYSQL_DSN"""\n'
+            )
+            tmp_errors = live_job_module_errors(
+                self.workflows,
+                tmp_path,
+                non_live_modules={"test_nonexistent_allowlist_entry.py": "stale"},
+            )
             self.assertTrue(any("test_new_pg.py" in e and "'postgres'" in e for e in tmp_errors), tmp_errors)
             self.assertTrue(any("test_new_my.py" in e and "'mysql'" in e for e in tmp_errors), tmp_errors)
             self.assertTrue(any("test_new_my.py" in e and "'mysql-compat'" in e for e in tmp_errors), tmp_errors)
             self.assertTrue(any("test_new_sc.py" in e and "'sqlite-compat'" in e for e in tmp_errors), tmp_errors)
+            self.assertTrue(any("test_new_apsw.py" in e and "'sqlite-compat'" in e for e in tmp_errors), tmp_errors)
+            for helper_mod in ("test_new_bulk_alias.py", "test_new_native_helper.py"):
+                self.assertTrue(any(helper_mod in e and "'postgres'" in e for e in tmp_errors), tmp_errors)
+                self.assertTrue(any(helper_mod in e and "'mysql'" in e for e in tmp_errors), tmp_errors)
+                self.assertTrue(any(helper_mod in e and "'mysql-compat'" in e for e in tmp_errors), tmp_errors)
+            self.assertTrue(any("test_nonexistent_allowlist_entry.py" in e for e in tmp_errors), tmp_errors)
             self.assertFalse(any("test_new_doc_only.py" in e for e in tmp_errors), tmp_errors)
 
     def test_presubmit_selftest_runs_in_the_sqlite_gate_job_with_pyyaml(self) -> None:

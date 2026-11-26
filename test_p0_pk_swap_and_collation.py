@@ -753,9 +753,13 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
             conn = pg_driver.connect(dsn)
         conn.autocommit = True
         cur = conn.cursor()
+        plan = None
+        plan_const = None
+        sq_ro_fn_drops: List[str] = []
         try:
             cur.execute("DROP VIEW IF EXISTS pg_bag_mv CASCADE;")
             cur.execute("DROP TABLE IF EXISTS __matview_store_pg_bag_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS __matview_stg_pg_bag_mv__pg_bag_logs CASCADE;")
             cur.execute("DROP TABLE IF EXISTS pg_bag_logs CASCADE;")
             cur.execute("CREATE TABLE pg_bag_logs (code INT, msg TEXT);")
             cur.execute(
@@ -814,11 +818,10 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
                 cur.execute("INSERT INTO pg_bag_mv VALUES (9, 'ro');")
 
             # Also verify literal constants in SELECT + NUMERIC 1.0 vs 1.00 + FLOAT8 0.0 vs -0.0
-            # + schema-qualified reader view & INSTEAD OF trigger.
-            cur.execute("DROP SCHEMA IF EXISTS mv_bag_sch CASCADE;")
-            cur.execute("CREATE SCHEMA mv_bag_sch;")
+            # + literal-dot reader view name & INSTEAD OF trigger.
             cur.execute("DROP VIEW IF EXISTS pg_bag_const_mv CASCADE;")
             cur.execute("DROP TABLE IF EXISTS __matview_store_pg_bag_const_mv CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS __matview_stg_pg_bag_const_mv__pg_bag_num CASCADE;")
             cur.execute("DROP TABLE IF EXISTS pg_bag_num CASCADE;")
             cur.execute("CREATE TABLE pg_bag_num (n NUMERIC, f FLOAT8, msg TEXT);")
             cur.execute(
@@ -873,12 +876,13 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
             cur.execute('DROP VIEW IF EXISTS "mv_bag_sch.pg_bag_sq_v" CASCADE;')
             v_sq = dc_replace(v_const, view_name="mv_bag_sch.pg_bag_sq_v")
             comp_sq = IncrementalViewCompiler(num_schemas, v_sq, dialect=Dialect.POSTGRES)
-            sq_view_ddl, sq_ro_trigs, _, _ = comp_sq._build_readonly_view_and_triggers(
+            sq_view_ddl, sq_ro_trigs, _, sq_ro_drops = comp_sq._build_readonly_view_and_triggers(
                 "mv_bag_sch.pg_bag_sq_v",
                 plan_const.backing_table_name,
                 plan_const.user_columns,
                 repeat_count_col="__mv_row_count",
             )
+            sq_ro_fn_drops = list(sq_ro_drops)
             cur.execute(sq_view_ddl)
             for ro_ddl in sq_ro_trigs:
                 cur.execute(ro_ddl)
@@ -890,7 +894,12 @@ class TestFinding6PkSwapAndShift(unittest.TestCase):
                 )
         finally:
             cur.execute('DROP VIEW IF EXISTS "mv_bag_sch.pg_bag_sq_v" CASCADE;')
-            cur.execute("DROP SCHEMA IF EXISTS mv_bag_sch CASCADE;")
+            for fn_name in sq_ro_fn_drops:
+                cur.execute(f'DROP FUNCTION IF EXISTS "{fn_name}"() CASCADE;')
+            for p in (plan_const, plan):
+                if p is not None:
+                    for fn_name in p.function_names:
+                        cur.execute(f'DROP FUNCTION IF EXISTS "{fn_name}"() CASCADE;')
             cur.execute("DROP VIEW IF EXISTS pg_bag_const_mv CASCADE;")
             cur.execute("DROP VIEW IF EXISTS pg_bag_mv CASCADE;")
             cur.execute("DROP TABLE IF EXISTS __matview_store_pg_bag_mv CASCADE;")
