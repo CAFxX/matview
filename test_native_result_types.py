@@ -3615,7 +3615,7 @@ class PostgresPseudotypeOutputRefusalTests(unittest.TestCase):
                 f"SELECT id, {fn_void}(id) AS r FROM {t}",
                 f"SELECT id, public.{fn_void}(id) AS r FROM {t}",
                 f"WITH c AS (SELECT id, {fn_void}(id) AS r FROM {t}) SELECT id, r FROM c",
-                f"SELECT id, pg_catalog.pg_sleep(0) AS r FROM {t}",
+                f"SELECT id, pg_catalog.void_in('') AS r FROM {t}",
             ]
             # MIN(composite) -> record was added in PostgreSQL 18.
             if pg_ver >= 180000:
@@ -3626,6 +3626,14 @@ class PostgresPseudotypeOutputRefusalTests(unittest.TestCase):
                         mgr.register_view(f"CREATE VIEW mv_bad_{idx}_{tag} AS {bad_sel};")
                     conn.rollback()
                     self.assertIn("pseudo-type", str(ctx.exception).lower())
+
+            # Volatile pg_catalog void-returning function is refused up front by the
+            # PostgreSQL volatility guard (cannot be frozen in a materialized view).
+            with self.subTest(refused_native_volatile=f"SELECT id, pg_catalog.pg_sleep(0) AS r FROM {t}"):
+                with self.assertRaises(UnsupportedMaterializedViewError) as ctx:
+                    mgr.register_view(f"CREATE VIEW mv_bad_sleep_{tag} AS SELECT id, pg_catalog.pg_sleep(0) AS r FROM {t};")
+                conn.rollback()
+                self.assertIn("volatile", str(ctx.exception).lower())
 
             good_specs = [
                 ("named_comp", f"SELECT id, ROW(v, g)::{pair_t} AS r FROM {t}"),
